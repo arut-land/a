@@ -64,3 +64,52 @@ account denial test and physical power-cut durability testing need a suitable
 Windows host; ordinary CI and cross-lint cannot prove those. Miri on Unix
 cannot execute Windows FFI or validate kernel buffer lifetimes. Portable
 path/staging/locking tests run locally; supported sys tests run under Miri.
+
+## Invariants exercised
+
+The portable black-box tests in
+[`daemon_acceptance.rs`](../../apps/cli/tests/blackbox/daemon_acceptance.rs)
+run on Unix and in the native Windows lane:
+
+- `concurrent_starters_share_one_daemon_and_stop_releases_its_lock`
+- `committed_turns_survive_a_daemon_restart`
+- `an_unclean_exit_releases_the_endpoint_and_recovers_committed_sessions`
+- `shell_paths_with_spaces_and_non_ascii_reach_the_native_directory`
+- `two_installs_upgrade_once_and_the_older_client_never_downgrades`
+
+Windows sys tests cover kernel-specific contracts:
+
+- `alternate_spellings_of_one_home_find_the_same_pipe`
+- `a_listener_has_one_owner_and_accepts_multiple_independent_clients`
+- `a_cancelled_read_keeps_its_buffer_and_completion_until_observed`
+- `shutdown_wakes_a_blocked_clone_without_waiting_for_the_peer`
+- `the_pipe_dacl_grants_access_only_to_the_current_token_sid`
+- `daemon_death_kills_the_whole_job_tree`
+- `process_identity_is_stable_and_not_a_pid_alone`
+- `extended_and_unc_paths_keep_their_shell_meaning`
+
+Portable sys invariants include
+`a_locked_record_remains_readable_and_excludes_other_writers` and
+`shell_directory_reports_roundtrip_spaces_unicode_and_line_endings`;
+both pass under Miri on Unix. The existing staging tests now run on Windows
+as well. Client tests for stopped-process identity and releasing a timed-out
+lock waiter also run on Windows through the shared lock seam.
+
+## Local validation (2026-10-21)
+
+On the Apple development host, the merged tree through main `0b9292f`
+passed `mise run check` (944 tests, 28 skipped), acceptance (18), web (6),
+and Apple (10). Windows cross-clippy, machete, dependency deny, and the
+no-Tokio check passed. Native Windows linking and execution have not run
+locally; the required CI lane is the gate for those results.
+
+The two portable path/lock invariants above passed under Miri. The full
+prescribed Miri task still stops at the existing unsupported
+`CFStringCreateWithCString` call in `sys::awake`. Windows kernel FFI and
+completion-buffer lifetimes cannot be checked by that Unix Miri run.
+
+`mise run size` measured 3,007 KiB before and after the Windows work alone.
+After merging main's fork implementation and protocol 7, it measured
+3,039 KiB, including fixture exclusion, below the 4,096 KiB cap. All builds
+used `CARGO_BUILD_JOBS=3`. Budgets and startup timing were deliberately not
+run on this shared machine; the coordinator runs them on a quiet host.

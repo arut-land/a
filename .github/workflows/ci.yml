@@ -163,6 +163,8 @@ jobs:
         shell: bash
     # Native completion, security, job containment, and daemon acceptance.
     steps:
+      # Recorded wire/provider fixtures must keep their checked-in bytes.
+      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
       - *mbx-dir
       - *cache
