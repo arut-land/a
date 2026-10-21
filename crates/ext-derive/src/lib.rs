@@ -6,13 +6,16 @@
 //! left out (an `Option`). `#[serde(rename = "..")]` names it, and
 //! `#[schema(min = 1, max = 600, min_items = 1)]` bounds it. No other
 //! property is allowed.
+//! Serde's supported subset is field `rename`, `default`,
+//! `skip_serializing`, `skip_serializing_if`, and container
+//! `deny_unknown_fields`. Other serde attributes are rejected so the
+//! schema cannot silently advertise a different deserialization shape.
 
 use std::fmt::Write as _;
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as Tokens;
 use quote::quote;
-use syn::meta::ParseNestedMeta;
 use syn::{Data, DeriveInput, Expr, Fields, Lit, LitInt, LitStr, Meta, parse_macro_input};
 
 #[proc_macro_derive(Schema, attributes(schema))]
@@ -33,6 +36,17 @@ struct Field {
 }
 
 fn derive(input: &DeriveInput) -> syn::Result<Tokens> {
+    for attr in &input.attrs {
+        if attr.path().is_ident("serde") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("deny_unknown_fields") {
+                    Ok(())
+                } else {
+                    Err(meta.error("unsupported serde container attribute in Schema"))
+                }
+            })?;
+        }
+    }
     let Data::Struct(data) = &input.data else {
         return Err(syn::Error::new_spanned(input, "a schema is of a struct"));
     };
@@ -47,6 +61,14 @@ fn derive(input: &DeriveInput) -> syn::Result<Tokens> {
         .iter()
         .map(field)
         .collect::<syn::Result<Vec<_>>>()?;
+    for (i, field) in fields.iter().enumerate() {
+        if fields[..i].iter().any(|other| other.name == field.name) {
+            return Err(syn::Error::new_spanned(
+                &named.named[i],
+                "duplicate deserialization property in Schema",
+            ));
+        }
+    }
     let properties = fields.iter().enumerate().map(|(i, f)| {
         let key = format!("{}{}:", if i == 0 { "" } else { "," }, json_string(&f.name));
         let (ty, doc) = (&f.ty, &f.doc);
@@ -107,12 +129,25 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("default") {
                     out.defaulted = true;
-                    skip(&meta)
+                    if meta.input.peek(syn::Token![=]) {
+                        meta.value()?.parse::<LitStr>()?;
+                    }
+                    Ok(())
                 } else if meta.path.is_ident("rename") {
+                    if !meta.input.peek(syn::Token![=]) {
+                        return Err(meta.error(
+                            "unsupported serde field attribute in Schema: use rename = \"name\"",
+                        ));
+                    }
                     out.name = meta.value()?.parse::<LitStr>()?.value();
                     Ok(())
+                } else if meta.path.is_ident("skip_serializing") {
+                    Ok(())
+                } else if meta.path.is_ident("skip_serializing_if") {
+                    meta.value()?.parse::<LitStr>()?;
+                    Ok(())
                 } else {
-                    skip(&meta)
+                    Err(meta.error("unsupported serde field attribute in Schema"))
                 }
             })?;
         } else if attr.path().is_ident("schema") {
@@ -130,16 +165,6 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
     }
     out.doc = doc.join(" ");
     Ok(out)
-}
-
-/// Passes over a serde setting this derive does not read.
-fn skip(meta: &ParseNestedMeta<'_>) -> syn::Result<()> {
-    if meta.input.peek(syn::Token![=]) {
-        meta.value()?.parse::<Expr>()?;
-    } else if !meta.input.is_empty() && !meta.input.peek(syn::Token![,]) {
-        meta.input.parse::<Tokens>()?;
-    }
-    Ok(())
 }
 
 /// `text` as a JSON string, quoted.

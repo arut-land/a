@@ -451,6 +451,12 @@ impl MessagesDecoder {
             DeltaType::ThinkingDelta => BlockType::Thinking,
             DeltaType::InputJsonDelta => {
                 let fragment = fragment.ok_or_else(missing)?;
+                let limits = self.w.limits();
+                let held = self.block(index).map_or(0, |block| block.json.len());
+                if fragment.len() > limits.argument_bytes.saturating_sub(held) {
+                    return Err(Error::limit("argument bytes"));
+                }
+                self.w.reserve(fragment.len())?;
                 let open = self.block(index);
                 let Some(Block {
                     kind: kind @ (BlockType::ToolUse | BlockType::Other),
@@ -545,6 +551,8 @@ impl MessagesDecoder {
         }
         self.settle(index)?;
         let Block { kind, json, .. } = self.block(index).map_or_default(std::mem::take);
+        let limits = self.w.limits();
+        crate::json::check_text(&json, limits.argument_bytes, limits.depth)?;
         let call = kind == BlockType::ToolUse;
         let unsigned = self.unsigned_thinking;
         let (mut complete, mut arguments) = (true, None);
@@ -764,5 +772,54 @@ impl Writes for MessagesDecoder {
             Some(EventType::Other) | None => {}
         }
         Ok(Flow::More)
+    }
+}
+
+#[cfg(test)]
+mod growth_tests {
+    use super::*;
+    use crate::protocol::{Decoder, Frame};
+    use crate::sse::DecodeLimits;
+
+    #[test]
+    fn private_hosted_and_tool_json_obey_argument_and_reply_limits() {
+        for kind in ["tool_use", "server_tool_use"] {
+            for (reply_bytes, argument_bytes) in [(1024, 8), (128, 1024)] {
+                let limits = DecodeLimits {
+                    reply_bytes,
+                    argument_bytes,
+                    ..Default::default()
+                };
+                let mut decoder = MessagesDecoder::new(false);
+                decoder.w = Writer::with_limits(KEY, limits);
+                let mut out = Vec::new();
+                let start = json!({"type": "content_block_start", "index": 0,
+                    "content_block": {"type": kind, "id": "id", "name": "tool"}})
+                .to_string();
+                decoder
+                    .frame(
+                        Frame {
+                            event: "message",
+                            data: &start,
+                        },
+                        &mut out,
+                    )
+                    .unwrap();
+                let delta = json!({"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": "123456789"}})
+                .to_string();
+                let error = decoder
+                    .frame(
+                        Frame {
+                            event: "message",
+                            data: &delta,
+                        },
+                        &mut out,
+                    )
+                    .unwrap_err();
+                assert_eq!(error.kind, Kind::Decode);
+                assert_eq!(decoder.block(0).unwrap().json, "");
+            }
+        }
     }
 }

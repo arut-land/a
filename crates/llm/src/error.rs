@@ -75,6 +75,11 @@ impl Error {
         Self::new(Kind::Unsupported, message)
     }
 
+    /// Local resource exhaustion is a decoding failure; retrying cannot fix it.
+    pub(crate) fn limit(resource: &str) -> Self {
+        Self::new(Kind::Decode, format!("reply exceeds the {resource} limit"))
+    }
+
     pub fn incomplete() -> Self {
         Self::new(
             Kind::Incomplete,

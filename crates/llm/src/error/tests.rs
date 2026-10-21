@@ -34,3 +34,16 @@ fn should_retry_header_overrides() {
     headers.insert("x-should-retry", "false".parse().unwrap());
     assert!(!Error::from_status(503, &headers, b"busy").is_retryable());
 }
+
+#[test]
+fn limit_errors_never_retry() {
+    let error = Error::limit("reply bytes");
+    assert_eq!(error.kind, Kind::Decode);
+    assert!(!error.is_retryable());
+    let encoded = serde_json::to_string(&error).expect("error encodes");
+    assert!(
+        !Error::from_json(&encoded)
+            .expect("error decodes")
+            .is_retryable()
+    );
+}
