@@ -101,8 +101,8 @@ fn ok(output: &Output) -> String {
 fn only_log(home: &Home) -> String {
     let mut logs = fs::read_dir(home.sessions_dir())
         .unwrap()
-        .map(|item| item.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|e| e == "jsonl"));
+        .map(|item| item.unwrap().path().join("log.jsonl"))
+        .filter(|path| path.is_file());
     let log = logs.next().unwrap();
     assert!(logs.next().is_none());
     fs::read_to_string(log).unwrap()
