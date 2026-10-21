@@ -125,6 +125,9 @@ struct Core {
     limits: DecodeLimits,
     bytes: usize,
     ingress_bytes: usize,
+    scan_left: usize,
+    // Conservative item sizes, indexed by part; edits only charge incoming data.
+    item_bytes: Vec<usize>,
     key: &'static str,
     out: Vec<Event>,
     /// The open items by wire index, in the order they opened. A reply
@@ -290,6 +293,8 @@ impl Core {
             limits,
             bytes: 0,
             ingress_bytes: 0,
+            scan_left: limits.reply_bytes,
+            item_bytes: Vec::new(),
             out: Vec::new(),
             open: Vec::new(),
             ended: Vec::new(),
@@ -371,11 +376,16 @@ impl Core {
     /// string field `key`: for a wire whose item states its text whole,
     /// written once instead of with each token.
     fn land(&mut self, index: usize, key: &str) -> Result<(), Error> {
-        self.reserve(
-            self.text(index)
-                .map_or(0, str::len)
-                .saturating_add(key.len()),
-        )?;
+        let text_bytes = self.text(index).map_or(0, str::len);
+        self.scan(text_bytes)?;
+        let text = self.text(index).unwrap_or_default();
+        let bytes =
+            crate::json::encoded_bytes(&text, self.limits.reply_bytes.saturating_sub(self.bytes))?
+                .saturating_add(key.len().saturating_mul(6))
+                .saturating_add(4);
+        self.reserve(bytes)?;
+        let part = self.item_part(index)?;
+        self.item_bytes[part as usize] = self.item_bytes[part as usize].saturating_add(bytes);
         let Draft { item, body, .. } = self.draft(index)?;
         let text = match body {
             Body::Text(text) | Body::Reasoning { text, .. } => text.as_str(),
@@ -451,7 +461,7 @@ impl Core {
                 "",
             ));
         }
-        let bytes = crate::json::value_bytes(&item, self.limits)?;
+        let bytes = self.measure(&item)?;
         let body_bytes = match &block {
             Open::Call { id, name } => id.len().saturating_add(name.len()),
             Open::Media(media) => crate::json::encoded_bytes(media, self.limits.reply_bytes)?,
@@ -459,6 +469,8 @@ impl Core {
         };
         self.reserve(bytes.saturating_add(body_bytes))?;
         self.insert(index, block.into(), item)?;
+        let part = self.item_part(index)?;
+        self.item_bytes[part as usize] = bytes;
         self.stream_call(index);
         Ok(())
     }
@@ -470,6 +482,7 @@ impl Core {
         self.ended.retain(|(at, _)| *at != index);
         let part = self.next_part;
         self.next_part += 1;
+        self.item_bytes.push(0);
         if let Some(by_index) = &mut self.by_index {
             by_index.push((part, index));
         }
@@ -539,30 +552,62 @@ impl Core {
     /// Edit the item at `index` in place: merge a delta, or replace the
     /// whole item the provider restates when it finishes. An index whose
     /// part already closed edits that part's item until the reply ends.
-    fn edit(&mut self, index: usize, edit: impl FnOnce(&mut Value)) -> Result<(), Error> {
-        let limits = self.limits;
-        let remaining = limits.reply_bytes.saturating_sub(self.bytes);
-        let item = if let Some(draft) = find(&mut self.open, index) {
-            &mut draft.item
-        } else {
-            let part = self.closed(index).ok_or_else(|| not_open(index))?;
-            let Some(kept) = self.items.iter_mut().find(|kept| kept.part == part) else {
-                return Ok(());
-            };
-            &mut kept.item
-        };
-        let before = crate::json::value_bytes(item, limits)?;
-        edit(item);
-        let after = crate::json::value_bytes(item, limits);
-        match after {
-            Ok(after) if after.saturating_sub(before) <= remaining => {
-                self.reserve(after.saturating_sub(before))
-            }
-            _ => {
-                *item = Value::Null;
-                Err(Error::limit("provider item"))
-            }
+    fn item_part(&self, index: usize) -> Result<u32, Error> {
+        self.get(index)
+            .map(|draft| draft.part)
+            .or_else(|| self.closed(index))
+            .ok_or_else(|| not_open(index))
+    }
+
+    fn edit(
+        &mut self,
+        index: usize,
+        growth: usize,
+        edit: impl FnOnce(&mut Value),
+    ) -> Result<(), Error> {
+        let part = self.item_part(index)?;
+        self.reserve(growth)?;
+        self.item_bytes[part as usize] = self.item_bytes[part as usize].saturating_add(growth);
+        if let Some(draft) = find(&mut self.open, index) {
+            edit(&mut draft.item);
+        } else if let Some(kept) = self.items.iter_mut().find(|kept| kept.part == part) {
+            edit(&mut kept.item);
         }
+        Ok(())
+    }
+
+    fn measure(&mut self, value: &Value) -> Result<usize, Error> {
+        self.measure_at(value, 0)
+    }
+
+    fn measure_at(&mut self, value: &Value, containers: usize) -> Result<usize, Error> {
+        let mut limits = self.limits;
+        limits.depth = limits
+            .depth
+            .checked_sub(containers)
+            .ok_or_else(|| Error::limit("JSON depth"))?;
+        limits.reply_bytes = limits.reply_bytes.saturating_sub(self.bytes);
+        crate::json::measured_value(value, limits, &mut self.scan_left)
+    }
+
+    fn scan(&mut self, bytes: usize) -> Result<(), Error> {
+        self.scan_left = self
+            .scan_left
+            .checked_sub(bytes)
+            .ok_or_else(|| Error::limit("provider item work"))?;
+        Ok(())
+    }
+
+    fn measure_str(&mut self, text: &str) -> Result<usize, Error> {
+        self.scan(text.len())?;
+        crate::json::encoded_bytes(&text, self.limits.reply_bytes.saturating_sub(self.bytes))
+    }
+
+    fn scan_item(&mut self, index: usize) -> Result<usize, Error> {
+        let part = self.item_part(index)?;
+        let bytes = self.item_bytes[part as usize];
+        self.scan(bytes)?;
+        Ok(bytes)
     }
 
     /// Replace the text, reasoning or argument JSON of the open item at
@@ -597,7 +642,7 @@ impl Core {
     /// Arguments the provider announced for the call at `index`, used only
     /// if no fragment arrives.
     fn announce(&mut self, index: usize, announced: Value) -> Result<(), Error> {
-        let bytes = crate::json::value_bytes(&announced, self.limits)?;
+        let bytes = self.measure(&announced)?;
         self.argument(index, bytes, false)?;
         self.reserve(bytes)?;
         if let Body::Call { arguments, .. } = &mut self.draft(index)?.body {
@@ -657,6 +702,29 @@ impl Core {
         Ok(())
     }
 
+    fn complete_arguments(&mut self, index: usize) -> Result<bool, Error> {
+        let Some(Draft {
+            body: Body::Call { arguments, .. },
+            ..
+        }) = self.get(index)
+        else {
+            return Ok(false);
+        };
+        let text = &arguments.text[arguments.content.clone()];
+        if !text.starts_with('{') || !text.ends_with('}') {
+            return Ok(false);
+        }
+        self.scan(text.len())?;
+        let Some(Draft {
+            body: Body::Call { arguments, .. },
+            ..
+        }) = self.get(index)
+        else {
+            return Ok(false);
+        };
+        Ok(arguments.complete())
+    }
+
     /// When another call takes over wire `index`, the one it held ends.
     fn take_over(
         &mut self,
@@ -665,14 +733,15 @@ impl Core {
         name: Option<&str>,
     ) -> Result<(), Error> {
         let names = name.is_some_and(|name| !name.is_empty());
-        let held = self.get(index).and_then(|draft| match &draft.body {
-            Body::Call {
-                id: Some(id),
-                arguments,
-                ..
-            } if new_id.is_some_and(|new| id != new) => Some(arguments.complete()),
-            _ => None,
+        let changes_id = self.get(index).is_some_and(|draft| {
+            matches!(&draft.body,
+            Body::Call { id: Some(id), .. } if new_id.is_some_and(|new| id != new))
         });
+        let held = if changes_id {
+            Some(self.complete_arguments(index)?)
+        } else {
+            None
+        };
         if let Some(complete) = held.filter(|complete| *complete || names) {
             let moved = self.fresh_index();
             if let Some(slot) = self.open.iter_mut().find(|(at, _)| *at == index) {
@@ -869,7 +938,7 @@ impl Core {
     /// output limit.
     fn end(&mut self, end: End) -> Result<Flow, Error> {
         if let Some(usage) = &end.raw_usage {
-            let bytes = crate::json::value_bytes(usage, self.limits)?;
+            let bytes = self.measure(usage)?;
             self.reserve(bytes)?;
         }
         self.reserve(
@@ -1006,12 +1075,11 @@ impl<S: Default> Writer<S> {
     // before the provider can allocate them, including edits to held items.
     fn ingress(&mut self, data: &str) -> Result<(), Error> {
         let limits = self.core.limits;
-        crate::json::check_text(data, limits.frame_bytes, limits.depth)?;
         if data.len() > limits.reply_bytes.saturating_sub(self.core.ingress_bytes) {
             return Err(Error::limit("reply bytes"));
         }
         self.core.ingress_bytes += data.len();
-        Ok(())
+        crate::json::check_text(data, limits.frame_bytes, limits.depth)
     }
 
     /// A wire whose call items hold their id in a slot replay can fill.
@@ -1078,11 +1146,84 @@ impl<S: Default> Writer<S> {
         self.core.push_text(index, fragment.into())
     }
 
-    /// Edit the item at `index` in place: merge a delta, or replace the
-    /// whole item the provider restates when it finishes. An index whose
-    /// part already closed edits that part's item until the reply ends.
-    pub fn edit(&mut self, index: usize, edit: impl FnOnce(&mut Value)) -> Result<(), Error> {
-        self.core.edit(index, edit)
+    /// Reserve the maximum bytes the callback can copy or add before it
+    /// runs. Token edits measure incoming fields, never the accumulated item.
+    /// A closed part's item remains editable until the reply ends.
+    pub(crate) fn edit(
+        &mut self,
+        index: usize,
+        growth: usize,
+        edit: impl FnOnce(&mut Value),
+    ) -> Result<(), Error> {
+        self.core.edit(index, growth, edit)
+    }
+
+    /// Measure incoming data, admitting each scan before performing it.
+    pub(crate) fn measure(&mut self, value: &Value) -> Result<usize, Error> {
+        self.core.measure(value)
+    }
+
+    pub(crate) fn measure_at(&mut self, value: &Value, containers: usize) -> Result<usize, Error> {
+        self.core.measure_at(value, containers)
+    }
+
+    pub(crate) fn measure_str(&mut self, text: &str) -> Result<usize, Error> {
+        self.core.measure_str(text)
+    }
+
+    pub(crate) fn complete_arguments(&mut self, index: usize) -> Result<bool, Error> {
+        self.core.complete_arguments(index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scan_work(&self) -> usize {
+        self.core.limits.reply_bytes - self.core.scan_left
+    }
+
+    pub(crate) fn replace(&mut self, index: usize, item: Value) -> Result<(), Error> {
+        let bytes = self.measure(&item)?;
+        self.edit(index, bytes, |stored| *stored = item)
+    }
+
+    pub(crate) fn measure_fields(&mut self, fields: &Map<String, Value>) -> Result<usize, Error> {
+        let mut bytes: usize = 2;
+        for (key, value) in fields {
+            bytes = bytes
+                .saturating_add(self.measure_str(key)?)
+                .saturating_add(2)
+                .saturating_add(self.measure_at(value, 1)?);
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn merge(&mut self, index: usize, fields: &Map<String, Value>) -> Result<(), Error> {
+        let bytes = self.measure_fields(fields)?;
+        self.edit(index, bytes, |item| merge(item, fields))
+    }
+
+    /// A whole-item operation pays for scanning and copying its current
+    /// contents before entering the callback. Token edits use `edit` instead.
+    pub(crate) fn inspect<T>(
+        &mut self,
+        index: usize,
+        read: impl FnOnce(&Value) -> T,
+    ) -> Result<T, Error> {
+        let bytes = self.core.scan_item(index)?;
+        self.reserve(bytes)?;
+        let mut result = None;
+        self.edit(index, 0, |item| result = Some(read(item)))?;
+        result.ok_or_else(|| not_open(index))
+    }
+
+    pub(crate) fn transform(
+        &mut self,
+        index: usize,
+        growth: usize,
+        edit: impl FnOnce(&mut Value),
+    ) -> Result<(), Error> {
+        let bytes = self.core.scan_item(index)?;
+        self.core.reserve(bytes)?;
+        self.edit(index, growth, edit)
     }
 
     /// Replace the text, reasoning or argument JSON of the open item at

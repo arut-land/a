@@ -381,8 +381,9 @@ impl GeminiDecoder {
                 // field replaces its namesake.
                 let kept =
                     |(key, value): &(String, Value)| key != "thoughtSignature" || value != "";
+                let growth = self.w.measure_fields(&rest)?;
                 let rest = rest.into_iter().filter(kept);
-                return self.w.edit(index, |item| {
+                return self.w.edit(index, growth, |item| {
                     if let Some(item) = item.as_object_mut() {
                         item.extend(rest);
                     }
@@ -415,7 +416,11 @@ impl GeminiDecoder {
                 self.signature = signature;
                 return Ok(());
             };
-            return self.w.edit(index, |item| {
+            let growth = signature
+                .as_ref()
+                .map_or(Ok(0), |value| self.w.measure_at(value, 1))?
+                .saturating_add(24);
+            return self.w.edit(index, growth, |item| {
                 if let (Some(item), Some(signature)) = (item.as_object_mut(), signature) {
                     item.insert("thoughtSignature".into(), signature);
                 }

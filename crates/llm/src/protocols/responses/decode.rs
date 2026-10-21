@@ -562,7 +562,7 @@ impl ResponsesDecoder {
             }
         }
         let reasoning = kind == Item::Reasoning;
-        self.w.edit(at, |stored| *stored = item)?;
+        self.w.replace(at, item)?;
         if reasoning {
             // Reasoning is sent only with the item it precedes, so it is
             // complete only once that item is.
@@ -628,7 +628,8 @@ impl ResponsesDecoder {
                     // Reasoning done without its ciphertext takes the
                     // terminal's.
                     if let (Item::Reasoning, Some(cipher)) = (kind, ciphertext(&item)) {
-                        self.w.edit(at, |stored| {
+                        let growth = self.w.measure_at(cipher, 1)?.saturating_add(24);
+                        self.w.edit(at, growth, |stored| {
                             if ciphertext(stored).is_none()
                                 && let Some(fields) = stored.as_object_mut()
                             {

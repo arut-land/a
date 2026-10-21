@@ -24,7 +24,7 @@ use crate::error::{Error, Kind};
 use crate::json::{Count, Fielded, FromFields, Json, Lenient, Word, tag, whole_object};
 use crate::protocol::Flow;
 use crate::spec::{Reason, SmolStr, Usage};
-use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, Writes, merge};
+use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, Writes};
 
 type Object = Map<String, Value>;
 
@@ -283,6 +283,7 @@ pub(crate) struct Block {
     kind: BlockType,
     /// The input JSON streamed to it.
     json: String,
+    depth: crate::json::JsonDepth,
     /// Whether its own deltas extended its text, which its item takes when
     /// it stops: the writer holds that text already.
     grew: bool,
@@ -374,6 +375,8 @@ impl MessagesDecoder {
             kind: if fallback { BlockType::Other } else { kind },
             ..Block::default()
         };
+        let bytes = self.w.measure_fields(block)?;
+        self.w.reserve(bytes)?;
         let block = Value::Object(block.clone());
         let (open, text) = match kind {
             BlockType::Text => (Open::Text, block.str("text")),
@@ -461,6 +464,7 @@ impl MessagesDecoder {
                 let Some(Block {
                     kind: kind @ (BlockType::ToolUse | BlockType::Other),
                     json,
+                    depth,
                     ..
                 }) = open
                 else {
@@ -469,6 +473,7 @@ impl MessagesDecoder {
                     );
                     return Err(Error::decode(takes_none, data));
                 };
+                depth.push(&fragment, limits.depth)?;
                 json.push_str(&fragment);
                 if *kind == BlockType::ToolUse {
                     self.w.push(index, fragment)?;
@@ -477,7 +482,8 @@ impl MessagesDecoder {
             }
             DeltaType::CitationsDelta => {
                 let citation = others.remove("citation").unwrap_or_default();
-                return self.w.edit(index, |item| {
+                let growth = self.w.measure_at(&citation, 2)?.saturating_add(16);
+                return self.w.edit(index, growth, |item| {
                     let Value::Object(item) = item else {
                         return;
                     };
@@ -491,7 +497,7 @@ impl MessagesDecoder {
             }
             DeltaType::SignatureDelta | DeltaType::Other => {
                 self.land(index, &others)?;
-                return self.w.edit(index, |item| merge(item, &others));
+                return self.w.merge(index, &others);
             }
         };
         // Nearly every frame: a block's own text, which waits for its stop.
@@ -516,15 +522,19 @@ impl MessagesDecoder {
             Some(block) if own && !block.eager => block.grew = true,
             _ => {
                 self.settle(index)?;
-                self.w.edit(index, |item| {
-                    append(item, key, &fragment);
-                    merge(item, &others);
-                })?;
+                let growth = self
+                    .w
+                    .measure_str(&fragment)?
+                    .saturating_add(key.len())
+                    .saturating_add(4);
+                self.w
+                    .edit(index, growth, |item| append(item, key, &fragment))?;
+                self.w.merge(index, &others)?;
                 return self.w.push(index, fragment);
             }
         }
         if !others.is_empty() {
-            self.w.edit(index, |item| merge(item, &others))?;
+            self.w.merge(index, &others)?;
         }
         self.w.push(index, fragment)
     }
@@ -552,51 +562,52 @@ impl MessagesDecoder {
         self.settle(index)?;
         let Block { kind, json, .. } = self.block(index).map_or_default(std::mem::take);
         let limits = self.w.limits();
-        crate::json::check_text(&json, limits.argument_bytes, limits.depth)?;
+        crate::json::check_text(&json, limits.argument_bytes, limits.depth.saturating_sub(1))?;
         let call = kind == BlockType::ToolUse;
         let unsigned = self.unsigned_thinking;
         let (mut complete, mut arguments) = (true, None);
-        self.w.edit(index, |item| {
-            let stated = |key| item.str(key).unwrap_or_default();
-            let kept = match kind {
-                BlockType::Text => !stated("text").trim().is_empty(),
-                BlockType::Thinking => unsigned || !stated("signature").is_empty(),
-                BlockType::RedactedThinking => !stated("data").is_empty(),
-                BlockType::ToolUse | BlockType::Fallback | BlockType::Other => {
-                    // What streamed, `None` if it is no JSON, else what the
-                    // block states.
-                    let input = match json.trim() {
-                        "" if json.is_empty() => Some(item.get("input").cloned()),
-                        "" => Some(Some(json!({}))),
-                        json => serde_json::from_str(json).ok().map(Some),
-                    };
-                    let input = match (input, call) {
-                        (Some(Some(input @ Value::Object(_))), _) => Some(input),
-                        (Some(None | Some(Value::Null)), true) => Some(json!({})),
-                        (Some(None), false) => None,
-                        // Input stated on the block that is no object stands
-                        // as the call's argument text, which the writer
-                        // judges.
-                        (Some(Some(stated)), true) if json.is_empty() => {
-                            arguments = Some(stated.to_string());
-                            return *item = Value::Null;
+        self.w
+            .transform(index, json.len().saturating_add(16), |item| {
+                let stated = |key| item.str(key).unwrap_or_default();
+                let kept = match kind {
+                    BlockType::Text => !stated("text").trim().is_empty(),
+                    BlockType::Thinking => unsigned || !stated("signature").is_empty(),
+                    BlockType::RedactedThinking => !stated("data").is_empty(),
+                    BlockType::ToolUse | BlockType::Fallback | BlockType::Other => {
+                        // What streamed, `None` if it is no JSON, else what the
+                        // block states.
+                        let input = match json.trim() {
+                            "" if json.is_empty() => Some(item.get("input").cloned()),
+                            "" => Some(Some(json!({}))),
+                            json => serde_json::from_str(json).ok().map(Some),
+                        };
+                        let input = match (input, call) {
+                            (Some(Some(input @ Value::Object(_))), _) => Some(input),
+                            (Some(None | Some(Value::Null)), true) => Some(json!({})),
+                            (Some(None), false) => None,
+                            // Input stated on the block that is no object stands
+                            // as the call's argument text, which the writer
+                            // judges.
+                            (Some(Some(stated)), true) if json.is_empty() => {
+                                arguments = Some(stated.to_string());
+                                return *item = Value::Null;
+                            }
+                            (_, true) => return *item = Value::Null,
+                            (_, false) => {
+                                complete = false;
+                                None
+                            }
+                        };
+                        if let (Some(input), Some(fields)) = (input, item.as_object_mut()) {
+                            fields.insert("input".into(), input);
                         }
-                        (_, true) => return *item = Value::Null,
-                        (_, false) => {
-                            complete = false;
-                            None
-                        }
-                    };
-                    if let (Some(input), Some(fields)) = (input, item.as_object_mut()) {
-                        fields.insert("input".into(), input);
+                        true
                     }
-                    true
+                };
+                if !kept {
+                    *item = Value::Null;
                 }
-            };
-            if !kept {
-                *item = Value::Null;
-            }
-        })?;
+            })?;
         if let Some(arguments) = arguments {
             self.w.push(index, &arguments)?;
         }
@@ -780,6 +791,40 @@ mod growth_tests {
     use super::*;
     use crate::protocol::{Decoder, Frame};
     use crate::sse::DecodeLimits;
+
+    #[test]
+    fn hosted_argument_depth_is_rejected_before_buffering() {
+        let limits = DecodeLimits::default();
+        let mut decoder = MessagesDecoder::new(false);
+        let mut out = Vec::new();
+        let start = json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "server_tool_use", "id": "id", "name": "tool"}})
+        .to_string();
+        decoder
+            .frame(
+                Frame {
+                    event: "message",
+                    data: &start,
+                },
+                &mut out,
+            )
+            .unwrap();
+        let delta = json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "[".repeat(limits.depth + 1)}})
+        .to_string();
+        let result = decoder.frame(
+            Frame {
+                event: "message",
+                data: &delta,
+            },
+            &mut out,
+        );
+        assert!(
+            result.is_err(),
+            "over-depth input was retained in the private buffer"
+        );
+        assert_eq!(decoder.block(0).unwrap().json, "");
+    }
 
     #[test]
     fn private_hosted_and_tool_json_obey_argument_and_reply_limits() {

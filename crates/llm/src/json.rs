@@ -59,6 +59,16 @@ pub(crate) fn check_text(text: &str, bytes: usize, depth: usize) -> Result<(), E
     JsonDepth::default().push(text, depth)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static ENCODED_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn encoded_work() -> usize {
+    ENCODED_WORK.get()
+}
+
 /// Count serialized bytes without making another copy of a provider tree.
 pub(crate) fn encoded_bytes(value: &impl serde::Serialize, limit: usize) -> Result<usize, Error> {
     struct Counter {
@@ -70,6 +80,8 @@ pub(crate) fn encoded_bytes(value: &impl serde::Serialize, limit: usize) -> Resu
             if bytes.len() > self.limit.saturating_sub(self.bytes) {
                 return Err(std::io::Error::other("JSON byte limit"));
             }
+            #[cfg(test)]
+            ENCODED_WORK.set(ENCODED_WORK.get() + bytes.len());
             self.bytes += bytes.len();
             Ok(bytes.len())
         }
@@ -82,31 +94,60 @@ pub(crate) fn encoded_bytes(value: &impl serde::Serialize, limit: usize) -> Resu
     Ok(counter.bytes)
 }
 
-pub(crate) fn value_bytes(value: &Value, limits: DecodeLimits) -> Result<usize, Error> {
-    fn depth(value: &Value, left: usize) -> Result<(), Error> {
+/// Each node and string scan is admitted before visiting it. Counting a
+/// string's length is constant work; escaping it is not.
+pub(crate) fn measured_value(
+    value: &Value,
+    limits: DecodeLimits,
+    work: &mut usize,
+) -> Result<usize, Error> {
+    fn charge(work: &mut usize, bytes: usize) -> Result<(), Error> {
+        *work = work
+            .checked_sub(bytes)
+            .ok_or_else(|| Error::limit("JSON work"))?;
+        Ok(())
+    }
+    fn string(text: &str, limit: usize, work: &mut usize) -> Result<usize, Error> {
+        charge(work, text.len())?;
+        encoded_bytes(&text, limit)
+    }
+    fn visit(value: &Value, left: usize, limit: usize, work: &mut usize) -> Result<usize, Error> {
+        charge(work, 1)?;
+        let mut bytes: usize = 0;
+        let mut add = |more: usize| -> Result<(), Error> {
+            bytes = bytes
+                .checked_add(more)
+                .filter(|size| *size <= limit)
+                .ok_or_else(|| Error::limit("JSON bytes"))?;
+            Ok(())
+        };
         match value {
             Value::Array(values) => {
                 let left = left
                     .checked_sub(1)
                     .ok_or_else(|| Error::limit("JSON depth"))?;
+                add(2 + values.len().saturating_sub(1))?;
                 for value in values {
-                    depth(value, left)?;
+                    add(visit(value, left, limit, work)?)?;
                 }
             }
             Value::Object(values) => {
                 let left = left
                     .checked_sub(1)
                     .ok_or_else(|| Error::limit("JSON depth"))?;
-                for value in values.values() {
-                    depth(value, left)?;
+                add(2 + values.len().saturating_sub(1))?;
+                for (key, value) in values {
+                    add(string(key, limit, work)?)?;
+                    add(1)?;
+                    add(visit(value, left, limit, work)?)?;
                 }
             }
-            _ => {}
+            Value::String(text) => add(string(text, limit, work)?)?,
+            _ => add(encoded_bytes(value, limit)?)?,
         }
-        Ok(())
+        Ok(bytes)
     }
-    depth(value, limits.depth)?;
-    encoded_bytes(value, limits.reply_bytes)
+    visit(value, limits.depth, limits.reply_bytes, work)
 }
 
 /// Lenient reads of a JSON value: a missing field or one of the wrong type
@@ -407,12 +448,16 @@ pub fn parse_partial_arguments(text: &str) -> Map<String, Value> {
     if check_text(text, limits.argument_bytes, limits.depth).is_err() {
         return Map::new();
     }
+    if let Ok(value) = serde_json::from_str(text) {
+        return match value {
+            Value::Object(object) => object,
+            _ => Map::new(),
+        };
+    }
     let Some(repaired) = repair_json(text) else {
         return Map::new();
     };
-    let complete = serde_json::from_str(text)
-        .ok()
-        .or_else(|| serde_json::from_str(&repaired).ok());
+    let complete = serde_json::from_str(&repaired).ok();
     if let Some(value) = complete {
         return match value {
             Value::Object(object) => object,
@@ -433,7 +478,20 @@ fn repair_json(text: &str) -> Option<String> {
     let mut in_string = false;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if repaired.len().saturating_add(6) > DecodeLimits::default().argument_bytes {
+        let growth = if in_string {
+            match c {
+                '\\' => match chars.peek() {
+                    Some(_) => 2,
+                    None => 1,
+                },
+                '\n' | '\r' | '\t' => 2,
+                c if c.is_control() => 6,
+                c => c.len_utf8(),
+            }
+        } else {
+            c.len_utf8()
+        };
+        if repaired.len().saturating_add(growth) > DecodeLimits::default().argument_bytes {
             return None;
         }
         if !in_string {
