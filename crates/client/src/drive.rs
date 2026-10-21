@@ -243,7 +243,6 @@ impl Driver {
         let runtime = rt;
         let spawner = runtime.clone();
         spawner.spawn(Box::pin(async move {
-            let client = ClientId::new();
             let mut pending = None;
             while let Some((generation, command)) = match pending.take() {
                 Some(command) => Some(command),
@@ -261,6 +260,7 @@ impl Driver {
                     restart,
                 } = *command
                 {
+                    let client = attach.client;
                     let cancelled = || epoch.load(Ordering::Acquire) != generation;
                     loop {
                         pending = rt::or(

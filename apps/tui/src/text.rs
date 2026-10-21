@@ -225,41 +225,7 @@ pub fn width_of(text: &str) -> usize {
     text.chars().map(|c| usize::from(char_width(c))).sum()
 }
 
-/// `text` without terminal escapes or control characters (a command's
-/// colored output would otherwise drive the terminal), tabs as spaces.
-pub fn sanitize(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.chars().any(|c| c.is_control() && c != '\n') {
-        return text.into();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\n' => out.push('\n'),
-            '\t' => out.push_str("    "),
-            // CSI: parameters and intermediates, then one final byte.
-            '\x1b' if chars.peek() == Some(&'[') => {
-                chars.next();
-                for c in chars.by_ref() {
-                    if ('\x40'..='\x7e').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            // OSC: up to BEL or ST.
-            '\x1b' if chars.peek() == Some(&']') => {
-                while let Some(c) = chars.next() {
-                    if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
-                        break;
-                    }
-                }
-            }
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out.into()
-}
+pub use client::sanitize;
 
 /// Rows being wrapped. The open row's last run is gathered as it grows
 /// and becomes a span when its pen changes or the row ends, so a row costs
@@ -432,14 +398,4 @@ mod tests {
     }
 
     const MUTED: Style = Style::new().fg(Color::DarkGray);
-
-    #[test]
-    fn sanitize_strips_escapes_and_controls() {
-        assert_eq!(sanitize("\x1b[31mred\x1b[0m\tx\x07"), "red    x");
-        assert_eq!(sanitize("\x1b]0;title\x07ok"), "ok");
-        assert!(matches!(
-            sanitize("plain\ntext"),
-            std::borrow::Cow::Borrowed(_)
-        ));
-    }
 }

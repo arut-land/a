@@ -8,8 +8,8 @@ use std::process::ExitCode;
 use std::thread;
 
 use client::{Driver, End, Env, Event, Link, Renderer, SessionClient, Show};
-use protocol::view::{Buttons, Change, Glyph, Item, Kind, Part, Shown, Status};
-use protocol::{CallId, Target, Verdict};
+use protocol::Target;
+use protocol::view::{Buttons, Change, Glyph, Item, Kind, Part, Status};
 use sys::{Signal, Signals};
 
 /// How the turn ended, as the exit status says it.
@@ -92,7 +92,7 @@ pub fn run(
         stdin: None,
         synced: false,
         turn: Turn::Unsent,
-        streaming: None,
+        stream: client::ReplyStream::default(),
         failed: false,
         ended: None,
     };
@@ -124,12 +124,10 @@ pub fn run(
 }
 
 /// Where the input stands.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Turn {
     Unsent,
-    Sent(String),
-    /// The session took it up: the turn running is ours.
-    Ours,
+    Sent(client::SubmissionId),
 }
 
 struct Once {
@@ -145,8 +143,7 @@ struct Once {
     /// The replay of the attach is in.
     synced: bool,
     turn: Turn,
-    /// The call whose reply is streaming.
-    streaming: Option<CallId>,
+    stream: client::ReplyStream,
     failed: bool,
     ended: Option<io::Result<ExitCode>>,
 }
@@ -167,8 +164,13 @@ impl Once {
         if let Some(mode) = &self.mode {
             effects = self.client.run(client::Cmd::Input(format!("/mode {mode}")));
         }
-        self.turn = Turn::Sent(text.clone());
-        effects.extend(self.client.run(client::Cmd::Input(text)));
+        match self.client.submit(text) {
+            Ok((id, sent)) => {
+                self.turn = Turn::Sent(id);
+                effects.extend(sent);
+            }
+            Err(notice) => self.fail(io::Error::other(notice.to_string())),
+        }
         effects
     }
 
@@ -203,7 +205,26 @@ impl Once {
         }
     }
 
+    fn taken(&self) -> bool {
+        matches!(self.turn, Turn::Sent(id) if matches!(self.client.submission(id), Some(client::SubmissionState::Taken | client::SubmissionState::Finished(_))))
+    }
+
     fn view(&mut self, change: &Change) {
+        if let Change::Batch { changes } = change {
+            for change in changes {
+                self.view(change);
+            }
+            return;
+        }
+        if self.taken() {
+            for event in self.stream.project(change, self.client.view()) {
+                match event {
+                    client::ReplyEvent::Start => {}
+                    client::ReplyEvent::Text(text) => crate::out(format_args!("{text}")),
+                    client::ReplyEvent::End => crate::out(format_args!("\n")),
+                }
+            }
+        }
         match change {
             Change::Synced => self.synced = true,
             Change::Error { message } => {
@@ -215,14 +236,10 @@ impl Once {
             Change::Mismatch { supported } => {
                 eprintln!("[{}]", protocol::view::mismatch_line(*supported));
             }
-            Change::Added {
-                item: Item::User { text, .. },
-                ..
-            } if matches!(&self.turn, Turn::Sent(sent) if sent == text) => self.turn = Turn::Ours,
             Change::Updated {
                 index,
                 part: Part::Outcome,
-            } if self.turn != Turn::Ours => {
+            } if !self.taken() => {
                 let p = self.client.view().items[*index].present();
                 if p.kind == Kind::Command && p.glyph == Glyph::Bad {
                     let why = p.body.text();
@@ -230,23 +247,7 @@ impl Once {
                     self.fail(io::Error::other(format!("{}: {why}", p.title)));
                 }
             }
-            _ if self.turn != Turn::Ours => {}
-            Change::Delta { call, text } => {
-                self.streaming = Some(*call);
-                crate::out(format_args!("{text}"));
-            }
-            Change::Added { item, .. } => match item {
-                Item::Assistant { text, .. } => crate::out(format_args!("{text}\n")),
-                // A retry streams its reply anew, from its start.
-                Item::Hook {
-                    call: Some(call),
-                    decision: Verdict::Retry { .. },
-                    ..
-                } if self.streaming.take_if(|s| s == call).is_some() => {
-                    crate::out(format_args!("\n"));
-                }
-                _ => {}
-            },
+            _ if !self.taken() => {}
             Change::Updated {
                 index,
                 part: Part::Outcome,
@@ -255,7 +256,7 @@ impl Once {
         }
     }
 
-    /// A reply streamed is ended; one that was not is written whole.
+    /// A later successful attempt supersedes a retryable failure.
     fn settled(&mut self, index: usize) {
         let item = &self.client.view().items[index];
         let Item::Reply { status, .. } = item else {
@@ -265,34 +266,27 @@ impl Once {
         if p.kind != Kind::Reply {
             return;
         }
-        if self.streaming.take_if(|s| s.0 == item.key()).is_some() {
-            crate::out(format_args!("\n"));
-        } else if let Shown::Markdown(text) = p.body
-            && !text.is_empty()
-        {
-            crate::out(format_args!("{text}\n"));
-        }
         match status {
             Status::Failed { .. } => {
                 eprintln!("a: {}", p.status);
                 self.failed = true;
             }
             Status::Interrupted => self.end(Ended::Interrupted),
-            Status::Running | Status::Done => {}
+            Status::Done => self.failed = false,
+            Status::Running => {}
         }
     }
 
     /// Only a complete kernel burst can certify that our turn ended.
     fn settle(&mut self) {
-        if self.turn != Turn::Ours {
+        let Turn::Sent(id) = self.turn else {
             return;
-        }
+        };
+        let Some(client::SubmissionState::Finished(activity)) = self.client.submission(id) else {
+            return;
+        };
         let view = self.client.view();
-        let turn = self.client.turn();
-        if turn
-            .activity
-            .is_some_and(protocol::Activity::requires_action)
-        {
+        if activity.requires_action() {
             let id = view.session.map_or_default(|s| s.short().to_string());
             let answer = format!("answer it with `a attach {id}` or in `a web`");
             let approval = view.items.iter().rev().find_map(|item| match item {
@@ -314,7 +308,7 @@ impl Once {
                 None => eprintln!("a: the turn waits for an answer in session {id}: {answer}"),
             }
             self.end(Ended::Waiting);
-        } else if !turn.running {
+        } else {
             self.end(if self.failed {
                 Ended::Failed
             } else {
@@ -372,7 +366,7 @@ mod tests {
     use super::*;
     use client::{ConnId, EventKind};
     use protocol::{
-        Activity, Audience, Body, DaemonMsg, Entry, Epoch, Json, Mode, Outcome, Seq, SessionId,
+        Activity, Author, Body, ClientId, DaemonMsg, Entry, Epoch, Mode, Seq, SessionId,
     };
     use protocol::{Decode, view::SessionView};
 
@@ -395,84 +389,80 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_ends_when_idle_arrives_after_its_last_entry() {
+    fn a_pipe_waits_for_its_own_input_and_the_certified_end() {
         let mut once = Once {
             client: SessionClient::new(Env::Keep),
-            prompt: None,
+            prompt: Some("same".into()),
             mode: None,
             read: true,
             stdin: None,
             synced: true,
-            turn: Turn::Sent("sleep 0".into()),
-            streaming: None,
+            turn: Turn::Unsent,
+            stream: client::ReplyStream::default(),
             failed: false,
             ended: None,
         };
-        let session = SessionId::new();
         receive(
             &mut once,
             DaemonMsg::Attached {
-                session,
+                session: SessionId::new(),
                 workspace: "/w".into(),
             },
         );
-        receive(
-            &mut once,
-            DaemonMsg::Activity {
-                seq: 0,
-                activity: Activity::Idle,
-            },
-        );
-        let entries = [
-            Body::Input {
-                text: "sleep 0".into(),
-                mode: Mode::Queue,
-                taken: true,
-                origin: None,
-            },
-            Body::ToolCall {
-                invoke: None,
-                tool: "sleep".into(),
-                input: Json::encode(&0).unwrap(),
-                id: None,
-                card: None,
-                by: Audience::Model,
-            },
-            Body::ToolResult {
-                call: CallId::new(2).unwrap(),
-                outcome: Outcome::Done {
-                    output: Json::encode(&0).unwrap(),
+        once.send();
+        let Turn::Sent(id) = once.turn else {
+            panic!("input was not submitted")
+        };
+        for (seq, origin) in [
+            (
+                1,
+                Author {
+                    client: ClientId::new(),
+                    ..id
                 },
-                card: None,
-            },
-        ];
-        for (body, seq) in entries.into_iter().zip(1..) {
+            ),
+            (2, id),
+        ] {
             receive(
                 &mut once,
-                DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)),
+                DaemonMsg::Entry(Entry::new(
+                    Seq::new(seq).unwrap(),
+                    Epoch(0),
+                    Body::Input {
+                        text: "same".into(),
+                        mode: Mode::Queue,
+                        taken: true,
+                        origin: Some(origin),
+                    },
+                )),
             );
-            assert!(once.ended.is_none(), "an entry prefix cannot end the turn");
+            assert!(once.ended.is_none());
+            receive(
+                &mut once,
+                DaemonMsg::Activity {
+                    seq: seq - 1,
+                    activity: Activity::Idle,
+                },
+            );
+            assert!(once.ended.is_none());
+            if seq == 1 {
+                receive(
+                    &mut once,
+                    DaemonMsg::Activity {
+                        seq,
+                        activity: Activity::Idle,
+                    },
+                );
+                assert!(
+                    once.ended.is_none(),
+                    "another client's identical input cannot finish this pipe"
+                );
+            }
         }
-        assert_eq!(once.client.view().activity, None);
-        receive(
-            &mut once,
-            DaemonMsg::Sessions {
-                sessions: vec![protocol::SessionSummary {
-                    id: session,
-                    workspace: "/w".into(),
-                    entries: 3,
-                    clients: 1,
-                    activity: Activity::Running,
-                    residency: protocol::Residency::Loaded,
-                    read_only: None,
-                }],
-            },
-        );
-        assert!(once.ended.is_none());
         receive(
             &mut once,
             DaemonMsg::Activity {
-                seq: 3,
+                seq: 2,
                 activity: Activity::Idle,
             },
         );
@@ -489,7 +479,7 @@ mod tests {
             stdin: None,
             synced: true,
             turn: Turn::Unsent,
-            streaming: None,
+            stream: client::ReplyStream::default(),
             failed: false,
             ended: None,
         };

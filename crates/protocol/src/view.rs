@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::ledger::{Keyed, OutcomeKind, Phase, Queued};
+use crate::ledger::{Keyed, OutcomeKind, Phase};
 use crate::{
     Activity, ApprovalReason, Audience, Body, CallId, Card, DaemonMsg, Entry, Json, Outcome,
     Permission, Seq, SessionId, SessionSummary, Verdict, WaitOn,
@@ -55,6 +55,14 @@ pub struct ViewState {
         skip_serializing_if = "crate::publication::Publications::is_empty"
     )]
     publications: crate::publication::Publications,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Queued {
+    seq: Seq,
+    text: String,
+    steer: bool,
+    origin: Option<crate::Author>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
@@ -98,11 +106,16 @@ impl ViewState {
         &self.publications
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply(&mut self, e: &Entry) {
         self.publications.apply(e);
         match &e.body {
             Body::Input {
-                text, mode, taken, ..
+                text,
+                mode,
+                taken,
+                origin,
+                ..
             } => {
                 if *taken {
                     self.turn = e.seq.get();
@@ -111,6 +124,7 @@ impl ViewState {
                         seq: e.seq,
                         text: text.clone(),
                         steer: *mode == crate::Mode::Steer,
+                        origin: *origin,
                     });
                 }
             }
@@ -118,6 +132,7 @@ impl ViewState {
                 seq: e.seq,
                 text: envelope.payload.clone(),
                 steer: false,
+                origin: None,
             }),
             Body::Take { input } => {
                 if let Some(at) = self.queued.iter().position(|q| q.seq == *input)
@@ -269,6 +284,7 @@ pub enum Item {
     User {
         seq: Seq,
         text: String,
+        origin: Option<crate::Author>,
     },
     Assistant {
         seq: Seq,
@@ -695,6 +711,7 @@ impl SessionView {
     }
 
     /// Folds a new entry: most start an item, the rest change one.
+    #[allow(clippy::too_many_lines)]
     fn entry(&mut self, e: &Entry) -> Option<Change> {
         if e.seq.get() <= self.seq {
             return None;
@@ -704,28 +721,32 @@ impl SessionView {
         let seq = e.seq;
         // Input taken up is shown as the user's message where it was taken:
         // its text is in the ledger until this entry leaves it.
-        let taken = match &e.body {
-            Body::Take { input } => {
-                let text = (self.state.queued.iter())
-                    .find(|q| q.seq == *input)
-                    .map(|q| q.text.clone());
-                Some(text)
-            }
-            _ => None,
+        let taken = if let Body::Take { input } = &e.body {
+            self.state
+                .queued
+                .iter()
+                .find(|q| q.seq == *input)
+                .map(|q| (q.text.clone(), q.origin))
+        } else {
+            None
         };
         self.state.apply(e);
         let item = match &e.body {
             Body::Input {
-                text, taken: true, ..
+                text,
+                taken: true,
+                origin,
+                ..
             } => Item::User {
                 seq,
                 text: text.clone(),
+                origin: *origin,
             },
             Body::Input { .. } => return None,
-            Body::Take { .. } => Item::User {
-                seq,
-                text: taken.flatten()?,
-            },
+            Body::Take { .. } => {
+                let (text, origin) = taken?;
+                Item::User { seq, text, origin }
+            }
             Body::ToolCall {
                 tool,
                 input,

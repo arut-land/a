@@ -13,6 +13,10 @@ mod inbox;
 mod one_rule;
 mod remote;
 mod session;
+mod stream;
+mod submission;
+pub use stream::{ReplyEvent, ReplyStream, sanitize};
+pub use submission::{Submission, SubmissionId, SubmissionState};
 mod watch;
 
 pub use approval::{ApprovalPart, approval_parts, approval_text};

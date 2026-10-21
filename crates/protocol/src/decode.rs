@@ -526,6 +526,7 @@ pub(crate) struct MsgFields {
 /// An [`Item`] of a snapshot.
 #[derive(Deserialize)]
 struct ItemFields {
+    origin: Option<Author>,
     invoke: Option<crate::Invocation>,
     #[serde(rename = "type")]
     ty: Option<Type>,
@@ -658,6 +659,7 @@ impl ItemFields {
             Type::User => Item::User {
                 seq: need(f.seq.take(), "seq")?,
                 text: req(f.text.take(), "text")?,
+                origin: f.origin.take(),
             },
             Type::Assistant => Item::Assistant {
                 seq: need(f.seq.take(), "seq")?,

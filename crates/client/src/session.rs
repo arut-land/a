@@ -101,6 +101,7 @@ pub enum Env {
 /// An attach to make on a new connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attach {
+    pub client: protocol::ClientId,
     pub target: Target,
     /// The entries after this one are replayed.
     pub since: u64,
@@ -111,8 +112,9 @@ pub struct Attach {
 }
 
 impl Attach {
-    pub const fn new(target: Target, env: Env) -> Self {
+    pub fn new(target: Target, env: Env) -> Self {
         Self {
+            client: protocol::ClientId::new(),
             target,
             since: 0,
             env,
@@ -266,6 +268,7 @@ pub struct SessionClient {
     /// Mutations sent and not yet answered: one refused because the daemon
     /// was draining is sent again, once, after the reattach.
     unanswered: VecDeque<ClientMsg>,
+    submission: Option<crate::Submission>,
 }
 
 impl SessionClient {
@@ -283,6 +286,7 @@ impl SessionClient {
             seq: 0,
             queued: Vec::new(),
             unanswered: VecDeque::new(),
+            submission: None,
         }
     }
 
@@ -362,7 +366,10 @@ impl SessionClient {
             self.unanswered.clear();
             self.queued.clear();
             self.view_current = false;
+            self.submission = None;
         }
+        let mut attach = attach;
+        attach.client = self.opened.client;
         self.opened = attach.clone();
         self.connect(attach, false, Link::Connecting, &mut out);
         out
@@ -431,6 +438,24 @@ impl SessionClient {
         done.unwrap_or_else(|notice| vec![Effect::Show(Show::Notice(notice))])
     }
 
+    /// Tracks one submitted input by its durable mutation origin.
+    pub fn submit(&mut self, text: String) -> Result<(crate::SubmissionId, Vec<Effect>), Notice> {
+        let effects = self.offer()?.input(text)?;
+        let id = protocol::Author {
+            client: self.opened.client,
+            seq: protocol::ClientSeq::new(self.seq).unwrap(),
+        };
+        self.submission = Some(crate::Submission::new(id));
+        Ok((id, effects))
+    }
+
+    pub fn submission(&self, id: crate::SubmissionId) -> Option<crate::SubmissionState> {
+        self.submission
+            .as_ref()
+            .filter(|s| s.id == id)
+            .map(|s| s.state)
+    }
+
     /// Sends `msg` once the connection is up, numbered if it is a
     /// mutation.
     fn send(&mut self, msg: ClientMsg) -> Vec<Effect> {
@@ -440,16 +465,18 @@ impl SessionClient {
     }
 
     fn put(&mut self, mut msg: ClientMsg, out: &mut Vec<Effect>) {
-        if !self.link.up() {
-            self.queued.push(msg);
-            return;
-        }
         if let Some(seq @ None) = msg.client_seq_mut() {
             self.seq += 1;
             *seq = Some(self.seq);
-            self.unanswered.push_back(msg.clone());
         }
-        out.push(Effect::Io(Io::Send(msg)));
+        if self.link.up() {
+            if is_mutation(&msg) {
+                self.unanswered.push_back(msg.clone());
+            }
+            out.push(Effect::Io(Io::Send(msg)));
+        } else {
+            self.queued.push(msg);
+        }
     }
 
     /// Takes in what the driver reports.
@@ -528,17 +555,18 @@ impl SessionClient {
                     .iter()
                     .position(|m| numbered(m, *client_seq));
                 let refused = at.and_then(|at| self.unanswered.remove(at));
-                if let (Some(mut again), Rejection::Draining) = (refused, reason) {
-                    if let Some(seq) = again.client_seq_mut() {
-                        *seq = None;
-                    }
+                if let (Some(again), Rejection::Draining) = (refused, reason) {
                     self.queued.push(again);
                     return;
                 }
             }
             _ => {}
         }
-        let Some(update) = self.view.fold(msg) else {
+        let update = self.view.fold(msg);
+        if let Some(submission) = &mut self.submission {
+            submission.fold(&self.view);
+        }
+        let Some(update) = update else {
             return;
         };
         match &update.change {
@@ -568,6 +596,7 @@ impl SessionClient {
             return None;
         };
         Some(Attach {
+            client: self.opened.client,
             target: Target::Id(session),
             since: if self.view.session == Some(session) {
                 self.view.seq
@@ -1189,7 +1218,7 @@ mod tests {
     #[test]
     fn a_resend_after_reconnect_runs_once() {
         let (mut client, _) = attached(Env::Origin);
-        client.run(Cmd::Input("late".into()));
+        let (id, _) = client.submit("late".into()).unwrap();
         // The daemon began draining as it read it: refused, so not done.
         let refused = client.step(msg(
             1,
@@ -1204,8 +1233,11 @@ mod tests {
         client.step(closed(1));
         let out = client.step(live(2, Caps::ALL));
         assert_eq!(sends(&out).len(), 1, "{out:?}");
+        assert_eq!(sends(&out)[0].client_seq(), Some(id.seq.get()));
+        assert_eq!(client.opened.client, id.client);
+        assert_eq!(client.submission(id), Some(crate::SubmissionState::Queued));
         // Taken this time: a second drain does not send it again.
-        client.step(msg(2, DaemonMsg::Ack { client_seq: 2 }));
+        client.step(msg(2, DaemonMsg::Ack { client_seq: 1 }));
         client.step(msg(2, DaemonMsg::Draining));
         client.step(closed(2));
         assert!(sends(&client.step(live(3, Caps::ALL))).is_empty());

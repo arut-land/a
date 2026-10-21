@@ -4,14 +4,14 @@ macro_rules! sayln {
         $crate::out(format_args!("\n"))
     };
     ($($arg:tt)*) => {
-        $crate::out(format_args!("{}\n", format_args!($($arg)*)))
+        $crate::out(format_args!("{}\n", client::sanitize(&format!($($arg)*))))
     };
 }
 
 /// [`out`]s formatted text.
 macro_rules! say {
     ($($arg:tt)*) => {
-        $crate::out(format_args!($($arg)*))
+        $crate::out(format_args!("{}", client::sanitize(&format!($($arg)*))))
     };
 }
 
@@ -25,10 +25,10 @@ use std::process::ExitCode;
 use std::thread;
 
 use client::{Driver, End, Endpoint, Env, Event, Link, Renderer, SessionClient, Show};
+use protocol::Target;
 use protocol::view::{
     Change, Item, Kind, Part, Presented, SessionView, Shown, answer_line, mismatch_line, recap_line,
 };
-use protocol::{CallId, Target, Verdict};
 use sys::Home;
 
 use crate::args::{Args, Cmd, Daemon};
@@ -72,7 +72,7 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("a: {e}");
+            eprintln!("a: {}", client::sanitize(&e.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -255,7 +255,7 @@ impl Repl {
                 "r" => Ok(self.client.restart()),
                 "l" => {
                     for line in d.log_tail() {
-                        eprintln!("  | {line}");
+                        eprintln!("  | {}", client::sanitize(&line));
                     }
                     prompt();
                     Ok(Vec::new())
@@ -343,7 +343,7 @@ impl Renderer for Repl {
                     }
                     self.screen.show(&update.change, self.client.view());
                 }
-                Show::Notice(notice) => eprintln!("[{notice}]"),
+                Show::Notice(notice) => eprintln!("[{}]", client::sanitize(&notice.to_string())),
                 Show::Sessions => {
                     for s in self.client.sessions() {
                         sayln!("  {s}");
@@ -368,9 +368,9 @@ fn report(d: &client::Diagnosis) {
         d.who(),
         client::HELLO_TIMEOUT.as_secs()
     );
-    eprintln!("  log: {}", d.log.display());
+    eprintln!("  log: {}", client::sanitize(&d.log.display().to_string()));
     if let Some(note) = d.crash_note() {
-        eprintln!("  {note}");
+        eprintln!("  {}", client::sanitize(&note));
     }
 }
 
@@ -381,14 +381,22 @@ fn report(d: &client::Diagnosis) {
 /// it begins to wait from then on.
 #[derive(Default)]
 struct Screen {
-    /// The call whose streamed reply is on the current line.
-    streaming: Option<CallId>,
+    stream: client::ReplyStream,
     /// The replay of the latest attach is in.
     synced: bool,
 }
 
 impl Screen {
     fn show(&mut self, change: &Change, view: &SessionView) {
+        if !matches!(change, Change::Batch { .. }) {
+            for event in self.stream.project(change, view) {
+                match event {
+                    client::ReplyEvent::Start => say!("a    "),
+                    client::ReplyEvent::Text(text) => say!("{text}"),
+                    client::ReplyEvent::End => sayln!(),
+                }
+            }
+        }
         match change {
             Change::Batch { changes } => {
                 for change in changes {
@@ -401,25 +409,10 @@ impl Screen {
                 self.synced = false;
                 sayln!("[session {} · {}]", session.short(), workspace.display());
             }
-            Change::Delta { call, text } => {
-                if self.streaming != Some(*call) {
-                    self.streaming = Some(*call);
-                    say!("a    ");
-                }
-                say!("{text}");
-            }
             Change::Added { item, .. } => {
-                // A retry streams its reply anew, on a line of its own.
-                if let Item::Hook {
-                    call: Some(call),
-                    decision: Verdict::Retry { .. },
-                    ..
-                } = item
-                    && self.streaming.take_if(|s| s == call).is_some()
-                {
-                    sayln!();
+                if !matches!(item, Item::Assistant { .. }) {
+                    print_all(&added(item));
                 }
-                print_all(&added(item));
             }
             // Sent in place of a long replay: shown as the replay would be.
             Change::Snapshot => {
@@ -443,8 +436,8 @@ impl Screen {
                 }
             }
             Change::Mismatch { supported } => eprintln!("[{}]", mismatch_line(*supported)),
-            Change::Error { message } => eprintln!("[error: {message}]"),
-            Change::Activity | Change::Draining => {}
+            Change::Error { message } => eprintln!("[error: {}]", client::sanitize(message)),
+            Change::Delta { .. } | Change::Activity | Change::Draining => {}
         }
     }
 
@@ -452,15 +445,6 @@ impl Screen {
         let p = view.present(item);
         match (part, p.kind) {
             (Part::Outcome, Kind::Reply) => {
-                // A streamed reply is on screen already; end its line.
-                let streamed = self.streaming.take_if(|s| s.0 == item.key()).is_some();
-                if streamed {
-                    sayln!();
-                } else if let Shown::Markdown(text) = p.body
-                    && !text.is_empty()
-                {
-                    sayln!("a    {text}");
-                }
                 if let Some(usage) = p.usage {
                     sayln!("     · {usage}");
                 }
@@ -726,7 +710,7 @@ mod parity {
 #[cfg(test)]
 mod approval_tests {
     use super::*;
-    use protocol::{Body, DaemonMsg, Decode, Entry, Epoch, Json, Seq};
+    use protocol::{Body, CallId, DaemonMsg, Decode, Entry, Epoch, Json, Seq};
 
     #[test]
     fn the_repl_never_prints_a_late_description() {

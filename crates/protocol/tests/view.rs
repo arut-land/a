@@ -577,6 +577,13 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     ]
     };
     let mut scenarios = vec![
+        ("queued submission origins survive snapshots and ownership transfer", {
+            let origin = protocol::Author { client: protocol::ClientId(Uuid::from_u128(0xc)), seq: protocol::ClientSeq::new(7).unwrap() };
+            let queued = entry(1, Body::Input { text: "same".into(), mode: Mode::Queue, taken: false, origin: Some(origin) });
+            let mut view = SessionView::default();
+            view.fold(&DaemonMsg::from_json(queued.to_string().as_bytes()).unwrap());
+            vec![attached(), msg(DaemonMsg::Snapshot(Box::new(view.snapshot()))), entry(2, Body::Take { input: Seq::new(1).unwrap() }), msg(DaemonMsg::Activity { seq: 2, activity: protocol::Activity::Idle }), msg(DaemonMsg::Synced { seq: 2 })]
+        }),
         ("publication identities survive snapshots and later publications", {
             let entries: Vec<_> = ["skills", "mcp-schemas"].into_iter().zip(1..).map(|(namespace, seq)| Entry::new(
                 Seq::new(seq).unwrap(), Epoch(0), Body::Context {
