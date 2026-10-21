@@ -23,20 +23,14 @@ pub(crate) fn request(id: u64, method: &str, mut params: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
 }
 
-pub(crate) fn decode(message: &Value, id: u64, cx: &Cx) -> Result<Option<Value>, Failure> {
+pub(crate) fn decode(message: &Value, id: u64) -> Result<Option<Value>, Failure> {
     if message["jsonrpc"] != "2.0" || !message.is_object() {
         return Err(Failure::Protocol("expected a JSON-RPC 2.0 object".into()));
     }
     if message.get("id").is_none() {
-        let method = message["method"]
+        message["method"]
             .as_str()
             .ok_or_else(|| Failure::Protocol("notification has no method".into()))?;
-        if method == "notifications/progress" && message["params"]["progressToken"] == id {
-            let params = &message["params"];
-            if let Some(text) = params["message"].as_str() {
-                cx.progress(text);
-            }
-        }
         return Ok(None);
     }
     if message["id"] != id
@@ -89,6 +83,7 @@ async fn exchange(
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let message = request(id, method, params);
+    let mut incoming = crate::incoming::Incoming::new(id);
     let bytes = serde_json::to_vec(&message).map_err(protocol)?;
     if bytes.len() > LIMIT {
         return Err(Failure::Limit);
@@ -144,8 +139,10 @@ async fn exchange(
                 if line.is_empty() {
                     if !event.is_empty() {
                         let value = serde_json::from_slice(&event).map_err(protocol)?;
+                        let result = incoming.decode(&value, event.len())?;
                         event.clear();
-                        if let Some(result) = decode(&value, id, cx)? {
+                        incoming.publish(cx, result.is_some());
+                        if let Some(result) = result {
                             return http_result(status, result);
                         }
                     }
@@ -163,8 +160,10 @@ async fn exchange(
         return Err(Failure::Protocol("SSE ended before its response".into()));
     }
     let value = serde_json::from_slice(&pending).map_err(protocol)?;
-    let result = decode(&value, id, cx)?
+    let result = incoming
+        .decode(&value, pending.len())?
         .ok_or_else(|| Failure::Protocol(format!("HTTP {status}: no response")))?;
+    incoming.publish(cx, true);
     http_result(status, result)
 }
 
@@ -270,8 +269,6 @@ mod tests {
 
     #[test]
     fn responses_must_match_one_pending_request_and_one_outcome() {
-        let rig = Rig::new("mcp-rpc", Registry::default());
-        let cx = rig.cx();
         for message in [
             json!({"jsonrpc":"1.0","id":1,"result":{"resultType":"complete"}}),
             json!({"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}),
@@ -279,11 +276,37 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"result":{}}),
             json!({"jsonrpc":"2.0","id":1,"method":"sampling/createMessage"}),
         ] {
-            assert!(matches!(
-                decode(&message, 1, &cx),
-                Err(Failure::Protocol(_))
-            ));
+            assert!(matches!(decode(&message, 1), Err(Failure::Protocol(_))));
         }
+    }
+
+    #[test]
+    fn sse_notifications_share_the_stdio_request_budget() {
+        struct Flood;
+        impl Http for Flood {
+            fn send(
+                &self,
+                _: http::Request<llm::http::Payload>,
+            ) -> llm::http::BoxFuture<'static, std::io::Result<llm::http::Response>> {
+                let event = json!({"jsonrpc":"2.0","method":"notifications/unknown"});
+                let bytes = format!("data: {event}\n\n").repeat(257).into_bytes();
+                Box::pin(std::future::ready(Ok(http::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(llm::http::body([bytes]))
+                    .unwrap())))
+            }
+        }
+        let rig = Rig::new("mcp-sse-budget", Registry::default());
+        let result = rt::block_on(exchange(
+            &Flood,
+            "http://fixture.invalid/mcp",
+            "tools/list",
+            json!({}),
+            http::HeaderMap::new(),
+            &rig.cx(),
+        ));
+        assert_eq!(result, Err(Failure::Limit));
+        assert!(rig.progress.lock().unwrap().is_empty());
     }
 
     #[test]

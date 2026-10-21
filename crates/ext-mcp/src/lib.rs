@@ -2,6 +2,7 @@
 //! logged tool result, never an eager part of assembling a session.
 
 mod headers;
+mod incoming;
 mod rpc;
 mod stdio;
 

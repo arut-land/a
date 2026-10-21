@@ -186,3 +186,35 @@ fn every_mcp_effect_is_unsafe_to_replay_and_policy_gates_before_start() {
     assert!(!rig.dir.join("effects").exists());
     assert_eq!(<Mcp as Extension>::NAME, "mcp");
 }
+
+#[test]
+fn notification_flood_is_bounded_per_request() {
+    let rig = rig("review-flood", Duration::from_secs(10));
+    let result = rig.done(
+        "mcp_call",
+        &json!({"server":"fixture","tool":"flood","arguments":{}}),
+    );
+    let progress_bytes = rig.progress.lock().unwrap().len();
+    finish(&rig);
+    assert!(progress_bytes <= 8 * 1024);
+    assert_eq!(
+        result["failed"], "limit",
+        "accepted {progress_bytes} progress bytes: {result}"
+    );
+}
+
+#[test]
+fn progress_bursts_publish_a_bounded_latest_value() {
+    let rig = rig("progress-burst", Duration::from_secs(10));
+    let result = rig.done(
+        "mcp_call",
+        &json!({"server":"fixture","tool":"progress-burst","arguments":{}}),
+    );
+    assert!(result.get("ok").is_some());
+    let text = rig.progress.lock().unwrap().clone();
+    assert!(text.starts_with("update 0\n"));
+    assert!(text.ends_with("update 99\n"));
+    assert!(text.lines().count() <= 8);
+    finish(&rig);
+}
+

@@ -52,6 +52,22 @@ fn main() {
                 )
                 .unwrap();
                 match tool {
+                    "progress-burst" => {
+                        for i in 0..100 {
+                            send(
+                                &json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":id,"message":format!("update {i}\n")}}),
+                            );
+                        }
+                        json!({"resultType":"complete","content":[]})
+                    }
+                    "flood" => {
+                        for _ in 0..40 {
+                            send(
+                                &json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":id,"message":"x".repeat(65536)}}),
+                            );
+                        }
+                        json!({"resultType":"complete","content":[]})
+                    }
                     "crash" => std::process::exit(7),
                     "wait" => {
                         send(

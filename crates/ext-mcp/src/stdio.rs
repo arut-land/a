@@ -153,22 +153,31 @@ impl Client {
             }
             remaining = &remaining[written..];
         }
+        let mut incoming = crate::incoming::Incoming::new(id);
         loop {
-            let value = self.read().await?;
-            if let Some(result) = rpc::decode(&value, id, cx)? {
+            let (value, bytes) = self.read().await?;
+            let result = incoming.decode(&value, bytes)?;
+            incoming.publish(cx, result.is_some());
+            if let Some(result) = result {
                 self.inflight = None;
                 return Ok(result);
             }
         }
     }
 
-    async fn read(&mut self) -> Result<Value, Failure> {
+    async fn read(&mut self) -> Result<(Value, usize), Failure> {
         loop {
             if let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+                if end > rpc::LIMIT {
+                    return Err(Failure::Limit);
+                }
                 let value = serde_json::from_slice(&self.pending[..end])
                     .map_err(|e| Failure::Protocol(e.to_string()))?;
                 self.pending.drain(..=end);
-                return Ok(value);
+                return Ok((value, end + 1));
+            }
+            if self.pending.len() > rpc::LIMIT {
+                return Err(Failure::Limit);
             }
             let mut bytes = [0; 8192];
             let n = self
@@ -178,9 +187,6 @@ impl Client {
                 .map_err(|e| io(&e))?;
             if n == 0 {
                 return Err(Failure::Crashed);
-            }
-            if self.pending.len() + n > rpc::LIMIT {
-                return Err(Failure::Limit);
             }
             self.pending.extend_from_slice(&bytes[..n]);
         }
