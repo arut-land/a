@@ -14,7 +14,7 @@ pub(crate) struct Index {
     sides: HashMap<ext::SideIdentity, CallId>,
     results: HashMap<CallId, (Seq, bool)>,
     interrupt: u64,
-    watches: HashMap<SessionId, Seq>,
+    watches: Vec<(SessionId, Seq)>,
     fired: HashMap<Seq, Seq>,
     hot: Option<(Seq, Vec<u8>)>,
 }
@@ -59,7 +59,9 @@ impl Index {
             }
             Body::Interrupt { .. } => self.interrupt = entry.seq.get(),
             Body::Watch { child } => {
-                self.watches.entry(*child).or_insert(entry.seq);
+                if let Err(at) = self.watches.binary_search_by_key(&child.0, |(id, _)| id.0) {
+                    self.watches.insert(at, (*child, entry.seq));
+                }
             }
             Body::Fired { watch, .. } => {
                 self.fired.entry(*watch).or_insert(entry.seq);
@@ -86,8 +88,9 @@ impl Index {
 
     pub(crate) fn fired(&self, child: SessionId) -> Option<Seq> {
         self.watches
-            .get(&child)
-            .and_then(|watch| self.fired.get(watch))
+            .binary_search_by_key(&child.0, |(id, _)| id.0)
+            .ok()
+            .and_then(|at| self.fired.get(&self.watches[at].1))
             .copied()
     }
 
