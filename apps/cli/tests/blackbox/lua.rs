@@ -157,7 +157,7 @@ fn lua_shell_delegation_requires_a_grant_and_obeys_the_policy_floor() {
     write(
         &env.home.root().join("ext"),
         "runner",
-        "a.tool{name='run',audience='user',description='run',input={type='object'},run=function(input,cx) return cx.tool('bash',{command='printf lua'}) end}",
+        "a.tool{name='run',audience='user',description='run',input={type='object'},run=function(input,cx) return cx.tool('run','bash',{command='printf lua'}) end}",
     );
     env.start();
     let mut conn = env.connect();
