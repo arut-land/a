@@ -72,3 +72,20 @@ validated numeric build identity into `sys::crash` so the daemon log and
 panic hook share its privacy boundary. Numeric unwind frames replace std's
 debug symbolizer and raw panic formatting; report storage is at most
 20 × 16 KiB, with a fixed 128-frame capture buffer.
+
+Review validation (2026-10-21): `mise run size` before fixes at `40aaade`
+was **3,039 KiB**; after at `d6e82a3` it is **3,252 KiB** (3,330,528 bytes),
+under 4,096 KiB and with the fixture scan passing. This comparison includes
+merges of main through `e133ee4` (forks, skills and protocol 8); the 213 KiB
+difference cannot be attributed to diagnostics alone.
+
+With `CARGO_BUILD_JOBS=3` and three nextest workers, `mise run check` passed
+**970 tests**, with 28 intentional skips. Standalone acceptance passed 13,
+web passed 6, and the typed API's compile-fail doctest passed. The Windows
+lint, machete and no-tokio checks passed. The review's torn-tail and final
+batch loss regressions are retained with invariant names. Additional tests
+park the consumer inside wake registration, exercise initial store create
+and load failures, classify side-request errors and timeouts without their
+content, verify both status timeout phases leave a witness, and check
+secret panic content and the maximum crash-report shape. Budgets and
+startup timings remain for the coordinator on a quiet machine.

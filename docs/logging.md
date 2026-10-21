@@ -36,7 +36,9 @@ traces belong elsewhere. The optional `engine/events` stream remains a
 foreground debugging aid on stderr, not a second persistent transcript.
 Detached stderr goes to the null device so arbitrary library diagnostics
 cannot bypass the typed API. A manually launched daemon can still show
-console errors. Crash reports under `crash/` use a separate closed JSON shape: validated
+console errors.
+
+Crash reports under `crash/` use a separate closed JSON shape: validated
 numeric build identity, pid and time, `panic` or `unclean_exit`, numeric
 callsite fingerprint/line/column, and at most 128 numeric image fingerprints
 and frame offsets. No panic payload, thread name, symbol, image name or source
@@ -53,33 +55,37 @@ producer tries a fixed 256-record queue and drops on contention or overflow.
 Admission and wake both avoid consumer-held locks: a coalescing atomic
 flag and `rt::Wakeup` publish the wake even during waiter registration.
 The producer neither formats nor writes a file, waits for queue space,
-nor awaits a log flush. A separate `rt` runtime drains batches through its blocking pool;
-its stalled disk worker cannot occupy the session commit executor. The
-queue and in-flight batch each hold at most 256 fixed-size records. Queue
+nor awaits a log flush. A separate `rt` runtime drains batches through its
+blocking pool; its stalled disk worker cannot occupy the session commit
+executor. The queue and in-flight batch each hold at most 256 fixed-size
+records. Queue
 losses and failed diagnostic writes are counted in a `lost` record when
-writing succeeds again. Diagnostic I/O errors never recurse into logging.
+writing succeeds again, including recovery within the final batch before
+a flush. Diagnostic I/O errors never recurse into logging.
 
 Each file is capped at 256 KiB by rotating before every write, independent
 of supervisor wakes. Live plus retained files use at most 768 KiB. Files
 are reopened after rotation; a partial failed write is truncated before
 another append is attempted. Reopening also truncates an unsealed tail left
-by a previous process, so the first new fact is always a complete line. This is best-effort
-observability, not a second durable ledger: it does not fsync. An abrupt
-process death can lose queued facts or tear the final diagnostic line.
+by a previous process, so the first new fact is always a complete line.
+This is best-effort observability, not a second durable ledger: it does not
+fsync. An abrupt process death can lose queued facts or tear the final diagnostic line.
 Orderly exit closes admission and gives queued writes at most 250 ms before
 releasing the daemon lock. It never holds a session commit for diagnostics.
 
 A daemon that cannot answer may be unable to report its own wedge. Local
 clients leave their last typed timeout or forced-stop observation in
-`run/daemon.witness`. It contains only the observed daemon pid/start stamp,
-time and reason. It is one bounded record; concurrent observations can
+`run/daemon.witness`. A status query records timeouts during both the hello
+and the status reply. The witness contains only the observed daemon
+pid/start stamp, time and reason. It is one bounded record; concurrent observations can
 replace or lose one another. The next daemon consumes it into the main log
 and removes it. Clients never append or rotate the daemon log themselves.
 
 The API has a compile-fail example rejecting `String`; deterministic tests
 exercise arbitrary error content, stalled consumers, saturated queues,
-write-failure accounting and rotation. The engine's Faulty-store test keeps
-the diagnostic disk stalled through store recovery and a subsequent commit.
+write-failure accounting and rotation. Crash tests use a multi-megabyte
+panic payload and check the largest numeric report against its cap. The
+engine's Faulty-store test keeps the diagnostic disk stalled through store recovery and a subsequent commit.
 Black-box acceptance checks the crash recovery session and rule; a signal
 exit test checks the recorded reason and absence of session content.
 Dependency and size measurements are in [the logging probe](perf/logging.md).
