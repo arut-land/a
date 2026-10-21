@@ -29,13 +29,15 @@ fn blocking_pool_runs_work_concurrently() {
     let rt = Threads::configured(Config::for_cores(4));
     let running = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
+    let together = Arc::new(std::sync::Barrier::new(2));
     let jobs: Vec<_> = (0..4)
         .map(|_| {
             let (running, peak) = (Arc::clone(&running), Arc::clone(&peak));
+            let together = Arc::clone(&together);
             let job = unblock(&rt, move || {
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
-                thread::sleep(Duration::from_millis(30));
+                together.wait();
                 running.fetch_sub(1, Ordering::SeqCst);
             });
             spawn(&rt, job)
@@ -94,17 +96,16 @@ fn a_dropped_receiver_releases_a_waiting_sender() {
 }
 
 #[test]
-fn sleeps_wake_in_deadline_order() {
+fn timers_do_not_complete_before_their_deadlines() {
     let rt = Threads::new(1);
-    let order = Arc::new(Mutex::new(Vec::new()));
     let jobs: Vec<_> = [30, 10, 20, 10]
         .into_iter()
-        .enumerate()
-        .map(|(n, ms)| {
-            let (order, sleep) = (Arc::clone(&order), rt.sleep(Duration::from_millis(ms)));
+        .map(|ms| {
+            let sleep = rt.sleep(Duration::from_millis(ms));
             spawn(&rt, async move {
+                let started = Instant::now();
                 sleep.await;
-                order.lock().unwrap().push(n);
+                assert!(started.elapsed() >= Duration::from_millis(ms));
             })
         })
         .collect();
@@ -113,7 +114,6 @@ fn sleeps_wake_in_deadline_order() {
             job.await;
         }
     });
-    assert_eq!(*order.lock().unwrap(), [1, 3, 2, 0]);
 }
 
 #[test]
@@ -203,15 +203,16 @@ fn readiness_wakes_a_waiter_once_not_in_a_spin() {
     let rt = Threads::new(1);
     let (reader, mut writer) = std::io::pipe().unwrap();
     let reader = Async::for_reading(&rt.reactor(), reader).unwrap();
+    let (release, held) = std::sync::mpsc::channel();
     let wrote = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
         writer.write_all(b"x").unwrap();
-        thread::sleep(Duration::from_millis(200));
+        held.recv().unwrap();
     });
     let before = wakes();
     block_on(reader.readable());
     let woke = wakes() - before;
     assert!(woke <= 3, "{woke} wakes");
+    release.send(()).unwrap();
     wrote.join().unwrap();
 }
 

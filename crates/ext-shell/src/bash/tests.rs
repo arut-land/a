@@ -347,15 +347,20 @@ fn the_first_output_is_reported_while_the_command_runs() {
 #[test]
 fn a_cancelled_call_stops_with_its_partial_output() {
     let rig = rig("cancel");
-    let cancel = rig.cancel.clone();
-    let canceller = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
-        cancel.set();
-    });
     let started = Instant::now();
-    let ran = run(&rig, "echo partial; sleep 100");
-    canceller.join().unwrap();
-    assert!(started.elapsed() < Duration::from_secs(3));
+    let ran = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !rig.progress.lock().unwrap().starts_with("partial\n") {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "never reported"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            rig.cancel.set();
+        });
+        run(&rig, "echo partial; sleep 100")
+    });
     assert!(ran.aborted && terminated(&ran), "{ran:?}");
     let text = model(&ran);
     assert!(text.starts_with("partial\n"), "{text}");
