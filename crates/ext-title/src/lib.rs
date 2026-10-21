@@ -61,7 +61,7 @@ impl Extension for Title {
             let Some(cx) = cx.cx() else {
                 return Reaction::NONE;
             };
-            Reaction::later(async move {
+            Reaction::later(ext::Requirement::Ordered, async move {
                 // Marked and asked at once: the mark goes first, and the
                 // request goes out while the call it is asked for is open.
                 let marked = cx.update::<Titled>(&true);

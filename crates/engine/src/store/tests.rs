@@ -896,3 +896,20 @@ fn a_publication_and_its_text_survive_every_torn_prefix_together() {
     assert!(unseal(&mut sealed));
     assert_eq!(Entry::from_json(&sealed).unwrap(), entry);
 }
+
+#[test]
+fn a_barrier_write_alone_does_not_survive_a_power_cut() {
+    let memory = Arc::new(Memory::default());
+    let faulty = Faulty::new(Arc::clone(&memory) as _);
+    let header = Header {
+        id: SessionId::new(),
+        workspace: std::env::temp_dir(),
+        parent: None,
+    };
+    let mut loaded = faulty.create(&header).unwrap();
+    let mut entries = [entry(1, 0)];
+    loaded.writer.append(&mut entries, true).unwrap();
+    loaded.writer.sync().unwrap();
+    faulty.cut();
+    assert_eq!(memory.entries(header.id).unwrap(), []);
+}

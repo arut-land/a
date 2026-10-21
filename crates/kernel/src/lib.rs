@@ -29,7 +29,7 @@ use std::time::Duration;
 pub use ext::host::Binding;
 pub use ext::{
     Action, Actions, Agent, Answer, Callable, Chained, Concurrency, Gate, Gated, Input, Later,
-    LoopPoints, Name, Recover, Replay,
+    LoopPoints, Name, Recover, Replay, Requirement,
 };
 #[cfg(doc)]
 use protocol::ledger::Ledger;
@@ -44,24 +44,20 @@ mod session;
 
 pub use crate::session::{Core, RESTART_CAP};
 
-/// What a step returns, in order. One [`Effect::Commit`] follows the
-/// last [`Effect::Append`], saying how soon the step's entries must be
-/// durable: a barrier whenever one of its effects is external, so an
-/// intent is durable before the work it names, and one step's entries
-/// share an fsync. The driver commits them before it carries out the
-/// rest. If the commit fails, the effects are dropped and the driver
-/// resumes from the log ([`Core::resume`]).
+/// Each step ends its appends with a commit. Admission declarations carry
+/// the required prefix even when the next step appends nothing. Ordered
+/// work can overlap cache flushing; unsafe work and numbered publication
+/// wait for durability. A failed write or epoch fences the work and resumes
+/// from the log ([`Core::resume`]).
 pub type Effects = SmallVec<[Effect; 4]>;
 
-/// How soon a step's entries must be durable: the one place that says,
-/// so the driver never reads an entry to decide.
+/// Whether the append must cross a write barrier. Admission and numbered
+/// publication independently require the appropriate completed prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Durability {
-    /// Written at once, for clients to see, and made durable by the next
-    /// barrier: nothing waits on it, so a crash loses at most what it
-    /// holds, which recovery treats as never logged.
+    /// Deferred facts become durable with a later publication or effect.
     Lazy,
-    /// Durable before anything follows it.
+    /// Ordered before any following effect is admitted.
     Barrier,
 }
 
@@ -71,8 +67,7 @@ pub enum Durability {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Barriers {
     /// Every step but one of notes alone (progress, an extension's
-    /// state): everything the session decided or learned is durable
-    /// before anything follows it.
+    /// state): each fact crosses its write barrier before admission.
     #[default]
     Step,
     /// Only a step that ends the turn: what the session learned between
@@ -225,6 +220,13 @@ pub enum Note {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ticket(pub u64);
 
+/// The prefix an effect depends on, independently of its current step's appends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admission {
+    pub through: u64,
+    pub requirement: Requirement,
+}
+
 /// What the driver is to do.
 #[derive(Debug, PartialEq)]
 pub enum Effect {
@@ -232,7 +234,13 @@ pub enum Effect {
     Append(Entry),
     /// Commit the entries appended, as durably as said: once per step,
     /// after the last of them.
-    Commit(Durability),
+    Commit {
+        through: u64,
+        durability: Durability,
+        publish: bool,
+    },
+    /// Applies to the following effect, including when this step appends nothing.
+    Require(Admission),
     /// Answer request `ticket`, once what it logged is committed.
     Reply {
         ticket: Ticket,
