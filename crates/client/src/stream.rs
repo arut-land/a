@@ -9,7 +9,10 @@ pub enum ReplyEvent<'a> {
 }
 
 #[derive(Default)]
-pub struct ReplyStream(Option<(CallId, usize)>);
+pub struct ReplyStream {
+    active: Option<(CallId, usize)>,
+    finished: u64,
+}
 
 impl ReplyStream {
     pub fn project<'a>(
@@ -30,14 +33,15 @@ impl ReplyStream {
                     .iter()
                     .any(|item| item.key() == call.0 && item.present().kind == Kind::Reply) =>
             {
-                if self.0.is_none_or(|(id, _)| id != *call) {
-                    if self.0.is_some() {
+                if self.active.is_none_or(|(id, _)| id != *call) {
+                    if self.active.is_some() {
                         events.push(ReplyEvent::End);
                     }
-                    self.0 = Some((*call, 0));
+                    self.active = Some((*call, 0));
+                    self.finished = self.finished.min(call.0.get() - 1);
                     events.push(ReplyEvent::Start);
                 }
-                self.0.as_mut().unwrap().1 += text.len();
+                self.active.as_mut().unwrap().1 += text.len();
                 events.push(ReplyEvent::Text(text));
             }
             Change::Added {
@@ -54,32 +58,55 @@ impl ReplyStream {
                         ..
                     },
                 ..
-            } if self.0.take_if(|(id, _)| id == call).is_some() => events.push(ReplyEvent::End),
+            } if self.active.take_if(|(id, _)| id == call).is_some() => {
+                events.push(ReplyEvent::End)
+            }
+            Change::Snapshot => {
+                // Historical replies belong to transcript rendering; reconcile only
+                // the reply this connection has already started emitting.
+                if let Some((call, _)) = self.active {
+                    if let Some(item) = view.items.iter().find(|item| item.key() == call.0) {
+                        self.finish(item, &mut events);
+                    } else {
+                        self.active = None;
+                        self.finished = self.finished.max(call.0.get());
+                        events.push(ReplyEvent::End);
+                    }
+                }
+            }
             Change::Updated {
                 index,
                 part: Part::Outcome,
             } => {
-                let item = &view.items[*index];
-                let p = item.present();
-                if p.kind == Kind::Reply {
-                    if let Some((_, emitted)) = self.0.take_if(|(id, _)| id.0 == item.key()) {
-                        if let Shown::Markdown(text) = p.body
-                            && let Some(rest) = text.get(emitted..)
-                            && !rest.is_empty()
-                        {
-                            events.push(ReplyEvent::Text(rest));
-                        }
-                        events.push(ReplyEvent::End);
-                    } else if let Shown::Markdown(text) = p.body
-                        && !text.is_empty()
-                    {
-                        events.extend([ReplyEvent::Start, ReplyEvent::Text(text), ReplyEvent::End]);
-                    }
-                }
+                self.finish(&view.items[*index], &mut events);
             }
             _ => {}
         }
         events
+    }
+
+    fn finish<'a>(&mut self, item: &'a Item, events: &mut Vec<ReplyEvent<'a>>) {
+        if !item.settled()
+            || item.key().get() <= self.finished
+            || item.present().kind != Kind::Reply
+        {
+            return;
+        }
+        let emitted = if let Some((_, emitted)) = self.active.take_if(|(id, _)| id.0 == item.key())
+        {
+            emitted
+        } else {
+            events.push(ReplyEvent::Start);
+            0
+        };
+        if let Shown::Markdown(text) = item.present().body
+            && let Some(rest) = text.get(emitted..)
+            && !rest.is_empty()
+        {
+            events.push(ReplyEvent::Text(rest));
+        }
+        events.push(ReplyEvent::End);
+        self.finished = item.key().get();
     }
 }
 
@@ -122,7 +149,11 @@ pub fn sanitize(text: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{Seq, view::Status};
+    use protocol::{Body, DaemonMsg, Entry, Epoch, Json, Outcome, Seq, SessionId, view::Status};
+
+    fn entry(seq: u64, body: Body) -> Entry {
+        Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)
+    }
 
     #[test]
     fn retry_text_is_emitted_once() {
@@ -169,6 +200,12 @@ mod tests {
             part: Part::Outcome,
         };
         assert_eq!(stream.project(&done, &view), [ReplyEvent::End]);
+        assert!(stream.project(&done, &view).is_empty());
+        assert_eq!(
+            stream.project(&delta, &view),
+            [ReplyEvent::Start, ReplyEvent::Text("reply")]
+        );
+        assert_eq!(stream.project(&done, &view), [ReplyEvent::End]);
         let mut resumed = ReplyStream::default();
         let partial = Change::Delta {
             call,
@@ -204,5 +241,79 @@ mod tests {
             sanitize("plain\ntext"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn reconnect_snapshot_finishes_a_partially_emitted_reply() {
+        let call = CallId::new(1).unwrap();
+        let mut view = SessionView::from_log(
+            SessionId::new(),
+            "/w".into(),
+            [entry(
+                1,
+                Body::ModelCall {
+                    model: "m".into(),
+                    purpose: None,
+                    r#for: None,
+                    attempt: 0,
+                    choice: protocol::ToolChoice::None,
+                    request: None,
+                },
+            )],
+        );
+        let mut stream = ReplyStream::default();
+        let update = view
+            .fold(&DaemonMsg::Delta {
+                call,
+                text: "hel".into(),
+                attempt: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            stream.project(&update.change, &view),
+            [ReplyEvent::Start, ReplyEvent::Text("hel")]
+        );
+        let running = view
+            .fold(&DaemonMsg::Snapshot(Box::new(view.snapshot())))
+            .unwrap();
+        assert!(stream.project(&running.change, &view).is_empty());
+        let mut daemon_view = view.clone();
+        daemon_view.fold(&DaemonMsg::Entry(entry(
+        2,
+        Body::ModelResult {
+            call,
+            r#for: None,
+            failure: None,
+            outcome: Outcome::Done {
+                output: Json::encode(
+                    &serde_json::json!({"message":{"content":[{"type":"text","text":"hello"}]}}),
+                )
+                .unwrap(),
+            },
+        },
+    )));
+        assert!(
+            matches!(&daemon_view.items[0], protocol::view::Item::Reply { text, .. } if text == "hello")
+        );
+        let update = view
+            .fold(&DaemonMsg::Snapshot(Box::new(daemon_view.snapshot())))
+            .unwrap();
+        assert!(matches!(update.change, Change::Snapshot));
+        assert_eq!(
+            stream.project(&update.change, &view),
+            [ReplyEvent::Text("lo"), ReplyEvent::End]
+        );
+        assert!(stream.project(&update.change, &view).is_empty());
+        assert!(
+            stream
+                .project(
+                    &Change::Updated {
+                        index: 0,
+                        part: Part::Outcome
+                    },
+                    &view
+                )
+                .is_empty()
+        );
     }
 }
