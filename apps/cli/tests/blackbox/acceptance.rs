@@ -303,7 +303,7 @@ fn a_command_run_by_the_agent_uses_the_attaching_shells_path_and_virtualenv() {
         after["output"],
         format!("venv python in {}\nno-token\n", venv.display())
     );
-    let log = fs::read_to_string(env.home.sessions_dir().join(format!("{id}.jsonl"))).unwrap();
+    let log = fs::read_to_string(env.home.sessions_dir().join(format!("{id}/log.jsonl"))).unwrap();
     assert!(
         log.contains("DEPLOY_TOKEN") && !log.contains("s3cret"),
         "{log}"
@@ -358,7 +358,7 @@ fn entries_after_a_torn_tail_survive_a_restart() {
     conn.until(|e| matches!(e.body, Body::Assistant { .. }));
     drop(conn);
     env.run(&["daemon", "stop"]);
-    let log = env.home.sessions_dir().join(format!("{id}.jsonl"));
+    let log = env.home.sessions_dir().join(format!("{id}/log.jsonl"));
     let mut text = fs::read_to_string(&log).unwrap();
     text.push_str(r#"{"seq":4,"ep"#);
     fs::write(&log, text).unwrap();
@@ -592,7 +592,7 @@ fn a_fork_copies_a_conversation_and_continues_without_changing_the_source() {
     let first = env.run(&["-p", "source message"]);
     assert_eq!(first, "source message\n");
     let (source, entries) = env.connect().attach(ANY, &env.ws);
-    let path = env.home.sessions_dir().join(format!("{source}.jsonl"));
+    let path = env.home.sessions_dir().join(format!("{source}/log.jsonl"));
     let before = fs::read(&path).unwrap();
     let fork = env.run(&["fork", &source.short().to_string()]);
     let fork = fork.trim();

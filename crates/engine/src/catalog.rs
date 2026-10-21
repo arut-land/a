@@ -113,6 +113,13 @@ impl Catalog {
         if let Some(reason) = reason {
             ext_logging::emit(ext_logging::Fact::CatalogRebuilt { reason });
         }
+        store.locate(
+            &catalog
+                .records()
+                .into_iter()
+                .map(|r| r.header)
+                .collect::<Vec<_>>(),
+        )?;
         let mut state = lock(&catalog.state);
         if rebuilt || state.bloated() {
             catalog.compact(&mut state);

@@ -233,6 +233,11 @@ pub enum ImportStep {
 /// Where session logs live. Each `create` or `load` hands out the log's
 /// writer under a lease newer than every one before.
 pub trait LogStore: Send + Sync {
+    /// Seeds id lookup from the derived catalog without scanning the directory tree.
+    fn locate(&self, _headers: &[Header]) -> io::Result<()> {
+        Ok(())
+    }
+
     /// A new, empty session log; fails with `AlreadyExists` if the id is taken.
     fn create(&self, header: &Header) -> io::Result<Loaded>;
 

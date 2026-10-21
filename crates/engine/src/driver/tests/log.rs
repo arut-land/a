@@ -95,6 +95,7 @@ impl OnDisk {
             file.extend_from_slice(line);
             seal(&mut file, at);
         }
+        fs::create_dir_all(self.path(header.id).parent().unwrap()).unwrap();
         fs::write(self.path(header.id), file).unwrap();
         header
     }
@@ -104,7 +105,7 @@ impl OnDisk {
     }
 
     fn path(&self, id: SessionId) -> PathBuf {
-        self.dir.join(format!("{id}.jsonl"))
+        self.dir.join(format!("{id}/log.jsonl"))
     }
 
     /// The lines of session `id`'s file after its header, unsealed.

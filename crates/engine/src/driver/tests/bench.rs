@@ -79,7 +79,7 @@ fn bench_loading_a_long_log() {
         created.writer.append_raw(&chunk).unwrap();
     }
     drop(created);
-    let bytes = std::fs::metadata(dir.join(format!("{}.jsonl", header.id)))
+    let bytes = std::fs::metadata(dir.join(format!("{}/log.jsonl", header.id)))
         .unwrap()
         .len();
     let derived = dir.join("derived");

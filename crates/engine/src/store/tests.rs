@@ -273,7 +273,7 @@ fn headers_list_sessions_oldest_first(store: &dyn LogStore) {
         session: made[0].id,
         call: 1,
     });
-    for h in made.iter().rev() {
+    for h in &made {
         append(&mut store.create(h).unwrap(), 1..=2);
     }
     assert_eq!(store.headers().unwrap(), made);
@@ -463,7 +463,11 @@ fn torn(tail: &[u8]) -> (Fixture, PathBuf, Header, Vec<Entry>) {
     let store = jsonl();
     let h = header("/w");
     let written = append(&mut store.create(&h).unwrap(), 1..=2);
-    let path = store.dir.as_ref().unwrap().join(format!("{}.jsonl", h.id));
+    let path = store
+        .dir
+        .as_ref()
+        .unwrap()
+        .join(format!("{}/log.jsonl", h.id));
     OpenOptions::new()
         .append(true)
         .open(&path)
@@ -524,11 +528,9 @@ fn jsonl_skips_a_file_whose_header_a_crash_cut_off() {
     let h = header("/w");
     store.create(&h).unwrap();
     let dir = store.dir.as_ref().unwrap();
-    fs::write(
-        dir.join(format!("{}.jsonl", SessionId::new())),
-        br#"{"id":"#,
-    )
-    .unwrap();
+    let torn = dir.join(SessionId::new().to_string());
+    fs::create_dir_all(&torn).unwrap();
+    fs::write(torn.join("log.jsonl"), br#"{"id":"#).unwrap();
     assert_eq!(store.headers().unwrap(), [h]);
 }
 
@@ -764,8 +766,8 @@ fn a_sidecar_the_log_does_not_bear_out_is_rebuilt_from_it() {
     log.writer.snapshot(&snapshot).unwrap();
     drop(log);
     let dir = store.dir.as_ref().unwrap();
-    let idx = dir.join(format!("derived/{}.idx", h.id));
-    let snap = dir.join(format!("derived/{}.snap", h.id));
+    let idx = dir.join(format!("{}/derived/log.idx", h.id));
+    let snap = dir.join(format!("{}/derived/log.snap", h.id));
     let whole_idx = fs::read(&idx).unwrap();
     let whole_snap = fs::read(&snap).unwrap();
     assert_eq!(whole_idx.len(), 6 * 8);
@@ -785,7 +787,7 @@ fn a_sidecar_the_log_does_not_bear_out_is_rebuilt_from_it() {
                 image: image("eight"),
             })
             .unwrap();
-        fs::read(dir.join(format!("derived/{}.snap", o.id))).unwrap()
+        fs::read(dir.join(format!("{}/derived/log.snap", o.id))).unwrap()
     };
     for (stale, short) in [(flipped, false), (ahead, false), (whole_snap.clone(), true)] {
         fs::write(&snap, &stale).unwrap();
@@ -912,8 +914,8 @@ fn imported_history_does_not_need_its_parents_file_or_derived_directory() {
     store.import(&copied, &entries).unwrap();
     drop(loaded);
     let dir = store.dir.as_ref().unwrap();
-    fs::remove_file(dir.join(format!("{}.jsonl", source.id))).unwrap();
-    fs::remove_dir_all(dir.join("derived")).unwrap();
+    fs::remove_file(dir.join(format!("{}/log.jsonl", source.id))).unwrap();
+    fs::remove_dir_all(dir.join(format!("{}/derived", source.id))).unwrap();
     let reopened = Jsonl::open(dir).unwrap();
     let mut replay = Vec::new();
     reopened
@@ -1033,4 +1035,49 @@ fn a_read_only_writer_still_flushes_the_prefix_it_will_replay() {
     rt::block_on(loaded.writer.flushed(&*FLUSH_RT)).unwrap();
     assert_eq!(memory.entries(header.id).unwrap(), entries);
     assert_eq!(loaded.writer.read_only(), Some(ReadOnly::Extensions));
+}
+
+#[test]
+fn nested_children_remain_addressable_after_the_catalog_is_lost() {
+    let store = jsonl();
+    let root = header("/w");
+    drop(store.create(&root).unwrap());
+    let child = Header {
+        parent: Some(Parent {
+            session: root.id,
+            call: 1,
+        }),
+        ..header("/w")
+    };
+    drop(store.create(&child).unwrap());
+    let grandchild = Header {
+        parent: Some(Parent {
+            session: child.id,
+            call: 1,
+        }),
+        ..header("/w")
+    };
+    let entry = store
+        .create(&grandchild)
+        .unwrap()
+        .append(Body::Assistant {
+            text: "nested".into(),
+        })
+        .unwrap();
+    let dir = store.dir.as_ref().unwrap();
+    assert!(
+        dir.join(root.id.to_string())
+            .join("children")
+            .join(child.id.to_string())
+            .join("children")
+            .join(grandchild.id.to_string())
+            .join("log.jsonl")
+            .is_file()
+    );
+    let reopened = Jsonl::open(dir).unwrap();
+    let headers = reopened.headers().unwrap();
+    assert_eq!(headers, [root, child, grandchild.clone()]);
+    assert_eq!(reopened.prefix(grandchild.id, 1).unwrap(), [entry]);
+    let catalog = crate::catalog::Catalog::open(dir.join("sessions.idx"), &reopened).unwrap();
+    assert_eq!(catalog.get(grandchild.id).unwrap().header, grandchild);
 }

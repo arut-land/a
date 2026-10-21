@@ -346,7 +346,7 @@ impl Env {
     /// A session's log as stored, asserting that every line is a complete
     /// entry.
     pub fn log(&self, id: SessionId) -> Vec<Entry> {
-        let path = self.home.sessions_dir().join(format!("{id}.jsonl"));
+        let path = self.home.sessions_dir().join(format!("{id}/log.jsonl"));
         let text = fs::read_to_string(path).unwrap();
         assert!(text.ends_with('\n'), "torn final line in {text}");
         text.lines()

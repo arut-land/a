@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
@@ -16,7 +17,8 @@ use super::{
 /// a file in another is kept as it is.
 pub(crate) const FORMAT: u32 = 1;
 
-/// One append-only JSONL file per session in a directory: the header on the
+/// One conversation directory per session, with owned children nested below it.
+/// The append-only `log.jsonl` contains the header on the
 /// first line, one entry per line after it. Sessions share their drive-cache
 /// flusher; a single writer per directory is the daemon lock's job.
 ///
@@ -27,14 +29,15 @@ pub(crate) const FORMAT: u32 = 1;
 /// file was damaged otherwise, so it is kept as it is.
 ///
 /// Derived from each log and never synced, two files in `derived/` spare
-/// the next load its length: `<id>.idx`, where each line ends, and
-/// `<id>.snap`, the newest snapshot. Either is used only as far as it
+/// the next load its length: `log.idx`, where each line ends, and
+/// `log.snap`, the newest snapshot. Either is used only as far as it
 /// agrees with the log, and a load without them reads the log whole, so
 /// the directory may be deleted at any time. Being apart, writing them
 /// leaves the logs' directory as it was, which the catalog reads the age
 /// of.
 pub struct Jsonl {
     dir: PathBuf,
+    paths: RwLock<HashMap<SessionId, PathBuf>>,
     leases: Local,
     flusher: Arc<rt::Flusher>,
     domain: sys::fs::FlushDomain,
@@ -43,10 +46,12 @@ pub struct Jsonl {
 impl Jsonl {
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
-        fs::create_dir_all(dir.join(DERIVED))?;
+        fs::create_dir_all(&dir)?;
+        let paths = HashMap::new();
         let domain = sys::fs::FlushDomain::of(&dir)?;
         Ok(Self {
             dir,
+            paths: RwLock::new(paths),
             leases: Local::default(),
             flusher: Arc::default(),
             domain,
@@ -59,7 +64,7 @@ impl Jsonl {
         entries: &[Entry],
         mut check: impl FnMut(ImportStep) -> io::Result<()>,
     ) -> io::Result<()> {
-        let path = self.path(header.id);
+        let path = self.prepare(header)?;
         if path.exists() {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
@@ -93,7 +98,7 @@ impl Jsonl {
             check(ImportStep::Rename)?;
             fs::rename(&pending, &path)?;
             check(ImportStep::DirectorySync)?;
-            sys::fs::sync_dir(&self.dir)?;
+            sys::fs::sync_dir(path.parent().unwrap())?;
             check(ImportStep::Published)
         })();
         if result.is_err() {
@@ -102,25 +107,135 @@ impl Jsonl {
         result
     }
 
-    fn path(&self, id: SessionId) -> PathBuf {
-        self.dir.join(format!("{id}.jsonl"))
+    fn path(&self, id: SessionId) -> io::Result<PathBuf> {
+        if let Some(path) = self
+            .paths
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+        {
+            return Ok(path.clone());
+        }
+        let root = self.dir.join(id.to_string()).join("log.jsonl");
+        if root.is_file() {
+            return Ok(root);
+        }
+        let found = discover(&self.dir)?;
+        let path = found.get(&id).cloned().ok_or(io::ErrorKind::NotFound)?;
+        self.paths
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(found);
+        Ok(path)
     }
+
+    fn prepare(&self, header: &Header) -> io::Result<PathBuf> {
+        let base = if let Some(parent) = header.parent {
+            let path = self.path(parent.session)?;
+            if !path.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "parent log is absent",
+                ));
+            }
+            path.parent().unwrap().join("children")
+        } else {
+            self.dir.clone()
+        };
+        fs::create_dir_all(&base)?;
+        if let Some(parent) = base.parent() {
+            sys::fs::sync_dir(parent)?;
+        }
+        let dir = base.join(header.id.to_string());
+        fs::create_dir_all(dir.join(DERIVED))?;
+        sys::fs::sync_dir(&base)?;
+        let path = dir.join("log.jsonl");
+        let mut paths = self.paths.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(known) = paths.get(&header.id)
+            && known != &path
+        {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        paths.insert(header.id, path.clone());
+        Ok(path)
+    }
+}
+
+fn discover(root: &Path) -> io::Result<HashMap<SessionId, PathBuf>> {
+    let mut paths = HashMap::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(dir) = pending.pop() {
+        for item in fs::read_dir(dir)? {
+            let item = item?;
+            if !item.file_type()?.is_dir() {
+                continue;
+            }
+            let Ok(id) = item.file_name().to_string_lossy().parse().map(SessionId) else {
+                continue;
+            };
+            let dir = item.path();
+            let log = dir.join("log.jsonl");
+            if log.is_file() && paths.insert(id, log).is_some() {
+                return Err(io::Error::other("duplicate conversation id"));
+            }
+            let children = dir.join("children");
+            if children.is_dir() {
+                pending.push(children);
+            }
+        }
+    }
+    Ok(paths)
 }
 
 /// Where the files derived from the logs are kept, in their directory.
 const DERIVED: &str = "derived";
 
-/// `<id>.jsonl`'s derived file of extension `ext`.
+/// The log's derived file of extension `ext`.
 fn beside(log: &Path, ext: &str) -> PathBuf {
     let name = Path::new(log.file_name().unwrap_or_default()).with_extension(ext);
     log.with_file_name(DERIVED).join(name)
 }
 
 impl LogStore for Jsonl {
+    fn locate(&self, headers: &[Header]) -> io::Result<()> {
+        let mut paths = self.paths.write().unwrap_or_else(PoisonError::into_inner);
+        let mut pending: Vec<_> = headers.iter().collect();
+        while !pending.is_empty() {
+            let before = pending.len();
+            pending.retain(|header| {
+                if paths.contains_key(&header.id) {
+                    return false;
+                }
+                let base = match header.parent {
+                    None => self.dir.clone(),
+                    Some(parent) => match paths.get(&parent.session) {
+                        Some(path) => path.parent().unwrap().join("children"),
+                        None => return true,
+                    },
+                };
+                paths.insert(
+                    header.id,
+                    base.join(header.id.to_string()).join("log.jsonl"),
+                );
+                false
+            });
+            if pending.len() == before {
+                // Orphans can survive manual deletion of an ancestor's log.
+                paths.extend(discover(&self.dir)?);
+                if pending.iter().any(|h| !paths.contains_key(&h.id)) {
+                    return Err(io::Error::other(
+                        "catalog ancestry has no stored conversation",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The file, header included, becomes durable with its first entry: a
     /// session with none has nothing to lose, and creating one costs no sync.
     fn create(&self, header: &Header) -> io::Result<Loaded> {
-        let path = self.path(header.id);
+        let path = self.prepare(header)?;
         let mut file = OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -133,20 +248,15 @@ impl LogStore for Jsonl {
         line.remove(at);
         seal(&mut line, 0);
         file.write_all(&line)?;
+        let directory = path.parent().unwrap().to_owned();
         let index = Index::new(file, path, line.len() as u64);
         index.persist(0);
         let epoch = self.leases.acquire(header.id, 0);
-        Ok(index.loaded(
-            0,
-            0,
-            epoch,
-            Ok(Some(self.dir.clone())),
-            Arc::clone(&self.flusher),
-        ))
+        Ok(index.loaded(0, 0, epoch, Ok(Some(directory)), Arc::clone(&self.flusher)))
     }
 
     fn prefix(&self, id: SessionId, seq: u64) -> io::Result<Vec<Entry>> {
-        let mut reader = BufReader::new(File::open(self.path(id))?);
+        let mut reader = BufReader::new(File::open(self.path(id)?)?);
         let mut line = Vec::new();
         reader.read_until(b'\n', &mut line)?;
         if !unseal(&mut line) {
@@ -186,16 +296,18 @@ impl LogStore for Jsonl {
     /// so it holds no session; nor does one whose header is not sealed.
     fn headers(&self) -> io::Result<Vec<Header>> {
         let mut headers = Vec::new();
-        for item in fs::read_dir(&self.dir)? {
-            let path = item?.path();
-            if path.extension().is_some_and(|e| e == "jsonl") {
-                let mut line = Vec::new();
-                BufReader::new(File::open(&path)?).read_until(b'\n', &mut line)?;
-                if unseal(&mut line)
-                    && let Ok(header) = serde_json::from_slice::<Header>(&line)
-                {
-                    headers.push(header);
-                }
+        let paths = discover(&self.dir)?;
+        self.paths
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(paths.clone());
+        for path in paths.into_values() {
+            let mut line = Vec::new();
+            BufReader::new(File::open(&path)?).read_until(b'\n', &mut line)?;
+            if unseal(&mut line)
+                && let Ok(header) = serde_json::from_slice::<Header>(&line)
+            {
+                headers.push(header);
             }
         }
         headers.sort_unstable_by_key(|h| h.id.0);
@@ -217,7 +329,7 @@ impl LogStore for Jsonl {
         restore: &mut dyn FnMut(Snapshot) -> bool,
         each: &mut dyn FnMut(Entry),
     ) -> io::Result<Loaded> {
-        let path = self.path(id);
+        let path = self.path(id)?;
         let file = OpenOptions::new().read(true).append(true).open(&path)?;
         self.domain.check(&file)?;
         let mut index = Index::new(file, path, 0);
@@ -263,11 +375,12 @@ impl LogStore for Jsonl {
         let agreed = placed.agreed(&index.read().ends);
         index.persist(agreed);
         let epoch = self.leases.acquire(id, floor);
+        let directory = index.path.parent().unwrap().to_owned();
         Ok(index.loaded(
             seq,
             read,
             epoch,
-            kept.map_or(Ok(Some(self.dir.clone())), Err),
+            kept.map_or(Ok(Some(directory)), Err),
             Arc::clone(&self.flusher),
         ))
     }
@@ -275,7 +388,7 @@ impl LogStore for Jsonl {
     #[cfg(test)]
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
         let mut entries = Vec::new();
-        let path = self.path(id);
+        let path = self.path(id)?;
         let mut index = Index::new(File::open(&path)?, path, 0);
         let other = index.header()?;
         index.scan(other, |e| entries.push(e))?;
@@ -286,7 +399,7 @@ impl LogStore for Jsonl {
     #[cfg(test)]
     fn count(&self, id: SessionId) -> io::Result<u64> {
         use std::io::Read as _;
-        let mut file = File::open(self.path(id))?;
+        let mut file = File::open(self.path(id)?)?;
         let (mut lines, mut buf) = (0u64, vec![0u8; 64 * 1024]);
         loop {
             match file.read(&mut buf)? {

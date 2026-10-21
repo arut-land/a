@@ -294,7 +294,7 @@ fn a_damaged_log_is_shown_and_never_written() {
         let entry = Entry::new(Seq::new(seq).unwrap(), Epoch(created.writer.epoch()), body);
         created.writer.append_raw(&[entry]).unwrap();
     }
-    let path = home.sessions_dir().join(format!("{id}.jsonl"));
+    let path = home.sessions_dir().join(format!("{id}/log.jsonl"));
     let mut file = std::fs::read(&path).unwrap();
     // In the call's line, before the last.
     let call = memchr::memchr_iter(b'\n', &file).nth(1).unwrap() + 10;
@@ -738,7 +738,19 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
             call: 2,
         }),
     };
+    let missing_parent = Header {
+        id: header.parent.unwrap().session,
+        workspace: header.workspace.clone(),
+        parent: None,
+    };
+    drop(store.create(&missing_parent).unwrap());
     let mut created = store.create(&header).unwrap();
+    std::fs::remove_file(
+        home.sessions_dir()
+            .join(missing_parent.id.to_string())
+            .join("log.jsonl"),
+    )
+    .unwrap();
     let bodies_written = [
         Body::Input {
             text: "sleep 0".into(),
@@ -1067,7 +1079,12 @@ fn cold_start_does_not_grow_with_session_count() {
         })
         .collect();
     for h in &headers {
-        std::fs::write(home.sessions_dir().join(format!("{}.jsonl", h.id)), "torn").unwrap();
+        std::fs::create_dir_all(home.sessions_dir().join(h.id.to_string())).unwrap();
+        std::fs::write(
+            home.sessions_dir().join(format!("{}/log.jsonl", h.id)),
+            "torn",
+        )
+        .unwrap();
     }
     let catalog = Catalog::open(home.catalog_file(), &store).unwrap();
     assert!(catalog.records().is_empty(), "the logs are unreadable");
@@ -1289,7 +1306,7 @@ fn a_fork_never_changes_its_source() {
     source.session().submit("first").unwrap();
     settle(&daemon);
     let id = source.session().id;
-    let path = home.sessions_dir().join(format!("{id}.jsonl"));
+    let path = home.sessions_dir().join(format!("{id}/log.jsonl"));
     let before = std::fs::read(&path).unwrap();
     let copied = daemon
         .attach_to(
@@ -1380,7 +1397,7 @@ fn a_hibernated_source_stays_hibernated_when_forked() {
     daemon.wait("source hibernated", PATIENCE, || {
         daemon.slot(id).unwrap().live().is_none()
     });
-    let before = std::fs::read(home.sessions_dir().join(format!("{id}.jsonl"))).unwrap();
+    let before = std::fs::read(home.sessions_dir().join(format!("{id}/log.jsonl"))).unwrap();
     let fork = daemon
         .attach_to(
             &Target::Fork {
@@ -1394,7 +1411,7 @@ fn a_hibernated_source_stays_hibernated_when_forked() {
     fork.session().submit("new branch").unwrap();
     settle(&daemon);
     assert_eq!(
-        std::fs::read(home.sessions_dir().join(format!("{id}.jsonl"))).unwrap(),
+        std::fs::read(home.sessions_dir().join(format!("{id}/log.jsonl"))).unwrap(),
         before
     );
     drop((fork, daemon));
