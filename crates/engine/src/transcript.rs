@@ -1,20 +1,15 @@
 //! What a session's log says, read back for the model: the conversation
 //! it sees.
 
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use ext::host::Registry;
 use llm::{Assistant, Message, Messages, ToolMessage, ToolResult};
-use protocol::{Body, CallId, Decode, Entry, Outcome, Seq, Verdict};
+use protocol::{Body, CallId, Entry, Outcome, Seq, Verdict};
 
-/// The conversation the model sees, folded from the log's facts as they
-/// commit, so that a model call reads it rather than the log. A model
-/// reply is the assistant message it stored, provider state included. A
-/// tool call the model made is answered under the model's id for it, as
-/// the tools of the registry it was folded on present the result. The
-/// system prompt leads, then the session's context, wherever it was logged.
+/// Provider replies remain intact; live updates and recovery share projection rules.
 pub struct Transcript {
     messages: Messages,
     /// Where the next context message goes: after the system prompt and
@@ -93,9 +88,13 @@ impl Transcript {
         system: &str,
     ) -> Self {
         let entries: Vec<_> = entries.into_iter().collect();
-        let edits = context_edits(entries.iter().map(Borrow::borrow));
+        ContextImage::new(entries.iter().map(|e| Cow::Borrowed(e.borrow())).collect())
+            .project(Self::empty(registry, system))
+    }
+
+    fn empty(registry: Arc<Registry>, system: &str) -> Self {
         let messages = Messages::from_iter((!system.is_empty()).then(|| Message::system(system)));
-        let mut transcript = Self {
+        Self {
             context: messages.len(),
             messages,
             calls: HashMap::new(),
@@ -103,23 +102,7 @@ impl Transcript {
             waiting: HashMap::new(),
             last: 0,
             registry,
-        };
-        for e in &entries {
-            let e = e.borrow();
-            let edit = edits
-                .iter()
-                .rev()
-                .find(|(from, to, _)| (*from..=*to).contains(&e.seq.get()));
-            match edit {
-                None => transcript.apply(e, None),
-                Some((from, _, Some(text))) if *from == e.seq.get() => {
-                    transcript.messages.push(Message::user(text.clone()));
-                    transcript.last = e.seq.get();
-                }
-                Some(_) => {}
-            }
         }
-        transcript
     }
 
     /// Folds entry `e`. `fresh` is the message of the reply this daemon
@@ -128,11 +111,10 @@ impl Transcript {
         let message = match context_fact(&e.body) {
             Some(ContextFact::Inherited(intent)) => {
                 if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
-                    let entries = image
-                        .image
-                        .iter()
-                        .filter_map(|j| Entry::from_json(j.raw().as_bytes()).ok());
-                    let messages = Self::of(entries, Arc::clone(&self.registry), "").into_context();
+                    let messages =
+                        ContextImage::new(image.entries().into_iter().map(Cow::Owned).collect())
+                            .project(Self::empty(Arc::clone(&self.registry), ""))
+                            .into_context();
                     for message in messages.iter() {
                         self.messages.push(message.clone());
                     }
@@ -218,38 +200,38 @@ impl Transcript {
 
     /// Pending exchanges cannot be replayed by a context-only child.
     pub fn into_context(self) -> Messages {
-        let requested: std::collections::HashSet<_> = self
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                Message::Assistant(a) => Some(a.tool_calls().map(|c| c.id.clone())),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        let answered: std::collections::HashSet<_> = self
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                Message::Tool(t) => Some(t.results.iter().map(|r| r.id.clone())),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        self.messages.iter().cloned().filter_map(|mut m| {
-            match &mut m {
+        let mut messages: Vec<_> = self.messages.iter().cloned().collect();
+        let mut requested = HashMap::new();
+        let mut answered: HashMap<usize, std::collections::HashSet<_>> = HashMap::new();
+        for (at, message) in messages.iter_mut().enumerate() {
+            match message {
                 Message::Assistant(a) => {
-                    a.content.retain(|p| !matches!(p, llm::AssistantPart::ToolCall(c) if !c.provider_executed && !answered.contains(&c.id)));
-                    if a.content.is_empty() { return None; }
+                    requested.extend(a.tool_calls().map(|c| (c.id.clone(), at)));
                 }
-                Message::Tool(t) => {
-                    t.results.retain(|r| requested.contains(&r.id));
-                    if t.results.is_empty() { return None; }
-                }
-                _ => {},
+                Message::Tool(t) => t.results.retain(|r| {
+                    if let Some(owner) = requested.remove(&r.id) {
+                        answered.entry(owner).or_default().insert(r.id.clone());
+                        true
+                    } else {
+                        false
+                    }
+                }),
+                _ => {}
             }
-            Some(m)
-        }).collect()
+        }
+        for (at, message) in messages.iter_mut().enumerate() {
+            if let Message::Assistant(a) = message {
+                a.content.retain(|p| !matches!(p, llm::AssistantPart::ToolCall(c) if !c.provider_executed && !answered.get(&at).is_some_and(|ids| ids.contains(&c.id))));
+            }
+        }
+        messages
+            .into_iter()
+            .filter(|m| match m {
+                Message::Assistant(a) => !a.content.is_empty(),
+                Message::Tool(t) => !t.results.is_empty(),
+                _ => true,
+            })
+            .collect()
     }
 
     pub fn into_messages(self) -> Messages {
@@ -277,7 +259,100 @@ fn context_edits(
         .collect()
 }
 
-/// The image contains projection inputs, never an executable child ledger.
+/// Sequence numbers belong to their layer; inherited authority is never projected.
+struct ContextImage<'a> {
+    layers: Vec<Vec<ContextInput<'a>>>,
+}
+
+enum ContextInput<'a> {
+    Entry(Cow<'a, Entry>),
+    Replacement { seq: Seq, text: String },
+    Inherited { seq: Seq, layer: usize },
+}
+
+impl<'a> ContextImage<'a> {
+    fn new(entries: Vec<Cow<'a, Entry>>) -> Self {
+        let mut pending = vec![entries];
+        let mut layers = Vec::new();
+        let mut at = 0;
+        while at < pending.len() {
+            let entries = std::mem::take(&mut pending[at]);
+            let edits = context_edits(entries.iter().map(AsRef::as_ref));
+            let mut inputs = Vec::new();
+            for entry in entries {
+                let edit = edits
+                    .iter()
+                    .rev()
+                    .find(|(from, to, _)| (*from..=*to).contains(&entry.seq.get()));
+                if let Some((from, _, text)) = edit {
+                    if *from == entry.seq.get()
+                        && let Some(text) = text
+                    {
+                        inputs.push(ContextInput::Replacement {
+                            seq: entry.seq,
+                            text: text.clone(),
+                        });
+                    }
+                    continue;
+                }
+                if let Body::Spawned { intent } = &entry.body {
+                    if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
+                        inputs.push(ContextInput::Inherited {
+                            seq: entry.seq,
+                            layer: pending.len(),
+                        });
+                        pending.push(image.entries().into_iter().map(Cow::Owned).collect());
+                    }
+                } else if context_fact(&entry.body).is_some() {
+                    inputs.push(ContextInput::Entry(entry));
+                }
+            }
+            layers.push(inputs);
+            at += 1;
+        }
+        Self { layers }
+    }
+
+    fn project(self, root: Transcript) -> Transcript {
+        let mut root = Some(root);
+        let mut inherited = HashMap::new();
+        for (layer, inputs) in self.layers.into_iter().enumerate().rev() {
+            let mut transcript = if layer == 0 {
+                root.take().expect("root reduced once")
+            } else {
+                Transcript::empty(
+                    Arc::clone(&root.as_ref().expect("root reduced last").registry),
+                    "",
+                )
+            };
+            for input in inputs {
+                match input {
+                    ContextInput::Entry(entry) => transcript.apply(&entry, None),
+                    ContextInput::Replacement { seq, text } => {
+                        transcript.messages.push(Message::user(text));
+                        transcript.last = seq.get();
+                    }
+                    ContextInput::Inherited { seq, layer } => {
+                        let messages: Messages =
+                            inherited.remove(&layer).expect("inherited layer reduced");
+                        for message in messages.iter() {
+                            transcript.messages.push(message.clone());
+                        }
+                        transcript.context = transcript.messages.len();
+                        transcript.last = seq.get();
+                    }
+                }
+            }
+            if layer == 0 {
+                return transcript;
+            }
+            inherited.insert(layer, transcript.into_context());
+        }
+        unreachable!("context has a root layer")
+    }
+}
+
+/// Stored projection facts carry no executable child ownership.
 pub(crate) fn context_image(entries: &[Entry]) -> Vec<protocol::Json> {
     let completed: std::collections::HashSet<_> = entries
         .iter()
@@ -286,7 +361,7 @@ pub(crate) fn context_image(entries: &[Entry]) -> Vec<protocol::Json> {
             _ => None,
         })
         .collect();
-    let taken_inputs: std::collections::HashSet<_> = entries
+    let taken: std::collections::HashSet<_> = entries
         .iter()
         .filter_map(|e| match context_fact(&e.body) {
             Some(ContextFact::Taken(input)) => Some(input),
@@ -297,253 +372,39 @@ pub(crate) fn context_image(entries: &[Entry]) -> Vec<protocol::Json> {
     entries
         .iter()
         .filter_map(|e| {
-            let projected = match context_fact(&e.body) {
-                Some(ContextFact::ToolCall { .. }) => completed.contains(&e.seq),
-                Some(ContextFact::Queued(_)) => taken_inputs.contains(&e.seq),
-                Some(_) => true,
-                None => false,
-            };
-            if projected {
-                return Some(protocol::Json::encode(e).expect("context entry encodes"));
-            }
-            // An edit can begin at a ledger-only entry; retain its replacement's position.
-            let edit = edits
+            if let Some((from, _, text)) = edits
                 .iter()
                 .rev()
-                .find(|(from, to, _)| (*from..=*to).contains(&e.seq.get()));
-            matches!(edit, Some((from, _, Some(_))) if *from == e.seq.get()).then(|| {
-                protocol::Json::encode(&Entry::new(
-                    e.seq,
-                    e.epoch,
-                    Body::Assistant {
-                        text: String::new(),
-                    },
-                ))
-                .expect("context position encodes")
-            })
+                .find(|(from, to, _)| (*from..=*to).contains(&e.seq.get()))
+            {
+                return (*from == e.seq.get())
+                    .then_some(text.as_ref())
+                    .flatten()
+                    .map(|text| {
+                        protocol::Json::encode(&Entry::new(
+                            e.seq,
+                            e.epoch,
+                            Body::Input {
+                                text: text.clone(),
+                                mode: protocol::Mode::Queue,
+                                taken: true,
+                                origin: None,
+                            },
+                        ))
+                        .expect("context replacement encodes")
+                    });
+            }
+            let projected = match context_fact(&e.body) {
+                Some(ContextFact::ToolCall { .. }) => completed.contains(&e.seq),
+                Some(ContextFact::Queued(_)) => taken.contains(&e.seq),
+                Some(ContextFact::Edit) | None => false,
+                Some(_) => true,
+            };
+            projected.then(|| protocol::Json::encode(e).expect("context entry encodes"))
         })
         .collect()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use protocol::{Epoch, Json, Mode, SessionId};
-    fn spawn_image(image: Vec<Json>) -> Json {
-        let intent = crate::tests::spawn_intent(1, "");
-        let mut intent = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
-        intent.image = image;
-        intent.into_json().unwrap()
-    }
-
-    #[test]
-    fn a_prefix_preserves_on_stop_context() {
-        let entries = [entry(
-            1,
-            Body::Decision {
-                call: None,
-                by: "review".into(),
-                d: Verdict::OnStop {
-                    text: "continue with the missing verification".into(),
-                },
-            },
-        )];
-        let registry = Arc::new(Registry::default());
-        let expected = Transcript::of(&entries, registry.clone(), "").into_context();
-        let image = context_image(&entries);
-        let intent = spawn_image(image);
-        let actual =
-            Transcript::of([entry(1, Body::Spawned { intent })], registry, "").into_messages();
-        assert_eq!(actual, expected);
-    }
-    fn entry(seq: u64, body: Body) -> Entry {
-        Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)
-    }
-    #[test]
-    fn a_prefix_projects_edits_and_publications_without_executable_ownership() {
-        let entries = vec![
-            entry(
-                1,
-                Body::Input {
-                    text: "old".into(),
-                    mode: Mode::Queue,
-                    taken: true,
-                    origin: None,
-                },
-            ),
-            entry(
-                2,
-                Body::Context {
-                    text: "skill".into(),
-                    publication: Some(protocol::publication::Publication {
-                        namespace: "skills".into(),
-                        key: Json::encode("review").unwrap(),
-                    }),
-                },
-            ),
-            entry(
-                3,
-                Body::Edit {
-                    target: Seq::new(1).unwrap(),
-                    upto: None,
-                    replace: Some(Json::encode("effective").unwrap()),
-                },
-            ),
-            entry(
-                4,
-                Body::ToolCall {
-                    invoke: None,
-                    tool: "task".into(),
-                    input: Json::null(),
-                    id: Some("pending".into()),
-                    card: None,
-                    by: protocol::Audience::Model,
-                },
-            ),
-            entry(
-                5,
-                Body::Watch {
-                    child: SessionId::new(),
-                },
-            ),
-            entry(
-                6,
-                Body::Edit {
-                    target: Seq::new(5).unwrap(),
-                    upto: None,
-                    replace: Some(Json::encode("ownership note").unwrap()),
-                },
-            ),
-        ];
-        let image = context_image(&entries);
-        let inherited: Vec<_> = image
-            .iter()
-            .map(|j| Entry::from_json(j.raw().as_bytes()).unwrap())
-            .collect();
-        assert!(
-            inherited
-                .iter()
-                .all(|e| !matches!(e.body, Body::Watch { .. } | Body::ToolCall { .. }))
-        );
-        let registry = Arc::new(Registry::default());
-        let expected = Transcript::of(&entries, registry.clone(), "").into_context();
-        let intent = spawn_image(image);
-        let child = [entry(1, Body::Spawned { intent })];
-        let actual = Transcript::of(&child, registry, "").into_messages();
-        assert_eq!(actual, expected);
-        assert_eq!(
-            actual,
-            Messages::from_iter([
-                Message::user("skill"),
-                Message::user("effective"),
-                Message::user("ownership note")
-            ])
-        );
-        let ledger = protocol::ledger::Ledger::of(child.iter());
-        assert!(ledger.open_calls().next().is_none());
-        assert!(ledger.armed().next().is_none());
-        assert!(
-            ledger
-                .publications()
-                .contains("skills", &Json::encode("review").unwrap())
-        );
-    }
-    #[test]
-    fn a_prefix_never_exports_an_unmatched_provider_tool_exchange() {
-        let call = |id: &str| {
-            llm::AssistantPart::ToolCall(llm::ToolCall {
-                id: id.into(),
-                name: "task".into(),
-                input: Json::encode(&serde_json::json!({})).unwrap(),
-                invalid: None,
-                provider_executed: false,
-                meta: llm::Meta::new(),
-            })
-        };
-        let assistant = Assistant {
-            content: vec![call("complete"), call("pending")],
-            origin: None,
-        };
-        let reply = llm::Response {
-            message: assistant,
-            finish: llm::Finish::new(llm::Reason::ToolCalls, None),
-            usage: llm::Usage::default(),
-            id: None,
-            model: None,
-            meta: llm::Meta::new(),
-        };
-        let entries = vec![
-            entry(
-                1,
-                Body::ModelResult {
-                    call: CallId::new(1).unwrap(),
-                    outcome: Outcome::Done {
-                        output: Json::encode(&reply).unwrap(),
-                    },
-                    r#for: None,
-                    failure: None,
-                },
-            ),
-            entry(
-                2,
-                Body::ToolCall {
-                    invoke: None,
-                    tool: "task".into(),
-                    input: Json::null(),
-                    id: Some("complete".into()),
-                    card: None,
-                    by: protocol::Audience::Model,
-                },
-            ),
-            entry(
-                3,
-                Body::ToolResult {
-                    call: CallId::new(2).unwrap(),
-                    outcome: Outcome::Done {
-                        output: Json::encode("answer").unwrap(),
-                    },
-                    card: None,
-                },
-            ),
-            entry(
-                4,
-                Body::ToolCall {
-                    invoke: None,
-                    tool: "task".into(),
-                    input: Json::null(),
-                    id: Some("pending".into()),
-                    card: None,
-                    by: protocol::Audience::Model,
-                },
-            ),
-        ];
-        let image = context_image(&entries);
-        let intent = spawn_image(image);
-        let messages = Transcript::of(
-            [entry(1, Body::Spawned { intent })],
-            Arc::new(Registry::default()),
-            "",
-        )
-        .into_messages();
-        let Message::Assistant(assistant) = &messages[0] else {
-            panic!("{messages:?}")
-        };
-        assert_eq!(
-            assistant
-                .tool_calls()
-                .map(|c| c.id.as_str())
-                .collect::<Vec<_>>(),
-            ["complete"]
-        );
-        let Message::Tool(tool) = &messages[1] else {
-            panic!("{messages:?}")
-        };
-        assert_eq!(
-            tool.results
-                .iter()
-                .map(|r| r.id.as_str())
-                .collect::<Vec<_>>(),
-            ["complete"]
-        );
-    }
-}
+#[path = "transcript/context_image_tests.rs"]
+mod context_image_tests;

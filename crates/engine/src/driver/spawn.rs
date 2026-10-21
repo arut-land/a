@@ -550,3 +550,7 @@ pub(super) fn restore(
     }
     Ok((registry, image))
 }
+
+#[cfg(test)]
+#[path = "spawn_context_tests.rs"]
+mod context_tests;
