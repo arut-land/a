@@ -273,6 +273,27 @@ impl States {
         }
     }
 
+    pub fn registered(&self, ext: &str, state: &str) -> bool {
+        self.held
+            .iter()
+            .any(|held| &*held.ext == ext && &*held.decl.name == state)
+    }
+
+    /// Reports the live fold's decision for an entry already applied.
+    pub fn mutation_result(&self, entry: &Entry) -> crate::MutationResult {
+        if let Body::Ext { ext, state, .. } = &entry.body {
+            let held = self
+                .held
+                .iter()
+                .find(|held| &*held.ext == ext && &*held.decl.name == state)
+                .ok_or(crate::MutationError::Unregistered)?;
+            if let Some(error) = held.rejected.get(&entry.seq) {
+                return Err(crate::MutationError::Rejected(error.clone()));
+            }
+        }
+        Ok(entry.seq)
+    }
+
     pub fn publications(&self) -> &protocol::publication::Publications {
         &self.publications
     }

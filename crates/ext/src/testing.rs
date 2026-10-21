@@ -151,11 +151,15 @@ impl Host for Recorder {
     }
 
     /// Committed at once: the fold is in memory.
-    fn note(&self, ext: &str, state: &str, data: Json) -> BoxFuture<'static, ()> {
-        lock(&self.states).fold(ext, state, &data);
+    fn note(
+        &self,
+        ext: &str,
+        state: &str,
+        data: Json,
+    ) -> BoxFuture<'static, crate::MutationResult> {
         let mut log = lock(&self.log);
         let seq = log.len() as u64 + 1;
-        log.push(Entry::new(
+        let entry = Entry::new(
             Seq::new(seq).unwrap(),
             Epoch(0),
             Body::Ext {
@@ -163,11 +167,20 @@ impl Host for Recorder {
                 state: state.to_owned(),
                 data,
             },
-        ));
-        Box::pin(std::future::ready(()))
+        );
+        let mut states = lock(&self.states);
+        states.apply(&entry);
+        let result = states.mutation_result(&entry);
+        log.push(entry);
+        Box::pin(std::future::ready(result))
     }
 
-    fn publish(&self, namespace: &str, key: Json, text: String) -> BoxFuture<'static, ()> {
+    fn publish(
+        &self,
+        namespace: &str,
+        key: Json,
+        text: String,
+    ) -> BoxFuture<'static, crate::MutationResult> {
         let mut log = lock(&self.log);
         let entry = Entry::new(
             Seq::new(log.len() as u64 + 1).unwrap(),
@@ -181,8 +194,9 @@ impl Host for Recorder {
             },
         );
         lock(&self.states).apply(&entry);
+        let seq = entry.seq;
         log.push(entry);
-        Box::pin(std::future::ready(()))
+        Box::pin(std::future::ready(Ok(seq)))
     }
 
     fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<Json>) {

@@ -335,6 +335,7 @@ pub struct CallInput {
 #[serde(rename_all = "snake_case")]
 pub enum Failure {
     Configuration(String),
+    Publication(String),
     Spawn(String),
     Transport(String),
     Redirect { status: u16 },
@@ -436,7 +437,7 @@ impl Tool for Schema {
             let key = (input.server.clone(), input.tool.clone(), definition);
             let loaded = cx.published::<ToolSchemas>(&key);
             if !loaded {
-                cx.publish::<ToolSchemas>(&key, format!("MCP schema {}/{}\n{}", input.server, input.tool, key.2)).await;
+                cx.publish::<ToolSchemas>(&key, format!("MCP schema {}/{}\n{}", input.server, input.tool, key.2)).await.map_err(|e| Failure::Publication(e.to_string()))?;
             }
             Ok(json!({"server":input.server,"tool":input.tool,"loaded":true,"already_loaded":loaded}))
         }.await;

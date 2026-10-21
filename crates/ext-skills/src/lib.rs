@@ -115,6 +115,7 @@ pub struct Input {
 #[serde(rename_all = "snake_case")]
 pub enum LoadError {
     UnknownSkill { name: String },
+    PublicationFailed { error: String },
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,7 +146,11 @@ impl Load {
                 use std::fmt::Write as _;
                 let _ = write!(context, "\nUse skill {name} with these arguments:\n{args}");
             }
-            cx.publish::<Instructions>(&key, context).await;
+            cx.publish::<Instructions>(&key, context)
+                .await
+                .map_err(|e| LoadError::PublicationFailed {
+                    error: e.to_string(),
+                })?;
         }
         Ok(if loaded {
             LoadedSkill::AlreadyLoaded

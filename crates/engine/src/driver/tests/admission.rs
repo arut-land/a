@@ -930,8 +930,8 @@ fn registry_adoption_waits_for_rest_and_the_complete_durable_prefix() {
     assert_eq!(session.session.fence.load(Ordering::SeqCst), fence);
     flush.release();
     assert_eq!(rt::block_on(ack), Some(Ok(())));
-    rt::block_on(first);
-    rt::block_on(second);
+    rt::block_on(first).unwrap();
+    rt::block_on(second).unwrap();
     session.wait("generation adopted", PATIENCE, || {
         !Arc::ptr_eq(&old, &session.session.state_view())
     });

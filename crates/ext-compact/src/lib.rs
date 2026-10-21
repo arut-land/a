@@ -151,7 +151,9 @@ async fn compact(cx: &Cx, call: CallId) -> Result<String, String> {
     let text = format!("<summary of the conversation so far>\n{summary}\n</summary>");
     cx.edit(first, Some(last), Some(&text));
     // A crash may repeat an edit; it must never retain only its completion mark.
-    cx.update::<Compacted>(&call.get()).await;
+    cx.update::<Compacted>(&call.get())
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(summary)
 }
 

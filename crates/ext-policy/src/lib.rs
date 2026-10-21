@@ -171,7 +171,9 @@ impl Tool for SetMode {
             let names: Vec<_> = Mode::ALL.iter().map(|m| m.name()).collect();
             format!("no mode {args}: one of {}", names.join(", "))
         })?;
-        cx.update::<ModeState>(&mode).await;
+        cx.update::<ModeState>(&mode)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(Moded { mode })
     }
 }

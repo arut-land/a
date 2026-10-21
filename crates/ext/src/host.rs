@@ -34,9 +34,15 @@ pub trait Host: Send + Sync {
     fn progress(&self, text: &str);
     /// Commits `data` as a change to extension `ext`'s state `state`:
     /// resolves once it is committed and folded in.
-    fn note(&self, ext: &str, state: &str, data: Json) -> BoxFuture<'static, ()>;
+    fn note(&self, ext: &str, state: &str, data: Json)
+    -> BoxFuture<'static, crate::MutationResult>;
     /// Seals a publication identity and model context in one ordinary entry.
-    fn publish(&self, namespace: &str, key: Json, text: String) -> BoxFuture<'static, ()>;
+    fn publish(
+        &self,
+        namespace: &str,
+        key: Json,
+        text: String,
+    ) -> BoxFuture<'static, crate::MutationResult>;
     /// Commits an `edit`: see [`Cx::edit`].
     fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<Json>);
     /// Lends the session's states to `read`, which cannot keep them.

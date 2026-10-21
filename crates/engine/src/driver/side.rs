@@ -26,11 +26,12 @@ impl Actor {
         if origin.fence != self.live.session.fence.load(super::Ordering::SeqCst) {
             return false;
         }
+        let Ok(entries) = self.live.frames.entries() else {
+            return false;
+        };
         let mut succeeded = false;
-        for entry in self
-            .live
-            .frames
-            .entries()
+        for entry in entries
+            .into_iter()
             .chain(
                 self.unsynced
                     .iter()
@@ -146,10 +147,10 @@ impl Actor {
             reply.send(Opened::Closed);
             return None;
         }
-        let previous = self
-            .live
-            .frames
-            .entries()
+        let entries = self.live.frames.entries().ok()?;
+        let previous = entries
+            .iter()
+            .cloned()
             .chain(
                 self.unsynced
                     .iter()
@@ -170,7 +171,7 @@ impl Actor {
                 _ => None,
             });
         if let Some(id) = previous {
-            let cached = self.live.frames.entries().find_map(|e| match e.body {
+            let cached = entries.into_iter().find_map(|e| match e.body {
                 Body::ModelResult {
                     call,
                     outcome,
@@ -193,7 +194,7 @@ impl Actor {
             return None;
         }
         let conversation = match side.context {
-            ext::SideContext::BeforeOwner => self.conversation(of),
+            ext::SideContext::BeforeOwner => self.conversation(of).ok()?,
             ext::SideContext::None => llm::Messages::default(),
         };
         let Ok(request) = side.intent(&conversation) else {
@@ -254,9 +255,10 @@ impl ext::Models for Own {
                 return Err(llm::Error::incomplete());
             }
             let cx = cx.clone();
+            let registry = Arc::clone(&self.2);
             let runtime = Arc::clone(&session.shared.rt);
             runtime.spawn(Box::pin(async move {
-                sent.send(side_call(&session, &cx, origin, side).await);
+                sent.send(side_call(&session, &cx, origin, side, &registry).await);
             }));
             answer
                 .await
@@ -270,9 +272,10 @@ async fn side_call(
     cx: &Cx,
     origin: ContextOrigin,
     side: ext::Side,
+    registry: &ext::host::Registry,
 ) -> Result<llm::Response, llm::Error> {
     let invalid = |e: String| llm::Error::new(llm::Kind::InvalidRequest, e);
-    let routed = session.role_model(&side.role);
+    let routed = session.role_model(&side.role, registry);
     let model = routed
         .and_then(|spec| {
             let env = lock(&session.env).clone();

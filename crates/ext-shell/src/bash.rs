@@ -298,7 +298,9 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
     // `pwd -P` resolves symlinks the starting directory may have.
     if std::fs::canonicalize(&dir).ok().as_ref() != Some(&cwd) {
         let base = cx.env.as_ref().map(|env| env.cwd.as_path());
-        cx.update::<Cwd>(&Cwd::change(&cwd, base)).await;
+        cx.update::<Cwd>(&Cwd::change(&cwd, base))
+            .await
+            .map_err(io::Error::other)?;
     }
     if done.lingering {
         cx.own(pgid, crate::job::ended(runtime(cx)?.reactor(), pgid, None));

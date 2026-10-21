@@ -87,26 +87,56 @@ impl FrameLog {
     /// The entries after `seq`, decoded from their lines a run at a time,
     /// in order: for what reads the log rarely, such as recovery after a
     /// failure.
-    pub fn entries_after(&self, seq: u64) -> impl Iterator<Item = Entry> + '_ {
-        let (mut next, last) = (seq + 1, self.seq());
-        let (mut run, mut read) = (Vec::new(), VecDeque::new());
+    pub fn batches_after(&self, seq: u64) -> impl Iterator<Item = io::Result<Vec<Entry>>> + '_ {
+        let last = self.seq();
+        let mut cursor = seq;
         std::iter::from_fn(move || {
-            loop {
-                if let Some(entry) = read.pop_front() {
-                    return Some(entry);
-                }
-                if next > last {
-                    return None;
-                }
-                run.clear();
-                next += lock(&self.lines).read(next..=last, RUN, &mut run).ok()?;
-                read.extend(lines(&run).filter_map(|line| Entry::from_json(line).ok()));
+            if cursor >= last {
+                return None;
             }
+            Some(match self.batch(cursor + 1, last) {
+                Ok((_, entries)) => {
+                    cursor += entries.len() as u64;
+                    Ok(entries)
+                }
+                Err(error) => {
+                    cursor = last;
+                    Err(error)
+                }
+            })
         })
     }
 
-    pub fn entries(&self) -> impl Iterator<Item = Entry> + '_ {
+    pub fn entries_after(&self, seq: u64) -> io::Result<Vec<Entry>> {
+        self.batches_after(seq)
+            .try_fold(Vec::new(), |mut entries, batch| {
+                entries.extend(batch?);
+                Ok(entries)
+            })
+    }
+
+    pub fn entries(&self) -> io::Result<Vec<Entry>> {
         self.entries_after(0)
+    }
+
+    fn batch(&self, next: u64, last: u64) -> io::Result<(Vec<u8>, Vec<Entry>)> {
+        let mut run = Vec::new();
+        let count = lock(&self.lines).read(next..=last, RUN, &mut run)?;
+        if count == 0 || count > last - next + 1 || run.last() != Some(&b'\n') {
+            return Err(io::Error::other("log read made no valid progress"));
+        }
+        let entries: Vec<_> = lines(&run)
+            .map(|line| Entry::from_json(line).map_err(io::Error::other))
+            .collect::<io::Result<_>>()?;
+        if entries.len() as u64 != count
+            || entries
+                .iter()
+                .zip(next..)
+                .any(|(entry, seq)| entry.seq.get() != seq)
+        {
+            return Err(io::Error::other("log batch is not contiguous"));
+        }
+        Ok((run, entries))
     }
 
     /// Queues the frames of the entries after `after`: from the tail when
@@ -131,9 +161,8 @@ impl FrameLog {
             }
             last
         };
-        let mut run = Vec::new();
-        match lock(&self.lines).read(after + 1..=last, RUN, &mut run) {
-            Ok(_) => ahead.extend(
+        match self.batch(after + 1, last) {
+            Ok((run, _)) => ahead.extend(
                 lines(&run)
                     .zip(after + 1..)
                     .map(|(line, seq)| Frame::from_line(seq, line)),
@@ -376,10 +405,13 @@ impl Queue {
                 follow.cursor += 1;
                 Step::Frame(frame)
             }
-            // Too large for a frame, or unreadable: the view ends here.
+            // Queued snapshots and acknowledgements certify a prefix we cannot deliver.
             Some(Err(_)) => {
-                self.unfollow();
-                self.step()
+                self.closed = true;
+                self.follow = None;
+                self.frames.clear();
+                self.ephemeral = 0;
+                Step::Nothing
             }
         }
     }
@@ -491,6 +523,63 @@ mod tests {
     /// Followers that keep up are served the frames the commit encoded,
     /// however many follow: no read of the log per client per entry. Only
     /// one that comes from far behind reads it, once per run.
+    #[test]
+    fn log_read_failure_never_becomes_a_valid_prefix() {
+        struct Broken {
+            lines: Arc<dyn Lines>,
+            fault: u8,
+        }
+        impl Lines for Broken {
+            fn read(
+                &self,
+                seqs: std::ops::RangeInclusive<u64>,
+                _: usize,
+                out: &mut Vec<u8>,
+            ) -> io::Result<u64> {
+                if *seqs.start() == 1 {
+                    return self.lines.read(1..=1, RUN, out);
+                }
+                match self.fault {
+                    0 => Err(io::Error::other("read failed after a valid entry")),
+                    1 => Ok(0),
+                    2 => self.lines.read(3..=3, RUN, out),
+                    3 => {
+                        self.lines.read(2..=2, RUN, out)?;
+                        out.truncate(out.len() / 2);
+                        out.push(b'\n');
+                        Ok(1)
+                    }
+                    _ => {
+                        self.lines.read(2..=2, RUN, out)?;
+                        Ok(2)
+                    }
+                }
+            }
+        }
+        let shown = log(&["first", "second", "third"]);
+        for fault in 0..5 {
+            let frames = Arc::new(FrameLog::new(
+                Arc::new(Broken {
+                    lines: Arc::clone(&shown.0.lines),
+                    fault,
+                }),
+                3,
+            ));
+            assert!(
+                frames.entries().is_err(),
+                "fault {fault} cannot certify a prefix"
+            );
+            let outbox = Outbox::new();
+            let follower = outbox.follow(
+                frames,
+                0,
+                vec![(3, Frame::new(&DaemonMsg::Synced { seq: 3 }).unwrap())],
+            );
+            assert_eq!(written(&outbox), [Some(1)]);
+            assert!(follower.wake().is_err());
+        }
+    }
+
     #[test]
     fn a_live_follower_reads_no_file() {
         let mut log = log(&[]);
