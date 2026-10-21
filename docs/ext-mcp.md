@@ -21,8 +21,12 @@ tracker_url = "https://tracker.example/mcp"
 tracker_description = "Public issue search"
 ```
 
-Names contain ASCII letters, digits or hyphens, at most 64 bytes. Each
-name selects either its argument list or `<name>_url`, never both. Commands
+`ServerName` validates ASCII letters, digits or hyphens, at most 64 bytes,
+when configuration or tool inputs are decoded. `ToolName` validates remote
+identities at discovery and tool-input decoding: nonempty names without
+whitespace or control characters, at most 128 UTF-8 bytes. Caches and
+dispatch use these types throughout. At most 64 servers can be configured.
+Each name selects either its argument list or `<name>_url`, never both. Commands
 are argv, not shell text. The child's directory and non-secret environment
 come from the attaching client (or daemon when none attached), with
 `<name>_env` overriding explicitly. Spawn hooks can wrap or refuse it.
@@ -61,8 +65,9 @@ can match the wrapper name and serialized server/tool arguments. Tool
 cards are pure functions of the logged input and result.
 
 `ResultFact` separates successful remote values from typed local failures:
-configuration, spawn, transport, crash, timeout, cancellation, protocol,
-remote JSON-RPC error, unsupported input request, and size limit. Remote
+configuration, spawn, transport, refused redirect, crash, timeout,
+cancellation, protocol, remote JSON-RPC error, unsupported input request,
+and size limit. Remote
 `isError` results stay intact and get a bad card. No request retries
 implicitly. Sampling, elicitation, resources, prompts and subscriptions
 are not provided; an `input_required` response is a typed failure.
@@ -71,14 +76,29 @@ Stdio uses newline-delimited JSON-RPC with per-request version and
 capabilities, and probes `server/discover` before its first operation.
 There is no `initialize` fallback. Cancellation attempts a nonblocking
 `notifications/cancelled` write and then kills the process group, including
-servers that ignore notifications. HTTP refuses all redirects before resending, including same-origin redirects.
-Provider HTTP callers choose their redirect policy explicitly. HTTP uses
-`llm::Ureq` over the existing
-runtime, supports JSON and request-scoped SSE, and closes its response
-stream on cancellation. It mirrors method, tool name and valid
+servers that ignore notifications. HTTP refuses all redirects before any
+resend, including same-origin redirects: configure the final endpoint
+explicitly. Provider HTTP callers choose their redirect policy explicitly.
+HTTP uses `llm::Ureq` over the existing runtime, supports JSON and
+request-scoped SSE, and closes its response stream on cancellation. It mirrors method, tool name and valid
 `x-mcp-header` parameters, using the prescribed Base64 sentinel encoding
 when necessary. Invalid header annotations are excluded from HTTP tool
-lists. Responses are bounded at 1 MiB, lists at 64 pages / 4096 tools;
+lists. Responses are bounded at 1 MiB. Discovery also has a 1 MiB aggregate
+budget across all pages, before any schema retention or projection; lists
+are further limited to 64 pages / 4096 tools. Exceeding any budget returns
+`Failure::Limit`. Index descriptions use a deterministic UTF-8 prefix,
+at most 512 bytes including an ellipsis. A retained result plus its escaped
+card therefore leaves headroom in the 16 MiB protocol frame.
+
+Every request owns a shared budget for all notifications, including unknown
+methods and unrelated progress tokens: 256 messages / 64 KiB of JSON.
+Both stdio and SSE spend it before retaining progress. One pending value
+holds the latest progress, truncated to 1 KiB. At most eight publications
+reach the engine per request: up to seven spaced by 100 ms, and a reserved
+final update. A timer runs only while an update is pending and a slot is
+available, so a quiet peer's latest update is still delivered without
+periodic idle polling. Floods become typed limit outcomes, close the HTTP
+response or kill the stdio group, and cannot enqueue unbounded engine work.
 JSON decoding also applies serde's nesting limit. External schema
 references are never fetched. Argument validation belongs to the server;
 the client checks the argument object and routing field types.
@@ -90,7 +110,9 @@ runs the fixture client, codec and daemon tests. The `fixture` feature
 builds the tiny `mcp-fixture` binary; the CLI's dev dependency enables it
 for workspace tests. It is absent from release builds. Tests record
 server starts and effects in isolated temporary homes, including replay
-and crash recovery. See [the dependency and size measurements](perf/mcp.md).
+and crash recovery. A descendant fixture independently proves that daemon
+stop and cancellation kill the whole server tree.
+See [the dependency and size measurements](perf/mcp.md).
 
 The implementation follows the current MCP [stdio binding](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio),
 [tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools),

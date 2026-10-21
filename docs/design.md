@@ -175,7 +175,11 @@ a selected schema are explicit calls. Stdio servers start on first use,
 one per server per session, with their process groups owned by the daemon.
 All MCP operations are external, unsafe to replay, and admitted only after
 their intent is durable; progress and typed results become logged facts.
-Streamable HTTP reuses the existing model HTTP transport and runtime.
+Streamable HTTP reuses the existing model HTTP transport and runtime with
+an explicit refusal of redirects. Per-request notification and publication
+budgets coalesce progress into a bounded latest value. Discovery has an
+aggregate byte budget; compact summaries and typed names keep the result
+and its card safely below the protocol frame limit.
 The client targets MCP 2026-07-28 without a legacy handshake fallback;
 HTTP authentication, sampling and elicitation remain unsupported.
 

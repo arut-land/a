@@ -58,7 +58,7 @@ and three configured servers, with a warm daemon and isolated homes,
 and run budgets/startup. Prompt bytes grow by the compact index, so model
 provider latency cannot be asserted to be identical without measurement.
 
-## Final validation
+## Initial integration validation
 
 After merging main, `CARGO_BUILD_JOBS=3 mise run check` passed formatting,
 clippy and **932 tests**, with 28 intentionally skipped. `acceptance`
@@ -77,3 +77,47 @@ MCP invariants include
 `approval_and_cancellation_precede_any_remote_effect`, and
 `interrupting_an_active_call_kills_its_server`. Codec tests cover fragmented
 JSON/SSE, response identity and safe mirrored HTTP headers.
+
+## Review hardening
+
+The HTTP transport now requires an explicit `Redirects` policy at every
+`llm::Ureq` construction. MCP chooses `Refuse`: even same-origin redirects
+return a typed outcome before a second request. The cross-host leak proof
+and a same-origin 307 test exercise the real HTTP transport.
+
+One state object per RPC request charges all notification methods against
+256 messages / 64 KiB and retains one latest progress value, at most 1 KiB.
+Publication has eight slots, with a reserved final update and 100 ms
+spacing; pending progress is flushed even when the server goes quiet.
+There is no background producer or unbounded intermediate queue. The
+connection reuses an 8 KiB heap read buffer so the timer race does not
+double an inline buffer in nested async futures.
+
+Discovery counts serialized bytes before retaining each page, stopping at
+1 MiB across the entire list. Summaries shorten descriptions to 512 UTF-8
+bytes. The oversized-page reproduction returns a typed limit; another
+test frames an accepted schema and its escaped card with at least 12 MiB
+of frame headroom. Server and tool identities are validated newtypes.
+A fixture that spawns a descendant verifies whole-group cleanup on both
+daemon stop and cancellation.
+
+The three independent review regressions remain in the suite:
+`cross_host_redirects_never_receive_mirrored_arguments`,
+`notification_flood_is_bounded_per_request`, and
+`paginated_discovery_cannot_exceed_the_client_frame_budget`.
+
+After merging main (`c7d9de5`), formatting, clippy and all **965 tests**
+passed (28 intentionally skipped). Acceptance passed 13 tests, web passed
+6 tests, and Windows lint, machete, no-tokio and deny all passed.
+`CARGO_BUILD_JOBS=3 mise run size` passed at **3120 KiB** (3,195,584
+bytes), below 4096 KiB. The previous validated release was 3072 KiB
+(3,145,856 bytes); the increase of 49,728 bytes (48.56 KiB) includes
+main's fork work as well as review hardening. This is not an isolated
+measurement of either contribution. Release artifacts and retained test
+directories were removed, with no remaining test servers or daemons.
+Quiet-machine latency/budgets remain deferred as requested.
+
+`ext-skills` is not present on merged main, so there is no newer shared
+context-publication primitive to adopt yet. MCP continues to use SDK text
+registration and logged loading tools; transport state remains private
+to `ext-mcp`.
