@@ -291,6 +291,7 @@ impl Fixture {
         let rt: rt::Rt = Arc::clone(&counting) as _;
         Self(
             Arc::new(Shared {
+                http_clients: std::sync::OnceLock::new(),
                 rt,
                 store,
                 catalog: crate::catalog::Catalog::memory(),
@@ -2390,4 +2391,50 @@ fn loading_cannot_wait_on_its_own_exhausted_pool() {
     drop(fixture);
     drop(store);
     std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn calls_share_transport_pools_but_not_origin_authority() {
+    let home = gpt_home();
+    let fixture = Fixture::new(
+        "echo",
+        Registry::default(),
+        with_home(&Script::new(&[]), &home),
+    );
+    let registry = fixture.0.registry.get();
+    let (tx, _rx) = channel::unbounded();
+    let session = Session::new(&Fixture::header(), &fixture.0, Arc::new(tx), &registry);
+    let old_origin = session.origin(CallId::new(1).unwrap(), 0).unwrap();
+    let old = session.cx(old_origin.clone(), &registry);
+    let current_origin = session.origin(CallId::new(2).unwrap(), 0).unwrap();
+    let current = session.cx(current_origin.clone(), &registry);
+    assert!(std::ptr::eq(
+        old.service::<dyn rt::Runtime>().unwrap(),
+        current.service::<dyn rt::Runtime>().unwrap()
+    ));
+    for policy in [
+        transport::RedirectPolicy::Follow,
+        transport::RedirectPolicy::Refuse,
+    ] {
+        assert!(Arc::ptr_eq(
+            &old.service::<dyn transport::HttpClients>()
+                .unwrap()
+                .client(policy),
+            &current
+                .service::<dyn transport::HttpClients>()
+                .unwrap()
+                .client(policy),
+        ));
+    }
+    session.cancelled(old.call);
+    assert!(!old_origin.current(&session));
+    assert!(current_origin.current(&session));
+    let side = ext::Side::new::<Agents>(
+        "authority",
+        ext::ModelRole::Session,
+        ext::SideContext::None,
+        llm::Messages::default(),
+    );
+    assert!(rt::block_on(old.models().unwrap().call(&current, side)).is_err());
+    std::fs::remove_file(home).unwrap();
 }

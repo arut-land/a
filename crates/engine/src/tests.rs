@@ -1944,7 +1944,7 @@ impl ext::Tool for PairTasks {
     const REPLAY: ext::Replay = ext::Replay::Safe;
     const CONCURRENCY: ext::Concurrency = ext::Concurrency::Shared;
     async fn call(&self, _: &NoInput, cx: &ext::Cx) -> Result<Self::Out, String> {
-        let sessions = cx.service::<dyn ext::Sessions>().unwrap();
+        let sessions = cx.sessions().unwrap();
         let mut results = Vec::new();
         for purpose in ["first", "second"] {
             let spawn = ext::Spawn::new::<Self>(
@@ -2121,7 +2121,7 @@ mod inheritance {
                 },
                 ext::DepthBudget::new(4),
             );
-            cx.service::<dyn ext::Sessions>()
+            cx.sessions()
                 .unwrap()
                 .spawn(cx, request.awaited())
                 .await

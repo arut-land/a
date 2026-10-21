@@ -415,9 +415,7 @@ impl Tool for List {
 struct ToolSchemas;
 impl ext::Publication for ToolSchemas {
     const NAME: &'static str = "mcp-schemas";
-    // Content belongs in the identity: a changed remote definition must be
-    // publishable even while an older schema remains in effective context.
-    type Key = (ServerName, ToolName, protocol::Json);
+    type Key = (ServerName, ToolName, &'static str, [u8; 32]);
 }
 
 struct Schema(Mcp);
@@ -434,10 +432,13 @@ impl Tool for Schema {
                 .ok_or_else(|| Failure::Protocol("unknown tool".into()))?;
             let definition = protocol::Json::encode(&remote.definition)
                 .map_err(|e| Failure::Protocol(e.to_string()))?;
-            let key = (input.server.clone(), input.tool.clone(), definition);
-            let loaded = cx.published::<ToolSchemas>(&key);
+            let digest = ring::digest::digest(&ring::digest::SHA256, definition.raw().as_bytes());
+            let key = (input.server.clone(), input.tool.clone(), "sha256-v1", <[u8; 32]>::try_from(digest.as_ref()).expect("SHA-256 digest"));
+            let publication = ext::PreparedPublication::new::<ToolSchemas>(&key, format!("MCP schema {}/{}\n{}", input.server, input.tool, definition))
+                .map_err(|e| Failure::Protocol(e.to_string()))?;
+            let loaded = cx.published_erased(<ToolSchemas as ext::Publication>::NAME, &publication.key);
             if !loaded {
-                cx.publish::<ToolSchemas>(&key, format!("MCP schema {}/{}\n{}", input.server, input.tool, key.2)).await.map_err(|e| Failure::Publication(e.to_string()))?;
+                cx.publish_erased(<ToolSchemas as ext::Publication>::NAME, publication.key, publication.text).await.map_err(|e| Failure::Publication(e.to_string()))?;
             }
             Ok(json!({"server":input.server,"tool":input.tool,"loaded":true,"already_loaded":loaded}))
         }.await;
@@ -494,5 +495,101 @@ impl Tool for Call {
     }
     fn present_result(input: &CallInput, output: &ResultFact) -> Option<Card> {
         result_card(&input.server, &input.tool, output)
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use ext::host::Registry;
+    use ext::testing::Rig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Default)]
+    struct Schemas(Arc<AtomicUsize>);
+
+    impl Extension for Schemas {
+        const NAME: &'static str = "schemas";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut Registrar) {
+            r.provide::<dyn transport::HttpClients>(Arc::new(self.clone()));
+        }
+    }
+    impl transport::HttpClients for Schemas {
+        fn client(&self, policy: transport::RedirectPolicy) -> Arc<dyn transport::Http> {
+            assert!(matches!(policy, transport::RedirectPolicy::Refuse));
+            Arc::new(self.clone())
+        }
+    }
+    impl transport::Http for Schemas {
+        fn send(
+            &self,
+            request: http::Request<transport::Payload>,
+        ) -> transport::BoxFuture<'static, std::io::Result<transport::Response>> {
+            let request: Value = serde_json::from_slice(&request.body().to_vec()).unwrap();
+            let description = if self.0.fetch_add(1, Ordering::SeqCst) == 2 {
+                "SECOND"
+            } else {
+                "FIRST"
+            }
+            .repeat(1024);
+            let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":{
+                "resultType":"complete", "tools":[{"name":"echo","description":description,"inputSchema":{"type":"object"}}]
+            }});
+            Box::pin(std::future::ready(Ok(http::Response::builder()
+                .header("content-type", "application/json")
+                .body(transport::body([serde_json::to_vec(&reply).unwrap()]))
+                .unwrap())))
+        }
+    }
+
+    #[test]
+    fn publication_keys_do_not_repeat_the_published_content() {
+        let rig = Rig::new(
+            "remote-schema-identity",
+            Registry::default().with(&Schemas::default()).unwrap(),
+        );
+        let schema = Schema(
+            Mcp::new(
+                vec![Server {
+                    name: ServerName::try_from("fixture".to_owned()).unwrap(),
+                    description: String::new(),
+                    transport: Transport::Http("http://fixture.invalid/mcp".into()),
+                    env: BTreeMap::new(),
+                }],
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+        );
+        let input = SchemaInput {
+            server: ServerName::try_from("fixture".to_owned()).unwrap(),
+            tool: ToolName::try_from("echo".to_owned()).unwrap(),
+        };
+        for loaded in [false, true, false, true] {
+            let ResultFact::Ok(result) = rt::block_on(schema.call(&input, &rig.cx())).unwrap()
+            else {
+                panic!("schema request failed")
+            };
+            assert_eq!(result["already_loaded"], loaded);
+        }
+        let log = rig.log.lock().unwrap();
+        let publications: Vec<_> = log
+            .iter()
+            .filter_map(|e| match &e.body {
+                protocol::Body::Context {
+                    text,
+                    publication: Some(p),
+                } => Some((text, &p.key)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(publications.len(), 2);
+        assert_ne!(publications[0].1, publications[1].1);
+        for (text, key) in publications {
+            assert!(text.len() > 5000);
+            assert!(key.raw().len() < 200);
+            assert!(key.raw().contains("sha256-v1"));
+            assert!(!key.raw().contains("FIRST") && !key.raw().contains("SECOND"));
+        }
     }
 }

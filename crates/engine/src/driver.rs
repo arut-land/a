@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use crate::catalog::Record;
 use crate::store::{Encoded, Header, Loaded, Parent, Snapshot, Writer};
-use ext::host::{Binding, Bound, Host, Parts, Registry, Services};
+use ext::host::{Binding, Bound, Host, Parts, Registry, SessionServices};
 use ext::point::View;
 use ext::{BoxFuture, Called, Cancel, Cx, Flag, States};
 use kernel::{
@@ -57,13 +57,14 @@ mod work;
 use work::{WorkHandle, WorkId, WorkSet};
 #[path = "services.rs"]
 mod services;
-use services::{Own, Viewed, bind};
+use services::{CallPorts, SessionLayers, Viewed, bind};
 
 mod inbox;
 mod side;
 pub(crate) mod spawn;
 
 pub struct Shared {
+    pub http_clients: std::sync::OnceLock<Arc<dyn transport::HttpClients>>,
     pub rt: rt::Rt,
     pub store: Arc<dyn crate::store::LogStore>,
     pub catalog: crate::catalog::Catalog,
@@ -257,6 +258,7 @@ pub enum Open {
 /// What a session's calls and decision points read: made before its log
 /// is folded, as the kernel's registry binds it.
 struct Session {
+    services: Arc<SessionServices>,
     spawn: Mutex<Option<spawn::SpawnIntent>>,
     fence: AtomicU64,
     id: SessionId,
@@ -2351,7 +2353,17 @@ impl Live {
 
 impl Session {
     fn new(header: &Header, shared: &Arc<Shared>, mail: Mail, registry: &Registry) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|session| Self {
+            services: Arc::new(
+                SessionServices::default()
+                    .with::<dyn ext::Layers>(Arc::new(SessionLayers(session.clone())))
+                    .with::<dyn rt::Runtime>(Arc::clone(&shared.rt))
+                    .with::<dyn transport::HttpClients>(Arc::clone(
+                        shared.http_clients.get_or_init(|| {
+                            Arc::new(transport::Clients::new(Arc::clone(&shared.rt)))
+                        }),
+                    )),
+            ),
             spawn: Mutex::default(),
             fence: AtomicU64::new(0),
             id: header.id,

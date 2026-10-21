@@ -1,7 +1,7 @@
 //! Admission freezes authority before any child is created.
 use super::{
-    Actor, Arc, Body, BoxFuture, CallId, Child, ContextRequest, Cx, Deserialize, Event, InFlight,
-    Json, Live, Open, Outcome, Own, Registry, Serialize, SessionId, Shared, lock, oneshot, or,
+    Actor, Arc, Body, BoxFuture, CallId, CallPorts, Child, ContextRequest, Cx, Deserialize, Event,
+    InFlight, Json, Live, Open, Outcome, Registry, Serialize, SessionId, Shared, lock, oneshot, or,
 };
 use crate::store::Header;
 use ext::{DepthBudget, SpawnRefusal};
@@ -392,7 +392,7 @@ impl Actor {
     }
 }
 
-impl ext::Sessions for Own {
+impl ext::Sessions for CallPorts {
     fn send<'a>(
         &'a self,
         _cx: &'a Cx,
@@ -407,12 +407,12 @@ impl ext::Sessions for Own {
         request: ext::Detached<ext::Spawn>,
     ) -> BoxFuture<'a, Result<ext::ConversationHandle, SpawnRefusal>> {
         Box::pin(async move {
-            let session = self.0.upgrade().ok_or(SpawnRefusal::Interrupted)?;
-            if !self.1.current(&session) {
+            let session = Arc::clone(&self.session);
+            if !self.origin.current(&session) {
                 return Err(SpawnRefusal::Interrupted);
             }
             let (reply, result) = oneshot::channel();
-            self.1.send(
+            self.origin.send(
                 &session,
                 ContextRequest::Child {
                     request: request.0,
@@ -423,15 +423,11 @@ impl ext::Sessions for Own {
         })
     }
     fn runner(&self) -> ext::Runner {
-        let agent = self
-            .0
-            .upgrade()
-            .and_then(|s| {
-                lock(&s.spawn)
-                    .as_ref()
-                    .map(|i| i.request.agent.clone())
-                    .or_else(|| s.shared.models.settings.agent(&s.workspace))
-            })
+        let session = &self.session;
+        let agent = lock(&session.spawn)
+            .as_ref()
+            .map(|i| i.request.agent.clone())
+            .or_else(|| session.shared.models.settings.agent(&session.workspace))
             .unwrap_or_else(|| ext::LOOP.into());
         ext::Runner {
             agent,
@@ -445,12 +441,12 @@ impl ext::Sessions for Own {
         request: ext::Awaited<ext::Spawn>,
     ) -> BoxFuture<'a, Result<Outcome, SpawnRefusal>> {
         Box::pin(async move {
-            let session = self.0.upgrade().ok_or(SpawnRefusal::Interrupted)?;
-            if !self.1.current(&session) {
+            let session = Arc::clone(&self.session);
+            if !self.origin.current(&session) {
                 return Err(SpawnRefusal::Interrupted);
             }
             let (reply, result) = oneshot::channel();
-            self.1.send(
+            self.origin.send(
                 &session,
                 ContextRequest::Child {
                     request: request.0,

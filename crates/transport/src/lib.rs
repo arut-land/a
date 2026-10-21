@@ -1,9 +1,5 @@
-//! The HTTP seam. A client is anything that sends one request and hands
-//! back the status, headers and a stream of body bytes; middleware is a
-//! client wrapping another. Nothing here names a runtime or an HTTP crate.
-//! A request's body is the pieces it was spliced from, sent in order: a
-//! conversation's encoded messages go as they are kept, not copied into
-//! one buffer.
+//! Request-scoped headers and bodies over reusable, policy-specific pools.
+//! Payload pieces avoid copying a conversation into one request buffer.
 
 use std::future::Future;
 use std::io;
@@ -15,14 +11,12 @@ use futures_core::Stream;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// A response body: its bytes as they arrive.
 pub type Body = Pin<Box<dyn Stream<Item = io::Result<Vec<u8>>> + Send>>;
 
 pub type Response = http::Response<Body>;
 
 pub trait Http: Send + Sync + 'static {
-    /// Sends `request`. A non-success status is still `Ok`: its body is the
-    /// provider's account of the failure.
+    /// Non-success statuses retain the peer's error body.
     fn send(&self, request: http::Request<Payload>) -> BoxFuture<'static, io::Result<Response>>;
 }
 
@@ -32,8 +26,6 @@ impl<H: Http + ?Sized> Http for Arc<H> {
     }
 }
 
-/// A request body: its bytes in the pieces it was spliced from, shared
-/// with the encodings a conversation keeps.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Payload(Vec<Arc<[u8]>>);
 
@@ -50,12 +42,10 @@ impl Payload {
         &self.0
     }
 
-    /// The bytes, copied into one buffer.
     pub fn to_vec(&self) -> Vec<u8> {
         self.0.concat()
     }
 
-    /// The bytes, read in order.
     pub fn reader(&self) -> impl io::Read + '_ {
         Reader(&self.0, 0)
     }
@@ -73,7 +63,6 @@ impl From<Vec<u8>> for Payload {
     }
 }
 
-/// The pieces left and how far into the first.
 struct Reader<'a>(&'a [Arc<[u8]>], usize);
 
 impl io::Read for Reader<'_> {
@@ -93,7 +82,6 @@ impl io::Read for Reader<'_> {
     }
 }
 
-/// A body of bytes already in hand.
 pub fn body(chunks: impl IntoIterator<Item = Vec<u8>>) -> Body {
     struct Ready(std::vec::IntoIter<Vec<u8>>);
 
@@ -107,3 +95,19 @@ pub fn body(chunks: impl IntoIterator<Item = Vec<u8>>) -> Body {
 
     Box::pin(Ready(chunks.into_iter().collect::<Vec<_>>().into_iter()))
 }
+
+/// Whether transport may resend a request at another URL.
+#[derive(Clone, Copy, Debug)]
+pub enum RedirectPolicy {
+    Refuse,
+    Follow,
+}
+
+pub trait HttpClients: Send + Sync {
+    fn client(&self, policy: RedirectPolicy) -> Arc<dyn Http>;
+}
+
+#[cfg(feature = "ureq")]
+mod ureq;
+#[cfg(feature = "ureq")]
+pub use ureq::{Clients, Ureq};

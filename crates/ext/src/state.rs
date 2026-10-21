@@ -50,6 +50,21 @@ pub trait Publication {
     type Key: Serialize + ?Sized;
 }
 
+#[derive(Clone, Debug)]
+pub struct PreparedPublication {
+    pub key: Json,
+    pub text: String,
+}
+
+impl PreparedPublication {
+    pub fn new<P: Publication>(key: &P::Key, text: String) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            key: Json::encode(key)?,
+            text,
+        })
+    }
+}
+
 /// A durable fold whose name and value are known only at run time.
 /// A failed change leaves its previous value intact.
 pub trait DynFold: Send + Sync {

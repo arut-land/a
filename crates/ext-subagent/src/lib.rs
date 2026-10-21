@@ -4,8 +4,8 @@
 //! the turn, survives a restart, and is heard from once.
 
 use ext::{
-    Concurrency, Configured, Cx, Extension, Json, Refused, Registrar, Replay, Schema, Sessions,
-    Table, Text, Tool,
+    Concurrency, Configured, Cx, Extension, Json, Refused, Registrar, Replay, Schema, Table, Text,
+    Tool,
 };
 use serde::{Deserialize, Serialize};
 
@@ -105,9 +105,7 @@ async fn awaited_task(
     purpose: &str,
     context: ext::ContextSource,
 ) -> Result<String, String> {
-    let sessions = cx
-        .service::<dyn Sessions>()
-        .ok_or("this engine runs no child sessions")?;
+    let sessions = cx.sessions().ok_or("this engine runs no child sessions")?;
     let mut spawn = ext::Spawn::new::<Subagent>(
         purpose,
         input.prompt.clone(),
@@ -145,9 +143,7 @@ impl Tool for BackgroundTask {
     const REPLAY: Replay = Replay::Safe;
     const CONCURRENCY: Concurrency = Concurrency::Shared;
     async fn call(&self, input: &BackgroundPrompt, cx: &Cx) -> Result<Self::Out, String> {
-        let sessions = cx
-            .service::<dyn Sessions>()
-            .ok_or("this engine runs no child sessions")?;
+        let sessions = cx.sessions().ok_or("this engine runs no child sessions")?;
         let spawn = ext::Spawn::new::<Subagent>(
             "background_task",
             input.prompt.clone(),

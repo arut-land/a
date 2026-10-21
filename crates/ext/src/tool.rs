@@ -17,7 +17,7 @@ use crate::BoxFuture;
 #[cfg(doc)]
 use crate::CwdOf;
 use crate::flag::Cancel;
-use crate::host::{Host, Services};
+use crate::host::{Host, SessionServices};
 use crate::point::{PointCx, View};
 use crate::schema::Schema;
 use crate::shape::Output;
@@ -123,7 +123,7 @@ pub struct Cx {
     /// on first use.
     pub spill: Arc<Path>,
     pub cancel: Cancel,
-    services: Arc<Services>,
+    services: Arc<SessionServices>,
     host: Arc<dyn Host>,
 }
 
@@ -186,27 +186,6 @@ impl Cx {
             Ok(_) | Err(MutationError::Revoked) => Ok(output),
             Err(error) => Err(error),
         }
-    }
-
-    /// Seals a typed publication key and its model context in one log entry.
-    pub fn publish<P: crate::Publication>(
-        &self,
-        key: &P::Key,
-        text: String,
-    ) -> BoxFuture<'static, MutationResult> {
-        match Json::encode(key) {
-            Ok(key) => self.publish_erased(P::NAME, key, text),
-            Err(error) => Box::pin(std::future::ready(Err(MutationError::Encoding(
-                error.to_string(),
-            )))),
-        }
-    }
-
-    pub fn published<P: crate::Publication>(&self, key: &P::Key) -> bool {
-        let Ok(key) = Json::encode(key) else {
-            return false;
-        };
-        self.published_erased(P::NAME, &key)
     }
 
     pub fn publish_erased(
@@ -293,6 +272,12 @@ impl Cx {
     /// Side model requests on behalf of this call: see [`Models`](crate::Models).
     pub fn models(&self) -> Option<&dyn crate::Models> {
         self.service::<dyn crate::Models>()
+            .or_else(|| self.host.models())
+    }
+
+    pub fn sessions(&self) -> Option<&dyn crate::Sessions> {
+        self.service::<dyn crate::Sessions>()
+            .or_else(|| self.host.sessions())
     }
 
     /// Service `S`, if an extension or the engine provides it.

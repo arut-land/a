@@ -66,7 +66,7 @@ pub use service::{
 };
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};
-pub use state::{Checkpoint, DynFold, Fold, Image, Publication, States};
+pub use state::{Checkpoint, DynFold, Fold, Image, PreparedPublication, Publication, States};
 pub use tool::{
     Args, Callable, Called, Concurrency, Cx, DynTool, MutationError, MutationResult, Parsed,
     Replay, SpawnSpec, Tool,

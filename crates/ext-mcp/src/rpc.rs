@@ -65,11 +65,11 @@ pub(crate) async fn http(
     headers: http::HeaderMap,
     cx: &Cx,
 ) -> Result<Value, Failure> {
-    let client = llm::Ureq::new(
-        std::sync::Arc::new(CallRuntime(cx.clone())),
-        llm::Redirects::Refuse,
-    );
-    exchange(&client, url, method, params, headers, cx).await
+    let client = cx
+        .service::<dyn transport::HttpClients>()
+        .expect("engine HTTP clients")
+        .client(transport::RedirectPolicy::Refuse);
+    exchange(&*client, url, method, params, headers, cx).await
 }
 
 async fn exchange(
@@ -175,44 +175,6 @@ fn http_result(status: http::StatusCode, result: Value) -> Result<Value, Failure
         Ok(result)
     } else {
         Err(Failure::Transport(format!("HTTP {status}")))
-    }
-}
-
-// Retain the call only as long as its HTTP request needs the runtime.
-struct CallRuntime(Cx);
-impl rt::Runtime for CallRuntime {
-    fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
-        self.0
-            .service::<dyn rt::Runtime>()
-            .expect("engine runtime")
-            .spawn(task);
-    }
-    fn spawn_blocking(
-        &self,
-        class: rt::BlockingClass,
-        bytes: usize,
-        work: Box<dyn FnOnce() + Send>,
-    ) -> rt::BoxFuture<'static, std::io::Result<()>> {
-        self.0
-            .service::<dyn rt::Runtime>()
-            .expect("engine runtime")
-            .spawn_blocking(class, bytes, work)
-    }
-    fn spawn_flush(
-        &self,
-        work: Box<dyn FnOnce() + Send>,
-    ) -> rt::BoxFuture<'static, std::io::Result<()>> {
-        self.0
-            .service::<dyn rt::Runtime>()
-            .expect("engine runtime")
-            .spawn_flush(work)
-    }
-
-    fn reactor(&self) -> rt::Reactor {
-        self.0
-            .service::<dyn rt::Runtime>()
-            .expect("engine runtime")
-            .reactor()
     }
 }
 
@@ -328,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn same_origin_redirects_are_refused_before_any_resend() {
+    fn mcp_redirects_are_always_refused() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::time::{Duration, Instant};

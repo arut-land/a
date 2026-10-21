@@ -25,6 +25,13 @@ pub use crate::point::{Decided, Hooks};
 
 /// The engine, as a running call reaches it.
 pub trait Host: Send + Sync {
+    fn models(&self) -> Option<&dyn crate::Models> {
+        None
+    }
+    fn sessions(&self) -> Option<&dyn crate::Sessions> {
+        None
+    }
+
     fn invoke(
         self: Arc<Self>,
         cx: Cx,
@@ -62,10 +69,10 @@ pub trait Host: Send + Sync {
 /// extensions': each by the type of its trait object, as
 /// [`Cx::service`] asks. Built once per session.
 #[derive(Default)]
-pub struct Services(Vec<(TypeId, Box<dyn Any + Send + Sync>)>);
+pub struct SessionServices(Vec<(TypeId, Box<dyn Any + Send + Sync>)>);
 
-impl Services {
-    /// With service `S`, as `services.with::<dyn Models>(Arc::new(..))`.
+impl SessionServices {
+    /// With a stable service such as `dyn Layers`; call authority belongs to `Host`.
     #[must_use]
     pub fn with<S: ?Sized + Send + Sync + 'static>(mut self, service: Arc<S>) -> Self {
         self.0.push((TypeId::of::<S>(), Box::new(service)));
@@ -90,7 +97,7 @@ pub struct Parts {
     pub model: Arc<str>,
     pub spill: Arc<Path>,
     pub cancel: Cancel,
-    pub services: Arc<Services>,
+    pub services: Arc<SessionServices>,
 }
 
 impl Parts {

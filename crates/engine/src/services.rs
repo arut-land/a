@@ -2,8 +2,8 @@
 
 use super::{
     Arc, Bound, BoxFuture, CallId, ContextOrigin, ContextRequest, Cx, Environment, Host, Json,
-    Model, Note, Ordering, Parts, Path, Registry, Services, Session, SessionId, States, View, Weak,
-    lock, oneshot,
+    Model, Note, Ordering, Parts, Path, Registry, Session, SessionId, States, View, Weak, lock,
+    oneshot,
 };
 
 impl Session {
@@ -16,28 +16,13 @@ impl Session {
             model: self.model_spec(registry).into(),
             spill: Arc::clone(&self.spill),
             cancel: origin.cancel.clone(),
-            services: self.services(origin.clone(), registry),
+            services: Arc::clone(&self.services),
         }
-        .cx(Arc::new(Calling {
+        .cx(Arc::new(CallPorts {
             origin,
             session: Arc::clone(self),
             registry: Arc::clone(registry),
         }))
-    }
-
-    pub(super) fn services(
-        self: &Arc<Self>,
-        origin: ContextOrigin,
-        registry: &Arc<Registry>,
-    ) -> Arc<Services> {
-        let own = Arc::new(Own(Arc::downgrade(self), origin, Arc::clone(registry)));
-        Arc::new(
-            Services::default()
-                .with::<dyn ext::Layers>(own.clone())
-                .with::<dyn ext::Sessions>(own.clone())
-                .with::<dyn ext::Models>(own)
-                .with::<dyn rt::Runtime>(Arc::clone(&self.shared.rt)),
-        )
     }
 
     pub(super) fn role_model(
@@ -160,13 +145,13 @@ pub(super) fn bind(registry: &Arc<Registry>, session: &Arc<Session>) -> Arc<Boun
     Arc::new(Bound::new(Arc::clone(registry), viewed, agent))
 }
 
-pub(super) struct Calling {
+pub(super) struct CallPorts {
     pub(super) origin: ContextOrigin,
     pub(super) session: Arc<Session>,
     pub(super) registry: Arc<Registry>,
 }
 
-impl Calling {
+impl CallPorts {
     fn report(&self, note: Note) {
         self.origin
             .send(&self.session, ContextRequest::Note { note, done: None });
@@ -188,7 +173,14 @@ impl Calling {
     }
 }
 
-impl Host for Calling {
+impl Host for CallPorts {
+    fn models(&self) -> Option<&dyn ext::Models> {
+        Some(self)
+    }
+    fn sessions(&self) -> Option<&dyn ext::Sessions> {
+        Some(self)
+    }
+
     fn invoke(
         self: Arc<Self>,
         _: Cx,
@@ -273,16 +265,9 @@ impl Host for Calling {
     }
 }
 
-/// The session, as its calls reach it for what only the engine has: the
-/// config layers, child sessions and side model requests. Its authority
-/// belongs to the context that obtained the service, never a later call.
-pub(super) struct Own(
-    pub(super) Weak<Session>,
-    pub(super) ContextOrigin,
-    pub(super) Arc<Registry>,
-);
+pub(super) struct SessionLayers(pub(super) Weak<Session>);
 
-impl ext::Layers for Own {
+impl ext::Layers for SessionLayers {
     fn model(&self, workspace: &Path) -> Result<(String, String), String> {
         let session = self.0.upgrade().ok_or("the session is gone")?;
         ext::Layers::model(&session.shared.models.settings, workspace)
