@@ -552,11 +552,11 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
             [
                 Body::Input { .. },
                 Body::ModelCall { .. },
-                Body::ModelResult { failure: None, call: a, outcome: Outcome::Done { .. } },
+                Body::ModelResult { r#for: None, failure: None, call: a, outcome: Outcome::Done { .. } },
                 Body::ToolCall { tool, id: Some(id), .. },
                 Body::ToolResult { call: b, outcome: Outcome::Done { output }, card: None },
                 Body::ModelCall { .. },
-                Body::ModelResult { failure: None, call: c, outcome: Outcome::Done { output: answer } },
+                Body::ModelResult { r#for: None, failure: None, call: c, outcome: Outcome::Done { output: answer } },
             ] if (a.get(), b.get(), c.get()) == (2, 4, 6) && tool == "lookup_harbor_label" && id == call_id && output.parse::<Value>().unwrap() == "crimson-harbor"
                 && answer.parse::<Value>().unwrap()["message"]["content"][1]["text"] == "The harbor label is crimson-harbor."
         ),
@@ -739,7 +739,7 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
             [
                 Body::Fired { watch, outcome },
                 Body::ModelCall { .. },
-                Body::ModelResult { failure: None, call, outcome: Outcome::Done { .. } },
+                Body::ModelResult { r#for: None, failure: None, call, outcome: Outcome::Done { .. } },
             ] if (watch.get(), call.get()) == (1, 3) && *outcome == found
         ),
         "{log:#?}"

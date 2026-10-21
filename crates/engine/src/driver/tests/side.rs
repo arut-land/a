@@ -72,7 +72,7 @@ fn a_side_call_is_logged_as_its_own_call() {
     let (side, of, purpose) = sides[0];
     assert_eq!((of, purpose), (2, "test"));
     let answered = log.iter().any(
-        |e| matches!(&e.body, Body::ModelResult { failure: None, call, outcome: Outcome::Done { .. } } if *call == side),
+        |e| matches!(&e.body, Body::ModelResult { r#for: Some(_), failure: None, call, outcome: Outcome::Done { .. } } if *call == side),
     );
     assert!(answered, "{log:#?}");
     // Resent once the side request answered, as the handler's decision.
@@ -108,7 +108,7 @@ fn a_side_call_dies_with_its_call() {
     let (side, ..) = sides(&log)[0];
     let ended = |call: CallId| {
         log.iter().position(|e| {
-            matches!(&e.body, Body::ModelResult { failure: None, call: c, outcome: Outcome::Interrupted { .. } } if *c == call)
+            matches!(&e.body, Body::ModelResult { r#for: _, failure: None, call: c, outcome: Outcome::Interrupted { .. } } if *c == call)
         })
     };
     let (side_end, call_end) = (ended(side), ended(CallId::new(2).unwrap()));
@@ -727,4 +727,51 @@ fn shutdown_never_admits_a_background_side_call_waiting_for_its_flush() {
         0,
         "shutdown must not spend on an unadmitted side call"
     );
+}
+struct DelayedSide(Flag);
+
+impl ext::SideProvider for DelayedSide {
+    fn reply<'a>(
+        &'a self,
+        side: &'a ext::Side,
+        messages: &'a llm::Messages,
+    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        Box::pin(async move {
+            self.0.wait().await;
+            ext::SideProvider::reply(&ext_fixtures::Fixtures, side, messages).await
+        })
+    }
+}
+
+impl Extension for DelayedSide {
+    const NAME: &'static str = "delayed-side";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn ext::SideProvider>(Arc::new(Self(self.0.clone())));
+    }
+}
+
+#[test]
+fn a_background_result_stays_out_of_context_after_its_intent_is_compacted() {
+    let release = Flag::default();
+    let http = Flaky::new([]);
+    let registry = Registry::default()
+        .with(&DelayedSide(release.clone()))
+        .unwrap();
+    let session = probes(&http, registry).start(&[]);
+    session.submit("background").unwrap();
+    until(&session, "background intent", |log| !sides(log).is_empty());
+    settle(&session);
+    session.submit("edit").unwrap();
+    settle(&session);
+    release.set();
+    until(&session, "background result", |log| {
+        let side = sides(log)[0].0;
+        log.iter()
+            .any(|e| matches!(e.body, Body::ModelResult { call, .. } if call == side))
+    });
+    let log = log_of(&session);
+    session.halt();
+    let messages = transcript(&log, log.len() as u64 + 1, Arc::new(Registry::default()));
+    assert_eq!(messages, [llm::Message::user("summary")]);
 }

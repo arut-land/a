@@ -570,6 +570,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 9,
                 Body::ModelResult {
+                    r#for: Some(CallId::new(4).unwrap()),
                     failure: Some(
                         protocol::Json::encode(&json!({"opaque": "model failure"})).unwrap(),
                     ),
@@ -585,6 +586,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 10,
                 Body::ModelResult {
+                    r#for: None,
                     failure: None,
                     call: CallId::new(8).unwrap(),
                     outcome: Outcome::Interrupted {

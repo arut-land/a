@@ -125,6 +125,7 @@ impl Actor {
                     call,
                     outcome,
                     failure,
+                    ..
                 } if call == id => Some(Opened::Cached { outcome, failure }),
                 _ => None,
             });

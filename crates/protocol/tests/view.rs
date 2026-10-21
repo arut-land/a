@@ -202,6 +202,7 @@ impl Session {
             });
             let outcome = outcome(rng, &output);
             self.commit(Body::ModelResult {
+                r#for: None,
                 failure: None,
                 call,
                 outcome,
@@ -615,6 +616,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     3,
                     Body::ModelResult {
+                        r#for: None,
                         failure: None,
                         call: CallId::new(2).unwrap(),
                         outcome: Outcome::Done {

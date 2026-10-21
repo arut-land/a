@@ -631,21 +631,28 @@ impl Core {
         ticket: Ticket,
         fx: &mut Effects,
     ) {
-        let open = self.fold.ledger.call(side).map(|open| &open.call);
-        let open = matches!(open, Some(Call::Side { .. }));
-        if open {
+        let owner = self
+            .fold
+            .ledger
+            .call(side)
+            .and_then(|open| match open.call {
+                Call::Side { of } => Some(of),
+                _ => None,
+            });
+        if let Some(of) = owner {
             self.append(
                 fx,
                 Body::ModelResult {
                     failure,
                     call: side,
+                    r#for: Some(of),
                     outcome,
                 },
             );
         }
         fx.push(Effect::Reply {
             ticket,
-            result: if open {
+            result: if owner.is_some() {
                 Ok(())
             } else {
                 Err("side call closed".into())
@@ -1376,6 +1383,7 @@ impl Core {
             self.append(
                 fx,
                 Body::ModelResult {
+                    r#for: Some(call),
                     failure: None,
                     call: side,
                     outcome,
@@ -1383,7 +1391,11 @@ impl Core {
             );
         }
         let body = match self.fold.ledger.call(call).map(|open| &open.call) {
-            Some(Call::Model { .. } | Call::Side { .. }) => Body::ModelResult {
+            Some(kind @ (Call::Model { .. } | Call::Side { .. })) => Body::ModelResult {
+                r#for: match kind {
+                    Call::Side { of } => Some(*of),
+                    _ => None,
+                },
                 failure: None,
                 call,
                 outcome,

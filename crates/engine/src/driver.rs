@@ -1840,6 +1840,7 @@ impl Actor {
                 call,
                 outcome,
                 failure,
+                ..
             } = &e.body
                 && let Some(waiters) = self.side_waiters.remove(call)
             {

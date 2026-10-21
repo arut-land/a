@@ -234,6 +234,7 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
     app.fold(&entry(
         4,
         Body::ModelResult {
+            r#for: None,
             failure: None,
             call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
@@ -268,7 +269,7 @@ fn a_titling_reply_titles_the_session_and_is_no_reply_of_its_own() {
             ),
             entry(
                 4,
-                Body::ModelResult { failure: None,
+                Body::ModelResult { r#for: Some(CallId::new(2).unwrap()), failure: None,
                     call: CallId::new(3).unwrap(),
                     outcome: Outcome::Done {
                         output: Json::encode(
@@ -481,6 +482,7 @@ fn ctrl_c_interrupts_a_running_model_call_too() {
     app.fold(&entry(
         3,
         Body::ModelResult {
+            r#for: None,
             failure: None,
             call: CallId::new(2).unwrap(),
             outcome: Outcome::Interrupted {
@@ -1234,7 +1236,7 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
         ],
     );
     app.clock.elapsed = std::time::Duration::from_secs(3);
-    app.fold(&entry(3, Body::ModelResult { failure: None,
+    app.fold(&entry(3, Body::ModelResult { r#for: None, failure: None,
         call:CallId::new(2).unwrap(),
         outcome:Outcome::Done {output:Json::encode(&json!({"message":{"content":[{"type":"text","text":"hi"}]},"usage":{"input":12,"output":3}})).unwrap()},
     }));

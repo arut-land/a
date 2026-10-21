@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 5;
+pub const PROTO: u32 = 6;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 5;
+pub const PROTO_MIN: u32 = 6;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -238,8 +238,9 @@ kinds! {
             purpose: Option<String> = default,
             request: Option<Json> = default,
         } = Durable;
-        /// The reply; `Done` carries the whole `llm::Response`.
-        ModelResult "model_result" { call: CallId, outcome: Outcome, failure: Option<Json> = default } = Durable;
+        /// The reply; `Done` carries the whole `llm::Response`. `for` names
+        /// a side request's owner even when an edit removes its intent.
+        ModelResult "model_result" { call: CallId, r#for: Option<CallId> = default, outcome: Outcome, failure: Option<Json> = default } = Durable;
         /// The committed intent to run a tool. Its seq is the call's id and
         /// idempotency key; `id` is the model's own id for the call, under which
         /// its result goes back. `by` is who called it: the model, unless the
@@ -1763,6 +1764,7 @@ mod tests {
                 text: "p\n".into(),
             },
             Body::ModelResult {
+                r#for: None,
                 failure: None,
                 call: CallId::new(2).unwrap(),
                 outcome: Outcome::Interrupted {

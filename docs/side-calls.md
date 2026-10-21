@@ -48,7 +48,10 @@ The intent crosses a durable admission barrier before the provider is
 polled, including when safe parent work starts before a shared flush.
 Duplicate consumers also share intents still awaiting that flush.
 
-`ModelResult` records the complete response and usage, or an outcome plus
+`ModelResult` carries the side owner in its own `for` field, so its
+classification survives removal of the intent by compaction or other edits.
+The transcript excludes side results directly without retaining a table of
+intents. The result records the complete response and usage, or an outcome plus
 an optional structured `llm::Error` in `failure`. The LLM crate owns error
 decoding. The result crosses a barrier before the awaited consumer is
 released. Duplicate consumers are released by durable publication. A

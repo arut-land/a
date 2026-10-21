@@ -937,6 +937,7 @@ pub fn model_call(attempt: u16) -> Body {
 
 pub fn model_result(call: u64, outcome: Outcome) -> Body {
     Body::ModelResult {
+        r#for: None,
         failure: None,
         call: CallId::new(call).unwrap(),
         outcome,
