@@ -333,6 +333,10 @@ mod tests {
                 workspace: PathBuf::from("/w"),
             },
             user(1, "hi"),
+            DaemonMsg::Activity {
+                seq: 1,
+                activity: protocol::Activity::Idle,
+            },
             DaemonMsg::Synced { seq: 1 },
         ]);
         page.take();
@@ -407,7 +411,7 @@ mod tests {
               data: elements <span> c d</span>"]
         );
 
-        // The committed reply replaces the streamed one, and Stop goes.
+        // The committed reply replaces the streamed one; Stop stays until idle.
         page.fold(&[entry(
             3,
             Body::ModelResult {
@@ -417,7 +421,13 @@ mod tests {
                 },
             },
         )]);
-        let settled = events(&mut page);
+        let mut settled = events(&mut page);
+        assert_eq!(settled.len(), 1, "{settled:?}");
+        page.fold(&[DaemonMsg::Activity {
+            seq: 3,
+            activity: protocol::Activity::Idle,
+        }]);
+        settled.extend(events(&mut page));
         assert_eq!(settled.len(), 2, "{settled:?}");
         assert!(
             settled[0].starts_with("event: datastar-patch-elements\ndata: elements <div id=\"i2\""),

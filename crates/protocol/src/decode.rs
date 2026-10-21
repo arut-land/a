@@ -27,9 +27,9 @@ use serde_json::{Error, Result};
 use crate::ledger::{Ledger, Phase};
 use crate::view::{Item, SessionView, Status, Usage};
 use crate::{
-    Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg, CommandInfo,
-    DaemonMsg, Decode, Entry, Environment, Epoch, HomeSettings, Installed, Json, Mode, Outcome,
-    Permission, Rejection, Role, Seq, SessionId, SessionSummary, SettingsChange, Target,
+    Activity, Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
+    CommandInfo, DaemonMsg, Decode, Entry, Environment, Epoch, HomeSettings, Installed, Json, Mode,
+    Outcome, Permission, Rejection, Role, Seq, SessionId, SessionSummary, SettingsChange, Target,
     ToolChoice, Verdict, WaitOn,
 };
 
@@ -261,6 +261,7 @@ same!(
     Mode,
     ToolChoice,
     Seq,
+    Activity,
     Author,
     SessionId,
     PathBuf,
@@ -457,6 +458,7 @@ pub(crate) struct MsgFields {
     pub(crate) session: Option<SessionId>,
     pub(crate) workspace: Option<PathBuf>,
     pub(crate) sessions: Option<Json>,
+    pub(crate) activity: Option<Activity>,
     pub(crate) tools: Option<Vec<String>>,
     pub(crate) message: Option<String>,
     pub(crate) mode: Option<Mode>,

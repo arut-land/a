@@ -166,8 +166,10 @@ fn esc_interrupts_a_running_turn_without_leaving_either_viewport() {
         term.wait_for("⎿  started");
         term.wait_for("Working…");
         term.send(b"\x1b");
-        let screen = term.wait_for("aborted");
-        assert!(!screen.text().contains("Working…"), "{}", screen.text());
+        term.wait_until("interrupted and idle", |screen| {
+            let text = screen.text();
+            text.contains("aborted") && !text.contains("Working…")
+        });
         term.send(b"still here\r");
         term.wait_for("⏺ still here");
         term.send(b"\x04");

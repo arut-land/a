@@ -125,7 +125,10 @@ impl Peer {
     fn answer(&mut self) -> DaemonMsg {
         loop {
             match self.recv() {
-                DaemonMsg::Entry(_) | DaemonMsg::Delta { .. } | DaemonMsg::Synced { .. } => {}
+                DaemonMsg::Entry(_)
+                | DaemonMsg::Delta { .. }
+                | DaemonMsg::Activity { .. }
+                | DaemonMsg::Synced { .. } => {}
                 msg => return msg,
             }
         }
@@ -248,6 +251,13 @@ fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
         matches!(&first, DaemonMsg::Entry(e) if matches!(e.body, Body::Extensions { .. })),
         "{first:?}"
     );
+    assert!(matches!(
+        peer.recv(),
+        DaemonMsg::Activity {
+            seq: 1,
+            activity: protocol::Activity::Idle
+        }
+    ));
     assert!(matches!(peer.recv(), DaemonMsg::Synced { seq: 1 }));
     // The input is logged before it is acknowledged, with what its step
     // logged after it.

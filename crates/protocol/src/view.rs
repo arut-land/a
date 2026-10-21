@@ -7,7 +7,11 @@
 //! any two clients that have folded the same session up to the same seq,
 //! which [`SessionView::state_hash`] checks. What only this connection saw
 //! (streamed text, the recap of what it missed) is kept beside it and left
-//! out. How an item is shown is decided once too, by [`Item::present`].
+//! out. Kernel activity is also connection state: the daemon sends it after
+//! the entries of a complete burst, including after replay or a snapshot.
+//! Every new entry invalidates it until the next activity frame. This keeps
+//! the gap between a reply and its requested calls from looking idle.
+//! How an item is shown is decided once too, by [`Item::present`].
 
 pub mod md;
 mod present;
@@ -21,8 +25,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ledger::{Ledger, OutcomeKind, Phase};
 use crate::{
-    Audience, Body, CallId, Card, DaemonMsg, Entry, Json, Outcome, Permission, Seq, SessionId,
-    SessionSummary, Verdict, WaitOn,
+    Activity, Audience, Body, CallId, Card, DaemonMsg, Entry, Json, Outcome, Permission, Seq,
+    SessionId, SessionSummary, Verdict, WaitOn,
 };
 
 pub use present::{
@@ -34,6 +38,12 @@ pub use present::{
 /// [`DaemonMsg::Snapshot`] carries.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct SessionView {
+    /// The kernel's activity at `seq`, or unknown while entries of its next
+    /// burst arrive. Never inferred from an entry prefix: a reply may have
+    /// settled before the calls it requested arrive. Attach sends this
+    /// separately after replay or snapshot, so it is connection state.
+    #[serde(skip)]
+    pub activity: Option<Activity>,
     pub session: Option<SessionId>,
     pub workspace: PathBuf,
     /// The last entry folded: a reconnect attaches with it as `since`.
@@ -261,6 +271,8 @@ pub enum Change {
     },
     /// The replay is in; [`SessionView::recap`] tells what it held.
     Synced,
+    /// The kernel published activity for the entries folded so far.
+    Activity,
     /// The daemon sent the whole view: the items are these now.
     Snapshot,
     Draining,
@@ -382,6 +394,7 @@ impl SessionView {
                         ..Self::default()
                     };
                 }
+                self.activity = None;
                 self.since = self.seq;
                 self.recap = None;
                 self.workspace.clone_from(workspace);
@@ -392,6 +405,10 @@ impl SessionView {
                 })
             }
             DaemonMsg::Entry(e) => self.entry(e),
+            DaemonMsg::Activity { seq, activity } if *seq == self.seq => {
+                self.activity = Some(*activity);
+                Some(Change::Activity)
+            }
             DaemonMsg::Delta {
                 call,
                 text,
@@ -436,10 +453,14 @@ impl SessionView {
             DaemonMsg::Snapshot(view) => Some(self.adopt(view)),
             // Skipped, but a reconnect still starts after it.
             DaemonMsg::Unknown { seq: Some(seq) } => {
-                self.seq = self.seq.max(*seq);
+                if *seq > self.seq {
+                    self.activity = None;
+                    self.seq = *seq;
+                }
                 None
             }
-            DaemonMsg::Welcome { .. }
+            DaemonMsg::Activity { .. }
+            | DaemonMsg::Welcome { .. }
             | DaemonMsg::Sessions { .. }
             | DaemonMsg::Settings { .. }
             | DaemonMsg::Status { .. }
@@ -459,6 +480,7 @@ impl SessionView {
         if self.streaming.as_ref().is_some_and(|s| !running(s.call)) {
             self.streaming = None;
         }
+        self.activity = None;
         self.session = snapshot.session;
         self.workspace.clone_from(&snapshot.workspace);
         self.seq = snapshot.seq;
@@ -472,6 +494,7 @@ impl SessionView {
         if e.seq.get() <= self.seq {
             return None;
         }
+        self.activity = None;
         self.seq = e.seq.get();
         let seq = e.seq;
         // Input taken up is shown as the user's message where it was taken:

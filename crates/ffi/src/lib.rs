@@ -366,6 +366,8 @@ pub(crate) fn commands(daemon: &[CommandInfo]) -> Vec<CommandHelp> {
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewChange {
+    /// The turn controls changed; carried by `ViewUpdate::turn`.
+    Activity,
     /// Attached; `reset` when the view started over.
     Attached {
         session: String,
@@ -798,6 +800,7 @@ impl ViewChange {
                 call: call.get(),
                 text: text.clone(),
             },
+            Change::Activity => Self::Activity,
             Change::Synced => Self::Synced {
                 recap: view.recap.as_ref().map(Into::into),
             },

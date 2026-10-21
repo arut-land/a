@@ -1409,8 +1409,21 @@ impl Actor {
     fn publish(&self) {
         let ledger = self.core.ledger();
         let mut summary = lock(&self.live.summary);
+        let changed =
+            summary.entries != self.live.frames.seq() || summary.activity != ledger.activity();
         summary.entries = self.live.frames.seq();
         summary.activity = ledger.activity();
+        // Unsynced entries cannot certify the activity of the visible prefix.
+        if changed && ledger.seq() == summary.entries {
+            let msg = DaemonMsg::Activity {
+                seq: summary.entries,
+                activity: summary.activity,
+            };
+            if let Ok(frame) = Frame::new(&msg) {
+                lock(&self.live.followers)
+                    .retain(|c| c.send_after(summary.entries, frame.clone()).is_ok());
+            }
+        }
     }
 
     fn effect(&mut self, effect: Effect) {
@@ -1730,6 +1743,16 @@ impl Actor {
         };
         frames.extend(Frame::new(&attached).ok().map(|f| (cursor, f)));
         frames.extend(snapshot.map(|frame| (seq, frame)));
+        if self.core.ledger().seq() == seq {
+            frames.extend(
+                Frame::new(&DaemonMsg::Activity {
+                    seq,
+                    activity: self.core.ledger().activity(),
+                })
+                .ok()
+                .map(|f| (seq, f)),
+            );
+        }
         frames.extend(
             Frame::new(&DaemonMsg::Synced { seq })
                 .ok()

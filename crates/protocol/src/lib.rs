@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 3;
+pub const PROTO: u32 = 4;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 3;
+pub const PROTO_MIN: u32 = 4;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -1129,6 +1129,9 @@ kinds! {
         Delta "delta" { call: CallId, text: String, attempt: u16 = default } = Ephemeral;
         /// Replay is complete; everything after this is live.
         Synced "synced" { seq: u64 } = Durable;
+        /// The kernel's activity after a complete burst, ordered after `seq`.
+        /// Entries after it invalidate it until the next activity frame.
+        Activity "activity" { seq: u64, activity: Activity } = Durable;
         Sessions "sessions" { sessions: Vec<SessionSummary> } = Control;
         /// The answer to [`ClientMsg::Status`].
         Status "status" {
