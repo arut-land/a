@@ -75,8 +75,9 @@ the child's context. The image stores transcript projection inputs inside the
 spawn authority,
 rather than installing those entries in the child's executable log. Unfinished
 tool intents and queued inputs are excluded, and unmatched provider exchanges
-are removed after projection. Keeping projection inputs preserves provider
-state and uses the same reducer for live and recovered context. Effective skill
+are removed after projection. Edits beginning at an excluded ledger entry keep
+an inert position for their replacement, preserving summaries without ownership.
+Keeping projection inputs preserves provider state and uses the same reducer for live and recovered context. Effective skill
 publication identities are restored with the image, so an inherited skill is
 not published again merely because its source has a different sequence space.
 Extension generation images accompany the prefix; only

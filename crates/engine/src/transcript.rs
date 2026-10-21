@@ -45,19 +45,7 @@ impl Transcript {
         system: &str,
     ) -> Self {
         let entries: Vec<_> = entries.into_iter().collect();
-        let edits: Vec<(u64, u64, Option<String>)> = (entries.iter())
-            .filter_map(|e| match &e.borrow().body {
-                Body::Edit {
-                    target,
-                    upto,
-                    replace,
-                } => {
-                    let text = replace.as_ref().and_then(|j| j.parse::<String>().ok());
-                    Some((target.get(), upto.unwrap_or(*target).get(), text))
-                }
-                _ => None,
-            })
-            .collect();
+        let edits = context_edits(entries.iter().map(|e| e.borrow()));
         let messages = Messages::from_iter((!system.is_empty()).then(|| Message::system(system)));
         let mut transcript = Self {
             context: messages.len(),
@@ -240,6 +228,26 @@ impl Transcript {
     }
 }
 
+fn context_edits(
+    entries: impl IntoIterator<Item = impl Borrow<Entry>>,
+) -> Vec<(u64, u64, Option<String>)> {
+    entries
+        .into_iter()
+        .filter_map(|e| match &e.borrow().body {
+            Body::Edit {
+                target,
+                upto,
+                replace,
+            } => Some((
+                target.get(),
+                upto.unwrap_or(*target).get(),
+                replace.as_ref().and_then(|j| j.parse::<String>().ok()),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The image contains projection inputs, never an executable child ledger.
 pub(crate) fn context_image(entries: &[Entry]) -> Vec<protocol::Json> {
     let completed: std::collections::HashSet<_> = entries
@@ -256,23 +264,43 @@ pub(crate) fn context_image(entries: &[Entry]) -> Vec<protocol::Json> {
             _ => None,
         })
         .collect();
+    let edits = context_edits(entries);
     entries
         .iter()
-        .filter(|e| match e.body {
-            Body::ToolCall { .. } => completed.contains(&CallId(e.seq)),
-            Body::Input { taken, .. } => taken || taken_inputs.contains(&e.seq),
-            Body::Enqueue { .. } => taken_inputs.contains(&e.seq),
-            Body::Take { .. }
-            | Body::Assistant { .. }
-            | Body::Context { .. }
-            | Body::Edit { .. }
-            | Body::ModelResult { r#for: None, .. }
-            | Body::ToolResult { .. }
-            | Body::Fired { .. }
-            | Body::Spawned { .. } => true,
-            _ => false,
+        .filter_map(|e| {
+            let projected = match e.body {
+                Body::ToolCall { .. } => completed.contains(&CallId(e.seq)),
+                Body::Input { taken, .. } => taken || taken_inputs.contains(&e.seq),
+                Body::Enqueue { .. } => taken_inputs.contains(&e.seq),
+                Body::Take { .. }
+                | Body::Assistant { .. }
+                | Body::Context { .. }
+                | Body::Edit { .. }
+                | Body::ModelResult { r#for: None, .. }
+                | Body::ToolResult { .. }
+                | Body::Fired { .. }
+                | Body::Spawned { .. } => true,
+                _ => false,
+            };
+            if projected {
+                return Some(protocol::Json::encode(e).expect("context entry encodes"));
+            }
+            // An edit can begin at a ledger-only entry; retain its replacement's position.
+            let edit = edits
+                .iter()
+                .rev()
+                .find(|(from, to, _)| (*from..=*to).contains(&e.seq.get()));
+            matches!(edit, Some((from, _, Some(_))) if *from == e.seq.get()).then(|| {
+                protocol::Json::encode(&Entry::new(
+                    e.seq,
+                    e.epoch,
+                    Body::Assistant {
+                        text: String::new(),
+                    },
+                ))
+                .expect("context position encodes")
+            })
         })
-        .map(|e| protocol::Json::encode(e).expect("context entry encodes"))
         .collect()
 }
 
@@ -329,6 +357,14 @@ mod tests {
                     child: SessionId::new(),
                 },
             ),
+            entry(
+                6,
+                Body::Edit {
+                    target: Seq::new(5).unwrap(),
+                    upto: None,
+                    replace: Some(Json::encode("ownership note").unwrap()),
+                },
+            ),
         ];
         let image = context_image(&entries);
         let inherited: Vec<_> = image
@@ -348,7 +384,11 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(
             actual,
-            Messages::from_iter([Message::user("skill"), Message::user("effective")])
+            Messages::from_iter([
+                Message::user("skill"),
+                Message::user("effective"),
+                Message::user("ownership note")
+            ])
         );
         let ledger = protocol::ledger::Ledger::of(child.iter());
         assert!(ledger.open_calls().next().is_none());
