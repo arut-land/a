@@ -224,6 +224,21 @@ impl Settings {
         ))
     }
 
+    pub fn fast_model(&self, workspace: &Path) -> Result<Option<String>, String> {
+        let local = self.workspace(workspace);
+        if let Some(model) = &local.as_ref().as_ref().map_err(Clone::clone)?.fast_model {
+            return Ok(Some(model.clone()));
+        }
+        Ok(self
+            .home
+            .get()
+            .as_ref()
+            .as_ref()
+            .map_err(Clone::clone)?
+            .fast_model
+            .clone())
+    }
+
     /// Variable `name` for a session whose client environment is `client`:
     /// the client's, else the home file's `[env]`.
     pub fn var(&self, client: Option<&Environment>, name: &str) -> Option<String> {

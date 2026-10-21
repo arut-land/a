@@ -275,7 +275,7 @@ impl Ledger {
                     open.ran();
                 }
             }
-            Body::ToolResult { call, outcome, .. } | Body::ModelResult { call, outcome } => {
+            Body::ToolResult { call, outcome, .. } | Body::ModelResult { call, outcome, .. } => {
                 self.settle(*call, outcome);
             }
             Body::Decision {
@@ -513,7 +513,13 @@ impl Ledger {
             Activity::Input
         } else if waits(|w| matches!(w, WaitOn::Client { .. })) {
             Activity::Client
-        } else if !self.open.is_empty() || !self.untaken.is_empty() || !self.armed.is_empty() {
+        } else if self
+            .open
+            .iter()
+            .any(|(_, open)| !matches!(open.call, Call::Side { .. }))
+            || !self.untaken.is_empty()
+            || !self.armed.is_empty()
+        {
             Activity::Running
         } else {
             Activity::Idle

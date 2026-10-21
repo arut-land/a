@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::BoxFuture;
 use protocol::{Environment, Outcome};
 
-use crate::{Cx, Name, SpawnSpec, States};
+use crate::{Cx, SpawnSpec, States};
 
 /// Where a session's commands run. The shell provides it; what works
 /// where they do (`edit`, the context the model is first given) asks it.
@@ -50,14 +50,11 @@ pub trait ModelSpec: Send + Sync {
     ) -> Result<(String, String), String>;
 }
 
-/// Model requests on behalf of a call, beside the session's own: what
-/// compacts a transcript, judges a call or titles a session asks. The
-/// engine provides it.
+/// Model requests owned by a session, outside its main transcript.
 pub trait Models: Send + Sync {
-    /// The reply to `side`, asked on behalf of the call `cx` runs: logged
-    /// under that call as a model call of its own, with its purpose,
-    /// counted in usage, held to its budget, and dropped with the call.
-    /// Sent once: a failure is the handler's to decide on.
+    /// Reuse the committed fact for this extension's key, or admit it and
+    /// return only after its result commits. A lost attempt is interrupted,
+    /// never repeated by recovery. The engine provides this service.
     fn call<'a>(
         &'a self,
         cx: &'a Cx,
@@ -65,60 +62,147 @@ pub trait Models: Send + Sync {
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>>;
 }
 
-/// A side model request.
-#[derive(Clone, Debug)]
+/// Routing intent, never a provider model id.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ModelRole {
+    Session,
+    Fast,
+}
+
+/// The immutable transcript prefix visible to a side request.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub enum SideContext {
+    None,
+    /// The effective conversation strictly before the owning call.
+    BeforeOwner,
+}
+
+/// A side request whose result the caller needs before continuing.
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Side {
-    /// What it is for, as logged: `compact`, `judge`, `title`.
-    pub purpose: Name,
-    /// The model, as `host:model`; `None` for the session's.
-    pub model: Option<String>,
-    /// The request; its model is set from `model`.
-    pub request: llm::Request,
-    /// Whether the request's messages follow the conversation its call's
-    /// model sees (system prompt included, so a provider's cache of it
-    /// serves): what summarises or titles the conversation.
-    pub conversation: bool,
+    pub purpose: String,
+    owner: String,
+    pub role: ModelRole,
+    pub messages: llm::Messages,
+    pub context: SideContext,
     pub budget: Budget,
+    background: bool,
+    session_key: bool,
 }
 
 impl Side {
-    /// A request for `purpose` of the session's model, of `messages`.
-    pub fn new(purpose: &str, messages: llm::Messages) -> Self {
+    /// Match the extension namespace and key policy, independently of
+    /// mutable config or a newly assembled prompt during recovery.
+    pub fn matches_intent(&self, intent: &llm::Json) -> bool {
+        #[derive(serde::Deserialize)]
+        struct Identity {
+            owner: String,
+            purpose: String,
+            session_key: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Intent {
+            request: Identity,
+        }
+        intent.parse::<Intent>().is_ok_and(|i| {
+            i.request.owner == self.owner
+                && i.request.purpose == self.purpose
+                && i.request.session_key == self.session_key
+        })
+    }
+
+    /// Reuse this purpose across owners, for session metadata such as a title.
+    #[must_use]
+    pub fn once_per_session(mut self) -> Self {
+        self.session_key = true;
+        self
+    }
+
+    pub const fn has_session_key(&self) -> bool {
+        self.session_key
+    }
+
+    /// The prompt and its selected transcript stay separate in the intent.
+    pub fn intent(&self, transcript: &llm::Messages) -> Result<llm::Json, String> {
+        #[derive(serde::Serialize)]
+        struct Intent<'a> {
+            request: &'a Side,
+            transcript: &'a llm::Messages,
+        }
+        llm::Json::encode(&Intent {
+            request: self,
+            transcript,
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    pub const fn is_background(&self) -> bool {
+        self.background
+    }
+
+    pub fn new<E: crate::Extension>(
+        purpose: &str,
+        role: ModelRole,
+        context: SideContext,
+        messages: llm::Messages,
+    ) -> Self {
         Self {
-            purpose: Name::from(purpose),
-            model: None,
-            request: llm::Request {
-                messages,
-                ..llm::Request::default()
-            },
-            conversation: false,
+            purpose: purpose.to_owned(),
+            owner: E::NAME.to_owned(),
+            role,
+            messages,
+            context,
             budget: Budget::default(),
+            background: false,
+            session_key: false,
         }
     }
 
-    /// The same, following the conversation its call's model sees.
-    #[must_use]
-    pub fn after_the_conversation(self) -> Self {
-        Self {
-            conversation: true,
-            ..self
-        }
+    /// A background request cannot be awaited for a model result.
+    pub fn background(mut self) -> Background {
+        self.background = true;
+        Background(self)
     }
 }
 
-/// What a side request may take.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Observation work: completion is a logged fact, never a main-turn reply.
+///
+/// ```compile_fail
+/// # fn awaited(models: &dyn ext::Models, cx: &ext::Cx, background: ext::Background) {
+/// let result = models.call(cx, background);
+/// # }
+/// ```
+pub struct Background(Side);
+
+impl Background {
+    pub fn start(self, cx: Cx) -> crate::Reaction {
+        crate::Reaction::later(crate::Requirement::Ordered, async move {
+            if let Some(models) = cx.models() {
+                // The service owns and commits both success and failure.
+                let _ = models.call(&cx, self.0).await;
+            }
+        })
+    }
+}
+
+/// Retry policy shared by main and side requests. The provider of this
+/// service owns the policy; the engine owns cancellation and persistence.
+pub trait SideRetry: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn after(&self, error: &llm::Error, attempt: u16, seed: u64) -> Option<Duration>;
+}
+
+/// What a side request may take, including retries and their backoffs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Budget {
-    /// The most output tokens it may ask for.
-    pub max_tokens: u32,
-    /// How long it may take; it fails after.
+    pub max_tokens: std::num::NonZeroU32,
     pub timeout: Duration,
 }
 
 impl Default for Budget {
     fn default() -> Self {
         Self {
-            max_tokens: 4096,
+            max_tokens: std::num::NonZeroU32::new(4096).unwrap(),
             timeout: Duration::from_secs(60),
         }
     }
@@ -132,4 +216,14 @@ pub trait Sessions: Send + Sync {
     /// recovery runs it), and heard from once. An interrupt of the call's
     /// turn reaches the child first.
     fn child<'a>(&'a self, cx: &'a Cx, input: String) -> BoxFuture<'a, Outcome>;
+}
+
+/// An extension-supplied model transport for side requests, useful for
+/// deterministic fixtures. It still runs behind the engine's log barriers.
+pub trait SideProvider: Send + Sync {
+    fn reply<'a>(
+        &'a self,
+        side: &'a Side,
+        messages: &'a llm::Messages,
+    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>>;
 }

@@ -22,8 +22,10 @@ impl Extension for Aside {
             };
             Answer::Later(ext::Later::new(async move {
                 let models = cx.models()?;
-                let side = ext::Side::new(
+                let side = ext::Side::new::<Aside>(
                     "test",
+                    ext::ModelRole::Session,
+                    ext::SideContext::None,
                     [llm::Message::user("Say hi.")].into_iter().collect(),
                 );
                 models.call(&cx, side).await.ok()?;
@@ -70,7 +72,7 @@ fn a_side_call_is_logged_as_its_own_call() {
     let (side, of, purpose) = sides[0];
     assert_eq!((of, purpose), (2, "test"));
     let answered = log.iter().any(
-        |e| matches!(&e.body, Body::ModelResult { call, outcome: Outcome::Done { .. } } if *call == side),
+        |e| matches!(&e.body, Body::ModelResult { r#for: Some(_), failure: None, call, outcome: Outcome::Done { .. } } if *call == side),
     );
     assert!(answered, "{log:#?}");
     // Resent once the side request answered, as the handler's decision.
@@ -106,7 +108,7 @@ fn a_side_call_dies_with_its_call() {
     let (side, ..) = sides(&log)[0];
     let ended = |call: CallId| {
         log.iter().position(|e| {
-            matches!(&e.body, Body::ModelResult { call: c, outcome: Outcome::Interrupted { .. } } if *c == call)
+            matches!(&e.body, Body::ModelResult { r#for: _, failure: None, call: c, outcome: Outcome::Interrupted { .. } } if *c == call)
         })
     };
     let (side_end, call_end) = (ended(side), ended(CallId::new(2).unwrap()));
@@ -292,6 +294,667 @@ fn a_title_call_is_a_side_call() {
     assert_eq!(titles.len(), 1, "titled once");
 }
 
+struct Probe;
+
+impl Tool for Probe {
+    type In = ext::Args;
+    type Out = String;
+    const NAME: &'static str = "side-probe";
+    const DESCRIPTION: &'static str = "ask a side model";
+    const REPLAY: Replay = Replay::Safe;
+    const CONCURRENCY: ext::Concurrency = ext::Concurrency::Shared;
+
+    async fn call(&self, args: &ext::Args, cx: &Cx) -> Result<String, String> {
+        if args.args == "edit" {
+            cx.edit(
+                Seq::new(1).unwrap(),
+                Seq::new(cx.call.get() - 1),
+                Some("summary"),
+            );
+            return Ok("edited".into());
+        }
+        let side = ext::Side::new::<Probes>(
+            "probe",
+            ext::ModelRole::Session,
+            ext::SideContext::None,
+            [llm::Message::user("Say hi.")].into_iter().collect(),
+        );
+        if args.args == "background" {
+            let work = side.background().start(cx.clone()).work.unwrap();
+            let completed = cx.service::<BackgroundCompletion>().map(|s| s.0.clone());
+            cx.service::<dyn rt::Runtime>()
+                .unwrap()
+                .spawn(Box::pin(async move {
+                    work.0.await;
+                    if let Some(completed) = completed {
+                        completed.set();
+                    }
+                }));
+            return Ok("started".into());
+        }
+        if args.args == "duplicate" {
+            let (done, other) = oneshot::channel();
+            let owned = cx.clone();
+            let again = side.clone();
+            cx.service::<dyn rt::Runtime>()
+                .unwrap()
+                .spawn(Box::pin(async move {
+                    done.send(owned.models().unwrap().call(&owned, again).await);
+                }));
+            let first = cx
+                .models()
+                .unwrap()
+                .call(cx, side)
+                .await
+                .map_err(|e| e.to_string())?;
+            let second = other.await.unwrap().map_err(|e| e.to_string())?;
+            assert_eq!(first.message.text(), second.message.text());
+            return Ok(first.message.text());
+        }
+        cx.models()
+            .unwrap()
+            .call(cx, side)
+            .await
+            .map(|r| r.message.text())
+            .map_err(|e| e.to_string())
+    }
+}
+
+struct Probes;
+
+impl ext::Agent for Probes {
+    fn step(&mut self, input: ext::Input, _: &dyn ext::LoopPoints) -> ext::Actions {
+        let ext::Input::User { text } = input else {
+            return ext::Actions::new();
+        };
+        (0..text.parse::<usize>().unwrap_or(1))
+            .map(|_| ext::Action::Call {
+                tool: "side-probe".into(),
+                input: Json::encode(&ext::Args { args: text.clone() }).unwrap(),
+                id: None,
+            })
+            .collect()
+    }
+}
+
+impl Extension for Probes {
+    const NAME: &'static str = "probes";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(Probe).agent("probes", || Box::new(Probes));
+    }
+}
+
+fn probes(http: &Arc<Flaky>, registry: Registry) -> Fixture {
+    Fixture::new(
+        "probes",
+        registry.with(&Probes).unwrap(),
+        Models {
+            http: Arc::clone(http) as Arc<dyn Http>,
+            ..openai(&Script::new(&[]))
+        },
+    )
+}
+
+#[test]
+fn replay_never_calls_a_side_model_again() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("1").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    let prefix: Vec<_> = log
+        .into_iter()
+        .take_while(|e| !matches!(e.body, Body::ToolResult { .. }))
+        .collect();
+    assert!(
+        prefix
+            .iter()
+            .any(|e| matches!(e.body, Body::ModelResult { .. }))
+    );
+
+    let replay = Flaky::new([]);
+    let session = probes(&replay, Registry::default()).start(&prefix);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(replay.sent(), 0);
+    assert_eq!(sides(&log).len(), 1);
+    assert!(log.iter().any(|e| matches!(&e.body,
+        Body::ToolResult { outcome: Outcome::Done { output }, .. }
+            if output.raw().contains("crimson-harbor"))));
+}
+
+#[test]
+fn crash_mid_side_call_recovers_as_interrupted_without_spending_again() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("1").unwrap();
+    http.wait_sent(1);
+    let prefix = log_of(&session);
+    session.halt();
+    let replay = Flaky::new([]);
+    let session = probes(&replay, Registry::default()).start(&prefix);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(replay.sent(), 0);
+    let side = sides(&log)[0].0;
+    assert!(log.iter().any(|e| matches!(&e.body,
+        Body::ModelResult { call, outcome: Outcome::Interrupted { .. }, .. } if *call == side)));
+    assert!(log.iter().any(|e| matches!(
+        e.body,
+        Body::ToolResult {
+            outcome: Outcome::Failed { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_side_call_dies_with_its_session() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("background").unwrap();
+    http.wait_sent(1);
+    until(&session, "owner done", |log| {
+        log.iter().any(|e| {
+            matches!(
+                e.body,
+                Body::ToolResult {
+                    outcome: Outcome::Done { .. },
+                    ..
+                }
+            )
+        })
+    });
+    let mut ledger = Ledger::default();
+    for entry in log_of(&session) {
+        ledger.apply(&entry);
+    }
+    assert_eq!(ledger.activity(), Activity::Idle);
+    session.halt();
+    let log = log_of(&session);
+    assert!(log.iter().any(|e| matches!(
+        e.body,
+        Body::ModelResult {
+            outcome: Outcome::Interrupted { .. },
+            ..
+        }
+    )));
+    assert_eq!(http.sent(), 1);
+}
+
+#[test]
+fn retry_policy_applies_to_side_calls_without_reentering_compaction() {
+    let http = Flaky::new([Reply::Status(429, &[]), Reply::Events(text_reply())]);
+    let registry = Registry::default()
+        .with(&ext_retry::Retry {
+            base: Duration::ZERO,
+            ..ext_retry::Retry::default()
+        })
+        .unwrap();
+    let session = probes(&http, registry).start(&[]);
+    session.submit("1").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 2);
+    let failures: Vec<_> = ext_logging::testing::pending().into_iter().filter(|fact| {
+        matches!(fact, ext_logging::Fact::ProviderError { session: id, .. } if *id == session.id)
+    }).collect();
+    assert!(
+        matches!(
+            failures.as_slice(),
+            [ext_logging::Fact::ProviderError {
+                kind: ext_logging::Provider::RateLimit,
+                status: Some(429),
+                retryable: true,
+                ..
+            }]
+        ),
+        "{failures:?}"
+    );
+    assert_eq!(sides(&log).len(), 1);
+    let failure = log
+        .iter()
+        .find_map(|e| match &e.body {
+            Body::Decision {
+                d:
+                    Verdict::SideRetry {
+                        attempt: 1,
+                        failure,
+                        ..
+                    },
+                ..
+            } => Some(failure),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        llm::Error::from_json(failure.raw()).unwrap().kind,
+        llm::Kind::RateLimit
+    );
+    assert!(log.iter().any(|e| matches!(
+        e.body,
+        Body::ToolResult {
+            outcome: Outcome::Done { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn side_concurrency_is_bounded_and_rejection_is_a_typed_fact() {
+    let http = Flaky::new((0..4).map(|_| Reply::Hang(String::new())));
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("5").unwrap();
+    until(&session, "side limit", |log| {
+        log.iter().any(|e| {
+            matches!(
+                e.body,
+                Body::ModelResult {
+                    failure: Some(_),
+                    ..
+                }
+            )
+        })
+    });
+    http.wait_sent(4);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 4);
+    let failure = log
+        .iter()
+        .find_map(|e| match &e.body {
+            Body::ModelResult {
+                failure: Some(failure),
+                ..
+            } => Some(failure),
+            _ => None,
+        })
+        .unwrap();
+    let failure = llm::Error::from_json(failure.raw()).unwrap();
+    assert_eq!(failure.kind, llm::Kind::InvalidRequest);
+    assert!(failure.message.contains("four side calls"));
+}
+
+#[test]
+fn fixtures_answer_side_calls_through_the_durable_service() {
+    let http = Flaky::new([]);
+    let registry = Registry::default().with(&ext_fixtures::Fixtures).unwrap();
+    let session = probes(&http, registry).start(&[]);
+    session.submit("1").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 0);
+    let view = SessionView::from_log(SessionId::new(), "/w".into(), &log);
+    assert_eq!(view.side("probe"), Some("fixture probe"));
+}
+
+#[test]
+fn concurrent_consumers_share_one_side_intent_and_result() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("duplicate").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 1);
+    assert_eq!(sides(&log).len(), 1);
+    assert!(log.iter().any(|e| matches!(
+        e.body,
+        Body::ToolResult {
+            outcome: Outcome::Done { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_fast_role_uses_config_and_logs_its_prompt_separately_from_context() {
+    let http = Flaky::new([Reply::Events(text_reply()), Reply::Events(text_reply())]);
+    let registry = Registry::default().with(&ext_title::Title).unwrap();
+    let harness = fixture(registry, &http);
+    let path = harness.0.models.settings.home.path();
+    let mut config = crate::config::File::read(path).unwrap();
+    config.fast_model = Some("openai:side-fast".into());
+    config.write(path).unwrap();
+    let session = harness.start(&[]);
+    session.submit("my distinct task").unwrap();
+    until(&session, "title result", |log| {
+        sides(log).first().is_some_and(|&(side, ..)| {
+            log.iter()
+                .any(|e| matches!(&e.body, Body::ModelResult { call, .. } if *call == side))
+        })
+    });
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(
+        http.bodies()
+            .iter()
+            .filter(|b| b["model"] == "side-fast")
+            .count(),
+        1
+    );
+    let intent = log
+        .iter()
+        .find_map(|e| match &e.body {
+            Body::ModelCall {
+                purpose: Some(p),
+                request: Some(request),
+                model,
+                ..
+            } if p == "title" => {
+                assert_eq!(model, "openai:side-fast");
+                Some(request.parse::<Value>().unwrap())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(intent["request"]["role"], "Fast");
+    assert!(
+        !intent["request"]["messages"]
+            .to_string()
+            .contains("my distinct task")
+    );
+    assert!(
+        intent["transcript"]
+            .to_string()
+            .contains("my distinct task")
+    );
+    let view = SessionView::from_log(SessionId::new(), "/w".into(), &log);
+    assert!(view.items.iter().any(|i| matches!(i,
+        protocol::view::Item::Reply { purpose: Some(p), usage: Some(_), .. } if p == "title")));
+    std::fs::remove_file(path).unwrap();
+}
+
+struct FailResultCommit(Arc<crate::store::Faulty>);
+
+impl ext::SideProvider for FailResultCommit {
+    fn reply<'a>(
+        &'a self,
+        side: &'a ext::Side,
+        messages: &'a llm::Messages,
+    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        Box::pin(async move {
+            let reply = ext::SideProvider::reply(&ext_fixtures::Fixtures, side, messages).await;
+            self.0.fail_next_sync(crate::store::SyncFailure::Discard);
+            reply
+        })
+    }
+}
+
+impl Extension for FailResultCommit {
+    const NAME: &'static str = "fail-side-result";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn ext::SideProvider>(Arc::new(Self(Arc::clone(&self.0))));
+    }
+}
+
+#[test]
+fn a_failed_result_commit_cannot_release_a_successful_side_reply() {
+    let faulty = Arc::new(crate::store::Faulty::new(Arc::new(Memory::default())));
+    let registry = Registry::default()
+        .with(&Probes)
+        .unwrap()
+        .with(&FailResultCommit(Arc::clone(&faulty)))
+        .unwrap();
+    let harness = Fixture::on(faulty, "probes", registry, openai(&Script::new(&[])));
+    let session = harness.start(&[]);
+    session.submit("1").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(sides(&log).len(), 1);
+    assert!(log.iter().any(|e| matches!(
+        e.body,
+        Body::ModelResult {
+            outcome: Outcome::Interrupted { .. },
+            ..
+        }
+    )));
+    assert!(!log.iter().any(|e| matches!(
+        e.body,
+        Body::ToolResult {
+            outcome: Outcome::Done { .. },
+            ..
+        }
+    )));
+}
+
+struct BackgroundCompletion(Flag);
+
+impl Extension for BackgroundCompletion {
+    const NAME: &'static str = "background-completion";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide(Arc::new(Self(self.0.clone())));
+    }
+}
+
+#[test]
+fn shutdown_never_admits_a_background_side_call_waiting_for_its_flush() {
+    let faulty = Arc::new(crate::store::Faulty::new(Arc::new(Memory::default())));
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let completed = Flag::default();
+    let harness = Fixture::on(
+        Arc::clone(&faulty) as _,
+        "probes",
+        Registry::default()
+            .with(&Probes)
+            .unwrap()
+            .with(&BackgroundCompletion(completed.clone()))
+            .unwrap(),
+        Models {
+            http: Arc::clone(&http) as Arc<dyn Http>,
+            ..openai(&Script::new(&[]))
+        },
+    );
+    let session = harness.create();
+    settle(&session);
+    let flush = faulty.hold_next_flush();
+    let (reply, ack) = oneshot::channel();
+    session.send(Msg::Request {
+        request: Request::Input {
+            text: "background".into(),
+            mode: Mode::Queue,
+        },
+        origin: None,
+        reply,
+    });
+    flush.started();
+    session.wait(
+        "background intent ordered after owner finished",
+        PATIENCE,
+        || !session.has_work() && !sides(&faulty.pending(session.id)).is_empty(),
+    );
+    assert_eq!(http.sent(), 0);
+    session.stop();
+    flush.release();
+    rt::block_on(session.ended.wait());
+    let _ = rt::block_on(ack);
+    assert!(rt::block_on(first(completed.wait(), harness.0.rt.sleep(PATIENCE))).is_some());
+    assert_eq!(
+        http.sent(),
+        0,
+        "shutdown must not spend on an unadmitted side call"
+    );
+}
+struct DelayedSide(Flag);
+
+impl ext::SideProvider for DelayedSide {
+    fn reply<'a>(
+        &'a self,
+        side: &'a ext::Side,
+        messages: &'a llm::Messages,
+    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        Box::pin(async move {
+            self.0.wait().await;
+            ext::SideProvider::reply(&ext_fixtures::Fixtures, side, messages).await
+        })
+    }
+}
+
+impl Extension for DelayedSide {
+    const NAME: &'static str = "delayed-side";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn ext::SideProvider>(Arc::new(Self(self.0.clone())));
+    }
+}
+
+#[test]
+fn a_background_result_stays_out_of_context_after_its_intent_is_compacted() {
+    let release = Flag::default();
+    let http = Flaky::new([]);
+    let registry = Registry::default()
+        .with(&DelayedSide(release.clone()))
+        .unwrap()
+        .with(&ext_fork::Fork)
+        .unwrap();
+    let fixture = probes(&http, registry);
+    let session = fixture.start(&[]);
+    session.submit("background").unwrap();
+    until(&session, "background intent", |log| !sides(log).is_empty());
+    settle(&session);
+    session.submit("edit").unwrap();
+    settle(&session);
+    release.set();
+    until(&session, "background result", |log| {
+        let side = sides(log)[0].0;
+        log.iter()
+            .any(|e| matches!(e.body, Body::ModelResult { call, .. } if call == side))
+    });
+    let log = log_of(&session);
+    session.halt();
+    let messages = transcript(&log, log.len() as u64 + 1, Arc::new(Registry::default()));
+    assert_eq!(messages, [llm::Message::user("summary")]);
+    let header = fixture
+        .0
+        .store
+        .headers()
+        .unwrap()
+        .into_iter()
+        .find(|header| header.id == session.id)
+        .unwrap();
+    let fork = copy_history(
+        &header,
+        log.last().unwrap().seq,
+        SessionId::new(),
+        &fixture.0,
+    )
+    .unwrap();
+    let copied = fixture.0.store.entries(fork.id).unwrap();
+    let messages = transcript(
+        &copied,
+        copied.len() as u64 + 1,
+        Arc::new(Registry::default()),
+    );
+    assert_eq!(messages, [llm::Message::user("summary")]);
+}
+
+#[test]
+fn compacted_forks_keep_loaded_skills_in_context_and_background_results_out() {
+    let home = std::env::temp_dir().join(format!("a-side-skills-{}", SessionId::new()));
+    let workspace = home.join("ws");
+    let directory = workspace.join(".a/skills/review");
+    std::fs::create_dir_all(&directory).unwrap();
+    let file = directory.join("SKILL.md");
+    std::fs::write(
+        &file,
+        "---\nname: review\ndescription: Review a change\n---\nprivate review instructions",
+    )
+    .unwrap();
+    let release = Flag::default();
+    let base = Registry::default()
+        .with(&Probes)
+        .unwrap()
+        .with(&DelayedSide(release.clone()))
+        .unwrap()
+        .with(&ext_fork::Fork)
+        .unwrap();
+    let loader = ext_skills::Loader::new(&home, ext_skills::Skills::default(), base.clone(), None);
+    let fixture = Fixture::new(
+        "probes",
+        base.with(&loader).unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let header = Header {
+        workspace,
+        ..Fixture::header()
+    };
+    let session = Live::start(&header, &fixture.0, Open::Create, Owner::None).unwrap();
+    let load = |session: &Arc<Live>, expected: &str| {
+        session.submit("/review").unwrap();
+        settle(session);
+        let log = log_of(session);
+        let output = log
+            .iter()
+            .rev()
+            .find_map(|e| match &e.body {
+                Body::ToolResult {
+                    outcome: Outcome::Done { output },
+                    ..
+                } => Some(output),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            output.parse::<Value>().unwrap(),
+            serde_json::json!({"Ok": expected})
+        );
+    };
+    load(&session, "loaded");
+    session.submit("background").unwrap();
+    until(&session, "background intent", |log| !sides(log).is_empty());
+    settle(&session);
+    session.submit("edit").unwrap();
+    settle(&session);
+    assert_eq!(
+        transcript(&log_of(&session), u64::MAX, Arc::new(Registry::default())),
+        [llm::Message::user("summary")]
+    );
+    load(&session, "loaded");
+    release.set();
+    until(&session, "background result", |log| {
+        let side = sides(log)[0].0;
+        log.iter()
+            .any(|e| matches!(e.body, Body::ModelResult { call, .. } if call == side))
+    });
+    let original = log_of(&session);
+    session.halt();
+    // Restoration must use the installation image, not rediscover this body.
+    std::fs::remove_file(file).unwrap();
+    let fork = copy_history(
+        &header,
+        original.last().unwrap().seq,
+        SessionId::new(),
+        &fixture.0,
+    )
+    .unwrap();
+    let branch = Live::start(&fork, &fixture.0, Open::Load, Owner::None).unwrap();
+    settle(&branch);
+    load(&branch, "already_loaded");
+    let copied = log_of(&branch);
+    branch.halt();
+    assert_eq!(&copied[..original.len()], &original);
+    let messages = transcript(&copied, u64::MAX, Arc::new(Registry::default()));
+    assert_eq!(messages.len(), 4, "{messages:#?}");
+    assert!(format!("{:?}", messages[0]).contains("private review instructions"));
+    assert_eq!(messages[1], llm::Message::user("summary"));
+    assert_eq!(messages[2], llm::Message::user("/review"));
+    assert_eq!(messages[3], llm::Message::user("/review"));
+    let view = SessionView::from_log(fork.id, fork.workspace, &copied);
+    assert_eq!(view.side("probe"), Some("fixture probe"));
+    drop(branch);
+    drop(session);
+    drop(fixture);
+    std::fs::remove_dir_all(home).unwrap();
+}
+
 #[test]
 fn side_failures_keep_classification_without_provider_content() {
     let secret = "private provider body, message and request id";
@@ -305,7 +968,11 @@ fn side_failures_keep_classification_without_provider_content() {
         error.status = status;
         error.body = Some(secret.into());
         error.request_id = Some(secret.into());
-        assert!(sided(session, Some(Replied::Failed(error))).1.is_err());
+        assert!(
+            super::super::side::sided(session, Some(Replied::Failed(error)))
+                .1
+                .is_err()
+        );
         let records: Vec<_> = ext_logging::testing::pending().into_iter().filter(|fact| {
             matches!(fact, ext_logging::Fact::ProviderError { session: id, .. } if *id == session)
         }).collect();
@@ -321,7 +988,7 @@ fn side_failures_keep_classification_without_provider_content() {
         assert!(!text.contains(secret));
     }
     let session = SessionId::new();
-    assert!(sided(session, None).1.is_err());
+    assert!(super::super::side::sided(session, None).1.is_err());
     assert!(
         ext_logging::testing::pending()
             .iter()
@@ -329,4 +996,17 @@ fn side_failures_keep_classification_without_provider_content() {
         ext_logging::Fact::ProviderError { session: id, kind: ext_logging::Provider::Transport, .. }
         if *id == session))
     );
+}
+
+#[test]
+fn cancellation_is_not_reported_as_a_side_provider_failure() {
+    let session = SessionId::new();
+    assert!(
+        super::super::side::sided(session, Some(Replied::Interrupted(None)))
+            .1
+            .is_err()
+    );
+    assert!(!ext_logging::testing::pending().iter().any(|fact| {
+        matches!(fact, ext_logging::Fact::ProviderError { session: id, .. } if *id == session)
+    }));
 }

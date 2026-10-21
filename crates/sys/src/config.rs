@@ -49,6 +49,8 @@ use toml_edit::{DocumentMut, Item, TableLike, TomlError};
 pub struct Config {
     /// `host[@protocol]:model`.
     pub model: Option<String>,
+    /// Model for the SDK Fast role; absent means the session model.
+    pub fast_model: Option<String>,
     pub agent: Option<String>,
     /// `[env]`: provider variables, such as `OPENAI_API_KEY`.
     pub env: BTreeMap<String, String>,
@@ -256,6 +258,7 @@ impl Config {
         let mut doc: DocumentMut = old.parse()?;
         let root = doc.as_table_mut();
         set(root, "model", self.model.as_deref());
+        set(root, "fast_model", self.fast_model.as_deref());
         set(root, "agent", self.agent.as_deref());
         if !self.env.is_empty() || root.contains_key("env") {
             let env = root
@@ -307,6 +310,7 @@ impl FromStr for Config {
         let doc: DocumentMut = text.parse()?;
         let mut config = Self {
             model: string(doc.as_table(), "model", "")?,
+            fast_model: string(doc.as_table(), "fast_model", "")?,
             agent: string(doc.as_table(), "agent", "")?,
             env: BTreeMap::new(),
             daemon: Daemon::default(),
@@ -462,6 +466,7 @@ mod tests {
     fn config(model: Option<&str>, env: &[(&str, &str)]) -> Config {
         Config {
             model: model.map(str::to_owned),
+            fast_model: None,
             agent: None,
             daemon: Daemon::default(),
             ext: Exts::default(),

@@ -656,7 +656,9 @@ impl Renderer for App {
 /// Adds what a finished model call used to `tokens`.
 fn spend(tokens: &mut Usage, item: &Item) {
     if let Item::Reply {
-        usage: Some(usage), ..
+        usage: Some(usage),
+        purpose: None,
+        ..
     } = item
     {
         tokens.input += usage.input;

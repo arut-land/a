@@ -203,6 +203,7 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
             entry(
                 3,
                 Body::ModelCall {
+                    request: None,
                     model: "gpt".into(),
                     attempt: 0,
                     choice: protocol::ToolChoice::Auto,
@@ -233,6 +234,8 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
     app.fold(&entry(
         4,
         Body::ModelResult {
+            r#for: None,
+            failure: None,
             call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
                 output: Json::encode(
@@ -256,7 +259,7 @@ fn a_titling_reply_titles_the_session_and_is_no_reply_of_its_own() {
         &[
             entry(
                 3,
-                Body::ModelCall {
+                Body::ModelCall { request: None,
                     model: "gpt".into(),
                     attempt: 0,
                     choice: protocol::ToolChoice::Auto,
@@ -266,7 +269,7 @@ fn a_titling_reply_titles_the_session_and_is_no_reply_of_its_own() {
             ),
             entry(
                 4,
-                Body::ModelResult {
+                Body::ModelResult { r#for: Some(CallId::new(2).unwrap()), failure: None,
                     call: CallId::new(3).unwrap(),
                     outcome: Outcome::Done {
                         output: Json::encode(
@@ -462,6 +465,7 @@ fn ctrl_c_interrupts_a_running_model_call_too() {
         entry(
             2,
             Body::ModelCall {
+                request: None,
                 model: "m".into(),
                 attempt: 0,
                 choice: protocol::ToolChoice::Auto,
@@ -478,6 +482,8 @@ fn ctrl_c_interrupts_a_running_model_call_too() {
     app.fold(&entry(
         3,
         Body::ModelResult {
+            r#for: None,
+            failure: None,
             call: CallId::new(2).unwrap(),
             outcome: Outcome::Interrupted {
                 output: Some("so far".into()),
@@ -875,6 +881,7 @@ fn render_cost() {
     msgs.push(entry(
         model.get(),
         Body::ModelCall {
+            request: None,
             model: "m".into(),
             attempt: 0,
             choice: protocol::ToolChoice::Auto,
@@ -1218,6 +1225,7 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
             entry(
                 2,
                 Body::ModelCall {
+                    request: None,
                     model: "m".into(),
                     attempt: 0,
                     choice: protocol::ToolChoice::Auto,
@@ -1228,7 +1236,7 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
         ],
     );
     app.clock.elapsed = std::time::Duration::from_secs(3);
-    app.fold(&entry(3, Body::ModelResult {
+    app.fold(&entry(3, Body::ModelResult { r#for: None, failure: None,
         call:CallId::new(2).unwrap(),
         outcome:Outcome::Done {output:Json::encode(&json!({"message":{"content":[{"type":"text","text":"hi"}]},"usage":{"input":12,"output":3}})).unwrap()},
     }));
@@ -1275,6 +1283,26 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
     ));
     assert_eq!(app.clock.before, 3);
     assert_eq!(app.clock.elapsed, std::time::Duration::ZERO);
+}
+
+#[test]
+fn side_usage_does_not_change_the_main_turn_counter() {
+    use super::spend;
+    use protocol::view::{Item, Status, Usage};
+    let mut tokens = Usage::default();
+    let item = Item::Reply {
+        call: CallId::new(1).unwrap(),
+        model: "fast".into(),
+        text: "title".into(),
+        status: Status::Done,
+        usage: Some(Usage {
+            input: 10,
+            output: 3,
+        }),
+        purpose: Some("title".into()),
+    };
+    spend(&mut tokens, &item);
+    assert_eq!(tokens, Usage::default());
 }
 
 #[test]

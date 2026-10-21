@@ -239,7 +239,7 @@ mod tests {
                 ("settings", 1),
                 ("subagent", 1),
                 ("retry", 1),
-                ("title", 1)
+                ("title", 2)
             ]
         );
         assert_eq!(registry.agents().collect::<Vec<_>>(), [ext::LOOP]);

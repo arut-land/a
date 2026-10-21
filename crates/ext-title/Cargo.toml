@@ -8,7 +8,6 @@ publish.workspace = true
 ext.workspace = true
 llm.workspace = true
 protocol.workspace = true
-serde.workspace = true
 
 [dev-dependencies]
 ext = { workspace = true, features = ["testing"] }

@@ -540,6 +540,7 @@ dependencies = [
  "ext-retry",
  "ext-settings",
  "ext-shell",
+ "ext-skills",
  "ext-subagent",
  "ext-title",
  "futures-core",
@@ -655,6 +656,7 @@ name = "ext-fixtures"
 version = "0.0.0"
 dependencies = [
  "ext",
+ "llm",
  "protocol",
  "rt",
  "serde",
@@ -797,7 +799,6 @@ dependencies = [
  "ext",
  "llm",
  "protocol",
- "serde",
 ]
 
 [[package]]

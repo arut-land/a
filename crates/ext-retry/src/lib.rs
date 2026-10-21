@@ -101,9 +101,25 @@ impl Extension for Retry {
 
     fn contribute(&self, r: &mut Registrar) {
         let this = *self;
+        r.provide::<dyn ext::SideRetry>(std::sync::Arc::new(this));
         r.on::<RequestError>(move |cx, failed| {
             Answer::Now(this.recover(&failed, seed(cx, failed.attempt)))
         });
+    }
+}
+
+impl ext::Provides<dyn ext::SideRetry> for Retry {}
+
+impl ext::SideRetry for Retry {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn after(&self, error: &llm::Error, attempt: u16, seed: u64) -> Option<Duration> {
+        match self.recover(&Failed { error, attempt }, seed) {
+            Some(Recover::Retry { after }) => Some(after),
+            _ => None,
+        }
     }
 }
 
