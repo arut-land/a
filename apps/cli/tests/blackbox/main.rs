@@ -3,21 +3,34 @@
 //! fixtures), over the harness in `common`. One binary, so the graph links
 //! once; `mise run acceptance`, `test:web` and `budgets` pick their module
 //! by name (`-E 'test(/^budgets::/)'`).
-#![cfg(unix)]
 
+#[cfg(unix)]
 mod common;
 
+#[cfg(unix)]
 mod acceptance;
+#[cfg(unix)]
 mod budgets;
+#[cfg(unix)]
 mod crash;
+#[cfg(unix)]
 mod home;
 #[cfg(feature = "web")]
+#[cfg(unix)]
 mod hygiene;
 #[cfg(feature = "lua")]
+#[cfg(unix)]
 mod lua;
+#[cfg(unix)]
 mod pipe;
+#[cfg(unix)]
 mod reactor;
+#[cfg(unix)]
 mod remote;
+#[cfg(unix)]
 mod tui;
 #[cfg(feature = "web")]
+#[cfg(unix)]
 mod web;
+
+mod daemon_acceptance;
