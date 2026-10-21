@@ -70,3 +70,5 @@ on a quiet machine, as requested.
 Discovery also uses the existing `sys` crate's regular-file open seam. This
 adds no third-party dependency: metadata rejects devices and FIFOs before open,
 and Unix `O_NONBLOCK` prevents a replacement FIFO from waiting for a writer.
+Containment reuses `rustix`'s existing descriptor-relative filesystem operations
+and the Windows handle path query, adding no dependency or parser change.

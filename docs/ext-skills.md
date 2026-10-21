@@ -122,3 +122,11 @@ Discovery skips nonregular `SKILL.md` candidates with the typed
 `sys::fs::RejectedFile::NotRegular` reason. It checks metadata before open and
 checks the resulting handle again; the Unix open is nonblocking, so a FIFO
 substituted between checks cannot stall shared generation preparation.
+
+Resolved package and `SKILL.md` paths must remain inside their configured root.
+An escaping symlink is skipped with `RejectedFile::OutsideRoot`; an alias whose
+resolved target is inside the root is allowed. An explicitly configured root
+may itself be an alias. Unix discovery opens the resolved relative path through
+pinned directory descriptors with `NOFOLLOW`, preventing a concurrent ancestor
+replacement from redirecting the open. Windows checks the opened handle's final
+path before reading. The scan reads no candidate body until these checks pass.

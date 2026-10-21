@@ -234,7 +234,7 @@ fn scan(root: &Path, found: &mut BTreeMap<String, Skill>) -> Result<(), Refused>
     let mut names = std::collections::BTreeSet::new();
     for directory in paths {
         let path = directory.join("SKILL.md");
-        let file = match sys::fs::open_regular(&path) {
+        let file = match sys::fs::open_regular_within(root, &path) {
             Ok(sys::fs::RegularFile::Open(file)) => file,
             Ok(sys::fs::RegularFile::Skipped(reason)) => {
                 eprintln!("warning: {}: {reason:?}", path.display());
