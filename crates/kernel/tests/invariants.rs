@@ -17,18 +17,16 @@ use serde_json::json;
 /// Carries effects out as a driver would, at once and always the same way:
 /// a tool is done with its name, a model's first reply of a turn calls
 /// `sleep` and the next calls nothing, a backoff is over, an answer comes.
-fn drive(s: &mut Session, fx: Effects) {
-    let mut todo: VecDeque<Effect> = fx.into_iter().collect();
+fn drive(s: &mut Session, fx: impl IntoIterator<Item = Work>) {
+    let mut todo: VecDeque<Work> = fx.into_iter().collect();
     while let Some(effect) = todo.pop_front() {
         let event = match effect {
-            Effect::RunTool { call, tool, .. } | Effect::Resume { call, tool, .. } => {
-                Event::ToolDone {
-                    call,
-                    outcome: done(json!(tool)),
-                    card: None,
-                }
-            }
-            Effect::Prepare { call, .. } => {
+            Work::RunTool { call, tool, .. } | Work::Resume { call, tool, .. } => Event::ToolDone {
+                call,
+                outcome: done(json!(tool)),
+                card: None,
+            },
+            Work::Prepare { call, .. } => {
                 let before = &s.log[usize::try_from(call.get()).unwrap() - 2].body;
                 let first = matches!(before, Body::Input { .. } | Body::Take { .. });
                 let calls = if first {
@@ -41,10 +39,10 @@ fn drive(s: &mut Session, fx: Effects) {
                     replied: Replied::Done(reply(&calls)),
                 }
             }
-            Effect::Sleep { call, .. } => Event::Woke { call },
+            Work::Sleep { call, .. } => Event::Woke { call },
             _ => continue,
         };
-        todo.extend(s.step(event));
+        todo.extend(into_work(s.step(event)));
     }
 }
 
@@ -81,20 +79,20 @@ fn crash_everywhere(reg: impl Fn() -> Reg, inputs: &[&str]) {
     let mut s = Session::new(reg().arc());
     for text in inputs {
         let fx = s.step(user(text));
-        drive(&mut s, fx);
+        drive(&mut s, into_work(fx));
     }
     let whole = s.log.clone();
     assert_eq!(*s.core.turn(), Turn::Idle, "{whole:#?}");
     for cut in 0..=whole.len() {
         let (mut s, fx) = Session::resume(reg().arc(), whole[..cut].to_vec(), &Load::default());
-        drive(&mut s, fx);
+        drive(&mut s, into_work(fx));
         let given = whole[..cut]
             .iter()
             .filter(|e| matches!(e.body, Body::Input { .. }))
             .count();
         for text in &inputs[given..] {
             let fx = s.step(user(text));
-            drive(&mut s, fx);
+            drive(&mut s, into_work(fx));
         }
         assert_eq!(
             conversation(&s.log),
@@ -132,20 +130,24 @@ fn recovery_is_just_resume() {
 /// snapshot taken there and handed the log after it resumes as one
 /// handed the whole log, whatever entry a crash came after: the same
 /// work, turn and ledger, and from there the same log.
-fn snapshot_everywhere(reg: &dyn Fn() -> Reg, inputs: &[&str], go: &dyn Fn(&mut Session, Effects)) {
+fn snapshot_everywhere(
+    reg: &dyn Fn() -> Reg,
+    inputs: &[&str],
+    go: &dyn Fn(&mut Session, Vec<Work>),
+) {
     let ledger = |s: &Session| serde_json::to_value(s.core.ledger()).unwrap();
     let mut s = Session::new(reg().arc());
     let mut rests = Vec::new();
-    let mut pending = Effects::new();
+    let mut pending = Vec::new();
     for text in inputs {
         if s.core.at_rest() {
             rests.push((s.log.len(), s.core.ledger().clone()));
         }
         if let Some(text) = text.strip_prefix('+') {
-            pending.extend(s.step(user(text)));
+            pending.extend(into_work(s.step(user(text))));
         } else {
             let mut fx = std::mem::take(&mut pending);
-            fx.extend(s.step(user(text)));
+            fx.extend(into_work(s.step(user(text))));
             go(&mut s, fx);
         }
     }
@@ -163,8 +165,8 @@ fn snapshot_everywhere(reg: &dyn Fn() -> Reg, inputs: &[&str], go: &dyn Fn(&mut 
             assert_eq!(restored, fx, "{at}");
             assert_eq!(b.core.turn(), a.core.turn(), "{at}");
             assert_eq!(ledger(&b), ledger(&a), "{at}");
-            go(&mut a, fx);
-            go(&mut b, restored);
+            go(&mut a, into_work(fx).collect());
+            go(&mut b, into_work(restored).collect());
             let given = whole[..cut]
                 .iter()
                 .filter(|e| matches!(e.body, Body::Input { .. }))
@@ -173,7 +175,7 @@ fn snapshot_everywhere(reg: &dyn Fn() -> Reg, inputs: &[&str], go: &dyn Fn(&mut 
                 let text = text.trim_start_matches('+');
                 for s in [&mut a, &mut b] {
                     let fx = s.step(user(text));
-                    go(s, fx);
+                    go(s, into_work(fx).collect());
                 }
             }
             assert_eq!(b.log, a.log, "{at}");
@@ -254,12 +256,12 @@ impl ext::Extension for OneAtATime {
 /// Carries out effects for the default loop: the session's `k`th reply
 /// calls `sleep` as many times as `script` says for `k`, so a run is a
 /// function of the conversation, however a crash renumbered its entries.
-fn drive_loop(s: &mut Session, fx: Effects, script: u64) {
-    let mut todo: VecDeque<Effect> = fx.into_iter().collect();
+fn drive_loop(s: &mut Session, fx: impl IntoIterator<Item = Work>, script: u64) {
+    let mut todo: VecDeque<Work> = fx.into_iter().collect();
     while let Some(effect) = todo.pop_front() {
         let event = match effect {
-            Effect::RunTool { call, tool, .. } => tool_done(call.get(), done(json!(tool))),
-            Effect::Prepare { call, .. } => {
+            Work::RunTool { call, tool, .. } => tool_done(call.get(), done(json!(tool))),
+            Work::Prepare { call, .. } => {
                 let k = (s.log.iter())
                     .filter(|e| matches!(e.body, Body::ModelResult { .. }))
                     .count() as u64;
@@ -270,10 +272,10 @@ fn drive_loop(s: &mut Session, fx: Effects, script: u64) {
                     replied: Replied::Done(response(&calls)),
                 }
             }
-            Effect::Sleep { call, .. } => Event::Woke { call },
+            Work::Sleep { call, .. } => Event::Woke { call },
             _ => continue,
         };
-        todo.extend(s.step(event));
+        todo.extend(into_work(s.step(event)));
     }
 }
 
@@ -297,22 +299,22 @@ fn loop_points_are_folds() {
         let mut s = Session::new(reg(script).arc());
         for text in inputs {
             let fx = s.step(user(text));
-            drive_loop(&mut s, fx, script);
+            drive_loop(&mut s, into_work(fx), script);
         }
         let whole = s.log.clone();
         let (_, fx) = Session::resume(reg(script).arc(), whole.clone(), &Load::default());
-        assert!(!fx.iter().any(|e| matches!(e, Effect::Append(_))), "{fx:?}");
+        assert!(fx.appends.is_empty(), "{fx:?}");
         for cut in 0..=whole.len() {
             let log = whole[..cut].to_vec();
             let (mut s, fx) = Session::resume(reg(script).arc(), log, &Load::default());
-            drive_loop(&mut s, fx, script);
+            drive_loop(&mut s, into_work(fx), script);
             let given = whole[..cut]
                 .iter()
                 .filter(|e| matches!(e.body, Body::Input { .. }))
                 .count();
             for text in &inputs[given..] {
                 let fx = s.step(user(text));
-                drive_loop(&mut s, fx, script);
+                drive_loop(&mut s, into_work(fx), script);
             }
             assert_eq!(
                 conversation(&s.log),
@@ -373,14 +375,14 @@ fn states() -> Vec<(&'static str, Session)> {
     states
 }
 
-fn starts_work(effect: &Effect, open_at_interrupt: u64) -> bool {
+fn starts_work(effect: &Work, open_at_interrupt: u64) -> bool {
     match effect {
-        Effect::RunTool { call, .. }
-        | Effect::Resume { call, .. }
-        | Effect::Prepare { call, .. }
-        | Effect::Await { call, .. }
-        | Effect::Recover { call, .. } => call.get() <= open_at_interrupt,
-        Effect::StartChild { .. } => true,
+        Work::RunTool { call, .. }
+        | Work::Resume { call, .. }
+        | Work::Prepare { call, .. }
+        | Work::Await { call, .. }
+        | Work::Recover { call, .. } => call.get() <= open_at_interrupt,
+        Work::StartChild { .. } => true,
         _ => false,
     }
 }
@@ -392,7 +394,7 @@ fn starts_work(effect: &Effect, open_at_interrupt: u64) -> bool {
 fn an_interrupt_never_starts_work() {
     for (name, mut s) in states() {
         let mark = s.log.len() as u64;
-        let mut todo: VecDeque<Effect> = s.step(interrupt()).into_iter().collect();
+        let mut todo: VecDeque<Work> = into_work(s.step(interrupt())).collect();
         if name == "stopping" {
             // What the first interrupt cancelled reports now.
             todo.push_back(cancel(2));
@@ -404,7 +406,7 @@ fn an_interrupt_never_starts_work() {
         while let Some(effect) = todo.pop_front() {
             assert!(!starts_work(&effect, mark), "{name}: {effect:?}");
             let event = match effect {
-                Effect::Cancel { call } => match &s.core.ledger().call(call).map(|o| &o.call) {
+                Work::Cancel { call } => match &s.core.ledger().call(call).map(|o| &o.call) {
                     Some(Call::Model { .. }) => Event::ModelDone {
                         call,
                         replied: Replied::Interrupted(None),
@@ -412,13 +414,13 @@ fn an_interrupt_never_starts_work() {
                     Some(Call::Tool { .. }) => tool_done(call.get(), INTERRUPTED),
                     Some(Call::Side { .. }) | None => continue,
                 },
-                Effect::Interrupt { child } => Event::ChildSettled {
+                Work::Interrupt { child } => Event::ChildSettled {
                     child,
                     outcome: INTERRUPTED,
                 },
                 _ => continue,
             };
-            todo.extend(s.step(event));
+            todo.extend(into_work(s.step(event)));
         }
         let interrupted = s.log.iter().filter(|e| e.body == Body::INTERRUPT).count();
         assert_eq!(interrupted, 1, "{name}: {:#?}", s.log);
@@ -435,10 +437,10 @@ fn an_interrupt_stops_only_its_turn() {
     s.step(user("sleep 1"));
     s.step(tool_done(2, done(json!(1))));
     // Lands between turns: nothing to stop, and nothing kept.
-    assert!(s.step(interrupt()).is_empty());
+    assert_eq!(s.step(interrupt()), StepPlan::default());
     let fx = s.step(user("sleep 2"));
     assert!(
-        fx.iter().any(|e| matches!(e, Effect::RunTool { .. })),
+        work(&fx).any(|e| matches!(e, Work::RunTool { .. })),
         "{fx:?}"
     );
 }
@@ -487,7 +489,10 @@ fn the_same_events_give_the_same_log() {
     // A resume asks `on_stop` of nothing: the log shows the agent stopped.
     let reg = Reg::echo().on_stop("more");
     let (resumed, fx) = Session::resume(reg.arc(), a.log.clone(), &Load::default());
-    assert!(fx.is_empty(), "{fx:?}");
+    assert!(
+        (fx.appends.is_empty() && work(&fx).next().is_none()),
+        "{fx:?}"
+    );
     assert_eq!(resumed.core.turn(), a.core.turn());
     assert_eq!(resumed.core.ledger().activity(), a.core.ledger().activity());
     // So do the calls of one reply, run together and ending out of order.
@@ -536,18 +541,19 @@ fn a_kernel_panic_is_a_resume() {
         panicking().step(user("$ ls"));
     }));
     let (mut s, fx) = Session::resume(Reg::echo().arc(), committed, &Load::default());
-    assert!(fx.is_empty(), "{fx:?}");
+    assert!(
+        (fx.appends.is_empty() && work(&fx).next().is_none()),
+        "{fx:?}"
+    );
     s.table(vec![(
         user("$ ls"),
-        vec![
-            BUSY,
-            append(3, input("$ ls")),
-            append(4, bash("ls")),
-            run_bash(4, "ls"),
-        ],
+        (
+            vec![entry(3, input("$ ls")), entry(4, bash("ls"))],
+            vec![BUSY, run_bash(4, "ls")],
+        ),
     )]);
     let (_, fx) = Session::resume(Reg::echo().arc(), s.log, &Load::default());
-    assert_eq!(fx.as_slice(), [append(5, tool_result(4, INTERRUPTED))]);
+    assert_plan(&fx, (vec![entry(5, tool_result(4, INTERRUPTED))], vec![]));
 }
 
 /// No extension is known by name below the extension layer: the
@@ -758,10 +764,7 @@ fn a_watch_fires_once() {
 #[test]
 fn a_run_commits_as_the_barriers_setting_says() {
     use kernel::{Barriers, Durability};
-    let last = |fx: &Effects| match fx.iter().rev().find(|e| matches!(e, Effect::Commit { .. })) {
-        Some(Effect::Commit { durability, .. }) => *durability,
-        _ => panic!("no commit in {fx:?}"),
-    };
+    let last = |fx: &StepPlan| fx.commit.expect("a step with appends").durability;
     let both = [
         (Barriers::Step, Durability::Barrier),
         (Barriers::Effects, Durability::Lazy),
@@ -769,34 +772,34 @@ fn a_run_commits_as_the_barriers_setting_says() {
     for (barriers, mid_turn) in both {
         let mut s = Session::with_barriers(Reg::modeled().arc(), barriers);
         // Input, then its model call sent: external, so barriers.
-        assert_eq!(last(&s.step_committing(user("hi"))), Durability::Barrier);
-        s.step_committing(prepared(2));
-        let fx = s.step_committing(model_done(2, &[("bash", json!({ "command": "ls" }))]));
-        assert!(fx.iter().any(|e| matches!(e, Effect::RunTool { .. })));
+        assert_eq!(last(&s.step(user("hi"))), Durability::Barrier);
+        s.step(prepared(2));
+        let fx = s.step(model_done(2, &[("bash", json!({ "command": "ls" }))]));
+        assert!(work(&fx).any(|e| matches!(e, Work::RunTool { .. })));
         assert_eq!(last(&fx), Durability::Barrier);
-        let fx = s.step_committing(Event::Note {
+        let fx = s.step(Event::Note {
             call: id(4),
             note: Note::Progress("half".into()),
         });
         assert_eq!(last(&fx), Durability::Lazy, "{barriers:?}");
-        let fx = s.step_committing(Event::Waits {
+        let fx = s.step(Event::Waits {
             call: id(4),
             on: WaitOn::Client { tool: "ls".into() },
         });
         assert_eq!(last(&fx), mid_turn, "{barriers:?}");
         // The call's result, and the turn's end.
-        s.step_committing(Event::Answer {
+        s.step(Event::Answer {
             call: id(4),
             value: Json::null(),
             origin: None,
             ticket: None,
         });
         assert_eq!(
-            last(&s.step_committing(tool_done(4, done(json!(1))))),
+            last(&s.step(tool_done(4, done(json!(1))))),
             Durability::Barrier
         );
-        s.step_committing(prepared(9));
-        let fx = s.step_committing(model_done(9, &[]));
+        s.step(prepared(9));
+        let fx = s.step(model_done(9, &[]));
         assert_eq!(*s.core.turn(), Turn::Idle);
         assert_eq!(last(&fx), Durability::Barrier, "{barriers:?}");
     }
@@ -810,25 +813,25 @@ fn no_external_effect_before_its_barrier() {
     for barriers in [kernel::Barriers::Step, kernel::Barriers::Effects] {
         let mut s = Session::with_barriers(Reg::modeled().arc(), barriers);
         let fx = s.step(user("hi"));
-        drive(&mut s, fx);
+        drive(&mut s, into_work(fx));
         let fx = s.step(user("/jobs"));
-        drive(&mut s, fx);
+        drive(&mut s, into_work(fx));
         let fx = s.step(interrupt());
-        drive(&mut s, fx);
+        drive(&mut s, into_work(fx));
         assert_eq!(*s.core.turn(), Turn::Idle, "{:#?}", s.log);
     }
 }
 
 /// The calls set running, in the order they start.
-fn running(fx: &Effects) -> impl Iterator<Item = CallId> + '_ {
-    fx.iter().filter_map(|e| match e {
-        Effect::RunTool { call, .. } => Some(*call),
+fn running(fx: &StepPlan) -> impl Iterator<Item = CallId> + '_ {
+    work(fx).filter_map(|e| match e {
+        Work::RunTool { call, .. } => Some(*call),
         _ => None,
     })
 }
 
-fn asks_the_model(fx: &Effects) -> bool {
-    fx.iter().any(|e| matches!(e, Effect::Prepare { .. }))
+fn asks_the_model(fx: &StepPlan) -> bool {
+    work(fx).any(|e| matches!(e, Work::Prepare { .. }))
 }
 
 /// What call `call` asked of its tool, as its intent logged it.
@@ -892,27 +895,19 @@ fn exclusive_tools_never_overlap() {
 #[test]
 fn replay_safe_work_requires_ordering_even_when_its_step_appends_nothing() {
     let mut s = Session::new(Reg::modeled().arc());
-    let first = s.step_committing(user("hello"));
-    assert!(first.iter().any(|effect| matches!(
-        effect,
-        Effect::Require(kernel::Admission {
+    let first = s.step(user("hello"));
+    assert!(first.admitted.iter().any(|guarded| guarded.admission
+        == kernel::Admission {
             through: 2,
-            requirement: kernel::Requirement::Ordered
-        })
-    )));
-    let prepared = s.step_committing(prepared(2));
-    assert!(
-        !prepared
-            .iter()
-            .any(|effect| matches!(effect, Effect::Append(_)))
-    );
-    assert!(prepared.iter().any(|effect| matches!(
-        effect,
-        Effect::Require(kernel::Admission {
+            requirement: kernel::Requirement::Ordered,
+        }));
+    let prepared = s.step(prepared(2));
+    assert!(prepared.appends.is_empty(), "{prepared:?}");
+    assert!(prepared.admitted.iter().any(|guarded| guarded.admission
+        == kernel::Admission {
             through: 2,
-            requirement: kernel::Requirement::Ordered
-        })
-    )));
+            requirement: kernel::Requirement::Ordered,
+        }));
 }
 
 #[test]
@@ -936,9 +931,7 @@ fn every_external_effect_has_an_explicit_admission() {
                 );
                 if matches!(
                     guarded.work,
-                    kernel::Work::StartChild { .. }
-                        | kernel::Work::Deliver { .. }
-                        | kernel::Work::Reply { .. }
+                    Work::StartChild { .. } | Work::Deliver { .. } | Work::Reply { .. }
                 ) {
                     assert_eq!(guarded.admission.requirement, kernel::Requirement::Durable);
                 }

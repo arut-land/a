@@ -21,8 +21,7 @@ use ext::{
     Concurrency, DynExtension, DynTool, Extension, Later, Name, Parsed, Refused, Registrar, Replay,
     Rewrite, States, Tier,
 };
-mod effects;
-pub use effects::{Effect, Effects};
+pub use kernel::{StepPlan, Work};
 
 use kernel::{
     Action, Actions, Agent, Answer, Barriers, Core, Durability, Event, Gated, Input, Load,
@@ -611,9 +610,9 @@ impl Session {
     /// A new session whose barriers fall as `barriers` says.
     pub fn with_barriers(registry: Arc<dyn Binding>, barriers: Barriers) -> Self {
         let mut core = Core::new(registry).with_barriers(barriers);
-        let fx = effects(core.resumed(&Load::default()));
-        barriered(&fx);
-        let log = appended(&fx).collect();
+        let fx = core.resumed(&Load::default());
+        barriered(&fx, core.ledger().seq());
+        let log = fx.appends;
         Self { core, log }
     }
 
@@ -624,12 +623,12 @@ impl Session {
         registry: Arc<dyn Binding>,
         mut log: Vec<Entry>,
         load: &Load<'_>,
-    ) -> (Self, Effects) {
+    ) -> (Self, StepPlan) {
         let (core, plan) = Core::resume(registry, &log, load);
-        let fx = effects(plan);
-        barriered(&fx);
-        log.extend(appended(&fx));
-        (Self { core, log }, uncommitted(fx))
+        let fx = plan;
+        barriered(&fx, core.ledger().seq());
+        log.extend(fx.appends.iter().cloned());
+        (Self { core, log }, fx)
     }
 
     /// Restores the session a snapshot of `ledger` was taken of, after
@@ -642,49 +641,29 @@ impl Session {
         mut log: Vec<Entry>,
         at: usize,
         load: &Load<'_>,
-    ) -> (Self, Effects) {
+    ) -> (Self, StepPlan) {
         let image = serde_json::to_vec(ledger).unwrap();
         let mut core = Core::restore(registry, serde_json::from_slice(&image).unwrap());
         for e in &log[at..] {
             core.load(e);
         }
-        let fx = effects(core.resumed(load));
-        barriered(&fx);
-        log.extend(appended(&fx));
-        (Self { core, log }, uncommitted(fx))
+        let fx = core.resumed(load);
+        barriered(&fx, core.ledger().seq());
+        log.extend(fx.appends.iter().cloned());
+        (Self { core, log }, fx)
     }
 
-    pub fn step(&mut self, event: Event) -> Effects {
-        uncommitted(self.step_committing(event))
+    pub fn step(&mut self, event: Event) -> StepPlan {
+        let plan = self.core.step(event);
+        barriered(&plan, self.core.ledger().seq());
+        self.log.extend(plan.appends.iter().cloned());
+        plan
     }
 
-    /// [`Session::step`], with the commits ending each run of appends.
-    pub fn step_committing(&mut self, event: Event) -> Effects {
-        let fx = effects(self.core.step(event));
-        barriered(&fx);
-        self.log.extend(appended(&fx));
-        fx
-    }
-
-    /// Steps through `rows`, each event's effects as expected.
-    pub fn table(&mut self, rows: Vec<(Event, Vec<Effect>)>) {
-        for (i, (event, mut want)) in rows.into_iter().enumerate() {
-            let shown = format!("{event:?}");
-            let mut got = self.step(event);
-            let phase = |effect: &Effect| match effect {
-                Effect::Cancel { .. } | Effect::MarkBusy(true) => 0,
-                Effect::Append(_) => 1,
-                Effect::MarkBusy(false) => 3,
-                _ => 2,
-            };
-            got.sort_by_key(phase);
-            want.sort_by_key(phase);
-            assert_eq!(
-                got.as_slice(),
-                want.as_slice(),
-                "row {i}: {shown}\nlog: {:#?}",
-                self.log
-            );
+    pub fn table(&mut self, rows: Vec<(Event, Expected)>) {
+        for (event, expected) in rows {
+            let plan = self.step(event);
+            assert_plan(&plan, expected);
         }
     }
 
@@ -693,55 +672,61 @@ impl Session {
     }
 }
 
-/// Holds the kernel to its one durability rule, at every step of every
-/// test: a step that appends commits once, after its last append, and as
-/// a barrier whenever anything in it reaches outside the session.
-pub fn barriered(fx: &Effects) {
-    let last = fx.iter().rposition(|e| matches!(e, Effect::Append(_)));
-    let commits: Vec<usize> = (fx.iter().enumerate())
-        .filter_map(|(i, e)| matches!(e, Effect::Commit { .. }).then_some(i))
-        .collect();
-    match last {
-        None => assert!(commits.is_empty(), "a commit of nothing in {fx:?}"),
-        Some(last) => assert_eq!(
-            commits,
-            [last + 1],
-            "one commit after the appends in {fx:?}"
-        ),
-    }
-    for (index, effect) in fx.iter().enumerate() {
-        if effect.external() {
-            assert!(
-                index > 0 && matches!(fx[index - 1], Effect::Require(_)),
-                "missing admission for {effect:?}"
-            );
+pub type Expected = (Vec<Entry>, Vec<Work>);
+
+pub fn work(plan: &StepPlan) -> impl DoubleEndedIterator<Item = &Work> {
+    plan.immediate
+        .iter()
+        .chain(plan.admitted.iter().map(|guarded| &guarded.work))
+}
+
+pub fn into_work(plan: StepPlan) -> impl Iterator<Item = Work> {
+    plan.immediate
+        .into_iter()
+        .chain(plan.admitted.into_iter().map(|guarded| guarded.work))
+}
+
+pub fn assert_plan(plan: &StepPlan, (entries, work): Expected) {
+    assert_eq!(plan.appends, entries, "{plan:?}");
+    let (mut immediate, admitted): (Vec<_>, Vec<_>) =
+        work.into_iter().partition(|work| !work.external());
+    let mut actual: Vec<_> = plan.immediate.iter().collect();
+    let phase = |work: &Work| match work {
+        Work::MarkBusy(true) => 0,
+        Work::Cancel { .. } => 1,
+        _ => 2,
+    };
+    immediate.sort_by_key(&phase);
+    actual.sort_by_key(|work| phase(work));
+    assert_eq!(actual, immediate.iter().collect::<Vec<_>>(), "{plan:?}");
+    assert_eq!(
+        plan.admitted
+            .iter()
+            .map(|guarded| &guarded.work)
+            .collect::<Vec<_>>(),
+        admitted.iter().collect::<Vec<_>>(),
+        "{plan:?}"
+    );
+}
+
+pub fn barriered(plan: &StepPlan, through: u64) {
+    assert_eq!(plan.commit.is_some(), !plan.appends.is_empty(), "{plan:?}");
+    if let Some(commit) = plan.commit {
+        assert_eq!(commit.through, plan.appends.last().unwrap().seq.get());
+        if plan.admitted.iter().any(|guarded| guarded.work.external()) {
+            assert_eq!(commit.durability, Durability::Barrier, "{plan:?}");
         }
     }
-    if last.is_some() && fx.iter().any(Effect::external) {
-        assert!(
-            fx.iter().any(|e| matches!(
-                e,
-                Effect::Commit {
-                    durability: Durability::Barrier,
-                    ..
-                }
-            )),
-            "an external effect without its barrier in {fx:?}"
-        );
-    }
-}
-
-/// `fx` without its commits.
-pub fn uncommitted(mut fx: Effects) -> Effects {
-    fx.retain(|e| !matches!(e, Effect::Commit { .. } | Effect::Require(_)));
-    fx
-}
-
-pub fn appended(fx: &Effects) -> impl Iterator<Item = Entry> + '_ {
-    fx.iter().filter_map(|e| match e {
-        Effect::Append(entry) => Some(entry.clone()),
-        _ => None,
-    })
+    assert!(
+        plan.immediate.iter().all(|work| !work.external()),
+        "{plan:?}"
+    );
+    assert!(
+        plan.admitted
+            .iter()
+            .all(|guarded| guarded.admission.through == through),
+        "{plan:?}"
+    );
 }
 
 // ── events ────────────────────────────────────────────────────────────
@@ -869,10 +854,6 @@ pub fn seq(seq: u64) -> Seq {
     Seq::new(seq).unwrap()
 }
 
-pub fn append(seq: u64, body: Body) -> Effect {
-    Effect::Append(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
-}
-
 pub fn entry(seq: u64, body: Body) -> Entry {
     Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)
 }
@@ -986,33 +967,33 @@ pub fn failed(error: &str) -> Outcome {
 
 pub const INTERRUPTED: Outcome = Outcome::Interrupted { output: None };
 
-pub fn run_tool(call: u64, tool: &str, input: Value) -> Effect {
-    Effect::RunTool {
+pub fn run_tool(call: u64, tool: &str, input: Value) -> Work {
+    Work::RunTool {
         call: id(call),
         tool: tool.to_owned(),
         input: Json::encode(&input).unwrap(),
     }
 }
 
-pub fn run_bash(call: u64, command: &str) -> Effect {
+pub fn run_bash(call: u64, command: &str) -> Work {
     run_tool(call, "bash", json!({ "command": command }))
 }
 
 /// The request of model call `call` to be prepared, as attempt `attempt`.
-pub fn prepare(call: u64, attempt: u16) -> Effect {
-    Effect::Prepare {
+pub fn prepare(call: u64, attempt: u16) -> Work {
+    Work::Prepare {
         call: id(call),
         attempt,
         choice: ToolChoice::Auto,
     }
 }
 
-pub fn send(call: u64) -> Effect {
-    Effect::Send { call: id(call) }
+pub fn send(call: u64) -> Work {
+    Work::Send { call: id(call) }
 }
 
-pub fn cancel(call: u64) -> Effect {
-    Effect::Cancel { call: id(call) }
+pub fn cancel(call: u64) -> Work {
+    Work::Cancel { call: id(call) }
 }
 
 pub fn wait_child(call: u64, link: u64) -> Body {
@@ -1022,34 +1003,5 @@ pub fn wait_child(call: u64, link: u64) -> Body {
     }
 }
 
-pub const BUSY: Effect = Effect::MarkBusy(true);
-pub const IDLE: Effect = Effect::MarkBusy(false);
-
-fn effects(plan: kernel::StepPlan) -> Effects {
-    let mut fx: Effects = plan.appends.into_iter().map(Effect::Append).collect();
-    if let Some(kernel::Commit {
-        through,
-        durability,
-        publish,
-    }) = plan.commit
-    {
-        fx.push(Effect::Commit {
-            through,
-            durability,
-            publish,
-        });
-    }
-    fx.extend(plan.immediate.into_iter().map(Effect::from));
-    for kernel::Guarded { admission, work } in plan.admitted {
-        fx.push(Effect::Require(admission));
-        fx.push(work.into());
-    }
-    if let Some(at) = fx
-        .iter()
-        .position(|effect| matches!(effect, Effect::MarkBusy(true)))
-    {
-        let busy = fx.remove(at);
-        fx.insert(0, busy);
-    }
-    fx
-}
+pub const BUSY: Work = Work::MarkBusy(true);
+pub const IDLE: Work = Work::MarkBusy(false);

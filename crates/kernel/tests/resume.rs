@@ -23,9 +23,9 @@ fn resume(
     reg: Reg,
     bodies: impl IntoIterator<Item = Body>,
     load: &Load<'_>,
-) -> (Session, Vec<Effect>) {
+) -> (Session, StepPlan) {
     let (s, fx) = Session::resume(reg.arc(), log(bodies), load);
-    (s, fx.into_vec())
+    (s, fx)
 }
 
 fn progress(call: u64, text: &str) -> Body {
@@ -44,14 +44,14 @@ fn a_crash_loop_cannot_retry_forever() {
     let mut log = log([input("hi"), model_call(0)]);
     for _ in 0..kernel::RESTART_CAP {
         let (s, fx) = Session::resume(reg(), log, &BUSY_LOAD);
-        assert!(matches!(fx.last(), Some(Effect::Sleep { .. })), "{fx:?}");
+        assert!(
+            matches!(work(&fx).last(), Some(Work::Sleep { .. })),
+            "{fx:?}"
+        );
         log = s.log;
     }
     let (s, fx) = Session::resume(reg(), log, &BUSY_LOAD);
-    assert!(
-        !fx.iter()
-            .any(|e| matches!(e, Effect::Sleep { .. } | Effect::Prepare { .. }))
-    );
+    assert!(!work(&fx).any(|e| matches!(e, Work::Sleep { .. } | Work::Prepare { .. })));
     let last = &s.log.last().unwrap().body;
     assert!(
         matches!(last, Body::ModelResult { outcome: Outcome::Failed { error }, .. } if error.contains("gave up after 10 attempts")),
@@ -73,7 +73,7 @@ fn a_refused_call_is_never_run_after_a_crash() {
     for cut in at + 1..whole.len() {
         let (s, fx) = Session::resume(Reg::echo().arc(), whole[..cut].to_vec(), &Load::default());
         assert!(
-            !fx.iter().any(|e| matches!(e, Effect::RunTool { .. })),
+            !work(&fx).any(|e| matches!(e, Work::RunTool { .. })),
             "cut after {cut}: {fx:?}"
         );
         let failed = Outcome::Failed {
@@ -104,16 +104,24 @@ fn a_safe_call_cut_off_runs_again_and_an_interrupt_before_it_stops_it() {
         [input("sleep 1"), sleep_call(1)],
         &Load::default(),
     );
-    assert_eq!(fx, [BUSY, run_tool(2, "sleep", json!({ "seconds": 1 }))]);
+    assert_plan(
+        &fx,
+        (
+            vec![],
+            vec![BUSY, run_tool(2, "sleep", json!({ "seconds": 1 }))],
+        ),
+    );
     s.table(vec![
-        (interrupt(), vec![cancel(2)]),
+        (interrupt(), (vec![], vec![cancel(2)])),
         (
             tool_done(2, INTERRUPTED),
-            vec![
-                append(3, tool_result(2, INTERRUPTED)),
-                append(4, Body::INTERRUPT),
-                IDLE,
-            ],
+            (
+                vec![
+                    entry(3, tool_result(2, INTERRUPTED)),
+                    entry(4, Body::INTERRUPT),
+                ],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -130,7 +138,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
     let cut = Outcome::Interrupted {
         output: Some("one\ntwo\n".into()),
     };
-    assert_eq!(fx, [append(5, tool_result(2, cut)), IDLE]);
+    assert_plan(&fx, (vec![entry(5, tool_result(2, cut))], vec![IDLE]));
 }
 
 /// An unsafe call gated before the crash may have started: it is not run
@@ -138,7 +146,10 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
 #[test]
 fn an_unsafe_call_gated_before_a_crash_is_never_run_twice() {
     let (_, fx) = resume(Reg::echo(), [input("$ rm"), bash("rm")], &BUSY_LOAD);
-    assert_eq!(fx, [append(3, tool_result(2, INTERRUPTED)), IDLE]);
+    assert_plan(
+        &fx,
+        (vec![entry(3, tool_result(2, INTERRUPTED))], vec![IDLE]),
+    );
 }
 
 /// The gate asked again decides as it did: what it logged before the
@@ -149,13 +160,15 @@ fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
     let pre = decision("policy", Some(2), Verdict::PreTool { input: rewritten });
     let reg = Reg::echo().policy(Policy::RewriteThenDeny);
     let (_, fx) = resume(reg, [input("$ echo hi"), bash("echo hi"), pre], &BUSY_LOAD);
-    assert_eq!(
-        fx,
-        [
-            append(4, permission(2, Permission::Deny)),
-            append(5, tool_result(2, failed("policy denied this call"))),
-            IDLE,
-        ]
+    assert_plan(
+        &fx,
+        (
+            vec![
+                entry(4, permission(2, Permission::Deny)),
+                entry(5, tool_result(2, failed("policy denied this call"))),
+            ],
+            vec![IDLE],
+        ),
     );
 }
 
@@ -172,7 +185,7 @@ fn a_wait_survives_a_restart_and_runs_once_answered() {
         ),
     ];
     let (mut s, fx) = resume(reg, bodies, &BUSY_LOAD);
-    assert_eq!(fx, [IDLE], "waiting is not work");
+    assert_plan(&fx, (vec![], vec![IDLE]));
     let answered = Body::Answer {
         call: id(2),
         value: Json::encode(&true).unwrap(),
@@ -180,7 +193,7 @@ fn a_wait_survives_a_restart_and_runs_once_answered() {
     };
     s.table(vec![(
         approve(2, true),
-        vec![BUSY, append(4, answered), run_bash(2, "echo")],
+        (vec![entry(4, answered)], vec![BUSY, run_bash(2, "echo")]),
     )]);
 }
 
@@ -194,23 +207,19 @@ fn a_model_call_cut_off_is_retried_as_a_failed_attempt() {
         attempt: 1,
         error: "the daemon stopped during the call".into(),
     };
-    assert_eq!(
-        fx,
-        [
-            append(3, decision("retry", Some(2), retry)),
-            Effect::Sleep {
+    assert_plan(
+        &fx,
+        (
+            vec![entry(3, decision("retry", Some(2), retry))],
+            vec![Work::Sleep {
                 call: id(2),
                 after: Duration::ZERO,
-            },
-        ]
+            }],
+        ),
     );
     let (_, fx) = resume(Reg::modeled(), [input("hi"), model_call(0)], &BUSY_LOAD);
     let cut = failed("the daemon stopped during the call");
-    assert_eq!(
-        fx,
-        [append(3, model_result(2, cut)), IDLE],
-        "with no retry, it fails"
-    );
+    assert_plan(&fx, (vec![entry(3, model_result(2, cut))], vec![IDLE]));
 }
 
 /// Restarts count as attempts, in the log: a session that crashes during
@@ -221,20 +230,23 @@ fn a_crash_loop_fails_once_the_retries_run_out() {
     let mut log = log([input("hi"), model_call(0)]);
     for _ in 0..RETRIES {
         let (s, fx) = Session::resume(reg(), log, &BUSY_LOAD);
-        assert!(matches!(fx.last(), Some(Effect::Sleep { .. })), "{fx:?}");
+        assert!(
+            matches!(work(&fx).last(), Some(Work::Sleep { .. })),
+            "{fx:?}"
+        );
         log = s.log;
     }
     let (_, fx) = Session::resume(reg(), log.clone(), &BUSY_LOAD);
     let seq = log.len() as u64 + 1;
     let cut = failed("the daemon stopped during the call");
-    assert_eq!(fx.as_slice(), [append(seq, model_result(2, cut)), IDLE]);
+    assert_plan(&fx, (vec![entry(seq, model_result(2, cut))], vec![IDLE]));
 }
 
 /// What the agent asked for that the log does not show is carried out.
 #[test]
 fn what_the_agent_asked_for_and_the_log_does_not_show_is_carried_out() {
     let (_, fx) = resume(Reg::echo(), [input("hi")], &Load::default());
-    assert_eq!(fx, [append(2, said("hi"))]);
+    assert_plan(&fx, (vec![entry(2, said("hi"))], vec![]));
 }
 
 /// Input still queued is taken up once, in order, before input that
@@ -243,10 +255,13 @@ fn what_the_agent_asked_for_and_the_log_does_not_show_is_carried_out() {
 fn input_queued_before_a_restart_runs_once_in_order() {
     let bodies = [input("one"), said("one"), queued("left")];
     let (mut s, fx) = resume(Reg::echo(), bodies, &BUSY_LOAD);
-    assert_eq!(fx, [append(4, take(3)), append(5, said("left")), IDLE]);
+    assert_plan(
+        &fx,
+        (vec![entry(4, take(3)), entry(5, said("left"))], vec![IDLE]),
+    );
     s.table(vec![(
         user("two"),
-        vec![append(6, input("two")), append(7, said("two"))],
+        (vec![entry(6, input("two")), entry(7, said("two"))], vec![]),
     )]);
 }
 
@@ -257,13 +272,15 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
         ..BUSY_LOAD
     };
     let (_, fx) = resume(Reg::echo(), [input("sleep 1"), sleep_call(1)], &load);
-    assert_eq!(
-        fx,
-        [
-            append(3, tool_result(2, INTERRUPTED)),
-            append(4, Body::INTERRUPT),
-            IDLE
-        ]
+    assert_plan(
+        &fx,
+        (
+            vec![
+                entry(3, tool_result(2, INTERRUPTED)),
+                entry(4, Body::INTERRUPT),
+            ],
+            vec![IDLE],
+        ),
     );
 }
 
@@ -288,14 +305,12 @@ fn leftover_processes_of_this_boot_are_killed() {
         ]
     };
     let (_, fx) = resume(Reg::echo(), bodies(), &BUSY_LOAD);
-    assert_eq!(
-        fx,
-        [
-            append(6, tool_result(2, INTERRUPTED)),
-            IDLE,
-            Effect::Kill { pgid: 7 },
-            Effect::Kill { pgid: 8 },
-        ]
+    assert_plan(
+        &fx,
+        (
+            vec![entry(6, tool_result(2, INTERRUPTED))],
+            vec![IDLE, Work::Kill { pgid: 7 }, Work::Kill { pgid: 8 }],
+        ),
     );
     // A background group outlives its call, until the session ends.
     let ended = [
@@ -305,13 +320,13 @@ fn leftover_processes_of_this_boot_are_killed() {
         tool_result(2, done(json!(0))),
     ];
     let (_, fx) = resume(Reg::echo(), ended.clone(), &BUSY_LOAD);
-    assert_eq!(fx, [IDLE, Effect::Kill { pgid: 8 }]);
+    assert_plan(&fx, (vec![], vec![IDLE, Work::Kill { pgid: 8 }]));
     let again = Load {
         fresh: false,
         ..BUSY_LOAD
     };
     let (_, fx) = resume(Reg::echo(), ended, &again);
-    assert_eq!(fx, [IDLE]);
+    assert_plan(&fx, (vec![], vec![IDLE]));
 }
 
 /// Links are re-armed: a link not yet watched is watched, and each child
@@ -323,26 +338,29 @@ fn links_are_rearmed() {
         child: child(),
         input: "go".into(),
     };
-    let start = || Effect::StartChild {
+    let start = || Work::StartChild {
         link: seq(1),
         child: child(),
         input: "go".into(),
     };
     let (_, fx) = resume(Reg::echo(), [link()], &Load::default());
-    assert_eq!(
-        fx,
-        [BUSY, append(2, Body::Watch { child: child() }), start()]
+    assert_plan(
+        &fx,
+        (
+            vec![entry(2, Body::Watch { child: child() })],
+            vec![BUSY, start()],
+        ),
     );
     let watch = Body::Watch { child: child() };
     let (_, fx) = resume(Reg::echo(), [link(), watch.clone()], &Load::default());
-    assert_eq!(fx, [BUSY, start()]);
+    assert_plan(&fx, (vec![], vec![BUSY, start()]));
     let fired = Body::Fired {
         watch: Seq::new(2).unwrap(),
         outcome: done(json!("ok")),
     };
     let (_, fx) = resume(Reg::echo(), [link(), watch, fired], &Load::default());
     // The agent is yet to say the child's result; the child is not started.
-    assert_eq!(fx, [append(4, said("child: \"ok\""))], "a watch fires once");
+    assert_plan(&fx, (vec![entry(4, said("child: \"ok\""))], vec![]));
 }
 
 /// A call waiting on a child whose result came in before the crash goes on
@@ -367,14 +385,17 @@ fn a_call_whose_child_settled_before_a_crash_resumes_with_its_result() {
         },
     ];
     let (_, fx) = resume(Reg::echo(), bodies, &BUSY_LOAD);
-    assert_eq!(
-        fx,
-        [Effect::Resume {
-            call: id(2),
-            tool: "task".into(),
-            input: Json::encode(&task).unwrap(),
-            value: Json::encode(&ok).unwrap(),
-        }]
+    assert_plan(
+        &fx,
+        (
+            vec![],
+            vec![Work::Resume {
+                call: id(2),
+                tool: "task".into(),
+                input: Json::encode(&task).unwrap(),
+                value: Json::encode(&ok).unwrap(),
+            }],
+        ),
     );
 }
 
@@ -389,7 +410,10 @@ fn a_command_cut_off_is_not_run_again() {
         by: protocol::Audience::User,
     };
     let (_, fx) = resume(Reg::echo(), [input("/jobs"), command], &BUSY_LOAD);
-    assert_eq!(fx, [append(3, tool_result(2, INTERRUPTED)), IDLE]);
+    assert_plan(
+        &fx,
+        (vec![entry(3, tool_result(2, INTERRUPTED))], vec![IDLE]),
+    );
 }
 
 /// A failed commit is a resume from what committed: the intent that did
@@ -402,9 +426,9 @@ fn a_failed_commit_is_resume() {
     // The result's commit fails: the driver resumes from what committed.
     s.step(tool_done(2, done(json!({ "slept": 1 }))));
     let (mut s, fx) = Session::resume(Reg::echo().arc(), committed, &BUSY_LOAD);
-    assert_eq!(
-        fx.as_slice(),
-        [run_tool(2, "sleep", json!({ "seconds": 1 }))]
+    assert_plan(
+        &fx,
+        (vec![], vec![run_tool(2, "sleep", json!({ "seconds": 1 }))]),
     );
     s.step(tool_done(2, done(json!({ "slept": 1 }))));
     let calls = s

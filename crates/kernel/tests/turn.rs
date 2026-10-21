@@ -34,7 +34,7 @@ fn model_tool_call(tool: &str, input: &serde_json::Value, id: &str) -> Body {
 fn input_with_nothing_running_starts_a_turn_at_once() {
     echo().table(vec![(
         user("hi"),
-        vec![append(1, input("hi")), append(2, said("hi"))],
+        (vec![entry(1, input("hi")), entry(2, said("hi"))], vec![]),
     )]);
 }
 
@@ -43,16 +43,17 @@ fn a_tool_runs_after_its_intent_and_its_result_ends_the_turn() {
     echo().table(vec![
         (
             user("$ ls"),
-            vec![
-                BUSY,
-                append(1, input("$ ls")),
-                append(2, bash("ls")),
-                run_bash(2, "ls"),
-            ],
+            (
+                vec![entry(1, input("$ ls")), entry(2, bash("ls"))],
+                vec![BUSY, run_bash(2, "ls")],
+            ),
         ),
         (
             tool_done(2, done(json!("a\n"))),
-            vec![append(3, tool_result(2, done(json!("a\n")))), IDLE],
+            (
+                vec![entry(3, tool_result(2, done(json!("a\n"))))],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -62,12 +63,15 @@ fn a_denied_call_is_answered_after_its_intent_without_running() {
     let mut s = Session::new(Reg::echo().policy(Policy::Deny(&["bash"])).arc());
     s.table(vec![(
         user("$ rm"),
-        vec![
-            append(1, input("$ rm")),
-            append(2, bash("rm")),
-            append(3, permission(2, Permission::Deny)),
-            append(4, tool_result(2, failed("policy denied this call"))),
-        ],
+        (
+            vec![
+                entry(1, input("$ rm")),
+                entry(2, bash("rm")),
+                entry(3, permission(2, Permission::Deny)),
+                entry(4, tool_result(2, failed("policy denied this call"))),
+            ],
+            vec![],
+        ),
     )]);
 }
 
@@ -75,18 +79,21 @@ fn asking() -> Session {
     Session::new(Reg::echo().policy(Policy::Ask(&["bash"])).arc())
 }
 
-fn asked() -> Vec<Effect> {
-    vec![
-        append(1, input("$ echo")),
-        append(2, bash("echo")),
-        append(
-            3,
-            permission(
-                2,
-                Permission::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() }),
+fn asked() -> Expected {
+    (
+        vec![
+            entry(1, input("$ echo")),
+            entry(2, bash("echo")),
+            entry(
+                3,
+                permission(
+                    2,
+                    Permission::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() }),
+                ),
             ),
-        ),
-    ]
+        ],
+        vec![],
+    )
 }
 
 fn answer(call: u64, approved: bool, ticket: u64) -> Event {
@@ -109,7 +116,7 @@ fn answered(call: u64, approved: bool) -> Body {
 /// Waiting for an approval is not work; the first answer wins.
 #[test]
 fn an_ask_waits_and_runs_once_approved() {
-    let ok = |ticket| Effect::Reply {
+    let ok = |ticket| Work::Reply {
         ticket: Ticket(ticket),
         result: Ok(()),
     };
@@ -117,30 +124,37 @@ fn an_ask_waits_and_runs_once_approved() {
         (user("$ echo"), asked()),
         (
             answer(1, true, 6),
-            vec![Effect::Reply {
-                ticket: Ticket(6),
-                result: Err("call 1 is not waiting for an answer".into()),
-            }],
+            (
+                vec![],
+                vec![Work::Reply {
+                    ticket: Ticket(6),
+                    result: Err("call 1 is not waiting for an answer".into()),
+                }],
+            ),
         ),
         (
             answer(2, true, 7),
-            vec![
-                BUSY,
-                append(4, answered(2, true)),
-                run_bash(2, "echo"),
-                ok(7),
-            ],
+            (
+                vec![entry(4, answered(2, true))],
+                vec![BUSY, run_bash(2, "echo"), ok(7)],
+            ),
         ),
         (
             answer(2, false, 8),
-            vec![Effect::Reply {
-                ticket: Ticket(8),
-                result: Err("call 2 is not waiting for an answer".into()),
-            }],
+            (
+                vec![],
+                vec![Work::Reply {
+                    ticket: Ticket(8),
+                    result: Err("call 2 is not waiting for an answer".into()),
+                }],
+            ),
         ),
         (
             tool_done(2, done(json!("echo\n"))),
-            vec![append(5, tool_result(2, done(json!("echo\n")))), IDLE],
+            (
+                vec![entry(5, tool_result(2, done(json!("echo\n"))))],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -151,13 +165,16 @@ fn a_refused_ask_answers_the_call_without_running_it() {
         (user("$ echo"), asked()),
         (
             approve(2, false),
-            vec![
-                append(4, answered(2, false)),
-                append(
-                    5,
-                    tool_result(2, failed("the user did not approve this call")),
-                ),
-            ],
+            (
+                vec![
+                    entry(4, answered(2, false)),
+                    entry(
+                        5,
+                        tool_result(2, failed("the user did not approve this call")),
+                    ),
+                ],
+                vec![],
+            ),
         ),
     ]);
 }
@@ -168,13 +185,16 @@ fn an_interrupt_while_asked_settles_the_call_without_running_it() {
         (user("$ echo"), asked()),
         (
             interrupt(),
-            vec![
-                append(4, tool_result(2, INTERRUPTED)),
-                append(5, Body::INTERRUPT),
-            ],
+            (
+                vec![
+                    entry(4, tool_result(2, INTERRUPTED)),
+                    entry(5, Body::INTERRUPT),
+                ],
+                vec![],
+            ),
         ),
         // Too late: nothing runs.
-        (approve(2, true), vec![]),
+        (approve(2, true), (vec![], vec![])),
     ]);
 }
 
@@ -187,31 +207,33 @@ fn an_interrupt_while_a_call_is_gated_starts_nothing() {
     s.table(vec![
         (
             user("$ x"),
-            vec![
-                BUSY,
-                append(1, input("$ x")),
-                append(2, bash("x")),
-                Effect::Await {
-                    call: id(2),
-                    answer: later,
-                },
-            ],
+            (
+                vec![entry(1, input("$ x")), entry(2, bash("x"))],
+                vec![
+                    BUSY,
+                    Work::Await {
+                        call: id(2),
+                        answer: later,
+                    },
+                ],
+            ),
         ),
         (
             interrupt(),
-            vec![
-                cancel(2),
-                append(3, tool_result(2, INTERRUPTED)),
-                append(4, Body::INTERRUPT),
-                IDLE,
-            ],
+            (
+                vec![
+                    entry(3, tool_result(2, INTERRUPTED)),
+                    entry(4, Body::INTERRUPT),
+                ],
+                vec![cancel(2), IDLE],
+            ),
         ),
         (
             Event::Gated {
                 call: id(2),
                 gated: Gated::run(Json::null()),
             },
-            vec![],
+            (vec![], vec![]),
         ),
     ]);
 }
@@ -223,7 +245,7 @@ fn a_gate_answering_later_runs_the_call_when_it_answers() {
     let gated = Gated::run(Json::encode(&json!({ "command": "x" })).unwrap());
     s.table(vec![(
         Event::Gated { call: id(2), gated },
-        vec![run_bash(2, "x")],
+        (vec![], vec![run_bash(2, "x")]),
     )]);
 }
 
@@ -231,10 +253,10 @@ fn a_gate_answering_later_runs_the_call_when_it_answers() {
 #[test]
 fn an_interrupt_between_turns_is_not_kept_for_the_next() {
     echo().table(vec![
-        (interrupt(), vec![]),
+        (interrupt(), (vec![], vec![])),
         (
             user("hi"),
-            vec![append(1, input("hi")), append(2, said("hi"))],
+            (vec![entry(1, input("hi")), entry(2, said("hi"))], vec![]),
         ),
     ]);
 }
@@ -244,34 +266,34 @@ fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
     modeled().table(vec![
         (
             user("hi"),
-            vec![
-                BUSY,
-                append(1, input("hi")),
-                append(2, model_call(0)),
-                prepare(2, 0),
-            ],
+            (
+                vec![entry(1, input("hi")), entry(2, model_call(0))],
+                vec![BUSY, prepare(2, 0)],
+            ),
         ),
-        (interrupt(), vec![cancel(2)]),
+        (interrupt(), (vec![], vec![cancel(2)])),
         // Interrupting again, before the call reports, does nothing more.
-        (interrupt(), vec![]),
+        (interrupt(), (vec![], vec![])),
         (
             Event::ModelDone {
                 call: id(2),
                 replied: Replied::Interrupted(Some("par".into())),
             },
-            vec![
-                append(
-                    3,
-                    model_result(
-                        2,
-                        Outcome::Interrupted {
-                            output: Some("par".into()),
-                        },
+            (
+                vec![
+                    entry(
+                        3,
+                        model_result(
+                            2,
+                            Outcome::Interrupted {
+                                output: Some("par".into()),
+                            },
+                        ),
                     ),
-                ),
-                append(4, Body::INTERRUPT),
-                IDLE,
-            ],
+                    entry(4, Body::INTERRUPT),
+                ],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -286,43 +308,47 @@ fn an_interrupt_cancels_every_call_of_the_reply_running() {
     modeled().table(vec![
         (
             user("go"),
-            vec![
-                BUSY,
-                append(1, input("go")),
-                append(2, model_call(0)),
-                prepare(2, 0),
-            ],
+            (
+                vec![entry(1, input("go")), entry(2, model_call(0))],
+                vec![BUSY, prepare(2, 0)],
+            ),
         ),
         (
             model_done(2, &calls),
-            vec![
-                append(
-                    3,
-                    model_result(
-                        2,
-                        Outcome::Done {
-                            output: reply(&calls),
-                        },
+            (
+                vec![
+                    entry(
+                        3,
+                        model_result(
+                            2,
+                            Outcome::Done {
+                                output: reply(&calls),
+                            },
+                        ),
                     ),
-                ),
-                append(4, model_tool_call("sleep", &a, "c0")),
-                run_tool(4, "sleep", a.clone()),
-                append(5, model_tool_call("sleep", &b, "c1")),
-                run_tool(5, "sleep", b.clone()),
-            ],
+                    entry(4, model_tool_call("sleep", &a, "c0")),
+                    entry(5, model_tool_call("sleep", &b, "c1")),
+                ],
+                vec![
+                    run_tool(4, "sleep", a.clone()),
+                    run_tool(5, "sleep", b.clone()),
+                ],
+            ),
         ),
-        (interrupt(), vec![cancel(4), cancel(5)]),
+        (interrupt(), (vec![], vec![cancel(4), cancel(5)])),
         (
             tool_done(5, INTERRUPTED),
-            vec![append(6, tool_result(5, INTERRUPTED))],
+            (vec![entry(6, tool_result(5, INTERRUPTED))], vec![]),
         ),
         (
             tool_done(4, INTERRUPTED),
-            vec![
-                append(7, tool_result(4, INTERRUPTED)),
-                append(8, Body::INTERRUPT),
-                IDLE,
-            ],
+            (
+                vec![
+                    entry(7, tool_result(4, INTERRUPTED)),
+                    entry(8, Body::INTERRUPT),
+                ],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -337,39 +363,41 @@ fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
     modeled().table(vec![
         (
             user("go"),
-            vec![
-                BUSY,
-                append(1, input("go")),
-                append(2, model_call(0)),
-                prepare(2, 0),
-            ],
+            (
+                vec![entry(1, input("go")), entry(2, model_call(0))],
+                vec![BUSY, prepare(2, 0)],
+            ),
         ),
         (
             model_done(2, &[("bash", a.clone()), ("bash", b.clone())]),
-            vec![
-                append(
-                    3,
-                    model_result(
-                        2,
-                        Outcome::Done {
-                            output: reply(&[("bash", a.clone()), ("bash", b.clone())]),
-                        },
+            (
+                vec![
+                    entry(
+                        3,
+                        model_result(
+                            2,
+                            Outcome::Done {
+                                output: reply(&[("bash", a.clone()), ("bash", b.clone())]),
+                            },
+                        ),
                     ),
-                ),
-                append(4, model_tool_call("bash", &a, "c0")),
-                run_bash(4, "a"),
-            ],
+                    entry(4, model_tool_call("bash", &a, "c0")),
+                ],
+                vec![run_bash(4, "a")],
+            ),
         ),
-        (interrupt(), vec![cancel(4)]),
+        (interrupt(), (vec![], vec![cancel(4)])),
         (
             tool_done(4, failed("cut")),
-            vec![
-                append(5, tool_result(4, failed("cut"))),
-                append(6, model_tool_call("bash", &b, "c1")),
-                append(7, tool_result(6, INTERRUPTED)),
-                append(8, Body::INTERRUPT),
-                IDLE,
-            ],
+            (
+                vec![
+                    entry(5, tool_result(4, failed("cut"))),
+                    entry(6, model_tool_call("bash", &b, "c1")),
+                    entry(7, tool_result(6, INTERRUPTED)),
+                    entry(8, Body::INTERRUPT),
+                ],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -386,48 +414,52 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
     modeled().table(vec![
         (
             user("go"),
-            vec![
-                BUSY,
-                append(1, input("go")),
-                append(2, model_call(0)),
-                prepare(2, 0),
-            ],
+            (
+                vec![entry(1, input("go")), entry(2, model_call(0))],
+                vec![BUSY, prepare(2, 0)],
+            ),
         ),
         (
             model_done(2, &[("sleep", sleep.clone())]),
-            vec![
-                append(
-                    3,
-                    model_result(
-                        2,
-                        Outcome::Done {
-                            output: reply(&[("sleep", sleep.clone())]),
-                        },
+            (
+                vec![
+                    entry(
+                        3,
+                        model_result(
+                            2,
+                            Outcome::Done {
+                                output: reply(&[("sleep", sleep.clone())]),
+                            },
+                        ),
                     ),
-                ),
-                append(4, model_tool_call("sleep", &sleep, "c0")),
-                run_tool(4, "sleep", sleep),
-            ],
+                    entry(4, model_tool_call("sleep", &sleep, "c0")),
+                ],
+                vec![run_tool(4, "sleep", sleep)],
+            ),
         ),
-        (steer("twice"), vec![append(5, steered)]),
-        (user("then"), vec![append(6, queued("then"))]),
+        (steer("twice"), (vec![entry(5, steered)], vec![])),
+        (user("then"), (vec![entry(6, queued("then"))], vec![])),
         (
             tool_done(4, done(json!({ "slept": 1 }))),
-            vec![
-                append(7, tool_result(4, done(json!({ "slept": 1 })))),
-                append(8, take(5)),
-                append(9, model_call(0)),
-                prepare(9, 0),
-            ],
+            (
+                vec![
+                    entry(7, tool_result(4, done(json!({ "slept": 1 })))),
+                    entry(8, take(5)),
+                    entry(9, model_call(0)),
+                ],
+                vec![prepare(9, 0)],
+            ),
         ),
         (
             model_done(9, &[]),
-            vec![
-                append(10, model_result(9, Outcome::Done { output: reply(&[]) })),
-                append(11, take(6)),
-                append(12, model_call(0)),
-                prepare(12, 0),
-            ],
+            (
+                vec![
+                    entry(10, model_result(9, Outcome::Done { output: reply(&[]) })),
+                    entry(11, take(6)),
+                    entry(12, model_call(0)),
+                ],
+                vec![prepare(12, 0)],
+            ),
         ),
     ]);
 }
@@ -438,25 +470,25 @@ fn queued_input_is_taken_up_in_order_once_the_turn_ends() {
     echo().table(vec![
         (
             user("sleep 1"),
-            vec![
-                BUSY,
-                append(1, input("sleep 1")),
-                append(2, sleep_call(1)),
-                run_tool(2, "sleep", sleep),
-            ],
+            (
+                vec![entry(1, input("sleep 1")), entry(2, sleep_call(1))],
+                vec![BUSY, run_tool(2, "sleep", sleep)],
+            ),
         ),
-        (user("a"), vec![append(3, queued("a"))]),
-        (user("b"), vec![append(4, queued("b"))]),
+        (user("a"), (vec![entry(3, queued("a"))], vec![])),
+        (user("b"), (vec![entry(4, queued("b"))], vec![])),
         (
             tool_done(2, done(json!({ "slept": 1 }))),
-            vec![
-                append(5, tool_result(2, done(json!({ "slept": 1 })))),
-                append(6, take(3)),
-                append(7, said("a")),
-                append(8, take(4)),
-                append(9, said("b")),
-                IDLE,
-            ],
+            (
+                vec![
+                    entry(5, tool_result(2, done(json!({ "slept": 1 })))),
+                    entry(6, take(3)),
+                    entry(7, said("a")),
+                    entry(8, take(4)),
+                    entry(9, said("b")),
+                ],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -465,19 +497,21 @@ fn queued_input_is_taken_up_in_order_once_the_turn_ends() {
 fn input_waits_its_turn_behind_a_call_waiting_for_approval() {
     asking().table(vec![
         (user("$ echo"), asked()),
-        (user("next"), vec![BUSY, append(4, queued("next"))]),
+        (user("next"), (vec![entry(4, queued("next"))], vec![BUSY])),
         (
             approve(2, true),
-            vec![append(5, answered(2, true)), run_bash(2, "echo")],
+            (vec![entry(5, answered(2, true))], vec![run_bash(2, "echo")]),
         ),
         (
             tool_done(2, done(json!("echo\n"))),
-            vec![
-                append(6, tool_result(2, done(json!("echo\n")))),
-                append(7, take(4)),
-                append(8, said("next")),
-                IDLE,
-            ],
+            (
+                vec![
+                    entry(6, tool_result(2, done(json!("echo\n")))),
+                    entry(7, take(4)),
+                    entry(8, said("next")),
+                ],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -486,18 +520,18 @@ fn retrying() -> Session {
     Session::new(Reg::modeled().retry(Duration::from_secs(1)).arc())
 }
 
-fn retried() -> Vec<Effect> {
+fn retried() -> Expected {
     let retry = Verdict::Retry {
         attempt: 1,
         error: "slow down".into(),
     };
-    vec![
-        append(3, decision("retry", Some(2), retry)),
-        Effect::Sleep {
+    (
+        vec![entry(3, decision("retry", Some(2), retry))],
+        vec![Work::Sleep {
             call: id(2),
             after: Duration::from_secs(1),
-        },
-    ]
+        }],
+    )
 }
 
 /// The `request_error` point retries: the next attempt is logged on the
@@ -509,21 +543,22 @@ fn a_failed_model_call_is_retried_as_the_request_error_point_asks() {
     s.table(vec![
         (
             user("hi"),
-            vec![
-                BUSY,
-                append(1, input("hi")),
-                append(2, model_call(0)),
-                prepare(2, 0),
-            ],
+            (
+                vec![entry(1, input("hi")), entry(2, model_call(0))],
+                vec![BUSY, prepare(2, 0)],
+            ),
         ),
         (model_failed(2), retried()),
-        (Event::Woke { call: id(2) }, vec![prepare(2, 1)]),
+        (Event::Woke { call: id(2) }, (vec![], vec![prepare(2, 1)])),
         (
             model_done(2, &[]),
-            vec![
-                append(4, model_result(2, Outcome::Done { output: reply(&[]) })),
-                IDLE,
-            ],
+            (
+                vec![entry(
+                    4,
+                    model_result(2, Outcome::Done { output: reply(&[]) }),
+                )],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -544,14 +579,20 @@ fn a_step_decision_is_logged_before_the_request_is_sent() {
                 decisions: vec![("fallback".into(), fallback.clone())],
                 answered: None,
             },
-            vec![append(3, decision("fallback", Some(2), fallback)), send(2)],
+            (
+                vec![entry(3, decision("fallback", Some(2), fallback))],
+                vec![send(2)],
+            ),
         ),
         (
             model_done(2, &[]),
-            vec![
-                append(4, model_result(2, Outcome::Done { output: reply(&[]) })),
-                IDLE,
-            ],
+            (
+                vec![entry(
+                    4,
+                    model_result(2, Outcome::Done { output: reply(&[]) }),
+                )],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -568,11 +609,13 @@ fn a_step_answer_stands_as_the_reply_and_nothing_is_sent() {
             decisions: Vec::new(),
             answered: Some(("cache".into(), Replied::Done(reply(&[])))),
         },
-        vec![
-            append(3, decision("cache", Some(2), Verdict::Answered)),
-            append(4, model_result(2, Outcome::Done { output: reply(&[]) })),
-            IDLE,
-        ],
+        (
+            vec![
+                entry(3, decision("cache", Some(2), Verdict::Answered)),
+                entry(4, model_result(2, Outcome::Done { output: reply(&[]) })),
+            ],
+            vec![IDLE],
+        ),
     )]);
 }
 
@@ -583,14 +626,16 @@ fn a_request_prepared_after_an_interrupt_is_not_sent() {
     let mut s = modeled();
     s.step(user("hi"));
     s.table(vec![
-        (interrupt(), vec![cancel(2)]),
+        (interrupt(), (vec![], vec![cancel(2)])),
         (
             prepared(2),
-            vec![
-                append(3, model_result(2, INTERRUPTED)),
-                append(4, Body::INTERRUPT),
-                IDLE,
-            ],
+            (
+                vec![
+                    entry(3, model_result(2, INTERRUPTED)),
+                    entry(4, Body::INTERRUPT),
+                ],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -602,16 +647,19 @@ fn a_call_fails_once_the_retries_run_out() {
     s.step(user("hi"));
     for attempt in 1..=RETRIES {
         s.step(model_failed(2));
-        assert_eq!(
-            s.step(Event::Woke { call: id(2) }).as_slice(),
-            [prepare(2, attempt)]
+        assert_plan(
+            &s.step(Event::Woke { call: id(2) }),
+            (vec![], vec![prepare(2, attempt)]),
         );
     }
     let fx = s.step(model_failed(2));
     let seq = s.log.len() as u64;
-    assert_eq!(
-        fx.as_slice(),
-        [append(seq, model_result(2, failed("slow down"))), IDLE]
+    assert_plan(
+        &fx,
+        (
+            vec![entry(seq, model_result(2, failed("slow down")))],
+            vec![IDLE],
+        ),
     );
 }
 
@@ -620,33 +668,32 @@ fn an_interrupt_in_backoff_sends_nothing_again() {
     retrying().table(vec![
         (
             user("hi"),
-            vec![
-                BUSY,
-                append(1, input("hi")),
-                append(2, model_call(0)),
-                prepare(2, 0),
-            ],
+            (
+                vec![entry(1, input("hi")), entry(2, model_call(0))],
+                vec![BUSY, prepare(2, 0)],
+            ),
         ),
         (model_failed(2), retried()),
         (
             interrupt(),
-            vec![
-                cancel(2),
-                append(4, model_result(2, INTERRUPTED)),
-                append(5, Body::INTERRUPT),
-                IDLE,
-            ],
+            (
+                vec![
+                    entry(4, model_result(2, INTERRUPTED)),
+                    entry(5, Body::INTERRUPT),
+                ],
+                vec![cancel(2), IDLE],
+            ),
         ),
-        (Event::Woke { call: id(2) }, vec![]),
+        (Event::Woke { call: id(2) }, (vec![], vec![])),
     ]);
 }
 
 /// A handler that answers later how to recover holds the call meanwhile:
 /// nothing is sent until it answers.
-fn recovering() -> (Session, Effect) {
+fn recovering() -> (Session, Work) {
     let mut s = Session::new(Reg::modeled().resend().arc());
     s.step(user("hi"));
-    let mut fx = s.step(model_failed(2)).into_vec();
+    let mut fx = into_work(s.step(model_failed(2))).collect::<Vec<_>>();
     assert_eq!(fx.len(), 1, "{fx:?}");
     (s, fx.remove(0))
 }
@@ -659,7 +706,7 @@ fn a_resend_rebuilds_from_the_transcript() {
     let (mut s, recover) = recovering();
     assert_eq!(
         recover,
-        Effect::Recover {
+        Work::Recover {
             call: id(2),
             answer: Later::new(async { None }),
         }
@@ -673,10 +720,10 @@ fn a_resend_rebuilds_from_the_transcript() {
             call: id(2),
             recovered: Some(("compact".into(), Recover::Resend)),
         },
-        vec![
-            append(3, decision("compact", Some(2), retry)),
-            prepare(2, 1),
-        ],
+        (
+            vec![entry(3, decision("compact", Some(2), retry))],
+            vec![prepare(2, 1)],
+        ),
     )]);
     // An answer of none fails the call with its error.
     let (mut s, _) = recovering();
@@ -686,7 +733,10 @@ fn a_resend_rebuilds_from_the_transcript() {
     };
     s.table(vec![(
         recovered,
-        vec![append(3, model_result(2, failed("slow down"))), IDLE],
+        (
+            vec![entry(3, model_result(2, failed("slow down")))],
+            vec![IDLE],
+        ),
     )]);
 }
 
@@ -696,12 +746,13 @@ fn an_interrupt_in_recovering_sends_nothing() {
     s.table(vec![
         (
             interrupt(),
-            vec![
-                cancel(2),
-                append(3, model_result(2, INTERRUPTED)),
-                append(4, Body::INTERRUPT),
-                IDLE,
-            ],
+            (
+                vec![
+                    entry(3, model_result(2, INTERRUPTED)),
+                    entry(4, Body::INTERRUPT),
+                ],
+                vec![cancel(2), IDLE],
+            ),
         ),
         // An answer that comes anyway changes nothing.
         (
@@ -709,7 +760,7 @@ fn an_interrupt_in_recovering_sends_nothing() {
                 call: id(2),
                 recovered: Some(("compact".into(), Recover::Resend)),
             },
-            vec![],
+            (vec![], vec![]),
         ),
     ]);
 }
@@ -719,16 +770,17 @@ fn a_failure_no_extension_retries_fails_the_turn() {
     modeled().table(vec![
         (
             user("hi"),
-            vec![
-                BUSY,
-                append(1, input("hi")),
-                append(2, model_call(0)),
-                prepare(2, 0),
-            ],
+            (
+                vec![entry(1, input("hi")), entry(2, model_call(0))],
+                vec![BUSY, prepare(2, 0)],
+            ),
         ),
         (
             model_failed(2),
-            vec![append(3, model_result(2, failed("slow down"))), IDLE],
+            (
+                vec![entry(3, model_result(2, failed("slow down")))],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -750,16 +802,14 @@ fn slash_commands_run_without_a_turn() {
     echo().table(vec![
         (
             user("/jobs now"),
-            vec![
-                BUSY,
-                append(1, input("/jobs now")),
-                append(2, command("now")),
-                run_tool(2, "jobs", json!({ "args": "now" })),
-            ],
+            (
+                vec![entry(1, input("/jobs now")), entry(2, command("now"))],
+                vec![BUSY, run_tool(2, "jobs", json!({ "args": "now" }))],
+            ),
         ),
         (
             tool_done(2, done(json!([]))),
-            vec![append(3, tool_result(2, done(json!([])))), IDLE],
+            (vec![entry(3, tool_result(2, done(json!([]))))], vec![IDLE]),
         ),
     ]);
 }
@@ -769,12 +819,15 @@ fn commands_obey_permission() {
     let mut s = Session::new(Reg::echo().policy(Policy::Deny(&["jobs"])).arc());
     s.table(vec![(
         user("/jobs"),
-        vec![
-            append(1, input("/jobs")),
-            append(2, command("")),
-            append(3, permission(2, Permission::Deny)),
-            append(4, tool_result(2, failed("policy denied this call"))),
-        ],
+        (
+            vec![
+                entry(1, input("/jobs")),
+                entry(2, command("")),
+                entry(3, permission(2, Permission::Deny)),
+                entry(4, tool_result(2, failed("policy denied this call"))),
+            ],
+            vec![],
+        ),
     )]);
 }
 
@@ -788,27 +841,33 @@ fn the_input_point_rewrites_or_refuses_input_before_it_is_logged() {
                 origin: None,
                 ticket: Some(Ticket(1)),
             },
-            vec![Effect::Reply {
-                ticket: Ticket(1),
-                result: Err("input: no secrets".into()),
-            }],
+            (
+                vec![],
+                vec![Work::Reply {
+                    ticket: Ticket(1),
+                    result: Err("input: no secrets".into()),
+                }],
+            ),
         ),
         (
             user("shout hi"),
-            vec![
-                append(
-                    1,
-                    decision(
-                        "input",
-                        None,
-                        Verdict::Input {
-                            original: "shout hi".into(),
-                        },
+            (
+                vec![
+                    entry(
+                        1,
+                        decision(
+                            "input",
+                            None,
+                            Verdict::Input {
+                                original: "shout hi".into(),
+                            },
+                        ),
                     ),
-                ),
-                append(2, input("HI")),
-                append(3, said("HI")),
-            ],
+                    entry(2, input("HI")),
+                    entry(3, said("HI")),
+                ],
+                vec![],
+            ),
         ),
     ]);
 }
@@ -818,21 +877,24 @@ fn the_on_stop_point_has_the_agent_go_on() {
     let mut s = Session::new(Reg::echo().on_stop("and again").arc());
     s.table(vec![(
         user("hi"),
-        vec![
-            append(1, input("hi")),
-            append(2, said("hi")),
-            append(
-                3,
-                decision(
-                    "policy",
-                    None,
-                    Verdict::OnStop {
-                        text: "and again".into(),
-                    },
+        (
+            vec![
+                entry(1, input("hi")),
+                entry(2, said("hi")),
+                entry(
+                    3,
+                    decision(
+                        "policy",
+                        None,
+                        Verdict::OnStop {
+                            text: "and again".into(),
+                        },
+                    ),
                 ),
-            ),
-            append(4, said("and again")),
-        ],
+                entry(4, said("and again")),
+            ],
+            vec![],
+        ),
     )]);
 }
 
@@ -849,34 +911,35 @@ fn a_generation_is_adopted_only_at_rest() {
     echo().table(vec![
         (
             user("sleep 1"),
-            vec![
-                BUSY,
-                append(1, input("sleep 1")),
-                append(2, sleep_call(1)),
-                run_tool(2, "sleep", sleep),
-            ],
+            (
+                vec![entry(1, input("sleep 1")), entry(2, sleep_call(1))],
+                vec![BUSY, run_tool(2, "sleep", sleep)],
+            ),
         ),
-        (Event::Registry(newer.clone()), vec![]),
+        (Event::Registry(newer.clone()), (vec![], vec![])),
         (
             tool_done(2, done(json!(1))),
-            vec![append(3, tool_result(2, done(json!(1)))), IDLE],
+            (vec![entry(3, tool_result(2, done(json!(1))))], vec![IDLE]),
         ),
         (
             user("old"),
-            vec![append(4, input("old")), append(5, said("old"))],
+            (vec![entry(4, input("old")), entry(5, said("old"))], vec![]),
         ),
         (
             Event::Registry(newer),
-            vec![append(
-                6,
-                Body::Extensions {
-                    installed: installed.to_vec(),
-                },
-            )],
+            (
+                vec![entry(
+                    6,
+                    Body::Extensions {
+                        installed: installed.to_vec(),
+                    },
+                )],
+                vec![],
+            ),
         ),
         (
             user("new"),
-            vec![append(7, input("new")), append(8, said("new"))],
+            (vec![entry(7, input("new")), entry(8, said("new"))], vec![]),
         ),
     ]);
 }
@@ -891,37 +954,41 @@ fn spawn(wait: bool) -> Event {
     }
 }
 
-fn spawned() -> Vec<Effect> {
-    vec![append(
-        3,
-        Body::Link {
-            intent: Json::null(),
-            child: child(),
-            input: "go".into(),
-        },
-    )]
+fn spawned() -> Expected {
+    (
+        vec![entry(
+            3,
+            Body::Link {
+                intent: Json::null(),
+                child: child(),
+                input: "go".into(),
+            },
+        )],
+        vec![],
+    )
 }
 
-fn started() -> Effect {
-    Effect::StartChild {
+fn started() -> Work {
+    Work::StartChild {
         link: seq(3),
         child: child(),
         input: "go".into(),
     }
 }
 
-fn tasked() -> Vec<Effect> {
+fn tasked() -> Expected {
     let task = json!({ "input": "go" });
-    vec![
-        BUSY,
-        append(1, input("task go")),
-        append(2, tool_call("task", task.clone())),
-        run_tool(2, "task", task),
-    ]
+    (
+        vec![
+            entry(1, input("task go")),
+            entry(2, tool_call("task", task.clone())),
+        ],
+        vec![BUSY, run_tool(2, "task", task)],
+    )
 }
 
-fn fired(seq: u64, watch: u64, outcome: Outcome) -> Effect {
-    append(
+fn fired(seq: u64, watch: u64, outcome: Outcome) -> protocol::Entry {
+    entry(
         seq,
         Body::Fired {
             watch: Seq::new(watch).unwrap(),
@@ -934,11 +1001,11 @@ fn fired(seq: u64, watch: u64, outcome: Outcome) -> Effect {
 #[test]
 fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
     let mut waits = spawned();
-    waits.extend([
-        append(4, wait_child(2, 3)),
-        append(5, Body::Watch { child: child() }),
-        started(),
+    waits.0.extend([
+        entry(4, wait_child(2, 3)),
+        entry(5, Body::Watch { child: child() }),
     ]);
+    waits.1.push(started());
     let ok = done(json!("ok"));
     echo().table(vec![
         (user("task go"), tasked()),
@@ -948,15 +1015,15 @@ fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
                 child: child(),
                 outcome: ok.clone(),
             },
-            vec![
-                fired(6, 5, ok.clone()),
-                Effect::Resume {
+            (
+                vec![fired(6, 5, ok.clone())],
+                vec![Work::Resume {
                     call: id(2),
                     tool: "task".into(),
                     input: Json::encode(&json!({ "input": "go" })).unwrap(),
                     value: Json::encode(&done(json!("ok"))).unwrap(),
-                },
-            ],
+                }],
+            ),
         ),
         // A child reports again after a restart: its watch fired already.
         (
@@ -964,11 +1031,11 @@ fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
                 child: child(),
                 outcome: ok.clone(),
             },
-            vec![],
+            (vec![], vec![]),
         ),
         (
             tool_done(2, ok.clone()),
-            vec![append(7, tool_result(2, ok)), IDLE],
+            (vec![entry(7, tool_result(2, ok))], vec![IDLE]),
         ),
     ]);
 }
@@ -978,26 +1045,31 @@ fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
 #[test]
 fn an_interrupt_stops_the_child_first() {
     let mut waits = spawned();
-    waits.extend([
-        append(4, wait_child(2, 3)),
-        append(5, Body::Watch { child: child() }),
-        started(),
+    waits.0.extend([
+        entry(4, wait_child(2, 3)),
+        entry(5, Body::Watch { child: child() }),
     ]);
+    waits.1.push(started());
     echo().table(vec![
         (user("task go"), tasked()),
         (spawn(true), waits),
-        (interrupt(), vec![Effect::Interrupt { child: child() }]),
+        (
+            interrupt(),
+            (vec![], vec![Work::Interrupt { child: child() }]),
+        ),
         (
             Event::ChildSettled {
                 child: child(),
                 outcome: INTERRUPTED,
             },
-            vec![
-                fired(6, 5, INTERRUPTED),
-                append(7, tool_result(2, INTERRUPTED)),
-                append(8, Body::INTERRUPT),
-                IDLE,
-            ],
+            (
+                vec![
+                    fired(6, 5, INTERRUPTED),
+                    entry(7, tool_result(2, INTERRUPTED)),
+                    entry(8, Body::INTERRUPT),
+                ],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -1010,7 +1082,8 @@ fn a_background_childs_result_starts_a_turn_of_its_own() {
         (user("task go"), tasked()),
         (spawn(false), {
             let mut fx = spawned();
-            fx.extend([append(4, Body::Watch { child: child() }), started()]);
+            fx.0.push(entry(4, Body::Watch { child: child() }));
+            fx.1.push(started());
             fx
         }),
         // The turn runs: the result waits for it to end.
@@ -1019,16 +1092,18 @@ fn a_background_childs_result_starts_a_turn_of_its_own() {
                 child: child(),
                 outcome: ok.clone(),
             },
-            vec![],
+            (vec![], vec![]),
         ),
         (
             tool_done(2, done(json!(null))),
-            vec![
-                append(5, tool_result(2, done(json!(null)))),
-                fired(6, 4, ok),
-                append(7, said("child: \"ok\"")),
-                IDLE,
-            ],
+            (
+                vec![
+                    entry(5, tool_result(2, done(json!(null)))),
+                    fired(6, 4, ok),
+                    entry(7, said("child: \"ok\"")),
+                ],
+                vec![IDLE],
+            ),
         ),
     ]);
 }
@@ -1040,19 +1115,18 @@ fn a_child_reports_each_time_it_settles() {
         ..Load::default()
     };
     let (mut s, fx) = Session::resume(Reg::echo().arc(), log([input("hi")]), &load);
-    let report = |text: &str| Effect::Report {
+    let report = |text: &str| Work::Report {
         outcome: Outcome::Done {
             output: Json::encode(&text).unwrap(),
         },
     };
-    assert_eq!(fx.as_slice(), [append(2, said("hi")), report("hi")]);
+    assert_plan(&fx, (vec![entry(2, said("hi"))], vec![report("hi")]));
     s.table(vec![(
         user("again"),
-        vec![
-            append(3, input("again")),
-            append(4, said("again")),
-            report("again"),
-        ],
+        (
+            vec![entry(3, input("again")), entry(4, said("again"))],
+            vec![report("again")],
+        ),
     )]);
 }
 
@@ -1065,32 +1139,33 @@ fn a_settled_call_cannot_write_and_stray_reports_change_nothing() {
     echo().table(vec![
         (
             user("$ make"),
-            vec![
-                BUSY,
-                append(1, input("$ make")),
-                append(2, bash("make")),
-                run_bash(2, "make"),
-            ],
+            (
+                vec![entry(1, input("$ make")), entry(2, bash("make"))],
+                vec![BUSY, run_bash(2, "make")],
+            ),
         ),
         (
             progress(),
-            vec![append(
-                3,
-                Body::Progress {
-                    call: CallId::new(2).unwrap(),
-                    text: "one\n".into(),
-                },
-            )],
+            (
+                vec![entry(
+                    3,
+                    Body::Progress {
+                        call: CallId::new(2).unwrap(),
+                        text: "one\n".into(),
+                    },
+                )],
+                vec![],
+            ),
         ),
         (
             tool_done(2, done(json!(0))),
-            vec![append(4, tool_result(2, done(json!(0)))), IDLE],
+            (vec![entry(4, tool_result(2, done(json!(0))))], vec![IDLE]),
         ),
-        (progress(), vec![]),
-        (tool_done(2, done(json!(0))), vec![]),
-        (tool_done(9, done(json!(0))), vec![]),
-        (model_done(2, &[]), vec![]),
-        (Event::Woke { call: id(2) }, vec![]),
+        (progress(), (vec![], vec![])),
+        (tool_done(2, done(json!(0))), (vec![], vec![])),
+        (tool_done(9, done(json!(0))), (vec![], vec![])),
+        (model_done(2, &[]), (vec![], vec![])),
+        (Event::Woke { call: id(2) }, (vec![], vec![])),
     ]);
 }
 
@@ -1104,7 +1179,7 @@ fn a_resend_runs_once() {
         origin: Some(author(1)),
         ticket: Some(Ticket(ticket)),
     };
-    let ok = |ticket| Effect::Reply {
+    let ok = |ticket| Work::Reply {
         ticket: Ticket(ticket),
         result: Ok(()),
     };
@@ -1116,8 +1191,11 @@ fn a_resend_runs_once() {
     };
     echo().table(vec![
         // Answered once its input is logged, before the turn it starts.
-        (hi(1), vec![append(1, logged), ok(1), append(2, said("hi"))]),
-        (hi(2), vec![ok(2)]),
+        (
+            hi(1),
+            (vec![entry(1, logged), entry(2, said("hi"))], vec![ok(1)]),
+        ),
+        (hi(2), (vec![], vec![ok(2)])),
     ]);
 }
 
@@ -1125,21 +1203,24 @@ fn a_resend_runs_once() {
 fn an_agents_refusal_is_logged_as_a_block() {
     echo().table(vec![(
         user("refuse bash"),
-        vec![
-            append(1, input("refuse bash")),
-            append(2, tool_call("bash", json!(null))),
-            append(
-                3,
-                decision(
-                    "agent",
-                    Some(2),
-                    Verdict::Block {
-                        reason: "not now".into(),
-                    },
+        (
+            vec![
+                entry(1, input("refuse bash")),
+                entry(2, tool_call("bash", json!(null))),
+                entry(
+                    3,
+                    decision(
+                        "agent",
+                        Some(2),
+                        Verdict::Block {
+                            reason: "not now".into(),
+                        },
+                    ),
                 ),
-            ),
-            append(4, tool_result(2, failed("not now"))),
-        ],
+                entry(4, tool_result(2, failed("not now"))),
+            ],
+            vec![],
+        ),
     )]);
 }
 
@@ -1151,28 +1232,26 @@ fn a_call_waits_on_a_dialog_and_resumes_with_its_answer() {
     echo().table(vec![
         (
             user("$ ask"),
-            vec![
-                BUSY,
-                append(1, input("$ ask")),
-                append(2, bash("ask")),
-                run_bash(2, "ask"),
-            ],
+            (
+                vec![entry(1, input("$ ask")), entry(2, bash("ask"))],
+                vec![BUSY, run_bash(2, "ask")],
+            ),
         ),
         (
             Event::Waits {
                 call: id(2),
                 on: dialog.clone(),
             },
-            vec![
-                append(
+            (
+                vec![entry(
                     3,
                     Body::Wait {
                         call: id(2),
                         on: dialog,
                     },
-                ),
-                IDLE,
-            ],
+                )],
+                vec![IDLE],
+            ),
         ),
         (
             Event::Answer {
@@ -1181,23 +1260,25 @@ fn a_call_waits_on_a_dialog_and_resumes_with_its_answer() {
                 origin: None,
                 ticket: None,
             },
-            vec![
-                BUSY,
-                append(
+            (
+                vec![entry(
                     4,
                     Body::Answer {
                         call: id(2),
                         value: Json::encode("ada").unwrap(),
                         origin: None,
                     },
-                ),
-                Effect::Resume {
-                    call: id(2),
-                    tool: "bash".into(),
-                    input: Json::encode(&json!({ "command": "ask" })).unwrap(),
-                    value: Json::encode("ada").unwrap(),
-                },
-            ],
+                )],
+                vec![
+                    BUSY,
+                    Work::Resume {
+                        call: id(2),
+                        tool: "bash".into(),
+                        input: Json::encode(&json!({ "command": "ask" })).unwrap(),
+                        value: Json::encode("ada").unwrap(),
+                    },
+                ],
+            ),
         ),
     ]);
 }
@@ -1271,9 +1352,9 @@ fn a_full_inbox_refuses_new_identity_but_acknowledges_duplicates() {
         envelope: envelope("overflow"),
         ticket: Ticket(2),
     });
-    assert!(fx.iter().any(|e| matches!(
+    assert!(work(&fx).any(|e| matches!(
         e,
-        Effect::Delivery {
+        Work::Delivery {
             result: Err(protocol::InboxRefusal::Full),
             ..
         }
@@ -1282,10 +1363,7 @@ fn a_full_inbox_refuses_new_identity_but_acknowledges_duplicates() {
         envelope: envelope("0"),
         ticket: Ticket(3),
     });
-    assert!(
-        fx.iter()
-            .any(|e| matches!(e, Effect::Delivery { result: Ok(()), .. }))
-    );
+    assert!(work(&fx).any(|e| matches!(e, Work::Delivery { result: Ok(()), .. })));
     assert_eq!(s.core.ledger().inbox_len(), protocol::INBOX_CAPACITY);
 }
 
@@ -1300,8 +1378,7 @@ fn an_outbox_replays_the_original_envelope_until_its_durable_ack() {
     });
     let (mut restored, fx) = Session::resume(Reg::echo().arc(), s.log.clone(), &Load::default());
     assert!(
-        fx.iter()
-            .any(|e| matches!(e, Effect::Deliver { envelope, .. } if envelope == &original))
+        work(&fx).any(|e| matches!(e, Work::Deliver { envelope, .. } if envelope == &original))
     );
     let mut changed = original.clone();
     changed.payload = "different".into();
@@ -1310,8 +1387,7 @@ fn an_outbox_replays_the_original_envelope_until_its_durable_ack() {
         ticket: Ticket(2),
     });
     assert!(
-        fx.iter()
-            .any(|e| matches!(e, Effect::Deliver { envelope, .. } if envelope == &original))
+        work(&fx).any(|e| matches!(e, Work::Deliver { envelope, .. } if envelope == &original))
     );
     restored.step(Event::Delivered {
         id: original.id.clone(),
@@ -1319,12 +1395,12 @@ fn an_outbox_replays_the_original_envelope_until_its_durable_ack() {
         ticket: Some(Ticket(2)),
     });
     let (mut again, fx) = Session::resume(Reg::echo().arc(), restored.log, &Load::default());
-    assert!(!fx.iter().any(|e| matches!(e, Effect::Deliver { .. })));
+    assert!(!work(&fx).any(|e| matches!(e, Work::Deliver { .. })));
     let fx = again.step(Event::SendEnvelope {
         envelope: original,
         ticket: Ticket(3),
     });
-    assert!(!fx.iter().any(|e| matches!(e, Effect::Deliver { .. })));
+    assert!(!work(&fx).any(|e| matches!(e, Work::Deliver { .. })));
     assert_eq!(
         again
             .log
@@ -1353,16 +1429,13 @@ fn cancel_wins_once_over_a_detached_result_even_after_reload() {
         origin: None,
         ticket: None,
     });
-    assert!(
-        fx.iter()
-            .any(|e| matches!(e, Effect::Interrupt { child: c } if *c == child()))
-    );
+    assert!(work(&fx).any(|e| matches!(e, Work::Interrupt { child: c } if *c == child())));
     s.step(Event::ChildSettled {
         child: child(),
         outcome: done(json!("late")),
     });
     let (mut restored, fx) = Session::resume(Reg::echo().arc(), s.log, &Load::default());
-    assert!(!fx.iter().any(|e| matches!(e, Effect::StartChild { .. })));
+    assert!(!work(&fx).any(|e| matches!(e, Work::StartChild { .. })));
     restored.step(Event::ChildSettled {
         child: child(),
         outcome: done(json!("later")),
@@ -1471,9 +1544,7 @@ fn an_unacknowledged_outbox_keeps_its_owner_recoverable() {
     assert!(!s.core.at_rest());
     let (mut restored, effects) = Session::resume(Reg::echo().arc(), s.log, &Load::default());
     assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::Deliver { envelope, .. } if envelope == &message))
+        work(&effects).any(|e| matches!(e, Work::Deliver { envelope, .. } if envelope == &message))
     );
     restored.step(Event::Delivered {
         id: message.id,
@@ -1515,11 +1586,10 @@ fn child_and_inbox_recovery_keep_their_original_identity() {
         .seq;
     let (mut recovered, effects) =
         Session::resume(Reg::echo().arc(), session.log, &Load::default());
-    assert!(effects.iter().any(|effect| matches!(effect, Effect::StartChild { link: recovered, child: id, input } if *recovered == link && *id == child && input == "original child input")));
+    assert!(work(&effects).any(|effect| matches!(effect, Work::StartChild { link: recovered, child: id, input } if *recovered == link && *id == child && input == "original child input")));
     assert!(
-        effects.iter().any(
-            |effect| matches!(effect, Effect::Deliver { envelope, .. } if envelope == &message)
-        )
+        work(&effects)
+            .any(|effect| matches!(effect, Work::Deliver { envelope, .. } if envelope == &message))
     );
     recovered.step(Event::Enqueue {
         envelope: message.clone(),
