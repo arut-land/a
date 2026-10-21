@@ -168,8 +168,10 @@ budgeted side requests with logged purpose and outcome; title, compact and
 the policy judge use it. Compaction edits the model's transcript without
 erasing history. Optional [Lua mods](ext-lua.md) already support tools,
 wire points, folds, text and agents in a bounded sandbox. They do not expose
-<<<<<<< HEAD
-every Rust service or decision point.
+every Rust service or decision point. [Skills](ext-skills.md) publish a small
+index per adopted generation and load instructions through a typed tool or
+user command. Both index and instructions are ordinary logged context; reload
+adoption waits for rest.
 
 [MCP tools](ext-mcp.md) register through the same SDK and policy path.
 The model initially sees a compact server index; listing tools and fetching
@@ -184,12 +186,7 @@ aggregate byte budget; compact summaries and typed names keep the result
 and its card safely below the protocol frame limit.
 The client targets MCP 2026-07-28 without a legacy handshake fallback;
 HTTP authentication, sampling and elicitation remain unsupported.
-=======
-every Rust service or decision point. [Skills](ext-skills.md) publish a small
-index per adopted generation and load instructions through a typed tool or
-user command. Both index and instructions are ordinary logged context; reload
-adoption waits for rest. MCP remains planned.
->>>>>>> main
+
 
 ## Runtime, wire and clients
 
@@ -257,20 +254,7 @@ this does not establish a working Windows daemon.
 **Done:** durable CLI sessions on macOS/Linux; connect-or-spawn, staging,
 drain/reconnect, CRC logs, snapshots, recovery, typed extensions and policy;
 recorded provider codecs; TUI, web and SwiftUI renderers over the client SDK;
-<<<<<<< HEAD
-optional Lua mods; child sessions; lazy MCP tools through the existing policy
-and replay rules; side model calls for title, compact and judge with
-purpose/outcome logging; conversation-only forks from `(session, seq)`
-with independent copied logs, recorded ancestry, exact Lua generations and
-rest-point validation ([fork semantics](fork.md)). These supersede the original
-M1/M2/M3 schedule: web and remote SSH are already present.
-
-**Next:**
-
-- `ext-skills`: skill discovery and loading on SDK primitives.
-
-=======
-optional Lua mods; lazy skill instructions; child sessions; side model calls
+lazy MCP tools; optional Lua mods; lazy skill instructions; child sessions; side model calls
 for title, compact and judge with purpose/outcome logging; conversation-only
 forks from `(session, seq)` with independent copied logs, recorded ancestry,
 exact extension generations and rest-point validation ([fork semantics](fork.md)).
@@ -278,8 +262,6 @@ These supersede the original M1/M2/M3 schedule: web and remote SSH are already p
 
 **Next:**
 
-- `ext-mcp`: external tools through the registry and existing policy path.
->>>>>>> main
 - Approval explanations that retain and present why a call needs consent.
 - Audit essential non-derivable facts: exact sent-request identity, runtime
   decisions and recovery inputs. Side-call logging exists; it is not proof
