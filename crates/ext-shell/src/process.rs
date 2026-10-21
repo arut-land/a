@@ -65,9 +65,9 @@ impl RunningProcess for Live {
 struct Reap(Option<sys::Child>, Arc<Live>);
 
 impl Reap {
-    fn complete(&mut self, status: Option<ExitStatus>) {
+    fn complete(&mut self) {
         if let Some(mut child) = self.0.take() {
-            *lock(&self.1.status) = Some(status.map_or_else(|| child.wait(), Ok));
+            *lock(&self.1.status) = Some(child.wait());
             self.1.exited.set();
         }
     }
@@ -77,7 +77,7 @@ impl Drop for Reap {
     fn drop(&mut self) {
         // Also covers failed registration and a runtime dropping its task.
         lock(&self.1.group).take();
-        self.complete(None);
+        self.complete();
         self.1.ended.set();
     }
 }
@@ -161,12 +161,13 @@ async fn launch(
     let watch = match watch(live.id) {
         Ok(watch) => Some(rt::Async::for_reading(&reactor, watch)?),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            if let Some(status) = owned.0.as_mut().unwrap().try_wait()? {
-                owned.complete(Some(status));
-                None
-            } else {
-                return Err(e);
-            }
+            // Exit observation can precede waitable status; reaping must not block the reactor.
+            owned = rt::unblock_with(rt, rt::BlockingClass::Network, 0, move || {
+                owned.complete();
+                owned
+            })
+            .await;
+            None
         }
         Err(e) => return Err(e),
     };
@@ -185,7 +186,7 @@ async fn launch(
         {
             return;
         }
-        owned.complete(None);
+        owned.complete();
         let _ = descendants(&reactor, &owned.1).await;
     }));
     Ok(OwnedProcess::new(live, input, output))
@@ -243,7 +244,8 @@ mod tests {
     use ext::host::Registry;
     use ext::testing::Rig;
     use ext::{Extension, Registrar, SpawnSpec};
-    use std::task::{Context, Waker};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll, Waker};
 
     fn spec(cx: &Cx, command: &str) -> LaunchSpec {
         LaunchSpec {
@@ -311,10 +313,14 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Manual(Mutex<Vec<rt::BoxFuture<'static, ()>>>);
+    struct Manual {
+        tasks: Mutex<Vec<rt::BoxFuture<'static, ()>>>,
+        blocking: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+        defer: AtomicBool,
+    }
     impl rt::Runtime for Manual {
         fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
-            lock(&self.0).push(task);
+            lock(&self.tasks).push(task);
         }
         fn spawn_blocking(
             &self,
@@ -322,7 +328,11 @@ mod tests {
             _: usize,
             work: Box<dyn FnOnce() + Send>,
         ) -> rt::BoxFuture<'static, io::Result<()>> {
-            work();
+            if self.defer.load(Ordering::Acquire) {
+                lock(&self.blocking).push(work);
+            } else {
+                work();
+            }
             Box::pin(std::future::ready(Ok(())))
         }
         fn spawn_flush(
@@ -348,6 +358,49 @@ mod tests {
     }
 
     #[test]
+    fn an_exited_watch_waits_for_reapable_status() {
+        let runtime = Arc::new(Manual::default());
+        let rig = Rig::new(
+            "watch-before-status",
+            Registry::default()
+                .with(&ManualService(Arc::clone(&runtime)))
+                .unwrap(),
+        );
+        let cx = rig.cx();
+        let pid = Mutex::new(None);
+        // Stdin holds the child until the test releases status acquisition.
+        let mut launching = std::pin::pin!(launch(
+            &cx,
+            spec(&cx, "read -r line"),
+            |id| {
+                *lock(&pid) = Some(id);
+                runtime.defer.store(true, Ordering::Release);
+                Err(io::ErrorKind::NotFound.into())
+            },
+            |reactor, input, _| rt::Async::new(reactor, input),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(launching.as_mut().poll(&mut context).is_pending());
+        let id = lock(&pid).unwrap();
+        assert!(sys::process_started(id).is_some());
+        let reaping = lock(&runtime.blocking)
+            .pop()
+            .expect("status acquisition was admitted");
+        sys::signal_process(id, sys::Signal::Terminate).unwrap();
+        reaping();
+        let Poll::Ready(Ok(process)) = launching.as_mut().poll(&mut context) else {
+            panic!("the reaped child must still be a successful launch");
+        };
+        rt::block_on(lock(&runtime.tasks).pop().unwrap());
+        let status = rt::block_on(process.process.wait()).unwrap();
+        assert!(!status.success());
+        assert_eq!(process.process.try_wait().unwrap(), Some(status));
+        assert_eq!(rt::block_on(process.process.wait()).unwrap(), status);
+        assert!(sys::process_started(id).is_none());
+        assert!(lock(&runtime.blocking).is_empty());
+    }
+
+    #[test]
     fn quiet_processes_do_not_require_polling() {
         let runtime = Arc::new(Manual::default());
         let rig = Rig::new(
@@ -359,12 +412,12 @@ mod tests {
         let cx = rig.cx();
         let process = rt::block_on(Provider.spawn(&cx, spec(&cx, "read -r line"))).unwrap();
         let control = Arc::clone(&process.process);
-        let mut task = lock(&runtime.0).pop().unwrap();
+        let mut task = lock(&runtime.tasks).pop().unwrap();
         let mut context = Context::from_waker(Waker::noop());
         assert!(task.as_mut().poll(&mut context).is_pending());
         assert!(control.try_wait().unwrap().is_none());
         assert!(
-            lock(&runtime.0).is_empty(),
+            lock(&runtime.tasks).is_empty(),
             "a quiet child scheduled extra work"
         );
         drop(process);
@@ -385,7 +438,7 @@ mod tests {
             failed.is_err(),
             "unsupported watches must clean up instead of scheduling polls"
         );
-        assert!(lock(&runtime.0).is_empty());
+        assert!(lock(&runtime.tasks).is_empty());
         assert!(sys::process_started(pid.unwrap()).is_none());
     }
 }
