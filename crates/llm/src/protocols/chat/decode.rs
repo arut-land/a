@@ -1003,3 +1003,41 @@ fn usage_of(usage: &Value, quirks: &Quirks) -> Usage {
         ..Usage::default()
     }
 }
+
+#[cfg(test)]
+mod growth_tests {
+    use super::*;
+
+    #[test]
+    fn small_argument_fragments_cost_linear_work() {
+        for fragment in ["x", " "] {
+            let work = |count| {
+                let mut decoder = ChatDecoder::new(Quirks::default());
+                let call = Call {
+                    function: Json::Object(Function {
+                        name: Json::Str("tool".into()),
+                        arguments: Json::Str(fragment.into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                decoder.call(Some(&call), None).unwrap();
+                let before = decoder.w.scan_work();
+                let encoded_before = crate::json::encoded_work();
+                for _ in 0..count {
+                    decoder.call(Some(&call), None).unwrap();
+                }
+                let at = decoder.calls().last().unwrap().0;
+                assert_eq!(decoder.w.text(at).unwrap().len(), count + 1);
+                (
+                    decoder.w.scan_work() - before,
+                    crate::json::encoded_work() - encoded_before,
+                )
+            };
+            let small = work(1024);
+            let large = work(2048);
+            assert_eq!(large.0, 2 * small.0);
+            assert_eq!(large.1, 2 * small.1);
+        }
+    }
+}
