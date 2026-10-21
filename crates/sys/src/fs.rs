@@ -105,14 +105,11 @@ fn final_path(file: &File) -> io::Result<std::path::PathBuf> {
     }
     let mut buffer = vec![0u16; 512];
     loop {
+        let capacity = u32::try_from(buffer.len())
+            .map_err(|_| io::Error::other("resolved path exceeds system capacity"))?;
         // SAFETY: the file owns the handle and buffer has the advertised capacity.
         let length = unsafe {
-            GetFinalPathNameByHandleW(
-                file.as_raw_handle(),
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                0,
-            )
+            GetFinalPathNameByHandleW(file.as_raw_handle(), buffer.as_mut_ptr(), capacity, 0)
         };
         if length == 0 {
             return Err(io::Error::last_os_error());

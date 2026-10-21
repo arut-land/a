@@ -39,8 +39,8 @@ this extension. Reading them later follows those tools' ordinary logging and
 policy rules.
 
 A successful load seals `Body::Context` text and its typed publication key
-in one log entry. A durable prefix therefore contains both or neither. The same instructions are published once per session;
-subsequent loads return `already_loaded` while that publication remains in
+in one log entry. A durable prefix therefore contains both or neither.
+Subsequent loads return `already_loaded` while that publication remains in
 the effective transcript. `Edit` ranges, including compaction, invalidate the
 covered publications. A subsequent load restores omitted instructions, and
 the adopted generation's index is restored before the next model request or
