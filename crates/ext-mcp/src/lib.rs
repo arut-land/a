@@ -1,6 +1,7 @@
 //! Lazy MCP tools, over stdio or the model HTTP transport. Discovery is a
 //! logged tool result, never an eager part of assembling a session.
 
+mod discovery;
 mod headers;
 mod incoming;
 mod rpc;
@@ -48,6 +49,9 @@ fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Mcp {
     pub fn new(servers: Vec<Server>, timeout: Duration) -> Result<Self, Refused> {
+        if servers.len() > 64 {
+            return Err(Refused("ext.mcp: at most 64 servers".into()));
+        }
         let mut names = std::collections::BTreeSet::new();
         for server in &servers {
             if server.name.is_empty()
@@ -175,6 +179,7 @@ impl Mcp {
 
     async fn tools(&self, server: &str, cx: &Cx) -> Result<Vec<Value>, Failure> {
         let mut tools = Vec::new();
+        let mut budget = discovery::Budget::default();
         let mut cursor = None;
         let mut seen = std::collections::BTreeSet::new();
         // Bound both a single response and the aggregate, including a server
@@ -184,6 +189,7 @@ impl Mcp {
                 .as_ref()
                 .map_or_else(|| json!({}), |c| json!({"cursor":c}));
             let mut result = self.request(server, "tools/list", params, cx).await?;
+            budget.include(&result)?;
             let page = result
                 .get_mut("tools")
                 .and_then(Value::as_array_mut)
@@ -277,7 +283,12 @@ impl Extension for Mcp {
         );
         for server in &self.0.servers {
             use std::fmt::Write;
-            let _ = writeln!(index, "{}: {}", server.name, server.description);
+            let _ = writeln!(
+                index,
+                "{}: {}",
+                server.name,
+                discovery::description(&server.description)
+            );
         }
         r.text(Text::system("mcp", 30, index))
             .tool(List(self.clone()))
@@ -378,7 +389,7 @@ impl Tool for List {
                 Value::Array(
                     tools
                         .into_iter()
-                        .map(|t| json!({"name":t["name"],"description":t["description"]}))
+                        .map(|t| json!({"name":t["name"],"description":t["description"].as_str().map(discovery::description)}))
                         .collect(),
                 )
             })

@@ -41,6 +41,21 @@ fn main() {
             "server/discover" => {
                 json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}})
             }
+            "tools/list" if marker.contains("review-large-list") => {
+                let page: usize = request["params"]["cursor"]
+                    .as_str()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap();
+                let mut result = json!({"resultType":"complete","tools":[{"name":format!("tool-{page}"),"description":"x".repeat(900_000),"inputSchema":{"type":"object"}}]});
+                if page < 19 {
+                    result["nextCursor"] = json!((page + 1).to_string());
+                }
+                result
+            }
+            "tools/list" if marker.contains("bounded-escaped") => {
+                json!({"resultType":"complete","tools":[{"name":"echo","description":"é".repeat(2000),"inputSchema":{"type":"object","description":"\u{0000}\n\\".repeat(80_000)}}]})
+            }
             "tools/list" => {
                 json!({"resultType":"complete","tools":[{"name":"echo","description":"Echo arguments","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]})
             }

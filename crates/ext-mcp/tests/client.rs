@@ -218,3 +218,39 @@ fn progress_bursts_publish_a_bounded_latest_value() {
     finish(&rig);
 }
 
+#[test]
+fn paginated_discovery_cannot_exceed_the_client_frame_budget() {
+    let rig = rig("review-large-list", Duration::from_secs(10));
+    let result = rig.done("mcp_list", &json!({"server":"fixture"}));
+    finish(&rig);
+    assert_eq!(result["failed"], "limit");
+    let bytes = serde_json::to_vec(&result).unwrap().len();
+    assert!(
+        bytes < 16 * 1024 * 1024,
+        "MCP list produced {bytes} bytes before entry/card framing"
+    );
+}
+
+#[test]
+fn selected_schemas_and_compact_indexes_fit_with_their_escaped_cards() {
+    let rig = rig("bounded-escaped", Duration::from_secs(10));
+    let list = rig.done("mcp_list", &json!({"server":"fixture"}));
+    assert!(list["ok"][0]["description"].as_str().unwrap().len() <= 512);
+    let cx = rig.cx();
+    let input = protocol::Json::encode(&json!({"server":"fixture","tool":"echo"})).unwrap();
+    let called = rt::block_on(rig.registry.tools().run("mcp_schema", &input, None, &cx));
+    assert!(matches!(called.outcome, protocol::Outcome::Done { .. }));
+    let entry = protocol::Entry::new(
+        protocol::Seq::new(2).unwrap(),
+        protocol::Epoch(1),
+        protocol::Body::ToolResult {
+            call: cx.call,
+            outcome: called.outcome,
+            card: called.card,
+        },
+    );
+    let frame = protocol::Frame::entry(&entry).unwrap();
+    assert!(frame.as_bytes().len() < 4 * 1024 * 1024);
+    assert!(protocol::frame_in(frame.as_bytes()).unwrap().is_some());
+    finish(&rig);
+}
