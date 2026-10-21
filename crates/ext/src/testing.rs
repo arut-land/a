@@ -168,11 +168,12 @@ impl Host for Recorder {
     }
 
     fn publish(&self, ext: &str, state: &str, data: Json, text: String) -> BoxFuture<'static, ()> {
-        let done = self.note(ext, state, data);
-        let mut log = lock(&self.log);
-        let seq = Seq::new(log.len() as u64 + 1).unwrap();
-        log.push(Entry::new(seq, Epoch(0), Body::Context { text }));
-        done
+        {
+            let mut log = lock(&self.log);
+            let seq = Seq::new(log.len() as u64 + 1).unwrap();
+            log.push(Entry::new(seq, Epoch(0), Body::Context { text }));
+        }
+        self.note(ext, state, data)
     }
 
     fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<Json>) {

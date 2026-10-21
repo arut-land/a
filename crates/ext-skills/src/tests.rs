@@ -56,7 +56,7 @@ fn instructions_are_published_once_and_replay_uses_only_the_log() {
         1
     );
     assert!(
-        matches!(&log[0].body, Body::Ext { ext, state, .. } if ext == "skills" && state == "loaded")
+        matches!(&log[1].body, Body::Ext { ext, state, .. } if ext == "skills" && state == "loaded")
     );
     rig.restart();
     assert_eq!(

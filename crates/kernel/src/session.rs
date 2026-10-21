@@ -674,8 +674,9 @@ impl Core {
                 {
                     self.append(fx, Body::Context { text });
                 }
-                self.append(fx, Body::Ext { ext, state, data });
-                Body::Context { text }
+                // A durable prefix cannot remember publication without its text.
+                self.append(fx, Body::Context { text });
+                Body::Ext { ext, state, data }
             }
             Note::Edit {
                 target,
