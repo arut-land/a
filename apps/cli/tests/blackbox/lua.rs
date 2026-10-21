@@ -59,7 +59,7 @@ fn named_lua_invocations_share_the_owners_instruction_budget() {
     env.start();
     let mut conn = env.connect();
     conn.attach(Target::New, &env.ws);
-    assert_eq!(done(&mut conn, "/budget leaf"), 4501500);
+    assert_eq!(done(&mut conn, "/budget leaf"), 4_501_500);
     conn.input("/budget");
     let entries = conn.until(
         |e| matches!(&e.body, Body::ToolCall { invoke: None, tool, .. } if tool == "budget"),
