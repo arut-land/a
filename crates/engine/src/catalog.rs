@@ -95,8 +95,9 @@ impl Catalog {
             _ => None,
         };
         // No log may change while a clean catalog can survive a crash.
-        File::create(&dirty)?.sync_all()?;
-        sys::fs::sync_dir(path.parent().unwrap())?;
+        let pending = dirty.with_extension("dirty.new");
+        File::create(&pending)?.sync_all()?;
+        sys::fs::publish(&pending, &dirty)?;
         let rebuilt = read.is_none();
         let catalog = Self::with(Some(path), read.map_or_else(|| rebuild(store), Ok)?);
         let mut state = lock(&catalog.state);
@@ -123,8 +124,7 @@ impl Catalog {
         let mut state = lock(&self.state);
         state.file = Some(rewrite(path, &state)?);
         state.lines = state.records.len();
-        fs::remove_file(path.with_extension("dirty"))?;
-        sys::fs::sync_dir(path.parent().unwrap())
+        sys::fs::remove_durable(&path.with_extension("dirty"))
     }
 
     fn with(path: Option<PathBuf>, state: State) -> Self {
@@ -279,7 +279,6 @@ fn rewrite(path: &Path, state: &State) -> io::Result<File> {
         file.write_all(&line(record)?)?;
     }
     file.sync_all()?;
-    sys::fs::replace(&new, path)?;
-    sys::fs::sync_dir(path.parent().unwrap())?;
+    sys::fs::publish(&new, path)?;
     OpenOptions::new().append(true).open(path)
 }

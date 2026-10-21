@@ -32,7 +32,7 @@ Windows daemon startup uses a re-listen handshake under `start.lock`.
 After checking the daemon lock, the starter closes its record handle,
 launches the child with `DETACHED_PROCESS`, and waits at most ten seconds for the child's binding acknowledgement through its
 stdout pipe. No daemon transport or lock handle is inherited. The child
-then claims the record and starts accepting; clients wait for its hello.
+claims the record before acknowledging readiness, then starts accepting; clients wait for its hello.
 Unix retains the bound-descriptor handoff and backlog connection.
 
 Record locks cover one byte far beyond the record's contents. Windows
@@ -142,3 +142,23 @@ successor therefore creates its own namespace with FIRST_PIPE_INSTANCE even
 when a client retains a previous generation's handle. No extra discovery file
 or compatibility path is needed. The portable retained-client acceptance test
 covers graceful restart; native CI exercises the Windows namespace lifetime.
+
+## Durable namespace publication
+
+Flushed files are published on NTFS with same-volume MoveFileExW using
+REPLACE_EXISTING and WRITE_THROUGH. File content flush precedes the rename;
+completion waits for the move on disk. No cross-volume copy fallback is
+allowed. Imports, catalog rewrites and dirty markers use this path. A new
+Windows log publishes its flushed header before handing out an append
+handle and a Publication receipt; Unix retains its deferred name barrier.
+Removing the catalog dirty marker durably renames it to an ignored tombstone
+before deleting that tombstone. A crash can leave garbage, not a clean
+catalog paired with an unpublished rewrite.
+
+Directory FlushFileBuffers with BACKUP_SEMANTICS has no documented persistence
+contract used here. Windows sync_dir returns Unsupported, rather than silently
+certifying a name. The guarantee assumes local NTFS and devices honoring
+flushes. Native CI exercises the operation and error paths; power-loss
+persistence still requires a storage test. This changes no dependency and adds
+one header flush/publication per new Windows session, without changing Unix's
+shared first-entry barrier. No Windows performance measurement is claimed.

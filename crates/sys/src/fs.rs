@@ -100,22 +100,117 @@ pub fn order_dir(dir: &Path) -> io::Result<()> {
     sync_dir(dir)
 }
 
-/// Makes the entries of `dir` durable: a file created in it survives a
-/// crash. Windows has no directory flush here; file flushes provide its
-/// filesystem ordering (see docs/perf/sessions.md).
+/// Makes directory entries durable on platforms with a directory barrier.
+/// Windows callers must publish names with `publish` instead.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
+    return File::open(dir)?.sync_all();
     #[cfg(windows)]
-    let _ = dir;
+    {
+        let _ = dir;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "publish names with write-through rename",
+        ))
+    }
+}
+
+/// Atomically replaces a name. Windows also waits for the move on disk.
+pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    return fs::rename(from, to);
+    #[cfg(windows)]
+    move_file(from, to, true)
+}
+
+#[cfg(windows)]
+fn move_file(from: &Path, to: &Path, replacing: bool) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let from = crate::windows::wide(from.as_os_str());
+    let to = crate::windows::wide(to.as_os_str());
+    // WRITE_THROUGH waits for the move on disk; COPY_ALLOWED is deliberately
+    // absent so publication cannot degrade to a cross-volume copy/delete.
+    // Microsoft does not document FlushFileBuffers as a directory barrier.
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw
+    // SAFETY: both NUL-terminated paths remain alive for the call.
+    crate::windows::ok(unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            if replacing {
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+            } else {
+                MOVEFILE_WRITE_THROUGH
+            },
+        )
+    })
+}
+
+/// Publishes an already flushed file, including its directory entry.
+pub fn publish(from: &Path, to: &Path) -> io::Result<()> {
+    replace(from, to)?;
+    #[cfg(unix)]
+    sync_dir(to.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
     Ok(())
 }
 
-/// Replaces `to` with `from` in one step: a reader sees the old file or
-/// the new one. `rename`, which on Windows std makes
-/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`.
-pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
+/// Removes the durable name before best-effort reclamation of its contents.
+pub fn remove_durable(path: &Path) -> io::Result<()> {
+    let tombstone = path.with_extension("removed");
+    publish(path, &tombstone)?;
+    fs::remove_file(tombstone)
+}
+
+/// A name whose publication must precede the log's first durable promise.
+/// Windows receives this only after a flushed temporary file was published;
+/// Unix retains its deferred directory barrier to share the first log flush.
+pub struct Publication {
+    #[cfg(unix)]
+    parent: std::path::PathBuf,
+}
+
+impl Publication {
+    pub fn order(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        order_dir(&self.parent)?;
+        Ok(())
+    }
+}
+
+/// Opens a log, optionally creating its header in an unpublished name first.
+pub fn open_log(path: &Path, header: Option<&[u8]>) -> io::Result<(File, Publication)> {
+    use std::io::Write;
+    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    #[cfg(windows)]
+    if let Some(header) = header {
+        let pending = path.with_extension("creating");
+        // Exclusive creation prevents two writers from sharing a temporary file.
+        let mut file = private_file().open(&pending)?;
+        file.write_all(header)?;
+        file.sync_all()?;
+        drop(file);
+        move_file(&pending, path, false)?;
+    }
+    let mut open = OpenOptions::new();
+    open.read(true).append(true);
+    #[cfg(unix)]
+    open.create_new(header.is_some());
+    let mut file = open.open(path)?;
+    #[cfg(unix)]
+    if let Some(header) = header {
+        file.write_all(header)?;
+    }
+    #[cfg(windows)]
+    let _ = (&mut file, parent);
+    Ok((
+        file,
+        Publication {
+            #[cfg(unix)]
+            parent: parent.to_owned(),
+        },
+    ))
 }
 
 /// Options that create a new file only its owner can read and write
@@ -458,5 +553,45 @@ mod lock_tests {
         try_lock(&other).unwrap();
         drop(other);
         fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn a_published_log_has_its_complete_header_before_appends() {
+        let root = std::env::temp_dir().join(format!("a-publish-log-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let (mut file, publication) = open_log(&path, Some(b"header\n")).unwrap();
+        publication.order().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"header\n");
+        assert!(open_log(&path, Some(b"replacement\n")).is_err());
+        file.write_all(b"entry\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let (mut file, publication) = open_log(&path, None).unwrap();
+        publication.order().unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"header\nentry\n");
+        drop(file);
+        remove_durable(&path).unwrap();
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_publication_never_replaces_the_existing_name() {
+        let root = std::env::temp_dir().join(format!("a-publish-failure-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("published");
+        fs::write(&path, b"old").unwrap();
+        assert!(publish(&root.join("missing"), &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        fs::remove_dir_all(root).unwrap();
     }
 }
