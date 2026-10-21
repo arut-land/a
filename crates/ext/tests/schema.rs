@@ -76,13 +76,13 @@ fn advertised_properties_match_deserialization() {
     struct Input {
         #[serde(rename = "type", skip_serializing)]
         r#kind: String,
-        #[serde(default = "default_count", skip_serializing_if = "Option::is_none")]
-        count: Option<u64>,
-        #[serde(default)]
+        #[serde(default = "default_count")]
+        count: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         enabled: bool,
     }
-    fn default_count() -> Option<u64> {
-        Some(3)
+    fn default_count() -> u64 {
+        3
     }
     let schema: Value = serde_json::from_str(&of::<Input>()).unwrap();
     assert_eq!(schema["required"], json!(["type"]));
@@ -95,10 +95,10 @@ fn advertised_properties_match_deserialization() {
     let decoded: Input = serde_json::from_value(values).unwrap();
     assert_eq!(
         (decoded.kind.as_str(), decoded.count, decoded.enabled),
-        ("call", Some(8), true)
+        ("call", 8, true)
     );
     let defaulted: Input = serde_json::from_value(json!({"type": "call"})).unwrap();
-    assert_eq!((defaulted.count, defaulted.enabled), (Some(3), false));
+    assert_eq!((defaulted.count, defaulted.enabled), (3, false));
     assert!(serde_json::from_value::<Input>(json!({"count": 8})).is_err());
     assert!(serde_json::from_value::<Input>(json!({"kind": "call"})).is_err());
     assert!(serde_json::from_value::<Input>(json!({"type": "call", "extra": 1})).is_err());
@@ -112,8 +112,7 @@ fn unsupported_serde_shape_changes_fail_to_compile() {
     let home = std::env::temp_dir().join(format!("a-schema-ui-{}", std::process::id()));
     fs::create_dir_all(home.join("src")).unwrap();
     fs::write(home.join("Cargo.toml"), format!(
-        "[package]\nname = \"schema-ui\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n[dependencies]\next = {{ path = {:?} }}\nserde = {{ version = \"1\", features = [\"derive\"] }}\n",
-        manifest,
+        "[package]\nname = \"schema-ui\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n[dependencies]\next = {{ path = {manifest:?} }}\nserde = {{ version = \"1\", features = [\"derive\"] }}\n",
     )).unwrap();
     fs::copy(
         manifest.join("tests/schema/unsupported.rs"),
