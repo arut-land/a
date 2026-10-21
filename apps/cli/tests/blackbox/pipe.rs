@@ -52,7 +52,7 @@ fn only_session(env: &Env) -> String {
 fn piped_stdin_is_one_prompt_and_only_the_reply_reaches_stdout() {
     let env = Env::new("pipe-reply");
     let out = piped(&env, &[], "two\nlines\n");
-    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(out.status.success(), "{out:?}");
     // The echo agent's reply, and no session line, escape or spinner.
     assert_eq!(text(&out.stdout), "two\nlines\n");
     assert_eq!(text(&out.stderr), "");
@@ -63,7 +63,7 @@ fn piped_stdin_is_one_prompt_and_only_the_reply_reaches_stdout() {
 fn a_prompt_goes_first_and_piped_stdin_follows_it() {
     let env = Env::new("pipe-prompt");
     let out = piped(&env, &["-p", "sum up"], "l1\nl2\n");
-    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(out.status.success(), "{out:?}");
     assert_eq!(text(&out.stdout), "sum up\n\nl1\nl2\n");
     let out = piped(&env, &["--prompt", "again", "resume"], "");
     assert_eq!(text(&out.stdout), "again\n");
@@ -123,11 +123,11 @@ fn the_mode_flag_or_its_variable_lets_a_piped_run_through() {
     let mut env = Env::new("pipe-mode");
     env.ext("policy", "ask = [\"bash\"]");
     let out = piped(&env, &["--mode", "auto"], "$ echo one > one.txt");
-    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(out.status.success(), "{out:?}");
     assert!(env.ws.join("one.txt").exists());
     env.vars.push(("A_MODE", "auto"));
     let out = piped(&env, &[], "$ echo two > two.txt");
-    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(out.status.success(), "{out:?}");
     assert!(env.ws.join("two.txt").exists());
     let out = piped(&env, &["--mode", "nope"], "hi");
     assert_eq!(out.status.code(), Some(1));
