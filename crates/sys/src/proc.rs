@@ -148,6 +148,48 @@ pub fn process_started(pid: u32) -> Option<u64> {
     imp::process_started(pid)
 }
 
+/// A daemon identity bound to its stop target. On Windows the same owned
+/// query+terminate handle checks creation time and performs termination.
+pub struct RecordedProcess {
+    #[cfg(windows)]
+    process: imp::RecordedProcess,
+    #[cfg(unix)]
+    record: crate::crash::Record,
+}
+
+impl RecordedProcess {
+    pub fn open(record: &crate::crash::Record) -> io::Result<Self> {
+        #[cfg(windows)]
+        return imp::RecordedProcess::open(record.pid, record.token)
+            .map(|process| Self { process });
+        #[cfg(unix)]
+        {
+            if !record.is_live() {
+                return Err(io::Error::other(
+                    "process is no longer the daemon that recorded it",
+                ));
+            }
+            Ok(Self {
+                record: record.clone(),
+            })
+        }
+    }
+
+    pub fn signal(&self, signal: Signal) -> io::Result<()> {
+        #[cfg(windows)]
+        return self.process.signal(signal);
+        #[cfg(unix)]
+        {
+            if !self.record.is_live() {
+                return Err(io::Error::other(
+                    "process is no longer the daemon that recorded it",
+                ));
+            }
+            signal_process(self.record.pid, signal)
+        }
+    }
+}
+
 /// Sends `signal` to a process.
 pub fn signal_process(pid: u32, signal: Signal) -> io::Result<()> {
     imp::signal_process(pid, signal)

@@ -627,18 +627,10 @@ pub fn stop(home: &Home) -> io::Result<bool> {
     if ask_to_stop(home, &daemon.build).is_ok() && wait_exited(home, Some(HELLO_TIMEOUT)) {
         return Ok(true);
     }
-    let signal = |signal| {
-        if !daemon.is_live() {
-            return Err(io::Error::other(format!(
-                "pid {} is no longer the daemon that recorded it; not signalling it",
-                daemon.pid
-            )));
-        }
-        sys::signal_process(daemon.pid, signal)
-    };
-    signal(Signal::Terminate)?;
+    let process = sys::RecordedProcess::open(&daemon)?;
+    process.signal(Signal::Terminate)?;
     if !wait_exited(home, Some(HELLO_TIMEOUT)) {
-        signal(Signal::Kill)?;
+        process.signal(Signal::Kill)?;
         wait_exited(home, None);
     }
     home.endpoint().remove();

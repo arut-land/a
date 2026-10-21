@@ -213,14 +213,18 @@ pub fn signal_group(id: u32, _signal: Signal) -> io::Result<()> {
 pub fn process_started(pid: u32) -> Option<u64> {
     // SAFETY: scalar inputs, checked owned result.
     let process = owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) }).ok()?;
+    created_at(&process).ok()
+}
+
+fn created_at(process: &OwnedHandle) -> io::Result<u64> {
     let mut times = [FILETIME {
         dwLowDateTime: 0,
         dwHighDateTime: 0,
     }; 4];
     let [created, exited, kernel, user] = &mut times;
     // SAFETY: the outputs are distinct FILETIME buffers and process is live.
-    ok(unsafe { GetProcessTimes(process.as_raw_handle(), created, exited, kernel, user) }).ok()?;
-    Some(u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime))
+    ok(unsafe { GetProcessTimes(process.as_raw_handle(), created, exited, kernel, user) })?;
+    Ok(u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime))
 }
 
 pub fn exit_watch(pid: u32) -> io::Result<OwnedHandle> {
@@ -234,10 +238,40 @@ pub fn exit_watch(pid: u32) -> io::Result<OwnedHandle> {
     })
 }
 
+/// The verified kernel object stays owned across both stop attempts.
+pub struct RecordedProcess(OwnedHandle);
+
+impl RecordedProcess {
+    pub fn open(pid: u32, expected: Option<u64>) -> io::Result<Self> {
+        // Holding the query+terminate handle pins identity even if the process
+        // exits and its numeric PID is reused before the stop attempt.
+        // https://learn.microsoft.com/en-us/windows/win32/procthread/process-handles-and-identifiers
+        // SAFETY: scalar inputs, with the checked handle immediately owned.
+        let process = owned(unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                0,
+                pid,
+            )
+        })?;
+        if expected != Some(created_at(&process)?) {
+            return Err(io::Error::other(
+                "process is no longer the daemon that recorded it",
+            ));
+        }
+        Ok(Self(process))
+    }
+
+    pub fn signal(&self, _signal: Signal) -> io::Result<()> {
+        // SAFETY: identity was checked through this same owned handle.
+        ok(unsafe { TerminateProcess(self.0.as_raw_handle(), 1) })
+    }
+}
+
 pub fn signal_process(pid: u32, _signal: Signal) -> io::Result<()> {
     // SAFETY: scalar inputs; checked handle is owned until termination returns.
     let process = owned(unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) })?;
-    // SAFETY: the caller validated the daemon's creation time before signalling.
+    // SAFETY: callers own this child PID; daemon stop uses RecordedProcess.
     ok(unsafe { TerminateProcess(process.as_raw_handle(), 1) })
 }
 
@@ -367,6 +401,37 @@ mod tests {
         child.wait().unwrap();
         reader.join().unwrap();
         assert_eq!(result.unwrap().unwrap(), 0);
+    }
+
+    #[test]
+    fn stop_keeps_one_verified_handle_through_exit_and_a_successor() {
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/D", "/C", "ping -n 60 127.0.0.1 >NUL"])
+            .envs(std::env::vars_os());
+        let mut child = spawn_group(
+            &mut command,
+            File::options().write(true).open("NUL").unwrap(),
+        )
+        .unwrap();
+        let token = process_started(child.id()).unwrap();
+        let missing_rejected = RecordedProcess::open(child.id(), None).is_err();
+        let wrong_rejected = RecordedProcess::open(child.id(), Some(token + 1)).is_err();
+        let process = RecordedProcess::open(child.id(), Some(token)).unwrap();
+        process.signal(Signal::Terminate).unwrap();
+        child.wait().unwrap();
+        signal_group(child.id(), Signal::Kill).unwrap();
+        let mut successor = spawn_group(
+            &mut command,
+            File::options().write(true).open("NUL").unwrap(),
+        )
+        .unwrap();
+        let _ = process.signal(Signal::Kill);
+        let successor_alive = successor.try_wait().unwrap().is_none();
+        signal_group(successor.id(), Signal::Kill).unwrap();
+        successor.wait().unwrap();
+        assert!(missing_rejected && wrong_rejected);
+        assert!(successor_alive);
     }
 
     #[test]

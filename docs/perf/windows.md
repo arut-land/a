@@ -162,3 +162,12 @@ flushes. Native CI exercises the operation and error paths; power-loss
 persistence still requires a storage test. This changes no dependency and adds
 one header flush/publication per new Windows session, without changing Unix's
 shared first-entry barrier. No Windows performance measurement is claimed.
+
+## Stop target ownership
+
+Fallback stop opens one query+terminate process handle, validates the recorded
+creation token through that handle, and keeps it across both stop attempts.
+Termination never reopens the PID. Missing or mismatched Windows tokens are
+rejected. The existing portable impostor-record test protects the public stop
+path; the native handle test retains the verified target after exit, starts a
+successor and confirms a second signal cannot affect that successor.
