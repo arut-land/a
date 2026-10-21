@@ -346,7 +346,20 @@ impl Env {
     /// A session's log as stored, asserting that every line is a complete
     /// entry.
     pub fn log(&self, id: SessionId) -> Vec<Entry> {
-        let path = self.home.sessions_dir().join(format!("{id}/log.jsonl"));
+        let mut roots = vec![self.home.sessions_dir()];
+        let path = loop {
+            let root = roots.pop().expect("session log exists");
+            let path = root.join(id.to_string()).join("log.jsonl");
+            if path.is_file() {
+                break path;
+            }
+            for entry in fs::read_dir(root).unwrap() {
+                let children = entry.unwrap().path().join("children");
+                if children.is_dir() {
+                    roots.push(children);
+                }
+            }
+        };
         let text = fs::read_to_string(path).unwrap();
         assert!(text.ends_with('\n'), "torn final line in {text}");
         text.lines()

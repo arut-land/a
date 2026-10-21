@@ -417,7 +417,7 @@ fn a_non_inheritable_extension_contributes_nothing_to_children() {
     let child = parent.inherited().unwrap();
     assert!(child.tools().get("bash").is_none());
     assert_eq!(child.commands().count(), 0);
-    assert!(child.system_prompt().is_empty());
+    assert_eq!(child.system_prompt(), "");
     assert_eq!(child.extensions().count(), 0);
     assert_eq!(child.installed(), parent.installed());
     assert_eq!(child.inherited().unwrap().extensions().count(), 0);
