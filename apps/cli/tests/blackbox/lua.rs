@@ -189,6 +189,7 @@ fn a_historical_fork_keeps_its_lua_generation_and_fold_across_restart() {
         )
     };
     write(&dir, "counter", &source(1));
+    env.start();
     let mut conn = env.connect();
     let (id, _) = conn.attach(Target::New, &env.ws);
     assert_eq!(done(&mut conn, "/count"), 1);
@@ -205,6 +206,7 @@ fn a_historical_fork_keeps_its_lua_generation_and_fold_across_restart() {
     assert_eq!(env.log(id), before);
     drop((conn, branch));
     assert!(env.cmd(&["daemon", "stop"]).status().unwrap().success());
+    env.start();
     let mut branch = env.connect();
     branch.attach(Target::Prefix(fork.to_owned()), &env.ws);
     assert_eq!(done(&mut branch, "/count"), 3);
