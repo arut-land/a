@@ -1,5 +1,5 @@
 //! Concurrent file-backed load and snapshot measurements; run instructions
-//! and results are in runtime-demand.md. No network provider is contacted.
+//! and results are in docs/perf/runtime-demand.md. No network provider is contacted.
 
 use super::*;
 use crate::outbox::Outbox;

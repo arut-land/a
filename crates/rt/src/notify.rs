@@ -77,29 +77,50 @@ impl Notify {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Threads, block_on, spawn};
+    use crate::block_on;
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Wake};
+
+    struct Count(AtomicUsize);
+
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn a_notify_wakes_every_waiter_and_is_remembered() {
-        static NOTIFY: Notify = Notify::new();
-        let rt = Threads::new(2);
-        let waiters: Vec<_> = (0..3)
+        let notify = Notify::new();
+        let mut waiters: Vec<_> = (0..3)
             .map(|_| {
-                spawn(&rt, async {
-                    let mut seen = 0;
-                    NOTIFY.changed(&mut seen).await;
-                    seen
-                })
+                let count = Arc::new(Count(AtomicUsize::new(0)));
+                let mut changed = Box::pin(notify.until(|| notify.count() != 0));
+                let waker = Waker::from(Arc::clone(&count));
+                assert!(
+                    changed
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                (changed, count)
             })
             .collect();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        NOTIFY.notify();
-        for waiter in waiters {
-            assert_eq!(block_on(waiter), 1);
+        notify.notify();
+        for (waiter, count) in &mut waiters {
+            assert_eq!(count.0.load(Ordering::SeqCst), 1);
+            block_on(waiter);
         }
-        // One that missed it sees it once.
         let mut seen = 0;
-        block_on(NOTIFY.changed(&mut seen));
+        block_on(notify.changed(&mut seen));
         assert_eq!(seen, 1);
+        assert!(
+            pin!(notify.changed(&mut seen))
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
     }
 }

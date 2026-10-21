@@ -17,7 +17,7 @@ pub fn open_browser(link: &str) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     crate::proc::prepare_spawn(&mut command);
-    let mut child = command.spawn()?;
+    let mut child = crate::proc::spawn(&mut command)?;
     // Some openers stay until the browser they started exits.
     thread::spawn(move || child.wait());
     Ok(())

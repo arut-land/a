@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#MISE description="Sample idle daemon RSS and profiler output on macOS"
 """Sample a fixture binary at the idle budget boundary, in fresh homes."""
 import argparse
 import fcntl

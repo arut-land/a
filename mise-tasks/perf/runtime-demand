@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+#MISE description="Measure concurrent file-backed session loads and snapshots"
+set -euo pipefail
+cargo nextest run --release -p engine --lib \
+  -E 'test(tests::runtime_demand::concurrent_session_sizing)' \
+  --run-ignored only --test-threads 1 --no-capture --no-tests fail

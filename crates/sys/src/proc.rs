@@ -16,6 +16,19 @@ pub(crate) use imp::passed;
 pub(crate) use imp::raw;
 pub use imp::{Child, ExitWatch};
 
+/// macOS creates std's exec-error pipe before setting CLOEXEC. A fork
+/// meanwhile can keep its writer alive until that unrelated child exits.
+pub(crate) fn spawn(cmd: &mut Command) -> io::Result<std::process::Child> {
+    #[cfg(target_vendor = "apple")]
+    let _spawning = {
+        static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SPAWNING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    cmd.spawn()
+}
+
 pub(crate) fn prepare_spawn(cmd: &mut Command) {
     #[cfg(unix)]
     {
@@ -324,7 +337,7 @@ mod imp {
         ]);
         super::prepare_spawn(cmd);
         pass(cmd, handles)?;
-        let child = cmd.spawn();
+        let child = super::spawn(cmd);
         drop((listener, lock));
         child
     }
@@ -341,8 +354,8 @@ mod imp {
         lead(cmd);
         cmd.stdin(std::process::Stdio::null())
             .stdout(output.try_clone()?)
-            .stderr(output)
-            .spawn()
+            .stderr(output);
+        super::spawn(cmd)
     }
 
     pub fn passed(fd: &impl AsRawFd) -> Passed {
@@ -906,11 +919,10 @@ pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(Child, ProcessPipe, Process
         use std::os::fd::OwnedFd;
         use std::process::Stdio;
         imp::lead(cmd);
-        let mut child = cmd
-            .stdin(Stdio::piped())
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        let mut child = spawn(cmd)?;
         let input = File::from(OwnedFd::from(child.stdin.take().unwrap()));
         let output = File::from(OwnedFd::from(child.stdout.take().unwrap()));
         Ok((child, input, output))
