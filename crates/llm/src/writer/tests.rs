@@ -1,5 +1,3 @@
-//! Ported from rig's completion-writer tests.
-
 use std::collections::HashSet;
 
 use serde_json::{Value, json};
@@ -599,4 +597,131 @@ fn landing_sets_the_streamed_text_on_the_item_whole() {
         item(&parts[0]),
         Some(json!({"type": "text", "text": "hello"}))
     );
+}
+
+#[test]
+fn all_ingress_paths_obey_the_same_reply_budget() {
+    fn writer() -> Writer {
+        let mut w = Writer::new("test");
+        w.core.limits = DecodeLimits {
+            reply_bytes: 128,
+            argument_bytes: 128,
+            ..Default::default()
+        };
+        w
+    }
+    fn limit(result: Result<(), Error>) {
+        let error = result.expect_err("oversized ingress");
+        assert_eq!(error.kind, Kind::Decode);
+        assert!(error.message.starts_with("reply exceeds the "));
+        assert!(!error.is_retryable());
+    }
+    let huge = "x".repeat(129);
+    let mut w = writer();
+    w.open(0, Open::Text, Value::Null).unwrap();
+    limit(w.push(0, &huge));
+    assert_eq!(w.text(0), Some(""));
+    limit(w.restate(0, &huge));
+    assert_eq!(w.text(0), Some(""));
+    limit(writer().whole(0, Open::Text, Value::Null, &huge));
+    limit(writer().open(0, Open::Opaque { replay: true }, json!({"blob": huge})));
+    limit(writer().open(
+        0,
+        Open::Media(Media {
+            media_type: "image/png".into(),
+            source: crate::Source::Data { data: huge.clone() },
+            meta: Meta::new(),
+        }),
+        Value::Null,
+    ));
+    let mut w = writer();
+    w.open(0, Open::Text, Value::Null).unwrap();
+    limit(w.edit(0, |item| *item = json!({"blob": huge})));
+    let mut w = writer();
+    w.whole(0, Open::Text, json!({}), "").unwrap();
+    limit(w.edit(0, |item| *item = json!({"blob": huge})));
+    let mut w = writer();
+    w.open(
+        0,
+        Open::Call {
+            id: "id".into(),
+            name: "tool".into(),
+        },
+        Value::Null,
+    )
+    .unwrap();
+    limit(w.announce(0, json!({"blob": huge})));
+    limit(writer().fragment(
+        0,
+        CallFragment {
+            arguments: Some(&huge),
+            ..Default::default()
+        },
+    ));
+    let mut w = writer();
+    w.open(0, Open::Text, Value::Null).unwrap();
+    w.push(0, "x".repeat(80)).unwrap();
+    limit(w.push(0, "x".repeat(49)));
+    limit(w.land(0, "text"));
+    let mut w = writer();
+    w.ingress(&" ".repeat(100)).unwrap();
+    limit(w.ingress(&" ".repeat(29)));
+    let mut w = writer();
+    limit(w.reserve(129));
+    let mut w = writer();
+    limit(
+        w.end(End {
+            raw_usage: Some(json!({"blob": huge})),
+            ..Default::default()
+        })
+        .map(drop),
+    );
+}
+
+#[test]
+fn arguments_and_unstarted_parts_have_independent_ceilings() {
+    let mut w: Writer = Writer::new("test");
+    w.core.limits = DecodeLimits {
+        argument_bytes: 8,
+        parts: 2,
+        depth: 2,
+        ..Default::default()
+    };
+    let fragment = |arguments| CallFragment {
+        arguments: Some(arguments),
+        ..Default::default()
+    };
+    w.fragment(0, fragment(r#"{"a":"#)).unwrap();
+    assert_eq!(
+        w.fragment(0, fragment("12345")).unwrap_err().kind,
+        Kind::Decode
+    );
+    assert_eq!(w.restate(0, "123456789").unwrap_err().kind, Kind::Decode);
+    assert_eq!(
+        w.announce(0, json!({"a": "1234"})).unwrap_err().kind,
+        Kind::Decode
+    );
+    w.open(1, Open::Text, Value::Null).unwrap();
+    assert_eq!(
+        w.open(2, Open::Text, Value::Null).unwrap_err().kind,
+        Kind::Decode
+    );
+    let mut w: Writer = Writer::new("test");
+    w.core.limits.depth = 2;
+    w.fragment(0, fragment(r#"{"a":["#)).unwrap();
+    assert_eq!(w.fragment(0, fragment("[")).unwrap_err().kind, Kind::Decode);
+    assert_eq!(w.ingress("[[[]]]").unwrap_err().kind, Kind::Decode);
+    let nested = serde_json::to_string("[[[]]]").unwrap();
+    w.fragment(
+        1,
+        CallFragment {
+            name: Some("tool"),
+            arguments: Some(&nested),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let error = w.finish(1).unwrap_err();
+    assert!(error.message.contains("JSON depth"));
+    assert!(!error.is_retryable());
 }

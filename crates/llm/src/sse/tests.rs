@@ -117,3 +117,66 @@ fn a_done_event_stops_the_framing() {
     assert!(matches!(flow, Ok(Flow::Done)));
     assert_eq!(seen, ["one"]);
 }
+
+#[test]
+fn frame_limits_cover_unterminated_lines_and_multiline_events() {
+    use super::DecodeLimits;
+    use crate::Kind;
+    let limits = DecodeLimits {
+        frame_bytes: 32,
+        ..Default::default()
+    };
+    for chunks in [
+        vec![vec![b'x'; 33]],
+        vec![vec![b'x'; 16], vec![b'x'; 17]],
+        vec![
+            b"data: 1234567890\n".to_vec(),
+            b"data: 1234567890\n\n".to_vec(),
+        ],
+    ] {
+        let mut framer = SseFramer::with_limits(limits);
+        let mut failure = None;
+        for chunk in chunks {
+            if let Err(error) = framer.push(&chunk, |_| Ok(Flow::More)) {
+                failure = Some(error);
+                break;
+            }
+        }
+        assert_eq!(failure.expect("bounded frame").kind, Kind::Decode);
+        assert!(framer.buffer.len() <= limits.frame_bytes);
+        assert!(framer.data.len() <= limits.frame_bytes);
+    }
+    let mut framer = SseFramer::with_limits(limits);
+    assert_eq!(events(&mut framer, &b"data: x\n\n".repeat(100)).len(), 100);
+    let mut framer = SseFramer::with_limits(limits);
+    assert_eq!(
+        framer
+            .push(&b"data: x\n\n".repeat(100), |_| Ok(Flow::Done))
+            .unwrap(),
+        Flow::Done
+    );
+}
+
+#[test]
+fn frame_bytes_include_both_bytes_of_crlf_and_replayed_bom_prefixes() {
+    let mut framer = SseFramer::with_limits(super::DecodeLimits {
+        frame_bytes: 11,
+        ..Default::default()
+    });
+    assert!(framer.push(b"data: x\r\n\r\n", |_| Ok(Flow::More)).is_ok());
+    let mut framer = SseFramer::with_limits(super::DecodeLimits {
+        frame_bytes: 10,
+        ..Default::default()
+    });
+    assert!(framer.push(b"data: x\r\n\r\n", |_| Ok(Flow::More)).is_err());
+    let mut framer = SseFramer::with_limits(super::DecodeLimits {
+        frame_bytes: 1,
+        ..Default::default()
+    });
+    assert!(
+        framer
+            .push(&[0xef, 0xbb, b'x'], |_| Ok(Flow::More))
+            .is_err()
+    );
+    assert_eq!(framer.buffer.len(), 0);
+}

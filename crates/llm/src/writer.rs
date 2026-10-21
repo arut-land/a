@@ -5,8 +5,9 @@
 //! - A part opens to the consumer at its first content, so empty text and
 //!   reasoning never appear; a call opens once it names its tool, and one
 //!   that never does is dropped.
-//! - A call's arguments are parsed at its end and never fail the reply; a
-//!   call with no id, or one an earlier call took, gets a fresh id.
+//! - A call's malformed arguments are kept at its end; resource limits fail
+//!   the reply. A call with no id, or one an earlier call took, gets a
+//!   fresh id.
 //! - Provider items become part state only when the provider stated them
 //!   complete, and only for parts before the first one that never
 //!   completed: a later item might need a partner that never arrived.
@@ -24,13 +25,11 @@ use crate::spec::{
     AssistantPart, Block, CallEnd, Ended, Event, Finish, Json, Media, Meta, Opaque, Reason,
     SmolStr, Usage,
 };
+use crate::sse::DecodeLimits;
 
 /// The first index the writer hands out itself ([`Writer::fresh_index`]);
 /// a provider's wire indices stay below it.
 pub const AUTO_INDEX: usize = 1 << 30;
-
-/// The most argument bytes one call accumulates.
-const MAX_ARGUMENTS: usize = 32 * 1024 * 1024;
 
 /// A decoder that writes through a [`Writer`]: what each frame wrote
 /// reaches the consumer once the frame is decoded.
@@ -51,6 +50,7 @@ pub trait Writes: Send {
 
 impl<T: Writes> Decoder for T {
     fn frame(&mut self, frame: Frame<'_>, out: &mut Vec<Event>) -> Result<Flow, Error> {
+        self.writer().ingress(frame.data)?;
         let flow = self.data(frame.data);
         self.writer().drain(out);
         flow
@@ -122,6 +122,9 @@ pub struct Writer<S = ()> {
 }
 
 struct Core {
+    limits: DecodeLimits,
+    bytes: usize,
+    ingress_bytes: usize,
     key: &'static str,
     out: Vec<Event>,
     /// The open items by wire index, in the order they opened. A reply
@@ -205,44 +208,51 @@ impl From<Open> for Body {
 
 #[derive(Default)]
 struct Arguments {
+    depth: crate::json::JsonDepth,
     text: String,
+    // Keep whitespace-only streams from rescanning the accumulated prefix.
+    content: std::ops::Range<usize>,
     /// How many bytes of `text` the stream has carried.
     streamed: usize,
-    overflowed: bool,
     /// Arguments announced when the call opened, used only when no
     /// fragment arrives.
     announced: Option<Value>,
 }
 
 impl Arguments {
-    fn push(&mut self, fragment: &str) {
+    fn push(&mut self, fragment: &str, depth: usize) -> Result<(), Error> {
         // Some gateways send a literal `null` before the real fragments; a
         // non-blank fragment supersedes it.
-        if self.text.trim() == "null" && !fragment.trim().is_empty() {
+        let trimmed = fragment.trim();
+        if &self.text[self.content.clone()] == "null" && !trimmed.is_empty() {
             self.text.clear();
+            self.content = 0..0;
+            self.depth = crate::json::JsonDepth::default();
         }
-        if self.text.len().saturating_add(fragment.len()) > MAX_ARGUMENTS {
-            self.overflowed = true;
-        } else {
-            self.text.push_str(fragment);
+        self.depth.push(fragment, depth)?;
+        if !trimmed.is_empty() {
+            if self.content.is_empty() {
+                self.content.start = self.text.len() + fragment.len() - fragment.trim_start().len();
+            }
+            self.content.end = self.text.len() + fragment.trim_end().len();
         }
+        self.text.push_str(fragment);
+        Ok(())
     }
 
-    fn end(&mut self) -> (Json, Option<String>) {
+    fn end(&mut self, limits: DecodeLimits) -> Result<(Json, Option<String>), Error> {
         if self.text.is_empty()
             && let Some(announced @ Value::Object(_)) = self.announced.take()
         {
-            return (Json::encode(&announced).unwrap_or_default(), None);
+            return Ok((Json::encode(&announced).unwrap_or_default(), None));
         }
-        let (input, invalid) = crate::json::arguments(&self.text);
-        let invalid = invalid.or_else(|| self.overflowed.then(|| std::mem::take(&mut self.text)));
-        (input, invalid)
+        crate::json::arguments(&self.text, limits)
     }
 
     /// The text the stream has not carried yet, now marked carried. Text
     /// that may still be a placeholder `null` waits.
     fn unstreamed(&mut self) -> Option<String> {
-        if "null".starts_with(self.text.trim()) {
+        if "null".starts_with(&self.text[self.content.clone()]) {
             return None;
         }
         let fragment = self
@@ -256,7 +266,7 @@ impl Arguments {
 
     /// Whether the text is a complete JSON object.
     fn complete(&self) -> bool {
-        !self.overflowed && crate::json::is_object(&self.text)
+        crate::json::is_object(&self.text[self.content.clone()])
     }
 }
 
@@ -274,9 +284,12 @@ fn not_open(index: usize) -> Error {
 }
 
 impl Core {
-    fn new(key: &'static str) -> Self {
+    fn new(key: &'static str, limits: DecodeLimits) -> Self {
         Self {
             key,
+            limits,
+            bytes: 0,
+            ingress_bytes: 0,
             out: Vec::new(),
             open: Vec::new(),
             ended: Vec::new(),
@@ -291,6 +304,30 @@ impl Core {
             call_id_slot: false,
             ids: seed(),
         }
+    }
+
+    // Restatements consume work too; releasing replaced bytes would let an
+    // endless stream of replacements evade the reply ceiling.
+    fn reserve(&mut self, bytes: usize) -> Result<(), Error> {
+        if bytes > self.limits.reply_bytes.saturating_sub(self.bytes) {
+            return Err(Error::limit("reply bytes"));
+        }
+        self.bytes += bytes;
+        Ok(())
+    }
+
+    fn argument(&self, index: usize, bytes: usize, append: bool) -> Result<(), Error> {
+        if let Some(Draft {
+            body: Body::Call { arguments, .. },
+            ..
+        }) = self.get(index)
+        {
+            let held = if append { arguments.text.len() } else { 0 };
+            if bytes > self.limits.argument_bytes.saturating_sub(held) {
+                return Err(Error::limit("argument bytes"));
+            }
+        }
+        Ok(())
     }
 
     /// Moves the events written so far to `out`.
@@ -334,6 +371,11 @@ impl Core {
     /// string field `key`: for a wire whose item states its text whole,
     /// written once instead of with each token.
     fn land(&mut self, index: usize, key: &str) -> Result<(), Error> {
+        self.reserve(
+            self.text(index)
+                .map_or(0, str::len)
+                .saturating_add(key.len()),
+        )?;
         let Draft { item, body, .. } = self.draft(index)?;
         let text = match body {
             Body::Text(text) | Body::Reasoning { text, .. } => text.as_str(),
@@ -409,12 +451,22 @@ impl Core {
                 "",
             ));
         }
-        self.insert(index, block.into(), item);
+        let bytes = crate::json::value_bytes(&item, self.limits)?;
+        let body_bytes = match &block {
+            Open::Call { id, name } => id.len().saturating_add(name.len()),
+            Open::Media(media) => crate::json::encoded_bytes(media, self.limits.reply_bytes)?,
+            _ => 0,
+        };
+        self.reserve(bytes.saturating_add(body_bytes))?;
+        self.insert(index, block.into(), item)?;
         self.stream_call(index);
         Ok(())
     }
 
-    fn insert(&mut self, index: usize, body: Body, item: Value) {
+    fn insert(&mut self, index: usize, body: Body, item: Value) -> Result<(), Error> {
+        if self.next_part as usize >= self.limits.parts {
+            return Err(Error::limit("parts"));
+        }
         self.ended.retain(|(at, _)| *at != index);
         let part = self.next_part;
         self.next_part += 1;
@@ -428,6 +480,7 @@ impl Core {
             body,
         };
         self.open.push((index, draft));
+        Ok(())
     }
 
     /// A part joins the message and opens to the consumer.
@@ -447,6 +500,9 @@ impl Core {
         if fragment.is_empty() {
             return Ok(());
         }
+        self.argument(index, fragment.len(), true)?;
+        self.reserve(fragment.len())?;
+        let depth = self.limits.depth;
         let draft = self.draft(index)?;
         let block = match &mut draft.body {
             Body::Text(text) => {
@@ -458,7 +514,7 @@ impl Core {
                 Block::Reasoning
             }
             Body::Call { arguments, .. } => {
-                arguments.push(&fragment);
+                arguments.push(&fragment, depth)?;
                 self.stream_call(index);
                 return Ok(());
             }
@@ -484,21 +540,38 @@ impl Core {
     /// whole item the provider restates when it finishes. An index whose
     /// part already closed edits that part's item until the reply ends.
     fn edit(&mut self, index: usize, edit: impl FnOnce(&mut Value)) -> Result<(), Error> {
-        if let Some(draft) = find(&mut self.open, index) {
-            edit(&mut draft.item);
-            return Ok(());
+        let limits = self.limits;
+        let remaining = limits.reply_bytes.saturating_sub(self.bytes);
+        let item = if let Some(draft) = find(&mut self.open, index) {
+            &mut draft.item
+        } else {
+            let part = self.closed(index).ok_or_else(|| not_open(index))?;
+            let Some(kept) = self.items.iter_mut().find(|kept| kept.part == part) else {
+                return Ok(());
+            };
+            &mut kept.item
+        };
+        let before = crate::json::value_bytes(item, limits)?;
+        edit(item);
+        let after = crate::json::value_bytes(item, limits);
+        match after {
+            Ok(after) if after.saturating_sub(before) <= remaining => {
+                self.reserve(after.saturating_sub(before))
+            }
+            _ => {
+                *item = Value::Null;
+                Err(Error::limit("provider item"))
+            }
         }
-        let part = self.closed(index).ok_or_else(|| not_open(index))?;
-        if let Some(kept) = self.items.iter_mut().find(|kept| kept.part == part) {
-            edit(&mut kept.item);
-        }
-        Ok(())
     }
 
     /// Replace the text, reasoning or argument JSON of the open item at
     /// `index` with the whole of it as the provider restates it. What
     /// streamed stands; the part ends holding `text`.
     fn restate(&mut self, index: usize, text: &str) -> Result<(), Error> {
+        let limits = self.limits;
+        self.argument(index, text.len(), false)?;
+        self.reserve(text.len())?;
         let draft = self.draft(index)?;
         match &mut draft.body {
             Body::Text(body) | Body::Reasoning { text: body, .. } => {
@@ -507,7 +580,12 @@ impl Core {
                 }
             }
             Body::Call { arguments, .. } => {
+                crate::json::check_text(text, limits.argument_bytes, limits.depth)?;
+                arguments.depth = crate::json::JsonDepth::default();
+                arguments.depth.push(text, limits.depth)?;
                 text.clone_into(&mut arguments.text);
+                let start = text.len() - text.trim_start().len();
+                arguments.content = start..text.trim_end().len().max(start);
                 // A call not yet started streams the restated text whole.
                 arguments.streamed = if draft.started { text.len() } else { 0 };
             }
@@ -519,6 +597,9 @@ impl Core {
     /// Arguments the provider announced for the call at `index`, used only
     /// if no fragment arrives.
     fn announce(&mut self, index: usize, announced: Value) -> Result<(), Error> {
+        let bytes = crate::json::value_bytes(&announced, self.limits)?;
+        self.argument(index, bytes, false)?;
+        self.reserve(bytes)?;
         if let Body::Call { arguments, .. } = &mut self.draft(index)?.body {
             arguments.announced = Some(announced);
         }
@@ -540,8 +621,16 @@ impl Core {
                 name: SmolStr::default(),
                 arguments: Arguments::default(),
             };
-            self.insert(index, body, Value::Null);
+            self.insert(index, body, Value::Null)?;
         }
+        let bytes = fragment.arguments.map_or(0, str::len);
+        self.argument(index, bytes, true)?;
+        self.reserve(
+            bytes
+                .saturating_add(fragment.id.map_or(0, str::len))
+                .saturating_add(fragment.name.map_or(0, str::len)),
+        )?;
+        let depth = self.limits.depth;
         let Body::Call {
             id,
             name,
@@ -562,7 +651,7 @@ impl Core {
             *name = fragment.into();
         }
         if let Some(fragment) = fragment.arguments {
-            arguments.push(fragment);
+            arguments.push(fragment, depth)?;
         }
         self.stream_call(index);
         Ok(())
@@ -665,11 +754,11 @@ impl Core {
         name: &str,
         mut arguments: Arguments,
         item: Value,
-    ) {
+    ) -> Result<(), Error> {
         if name.is_empty() {
-            return;
+            return Ok(());
         }
-        let (input, invalid) = arguments.end();
+        let (input, invalid) = arguments.end(self.limits)?;
         // A call that streamed no text (none arrived, or only a
         // placeholder `null`) states the arguments it ends with.
         if arguments.streamed == 0 {
@@ -692,6 +781,7 @@ impl Core {
                 provider_executed: false,
             }),
         });
+        Ok(())
     }
 
     fn close_item(&mut self, index: usize, complete: bool) -> Result<(), Error> {
@@ -742,7 +832,7 @@ impl Core {
                 name,
                 arguments,
             } => {
-                self.close_call(part, id, &name, arguments, item);
+                self.close_call(part, id, &name, arguments, item)?;
                 return Ok(());
             }
         };
@@ -778,6 +868,17 @@ impl Core {
     /// fails, as does one that ends with a call left open short of the
     /// output limit.
     fn end(&mut self, end: End) -> Result<Flow, Error> {
+        if let Some(usage) = &end.raw_usage {
+            let bytes = crate::json::value_bytes(usage, self.limits)?;
+            self.reserve(bytes)?;
+        }
+        self.reserve(
+            end.message
+                .as_ref()
+                .map_or(0, String::len)
+                .saturating_add(end.response_id.as_ref().map_or(0, SmolStr::len))
+                .saturating_add(end.model.as_ref().map_or(0, SmolStr::len)),
+        )?;
         let unfinished_call = self
             .open
             .iter()
@@ -882,10 +983,35 @@ impl Core {
 impl<S: Default> Writer<S> {
     /// A writer for a protocol whose part state goes under `key`.
     pub fn new(key: &'static str) -> Self {
+        Self::with_limits(key, DecodeLimits::default())
+    }
+
+    pub(crate) fn with_limits(key: &'static str, limits: DecodeLimits) -> Self {
         Self {
-            core: Core::new(key),
+            core: Core::new(key, limits),
             states: Vec::new(),
         }
+    }
+
+    pub(crate) fn limits(&self) -> DecodeLimits {
+        self.core.limits
+    }
+
+    /// Private codec buffers share the writer's reply ceiling.
+    pub(crate) fn reserve(&mut self, bytes: usize) -> Result<(), Error> {
+        self.core.reserve(bytes)
+    }
+
+    // The wire ceiling also bounds temporary trees and private codec state
+    // before the provider can allocate them, including edits to held items.
+    fn ingress(&mut self, data: &str) -> Result<(), Error> {
+        let limits = self.core.limits;
+        crate::json::check_text(data, limits.frame_bytes, limits.depth)?;
+        if data.len() > limits.reply_bytes.saturating_sub(self.core.ingress_bytes) {
+            return Err(Error::limit("reply bytes"));
+        }
+        self.core.ingress_bytes += data.len();
+        Ok(())
     }
 
     /// A wire whose call items hold their id in a slot replay can fill.
