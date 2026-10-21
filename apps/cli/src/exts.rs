@@ -36,6 +36,8 @@ fn linked(config: &Config) -> Result<Registry, Refused> {
             .with(Tier::Guarded, &floor)?
             .with(Tier::Pre, &configured::<ext_policy::Policy>(config)?)?
     };
+    #[cfg(feature = "fork")]
+    let built = built.with(Tier::Pre, &configured::<ext_fork::Fork>(config)?)?;
     #[cfg(feature = "prompt")]
     let built = built.with(Tier::Pre, &configured::<ext_prompt::Prompt>(config)?)?;
     #[cfg(feature = "shell")]
@@ -201,6 +203,7 @@ mod tests {
                 ("policy-floor", 1),
                 ("loop", 1),
                 ("policy", 2),
+                ("fork", 1),
                 ("prompt", 1),
                 ("shell", 1),
                 ("edit", 1),

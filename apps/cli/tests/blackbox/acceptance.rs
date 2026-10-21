@@ -570,3 +570,40 @@ fn an_older_and_a_newer_build_share_one_daemon_and_never_fight() {
     assert_eq!(runtime.current().unwrap(), new_id);
     term.finish();
 }
+
+#[cfg(feature = "fork")]
+#[test]
+fn a_fork_copies_a_conversation_and_continues_without_changing_the_source() {
+    let env = Env::new("fork");
+    let first = env.run(&["-p", "source message"]);
+    assert_eq!(first, "source message\n");
+    let (source, entries) = env.connect().attach(ANY, &env.ws);
+    let path = env.home.sessions_dir().join(format!("{source}.jsonl"));
+    let before = fs::read(&path).unwrap();
+    let fork = env.run(&["fork", &source.short().to_string()]);
+    let fork = fork.trim();
+    let (copied, history) = env
+        .connect()
+        .attach(Target::Prefix(fork.to_owned()), &env.ws);
+    assert_ne!(copied, source);
+    assert_eq!(&history[..entries.len()], &entries);
+    assert_eq!(
+        env.run(&["-p", "fork message", "attach", fork]),
+        "fork message\n"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    let boundary = entries
+        .iter()
+        .find(|e| matches!(e.body, Body::Input { .. }))
+        .unwrap()
+        .seq;
+    let refused = env
+        .cmd(&["fork", &format!("{source}@{boundary}")])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("rest point"));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    let at = env.run(&["fork", &format!("{source}@{}", entries.last().unwrap().seq)]);
+    assert_ne!(at.trim(), fork);
+}

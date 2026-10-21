@@ -461,6 +461,7 @@ impl SessionView {
             }
             DaemonMsg::Activity { .. }
             | DaemonMsg::Welcome { .. }
+            | DaemonMsg::ForkRejected { .. }
             | DaemonMsg::Sessions { .. }
             | DaemonMsg::Settings { .. }
             | DaemonMsg::Status { .. }

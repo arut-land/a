@@ -400,6 +400,19 @@ impl Session {
         Ok(Some(action))
     }
 
+    /// Forks the current conversation at a rest point. Files stay as they
+    /// are; the fork keeps its recorded directory and environment.
+    pub async fn fork(&self, seq: Option<u64>) -> Result<(), ClientError> {
+        let seq = seq
+            .map(|seq| {
+                protocol::Seq::new(seq).ok_or_else(|| ClientError::InvalidArgument {
+                    message: "fork sequence must be positive".into(),
+                })
+            })
+            .transpose()?;
+        self.run(Cmd::Fork(seq)).await
+    }
+
     /// Input for the running turn, before its next step.
     pub async fn steer(&self, text: String) -> Result<(), ClientError> {
         self.intend(move |client| client.offer()?.steer(text)).await

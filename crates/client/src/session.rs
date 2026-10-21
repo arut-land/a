@@ -199,6 +199,7 @@ pub enum Notice {
     RemoteEnv,
     /// The driver could not send a message.
     NotSent(Error),
+    ForkRejected(protocol::ForkError),
 }
 
 impl fmt::Display for Notice {
@@ -213,6 +214,7 @@ impl fmt::Display for Notice {
             Self::RemoteEnv => f.write_str(
                 "the host's environment is captured when `a` connects; reattach to refresh it",
             ),
+            Self::ForkRejected(reason) => reason.fmt(f),
             Self::NotSent(e) => write!(f, "not sent: {e}"),
         }
     }
@@ -338,7 +340,12 @@ impl SessionClient {
     /// Attaches to `target` with this client's environment, on a new
     /// connection.
     pub fn open(&mut self, target: Target) -> Vec<Effect> {
-        let attach = Attach::new(target, self.env.clone());
+        let env = if matches!(target, Target::Fork { .. }) {
+            Env::Keep
+        } else {
+            self.env.clone()
+        };
+        let attach = Attach::new(target, env);
         self.attach(attach)
     }
 
@@ -399,6 +406,21 @@ impl SessionClient {
             Cmd::Detach => Ok(self.detach()),
             Cmd::Sessions => self.offer().and_then(|o| o.send(ClientMsg::List)),
             Cmd::Open(target) => Ok(self.open(target)),
+            Cmd::Fork(seq) => match self.view.session {
+                Some(session) => self.offer().map(|offer| {
+                    offer.0.send(ClientMsg::Attach {
+                        target: Target::Fork {
+                            session: session.to_string(),
+                            seq,
+                        },
+                        workspace: PathBuf::new(),
+                        since: 0,
+                        env: None,
+                        decl: protocol::ClientDecl::default(),
+                    })
+                }),
+                None => Err(Notice::NotConnected),
+            },
             Cmd::Help => Ok(Vec::new()),
         };
         done.unwrap_or_else(|notice| vec![Effect::Show(Show::Notice(notice))])
@@ -474,6 +496,12 @@ impl SessionClient {
 
     fn msg(&mut self, msg: &DaemonMsg, out: &mut Vec<Effect>) {
         match msg {
+            DaemonMsg::ForkRejected { reason } => {
+                out.push(Effect::Show(Show::Notice(Notice::ForkRejected(
+                    reason.clone(),
+                ))));
+                return;
+            }
             DaemonMsg::Attached { session, .. } => {
                 self.opened.target = Target::Id(*session);
                 self.view_current = true;
@@ -798,6 +826,31 @@ mod tests {
                 },
             },
         ))
+    }
+
+    #[test]
+    fn a_fork_refusal_keeps_the_source_attached_and_never_refreshes_its_environment() {
+        let (mut client, source) = attached(Env::Origin);
+        let connection = client.connection();
+        let effects = client.run(Cmd::Fork(Seq::new(7)));
+        assert_eq!(connects(&effects), []);
+        assert!(matches!(sends(&effects)[..], [ClientMsg::Attach {
+            target: Target::Fork { session, seq: Some(seq) }, env: None, since: 0, ..
+        }] if session == &source.to_string() && seq.get() == 7));
+        let refused = client.step(msg(
+            connection.0,
+            DaemonMsg::ForkRejected {
+                reason: protocol::ForkError::Unfinished,
+            },
+        ));
+        assert_eq!(
+            notices(&refused),
+            [&Notice::ForkRejected(protocol::ForkError::Unfinished)]
+        );
+        assert_eq!(refused.len(), 1);
+        assert!(matches!(client.link(), Link::Live { .. }));
+        assert_eq!(client.view().session, Some(source));
+        assert!(client.offer().is_ok());
     }
 
     #[test]

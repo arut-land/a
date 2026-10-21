@@ -14,6 +14,7 @@ ext-compact = { workspace = true, optional = true }
 ext-edit = { workspace = true, optional = true }
 ext-fixtures.workspace = true
 ext-mcp = { workspace = true, optional = true }
+ext-fork = { workspace = true, optional = true }
 ext-lua = { workspace = true, optional = true }
 ext-policy = { workspace = true, optional = true }
 ext-prompt = { workspace = true, optional = true }
@@ -30,9 +31,10 @@ usage-rs.workspace = true
 web = { workspace = true, optional = true }
 
 [features]
-default = ["mcp", "web", "policy", "prompt", "shell", "edit", "compact", "retry", "settings", "subagent", "title"]
+default = ["mcp", "fork", "web", "policy", "prompt", "shell", "edit", "compact", "retry", "settings", "subagent", "title"]
 # User mods; opt-in until quiet-machine startup has been verified.
 lua = ["dep:ext-lua"]
+fork = ["dep:ext-fork"]
 # Lazy Model Context Protocol servers.
 mcp = ["shell", "dep:ext-mcp"]
 # `a web`; about 110 KiB of the release binary.

@@ -75,6 +75,7 @@ macro_rules! conformance {
     ($($backend:ident),*) => {
         $(cases!($backend;
             round_trip,
+            importing_a_prefix_preserves_the_sources_writer_lease,
             multiline_payloads_survive_reload,
             appends_keep_their_order_across_reopens,
             batches_append_in_order,
@@ -874,6 +875,109 @@ fn multiline_payloads_survive_reload(store: &dyn LogStore) {
     );
 }
 
+fn importing_a_prefix_preserves_the_sources_writer_lease(store: &dyn LogStore) {
+    let source = header("/w");
+    let mut loaded = store.create(&source).unwrap();
+    loaded
+        .append(Body::Assistant { text: "one".into() })
+        .unwrap();
+    let entries = store.prefix(source.id, 1).unwrap();
+    let copied = header("/w");
+    store.import(&copied, &entries).unwrap();
+    loaded
+        .append(Body::Assistant { text: "two".into() })
+        .unwrap();
+    assert_eq!(store.prefix(copied.id, 1).unwrap(), entries);
+    assert_eq!(store.count(source.id).unwrap(), 2);
+    let mut replay = Vec::new();
+    let copied = store
+        .load(copied.id, &mut |_| false, &mut |e| replay.push(e))
+        .unwrap();
+    assert!(copied.writer.read_only().is_none());
+    assert_eq!(replay, entries);
+}
+
+#[test]
+fn imported_history_does_not_need_its_parents_file_or_derived_directory() {
+    let store = jsonl();
+    let source = header("/w");
+    let mut loaded = store.create(&source).unwrap();
+    loaded
+        .append(Body::Assistant {
+            text: "durable".into(),
+        })
+        .unwrap();
+    let copied = header("/w");
+    let entries = store.prefix(source.id, 1).unwrap();
+    store.import(&copied, &entries).unwrap();
+    drop(loaded);
+    let dir = store.dir.as_ref().unwrap();
+    fs::remove_file(dir.join(format!("{}.jsonl", source.id))).unwrap();
+    fs::remove_dir_all(dir.join("derived")).unwrap();
+    let reopened = Jsonl::open(dir).unwrap();
+    let mut replay = Vec::new();
+    reopened
+        .load(copied.id, &mut |_| false, &mut |e| replay.push(e))
+        .unwrap();
+    assert_eq!(replay, entries);
+}
+
+#[test]
+fn every_failed_import_is_absent_or_discovered_after_an_orderly_shutdown() {
+    use crate::catalog::Catalog;
+    for step in [
+        ImportStep::Write,
+        ImportStep::FileSync,
+        ImportStep::Rename,
+        ImportStep::DirectorySync,
+        ImportStep::Published,
+    ] {
+        let dir = temp_dir();
+        let inner = Arc::new(Jsonl::open(dir.join("sessions")).unwrap());
+        let store = Faulty::new(inner.clone());
+        let catalog_path = dir.join("catalog");
+        let catalog = Catalog::open(catalog_path.clone(), &store).unwrap();
+        let header = header("/w");
+        let entries = [entry(1, 1)];
+        store.fail_import_at(step);
+        assert!(
+            catalog.import(&store, &header, &entries).is_err(),
+            "{step:?}"
+        );
+        assert!(catalog.clean().is_err(), "{step:?}");
+        assert!(catalog_path.with_extension("dirty").exists());
+        drop(catalog);
+        let catalog = Catalog::open(catalog_path, &*inner).unwrap();
+        let published = matches!(step, ImportStep::DirectorySync | ImportStep::Published);
+        assert_eq!(catalog.get(header.id).is_some(), published, "{step:?}");
+        if published {
+            assert_eq!(inner.prefix(header.id, 1).unwrap(), entries);
+        }
+        catalog.clean().unwrap();
+        drop((catalog, store, inner));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn a_successful_import_survives_a_clean_catalog_restart() {
+    use crate::catalog::Catalog;
+    let dir = temp_dir();
+    let store = Jsonl::open(dir.join("sessions")).unwrap();
+    let path = dir.join("catalog");
+    let catalog = Catalog::open(path.clone(), &store).unwrap();
+    let header = header("/w");
+    let entries = [entry(1, 1)];
+    catalog.import(&store, &header, &entries).unwrap();
+    catalog.clean().unwrap();
+    drop(catalog);
+    let catalog = Catalog::open(path, &store).unwrap();
+    assert_eq!(catalog.get(header.id).unwrap().entries, 1);
+    assert_eq!(store.prefix(header.id, 1).unwrap(), entries);
+    drop((catalog, store));
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn a_barrier_write_alone_does_not_survive_a_power_cut() {
     let memory = Arc::new(Memory::default());
@@ -889,4 +993,21 @@ fn a_barrier_write_alone_does_not_survive_a_power_cut() {
     loaded.writer.sync().unwrap();
     faulty.cut();
     assert_eq!(memory.entries(header.id).unwrap(), []);
+}
+
+#[test]
+fn a_read_only_writer_still_flushes_the_prefix_it_will_replay() {
+    let memory = Arc::new(Memory::default());
+    let faulty = Faulty::new(memory.clone());
+    let header = header("/w");
+    let mut loaded = faulty.create(&header).unwrap();
+    let mut entries = [entry(1, 0)];
+    loaded.writer.append(&mut entries, true).unwrap();
+    loaded.writer.keep(ReadOnly::Extensions);
+    let mut forbidden = [entry(2, 0)];
+    assert!(loaded.writer.append(&mut forbidden, true).is_err());
+    loaded.writer.sync().unwrap();
+    rt::block_on(loaded.writer.flushed(&*FLUSH_RT)).unwrap();
+    assert_eq!(memory.entries(header.id).unwrap(), entries);
+    assert_eq!(loaded.writer.read_only(), Some(ReadOnly::Extensions));
 }

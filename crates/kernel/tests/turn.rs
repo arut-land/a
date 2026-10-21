@@ -836,6 +836,7 @@ fn a_generation_is_adopted_only_at_rest() {
     let installed = ["fixtures", "extras"].map(|name| Installed {
         name: name.into(),
         version: 1,
+        image: None,
     });
     echo().table(vec![
         (
