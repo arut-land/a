@@ -9,7 +9,6 @@ pub mod pty;
 use std::fs;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
@@ -145,11 +144,7 @@ pub struct Env {
 
 impl Env {
     pub fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("a-acc-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        // Canonical, as the daemon's paths are: its process is found by them.
-        let root = fs::canonicalize(root).unwrap();
+        let root = crate::support::isolated_root(name);
         let (bin, ws) = (root.join("bin"), root.join("ws"));
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&ws).unwrap();
@@ -275,7 +270,9 @@ impl Env {
             status,
             stdout,
             stderr,
-        } = self.cmd(args).stdin(Stdio::null()).output().unwrap();
+        } = crate::support::TestProcess::spawn(self.cmd(args).stdin(Stdio::null()))
+            .collect(crate::support::deadline())
+            .unwrap();
         let stderr = String::from_utf8_lossy(&stderr);
         assert!(status.success(), "a {args:?} failed ({status}): {stderr}");
         String::from_utf8(stdout).unwrap()
@@ -385,7 +382,7 @@ impl Drop for Env {
         if std::thread::panicking() {
             let _ = writeln!(io::stderr(), "kept {}", self.root.display());
         } else {
-            let _ = fs::remove_dir_all(&self.root);
+            crate::support::remove_home(&self.root);
         }
     }
 }
@@ -394,18 +391,14 @@ impl Drop for Env {
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Conn {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<sys::Stream>,
+    writer: sys::Stream,
     /// Everything received, folded as a client's view.
     pub view: SessionView,
     /// The seq of the last entry received, and of its session.
     last: Option<(SessionId, u64)>,
 }
 
-/// The hello these tests say, as the first clients did: any build the
-/// daemon's staged `current` does not outrank (it answers with a welcome,
-/// never a drain), with no `min` and no capabilities, which the daemon
-/// must keep serving.
 pub fn hello() -> ClientMsg {
     ClientMsg::Hello {
         proto: PROTO,
@@ -419,7 +412,7 @@ pub fn hello() -> ClientMsg {
 impl Conn {
     /// A connection to `home`'s socket, before any hello.
     pub fn open(home: &Home) -> Self {
-        Self::from(UnixStream::connect(home.endpoint().path()).unwrap())
+        Self::from(home.endpoint().connect().unwrap())
     }
 
     /// [`Conn::open`] to a daemon that is starting by itself: connects
@@ -430,13 +423,13 @@ impl Conn {
         let endpoint = home.endpoint();
         let mut stream = None;
         wait_for("the daemon to listen", || {
-            stream = UnixStream::connect(endpoint.path()).ok();
+            stream = endpoint.connect().ok();
             stream.is_some()
         });
         Self::from(stream.unwrap())
     }
 
-    fn from(stream: UnixStream) -> Self {
+    fn from(stream: sys::Stream) -> Self {
         stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         Self {
             reader: BufReader::new(stream.try_clone().unwrap()),

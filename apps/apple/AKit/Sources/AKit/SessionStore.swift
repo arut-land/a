@@ -1,12 +1,13 @@
 import Foundation
 import Observation
 
-/// One session as the app shows it: a copy of the Rust session client's
-/// view, kept in step by its numbered updates. It holds no rule of its own:
-/// the turn (what runs, what waits, what the controls offer), each call's
-/// phase, whose reply is streaming and the link come computed from Rust.
-/// The stream drops updates when its buffer is full, so a `rev` gap asks
-/// the source for what was missed (or a snapshot) before going on.
+public enum AttachmentState: Equatable {
+    case detached
+    case attaching
+    case attached(id: String)
+}
+
+/// A session view follows numbered Rust updates; gaps require resynchronization.
 @Observable
 public final class SessionStore {
     public private(set) var items: [ViewItem] = []
@@ -31,8 +32,15 @@ public final class SessionStore {
     /// How many gaps this store has caught up on.
     public private(set) var resyncs = 0
 
-    @ObservationIgnored private let source: any ViewSource
-    @ObservationIgnored private let session: Session?
+    public private(set) var attachment: AttachmentState = .detached {
+        didSet {
+            if attachment != oldValue { attachmentChanged?(self) }
+        }
+    }
+
+    @ObservationIgnored private var source: (any ViewSource)?
+    @ObservationIgnored private var session: Session?
+    @ObservationIgnored fileprivate var attachmentChanged: ((SessionStore) -> Void)?
     @ObservationIgnored private var listening: Task<Void, Never>?
 
     /// A store for `session`; `open` attaches it.
@@ -49,10 +57,11 @@ public final class SessionStore {
 
     /// Starts following the source's updates.
     public func listen() {
-        guard listening == nil else { return }
+        guard listening == nil, let source else { return }
         let updates = source.updates()
         listening = Task { [weak self] in
             for await update in updates {
+                guard !Task.isCancelled else { break }
                 self?.apply(update)
             }
         }
@@ -60,9 +69,11 @@ public final class SessionStore {
 
     /// Follows the session, then attaches to `target`.
     public func open(_ target: OpenTarget) {
+        guard let session, attachment == .detached else { return }
+        attachment = .attaching
         listen()
         do {
-            try session?.open(target: target)
+            try session.open(target: target)
         } catch {
             problem = error.localizedDescription
         }
@@ -101,9 +112,22 @@ public final class SessionStore {
     }
 
     public func detach() async {
-        await run { try await $0.detach() }
+        let session = self.session
+        releaseAttachment()
+        do {
+            try await session?.detach()
+        } catch {
+            problem = error.localizedDescription
+        }
+    }
+
+    private func releaseAttachment() {
         listening?.cancel()
         listening = nil
+        session = nil
+        source = nil
+        link = .detached
+        attachment = .detached
     }
 
     private func run(_ action: (Session) async throws -> Void) async {
@@ -126,6 +150,7 @@ public final class SessionStore {
     }
 
     private func catchUp() {
+        guard let source else { return }
         resyncs += 1
         switch source.resync(from: rev) {
         case .updates(let updates):
@@ -140,11 +165,12 @@ public final class SessionStore {
     private func adopt(_ s: SessionSnapshot) {
         (rev, seq, sessionId, workspace, title) = (s.rev, s.seq, s.session, s.workspace, s.title)
         (items, link, recap, streaming, turn) = (s.items, s.link, s.recap, s.streaming, s.turn)
+        if let id = s.session { attachment = .attached(id: id) }
+        if s.link == .detached { releaseAttachment() }
     }
 
     private func fold(_ update: ViewUpdate) {
         (rev, seq, turn, title) = (update.rev, update.seq, update.turn, update.title)
-        // The streamed text is the deltas since the update named its call.
         if streaming?.call != update.streaming {
             streaming = update.streaming.map { StreamingText(call: $0, text: "") }
         }
@@ -154,6 +180,7 @@ public final class SessionStore {
                 (items, recap) = ([], nil)
             }
             (sessionId, self.workspace) = (session, workspace)
+            attachment = .attached(id: session)
         case .added(let index, let item):
             items.insert(item, at: min(Int(index), items.count))
         case .updated(let index, let patch):
@@ -173,9 +200,47 @@ public final class SessionStore {
             problem = message
         case .link(let state):
             link = state
+            if state == .detached { releaseAttachment() }
             if case .lost(let message, let newer) = state {
                 (problem, newerBuild) = (message, newer)
             }
+        }
+    }
+}
+
+/// Cache keys and selection track the identity reported by the live attachment.
+@Observable
+public final class SessionStoreCache {
+    public private(set) var stores: [String: SessionStore] = [:]
+    public var selection: String?
+
+    public init() {}
+
+    @discardableResult
+    public func open(_ id: String, client: Client) -> SessionStore {
+        if let store = stores[id] { return store }
+        let store = SessionStore(session: Session(client: client))
+        insert(store, id: id)
+        store.open(.id(id: id))
+        return store
+    }
+
+    public func insert(_ store: SessionStore, id: String) {
+        stores[id] = store
+        store.attachmentChanged = { [weak self] store in self?.rekey(store) }
+        if case .attached = store.attachment { rekey(store) }
+    }
+
+    private func rekey(_ store: SessionStore) {
+        if case .attaching = store.attachment { return }
+        let oldKeys = stores.keys.filter { stores[$0] === store }
+        let selected = oldKeys.contains { $0 == selection }
+        for key in oldKeys { stores.removeValue(forKey: key) }
+        if case .attached(let id) = store.attachment {
+            stores[id] = store
+            if selected { selection = id }
+        } else if selected {
+            selection = nil
         }
     }
 }

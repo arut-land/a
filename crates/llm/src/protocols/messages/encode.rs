@@ -68,10 +68,10 @@ pub(super) fn body(
         Some(Value::Array(raw)) => raw,
         Some(_) => return Err(Error::unsupported("the `tools` option must be an array")),
     };
-    // A breakpoint goes on the last tool not deferred: when that is one of
-    // the request's own, that one is written for this request, marked.
+    // Only relocate a typed tool when it will receive the breakpoint;
+    // otherwise its cached declaration must stay in `typed`.
     let deferred = |tool: &Value| tool.get("defer_loading") == Some(&Value::Bool(true));
-    if caching.marks_tools() && typed.pop().is_some() && tools.iter().all(deferred) {
+    if caching.marks_tools() && tools.iter().all(deferred) && typed.pop().is_some() {
         let last = request.tools.last().expect("a tool was encoded");
         tools.insert(0, tool_json(last, quirks));
     }

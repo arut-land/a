@@ -38,3 +38,5 @@ mod tui;
 mod web;
 
 mod daemon_acceptance;
+
+mod support;

@@ -27,6 +27,7 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     let workspace = FileManager.default.temporaryDirectory
         .appending(path: "akit-live-\(ProcessInfo.processInfo.processIdentifier)")
     try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: workspace) }
 
     let store = SessionStore(session: Session(client: client))
     store.open(.new(workspace: workspace.path))
@@ -51,26 +52,21 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
         }
     }
 
-    // The daemon pushes the list; nothing polls it.
     let list = SessionListStore(client: client)
     let following = Task { await list.follow() }
     try await eventually("the session listed") {
         list.sessions.contains { $0.id == id && $0.clients >= 1 }
     }
 
-    // A second client of the same session folds to the same state.
     let other = SessionStore(session: Session(client: client))
     other.open(.id(id: id))
     try await eventually("the replay and recap") {
         other.link == .live && other.seq == store.seq && other.recap != nil
     }
     #expect(other.items == store.items)
-    // The recap reads as the Rust clients print it.
     #expect(other.recap?.line.hasPrefix("recap · you: $ echo hello · ran bash") == true)
 
-    // A running call stops on an interrupt.
     #expect(!store.turn.running && !store.turn.canInterrupt)
-    // Typed lines go through the commands every client shares.
     #expect(await store.submit("/help") == .help)
     #expect(store.commands.contains { $0.usage == "/interrupt" })
     await store.send("$ sleep 30")
@@ -90,4 +86,72 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
         list.sessions.contains { $0.id == id && $0.clients == 0 }
     }
     following.cancel()
+}
+
+@Test(.enabled(if: live != nil))
+func detached_session_reopens_with_a_new_handle() async throws {
+    let client = try Client(helper: live!)
+    let cache = SessionStoreCache()
+    let workspace = FileManager.default.temporaryDirectory.appending(path: "akit-detach-\(UUID())")
+    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: workspace) }
+    weak var handle: Session?
+    let store: SessionStore = {
+        let session = Session(client: client)
+        handle = session
+        return SessionStore(session: session)
+    }()
+    store.open(.new(workspace: workspace.path))
+    try await eventually("attached") { store.link == .live }
+    let id = try #require(store.sessionId)
+    cache.insert(store, id: id)
+    cache.selection = id
+
+    await store.detach()
+    #expect(store.attachment == .detached)
+    #expect(handle == nil)
+    #expect(cache.stores[id] == nil && cache.selection == nil)
+    cache.selection = id
+    let reopened = cache.open(id, client: client)
+    #expect(reopened !== store)
+    try await eventually("reopened") { reopened.link == .live }
+    #expect(reopened.attachment == .attached(id: id))
+    await reopened.send("reopened")
+    try await eventually("new handle receives replies") {
+        reopened.items.contains { if case .assistant(_, "reopened", _) = $0 { true } else { false } }
+    }
+    await reopened.detach()
+}
+
+@Test(.enabled(if: live != nil))
+func fork_rekeys_the_cached_store() async throws {
+    let client = try Client(helper: live!)
+    let cache = SessionStoreCache()
+    let workspace = FileManager.default.temporaryDirectory.appending(path: "akit-fork-\(UUID())")
+    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: workspace) }
+    let store = SessionStore(session: Session(client: client))
+    store.open(.new(workspace: workspace.path))
+    try await eventually("attached") { store.link == .live }
+    let original = try #require(store.sessionId)
+    cache.insert(store, id: original)
+    cache.selection = original
+    await store.send("before fork")
+    try await eventually("fork rest point") { !store.turn.running && store.items.contains {
+        if case .assistant(_, "before fork", _) = $0 { true } else { false }
+    } }
+
+    _ = await store.submit("/fork")
+    try await eventually("fork attached") { store.link == .live && store.sessionId != original }
+    let fork = try #require(store.sessionId)
+    #expect(cache.stores[original] == nil)
+    #expect(cache.stores[fork] === store)
+    #expect(cache.selection == fork)
+    #expect(cache.stores.count == 1)
+    let reopened = cache.open(original, client: client)
+    #expect(reopened !== store)
+    try await eventually("original reattached") { reopened.link == .live }
+    #expect(reopened.sessionId == original && store.sessionId == fork)
+    await reopened.detach()
+    await store.detach()
 }
