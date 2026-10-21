@@ -6,11 +6,13 @@ publish.workspace = true
 autotests = false
 
 [dependencies]
+ring = { version = "0.17", default-features = false, features = ["std"] }
+transport = { workspace = true, features = ["ureq"] }
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 ext.workspace = true
 ext-derive.workspace = true
 http.workspace = true
-llm = { workspace = true, features = ["ureq"] }
+llm.workspace = true
 protocol.workspace = true
 rt.workspace = true
 serde.workspace = true

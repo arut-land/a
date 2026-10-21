@@ -88,7 +88,7 @@ impl GenerationLayer for Loader {
         let catalog = Arc::new(catalog);
         Ok(PreparedLayer {
             inputs: catalog.clone(),
-            registrations: vec![(Tier::Pre, Arc::new(Catalog(catalog)))],
+            registrations: vec![(Tier::Pre, Arc::new(Catalog::new(catalog)))],
         })
     }
 
@@ -103,9 +103,12 @@ impl GenerationLayer for Loader {
             .image
             .as_ref()
             .ok_or_else(|| Refused("recorded skill catalog is absent".into()))?
-            .parse::<BTreeMap<String, Skill>>()
+            .parse::<(uuid::Uuid, BTreeMap<String, Skill>)>()
             .map_err(|e| Refused(e.to_string()))?;
-        Ok(vec![(Tier::Pre, Arc::new(Catalog(Arc::new(catalog))))])
+        Ok(vec![(
+            Tier::Pre,
+            Arc::new(Catalog(Arc::new(catalog.1), catalog.0)),
+        )])
     }
 }
 

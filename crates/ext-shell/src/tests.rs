@@ -1,4 +1,4 @@
-use ext::host::{Host, Parts, Services};
+use ext::host::{Host, Parts, SessionServices};
 use ext::{BoxFuture, MutationError, MutationResult, States};
 use protocol::{Json, Outcome, Seq};
 use rt::oneshot;
@@ -111,7 +111,7 @@ fn revoking_a_pending_cwd_record_preserves_the_shell_result() {
         spill: original.spill,
         cancel: original.cancel,
         services: Arc::new(
-            Services::default().with::<dyn rt::Runtime>(Arc::new(rt::Threads::default())),
+            SessionServices::default().with::<dyn rt::Runtime>(Arc::new(rt::Threads::default())),
         ),
     }
     .cx(Arc::new(PausedRecord {

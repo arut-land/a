@@ -9,6 +9,7 @@ publish.workspace = true
 events = []
 
 [dependencies]
+transport.workspace = true
 ext-logging.workspace = true
 # Each log line's checksum, in hardware where the CPU has it.
 crc32c = "0.6.8"

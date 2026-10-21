@@ -359,13 +359,16 @@ impl Daemon {
             })
             .collect();
         let rt: rt::Rt = runtime.clone();
+        let http_clients: Arc<dyn transport::HttpClients> =
+            Arc::new(transport::Clients::new(Arc::clone(&rt)));
         let models = model::Models {
             settings: config::Settings::new(home.config_file(), config.agent.clone()),
-            http: Arc::new(llm::Ureq::new(Arc::clone(&rt), llm::Redirects::Follow)),
+            http: http_clients.client(transport::RedirectPolicy::Follow),
         };
         let registry = ext::host::Current::new(config.registry().map_err(io::Error::other)?);
         let daemon = Arc::new_cyclic(|daemon| Self {
             shared: Arc::new(Shared {
+                http_clients: std::sync::OnceLock::from(http_clients),
                 rt,
                 store,
                 catalog,

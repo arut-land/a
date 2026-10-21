@@ -48,12 +48,18 @@ impl Extension for Skills {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        ext::DynExtension::contribute(&Catalog(self.catalog.clone()), r);
+        ext::DynExtension::contribute(&Catalog::new(self.catalog.clone()), r);
     }
 }
 
 /// Recovery must retain instructions after source files disappear.
-struct Catalog(Arc<BTreeMap<String, Skill>>);
+struct Catalog(Arc<BTreeMap<String, Skill>>, uuid::Uuid);
+
+impl Catalog {
+    fn new(skills: Arc<BTreeMap<String, Skill>>) -> Self {
+        Self(skills, uuid::Uuid::now_v7())
+    }
+}
 impl ext::DynExtension for Catalog {
     fn name(&self) -> ext::Name {
         ext::Name::from(<Skills as Extension>::NAME)
@@ -62,15 +68,32 @@ impl ext::DynExtension for Catalog {
         <Skills as Extension>::VERSION
     }
     fn image(&self) -> Option<protocol::Json> {
-        Some(protocol::Json::encode(&*self.0).expect("a catalog contains only strings"))
+        Some(protocol::Json::encode(&(self.1, &*self.0)).expect("a catalog contains only strings"))
     }
     fn contribute(&self, r: &mut Registrar) {
-        r.tool(Load(self.0.clone()));
+        let load = Load(Arc::new(
+            self.0
+                .iter()
+                .map(|(name, skill)| {
+                    let text = format!(
+                        "Skill {name}\nBase directory: {}\n\n{}",
+                        skill.directory, skill.body
+                    );
+                    let publication = ext::PreparedPublication::new::<Instructions>(
+                        &(self.1, name.clone()),
+                        text,
+                    )
+                    .expect("skill identity contains only strings");
+                    (name.clone(), publication)
+                })
+                .collect(),
+        ));
+        r.tool(load.clone());
         for (name, skill) in &*self.0 {
             r.dyn_tool(Arc::new(Command {
                 name: name.clone(),
                 description: skill.description.clone(),
-                load: Load(self.0.clone()),
+                load: load.clone(),
             }));
         }
         r.text(ext::Text::generation("skills-index", 50, self.index()));
@@ -102,7 +125,7 @@ impl Catalog {
 struct Instructions;
 impl Publication for Instructions {
     const NAME: &'static str = "skills";
-    type Key = (String, String);
+    type Key = (uuid::Uuid, String);
 }
 
 /// The skill to load, exactly as named by the index.
@@ -128,7 +151,7 @@ pub enum LoadedSkill {
 }
 
 #[derive(Clone)]
-struct Load(Arc<BTreeMap<String, Skill>>);
+struct Load(Arc<BTreeMap<String, ext::PreparedPublication>>);
 
 impl Load {
     async fn load(&self, name: &str, args: &str, cx: &Cx) -> Result<LoadedSkill, LoadError> {
@@ -136,19 +159,18 @@ impl Load {
             .0
             .get(name)
             .ok_or_else(|| LoadError::UnknownSkill { name: name.into() })?;
-        let text = format!(
-            "Skill {name}\nBase directory: {}\n\n{}",
-            skill.directory, skill.body
-        );
-        let key = (name.to_owned(), text.clone());
-        let loaded = cx.published::<Instructions>(&key);
+        let loaded = cx.published_erased(Instructions::NAME, &skill.key);
         if !loaded || !args.is_empty() {
-            let mut context = if loaded { String::new() } else { text.clone() };
+            let mut context = if loaded {
+                String::new()
+            } else {
+                skill.text.clone()
+            };
             if !args.is_empty() {
                 use std::fmt::Write as _;
                 let _ = write!(context, "\nUse skill {name} with these arguments:\n{args}");
             }
-            cx.publish::<Instructions>(&key, context)
+            cx.publish_erased(Instructions::NAME, skill.key.clone(), context)
                 .await
                 .map_err(|e| LoadError::PublicationFailed {
                     error: e.to_string(),
@@ -241,3 +263,85 @@ fn serde_schema() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use ext::host::Registry;
+    use ext::testing::Rig;
+    use serde_json::json;
+
+    #[test]
+    fn publication_keys_do_not_repeat_the_published_content() {
+        let catalog = Catalog::new(Arc::new(BTreeMap::from([(
+            "review".into(),
+            Skill {
+                description: "Review".into(),
+                directory: "/workspace".into(),
+                body: "PRIVATE BODY".repeat(1024),
+            },
+        )])));
+        let rig = Rig::new(
+            "compact-publication",
+            Registry::default()
+                .with_dyn(ext::Tier::Pre, &catalog)
+                .unwrap(),
+        );
+        rig.done("skill", &json!({"name":"review"}));
+        let log = rig.log.lock().unwrap();
+        let protocol::Body::Context {
+            text,
+            publication: Some(publication),
+        } = &log[0].body
+        else {
+            panic!("missing publication")
+        };
+        assert!(text.contains("PRIVATE BODY"));
+        assert!(!publication.key.raw().contains("PRIVATE BODY"));
+        assert!(publication.key.raw().len() < 100);
+    }
+
+    #[test]
+    fn edited_away_publications_can_be_published_again() {
+        let skills = Skills {
+            catalog: Arc::new(BTreeMap::from([(
+                "review".into(),
+                Skill {
+                    description: "Review".into(),
+                    directory: "/workspace".into(),
+                    body: "PRIVATE BODY".into(),
+                },
+            )])),
+            ..Skills::default()
+        };
+        let rig = Rig::new(
+            "edited-publication",
+            Registry::default().with(&skills).unwrap(),
+        );
+        assert_eq!(
+            rig.done("skill", &json!({"name":"review"})),
+            json!({"Ok":"loaded"})
+        );
+        let seq = rig.log.lock().unwrap()[0].seq;
+        rig.cx().edit(seq, None, None);
+        assert_eq!(
+            rig.done("skill", &json!({"name":"review"})),
+            json!({"Ok":"loaded"})
+        );
+        let keys: Vec<_> = rig
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.body {
+                protocol::Body::Context {
+                    publication: Some(p),
+                    ..
+                } => Some(p.key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], keys[1]);
+    }
+}

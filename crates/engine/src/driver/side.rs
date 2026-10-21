@@ -1,9 +1,9 @@
 //! Side requests: admission, replay, bounded execution, and committed results.
 
 use super::{
-    Actor, Arc, Body, BoxFuture, CallId, Cancel, ContextOrigin, ContextRequest, Cx, Event, Json,
-    Model, Msg, Opened, Outcome, Own, PendingSide, Phase, Replied, Session, SideAdmitted, Ticket,
-    contain, first, lock, oneshot, replied, reply, unless,
+    Actor, Arc, Body, BoxFuture, CallId, CallPorts, Cancel, ContextOrigin, ContextRequest, Cx,
+    Event, Json, Model, Msg, Opened, Outcome, PendingSide, Phase, Replied, Session, SideAdmitted,
+    Ticket, contain, first, lock, oneshot, replied, reply, unless,
 };
 
 pub(super) enum SideFact {
@@ -229,16 +229,16 @@ impl Actor {
     }
 }
 
-impl ext::Models for Own {
+impl ext::Models for CallPorts {
     fn call<'a>(
         &'a self,
         cx: &'a Cx,
         side: ext::Side,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
-            let session = self.0.upgrade().ok_or_else(llm::Error::incomplete)?;
+            let session = Arc::clone(&self.session);
             let (sent, answer) = oneshot::channel();
-            let origin = self.1.clone();
+            let origin = self.origin.clone();
             if !origin.current(&session)
                 && (!side.is_background()
                     || origin.fence != session.fence.load(super::Ordering::SeqCst))
@@ -246,7 +246,7 @@ impl ext::Models for Own {
                 return Err(llm::Error::incomplete());
             }
             let cx = cx.clone();
-            let registry = Arc::clone(&self.2);
+            let registry = Arc::clone(&self.registry);
             let runtime = Arc::clone(&session.shared.rt);
             runtime.spawn(Box::pin(async move {
                 sent.send(side_call(&session, &cx, origin, side, &registry).await);

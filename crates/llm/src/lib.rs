@@ -9,7 +9,7 @@ mod client;
 mod conversation;
 mod error;
 pub mod hosts;
-pub mod http;
+pub use transport as http;
 mod json;
 pub mod models;
 mod prepare;
@@ -18,8 +18,6 @@ pub mod protocols;
 mod replay;
 pub mod spec;
 mod sse;
-#[cfg(feature = "ureq")]
-mod ureq;
 mod writer;
 
 pub use accumulate::Accumulator;
@@ -32,4 +30,4 @@ pub use prepare::NO_RESULT;
 pub use protocol::{Auth, Decoder, Encoded, Flow, Frame, Protocol, Provider, Secret, Target};
 pub use spec::*;
 #[cfg(feature = "ureq")]
-pub use ureq::{Redirects, Ureq};
+pub use transport::{RedirectPolicy as Redirects, Ureq};

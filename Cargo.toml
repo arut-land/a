@@ -33,6 +33,7 @@ json = { path = "crates/json" }
 kernel = { path = "crates/kernel" }
 client = { path = "crates/client" }
 engine = { path = "crates/engine" }
+transport = { path = "crates/transport" }
 llm = { path = "crates/llm" }
 protocol = { path = "crates/protocol" }
 rt = { path = "crates/rt" }

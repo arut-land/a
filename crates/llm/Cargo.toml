@@ -5,29 +5,18 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-# An HTTP client over ureq, run through the `rt` runtime; with neither TLS
-# feature it speaks plain http only.
-ureq = ["dep:ureq", "dep:rt"]
-# Which TLS it speaks is chosen where `a` is assembled, by target, so no
-# platform is named here. The OS's (Security.framework, SChannel): no
-# bundled crypto. ureq's connector needs its `native-tls` feature, which
-# links webpki's roots though the platform verifier never reads them.
-tls-native = ["ureq", "ureq/native-tls"]
-# rustls with the platform verifier. Not `rustls`, which adds webpki-roots:
-# Mozilla's roots, linked because ureq matches on `RootCerts` at run time
-# though the platform verifier never reads them (129 KiB on macOS).
-tls-rustls = ["ureq", "ureq/rustls-no-provider", "ureq/_ring", "ureq/platform-verifier"]
+ureq = ["transport/ureq"]
+tls-native = ["transport/tls-native"]
+tls-rustls = ["transport/tls-rustls"]
 
 [dependencies]
-futures-core = { version = "0.3", default-features = false, features = ["std"] }
 http.workspace = true
 json.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 smol_str = { version = "0.3", default-features = false, features = ["serde", "std"] }
-rt = { workspace = true, optional = true }
 
-ureq = { workspace = true, optional = true }
+transport.workspace = true
 
 [dev-dependencies]
 rt.workspace = true

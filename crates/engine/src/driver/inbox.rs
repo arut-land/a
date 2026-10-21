@@ -1,5 +1,5 @@
 //! Durable transport: both ends acknowledge only behind their log barriers.
-use super::{Actor, Arc, BoxFuture, ContextRequest, Live, Msg, Own, Ticket, oneshot};
+use super::{Actor, Arc, BoxFuture, CallPorts, ContextRequest, Live, Msg, Ticket, oneshot};
 use protocol::{Envelope, InboxRefusal};
 
 impl Actor {
@@ -61,19 +61,19 @@ impl Live {
     }
 }
 
-impl Own {
+impl CallPorts {
     pub(super) fn send_message(
         &self,
         message: ext::SendMessage,
     ) -> BoxFuture<'_, Result<(), InboxRefusal>> {
         Box::pin(async move {
-            let session = self.0.upgrade().ok_or(InboxRefusal::Interrupted)?;
-            if !self.1.current(&session) {
+            let session = Arc::clone(&self.session);
+            if !self.origin.current(&session) {
                 return Err(InboxRefusal::Interrupted);
             }
-            let envelope = message.envelope(session.id, self.1.id);
+            let envelope = message.envelope(session.id, self.origin.id);
             let (reply, result) = oneshot::channel();
-            self.1
+            self.origin
                 .send(&session, ContextRequest::Send { envelope, reply });
             result.await.unwrap_or(Err(InboxRefusal::Interrupted))
         })

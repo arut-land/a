@@ -605,7 +605,7 @@ fn stale_request<'a>(
     } else if matches!(probe, RetainedProbe::Child) {
         Box::pin(async move {
             let _ = old
-                .service::<dyn ext::Sessions>()
+                .sessions()
                 .unwrap()
                 .spawn(
                     old,

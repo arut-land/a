@@ -22,14 +22,13 @@ use ureq::unversioned::transport::{
     Transport,
 };
 
-use crate::http::{BoxFuture, Http, Payload, Response};
+use crate::{BoxFuture, Http, HttpClients, Payload, RedirectPolicy, Response};
 
 /// How long to wait for a reply's head: a reasoning model may think for
 /// minutes before its first byte.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CHUNK: usize = 16 * 1024;
-/// Chunks read ahead of the consumer.
 const AHEAD: usize = 16;
 
 #[derive(Clone)]
@@ -46,8 +45,6 @@ enum Piece {
 #[cfg(all(feature = "tls-native", feature = "tls-rustls"))]
 compile_error!("one TLS provider: tls-native or tls-rustls");
 
-/// The TLS the build chose; without either feature the agent speaks
-/// plain http only.
 #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
 const PROVIDER: TlsProvider = if cfg!(feature = "tls-native") {
     TlsProvider::NativeTls
@@ -55,15 +52,8 @@ const PROVIDER: TlsProvider = if cfg!(feature = "tls-native") {
     TlsProvider::Rustls
 };
 
-/// Whether a caller permits the HTTP transport to resend at another URL.
-#[derive(Clone, Copy, Debug)]
-pub enum Redirects {
-    Refuse,
-    Follow,
-}
-
 impl Ureq {
-    pub fn new(rt: Arc<dyn rt::Runtime>, redirects: Redirects) -> Self {
+    pub fn new(rt: Arc<dyn rt::Runtime>, redirects: RedirectPolicy) -> Self {
         let config = ureq::Agent::config_builder();
         #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
         let config = config.tls_config(
@@ -75,8 +65,8 @@ impl Ureq {
         let config = config
             .http_status_as_error(false)
             .max_redirects(match redirects {
-                Redirects::Refuse => 0,
-                Redirects::Follow => 10,
+                RedirectPolicy::Refuse => 0,
+                RedirectPolicy::Follow => 10,
             })
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_recv_response(Some(HEAD_TIMEOUT))
@@ -121,7 +111,6 @@ impl Http for Ureq {
                 CURRENT.set(Some(Arc::clone(&abort)));
                 run(&agent, request, &tx);
                 CURRENT.set(None);
-                // Done with the connection: it may serve the next request now.
                 abort.release();
             }),
         );
@@ -141,15 +130,12 @@ impl Http for Ureq {
     }
 }
 
-/// Sends `request` on `agent` and hands its head and body chunks to `tx`,
-/// until the body ends or the receiver goes away.
 fn run(
     agent: &ureq::Agent,
     request: http::Request<Payload>,
     tx: &rt::channel::BlockingSender<io::Result<Piece>>,
 ) {
     let (mut parts, body) = request.into_parts();
-    // Read from its pieces as it goes out, at the length they make.
     parts
         .headers
         .insert(http::header::CONTENT_LENGTH, body.len().into());
@@ -177,15 +163,13 @@ fn run(
             Err(error) => Err(error),
         };
         let failed = piece.is_err();
-        // A receiver that went away wants no more of the body.
         if tx.send(piece).is_err() || failed {
             return;
         }
     }
 }
 
-/// The chunks after the head, as a body. Dropping it drops `guard`.
-fn chunks(rx: rt::channel::Receiver<io::Result<Piece>>, guard: Guard) -> crate::http::Body {
+fn chunks(rx: rt::channel::Receiver<io::Result<Piece>>, guard: Guard) -> crate::Body {
     struct Chunks {
         rx: rt::channel::Receiver<io::Result<Piece>>,
         _guard: Guard,
@@ -216,13 +200,11 @@ thread_local! {
     static CURRENT: RefCell<Option<Arc<Abort>>> = const { RefCell::new(None) };
 }
 
-/// The socket a request runs on, for its caller to shut down.
 #[derive(Default)]
 struct Abort(Mutex<Line>);
 
 #[derive(Default)]
 struct Line {
-    /// The socket in use, by its [`Socket::id`], and a handle on it.
     socket: Option<(u64, TcpStream)>,
     /// Whether the caller went away: a socket registered later is shut at
     /// once.
@@ -234,7 +216,6 @@ impl Abort {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Registers `socket` as the one the request now runs on.
     fn register(&self, id: u64, socket: &TcpStream) {
         let mut line = self.line();
         if line.abandoned {
@@ -244,8 +225,6 @@ impl Abort {
         }
     }
 
-    /// Lets the socket go: the request ended, and its connection may be
-    /// pooled.
     fn release(&self) {
         self.line().socket = None;
     }
@@ -259,8 +238,6 @@ impl Abort {
     }
 }
 
-/// Held by the reply's future, then its body: dropping it abandons the
-/// request.
 struct Guard(Arc<Abort>);
 
 impl Drop for Guard {
@@ -269,8 +246,6 @@ impl Drop for Guard {
     }
 }
 
-/// Opens plain TCP connections, as ureq's own connector does, as
-/// [`Socket`]s.
 #[derive(Debug)]
 struct Tcp;
 
@@ -317,7 +292,6 @@ impl<In: Transport> Connector<In> for Tcp {
     }
 }
 
-/// A TCP connection that registers with the request using it.
 struct Socket {
     id: u64,
     stream: TcpStream,
@@ -347,7 +321,6 @@ impl Socket {
     }
 }
 
-/// Sets a socket timeout to `timeout`, unless it is that already.
 fn retime(
     timeout: NextTimeout,
     set: &mut Option<Duration>,
@@ -361,7 +334,6 @@ fn retime(
     Ok(())
 }
 
-/// `e`, or the timeout it means.
 fn expired(e: io::Error, timeout: NextTimeout) -> ureq::Error {
     match e.kind() {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => ureq::Error::Timeout(timeout.reason),
@@ -396,8 +368,6 @@ impl Transport for Socket {
         Ok(read > 0)
     }
 
-    /// Whether the idle connection is still up: nothing to read, and not
-    /// closed.
     fn is_open(&mut self) -> bool {
         let probe = || -> io::Result<bool> {
             self.stream.set_nonblocking(true)?;
@@ -417,6 +387,29 @@ impl fmt::Debug for Socket {
         f.debug_struct("Socket")
             .field("addr", &self.stream.peer_addr().ok())
             .finish_non_exhaustive()
+    }
+}
+
+pub struct Clients {
+    follow: Arc<dyn Http>,
+    refuse: Arc<dyn Http>,
+}
+
+impl Clients {
+    pub fn new(rt: Arc<dyn rt::Runtime>) -> Self {
+        Self {
+            follow: Arc::new(Ureq::new(Arc::clone(&rt), RedirectPolicy::Follow)),
+            refuse: Arc::new(Ureq::new(rt, RedirectPolicy::Refuse)),
+        }
+    }
+}
+
+impl HttpClients for Clients {
+    fn client(&self, policy: RedirectPolicy) -> Arc<dyn Http> {
+        Arc::clone(match policy {
+            RedirectPolicy::Follow => &self.follow,
+            RedirectPolicy::Refuse => &self.refuse,
+        })
     }
 }
 

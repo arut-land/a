@@ -61,7 +61,7 @@ fn client() -> (Ureq, mpsc::Receiver<()>) {
         inner: rt::Threads::new(1),
         done,
     };
-    (Ureq::new(Arc::new(rt), Redirects::Follow), returned)
+    (Ureq::new(Arc::new(rt), RedirectPolicy::Follow), returned)
 }
 
 fn request(port: u16) -> http::Request<Payload> {
@@ -107,7 +107,7 @@ fn server(reply: &'static [u8]) -> (u16, mpsc::Receiver<()>, mpsc::Receiver<()>)
     (port, got_rx, closed_rx)
 }
 
-fn next_chunk(body: &mut crate::http::Body) -> Option<io::Result<Vec<u8>>> {
+fn next_chunk(body: &mut crate::Body) -> Option<io::Result<Vec<u8>>> {
     rt::block_on(std::future::poll_fn(|cx| {
         futures_core::Stream::poll_next(Pin::as_mut(body), cx)
     }))
@@ -177,6 +177,56 @@ fn a_finished_reply_leaves_its_connection_to_the_next_request() {
         let reply = rt::block_on(http.send(request(port))).unwrap();
         let mut body = reply.into_body();
         assert_eq!(&next_chunk(&mut body).unwrap().unwrap()[..], b"ok");
+        assert!(next_chunk(&mut body).is_none());
+    }
+    server.join().unwrap();
+}
+
+#[test]
+fn credentials_never_cross_transport_scopes() {
+    use crate::{Clients, HttpClients};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        for credential in [Some("model-secret"), Some("mcp-secret"), None, None] {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                headers.push_str(&line.to_ascii_lowercase());
+            }
+            match credential {
+                Some(value) => assert!(headers.contains(&format!("authorization: {value}\r\n"))),
+                None => assert!(!headers.contains("authorization:")),
+            }
+            assert!(!headers.contains("cookie:"));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nSet-Cookie: secret=private\r\nConnection: close\r\n\r\n").unwrap();
+        }
+    });
+    let runtime = Arc::new(rt::Threads::new(1));
+    let clients = Clients::new(runtime);
+    for (policy, credential) in [
+        (RedirectPolicy::Follow, Some("model-secret")),
+        (RedirectPolicy::Refuse, Some("mcp-secret")),
+        (RedirectPolicy::Follow, None),
+        (RedirectPolicy::Refuse, None),
+    ] {
+        let mut request = request(port);
+        if let Some(value) = credential {
+            request
+                .headers_mut()
+                .insert(http::header::AUTHORIZATION, value.parse().unwrap());
+        }
+        let reply = rt::block_on(clients.client(policy).send(request)).unwrap();
+        let mut body = reply.into_body();
         assert!(next_chunk(&mut body).is_none());
     }
     server.join().unwrap();

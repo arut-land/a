@@ -9,9 +9,10 @@ publish.workspace = true
 # call needs from the OS or a runtime it asks the engine for, as a service.
 [features]
 # `testing::Rig`, a stand-in engine for an extension's tests.
-testing = ["dep:rt", "dep:sys"]
+testing = ["dep:rt", "dep:sys", "transport/ureq"]
 
 [dependencies]
+transport.workspace = true
 ext-derive.workspace = true
 llm.workspace = true
 protocol.workspace = true
