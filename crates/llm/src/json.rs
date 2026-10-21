@@ -1,15 +1,113 @@
 //! JSON as providers send it: read leniently, and tool arguments parsed so
-//! a malformed or cut-off call never fails a reply (ported from rig).
+//! malformed calls keep their stated input within the decoding ceilings.
 
+use std::collections::VecDeque;
 use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
+
+use crate::error::Error;
+use crate::sse::DecodeLimits;
 
 mod read;
 
 pub(crate) use read::{
     Count, Fielded, Fields, First, FromFields, Json, Obj, Word, fields, next, tag, word,
 };
+
+/// Strings hide structural punctuation, including across argument fragments.
+#[derive(Default)]
+pub(crate) struct JsonDepth {
+    depth: usize,
+    string: bool,
+    escaped: bool,
+}
+
+impl JsonDepth {
+    pub(crate) fn push(&mut self, text: &str, limit: usize) -> Result<(), Error> {
+        for byte in text.bytes() {
+            if self.string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.string = false;
+                }
+            } else {
+                match byte {
+                    b'"' => self.string = true,
+                    b'{' | b'[' => {
+                        if self.depth >= limit {
+                            return Err(Error::limit("JSON depth"));
+                        }
+                        self.depth += 1;
+                    }
+                    b'}' | b']' => self.depth = self.depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn check_text(text: &str, bytes: usize, depth: usize) -> Result<(), Error> {
+    if text.len() > bytes {
+        return Err(Error::limit("JSON bytes"));
+    }
+    JsonDepth::default().push(text, depth)
+}
+
+/// Count serialized bytes without making another copy of a provider tree.
+pub(crate) fn encoded_bytes(value: &impl serde::Serialize, limit: usize) -> Result<usize, Error> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes) {
+                return Err(std::io::Error::other("JSON byte limit"));
+            }
+            self.bytes += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, limit };
+    serde_json::to_writer(&mut counter, value).map_err(|_| Error::limit("JSON bytes"))?;
+    Ok(counter.bytes)
+}
+
+pub(crate) fn value_bytes(value: &Value, limits: DecodeLimits) -> Result<usize, Error> {
+    fn depth(value: &Value, left: usize) -> Result<(), Error> {
+        match value {
+            Value::Array(values) => {
+                let left = left
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::limit("JSON depth"))?;
+                for value in values {
+                    depth(value, left)?;
+                }
+            }
+            Value::Object(values) => {
+                let left = left
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::limit("JSON depth"))?;
+                for value in values.values() {
+                    depth(value, left)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    depth(value, limits.depth)?;
+    encoded_bytes(value, limits.reply_bytes)
+}
 
 /// Lenient reads of a JSON value: a missing field or one of the wrong type
 /// is `None`, and numbers may arrive as strings.
@@ -152,7 +250,11 @@ pub fn overlay(body: &mut Value, overlay: &Map<String, Value>) {
 /// spacing and order the model wrote it in: that text is the call's input
 /// from here on, the same in the log and in every request that sends it
 /// back.
-pub fn arguments(text: &str) -> (::json::Json, Option<String>) {
+pub(crate) fn arguments(
+    text: &str,
+    limits: DecodeLimits,
+) -> Result<(::json::Json, Option<String>), Error> {
+    check_text(text, limits.argument_bytes, limits.depth)?;
     let parsed = if text.trim().is_empty() {
         Ok(Value::Object(Map::new()))
     } else {
@@ -161,17 +263,20 @@ pub fn arguments(text: &str) -> (::json::Json, Option<String>) {
     let (arguments, invalid) = match parsed {
         Ok(Value::Object(arguments)) => (arguments, false),
         Ok(Value::Null) => (Map::new(), false),
-        Ok(Value::String(inner)) => match serde_json::from_str(&inner) {
-            Ok(Value::Object(arguments)) => (arguments, false),
-            _ => (Map::new(), true),
-        },
+        Ok(Value::String(inner)) => {
+            check_text(&inner, limits.argument_bytes, limits.depth)?;
+            match serde_json::from_str(&inner) {
+                Ok(Value::Object(arguments)) => (arguments, false),
+                _ => (Map::new(), true),
+            }
+        }
         Ok(_) => (Map::new(), true),
-        Err(_) => (parse_partial_object(text).unwrap_or_default(), true),
+        Err(_) => (partial_object(text, limits).unwrap_or_default(), true),
     };
-    (
+    Ok((
         ::json::Json::encode(&arguments).unwrap_or_default(),
         invalid.then(|| text.to_owned()),
-    )
+    ))
 }
 
 /// Whether `text` is a whole JSON object; nothing at all is one.
@@ -189,15 +294,27 @@ pub(crate) fn is_object(text: &str) -> bool {
         && serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
 }
 
-pub fn parse_partial_object(text: &str) -> Option<Map<String, Value>> {
-    // Bounds the work on a large cut-off input: the last valid cut is
-    // almost always near its end.
-    const MAX_ATTEMPTS: usize = 256;
+const CHECKPOINTS: usize = 256;
+type Checkpoint = (usize, Vec<u8>, bool);
+
+fn checkpoint(cuts: &mut VecDeque<Checkpoint>, at: usize, stack: &[u8], quote: bool) {
+    let mut open = if cuts.len() == CHECKPOINTS {
+        cuts.pop_front().expect("full checkpoints").1
+    } else {
+        Vec::new()
+    };
+    open.clear();
+    open.extend_from_slice(stack);
+    cuts.push_back((at, open, quote));
+}
+
+fn checkpoints(text: &str, limits: DecodeLimits) -> Option<VecDeque<Checkpoint>> {
+    check_text(text, limits.argument_bytes, limits.depth).ok()?;
     let mut stack = Vec::new();
     let mut in_string = false;
     let mut escaped = false;
     // Prefix lengths a value just ended at, with the containers open there.
-    let mut cuts: Vec<(usize, Vec<u8>, bool)> = Vec::new();
+    let mut cuts = VecDeque::with_capacity(CHECKPOINTS);
     let bytes = text.as_bytes();
     for (at, byte) in bytes.iter().enumerate() {
         if in_string {
@@ -206,7 +323,7 @@ pub fn parse_partial_object(text: &str) -> Option<Map<String, Value>> {
                 (false, b'\\') => escaped = true,
                 (false, b'"') => {
                     in_string = false;
-                    cuts.push((at + 1, stack.clone(), false));
+                    checkpoint(&mut cuts, at + 1, &stack, false);
                 }
                 (false, _) => {}
             }
@@ -216,18 +333,18 @@ pub fn parse_partial_object(text: &str) -> Option<Map<String, Value>> {
             b'"' => in_string = true,
             b'{' | b'[' => {
                 stack.push(*byte);
-                cuts.push((at + 1, stack.clone(), false));
+                checkpoint(&mut cuts, at + 1, &stack, false);
             }
             b'}' | b']' => {
                 stack.pop();
-                cuts.push((at + 1, stack.clone(), false));
+                checkpoint(&mut cuts, at + 1, &stack, false);
             }
             b if b.is_ascii_alphanumeric() || *b == b'.' || *b == b'-' || *b == b'+' => {
                 let next = bytes.get(at + 1).copied();
                 if !next.is_some_and(|n| {
                     n.is_ascii_alphanumeric() || n == b'.' || n == b'-' || n == b'+'
                 }) {
-                    cuts.push((at + 1, stack.clone(), false));
+                    checkpoint(&mut cuts, at + 1, &stack, false);
                 }
             }
             _ => {}
@@ -235,24 +352,37 @@ pub fn parse_partial_object(text: &str) -> Option<Map<String, Value>> {
     }
     if in_string {
         let at = text.len() - usize::from(escaped);
-        cuts.push((at, stack.clone(), true));
+        checkpoint(&mut cuts, at, &stack, true);
     }
-    cuts.iter()
-        .rev()
-        .take(MAX_ATTEMPTS)
-        .find_map(|(at, open, quote)| {
-            let mut candidate = text.get(..*at)?.to_owned();
-            if *quote {
-                candidate.push('"');
-            }
-            for container in open.iter().rev() {
-                candidate.push(if *container == b'{' { '}' } else { ']' });
-            }
-            match serde_json::from_str(&candidate) {
-                Ok(Value::Object(object)) => Some(object),
-                _ => None,
-            }
-        })
+    Some(cuts)
+}
+
+pub fn parse_partial_object(text: &str) -> Option<Map<String, Value>> {
+    partial_object(text, DecodeLimits::default())
+}
+
+fn partial_object(text: &str, limits: DecodeLimits) -> Option<Map<String, Value>> {
+    let cuts = checkpoints(text, limits)?;
+    // Bound total copying and parsing, even when every recent cut is invalid.
+    let mut work = limits.reply_bytes;
+    for (at, open, quote) in cuts.iter().rev() {
+        let size = at
+            .checked_add(open.len())?
+            .checked_add(usize::from(*quote))?;
+        work = work.checked_sub(size)?;
+        let mut candidate = String::with_capacity(size);
+        candidate.push_str(text.get(..*at)?);
+        if *quote {
+            candidate.push('"');
+        }
+        for container in open.iter().rev() {
+            candidate.push(if *container == b'{' { '}' } else { ']' });
+        }
+        if let Ok(Value::Object(object)) = serde_json::from_str(&candidate) {
+            return Some(object);
+        }
+    }
+    None
 }
 
 /// The best object a tool call's argument text states so far, for showing a
@@ -273,10 +403,13 @@ pub fn parse_partial_object(text: &str) -> Option<Map<String, Value>> {
 /// assert_eq!(partial["content"], "Hel");
 /// ```
 pub fn parse_partial_arguments(text: &str) -> Map<String, Value> {
-    if text.trim().is_empty() {
+    let limits = DecodeLimits::default();
+    if check_text(text, limits.argument_bytes, limits.depth).is_err() {
         return Map::new();
     }
-    let repaired = repair_json(text);
+    let Some(repaired) = repair_json(text) else {
+        return Map::new();
+    };
     let complete = serde_json::from_str(text)
         .ok()
         .or_else(|| serde_json::from_str(&repaired).ok());
@@ -295,11 +428,14 @@ pub fn parse_partial_arguments(text: &str) -> Map<String, Value> {
 /// `text` with raw control characters inside strings escaped and each
 /// backslash that starts no valid escape doubled, as models sometimes write
 /// them.
-fn repair_json(text: &str) -> String {
+fn repair_json(text: &str) -> Option<String> {
     let mut repaired = String::with_capacity(text.len());
     let mut in_string = false;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
+        if repaired.len().saturating_add(6) > DecodeLimits::default().argument_bytes {
+            return None;
+        }
         if !in_string {
             in_string = c == '"';
             repaired.push(c);
@@ -332,7 +468,7 @@ fn repair_json(text: &str) -> String {
             c => repaired.push(c),
         }
     }
-    repaired
+    Some(repaired)
 }
 
 /// `text` without a `\u` escape its end cuts short, which would otherwise

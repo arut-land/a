@@ -147,7 +147,33 @@ fn decode(dir: &str, doc: &serde_yaml_ng::Value) -> Option<Value> {
         },
         ..Request::default()
     };
-    let reply = rt::block_on(llm::generate(&recorded, &provider, &request));
+    let reply = rt::block_on(async {
+        let mut stream = llm::stream(&recorded, &provider, &request);
+        let (mut finishes, mut failure) = (0, None);
+        while let Some(event) = stream.next().await {
+            assert!(
+                failure.is_none() && finishes == 0,
+                "event after a terminal outcome"
+            );
+            match event {
+                Ok(llm::Event::Finish { .. }) => finishes += 1,
+                Ok(_) => assert_eq!(finishes, 0, "events after Finish"),
+                Err(error) => {
+                    assert!(failure.is_none(), "more than one terminal error");
+                    failure = Some(error);
+                }
+            }
+        }
+        assert_eq!(finishes + usize::from(failure.is_some()), 1);
+        assert!(
+            stream.next().await.is_none(),
+            "a terminal stream stays ended"
+        );
+        match failure {
+            Some(error) => Err(error),
+            None => stream.finish(Some(llm::origin(&provider, &request.model))),
+        }
+    });
     Some(match reply {
         Err(error) => json!({"error": error.to_string(), "kind": format!("{:?}", error.kind)}),
         Ok(response) => {
@@ -253,7 +279,7 @@ fn agrees(expected: &Value, ours: &Value) -> bool {
 }
 
 #[test]
-fn every_recorded_stream_decodes_as_rig_decodes_it() {
+fn terminal_stream_semantics_match_the_recorded_corpus() {
     let root = root();
     let mut files = Vec::new();
     walk(&root.join("expected"), &mut files);

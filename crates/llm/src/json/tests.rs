@@ -148,3 +148,37 @@ mod partial_arguments {
         }
     }
 }
+
+#[test]
+fn partial_json_checkpoint_memory_is_bounded() {
+    let limits = DecodeLimits {
+        argument_bytes: 128 * 1024,
+        depth: 8,
+        ..Default::default()
+    };
+    let text = format!(r#"{{"a":[{}"#, "0,".repeat(20_000));
+    let cuts = checkpoints(&text, limits).expect("bounded input");
+    assert_eq!(cuts.len(), CHECKPOINTS);
+    assert_eq!(cuts.capacity(), CHECKPOINTS);
+    assert!(cuts.iter().all(|(_, stack, _)| stack.len() <= limits.depth));
+    assert!(
+        cuts.iter()
+            .map(|(_, stack, _)| stack.capacity())
+            .sum::<usize>()
+            <= CHECKPOINTS * limits.depth
+    );
+    assert!(checkpoints(&"[".repeat(limits.depth + 1), limits).is_none());
+    assert!(checkpoints(&" ".repeat(limits.argument_bytes + 1), limits).is_none());
+    assert!(parse_partial_object(r#"{"a":[1,2,3],"b":"cut"#).is_some());
+}
+
+#[test]
+fn partial_candidates_spend_their_copy_budget_before_allocating() {
+    let text = r#"{"a": 1,"b":"cut"#;
+    let limits = DecodeLimits {
+        reply_bytes: text.len() - 1,
+        ..Default::default()
+    };
+    assert!(partial_object(text, limits).is_none());
+    assert!(partial_object(text, DecodeLimits::default()).is_some());
+}

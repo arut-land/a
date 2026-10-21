@@ -17,7 +17,7 @@ use crate::error::{Error, Kind};
 use crate::http::{Body, BoxFuture, Http};
 use crate::protocol::{Decoder, Flow, Provider, Target};
 use crate::spec::{Event, Origin, Request, Response};
-use crate::sse::SseFramer;
+use crate::sse::{DecodeLimits, SseFramer};
 
 /// Streams the reply to `request` from `provider`.
 pub fn stream(http: &dyn Http, provider: &Provider, request: &Request) -> Events {
@@ -198,7 +198,9 @@ impl Events {
                 } => {
                     match ready!(body.as_mut().poll_next(cx)) {
                         Some(Ok(chunk)) if read.len() < 64 * 1024 => {
-                            read.extend_from_slice(&chunk);
+                            read.extend_from_slice(
+                                &chunk[..chunk.len().min(64 * 1024 - read.len())],
+                            );
                             continue;
                         }
                         Some(Ok(_) | Err(_)) | None => {}
@@ -226,7 +228,7 @@ impl Reader {
     fn new(body: Body, decoder: Box<dyn Decoder>) -> Self {
         Self {
             body,
-            sse: SseFramer::new(),
+            sse: SseFramer::with_limits(DecodeLimits::default()),
             decoder,
             queue: VecDeque::new(),
             decoded: Vec::new(),

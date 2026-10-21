@@ -7,11 +7,35 @@
 use crate::error::Error;
 use crate::protocol::{Flow, Frame};
 
+/// Per-reply ceilings, shared by framing and provider decoding.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DecodeLimits {
+    pub frame_bytes: usize,
+    pub reply_bytes: usize,
+    pub argument_bytes: usize,
+    pub parts: usize,
+    pub depth: usize,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            frame_bytes: 8 * 1024 * 1024,
+            reply_bytes: 64 * 1024 * 1024,
+            argument_bytes: 32 * 1024 * 1024,
+            parts: 4096,
+            depth: 64,
+        }
+    }
+}
+
 const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
 
 #[derive(Debug, Default)]
 pub struct SseFramer {
     buffer: Vec<u8>,
+    limits: DecodeLimits,
+    frame_bytes: usize,
     bom_prefix: usize,
     bom_done: bool,
     /// The event being assembled from its field lines.
@@ -20,6 +44,7 @@ pub struct SseFramer {
 }
 
 impl SseFramer {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -31,43 +56,90 @@ impl SseFramer {
         chunk: &[u8],
         mut each: impl FnMut(Frame<'_>) -> Result<Flow, Error>,
     ) -> Result<Flow, Error> {
-        let chunk = self.strip_bom(chunk);
-        self.buffer.extend_from_slice(chunk);
-        let mut start = 0;
-        let mut flow = Ok(Flow::More);
-        while let Some((line_len, consumed)) = terminated_line(&self.buffer[start..]) {
-            let line = String::from_utf8_lossy(&self.buffer[start..start + line_len]);
-            start += consumed;
-            if !line.is_empty() {
-                line_field(&line, &mut self.event_type, &mut self.data);
-                continue;
+        let chunk = self.strip_bom(chunk)?;
+        for &byte in chunk {
+            if self.buffer.last() == Some(&b'\r') {
+                if byte == b'\n' {
+                    self.charge(1)?;
+                }
+                self.buffer.pop();
+                let flow = self.line(&mut each)?;
+                if flow == Flow::Done {
+                    return Ok(flow);
+                }
+                if byte == b'\n' {
+                    continue;
+                }
             }
-            // A blank line dispatches the event, if it has data.
-            if !self.data.is_empty() {
-                self.data.pop();
-                let event = if self.event_type.is_empty() {
+            self.charge(1)?;
+            if byte == b'\n' {
+                let flow = self.line(&mut each)?;
+                if flow == Flow::Done {
+                    return Ok(flow);
+                }
+            } else {
+                self.buffer.push(byte);
+            }
+        }
+        Ok(Flow::More)
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), Error> {
+        if bytes > self.limits.frame_bytes.saturating_sub(self.frame_bytes) {
+            return Err(Error::limit("SSE frame bytes"));
+        }
+        self.frame_bytes += bytes;
+        Ok(())
+    }
+
+    pub(crate) fn with_limits(limits: DecodeLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
+    fn line(
+        &mut self,
+        each: &mut impl FnMut(Frame<'_>) -> Result<Flow, Error>,
+    ) -> Result<Flow, Error> {
+        if !self.buffer.is_empty() {
+            let line = String::from_utf8_lossy(&self.buffer);
+            let size = self
+                .event_type
+                .len()
+                .saturating_add(self.data.len())
+                .saturating_add(line.len())
+                .saturating_add(1);
+            if size > self.limits.frame_bytes {
+                return Err(Error::limit("SSE frame bytes"));
+            }
+            line_field(&line, &mut self.event_type, &mut self.data);
+            self.buffer.clear();
+            return Ok(Flow::More);
+        }
+        self.frame_bytes = 0;
+        let flow = if self.data.is_empty() {
+            Ok(Flow::More)
+        } else {
+            self.data.pop();
+            each(Frame {
+                event: if self.event_type.is_empty() {
                     "message"
                 } else {
                     &self.event_type
-                };
-                flow = each(Frame {
-                    event,
-                    data: &self.data,
-                });
-                self.data.clear();
-            }
-            self.event_type.clear();
-            if !matches!(flow, Ok(Flow::More)) {
-                break;
-            }
-        }
-        self.buffer.drain(..start);
+                },
+                data: &self.data,
+            })
+        };
+        self.data.clear();
+        self.event_type.clear();
         flow
     }
 
-    fn strip_bom<'a>(&mut self, chunk: &'a [u8]) -> &'a [u8] {
+    fn strip_bom<'a>(&mut self, chunk: &'a [u8]) -> Result<&'a [u8], Error> {
         if self.bom_done {
-            return chunk;
+            return Ok(chunk);
         }
         let mut rest = chunk;
         while let Some(&byte) = rest.first() {
@@ -75,18 +147,19 @@ impl SseFramer {
                 // Not a BOM after all: replay the bytes that matched so far.
                 let matched = std::mem::take(&mut self.bom_prefix);
                 self.bom_done = true;
+                self.charge(matched)?;
                 self.buffer.extend_from_slice(&BOM[..matched]);
-                return rest;
+                return Ok(rest);
             }
             self.bom_prefix += 1;
             rest = &rest[1..];
             if self.bom_prefix == BOM.len() {
                 self.bom_prefix = 0;
                 self.bom_done = true;
-                return rest;
+                return Ok(rest);
             }
         }
-        rest
+        Ok(rest)
     }
 }
 
@@ -106,23 +179,6 @@ fn line_field(line: &str, event_type: &mut String, data: &mut String) {
             data.push('\n');
         }
         _ => {}
-    }
-}
-
-/// The length of the line `buffer` starts with, and the bytes it takes with
-/// its terminator; `None` until the line is terminated.
-fn terminated_line(buffer: &[u8]) -> Option<(usize, usize)> {
-    let pos = buffer
-        .iter()
-        .position(|byte| *byte == b'\n' || *byte == b'\r')?;
-    match buffer[pos] {
-        b'\n' => Some((pos, pos + 1)),
-        _ => match buffer.get(pos + 1) {
-            Some(b'\n') => Some((pos, pos + 2)),
-            Some(_) => Some((pos, pos + 1)),
-            // The `\n` of a `\r\n` pair may still arrive.
-            None => None,
-        },
     }
 }
 
