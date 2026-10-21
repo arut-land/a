@@ -168,6 +168,8 @@ default `Threads` implementation uses async-executor and async-io plus a
 blocking pool. Alternative adapters are feature-gated; the optional Tokio
 adapter is not linked by `a`. Platform calls and production unsafe code
 belong in `sys`; `rt` owns readiness integration.
+One remaining seam gap is `ext-prompt`'s direct OS/architecture lookup for
+prompt text; it should consume the build's `sys::Platform` identity too.
 
 `json::Json` holds shared raw JSON bytes. Arguments, output, model responses
 and extension state pass through layers without decoding by non-owners.
@@ -262,7 +264,3 @@ for the distributed design. Each needs its own contract and measurements.
   load, beyond idle and synthetic workloads?
 - Which runtime-extension capabilities and isolation should MCP and future
   out-of-process extensions share with Lua?
-
-The Oct 18 design's distributed leases, runtime tiers and transport stack
-are proposals, not current contracts. The Oct 21 export's race reports need
-reproduction against the current code before being treated as known bugs.
