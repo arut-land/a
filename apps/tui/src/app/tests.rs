@@ -332,6 +332,36 @@ fn a_card_folds_on_click_and_ctrl_o_shows_all_output() {
 }
 
 #[test]
+fn tool_success_can_precede_the_idle_frame_that_makes_ctrl_c_detach() {
+    let (mut app, _) = app(Viewport::Full, &asked_command());
+    app.fold(&entry(
+        5,
+        Body::ToolResult {
+            call: CallId::new(3).unwrap(),
+            outcome: Outcome::Done {
+                output: Json::encode(&json!({"output": "first\n", "exit": 0})).unwrap(),
+            },
+            card: Some(Card {
+                title: "$ ls".into(),
+                note: "exit 0".into(),
+                ..Card::default()
+            }),
+        },
+    ));
+    let (_, rows) = frame(&mut app, 80, 24);
+    find(&rows, "✓ exit 0");
+    assert_eq!(
+        press(&mut app, Key::Ctrl('c')),
+        Some(Effect::Cmd(Cmd::Interrupt))
+    );
+    app.fold(&DaemonMsg::Activity {
+        seq: 5,
+        activity: Activity::Idle,
+    });
+    assert_eq!(press(&mut app, Key::Ctrl('c')), Some(Effect::Detach));
+}
+
+#[test]
 fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
     let msgs: Vec<_> = (2..40)
         .map(|seq| {

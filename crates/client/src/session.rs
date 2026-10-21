@@ -238,7 +238,7 @@ pub struct TurnView {
 }
 
 /// The normal send window; cancellation can reserve one further slot.
-const UNANSWERED: usize = 64;
+pub(crate) const UNANSWERED: usize = 64;
 
 /// One session's client, sans I/O.
 pub struct SessionClient {
@@ -680,7 +680,7 @@ impl Offer<'_> {
     }
 }
 
-const fn is_mutation(msg: &ClientMsg) -> bool {
+pub(crate) const fn is_mutation(msg: &ClientMsg) -> bool {
     matches!(
         msg,
         ClientMsg::Input { .. } | ClientMsg::Approve { .. } | ClientMsg::Interrupt { .. }

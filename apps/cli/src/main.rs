@@ -197,9 +197,11 @@ enum Input {
 fn repl(daemon: &client::Daemon, target: Target) -> io::Result<()> {
     let (tx, rx) = client::inbox();
     let events = tx.clone();
-    let driver = Driver::new(daemon.clone(), move |_, event| {
+    let runtime: rt::Rt = std::sync::Arc::new(rt::Threads::default());
+    let driver = Driver::new(move |_, event| {
         let _ = events.send(Input::Client(event));
-    });
+    })
+    .start(runtime.clone(), daemon.clone());
     let mut repl = Repl {
         client: SessionClient::new(Env::Origin),
         screen: Screen::default(),

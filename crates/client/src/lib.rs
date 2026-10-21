@@ -3,7 +3,7 @@
 //! socket, spawned if needed; another machine's through `ssh <host> a
 //! bridge`, whose stdio carries the same frames). Above it, without I/O, a
 //! session's link, view and intents ([`SessionClient`]) and the one slash
-//! command table ([`COMMANDS`]); a thin [`Driver`] runs them on threads.
+//! command table ([`COMMANDS`]); a [`Driver`] owns transport on the supplied runtime.
 
 mod approval;
 mod command;
@@ -17,7 +17,7 @@ mod watch;
 
 pub use approval::{ApprovalPart, approval_parts, approval_text};
 pub use command::{COMMANDS, Cmd, Command, help, parse};
-pub use drive::{Driver, Renderer, pump};
+pub use drive::{ClientHandle, Driver, Renderer, pump};
 pub use inbox::{Inbox, Post, inbox};
 pub use session::{
     Attach, ConnId, Effect, End, Env, Event, EventKind, Io, Link, Notice, Offer, SessionClient,
@@ -58,6 +58,8 @@ pub enum Error {
     /// The daemon refuses to serve, as it says (after a crash loop).
     Refused(String),
     Fork(protocol::ForkError),
+    /// No additional request was admitted; a pending environment request keeps its latest value.
+    Busy,
     /// The daemon closed the connection.
     Closed,
     /// The socket, `ssh` or the spawn failed.
@@ -94,6 +96,7 @@ impl fmt::Display for Error {
             Self::Fork(reason) => reason.fmt(f),
             Self::NotResponding => f.write_str("the daemon is not responding"),
             Self::Refused(why) | Self::Io(_, why) => f.write_str(why),
+            Self::Busy => f.write_str("the client transport is busy; try again"),
             Self::Closed => f.write_str("the daemon closed the connection"),
         }
     }
@@ -120,6 +123,7 @@ impl From<Error> for io::Error {
             Error::Mismatch { .. } => io::ErrorKind::Unsupported,
             Error::NotResponding => io::ErrorKind::TimedOut,
             Error::Refused(_) | Error::Fork(_) => io::ErrorKind::Other,
+            Error::Busy => io::ErrorKind::WouldBlock,
             Error::Closed => io::ErrorKind::UnexpectedEof,
             Error::Io(kind, _) => *kind,
         };
@@ -127,31 +131,57 @@ impl From<Error> for io::Error {
     }
 }
 
-/// The read half of a connection, over any byte stream.
-pub struct Reader(BufReader<Box<dyn Read + Send>>);
+/// The read half of a connection.
+pub struct Reader(BufReader<Transport>);
 
-/// The write half of a connection.
-pub struct Writer(Box<dyn WriteTransport>);
-
-trait WriteTransport: Write + Send {
-    fn shutdown(&mut self);
+/// The write half owns cancellation of its peer reader.
+pub struct Writer {
+    io: Option<Transport>,
+    child: Option<sys::Child>,
 }
 
-impl WriteTransport for Stream {
-    fn shutdown(&mut self) {
-        let _ = Stream::shutdown(self, std::net::Shutdown::Read);
+enum Transport {
+    Local(Stream),
+    Pipe(sys::ProcessPipe),
+}
+
+// Pipe and socket types coincide on some targets.
+#[allow(clippy::match_same_arms)]
+impl Read for Transport {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Local(io) => io.read(bytes),
+            Self::Pipe(io) => io.read(bytes),
+        }
+    }
+}
+
+#[allow(clippy::match_same_arms)]
+impl Write for Transport {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Local(io) => io.write(bytes),
+            Self::Pipe(io) => io.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        // The reader owns a clone; closing this write handle alone cannot wake it.
-        self.0.shutdown();
+        if let Some(Transport::Local(stream)) = &self.io {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
-/// A daemon connection, split so reading and writing can run on their own
-/// threads.
+/// A daemon connection, split so reading and writing can make progress independently.
 pub struct Connection {
     pub reader: Reader,
     pub writer: Writer,
@@ -187,27 +217,7 @@ impl Connection {
     /// the directory given, else from the origin's; an attach that keeps
     /// the session's environment captures nothing.
     pub fn attach(&self, attach: &Attach) -> io::Result<ClientMsg> {
-        let (workspace, env) = match &attach.env {
-            Env::Keep => (attach.workspace.clone().unwrap_or_default(), None),
-            Env::Origin => {
-                let env = self.origin()?;
-                (
-                    attach.workspace.clone().unwrap_or_else(|| env.cwd.clone()),
-                    Some(env),
-                )
-            }
-            Env::Given(env) => (
-                attach.workspace.clone().unwrap_or_else(|| env.cwd.clone()),
-                Some(env.clone()),
-            ),
-        };
-        Ok(ClientMsg::Attach {
-            target: attach.target.clone(),
-            workspace,
-            since: attach.since,
-            env,
-            decl: ClientDecl::default(),
-        })
+        attaching(attach, || self.origin())
     }
 
     /// Sends each of `msgs`.
@@ -243,6 +253,33 @@ impl Connection {
         self.reader
             .until(|msg| list.fold(&msg).then(|| std::mem::take(&mut list.sessions)))
     }
+}
+
+fn attaching(
+    attach: &Attach,
+    origin: impl FnOnce() -> io::Result<Environment>,
+) -> io::Result<ClientMsg> {
+    let (workspace, env) = match &attach.env {
+        Env::Keep => (attach.workspace.clone().unwrap_or_default(), None),
+        Env::Origin => {
+            let env = origin()?;
+            (
+                attach.workspace.clone().unwrap_or_else(|| env.cwd.clone()),
+                Some(env),
+            )
+        }
+        Env::Given(env) => (
+            attach.workspace.clone().unwrap_or_else(|| env.cwd.clone()),
+            Some(env.clone()),
+        ),
+    };
+    Ok(ClientMsg::Attach {
+        target: attach.target.clone(),
+        workspace,
+        since: attach.since,
+        env,
+        decl: ClientDecl::default(),
+    })
 }
 
 /// Why no one session matches a prefix.
@@ -316,7 +353,7 @@ impl Writer {
     /// Sends `msg` as it is: a mutation is numbered by the session client
     /// that made it, which keeps it for the daemon's answer.
     pub fn send(&mut self, msg: &ClientMsg) -> io::Result<()> {
-        write_frame(&mut self.0, msg)
+        write_frame(self.io.as_mut().expect("owned writer"), msg)
     }
 }
 
@@ -515,8 +552,11 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
 
 fn split(stream: &Stream) -> io::Result<Connection> {
     Ok(Connection {
-        reader: Reader(BufReader::new(Box::new(stream.try_clone()?))),
-        writer: Writer(Box::new(stream.try_clone()?)),
+        reader: Reader(BufReader::new(Transport::Local(stream.try_clone()?))),
+        writer: Writer {
+            io: Some(Transport::Local(stream.try_clone()?)),
+            child: None,
+        },
         remote: None,
         welcome: Welcome::default(),
         commands: Vec::new(),

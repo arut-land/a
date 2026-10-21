@@ -46,18 +46,22 @@ final class AppModel {
     var cliDir = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".local/bin")
     private(set) var cliStatus: CliStatus?
     private(set) var cliProblem: String?
+    private(set) var daemonPid: UInt32?
+    private(set) var daemonProblem: String?
     /// A message for an alert, such as the outcome of installing the CLI.
     var notice: String?
 
     init() {
-        // Staging the bundled helper lets the app and CLI share the daemon.
         let helper = Bundle.main.bundleURL.appending(path: "Contents/Helpers/a").path
-        do {
-            let client = try Client(helper: helper)
-            self.client = client
-            list = SessionListStore(client: client)
-        } catch {
-            problem = error.localizedDescription
+        Task {
+            do {
+                let client = try await startClient(helper: helper)
+                self.client = client
+                list = SessionListStore(client: client)
+                await refreshDaemon()
+            } catch {
+                problem = error.localizedDescription
+            }
         }
     }
 
@@ -94,7 +98,15 @@ final class AppModel {
         }
     }
 
-    var daemonPid: UInt32? { client?.daemonPid() }
+    func refreshDaemon() async {
+        guard let client else { return }
+        do {
+            daemonPid = try await client.daemonPid()
+            daemonProblem = nil
+        } catch {
+            daemonProblem = error.localizedDescription
+        }
+    }
 
     func refreshCli() async {
         guard let client else { return }

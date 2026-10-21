@@ -214,7 +214,7 @@ pub struct Live {
     /// This stream's number: a reload's stream replaces it.
     stream: u64,
     inbox: Receiver<TabIn>,
-    driver: Driver,
+    driver: client::ClientHandle,
     page: Page,
 }
 
@@ -223,9 +223,10 @@ impl Live {
         let (tx, inbox) = rt::channel::unbounded();
         let tx = Arc::new(tx);
         let events = Arc::clone(&tx);
-        let driver = Driver::new(app.daemon.clone(), move |_, event| {
+        let driver = Driver::new(move |_, event| {
             let _ = events.send(TabIn::Client(event));
-        });
+        })
+        .start(app.rt.clone(), app.daemon.clone());
         let stream = app.streams.fetch_add(1, Ordering::Relaxed);
         lock(&app.tabs).insert(id.to_owned(), (stream, tx));
         let (page, open) = Page::new(session);
@@ -289,14 +290,6 @@ impl Drop for Live {
             tabs.remove(&self.id);
         }
         drop(tabs);
-        let (driver, effects) = (self.driver.clone(), self.page.client.detach());
-        let admitted = self.app.rt.spawn_blocking(
-            rt::BlockingClass::Network,
-            64 << 10,
-            Box::new(move || driver.pump(&mut (), effects)),
-        );
-        self.app.rt.spawn(Box::pin(async move {
-            let _ = admitted.await;
-        }));
+        self.driver.pump(&mut (), self.page.client.detach());
     }
 }

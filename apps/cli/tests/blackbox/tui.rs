@@ -33,7 +33,10 @@ fn the_full_screen_client_shows_replies_and_answers_approvals_by_click() {
     // The approval bar's own choice, on the row under its question.
     let (x, y) = screen.find("1. Yes").unwrap();
     term.click((x + 2, y));
-    term.wait_for("✓ exit 0");
+    // The idle hint follows ordered Activity; tool success alone is an entry prefix.
+    term.wait_until("certified idle after tool completion", |screen| {
+        screen.find("✓ exit 0").is_some() && screen.find("message the agent").is_some()
+    });
     assert_eq!(fs::read_to_string(&ran).unwrap(), "ran\n");
 
     // Ctrl-C with an empty input detaches and gives the terminal back.
@@ -69,7 +72,10 @@ fn the_inline_client_prints_the_transcript_into_the_scrollback() {
     term.send(b"$ echo first\r");
     term.wait_for("Do you want to proceed? $ echo first");
     term.send(b"y");
-    term.wait_for("✓ exit 0");
+    // The idle hint follows ordered Activity; tool success alone is an entry prefix.
+    term.wait_until("certified idle after tool completion", |screen| {
+        screen.find("✓ exit 0").is_some() && screen.find("message the agent").is_some()
+    });
     term.send(b"\x03");
     assert!(term.wait().success());
 

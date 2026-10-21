@@ -17,30 +17,39 @@ use super::term::{self, Terminal};
 pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()> {
     let (tx, rx) = client::inbox();
     let events = tx.clone();
-    let driver = Driver::new(daemon.clone(), move |_, event| {
+    let runtime: rt::Rt = std::sync::Arc::new(rt::Threads::default());
+    let driver = Driver::new(move |_, event| {
         let _ = events.send(Event::Client(event));
-    });
+    })
+    .start(runtime.clone(), daemon.clone());
     let mut app = App::new(viewport, &target);
-    let first = app.client.open(target);
-    // ssh may ask for a password on the terminal: let it, before the
-    // terminal is ours.
-    let first = match daemon.endpoint {
-        Endpoint::Ssh(_) => first
-            .into_iter()
-            .filter_map(|effect| match effect {
-                client::Effect::Io(Io::Connect {
-                    conn,
-                    attach,
-                    restart,
-                }) => {
-                    driver.connect(conn, &attach, restart);
-                    None
-                }
-                effect => Some(effect),
-            })
-            .collect(),
-        Endpoint::Local(_) => first,
-    };
+    let mut first = app.client.open(target);
+    // SSH may need the terminal for authentication before raw mode starts.
+    if matches!(daemon.endpoint, Endpoint::Ssh(_)) {
+        let connecting = first
+            .iter()
+            .position(|effect| matches!(effect, client::Effect::Io(Io::Connect { .. })))
+            .expect("initial connect");
+        if let client::Effect::Io(io) = first.remove(connecting) {
+            driver.io(io).ok();
+        }
+        loop {
+            let Some(Event::Client(event)) = rx.recv() else {
+                return Err(io::Error::other("connection ended"));
+            };
+            let ready = matches!(
+                event.kind,
+                client::EventKind::Connected { .. }
+                    | client::EventKind::Failed(_)
+                    | client::EventKind::Wedged(_)
+            );
+            let effects = app.client.step(event);
+            driver.pump(&mut app, effects);
+            if ready {
+                break;
+            }
+        }
+    }
     // Caught before the terminal is ours, so none ends the client with it
     // raw; the input thread reads them.
     let signals = Signals::catch(&term::SIGNALS)?;
@@ -92,7 +101,7 @@ const TICK: Duration = Duration::from_millis(125);
 struct Redraw;
 
 struct Client {
-    driver: Driver,
+    driver: client::ClientHandle,
     app: App,
     screen: Screen,
 }

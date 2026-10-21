@@ -80,7 +80,7 @@ public final class SessionStore {
     }
 
     public func send(_ text: String) async {
-        await run { try await $0.send(text: text) }
+        run { try $0.send(text: text) }
     }
 
     /// A line typed, parsed by the commands every client shares; what it
@@ -88,7 +88,7 @@ public final class SessionStore {
     public func submit(_ line: String) async -> AppAction? {
         guard let session else { return nil }
         do {
-            return try await session.submit(line: line)
+            return try session.submit(line: line)
         } catch {
             problem = error.localizedDescription
             return nil
@@ -100,22 +100,22 @@ public final class SessionStore {
 
     /// Replaces a daemon that stopped answering, and attaches again.
     public func restart() async {
-        await run { try await $0.restart() }
+        run { try $0.restart() }
     }
 
     public func approve(call: UInt64, approved: Bool) async {
-        await run { try await $0.approve(call: call, approved: approved) }
+        run { try $0.approve(call: call, approved: approved) }
     }
 
     public func interrupt() async {
-        await run { try await $0.interrupt() }
+        run { try $0.interrupt() }
     }
 
     public func detach() async {
         let session = self.session
         releaseAttachment()
         do {
-            try await session?.detach()
+            try session?.detach()
         } catch {
             problem = error.localizedDescription
         }
@@ -130,10 +130,10 @@ public final class SessionStore {
         attachment = .detached
     }
 
-    private func run(_ action: (Session) async throws -> Void) async {
+    private func run(_ action: (Session) throws -> Void) {
         guard let session else { return }
         do {
-            try await action(session)
+            try action(session)
         } catch {
             problem = error.localizedDescription
         }
@@ -272,4 +272,15 @@ public final class SessionListStore {
             changed()
         }
     }
+}
+
+/// Staging and login-shell environment acquisition can wait on disk or a process.
+public nonisolated func startClient(helper: String) async throws -> Client {
+    try await stageClient { try Client(helper: helper) }
+}
+
+nonisolated func stageClient<T: Sendable>(
+    _ stage: @escaping @Sendable () throws -> T
+) async throws -> T {
+    try await Task.detached(operation: stage).value
 }

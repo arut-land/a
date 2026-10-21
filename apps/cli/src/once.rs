@@ -51,9 +51,11 @@ pub fn run(
 ) -> io::Result<ExitCode> {
     let (tx, rx) = client::inbox();
     let events = tx.clone();
-    let driver = Driver::new(daemon.clone(), move |_, event| {
+    let runtime: rt::Rt = std::sync::Arc::new(rt::Threads::default());
+    let driver = Driver::new(move |_, event| {
         let _ = events.send(Input::Client(event));
-    });
+    })
+    .start(runtime.clone(), daemon.clone());
     let stdin = tx.clone();
     thread::spawn(move || {
         let text = (!io::stdin().is_terminal()).then(|| {
@@ -90,6 +92,11 @@ pub fn run(
     loop {
         driver.pump(&mut once, effects);
         if let Some(ended) = once.ended {
+            // An interrupt must reach the transport before detaching revokes I/O.
+            let _ = rt::block_on(rt::or(driver.flush(), async {
+                runtime.sleep(client::HELLO_TIMEOUT).await;
+                Err(client::Error::NotResponding)
+            }));
             driver.pump(&mut (), once.client.detach());
             return ended;
         }

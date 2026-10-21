@@ -52,6 +52,10 @@ pub enum ClientError {
         message: String,
         newer: Option<String>,
     },
+    /// Admission is full; retry after the outstanding work completes.
+    Busy {
+        message: String,
+    },
     /// The connection is gone; open the session again.
     Closed,
     /// The session is not open: not yet, or no longer.
@@ -77,6 +81,7 @@ impl ClientError {
             Self::Unavailable { .. } => "unavailable",
             Self::NotResponding { .. } => "not_responding",
             Self::Mismatch { .. } => "mismatch",
+            Self::Busy { .. } => "busy",
             Self::Closed => "closed",
             Self::NotOpen => "not_open",
             Self::NotOffered { .. } => "not_offered",
@@ -89,7 +94,8 @@ impl ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unavailable { message }
+            Self::Busy { message }
+            | Self::Unavailable { message }
             | Self::NotResponding { message }
             | Self::Mismatch { message, .. }
             | Self::Protocol { message }
@@ -113,6 +119,7 @@ impl From<client::Error> for ClientError {
             },
             client::Error::NotResponding => Self::NotResponding { message },
             client::Error::Closed => Self::Closed,
+            client::Error::Busy => Self::Busy { message },
             client::Error::Fork(_) | client::Error::Refused(_) | client::Error::Io(..) => {
                 Self::Unavailable { message }
             }
@@ -123,7 +130,11 @@ impl From<client::Error> for ClientError {
 impl From<Notice> for ClientError {
     fn from(notice: Notice) -> Self {
         match notice {
-            Notice::NotConnected | Notice::NotSent(_) => Self::NotOpen,
+            Notice::NotSent(error) => error.into(),
+            Notice::Backpressure => Self::Busy {
+                message: notice.to_string(),
+            },
+            Notice::NotConnected => Self::NotOpen,
             notice => Self::NotOffered {
                 message: notice.to_string(),
             },
