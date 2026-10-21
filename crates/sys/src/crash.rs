@@ -159,9 +159,8 @@ impl Breaker {
     }
 
     /// Whether a starting daemon must refuse to serve, after `limit` young
-    /// deaths in a row (0 for never). A refusing daemon records nothing, so
-    /// its exit is no death and the breaker stays as it is until a clean
-    /// exit or a reset.
+    /// deaths in a row (0 for never). A refusing daemon clears its discovery
+    /// record on exit without resetting the breaker.
     pub const fn tripped(self, limit: u32) -> bool {
         limit > 0 && self.young >= limit
     }

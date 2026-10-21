@@ -1,7 +1,10 @@
 /// MS C argv parsing doubles backslashes only before quotes and the closing
-/// quote. Always quoting also covers empty arguments and whitespace.
+/// quote. Bare arguments preserve switch parsing in native command interpreters.
 pub(super) fn quote(arg: &[u16]) -> Vec<u16> {
     let (slash, quote) = (u16::from(b'\\'), u16::from(b'"'));
+    if !arg.is_empty() && !arg.iter().any(|&unit| matches!(unit, 9 | 32 | 34)) {
+        return arg.to_vec();
+    }
     let mut out = vec![quote];
     let mut slashes = 0;
     for &unit in arg {
@@ -33,7 +36,8 @@ mod tests {
             ("", "\"\""),
             ("a b", "\"a b\""),
             ("a\"b", "\"a\\\"b\""),
-            ("c:\\a\\", "\"c:\\a\\\\\""),
+            ("c:\\a b\\", "\"c:\\a b\\\\\""),
+            ("/D", "/D"),
         ] {
             assert_eq!(
                 String::from_utf16(&quote(&input.encode_utf16().collect::<Vec<_>>())).unwrap(),

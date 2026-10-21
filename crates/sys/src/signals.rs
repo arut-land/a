@@ -133,12 +133,10 @@ mod imp {
             // SAFETY: exercises the same scalar callback input the OS supplies.
             assert_eq!(unsafe { control(CTRL_BREAK_EVENT) }, 1);
             // SAFETY: the source owns this event for the entire test.
-            assert_eq!(
-                unsafe { WaitForSingleObject(signals.as_handle().as_raw_handle(), 0) },
-                0
-            );
+            let status = unsafe { WaitForSingleObject(signals.as_handle().as_raw_handle(), 0) };
+            assert_eq!(status, 0);
             assert_eq!(signals.take(), [Signal::Terminate]);
-            assert!(signals.take().is_empty());
+            assert_eq!(signals.take(), []);
             // SAFETY: an unrequested callback must remain unhandled.
             assert_eq!(unsafe { control(CTRL_CLOSE_EVENT) }, 0);
         }

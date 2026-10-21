@@ -64,9 +64,7 @@ impl Spawner for Shell {
         if spawn.argv.is_empty() {
             return Err("a spawn hook left no program to run".to_owned());
         }
-        let mut command = bash::process(&spawn);
-        sys::Group::lead(&mut command);
-        Ok(command)
+        Ok(bash::process(&spawn))
     }
 }
 

@@ -173,12 +173,18 @@ impl<T: std::os::windows::io::AsSocket> Async<T> {
     }
 }
 
+#[cfg(unix)]
+impl Async<std::fs::File> {
+    /// Child output only needs read readiness.
+    pub fn read_pipe(reactor: &Reactor, io: std::fs::File) -> io::Result<Self> {
+        Self::for_reading(reactor, io)
+    }
+}
+
+#[cfg(windows)]
 impl Async<sys::ProcessPipe> {
-    /// Child output needs readiness on Unix and overlapped completion on Windows.
+    /// Child output completes overlapped reads on its owned event.
     pub fn read_pipe(reactor: &Reactor, io: sys::ProcessPipe) -> io::Result<Self> {
-        #[cfg(unix)]
-        return Self::for_reading(reactor, io);
-        #[cfg(windows)]
         Self::new(reactor, io)
     }
 }
