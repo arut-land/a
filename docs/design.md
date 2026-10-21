@@ -28,8 +28,9 @@ client first connects to the daemon's endpoint. On a cold start, clients
 serialize through `start.lock`, recheck the connection, take the daemon
 lock, then start a detached `a __daemon`. Unix passes the bound listener
 and lock; the client connects into its backlog. Windows starts the child
-without inherited transport handles and waits for its binding acknowledgement
-under the start lock. Neither path polls for readiness. The daemon
+with an explicit stdio handle allowlist and waits for discovery publication
+under the start lock. Its locked daemon record selects a process-generation
+pipe, so retained clients cannot reserve a successor's endpoint. Neither path polls for readiness. The daemon
 holds its pid-file lock for its lifetime, excluding other writers to that
 home. `A_HOME` overrides the default `~/.a`.
 

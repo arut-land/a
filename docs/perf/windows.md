@@ -1,6 +1,7 @@
 # Windows daemon platform
 
-The transport uses byte-mode local named pipes. The name includes hashes of
+The transport uses byte-mode local named pipes selected by the locked daemon
+record. Each process generation has its own pipe name, including hashes of
 both the home directory's file identity and the current process token's
 user SID, so case variants and junction aliases find the same daemon. Every
 instance has an explicit protected DACL containing one allow ACE for that SID, rejects
@@ -183,3 +184,45 @@ parent stdio uses overlapped private pipes and the same completion ownership
 as daemon transport; inherited child stdio remains synchronous. Unix keeps
 ordinary readiness pipes. No extra package, worker thread or timer is added.
 Native CI must execute these integration paths as well as the five fixes.
+
+## Review validation (2026-10-21)
+
+All five review findings have separate fix commits. Discovery additionally
+requires the published record lock to be held: an exited process object can
+remain queryable while a handle retains it. The native
+`an_unlocked_record_never_discovers_a_retained_generation` test holds an old
+client handle while proving an unlocked identity is no longer discoverable.
+
+Merged main through 5b577df, including protocol 9; this Windows work changes
+no wire encoding or corpus. Local validation on the Apple host passed:
+
+- `check`: fmt, clippy and 1,026 tests (28 skipped).
+- `acceptance`: 20 tests, including
+  `a_cold_clients_output_reaches_eof_while_the_daemon_stays_alive` and
+  `a_successor_starts_while_an_old_client_keeps_its_handle`.
+- `check:windows`: cross-clippy across workspace targets, excluding optional
+  vendored Lua as the existing task specifies.
+- `machete`, `check:no-tokio`, `deny`, `test:web` (6) and `apple:test` (10).
+- Portable Miri: `failed_publication_never_replaces_the_existing_name`,
+  `empty_spaces_quotes_and_trailing_slashes_keep_their_argument`,
+  `a_locked_record_remains_readable_and_excludes_other_writers` and
+  `shell_directory_reports_roundtrip_spaces_unicode_and_line_endings`.
+
+The full prescribed Miri task still cannot emulate the existing CoreFoundation
+awake call. The complete new-log publication invariant passes natively on Unix,
+but Miri cannot emulate Apple's F_BARRIERFSYNC command. Windows-only unsafe
+FFI cannot execute under this Unix Miri target.
+
+Review baseline shipped size was 3,039 KiB; after the fixes and newer main
+merges it is 3,398 KiB, below 4,096 KiB, with fixture exclusion passing. These
+are Apple measurements, not Windows size or latency evidence. Builds used
+CARGO_BUILD_JOBS=3; shared-machine budgets/startup were deliberately not run.
+
+Only native Windows CI can execute the handle allowlists and EOF isolation,
+abandoned-connect recycling, retained-client restart, write-through publication
+and Win32 failure propagation, same-handle identity/termination, console-event
+wakeups, and overlapped MCP stdio/job cleanup. It must also prove linking,
+DACL inspection/SID checks, no-console startup, locking and staged upgrades.
+The CI lane has not been run or pushed from this host. Cross-account denial,
+physical power-loss persistence and Windows performance measurements still
+require an appropriate native host; ordinary CI cannot certify those results.
