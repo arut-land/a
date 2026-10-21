@@ -110,6 +110,10 @@ impl Host for Recorded {
     fn note(&self, _: &str, _: &str, _: Json) -> BoxFuture<'static, ()> {
         Box::pin(std::future::ready(()))
     }
+    fn publish(&self, _: &str, _: &str, _: Json, _: String) -> BoxFuture<'static, ()> {
+        Box::pin(std::future::ready(()))
+    }
+
     fn edit(&self, _: protocol::Seq, _: Option<protocol::Seq>, _: Option<Json>) {}
     fn states(&self, read: &mut dyn FnMut(&States)) {
         read(&States::default());

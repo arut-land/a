@@ -153,6 +153,21 @@ impl Cx {
         }
     }
 
+    /// Commits a fold change and the context it describes in one commit.
+    /// A replay reads the stored text rather than running the producer again.
+    pub fn publish<S: Fold>(&self, change: &S::Change, text: String) -> BoxFuture<'static, ()> {
+        let mut ext = None;
+        self.host
+            .states(&mut |states| ext = states.ext_of::<S>().cloned());
+        let Some(ext) = ext else {
+            return Box::pin(std::future::ready(()));
+        };
+        match Json::encode(change) {
+            Ok(data) => self.host.publish(&ext, S::NAME, data, text),
+            Err(_) => Box::pin(std::future::ready(())),
+        }
+    }
+
     /// Reads a fold named at run time, as JSON.
     pub fn state_erased(&self, ext: &str, name: &str) -> Option<Json> {
         let mut value = None;

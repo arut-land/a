@@ -2114,6 +2114,23 @@ impl Host for Calling {
         })
     }
 
+    fn publish(&self, ext: &str, state: &str, data: Json, text: String) -> BoxFuture<'static, ()> {
+        let (done, committed) = oneshot::channel();
+        let _ = self.session.mail.send(Msg::Note {
+            call: self.call,
+            note: Note::Publish {
+                ext: ext.to_owned(),
+                state: state.to_owned(),
+                data,
+                text,
+            },
+            done: Some(done),
+        });
+        Box::pin(async move {
+            let _ = committed.await;
+        })
+    }
+
     fn edit(&self, target: protocol::Seq, upto: Option<protocol::Seq>, replace: Option<Json>) {
         self.report(Note::Edit {
             target,

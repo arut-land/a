@@ -98,6 +98,8 @@ pub enum Place {
     /// The facts a session's model is first given, made from where it
     /// runs; logged then, so later turns read the same.
     Context(Arc<Context>),
+    /// Context logged before the first model call on each live registry generation.
+    Generation(Cow<'static, str>),
 }
 
 /// Text the model reads. Texts join by `order`, then install order, in
@@ -119,6 +121,16 @@ impl Text {
             order,
             tool: None,
             place: Place::System(text.into()),
+        }
+    }
+
+    /// Context for this immutable registry generation, logged when adopted.
+    pub fn generation(name: &str, order: i32, text: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            name: Name::from(name),
+            order,
+            tool: None,
+            place: Place::Generation(text.into()),
         }
     }
 

@@ -167,6 +167,14 @@ impl Host for Recorder {
         Box::pin(std::future::ready(()))
     }
 
+    fn publish(&self, ext: &str, state: &str, data: Json, text: String) -> BoxFuture<'static, ()> {
+        let done = self.note(ext, state, data);
+        let mut log = lock(&self.log);
+        let seq = Seq::new(log.len() as u64 + 1).unwrap();
+        log.push(Entry::new(seq, Epoch(0), Body::Context { text }));
+        done
+    }
+
     fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<Json>) {
         let mut log = lock(&self.log);
         let seq = log.len() as u64 + 1;

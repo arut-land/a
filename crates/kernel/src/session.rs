@@ -31,6 +31,7 @@ pub const RESTART_CAP: u16 = 10;
 /// generation its steps run on.
 pub struct Core {
     registry: Arc<dyn Binding>,
+    generation_context: Option<String>,
     fold: Fold,
     turn: Turn,
     /// Whether the session is a child, which reports as it settles.
@@ -88,6 +89,7 @@ impl Core {
     pub fn restore(registry: Arc<dyn Binding>, ledger: Ledger) -> Self {
         Self {
             fold: Fold::restore(registry.agent(), ledger),
+            generation_context: registry.generation_context(),
             registry,
             turn: Turn::Idle,
             child: false,
@@ -641,7 +643,10 @@ impl Core {
             _ => matches!(self.step_of(call), Some(Step::Awaiting { .. })),
         };
         let running = self.step_of(call) == Some(Step::Running);
-        let ext = matches!(note, Note::State { .. } | Note::Edit { .. });
+        let ext = matches!(
+            note,
+            Note::State { .. } | Note::Publish { .. } | Note::Edit { .. }
+        );
         if !(running || deciding && ext) {
             return;
         }
@@ -658,6 +663,20 @@ impl Core {
             },
             Note::Progress(text) => Body::Progress { call, text },
             Note::State { ext, state, data } => Body::Ext { ext, state, data },
+            Note::Publish {
+                ext,
+                state,
+                data,
+                text,
+            } => {
+                if !self.fold.ledger.has_context()
+                    && let Some(text) = self.registry.context()
+                {
+                    self.append(fx, Body::Context { text });
+                }
+                self.append(fx, Body::Ext { ext, state, data });
+                Body::Context { text }
+            }
             Note::Edit {
                 target,
                 upto,
@@ -850,6 +869,9 @@ impl Core {
                 {
                     self.append(fx, Body::Context { text });
                 }
+                if let Some(text) = self.generation_context.take() {
+                    self.append(fx, Body::Context { text });
+                }
                 let model = self.registry.model();
                 let body = Body::ModelCall {
                     model,
@@ -1029,6 +1051,7 @@ impl Core {
     fn resolve(&mut self, next: Arc<dyn Binding>, fx: &mut Effects) {
         let installed = next.installed();
         let changed = installed != self.registry.installed();
+        self.generation_context = next.generation_context();
         self.registry = next;
         if changed {
             self.append(fx, Body::Extensions { installed });

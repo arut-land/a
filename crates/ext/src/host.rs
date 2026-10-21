@@ -6,7 +6,7 @@
 use std::any::{Any, TypeId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use protocol::{Audience, CallId, Card, Environment, Installed, Json, Outcome, Seq, SessionId};
 
@@ -34,6 +34,8 @@ pub trait Host: Send + Sync {
     /// Commits `data` as a change to extension `ext`'s state `state`:
     /// resolves once it is committed and folded in.
     fn note(&self, ext: &str, state: &str, data: Json) -> BoxFuture<'static, ()>;
+    /// Commits a state change and model context together, as ordinary entries.
+    fn publish(&self, ext: &str, state: &str, data: Json, text: String) -> BoxFuture<'static, ()>;
     /// Commits an `edit`: see [`Cx::edit`].
     fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<Json>);
     /// Lends the session's states to `read`, which cannot keep them.
@@ -140,11 +142,12 @@ impl Toolset {
     }
 }
 
+#[derive(Clone)]
 struct Loaded {
     name: Name,
     version: u32,
     tier: Tier,
-    made: Registrar,
+    made: Arc<Registrar>,
 }
 
 /// The extensions a daemon runs with, and what they make.
@@ -160,6 +163,17 @@ pub struct Registry {
     prompt: OnceLock<String>,
     specs: OnceLock<llm::Tools>,
     warnings: Vec<String>,
+}
+
+impl Clone for Registry {
+    fn clone(&self) -> Self {
+        let mut registry = Self {
+            installed: self.installed.clone(),
+            ..Self::default()
+        };
+        registry.rebuild();
+        registry
+    }
 }
 
 impl Registry {
@@ -183,7 +197,7 @@ impl Registry {
             name: ext.name(),
             version: ext.version(),
             tier,
-            made,
+            made: Arc::new(made),
         })
     }
 
@@ -367,7 +381,7 @@ impl Registry {
                 .filter(|t| self.offered(t))
                 .filter_map(|t| match &t.place {
                     Place::System(text) => Some(&**text),
-                    Place::Context(_) => None,
+                    Place::Context(_) | Place::Generation(_) => None,
                 })
                 .collect();
             texts.join("\n\n")
@@ -387,7 +401,21 @@ impl Registry {
             .filter(|t| self.offered(t))
             .filter_map(|t| match &t.place {
                 Place::Context(make) => make(facts),
-                Place::System(_) => None,
+                Place::Generation(_) | Place::System(_) => None,
+            })
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+
+    /// Context supplied by this immutable registry revision.
+    pub fn generation_context(&self) -> Option<String> {
+        let parts: Vec<_> = self
+            .texts
+            .iter()
+            .filter(|t| self.offered(t))
+            .filter_map(|t| match &t.place {
+                Place::Generation(text) => Some(text.as_ref()),
+                _ => None,
             })
             .collect();
         (!parts.is_empty()).then(|| parts.join("\n\n"))
@@ -455,6 +483,36 @@ struct By {
 pub trait Generations: Send + Sync {
     fn generation(&self) -> u64;
     fn registry(&self) -> Arc<Registry>;
+    /// Registers a weak callback. Mutable sources notify it after publication,
+    /// off the async worker, before preparation returns.
+    fn subscribe(&self, _changed: Weak<Changed>) {}
+}
+
+pub type Changed = dyn Fn() + Send + Sync;
+
+/// Weak subscriptions do not keep derived sources or sessions alive.
+#[derive(Default)]
+pub struct Updates(Mutex<Vec<Weak<Changed>>>);
+
+impl Updates {
+    pub fn subscribe(&self, changed: Weak<Changed>) {
+        let mut listeners = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        listeners.retain(|listener| listener.strong_count() > 0);
+        listeners.push(changed);
+    }
+
+    pub fn notify(&self) {
+        let listeners: Vec<_> = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for changed in listeners {
+            changed();
+        }
+    }
 }
 
 /// Opens a workspace subscription off the async worker. Consumers own its
@@ -518,6 +576,11 @@ pub trait Binding: Send + Sync {
     /// What the model is told of where the session runs, logged once
     /// before its first call.
     fn context(&self) -> Option<String> {
+        None
+    }
+
+    /// Context logged when a live session adopts a new registry generation.
+    fn generation_context(&self) -> Option<String> {
         None
     }
 
@@ -738,6 +801,10 @@ impl<V: View + Send + Sync + 'static> Binding for Bound<V> {
 
     fn model(&self) -> String {
         self.view.model()
+    }
+
+    fn generation_context(&self) -> Option<String> {
+        self.registry.generation_context()
     }
 
     fn context(&self) -> Option<String> {
