@@ -283,6 +283,7 @@ pub(crate) struct Block {
     kind: BlockType,
     /// The input JSON streamed to it.
     json: String,
+    depth: crate::json::JsonDepth,
     /// Whether its own deltas extended its text, which its item takes when
     /// it stops: the writer holds that text already.
     grew: bool,
@@ -461,6 +462,7 @@ impl MessagesDecoder {
                 let Some(Block {
                     kind: kind @ (BlockType::ToolUse | BlockType::Other),
                     json,
+                    depth,
                     ..
                 }) = open
                 else {
@@ -469,6 +471,7 @@ impl MessagesDecoder {
                     );
                     return Err(Error::decode(takes_none, data));
                 };
+                depth.push(&fragment, limits.depth)?;
                 json.push_str(&fragment);
                 if *kind == BlockType::ToolUse {
                     self.w.push(index, fragment)?;
@@ -780,6 +783,39 @@ mod growth_tests {
     use super::*;
     use crate::protocol::{Decoder, Frame};
     use crate::sse::DecodeLimits;
+
+    #[test]
+    fn hosted_argument_depth_is_rejected_before_buffering() {
+        let limits = DecodeLimits::default();
+        let mut decoder = MessagesDecoder::new(false);
+        let mut out = Vec::new();
+        let start = json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "server_tool_use", "id": "id", "name": "tool"}})
+        .to_string();
+        decoder
+            .frame(
+                Frame {
+                    event: "message",
+                    data: &start,
+                },
+                &mut out,
+            )
+            .unwrap();
+        let delta = json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "[".repeat(limits.depth + 1)}})
+        .to_string();
+        let result = decoder.frame(
+            Frame {
+                event: "message",
+                data: &delta,
+            },
+            &mut out,
+        );
+        assert!(
+            result.is_err(),
+            "over-depth input was retained in the private buffer"
+        );
+    }
 
     #[test]
     fn private_hosted_and_tool_json_obey_argument_and_reply_limits() {
