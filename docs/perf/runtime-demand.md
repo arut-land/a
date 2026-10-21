@@ -32,8 +32,10 @@ Async workers start together on first spawn; blocking workers start on
 demand. Starting workers count against the limit while their first
 instruction is still unscheduled. Blocking workers retire after one ten-second idle wait, releasing their
 thread resources. No last-worker polling loop remains after retirement.
-The shared async-io reactor remains process-scoped. Runtime shutdown
-reclaims the runtime's own workers, not that shared reactor.
+The shared async-io reactor remains process-scoped. Owner shutdown reclaims the runtime's own workers, not that shared
+reactor. A last handle dropped on one of its own workers signals shutdown
+without joining: the executor must return before its pending futures can
+release I/O cancellation guards. This path has a dedicated regression test.
 
 Network reservations include request payload and bounded stream buffers.
 Logging reserves its fixed-record batch plus encoding scratch. Generic
@@ -57,7 +59,8 @@ its socket, including registration after cancellation.
 ## Worker comparison
 
 Command: `CARGO_BUILD_JOBS=2 cargo run --release -p rt --example demand`.
-Measured on the shared development machine on 2026-10-21. This is a
+Measured on the shared arm64 development machine (8 logical cores, 16 GiB
+RAM) on 2026-10-21. This is a
 fixed-workload scheduling comparison, not a startup or resource-budget
 measurement. No budgets or startup timings were run.
 
@@ -84,3 +87,41 @@ their dependency subgraphs were removed. The invariant tests cover worker
 startup accounting, reservation release, storage progress under network
 saturation, one-worker loading, cold replay, owned shutdown, and idle
 wake counts in isolated nextest processes.
+
+## Acceptance and integration
+
+All six required invariants are exercised by name:
+
+- `submission_bursts_count_starting_workers`
+- `saturated_network_work_cannot_starve_a_flush`
+- `loading_cannot_wait_on_its_own_exhausted_pool`
+- `cold_replay_does_not_block_async_workers`
+- `runtime_shutdown_reclaims_workers`
+- `idle_runtime_has_no_periodic_wakeups`
+
+Cold replay also verifies that swapping a log reader can proceed while the
+old reader is stalled. Additional checks cover cancelled byte waiters,
+oversized reservations, closed admission, and failure of all flush waiters
+when their leader cannot be admitted.
+
+The coordinator expanded C09 ownership for these integration call sites:
+`apps/web/src/app.rs`, `crates/ffi/src/live.rs`,
+`crates/ext-mcp/src/rpc.rs`, `crates/ext-lua/src/loader.rs`,
+`crates/engine/src/server.rs`, `crates/engine/src/driver/side.rs`,
+`crates/engine/src/driver/spawn.rs`, and the runtime/config/flush consumers
+in `crates/engine/src/driver/tests.rs`, `crates/engine/src/config/tests.rs`,
+and `crates/engine/src/store/tests.rs`.
+
+Final validation on the merged tree, with `CARGO_BUILD_JOBS=2`:
+
+- `mise run check`: formatting, clippy, and 1,127 tests passed; 29 skipped.
+- `mise run acceptance`: 23 passed.
+- `mise run check:windows`: Windows cross-target clippy passed.
+- `mise run machete`, `check:no-tokio`, and `deny`: passed.
+- `mise run test:web`: 6 passed.
+- `mise run apple:test`: 14 Swift integration tests passed.
+- `mise run size`: 3,624 KiB before, 3,657 KiB after, below 4,096 KiB;
+  the final measurement includes the merged main changes.
+
+Budgets and startup timings were deliberately not run. No sys unsafe code
+changed, so Miri was not required. Native Windows execution was not tested.

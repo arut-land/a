@@ -126,7 +126,8 @@ impl FrameLog {
 
     fn batch(&self, next: u64, last: u64) -> io::Result<(Vec<u8>, Vec<Entry>)> {
         let mut run = Vec::new();
-        let count = lock(&self.lines).read(next..=last, RUN, &mut run)?;
+        let reader = Arc::clone(&lock(&self.lines));
+        let count = reader.read(next..=last, RUN, &mut run)?;
         if count == 0 || count > last - next + 1 || run.last() != Some(&b'\n') {
             return Err(io::Error::other("log read made no valid progress"));
         }
@@ -351,8 +352,8 @@ impl Outbox {
         }
     }
 
-    /// The next frame to write if there is one now. The log is read
-    /// outside the queue's lock: a cold read holds up no sender.
+    /// Draining a write batch must not perform cold I/O on an async worker;
+    /// only frames already in memory are available here.
     pub fn try_ready(&self) -> Option<Frame> {
         loop {
             let (log, cursor, follows) = match self.queue().step() {
@@ -804,17 +805,12 @@ mod scheduling {
         let (entered, reading) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
         let outbox = Outbox::new();
-        let _follower = outbox.follow(
-            Arc::new(FrameLog::new(
-                Arc::new(Cold {
-                    entered,
-                    release: Mutex::new(released),
-                }),
-                1,
-            )),
-            0,
-            Vec::new(),
-        );
+        let reader: Arc<dyn Lines> = Arc::new(Cold {
+            entered,
+            release: Mutex::new(released),
+        });
+        let log = Arc::new(FrameLog::new(Arc::clone(&reader), 1));
+        let _follower = outbox.follow(Arc::clone(&log), 0, Vec::new());
         let runtime = Arc::clone(&rt);
         let read = rt::spawn(&*rt, async move { outbox.next(&*runtime).await });
         reading
@@ -822,6 +818,7 @@ mod scheduling {
             .unwrap();
         let (sent, responsive) = std::sync::mpsc::channel();
         rt.spawn(Box::pin(async move {
+            log.reloaded(reader);
             sent.send(()).unwrap();
         }));
         let result = responsive.recv_timeout(std::time::Duration::from_secs(2));

@@ -140,18 +140,29 @@ impl Threads {
         for (stop, _) in &threads {
             stop.notify();
         }
-        for (_, thread) in threads {
-            if thread.thread().id() != thread::current().id() {
-                let _ = thread.join();
+        let blocking: Vec<_> = self
+            .blocking
+            .iter()
+            .flat_map(|pool| std::mem::take(&mut *lock(&pool.threads)))
+            .collect();
+        let current = thread::current().id();
+        let on_worker = threads
+            .iter()
+            .any(|(_, worker)| worker.thread().id() == current)
+            || blocking
+                .iter()
+                .any(|worker| worker.thread().id() == current);
+        // A worker dropping the last handle must first return to its executor
+        // so pending futures release the guards that cancel native I/O.
+        if !on_worker {
+            for (_, worker) in threads {
+                let _ = worker.join();
             }
         }
         drop(tasks);
-        for pool in &self.blocking {
-            let threads = std::mem::take(&mut *lock(&pool.threads));
-            for worker in threads {
-                if worker.thread().id() != thread::current().id() {
-                    let _ = worker.join();
-                }
+        if !on_worker {
+            for worker in blocking {
+                let _ = worker.join();
             }
         }
     }
@@ -446,6 +457,47 @@ mod tests {
             block_on(rt.spawn_blocking(BlockingClass::Storage, 0, Box::new(|| panic!("closed"))))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn the_last_handle_can_drop_on_a_worker_without_joining_its_own_cancellation() {
+        struct Release(std::sync::mpsc::Sender<()>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let rt = Arc::new(Threads::new(1));
+        let (release, released) = std::sync::mpsc::channel();
+        let guard = Release(release);
+        rt.spawn(Box::pin(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        }));
+        let runtime = Arc::clone(&rt);
+        let (go, started) = oneshot::channel();
+        let (done, dropped) = std::sync::mpsc::channel();
+        let (finished, ended) = std::sync::mpsc::channel();
+        rt.spawn(Box::pin(async move {
+            started.await.unwrap();
+            runtime
+                .spawn_blocking(
+                    BlockingClass::Storage,
+                    0,
+                    Box::new(move || {
+                        released.recv_timeout(Duration::from_secs(5)).unwrap();
+                        finished.send(()).unwrap();
+                    }),
+                )
+                .await
+                .unwrap();
+            drop(runtime);
+            done.send(()).unwrap();
+        }));
+        drop(rt);
+        go.send(());
+        dropped.recv_timeout(Duration::from_secs(2)).unwrap();
+        ended.recv_timeout(Duration::from_secs(2)).unwrap();
     }
 
     #[test]

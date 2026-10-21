@@ -358,12 +358,21 @@ impl Actor {
                     refusal = Some(SpawnRefusal::Unavailable(error.to_string()));
                 }
                 if let Ok(entries) = entries {
-                    let entries: Vec<_> = entries
-                        .into_iter()
-                        .chain(self.pending_entries())
-                        .filter(|e| e.seq <= seq)
-                        .collect();
-                    image = crate::transcript::context_image(&entries);
+                    let pending: Vec<_> = self.pending_entries().collect();
+                    image = rt::unblock_with(
+                        &*self.live.session.shared.rt,
+                        rt::BlockingClass::Cpu,
+                        rt::STORAGE_BYTES,
+                        move || {
+                            let entries: Vec<_> = entries
+                                .into_iter()
+                                .chain(pending)
+                                .filter(|e| e.seq <= seq)
+                                .collect();
+                            crate::transcript::context_image(&entries)
+                        },
+                    )
+                    .await;
                 }
             }
         }

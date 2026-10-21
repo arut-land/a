@@ -100,7 +100,17 @@ impl Http for Ureq {
         let agent = self.agent.clone();
         let abort = Arc::new(Abort::default());
         let guard = Guard(Arc::clone(&abort));
-        let bytes = request.body().len().saturating_add((AHEAD + 1) * CHUNK);
+        let bytes = request.headers().iter().fold(
+            request
+                .body()
+                .len()
+                .saturating_add((AHEAD + 1) * CHUNK + (128 << 10)),
+            |bytes, (name, value)| {
+                bytes
+                    .saturating_add(name.as_str().len())
+                    .saturating_add(value.len())
+            },
+        );
         let admitted = self.rt.spawn_blocking(
             rt::BlockingClass::Network,
             bytes,
