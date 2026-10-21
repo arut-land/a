@@ -25,7 +25,7 @@ pub struct Ledger {
     armed: Keyed<Seq, SessionId>,
     /// Every child linked, in order, and the children ever watched.
     links: Vec<Link>,
-    watched: BTreeSet<u128>,
+    watched: Vec<u128>,
     /// Background process groups started, with the boot they ran in.
     background: Vec<(u32, String)>,
     env: Option<Environment>,
@@ -379,7 +379,9 @@ impl Ledger {
             }
             Body::Watch { child } => {
                 self.armed.insert(here.0, *child);
-                self.watched.insert(child.0.as_u128());
+                if let Err(at) = self.watched.binary_search(&child.0.as_u128()) {
+                    self.watched.insert(at, child.0.as_u128());
+                }
             }
             Body::Fired { watch, outcome } => {
                 self.armed.remove(*watch);
@@ -535,7 +537,7 @@ impl Ledger {
 
     /// Whether `child` was ever watched.
     pub fn watched(&self, child: SessionId) -> bool {
-        self.watched.contains(&child.0.as_u128())
+        self.watched.binary_search(&child.0.as_u128()).is_ok()
     }
 
     /// The background process groups started, with the boot each ran in.
