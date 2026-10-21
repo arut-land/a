@@ -17,9 +17,7 @@ pub mod view;
 
 use std::io::{self, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::thread;
 
 use client::Daemon;
 use rt::Rt;
@@ -45,7 +43,7 @@ pub fn run(daemon: Daemon, open: bool) -> io::Result<()> {
         )
     });
     drop(out);
-    if open && let Err(e) = open_browser(&link) {
+    if open && let Err(e) = sys::open_browser(&link) {
         eprintln!("[could not open a browser: {e}; open the link above]");
     }
     // Each connection is a task of its own; this thread only waits for the
@@ -60,21 +58,4 @@ pub fn run(daemon: Daemon, open: bool) -> io::Result<()> {
             rt.spawn(Box::pin(task));
         }
     })
-}
-
-fn open_browser(link: &str) -> io::Result<()> {
-    let program = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let mut child = Command::new(program)
-        .arg(link)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    // Reaped aside: some openers stay until the browser they started exits.
-    thread::spawn(move || child.wait());
-    Ok(())
 }

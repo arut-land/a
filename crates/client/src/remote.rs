@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{ClientMsg, read_frame};
-use sys::Staged;
+use sys::{Platform, Staged};
 
 use crate::{Connection, Reader, Welcome, WriteTransport, Writer};
 
@@ -107,11 +107,10 @@ fn install(host: &str, staged: &Staged) -> io::Result<()> {
         .output()?;
     let uname = String::from_utf8_lossy(&uname.stdout);
     let uname = uname.trim();
-    let here = (std::env::consts::OS, std::env::consts::ARCH);
-    if platform(uname) != Some(here) {
+    let here = Platform::CURRENT;
+    if Platform::from_uname(uname) != Some(here) {
         return Err(io::Error::other(format!(
-            "`a` is not installed on {host}, and this build is for {} {}, not {uname:?}; install `a` there and retry",
-            here.0, here.1
+            "`a` is not installed on {host}, and this build is for {here}, not {uname:?}; install `a` there and retry"
         )));
     }
     let dir = format!(".a/runtime/{}", staged.id);
@@ -121,23 +120,6 @@ fn install(host: &str, staged: &Staged) -> io::Result<()> {
         .arg(&staged.exe)
         .arg(format!("{host}:{dir}/a"));
     run(&mut scp)
-}
-
-/// `uname -sm` as Rust's `(OS, ARCH)`.
-fn platform(uname: &str) -> Option<(&'static str, &'static str)> {
-    let (os, arch) = uname.split_once(' ')?;
-    let os = match os {
-        "Darwin" => "macos",
-        "Linux" => "linux",
-        "FreeBSD" => "freebsd",
-        _ => return None,
-    };
-    let arch = match arch {
-        "arm64" | "aarch64" => "aarch64",
-        "x86_64" | "amd64" => "x86_64",
-        _ => return None,
-    };
-    Some((os, arch))
 }
 
 fn run(command: &mut Command) -> io::Result<()> {
@@ -178,14 +160,6 @@ fn token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reads_uname_as_rust_platforms() {
-        assert_eq!(platform("Darwin arm64"), Some(("macos", "aarch64")));
-        assert_eq!(platform("Linux x86_64"), Some(("linux", "x86_64")));
-        assert_eq!(platform("Linux riscv64"), None);
-        assert_eq!(platform(""), None);
-    }
 
     #[test]
     fn quotes_scripts_for_the_login_shell() {

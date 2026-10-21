@@ -9,7 +9,8 @@
 //! environment again), a detach never reading as a lost daemon, a wedged
 //! daemon, input given while reconnecting, and which intents the session
 //! takes now ([`Offer`]): an app cannot build a steer no turn is running
-//! for, or an approval no call waits for.
+//! for, or an approval no call waits for. Turn completion comes only from
+//! ordered kernel activity, never from the ledger at an entry prefix.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -221,7 +222,9 @@ impl fmt::Display for Notice {
 /// so no app derives it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TurnView {
-    /// A call is unsettled.
+    /// The kernel's activity at the current entry, unknown during a burst.
+    pub activity: Option<Activity>,
+    /// Working, including while the next complete burst is arriving.
     pub running: bool,
     /// The oldest call waiting for an approval.
     pub asking: Option<CallId>,
@@ -306,10 +309,12 @@ impl SessionClient {
             };
         }
         let ledger = &self.view.ledger;
-        let running = ledger.activity() != Activity::Idle;
+        let activity = self.view.activity;
+        let running = activity != Some(Activity::Idle);
         let asking = ledger.inbox().next();
         let asks = u32::try_from(ledger.inbox().count()).unwrap_or(u32::MAX);
         TurnView {
+            activity,
             running,
             asking,
             asks,
@@ -728,6 +733,13 @@ mod tests {
                     origin: None,
                 },
             )),
+        ));
+        client.step(msg(
+            1,
+            DaemonMsg::Activity {
+                seq: 1,
+                activity: Activity::Idle,
+            },
         ));
         client.step(msg(1, DaemonMsg::Synced { seq: 1 }));
         (client, session)

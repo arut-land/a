@@ -9,27 +9,18 @@
 //! terminal and the daemon each feed it from their own thread, so an idle
 //! client never wakes.
 //!
-//! Unix only, like the daemon: elsewhere [`viewport`] picks the line REPL.
+//! Where raw terminal input is unsupported, [`viewport`] picks the line REPL.
 
-#[cfg(unix)]
 mod app;
-#[cfg(unix)]
 mod editor;
-#[cfg(unix)]
 mod keys;
-#[cfg(unix)]
 mod render;
-#[cfg(unix)]
 mod run;
-#[cfg(unix)]
 mod screen;
-#[cfg(unix)]
 mod term;
-#[cfg(unix)]
 mod text;
 /// Items as rows: public for the test that every renderer shows an item
 /// the same way.
-#[cfg(unix)]
 #[doc(hidden)]
 pub mod view;
 
@@ -53,8 +44,8 @@ pub fn plain() -> bool {
 /// and stdout are both terminals; [`plain`] asks for lines anyway,
 /// `A_TUI=inline` for the inline viewport.
 pub fn viewport() -> Option<Viewport> {
-    // The daemon is Unix only for now: elsewhere the REPL says so.
-    if !cfg!(unix) || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+    // Raw input support is a platform capability, not a renderer decision.
+    if !sys::terminal::SUPPORTED || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return None;
     }
     if plain() || std::env::var_os("TERM").is_some_and(|t| t == "dumb") {
@@ -67,7 +58,6 @@ pub fn viewport() -> Option<Viewport> {
 }
 
 /// What wakes the event loop.
-#[cfg(unix)]
 enum Event {
     Input(keys::Input),
     /// The terminal changed size.
@@ -81,11 +71,4 @@ enum Event {
     Tick,
 }
 
-#[cfg(unix)]
 pub use run::run;
-
-/// [`viewport`] never picks a client here.
-#[cfg(not(unix))]
-pub fn run(_: &client::Daemon, _: protocol::Target, _: Viewport) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
-}

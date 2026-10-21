@@ -18,6 +18,19 @@ pub(crate) use imp::passed;
 #[cfg(unix)]
 pub(crate) use imp::raw;
 
+/// Finds bash using the system location first, then the session's PATH.
+pub fn find_bash(search: Option<&str>) -> Option<String> {
+    let system = std::path::Path::new("/bin/bash");
+    if system.is_file() {
+        return Some(system.display().to_string());
+    }
+    let name = format!("bash{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(search?)
+        .map(|dir| dir.join(&name))
+        .find(|path| path.is_file())
+        .map(|path| path.display().to_string())
+}
+
 /// A process group: a command and everything it started, signalled whole.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Group(pub u32);

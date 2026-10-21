@@ -7,9 +7,6 @@
 //! leaves one out: it is replaced by an extension of its name that
 //! contributes nothing.
 
-// Only the daemon, which runs on Unix alone, assembles them.
-#![cfg_attr(not(unix), allow(dead_code))]
-
 use engine::Config;
 use ext::host::{Built, Registry};
 use ext::{Configured, DynExtension, Name, Refused, Registrar, Table, Tier};

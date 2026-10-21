@@ -27,6 +27,9 @@ a -p "and the tests?" resume        # one more turn in the latest session
   with `claude -p`: a file is read whole, not a line at a time (the line
   REPL is the way to send one message per line). Text starting `/` is a
   slash command, as typed.
+- Completion comes from the daemon's ordered activity frame after the last
+  committed entry of a kernel burst. Entry prefixes never imply completion;
+  no session-list query is needed.
 - It runs in a new session, or the one `resume`/`attach` names, which stays
   in the daemon like any other: `a ls` lists it, `a attach` opens it.
 - stdout gets what the agent says, streamed as it is written: every reply's

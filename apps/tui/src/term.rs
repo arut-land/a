@@ -7,9 +7,8 @@ use std::sync::{Mutex, Once, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use rustix::event::{PollFd, PollFlags, poll};
-use rustix::io::Errno;
-use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
+pub use sys::terminal::size;
+use sys::terminal::{Input, InputReader, RawMode};
 use sys::{Signal, Signals};
 
 use super::Event;
@@ -30,7 +29,7 @@ pub const LEAVE_FULL: &[u8] = b"\x1b[?1006l\x1b[?1000l\x1b[?1049l";
 
 /// The viewport we hold the terminal for and its mode before: a panic hook
 /// and the input thread restore it too.
-static HELD: Mutex<Option<(Viewport, Termios)>> = Mutex::new(None);
+static HELD: Mutex<Option<(Viewport, RawMode)>> = Mutex::new(None);
 
 pub struct Terminal(());
 
@@ -47,11 +46,7 @@ impl Terminal {
                 previous(info);
             }));
         });
-        let stdin = rustix::stdio::stdin();
-        let cooked = tcgetattr(stdin)?;
-        let mut raw = cooked.clone();
-        raw.make_raw();
-        tcsetattr(stdin, OptionalActions::Now, &raw)?;
+        let cooked = RawMode::enter()?;
         *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some((viewport, cooked));
         let mut out = io::stdout().lock();
         if viewport == Viewport::Full {
@@ -74,7 +69,7 @@ impl Drop for Terminal {
 fn restore() {
     let held = HELD.lock().unwrap_or_else(PoisonError::into_inner).take();
     if let Some((viewport, cooked)) = held {
-        let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &cooked);
+        let _ = cooked.restore();
         let mut out = io::stdout().lock();
         let _ = out.write_all(LEAVE);
         if viewport == Viewport::Full {
@@ -103,12 +98,6 @@ fn end(signal: Signal) -> ! {
     sys::reraise(signal)
 }
 
-/// The terminal's columns and rows.
-pub fn size() -> io::Result<(u16, u16)> {
-    let size = tcgetwinsize(rustix::stdio::stdout())?;
-    Ok((size.ws_col, size.ws_row))
-}
-
 /// Reads the terminal and `signals` on a thread of its own. It blocks in
 /// `poll` with no timeout: an idle client never wakes. What it posts goes
 /// ahead of the daemon's backlog in the inbox: a key or a resize is folded
@@ -117,50 +106,38 @@ pub fn size() -> io::Result<(u16, u16)> {
 /// may yet have a while to go, and a SIGTERM must end it all the same.
 pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
     thread::spawn(move || {
-        let stdin = rustix::stdio::stdin();
+        let mut reader = InputReader::new(signals);
         let mut decoder = Decoder::default();
         let mut buf = [0; 4096];
         let mut open = true;
-        loop {
-            let mut fds = [
-                PollFd::new(&signals, PollFlags::IN),
-                PollFd::new(&stdin, PollFlags::IN),
-            ];
-            let polled = if open { &mut fds[..] } else { &mut fds[..1] };
-            match poll(polled, None) {
-                Ok(_) | Err(Errno::INTR) => {}
-                Err(_) => return,
-            }
-            let (signalled, input) = (!fds[0].revents().is_empty(), !fds[1].revents().is_empty());
-            let mut resized = false;
-            if signalled {
-                for signal in signals.take() {
-                    if signal == Signal::Resize {
-                        resized = true;
-                    } else {
-                        end(signal);
+        while let Ok(input) = reader.read(&mut buf) {
+            match input {
+                Input::Signals(signals) => {
+                    let mut resized = false;
+                    for signal in signals {
+                        if signal == Signal::Resize {
+                            resized = true;
+                        } else {
+                            end(signal);
+                        }
+                    }
+                    if resized && open && tx.send_first(Event::Resized).is_err() {
+                        open = false;
+                        reader.close_input();
                     }
                 }
-            }
-            if resized && open && tx.send_first(Event::Resized).is_err() {
-                open = false;
-            }
-            if input && open {
-                let n = match rustix::io::read(stdin, &mut buf) {
-                    Ok(n @ 1..) => n,
-                    Err(Errno::INTR | Errno::AGAIN) => continue,
-                    Ok(0) | Err(_) => {
-                        open = false;
-                        let _ = tx.send(Event::InputClosed);
-                        continue;
-                    }
-                };
-                // A full buffer says more is waiting: an ESC it ends with
-                // may start a sequence.
-                for input in decoder.feed(&buf[..n], n == buf.len()) {
-                    if tx.send_first(Event::Input(input)).is_err() {
-                        open = false;
-                        break;
+                Input::Closed => {
+                    open = false;
+                    let _ = tx.send(Event::InputClosed);
+                }
+                Input::Bytes(n) => {
+                    // A full buffer may end in the start of an escape sequence.
+                    for input in decoder.feed(&buf[..n], n == buf.len()) {
+                        if tx.send_first(Event::Input(input)).is_err() {
+                            open = false;
+                            reader.close_input();
+                            break;
+                        }
                     }
                 }
             }
