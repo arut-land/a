@@ -123,3 +123,37 @@ for explicit schema loading. Keys include the exact schema, deduplicate
 only while its context is effective, and are restored from the log after
 restart. The frame-budget test includes publication keys and text as well
 as the result card. Transport state remains private to `ext-mcp`.
+
+## Shared publication integration validation
+
+After merging main's skills/publication work (`5918a4e`) and adopting it
+in MCP (`f4efc19`), the final check passed formatting, clippy and **983
+tests**, with 28 intentionally skipped. Acceptance passed all 13 tests;
+web passed all 6. Windows lint, machete, no-tokio, deny and size passed.
+An earlier full run lost a CLI `--version` warmup to SIGKILL; the unchanged
+test passed on the complete rerun.
+
+The final release is **3300 KiB** (3,380,192 bytes), below 4096 KiB. The
+previous validated pre-review release was 3072 KiB (3,145,856 bytes), a
+difference of 234,336 bytes (228.84 KiB). This includes main's skills and
+fork integration as well as MCP changes. Release artifacts and the one
+retained startup-test directory were removed. No task-owned servers or
+daemons remained; quiet-machine performance measurements stay deferred.
+
+Implementation and integration commits, newest first:
+
+```text
+f4efc19 mcp: share generation context and typed schema publications
+57a1dc7 docs: resolve skills and mcp design together
+5918a4e merge: integrate shared context publication for mcp
+6c30867 docs: record mcp review limits and validation
+8e517c2 test: split mcp fixture dispatch and retain review cases
+0a3b235 mcp: keep receive storage out of timer futures
+c7d9de5 merge: integrate main with mcp review fixes
+9193107 mcp: prove descendant cleanup on stop and cancellation
+7ed1cd2 mcp: publish pending progress while the peer is quiet
+e8588e9 mcp: validate identities at config and discovery boundaries
+27aca66 mcp: bound aggregate discovery and compact summaries
+37992f4 mcp: bound request notifications and coalesce progress
+0beba5f mcp: refuse redirects before resending requests
+```
