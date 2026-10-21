@@ -21,9 +21,16 @@ pub struct Limits {
 }
 
 impl Limits {
-    fn image(self, source: &str, tools: &[String]) -> mlua::Result<Json> {
-        Json::encode(&(source, tools, self.memory, self.instructions, self.slice))
-            .map_err(mlua::Error::external)
+    fn image(self, source: &str, tools: &[String], inherit: bool) -> mlua::Result<Json> {
+        Json::encode(&(
+            source,
+            tools,
+            self.memory,
+            self.instructions,
+            self.slice,
+            inherit,
+        ))
+        .map_err(mlua::Error::external)
     }
 }
 
@@ -143,6 +150,7 @@ fn encode(value: &Value) -> mlua::Result<Json> {
 
 #[derive(Clone)]
 pub struct Mod {
+    inherit: bool,
     name: Name,
     version: u32,
     image: Json,
@@ -155,6 +163,7 @@ pub struct Mod {
 
 #[derive(Default)]
 struct Contributions {
+    inherit: Option<bool>,
     tools: Vec<Table>,
     hooks: Vec<(String, Function)>,
     texts: Vec<Text>,
@@ -249,6 +258,20 @@ fn register(lua: &Lua) -> mlua::Result<Arc<Mutex<Contributions>>> {
     let api = lua.create_table()?;
     let collect = Arc::downgrade(&made);
     api.set(
+        "inherit",
+        lua.create_function(move |_, inherit: bool| {
+            let collect = collect
+                .upgrade()
+                .ok_or_else(|| mlua::Error::runtime("registration has ended"))?;
+            let mut made = locked(&collect);
+            if made.inherit.replace(inherit).is_some() {
+                return Err(mlua::Error::runtime("inheritance must be declared once"));
+            }
+            Ok(())
+        })?,
+    )?;
+    let collect = Arc::downgrade(&made);
+    api.set(
         "agent",
         lua.create_function(move |_, spec: Table| {
             let collect = collect
@@ -327,16 +350,17 @@ fn register(lua: &Lua) -> mlua::Result<Arc<Mutex<Contributions>>> {
 
 impl Mod {
     pub(crate) fn restore(name: &str, image: &Json) -> Result<Self, Refused> {
-        let (source, tools, memory, instructions, slice): (
+        let (source, tools, memory, instructions, slice, inherit): (
             String,
             Vec<String>,
             usize,
             u64,
             Duration,
+            bool,
         ) = image
             .parse()
             .map_err(|e| Refused(format!("lua {name}: {e}")))?;
-        Self::load(
+        let module = Self::load(
             name,
             &source,
             &tools,
@@ -345,7 +369,13 @@ impl Mod {
                 instructions,
                 slice,
             },
-        )
+        )?;
+        if module.inherit != inherit {
+            return Err(Refused(format!(
+                "lua {name}: inheritance differs from generation image"
+            )));
+        }
+        Ok(module)
     }
 
     /// Compiles one generation; registration is transactional.
@@ -388,10 +418,12 @@ impl Mod {
         let mut made = std::mem::take(&mut *locked(&made));
         let name = Name::from(name);
         let grants: Arc<[String]> = tools.to_vec().into();
+        let inherit = made.inherit.unwrap_or(true);
         let mut result = Self {
+            inherit,
             name: Arc::clone(&name),
             version: fingerprint(source),
-            image: limits.image(source, tools)?,
+            image: limits.image(source, tools, inherit)?,
             tools: Vec::new(),
             hooks: Vec::new(),
             texts: std::mem::take(&mut made.texts),
@@ -475,6 +507,10 @@ fn fingerprint(source: &str) -> u32 {
 }
 
 impl DynExtension for Mod {
+    fn inherit(&self) -> bool {
+        self.inherit
+    }
+
     fn image(&self) -> Option<Json> {
         Some(self.image.clone())
     }
@@ -919,6 +955,29 @@ mod tests {
         format!(
             "a.tool{{name='test',description='test',input={{type='object'}},run=function(input,cx) {body} end}}"
         )
+    }
+
+    #[test]
+    fn lua_inheritance_is_a_restorable_whole_generation_decision() {
+        let source = "a.inherit(false); a.text{name='root',text='root only'}; a.agent{name='root',step=function() return {} end}";
+        let module = Mod::load("root", source, &[], Limits::default()).unwrap();
+        let restored = Mod::restore("root", &module.image).unwrap();
+        for module in [&module, &restored] {
+            assert!(!module.inherit());
+            let registry = Registry::default()
+                .with_dyn(ext::Tier::User, module)
+                .unwrap();
+            assert_eq!(registry.installed().len(), 1);
+            let inherited = registry.inherited().unwrap();
+            assert_eq!(inherited.extensions().count(), 0);
+            assert_eq!(inherited.agents().collect::<Vec<_>>(), [ext::LOOP]);
+            assert!(inherited.system_prompt().is_empty());
+        }
+        let default = Mod::load("default", "", &[], Limits::default()).unwrap();
+        assert!(Mod::restore("default", &default.image).unwrap().inherit());
+        let mut image: serde_json::Value = module.image.parse().unwrap();
+        image[5] = true.into();
+        assert!(Mod::restore("root", &Json::encode(&image).unwrap()).is_err());
     }
 
     #[test]

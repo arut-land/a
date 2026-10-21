@@ -159,3 +159,8 @@ to 4096 entries per root, with an aggregate compilation budget of one second.
 Fold rebuilds use a compatible snapshot plus its suffix, or full replay, with
 at most 100,000 entries and a one-second budget. A rejected rebuild keeps the
 current generation and reports why; no partial state is installed.
+
+A generation inherits into children by default. Declare `a.inherit(false)` once
+during registration to exclude the entire generation (tools, hooks, texts, folds
+and agents). The declaration is persisted in its image and checked against the
+source when restored.
