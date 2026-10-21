@@ -1147,9 +1147,14 @@ pub fn serve(
             kind: Fault(error.kind()),
         });
     }
-    rt::block_on(ext_logging::flush(&*runtime));
-    runtime.shutdown();
+    finish_runtime(&runtime);
     result
+}
+
+fn finish_runtime(runtime: &rt::Threads) {
+    let deadline = std::time::Instant::now() + ext_logging::FLUSH_GRACE;
+    rt::block_on(ext_logging::flush_until(runtime, deadline));
+    runtime.shutdown_until(deadline);
 }
 
 fn run(

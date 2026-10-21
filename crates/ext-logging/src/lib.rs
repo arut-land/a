@@ -8,7 +8,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::SessionId;
 use serde::{Deserialize, Serialize, Serializer};
@@ -417,11 +417,22 @@ pub fn emit(fact: impl Loggable) {
 
 /// Best effort only, including on orderly exit: a wedged disk never holds
 /// daemon shutdown indefinitely. There is deliberately no flush in `Drop`.
+pub const FLUSH_GRACE: Duration = Duration::from_millis(250);
+
 pub async fn flush(rt: &dyn rt::Runtime) {
+    flush_until(rt, rt.now() + FLUSH_GRACE).await;
+}
+
+/// The runtime owner uses this same deadline when reclaiming its workers.
+pub async fn flush_until(rt: &dyn rt::Runtime, deadline: Instant) {
     if let Some(logger) = CURRENT.get() {
         logger.0.closed.store(true, Ordering::Release);
         logger.0.ready.notify();
-        rt::or(logger.flush(), rt.sleep(Duration::from_millis(250))).await;
+        rt::or(
+            logger.flush(),
+            rt.sleep(deadline.saturating_duration_since(rt.now())),
+        )
+        .await;
     }
 }
 

@@ -1,5 +1,5 @@
 //! Owned async workers and independently admitted blocking classes. Idle
-//! workers retire after one idle timeout; shutdown closes admission before joining.
+//! workers retire after one idle timeout; shutdown closes admission and bounds reclamation.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::{BlockingClass, BoxFuture, Reactor, Runtime, Wakeup, lock};
 use async_executor::Executor;
@@ -54,6 +55,7 @@ impl Config {
 
 pub struct Threads {
     config: Config,
+    lifecycle: Arc<Lifecycle>,
     workers: Mutex<Workers>,
     blocking: [Arc<Blocking>; 4],
 }
@@ -63,8 +65,46 @@ struct Workers {
     threads: Vec<(Arc<Wakeup>, JoinHandle<()>)>,
 }
 
+#[derive(Default)]
+struct Lifecycle {
+    running: Mutex<usize>,
+    ended: Condvar,
+}
+
+struct Worker(Arc<Lifecycle>);
+
+impl Lifecycle {
+    fn worker(self: &Arc<Self>) -> Worker {
+        *lock(&self.running) += 1;
+        Worker(Arc::clone(self))
+    }
+
+    fn wait_until(&self, deadline: Instant) {
+        let mut running = lock(&self.running);
+        while *running != 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next, _) = self
+                .ended
+                .wait_timeout(running, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            running = next;
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        *lock(&self.0.running) -= 1;
+        self.0.ended.notify_all();
+    }
+}
+
 struct Blocking {
     limits: PoolLimits,
+    lifecycle: Arc<Lifecycle>,
     #[cfg(test)]
     start_gate: Mutex<Option<Arc<Gate>>>,
     state: Mutex<Pool>,
@@ -94,8 +134,10 @@ impl Threads {
 
     pub fn configured(config: Config) -> Self {
         assert!(config.workers > 0);
+        let lifecycle = Arc::new(Lifecycle::default());
         Self {
             config,
+            lifecycle: Arc::clone(&lifecycle),
             workers: Mutex::new(Workers {
                 tasks: Some(Arc::default()),
                 threads: Vec::new(),
@@ -114,6 +156,7 @@ impl Threads {
                 assert!(limits.workers > 0 && limits.queue > 0 && limits.bytes > 0);
                 Arc::new(Blocking {
                     limits,
+                    lifecycle: Arc::clone(&lifecycle),
                     #[cfg(test)]
                     start_gate: Mutex::default(),
                     state: Mutex::default(),
@@ -124,13 +167,22 @@ impl Threads {
         }
     }
 
-    /// Call from the owner after cancelling external I/O. Running closures
-    /// cannot be forcibly stopped; they finish before their pool is reclaimed.
+    /// Best-effort reclamation; a native I/O stall cannot hold the owner
+    /// indefinitely. Call `shutdown_until` to share an existing deadline.
     pub fn shutdown(&self) {
+        self.shutdown_until(Instant::now() + Duration::from_millis(250));
+    }
+
+    /// Close admission and signal every worker. Only finished threads may
+    /// be joined: at the deadline, running native closures must be detached.
+    pub fn shutdown_until(&self, deadline: Instant) {
         let mut workers = lock(&self.workers);
         let tasks = workers.tasks.take();
         let threads = std::mem::take(&mut workers.threads);
         drop(workers);
+        if tasks.is_none() && threads.is_empty() {
+            return;
+        }
         for pool in &self.blocking {
             let mut state = lock(&pool.state);
             state.closed = true;
@@ -152,16 +204,18 @@ impl Threads {
             || blocking
                 .iter()
                 .any(|worker| worker.thread().id() == current);
-        // A worker dropping the last handle must first return to its executor
-        // so pending futures release the guards that cancel native I/O.
-        if !on_worker {
-            for (_, worker) in threads {
-                let _ = worker.join();
-            }
-        }
+        // Executors cancel their futures on their workers, where a blocking
+        // destructor cannot consume the owner's shutdown deadline.
         drop(tasks);
         if !on_worker {
-            for worker in blocking {
+            self.lifecycle.wait_until(deadline);
+        }
+        for worker in threads
+            .into_iter()
+            .map(|(_, worker)| worker)
+            .chain(blocking)
+        {
+            if worker.is_finished() {
                 let _ = worker.join();
             }
         }
@@ -193,9 +247,14 @@ impl Runtime for Threads {
                 let tasks = Arc::clone(&tasks);
                 let stop = Arc::new(Wakeup::new());
                 let stopped = Arc::clone(&stop);
+                let worker = self.lifecycle.worker();
                 let handle = thread::Builder::new()
                     .name(format!("rt-worker-{n}"))
-                    .spawn(move || crate::block_on(tasks.run(stopped.wait())))
+                    .spawn(move || {
+                        crate::block_on(tasks.run(stopped.wait()));
+                        drop(tasks);
+                        drop(worker);
+                    })
                     .expect("spawn async worker");
                 workers.threads.push((stop, handle));
             }
@@ -272,10 +331,14 @@ impl Future for Admission {
             let pool = Arc::clone(&this.pool);
             // Count the thread before releasing the queue lock: bursts must
             // not mistake workers still starting for missing capacity.
+            let worker = this.pool.lifecycle.worker();
             match thread::Builder::new()
                 .name("rt-blocking".into())
-                .spawn(move || pool.serve())
-            {
+                .spawn(move || {
+                    pool.serve();
+                    drop(pool);
+                    drop(worker);
+                }) {
                 Ok(worker) => {
                     let mut threads = lock(&this.pool.threads);
                     threads.retain(|worker| !worker.is_finished());
@@ -367,7 +430,6 @@ impl Gate {
 mod tests {
     use super::*;
     use crate::{block_on, oneshot, spawn};
-    use std::time::Duration;
 
     #[test]
     fn submission_bursts_count_starting_workers() {
@@ -457,6 +519,38 @@ mod tests {
             block_on(rt.spawn_blocking(BlockingClass::Storage, 0, Box::new(|| panic!("closed"))))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn shutdown_deadline_detaches_stalled_work_and_keeps_admission_closed() {
+        let rt = Arc::new(Threads::new(1));
+        let (release, released) = std::sync::mpsc::channel();
+        let (entered, running) = std::sync::mpsc::channel();
+        let (finished, ended) = std::sync::mpsc::channel();
+        block_on(rt.spawn_blocking(
+            BlockingClass::Storage,
+            1,
+            Box::new(move || {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                finished.send(()).unwrap();
+            }),
+        ))
+        .unwrap();
+        running.recv_timeout(Duration::from_secs(2)).unwrap();
+        let owner = Arc::clone(&rt);
+        let (stopped, done) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            owner.shutdown_until(Instant::now());
+            owner.shutdown();
+            stopped.send(()).unwrap();
+        });
+        let result = done.recv_timeout(Duration::from_millis(500));
+        release.send(()).unwrap();
+        ended.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        result.expect("an expired deadline cannot join a stalled worker");
+        assert!(block_on(rt.spawn_blocking(BlockingClass::Storage, 0, Box::new(|| {}))).is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Runtime demand (C09)
 
-`Threads` owns and joins its async and blocking workers. Each blocking
+`Threads` owns its async and blocking workers and bounds shutdown with a deadline. Each blocking
 class has its own queue and byte ledger. Admission is a cancellable
 future: a full queue or byte budget suspends its caller without occupying
 a worker. Both queued and running jobs retain their byte reservations.
@@ -32,8 +32,11 @@ Async workers start together on first spawn; blocking workers start on
 demand. Starting workers count against the limit while their first
 instruction is still unscheduled. Blocking workers retire after one ten-second idle wait, releasing their
 thread resources. No last-worker polling loop remains after retirement.
-The shared async-io reactor remains process-scoped. Owner shutdown reclaims the runtime's own workers, not that shared
-reactor. A last handle dropped on one of its own workers signals shutdown
+The shared async-io reactor remains process-scoped. Owner shutdown closes
+admission and signals the workers, then waits on their completion until its
+deadline. It only joins threads that have already finished. Live threads are
+detached at the deadline so uninterruptible native I/O cannot hold the owner.
+The runtime destructor does not restart the wait after explicit shutdown. A last handle dropped on one of its own workers signals shutdown
 without joining: the executor must return before its pending futures can
 release I/O cancellation guards. This path has a dedicated regression test.
 
@@ -50,10 +53,11 @@ Config lookups clone immutable snapshots; demand-triggered refreshes do
 the filesystem work on storage workers.
 
 The daemon owns one runtime for sessions and logging. Shutdown stops
-sessions, flushes logging, closes blocking admission, cancels remaining async tasks,
-and joins workers after accepted work finishes. Running native
-I/O must first be cancelled by its owning operation; Rust cannot forcibly
-terminate an arbitrary closure. HTTP response cancellation still closes
+sessions, then gives logging and runtime reclamation one shared 250 ms
+deadline. Runtime shutdown closes admission, signals workers, and cancels
+async tasks on their executor workers. Healthy workers are reclaimed; an
+uninterruptible native closure is detached when the deadline expires so
+the daemon can exit. HTTP response cancellation still closes
 its socket, including registration after cancellation.
 
 ## Worker comparison

@@ -166,6 +166,27 @@ fn a_stalled_diagnostic_writer_never_blocks_commit_or_store_recovery() {
     );
 }
 
+#[test]
+fn logging_flush_deadline_also_bounds_owned_runtime_shutdown() {
+    let runtime = Arc::new(rt::Threads::new(2));
+    let handle: rt::Rt = runtime.clone();
+    let stall = ext_logging::testing::stall(&handle);
+    drop(handle);
+    let (finished, done) = std::sync::mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        crate::finish_runtime(&runtime);
+        drop(runtime);
+        finished.send(()).unwrap();
+    });
+    let result = done.recv_timeout(Duration::from_millis(500));
+    drop(stall);
+    owner.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "a stalled logger outlived the owner's shutdown deadline"
+    );
+}
+
 /// The actor runs only when polled by the test; I/O completes inline and
 /// deferred timers never fire, so queued messages define exact bursts.
 struct Manual {
