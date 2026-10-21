@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 12;
+pub const PROTO: u32 = 13;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 12;
+pub const PROTO_MIN: u32 = 13;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -1255,7 +1255,7 @@ kinds! {
         /// to it: for an attach from far behind, or a client that fell too far
         /// behind live. Folding it and what follows equals folding the entries
         /// it stands for.
-        Snapshot "snapshot" (Box<view::SessionView>) = Durable, read decode::snapshot_msg;
+        Snapshot "snapshot" (Box<view::ViewSnapshot>) = Durable, read decode::snapshot_msg;
         /// This connection's mutation numbered `client_seq` was taken; what
         /// it causes follows as entries. A mutation sent without a number
         /// is answered only when refused, with an [`DaemonMsg::Error`].

@@ -784,7 +784,10 @@ impl Folding {
         registry: &Registry,
         shared: &Shared,
     ) -> Result<(), String> {
-        let image: Image = snapshot.image.parse().map_err(|e| e.to_string())?;
+        let image: RecoveryImage = snapshot.image.parse().map_err(|e| e.to_string())?;
+        if image.ledger.seq() != snapshot.covers {
+            return Err("checkpoint sequence mismatch".into());
+        }
         if image.build != shared.build {
             return Err(format!("of build {}", image.build));
         }
@@ -792,6 +795,7 @@ impl Folding {
             return Err("of other extensions".to_owned());
         }
         self.states.restore(&image.states)?;
+        self.invocations = image.invocations;
         self.snapshot = Some(snapshot.clone());
         let core = Core::restore(Arc::clone(binding), image.ledger);
         self.core = core.with_barriers(shared.barriers);
@@ -813,18 +817,15 @@ impl Folding {
     }
 }
 
-/// What a snapshot of a session keeps: the ledger and the extensions'
-/// states as they stood at rest, which is all a session at rest is
-/// ([`Core::restore`]), under what made them. A load that cannot read
-/// one, or one of another build or other extensions, folds the log
-/// instead: the snapshot is derived, and only ever spares the fold.
+/// Only idle kernels can be checkpointed; transient scheduling state is absent.
 #[derive(Serialize, Deserialize)]
-struct Image {
+struct RecoveryImage {
     build: String,
     extensions: Vec<protocol::Installed>,
     has_input: bool,
     ledger: Ledger,
     states: ext::Checkpoint,
+    invocations: Invocations,
 }
 
 const SNAPSHOT_EVERY: u64 = 64 << 10;

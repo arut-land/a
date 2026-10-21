@@ -40,7 +40,11 @@ fn app(viewport: Viewport, msgs: &[DaemonMsg]) -> (App, SessionId) {
     }
     app.fold(&DaemonMsg::Activity {
         seq: app.view().seq,
-        activity: app.view().ledger.activity(),
+        activity: protocol::ledger::Ledger::of(msgs.iter().filter_map(|m| match m {
+            DaemonMsg::Entry(entry) => Some(entry),
+            _ => None,
+        }))
+        .activity(),
     });
     (app, session)
 }

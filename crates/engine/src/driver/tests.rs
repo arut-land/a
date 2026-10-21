@@ -1122,7 +1122,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
             .unwrap();
         view.fold(&msg);
     }
-    assert_eq!(view.ledger.inbox().next(), CallId::new(2));
+    assert_eq!(view.state.inbox().next(), CallId::new(2));
     assert!(view.recap.is_some_and(|r| r.asks == 1));
     resumed.answer(2, true).unwrap();
     let log = finished(&resumed, 2);
@@ -2441,4 +2441,152 @@ fn calls_share_transport_pools_but_not_origin_authority() {
     );
     assert!(rt::block_on(old.models().unwrap().call(&current, side)).is_err());
     std::fs::remove_file(home).unwrap();
+}
+
+#[test]
+fn child_snapshot_resume_equals_full_log_resume() {
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
+        ext_fixtures::ECHO,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let mut header = Fixture::header();
+    header.parent = Some(Parent {
+        session: SessionId::new(),
+        call: 1,
+    });
+    let session = Live::start(&header, &fixture.0, Open::Create, Owner::None).unwrap();
+    session
+        .submit(&"x".repeat(usize::try_from(SNAPSHOT_EVERY).unwrap()))
+        .unwrap();
+    settle(&session);
+    let covers = log_of(&session).len() as u64;
+    assert_eq!(*lock(&probe.snapshots), [covers]);
+    let registry = fixture.0.registry.get();
+    let binding = bind(&registry, &session.session) as Arc<dyn Binding>;
+    for suffix in [false, true] {
+        if suffix {
+            session.submit("suffix").unwrap();
+            settle(&session);
+        }
+        let entries = log_of(&session);
+        let (loaded, mut restored) =
+            Folding::open(&header, &fixture.0, Open::Load, &binding, &registry).unwrap();
+        assert!(restored.snapshot.is_some());
+        assert_eq!(
+            loaded.read,
+            Encoded::of(&entries[usize::try_from(covers).unwrap()..])
+                .unwrap()
+                .lines()
+                .map(|line| line.len() as u64 + 1)
+                .sum::<u64>()
+        );
+        let mut full = Folding::new(&binding, &registry, &fixture.0);
+        for e in &entries {
+            full.fold(e);
+        }
+        assert_eq!(restored.core.ledger(), full.core.ledger());
+        let load = Load {
+            owner: Owner::Present,
+            ..Load::default()
+        };
+        let expected = full.core.resumed(&load);
+        assert!(
+            expected
+                .immediate
+                .iter()
+                .chain(expected.admitted.iter().map(|g| &g.work))
+                .any(|w| matches!(
+                    w,
+                    kernel::Work::Report {
+                        outcome: Outcome::Done { .. }
+                    }
+                ))
+        );
+        assert_eq!(restored.core.resumed(&load), expected);
+    }
+    session.halt();
+}
+
+#[test]
+fn corrupt_or_mismatched_checkpoints_fall_back_to_the_log() {
+    let fixture = Fixture::new(
+        ext_fixtures::ECHO,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let header = Fixture::header();
+    let session = Live::start(&header, &fixture.0, Open::Create, Owner::None).unwrap();
+    session.submit("result").unwrap();
+    settle(&session);
+    session.halt();
+    let entries = log_of(&session);
+    let registry = fixture.0.registry.get();
+    let binding = bind(&registry, &session.session) as Arc<dyn Binding>;
+    let mut full = Folding::new(&binding, &registry, &fixture.0);
+    for e in &entries {
+        full.fold(e);
+    }
+    let valid = serde_json::to_value(RecoveryImage {
+        build: fixture.0.build.clone(),
+        extensions: registry.installed(),
+        has_input: true,
+        ledger: full.core.ledger().clone(),
+        states: full.states.image().unwrap(),
+        invocations: full.invocations.clone(),
+    })
+    .unwrap();
+    for fault in [
+        "corrupt",
+        "build",
+        "extensions",
+        "sequence",
+        "states",
+        "ledger",
+    ] {
+        let mut image = valid.clone();
+        match fault {
+            "corrupt" => image = json!({}),
+            "build" => image["build"] = json!("other"),
+            "extensions" => image["extensions"] = json!([]),
+            "sequence" => image["ledger"]["seq"] = json!(0),
+            "states" => image["states"] = json!({}),
+            "ledger" => {
+                image["ledger"].as_object_mut().unwrap().remove("open");
+            }
+            _ => unreachable!(),
+        }
+        let mut loaded = fixture
+            .0
+            .store
+            .load(header.id, &mut |_| false, &mut |_| {})
+            .unwrap();
+        loaded
+            .writer
+            .snapshot(&Snapshot {
+                covers: entries.len() as u64,
+                image: Json::encode(&image).unwrap(),
+            })
+            .unwrap();
+        let (loaded, restored) =
+            Folding::open(&header, &fixture.0, Open::Load, &binding, &registry).unwrap();
+        assert!(restored.snapshot.is_none(), "{fault}");
+        assert_eq!(
+            loaded.read,
+            Encoded::of(&entries)
+                .unwrap()
+                .lines()
+                .map(|line| line.len() as u64 + 1)
+                .sum::<u64>(),
+            "{fault}"
+        );
+        assert_eq!(restored.core.ledger(), full.core.ledger(), "{fault}");
+        assert_eq!(
+            restored.states.image().unwrap(),
+            full.states.image().unwrap(),
+            "{fault}"
+        );
+    }
 }

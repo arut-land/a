@@ -1,9 +1,9 @@
 //! Ordered writes and durable publication belong to the same session writer.
 
 use super::{
-    Actor, Admission, Arc, AssertUnwindSafe, Encoded, Entry, Flag, Future, Image, Json, Msg,
-    Ordering, Poll, Record, Requirement, SYNC_LAG, Snapshot, WorkId, Writer, catch_unwind, channel,
-    io, lock, oneshot, relisted, store_fault, unless,
+    Actor, Admission, Arc, AssertUnwindSafe, Encoded, Entry, Flag, Future, Json, Msg, Ordering,
+    Poll, Record, RecoveryImage, Requirement, SYNC_LAG, Snapshot, WorkId, Writer, catch_unwind,
+    channel, io, lock, oneshot, relisted, store_fault, unless,
 };
 
 #[derive(Default)]
@@ -235,17 +235,13 @@ impl Actor {
         Ok(())
     }
 
-    /// Keeps a snapshot of the session beside its log, if it is at rest
-    /// and all it logged is durable: what the next load starts from. A
-    /// child's is not kept: what it settled with is the daemon's to read
-    /// from its log, not the ledger's to carry. One that cannot be taken
-    /// is reported and not tried again until as much log follows.
+    /// Checkpoints require an idle kernel and a fully durable prefix.
     pub(super) async fn keep_snapshot(&mut self) {
         let covers = self.core.ledger().seq();
         let rest = self.core.at_rest()
             && self.journal.unsynced.is_empty()
             && covers == self.live.frames.seq();
-        if !rest || self.live.parent.is_some() || self.journal.writer.is_none() {
+        if !rest || self.journal.writer.is_none() {
             return;
         }
         self.journal.since_snapshot = 0;
@@ -261,12 +257,13 @@ impl Actor {
                 return;
             }
         };
-        let image = Image {
+        let image = RecoveryImage {
             build: self.live.session.shared.build.clone(),
             extensions: self.registry.installed(),
             has_input: self.live.has_input(),
             ledger: self.core.ledger().clone(),
             states,
+            invocations: self.projection.invocations.clone(),
         };
         let Some(mut writer) = self.journal.writer.take() else {
             return;

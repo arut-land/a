@@ -646,7 +646,7 @@ impl Renderer for App {
             }
         }
         self.clock.sync(
-            self.client.view().ledger.turn_start(),
+            self.client.view().state.turn_start(),
             self.working(),
             self.tokens.output,
         );

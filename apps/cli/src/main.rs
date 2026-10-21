@@ -428,7 +428,7 @@ impl Screen {
                 if let Some(recap) = &view.recap {
                     sayln!("[{}]", recap_line(recap));
                 }
-                for call in view.ledger.inbox() {
+                for call in view.state.inbox() {
                     if let Some(item) = view.items.iter().find(|i| i.key() == call.0) {
                         sayln!("{}", ask(&view.present(item)));
                     }

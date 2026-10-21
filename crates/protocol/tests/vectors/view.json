@@ -8,7 +8,7 @@
       "{\"call\":3,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}",
       "{\"call\":2,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}"
     ],
-    "hash": "b7066dc21214db56",
+    "hash": "d9a659a228a360ee",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -117,25 +117,13 @@
           "type": "tool"
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [],
-        "outbox": [],
-        "received": [],
-        "seq": 5,
-        "turn": 1,
-        "untaken": [],
-        "watched": []
-      },
       "seq": 5,
       "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "turn": 1
+      },
       "workspace": "/w"
     },
     "updates": [
@@ -241,7 +229,7 @@
       "{\"call\":4,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Only lists files.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
       "{\"seq\":5,\"t\":\"synced\"}"
     ],
-    "hash": "25ae3760aa7de266",
+    "hash": "c338bd44b22cd3a2",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -384,46 +372,25 @@
           "usage": null
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [
+      "seq": 5,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [
           [
             1,
             {
-              "call": {
-                "tool": {
-                  "by": "model",
-                  "input": {
-                    "command": "original harmless input"
-                  },
-                  "invoke": null,
-                  "tool": "bash"
-                }
-              },
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
-              }
+              },
+              "progress": null
             }
           ]
         ],
-        "outbox": [],
-        "received": [],
-        "seq": 5,
-        "turn": 0,
-        "untaken": [],
-        "watched": []
+        "queued": [],
+        "turn": 0
       },
-      "seq": 5,
-      "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
     },
     "updates": [
@@ -566,7 +533,7 @@
       "{\"call\":4,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Only lists files.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
       "{\"seq\":5,\"t\":\"synced\"}"
     ],
-    "hash": "ee9c9dc92d20b0b5",
+    "hash": "baf02b23c176b073",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -731,46 +698,25 @@
           "usage": null
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [
+      "seq": 5,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [
           [
             1,
             {
-              "call": {
-                "tool": {
-                  "by": "model",
-                  "input": {
-                    "command": "original harmless input"
-                  },
-                  "invoke": null,
-                  "tool": "edit"
-                }
-              },
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
-              }
+              },
+              "progress": null
             }
           ]
         ],
-        "outbox": [],
-        "received": [],
-        "seq": 5,
-        "turn": 0,
-        "untaken": [],
-        "watched": []
+        "queued": [],
+        "turn": 0
       },
-      "seq": 5,
-      "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
     },
     "updates": [
@@ -923,7 +869,7 @@
       "{\"call\":3,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Lists files in the current directory.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}",
       "{\"seq\":4,\"t\":\"synced\"}"
     ],
-    "hash": "d5867216e70363e7",
+    "hash": "6b58ae3c4aed9325",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1031,46 +977,25 @@
           "usage": null
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [
+      "seq": 4,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [
           [
             1,
             {
-              "call": {
-                "tool": {
-                  "by": "model",
-                  "input": {
-                    "command": "ls"
-                  },
-                  "invoke": null,
-                  "tool": "bash"
-                }
-              },
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
-              }
+              },
+              "progress": null
             }
           ]
         ],
-        "outbox": [],
-        "received": [],
-        "seq": 4,
-        "turn": 0,
-        "untaken": [],
-        "watched": []
+        "queued": [],
+        "turn": 0
       },
-      "seq": 4,
-      "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
     },
     "updates": [
@@ -1187,7 +1112,7 @@
       "{\"activity\":\"idle\",\"seq\":2,\"t\":\"activity\"}",
       "{\"seq\":2,\"t\":\"synced\"}"
     ],
-    "hash": "fd5f27f01593d32c",
+    "hash": "2296c5a40a8a0a09",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1248,25 +1173,13 @@
           "type": "assistant"
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [],
-        "outbox": [],
-        "received": [],
-        "seq": 2,
-        "turn": 1,
-        "untaken": [],
-        "watched": []
-      },
       "seq": 2,
       "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "turn": 1
+      },
       "workspace": "/w"
     },
     "updates": [
@@ -1345,7 +1258,7 @@
       "{\"call\":1,\"card\":{\"body\":\"hi\\n\",\"note\":\"exit 0\",\"title\":\"$ echo hi\"},\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}",
       "{\"seq\":4,\"t\":\"synced\"}"
     ],
-    "hash": "8a401a4ef94b8903",
+    "hash": "bacf42a5a38aad4c",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1429,25 +1342,13 @@
           "type": "tool"
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [],
-        "outbox": [],
-        "received": [],
-        "seq": 4,
-        "turn": 0,
-        "untaken": [],
-        "watched": []
-      },
       "seq": 4,
       "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "turn": 0
+      },
       "workspace": "/w"
     },
     "updates": [
@@ -1535,7 +1436,7 @@
       "{\"call\":2,\"t\":\"delta\",\"text\":\"lo\"}",
       "{\"call\":2,\"epoch\":0,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"hello\",\"type\":\"text\"}]},\"usage\":{\"input\":4,\"output\":2}},\"status\":\"done\"},\"seq\":3,\"t\":\"entry\"}"
     ],
-    "hash": "d2997d54b2d14372",
+    "hash": "a20820babbfe5e78",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1618,25 +1519,13 @@
           }
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [],
-        "outbox": [],
-        "received": [],
-        "seq": 3,
-        "turn": 1,
-        "untaken": [],
-        "watched": []
-      },
       "seq": 3,
       "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "turn": 1
+      },
       "workspace": "/w"
     },
     "updates": [
@@ -1728,7 +1617,7 @@
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":true}",
       "{\"call\":1,\"card\":{\"body\":\"hi\\n\",\"note\":\"exit 0\",\"title\":\"$ echo hi\"},\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}"
     ],
-    "hash": "e7acef9456f1e242",
+    "hash": "fda57fd08cb55a17",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1825,25 +1714,13 @@
           "type": "tool"
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [],
-        "outbox": [],
-        "received": [],
-        "seq": 4,
-        "turn": 0,
-        "untaken": [],
-        "watched": []
-      },
       "seq": 4,
       "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "turn": 0
+      },
       "workspace": "/w"
     },
     "updates": [
@@ -1931,7 +1808,7 @@
       "{\"epoch\":0,\"input\":2,\"kind\":\"take\",\"seq\":4,\"t\":\"entry\"}",
       "{\"seq\":4,\"t\":\"synced\"}"
     ],
-    "hash": "16181453d2f7f4a6",
+    "hash": "77c7e887b1ec179f",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2002,25 +1879,13 @@
           "type": "user"
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [],
-        "outbox": [],
-        "received": [],
-        "seq": 4,
-        "turn": 1,
-        "untaken": [],
-        "watched": []
-      },
       "seq": 4,
       "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "turn": 1
+      },
       "workspace": "/w"
     },
     "updates": [
@@ -2096,7 +1961,7 @@
       "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":{\"slept\":1},\"status\":\"done\"},\"seq\":3,\"t\":\"entry\",\"watch\":2}",
       "{\"seq\":3,\"t\":\"synced\"}"
     ],
-    "hash": "b22678dc0d0d112f",
+    "hash": "53b479be5658306c",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2154,34 +2019,13 @@
           "watch": 2
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [
-          {
-            "child": "00000000-0000-0000-0000-00000000000c",
-            "input": "sleep 1",
-            "intent": null,
-            "seq": 1
-          }
-        ],
-        "open": [],
-        "outbox": [],
-        "received": [],
-        "seq": 3,
-        "turn": 0,
-        "untaken": [],
-        "watched": [
-          "00000000-0000-0000-0000-00000000000c"
-        ]
-      },
       "seq": 3,
       "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "turn": 0
+      },
       "workspace": "/w"
     },
     "updates": [
@@ -2254,7 +2098,7 @@
       "{\"epoch\":0,\"kind\":\"input\",\"seq\":3,\"t\":\"entry\",\"taken\":true,\"text\":\"two\"}",
       "{\"seq\":3,\"t\":\"synced\"}"
     ],
-    "hash": "77894b63878a3566",
+    "hash": "7627970fa04db95c",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2327,25 +2171,13 @@
           "type": "user"
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [],
-        "outbox": [],
-        "received": [],
-        "seq": 3,
-        "turn": 3,
-        "untaken": [],
-        "watched": []
-      },
       "seq": 3,
       "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "turn": 3
+      },
       "workspace": "/w"
     },
     "updates": [
@@ -2439,7 +2271,7 @@
       "{\"cwd\":\"/w\",\"epoch\":0,\"kind\":\"environment\",\"seq\":2,\"t\":\"entry\",\"tty\":false,\"vars\":{}}",
       "{\"seq\":2,\"t\":\"synced\"}"
     ],
-    "hash": "06224d84569c39a0",
+    "hash": "58bdd7d7691683e4",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2480,29 +2312,13 @@
           "type": "environment"
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": {
-          "cwd": "/w",
-          "tty": false,
-          "vars": {}
-        },
-        "extensions": null,
-        "links": [],
-        "open": [],
-        "outbox": [],
-        "received": [],
-        "seq": 2,
-        "turn": 0,
-        "untaken": [],
-        "watched": []
-      },
       "seq": 2,
       "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "turn": 0
+      },
       "workspace": "/w"
     },
     "updates": [
@@ -2549,7 +2365,7 @@
       "{\"call\":5,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":\"no jobs\",\"status\":\"done\"},\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "fd21c961a131ddf7",
+    "hash": "1c550a679b545ed0",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2677,25 +2493,13 @@
           "type": "tool"
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [],
-        "outbox": [],
-        "received": [],
-        "seq": 6,
-        "turn": 4,
-        "untaken": [],
-        "watched": []
-      },
       "seq": 6,
       "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "turn": 4
+      },
       "workspace": "/w"
     },
     "updates": [
@@ -2797,11 +2601,11 @@
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":2,\"t\":\"delta\",\"text\":\"thinking\"}",
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"items\":[{\"seq\":1,\"text\":\"one\",\"type\":\"user\"},{\"call\":2,\"model\":\"m\",\"status\":{\"status\":\"running\"},\"text\":\"\",\"type\":\"reply\",\"usage\":null},{\"call\":3,\"input\":{\"command\":\"echo hi\"},\"outcome\":null,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"reason\":{\"mode\":{\"mode\":\"ask\"}},\"tool\":\"bash\",\"type\":\"tool\"}],\"ledger\":{\"acknowledgements\":[],\"armed\":[],\"background\":[],\"clients\":[],\"context\":false,\"env\":null,\"extensions\":null,\"links\":[],\"open\":[[2,{\"call\":{\"model\":{\"attempt\":0,\"choice\":\"auto\"}},\"phase\":\"running\"}],[3,{\"call\":{\"tool\":{\"by\":\"model\",\"input\":{\"command\":\"echo hi\"},\"invoke\":null,\"tool\":\"bash\"}},\"phase\":{\"waiting\":{\"on\":\"approval\"}}}]],\"outbox\":[],\"received\":[],\"seq\":4,\"turn\":1,\"untaken\":[],\"watched\":[]},\"seq\":4,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"snapshot\",\"workspace\":\"/w\"}",
+      "{\"items\":[{\"seq\":1,\"text\":\"one\",\"type\":\"user\"},{\"call\":2,\"model\":\"m\",\"status\":{\"status\":\"running\"},\"text\":\"\",\"type\":\"reply\",\"usage\":null},{\"call\":3,\"input\":{\"command\":\"echo hi\"},\"outcome\":null,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"reason\":{\"mode\":{\"mode\":\"ask\"}},\"tool\":\"bash\",\"type\":\"tool\"}],\"seq\":4,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[[3,{\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"progress\":null}]],\"queued\":[],\"turn\":1},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
       "{\"seq\":4,\"t\":\"synced\"}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":5,\"t\":\"entry\",\"text\":\"done\"}"
     ],
-    "hash": "7e562cff872975b2",
+    "hash": "7b764cfd6c3f181c",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2874,58 +2678,25 @@
             "type": "tool"
           }
         ],
-        "ledger": {
-          "acknowledgements": [],
-          "armed": [],
-          "background": [],
-          "clients": [],
-          "context": false,
-          "env": null,
-          "extensions": null,
-          "links": [],
-          "open": [
-            [
-              2,
-              {
-                "call": {
-                  "model": {
-                    "attempt": 0,
-                    "choice": "auto"
-                  }
-                },
-                "phase": "running"
-              }
-            ],
+        "seq": 4,
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "state": {
+          "calls": [
             [
               3,
               {
-                "call": {
-                  "tool": {
-                    "by": "model",
-                    "input": {
-                      "command": "echo hi"
-                    },
-                    "invoke": null,
-                    "tool": "bash"
-                  }
-                },
                 "phase": {
                   "waiting": {
                     "on": "approval"
                   }
-                }
+                },
+                "progress": null
               }
             ]
           ],
-          "outbox": [],
-          "received": [],
-          "seq": 4,
-          "turn": 1,
-          "untaken": [],
-          "watched": []
+          "queued": [],
+          "turn": 1
         },
-        "seq": 4,
-        "session": "00000000-0000-0000-0000-00000000000a",
         "t": "snapshot",
         "workspace": "/w"
       },
@@ -2984,58 +2755,25 @@
           "type": "assistant"
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [
-          [
-            2,
-            {
-              "call": {
-                "model": {
-                  "attempt": 0,
-                  "choice": "auto"
-                }
-              },
-              "phase": "running"
-            }
-          ],
+      "seq": 5,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [
           [
             3,
             {
-              "call": {
-                "tool": {
-                  "by": "model",
-                  "input": {
-                    "command": "echo hi"
-                  },
-                  "invoke": null,
-                  "tool": "bash"
-                }
-              },
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
-              }
+              },
+              "progress": null
             }
           ]
         ],
-        "outbox": [],
-        "received": [],
-        "seq": 5,
-        "turn": 1,
-        "untaken": [],
-        "watched": []
+        "queued": [],
+        "turn": 1
       },
-      "seq": 5,
-      "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
     },
     "updates": [
@@ -3190,7 +2928,7 @@
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":29,\"t\":\"entry\",\"text\":\"a38\"}",
       "{\"cwd\":\"/w1\",\"epoch\":0,\"kind\":\"environment\",\"seq\":30,\"t\":\"entry\",\"tty\":false,\"vars\":{}}"
     ],
-    "hash": "47dda30ec1f843ef",
+    "hash": "219ab386d7c42b73",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -3763,85 +3501,25 @@
           "type": "environment"
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": {
-          "cwd": "/w1",
-          "tty": false,
-          "vars": {}
-        },
-        "extensions": null,
-        "links": [
-          {
-            "child": "00000000-0000-0000-16df-9d6ac76bd322",
-            "input": "go",
-            "intent": null,
-            "seq": 1
-          },
-          {
-            "child": "00000000-0000-0000-8c31-dc059121ada3",
-            "input": "go",
-            "intent": null,
-            "seq": 16
-          },
-          {
-            "child": "00000000-0000-0000-0ceb-9e68e19650bf",
-            "input": "go",
-            "intent": null,
-            "seq": 24
-          }
-        ],
-        "open": [
-          [
-            6,
-            {
-              "call": {
-                "model": {
-                  "attempt": 0,
-                  "choice": "auto"
-                }
-              },
-              "phase": "running"
-            }
-          ],
+      "seq": 30,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [
           [
             27,
             {
-              "call": {
-                "tool": {
-                  "by": "model",
-                  "input": {
-                    "command": "echo 3"
-                  },
-                  "invoke": null,
-                  "tool": "bash"
-                }
-              },
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
-              }
+              },
+              "progress": null
             }
           ]
         ],
-        "outbox": [],
-        "received": [],
-        "seq": 30,
-        "turn": 22,
-        "untaken": [],
-        "watched": [
-          "00000000-0000-0000-16df-9d6ac76bd322",
-          "00000000-0000-0000-8c31-dc059121ada3",
-          "00000000-0000-0000-0ceb-9e68e19650bf"
-        ]
+        "queued": [],
+        "turn": 22
       },
-      "seq": 30,
-      "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
     },
     "updates": [
@@ -4419,7 +4097,7 @@
       "{\"message\":\"e\",\"t\":\"error\"}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":8,\"t\":\"entry\",\"text\":\"a11\"}"
     ],
-    "hash": "c53adb6237d446aa",
+    "hash": "1e40177d193870d2",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -4578,34 +4256,13 @@
           "type": "assistant"
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [
-          {
-            "child": "00000000-0000-0000-77d3-d4856d3c62a6",
-            "input": "go",
-            "intent": null,
-            "seq": 5
-          }
-        ],
-        "open": [],
-        "outbox": [],
-        "received": [],
-        "seq": 8,
-        "turn": 0,
-        "untaken": [],
-        "watched": [
-          "00000000-0000-0000-77d3-d4856d3c62a6"
-        ]
-      },
       "seq": 8,
       "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "turn": 0
+      },
       "workspace": "/w"
     },
     "updates": [
@@ -4762,7 +4419,7 @@
       "{\"call\":4,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Only lists files.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
       "{\"seq\":5,\"t\":\"synced\"}"
     ],
-    "hash": "15b615a4b71d7e20",
+    "hash": "f0f26f3ff19d318a",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -4904,46 +4561,25 @@
           "usage": null
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [
+      "seq": 5,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [
           [
             1,
             {
-              "call": {
-                "tool": {
-                  "by": "user",
-                  "input": {
-                    "command": "original harmless input"
-                  },
-                  "invoke": null,
-                  "tool": "bash"
-                }
-              },
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
-              }
+              },
+              "progress": null
             }
           ]
         ],
-        "outbox": [],
-        "received": [],
-        "seq": 5,
-        "turn": 0,
-        "untaken": [],
-        "watched": []
+        "queued": [],
+        "turn": 0
       },
-      "seq": 5,
-      "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
     },
     "updates": [
@@ -5084,7 +4720,7 @@
       "{\"call\":4,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Only lists files.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
       "{\"seq\":5,\"t\":\"synced\"}"
     ],
-    "hash": "fe5a6e51bc49a4a7",
+    "hash": "c4c6bfb19bb4b9e3",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -5248,46 +4884,25 @@
           "usage": null
         }
       ],
-      "ledger": {
-        "acknowledgements": [],
-        "armed": [],
-        "background": [],
-        "clients": [],
-        "context": false,
-        "env": null,
-        "extensions": null,
-        "links": [],
-        "open": [
+      "seq": 5,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [
           [
             1,
             {
-              "call": {
-                "tool": {
-                  "by": "user",
-                  "input": {
-                    "command": "original harmless input"
-                  },
-                  "invoke": null,
-                  "tool": "edit"
-                }
-              },
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
-              }
+              },
+              "progress": null
             }
           ]
         ],
-        "outbox": [],
-        "received": [],
-        "seq": 5,
-        "turn": 0,
-        "untaken": [],
-        "watched": []
+        "queued": [],
+        "turn": 0
       },
-      "seq": 5,
-      "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
     },
     "updates": [

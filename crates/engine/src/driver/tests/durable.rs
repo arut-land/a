@@ -881,11 +881,12 @@ fn a_rejected_reduction_has_the_same_outcome_at_every_snapshot_position() {
         h.complete();
         h.request("rest");
         entries = log_of(&h.session);
-        let image = Image {
+        let image = RecoveryImage {
             build: h.session.session.shared.build.clone(),
             extensions: registry.installed(),
             has_input: h.session.has_input(),
             ledger: Ledger::of(&entries),
+            invocations: Invocations::default(),
             states: lock(&h.session.session.state_view()).image().unwrap(),
         };
         checkpoints.push(Some(Snapshot {

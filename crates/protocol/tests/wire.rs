@@ -823,7 +823,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         ),
         sample(
             "snapshot",
-            DaemonMsg::Snapshot(Box::new(SessionView::from_log(SESSION, "/w".into(), &log))),
+            DaemonMsg::Snapshot(Box::new(SessionView::from_log(SESSION, "/w".into(), &log).snapshot())),
         ),
         sample("ack", DaemonMsg::Ack { client_seq: 2 }),
         sample(

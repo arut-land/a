@@ -303,7 +303,7 @@ impl Session {
             })
             .collect();
         let view = SessionView::from_log(SESSION, "/w".into(), &entries);
-        let wire = serde_json::to_vec(&DaemonMsg::Snapshot(Box::new(view))).unwrap();
+        let wire = serde_json::to_vec(&DaemonMsg::Snapshot(Box::new(view.snapshot()))).unwrap();
         let mut msgs = self.attach(upto, upto);
         msgs.insert(1, DaemonMsg::from_json(&wire).unwrap());
         msgs
@@ -357,8 +357,8 @@ fn assert_same(a: &SessionView, b: &SessionView, seed: u64) {
     );
     assert_eq!(a.state_hash(), b.state_hash(), "seed {seed}");
     assert_eq!(
-        a.ledger.inbox().collect::<Vec<_>>(),
-        b.ledger.inbox().collect::<Vec<_>>(),
+        a.state.inbox().collect::<Vec<_>>(),
+        b.state.inbox().collect::<Vec<_>>(),
         "seed {seed}"
     );
 }
@@ -421,7 +421,7 @@ fn a_snapshot_folds_to_the_replay_it_stands_for() {
 /// snapshot of any later point, then follows live again, ends where one
 /// that kept up does.
 #[test]
-fn a_snapshot_then_what_follows_equals_the_whole_session() {
+fn snapshot_plus_suffix_equals_live_view() {
     for seed in 1..=SEEDS {
         let mut rng = Rng(seed);
         let s = Session::generate(&mut rng);
@@ -496,7 +496,7 @@ fn activity_never_certifies_a_newer_entry_or_a_replacement_view() {
     assert_eq!(view.activity, None);
     view.fold(&idle(1));
     assert_eq!(view.activity, Some(protocol::Activity::Idle));
-    let snapshot = DaemonMsg::Snapshot(Box::new(view.clone()));
+    let snapshot = DaemonMsg::Snapshot(Box::new(view.snapshot()));
     view.fold(&snapshot);
     assert_eq!(view.activity, None);
     view.fold(&idle(1));
@@ -952,7 +952,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     attempt: 0,
                 }),
                 attached(),
-                msg(DaemonMsg::Snapshot(Box::new(view))),
+                msg(DaemonMsg::Snapshot(Box::new(view.snapshot()))),
                 msg(DaemonMsg::Synced { seq: 4 }),
                 entry(
                     5,
@@ -1100,7 +1100,7 @@ fn a_recap_tells_what_the_replay_held() {
         ..Recap::default()
     };
     assert_eq!(view.recap, Some(recap));
-    assert_eq!(view.ledger.inbox().next(), CallId::new(2));
+    assert_eq!(view.state.inbox().next(), CallId::new(2));
     // Attached again with nothing new: nothing to tell.
     fold(&mut view, &[attached, DaemonMsg::Synced { seq: 3 }]);
     assert_eq!(view.recap, None);
@@ -1190,5 +1190,48 @@ fn answered_and_cancelled_questions_stop_presenting_existing_descriptions() {
             terminal,
         )));
         assert!(view.present(&view.items[0]).description.is_none());
+    }
+}
+
+#[test]
+fn view_snapshots_contain_no_execution_authority() {
+    for seed in 1..=SEEDS {
+        let s = Session::generate(&mut Rng(seed));
+        let view = folded(&s.watched());
+        let mut changed = s.watched();
+        for message in &mut changed {
+            if let DaemonMsg::Entry(entry) = message {
+                match &mut entry.body {
+                    Body::Environment(env) => {
+                        env.vars.insert("EXECUTION_SECRET".into(), "hidden".into());
+                    }
+                    Body::ToolProcess { pgid, boot, .. } => {
+                        *pgid = 999;
+                        *boot = "different-boot".into();
+                    }
+                    Body::ModelCall { attempt, .. } => *attempt = 99,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(folded(&changed).state_hash(), view.state_hash());
+        let snapshot = serde_json::to_value(view.snapshot()).unwrap();
+        let state = snapshot["state"].as_object().unwrap();
+        assert_eq!(
+            state.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["calls", "queued", "turn"]
+        );
+        for call in state["calls"].as_array().unwrap() {
+            assert_eq!(
+                call[1]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["phase", "progress"]
+            );
+        }
+        assert!(snapshot.get("ledger").is_none());
     }
 }

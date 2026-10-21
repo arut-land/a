@@ -1,9 +1,4 @@
-//! What a session's log says now, folded once per entry as it commits or
-//! loads, so that no question about the log scans it: which calls are open
-//! and where each stands, what waits for the user and for the agent, which
-//! watches are armed, and the environment and context last logged. Pure:
-//! the daemon and any client fold the same entries to the same ledger, and
-//! a snapshot carries one as it is.
+//! Execution state recovered from the durable session log.
 
 use std::collections::VecDeque;
 
@@ -15,7 +10,6 @@ use crate::{
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct Ledger {
     /// The seq of the last entry folded.
     seq: u64,
@@ -36,14 +30,13 @@ pub struct Ledger {
     env: Option<Environment>,
     extensions: Option<Vec<Installed>>,
     context: bool,
-    #[serde(skip_serializing_if = "crate::publication::Publications::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::publication::Publications::is_empty"
+    )]
     publications: crate::publication::Publications,
     /// The last mutation logged of each client that named itself.
     clients: Vec<(ClientId, ClientSeq)>,
-    /// What the session last settled with, as a child hands it back: the
-    /// daemon's to read, so a snapshot leaves it out (its raw JSON would
-    /// make the view's hash hang on the spelling of a reply).
-    #[serde(skip)]
     result: Option<Outcome>,
     /// The seq of the input that started the current turn; 0 before the
     /// first.
@@ -105,6 +98,58 @@ impl Phase {
     /// attached is asked for.
     pub const fn asking(&self) -> bool {
         matches!(self, Self::Waiting(WaitOn::Approval))
+    }
+
+    pub(crate) fn decide(&mut self, d: &Verdict) {
+        match self {
+            Self::Waiting(WaitOn::Approval) => {
+                if let Verdict::Approval { approved } = d {
+                    self.approve(*approved);
+                }
+            }
+            Self::Gating { at } => {
+                *self = match d {
+                    Verdict::Permission {
+                        permission: Permission::Ask(_),
+                    } => Self::Waiting(WaitOn::Approval),
+                    Verdict::Permission {
+                        permission: Permission::Deny,
+                    }
+                    | Verdict::Block { .. }
+                    | Verdict::Approval { approved: false } => Self::Settled(OutcomeKind::Failed),
+                    _ => Self::Gating {
+                        at: at.saturating_add(1),
+                    },
+                };
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn wait(&mut self, on: &WaitOn) {
+        let may = match on {
+            WaitOn::Approval => matches!(self, Self::Gating { .. }),
+            _ => matches!(self, Self::Gating { .. } | Self::Running),
+        };
+        if may {
+            *self = Self::Waiting(on.clone());
+        }
+    }
+
+    pub(crate) fn answer(&mut self, value: &Json) {
+        match self {
+            Self::Waiting(WaitOn::Approval) => self.approve(value.parse().unwrap_or_default()),
+            Self::Waiting(_) => *self = Self::Running,
+            _ => {}
+        }
+    }
+
+    fn approve(&mut self, approved: bool) {
+        *self = if approved {
+            Self::Running
+        } else {
+            Self::Settled(OutcomeKind::Failed)
+        };
     }
 }
 
@@ -384,67 +429,20 @@ impl Ledger {
             *at = (*at).max(*attempt);
             return;
         }
-        match open.phase {
-            Phase::Waiting(WaitOn::Approval) => {
-                if let Verdict::Approval { approved } = d {
-                    self.answered(call, *approved);
-                }
-            }
-            Phase::Gating { at } => {
-                open.phase = match d {
-                    Verdict::Permission {
-                        permission: Permission::Ask(_),
-                    } => Phase::Waiting(WaitOn::Approval),
-                    Verdict::Permission {
-                        permission: Permission::Deny,
-                    }
-                    | Verdict::Block { .. }
-                    | Verdict::Approval { approved: false } => Phase::Settled(OutcomeKind::Failed),
-                    _ => Phase::Gating {
-                        at: at.saturating_add(1),
-                    },
-                };
-            }
-            _ => {}
-        }
+        open.phase.decide(d);
     }
 
-    /// Call `call` waits on `on`. A tool call waits for an approval only
-    /// while gated, so an answered one is not asked again.
     fn wait(&mut self, call: CallId, on: &WaitOn) {
-        let Some(open) = self.open.get_mut(call) else {
-            return;
-        };
-        let may = match on {
-            WaitOn::Approval => matches!(open.phase, Phase::Gating { .. }),
-            _ => matches!(open.phase, Phase::Gating { .. } | Phase::Running),
-        };
-        if may && matches!(open.call, Call::Tool { .. }) {
-            open.phase = Phase::Waiting(on.clone());
+        if let Some(open) = self.open.get_mut(call)
+            && matches!(open.call, Call::Tool { .. })
+        {
+            open.phase.wait(on);
         }
     }
 
-    /// The first answer to what call `call` waits on wins.
     fn answer(&mut self, call: CallId, value: &Json) {
-        let Some(open) = self.open.get_mut(call) else {
-            return;
-        };
-        match open.phase {
-            Phase::Waiting(WaitOn::Approval) => {
-                self.answered(call, value.parse().unwrap_or_default());
-            }
-            Phase::Waiting(_) => open.phase = Phase::Running,
-            _ => {}
-        }
-    }
-
-    fn answered(&mut self, call: CallId, approved: bool) {
         if let Some(open) = self.open.get_mut(call) {
-            open.phase = if approved {
-                Phase::Running
-            } else {
-                Phase::Settled(OutcomeKind::Failed)
-            };
+            open.phase.answer(value);
         }
     }
 

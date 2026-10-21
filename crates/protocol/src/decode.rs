@@ -24,9 +24,9 @@ use serde::de::{Deserializer, Error as _, Visitor};
 use serde::{Deserialize, forward_to_deserialize_any};
 use serde_json::{Error, Result};
 
-use crate::ledger::{Ledger, Phase};
+use crate::ledger::Phase;
 use crate::publication;
-use crate::view::{Item, SessionView, Status, Usage};
+use crate::view::{Item, Status, Usage, ViewSnapshot, ViewState};
 use crate::{
     Activity, Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
     CommandInfo, DaemonMsg, Decode, Entry, Environment, Epoch, ForkError, HomeSettings, Installed,
@@ -307,7 +307,7 @@ parsed!(
     Seq,
     Outcome,
     ClientId,
-    Ledger,
+    ViewState,
     Vec<Item>,
     Vec<SessionSummary>
 );
@@ -498,7 +498,7 @@ pub(crate) struct MsgFields {
     pub(crate) reason: Option<Json>,
     pub(crate) items: Option<Json>,
     #[serde(default, deserialize_with = "present")]
-    pub(crate) ledger: Option<Json>,
+    pub(crate) state: Option<Json>,
     pub(crate) pid: Option<u32>,
     pub(crate) started: Option<u64>,
     pub(crate) clients: Option<u32>,
@@ -616,13 +616,12 @@ pub(crate) fn entry_msg(_: &mut MsgFields) -> Result<DaemonMsg> {
 }
 
 pub(crate) fn snapshot_msg(f: &mut MsgFields) -> Result<DaemonMsg> {
-    Ok(DaemonMsg::Snapshot(Box::new(SessionView {
+    Ok(DaemonMsg::Snapshot(Box::new(ViewSnapshot {
         session: f.session.take(),
         workspace: req(f.workspace.take(), "workspace")?,
         seq: req(f.seq.take(), "seq")?,
-        ledger: need(f.ledger.take(), "ledger")?,
+        state: need(f.state.take(), "state")?,
         items: need(f.items.take(), "items")?,
-        ..SessionView::default()
     })))
 }
 

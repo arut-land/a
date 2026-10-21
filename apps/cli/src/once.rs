@@ -444,7 +444,7 @@ mod tests {
             );
             assert!(once.ended.is_none(), "an entry prefix cannot end the turn");
         }
-        assert_eq!(once.client.view().ledger.activity(), Activity::Idle);
+        assert_eq!(once.client.view().activity, None);
         receive(
             &mut once,
             DaemonMsg::Sessions {

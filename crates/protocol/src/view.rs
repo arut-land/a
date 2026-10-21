@@ -17,13 +17,14 @@ pub mod md;
 mod present;
 
 use std::borrow::{Borrow, Cow};
+use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::ledger::{Ledger, OutcomeKind, Phase};
+use crate::ledger::{Keyed, OutcomeKind, Phase, Queued};
 use crate::{
     Activity, ApprovalReason, Audience, Body, CallId, Card, DaemonMsg, Entry, Json, Outcome,
     Permission, Seq, SessionId, SessionSummary, Verdict, WaitOn,
@@ -34,8 +35,125 @@ pub use present::{
     recap_line,
 };
 
-/// One session as a client shows it. Its serialized form is also what a
-/// [`DaemonMsg::Snapshot`] carries.
+/// Reconnection and rendering state, with no authority to resume execution.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ViewSnapshot {
+    pub session: Option<SessionId>,
+    pub workspace: PathBuf,
+    pub seq: u64,
+    pub state: ViewState,
+    pub items: Vec<Item>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, serde::Deserialize)]
+pub struct ViewState {
+    calls: Keyed<CallId, ViewCall>,
+    queued: VecDeque<Queued>,
+    turn: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
+struct ViewCall {
+    phase: Phase,
+    progress: Option<String>,
+}
+
+impl ViewState {
+    fn call(&self, call: CallId) -> Option<&ViewCall> {
+        self.calls.get(call)
+    }
+
+    pub fn inbox(&self) -> impl Iterator<Item = CallId> + '_ {
+        self.calls
+            .iter()
+            .filter(|(_, c)| c.phase.asking())
+            .map(|(id, _)| id)
+    }
+
+    pub const fn turn_start(&self) -> u64 {
+        self.turn
+    }
+
+    fn apply(&mut self, e: &Entry) {
+        match &e.body {
+            Body::Input {
+                text, mode, taken, ..
+            } => {
+                if *taken {
+                    self.turn = e.seq.get();
+                } else {
+                    self.queued.push_back(Queued {
+                        seq: e.seq,
+                        text: text.clone(),
+                        steer: *mode == crate::Mode::Steer,
+                    });
+                }
+            }
+            Body::Enqueue { envelope } => self.queued.push_back(Queued {
+                seq: e.seq,
+                text: envelope.payload.clone(),
+                steer: false,
+            }),
+            Body::Take { input } => {
+                if let Some(at) = self.queued.iter().position(|q| q.seq == *input)
+                    && let Some(q) = self.queued.remove(at)
+                    && !q.steer
+                {
+                    self.turn = e.seq.get();
+                }
+            }
+            Body::ToolCall { .. } => {
+                self.calls.insert(
+                    CallId(e.seq),
+                    ViewCall {
+                        phase: Phase::Gating { at: 0 },
+                        progress: None,
+                    },
+                );
+            }
+            Body::ToolResult { call, .. } | Body::ModelResult { call, .. } => {
+                self.calls.remove(*call);
+            }
+            Body::Decision {
+                call: Some(call),
+                d,
+                ..
+            } => {
+                if let Some(c) = self.calls.get_mut(*call) {
+                    c.phase.decide(d);
+                }
+            }
+            Body::Wait { call, on } => {
+                if let Some(c) = self.calls.get_mut(*call) {
+                    c.phase.wait(on);
+                }
+            }
+            Body::Answer { call, value, .. } => {
+                if let Some(c) = self.calls.get_mut(*call) {
+                    c.phase.answer(value);
+                }
+            }
+            Body::Progress { call, text } => {
+                if let Some(c) = self.calls.get_mut(*call) {
+                    c.progress.get_or_insert_default().push_str(text);
+                    if matches!(c.phase, Phase::Gating { .. }) {
+                        c.phase = Phase::Running;
+                    }
+                }
+            }
+            Body::ToolProcess { call, .. } => {
+                if let Some(c) = self.calls.get_mut(*call)
+                    && matches!(c.phase, Phase::Gating { .. })
+                {
+                    c.phase = Phase::Running;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One session as a client shows it, including transient connection state.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct SessionView {
     /// The kernel's activity at `seq`, or unknown while entries of its next
@@ -48,9 +166,7 @@ pub struct SessionView {
     pub workspace: PathBuf,
     /// The last entry folded: a reconnect attaches with it as `since`.
     pub seq: u64,
-    /// What the log says now: where each open call stands, what waits,
-    /// the environment. The one rule for all of it, shared with the daemon.
-    pub ledger: Ledger,
+    pub state: ViewState,
     /// The transcript, in log order.
     pub items: Vec<Item>,
     /// What happened since the seq the latest attach started from, once
@@ -315,6 +431,16 @@ pub enum Part {
 }
 
 impl SessionView {
+    pub fn snapshot(&self) -> ViewSnapshot {
+        ViewSnapshot {
+            session: self.session,
+            workspace: self.workspace.clone(),
+            seq: self.seq,
+            state: self.state.clone(),
+            items: self.items.clone(),
+        }
+    }
+
     /// The view of `session` as its log `entries` leave it: what a client
     /// that attached and folded them would hold, but for what only a
     /// connection sees.
@@ -381,7 +507,7 @@ impl SessionView {
             outcome: None,
             ..
         } = item
-            && let Some(text) = self.ledger.call(*call).and_then(|c| c.progress.as_deref())
+            && let Some(text) = self.state.call(*call).and_then(|c| c.progress.as_deref())
         {
             shown.body = Shown::Text(text.into());
         }
@@ -391,7 +517,7 @@ impl SessionView {
             ..
         } = item
             && self
-                .ledger
+                .state
                 .call(*call)
                 .is_some_and(|open| open.phase.asking())
         {
@@ -529,7 +655,7 @@ impl SessionView {
 
     /// Takes the log-derived state of `snapshot`, keeping what only this
     /// connection saw where it still holds: the reply streaming in.
-    fn adopt(&mut self, snapshot: &Self) -> Change {
+    fn adopt(&mut self, snapshot: &ViewSnapshot) -> Change {
         let running = |call| {
             snapshot.items.iter().any(
                 |i| matches!(i, Item::Reply { call: c, status: Status::Running, .. } if *c == call),
@@ -542,7 +668,7 @@ impl SessionView {
         self.session = snapshot.session;
         self.workspace.clone_from(&snapshot.workspace);
         self.seq = snapshot.seq;
-        self.ledger.clone_from(&snapshot.ledger);
+        self.state.clone_from(&snapshot.state);
         self.items.clone_from(&snapshot.items);
         Change::Snapshot
     }
@@ -559,14 +685,14 @@ impl SessionView {
         // its text is in the ledger until this entry leaves it.
         let taken = match &e.body {
             Body::Take { input } => {
-                let text = (self.ledger.untaken().iter())
+                let text = (self.state.queued.iter())
                     .find(|q| q.seq == *input)
                     .map(|q| q.text.clone());
                 Some(text)
             }
             _ => None,
         };
-        self.ledger.apply(e);
+        self.state.apply(e);
         let item = match &e.body {
             Body::Input {
                 text, taken: true, ..
@@ -690,7 +816,7 @@ impl SessionView {
                 let Item::Tool { phase, .. } = &mut self.items[at] else {
                     return None;
                 };
-                let now = self.ledger.call(*call).map(|open| &open.phase);
+                let now = self.state.call(*call).map(|open| &open.phase);
                 match (&*phase, now) {
                     (Phase::Waiting(WaitOn::Approval), Some(now)) if !now.asking() => {
                         let approved = *now == Phase::Running;
@@ -772,7 +898,7 @@ impl SessionView {
             .filter(|owner| {
                 described
                     && self
-                        .ledger
+                        .state
                         .call(*owner)
                         .is_some_and(|open| open.phase.asking())
             })
@@ -795,7 +921,7 @@ impl SessionView {
     /// Brings tool call `call`'s item to the phase the ledger has it at;
     /// the change, if that moved it.
     fn rephase(&mut self, call: CallId) -> Option<Change> {
-        let now = self.ledger.call(call)?.phase.clone();
+        let now = self.state.call(call)?.phase.clone();
         let at = self.call(call)?;
         match &mut self.items[at] {
             Item::Tool { phase, .. } if *phase != now => *phase = now,
@@ -869,7 +995,7 @@ impl SessionView {
                 Item::User { text, .. } => Some(short(text)),
                 _ => None,
             }),
-            asks: u32::try_from(self.ledger.inbox().count()).unwrap_or(u32::MAX),
+            asks: u32::try_from(self.state.inbox().count()).unwrap_or(u32::MAX),
             ..Recap::default()
         };
         for item in &self.items[prompt.map_or(0, |at| at + 1)..] {
