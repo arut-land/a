@@ -18,8 +18,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_UNLIMITED_INSTANCES, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, ResetEvent, SetEvent, WaitForSingleObject};
 
@@ -142,35 +142,63 @@ pub fn listener_nonblocking(listener: &Listener, value: bool) -> io::Result<()> 
 
 pub fn accept(listener: &Listener) -> io::Result<Stream> {
     let mut state = lock(&listener.state);
-    if state.operation.is_none() {
-        let mut op = Operation::new(
-            Arc::clone(&state.file),
-            duplicate(&listener.event)?,
-            Vec::new(),
-        )?;
-        // SAFETY: op owns the stable OVERLAPPED and event until completion.
-        let success = unsafe { ConnectNamedPipe(op.file.as_raw_handle(), op.raw.as_mut()) };
-        if success == 0 {
-            match io::Error::last_os_error()
-                .raw_os_error()
-                .map(i32::cast_unsigned)
-            {
-                Some(ERROR_PIPE_CONNECTED) => {}
-                Some(ERROR_IO_PENDING) => op.pending = true,
-                _ => return Err(io::Error::last_os_error()),
+    loop {
+        if state.operation.is_none() {
+            let mut op = Operation::new(
+                Arc::clone(&state.file),
+                duplicate(&listener.event)?,
+                Vec::new(),
+            )?;
+            // SAFETY: op owns the stable OVERLAPPED and event until completion.
+            let success = unsafe { ConnectNamedPipe(op.file.as_raw_handle(), op.raw.as_mut()) };
+            if success == 0 {
+                let error = io::Error::last_os_error();
+                match error.raw_os_error().map(i32::cast_unsigned) {
+                    Some(ERROR_PIPE_CONNECTED) => {}
+                    Some(ERROR_IO_PENDING) => op.pending = true,
+                    Some(ERROR_NO_DATA) => {
+                        recycle(&mut state)?;
+                        continue;
+                    }
+                    _ => return Err(error),
+                }
             }
+            state.operation = Some(op);
         }
-        state.operation = Some(op);
+        match state
+            .operation
+            .as_mut()
+            .unwrap()
+            .finish(listener.nonblocking.load(Ordering::Acquire), None)
+        {
+            Ok(_) => {}
+            Err(error) if eof(&error) => {
+                recycle(&mut state)?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+        let next = instance(&listener.path, false)?;
+        state.operation = None;
+        let connected = std::mem::replace(&mut state.file, next);
+        return Stream::new(connected);
     }
-    state
-        .operation
-        .as_mut()
-        .unwrap()
-        .finish(listener.nonblocking.load(Ordering::Acquire), None)?;
-    let next = instance(&listener.path, false)?;
+}
+
+fn recycle(state: &mut Accept) -> io::Result<()> {
     state.operation = None;
-    let connected = std::mem::replace(&mut state.file, next);
-    Stream::new(connected)
+    // A client can close before ConnectNamedPipe: ERROR_NO_DATA needs an
+    // explicit disconnect before the instance can listen again. By contrast,
+    // ERROR_PIPE_CONNECTED is a valid connection, not an abandoned instance.
+    // https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-connectnamedpipe
+    // SAFETY: the listener owns this server instance and any operation is joined.
+    if unsafe { DisconnectNamedPipe(state.file.as_raw_handle()) } == 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_PIPE_NOT_CONNECTED.cast_signed()) {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -558,6 +586,27 @@ mod tests {
             client.read_exact(&mut bytes).unwrap();
             assert_eq!(bytes, text);
         }
+    }
+
+    #[test]
+    fn abandoned_connections_never_end_the_listener() {
+        let home = home("abandoned");
+        let listener = home.bind().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        for _ in 0..4 {
+            drop(home.endpoint().connect().unwrap());
+            match accept(&listener.0) {
+                Ok(stream) => drop(stream),
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+            }
+            assert_eq!(accept(&listener.0).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        }
+        let mut client = home.endpoint().connect().unwrap();
+        let mut server = accept(&listener.0).unwrap();
+        client.write_all(b"still serving").unwrap();
+        let mut bytes = [0; 13];
+        server.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"still serving");
     }
 
     #[test]
