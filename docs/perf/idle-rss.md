@@ -13,8 +13,10 @@ fresh isolated `A_HOME`, an empty workspace, the echo fixture agent, and a
 repository's `cargo build-release` alias (build-std, size optimization, fat
 LTO), and `-p a --features fixtures`. Each build completes before sampling.
 The historical checkouts are detached, separate from the working branch.
-The rows include every first-parent merge in `eab69fe..9736499`, plus the
-baseline and final main. Binary sizes in this table include fixtures.
+The initial sweep includes every first-parent merge in `eab69fe..9736499`,
+plus the baseline and main at the start of the task. Main advanced during
+the work; the final two history rows measure its additional C08 merge and
+Apple follow-up unmodified, before final validation. Binary sizes in this table include fixtures.
 
 There was unrelated TypeScript work at the start and security scanning
 throughout; another worktree briefly built near the end. These are repeated
@@ -43,13 +45,19 @@ No unrelated process was stopped. The raw observations are in
 | `021d746` | C09 integration | 9984 / 10192 / 10304 | 3657 |
 | `7c9c1d4` | C09 integration | 10192 / 10272 / 10336 | 3657 |
 | `9736499` | main: runtime sizing / admitted edits | 10160 / 10240 / 10304 | 3673 |
+| `6505a4d` | C08 integration | 10272 / 10384 / 10384 | 3721 |
+| `975aa68` | final main (Apple follow-up) | 10336 / 10416 / 10448 | 3721 |
 | `batch` | batched watches only | 9984 / 10128 / 10176 | 3705 |
 
 The largest merge-to-merge increase is skills at `054a27c`: median RSS
 8,336 → 9,936 KiB (**+1,600 KiB**). Later additions consume the remaining
 headroom: final main is 10,240 KiB median, 10,304 KiB maximum. The originally
 reported 10,464 KiB is consistent with a build having essentially no margin;
-this sweep reproduces the failure without reproducing that exact sample.
+the original sweep reproduces the failure without that exact sample. The
+additional final-main control measures 10,416 KiB median and 10,448 KiB
+maximum, before applying the fix. Its binary is identical to the C08 merge
+(the Apple-only follow-up triggers no Rust rebuild); the 32 KiB median
+difference between their five-sample groups illustrates startup variation.
 
 ## Attribution
 
@@ -60,7 +68,7 @@ Representative captures, all KiB except thread counts:
 | Revision | Footprint | Live malloc bytes | Malloc resident | Stack resident | Threads | Clean text attributed by footprint |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `eab69fe` | 2688 | 394 | 1200 | 192 | 7 | 1696 |
-| `e33cd6d` | 2864 | — | — | 256 | 10 | 1840 |
+| `e33cd6d` | 2864 | 425 | 1312 | 256 | 10 | 1840 |
 | `054a27c` | 3632 | 532 | 1760 | 336 | 13 | 1952 |
 | `9736499` | 3648 | 532 | 1760 | 336 | 11 | 2160 |
 | Batched watches | 3536 | 530 | 1664 | 320 | 10 | 2144 |
@@ -107,7 +115,9 @@ ancestor causes a resubscription. When a skill/Lua root appears, refresh
 installs a recursive notify subscription before scanning it; disappearance
 releases it. Parent watches remain to observe replacement at the same path.
 Ancestor events invalidate unchanged path names too, because an inode may
-have been replaced. All initial recursive paths are installed in one batch.
+have been replaced. A bounded recheck after registration closes creation
+between the initial stat and arming the ancestor watch. All initial recursive
+paths are installed in one batch.
 
 Skills and Lua supply their actual roots rather than recursively watching
 the whole workspace and home. Source preparation still runs off async
@@ -159,3 +169,42 @@ It never reads the developer's home or `.env.local`. The probe uses macOS
 profiling commands; the maintained budget test remains the cross-platform
 gate. Cargo may reorder old lockfile entries; restore only those generated
 scratch-checkout changes before checking out the next revision.
+
+## Validation after merging main
+
+Main through `975aa68` was merged as `6fd6f0d`. The final code also closes
+creation between checking roots and registering their ancestor watches;
+subscriptions retry that plan at most eight times under concurrent changes.
+The exact nested-file event assertions rule out a stale ancestor notification
+satisfying the creation/replacement regression.
+
+- `CARGO_BUILD_JOBS=2 mise run check`: formatting, clippy and **1,143 tests
+  passed**, 30 intentionally skipped.
+- `acceptance`: **23 passed**; `test:web`: **6 passed**; `apple:test`: **16 passed**.
+- `check:windows`, `check:no-tokio`, `machete`, `deny`: passed.
+- `mise run size`: **3,705 KiB before**, **3,721 KiB after**, below 4,096 KiB;
+  fixture exclusion passes. The difference includes the intervening C08 and
+  Apple main integration, not just this fix.
+
+An initial post-merge budget run passed cold start (38.198 ms median,
+3.081792 ms process floor) and idle RSS (9,808 KiB, terminal CPU 0 ns), but
+failed attach p99 at **3.907125 ms** against **2 ms**. Its terminal-frame and
+shell-wake checks were not reached. It is retained here rather than counted
+as a passing complete budget run. After prebuilding the final fixture binary and allowing a 30-second quiet
+window, the complete strict `mise run budgets` passes, including the shell
+wake check. Security scanning remained active; no latency result is claimed
+to be a portable or noise-free bound. Every reported budget line:
+
+```text
+a (fixtures): 3737 KiB of 4096 KiB
+cold start to first daemon reply: median 31.852ms, min 25.255208ms, max 41.898083ms; process floor 1.951083ms
+idle: daemon 9728 KiB RSS; terminal client 0ns of CPU in 3 s, 8464 KiB RSS
+attach with a 21-entry replay: min 119.375µs, p50 129.625µs, p95 143.083µs, p99 179.541µs
+terminal client, spawn to first frame: [3.7385ms, 4.00325ms, 6.517667ms, 6.892584ms, 7.06825ms]
+quiet shell: 0 runtime wakes in 1 s
+```
+
+All four daemon/client tests and the isolated shell test passed. The actual
+budget harness leaves **512 KiB** below the unchanged RSS cap. Its richer
+Cargo/nextest environment differs from the standalone probe's inherited
+environment; these observations are retained separately, not pooled.

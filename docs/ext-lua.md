@@ -154,6 +154,11 @@ account for. JSON is bounded to 256 KiB, 64 levels and 8192 nodes; repeated tabl
 are rejected. Source is capped at 256 KiB, text at 8 KiB, and a workspace loads at most 128 mods. A mod registers at most 128
 contributions.
 
+Missing extension roots watch their nearest existing ancestors without
+recursively watching the workspace or home. Creation and replacement install
+a recursive subscription before preparation. On macOS the empty-root watches
+share the async reactor; FSEvents starts only for existing extension trees.
+
 Workspace preparation also limits combined source to 1 MiB and directory scans
 to 4096 entries per root, with an aggregate compilation budget of one second.
 Fold rebuilds use a compatible snapshot plus its suffix, or full replay, with
