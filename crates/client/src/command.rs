@@ -24,6 +24,8 @@ pub enum Cmd {
     Sessions,
     /// Attaches to another session (`/new` is [`Target::New`]).
     Open(Target),
+    /// Copy the current conversation through `seq`, then switch to it.
+    Fork(Option<protocol::Seq>),
     Help,
 }
 
@@ -67,6 +69,22 @@ pub const COMMANDS: &[Command] = &[
         args: "",
         help: "start a new session",
         parse: |rest| rest.is_empty().then_some(Cmd::Open(Target::New)),
+    },
+    Command {
+        name: "fork",
+        aliases: &[],
+        args: "[seq]",
+        help: "fork conversation at a rest point; workspace files stay as they are",
+        parse: |rest| {
+            if rest.is_empty() {
+                Some(Cmd::Fork(None))
+            } else {
+                rest.parse()
+                    .ok()
+                    .and_then(protocol::Seq::new)
+                    .map(|seq| Cmd::Fork(Some(seq)))
+            }
+        },
     },
     Command {
         name: "interrupt",
@@ -168,6 +186,8 @@ mod tests {
             ("/env", None, Some(Cmd::Input("/env".into()))),
             ("/sessions", None, Some(Cmd::Sessions)),
             ("/new", None, Some(Cmd::Open(Target::New))),
+            ("/fork", None, Some(Cmd::Fork(None))),
+            ("/fork 7", None, Some(Cmd::Fork(protocol::Seq::new(7)))),
             ("/help", None, Some(Cmd::Help)),
             (
                 "/steer and tests",

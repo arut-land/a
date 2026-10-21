@@ -12,6 +12,7 @@ dependencies = [
  "ext-compact",
  "ext-edit",
  "ext-fixtures",
+ "ext-fork",
  "ext-lua",
  "ext-policy",
  "ext-prompt",
@@ -530,6 +531,7 @@ dependencies = [
  "ext-compact",
  "ext-edit",
  "ext-fixtures",
+ "ext-fork",
  "ext-logging",
  "ext-policy",
  "ext-prompt",
@@ -667,6 +669,15 @@ dependencies = [
  "serde",
  "serde_json",
  "sys",
+]
+
+[[package]]
+name = "ext-fork"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "kernel",
+ "protocol",
 ]
 
 [[package]]

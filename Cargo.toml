@@ -16,6 +16,7 @@ ext = { path = "crates/ext" }
 ext-compact = { path = "crates/ext-compact" }
 ext-derive = { path = "crates/ext-derive" }
 ext-edit = { path = "crates/ext-edit" }
+ext-fork = { path = "crates/ext-fork" }
 ext-fixtures = { path = "crates/ext-fixtures" }
 ext-logging = { path = "crates/ext-logging" }
 ext-lua = { path = "crates/ext-lua" }

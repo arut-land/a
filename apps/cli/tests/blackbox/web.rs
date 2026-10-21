@@ -539,3 +539,49 @@ fn a_tab_rides_out_a_daemon_upgrade() {
     assert!(since.contains(">before<"), "{since}");
     assert_eq!(env.daemons(), [second]);
 }
+
+#[cfg(feature = "fork")]
+#[test]
+fn a_web_fork_switches_to_the_new_conversation_without_rewinding_files() {
+    let env = Env::new("web-fork");
+    let mut web = Web::start(&env);
+    web.sign_in();
+    let source = web.new_session();
+    let tab = "abcdefabcdefabcdefabcdefabcdefab";
+    let mut events = web.events(&source, tab);
+    events.until("initial transcript", |patches| {
+        patches.iter().any(|p| p.html.contains("id=\"transcript\""))
+    });
+    assert_eq!(web.call("/api/send", tab, "before fork").status(), 200);
+    events.until("source reply", |patches| {
+        shown(patches).matches(">before fork<").count() == 2
+    });
+    assert_eq!(web.call("/api/send", tab, "/fork").status(), 200);
+    events.until("fork navigation", |patches| {
+        patches
+            .iter()
+            .any(|p| p.html.contains("window.location.replace"))
+    });
+    let html = &events
+        .patches
+        .iter()
+        .find(|p| p.html.contains("window.location.replace"))
+        .unwrap()
+        .html;
+    let path = between(html, "window.location.replace('", "')").unwrap();
+    assert_ne!(path, format!("/s/{source}"));
+    assert!(path.starts_with("/s/"));
+    let fork = path.trim_start_matches("/s/");
+    assert_eq!(
+        env.run(&["-p", "after fork", "attach", fork]),
+        "after fork\n"
+    );
+    let (_, history) = env
+        .connect()
+        .attach(protocol::Target::Prefix(source), &env.ws);
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(&e.body, protocol::Body::Input { text, .. } if text == "after fork"))
+    );
+}

@@ -70,3 +70,9 @@ the protocol (`a bridge`).
 log` reads the current JSONL diagnostic file without starting the daemon.
 The [logging contract](logging.md) describes its typed facts, retention,
 privacy boundary and best-effort delivery.
+
+## Fork a conversation
+
+`a fork <session>[@<seq>]` creates a new session and prints its id. `/fork [seq]` copies the current conversation at a rest point and switches to it.
+Files stay as they are; this does not rewind or copy the workspace. The fork
+keeps its recorded cwd and environment. See [fork semantics](fork.md).

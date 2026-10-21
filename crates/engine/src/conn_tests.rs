@@ -613,3 +613,79 @@ fn the_daemon_finds_the_workspace_from_the_clients_directory_and_git_variables()
     );
     assert_eq!(attached(Some(work_tree)), repo.join("other"));
 }
+
+#[test]
+fn fork_refusals_are_typed_and_leave_the_source_attachment_usable() {
+    let fixture = Fixture::new("fork-refusals");
+    let mut peer = fixture.connect();
+    peer.send(&hello(Caps::ALL));
+    assert!(matches!(peer.answer(), DaemonMsg::Welcome { .. }));
+    peer.send(&attach(Target::New, 0, ClientDecl::default()));
+    let DaemonMsg::Attached { session, .. } = peer.answer() else {
+        panic!("not attached")
+    };
+    peer.send(&input("complete", 1));
+    assert!(matches!(peer.answer(), DaemonMsg::Ack { .. }));
+    fixture.settle();
+    let log = fixture.daemon.shared.store.entries(session).unwrap();
+    let pending = log
+        .iter()
+        .find(|entry| matches!(entry.body, Body::Input { .. }))
+        .unwrap()
+        .seq;
+    for (source, seq, decl, expected) in [
+        (
+            "no-such-session".to_owned(),
+            None,
+            ClientDecl::default(),
+            protocol::ForkError::SourceNotFound,
+        ),
+        (
+            session.to_string(),
+            Seq::new(u64::MAX),
+            ClientDecl::default(),
+            protocol::ForkError::InvalidSequence,
+        ),
+        (
+            session.to_string(),
+            Some(pending),
+            ClientDecl::default(),
+            protocol::ForkError::Unfinished,
+        ),
+        (
+            session.to_string(),
+            None,
+            ClientDecl {
+                role: Role::Viewer,
+                ..ClientDecl::default()
+            },
+            protocol::ForkError::Viewer,
+        ),
+    ] {
+        peer.send(&attach(
+            Target::Fork {
+                session: source,
+                seq,
+            },
+            0,
+            decl,
+        ));
+        assert!(matches!(peer.answer(), DaemonMsg::ForkRejected { reason } if reason == expected));
+    }
+    peer.send(&input("still attached", 2));
+    assert!(matches!(peer.answer(), DaemonMsg::Ack { .. }));
+    fixture.settle();
+    assert_eq!(fixture.daemon.shared.store.headers().unwrap().len(), 1);
+    assert!(
+        fixture
+            .daemon
+            .shared
+            .store
+            .entries(session)
+            .unwrap()
+            .iter()
+            .any(
+                |entry| matches!(&entry.body, Body::Input { text, .. } if text == "still attached")
+            )
+    );
+}

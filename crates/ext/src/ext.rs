@@ -46,6 +46,9 @@ pub trait Extension: Send + Sync {
 pub trait DynExtension: Send + Sync {
     fn name(&self) -> Name;
     fn version(&self) -> u32;
+    fn image(&self) -> Option<protocol::Json> {
+        None
+    }
     fn contribute(&self, r: &mut Registrar);
 }
 

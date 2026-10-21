@@ -339,21 +339,7 @@ impl Conn<'_> {
                     env,
                     decl,
                 } => {
-                    let found = || workspace_of(&workspace, env.as_ref());
-                    match self.daemon.resolve(&target, found).await {
-                        Ok(s) => {
-                            self.decl = decl;
-                            // Before the replay, so a client that saw itself
-                            // attached knows its environment is recorded.
-                            if let Some(env) = env {
-                                s.session().set_env(env);
-                            }
-                            s.session().attach(self.outbox.clone(), since).await;
-                            session_event("attach", s.session().id, || format!("since {since}"));
-                            self.attached = Some(s);
-                        }
-                        Err(e) => self.error(e.to_string()),
-                    }
+                    self.attach(target, workspace, since, env, decl).await;
                 }
                 ClientMsg::Declare(decl) => self.decl = decl,
                 ClientMsg::Environment(env) => match &self.attached {
@@ -395,6 +381,56 @@ impl Conn<'_> {
         }
         self.outbox.unfollow();
         Ok(())
+    }
+
+    async fn attach(
+        &mut self,
+        target: protocol::Target,
+        workspace: PathBuf,
+        since: u64,
+        env: Option<Environment>,
+        decl: ClientDecl,
+    ) {
+        if matches!(target, protocol::Target::Fork { .. })
+            && (self.decl.role == Role::Viewer || decl.role == Role::Viewer)
+        {
+            self.reply(&DaemonMsg::ForkRejected {
+                reason: protocol::ForkError::Viewer,
+            });
+            return;
+        }
+        let env = if matches!(target, protocol::Target::Fork { .. }) {
+            None
+        } else {
+            env
+        };
+        let found = || workspace_of(&workspace, env.as_ref());
+        let resolved = match &target {
+            protocol::Target::Fork { session, seq } => {
+                match self.daemon.fork(session, *seq).await {
+                    Ok(session) => Ok(session),
+                    Err(reason) => {
+                        self.reply(&DaemonMsg::ForkRejected { reason });
+                        return;
+                    }
+                }
+            }
+            _ => self.daemon.resolve(&target, found).await,
+        };
+        match resolved {
+            Ok(s) => {
+                self.decl = decl;
+                // Before the replay, so a client that saw itself
+                // attached knows its environment is recorded.
+                if let Some(env) = env {
+                    s.session().set_env(env);
+                }
+                s.session().attach(self.outbox.clone(), since).await;
+                session_event("attach", s.session().id, || format!("since {since}"));
+                self.attached = Some(s);
+            }
+            Err(e) => self.error(e.to_string()),
+        }
     }
 
     /// The home settings, after `change` if this client may make it: the

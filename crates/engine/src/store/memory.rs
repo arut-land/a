@@ -66,6 +66,42 @@ impl LogStore for Memory {
         Ok(self.loaded(header.id, lines, 0, 0))
     }
 
+    fn prefix(&self, id: SessionId, seq: u64) -> io::Result<Vec<Entry>> {
+        let mut entries = self.shared(id)?.entries()?;
+        if (entries.len() as u64) < seq {
+            return Err(io::ErrorKind::NotFound.into());
+        }
+        entries.truncate(usize::try_from(seq).map_err(io::Error::other)?);
+        Ok(entries)
+    }
+
+    fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()> {
+        if entries
+            .iter()
+            .enumerate()
+            .any(|(index, entry)| entry.seq.get() != index as u64 + 1)
+        {
+            return Err(io::Error::other("import has a sequence gap"));
+        }
+        let encoded = Encoded::of(entries)?;
+        let lines = Arc::new(Shared {
+            lines: Mutex::new(encoded.lines().map(Into::into).collect()),
+            snapshot: Mutex::default(),
+        });
+        let mut sessions = lock(&self.sessions);
+        if sessions.contains_key(&header.id) {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        sessions.insert(
+            header.id,
+            Stored {
+                header: header.clone(),
+                lines,
+            },
+        );
+        Ok(())
+    }
+
     fn headers(&self) -> io::Result<Vec<Header>> {
         let mut headers: Vec<Header> = lock(&self.sessions)
             .values()
