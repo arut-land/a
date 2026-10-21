@@ -11,6 +11,8 @@ use crate::view::{self, End, EndRow, ItemRow, TitleSpan, Transcript, html};
 
 pub struct Page {
     pub client: SessionClient,
+    session: SessionId,
+    forking: bool,
     /// The daemon's latest complaint, until the transcript moves on.
     error: Option<String>,
     /// The end the page shows, once it shows the transcript.
@@ -31,6 +33,8 @@ impl Page {
         let open = client.attach(Attach::new(Target::Id(session), Env::Keep));
         let page = Self {
             client,
+            session,
+            forking: false,
             error: None,
             shown: None,
             titled: None,
@@ -65,6 +69,10 @@ impl Page {
                 self.error = Some("not available on the web page".to_owned());
                 Vec::new()
             }
+            Cmd::Fork(seq) => {
+                self.forking = true;
+                self.client.run(Cmd::Fork(seq))
+            }
             cmd => self.client.run(cmd),
         }
     }
@@ -86,8 +94,20 @@ impl Page {
     /// [`Page::settle`]. Until the attach is synced (again, after an
     /// upgrade) the page is left as it is; then it is shown whole.
     fn update(&mut self, update: Update) {
+        if let Change::Attached { .. } = &update.change
+            && self.forking
+            && let Some(session) = self.client.view().session
+            && session != self.session
+        {
+            self.session = session;
+            self.forking = false;
+            self.out.extend_from_slice(format!("event: datastar-patch-elements\ndata: selector body\ndata: mode append\ndata: elements <script>window.location.replace('/s/{session}')</script>\n\n").as_bytes());
+        }
         match &update.change {
-            Change::Error { message } => self.error = Some(message.clone()),
+            Change::Error { message } => {
+                self.forking = false;
+                self.error = Some(message.clone());
+            }
             Change::Added { .. } => self.error = None,
             _ => {}
         }

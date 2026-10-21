@@ -458,6 +458,13 @@ impl Log for Probed {
 }
 
 impl LogStore for Probe {
+    fn prefix(&self, id: SessionId, seq: u64) -> io::Result<Vec<Entry>> {
+        self.store.prefix(id, seq)
+    }
+    fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()> {
+        self.store.import(header, entries)
+    }
+
     fn create(&self, header: &Header) -> io::Result<Loaded> {
         let mut loaded = self.store.create(header)?;
         loaded.writer.log = Box::new(Probed(loaded.writer.log, self.clone()));
@@ -775,6 +782,7 @@ fn extensions_are_logged_when_they_change() {
         installed: vec![Installed {
             name: "harbor".into(),
             version: 0,
+            image: None,
         }],
     };
     let upgraded = fixture.start(&[entry(1, older)]);
@@ -2031,6 +2039,7 @@ fn one_fsync_per_step() {
         installed: vec![Installed {
             name: "shell".into(),
             version: 0,
+            image: None,
         }],
     };
     let bash = Body::ToolCall {
@@ -2163,5 +2172,56 @@ fn unchanged_generations_never_prepare_or_read_the_log_on_bursts() {
         hops,
         "ordinary bursts cannot dispatch blocking preparation"
     );
+    session.halt();
+}
+
+#[test]
+fn every_recorded_prefix_is_either_copied_exactly_or_refused_without_a_log() {
+    let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
+    let script = Script::new(&replies);
+    let registry = Registry::default()
+        .with(&Harbor)
+        .unwrap()
+        .with(&ext_fork::Fork)
+        .unwrap();
+    let fixture = Fixture::new(ext::LOOP, registry, openai(&script));
+    let session = fixture.create();
+    session.submit("Call the tool, then answer.").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    let header = fixture
+        .0
+        .store
+        .headers()
+        .unwrap()
+        .into_iter()
+        .find(|h| h.id == session.id)
+        .unwrap();
+    let mut copied = 0;
+    for (index, entry) in log.iter().enumerate() {
+        let before = fixture.0.store.headers().unwrap().len();
+        match copy_history(&header, entry.seq, SessionId::new(), &fixture.0) {
+            Ok(fork) => {
+                let imported = fixture.0.store.entries(fork.id).unwrap();
+                assert_eq!(&imported[..=index], &log[..=index]);
+                let mut expected = SessionView::default();
+                let mut actual = SessionView::default();
+                for entry in &log[..=index] {
+                    expected.fold(&DaemonMsg::Entry(entry.clone()));
+                }
+                for entry in &imported[..=index] {
+                    actual.fold(&DaemonMsg::Entry(entry.clone()));
+                }
+                assert_eq!(expected.state_hash(), actual.state_hash());
+                copied += 1;
+            }
+            Err(error) => {
+                assert!(error.to_string().contains("rest point"), "{error}");
+                assert_eq!(fixture.0.store.headers().unwrap().len(), before);
+            }
+        }
+    }
+    assert!(copied >= 2);
+    assert_eq!(fixture.0.store.entries(session.id).unwrap(), log);
     session.halt();
 }

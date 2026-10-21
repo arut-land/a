@@ -333,7 +333,12 @@ impl SessionClient {
     /// Attaches to `target` with this client's environment, on a new
     /// connection.
     pub fn open(&mut self, target: Target) -> Vec<Effect> {
-        let attach = Attach::new(target, self.env.clone());
+        let env = if matches!(target, Target::Fork { .. }) {
+            Env::Keep
+        } else {
+            self.env.clone()
+        };
+        let attach = Attach::new(target, env);
         self.attach(attach)
     }
 
@@ -394,6 +399,21 @@ impl SessionClient {
             Cmd::Detach => Ok(self.detach()),
             Cmd::Sessions => self.offer().map(|o| o.0.send(ClientMsg::List)),
             Cmd::Open(target) => Ok(self.open(target)),
+            Cmd::Fork(seq) => match self.view.session {
+                Some(session) => self.offer().map(|offer| {
+                    offer.0.send(ClientMsg::Attach {
+                        target: Target::Fork {
+                            session: session.to_string(),
+                            seq,
+                        },
+                        workspace: PathBuf::new(),
+                        since: 0,
+                        env: None,
+                        decl: protocol::ClientDecl::default(),
+                    })
+                }),
+                None => Err(Notice::NotConnected),
+            },
             Cmd::Help => Ok(Vec::new()),
         };
         done.unwrap_or_else(|notice| vec![Effect::Show(Show::Notice(notice))])
@@ -759,6 +779,26 @@ mod tests {
                 },
             },
         ))
+    }
+
+    #[test]
+    fn a_fork_refusal_keeps_the_source_attached_and_never_refreshes_its_environment() {
+        let (mut client, source) = attached(Env::Origin);
+        let connection = client.connection();
+        let effects = client.run(Cmd::Fork(Seq::new(7)));
+        assert_eq!(connects(&effects), []);
+        assert!(matches!(sends(&effects)[..], [ClientMsg::Attach {
+            target: Target::Fork { session, seq: Some(seq) }, env: None, since: 0, ..
+        }] if session == &source.to_string() && seq.get() == 7));
+        client.step(msg(
+            connection.0,
+            DaemonMsg::Error {
+                message: "requires a rest point".into(),
+            },
+        ));
+        assert!(matches!(client.link(), Link::Live { .. }));
+        assert_eq!(client.view().session, Some(source));
+        assert!(client.offer().is_ok());
     }
 
     #[test]

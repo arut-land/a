@@ -435,6 +435,25 @@ impl Daemon {
         Ok(session)
     }
 
+    /// Copies a conversation through `seq` (or its latest entry) into an
+    /// independent session. Files stay as they are; the recorded environment
+    /// is retained, without secrets that were redacted from the log.
+    pub fn fork_session(
+        &self,
+        session: String,
+        seq: Option<protocol::Seq>,
+    ) -> Result<SessionId, Error> {
+        let attach = Attach::new(protocol::Target::Fork { session, seq }, Env::Keep);
+        let mut conn = self.connect_as(None, &|| {}, &|conn| Ok(vec![conn.attach(&attach)?]))?;
+        let session = conn.reader.until(|msg| match msg {
+            DaemonMsg::Attached { session, .. } => Some(Ok(session)),
+            DaemonMsg::Error { message } => Some(Err(io::Error::other(message))),
+            _ => None,
+        })??;
+        conn.writer.send(&ClientMsg::Detach)?;
+        Ok(session)
+    }
+
     /// Stops any running local daemon and connects to a fresh one, which
     /// serves even after the crash-loop breaker stopped the last ones.
     pub fn restart(&self) -> Result<Connection, Error> {

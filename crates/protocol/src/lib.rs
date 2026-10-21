@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 3;
+pub const PROTO: u32 = 5;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 3;
+pub const PROTO_MIN: u32 = 5;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -444,6 +444,9 @@ impl Mark {
 pub struct Installed {
     pub name: String,
     pub version: u32,
+    /// Portable code and execution limits for a dynamic extension generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<Json>,
 }
 
 /// A client's shell environment: what a command the agent runs for it sees.
@@ -575,6 +578,11 @@ pub enum Outcome {
 #[serde(rename_all = "snake_case")]
 pub enum Target {
     New,
+    /// Copy conversation history into an independent session; never rewinds files.
+    Fork {
+        session: String,
+        seq: Option<Seq>,
+    },
     Latest {
         any_workspace: bool,
     },

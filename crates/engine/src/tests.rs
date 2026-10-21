@@ -44,6 +44,7 @@ fn home(name: &str) -> (PathBuf, Home) {
 /// and the fixtures.
 pub(crate) fn extensions(policy: &ext_policy::Policy) -> Result<Registry, ext::Refused> {
     Registry::default()
+        .with_in(ext::Tier::Pre, &ext_fork::Fork)?
         .with_in(ext::Tier::Pre, policy)?
         .with_in(ext::Tier::Pre, &ext_prompt::Prompt::default())?
         .with_in(ext::Tier::Pre, &ext_shell::Shell)?
@@ -1279,5 +1280,191 @@ fn shutdown_waits_for_reserved_loads_and_stops_their_actors_before_cleaning() {
     assert!(slot.ending().is_none());
     assert!(!home.catalog_file().with_extension("dirty").exists());
     drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_fork_never_changes_its_source() {
+    let (root, home) = home("fork-source");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let source = daemon.attach_to(&Target::New, std::env::temp_dir).unwrap();
+    source.session().submit("first").unwrap();
+    settle(&daemon);
+    let id = source.session().id;
+    let path = home.sessions_dir().join(format!("{id}.jsonl"));
+    let before = std::fs::read(&path).unwrap();
+    let copied = daemon
+        .attach_to(
+            &Target::Fork {
+                session: id.to_string(),
+                seq: None,
+            },
+            PathBuf::new,
+        )
+        .unwrap();
+    assert_ne!(copied.session().id, id);
+    copied.session().submit("only in the fork").unwrap();
+    settle(&daemon);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(copied.session().workspace, source.session().workspace);
+    let source_entries = daemon.shared.store.entries(id).unwrap();
+    let copied_entries = daemon.shared.store.entries(copied.session().id).unwrap();
+    assert_eq!(copied_entries[..source_entries.len()], source_entries);
+    assert!(
+        matches!(&copied_entries[source_entries.len()].body, Body::Ext { ext, state, data }
+        if ext == "fork" && state == "parent" && data.parse::<ext_fork::Parent>().unwrap().session == id)
+    );
+    drop((copied, source, daemon));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn every_forkable_prefix_has_the_sources_view_and_unfinished_prefixes_create_nothing() {
+    let (root, home) = home("fork-prefixes");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let source = daemon.attach_to(&Target::New, std::env::temp_dir).unwrap();
+    source.session().submit("first").unwrap();
+    settle(&daemon);
+    source.session().submit("second").unwrap();
+    settle(&daemon);
+    let id = source.session().id;
+    let entries = daemon.shared.store.entries(id).unwrap();
+    let mut accepted = 0;
+    let mut rejected = 0;
+    for seq in 1..=entries.len() {
+        let count = daemon.shared.store.headers().unwrap().len();
+        let result = daemon.attach_to(
+            &Target::Fork {
+                session: id.to_string(),
+                seq: Seq::new(seq as u64),
+            },
+            PathBuf::new,
+        );
+        match result {
+            Ok(fork) => {
+                accepted += 1;
+                settle(&daemon);
+                let prefix = &entries[..seq];
+                let copied = daemon.shared.store.entries(fork.session().id).unwrap();
+                assert_eq!(&copied[..seq], prefix);
+                let mut source_view = protocol::view::SessionView::default();
+                let mut fork_view = protocol::view::SessionView::default();
+                for entry in prefix {
+                    source_view.fold(&protocol::DaemonMsg::Entry(entry.clone()));
+                }
+                for entry in &copied[..seq] {
+                    fork_view.fold(&protocol::DaemonMsg::Entry(entry.clone()));
+                }
+                assert_eq!(source_view, fork_view);
+            }
+            Err(error) => {
+                rejected += 1;
+                assert!(error.to_string().contains("rest point"), "{error}");
+                assert_eq!(daemon.shared.store.headers().unwrap().len(), count);
+            }
+        }
+    }
+    assert!(accepted > 0 && rejected > 0);
+    drop((source, daemon));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_hibernated_source_stays_hibernated_when_forked() {
+    let (root, home) = home("fork-hibernated");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let source = daemon.attach_to(&Target::New, std::env::temp_dir).unwrap();
+    source.session().submit("first").unwrap();
+    settle(&daemon);
+    let id = source.session().id;
+    drop(source);
+    daemon.hibernate(Duration::ZERO);
+    daemon.wait("source hibernated", PATIENCE, || {
+        daemon.slot(id).unwrap().live().is_none()
+    });
+    let before = std::fs::read(home.sessions_dir().join(format!("{id}.jsonl"))).unwrap();
+    let fork = daemon
+        .attach_to(
+            &Target::Fork {
+                session: id.to_string(),
+                seq: None,
+            },
+            PathBuf::new,
+        )
+        .unwrap();
+    assert!(daemon.slot(id).unwrap().live().is_none());
+    fork.session().submit("new branch").unwrap();
+    settle(&daemon);
+    assert_eq!(
+        std::fs::read(home.sessions_dir().join(format!("{id}.jsonl"))).unwrap(),
+        before
+    );
+    drop((fork, daemon));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_pending_approval_cannot_be_forked_or_answered_in_a_second_session() {
+    let (root, _, daemon) = asking("fork-approval");
+    let source = daemon.attach_to(&Target::New, std::env::temp_dir).unwrap();
+    source.session().submit("$ echo never").unwrap();
+    settle(&daemon);
+    assert_eq!(source.session().summary().activity, Activity::Approval);
+    let id = source.session().id;
+    let before = daemon.shared.store.entries(id).unwrap();
+    let result = daemon.attach_to(
+        &Target::Fork {
+            session: id.to_string(),
+            seq: None,
+        },
+        PathBuf::new,
+    );
+    assert!(result.is_err());
+    assert_eq!(daemon.shared.store.headers().unwrap().len(), 1);
+    assert_eq!(daemon.shared.store.entries(id).unwrap(), before);
+    drop((source, daemon));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_fork_keeps_the_selected_recorded_environment_without_live_secrets() {
+    let (root, home) = home("fork-environment");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let source = daemon.attach_to(&Target::New, std::env::temp_dir).unwrap();
+    let old = Environment {
+        cwd: root.join("old"),
+        vars: std::collections::BTreeMap::from([
+            ("EXAMPLE".into(), "old".into()),
+            ("PASSWORD".into(), "fixture-secret".into()),
+        ]),
+        ..Environment::default()
+    };
+    source.session().set_env(old.clone());
+    source.session().submit("first").unwrap();
+    settle(&daemon);
+    let boundary = source.session().summary().entries;
+    source.session().set_env(Environment {
+        cwd: root.join("new"),
+        ..Environment::default()
+    });
+    source.session().submit("second").unwrap();
+    settle(&daemon);
+    let fork = daemon
+        .attach_to(
+            &Target::Fork {
+                session: source.session().id.to_string(),
+                seq: Seq::new(boundary),
+            },
+            PathBuf::new,
+        )
+        .unwrap();
+    settle(&daemon);
+    let log = daemon.shared.store.entries(fork.session().id).unwrap();
+    let env = Ledger::of(&log).env().cloned().unwrap();
+    assert_eq!(env.cwd, old.cwd);
+    assert_eq!(env.vars.get("EXAMPLE").unwrap(), "old");
+    assert!(!env.vars.contains_key("PASSWORD"));
+    assert_eq!(env.redacted, ["PASSWORD"]);
+    drop((fork, source, daemon));
     std::fs::remove_dir_all(root).unwrap();
 }

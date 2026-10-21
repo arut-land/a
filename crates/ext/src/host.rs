@@ -143,6 +143,7 @@ impl Toolset {
 struct Loaded {
     name: Name,
     version: u32,
+    image: Option<Json>,
     tier: Tier,
     made: Registrar,
 }
@@ -182,6 +183,7 @@ impl Registry {
         self.install(Loaded {
             name: ext.name(),
             version: ext.version(),
+            image: ext.image(),
             tier,
             made,
         })
@@ -410,10 +412,12 @@ impl Registry {
 
     /// The extensions, as a log records them.
     pub fn installed(&self) -> Vec<Installed> {
-        self.extensions()
-            .map(|(name, version)| Installed {
-                name: name.to_owned(),
-                version,
+        self.installed
+            .iter()
+            .map(|loaded| Installed {
+                name: loaded.name.to_string(),
+                version: loaded.version,
+                image: loaded.image.clone(),
             })
             .collect()
     }
@@ -451,10 +455,33 @@ struct By {
     ext: Name,
 }
 
+/// Policy for importing a conversation prefix into an independent session.
+/// The engine supplies storage and publication; an extension decides which
+/// prefixes may continue and the durable fact recording their origin.
+pub trait HistoryPolicy: Send + Sync {
+    fn prepare(
+        &self,
+        binding: Arc<dyn Binding>,
+        entries: &[protocol::Entry],
+        source: SessionId,
+        seq: Seq,
+    ) -> Result<protocol::Body, Refused>;
+}
+
 /// An owned workspace subscription. Reads never perform I/O or prepare work.
 pub trait Generations: Send + Sync {
     fn generation(&self) -> u64;
     fn registry(&self) -> Arc<Registry>;
+    /// Rebuilds a recorded generation without consulting current source files.
+    fn restore(self: Arc<Self>, installed: &[Installed]) -> Result<Arc<Registry>, Refused> {
+        let registry = self.registry();
+        if registry.installed() != installed {
+            return Err(Refused(
+                "recorded extension generation cannot be restored".into(),
+            ));
+        }
+        Ok(registry)
+    }
 }
 
 /// Opens a workspace subscription off the async worker. Consumers own its

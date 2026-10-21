@@ -177,3 +177,35 @@ fn lua_shell_delegation_requires_a_grant_and_obeys_the_policy_floor() {
         matches!(command(&mut conn,"/run"), Outcome::Failed { error } if error.contains("denied"))
     );
 }
+
+#[cfg(feature = "fork")]
+#[test]
+fn a_historical_fork_keeps_its_lua_generation_and_fold_across_restart() {
+    let env = Env::new("lua-fork");
+    let dir = env.home.root().join("ext");
+    let source = |n| {
+        format!(
+            "a.fold{{name='count',initial=0,apply=function(s,c) return s+c end}}; a.tool{{name='count',audience='user',description='count',input={{type='object'}},run=function(input,cx) cx.update('count',{n}); return cx.state('count') end}}"
+        )
+    };
+    write(&dir, "counter", &source(1));
+    let mut conn = env.connect();
+    let (id, _) = conn.attach(Target::New, &env.ws);
+    assert_eq!(done(&mut conn, "/count"), 1);
+    let boundary = env.log(id).last().unwrap().seq;
+    write(&dir, "counter", &source(3));
+    assert_eq!(done(&mut conn, "/lua-reload"), true);
+    assert_eq!(done(&mut conn, "/count"), 4);
+    let before = env.log(id);
+    let fork = env.run(&["fork", &format!("{id}@{boundary}")]);
+    let fork = fork.trim();
+    let mut branch = env.connect();
+    branch.attach(Target::Prefix(fork.to_owned()), &env.ws);
+    assert_eq!(done(&mut branch, "/count"), 2);
+    assert_eq!(env.log(id), before);
+    drop((conn, branch));
+    assert!(env.cmd(&["daemon", "stop"]).status().unwrap().success());
+    let mut branch = env.connect();
+    branch.attach(Target::Prefix(fork.to_owned()), &env.ws);
+    assert_eq!(done(&mut branch, "/count"), 3);
+}

@@ -81,6 +81,19 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             },
         ),
         sample(
+            "attach_fork",
+            ClientMsg::Attach {
+                target: Target::Fork {
+                    session: SESSION.to_string(),
+                    seq: Seq::new(7),
+                },
+                workspace: "/ignored".into(),
+                since: 0,
+                env: None,
+                decl: ClientDecl::default(),
+            },
+        ),
+        sample(
             "attach_latest",
             ClientMsg::Attach {
                 target: Target::Latest {
@@ -627,9 +640,17 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                     installed: vec![Installed {
                         name: "shell".into(),
                         version: 1,
+                    image: None,
                     }],
                 },
             ),
+        ),
+        sample(
+            "entry_extensions_dynamic",
+            entry(19, Body::Extensions { installed: vec![Installed {
+                name: "counter".into(), version: 7,
+                image: Some(protocol::Json::encode(&json!(["a.text{name='test',text='old'}", [], 4_194_304, 100_000, {"secs":0,"nanos":25_000_000}])).unwrap()),
+            }] }),
         ),
         sample(
             "entry_ext",

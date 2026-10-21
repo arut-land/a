@@ -75,6 +75,7 @@ macro_rules! conformance {
     ($($backend:ident),*) => {
         $(cases!($backend;
             round_trip,
+            importing_a_prefix_preserves_the_sources_writer_lease,
             multiline_payloads_survive_reload,
             appends_keep_their_order_across_reopens,
             batches_append_in_order,
@@ -872,4 +873,51 @@ fn multiline_payloads_survive_reload(store: &dyn LogStore) {
         data.parse::<serde_json::Value>().unwrap(),
         serde_json::from_str::<serde_json::Value>(text).unwrap()
     );
+}
+
+fn importing_a_prefix_preserves_the_sources_writer_lease(store: &dyn LogStore) {
+    let source = header("/w");
+    let mut loaded = store.create(&source).unwrap();
+    loaded
+        .append(Body::Assistant { text: "one".into() })
+        .unwrap();
+    let entries = store.prefix(source.id, 1).unwrap();
+    let copied = header("/w");
+    store.import(&copied, &entries).unwrap();
+    loaded
+        .append(Body::Assistant { text: "two".into() })
+        .unwrap();
+    assert_eq!(store.prefix(copied.id, 1).unwrap(), entries);
+    assert_eq!(store.count(source.id).unwrap(), 2);
+    let mut replay = Vec::new();
+    let copied = store
+        .load(copied.id, &mut |_| false, &mut |e| replay.push(e))
+        .unwrap();
+    assert!(copied.writer.read_only().is_none());
+    assert_eq!(replay, entries);
+}
+
+#[test]
+fn imported_history_does_not_need_its_parents_file_or_derived_directory() {
+    let store = jsonl();
+    let source = header("/w");
+    let mut loaded = store.create(&source).unwrap();
+    loaded
+        .append(Body::Assistant {
+            text: "durable".into(),
+        })
+        .unwrap();
+    let copied = header("/w");
+    let entries = store.prefix(source.id, 1).unwrap();
+    store.import(&copied, &entries).unwrap();
+    drop(loaded);
+    let dir = store.dir.as_ref().unwrap();
+    fs::remove_file(dir.join(format!("{}.jsonl", source.id))).unwrap();
+    fs::remove_dir_all(dir.join("derived")).unwrap();
+    let reopened = Jsonl::open(dir).unwrap();
+    let mut replay = Vec::new();
+    reopened
+        .load(copied.id, &mut |_| false, &mut |e| replay.push(e))
+        .unwrap();
+    assert_eq!(replay, entries);
 }

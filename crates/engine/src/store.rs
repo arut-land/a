@@ -181,6 +181,14 @@ pub trait LogStore: Send + Sync {
     /// A new, empty session log; fails with `AlreadyExists` if the id is taken.
     fn create(&self, header: &Header) -> io::Result<Loaded>;
 
+    /// Reads exactly a committed prefix without acquiring a writer lease,
+    /// recovering a torn tail, or touching any derived files.
+    fn prefix(&self, id: SessionId, seq: u64) -> io::Result<Vec<Entry>>;
+
+    /// Publishes a complete imported history atomically. A failed import
+    /// must never expose a partial session through `headers`.
+    fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()>;
+
     /// Every session's header, oldest first, without reading the entries.
     fn headers(&self) -> io::Result<Vec<Header>>;
 

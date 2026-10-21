@@ -73,6 +73,100 @@ impl Shared {
     }
 }
 
+fn recorded_registry(
+    shared: &Shared,
+    source: Option<&Arc<dyn ext::host::Generations>>,
+    installed: Option<&[protocol::Installed]>,
+) -> io::Result<Arc<Registry>> {
+    match (source, installed) {
+        (Some(source), Some(installed)) => Arc::clone(source)
+            .restore(installed)
+            .map_err(io::Error::other),
+        (Some(source), None) => Ok(source.registry()),
+        (None, Some(installed)) if installed.iter().any(|i| i.image.is_some()) => Err(
+            io::Error::other("recorded dynamic extensions require their loader"),
+        ),
+        (None, _) => Ok(shared.registry.get()),
+    }
+}
+
+fn load_registry(
+    header: &Header,
+    shared: &Shared,
+    source: &Arc<dyn ext::host::Generations>,
+) -> io::Result<Arc<Registry>> {
+    let seq = shared.catalog.get(header.id).map_or(0, |r| r.entries);
+    let entries = shared.store.prefix(header.id, seq)?;
+    let installed = entries.iter().rev().find_map(|entry| match &entry.body {
+        Body::Extensions { installed } => Some(installed.as_slice()),
+        _ => None,
+    });
+    recorded_registry(shared, Some(source), installed)
+}
+
+pub(crate) fn copy_history(
+    header: &Header,
+    seq: protocol::Seq,
+    id: SessionId,
+    shared: &Arc<Shared>,
+) -> io::Result<Header> {
+    let mut entries = shared.store.prefix(header.id, seq.get())?;
+    let source = shared.source(&header.workspace)?;
+    let installed = entries.iter().rev().find_map(|entry| match &entry.body {
+        Body::Extensions { installed } => Some(installed.as_slice()),
+        _ => None,
+    });
+    let registry = recorded_registry(shared, source.as_ref(), installed)?;
+    let policy = registry
+        .service::<dyn ext::host::HistoryPolicy>()
+        .ok_or_else(|| io::Error::other("fork extension is disabled"))?;
+    let (tx, _rx) = channel::unbounded();
+    let session = Arc::new(Session {
+        id,
+        workspace: Arc::from(header.workspace.as_path()),
+        spill: Arc::from(shared.spill.as_path()),
+        mail: Arc::new(tx),
+        states: Mutex::new(Arc::new(Mutex::new(registry.states()))),
+        env: Mutex::default(),
+        jobs: Mutex::default(),
+        cancels: Mutex::default(),
+        changed: rt::Notify::new(),
+        services: OnceLock::new(),
+        shared: Arc::clone(shared),
+    });
+    for entry in &entries {
+        lock(&session.state_view()).apply(entry);
+        if let Body::Environment(env) = &entry.body {
+            *lock(&session.env) = Some(Arc::new(env.clone()));
+        }
+    }
+    let binding = bind(&registry, &session);
+    let fact = policy
+        .prepare(binding as Arc<dyn Binding>, &entries, header.id, seq)
+        .map_err(io::Error::other)?;
+    entries.push(Entry::new(
+        protocol::Seq::new(seq.get() + 1).ok_or_else(|| io::Error::other("sequence exhausted"))?,
+        protocol::Epoch(
+            entries
+                .last()
+                .map_or(0, |entry| entry.epoch.0)
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("epoch exhausted"))?,
+        ),
+        fact,
+    ));
+    let copied = Header {
+        id: session.id,
+        workspace: header.workspace.clone(),
+        parent: None,
+    };
+    shared.store.import(&copied, &entries)?;
+    let mut record = Record::new(copied.clone());
+    record.entries = seq.get() + 1;
+    shared.catalog.record(record);
+    Ok(copied)
+}
+
 /// How [`Live::start`] opens a session's log.
 #[derive(Clone, Copy)]
 pub enum Open {
@@ -238,7 +332,11 @@ impl Live {
             || shared.registry.generation(),
             |source| source.generation(),
         );
-        let registry = source.as_ref().map_or(base, |source| source.registry());
+        let registry = match (&source, open) {
+            (Some(source), Open::Load) => load_registry(header, shared, source)?,
+            (Some(source), Open::Create) => source.registry(),
+            (None, _) => base,
+        };
         let (tx, rx) = channel::unbounded();
         let session = Arc::new(Session {
             id: header.id,

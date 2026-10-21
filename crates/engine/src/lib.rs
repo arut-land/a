@@ -540,8 +540,20 @@ impl Daemon {
         target: &Target,
         workspace: impl FnOnce() -> PathBuf,
     ) -> io::Result<Attachment> {
-        let found = match target {
+        match target {
             Target::New => return self.create(workspace()).await,
+            Target::Fork { session, seq } => return self.fork(session, *seq).await,
+            _ => {}
+        }
+        let slot = self.find(target, workspace)?;
+        Ok(self.live(&slot).await?.open())
+    }
+
+    fn find(&self, target: &Target, workspace: impl FnOnce() -> PathBuf) -> io::Result<Arc<Slot>> {
+        let found = match target {
+            Target::New | Target::Fork { .. } => {
+                return Err(io::Error::other("expected an existing session"));
+            }
             Target::Id(id) => self.slot(*id),
             Target::Prefix(prefix) => {
                 let slots = lock(&self.slots);
@@ -580,7 +592,43 @@ impl Daemon {
         };
         let slot =
             found.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no matching session"))?;
-        Ok(self.live(&slot).await?.open())
+        Ok(slot)
+    }
+
+    async fn fork(&self, session: &str, seq: Option<protocol::Seq>) -> io::Result<Attachment> {
+        let source = self.find(&Target::Prefix(session.to_owned()), PathBuf::new)?;
+        let latest = source.summary().entries;
+        let seq = seq.map_or(latest, protocol::Seq::get);
+        if seq == 0 || seq > latest {
+            return Err(io::Error::other(
+                "fork sequence is outside the source history",
+            ));
+        }
+        let header = Header {
+            id: SessionId::new(),
+            workspace: source.header.workspace.clone(),
+            parent: None,
+        };
+        let slot = self.new_slot(header)?;
+        let shared = Arc::clone(&self.shared);
+        let source_header = source.header.clone();
+        let id = slot.header.id;
+        let copied = rt::unblock(&*self.shared.rt, move || {
+            driver::copy_history(
+                &source_header,
+                protocol::Seq::new(seq).unwrap(),
+                id,
+                &shared,
+            )
+        })
+        .await;
+        if let Err(error) = copied {
+            let result = self.started(&slot, Err(error));
+            lock(&self.slots).retain(|known| !Arc::ptr_eq(known, &slot));
+            self.pulse.notify();
+            return result.map(|live| live.open());
+        }
+        Ok(self.start(&slot, Open::Load).await?.open())
     }
 
     async fn create(&self, workspace: PathBuf) -> io::Result<Attachment> {

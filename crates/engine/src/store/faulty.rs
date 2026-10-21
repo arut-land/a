@@ -79,6 +79,14 @@ impl LogStore for Faulty {
         Ok(self.wrap(header.id, loaded))
     }
 
+    fn prefix(&self, id: SessionId, seq: u64) -> io::Result<Vec<Entry>> {
+        self.inner.prefix(id, seq)
+    }
+
+    fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()> {
+        self.inner.import(header, entries)
+    }
+
     fn headers(&self) -> io::Result<Vec<Header>> {
         self.inner.headers()
     }
