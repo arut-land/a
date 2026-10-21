@@ -159,7 +159,7 @@ fn recorded_registry(
         (Some(source), Some(installed)) => Arc::clone(source)
             .restore(installed)
             .map_err(io::Error::other),
-        (Some(source), None) => Ok(source.registry()),
+        (Some(source), None) => Ok(source.snapshot().registry),
         (None, Some(installed)) if installed.iter().any(|i| i.image.is_some()) => Err(
             io::Error::other("recorded dynamic extensions require their loader"),
         ),
@@ -492,11 +492,12 @@ impl Live {
         owner: Owner,
     ) -> io::Result<Arc<Self>> {
         let source = shared.source(&header.workspace)?;
-        let generation = source.as_ref().map_or_else(
-            || shared.registry.generation(),
-            |source| source.generation(),
-        );
-        let (registry, image) = spawn::restore(header, shared, open, source.as_ref())?;
+        let snapshot = source
+            .as_ref()
+            .map_or_else(|| shared.registry.snapshot(), |source| source.snapshot());
+        let generation = snapshot.id;
+        let (registry, image) =
+            spawn::restore(header, shared, open, source.as_ref(), snapshot.registry)?;
         let (tx, rx) = channel::unbounded();
         let session = Session::new(header, shared, Arc::new(tx), &registry);
         *lock(&session.spawn) = image;
@@ -950,34 +951,15 @@ impl Actor {
             .count()
     }
 
-    fn next_registry(&self) -> Result<Arc<Registry>, ext::Refused> {
-        let shared = &self.live.session.shared;
-        let newest = self
-            .source
-            .as_ref()
-            .map_or_else(|| shared.registry.get(), |source| source.registry());
-        if self.live.parent.is_some() {
-            let spawn = lock(&self.live.session.spawn);
-            newest
-                .select(
-                    ext::Inheritance::All,
-                    spawn.as_ref().map(|i| i.extensions.as_slice()),
-                )
-                .map(Arc::new)
-        } else {
-            Ok(newest)
-        }
-    }
-
     fn can_refresh(&self) -> bool {
         lock(&self.live.session.spawn).is_none()
             && self.phase == Phase::Serving
             && self.core.at_rest()
     }
-    fn source_generation(&self) -> u64 {
+    fn source_snapshot(&self) -> ext::host::GenerationSnapshot {
         self.source.as_ref().map_or_else(
-            || self.live.session.shared.registry.generation(),
-            |source| source.generation(),
+            || self.live.session.shared.registry.snapshot(),
+            |source| source.snapshot(),
         )
     }
 
@@ -985,7 +967,8 @@ impl Actor {
         if !self.can_refresh() {
             return Ok(());
         }
-        let number = self.source_generation();
+        let snapshot = self.source_snapshot();
+        let number = snapshot.id;
         if number == self.generation {
             return Ok(());
         }
@@ -1000,9 +983,7 @@ impl Actor {
         }
         self.generation = number;
         let shared = Arc::clone(&self.live.session.shared);
-        let Ok(newest) = self.next_registry() else {
-            return Ok(());
-        };
+        let newest = snapshot.registry;
         let bound = bind(&newest, &self.live.session);
         let binding = Arc::clone(&bound) as Arc<dyn Binding>;
         let frames = Arc::clone(&self.live.frames);
@@ -1061,7 +1042,7 @@ impl Actor {
         .await;
         match prepared {
             Ok(states) => {
-                if self.source_generation() != number {
+                if self.source_snapshot().id != number {
                     return Ok(());
                 }
                 self.retire_contexts();

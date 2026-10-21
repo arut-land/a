@@ -423,6 +423,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fresh_resources_never_arrive_through_settings_inheritance() {
+        #[derive(Default, Serialize, Deserialize)]
+        struct Setting(u64, #[serde(skip)] Arc<()>);
+        impl Fold for Setting {
+            const NAME: &'static str = "setting";
+            const SETTINGS: bool = true;
+            type Change = u64;
+            fn apply(&mut self, value: &u64) {
+                self.0 = *value;
+            }
+        }
+        let fresh = || {
+            States::new([
+                (Name::from("extension"), Decl::of::<Setting>()),
+                (Name::from("extension"), Decl::of::<Count>()),
+            ])
+        };
+        let mut parent = fresh();
+        parent.fold("extension", "setting", &Json::encode(&7).unwrap());
+        parent.fold("extension", "count", &Json::encode(&42).unwrap());
+        let image = parent.settings_image().unwrap();
+        assert_eq!(image.folds.len(), 1);
+        let mut child = fresh();
+        child.inherit_settings(&parent).unwrap();
+        let mut restored = fresh();
+        restored.restore_settings(&image).unwrap();
+        for states in [&child, &restored] {
+            assert_eq!(states.get::<Setting>().unwrap().0, 7);
+            assert_eq!(states.get::<Count>().unwrap().0, 0);
+            assert!(!Arc::ptr_eq(
+                &states.get::<Setting>().unwrap().1,
+                &parent.get::<Setting>().unwrap().1
+            ));
+        }
+        let mut grandchild = fresh();
+        grandchild.inherit_settings(&restored).unwrap();
+        assert_eq!(grandchild.get::<Setting>().unwrap().0, 7);
+        assert_eq!(grandchild.get::<Count>().unwrap().0, 0);
+        assert!(!Arc::ptr_eq(
+            &grandchild.get::<Setting>().unwrap().1,
+            &restored.get::<Setting>().unwrap().1
+        ));
+    }
+
     /// A state restored from its image folds on as the one imaged did;
     /// an image a state cannot read restores nothing.
     #[test]

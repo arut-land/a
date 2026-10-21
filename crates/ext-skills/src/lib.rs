@@ -48,20 +48,12 @@ impl Extension for Skills {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.tool(Load(self.catalog.clone()));
-        for (name, skill) in &*self.catalog {
-            r.dyn_tool(Arc::new(Command {
-                name: name.clone(),
-                description: skill.description.clone(),
-                load: Load(self.catalog.clone()),
-            }));
-        }
-        r.text(ext::Text::generation("skills-index", 50, self.index()));
+        ext::DynExtension::contribute(&Catalog(self.catalog.clone()), r);
     }
 }
 
-/// The installed overlay carries exactly the immutable catalog it contributes.
-struct Catalog(Skills);
+/// Recovery must retain instructions after source files disappear.
+struct Catalog(Arc<BTreeMap<String, Skill>>);
 impl ext::DynExtension for Catalog {
     fn name(&self) -> ext::Name {
         ext::Name::from(<Skills as Extension>::NAME)
@@ -70,10 +62,18 @@ impl ext::DynExtension for Catalog {
         <Skills as Extension>::VERSION
     }
     fn image(&self) -> Option<protocol::Json> {
-        Some(protocol::Json::encode(&*self.0.catalog).expect("a catalog contains only strings"))
+        Some(protocol::Json::encode(&*self.0).expect("a catalog contains only strings"))
     }
     fn contribute(&self, r: &mut Registrar) {
-        Extension::contribute(&self.0, r);
+        r.tool(Load(self.0.clone()));
+        for (name, skill) in &*self.0 {
+            r.dyn_tool(Arc::new(Command {
+                name: name.clone(),
+                description: skill.description.clone(),
+                load: Load(self.0.clone()),
+            }));
+        }
+        r.text(ext::Text::generation("skills-index", 50, self.index()));
     }
 }
 
@@ -84,12 +84,14 @@ impl Skills {
         self.reserved.extend(names.into_iter().map(str::to_owned));
         self
     }
+}
 
+impl Catalog {
     fn index(&self) -> String {
         let mut index = String::from(
             "Current available skills (supersedes earlier indices; instructions load only on request). Call skill with {name}, or use /name:\n",
         );
-        for (name, skill) in &*self.catalog {
+        for (name, skill) in &*self.0 {
             use std::fmt::Write as _;
             let _ = writeln!(index, "{name}: {}", skill.description);
         }
