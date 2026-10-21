@@ -83,6 +83,52 @@ impl Shared {
     }
 }
 
+impl Shared {
+    pub(crate) fn owner(&self, header: &Header) -> io::Result<Owner> {
+        let Some(mut parent) = header.parent else {
+            return Ok(Owner::None);
+        };
+        let Some(daemon) = self.daemon.upgrade() else {
+            return Ok(Owner::Gone);
+        };
+        let mut child = header.id;
+        loop {
+            let Some(slot) = daemon.slot(parent.session) else {
+                return Ok(Owner::Gone);
+            };
+            let cancelled = if let Some(live) = slot.live() {
+                cancelled_watch(live.frames.entries(), child)
+            } else {
+                let seq = self.catalog.get(parent.session).map_or(0, |r| r.entries);
+                cancelled_watch(self.store.prefix(parent.session, seq)?, child)
+            };
+            if cancelled {
+                return Ok(Owner::Cancelled);
+            }
+            let Some(ancestor) = slot.header.parent else {
+                return Ok(Owner::Present);
+            };
+            child = parent.session;
+            parent = ancestor;
+        }
+    }
+}
+
+fn cancelled_watch(entries: impl IntoIterator<Item = Entry>, child: SessionId) -> bool {
+    let mut watch = None;
+    for entry in entries {
+        match entry.body {
+            Body::Watch { child: watched } if watched == child => watch = Some(entry.seq),
+            Body::Fired {
+                watch: fired,
+                outcome: Outcome::Interrupted { .. },
+            } if watch == Some(fired) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn recorded_registry(
     shared: &Shared,
     source: Option<&Arc<dyn ext::host::Generations>>,
@@ -595,6 +641,10 @@ impl Live {
     }
 
     /// Interrupts the turn, from inside the daemon.
+    pub(crate) fn cancel_owned(&self) {
+        self.send(Msg::Step(Event::OwnerCancelled));
+    }
+
     pub(crate) fn interrupt(&self) {
         let interrupt = Event::Interrupt {
             origin: None,
@@ -1731,19 +1781,19 @@ impl Actor {
                 .writer
                 .sync()
                 .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e))?;
-            io::Result::Ok((loaded, folding))
+            io::Result::Ok((loaded, folding, shared.owner(&header)?))
         })
         .await;
         let reloaded = match reloaded {
-            Ok((mut loaded, folding)) => loaded
+            Ok((mut loaded, folding, owner)) => loaded
                 .writer
                 .flushed(&*self.live.session.shared.rt)
                 .await
                 .inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Reload, e))
-                .map(|()| (loaded, folding)),
+                .map(|()| (loaded, folding, owner)),
             Err(error) => Err(error),
         };
-        let (loaded, folding) = match reloaded {
+        let (loaded, folding, owner) = match reloaded {
             Ok(reloaded) => reloaded,
             Err(e) => {
                 eprintln!("session {}: reloading: {e}", self.live.id.short());
@@ -1775,7 +1825,7 @@ impl Actor {
         let load = Load {
             boot: sys::boot_id(),
             busy: self.live.has_work(),
-            owner: self.owner(),
+            owner,
             ..Load::default()
         };
         let resumed = catch_unwind(AssertUnwindSafe(|| self.core.resumed(&load)));
@@ -1822,15 +1872,6 @@ impl Actor {
         self.waiting_sync.clear();
         self.sync_armed = false;
         self.writer.take();
-    }
-
-    fn owner(&self) -> Owner {
-        let daemon = self.live.session.shared.daemon.upgrade();
-        match (self.live.parent, daemon) {
-            (None, _) => Owner::None,
-            (Some(parent), Some(daemon)) if daemon.knows(parent.session) => Owner::Present,
-            (Some(_), _) => Owner::Gone,
-        }
     }
 
     /// Registers the epoch after the write barriers, in the appending

@@ -28,7 +28,7 @@ fn a_failed_enqueue_releases_transport_for_retry() {
     assert!(!kept.iter().any(|e| matches!(e.body, Body::Enqueue { .. })));
     assert_eq!(
         result,
-        std::task::Poll::Ready(Some(Err(protocol::InboxRefusal::Interrupted)))
+        Poll::Ready(Some(Err(protocol::InboxRefusal::Interrupted)))
     );
 }
 

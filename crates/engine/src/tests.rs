@@ -1818,6 +1818,97 @@ fn interrupt_cancels_detached_descendants_after_the_spawning_call_completes() {
 }
 
 struct PairTasks;
+#[test]
+fn a_cancelled_detached_child_stays_cancelled_across_partial_delivery() {
+    let (root, home) = home("cancel-source");
+    let config = Config {
+        ext: exts("[ext.policy]\nask = [\"bash\"]"),
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    let id = parent.session().id;
+    parent
+        .session()
+        .submit("call background_task {\"prompt\":\"$ echo hi\",\"messages\":[]}")
+        .unwrap();
+    until(&daemon, id, |log| {
+        log.iter().any(|b| matches!(b, Body::ToolResult { .. }))
+    });
+    daemon.wait("child approval", PATIENCE, || {
+        daemon
+            .list()
+            .iter()
+            .any(|s| s.activity == Activity::Approval)
+    });
+    let headers = daemon.shared.store.headers().unwrap();
+    let child = headers.iter().find(|h| h.parent.is_some()).unwrap();
+    let before_interrupt = daemon.shared.store.entries(child.id).unwrap();
+    parent.session().interrupt();
+    settle(&daemon);
+    let parent_log = daemon.shared.store.entries(id).unwrap();
+    assert_eq!(
+        fired(&bodies(&*daemon.shared.store, id)),
+        [&Outcome::Interrupted { output: None }]
+    );
+    let child_log = daemon.shared.store.entries(child.id).unwrap();
+    let terminal = parent_log
+        .iter()
+        .position(|e| {
+            matches!(
+                e.body,
+                Body::Fired {
+                    outcome: Outcome::Interrupted { .. },
+                    ..
+                }
+            )
+        })
+        .unwrap()
+        + 1;
+    assert!(child_log.len() > before_interrupt.len());
+    drop(parent);
+    drop(daemon);
+    for parent_cut in terminal..=parent_log.len() {
+        for child_cut in 1..=child_log.len() {
+            let (case_root, case_home) =
+                self::home(&format!("cancel-gap-{parent_cut}-{child_cut}"));
+            let store = Jsonl::open(case_home.sessions_dir()).unwrap();
+            store
+                .import(
+                    headers.iter().find(|h| h.id == id).unwrap(),
+                    &parent_log[..parent_cut],
+                )
+                .unwrap();
+            store.import(child, &child_log[..child_cut]).unwrap();
+            let restored = Daemon::load(&case_home, &config).unwrap();
+            let attachment = restored
+                .attach_to(&Target::Id(child.id), PathBuf::new)
+                .unwrap();
+            attachment.session().barrier();
+            assert_eq!(
+                attachment.session().summary().activity,
+                Activity::Idle,
+                "parent {parent_cut}, child {child_cut}"
+            );
+            assert!(
+                attachment
+                    .session()
+                    .submit("cannot restart cancelled ownership")
+                    .is_err()
+            );
+            assert!(
+                !bodies(&*restored.shared.store, child.id)
+                    .iter()
+                    .any(|b| matches!(b, Body::ToolProcess { .. }))
+            );
+            drop(attachment);
+            drop(restored);
+            std::fs::remove_dir_all(case_root).unwrap();
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 impl ext::Extension for PairTasks {
     const NAME: &'static str = "pair_tasks";
     const VERSION: u32 = 1;

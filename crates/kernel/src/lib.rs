@@ -158,6 +158,8 @@ pub enum Event {
     },
     /// Child session `child` settled with `outcome`.
     ChildSettled { child: SessionId, outcome: Outcome },
+    /// Ownership was durably cancelled; future input cannot revive it.
+    OwnerCancelled,
     SendEnvelope {
         envelope: protocol::Envelope,
         ticket: Ticket,
@@ -460,6 +462,8 @@ pub enum Owner {
     Present,
     /// A child whose owner is gone: nothing of its turn runs again.
     Gone,
+    /// The owning watch or an ancestor's watch was interrupted.
+    Cancelled,
 }
 
 /// How a session's log is resumed.

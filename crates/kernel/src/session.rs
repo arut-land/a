@@ -37,6 +37,7 @@ pub struct Core {
     turn: Turn,
     /// Whether the session is a child, which reports as it settles.
     child: bool,
+    owned_cancelled: bool,
     /// What the busy mark says.
     busy: bool,
     /// The last entry when the session last reported.
@@ -94,6 +95,7 @@ impl Core {
             registry,
             turn: Turn::Idle,
             child: false,
+            owned_cancelled: false,
             busy: false,
             reported: 0,
             deferred: VecDeque::new(),
@@ -118,7 +120,8 @@ impl Core {
     pub fn resumed(&mut self, load: &Load<'_>) -> Effects {
         // What the log shows the agent stepped through is done.
         self.fold.stepped = false;
-        self.child = load.owner == Owner::Present;
+        self.child = matches!(load.owner, Owner::Present | Owner::Cancelled);
+        self.owned_cancelled = matches!(load.owner, Owner::Gone | Owner::Cancelled);
         self.busy = load.busy;
         let mut fx = Effects::new();
         let installed = self.registry.installed();
@@ -141,6 +144,10 @@ impl Core {
                 origin,
                 ticket,
             } => self.input(text, mode, origin, ticket, &mut fx),
+            Event::OwnerCancelled => {
+                self.owned_cancelled = true;
+                self.interrupt(None, &mut fx);
+            }
             Event::Interrupt { origin, ticket } => {
                 if !self.resent(origin) {
                     self.interrupt(origin, &mut fx);
@@ -359,7 +366,9 @@ impl Core {
     }
 
     fn enqueue(&mut self, envelope: protocol::Envelope, ticket: Ticket, fx: &mut Effects) {
-        let result = if self.fold.ledger.received(&envelope.id) {
+        let result = if self.owned_cancelled {
+            Err(protocol::InboxRefusal::Unavailable)
+        } else if self.fold.ledger.received(&envelope.id) {
             Ok(())
         } else if self.fold.ledger.inbox_len() >= protocol::INBOX_CAPACITY {
             Err(protocol::InboxRefusal::Full)
@@ -406,6 +415,13 @@ impl Core {
         ticket: Option<Ticket>,
         fx: &mut Effects,
     ) {
+        if self.owned_cancelled {
+            return reply(
+                fx,
+                ticket,
+                Err("conversation ownership was cancelled".into()),
+            );
+        }
         if self.resent(origin) {
             return reply(fx, ticket, Ok(()));
         }
@@ -1052,6 +1068,30 @@ impl Core {
                 }
                 Turn::Acting { .. } | Turn::Idle => {}
             }
+            if self.owned_cancelled {
+                let pending: Vec<_> = self
+                    .fold
+                    .ledger
+                    .pending_outbox()
+                    .map(|e| e.id.clone())
+                    .collect();
+                for envelope_id in pending {
+                    self.append(
+                        fx,
+                        Body::Ack {
+                            envelope_id,
+                            refusal: Some(protocol::InboxRefusal::Interrupted),
+                        },
+                    );
+                }
+                while let Some(input) = self.fold.ledger.untaken().front().map(|q| q.seq) {
+                    self.append(fx, Body::Take { input });
+                }
+                self.fold.asked.clear();
+                self.fold.stepped = false;
+                self.turn = Turn::Idle;
+                return;
+            }
             let next_request = matches!(&self.turn, Turn::Acting { open } if open.is_empty())
                 && matches!(
                     self.fold.asked.front(),
@@ -1405,6 +1445,10 @@ impl Core {
             }
         }
         fx.extend(kills.into_iter().map(|pgid| Effect::Kill { pgid }));
+        if self.owned_cancelled {
+            self.cancel_recovered(fx);
+            return;
+        }
         self.relink(fx);
         // A command cut off is not run again.
         let commands: SmallVec<[CallId; 1]> = self.fold.ledger.open_commands().collect();
@@ -1419,12 +1463,7 @@ impl Core {
                 open: SmallVec::new(),
             };
         }
-        let orphan = load.owner == Owner::Gone;
         for (call, kind, phase) in open {
-            if orphan {
-                self.settle(call, self.interrupted(call), fx);
-                continue;
-            }
             match kind {
                 Call::Model { attempt, .. } => self.restart(call, attempt, fx),
                 Call::Tool { tool, input, .. } => self.reopen(call, &tool, &input, &phase, fx),
@@ -1432,12 +1471,29 @@ impl Core {
                 Call::Side { .. } => self.settle(call, Outcome::Interrupted { output: None }, fx),
             }
         }
-        if orphan && self.turn != Turn::Idle {
-            self.turn = Turn::Stopping {
-                open: SmallVec::new(),
-                origin: None,
-            };
+    }
+
+    fn cancel_recovered(&mut self, fx: &mut Effects) {
+        let children: Vec<_> = self.fold.ledger.armed().map(|(_, child)| child).collect();
+        for child in children {
+            fx.push(Effect::Interrupt { child });
+            self.fire(child, &Outcome::Interrupted { output: None }, fx);
         }
+        let calls: Vec<_> = self
+            .fold
+            .ledger
+            .open_calls()
+            .map(|(call, _)| call)
+            .chain(self.fold.ledger.open_commands())
+            .collect();
+        let interrupted = !calls.is_empty();
+        for call in calls {
+            self.settle(call, self.interrupted(call), fx);
+        }
+        if interrupted || !matches!(self.fold.ledger.result(), Some(Outcome::Interrupted { .. })) {
+            self.append(fx, Body::Interrupt { origin: None });
+        }
+        self.turn = Turn::Idle;
     }
 
     /// Re-arms links: a link not yet watched is watched, and every child

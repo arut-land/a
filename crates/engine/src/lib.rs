@@ -389,8 +389,8 @@ impl Daemon {
         let starting: Vec<_> = (busy.iter())
             .map(|slot| {
                 let (shared, header) = (Arc::clone(&daemon.shared), slot.header.clone());
-                let owner = daemon.owner(slot);
                 rt::unblock(&*daemon.shared.rt, move || {
+                    let owner = shared.owner(&header)?;
                     Live::start(&header, &shared, Open::Load, owner)
                 })
             })
@@ -417,20 +417,6 @@ impl Daemon {
             .iter()
             .find(|s| s.header.id == id)
             .cloned()
-    }
-
-    /// Whether session `id` exists.
-    fn knows(&self, id: SessionId) -> bool {
-        self.slot(id).is_some()
-    }
-
-    /// Who owns the session `slot` holds.
-    fn owner(&self, slot: &Slot) -> kernel::Owner {
-        match slot.header.parent {
-            None => kernel::Owner::None,
-            Some(parent) if self.knows(parent.session) => kernel::Owner::Present,
-            Some(_) => kernel::Owner::Gone,
-        }
     }
 
     /// The slot's live session, loaded first if it is not: off the async
@@ -485,9 +471,12 @@ impl Daemon {
     /// pool, and hands it to whoever waits.
     async fn start(&self, slot: &Arc<Slot>, open: Open) -> io::Result<Arc<Live>> {
         let (shared, header) = (Arc::clone(&self.shared), slot.header.clone());
-        let owner = self.owner(slot);
         let rt = Arc::clone(&self.shared.rt);
-        let started = rt::unblock(&*rt, move || Live::start(&header, &shared, open, owner)).await;
+        let started = rt::unblock(&*rt, move || {
+            let owner = shared.owner(&header)?;
+            Live::start(&header, &shared, open, owner)
+        })
+        .await;
         self.started(slot, started)
     }
 
@@ -798,7 +787,7 @@ impl Daemon {
     /// Interrupts child session `child`'s turn, if it runs.
     fn interrupt(&self, child: SessionId) {
         if let Some(live) = self.slot(child).and_then(|s| s.live()) {
-            live.interrupt();
+            live.cancel_owned();
         }
     }
 
