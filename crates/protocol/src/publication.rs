@@ -32,19 +32,19 @@ impl SpawnImage {
 
 impl Publications {
     pub fn apply(&mut self, entry: &Entry) {
-        if let Body::Spawned { intent } = &entry.body {
-            if let Ok(image) = SpawnImage::from_json(intent) {
-                let mut inherited = Self::default();
-                for encoded in image.image {
-                    if let Ok(source) = Entry::from_json(encoded.raw().as_bytes()) {
-                        inherited.apply(&source);
-                    }
+        if let Body::Spawned { intent } = &entry.body
+            && let Ok(image) = SpawnImage::from_json(intent)
+        {
+            let mut inherited = Self::default();
+            for encoded in image.image {
+                if let Ok(source) = Entry::from_json(encoded.raw().as_bytes()) {
+                    inherited.apply(&source);
                 }
-                self.0.insert(
-                    entry.seq.get(),
-                    inherited.0.into_values().flatten().collect(),
-                );
             }
+            self.0.insert(
+                entry.seq.get(),
+                inherited.0.into_values().flatten().collect(),
+            );
         }
         if let Body::Edit { target, upto, .. } = &entry.body {
             let end = upto.unwrap_or(*target).get();

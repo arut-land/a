@@ -1590,7 +1590,7 @@ fn recursive_children_keep_the_admitted_runner_and_decreasing_budget() {
         let Body::Spawned { intent } = &log[0] else {
             panic!("{log:?}")
         };
-        let value = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
+        let value = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
         assert_eq!(value.request.agent, ext_fixtures::ECHO);
         assert_eq!(value.installed, daemon.shared.registry.get().installed());
         depths.push(value.request.depth.remaining());
@@ -1632,7 +1632,7 @@ fn a_prefix_child_is_admitted_inside_its_unfinished_owning_turn() {
     let Body::Spawned { intent } = &child[0] else {
         panic!("{child:?}")
     };
-    let image = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
+    let image = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
     assert!(
         image.image.iter().any(|e| matches!(Entry::from_json(e.raw().as_bytes()).unwrap().body, Body::Input { text, .. } if text == "before"))
     );

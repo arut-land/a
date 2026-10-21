@@ -971,7 +971,7 @@ mod tests {
             let inherited = registry.inherited().unwrap();
             assert_eq!(inherited.extensions().count(), 0);
             assert_eq!(inherited.agents().collect::<Vec<_>>(), [ext::LOOP]);
-            assert!(inherited.system_prompt().is_empty());
+            assert_eq!(inherited.system_prompt(), "");
         }
         let default = Mod::load("default", "", &[], Limits::default()).unwrap();
         assert!(Mod::restore("default", &default.image).unwrap().inherit());
