@@ -147,10 +147,10 @@ pub(crate) fn copy_history(
         header.id,
         seq,
     )?;
-    let (mut entries, parent) = prefix.into_history();
+    let (mut entries, parent, namespace) = prefix.into_history();
     let fact = Body::Ext {
-        ext: "fork".into(),
-        state: "parent".into(),
+        ext: namespace.ext.to_string(),
+        state: namespace.state.to_string(),
         data: Json::encode(&parent).map_err(io::Error::other)?,
     };
     entries.push(Entry::new(

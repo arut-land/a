@@ -52,9 +52,10 @@ Extension folds replay only the chosen prefix. Dynamic extension installation
 facts retain portable generation images: Lua source, tool grants and execution
 limits. Replay reconstructs the recorded generation, even after its files
 change or disappear; it never substitutes today's Lua code. Images are part
-of the durable log, not a snapshot cache. A build without the required generation opens that history read-only with
-`ReadOnly::Extensions`; it never replaces the recorded generation. Restoring a Lua generation currently scans the prefix
-before using its derived state snapshot. A subsequent explicit Lua reload or
+of the durable log, not a snapshot cache. A build without the required
+generation opens that history read-only with `ReadOnly::Extensions`; it never
+replaces the recorded generation. Restoring a Lua generation currently scans
+the prefix before using its derived state snapshot. A subsequent explicit Lua reload or
 workspace generation change can adopt a new generation at rest.
 
 The coordinator chose conversation-only semantics for this implementation.

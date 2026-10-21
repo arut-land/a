@@ -20,7 +20,7 @@ use crate::{
 };
 
 pub use crate::assemble::Built;
-pub use crate::history::ValidatedPrefix;
+pub use crate::history::{HistoryNamespace, ValidatedPrefix};
 pub use crate::point::{Decided, Hooks};
 
 /// The engine, as a running call reaches it.
@@ -460,6 +460,7 @@ struct By {
 /// The engine supplies storage and publication; an extension decides which
 /// prefixes may continue. `ValidatedPrefix` preserves their checked ancestry.
 pub trait HistoryPolicy: Send + Sync {
+    fn namespace(&self) -> HistoryNamespace;
     fn validate(
         &self,
         binding: Arc<dyn Binding>,

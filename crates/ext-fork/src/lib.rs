@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use ext::host::{Binding, HistoryPolicy};
+use ext::host::{Binding, HistoryNamespace, HistoryPolicy};
 use ext::{Configured, Extension, Refused, Registrar, Table};
 use protocol::{Entry, ForkError};
 
@@ -25,6 +25,13 @@ impl Configured for Fork {
 }
 
 impl HistoryPolicy for Fork {
+    fn namespace(&self) -> HistoryNamespace {
+        HistoryNamespace {
+            ext: Self::NAME.into(),
+            state: "parent".into(),
+        }
+    }
+
     fn validate(&self, binding: Arc<dyn Binding>, entries: &[Entry]) -> Result<(), ForkError> {
         let mut core = kernel::Core::new(binding);
         for entry in entries {
