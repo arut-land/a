@@ -92,6 +92,33 @@ fn a_failed_deferred_sync_recovers_before_accepting_more_work() {
     }
 }
 
+#[test]
+fn a_stalled_diagnostic_writer_never_blocks_commit_or_store_recovery() {
+    let logger_rt: rt::Rt = Arc::new(rt::Threads::new(1));
+    let _stalled = ext_logging::testing::stall(&logger_rt);
+    let mut harness = ManualSession::new();
+    let before = harness.session.frames.seq();
+    let waited = harness.note();
+    harness.poll();
+    harness.faulty.fail_next_sync(SyncFailure::Discard);
+    harness.session.send(Msg::Sync);
+    harness.poll();
+    assert!(rt::block_on(waited).is_none());
+    // More than the diagnostic queue can hold: both commits and recovery
+    // must complete while its writer is still waiting on the test's guard.
+    for _ in 0..512 {
+        ext_logging::emit(ext_logging::Fact::RegistryRejected);
+    }
+    harness.request("after a diagnostic disk stall");
+    assert!(harness.session.frames.seq() > before);
+    let kept = harness.finish();
+    assert!(
+        kept.iter()
+            .any(|e| matches!(&e.body, Body::Assistant { text }
+        if text == "after a diagnostic disk stall"))
+    );
+}
+
 /// The actor runs only when polled by the test; I/O completes inline and
 /// deferred timers never fire, so queued messages define exact bursts.
 struct Manual {

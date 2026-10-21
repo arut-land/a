@@ -834,7 +834,6 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     let exit = Exit {
         home: home.clone(),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
-        log: None,
     };
     let life = Lifecycle::new("test".into(), home.runtime());
     let supervisor = std::sync::Arc::clone(&daemon);
@@ -919,7 +918,6 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     let exit = Exit {
         home: home.clone(),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
-        log: None,
     };
     let life = Lifecycle::new("test".into(), home.runtime());
     let supervisor = std::sync::Arc::clone(&daemon);

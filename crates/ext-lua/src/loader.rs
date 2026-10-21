@@ -126,6 +126,9 @@ impl Compiler {
             let module = match Mod::load(name, source, &grants, self.limits) {
                 Ok(module) => module,
                 Err(error) if initial => {
+                    ext_logging::emit(ext_logging::Fact::ExtensionRejected {
+                        module: ext_logging::workspace(Path::new(name)),
+                    });
                     eprintln!("warning: {error}");
                     continue;
                 }
@@ -137,6 +140,9 @@ impl Compiler {
                     registry
                 }
                 Err(error) if initial => {
+                    ext_logging::emit(ext_logging::Fact::ExtensionRejected {
+                        module: ext_logging::workspace(Path::new(name)),
+                    });
                     eprintln!("warning: {error}");
                     let mut registry = (self.base)()?;
                     for module in &installed {
@@ -161,6 +167,23 @@ impl Workspace {
         initial: bool,
     ) -> Result<(), Refused> {
         let _preparing = lock(&self.preparing);
+        let result = self.prepare_inner(compiler, path, initial);
+        if result.is_err() {
+            ext_logging::emit(ext_logging::Fact::Generation {
+                workspace: ext_logging::workspace(path),
+                number: self.generation(),
+                accepted: false,
+            });
+        }
+        result
+    }
+
+    fn prepare_inner(
+        self: &Arc<Self>,
+        compiler: &Arc<Compiler>,
+        path: &Path,
+        initial: bool,
+    ) -> Result<(), Refused> {
         let found = compiler.scan(path)?;
         if !initial && *lock(&self.files) == found {
             return Ok(());
@@ -175,7 +198,12 @@ impl Workspace {
             })?;
         *lock(&self.files) = found;
         *lock(&self.current) = Arc::new(registry);
-        self.number.fetch_add(1, Ordering::Release);
+        let number = self.number.fetch_add(1, Ordering::Release) + 1;
+        ext_logging::emit(ext_logging::Fact::Generation {
+            workspace: ext_logging::workspace(path),
+            number,
+            accepted: true,
+        });
         Ok(())
     }
 

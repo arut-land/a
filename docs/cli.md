@@ -63,3 +63,10 @@ a -p "and the tests?" resume        # one more turn in the latest session
 No output format flag: stdout is the reply, and scripts that want the
 structure read the session's log (`$A_HOME/sessions/<id>.jsonl`) or speak
 the protocol (`a bridge`).
+
+## Daemon diagnostics
+
+`a daemon status` reports liveness and the diagnostic log path. `a daemon
+log` reads the current JSONL diagnostic file without starting the daemon.
+The [logging contract](logging.md) describes its typed facts, retention,
+privacy boundary and best-effort delivery.

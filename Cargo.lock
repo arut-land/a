@@ -437,6 +437,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 name = "client"
 version = "0.0.0"
 dependencies = [
+ "ext-logging",
  "protocol",
  "serde_json",
  "sys",
@@ -529,6 +530,7 @@ dependencies = [
  "ext-compact",
  "ext-edit",
  "ext-fixtures",
+ "ext-logging",
  "ext-policy",
  "ext-prompt",
  "ext-retry",
@@ -656,10 +658,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext-logging"
+version = "0.0.0"
+dependencies = [
+ "json",
+ "protocol",
+ "rt",
+ "serde",
+ "serde_json",
+ "sys",
+]
+
+[[package]]
 name = "ext-lua"
 version = "0.0.0"
 dependencies = [
  "ext",
+ "ext-logging",
  "llm",
  "mlua",
  "protocol",

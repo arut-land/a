@@ -191,6 +191,20 @@ fn a_safe_tool_reruns_after_the_daemon_is_killed() {
     assert_eq!(torn.len(), 3);
     assert_contiguous(&entries);
     assert_eq!(entries, env.log(id));
+    env.run(&["daemon", "stop"]);
+    let diagnostic = env.run(&["daemon", "log"]);
+    let records: Vec<serde_json::Value> = diagnostic
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records
+            .iter()
+            .any(|r| r["fact"]["recovery"]["session"] == id.0.to_string()
+                && r["fact"]["recovery"]["rule"] == "resume_ledger"),
+        "{diagnostic}"
+    );
+    assert!(!diagnostic.contains("sleep 2"));
     let results: Vec<_> = entries.iter().filter_map(|e| result_of(e, call)).collect();
     assert_eq!(
         results,
@@ -554,7 +568,7 @@ fn an_older_and_a_newer_build_share_one_daemon_and_never_fight() {
     let second = env.pid().unwrap();
     assert_ne!(second, first);
     let log = fs::read_to_string(env.home.daemon_log()).unwrap();
-    assert!(log.contains("drained for a newer build"), "{log}");
+    assert!(log.contains("\"reason\":\"upgrade\""), "{log}");
     term.type_line("still here");
     assert_eq!(
         term.lines_until("a    still here").last().unwrap(),

@@ -157,7 +157,19 @@ impl LogStore for Jsonl {
             each(entry);
         })?;
         let (seq, read) = (index.read().ends.len() as u64, index.end() - from);
+        if kept.is_some() {
+            ext_logging::emit(ext_logging::Fact::StoreRepair {
+                session: id,
+                rule: ext_logging::Rule::PreserveReadOnly,
+                offset: index.end(),
+            });
+        }
         if kept.is_none() && index.end() < index.file.metadata()?.len() {
+            ext_logging::emit(ext_logging::Fact::StoreRepair {
+                session: id,
+                rule: ext_logging::Rule::CutTornTail,
+                offset: index.end(),
+            });
             index.file.set_len(index.end())?;
             sys::sync_data(&index.file)?;
         }

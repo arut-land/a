@@ -116,5 +116,31 @@ fn the_daemon_resolves_prefixes_reports_its_status_and_stops_when_asked() {
     assert_eq!(env.run(&["daemon", "stop"]).trim(), "stopped");
     assert_eq!(env.pid(), None);
     let log = fs::read_to_string(env.home.daemon_log()).unwrap();
-    assert!(log.contains("asked to stop, exiting"), "{log}");
+    assert!(log.contains("\"reason\":\"requested\""), "{log}");
+}
+
+#[test]
+fn a_signal_exit_leaves_its_reason_without_session_content() {
+    let env = Env::new("signal-log");
+    let pid = env.start();
+    let mut conn = env.connect();
+    conn.attach(Target::New, &env.ws);
+    let input = "private prompt, key, and echoed tool output: secret-93d7";
+    conn.input(input);
+    conn.until(|e| matches!(&e.body, Body::Assistant { text } if text == input));
+    sys::signal_process(pid, sys::Signal::Terminate).unwrap();
+    env.wait_exited("the signalled daemon to stop");
+    let text = env.run(&["daemon", "log"]);
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records
+            .iter()
+            .any(|r| r["fact"]["stopped"]["reason"] == "terminate"),
+        "{text}"
+    );
+    assert!(!text.contains(input), "{text}");
+    assert!(env.pid().is_none(), "reading a log never starts a daemon");
 }

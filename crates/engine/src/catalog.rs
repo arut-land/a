@@ -87,16 +87,30 @@ impl Catalog {
     /// The catalog at `path` of the logs `store` keeps: read, or
     /// rebuilt from the logs unless the last daemon left it clean.
     pub fn open(path: PathBuf, store: &dyn LogStore) -> io::Result<Self> {
+        use ext_logging::CatalogReason;
         let dirty = path.with_extension("dirty");
-        let read = match fs::exists(&dirty) {
-            Ok(false) => read(&path).ok(),
-            _ => None,
+        let (read, reason) = match fs::exists(&dirty) {
+            Ok(false) => match read(&path) {
+                Ok(state) => (Some(state), None),
+                Err(e) => (
+                    None,
+                    Some(if e.kind() == io::ErrorKind::NotFound {
+                        CatalogReason::Missing
+                    } else {
+                        CatalogReason::Unreadable
+                    }),
+                ),
+            },
+            _ => (None, Some(CatalogReason::Unclean)),
         };
         // No log may change while a clean catalog can survive a crash.
         File::create(&dirty)?.sync_all()?;
         sys::fs::sync_dir(path.parent().unwrap())?;
         let rebuilt = read.is_none();
         let catalog = Self::with(Some(path), read.map_or_else(|| rebuild(store), Ok)?);
+        if let Some(reason) = reason {
+            ext_logging::emit(ext_logging::Fact::CatalogRebuilt { reason });
+        }
         let mut state = lock(&catalog.state);
         if rebuilt || state.bloated() {
             catalog.compact(&mut state);
@@ -163,6 +177,7 @@ impl Catalog {
         if let (Some(file), Ok(line)) = (&mut state.file, line)
             && let Err(e) = file.write_all(&line)
         {
+            catalog_fault(&e);
             eprintln!("the session catalog: {e}");
         }
     }
@@ -177,7 +192,7 @@ impl Catalog {
                 state.file = Some(file);
                 state.lines = state.records.len();
             }
-            Err(e) => eprintln!("the session catalog: {e}"),
+            Err(e) => catalog_fault(&e),
         }
     }
 }
@@ -216,6 +231,11 @@ fn rebuild(store: &dyn LogStore) -> io::Result<State> {
         let (entries, read_only) = match loaded {
             Ok(loaded) => (loaded.seq, loaded.writer.read_only()),
             Err(e) => {
+                ext_logging::emit(ext_logging::Fact::Fault {
+                    session: Some(header.id),
+                    operation: ext_logging::Operation::Reload,
+                    kind: ext_logging::Fault(e.kind()),
+                });
                 eprintln!("session {}: cataloguing: {e}", header.id.short());
                 continue;
             }
@@ -243,4 +263,12 @@ fn rewrite(path: &Path, state: &State) -> io::Result<File> {
     sys::fs::replace(&new, path)?;
     sys::fs::sync_dir(path.parent().unwrap())?;
     OpenOptions::new().append(true).open(path)
+}
+
+fn catalog_fault(error: &io::Error) {
+    ext_logging::emit(ext_logging::Fact::Fault {
+        session: None,
+        operation: ext_logging::Operation::Catalog,
+        kind: ext_logging::Fault(error.kind()),
+    });
 }

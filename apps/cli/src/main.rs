@@ -127,6 +127,11 @@ const RESTART: &str = "run `a daemon restart` to replace it";
 fn daemon_cmd(daemon: &client::Daemon, action: Daemon) -> io::Result<()> {
     let home = daemon.home()?;
     match action {
+        Daemon::Log => match std::fs::read_to_string(home.daemon_log()) {
+            Ok(text) => out(format_args!("{text}")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        },
         Daemon::Status => {
             let d = client::diagnose(home);
             match (d.pid, client::status(home)) {
@@ -522,8 +527,8 @@ fn web(_daemon: client::Daemon, _open: bool) -> io::Result<()> {
 }
 
 /// The daemon. Started by a client (`listen_fd`), it leaves the client's
-/// session and logs to `logs/daemon.log`; by hand, it stays at the
-/// terminal.
+/// session and discards untyped stderr; by hand, it stays at the terminal.
+/// The engine owns the typed diagnostic log in either case.
 fn serve(
     daemon: &client::Daemon,
     listen_fd: Option<i32>,
@@ -534,7 +539,7 @@ fn serve(
     sys::crash::install(home.crash_dir(), daemon.staged.id.clone());
     let listener = if let Some(fd) = listen_fd {
         sys::detach_session()?;
-        sys::log::redirect_stderr(&home.daemon_log())?;
+        sys::log::discard_stderr()?;
         sys::Listener::adopt(fd.into())?
     } else {
         home.bind()?
@@ -542,7 +547,6 @@ fn serve(
     let start = engine::Start {
         lock: lock_fd.map(|fd| sys::adopt_lock(fd.into())).transpose()?,
         reset_breaker,
-        logs: listen_fd.is_some(),
     };
     engine::serve(
         &listener,

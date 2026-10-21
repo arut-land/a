@@ -314,8 +314,12 @@ impl Live {
         // A process restart can read cache-resident entries that no client
         // has seen. Replaying them makes the same promise as a live commit.
         if loaded.seq != 0 {
-            loaded.writer.sync()?;
-            rt::block_on(loaded.writer.flushed(&*shared.rt))?;
+            loaded
+                .writer
+                .sync()
+                .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e))?;
+            rt::block_on(loaded.writer.flushed(&*shared.rt))
+                .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e))?;
         }
         let Folding {
             mut core,
@@ -338,10 +342,7 @@ impl Live {
         // A log kept as it is is shown, never resumed or stepped: nothing
         // would commit.
         let read_only = loaded.writer.read_only();
-        let first = match read_only {
-            None => core.resumed(&load),
-            Some(_) => Effects::new(),
-        };
+        let first = resumed(&mut core, &load, read_only, open, header.id);
         let live = Arc::new(Self {
             id: header.id,
             workspace: header.workspace.clone(),
@@ -837,6 +838,10 @@ impl Actor {
                     .await
             }
             Err(error) => {
+                ext_logging::emit(ext_logging::Fact::AdoptionRejected {
+                    session: self.live.id,
+                    generation: number,
+                });
                 eprintln!("warning: {error}");
                 Ok(())
             }
@@ -1010,6 +1015,9 @@ impl Actor {
                 replied,
                 message,
             } => {
+                if let Replied::Failed(error) = &replied {
+                    provider_error(self.live.id, error);
+                }
                 self.inflight.remove(&call);
                 self.replied = message.map(|m| (call, m));
                 Event::ModelDone { call, replied }
@@ -1184,6 +1192,9 @@ impl Actor {
                 }
                 Err(panic) => {
                     let why = panicked(&*panic);
+                    ext_logging::emit(ext_logging::Fact::KernelPanic {
+                        session: self.live.id,
+                    });
                     eprintln!("session {}: the kernel {why}", self.live.id.short());
                     if self.carry(fx).await.is_ok() {
                         Box::pin(self.resume()).await;
@@ -1382,7 +1393,7 @@ impl Actor {
     fn track(&mut self, through: u64, mut epoch: rt::FlushEpoch) -> io::Result<()> {
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         if let Poll::Ready(result) = std::pin::Pin::new(&mut epoch).poll(&mut cx) {
-            result?;
+            result.inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Commit, e))?;
             if self.flushes.is_empty() {
                 self.durable(through);
             } else {
@@ -1436,6 +1447,7 @@ impl Actor {
             match pending.result.expect("completed epoch") {
                 Ok(()) => self.durable(pending.through),
                 Err(error) => {
+                    store_fault(self.live.id, ext_logging::Operation::Commit, &error);
                     self.failed(format!("flushing: {error}"), Vec::new()).await;
                     break;
                 }
@@ -1485,6 +1497,7 @@ impl Actor {
     /// cancelled, what was asked is answered that the session stopped, and
     /// the kernel is rebuilt from the committed log, as a load rebuilds it.
     async fn resume(&mut self) {
+        recovery(self.live.id, ext_logging::Rule::ReloadAfterFault);
         self.live.session.fence.fetch_add(1, Ordering::SeqCst);
         self.reactions_cancel.set();
         self.reactions_cancel = Cancel::default();
@@ -1531,6 +1544,7 @@ impl Actor {
         let (loaded, folding) = match reloaded {
             Ok(reloaded) => reloaded,
             Err(e) => {
+                store_fault(self.live.id, ext_logging::Operation::Reload, &e);
                 eprintln!("session {}: reloading: {e}", self.live.id.short());
                 self.phase = Phase::Draining;
                 return;
@@ -1575,6 +1589,9 @@ impl Actor {
             // when next wanted.
             Err(panic) => {
                 let why = panicked(&*panic);
+                ext_logging::emit(ext_logging::Fact::KernelPanic {
+                    session: self.live.id,
+                });
                 eprintln!("session {}: resuming {why}", self.live.id.short());
                 self.phase = Phase::Draining;
             }
@@ -1643,7 +1660,8 @@ impl Actor {
             self.listed = listed;
         }
         self.writer = Some(writer);
-        let lines = written?;
+        let lines = written
+            .inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Commit, e))?;
         crate::session_event("commit", self.live.id, || {
             let how = if durable { "synced" } else { "written" };
             format!("{} entries {how}", entries.len())
@@ -1682,6 +1700,11 @@ impl Actor {
         let states = match lock(&self.live.session.state_view()).image() {
             Ok(states) => states,
             Err(e) => {
+                ext_logging::emit(ext_logging::Fact::Fault {
+                    session: Some(self.live.id),
+                    operation: ext_logging::Operation::Snapshot,
+                    kind: ext_logging::Fault(io::ErrorKind::InvalidData),
+                });
                 eprintln!("session {}: snapshot: {e}", self.live.id.short());
                 return;
             }
@@ -1714,7 +1737,10 @@ impl Actor {
                 self.fold_snapshot = Some(snapshot);
                 crate::session_event("snapshot", self.live.id, || format!("at {covers}"));
             }
-            Err(e) => eprintln!("session {}: snapshot: {e}", self.live.id.short()),
+            Err(e) => {
+                store_fault(self.live.id, ext_logging::Operation::Snapshot, &e);
+                eprintln!("session {}: snapshot: {e}", self.live.id.short());
+            }
         }
     }
 
@@ -1766,7 +1792,7 @@ impl Actor {
         })
         .await;
         self.writer = Some(writer);
-        result?;
+        result.inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Commit, e))?;
         if let Some(epoch) = epoch {
             self.track(self.ordered_seq, epoch)?;
         } else {
@@ -2935,3 +2961,55 @@ impl Failure for (Replied, Option<llm::Assistant>) {
 
 #[cfg(test)]
 mod tests;
+
+fn provider_error(session: SessionId, error: &llm::Error) {
+    use ext_logging::Provider;
+    let kind = match error.kind {
+        llm::Kind::Transport => Provider::Transport,
+        llm::Kind::Auth => Provider::Auth,
+        llm::Kind::RateLimit => Provider::RateLimit,
+        llm::Kind::Quota => Provider::Quota,
+        llm::Kind::ContextOverflow => Provider::ContextOverflow,
+        llm::Kind::InvalidRequest => Provider::InvalidRequest,
+        llm::Kind::ContentFilter => Provider::ContentFilter,
+        llm::Kind::Server => Provider::Server,
+        llm::Kind::Decode => Provider::Decode,
+        llm::Kind::Incomplete => Provider::Incomplete,
+        llm::Kind::Unsupported => Provider::Unsupported,
+        llm::Kind::Other => Provider::Other,
+    };
+    ext_logging::emit(ext_logging::Fact::ProviderError {
+        session,
+        kind,
+        status: error.status,
+        retryable: error.is_retryable(),
+    });
+}
+
+fn store_fault(session: SessionId, operation: ext_logging::Operation, error: &io::Error) {
+    ext_logging::emit(ext_logging::Fact::Fault {
+        session: Some(session),
+        operation,
+        kind: ext_logging::Fault(error.kind()),
+    });
+}
+
+fn resumed(
+    core: &mut Core,
+    load: &Load<'_>,
+    read_only: Option<ReadOnly>,
+    open: Open,
+    session: SessionId,
+) -> Effects {
+    if read_only.is_some() {
+        return Effects::new();
+    }
+    if matches!(open, Open::Load) && load.busy {
+        recovery(session, ext_logging::Rule::ResumeLedger);
+    }
+    core.resumed(load)
+}
+
+fn recovery(session: SessionId, rule: ext_logging::Rule) {
+    ext_logging::emit(ext_logging::Fact::Recovery { session, rule });
+}

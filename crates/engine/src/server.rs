@@ -46,7 +46,11 @@ pub(crate) async fn accept(
         rt.spawn(Box::pin(async move {
             let _client = Client::new(&daemon);
             if let Err(e) = handle(&daemon, &life, stream).await {
-                eprintln!("connection: {e}");
+                ext_logging::emit(ext_logging::Fact::Fault {
+                    session: None,
+                    operation: ext_logging::Operation::Connection,
+                    kind: ext_logging::Fault(e.kind()),
+                });
             }
         }));
     }
@@ -235,6 +239,10 @@ pub(crate) async fn handle(
             Ok(())
         }
         _ => {
+            ext_logging::emit(ext_logging::Fact::Mismatch {
+                min: theirs.min,
+                max: theirs.max,
+            });
             reply(
                 &outbox,
                 &DaemonMsg::Mismatch {
@@ -372,7 +380,7 @@ impl Conn<'_> {
                     self.error("this client is a viewer".into());
                 }
                 ClientMsg::Shutdown => {
-                    self.daemon.stopping.store(true, Ordering::SeqCst);
+                    lock(&self.daemon.stopping).get_or_insert(ext_logging::Stop::Requested);
                     self.daemon.pulse.notify();
                 }
                 ClientMsg::Detach => break,

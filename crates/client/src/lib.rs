@@ -377,6 +377,23 @@ impl Daemon {
         on_drain: &dyn Fn(),
         first: &dyn Fn(&Connection) -> io::Result<Vec<ClientMsg>>,
     ) -> Result<Connection, Error> {
+        self.connect_inner(client, on_drain, first)
+            .inspect_err(|e| {
+                if matches!(e, Error::NotResponding)
+                    && let Endpoint::Local(home) = &self.endpoint
+                    && let Some(daemon) = live_daemon(home)
+                {
+                    ext_logging::witness(home, &daemon, ext_logging::Observation::Unresponsive);
+                }
+            })
+    }
+
+    fn connect_inner(
+        &self,
+        client: Option<ClientId>,
+        on_drain: &dyn Fn(),
+        first: &dyn Fn(&Connection) -> io::Result<Vec<ClientMsg>>,
+    ) -> Result<Connection, Error> {
         // A daemon exiting (idle) as we connect, or draining, gets one more
         // try each.
         for _ in 0..3 {
@@ -614,8 +631,10 @@ pub fn stop(home: &Home) -> io::Result<bool> {
         }
         sys::signal_process(daemon.pid, signal)
     };
+    ext_logging::witness(home, &daemon, ext_logging::Observation::Terminate);
     signal(Signal::Terminate)?;
     if !wait_exited(home, Some(HELLO_TIMEOUT)) {
+        ext_logging::witness(home, &daemon, ext_logging::Observation::Kill);
         signal(Signal::Kill)?;
         wait_exited(home, None);
     }
