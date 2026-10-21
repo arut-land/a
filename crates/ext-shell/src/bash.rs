@@ -15,15 +15,15 @@
 //! is kept as the whole output when that was cut. A command whose output
 //! passes [`OUTPUT_CAP`] is stopped.
 
+use ext::{LaunchSpec, OwnedProcess, ProcessOutput, ProcessSignal, Processes};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command as Process, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
-use sys::Child;
 
 use protocol::{Card, Environment, Mark};
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,6 @@ pub const MAX_TIMEOUT: u64 = 600;
 const IDLE: Duration = Duration::from_millis(100);
 /// After the shell exits, the most the call waits for its output to end.
 const LINGER: Duration = Duration::from_secs(2);
-const TICK: Duration = Duration::from_millis(20);
 /// The most output read in one go, so a flood shares the reactor.
 const READ: u64 = 1 << 20;
 /// How often output is reported as it arrives: each report is a log entry,
@@ -264,7 +263,7 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
     let env = environment(cx, std::env::vars());
     let log = cx.spill.join(format!("{}.log", cx.call));
     if input.background {
-        return background(cx, spawn(cx, &input.command, &dir, env, None)?, &log);
+        return background(cx, spawn(cx, &input.command, &dir, env, None)?, &log).await;
     }
     let report = cx.spill.join(format!("{}.cwd", cx.call));
     let spawn = spawn(cx, &input.command, &dir, env, Some(&report))?;
@@ -272,13 +271,18 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
     let (file, log) = create_private(&log)?;
     // Watched before anything can write to it: a write before the watch
     // raises no edge, and would be read only once the command exits.
-    let written = sys::write_watch(&log)
-        .and_then(|watch| rt::Async::for_reading(&runtime(cx)?.reactor(), watch))
-        .ok();
-    let child = {
-        let mut cmd = process(&spawn);
-        sys::spawn_group(&mut cmd, file)?
-    };
+    let written = rt::Async::for_reading(&runtime(cx)?.reactor(), sys::write_watch(&log)?)?;
+    let child = cx
+        .service::<dyn Processes>()
+        .ok_or_else(|| io::Error::other("no process provider"))?
+        .spawn(
+            cx,
+            LaunchSpec {
+                process: spawn,
+                output: ProcessOutput::File(file),
+            },
+        )
+        .await?;
     let pgid = child.id();
     cx.spawned(pgid, false);
     let limit = input.timeout.unwrap_or(TIMEOUT).clamp(1, MAX_TIMEOUT);
@@ -299,7 +303,7 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
     let moved = (std::fs::canonicalize(&dir).ok().as_ref() != Some(&cwd))
         .then(|| Cwd::change(&cwd, cx.env.as_ref().map(|env| env.cwd.as_path())));
     if done.lingering {
-        cx.own(pgid, crate::job::ended(runtime(cx)?.reactor(), pgid, None));
+        done.process.detach(cx);
     }
     let Rendered {
         text,
@@ -331,19 +335,25 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
 
 /// Starts the command with its output going straight to its log, and
 /// leaves it running: the session owns it from here.
-fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
+async fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
     let started = runtime(cx)?.now();
     let (file, log) = create_private(log)?;
-    let mut cmd = process(&spawn);
-    let child = sys::spawn_group(&mut cmd, file)?;
-    drop(cmd);
+    let cwd = spawn.cwd.clone();
+    let child = cx
+        .service::<dyn Processes>()
+        .ok_or_else(|| io::Error::other("no process provider"))?
+        .spawn(
+            cx,
+            LaunchSpec {
+                process: spawn,
+                output: ProcessOutput::File(file),
+            },
+        )
+        .await?;
     let pgid = child.id();
-    cx.own(
-        pgid,
-        crate::job::ended(runtime(cx)?.reactor(), pgid, Some(child)),
-    );
+    child.detach(cx);
     Ok(Ran {
-        cwd: spawn.cwd,
+        cwd,
         duration_ms: duration_ms(started),
         background: Some(Job { pgid, log }),
         ..Ran::default()
@@ -381,28 +391,14 @@ fn spawn(
         "cd -- {} || exit\n{command}",
         quote(&sys::shell_path(dir))
     );
-    let mut spawn = Spawn {
+    let spawn = Spawn {
         argv: [bash.as_str(), "--noprofile", "--norc", "-c", &script]
             .map(str::to_owned)
             .into(),
         env,
         cwd: dir.to_path_buf(),
     };
-    cx.spawn_hooks(&mut spawn).map_err(io::Error::other)?;
-    if spawn.argv.is_empty() {
-        return Err(io::Error::other("a spawn hook left no program to run"));
-    }
     Ok(spawn)
-}
-
-pub(crate) fn process(spawn: &Spawn) -> Process {
-    let mut cmd = Process::new(&spawn.argv[0]);
-    cmd.args(&spawn.argv[1..])
-        .env_clear()
-        .envs(&spawn.env)
-        .current_dir(&spawn.cwd)
-        .stdin(Stdio::null());
-    cmd
 }
 
 /// The session's environment (the client's, or else the daemon's without
@@ -551,14 +547,13 @@ struct Finished {
     stopped: Option<Stop>,
     lingering: bool,
     output: Rendered,
+    process: OwnedProcess,
 }
 
-/// A command's log, and what turns readable as it is written to: made
-/// before the command could write, or `None` where writes cannot be
-/// watched.
+/// Installed before launch so the first write cannot lose its wakeup.
 struct Followed<'a> {
     log: &'a Path,
-    written: Option<rt::Async<sys::fs::WriteWatch>>,
+    written: rt::Async<sys::fs::WriteWatch>,
 }
 
 /// Follows the command's output in `log` until it ends, reporting it as it
@@ -570,21 +565,15 @@ struct Followed<'a> {
 /// its group is left to write, or it has paused [`IDLE`], or after
 /// [`LINGER`].
 async fn supervise(
-    mut child: Child,
+    child: OwnedProcess,
     Followed { log, written }: Followed<'_>,
     limit: Duration,
     cx: &Cx,
     progress: &Partials<String>,
 ) -> io::Result<Finished> {
-    let pgid = child.id();
     let mut file = File::open(log)?;
     let rt = runtime(cx)?;
     let reactor = rt.reactor();
-    // Where writes or the exit cannot be watched, they are looked for
-    // every tick.
-    let exit = sys::exit_watch(pgid)
-        .and_then(|watch| rt::Async::for_reading(&reactor, watch))
-        .ok();
     let mut buf = vec![0; 64 * 1024];
     let (mut output, mut live) = (Output::default(), Live::default());
     let start = rt.now();
@@ -592,46 +581,37 @@ async fn supervise(
         deadline: start + limit,
     };
     let (mut heard, mut reported) = (start, start);
-    let (mut unreported, mut behind, mut exit_seen) = (false, false, false);
+    let (mut unreported, mut behind) = (false, false);
     loop {
         let now = rt.now();
         let exited = matches!(run, Run::Exited { .. });
-        let unwatched = written.is_none() || (!exited && (exit.is_none() || exit_seen));
-        let next = [
-            run.deadline(heard),
-            unwatched.then_some(now + TICK),
-            unreported.then_some(reported + REPORT),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
+        let next = [run.deadline(heard), unreported.then_some(reported + REPORT)]
+            .into_iter()
+            .flatten()
+            .min();
         let wait = next.map(|at| at.saturating_duration_since(now));
         if !behind && wait.is_none_or(|wait| !wait.is_zero()) {
-            let writes = when(written.is_some(), async {
-                if let Some(written) = &written {
-                    written.readable().await;
-                }
+            let writes = written.readable_result();
+            let exits = when(!exited, async { child.wait().await.map(|_| ()) });
+            let cancelled = when(matches!(run, Run::Running { .. }), async {
+                cx.cancel.wait().await;
+                Ok(())
             });
-            let watched = exit.as_ref().filter(|_| !exited && !exit_seen);
-            let exits = when(watched.is_some(), async {
-                if let Some(exit) = watched {
-                    exit.readable().await;
-                }
+            let sleep = when(wait.is_some(), async {
+                rt.sleep(wait.unwrap_or_default()).await;
+                Ok(())
             });
-            let running = matches!(run, Run::Running { .. });
-            let cancelled = when(running, cx.cancel.wait());
-            let sleep = when(wait.is_some(), rt.sleep(wait.unwrap_or_default()));
-            exit_seen |= exited_first(writes, exits, cancelled, sleep).await;
+            rt::or(writes, rt::or(exits, rt::or(cancelled, sleep))).await?;
         }
-        // Taken before reading, so a write meanwhile is the next edge.
-        if let Some(written) = &written {
-            written.get_ref().clear();
-        }
+        written.get_ref().clear();
         let read = follow(&mut file, &mut buf, READ, |chunk| {
             output.push(chunk);
             live.push(chunk);
         })?;
         behind = read == READ;
+        if read > 0 {
+            reactor.yield_now().await;
+        }
         let now = rt.now();
         if read > 0 {
             heard = now;
@@ -652,18 +632,21 @@ async fn supervise(
         let signal;
         (run, signal) = run.step(now, seen);
         if let Some(signal) = signal {
-            let _ = sys::Group(pgid).signal(signal);
+            let _ = child.signal(match signal {
+                Signal::Terminate => ProcessSignal::Terminate,
+                _ => ProcessSignal::Kill,
+            });
         }
         if let Run::Exited { status, why, at } = run {
             let quiet = now >= heard.max(at) + IDLE;
-            if !behind && (!sys::Group(pgid).alive() || quiet || now >= at + LINGER) {
+            if !behind && (!child.alive() || quiet || now >= at + LINGER) {
                 // What was written meanwhile, up to the cap.
-                let rest = OUTPUT_CAP.saturating_sub(output.bytes());
+                let rest = OUTPUT_CAP.saturating_sub(output.bytes()).min(READ);
                 follow(&mut file, &mut buf, rest, |chunk| output.push(chunk))?;
-                let mut lingering = sys::Group(pgid).alive();
+                let mut lingering = child.alive();
                 // A command that was stopped leaves nothing behind.
                 if lingering && why.is_some() {
-                    let _ = sys::Group(pgid).kill();
+                    let _ = child.signal(ProcessSignal::Kill);
                     lingering = false;
                 }
                 return Ok(Finished {
@@ -671,6 +654,7 @@ async fn supervise(
                     stopped: why,
                     lingering,
                     output: output.finish(log),
+                    process: child,
                 });
             }
         }
@@ -701,38 +685,12 @@ fn follow(
     Ok(read)
 }
 
-/// Waits for whichever of the four comes first; whether it was the exit.
-async fn exited_first(
-    writes: impl Future<Output = ()>,
-    exits: impl Future<Output = ()>,
-    cancelled: impl Future<Output = ()>,
-    sleep: impl Future<Output = ()>,
-) -> bool {
-    let written = async {
-        writes.await;
-        false
-    };
-    let exited = async {
-        exits.await;
-        true
-    };
-    let stopped = async {
-        cancelled.await;
-        false
-    };
-    let slept = async {
-        sleep.await;
-        false
-    };
-    rt::or(written, rt::or(exited, rt::or(stopped, slept))).await
-}
-
 /// `future`, or one that never resolves when `cond` does not hold.
-async fn when(cond: bool, future: impl Future<Output = ()>) {
+async fn when<T>(cond: bool, future: impl Future<Output = T>) -> T {
     if cond {
-        future.await;
+        future.await
     } else {
-        std::future::pending::<()>().await;
+        std::future::pending().await
     }
 }
 

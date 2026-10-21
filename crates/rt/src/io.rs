@@ -18,6 +18,20 @@ pub enum Reactor {
 }
 
 impl Reactor {
+    /// Continuously ready I/O must give other sessions a poll.
+    pub async fn yield_now(&self) {
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                return std::task::Poll::Ready(());
+            }
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        })
+        .await;
+    }
+
     /// Resolves after `duration`, on this reactor's timers.
     pub fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
         match self {
@@ -173,6 +187,11 @@ impl<T: Source> Async<T> {
     /// resolved: soon after registering, for one already readable.
     pub async fn readable(&self) {
         let _ = self.ready(false).await;
+    }
+
+    /// Process supervisors must clean up if readiness observation fails.
+    pub async fn readable_result(&self) -> io::Result<()> {
+        self.ready(false).await
     }
 
     /// As [`Async::readable`], for writing.

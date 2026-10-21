@@ -1,9 +1,8 @@
 //! Processes: groups a command's whole tree lives in, handles a child is
 //! given, and watches on a process's exit.
 //!
-//! A [`Group`] is a Unix process group (its pgid is its leader's pid) or,
-//! on Windows, a kill-on-close job object indexed by its leader. Windows
-//! trees die with their owning daemon, so recovery has none left to reap.
+//! [`OwnedGroup`] holds live containment; [`GroupId`] is only its recovery
+//! identity. Windows jobs die with their daemon, leaving no recovery handles.
 
 use std::fs::File;
 use std::io;
@@ -66,18 +65,11 @@ pub fn find_bash(search: Option<&str>) -> Option<String> {
         .map(|path| path.display().to_string())
 }
 
-/// A process group: a command and everything it started, signalled whole.
+/// Persisted identity for explicit recovery; it never owns native resources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Group(pub u32);
+pub struct GroupId(pub u32);
 
-impl Group {
-    /// Makes the process `cmd` starts lead a group of its own, with no
-    /// controlling terminal (a prompt for a password fails instead of
-    /// waiting), whose id is its pid.
-    pub fn lead(cmd: &mut Command) {
-        imp::lead(cmd);
-    }
-
+impl GroupId {
     /// Sends `signal` to every process in the group. A group that is gone
     /// has nothing left to signal.
     pub fn signal(self, signal: Signal) -> io::Result<()> {
@@ -98,6 +90,91 @@ impl Group {
     /// The live processes of the group.
     pub fn members(self) -> Vec<u32> {
         imp::group_members(self.0)
+    }
+}
+
+/// Live containment; dropping it terminates everything it still owns.
+pub struct OwnedGroup {
+    id: GroupId,
+    #[cfg(windows)]
+    handle: std::os::windows::io::OwnedHandle,
+}
+
+impl OwnedGroup {
+    /// Makes the process `cmd` starts lead a group of its own, with no
+    /// controlling terminal (a prompt for a password fails instead of
+    /// waiting), whose id is its pid.
+    pub fn lead(cmd: &mut Command) {
+        imp::lead(cmd);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn new(child: &Child) -> Self {
+        Self {
+            id: GroupId(child.id()),
+        }
+    }
+
+    pub const fn id(&self) -> GroupId {
+        self.id
+    }
+
+    pub fn signal(&self, signal: Signal) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.id.signal(signal)
+        }
+        #[cfg(windows)]
+        {
+            let _ = signal;
+            imp::terminate_group(&self.handle)
+        }
+    }
+
+    pub fn members(&self) -> Vec<u32> {
+        #[cfg(unix)]
+        {
+            self.id.members()
+        }
+        #[cfg(windows)]
+        {
+            imp::members(&self.handle)
+        }
+    }
+
+    pub fn alive(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.id.alive()
+        }
+        #[cfg(windows)]
+        {
+            !self.members().is_empty()
+        }
+    }
+}
+
+impl Drop for OwnedGroup {
+    fn drop(&mut self) {
+        let _ = self.signal(Signal::Kill);
+    }
+}
+
+/// Containment cannot be lost between launch and asynchronous adoption.
+pub struct ContainedChild {
+    pub child: Child,
+    pub group: OwnedGroup,
+}
+
+impl std::ops::Deref for ContainedChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+impl std::ops::DerefMut for ContainedChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
     }
 }
 
@@ -155,7 +232,14 @@ pub fn daemon_ready() -> io::Result<()> {
 }
 
 /// Creates a command's process tree as a group before any user code runs.
-pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<Child> {
+pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<ContainedChild> {
+    #[cfg(unix)]
+    {
+        let child = imp::spawn_group(cmd, output)?;
+        let group = OwnedGroup::new(&child);
+        Ok(ContainedChild { child, group })
+    }
+    #[cfg(windows)]
     imp::spawn_group(cmd, output)
 }
 
@@ -811,9 +895,9 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        Group(child.id()).kill().unwrap();
+        GroupId(child.id()).kill().unwrap();
         assert!(!child.wait().unwrap().success());
-        Group(child.id()).kill().unwrap();
+        GroupId(child.id()).kill().unwrap();
     }
 
     /// Found without a subprocess, the same each time, and the one the
@@ -847,12 +931,12 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 30 & read _"])
             .stdin(std::process::Stdio::piped());
-        Group::lead(&mut cmd);
+        OwnedGroup::lead(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         let watch = exit_watch(child.id()).unwrap();
         assert!(!readable(&watch, 50));
         // The shell and its background sleep.
-        let group = Group(child.id());
+        let group = GroupId(child.id());
         let mut members = Vec::new();
         for _ in 0..100 {
             members = group.members();
@@ -886,9 +970,9 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
-        Group::lead(&mut cmd);
+        OwnedGroup::lead(&mut cmd);
         let mut child = cmd.spawn().unwrap();
-        let group = Group(child.id());
+        let group = GroupId(child.id());
         assert!(group.alive());
         let pgid = rustix::process::Pid::from_raw(child.id().cast_signed()).unwrap();
         assert!(imp::has_members(pgid));
@@ -913,7 +997,7 @@ pub type ProcessPipe = File;
 pub type ProcessPipe = crate::Stream;
 
 /// Starts a contained child with only its explicit stdio inherited.
-pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(Child, ProcessPipe, ProcessPipe)> {
+pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(ContainedChild, ProcessPipe, ProcessPipe)> {
     #[cfg(unix)]
     {
         use std::os::fd::OwnedFd;
@@ -925,7 +1009,8 @@ pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(Child, ProcessPipe, Process
         let mut child = spawn(cmd)?;
         let input = File::from(OwnedFd::from(child.stdin.take().unwrap()));
         let output = File::from(OwnedFd::from(child.stdout.take().unwrap()));
-        Ok((child, input, output))
+        let group = OwnedGroup::new(&child);
+        Ok((ContainedChild { child, group }, input, output))
     }
     #[cfg(windows)]
     imp::spawn_stdio(cmd)

@@ -597,8 +597,7 @@ fn stale_request<'a>(
             origin.send(
                 session,
                 ContextRequest::Own {
-                    pgid: 42,
-                    ended: Box::pin(std::future::pending()),
+                    process: ext::OwnedProcess::new(Arc::new(StaleProcess), None, None),
                 },
             );
         })
@@ -1202,4 +1201,26 @@ fn delegated_results_wait_for_their_own_durable_prefix() {
         1
     );
     session.halt();
+}
+
+struct StaleProcess;
+impl ext::RunningProcess for StaleProcess {
+    fn id(&self) -> u32 {
+        42
+    }
+    fn signal(&self, _: ext::ProcessSignal) -> io::Result<()> {
+        Ok(())
+    }
+    fn alive(&self) -> bool {
+        false
+    }
+    fn try_wait(&self) -> io::Result<Option<std::process::ExitStatus>> {
+        Ok(None)
+    }
+    fn wait(&self) -> BoxFuture<'_, io::Result<std::process::ExitStatus>> {
+        Box::pin(std::future::pending())
+    }
+    fn ended(&self) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
 }

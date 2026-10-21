@@ -1419,7 +1419,7 @@ fn background_processes_keep_the_session_and_end_with_it() {
         Duration::from_secs(5),
         || !session.has_jobs(),
     );
-    assert!(!sys::Group(pgid).alive());
+    assert!(!sys::GroupId(pgid).alive());
 }
 
 /// `lookup_harbor_label`, held until released or the turn is interrupted.
@@ -1961,7 +1961,11 @@ fn the_busy_mark_rides_its_commit() {
     let (hops, commits) = (fixture.hops() - hops, lock(&probe.batches).len() - commits);
     session.halt();
     assert_eq!(*lock(&fixture.0.catalog.marks), [true, false]);
-    assert_eq!(hops, commits, "a hop besides the {commits} commits");
+    assert_eq!(
+        hops,
+        commits + 1,
+        "only launch may add a hop to the {commits} commits"
+    );
 }
 
 /// Progress and extension state are written as they come, and made

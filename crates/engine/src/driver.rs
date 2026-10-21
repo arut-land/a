@@ -268,7 +268,7 @@ struct Session {
     states: Mutex<Arc<Mutex<States>>>,
     env: Mutex<Option<Arc<Environment>>>,
     /// Background process groups the session owns, until each ends.
-    jobs: Mutex<Vec<u32>>,
+    jobs: Mutex<Vec<Arc<dyn ext::RunningProcess>>>,
     work: Mutex<WorkSet<WorkId>>,
     /// Notified as the session changes: a commit, work beginning or
     /// ending, a job ending, the actor ending. What waits on the session
@@ -438,8 +438,7 @@ enum ContextRequest {
         reply: oneshot::Sender<Opened>,
     },
     Own {
-        pgid: u32,
-        ended: BoxFuture<'static, ()>,
+        process: ext::OwnedProcess,
     },
 }
 
@@ -661,8 +660,8 @@ impl Live {
 
     pub(crate) fn stop(&self) {
         self.send(Msg::Stop);
-        for &pgid in lock(&self.session.jobs).iter() {
-            let _ = sys::Group(pgid).kill();
+        for process in lock(&self.session.jobs).iter() {
+            let _ = process.signal(ext::ProcessSignal::Kill);
         }
     }
 
@@ -1288,6 +1287,10 @@ impl Actor {
         Some((event, None))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every port shares the origin admission check"
+    )]
     async fn context(
         &mut self,
         origin: &ContextOrigin,
@@ -1370,24 +1373,26 @@ impl Actor {
                 .open_side(origin.clone(), model, side, reply)
                 .await
                 .map(|event| (event, None)),
-            ContextRequest::Own { pgid, ended } => {
-                lock(&session.jobs).push(pgid);
-                self.live
-                    .session
-                    .spawn_work(WorkId::Job(pgid), origin.admission, |cancel| {
+            ContextRequest::Own { process } => {
+                lock(&session.jobs).push(Arc::clone(&process.process));
+                self.live.session.spawn_work(
+                    WorkId::Job(Arc::as_ptr(&process.process).cast::<()>() as usize),
+                    origin.admission,
+                    |cancel| {
                         Box::pin(async move {
-                            let mut ended = pin!(ended);
+                            let mut ended = pin!(process.ended());
                             if unless(&cancel, &mut ended).await.is_none() {
-                                let _ = sys::Group(pgid).kill();
+                                let _ = process.signal(ext::ProcessSignal::Kill);
                                 ended.await;
                             }
-                            lock(&session.jobs).retain(|&p| p != pgid);
+                            lock(&session.jobs).retain(|p| !Arc::ptr_eq(p, &process.process));
                             session.changed.notify();
                             if let Some(daemon) = session.shared.daemon.upgrade() {
                                 daemon.jobs.notify();
                             }
                         })
-                    });
+                    },
+                );
                 None
             }
         }
@@ -1980,7 +1985,7 @@ impl Actor {
                 }
             }
             Effect::Kill { pgid } => {
-                let _ = sys::Group(pgid).kill();
+                let _ = sys::GroupId(pgid).kill();
             }
             Effect::MarkBusy(busy) => {
                 self.live.busy.store(busy, Ordering::SeqCst);

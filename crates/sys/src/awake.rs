@@ -92,7 +92,7 @@ mod imp {
     //! A `systemd-inhibit` lock, held for as long as the process it runs.
     use std::process::{Child, Command, Stdio};
 
-    pub struct Hold(Child);
+    pub struct Hold(Child, crate::OwnedGroup);
 
     impl Hold {
         pub fn new(why: &str) -> Option<Self> {
@@ -103,15 +103,18 @@ mod imp {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            crate::Group::lead(&mut cmd);
-            crate::proc::spawn(&mut cmd).ok().map(Self)
+            crate::OwnedGroup::lead(&mut cmd);
+            crate::proc::spawn(&mut cmd).ok().map(|child| {
+                let group = crate::OwnedGroup::new(&child);
+                Self(child, group)
+            })
         }
     }
 
     impl Drop for Hold {
         fn drop(&mut self) {
             // Its group: `systemd-inhibit` and the `sleep` it waits on.
-            let _ = crate::Group(self.0.id()).kill();
+            let _ = self.1.signal(crate::Signal::Kill);
             let _ = self.0.wait();
         }
     }

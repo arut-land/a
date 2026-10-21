@@ -619,7 +619,7 @@ struct AsyncConnection {
 }
 
 struct Reaper {
-    child: Option<sys::Child>,
+    child: Option<sys::ContainedChild>,
     rt: Rt,
 }
 

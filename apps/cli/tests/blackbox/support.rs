@@ -44,7 +44,7 @@ pub fn remove_home(root: &Path) {
 
 enum Process {
     Piped(Child),
-    Contained(sys::Child),
+    Contained(sys::ContainedChild),
 }
 
 impl Process {
@@ -96,22 +96,18 @@ impl TestProcess {
         )
     }
 
+    pub fn group(&self) -> &sys::OwnedGroup {
+        match &self.child {
+            Process::Contained(child) => &child.group,
+            Process::Piped(_) => panic!("uncontained test process"),
+        }
+    }
+
     pub fn contained(command: &mut Command, output: fs::File) -> Self {
         let child = sys::spawn_group(command, output).unwrap();
         Self {
             child: Process::Contained(child),
             readers: [None, None],
-        }
-    }
-
-    #[allow(
-        clippy::match_same_arms,
-        reason = "sys and std children differ on Windows"
-    )]
-    pub fn id(&self) -> u32 {
-        match &self.child {
-            Process::Piped(child) => child.id(),
-            Process::Contained(child) => child.id(),
         }
     }
 
@@ -163,7 +159,7 @@ impl Drop for TestProcess {
                 let _ = child.wait();
             }
             Process::Contained(child) => {
-                let _ = sys::Group(child.id()).kill();
+                let _ = child.group.signal(sys::Signal::Kill);
                 let _ = child.kill();
                 let _ = child.wait();
             }

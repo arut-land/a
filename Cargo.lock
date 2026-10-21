@@ -503,7 +503,6 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
- "sys",
  "transport",
 ]
 

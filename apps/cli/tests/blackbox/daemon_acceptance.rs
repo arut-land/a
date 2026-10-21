@@ -174,27 +174,31 @@ fn timeout_reaps_only_the_test_process_tree() {
         TestProcess::contained(&mut command(), fs::File::create(&unrelated_output).unwrap());
     let output = env.home.root().join("tree");
     let process = TestProcess::contained(&mut command(), fs::File::create(&output).unwrap());
-    let group = sys::Group(process.id());
+
     let ready_deadline = deadline();
     while !fs::read(&output).unwrap().starts_with(b"ready")
-        || group.members().len() < 2
+        || process.group().members().len() < 2
         || !fs::read(&unrelated_output).unwrap().starts_with(b"ready")
     {
         assert!(Instant::now() < ready_deadline);
         std::thread::sleep(Duration::from_millis(10));
     }
+    let members = process.group().members();
     let error = process
         .collect(Instant::now() + Duration::from_millis(20))
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    while group.alive() {
+    while members
+        .iter()
+        .any(|&pid| sys::process_started(pid).is_some())
+    {
         assert!(
             Instant::now() < ready_deadline,
             "timed out tree remains alive"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(sys::Group(unrelated.id()).alive());
+    assert!(unrelated.group().alive());
 }
 
 #[test]

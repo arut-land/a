@@ -7,7 +7,6 @@ use std::process::{Command, ExitStatus};
 mod spawn;
 pub use spawn::Child;
 use std::ptr::{null, null_mut};
-use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME};
 use windows_sys::Win32::System::JobObjects::{
@@ -22,7 +21,7 @@ use windows_sys::Win32::System::Threading::{
 
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
-use super::Passed;
+use super::{ContainedChild, GroupId, OwnedGroup, Passed};
 use crate::Signal;
 use crate::windows::{Security, ok, owned};
 
@@ -112,28 +111,18 @@ pub fn lead(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
-struct Job {
-    id: u32,
-    handle: OwnedHandle,
-}
-static JOBS: OnceLock<Mutex<Vec<Job>>> = OnceLock::new();
-
-fn jobs() -> std::sync::MutexGuard<'static, Vec<Job>> {
-    JOBS.get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// Job assignment is a process creation attribute, so no shell can fork
 /// before containment. The daemon alone owns each kill-on-close handle.
-pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<Child> {
+pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<ContainedChild> {
     let input = File::open("NUL")?;
     let child = spawn_job(cmd, [&input, &output, &output]);
     drop(output);
     child
 }
 
-pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(Child, crate::Stream, crate::Stream)> {
+pub fn spawn_stdio(
+    cmd: &mut Command,
+) -> io::Result<(ContainedChild, crate::Stream, crate::Stream)> {
     let (input, child_input) = crate::endpoint::imp::process_pipe()?;
     let (output, child_output) = crate::endpoint::imp::process_pipe()?;
     let error = File::options().write(true).open("NUL")?;
@@ -141,7 +130,10 @@ pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(Child, crate::Stream, crate
     Ok((child, input, output))
 }
 
-fn spawn_job(cmd: &Command, io: [&dyn std::os::windows::io::AsHandle; 3]) -> io::Result<Child> {
+fn spawn_job(
+    cmd: &Command,
+    io: [&dyn std::os::windows::io::AsHandle; 3],
+) -> io::Result<ContainedChild> {
     let security = Security::user_only()?;
     let attributes = security.attributes();
     // SAFETY: attributes live through creation, unnamed job cannot be pre-created.
@@ -164,16 +156,14 @@ fn spawn_job(cmd: &Command, io: [&dyn std::os::windows::io::AsHandle; 3]) -> io:
         Some(&job),
         CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
     )?;
-    let mut jobs = jobs();
-    jobs.retain(|job| !members(&job.handle).is_empty());
-    jobs.push(Job {
-        id: child.id(),
+    let group = OwnedGroup {
+        id: GroupId(child.id()),
         handle: job,
-    });
-    Ok(child)
+    };
+    Ok(ContainedChild { child, group })
 }
 
-fn members(job: &OwnedHandle) -> Vec<u32> {
+pub(super) fn members(job: &OwnedHandle) -> Vec<u32> {
     let mut count = 64;
     loop {
         // Pointer-sized storage aligns JOBOBJECT_BASIC_PROCESS_ID_LIST.
@@ -206,23 +196,20 @@ fn members(job: &OwnedHandle) -> Vec<u32> {
     }
 }
 
-pub fn group_members(id: u32) -> Vec<u32> {
-    jobs()
-        .iter()
-        .find(|job| job.id == id)
-        .map_or_else(Vec::new, |job| members(&job.handle))
+// Kill-on-close jobs cannot survive their daemon; numeric recovery owns none.
+pub fn group_members(_id: u32) -> Vec<u32> {
+    Vec::new()
+}
+pub fn group_alive(_id: u32) -> bool {
+    false
+}
+pub fn signal_group(_id: u32, _signal: Signal) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
-pub fn group_alive(id: u32) -> bool {
-    !group_members(id).is_empty()
-}
-
-pub fn signal_group(id: u32, _signal: Signal) -> io::Result<()> {
-    if let Some(job) = jobs().iter().find(|job| job.id == id) {
-        // SAFETY: this process owns the job; all its children are ours.
-        ok(unsafe { TerminateJobObject(job.handle.as_raw_handle(), 1) })?;
-    }
-    Ok(())
+pub(super) fn terminate_group(job: &OwnedHandle) -> io::Result<()> {
+    // SAFETY: the borrowed job remains owned throughout termination.
+    ok(unsafe { TerminateJobObject(job.as_raw_handle(), 1) })
 }
 
 pub fn process_started(pid: u32) -> Option<u64> {
@@ -329,7 +316,7 @@ mod tests {
         let mut child = spawn_group(&mut command, output).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let members = loop {
-            let members = group_members(child.id());
+            let members = child.group.members();
             if members.len() >= 2 {
                 break members;
             }
@@ -350,7 +337,7 @@ mod tests {
         io::stdout().flush().unwrap();
         let mut byte = [0];
         let _ = io::stdin().read_exact(&mut byte);
-        let _ = signal_group(child.id(), Signal::Kill);
+        let _ = child.group.signal(Signal::Kill);
         let _ = child.wait();
     }
 
@@ -412,7 +399,7 @@ mod tests {
             let _ = tx.send(input.read(&mut [0]));
         });
         let result = rx.recv_timeout(std::time::Duration::from_secs(5));
-        signal_group(child.id(), Signal::Kill).unwrap();
+        child.group.signal(Signal::Kill).unwrap();
         child.wait().unwrap();
         reader.join().unwrap();
         assert_eq!(result.unwrap().unwrap(), 0);
@@ -435,7 +422,7 @@ mod tests {
         let process = RecordedProcess::open(child.id(), Some(token)).unwrap();
         process.signal(Signal::Terminate).unwrap();
         child.wait().unwrap();
-        signal_group(child.id(), Signal::Kill).unwrap();
+        child.group.signal(Signal::Kill).unwrap();
         let mut successor = spawn_group(
             &mut command,
             File::options().write(true).open("NUL").unwrap(),
@@ -443,7 +430,7 @@ mod tests {
         .unwrap();
         let _ = process.signal(Signal::Kill);
         let successor_alive = successor.try_wait().unwrap().is_none();
-        signal_group(successor.id(), Signal::Kill).unwrap();
+        successor.group.signal(Signal::Kill).unwrap();
         successor.wait().unwrap();
         assert!(missing_rejected && wrong_rejected);
         assert!(successor_alive);
@@ -454,5 +441,32 @@ mod tests {
         let token = process_started(std::process::id()).unwrap();
         assert_ne!(token, 0);
         assert_eq!(process_started(std::process::id()), Some(token));
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::GetHandleInformation;
+
+    #[test]
+    fn completed_windows_jobs_need_no_future_spawn_to_be_released() {
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/D", "/C", "exit 0"])
+            .envs(std::env::vars_os());
+        let mut child = spawn_group(
+            &mut command,
+            File::options().write(true).open("NUL").unwrap(),
+        )
+        .unwrap();
+
+        child.wait().unwrap();
+        let handle = child.group.handle.as_raw_handle();
+        drop(child.group);
+        let mut flags = 0;
+        // SAFETY: this API validates the former handle without adopting or closing it.
+        assert_eq!(unsafe { GetHandleInformation(handle, &raw mut flags) }, 0);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(6));
     }
 }

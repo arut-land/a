@@ -113,7 +113,7 @@ impl Host for Recorded {
     }
 
     fn spawned(&self, _: u32, _: bool) {}
-    fn own(&self, _: u32, _: BoxFuture<'static, ()>) {}
+    fn own(&self, _: crate::OwnedProcess) {}
     fn progress(&self, text: &str) {
         self.progress.lock().unwrap().push_str(text);
     }

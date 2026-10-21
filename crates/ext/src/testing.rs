@@ -44,6 +44,7 @@ pub struct Recorder {
     /// The `ext` entries the calls logged.
     pub log: Mutex<Vec<Entry>>,
     pub spawned: Mutex<Vec<(u32, bool)>>,
+    processes: Mutex<Vec<crate::OwnedProcess>>,
     /// The output the calls reported as they ran.
     pub progress: Mutex<String>,
     /// Notified each time a group the session owns ends.
@@ -75,6 +76,7 @@ impl Rig {
                 registry,
                 log: Mutex::default(),
                 spawned: Mutex::default(),
+                processes: Mutex::default(),
                 progress: Mutex::default(),
                 ends: Arc::default(),
             }),
@@ -130,8 +132,9 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        for &(pgid, _) in lock(&self.spawned).iter() {
-            let _ = sys::Group(pgid).kill();
+        for process in lock(&self.processes).drain(..) {
+            let _ = process.signal(crate::ProcessSignal::Kill);
+            rt::block_on(process.ended());
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -227,11 +230,13 @@ impl Host for Recorder {
         lock(&self.spawned).push((pgid, background));
     }
 
-    fn own(&self, pgid: u32, ended: BoxFuture<'static, ()>) {
-        self.spawned(pgid, true);
+    fn own(&self, process: crate::OwnedProcess) {
+        self.spawned(process.id(), true);
+        let running = Arc::clone(&process.process);
+        lock(&self.processes).push(process);
         let ends = Arc::clone(&self.ends);
         RT.spawn(Box::pin(async move {
-            ended.await;
+            running.ended().await;
             ends.notify();
         }));
     }

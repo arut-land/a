@@ -46,7 +46,7 @@ fn failed(rig: &Rig, tool: &str) -> Failure {
 fn finish(rig: &Rig) {
     // Rig records process ownership; the real engine supplies its cleanup.
     for (pid, _) in rig.spawned.lock().unwrap().iter() {
-        let _ = sys::Group(*pid).kill();
+        let _ = sys::GroupId(*pid).kill();
     }
     rt::block_on(async {
         let reactor = rt::Reactor::AsyncIo;
@@ -56,7 +56,7 @@ fn finish(rig: &Rig) {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|(p, _)| !sys::Group(*p).alive())
+                .all(|(p, _)| !sys::GroupId(*p).alive())
             {
                 return;
             }

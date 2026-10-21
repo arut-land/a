@@ -27,12 +27,12 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
-    struct Capture(std::process::Child);
+    struct Capture(std::process::Child, crate::OwnedGroup);
     impl Drop for Capture {
         fn drop(&mut self) {
             // Every error path (including unwinding) revokes the entire
             // shell group and reaps the child. No detached reader survives.
-            let _ = crate::Group(self.0.id()).kill();
+            let _ = self.1.signal(crate::Signal::Kill);
             let _ = self.0.wait();
         }
     }
@@ -47,8 +47,10 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    crate::Group::lead(&mut command);
-    let mut child = Capture(crate::proc::spawn(&mut command)?);
+    crate::OwnedGroup::lead(&mut command);
+    let child = crate::proc::spawn(&mut command)?;
+    let group = crate::OwnedGroup::new(&child);
+    let mut child = Capture(child, group);
     let mut stdout = child.0.stdout.take().expect("stdout is piped");
     fcntl_setfl(&stdout, fcntl_getfl(&stdout)? | OFlags::NONBLOCK)?;
     let mut out = Vec::new();

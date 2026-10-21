@@ -17,9 +17,9 @@ protocol.workspace = true
 rt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sys.workspace = true
 
 [dev-dependencies]
+sys.workspace = true
 ext = { workspace = true, features = ["testing"] }
 ext-shell.workspace = true
 ext-policy.workspace = true

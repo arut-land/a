@@ -4,7 +4,6 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::future::Future;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -256,11 +255,9 @@ impl Cx {
         self.host.spawned(pgid, background);
     }
 
-    /// Hands process group `pgid` to the session, past this call: it is
-    /// recorded, and the session owns it until `ended`, which watches it,
-    /// resolves.
-    pub fn own(&self, pgid: u32, ended: impl Future<Output = ()> + Send + 'static) {
-        self.host.own(pgid, Box::pin(ended));
+    /// Transfers live ownership to the session, including cancellation and reaping.
+    pub fn own(&self, process: crate::OwnedProcess) {
+        self.host.own(process);
     }
 
     /// Logs `text` as more of the call's output, for clients to show as

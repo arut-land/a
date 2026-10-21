@@ -41,9 +41,7 @@ pub trait Host: Send + Sync {
     ) -> BoxFuture<'static, Called>;
     /// See [`Cx::spawned`].
     fn spawned(&self, pgid: u32, background: bool);
-    /// See [`Cx::own`]: the engine runs `ended`, and the session owns
-    /// `pgid` until it resolves.
-    fn own(&self, pgid: u32, ended: BoxFuture<'static, ()>);
+    fn own(&self, process: crate::OwnedProcess);
     /// See [`Cx::progress`].
     fn progress(&self, text: &str);
     /// Commits `data` as a change to extension `ext`'s state `state`:

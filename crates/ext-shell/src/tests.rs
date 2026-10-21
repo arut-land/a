@@ -23,8 +23,8 @@ impl Host for PausedRecord {
     fn spawned(&self, pgid: u32, background: bool) {
         self.rig.spawned(pgid, background);
     }
-    fn own(&self, pgid: u32, ended: BoxFuture<'static, ()>) {
-        self.rig.own(pgid, ended);
+    fn own(&self, process: ext::OwnedProcess) {
+        self.rig.own(process);
     }
     fn progress(&self, text: &str) {
         self.rig.progress(text);

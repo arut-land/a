@@ -6,7 +6,6 @@
 //! [`Layers`], to every call.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use crate::BoxFuture;
@@ -22,11 +21,85 @@ pub trait CwdOf: Send + Sync {
     fn dir(&self, workspace: &Path, env: Option<&Environment>, states: &States) -> PathBuf;
 }
 
-/// Starts the processes tools run: one extension owns how (the shell).
-pub trait Spawner: Send + Sync {
-    /// The process `spawn` describes, as the `spawn` point leaves it,
-    /// ready to start.
-    fn process(&self, cx: &Cx, spawn: SpawnSpec) -> Result<Command, String>;
+/// Launch and live ownership are one operation; numeric ids are recovery facts.
+pub trait Processes: Send + Sync {
+    fn spawn<'a>(
+        &'a self,
+        cx: &'a Cx,
+        launch: LaunchSpec,
+    ) -> BoxFuture<'a, Result<OwnedProcess, SpawnError>>;
+}
+
+pub type SpawnError = std::io::Error;
+
+pub struct LaunchSpec {
+    pub process: SpawnSpec,
+    pub output: ProcessOutput,
+}
+
+pub enum ProcessOutput {
+    File(std::fs::File),
+    Stdio,
+}
+
+#[derive(Clone, Copy)]
+pub enum ProcessSignal {
+    Terminate,
+    Kill,
+}
+
+/// The provider owns registration and native resources behind this port.
+pub trait RunningProcess: Send + Sync {
+    fn id(&self) -> u32;
+    fn signal(&self, signal: ProcessSignal) -> std::io::Result<()>;
+    fn alive(&self) -> bool;
+    fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn wait(&self) -> BoxFuture<'_, std::io::Result<std::process::ExitStatus>>;
+    fn ended(&self) -> BoxFuture<'_, ()>;
+}
+
+pub trait ProcessPipe: Send + Sync {
+    fn read<'a>(&'a self, bytes: &'a mut [u8]) -> BoxFuture<'a, std::io::Result<usize>>;
+    fn write<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, std::io::Result<usize>>;
+    fn try_write(&self, bytes: &[u8]) -> std::io::Result<usize>;
+}
+
+pub struct OwnedProcess {
+    pub process: std::sync::Arc<dyn RunningProcess>,
+    pub input: Option<Box<dyn ProcessPipe>>,
+    pub output: Option<Box<dyn ProcessPipe>>,
+}
+
+impl OwnedProcess {
+    pub fn new(
+        process: std::sync::Arc<dyn RunningProcess>,
+        input: Option<Box<dyn ProcessPipe>>,
+        output: Option<Box<dyn ProcessPipe>>,
+    ) -> Self {
+        Self {
+            process,
+            input,
+            output,
+        }
+    }
+
+    /// Transfer cancellation to the session while retaining native ownership.
+    pub fn detach(self, cx: &Cx) {
+        cx.own(self);
+    }
+}
+
+impl std::ops::Deref for OwnedProcess {
+    type Target = dyn RunningProcess;
+    fn deref(&self) -> &Self::Target {
+        &*self.process
+    }
+}
+
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        let _ = self.signal(ProcessSignal::Kill);
+    }
 }
 
 /// The config layers the engine reads: a workspace's file, then the home

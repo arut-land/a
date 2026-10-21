@@ -216,10 +216,10 @@ impl Host for CallPorts {
         });
     }
 
-    fn own(&self, pgid: u32, ended: BoxFuture<'static, ()>) {
-        self.spawned(pgid, true);
+    fn own(&self, process: ext::OwnedProcess) {
+        self.spawned(process.id(), true);
         self.origin
-            .send(&self.session, ContextRequest::Own { pgid, ended });
+            .send(&self.session, ContextRequest::Own { process });
     }
 
     fn progress(&self, text: &str) {

@@ -137,7 +137,7 @@ pub struct Reader(BufReader<Transport>);
 /// The write half owns cancellation of its peer reader.
 pub struct Writer {
     io: Option<Transport>,
-    child: Option<sys::Child>,
+    child: Option<sys::ContainedChild>,
 }
 
 enum Transport {

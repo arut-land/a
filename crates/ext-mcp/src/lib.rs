@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use ext::{Configured, Cx, Extension, Need, Refused, Registrar, Spawner, Table, Text, Tool};
+use ext::{Configured, Cx, Extension, Refused, Registrar, Table, Text, Tool};
 use protocol::{Card, Mark, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -131,7 +131,7 @@ impl Mcp {
                     let mut client = if let Some(client) = client.filter(stdio::Client::alive) {
                         client
                     } else {
-                        let mut client = stdio::Client::start(server, cx, Arc::downgrade(&self.0))?;
+                        let mut client = stdio::Client::start(server, cx).await?;
                         let discovered = client.request("server/discover", json!({}), cx).await?;
                         if !discovered["supportedVersions"]
                             .as_array()
@@ -280,7 +280,6 @@ impl Configured for Mcp {
 impl Extension for Mcp {
     const NAME: &'static str = "mcp";
     const VERSION: u32 = 1;
-    type Needs = (Need<dyn Spawner>, ());
 
     fn contribute(&self, r: &mut Registrar) {
         if self.0.servers.is_empty() {
@@ -541,6 +540,35 @@ mod publication_tests {
                 .body(transport::body([serde_json::to_vec(&reply).unwrap()]))
                 .unwrap())))
         }
+    }
+
+    #[test]
+    fn http_only_mcp_needs_no_process_provider() {
+        let mcp = Mcp::new(
+            vec![Server {
+                name: ServerName::try_from("http-only".to_owned()).unwrap(),
+                description: String::new(),
+                transport: Transport::Http("http://fixture.invalid/mcp".into()),
+                env: BTreeMap::new(),
+            }],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let registry = Registry::default()
+            .with(&Schemas::default())
+            .unwrap()
+            .with(&mcp)
+            .unwrap();
+        assert!(registry.service::<dyn ext::Processes>().is_none());
+        let rig = Rig::new("http-without-processes", registry);
+        let result = rt::block_on(mcp.request(
+            &ServerName::try_from("http-only".to_owned()).unwrap(),
+            "tools/list",
+            json!({}),
+            &rig.cx(),
+        ))
+        .unwrap();
+        assert_eq!(result["tools"][0]["name"], "echo");
     }
 
     #[test]

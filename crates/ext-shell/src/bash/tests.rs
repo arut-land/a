@@ -73,7 +73,7 @@ fn model(ran: &Ran) -> String {
 
 fn wait_dead(pgid: u32) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while sys::Group(pgid).alive() {
+    while sys::GroupId(pgid).alive() {
         assert!(Instant::now() < deadline, "group {pgid} survived");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -153,7 +153,7 @@ fn a_background_child_holding_the_pipe_does_not_hold_the_call() {
     let (pgid, _) = rig.spawned.lock().unwrap()[0];
     assert_eq!((ran.output.as_str(), ran.exit), ("started\n", Some(0)));
     assert_eq!(ran.lingering, Some(pgid));
-    assert!(sys::Group(pgid).alive());
+    assert!(sys::GroupId(pgid).alive());
     assert_eq!(
         rig.spawned.lock().unwrap()[1],
         (pgid, true),
@@ -398,7 +398,7 @@ fn a_background_command_returns_at_once_with_its_log() {
         assert!(Instant::now() < deadline, "the log never filled");
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(sys::Group(job.pgid).alive());
+    assert!(sys::GroupId(job.pgid).alive());
     assert!(model(&ran).starts_with(&format!("[running in the background: pgid {}", job.pgid)));
 }
 
@@ -415,7 +415,7 @@ fn a_job_end_is_seen_at_once() {
         let started = Instant::now();
         rt::block_on(rig.ends.changed(&mut seen));
         let took = started.elapsed();
-        assert!(!sys::Group(pgid).alive(), "{command}");
+        assert!(!sys::GroupId(pgid).alive(), "{command}");
         // Re-checking on a backoff would first look again at 1.55 s.
         assert!(took >= Duration::from_millis(900), "{command}: {took:?}");
         assert!(took < Duration::from_millis(1300), "{command}: {took:?}");
@@ -586,4 +586,70 @@ fn the_supervisor_moves_only_as_its_states_allow() {
     assert_eq!(term(Stop::Aborted).deadline(t), Some(t + GRACE));
     assert_eq!(killed.deadline(t), None);
     assert_eq!(exited(None).deadline(t), Some(t + IDLE));
+}
+
+#[test]
+fn continuous_output_yields_to_other_sessions() {
+    use std::io::Write;
+    let rig = rig("output-quantum");
+    let cx = rig.cx();
+    rt::block_on(async {
+        let log = cx.spill.join("quantum.log");
+        let (mut file, log) = create_private(&log).unwrap();
+        file.write_all(&vec![b'x'; usize::try_from(READ * 3).unwrap()])
+            .unwrap();
+        let written = rt::Async::for_reading(
+            &runtime(&cx).unwrap().reactor(),
+            sys::write_watch(&log).unwrap(),
+        )
+        .unwrap();
+        let process = cx
+            .service::<dyn Processes>()
+            .unwrap()
+            .spawn(
+                &cx,
+                LaunchSpec {
+                    process: spawn(
+                        &cx,
+                        "exit 0",
+                        &cx.dir(),
+                        environment(&cx, std::env::vars()),
+                        None,
+                    )
+                    .unwrap(),
+                    output: ProcessOutput::File(file),
+                },
+            )
+            .await
+            .unwrap();
+        process.wait().await.unwrap();
+        let advanced = ext::Flag::default();
+        let observed = &advanced;
+        let cx = &cx;
+        let log = &log;
+        let mut work = ext::stream(|progress| async move {
+            supervise(
+                process,
+                Followed { log, written },
+                Duration::from_secs(5),
+                cx,
+                &progress,
+            )
+            .await
+            .unwrap();
+            assert!(
+                observed.is_set(),
+                "output consumed every quantum before another session ran"
+            );
+            Ok::<_, String>(())
+        });
+        rt::or(
+            async { while !matches!(work.next().await, shape::Next::Done(Ok(()))) {} },
+            async {
+                advanced.set();
+                std::future::pending::<()>().await;
+            },
+        )
+        .await;
+    });
 }

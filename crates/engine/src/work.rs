@@ -11,7 +11,8 @@ pub(super) enum WorkId {
     Reaction(u64),
     Delivery,
     Report(SessionId),
-    Job(u32),
+    // Retained control identity, so recycling a leader pid cannot replace live work.
+    Job(usize),
     Sync,
 }
 

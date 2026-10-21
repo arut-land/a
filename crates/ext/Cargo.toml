@@ -9,7 +9,7 @@ publish.workspace = true
 # call needs from the OS or a runtime it asks the engine for, as a service.
 [features]
 # `testing::Rig`, a stand-in engine for an extension's tests.
-testing = ["dep:rt", "dep:sys", "transport/ureq"]
+testing = ["dep:rt", "transport/ureq"]
 
 [dependencies]
 transport.workspace = true
@@ -20,7 +20,6 @@ serde.workspace = true
 serde_json.workspace = true
 smallvec = { version = "1.13", default-features = false }
 rt = { workspace = true, optional = true }
-sys = { workspace = true, optional = true }
 
 [lints]
 workspace = true
