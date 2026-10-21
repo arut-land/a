@@ -1,97 +1,10 @@
 //! Daemon promises exercised through the shipped command interface on every host.
 
+use crate::support::{Isolated, TestProcess, deadline};
 use std::fs;
-use std::process::{Command, Output};
-
-use sys::Home;
-
-struct Isolated {
-    home: Home,
-}
-
-impl Isolated {
-    fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("a-daemon-{name}-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let home = Home::from(root);
-        fs::write(
-            home.config_file(),
-            "[daemon]\nagent = \"echo\"\nidle_secs = 60\n",
-        )
-        .unwrap();
-        Self { home }
-    }
-
-    fn command(&self, args: &[&str]) -> Command {
-        self.command_at(std::path::Path::new(env!("CARGO_BIN_EXE_a")), args)
-    }
-
-    fn command_at(&self, exe: &std::path::Path, args: &[&str]) -> Command {
-        let mut command = Command::new(exe);
-        command
-            .args(args)
-            .env("A_HOME", self.home.root())
-            .env_remove("A_HOST")
-            .current_dir(self.home.root());
-        command
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        let output = self.command(args).output().unwrap();
-        assert!(
-            output.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        output
-    }
-
-    fn logs(&self) -> std::collections::BTreeMap<String, Vec<u8>> {
-        fs::read_dir(self.home.sessions_dir())
-            .unwrap()
-            .map(|entry| entry.unwrap().path().join("log.jsonl"))
-            .filter(|path| path.is_file())
-            .map(|path| {
-                (
-                    path.parent()
-                        .unwrap()
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                    fs::read(&path).unwrap(),
-                )
-            })
-            .collect()
-    }
-
-    fn pid(&self) -> u32 {
-        fs::read_to_string(self.home.daemon_pid_file())
-            .unwrap()
-            .parse::<sys::crash::Record>()
-            .unwrap()
-            .pid
-    }
-}
-
-impl Drop for Isolated {
-    fn drop(&mut self) {
-        let _ = self.command(&["daemon", "stop"]).output();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match fs::remove_dir_all(self.home.root()) {
-                Ok(()) => break,
-                Err(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => {
-                    assert!(std::thread::panicking(), "cleaning isolated home: {error}");
-                    break;
-                }
-            }
-        }
-    }
-}
+use std::io;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[test]
 fn concurrent_starters_share_one_daemon_and_stop_releases_its_lock() {
@@ -100,16 +13,19 @@ fn concurrent_starters_share_one_daemon_and_stop_releases_its_lock() {
         .map(|_| env.command(&["ls"]).spawn().unwrap())
         .collect();
     for child in clients {
-        assert!(child.wait_with_output().unwrap().status.success());
+        assert!(
+            TestProcess::from(child)
+                .collect(deadline())
+                .unwrap()
+                .status
+                .success()
+        );
     }
     let pid = env.pid();
     env.run(&["ls"]);
     assert_eq!(env.pid(), pid);
     env.run(&["daemon", "stop"]);
-    assert!(client::wait_exited(
-        &env.home,
-        Some(std::time::Duration::from_secs(5))
-    ));
+    assert!(client::wait_exited(&env.home, Some(Duration::from_secs(5))));
     env.run(&["ls"]);
     assert_ne!(env.pid(), pid);
 }
@@ -133,10 +49,10 @@ fn shell_paths_with_spaces_and_non_ascii_reach_the_native_directory() {
     let env = Isolated::new("shell");
     let dir = env.home.root().join("space café");
     fs::create_dir_all(&dir).unwrap();
-    let output = env
-        .command(&["--mode", "auto", "-p", "$ printf shell-ok > result.txt"])
-        .current_dir(&dir)
-        .output()
+    let mut command = env.command(&["--mode", "auto", "-p", "$ printf shell-ok > result.txt"]);
+    command.current_dir(&dir);
+    let output = TestProcess::spawn(&mut command)
+        .collect(deadline())
         .unwrap();
     assert!(
         output.status.success(),
@@ -154,10 +70,7 @@ fn an_unclean_exit_releases_the_endpoint_and_recovers_committed_sessions() {
     let before = env.logs();
     let pid = env.pid();
     sys::signal_process(pid, sys::Signal::Kill).unwrap();
-    assert!(client::wait_exited(
-        &env.home,
-        Some(std::time::Duration::from_secs(5))
-    ));
+    assert!(client::wait_exited(&env.home, Some(Duration::from_secs(5))));
     env.run(&["ls"]);
     assert_eq!(before, env.logs());
     assert_ne!(env.pid(), pid);
@@ -173,7 +86,7 @@ fn two_installs_upgrade_once_and_the_older_client_never_downgrades() {
     let mut file = fs::File::options().append(true).open(&older).unwrap();
     file.write_all(&[0]).unwrap();
     file.set_modified(
-        fs::metadata(source).unwrap().modified().unwrap() - std::time::Duration::from_secs(3600),
+        fs::metadata(source).unwrap().modified().unwrap() - Duration::from_secs(3600),
     )
     .unwrap();
     drop(file);
@@ -197,21 +110,15 @@ fn a_cold_clients_output_reaches_eof_while_the_daemon_stays_alive() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let result = rx.recv_timeout(std::time::Duration::from_secs(10));
-    if result.is_err() {
-        env.run(&["daemon", "stop"]);
-    }
-    reader.join().unwrap();
-    assert!(result.unwrap().unwrap().status.success());
+    assert!(
+        TestProcess::from(child)
+            .collect(deadline())
+            .unwrap()
+            .status
+            .success()
+    );
     assert_ne!(std::process::id(), env.pid());
-    assert!(!client::wait_exited(
-        &env.home,
-        Some(std::time::Duration::ZERO)
-    ));
+    assert!(!client::wait_exited(&env.home, Some(Duration::ZERO)));
 }
 
 #[test]
@@ -224,4 +131,105 @@ fn a_successor_starts_while_an_old_client_keeps_its_handle() {
     env.run(&["ls"]);
     assert_ne!(env.pid(), previous);
     drop(retained);
+}
+
+#[test]
+fn output_larger_than_pipe_capacity_completes() {
+    let env = Isolated::new("large-output");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "daemon_acceptance::process_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("A_TEST_PROCESS", "output")
+        .env("A_HOME", env.home.root());
+    let output = TestProcess::spawn(&mut command)
+        .collect(deadline())
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        output
+            .stdout
+            .windows(1_048_576)
+            .any(|w| w.iter().all(|&b| b == b'o'))
+    );
+    assert_eq!(output.stderr, vec![b'e'; 1_048_576]);
+}
+
+#[test]
+fn timeout_reaps_only_the_test_process_tree() {
+    let env = Isolated::new("process-timeout");
+    let command = || {
+        let mut command = Command::new(sys::find_bash(None).unwrap());
+        command
+            .args(["-c", "sleep 600 & echo ready; wait"])
+            .env("A_HOME", env.home.root());
+        command
+    };
+    let unrelated_output = env.home.root().join("unrelated");
+    let unrelated =
+        TestProcess::contained(&mut command(), fs::File::create(&unrelated_output).unwrap());
+    let output = env.home.root().join("tree");
+    let process = TestProcess::contained(&mut command(), fs::File::create(&output).unwrap());
+    let group = sys::Group(process.id());
+    let ready_deadline = deadline();
+    while !fs::read(&output).unwrap().starts_with(b"ready")
+        || group.members().len() < 2
+        || !fs::read(&unrelated_output).unwrap().starts_with(b"ready")
+    {
+        assert!(Instant::now() < ready_deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let error = process
+        .collect(Instant::now() + Duration::from_millis(20))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    while group.alive() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "timed out tree remains alive"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(sys::Group(unrelated.id()).alive());
+}
+
+#[test]
+fn every_case_uses_an_isolated_home() {
+    let first = Isolated::new("same-case");
+    let root;
+    {
+        let second = Isolated::new("same-case");
+        root = second.home.root().to_owned();
+        assert_ne!(first.home.root(), root);
+        assert_eq!(
+            second
+                .command(&[])
+                .get_envs()
+                .find(|(key, _)| *key == "A_HOME")
+                .unwrap()
+                .1,
+            Some(root.as_os_str())
+        );
+        first.run(&["new"]);
+        assert_eq!(second.run(&["ls"]).stdout, b"");
+        assert_ne!(first.pid(), second.pid());
+        let stream: sys::Stream = second.home.endpoint().connect().unwrap();
+        drop(stream);
+    }
+    assert!(!root.exists());
+    assert!(first.home.root().exists());
+}
+
+#[test]
+#[ignore = "subprocess fixture for process collection"]
+fn process_fixture() {
+    use std::io::Write;
+    if std::env::var("A_TEST_PROCESS").as_deref() == Ok("output") {
+        io::stdout().write_all(&vec![b'o'; 1_048_576]).unwrap();
+        io::stderr().write_all(&vec![b'e'; 1_048_576]).unwrap();
+    }
 }
