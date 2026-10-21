@@ -83,7 +83,6 @@ pub fn run(
         synced: false,
         turn: Turn::Unsent,
         streaming: None,
-        asked: None,
         failed: false,
         ended: None,
     };
@@ -132,9 +131,6 @@ struct Once {
     turn: Turn,
     /// The call whose reply is streaming.
     streaming: Option<CallId>,
-    /// The daemon was asked how the session lists, with the view at this
-    /// seq: see [`Once::settle`].
-    asked: Option<u64>,
     failed: bool,
     ended: Option<io::Result<ExitCode>>,
 }
@@ -274,18 +270,17 @@ impl Once {
         }
     }
 
-    /// Ours, the turn has ended, or waits on someone no pipeline has. The
-    /// view folds entry by entry, and the daemon commits a step's entries
-    /// at once: between a reply and the calls it asks for, the view is idle
-    /// where the session never was. So an idle view asks the daemon, whose
-    /// listing is as of a whole step ([`Once::listed`]).
-    fn settle(&mut self) -> Vec<client::Effect> {
+    /// Only a complete kernel burst can certify that our turn ended.
+    fn settle(&mut self) {
         if self.turn != Turn::Ours {
-            return Vec::new();
+            return;
         }
         let view = self.client.view();
-        let activity = view.ledger.activity();
-        if activity.requires_action() {
+        let turn = self.client.turn();
+        if turn
+            .activity
+            .is_some_and(protocol::Activity::requires_action)
+        {
             let id = view.session.map_or_default(|s| s.short().to_string());
             let answer = format!("answer it with `a attach {id}` or in `a web`");
             let approval = view.items.iter().rev().find_map(|item| match item {
@@ -305,34 +300,13 @@ impl Once {
                 None => eprintln!("a: the turn waits for an answer in session {id}: {answer}"),
             }
             self.end(Ended::Waiting);
-        } else if !self.client.turn().running && self.asked.is_none() {
-            self.asked = Some(view.seq);
-            return self.client.run(client::Cmd::Sessions);
-        }
-        Vec::new()
-    }
-
-    /// The daemon's answer to [`Once::settle`]'s question: idle as of the
-    /// step the view was at (or a later one), the turn is over.
-    fn listed(&mut self) -> Vec<client::Effect> {
-        let (Some(at), Some(id)) = (self.asked, self.client.view().session) else {
-            return Vec::new();
-        };
-        let Some(listed) = self.client.sessions().iter().find(|s| s.id == id) else {
-            return Vec::new();
-        };
-        if listed.entries < at {
-            return self.client.run(client::Cmd::Sessions);
-        }
-        self.asked = None;
-        if listed.activity == protocol::Activity::Idle && !self.client.turn().running {
+        } else if !turn.running {
             self.end(if self.failed {
                 Ended::Failed
             } else {
                 Ended::Done
             });
         }
-        Vec::new()
     }
 }
 
@@ -349,11 +323,11 @@ impl Renderer for Once {
                     if matches!(update.change, Change::Synced) {
                         effects.extend(self.send());
                     }
-                    effects.extend(self.settle());
+                    self.settle();
                 }
                 Show::Notice(notice) => eprintln!("[{notice}]"),
                 Show::Link => self.link(),
-                Show::Sessions => effects.extend(self.listed()),
+                Show::Sessions => {}
             }
         }
         effects
@@ -374,7 +348,113 @@ fn input(prompt: Option<&str>, stdin: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::input;
+    use super::*;
+    use client::{ConnId, EventKind};
+    use protocol::{
+        Activity, Audience, Body, DaemonMsg, Entry, Epoch, Json, Mode, Outcome, Seq, SessionId,
+    };
+
+    fn receive(once: &mut Once, msg: DaemonMsg) {
+        let effects = once.client.step(Event {
+            conn: ConnId(0),
+            kind: EventKind::Msg(msg),
+        });
+        let shown = effects
+            .into_iter()
+            .filter_map(|e| match e {
+                client::Effect::Show(show) => Some(show),
+                client::Effect::Io(_) => None,
+            })
+            .collect();
+        assert!(
+            once.show(shown).is_empty(),
+            "completion never queries the daemon"
+        );
+    }
+
+    #[test]
+    fn a_turn_ends_when_idle_arrives_after_its_last_entry() {
+        let mut once = Once {
+            client: SessionClient::new(Env::Keep),
+            prompt: None,
+            mode: None,
+            read: true,
+            stdin: None,
+            synced: true,
+            turn: Turn::Sent("sleep 0".into()),
+            streaming: None,
+            failed: false,
+            ended: None,
+        };
+        let session = SessionId::new();
+        receive(
+            &mut once,
+            DaemonMsg::Attached {
+                session,
+                workspace: "/w".into(),
+            },
+        );
+        receive(
+            &mut once,
+            DaemonMsg::Activity {
+                seq: 0,
+                activity: Activity::Idle,
+            },
+        );
+        let entries = [
+            Body::Input {
+                text: "sleep 0".into(),
+                mode: Mode::Queue,
+                taken: true,
+                origin: None,
+            },
+            Body::ToolCall {
+                tool: "sleep".into(),
+                input: Json::encode(&0).unwrap(),
+                id: None,
+                card: None,
+                by: Audience::Model,
+            },
+            Body::ToolResult {
+                call: CallId::new(2).unwrap(),
+                outcome: Outcome::Done {
+                    output: Json::encode(&0).unwrap(),
+                },
+                card: None,
+            },
+        ];
+        for (body, seq) in entries.into_iter().zip(1..) {
+            receive(
+                &mut once,
+                DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)),
+            );
+            assert!(once.ended.is_none(), "an entry prefix cannot end the turn");
+        }
+        assert_eq!(once.client.view().ledger.activity(), Activity::Idle);
+        receive(
+            &mut once,
+            DaemonMsg::Sessions {
+                sessions: vec![protocol::SessionSummary {
+                    id: session,
+                    workspace: "/w".into(),
+                    entries: 3,
+                    clients: 1,
+                    activity: Activity::Running,
+                    residency: protocol::Residency::Loaded,
+                    read_only: None,
+                }],
+            },
+        );
+        assert!(once.ended.is_none());
+        receive(
+            &mut once,
+            DaemonMsg::Activity {
+                seq: 3,
+                activity: Activity::Idle,
+            },
+        );
+        assert_eq!(once.ended.unwrap().unwrap(), ExitCode::SUCCESS);
+    }
 
     #[test]
     fn the_prompt_comes_first_and_stdin_after_a_blank_line() {

@@ -171,7 +171,7 @@ fn a_committed_entry_is_encoded_exactly_once() {
     settle(&session);
     let shared = |a: &Frame, b: &Frame| std::ptr::eq(a.as_bytes(), b.as_bytes());
     let (first, second) = (sent(&session, 0), sent(&session, 0));
-    assert_eq!(first.len(), 3, "attached, snapshot, synced");
+    assert_eq!(first.len(), 4, "attached, snapshot, activity, synced");
     assert!(shared(&first[1], &second[1]), "one snapshot for both");
     let near = 300 - SNAPSHOT_GAP;
     let replayed = entries(sent(&session, near));

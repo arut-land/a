@@ -434,6 +434,32 @@ fn attaching_to_another_session_starts_over() {
     assert_eq!(view.seq, 0);
 }
 
+#[test]
+fn activity_never_certifies_a_newer_entry_or_a_replacement_view() {
+    let mut view = SessionView::default();
+    let idle = |seq| DaemonMsg::Activity {
+        seq,
+        activity: protocol::Activity::Idle,
+    };
+    view.fold(&idle(0));
+    assert_eq!(view.activity, Some(protocol::Activity::Idle));
+    view.fold(&DaemonMsg::Unknown { seq: Some(1) });
+    assert_eq!(view.activity, None);
+    assert!(view.fold(&idle(0)).is_none());
+    assert_eq!(view.activity, None);
+    view.fold(&idle(1));
+    assert_eq!(view.activity, Some(protocol::Activity::Idle));
+    let snapshot = DaemonMsg::Snapshot(Box::new(view.clone()));
+    view.fold(&snapshot);
+    assert_eq!(view.activity, None);
+    view.fold(&idle(1));
+    view.fold(&DaemonMsg::Attached {
+        session: SESSION,
+        workspace: "/w".into(),
+    });
+    assert_eq!(view.activity, None);
+}
+
 fn vectors_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/view.json")
 }
@@ -490,6 +516,31 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             .collect::<Vec<_>>()
     };
     vec![
+        (
+            "only a complete burst certifies idle after its final entry",
+            vec![
+                attached(),
+                msg(DaemonMsg::Activity {
+                    seq: 0,
+                    activity: protocol::Activity::Idle,
+                }),
+                entry(1, input("hi")),
+                msg(DaemonMsg::Activity {
+                    seq: 1,
+                    activity: protocol::Activity::Running,
+                }),
+                entry(2, Body::Assistant { text: "hi".into() }),
+                msg(DaemonMsg::Activity {
+                    seq: 1,
+                    activity: protocol::Activity::Idle,
+                }),
+                msg(DaemonMsg::Activity {
+                    seq: 2,
+                    activity: protocol::Activity::Idle,
+                }),
+                msg(DaemonMsg::Synced { seq: 2 }),
+            ],
+        ),
         (
             "each committed tool progress chunk updates its live presentation",
             vec![

@@ -681,6 +681,13 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 attempt: 0,
             },
         ),
+        sample(
+            "activity",
+            DaemonMsg::Activity {
+                seq: 7,
+                activity: Activity::Idle,
+            },
+        ),
         sample("synced", DaemonMsg::Synced { seq: 3 }),
         sample(
             "sessions",

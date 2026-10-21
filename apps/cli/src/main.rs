@@ -423,7 +423,7 @@ impl Screen {
             }
             Change::Mismatch { supported } => eprintln!("[{}]", mismatch_line(*supported)),
             Change::Error { message } => eprintln!("[error: {message}]"),
-            Change::Draining => {}
+            Change::Activity | Change::Draining => {}
         }
     }
 

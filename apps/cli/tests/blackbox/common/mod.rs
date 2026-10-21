@@ -495,6 +495,7 @@ impl Conn {
         loop {
             match self.recv() {
                 DaemonMsg::Entry(e) => replay.push(e),
+                DaemonMsg::Activity { .. } => {}
                 DaemonMsg::Synced { seq } => {
                     assert_eq!(seq, replay.last().map_or(0, |e| e.seq.get()));
                     return (session, replay);
