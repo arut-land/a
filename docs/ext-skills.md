@@ -69,9 +69,9 @@ new index; later indices supersede earlier ones. Previously loaded instructions
 stay in the log; load the skill again to adopt its changed body. Deleting a skill
 removes it from the next index and command set, without rewriting history.
 A nonexistent workspace can attach without a workspace watcher; reopen it after
-creating its directory to discover workspace skills. Subscriptions and watchers
-are released with the session. The skills source
-wraps an optional Lua source; changes from either produce a complete registry,
+creating its directory to discover workspace skills. Workspace subscriptions
+share one catalog and watcher; weak indexing releases them with the last
+session. The skills source wraps an optional Lua source; changes from either produce a complete registry,
 and an unsuccessful overlay retains the last working combined generation.
 
 The SDK additions are general: `Text::generation` supplies logged context for

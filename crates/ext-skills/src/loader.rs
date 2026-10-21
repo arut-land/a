@@ -13,11 +13,13 @@ use crate::{Skill, Skills, parse};
 /// Composes skills over a base registry and an optional generation source
 /// (for example Lua). Sessions retain their immutable generation until rest.
 pub struct Loader(Arc<Source>);
+#[derive(Clone)]
 struct Source {
     home: PathBuf,
     skills: Skills,
     base: Arc<Registry>,
     inner: Option<Arc<dyn Sources>>,
+    workspaces: Arc<Mutex<BTreeMap<PathBuf, Weak<Workspace>>>>,
 }
 struct Workspace {
     source: Arc<Source>,
@@ -51,6 +53,7 @@ impl Loader {
             skills,
             base: Arc::new(base),
             inner,
+            workspaces: Arc::default(),
         }))
     }
 }
@@ -74,20 +77,19 @@ impl Generations for Workspace {
 }
 impl Sources for Source {
     fn open(&self, path: &Path, prepare: Prepare) -> Result<Arc<dyn Generations>, Refused> {
-        // Each subscription owns its watcher and releases it with its session.
-        let source = Arc::new(Self {
-            home: self.home.clone(),
-            skills: self.skills.clone(),
-            base: self.base.clone(),
-            inner: self.inner.clone(),
-        });
+        let path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_owned(),
+            Err(e) => return Err(Refused(e.to_string())),
+        };
+        let mut index = lock(&self.workspaces);
+        index.retain(|_, workspace| workspace.strong_count() > 0);
+        if let Some(workspace) = index.get(&path).and_then(Weak::upgrade) {
+            return Ok(workspace);
+        }
         let workspace = Arc::new(Workspace {
-            source,
-            path: match path.canonicalize() {
-                Ok(path) => path,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_owned(),
-                Err(e) => return Err(Refused(e.to_string())),
-            },
+            source: Arc::new(self.clone()),
+            path: path.clone(),
             inner: OnceLock::new(),
             current: Mutex::new(Published {
                 registry: self.base.clone(),
@@ -101,7 +103,7 @@ impl Sources for Source {
             updates: Updates::default(),
         });
         if let Some(inner) = &self.inner {
-            let inner = inner.open(path, prepare.clone())?;
+            let inner = inner.open(&path, prepare.clone())?;
             let weak = Arc::downgrade(&workspace);
             let changed: Arc<Changed> = Arc::new(move || {
                 if let Some(workspace) = weak.upgrade() {
@@ -149,6 +151,9 @@ impl Sources for Source {
         }
         *lock(&workspace.watcher) = Some(watcher);
         workspace.refresh()?;
+        if path.is_dir() {
+            index.insert(path, Arc::downgrade(&workspace));
+        }
         Ok(workspace)
     }
 }
@@ -329,6 +334,7 @@ mod tests {
             skills: Skills::default(),
             base: Arc::new(Registry::default()),
             inner: None,
+            workspaces: Arc::default(),
         });
         let workspace = Workspace {
             source,
@@ -411,6 +417,7 @@ mod tests {
                 skills: Skills::default(),
                 base: Arc::new(Registry::default()),
                 inner: None,
+                workspaces: Arc::default(),
             }),
             path: rig.workspace(),
             inner: OnceLock::new(),

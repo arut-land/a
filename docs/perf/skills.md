@@ -60,7 +60,9 @@ let header = Header {
 println!("{}: {}", header.name, header.description);
 ```
 
-`mise run size`: **2975 KiB before, 3123 KiB after** (+148 KiB for the
-extension, parser, watcher and SDK plumbing together), below the 4096 KiB
-budget. Budgets and startup are left to the coordinator on a quiet machine,
-as requested.
+`mise run size`: **2975 KiB before, 3123 KiB before the main merge**
+(+148 KiB for the extension, parser, watcher and SDK plumbing together).
+After merging main and sharing workspace subscriptions, the integrated build
+measures **3139 KiB**, below the 4096 KiB budget. The integrated delta includes
+main's intervening changes. Budgets and startup are left to the coordinator
+on a quiet machine, as requested.

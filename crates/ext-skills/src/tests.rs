@@ -133,6 +133,13 @@ fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
         .unwrap()
         .open(&workspace, Arc::new(|_| {}))
         .unwrap();
+    let another = registry
+        .service::<dyn Sources>()
+        .unwrap()
+        .open(&workspace, Arc::new(|_| {}))
+        .unwrap();
+    assert!(Arc::ptr_eq(&source, &another));
+    drop(another);
     let registry = source.registry();
     let catalog = registry.tools().get("skill").unwrap();
     assert_eq!(catalog.replay(), ext::Replay::Unsafe);
