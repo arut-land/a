@@ -30,6 +30,8 @@ struct Shared<T> {
     state: Mutex<State<T>>,
     space: Condvar,
     capacity: usize,
+    #[cfg(test)]
+    blocked: crate::Notify,
 }
 
 impl<T> Shared<T> {
@@ -42,6 +44,8 @@ impl<T> Shared<T> {
     fn push(&self, item: T) -> Result<(), T> {
         let mut state = self.state();
         while state.items.len() >= self.capacity && !state.receiver_gone {
+            #[cfg(test)]
+            self.blocked.notify();
             state = wait(&self.space, state);
         }
         if state.receiver_gone {
@@ -79,6 +83,8 @@ fn channel<T>(capacity: usize) -> (Arc<Shared<T>>, Receiver<T>) {
         }),
         space: Condvar::new(),
         capacity,
+        #[cfg(test)]
+        blocked: crate::Notify::new(),
     });
     (Arc::clone(&shared), Receiver(shared))
 }
@@ -165,5 +171,21 @@ impl<T> futures_core::Stream for Receiver<T> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
         self.poll_recv(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dropped_receiver_releases_a_waiting_sender() {
+        let (tx, rx) = bounded(1);
+        tx.send(1).unwrap();
+        let shared = Arc::clone(&tx.0);
+        let waiting = std::thread::spawn(move || tx.send(2));
+        crate::block_on(shared.blocked.until(|| shared.blocked.count() > 0));
+        drop(rx);
+        assert_eq!(waiting.join().unwrap(), Err(2));
     }
 }

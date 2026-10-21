@@ -1,5 +1,7 @@
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Waker};
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -86,16 +88,6 @@ fn a_oneshot_hands_over_its_value_or_ends_with_none_unsent() {
 }
 
 #[test]
-fn a_dropped_receiver_releases_a_waiting_sender() {
-    let (tx, rx) = channel::bounded(1);
-    tx.send(1).unwrap();
-    let waiting = thread::spawn(move || tx.send(2));
-    thread::sleep(Duration::from_millis(20));
-    drop(rx);
-    assert_eq!(waiting.join().unwrap(), Err(2));
-}
-
-#[test]
 fn timers_do_not_complete_before_their_deadlines() {
     let rt = Threads::new(1);
     let jobs: Vec<_> = [30, 10, 20, 10]
@@ -141,12 +133,15 @@ fn idle_runtime_has_no_periodic_wakeups() {
     block_on(spawn(&rt, rt.sleep(Duration::from_millis(5))));
     block_on(unblock(&rt, || ()));
     // A task waiting for a later deadline keeps every worker asleep.
-    let late = spawn(&rt, rt.sleep(Duration::from_secs(30)));
-    thread::sleep(Duration::from_millis(20));
+    let mut late = pin!(rt.sleep(Duration::from_secs(30)));
+    assert!(
+        late.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
     let before = wakes();
     thread::sleep(Duration::from_millis(500));
     assert_eq!(wakes(), before);
-    drop(late);
 }
 
 #[test]
@@ -159,12 +154,15 @@ fn a_timer_wakes_at_its_deadline_not_before() {
     assert!(took < Duration::from_millis(500), "{took:?}");
     // A deadline earlier than the one the reactor waits for still fires
     // on time.
-    let late = spawn(&rt, rt.sleep(Duration::from_secs(30)));
-    thread::sleep(Duration::from_millis(10));
+    let mut late = pin!(rt.sleep(Duration::from_secs(30)));
+    assert!(
+        late.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
     let started = Instant::now();
     block_on(rt.sleep(Duration::from_millis(10)));
     assert!(started.elapsed() < Duration::from_millis(500));
-    drop(late);
 }
 
 /// Reads a pipe through `rt`'s reactor while another thread writes it.
@@ -203,13 +201,20 @@ fn readiness_wakes_a_waiter_once_not_in_a_spin() {
     let rt = Threads::new(1);
     let (reader, mut writer) = std::io::pipe().unwrap();
     let reader = Async::for_reading(&rt.reactor(), reader).unwrap();
+    let mut ready = pin!(reader.readable());
+    assert!(
+        ready
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
     let (release, held) = std::sync::mpsc::channel();
     let wrote = thread::spawn(move || {
         writer.write_all(b"x").unwrap();
         held.recv().unwrap();
     });
     let before = wakes();
-    block_on(reader.readable());
+    block_on(ready);
     let woke = wakes() - before;
     assert!(woke <= 3, "{woke} wakes");
     release.send(()).unwrap();
