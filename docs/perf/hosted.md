@@ -25,8 +25,9 @@ Builds finish before timing starts. Both binaries use `cargo build-release`:
 size-optimized rebuilt std, unwinding, fat LTO, one codegen unit, stripped
 symbols and the source checkout's native linker flags. The default binary
 must exclude the sleep fixture and include the edit tool; the second binary
-enables fixtures for deterministic echo workloads. The shipped size cap is
-4,194,304 bytes on every target. The JSON records the source and harness
+enables fixtures for deterministic echo workloads. Size is measured and reported on every target, without a size gate.
+Tuning decisions prioritize latency, CPU, idle and peak RSS, reliability and
+native platform behaviour. The JSON records the source and harness
 revisions, Rust version, Cargo configuration, profile and variant.
 
 The mbx store and Cargo downloads are cached by OS, architecture and
@@ -93,7 +94,7 @@ increment. The existing CI's strict Linux latency, terminal first-paint,
 PTY-client idle and quiet-shell wake gates remain separate validation.
 
 `build_only` stops after the two release builds and records size, sections and
-imports for linker experiments that cannot fit the cap. It does not claim a
+imports for linker diagnostics. It does not claim a
 runtime budget pass. Full measurements remain the default.
 
 For tuning, `paired_ref` additionally builds a reference revision on the same

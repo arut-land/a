@@ -205,8 +205,6 @@ def summarize(output, source, variant, runner):
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     # Keep measurements even when a hard budget fails.
     failures = []
-    if len(binary) > 4096 * 1024:
-        failures.append("shipped size exceeds 4096 KiB")
     if metrics["idle_rss_kib"]["max"] >= 10240:
         failures.append("idle daemon RSS reaches 10240 KiB")
     if metrics["idle_daemon_cpu_ms"]["max"] > 0 or metrics["idle_line_client_cpu_ms"]["max"] > 0:
@@ -299,7 +297,6 @@ def main():
     if args.bloat:
         bloat(source, output)
     if args.build_only:
-        assert (output / ("a" + SUFFIX)).stat().st_size <= 4096 * 1024, "shipped size exceeds 4096 KiB"
         return
     os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
     workloads = load_task("workloads")

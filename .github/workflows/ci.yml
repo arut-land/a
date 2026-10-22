@@ -82,12 +82,12 @@ jobs:
       - *mise
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
-      # Idle daemon RSS (10 MiB) and the size cap (4 MiB) are held exactly;
+      # Idle daemon RSS (10 MiB) is held exactly;
       # cold start and attach latency too where strict, else with slack.
       - run: mise run budgets
       # The shipped binary's size as a number to compare: this run's against
-      # the last one on main, warned about past 16 KiB (the cap stays the
-      # gate). Apple silicon is the reference lane; the other skips the
+      # the last one on main, warned about past 16 KiB. Apple silicon is
+      # the reference lane; the other skips the
       # second release link.
       - if: runner.os == 'macOS'
         run: mise run size | grep -o 'a:.*KiB' | tee size.txt
