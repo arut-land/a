@@ -230,6 +230,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - *native-cargo
+      - if: runner.arch == 'X64'
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
       - *mbx-dir
       - *cache
       - uses: jdx/mise-action@v5
