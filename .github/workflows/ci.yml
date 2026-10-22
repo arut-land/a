@@ -40,10 +40,10 @@ jobs:
           & $exe --version
           $workerScript = Join-Path $env:RUNNER_TEMP 'a-io-worker.ps1'
           @'
-          param([string]$Path)
+          param([string]$loadPath)
           $bytes = New-Object byte[] (64 * 1024 * 1024)
           [Random]::new(1).NextBytes($bytes)
-          $file = [IO.File]::Open($Path, [IO.FileMode]::CreateNew)
+          $file = [IO.File]::Open($loadPath, [IO.FileMode]::CreateNew)
           try {
             while ($true) {
               $file.Position = 0
@@ -57,9 +57,9 @@ jobs:
           $previousHome = $env:A_HOME
           try {
             foreach ($worker in 1..4) {
-              $path = Join-Path $systemTemp ('a-io-load-' + [guid]::NewGuid())
-              $process = Start-Process pwsh -NoNewWindow -PassThru -ArgumentList '-NoProfile', '-File', $workerScript, $path
-              $workers += @{ Process = $process; Path = $path }
+              $loadPath = Join-Path $systemTemp ('a-io-load-' + [guid]::NewGuid())
+              $process = Start-Process pwsh -NoNewWindow -PassThru -ArgumentList '-NoProfile', '-File', $workerScript, $loadPath
+              $workers += @{ Process = $process; Path = $loadPath }
             }
             $ready = [Diagnostics.Stopwatch]::StartNew()
             while (@($workers | Where-Object { -not (Test-Path $_.Path) -or (Get-Item $_.Path).Length -lt 67108864 }).Count -gt 0) {
@@ -69,12 +69,12 @@ jobs:
             foreach ($location in @($systemTemp, $env:RUNNER_TEMP)) {
               $wave = @()
               foreach ($client in 1..4) {
-                $home = Join-Path $location ('a-io-probe-' + [guid]::NewGuid())
-                New-Item -ItemType Directory $home | Out-Null
-                $env:A_HOME = $home
-                $errorFile = Join-Path $home 'stderr'
-                $process = Start-Process $exe -ArgumentList 'ls' -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $home 'stdout') -RedirectStandardError $errorFile
-                $probe = @{ Process = $process; Home = $home; ErrorFile = $errorFile }
+                $probeRoot = Join-Path $location ('a-io-probe-' + [guid]::NewGuid())
+                New-Item -ItemType Directory $probeRoot | Out-Null
+                $env:A_HOME = $probeRoot
+                $errorFile = Join-Path $probeRoot 'stderr'
+                $process = Start-Process $exe -ArgumentList 'ls' -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $probeRoot 'stdout') -RedirectStandardError $errorFile
+                $probe = @{ Process = $process; Home = $probeRoot; ErrorFile = $errorFile }
                 $wave += $probe
                 $probes += $probe
               }
