@@ -111,11 +111,11 @@ impl FlushRequest {
     }
 }
 
-/// Hands ordered completion back before reusing the blocking thread for its flush.
+/// Returns storage admission before flushing, so one slow cache cannot stall writes.
 pub fn unblock_flush<T: Send + 'static>(
     rt: &dyn Runtime,
     work: impl FnOnce() -> (T, Option<FlushLeader>) + Send + 'static,
-) -> impl Future<Output = T> + Send + 'static {
+) -> impl Future<Output = T> + Send + '_ {
     let (send, receive) = oneshot::channel();
     let admitted = rt.spawn_blocking(
         crate::BlockingClass::Storage,
@@ -123,15 +123,19 @@ pub fn unblock_flush<T: Send + 'static>(
         Box::new(move || {
             let (ordered, leader) = work();
             let leader = leader.map(FlushLeader::seal);
-            send.send(ordered);
-            if let Some(leader) = leader {
-                leader.run();
-            }
+            send.send((ordered, leader));
         }),
     );
     async move {
         admitted.await.expect("write admission failed");
-        receive.await.expect("ordered write panicked")
+        let (ordered, leader) = receive.await.expect("ordered write panicked");
+        if let Some(leader) = leader {
+            let admitted = rt.spawn_flush(Box::new(move || leader.run()));
+            rt.spawn(Box::pin(async move {
+                let _ = admitted.await;
+            }));
+        }
+        ordered
     }
 }
 
@@ -256,36 +260,38 @@ mod tests {
     }
 
     #[test]
-    fn ordered_completion_precedes_the_flush_on_the_same_blocking_thread() {
-        let rt = Manual::default();
+    fn a_blocked_flush_never_holds_storage_admission() {
+        let rt = crate::Threads::configured(crate::threads::Config::for_cores(1));
         let flusher = Flusher::default();
         let (started, running) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
-        let ordered = unblock_flush(&rt, move || {
-            let appender = std::thread::current().id();
+        let (value, epoch) = crate::block_on(unblock_flush(&rt, move || {
             let request = flusher.enroll(move || {
-                assert_eq!(std::thread::current().id(), appender);
                 started.send(()).unwrap();
-                released.recv().unwrap();
+                let _ = released.recv();
                 Ok(())
             });
             ((7, request.epoch), request.leader)
-        });
-        std::thread::scope(|scope| {
-            let worker = lock(&rt.0).take().unwrap();
-            let worker = scope.spawn(worker);
-            running.recv().unwrap();
-            let mut ordered = std::pin::pin!(ordered);
-            let mut cx = Context::from_waker(std::task::Waker::noop());
-            let Poll::Ready((value, epoch)) = ordered.as_mut().poll(&mut cx) else {
-                panic!("ordering cannot wait for a blocked full flush");
-            };
-            assert_eq!(value, 7);
-            assert!(lock(&rt.0).is_none(), "no intermediate blocking job");
-            release.send(()).unwrap();
-            crate::block_on(epoch).unwrap();
-            worker.join().unwrap();
-        });
+        }));
+        assert_eq!(value, 7);
+        running
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let (done, received) = std::sync::mpsc::channel();
+        let next = rt.spawn_blocking(
+            crate::BlockingClass::Storage,
+            0,
+            Box::new(move || {
+                let _ = done.send(());
+            }),
+        );
+        rt.spawn(Box::pin(async move {
+            let _ = next.await;
+        }));
+        let proceeded = received.recv_timeout(std::time::Duration::from_secs(1));
+        release.send(()).unwrap();
+        proceeded.unwrap();
+        crate::block_on(epoch).unwrap();
     }
 
     #[test]
