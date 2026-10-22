@@ -31,7 +31,8 @@ native platform behaviour. The JSON records the source and harness
 revisions, Rust version, Cargo configuration, profile and variant.
 
 The mbx store and Cargo downloads are cached by OS, architecture and
-configuration. Rustup installs its pinned toolchain outside the cache, so a
+configuration. Rustup installs an explicitly native host toolchain in a private runner-local
+directory outside the cache, so a
 cancelled installation cannot leave a partial toolchain in subsequent runs. Intel macOS uses rust-cache for native Cargo artifacts because
 mbx 1.24.1 publishes no Intel macOS executable. Windows ARM installs native
 Hyperfine and mbx from the checked-in mise lockfile. Release and benchmark
@@ -100,7 +101,8 @@ imports for linker diagnostics. It does not claim a
 runtime budget pass. Full measurements remain the default.
 
 For tuning, `paired_ref` additionally builds a reference revision on the same
-runner. Five alternating AB/BA rounds measure startup, cold reply, attach,
+runner. Reference builds omit the protocol and TUI bench executables, which
+these paired windows do not use. Five alternating AB/BA rounds measure startup, cold reply, attach,
 idle RSS/CPU, driver turns and large JSON. Each role uses fresh isolated
 homes. All builds finish before these paired windows. Both raw observations
 and `paired.json` remain in the artifact, with a second summary table. Use

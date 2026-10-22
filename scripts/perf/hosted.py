@@ -73,7 +73,7 @@ def windows_image(binary):
     return dict(headers=headers, dependencies=dependencies)
 
 
-def build(source, output, variant, benchmarks=True):
+def build(source, output, variant, benchmarks=True, packages=("engine", "protocol", "tui")):
     config = list(variant.get("config", []))
     flags = variant.get("rustflags", [])
     if flags:
@@ -99,6 +99,8 @@ def build(source, output, variant, benchmarks=True):
     run(["cargo", "build-release", "-p", "a", "--example", "perf-attach", *overrides], cwd=source, env=env)
     shutil.copy2(release / "examples" / ("perf-attach" + SUFFIX), output / ("perf-attach" + SUFFIX))
     for package, target in [("engine", ["--lib"]), ("protocol", ["--test", "bench"]), ("tui", ["--lib"])]:
+        if package not in packages:
+            continue
         result = run(["cargo", "test", "--release", *STD, "-p", package, *target,
                       "--no-run", "--message-format=json", *overrides], cwd=source, env=env,
                      stdout=subprocess.PIPE, text=True)
@@ -244,7 +246,7 @@ def paired(output, source, reference):
     root.mkdir(exist_ok=True)
     reference_output = root / "reference"
     reference_output.mkdir(exist_ok=True)
-    build(reference_source, reference_output, {})
+    build(reference_source, reference_output, {}, packages=("engine",))
     builds = dict(reference=reference_output, candidate=output)
     values = {role: {} for role in builds}
     orders = []
