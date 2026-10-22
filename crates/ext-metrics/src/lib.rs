@@ -65,9 +65,15 @@ impl Prices {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Attempts {
+    pub executed: u64,
+    pub ambiguous: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Total {
-    pub attempts: u64,
+    pub attempts: Attempts,
     pub usage: [UsageTotal; 10],
     pub cost: UsageTotal,
     pub call_ns: UsageTotal,
@@ -92,7 +98,7 @@ struct Conversation {
     parent: Option<SessionId>,
     covered: ext::LogCursor,
     facts: Vec<CallFact>,
-    uncertain: Vec<CallId>,
+    uncertain: Vec<(CallId, u16)>,
 }
 
 impl Projection {
@@ -137,15 +143,35 @@ impl Projection {
                     Body::ModelResult { call, .. } | Body::Decision { call: Some(call), .. } if *call == f.id.call)
             });
             match &entry.body {
-                Body::ModelCall { r#for: None, .. } => log.uncertain.push(CallId(entry.seq)),
+                Body::ModelCall {
+                    r#for: None,
+                    attempt,
+                    ..
+                } => {
+                    log.uncertain.push((CallId(entry.seq), *attempt));
+                }
+                Body::Decision {
+                    call: Some(call),
+                    d:
+                        protocol::Verdict::Retry { attempt, .. }
+                        | protocol::Verdict::SideRetry { attempt, .. },
+                    ..
+                } if log.uncertain.iter().any(|(id, _)| id == call) => {
+                    log.uncertain.push((*call, *attempt));
+                }
                 Body::ModelResult { call, outcome, .. }
-                    if fact.is_some()
-                        || entry.execution.is_none()
-                            && !matches!(outcome, protocol::Outcome::Interrupted { .. }) =>
+                    if entry.execution.is_none()
+                        && !matches!(outcome, protocol::Outcome::Interrupted { .. }) =>
                 {
-                    log.uncertain.retain(|id| id != call);
+                    if let Some(i) = log.uncertain.iter().rposition(|(id, _)| id == call) {
+                        log.uncertain.remove(i);
+                    }
                 }
                 _ => {}
+            }
+            if let Some(fact) = &fact {
+                log.uncertain
+                    .retain(|id| *id != (fact.id.call, fact.id.attempt));
             }
             if before != log.uncertain.len() {
                 self.cached = None;
@@ -216,7 +242,7 @@ impl Projection {
                 {
                     continue;
                 }
-                total.attempts += 1;
+                total.attempts.executed += 1;
                 let usage = fact
                     .usage
                     .as_ref()
@@ -244,8 +270,9 @@ impl Projection {
             let missing = log
                 .uncertain
                 .iter()
-                .filter(|id| filter.call.is_none_or(|c| c == **id))
+                .filter(|(id, _)| filter.call.is_none_or(|c| c == *id))
                 .count() as u64;
+            total.attempts.ambiguous += missing;
             for count in &mut total.usage {
                 count.missing += missing;
             }

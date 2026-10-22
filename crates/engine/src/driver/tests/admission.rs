@@ -1281,7 +1281,7 @@ fn cancelled_before_provider_send_adds_no_executed_attempt() {
         currency: "USD".into(),
         models: Vec::new(),
     };
-    assert_eq!(projection.own(session.id, &prices).attempts, 0);
+    assert_eq!(projection.own(session.id, &prices).attempts.executed, 0);
 }
 
 struct StaleProcess;

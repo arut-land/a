@@ -354,7 +354,7 @@ fn every_provider_retry_has_one_execution_settlement() {
 }
 
 #[test]
-fn cancellation_after_send_leaves_execution_unknown() {
+fn cancellation_after_send_counts_one_executed_attempt() {
     let http = Flaky::new([Reply::Hang(String::new())]);
     let session = fixture(quick(), &http).start(&[]);
     session.submit("hi").unwrap();
@@ -364,7 +364,14 @@ fn cancellation_after_send_leaves_execution_unknown() {
     let log = log_of(&session);
     session.halt();
     assert_eq!(http.sent(), 1);
-    assert!(log.iter().all(|e| e.execution.is_none()));
+    let facts: Vec<_> = log
+        .iter()
+        .filter_map(|e| e.execution.as_ref())
+        .map(|j| protocol::CallFact::from_json(j).unwrap())
+        .collect();
+    assert_eq!(facts.len(), 1);
+    assert!(facts[0].elapsed_ns.is_some_and(|ns| ns > 0));
+    assert!(facts[0].usage.is_none());
     let mut projection = ext_metrics::Projection::default();
     projection.fold(&ext::LogPrefix {
         session: session.id,
@@ -382,13 +389,34 @@ fn cancellation_after_send_leaves_execution_unknown() {
             models: Vec::new(),
         },
     );
-    assert_eq!(total.attempts, 0);
     assert_eq!(
-        total.call_ns,
-        ext_metrics::UsageTotal {
-            known: 0,
-            missing: 1
+        total.attempts,
+        ext_metrics::Attempts {
+            executed: 1,
+            ambiguous: 0
         }
     );
+    assert!(total.call_ns.known > 0);
+    assert_eq!(total.call_ns.missing, 0);
     assert!(total.usage.iter().all(|u| u.missing == 1));
+}
+
+#[test]
+fn a_streaming_failure_retains_execution_timing() {
+    let http = Flaky::new([Reply::Events(cut(&text_reply(), 3))]);
+    let session = fixture(Registry::default(), &http).start(&[]);
+    session.submit("hi").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 1);
+    assert!(matches!(model_result(&log), Some(Outcome::Failed { .. })));
+    let facts: Vec<_> = log
+        .iter()
+        .filter_map(|e| e.execution.as_ref())
+        .map(|j| protocol::CallFact::from_json(j).unwrap())
+        .collect();
+    assert_eq!(facts.len(), 1);
+    assert!(facts[0].elapsed_ns.is_some_and(|ns| ns > 0));
+    assert!(facts[0].usage.is_none());
 }

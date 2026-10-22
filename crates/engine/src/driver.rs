@@ -2678,7 +2678,7 @@ async fn reply(
                 .and_then(llm::Error::usage_json)
         });
     let Some(read) = read else {
-        observed.started = None;
+        observed.usage = None;
         let text = events.and_then(llm::Events::interrupted);
         return (Replied::Interrupted(text), None);
     };

@@ -235,9 +235,11 @@ Execution metadata rides on the existing result or retry settlement in the
 same commit; recording metrics adds no entries or flushes. Facts freeze the
 resolved
 model, role, runner, agent, side classification, wall-clock correlation and
-monotonic clock epoch. An intent without execution settlement retains unknown
-usage and duration without claiming an executed attempt. No start fact is
-recorded. Cancellation leaves an intent without execution settlement. Usage
+monotonic clock epoch. Unsettled intents retain unknown
+usage and duration per attempt, even after a later retry succeeds. Attempt
+counts distinguish `executed` from `ambiguous`: a crash cannot prove whether
+an intent was sent. No start fact is recorded. Cancellation after sending
+settles one executed attempt with measured duration and unknown usage. Usage
 counts are captured in `llm` before reply serialization,
 including failed finishes; missing counts remain unknown. No elapsed duration
 is reconstructed by subtracting clocks across a restart.

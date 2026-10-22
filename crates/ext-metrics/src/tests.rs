@@ -79,7 +79,7 @@ fn retries_count_each_executed_attempt_once() {
         vec![first.clone(), first, fact(id, 1, 10, Some(10))],
     ));
     let total = p.own(id, &prices());
-    assert_eq!(total.attempts, 2);
+    assert_eq!(total.attempts.executed, 2);
     assert_eq!(
         total.usage[0],
         UsageTotal {
@@ -117,8 +117,8 @@ fn cached_replay_and_copied_forks_add_no_spend() {
     p.fold(&original);
     p.fold(&original);
     p.fold(&log(fork, None, vec![f]));
-    assert_eq!(p.own(id, &prices()).attempts, 1);
-    assert_eq!(p.own(fork, &prices()).attempts, 0);
+    assert_eq!(p.own(id, &prices()).attempts.executed, 1);
+    assert_eq!(p.own(fork, &prices()).attempts.executed, 0);
 }
 #[test]
 fn subtree_totals_count_descendants_once() {
@@ -133,8 +133,8 @@ fn subtree_totals_count_descendants_once() {
         p.fold(&prefix);
         p.fold(&prefix);
     }
-    assert_eq!(p.subtree(root, &prices()).attempts, 3);
-    assert_eq!(p.own(root, &prices()).attempts, 1);
+    assert_eq!(p.subtree(root, &prices()).attempts.executed, 3);
+    assert_eq!(p.own(root, &prices()).attempts.executed, 1);
     assert_eq!(
         p.query(
             root,
@@ -145,7 +145,8 @@ fn subtree_totals_count_descendants_once() {
             },
             &prices()
         )
-        .attempts,
+        .attempts
+        .executed,
         1
     );
     assert_eq!(
@@ -158,7 +159,8 @@ fn subtree_totals_count_descendants_once() {
             },
             &prices()
         )
-        .attempts,
+        .attempts
+        .executed,
         0
     );
 }
@@ -299,7 +301,8 @@ fn pricing_adjustments_require_observed_subsets() {
             },
             &table
         )
-        .attempts,
+        .attempts
+        .executed,
         0
     );
 }
@@ -335,7 +338,13 @@ fn an_unsettled_intent_has_unknown_spend_without_claiming_execution() {
     let mut projection = Projection::default();
     projection.fold(&prefix);
     let total = projection.own(id, &prices());
-    assert_eq!(total.attempts, 0);
+    assert_eq!(
+        total.attempts,
+        Attempts {
+            executed: 0,
+            ambiguous: 1
+        }
+    );
     assert_eq!(total.usage[0].missing, 1);
     assert_eq!(total.call_ns.missing, 1);
 }
@@ -394,7 +403,7 @@ fn copied_interrupted_intents_do_not_create_unknown_spend() {
     let mut projection = Projection::default();
     projection.fold(&prefix);
     let total = projection.own(id, &prices());
-    assert_eq!(total.attempts, 1);
+    assert_eq!(total.attempts.executed, 1);
     assert_eq!(total.usage[0].missing, 0);
 }
 
@@ -420,6 +429,69 @@ fn overlapping_suffixes_do_not_duplicate_uncertain_intents() {
     projection.fold(&prefix);
     projection.fold(&prefix);
     assert_eq!(projection.own(id, &prices()).usage[0].missing, 1);
+}
+
+#[test]
+fn successful_recovery_keeps_the_crashed_attempts_usage_unknown() {
+    let id = SessionId::new();
+    let mut prefix = log(id, None, vec![fact(id, 1, 10, Some(10))]);
+    prefix.entries[0].seq = Seq::new(3).unwrap();
+    prefix.entries.splice(
+        0..0,
+        [
+            Entry::new(
+                Seq::new(1).unwrap(),
+                Epoch(0),
+                Body::ModelCall {
+                    model: "test".into(),
+                    attempt: 0,
+                    choice: protocol::ToolChoice::Auto,
+                    r#for: None,
+                    purpose: None,
+                    request: None,
+                },
+            ),
+            Entry::new(
+                Seq::new(2).unwrap(),
+                Epoch(1),
+                Body::Decision {
+                    call: CallId::new(1),
+                    by: "retry".into(),
+                    d: protocol::Verdict::Retry {
+                        attempt: 1,
+                        error: "daemon stopped during attempt zero".into(),
+                    },
+                },
+            ),
+        ],
+    );
+    prefix.entries[2].epoch = Epoch(1);
+    prefix.entries[2].body = Body::ModelResult {
+        call: CallId::new(1).unwrap(),
+        r#for: None,
+        outcome: protocol::Outcome::Done {
+            output: Json::encode(&"recovered").unwrap(),
+        },
+        failure: None,
+    };
+    prefix.cursor.seq = 3;
+    let mut projection = Projection::default();
+    projection.fold(&prefix);
+    let total = projection.own(id, &prices());
+    assert_eq!(
+        total.attempts,
+        Attempts {
+            executed: 1,
+            ambiguous: 1
+        }
+    );
+    assert_eq!(
+        total.usage[0],
+        UsageTotal {
+            known: 10,
+            missing: 1
+        }
+    );
 }
 
 #[test]
@@ -469,7 +541,7 @@ fn unreadable_settlement_metadata_preserves_uncertainty() {
     let mut projection = Projection::default();
     projection.fold(&prefix);
     let total = projection.own(id, &prices());
-    assert_eq!(total.attempts, 0);
+    assert_eq!(total.attempts.executed, 0);
     assert_eq!(total.usage[0].missing, 1);
 }
 
@@ -514,7 +586,7 @@ fn a_retry_without_execution_settlement_remains_unknown_after_restart() {
     let mut projection = Projection::default();
     projection.fold(&prefix);
     let total = projection.own(id, &prices());
-    assert_eq!(total.attempts, 1);
+    assert_eq!(total.attempts.executed, 1);
     assert_eq!(
         total.usage[0],
         UsageTotal {
