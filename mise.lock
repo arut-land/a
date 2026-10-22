@@ -47,6 +47,11 @@ checksum = "sha256:4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196
 url = "https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
 url_api = "https://api.github.com/repos/yonaskolb/XcodeGen/releases/assets/478866069"
 
+[tools."aqua:yonaskolb/XcodeGen"."platforms.macos-x64"]
+checksum = "sha256:4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
+url = "https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
+url_api = "https://api.github.com/repos/yonaskolb/XcodeGen/releases/assets/478866069"
+
 [[tools."cargo:cargo-bloat"]]
 version = "0.12.1"
 backend = "cargo:cargo-bloat"
@@ -115,6 +120,11 @@ url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/64052245
 checksum = "sha256:3837df80dae7d8d1d84f6b9c73890b9b6f79b3b74360d9b5a788524740b7bfdf"
 url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-darwin-aarch64.tar.gz"
 url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640537186"
+
+[tools."github:boltffi/boltffi"."platforms.macos-x64"]
+checksum = "sha256:a2d180c6eef4bdd40535e7535a5627032e9d0d92a63c6fed302ebfd17ddddbc7"
+url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-darwin-x86_64.tar.gz"
+url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640544290"
 
 [tools."github:boltffi/boltffi"."platforms.windows-x64"]
 checksum = "sha256:8a5cd4e01114432f40b80b90f5a7fe3e892e39f6a717a056595c41f0483b8e60"

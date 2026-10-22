@@ -40,6 +40,19 @@ jobs:
     runs-on: ${{ matrix.os == 'macos-latest' && inputs.macos_runner || matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      # mbx has no Intel macOS executable; Cargo can own its build cache there.
+      - &native-cargo
+        if: runner.os == 'macOS' && runner.arch == 'X64'
+        name: Use native Cargo
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          path = Path('mise.toml')
+          text = path.read_text().replace('mr-boxington = "1.24.1"\n', '')
+          start = text.index('[wrappers.cargo]\n')
+          end = text.index('[tasks]\n', start)
+          path.write_text(text[:start] + text[end:])
+          PYTHON
       # mbx (the cargo wrapper in mise.toml) keeps compiled crates in its own
       # store; caching that store and the toolchain is what makes reruns fast.
       - &mbx-dir
@@ -58,7 +71,7 @@ jobs:
       - &mise
         uses: jdx/mise-action@v5
         with:
-          install_args: rust mr-boxington cargo:cargo-nextest ${{ runner.os == 'Linux' && 'mold' || '' }}
+          install_args: rust ${{ (runner.os != 'macOS' || runner.arch != 'X64') && 'mr-boxington' || '' }} cargo:cargo-nextest ${{ runner.os == 'Linux' && 'mold' || '' }}
       # The no-polling acceptance test traces the client's syscalls.
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev strace
@@ -86,6 +99,7 @@ jobs:
       A_STRICT_BUDGETS: ${{ matrix.strict }}
     steps:
       - uses: actions/checkout@v7
+      - *native-cargo
       - *mbx-dir
       - *cache
       - *mise
@@ -202,7 +216,7 @@ jobs:
       - *cache
       - uses: jdx/mise-action@v5
         with:
-          install_args: rust mr-boxington cargo:cargo-nextest
+          install_args: rust ${{ (runner.os != 'macOS' || runner.arch != 'X64') && 'mr-boxington' || '' }} cargo:cargo-nextest
       - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
       - run: mise exec -- cargo build -p a
       - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
@@ -215,11 +229,12 @@ jobs:
     runs-on: ${{ inputs.macos_runner || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v7
+      - *native-cargo
       - *mbx-dir
       - *cache
       - uses: jdx/mise-action@v5
         with:
-          install_args: rust mr-boxington github:boltffi/boltffi aqua:yonaskolb/XcodeGen
+          install_args: rust ${{ (runner.os != 'macOS' || runner.arch != 'X64') && 'mr-boxington' || '' }} github:boltffi/boltffi aqua:yonaskolb/XcodeGen
       - run: mise run apple:test
       - run: mise run apple:build
 
