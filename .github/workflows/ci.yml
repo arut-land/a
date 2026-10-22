@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      measure_refs:
+        description: 'JSON array of revisions to measure on Apple silicon'
+        type: string
+        default: '[]'
 
 permissions:
   contents: read
@@ -212,3 +217,31 @@ jobs:
           install_args: rust mr-boxington github:boltffi/boltffi aqua:yonaskolb/XcodeGen
       - run: mise run apple:test
       - run: mise run apple:build
+
+  measurements:
+    if: github.event_name == 'workflow_dispatch' && inputs.measure_refs != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: ${{ fromJSON(inputs.measure_refs) }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.revision }}
+      - *mbx-dir
+      - *cache
+      - *mise
+      - run: mise run size
+      - name: Record exact shipped bytes and source lines
+        shell: bash
+        run: |
+          revision=$(git rev-parse HEAD)
+          bytes=$(wc -c < target/release/a | tr -d ' ')
+          lines=$(git ls-files '*.rs' | xargs cat | wc -l | tr -d ' ')
+          echo "$revision,$lines,$bytes" | tee measurement.csv
+          echo "Revision: $revision; Rust lines: $lines; shipped bytes: $bytes" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: measurement-${{ matrix.revision }}
+          path: measurement.csv
