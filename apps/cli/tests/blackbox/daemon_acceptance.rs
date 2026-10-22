@@ -10,16 +10,10 @@ use std::time::{Duration, Instant};
 fn concurrent_starters_share_one_daemon_and_stop_releases_its_lock() {
     let env = Isolated::new("concurrent");
     let clients: Vec<_> = (0..8)
-        .map(|_| env.command(&["ls"]).spawn().unwrap())
+        .map(|_| TestProcess::spawn(&mut env.command(&["ls"])))
         .collect();
     for child in clients {
-        assert!(
-            TestProcess::from(child)
-                .collect(deadline())
-                .unwrap()
-                .status
-                .success()
-        );
+        assert!(child.collect(deadline()).unwrap().status.success());
     }
     let pid = env.pid();
     env.run(&["ls"]);
@@ -104,14 +98,8 @@ fn two_installs_upgrade_once_and_the_older_client_never_downgrades() {
 #[test]
 fn a_cold_clients_output_reaches_eof_while_the_daemon_stays_alive() {
     let env = Isolated::new("stdio-eof");
-    let child = env
-        .command(&["ls"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
     assert!(
-        TestProcess::from(child)
+        TestProcess::spawn(&mut env.command(&["ls"]))
             .collect(deadline())
             .unwrap()
             .status

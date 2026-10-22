@@ -287,3 +287,33 @@ impl Drop for Isolated {
         remove_home(self.home.root());
     }
 }
+
+#[test]
+fn a_collection_timeout_distinguishes_an_exited_child_from_an_open_stream() {
+    struct GatedReader(mpsc::Receiver<()>);
+    impl Read for GatedReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_a"));
+    command.arg("--version");
+    let mut process = TestProcess::spawn(&mut command);
+    let Process::Piped(child) = &mut process.child else {
+        unreachable!();
+    };
+    let pid = child.id();
+    child.wait().unwrap();
+    let (release, gate) = mpsc::channel();
+    process.readers = [Some(Box::new(GatedReader(gate))), None];
+    let error = process.collect(Instant::now()).unwrap_err();
+    drop(release);
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    let message = error.to_string();
+    assert!(message.contains(&format!("pid={pid}")), "{message}");
+    assert!(message.contains("--version"), "{message}");
+    assert!(message.contains("status=Some("), "{message}");
+    assert!(message.contains("stdout=pending stderr=eof"), "{message}");
+}
