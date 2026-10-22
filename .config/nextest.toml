@@ -1,0 +1,3 @@
+[profile.windows]
+# A blocked native operation must fail the test instead of stalling CI.
+slow-timeout = { period = "60s", terminate-after = 2 }

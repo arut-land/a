@@ -179,6 +179,7 @@ jobs:
       # Session panic isolation and the test harness require unwinding;
       # Cranelift does not support it on Windows.
       CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+      NEXTEST_PROFILE: windows
     defaults:
       run:
         shell: bash
