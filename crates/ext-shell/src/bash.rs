@@ -27,7 +27,6 @@ use std::time::{Duration, Instant};
 
 use protocol::{Card, Environment, Mark};
 use serde::{Deserialize, Serialize};
-use sys::Signal;
 
 pub use crate::output::OUTPUT_CAP;
 use crate::output::{Live, Output, Rendered, create_private, private_dir};
@@ -469,7 +468,7 @@ impl Run {
     /// The next state at `now`, and the signal to send the group to get
     /// there. The shell's exit ends any state but its own; a stop starts
     /// only while it runs.
-    fn step(self, now: Instant, seen: Seen) -> (Self, Option<Signal>) {
+    fn step(self, now: Instant, seen: Seen) -> (Self, Option<ProcessSignal>) {
         let exited = |status, why| {
             (
                 Self::Exited {
@@ -494,7 +493,7 @@ impl Run {
                     return (self, None);
                 };
                 let kill = KillPhase::Term { at: now };
-                (Self::Stopping { why, kill }, Some(Signal::Terminate))
+                (Self::Stopping { why, kill }, Some(ProcessSignal::Terminate))
             }
             (
                 Self::Stopping {
@@ -504,7 +503,7 @@ impl Run {
                 None,
             ) if now >= at + GRACE => {
                 let kill = KillPhase::Killed;
-                (Self::Stopping { why, kill }, Some(Signal::Kill))
+                (Self::Stopping { why, kill }, Some(ProcessSignal::Kill))
             }
             (Self::Exited { .. }, _) | (Self::Stopping { .. }, None) => (self, None),
         }
@@ -615,10 +614,7 @@ async fn supervise(
         let signal;
         (run, signal) = run.step(now, seen);
         if let Some(signal) = signal {
-            let _ = child.signal(match signal {
-                Signal::Terminate => ProcessSignal::Terminate,
-                _ => ProcessSignal::Kill,
-            });
+            let _ = child.signal(signal);
         }
         if let Run::Exited { status, why, at } = run {
             let quiet = now >= heard.max(at) + IDLE;

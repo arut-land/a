@@ -543,7 +543,7 @@ fn the_supervisor_moves_only_as_its_states_allow() {
         why: Stop::Aborted,
         kill: KillPhase::Killed,
     };
-    let term_signal = Some(Signal::Terminate);
+    let term_signal = Some(ProcessSignal::Terminate);
     let timed_out = Run::Stopping {
         why: Stop::TimedOut,
         kill: KillPhase::Term { at: later },
@@ -561,7 +561,7 @@ fn the_supervisor_moves_only_as_its_states_allow() {
             t + GRACE,
             seen,
             killed,
-            Some(Signal::Kill),
+            Some(ProcessSignal::Kill),
         ),
         (killed, later, seen, killed, None),
         (
@@ -576,9 +576,11 @@ fn the_supervisor_moves_only_as_its_states_allow() {
         (exited(None), later, flood, exited(None), None),
     ];
     for (from, now, seen, to, signal) in table {
+        let (state, sent) = from.step(now, seen);
+        let kind = |signal| std::mem::discriminant(&signal);
         assert_eq!(
-            from.step(now, seen),
-            (to, signal),
+            (state, sent.map(kind)),
+            (to, signal.map(kind)),
             "{from:?} seeing {seen:?}"
         );
     }
