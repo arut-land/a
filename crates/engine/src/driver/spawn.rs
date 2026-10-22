@@ -16,7 +16,7 @@ pub(crate) struct SpawnIntent {
     pub model: String,
     pub routing: Result<crate::model::FrozenRoute, String>,
     pub installed: Vec<protocol::Installed>,
-    pub image: Vec<Json>,
+    pub image: protocol::publication::ContextImage,
     pub extensions: Vec<String>,
     pub settings: ext::Checkpoint,
     pub refusal: Option<SpawnRefusal>,
@@ -294,7 +294,7 @@ impl Actor {
             .models
             .model(&session.workspace, env.as_deref(), &model)
             .map(|m| m.freeze());
-        let mut image = Vec::new();
+        let mut image = protocol::publication::ContextImage::default();
         let installed = registry.installed();
         if let ext::ContextSource::Prefix { session, seq } = request.context {
             if session != self.live.id || seq.get() > self.journal.ordered_seq {

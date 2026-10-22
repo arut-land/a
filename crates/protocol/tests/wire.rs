@@ -49,6 +49,48 @@ fn envelope() -> protocol::Envelope {
     }
 }
 
+fn context_image() -> protocol::publication::ContextImage {
+    use protocol::publication::{
+        ContextInput, ContextLayer, ContextValue, Publication, RunnerKind,
+    };
+    let values = [
+        ContextValue::Inherited(1),
+        ContextValue::User("summary at an excluded position".into()),
+        ContextValue::Queued("consumed input".into()),
+        ContextValue::Taken(Seq::new(3).unwrap()),
+        ContextValue::Assistant("answer".into()),
+        ContextValue::Context(
+            "published context".into(),
+            Some(Publication {
+                namespace: "skills".into(),
+                key: protocol::Json::encode("review").unwrap(),
+            }),
+        ),
+        ContextValue::Child(Outcome::Interrupted { output: None }),
+        ContextValue::Reply(protocol::Json::null()),
+        ContextValue::ToolCall("provider-id".into(), "example".into()),
+        ContextValue::ToolResult(
+            CallId::new(9).unwrap(),
+            Outcome::Interrupted { output: None },
+        ),
+    ];
+    let inputs: Vec<_> = values
+        .into_iter()
+        .zip(1..)
+        .map(|(value, seq)| ContextInput(Seq::new(seq).unwrap(), value))
+        .collect();
+    vec![
+        ContextLayer(RunnerKind::Agent, inputs),
+        ContextLayer(
+            RunnerKind::ModelOnly,
+            vec![ContextInput(
+                Seq::new(1).unwrap(),
+                ContextValue::User("ancestor".into()),
+            )],
+        ),
+    ]
+}
+
 fn client_samples() -> Vec<Sample<ClientMsg>> {
     let env = Environment {
         cwd: "/w".into(),
@@ -724,9 +766,9 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         sample("entry_enqueue", entry(1, Body::Enqueue { envelope: envelope() })),
         sample("entry_ack", entry(2, Body::Ack { envelope_id: envelope().id, refusal: None })),
         sample("entry_inbox_full", entry(2, Body::Ack { envelope_id: envelope().id, refusal: Some(protocol::InboxRefusal::Full) })),
-        sample("entry_spawned_model_only", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::ModelOnly, authority: protocol::Json::null(), image: Vec::new() }.to_json().unwrap() })),
+        sample("entry_spawned_model_only", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::ModelOnly, authority: protocol::Json::null(), image: protocol::publication::ContextImage::default() }.to_json().unwrap() })),
         sample("entry_model_thread", entry(2, Body::ModelCall { model: "example:model".into(), attempt: 0, choice: protocol::ToolChoice::None, r#for: CallId::new(1), purpose: Some("example".into()), request: Some(protocol::publication::ThreadImage { turn: protocol::Json::null(), authority: protocol::Json::null() }.to_json().unwrap()) })),
-        sample("entry_spawned", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::Agent, authority: protocol::Json::null(), image: Vec::new() }.to_json().unwrap() })),
+        sample("entry_spawned", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::Agent, authority: protocol::Json::null(), image: context_image() }.to_json().unwrap() })),
         sample(
             "entry_watch",
             entry(

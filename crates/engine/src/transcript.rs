@@ -1,12 +1,13 @@
 //! What a session's log says, read back for the model: the conversation
 //! it sees.
 
-use std::borrow::{Borrow, Cow};
-use std::collections::HashMap;
+use std::borrow::Borrow;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ext::host::Registry;
 use llm::{Assistant, Message, Messages, ToolMessage, ToolResult};
+use protocol::publication::{ContextImage, ContextInput, ContextLayer, ContextValue, RunnerKind};
 use protocol::{Body, CallId, Entry, Outcome, Seq, Verdict};
 
 /// Provider replies remain intact; live updates and recovery share projection rules.
@@ -30,50 +31,32 @@ pub struct Transcript {
     registry: Arc<Registry>,
 }
 
-// Both the live reducer and immutable images admit context through this seam.
-enum ContextFact<'a> {
-    Inherited(&'a protocol::Json),
-    User(&'a str),
-    Queued(&'a str),
-    Taken(Seq),
-    Assistant(&'a str),
-    Context(&'a str),
-    Child(&'a Outcome),
-    Reply(&'a protocol::Json),
-    ToolCall { id: &'a str, tool: &'a str },
-    ToolResult { call: CallId, outcome: &'a Outcome },
-    Edit,
-}
-
-fn context_fact(body: &Body) -> Option<ContextFact<'_>> {
+fn context_fact(body: &Body) -> Option<ContextValue> {
     Some(match body {
-        Body::Spawned { intent } => ContextFact::Inherited(intent),
         Body::Input {
             text, taken: true, ..
         }
         | Body::Decision {
             d: Verdict::OnStop { text },
             ..
-        } => ContextFact::User(text),
-        Body::Input { text, .. } => ContextFact::Queued(text),
-        Body::Enqueue { envelope } => ContextFact::Queued(&envelope.payload),
-        Body::Take { input } => ContextFact::Taken(*input),
-        Body::Assistant { text } => ContextFact::Assistant(text),
-        Body::Context { text, .. } => ContextFact::Context(text),
-        Body::Fired { outcome, .. } => ContextFact::Child(outcome),
+        } => ContextValue::User(text.clone()),
+        Body::Input { text, .. } => ContextValue::Queued(text.clone()),
+        Body::Enqueue { envelope } => ContextValue::Queued(envelope.payload.clone()),
+        Body::Take { input } => ContextValue::Taken(*input),
+        Body::Assistant { text } => ContextValue::Assistant(text.clone()),
+        Body::Context { text, publication } => {
+            ContextValue::Context(text.clone(), publication.clone())
+        }
+        Body::Fired { outcome, .. } => ContextValue::Child(outcome.clone()),
         Body::ModelResult {
             r#for: None,
             outcome: Outcome::Done { output },
             ..
-        } => ContextFact::Reply(output),
+        } => ContextValue::Reply(output.clone()),
         Body::ToolCall {
             tool, id: Some(id), ..
-        } => ContextFact::ToolCall { id, tool },
-        Body::ToolResult { call, outcome, .. } => ContextFact::ToolResult {
-            call: *call,
-            outcome,
-        },
-        Body::Edit { .. } => ContextFact::Edit,
+        } => ContextValue::ToolCall(id.clone(), tool.clone()),
+        Body::ToolResult { call, outcome, .. } => ContextValue::ToolResult(*call, outcome.clone()),
         _ => return None,
     })
 }
@@ -89,8 +72,14 @@ impl Transcript {
         system: &str,
     ) -> Self {
         let entries: Vec<_> = entries.into_iter().collect();
-        ContextImage::new(entries.iter().map(|e| Cow::Borrowed(e.borrow())).collect())
-            .project(Self::empty(registry, system))
+        project(
+            normalize(
+                &entries.iter().map(Borrow::borrow).collect::<Vec<_>>(),
+                false,
+            ),
+            registry,
+            system,
+        )
     }
 
     fn empty(registry: Arc<Registry>, system: &str) -> Self {
@@ -110,34 +99,39 @@ impl Transcript {
     /// Folds entry `e`. `fresh` is the message of the reply this daemon
     /// just had, which `e` stores: taken as it is rather than read again.
     pub fn apply(&mut self, e: &Entry, fresh: Option<Assistant>) {
-        let message = match context_fact(&e.body) {
-            Some(ContextFact::Inherited(intent)) => {
-                if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
-                    self.model_only = image.runner == protocol::publication::RunnerKind::ModelOnly;
-                    let messages =
-                        ContextImage::new(image.entries().into_iter().map(Cow::Owned).collect())
-                            .project(Self::empty(Arc::clone(&self.registry), ""))
-                            .into_context();
-                    for message in messages.iter() {
-                        self.messages.push(message.clone());
-                    }
-                    self.context = self.messages.len();
-                    self.last = e.seq.get();
-                }
+        if let Body::Spawned { intent } = &e.body {
+            if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
+                self.model_only = image.runner == RunnerKind::ModelOnly;
+                let messages = project(image.image, Arc::clone(&self.registry), "").into_context();
+                self.inherit(&messages, e.seq);
+            }
+        } else if let Some(value) = context_fact(&e.body) {
+            self.apply_input(e.seq, value, fresh);
+        }
+    }
+
+    fn inherit(&mut self, messages: &Messages, seq: Seq) {
+        for message in messages.iter() {
+            self.messages.push(message.clone());
+        }
+        self.context = self.messages.len();
+        self.last = seq.get();
+    }
+
+    fn apply_input(&mut self, seq: Seq, value: ContextValue, fresh: Option<Assistant>) {
+        let message = match value {
+            ContextValue::User(text) => Message::user(text),
+            ContextValue::Queued(text) => {
+                self.waiting.insert(seq, text);
                 return;
             }
-            Some(ContextFact::User(text)) => Message::user(text.to_owned()),
-            Some(ContextFact::Queued(text)) => {
-                self.waiting.insert(e.seq, text.to_owned());
-                return;
-            }
-            Some(ContextFact::Taken(input)) => match self.waiting.remove(&input) {
+            ContextValue::Taken(input) => match self.waiting.remove(&input) {
                 Some(text) if self.model_only => {
                     if let Ok((turn, _)) = ext::ModelTurn::from_intent(&text) {
                         for message in turn.messages.iter() {
                             self.messages.push(message.clone());
                         }
-                        self.last = e.seq.get();
+                        self.last = seq.get();
                         return;
                     }
                     Message::user(text)
@@ -145,16 +139,15 @@ impl Transcript {
                 Some(text) => Message::user(text),
                 None => return,
             },
-            Some(ContextFact::Assistant(text)) => Message::assistant(text.to_owned()),
-            Some(ContextFact::Context(text)) => {
-                self.messages
-                    .insert(self.context, Message::user(text.to_owned()));
+            ContextValue::Assistant(text) => Message::assistant(text),
+            ContextValue::Context(text, _) => {
+                self.messages.insert(self.context, Message::user(text));
                 self.context += 1;
-                self.last = e.seq.get();
+                self.last = seq.get();
                 return;
             }
-            Some(ContextFact::Child(outcome)) => Message::user(ext::child_result(outcome)),
-            Some(ContextFact::Reply(output)) => {
+            ContextValue::Child(outcome) => Message::user(ext::child_result(&outcome)),
+            ContextValue::Reply(output) => {
                 let reply = match fresh {
                     Some(message) => Ok(message),
                     None => llm::Response::from_json(output.raw()).map(|r| r.message),
@@ -164,16 +157,15 @@ impl Transcript {
                     Err(_) => return,
                 }
             }
-            Some(ContextFact::ToolCall { id, tool }) => {
-                self.calls
-                    .insert(CallId(e.seq), (id.to_owned(), tool.to_owned()));
+            ContextValue::ToolCall(id, tool) => {
+                self.calls.insert(CallId(seq), (id, tool));
                 return;
             }
-            Some(ContextFact::ToolResult { call, outcome }) => {
+            ContextValue::ToolResult(call, outcome) => {
                 let Some((id, tool)) = self.calls.remove(&call) else {
                     return;
                 };
-                let (output, error) = self.registry.tools().to_model(&tool, outcome);
+                let (output, error) = self.registry.tools().to_model(&tool, &outcome);
                 let result = ToolResult {
                     id: id.into(),
                     name: tool.into(),
@@ -181,7 +173,7 @@ impl Transcript {
                     error,
                     meta: llm::Meta::new(),
                 };
-                self.last = e.seq.get();
+                self.last = seq.get();
                 // Only a tool message changes to take the result.
                 if let Some(Message::Tool(answers)) = self.messages.last_mut() {
                     let at = self.answered.partition_point(|&seq| seq < call);
@@ -195,10 +187,10 @@ impl Transcript {
                 }
                 return;
             }
-            _ => return,
+            ContextValue::Inherited(_) => return,
         };
         self.messages.push(message);
-        self.last = e.seq.get();
+        self.last = seq.get();
     }
 
     /// Whether the tools of `registry` presented the results.
@@ -215,7 +207,7 @@ impl Transcript {
     pub fn into_context(self) -> Messages {
         let mut messages: Vec<_> = self.messages.iter().cloned().collect();
         let mut requested = HashMap::new();
-        let mut answered: HashMap<usize, std::collections::HashSet<_>> = HashMap::new();
+        let mut answered: HashMap<usize, HashSet<_>> = HashMap::new();
         for (at, message) in messages.iter_mut().enumerate() {
             match message {
                 Message::Assistant(a) => {
@@ -272,154 +264,95 @@ fn context_edits(
         .collect()
 }
 
-/// Sequence numbers belong to their layer; inherited authority is never projected.
-struct ContextImage<'a> {
-    layers: Vec<Vec<ContextInput<'a>>>,
+/// Edits stay in their owning layer; only inherited anchors are rebased.
+pub(crate) fn context_image(entries: &[Entry]) -> ContextImage {
+    normalize(&entries.iter().collect::<Vec<_>>(), true)
 }
 
-enum ContextInput<'a> {
-    Entry(Cow<'a, Entry>),
-    Replacement { seq: Seq, text: String },
-    Inherited { seq: Seq, layer: usize },
-}
-
-impl<'a> ContextImage<'a> {
-    fn new(entries: Vec<Cow<'a, Entry>>) -> Self {
-        let mut pending = vec![entries];
-        let mut layers = Vec::new();
-        let mut at = 0;
-        while at < pending.len() {
-            let entries = std::mem::take(&mut pending[at]);
-            let edits = context_edits(entries.iter().map(AsRef::as_ref));
-            let mut inputs = Vec::new();
-            for entry in entries {
-                let edit = edits
-                    .iter()
-                    .rev()
-                    .find(|(from, to, _)| (*from..=*to).contains(&entry.seq.get()));
-                if let Some((from, _, text)) = edit {
-                    if *from == entry.seq.get()
-                        && let Some(text) = text
-                    {
-                        inputs.push(ContextInput::Replacement {
-                            seq: entry.seq,
-                            text: text.clone(),
-                        });
-                    }
-                    continue;
-                }
-                if let Body::Spawned { intent } = &entry.body {
-                    if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
-                        if image.runner == protocol::publication::RunnerKind::ModelOnly {
-                            inputs.push(ContextInput::Entry(entry));
-                            continue;
-                        }
-                        inputs.push(ContextInput::Inherited {
-                            seq: entry.seq,
-                            layer: pending.len(),
-                        });
-                        pending.push(image.entries().into_iter().map(Cow::Owned).collect());
-                    }
-                } else if context_fact(&entry.body).is_some() {
-                    inputs.push(ContextInput::Entry(entry));
-                }
+fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
+    let edits = context_edits(entries.iter().copied());
+    let completed = inherited.then(|| {
+        entries
+            .iter()
+            .filter_map(|e| match &e.body {
+                Body::ToolResult { call, .. } => Some(call.0),
+                Body::Take { input } => Some(*input),
+                _ => None,
+            })
+            .collect::<HashSet<_>>()
+    });
+    let mut image = vec![ContextLayer::default()];
+    for e in entries {
+        let value = if let Some((from, _, text)) = edits
+            .iter()
+            .rev()
+            .find(|(from, to, _)| (*from..=*to).contains(&e.seq.get()))
+        {
+            if *from != e.seq.get() {
+                continue;
             }
-            layers.push(inputs);
-            at += 1;
-        }
-        Self { layers }
-    }
-
-    fn project(self, root: Transcript) -> Transcript {
-        let mut root = Some(root);
-        let mut inherited = HashMap::new();
-        for (layer, inputs) in self.layers.into_iter().enumerate().rev() {
-            let mut transcript = if layer == 0 {
-                root.take().expect("root reduced once")
+            let Some(text) = text else {
+                continue;
+            };
+            ContextValue::User(text.clone())
+        } else if let Body::Spawned { intent } = &e.body {
+            let Ok(mut spawn) = protocol::publication::SpawnImage::from_json(intent) else {
+                continue;
+            };
+            image[0].0 = spawn.runner;
+            let offset = image.len();
+            if spawn.image.is_empty() {
+                image.push(ContextLayer::default());
             } else {
-                Transcript::empty(
-                    Arc::clone(&root.as_ref().expect("root reduced last").registry),
-                    "",
-                )
-            };
-            for input in inputs {
-                match input {
-                    ContextInput::Entry(entry) => transcript.apply(&entry, None),
-                    ContextInput::Replacement { seq, text } => {
-                        transcript.messages.push(Message::user(text));
-                        transcript.last = seq.get();
-                    }
-                    ContextInput::Inherited { seq, layer } => {
-                        let messages: Messages =
-                            inherited.remove(&layer).expect("inherited layer reduced");
-                        for message in messages.iter() {
-                            transcript.messages.push(message.clone());
+                for ContextLayer(_, inputs) in &mut spawn.image {
+                    for ContextInput(_, value) in inputs {
+                        if let ContextValue::Inherited(scope) = value {
+                            *scope += offset;
                         }
-                        transcript.context = transcript.messages.len();
-                        transcript.last = seq.get();
                     }
                 }
+                image.extend(spawn.image);
             }
-            if layer == 0 {
-                return transcript;
+            ContextValue::Inherited(offset)
+        } else {
+            let Some(value) = context_fact(&e.body) else {
+                continue;
+            };
+            if completed.as_ref().is_some_and(|done| {
+                matches!(value, ContextValue::ToolCall(..) | ContextValue::Queued(_))
+                    && !done.contains(&e.seq)
+            }) {
+                continue;
             }
-            inherited.insert(layer, transcript.into_context());
-        }
-        unreachable!("context has a root layer")
+            value
+        };
+        image[0].1.push(ContextInput(e.seq, value));
     }
+    image
 }
 
-/// Stored projection facts carry no executable child ownership.
-pub(crate) fn context_image(entries: &[Entry]) -> Vec<protocol::Json> {
-    let completed: std::collections::HashSet<_> = entries
-        .iter()
-        .filter_map(|e| match context_fact(&e.body) {
-            Some(ContextFact::ToolResult { call, .. }) => Some(call.0),
-            _ => None,
-        })
-        .collect();
-    let taken: std::collections::HashSet<_> = entries
-        .iter()
-        .filter_map(|e| match context_fact(&e.body) {
-            Some(ContextFact::Taken(input)) => Some(input),
-            _ => None,
-        })
-        .collect();
-    let edits = context_edits(entries);
-    entries
-        .iter()
-        .filter_map(|e| {
-            if let Some((from, _, text)) = edits
-                .iter()
-                .rev()
-                .find(|(from, to, _)| (*from..=*to).contains(&e.seq.get()))
-            {
-                return (*from == e.seq.get())
-                    .then_some(text.as_ref())
-                    .flatten()
-                    .map(|text| {
-                        protocol::Json::encode(&Entry::new(
-                            e.seq,
-                            e.epoch,
-                            Body::Input {
-                                text: text.clone(),
-                                mode: protocol::Mode::Queue,
-                                taken: true,
-                                origin: None,
-                            },
-                        ))
-                        .expect("context replacement encodes")
-                    });
+fn project(image: ContextImage, registry: Arc<Registry>, system: &str) -> Transcript {
+    let mut inherited = HashMap::new();
+    for (scope, ContextLayer(runner, inputs)) in image.into_iter().enumerate().rev() {
+        let mut transcript =
+            Transcript::empty(Arc::clone(&registry), if scope == 0 { system } else { "" });
+        transcript.model_only = runner == RunnerKind::ModelOnly;
+        for ContextInput(seq, value) in inputs {
+            if let ContextValue::Inherited(child) = value {
+                transcript.inherit(
+                    &inherited.remove(&child).expect("inherited scope reduced"),
+                    seq,
+                );
+            } else {
+                transcript.apply_input(seq, value, None);
             }
-            let projected = match context_fact(&e.body) {
-                Some(ContextFact::ToolCall { .. }) => completed.contains(&e.seq),
-                Some(ContextFact::Queued(_)) => taken.contains(&e.seq),
-                Some(ContextFact::Edit) | None => false,
-                Some(_) => true,
-            };
-            projected.then(|| protocol::Json::encode(e).expect("context entry encodes"))
-        })
-        .collect()
+        }
+        if scope == 0 {
+            return transcript;
+        }
+        inherited.insert(scope, transcript.into_context());
+    }
+    Transcript::empty(registry, system)
 }
 
 #[cfg(test)]

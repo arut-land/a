@@ -46,11 +46,20 @@ and each crate's `//!` comment supplying the details.
 - **Async to the core, over `rt`.** No crate named exactly `tokio` in
   anything `a` builds (`mise run check:no-tokio`, `deny.toml`). Never
   propose sync-first.
-- **Platform seams are `sys` and `rt` only.** Nothing above them names an
-  OS; `mise run check:windows` lints the whole workspace for Windows.
+- **Native on every OS.** Behave as each platform's own team would build
+  `a`: follow Linux, macOS and Windows conventions and recommendations and
+  use their native facilities, never forcing one platform's patterns on
+  another. Logic, layout and storage formats may differ per OS or
+  architecture behind typed, compile-time seams (`sys`, `rt`, or a per-OS
+  backend behind a trait). Nothing above those seams names an OS;
+  `mise run check:windows` lints the whole workspace for Windows.
 - **Dependencies need a measured reason.** Prefer a maintained crate over
   hand-rolling; hand-roll only when measurements show no crate fits the
-  size, memory or CPU budgets, and record the comparison in `docs/perf`.
+  memory, CPU or reliability needs, and record the comparison in
+  `docs/perf`. Binary size is measured and reported, not a hard cap:
+  never hand-roll or bend the architecture to save bytes, and never take
+  a crate whose size or dependency tree is out of proportion to what it
+  gives.
 - **Large serde types decode in their owning crate** (`protocol::Decode`,
   `llm::Response::from_value`): release builds do not share generic
   instantiations across crates. No internally tagged enum inside another.
@@ -88,7 +97,7 @@ and each crate's `//!` comment supplying the details.
 | `check` | fmt, clippy `-D warnings`, every test (nextest) |
 | `acceptance`, `test:web` | The black-box M1 and web UI tests on the dev build |
 | `budgets` | Cold start, attach latency, idle RSS on a release build with fixtures; proves the shipped build lacks them |
-| `size`, `startup`, `bloat` | Release binary under 4 MiB (scanned for fixtures), cold start against the process floor, where size goes |
+| `size`, `startup`, `bloat` | Release binary size (reported, scanned for fixtures), cold start against the process floor, where size goes |
 | `deny`, `machete`, `check:no-tokio`, `check:windows`, `test:miri`, `fuzz` | Licenses and bans, unused deps, no tokio, the Windows lint, miri over `sys`, the bolero targets |
 | `generate [dir]` | Shell completions and the man page from the argv spec |
 | `web`, `apple:test`, `apple:build`, `apple:run` | `a web` against an isolated home; the macOS app's FFI, tests, build |
