@@ -1,5 +1,7 @@
-use protocol::view::{Change, Item, Kind, Part, SessionView, Shown};
-use protocol::{CallId, Verdict};
+use std::collections::HashMap;
+
+use protocol::view::{Item, Kind, SessionView};
+use protocol::{Seq, SessionId};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReplyEvent<'a> {
@@ -9,104 +11,46 @@ pub enum ReplyEvent<'a> {
 }
 
 #[derive(Default)]
-pub struct ReplyStream {
-    active: Option<(CallId, usize)>,
-    finished: u64,
-}
+pub struct ReplyStream(HashMap<(Option<SessionId>, Seq), (usize, bool)>);
 
 impl ReplyStream {
-    pub fn project<'a>(
-        &mut self,
-        change: &'a Change,
-        view: &'a SessionView,
-    ) -> Vec<ReplyEvent<'a>> {
+    pub fn project<'a>(&mut self, view: &'a SessionView) -> Vec<ReplyEvent<'a>> {
         let mut events = Vec::new();
-        match change {
-            Change::Batch { changes } => {
-                for change in changes {
-                    events.extend(self.project(change, view));
-                }
+        for item in &view.items {
+            if !matches!(item.present().kind, Kind::Reply | Kind::Assistant) {
+                continue;
             }
-            Change::Delta { call, text }
-                if view
-                    .items
-                    .iter()
-                    .any(|item| item.key() == call.0 && item.present().kind == Kind::Reply) =>
+            let text = match item {
+                Item::Reply { call, text, .. } if !item.settled() => view
+                    .streaming
+                    .as_ref()
+                    .filter(|s| s.call == *call)
+                    .map_or(text.as_str(), |s| s.text.as_str()),
+                Item::Reply { text, .. } | Item::Assistant { text, .. } => text,
+                _ => continue,
+            };
+            if text.is_empty() && !item.settled() {
+                continue;
+            }
+            let (emitted, ended) = self.0.entry((view.session, item.key())).or_insert_with(|| {
+                events.push(ReplyEvent::Start);
+                (0, false)
+            });
+            if *ended {
+                continue;
+            }
+            if let Some(suffix) = text.get(*emitted..)
+                && !suffix.is_empty()
             {
-                if self.active.is_none_or(|(id, _)| id != *call) {
-                    if self.active.is_some() {
-                        events.push(ReplyEvent::End);
-                    }
-                    self.active = Some((*call, 0));
-                    self.finished = self.finished.min(call.0.get() - 1);
-                    events.push(ReplyEvent::Start);
-                }
-                self.active.as_mut().unwrap().1 += text.len();
-                events.push(ReplyEvent::Text(text));
+                events.push(ReplyEvent::Text(suffix));
+                *emitted = text.len();
             }
-            Change::Added {
-                item: Item::Assistant { text, .. },
-                ..
-            } => {
-                events.extend([ReplyEvent::Start, ReplyEvent::Text(text), ReplyEvent::End]);
-            }
-            Change::Added {
-                item:
-                    Item::Hook {
-                        call: Some(call),
-                        decision: Verdict::Retry { .. },
-                        ..
-                    },
-                ..
-            } if self.active.take_if(|(id, _)| id == call).is_some() => {
+            if item.settled() {
                 events.push(ReplyEvent::End);
+                *ended = true;
             }
-            Change::Snapshot => {
-                // Historical replies belong to transcript rendering; reconcile only
-                // the reply this connection has already started emitting.
-                if let Some((call, _)) = self.active {
-                    if let Some(item) = view.items.iter().find(|item| item.key() == call.0) {
-                        self.finish(item, &mut events);
-                    } else {
-                        self.active = None;
-                        self.finished = self.finished.max(call.0.get());
-                        events.push(ReplyEvent::End);
-                    }
-                }
-            }
-            Change::Updated {
-                index,
-                part: Part::Outcome,
-            } => {
-                self.finish(&view.items[*index], &mut events);
-            }
-            _ => {}
         }
         events
-    }
-
-    fn finish<'a>(&mut self, item: &'a Item, events: &mut Vec<ReplyEvent<'a>>) {
-        if !item.settled()
-            || item.key().get() <= self.finished
-            || item.present().kind != Kind::Reply
-        {
-            return;
-        }
-        let emitted = if let Some((_, emitted)) = self.active.take_if(|(id, _)| id.0 == item.key())
-        {
-            emitted
-        } else {
-            events.push(ReplyEvent::Start);
-            0
-        };
-        if let Shown::Markdown(text) = item.present().body
-            && let Some(rest) = text.get(emitted..)
-            && !rest.is_empty()
-        {
-            events.push(ReplyEvent::Text(rest));
-        }
-        events.push(ReplyEvent::End);
-        self.finished = item.key().get();
     }
 }
 
@@ -149,7 +93,12 @@ pub fn sanitize(text: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{Body, DaemonMsg, Entry, Epoch, Json, Outcome, Seq, SessionId, view::Status};
+    use crate::{Submission, SubmissionState};
+    use protocol::{
+        Activity, Author, Body, CallId, ClientId, ClientSeq, DaemonMsg, Entry, Epoch, Json, Mode,
+        Outcome, Seq, SessionId,
+        view::{Change, Status},
+    };
 
     fn entry(seq: u64, body: Body) -> Entry {
         Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)
@@ -157,77 +106,28 @@ mod tests {
 
     #[test]
     fn retry_text_is_emitted_once() {
-        let call = CallId::new(1).unwrap();
         let mut stream = ReplyStream::default();
-        let mut view = SessionView::default();
-        view.items.push(Item::Reply {
-            call,
-            model: "m".into(),
-            text: "reply".into(),
-            status: Status::Done,
-            usage: None,
-            purpose: None,
-            owner: None,
-        });
-        let delta = Change::Delta {
-            call,
-            text: "reply".into(),
-        };
-        assert_eq!(
-            stream.project(&delta, &view),
-            [ReplyEvent::Start, ReplyEvent::Text("reply")]
-        );
-        let retry = Change::Added {
-            index: 1,
-            item: Item::Hook {
-                seq: Seq::new(2).unwrap(),
-                hook: "retry".into(),
-                call: Some(call),
-                tool: String::new(),
-                decision: Verdict::Retry {
-                    attempt: 1,
-                    error: "retry".into(),
-                },
-            },
-        };
-        assert_eq!(stream.project(&retry, &view), [ReplyEvent::End]);
-        assert_eq!(
-            stream.project(&delta, &view),
-            [ReplyEvent::Start, ReplyEvent::Text("reply")]
-        );
-        let done = Change::Updated {
-            index: 0,
-            part: Part::Outcome,
-        };
-        assert_eq!(stream.project(&done, &view), [ReplyEvent::End]);
-        assert_eq!(stream.project(&done, &view), []);
-        assert_eq!(
-            stream.project(&delta, &view),
-            [ReplyEvent::Start, ReplyEvent::Text("reply")]
-        );
-        assert_eq!(stream.project(&done, &view), [ReplyEvent::End]);
-        let mut resumed = ReplyStream::default();
-        let partial = Change::Delta {
+        let mut view = reply(SessionId::new(), Status::Running, "");
+        let call = CallId::new(1).unwrap();
+        view.fold(&DaemonMsg::Delta {
             call,
             text: "rep".into(),
-        };
+            attempt: 0,
+        });
         assert_eq!(
-            resumed.project(&partial, &view),
+            stream.project(&view),
             [ReplyEvent::Start, ReplyEvent::Text("rep")]
         );
-        assert_eq!(
-            resumed.project(&done, &view),
-            [ReplyEvent::Text("ly"), ReplyEvent::End]
-        );
-        let mut replay = ReplyStream::default();
-        assert_eq!(
-            replay.project(&done, &view),
-            [
-                ReplyEvent::Start,
-                ReplyEvent::Text("reply"),
-                ReplyEvent::End
-            ]
-        );
+        view.fold(&DaemonMsg::Delta {
+            call,
+            text: "reply".into(),
+            attempt: 1,
+        });
+        assert_eq!(stream.project(&view), [ReplyEvent::Text("ly")]);
+        let snapshot = reply(view.session.unwrap(), Status::Done, "reply").snapshot();
+        view.fold(&DaemonMsg::Snapshot(Box::new(snapshot)));
+        assert_eq!(stream.project(&view), [ReplyEvent::End]);
+        assert_eq!(stream.project(&view), []);
     }
 
     #[test]
@@ -262,21 +162,19 @@ mod tests {
             )],
         );
         let mut stream = ReplyStream::default();
-        let update = view
-            .fold(&DaemonMsg::Delta {
-                call,
-                text: "hel".into(),
-                attempt: 0,
-            })
-            .unwrap();
+        view.fold(&DaemonMsg::Delta {
+            call,
+            text: "hel".into(),
+            attempt: 0,
+        })
+        .unwrap();
         assert_eq!(
-            stream.project(&update.change, &view),
+            stream.project(&view),
             [ReplyEvent::Start, ReplyEvent::Text("hel")]
         );
-        let running = view
-            .fold(&DaemonMsg::Snapshot(Box::new(view.snapshot())))
+        view.fold(&DaemonMsg::Snapshot(Box::new(view.snapshot())))
             .unwrap();
-        assert_eq!(stream.project(&running.change, &view), []);
+        assert_eq!(stream.project(&view), []);
         let mut daemon_view = view.clone();
         daemon_view.fold(&DaemonMsg::Entry(entry(
         2,
@@ -298,19 +196,128 @@ mod tests {
             .unwrap();
         assert!(matches!(update.change, Change::Snapshot));
         assert_eq!(
-            stream.project(&update.change, &view),
+            stream.project(&view),
             [ReplyEvent::Text("lo"), ReplyEvent::End]
         );
-        assert_eq!(stream.project(&update.change, &view), []);
-        assert_eq!(
-            stream.project(
-                &Change::Updated {
-                    index: 0,
-                    part: Part::Outcome
-                },
-                &view
-            ),
-            []
+        assert_eq!(stream.project(&view), []);
+        assert_eq!(stream.project(&view), []);
+    }
+    #[test]
+    fn a_submission_recovered_before_its_first_delta_still_emits_its_reply() {
+        let id = Author {
+            client: ClientId::new(),
+            seq: ClientSeq::new(1).unwrap(),
+        };
+        let daemon_view = SessionView::from_log(
+            SessionId::new(),
+            "/w".into(),
+            [
+                Entry::new(
+                    Seq::new(1).unwrap(),
+                    Epoch(0),
+                    Body::Input {
+                        text: "hello".into(),
+                        mode: Mode::Queue,
+                        taken: true,
+                        origin: Some(id),
+                    },
+                ),
+                Entry::new(
+                    Seq::new(2).unwrap(),
+                    Epoch(0),
+                    Body::Assistant {
+                        text: "reply".into(),
+                    },
+                ),
+            ],
         );
+        let mut view = SessionView::default();
+        view.fold(&DaemonMsg::Snapshot(Box::new(daemon_view.snapshot())))
+            .unwrap();
+        view.fold(&DaemonMsg::Activity {
+            seq: 2,
+            activity: Activity::Idle,
+        });
+        let mut submission = Submission::new(id);
+        submission.fold(&view);
+        assert_eq!(submission.state, SubmissionState::Finished(Activity::Idle));
+        assert_eq!(
+            ReplyStream::default().project(&view),
+            [
+                ReplyEvent::Start,
+                ReplyEvent::Text("reply"),
+                ReplyEvent::End
+            ],
+            "pipe mode must not finish successfully without emitting its recovered reply"
+        );
+    }
+
+    fn reply(session: SessionId, status: Status, text: &str) -> SessionView {
+        let mut view = SessionView::default();
+        view.session = Some(session);
+        view.items.push(Item::Reply {
+            call: CallId::new(1).unwrap(),
+            model: "m".into(),
+            text: text.into(),
+            status,
+            usage: None,
+            purpose: None,
+            owner: None,
+        });
+        view
+    }
+
+    #[test]
+    fn switching_sessions_does_not_suppress_replayed_replies_with_reused_call_numbers() {
+        let mut stream = ReplyStream::default();
+        let first = reply(SessionId::new(), Status::Done, "first session");
+        let second = reply(SessionId::new(), Status::Done, "second session");
+        assert_eq!(
+            stream.project(&first),
+            [
+                ReplyEvent::Start,
+                ReplyEvent::Text("first session"),
+                ReplyEvent::End
+            ]
+        );
+        assert_eq!(
+            stream.project(&second),
+            [
+                ReplyEvent::Start,
+                ReplyEvent::Text("second session"),
+                ReplyEvent::End
+            ]
+        );
+        assert_eq!(stream.project(&first), []);
+    }
+
+    #[test]
+    fn a_delta_after_a_completing_snapshot_cannot_end_the_reply_twice() {
+        let mut stream = ReplyStream::default();
+        let mut view = reply(SessionId::new(), Status::Running, "");
+        let call = CallId::new(1).unwrap();
+        view.fold(&DaemonMsg::Delta {
+            call,
+            text: "hel".into(),
+            attempt: 0,
+        });
+        assert_eq!(
+            stream.project(&view),
+            [ReplyEvent::Start, ReplyEvent::Text("hel")]
+        );
+        let snapshot = reply(view.session.unwrap(), Status::Done, "hello").snapshot();
+        view.fold(&DaemonMsg::Snapshot(Box::new(snapshot.clone())));
+        assert_eq!(
+            stream.project(&view),
+            [ReplyEvent::Text("lo"), ReplyEvent::End]
+        );
+        view.fold(&DaemonMsg::Delta {
+            call,
+            text: "late text".into(),
+            attempt: 0,
+        });
+        assert_eq!(stream.project(&view), []);
+        view.fold(&DaemonMsg::Snapshot(Box::new(snapshot)));
+        assert_eq!(stream.project(&view), []);
     }
 }

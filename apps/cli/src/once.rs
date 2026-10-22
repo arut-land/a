@@ -209,8 +209,9 @@ impl Once {
             }
             return;
         }
+        let events = self.stream.project(self.client.view());
         if self.taken() {
-            for event in self.stream.project(change, self.client.view()) {
+            for event in events {
                 match event {
                     client::ReplyEvent::Start => {}
                     client::ReplyEvent::Text(text) => crate::out(format_args!("{text}")),

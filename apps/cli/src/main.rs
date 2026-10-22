@@ -394,7 +394,7 @@ struct Screen {
 impl Screen {
     fn show(&mut self, change: &Change, view: &SessionView) {
         if !matches!(change, Change::Batch { .. }) {
-            for event in self.stream.project(change, view) {
+            for event in self.stream.project(view) {
                 match event {
                     client::ReplyEvent::Start => say!("a    "),
                     client::ReplyEvent::Text(text) => say!("{text}"),
@@ -422,6 +422,9 @@ impl Screen {
             // Sent in place of a long replay: shown as the replay would be.
             Change::Snapshot => {
                 for item in &view.items {
+                    if matches!(item.present().kind, Kind::Reply | Kind::Assistant) {
+                        continue;
+                    }
                     print_all(&added(item));
                     if item.settled() {
                         print_all(&outcome(&item.present()));
