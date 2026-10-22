@@ -244,9 +244,8 @@ counts are captured in `llm` before reply serialization,
 including failed finishes; missing counts remain unknown. No elapsed duration
 is reconstructed by subtracting clocks across a restart.
 
-`/metrics` queries the current ownership subtree; its optional JSON argument
-selects `subtree`, `agent`, `side`, `call` and `prices`. A price table supplies
-`prices` as `[version, currency, models]`, where `models` is a list of
+`/metrics` queries the current ownership subtree. Its optional JSON argument
+is a price table `[version, currency, models]`, where `models` is a list of
 `[model, rates]` pairs sorted at query admission. Each rate array has ten
 signed nanocurrency rates in `llm::Count::ALL` order. Input/output counts
 include their subsets, so cache
@@ -257,7 +256,7 @@ increase `UsageTotal.missing`; `known` is only the observed portion.
 
 Own totals include only attempts executed in that conversation. Subtree
 queries follow immutable ownership edges once; copied fork facts and cached
-replies add no spend. Filters select agent and side/main dimensions without
+replies add no spend. Projection API filters select agent and side/main dimensions without
 changing the facts. Critical elapsed time is the envelope of measured intervals
 within each clock epoch, separately from summed call durations. Multiple epochs
 and unfinished intervals report incomplete coverage; wall clocks never fill

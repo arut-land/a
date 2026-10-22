@@ -496,16 +496,13 @@ fn successful_recovery_keeps_the_crashed_attempts_usage_unknown() {
 
 #[test]
 fn supplied_prices_are_sorted_and_duplicates_are_rejected() {
-    let selection = Selection::parse(
-        r#"{"prices":["v1","USD",[["z",[0,0,0,0,0,0,0,0,0,0]],["a",[0,0,0,0,0,0,0,0,0,0]]]]}"#,
-    )
-    .unwrap();
-    assert_eq!(selection.prices.models[0].0, "a");
+    let prices =
+        Prices::parse(r#"["v1","USD",[["z",[0,0,0,0,0,0,0,0,0,0]],["a",[0,0,0,0,0,0,0,0,0,0]]]]"#)
+            .unwrap();
+    assert_eq!(prices.models[0].0, "a");
     assert!(
-        Selection::parse(
-            r#"{"prices":["v1","USD",[["a",[0,0,0,0,0,0,0,0,0,0]],["a",[0,0,0,0,0,0,0,0,0,0]]]]}"#
-        )
-        .is_err()
+        Prices::parse(r#"["v1","USD",[["a",[0,0,0,0,0,0,0,0,0,0]],["a",[0,0,0,0,0,0,0,0,0,0]]]]"#)
+            .is_err()
     );
 }
 

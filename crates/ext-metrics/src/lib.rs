@@ -24,7 +24,7 @@ impl UsageTotal {
 
 /// Nanocurrency per count in `llm::Count::ALL` order. Signed adjustments
 /// price subsets (such as cached input) without billing inclusive totals twice.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(from = "SuppliedPrices")]
 pub struct Prices {
     pub version: String,
@@ -45,6 +45,20 @@ impl From<SuppliedPrices> for Prices {
 }
 
 impl Prices {
+    #[inline(never)]
+    fn parse(args: &str) -> Result<Self, String> {
+        let mut prices = if args.trim().is_empty() {
+            Self::default()
+        } else {
+            serde_json::from_str::<Self>(args).map_err(|e| e.to_string())?
+        };
+        prices.models.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        if prices.models.windows(2).any(|p| p[0].0 == p[1].0) {
+            return Err("duplicate model price".into());
+        }
+        Ok(prices)
+    }
+
     #[inline(never)]
     fn cost(&self, fact: &CallFact, usage: [Option<u64>; 10]) -> Option<u64> {
         if let Some(charge) = &fact.charge {
@@ -305,66 +319,20 @@ impl Extension for Metrics {
 }
 
 struct Query(Mutex<Projection>);
-#[derive(Deserialize)]
-struct Selection {
-    #[serde(default)]
-    subtree: bool,
-    agent: Option<String>,
-    side: Option<bool>,
-    call: Option<CallId>,
-    prices: Prices,
-}
-impl Selection {
-    #[inline(never)]
-    fn parse(args: &str) -> Result<Self, String> {
-        let mut selection: Selection = if args.trim().is_empty() {
-            Selection {
-                subtree: true,
-                agent: None,
-                side: None,
-                call: None,
-                prices: Prices {
-                    version: "unpriced".into(),
-                    currency: String::new(),
-                    models: Vec::new(),
-                },
-            }
-        } else {
-            serde_json::from_str(args).map_err(|e| e.to_string())?
-        };
-        selection
-            .prices
-            .models
-            .sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-        if selection.prices.models.windows(2).any(|p| p[0].0 == p[1].0) {
-            return Err("duplicate model price".into());
-        }
-        Ok(selection)
-    }
-}
 
 impl Query {
     #[inline(never)]
     fn finish(
         &self,
         session: SessionId,
-        selection: Selection,
+        prices: Prices,
         logs: Vec<ext::LogPrefix>,
     ) -> Result<Total, String> {
         let mut projection = self.0.lock().map_err(|e| e.to_string())?;
         for log in logs {
             projection.fold(&log);
         }
-        Ok(projection.query(
-            session,
-            selection.subtree,
-            &Filter {
-                agent: selection.agent,
-                side: selection.side,
-                call: selection.call,
-            },
-            &selection.prices,
-        ))
+        Ok(projection.query(session, true, &Filter::default(), &prices))
     }
 }
 
@@ -372,18 +340,19 @@ impl Tool for Query {
     type In = Args;
     type Out = Total;
     const NAME: &'static str = "metrics";
-    const DESCRIPTION: &'static str = "derive usage, timing and cost; JSON: subtree, agent, side, prices [version,currency,[[model,rates],...]]";
+    const DESCRIPTION: &'static str =
+        "derive subtree usage and timing; optional prices [version,currency,[[model,rates],...]]";
     const AUDIENCE: protocol::Audience = protocol::Audience::User;
     const REPLAY: ext::Replay = ext::Replay::Safe;
     async fn call(&self, Args { args }: &Args, cx: &Cx) -> Result<Total, String> {
-        let selection = Selection::parse(args)?;
+        let prices = Prices::parse(args)?;
         let cursors = self.0.lock().map_err(|e| e.to_string())?.cursors();
         let logs = cx
             .service::<dyn ext::Logs>()
             .ok_or("no log reader")?
-            .read(cx.session, selection.subtree, cursors)
+            .read(cx.session, true, cursors)
             .await?;
-        self.finish(cx.session, selection, logs)
+        self.finish(cx.session, prices, logs)
     }
 }
 
