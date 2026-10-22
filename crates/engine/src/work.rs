@@ -48,25 +48,20 @@ impl<K: Send + 'static> WorkHandle<K> {
     }
 }
 
-pub(super) struct WorkSet<K>(Vec<WorkHandle<K>>);
+#[derive(Default)]
+pub(super) struct WorkSet(Vec<WorkHandle>);
 
-impl<K> Default for WorkSet<K> {
-    fn default() -> Self {
-        Self(Vec::new())
-    }
-}
-
-impl<K: PartialEq> WorkSet<K> {
-    pub(super) fn insert(&mut self, handle: WorkHandle<K>) {
+impl WorkSet {
+    pub(super) fn insert(&mut self, handle: WorkHandle) {
         self.cancel(&handle.id);
         self.0.push(handle);
     }
 
-    pub(super) fn get_mut(&mut self, id: &K) -> Option<&mut WorkHandle<K>> {
+    pub(super) fn get_mut(&mut self, id: &WorkId) -> Option<&mut WorkHandle> {
         self.0.iter_mut().find(|handle| &handle.id == id)
     }
 
-    pub(super) fn cancel(&mut self, id: &K) {
+    pub(super) fn cancel(&mut self, id: &WorkId) {
         if let Some(at) = self.0.iter().position(|handle| &handle.id == id) {
             self.0.remove(at).cancel.set();
         }
@@ -79,11 +74,9 @@ impl<K: PartialEq> WorkSet<K> {
     }
 }
 
-impl<K> Drop for WorkSet<K> {
+impl Drop for WorkSet {
     fn drop(&mut self) {
-        for handle in &self.0 {
-            handle.cancel.set();
-        }
+        self.revoke();
     }
 }
 
@@ -120,30 +113,6 @@ mod tests {
     use kernel::Requirement;
 
     #[test]
-    fn retirement_revokes_replaced_report_tasks() {
-        let mut work = WorkSet::default();
-        let id = WorkId::Report(SessionId::new());
-        let first = WorkHandle::new(
-            id.clone(),
-            7,
-            Admission {
-                through: 11,
-                requirement: Requirement::Durable,
-            },
-            Cancel::default(),
-        );
-        let second = WorkHandle::new(id, 7, first.admission, Cancel::default());
-        work.insert(first.clone());
-        work.insert(second.clone());
-        work.revoke();
-        assert!(second.cancel.is_set());
-        assert!(
-            first.cancel.is_set(),
-            "replacement must not orphan live report work"
-        );
-    }
-
-    #[test]
     fn generation_retirement_revokes_every_owned_task() {
         let mut work = WorkSet::default();
         let ids = [
@@ -171,7 +140,14 @@ mod tests {
                 handle
             })
             .collect();
+        let replaced = handles[4].clone();
+        let mut replacement = replaced.clone();
+        replacement.cancel = Cancel::default();
+        work.insert(replacement.clone());
+        assert!(replaced.cancel.is_set());
+        assert!(!replacement.cancel.is_set());
         work.revoke();
+        assert!(replacement.cancel.is_set());
         assert!(handles.iter().all(|handle| handle.cancel.is_set()));
         assert!(work.0.is_empty());
         let next = WorkHandle::new(

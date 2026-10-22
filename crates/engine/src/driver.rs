@@ -316,7 +316,7 @@ struct Session {
     pending_env: Mutex<Option<Arc<Environment>>>,
     /// Background process groups the session owns, until each ends.
     jobs: Mutex<Vec<Arc<dyn ext::RunningProcess>>>,
-    work: Mutex<WorkSet<WorkId>>,
+    work: Mutex<WorkSet>,
     /// Notified as the session changes: a commit, work beginning or
     /// ending, a job ending, the actor ending. What waits on the session
     /// waits here, never by polling.
