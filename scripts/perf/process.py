@@ -5,11 +5,15 @@ import sys
 import psutil
 
 
-def snapshot(pid):
+def snapshot(pid, threads=False):
     process = psutil.Process(pid)
     cpu = process.cpu_times()
-    return {"rss_kib": process.memory_info().rss / 1024,
-            "cpu_seconds": cpu.user + cpu.system}
+    result = {"rss_kib": process.memory_info().rss / 1024,
+              "cpu_seconds": cpu.user + cpu.system}
+    if threads:
+        result["threads"] = [dict(id=t.id, user_seconds=t.user_time, kernel_seconds=t.system_time)
+                             for t in process.threads()]
+    return result
 
 
 def stop_daemon(binary, env, cwd=None):

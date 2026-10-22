@@ -137,11 +137,13 @@ def budgets(output, binary=None, probe=None, samples=5):
                 rss.append(snapshot(pid)["rss_kib"])
                 # Blocking workers retire after ten idle seconds; CPU measures steady idle.
                 time.sleep(12)
-                before = [snapshot(p)["cpu_seconds"] for p in (pid, client.pid)]
+                before = [snapshot(p, threads=True) for p in (pid, client.pid)]
                 time.sleep(10)
-                after = [snapshot(p) for p in (pid, client.pid)]
-                cpu.append((after[0]["cpu_seconds"] - before[0]) * 1000)
-                client_cpu.append((after[1]["cpu_seconds"] - before[1]) * 1000)
+                after = [snapshot(p, threads=True) for p in (pid, client.pid)]
+                (output / f"idle-{trial}.json").write_text(json.dumps(dict(
+                    daemon_pid=pid, client_pid=client.pid, before=before, after=after), indent=2))
+                cpu.append((after[0]["cpu_seconds"] - before[0]["cpu_seconds"]) * 1000)
+                client_cpu.append((after[1]["cpu_seconds"] - before[1]["cpu_seconds"]) * 1000)
                 session = cli("new").stdout.decode().strip()
                 for n in range(10):
                     cli("-p", f"message {n}", "resume", session)
