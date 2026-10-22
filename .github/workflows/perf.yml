@@ -78,6 +78,11 @@ jobs:
       fail-fast: false
       matrix:
         runner: ${{ fromJSON(needs.matrix.outputs.runners) }}
+    env:
+      PERF_VARIANT: ${{ inputs.variant || '{}' }}
+      PERF_REFERENCE: ${{ inputs.paired_ref }}
+      PERF_BUILD_ONLY: ${{ inputs.build_only }}
+      PERF_BLOAT: ${{ inputs.bloat }}
     defaults:
       run:
         shell: bash
@@ -153,20 +158,32 @@ jobs:
           for path in ['apps/cli/examples/perf-attach.rs', 'crates/engine/src/driver/tests/bench.rs']:
               shutil.copy2(path, '../measured/' + path)
           PY
-      - name: Build, then measure one variant
-        env:
-          PERF_VARIANT: ${{ inputs.variant || '{}' }}
-          PAIRED_REF: ${{ inputs.paired_ref }}
-          BUILD_ONLY: ${{ inputs.build_only }}
-          BLOAT: ${{ inputs.bloat }}
+      - name: Build release binaries and saved benchmarks
+        id: build
         run: |
           extra=()
-          if [[ "$BUILD_ONLY" == true ]]; then extra+=(--build-only); fi
-          if [[ "$BLOAT" == true ]]; then extra+=(--bloat); fi
+          if [[ "$PERF_BUILD_ONLY" == true ]]; then extra+=(--build-only); fi
+          if [[ "$PERF_BLOAT" == true ]]; then extra+=(--bloat); fi
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
-            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PAIRED_REF" "${extra[@]}"
+            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase build --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' "${extra[@]}"
           else
-            mise exec -- python scripts/perf/hosted.py --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PAIRED_REF" "${extra[@]}"
+            mise exec -- python scripts/perf/hosted.py --phase build --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' "${extra[@]}"
+          fi
+      - name: Measure startup budgets workloads and benches
+        if: env.PERF_BUILD_ONLY != 'true'
+        run: |
+          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
+            python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
+          else
+            mise exec -- python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
+          fi
+      - name: Measure alternating reference and candidate rounds
+        if: always() && steps.build.outcome == 'success' && env.PERF_REFERENCE != '' && env.PERF_BUILD_ONLY != 'true'
+        run: |
+          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
+            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase paired --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
+          else
+            mise exec -- python scripts/perf/hosted.py --phase paired --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
           fi
       - name: Compare with main
         if: always()
