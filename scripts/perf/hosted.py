@@ -38,6 +38,19 @@ def load_task(name):
     return module
 
 
+def hardware():
+    processor = platform.processor()
+    if sys.platform == "linux":
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                processor = line.split(":", 1)[1].strip()
+                break
+    elif sys.platform == "darwin":
+        processor = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
+    return dict(processor=processor, cores=os.cpu_count(), image=os.environ.get("ImageOS"),
+                image_version=os.environ.get("ImageVersion"), python=sys.version)
+
+
 def distribution(samples):
     samples = sorted(samples)
     return dict(median=statistics.median(samples), min=min(samples), max=max(samples),
@@ -171,7 +184,7 @@ def summarize(output, source, variant, runner):
     metrics["fixture_size_kib"] = distribution([(output / ("a-fixtures" + SUFFIX)).stat().st_size / 1024])
     result = dict(schema=1, runner=runner, platform=platform.platform(), machine=platform.machine(),
                   revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
-                  workflow_revision=os.environ.get("GITHUB_SHA"), variant=variant,
+                  workflow_revision=os.environ.get("GITHUB_SHA"), variant=variant, hardware=hardware(),
                   toolchain=subprocess.check_output(["rustc", "-vV"], text=True),
                   idle_window_seconds=10, cpu_settle_seconds=15, rss_settle_seconds=3,
                   cargo_config=(source / ".cargo/config.toml").read_text(),

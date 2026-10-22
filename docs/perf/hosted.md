@@ -29,8 +29,9 @@ enables fixtures for deterministic echo workloads. The shipped size cap is
 4,194,304 bytes on every target. The JSON records the source and harness
 revisions, Rust version, Cargo configuration, profile and variant.
 
-The existing mbx store and Rust toolchain are cached by OS, architecture and
-configuration. Intel macOS uses rust-cache for native Cargo artifacts because
+The mbx store and Cargo downloads are cached by OS, architecture and
+configuration. Rustup installs its pinned toolchain outside the cache, so a
+cancelled installation cannot leave a partial toolchain in subsequent runs. Intel macOS uses rust-cache for native Cargo artifacts because
 mbx 1.24.1 publishes no Intel macOS executable. Windows ARM installs native
 Hyperfine and mbx from the checked-in mise lockfile. Release and benchmark
 builds use LLVM; they do not need a Cranelift component.
@@ -71,7 +72,7 @@ five p99 estimates. Idle CPU zero means no increment at the OS counter's
 resolution, not a claim about instructions below that resolution.
 
 `result.json` preserves raw samples, median, min/max and p10/p90 for every
-axis. Each lane uploads its JSON, workload/load records and `summary.md` for
+axis. Each lane uploads its shipped binary, JSON, workload/load records and `summary.md` for
 30 days, including measurements from budget failures. Its job summary shows
 the same table. Missing measurements stay absent.
 

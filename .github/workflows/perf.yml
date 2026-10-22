@@ -98,14 +98,14 @@ jobs:
         id: cache
         with:
           path: |
-            ~/.rustup/toolchains
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/mbx/actions
           key: perf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('harness/rust-toolchain.toml', 'harness/Cargo.lock', 'harness/.cargo/*.toml') }}-${{ github.run_id }}
           restore-keys: perf-${{ runner.os }}-${{ runner.arch }}-
       # ARM Windows has no Cranelift component; release and benches use LLVM.
-      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src
+      - id: toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src
       - uses: jdx/mise-action@v5
         with:
           working_directory: harness
@@ -150,16 +150,17 @@ jobs:
         with:
           name: perf-${{ matrix.runner }}
           path: |
+            harness/target/hosted-perf/a
+            harness/target/hosted-perf/a.exe
             harness/target/hosted-perf/**/*.json
             harness/target/hosted-perf/**/*.jsonl
             harness/target/hosted-perf/**/*.md
           if-no-files-found: error
           retention-days: 30
       - uses: actions/cache/save@v6
-        if: always() && steps.cache.outputs.cache-hit != 'true'
+        if: always() && steps.toolchain.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
         with:
           path: |
-            ~/.rustup/toolchains
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/mbx/actions
