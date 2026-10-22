@@ -350,7 +350,7 @@ fn an_unsettled_intent_has_unknown_spend_without_claiming_execution() {
 }
 
 #[test]
-fn unrelated_suffixes_preserve_the_accounting_cache() {
+fn unrelated_suffixes_advance_coverage_without_changing_accounting() {
     let id = SessionId::new();
     let mut projection = Projection::default();
     projection.fold(&log(id, None, vec![fact(id, 0, 0, Some(10))]));
@@ -373,7 +373,6 @@ fn unrelated_suffixes_preserve_the_accounting_cache() {
         )],
     };
     projection.fold(&suffix);
-    assert!(projection.cached.is_some());
     assert_eq!(projection.cursors()[0].1.seq, 2);
     assert_eq!(projection.own(id, &prices()), before);
 }

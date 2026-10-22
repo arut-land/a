@@ -264,9 +264,9 @@ the gaps. Disposable in-memory folds retain conversation/sequence/epoch cursors.
 Reads
 seek to the covered line, validate it and decode only the suffix; replaced
 coverage resets the fold. Copied history is excluded at the history-policy
-boundary. Unrelated entries advance the cursor without invalidating accounting
-results. Query caches include the versioned price table and selection.
-Repricing changes no execution fact. No durable accumulator is maintained;
+boundary. Unrelated entries advance the cursor without changing accounting.
+Queries aggregate cached facts with the supplied versioned prices; results are
+not cached. Repricing changes no execution fact. No durable accumulator is maintained;
 query replies are ordinary tool outcomes and are never counted as execution.
 
 ## Layer boundaries and future modes

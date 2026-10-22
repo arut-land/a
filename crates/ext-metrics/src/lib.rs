@@ -95,7 +95,7 @@ pub struct Total {
     pub critical_ns: UsageTotal,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default)]
 pub struct Filter {
     pub agent: Option<String>,
     pub side: Option<bool>,
@@ -105,7 +105,6 @@ pub struct Filter {
 #[derive(Default)]
 pub struct Projection {
     logs: Vec<(SessionId, Conversation)>,
-    cached: Option<(SessionId, bool, Filter, Prices, Total)>,
 }
 
 struct Conversation {
@@ -124,7 +123,6 @@ impl Projection {
         {
             Ok(i) => i,
             Err(i) => {
-                self.cached = None;
                 self.logs.insert(
                     i,
                     (
@@ -144,14 +142,12 @@ impl Projection {
         if prefix.reset {
             log.facts.clear();
             log.uncertain.clear();
-            self.cached = None;
         }
         let after = if prefix.reset { 0 } else { log.covered.seq };
         for entry in &prefix.entries {
             if entry.seq.get() <= after.max(prefix.inherited_through) {
                 continue;
             }
-            let before = log.uncertain.len();
             let fact = entry.execution.as_ref().and_then(|j| CallFact::from_json(j).ok()).filter(|f| {
                 f.id.executing_session == prefix.session && matches!(&entry.body,
                     Body::ModelResult { call, .. } | Body::Decision { call: Some(call), .. } if *call == f.id.call)
@@ -187,14 +183,10 @@ impl Projection {
                 log.uncertain
                     .retain(|id| *id != (fact.id.call, fact.id.attempt));
             }
-            if before != log.uncertain.len() {
-                self.cached = None;
-            }
             if let Some(fact) = fact
                 && let Err(i) = log.facts.binary_search_by_key(&fact.id, |f| f.id)
             {
                 log.facts.insert(i, fact);
-                self.cached = None;
             }
         }
         if prefix.reset || prefix.cursor.seq >= log.covered.seq {
@@ -238,11 +230,6 @@ impl Projection {
         filter: &Filter,
         prices: &Prices,
     ) -> Total {
-        if let Some((r, d, f, p, total)) = &self.cached
-            && (*r, *d, f, p) == (root, descendants, filter, prices)
-        {
-            return total.clone();
-        }
         let mut total = Total::default();
         let mut epochs = Vec::<(SessionId, u64, u64)>::new();
         for (session, log) in &self.logs {
@@ -298,13 +285,6 @@ impl Projection {
         for (_, start, end) in epochs {
             total.critical_ns.add(Some(end - start));
         }
-        self.cached = Some((
-            root,
-            descendants,
-            filter.clone(),
-            prices.clone(),
-            total.clone(),
-        ));
         total
     }
 }
