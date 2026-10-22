@@ -88,7 +88,6 @@ pub fn run(
         client: SessionClient::new(Env::Origin),
         prompt,
         mode,
-        read: false,
         stdin: None,
         synced: false,
         turn: None,
@@ -115,7 +114,7 @@ pub fn run(
             Input::Client(event) => once.client.step(event),
             Input::Busy => return Err(client::Error::Busy.into()),
             Input::Stdin(text) => {
-                (once.read, once.stdin) = (true, text);
+                once.stdin = Some(input(once.prompt.take().as_deref(), text.as_deref()));
                 once.send()
             }
             Input::Interrupt => once.interrupt(),
@@ -129,9 +128,7 @@ struct Once {
     prompt: Option<String>,
     /// `--mode`: set with the policy's `/mode` before the prompt goes.
     mode: Option<String>,
-    /// Stdin is read (or a terminal, not to be read).
-    read: bool,
-    /// What it held.
+    /// Complete input, once stdin has been read (or found to be a terminal).
     stdin: Option<String>,
     /// The replay of the attach is in.
     synced: bool,
@@ -144,10 +141,12 @@ struct Once {
 impl Once {
     /// Sends the input once attached and stdin is read.
     fn send(&mut self) -> Vec<client::Effect> {
-        if !self.synced || !self.read || self.turn.is_some() {
+        if !self.synced || self.turn.is_some() {
             return Vec::new();
         }
-        let text = input(self.prompt.as_deref(), self.stdin.as_deref());
+        let Some(text) = self.stdin.take() else {
+            return Vec::new();
+        };
         if text.is_empty() {
             errln!("a: nothing to send: give a prompt with -p, or on stdin");
             self.end(Ended::Usage);
@@ -181,11 +180,11 @@ impl Once {
     }
 
     fn link(&mut self) {
-        match self.client.link().clone() {
+        match self.client.link() {
             Link::Reconnecting { .. } => errln!("[daemon upgraded; reconnecting]"),
             Link::Draining => errln!("[waiting for the previous daemon to finish its work]"),
             Link::Wedged(d) => {
-                crate::report(&d);
+                crate::report(d);
                 self.fail(io::Error::new(io::ErrorKind::TimedOut, crate::RESTART));
             }
             Link::Ended(End::Lost(why)) => {
@@ -390,8 +389,7 @@ mod tests {
             client: SessionClient::new(Env::Keep),
             prompt: Some("same".into()),
             mode: None,
-            read: true,
-            stdin: None,
+            stdin: Some("same".into()),
             synced: true,
             turn: None,
             stream: client::ReplyStream::default(),
@@ -471,8 +469,7 @@ mod tests {
             client: SessionClient::new(Env::Keep),
             prompt: Some("hello".into()),
             mode: None,
-            read: true,
-            stdin: None,
+            stdin: Some("hello".into()),
             synced: true,
             turn: None,
             stream: client::ReplyStream::default(),
