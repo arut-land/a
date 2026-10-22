@@ -80,7 +80,10 @@ impl Transcript {
     ) -> Self {
         let entries: Vec<_> = entries.into_iter().collect();
         project(
-            normalize(entries.iter().map(Borrow::borrow), false),
+            normalize(
+                &entries.iter().map(Borrow::borrow).collect::<Vec<_>>(),
+                false,
+            ),
             Self::empty(registry, system),
         )
     }
@@ -271,12 +274,11 @@ fn context_edits(
 }
 
 /// Edits are resolved in their owning scope before inherited inputs are rebased.
-pub(crate) fn context_image<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> ContextImage {
-    normalize(entries, true)
+pub(crate) fn context_image(entries: &[Entry]) -> ContextImage {
+    normalize(&entries.iter().collect::<Vec<_>>(), true)
 }
 
-fn normalize<'a>(entries: impl IntoIterator<Item = &'a Entry>, inherited: bool) -> ContextImage {
-    let entries: Vec<_> = entries.into_iter().collect();
+fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
     let edits = context_edits(entries.iter().copied());
     let completed: std::collections::HashSet<_> = entries
         .iter()
@@ -296,7 +298,7 @@ fn normalize<'a>(entries: impl IntoIterator<Item = &'a Entry>, inherited: bool) 
         scopes: vec![RunnerKind::Agent],
         inputs: Vec::new(),
     };
-    for e in &entries {
+    for e in entries {
         let value = if let Some((from, _, text)) = edits
             .iter()
             .rev()

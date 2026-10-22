@@ -585,6 +585,6 @@ fn model_only_inputs_keep_their_interpretation_across_agent_scopes() {
             Transcript::of([&child], registry.clone(), "").into_context(),
             expected
         );
-        image = context_image([&child]);
+        image = context_image(std::slice::from_ref(&child));
     }
 }
