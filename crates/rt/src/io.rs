@@ -2,7 +2,7 @@
 //! run on: its timers, and descriptors registered with it, whose operations
 //! wait for readiness instead of blocking a thread.
 
-use std::io;
+use std::io::{self, Write as _};
 use std::time::Duration;
 
 use crate::BoxFuture;
@@ -20,16 +20,7 @@ pub enum Reactor {
 impl Reactor {
     /// Continuously ready I/O must give other sessions a poll.
     pub async fn yield_now(&self) {
-        let mut yielded = false;
-        std::future::poll_fn(|cx| {
-            if yielded {
-                return std::task::Poll::Ready(());
-            }
-            yielded = true;
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        })
-        .await;
+        crate::yield_now().await;
     }
 
     /// Resolves after `duration`, on this reactor's timers.
@@ -81,17 +72,17 @@ enum Inner<T: Source> {
 impl<T: std::os::fd::AsFd> Async<T> {
     /// Registers `io`, in non-blocking mode, for reading and writing.
     pub fn new(reactor: &Reactor, io: T) -> io::Result<Self> {
-        Self::register(reactor, io, true)
+        Self::register(reactor, io)
     }
 
     /// For a descriptor only ever read, or one that only signals (a pipe's
     /// read end, a pidfd, a kqueue): it is not watched for writing, which
     /// some descriptors refuse.
     pub fn for_reading(reactor: &Reactor, io: T) -> io::Result<Self> {
-        Self::register(reactor, io, false)
+        Self::register(reactor, io)
     }
 
-    fn register(reactor: &Reactor, io: T, write: bool) -> io::Result<Self> {
+    fn register(reactor: &Reactor, io: T) -> io::Result<Self> {
         match rustix::io::ioctl_fionbio(&io, true) {
             // Nothing is read from a descriptor that has no modes, such as
             // a kqueue watching a process: it only signals.
@@ -100,10 +91,7 @@ impl<T: std::os::fd::AsFd> Async<T> {
         }
         let inner = match reactor {
             // async-io watches a direction only while it is waited for.
-            Reactor::AsyncIo => {
-                let _ = write;
-                Inner::AsyncIo(async_io::Async::new_nonblocking(io)?)
-            }
+            Reactor::AsyncIo => Inner::AsyncIo(async_io::Async::new_nonblocking(io)?),
         };
         Ok(Self(inner))
     }
@@ -218,6 +206,20 @@ impl<T: Source> Async<T> {
     /// Use [`Async::flush`] to await completion of accepted writes.
     pub async fn write_with<R>(&self, op: impl FnMut(&T) -> io::Result<R>) -> io::Result<R> {
         self.retry(true, op).await
+    }
+
+    /// Writes a whole batch and completes every accepted write before returning.
+    pub async fn write_all(&self, mut bytes: &[u8]) -> io::Result<()>
+    where
+        for<'a> &'a T: io::Write,
+    {
+        while !bytes.is_empty() {
+            match self.write_with(|mut io| io.write(bytes)).await? {
+                0 => return Err(io::ErrorKind::WriteZero.into()),
+                n => bytes = &bytes[n..],
+            }
+        }
+        self.flush().await
     }
 
     /// Completes accepted writes without resubmitting their buffers.

@@ -9,7 +9,6 @@ use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
@@ -205,7 +204,7 @@ struct Abort(Mutex<Line>);
 
 #[derive(Default)]
 struct Line {
-    socket: Option<(u64, Arc<TcpStream>)>,
+    socket: Option<Arc<TcpStream>>,
     /// Whether the caller went away: a socket registered later is shut at
     /// once.
     abandoned: bool,
@@ -216,14 +215,18 @@ impl Abort {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn register(&self, id: u64, socket: &Arc<TcpStream>) {
+    fn register(&self, socket: &Arc<TcpStream>) {
         let mut line = self.line();
         if line.abandoned {
             let _ = socket.shutdown(Shutdown::Both);
-        } else if line.socket.as_ref().is_none_or(|(at, _)| *at != id) {
+        } else if line
+            .socket
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, socket))
+        {
             // Cancellation targets the same socket performing the blocking
             // read, rather than a separately duplicated Winsock descriptor.
-            line.socket = Some((id, Arc::clone(socket)));
+            line.socket = Some(Arc::clone(socket));
         }
     }
 
@@ -234,7 +237,7 @@ impl Abort {
     fn abandon(&self) {
         let mut line = self.line();
         line.abandoned = true;
-        if let Some((_, socket)) = line.socket.take() {
+        if let Some(socket) = line.socket.take() {
             let _ = socket.shutdown(Shutdown::Both);
         }
     }
@@ -295,7 +298,6 @@ impl<In: Transport> Connector<In> for Tcp {
 }
 
 struct Socket {
-    id: u64,
     stream: Arc<TcpStream>,
     buffers: LazyBuffers,
     read: Option<Duration>,
@@ -304,9 +306,7 @@ struct Socket {
 
 impl Socket {
     fn new(stream: TcpStream, buffers: LazyBuffers) -> Self {
-        static IDS: AtomicU64 = AtomicU64::new(0);
         Self {
-            id: IDS.fetch_add(1, Ordering::Relaxed),
             stream: Arc::new(stream),
             buffers,
             read: None,
@@ -317,7 +317,7 @@ impl Socket {
     fn register(&self) {
         CURRENT.with_borrow(|abort| {
             if let Some(abort) = abort {
-                abort.register(self.id, &self.stream);
+                abort.register(&self.stream);
             }
         });
     }
