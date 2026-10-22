@@ -71,10 +71,10 @@ struct Workers {
     threads: Vec<(Arc<Wakeup>, JoinHandle<()>)>,
 }
 
-// async-executor's scheduler borrows its State. Cancellation drains tasks,
-// but an external wake can still be inside the scheduler when State is freed.
-// Only expose wakers that hold the executor for the duration of scheduling;
-// a weak reference avoids keeping pending tasks and their executor in a cycle.
+// The pinned scheduler owns its State, so concurrent destruction is sound.
+// Holding the executor during scheduling prevents enqueueing after its final
+// drain, which would leak a State/queued-task cycle. A weak reference avoids
+// retaining the executor through its tasks and makes late wakes no-ops.
 struct TaskWake {
     executor: Weak<Executor<'static>>,
     task: Waker,

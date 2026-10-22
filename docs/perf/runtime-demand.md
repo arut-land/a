@@ -53,19 +53,22 @@ A last handle dropped on one of its own workers signals shutdown without
 joining: the executor must return before its pending futures can
 release I/O cancellation guards. This path has a dedicated regression test.
 
-Task wakers pin the executor only while forwarding a wake. A weak reference
-breaks the ownership cycle and makes wakes after executor destruction no-ops.
-This guards async-executor 1.14.0's borrowed scheduler state against concurrent
-executor destruction; the unguarded race reports undefined behaviour in Miri.
+Task wakers hold the executor only while forwarding a wake, so scheduling
+finishes before executor destruction performs its final queue drain. Without
+that ordering, a late enqueue can leak a scheduler-state/queued-task ownership
+cycle. The guard's weak reference avoids retaining the executor through its
+pending tasks and makes wakes after executor destruction no-ops. The guard
+exists for reclamation; scheduler lifetime safety comes from async-executor's
+owned `Arc<State>`, pinned to upstream fix
+[`96a1f6a19ceb828c8eb8a10cb4b40daefdbdb945`](https://github.com/smol-rs/async-executor/pull/164).
 The private spawn adapter caches one wrapper for the task's fixed scheduler
-waker: one Arc allocation on first poll, none on subsequent polls. Comparing
-cloned scheduler wakers with `will_wake` caused false negatives and repeated
-allocations in both the native dev build and Miri. Each forwarded wake pays
-one weak upgrade and strong-reference release; no timers or idle work are added.
-The `task_wakes_can_race_executor_drop` and
-`task_waker_is_reused_when_the_scheduler_waker_is_unchanged` tests cover the
-race, late wakes, executor reclamation and allocation reuse. `mise run test:miri`
-runs both before the existing sys tests.
+waker: one Arc allocation on first poll, none on subsequent polls. Scheduler
+waker identity is fixed even when `will_wake` returns a false negative. Each
+forwarded wake pays one weak upgrade and strong-reference release; no timers
+or idle work are added. The `task_wakes_can_race_executor_drop` and
+`task_waker_is_reused_when_the_scheduler_waker_is_unchanged` invariants cover
+concurrent wakes, late wakes, executor reclamation and allocation reuse.
+`mise run test:miri` runs both with leak checking before the sys tests.
 
 Network reservations include request payload and bounded stream buffers.
 Logging reserves its fixed-record batch plus encoding scratch. Generic
