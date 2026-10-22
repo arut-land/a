@@ -106,7 +106,7 @@ impl<'de> Fields<'de> for Reply {
     ) -> std::result::Result<bool, A::Error> {
         match key {
             "message" => {
-                let message: Message = next(map)?;
+                let mut message: Message = next(map)?;
                 let super::Message::Assistant(assistant) =
                     message.build("assistant").map_err(A::Error::custom)?
                 else {
@@ -115,7 +115,7 @@ impl<'de> Fields<'de> for Reply {
                 self.message = Some(assistant);
             }
             "finish" => {
-                let finish: FinishFields = next(map)?;
+                let mut finish: FinishFields = next(map)?;
                 self.finish = Some(finish.build().map_err(A::Error::custom)?);
             }
             "usage" => self.usage = Some(next::<_, UsageFields>(map)?.0),
@@ -154,7 +154,7 @@ impl<'de> Fields<'de> for Message {
 }
 
 impl Message {
-    fn build(self, role: &str) -> Result<super::Message> {
+    fn build(&mut self, role: &str) -> Result<super::Message> {
         let mut message = match role {
             "system" => super::Message::System(super::System {
                 content: Vec::new(),
@@ -164,7 +164,7 @@ impl Message {
             }),
             "assistant" => super::Message::Assistant(Assistant {
                 content: Vec::new(),
-                origin: self.origin.and_then(|o| o.0),
+                origin: self.origin.take().and_then(|o| o.0),
             }),
             "tool" => super::Message::Tool(super::ToolMessage {
                 results: Vec::new(),
@@ -172,11 +172,11 @@ impl Message {
             role => return Err(unknown(role, &["system", "user", "assistant", "tool"])),
         };
         let parts = if role == "tool" {
-            self.results
+            std::mem::take(&mut self.results)
         } else {
-            required(self.content, "content")?
+            required(self.content.take(), "content")?
         };
-        for part in parts {
+        for mut part in parts {
             match &mut message {
                 super::Message::System(system) => system.content.push(part.text()?),
                 super::Message::User(user) => user.content.push(part.user()?),
@@ -193,8 +193,8 @@ struct OptionalOrigin(Option<Origin>);
 
 impl<'de> Deserialize<'de> for OptionalOrigin {
     fn deserialize<D: Deserializer<'de>>(json: D) -> std::result::Result<Self, D::Error> {
-        let origin: Option<OriginFields> = Deserialize::deserialize(json)?;
-        let origin = origin.map(OriginFields::build).transpose();
+        let mut origin: Option<OriginFields> = Deserialize::deserialize(json)?;
+        let origin = origin.as_mut().map(OriginFields::build).transpose();
         origin.map(OptionalOrigin).map_err(D::Error::custom)
     }
 }
@@ -223,11 +223,11 @@ impl<'de> Fields<'de> for OriginFields {
 }
 
 impl OriginFields {
-    fn build(self) -> Result<Origin> {
+    fn build(&mut self) -> Result<Origin> {
         Ok(Origin {
-            protocol: required(self.protocol, "protocol")?,
-            provider: required(self.provider, "provider")?,
-            model: required(self.model, "model")?,
+            protocol: required(self.protocol.take(), "protocol")?,
+            provider: required(self.provider.take(), "provider")?,
+            model: required(self.model.take(), "model")?,
         })
     }
 }
@@ -256,7 +256,7 @@ impl<'de> Fields<'de> for FinishFields {
 }
 
 impl FinishFields {
-    fn build(self) -> Result<Finish> {
+    fn build(&mut self) -> Result<Finish> {
         const REASONS: &[&str] = &[
             "stop",
             "length",
@@ -265,7 +265,7 @@ impl FinishFields {
             "error",
             "other",
         ];
-        let reason = match required(self.reason, "reason")?.as_str() {
+        let reason = match required(self.reason.take(), "reason")?.as_str() {
             "stop" => Reason::Stop,
             "length" => Reason::Length,
             "tool_calls" => Reason::ToolCalls,
@@ -276,8 +276,8 @@ impl FinishFields {
         };
         Ok(Finish {
             reason,
-            raw: self.raw,
-            message: self.message,
+            raw: self.raw.take(),
+            message: self.message.take(),
         })
     }
 }
@@ -373,22 +373,29 @@ impl<'de> Fields<'de> for Part {
 }
 
 impl Part {
-    fn text(self) -> Result<Text> {
+    fn text(&mut self) -> Result<Text> {
         Ok(Text {
-            text: required(self.text, "text")?,
-            meta: self.meta.unwrap_or_default().0,
+            text: required(self.text.take(), "text")?,
+            meta: self.meta.take().unwrap_or_default().0,
         })
     }
-    fn tool_result(self) -> Result<ToolResult> {
+    fn media(&mut self) -> Result<Media> {
+        Ok(Media {
+            media_type: required(self.media_type.take(), "media_type")?,
+            source: required(self.source.as_mut(), "source")?.build()?,
+            meta: self.meta.take().unwrap_or_default().0,
+        })
+    }
+    fn tool_result(&mut self) -> Result<ToolResult> {
         Ok(ToolResult {
-            id: required(self.id, "id")?,
-            name: required(self.name, "name")?,
-            output: required(self.output, "output")?.build()?,
+            id: required(self.id.take(), "id")?,
+            name: required(self.name.take(), "name")?,
+            output: required(self.output.as_mut(), "output")?.build()?,
             error: self.error.unwrap_or(false),
-            meta: self.meta.unwrap_or_default().0,
+            meta: self.meta.take().unwrap_or_default().0,
         })
     }
-    fn build(self) -> Result<AssistantPart> {
+    fn build(&mut self) -> Result<AssistantPart> {
         const KINDS: &[&str] = &[
             "text",
             "reasoning",
@@ -397,50 +404,38 @@ impl Part {
             "media",
             "opaque",
         ];
-        let mut part = self;
-        let kind = required(part.kind.take(), "type")?;
-        if kind == "text" {
-            return Ok(AssistantPart::Text(part.text()?));
+        let kind = required(self.kind.take(), "type")?;
+        match kind.as_str() {
+            "text" => return self.text().map(AssistantPart::Text),
+            "media" => return self.media().map(AssistantPart::Media),
+            "tool_result" => return self.tool_result().map(AssistantPart::ToolResult),
+            _ => {}
         }
-        if kind == "tool_result" {
-            return Ok(AssistantPart::ToolResult(part.tool_result()?));
-        }
-        let Self {
-            text,
-            redacted,
-            id,
-            name,
-            input,
-            invalid,
-            provider_executed,
-            media_type,
-            source,
-            meta,
-            ..
-        } = part;
-        let meta = meta.unwrap_or_default().0;
+        let meta = self.meta.take().unwrap_or_default().0;
         Ok(match kind.as_str() {
             "reasoning" => AssistantPart::Reasoning(Reasoning {
-                text: text.unwrap_or_default(),
-                redacted: redacted.unwrap_or(false),
+                text: self.text.take().unwrap_or_default(),
+                redacted: self.redacted.unwrap_or(false),
                 meta,
             }),
             "tool_call" => AssistantPart::ToolCall(ToolCall {
-                id: required(id, "id")?,
-                name: required(name, "name")?,
-                input: object(required(input, "input")?)?,
-                invalid,
-                provider_executed: provider_executed.unwrap_or(false),
-                meta,
-            }),
-            "media" => AssistantPart::Media(Media {
-                media_type: required(media_type, "media_type")?,
-                source: required(source, "source")?.build()?,
+                id: required(self.id.take(), "id")?,
+                name: required(self.name.take(), "name")?,
+                input: object(required(self.input.take(), "input")?)?,
+                invalid: self.invalid.take(),
+                provider_executed: self.provider_executed.unwrap_or(false),
                 meta,
             }),
             "opaque" => AssistantPart::Opaque(Opaque { meta }),
             kind => return Err(unknown(kind, KINDS)),
         })
+    }
+    fn user(&mut self) -> Result<UserPart> {
+        match required(self.kind.take(), "type")?.as_str() {
+            "text" => self.text().map(UserPart::Text),
+            "media" => self.media().map(UserPart::Media),
+            kind => Err(unknown(kind, &["text", "media"])),
+        }
     }
 }
 
@@ -467,40 +462,22 @@ impl<'de> Fields<'de> for OutputFields {
 }
 
 impl OutputFields {
-    fn build(self) -> Result<Output> {
+    fn build(&mut self) -> Result<Output> {
         const KINDS: &[&str] = &["text", "json", "content"];
-        let kind = required(self.kind, "type")?;
-        let value = required(self.value, "value")?;
+        let kind = required(self.kind.take(), "type")?;
+        let value = required(self.value.take(), "value")?;
         Ok(match kind.as_str() {
             "text" => Output::Text(serde_json::from_slice(value.get().as_bytes())?),
             "json" => Output::Json(Json::from(value)),
             "content" => {
                 let parts: Vec<Part> = serde_json::from_slice(value.get().as_bytes())?;
                 let mut content = Vec::new();
-                for part in parts {
+                for mut part in parts {
                     content.push(part.user()?);
                 }
                 Output::Content(content)
             }
             kind => return Err(unknown(kind, KINDS)),
-        })
-    }
-}
-
-impl Part {
-    fn user(self) -> Result<UserPart> {
-        let meta = self.meta.unwrap_or_default().0;
-        Ok(match required(self.kind, "type")?.as_str() {
-            "text" => UserPart::Text(Text {
-                text: required(self.text, "text")?,
-                meta,
-            }),
-            "media" => UserPart::Media(Media {
-                media_type: required(self.media_type, "media_type")?,
-                source: required(self.source, "source")?.build()?,
-                meta,
-            }),
-            kind => return Err(unknown(kind, &["text", "media"])),
         })
     }
 }
@@ -531,16 +508,16 @@ impl<'de> Fields<'de> for SourceFields {
 }
 
 impl SourceFields {
-    fn build(self) -> Result<Source> {
-        Ok(match required(self.kind, "type")?.as_str() {
+    fn build(&mut self) -> Result<Source> {
+        Ok(match required(self.kind.take(), "type")?.as_str() {
             "data" => Source::Data {
-                data: required(self.data, "data")?,
+                data: required(self.data.take(), "data")?,
             },
             "url" => Source::Url {
-                url: required(self.url, "url")?,
+                url: required(self.url.take(), "url")?,
             },
             "file" => Source::File {
-                id: required(self.id, "id")?,
+                id: required(self.id.take(), "id")?,
             },
             kind => return Err(unknown(kind, &["data", "url", "file"])),
         })

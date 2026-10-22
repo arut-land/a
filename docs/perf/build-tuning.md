@@ -210,13 +210,13 @@ The 1000-regeneration probe bounds the last request to fewer than 3100
 messages and child history to less than 2 MB. The child keeps 2002 own
 instruction/reply messages and no copies of the owner's original input.
 
-Production Rust grows by 210 lines during review, or 727 over main,
+Production Rust grows by 187 lines during review, or 704 over main,
 excluding test files and inline test modules. This exceeds the original
-500-line estimate by 227: the original implementation was 17 lines over,
-and review requires 210 additional lines. Those changes comprise engine
+500-line estimate by 204: the original implementation was 17 lines over,
+and review requires 187 additional lines. Those changes comprise engine
 ownership/recovery, per-turn projection and shared committed reply delivery
 (+174), typed SDK codecs (+81), generic kernel recovery (+10), and protocol
-ownership derivation (+5), offset by merging the message readers (-60).
+ownership derivation (+5), offset by merging the message readers and their in-place construction (-83).
 
 Files outside the original F01 manifest:
 
