@@ -180,76 +180,11 @@ and build-std release builds; only the final link is never cached.
 - "aube" is a Node package manager, not mbx (jdx/mr-boxington).
 - Deno's ICF saved 3.77 MB, not the 6 MB in its config comment (deno#34478).
 
-## Persistent model-only threads (F01)
+## Thread ids (uuid `v5`)
 
-The release measurements use `CARGO_BUILD_JOBS=2 mise run size`, including
-build-std and the normal shipping feature set. No budget or startup runs
-were used.
-
-| State | Release binary |
-| --- | ---: |
-| Main before F01 | 3915 KiB |
-| F01 before lifecycle review | 3996 KiB |
-| First ownership, recovery and retention review | 3948 KiB |
-| Positive recovery evidence, owner authority and bounded requests | 3964 KiB |
-| Mandatory current instructions and shared lifecycle/codec/reply paths | 3948 KiB |
-
-The final review removes 16 KiB, recovering 48 KiB of the original 81 KiB
-growth and leaving 148 KiB under the 4096 KiB cap. Message decoding shares
-byte-based field readers. SDK turn, runner and role codecs live in their
-owning crate. Spawn admission and recovery share one SDK spec codec rather
-than copying fields into an engine authority type. Request assembly and
-message serialization live together in `llm`; context policies use tuples.
-Preparation, dispatch and committed reply delivery share their existing
-lifecycle paths, and invocation metadata no longer duplicates result payloads.
-
-Thread ids use the existing UUID crate's namespace derivation (`v5`, with
-its maintained `sha1_smol` backend), so an owner and thread key determine the
-id without storing a writable foreign conversation id in copied history.
-The measurements include that dependency; a second hash implementation is
-unnecessary. The executing address is derived from the caller's session,
-never read from a copied record.
-
-The 1000-regeneration probe requires constant request length and serialized
-bytes after warmup, at most ten messages and 8192 bytes. Durable child
-history still contains 2002 own instruction/reply messages, no owner input
-copies, and less than 2 MB of log data. Historical system instructions expire
-with their exchanges. The admitted kind's system prompt and the explicit
-current input survive request trimming; mandatory instructions above the
-ceiling fail with `InvalidRequest` before a provider call.
-
-Production Rust shrinks by 138 lines in the final review, leaving 767 over
-main, excluding test files and trailing inline test modules. The original
-500-line estimate is still exceeded by 267: the initial implementation added
-517 lines, the first lifecycle review added 187, and the authority/bounds
-review added 201 before these 138 deletions. The retained work implements
-owner-derived identity, typed recovery evidence, admitted owner projection,
-request bounds and shared durable conversation delivery. The simplification
-cuts remove separate prepare/send wrappers, the duplicate `SpawnAuthority`,
-three result lookup/wait paths, invocation result payloads and the selector's
-separate owner/history branches and historical-system scans.
-
-Files outside the original F01 manifest:
-
-| File | Reason |
-| --- | --- |
-| `Cargo.toml`, `Cargo.lock` | Enable UUID namespace derivation for session-owned thread ids. |
-| `apps/cli/src/exts.rs` | Check the title extension's new source version. |
-| `apps/cli/tests/blackbox/web.rs` | Count attachments for the selected session when owned threads also appear in listings. |
-| `crates/engine/src/driver.rs` | Admit runners, restore model-only bindings after faults, and supply generic recovery with typed interruption evidence. |
-| `crates/engine/src/driver/inbox.rs` | Await committed conversation replies through the actor. |
-| `crates/engine/src/projection.rs` | Share committed reply delivery and couple owner prefixes to their admitted projection authority. |
-| `crates/engine/src/services.rs` | Bind model-only conversations without tools or loop hooks. |
-| `crates/engine/src/store/index.rs` | Index thread identities, input aliases and committed outcomes without payload retention. |
-| `crates/engine/src/transcript.rs` | Retain only thread exchanges and project per-turn owner context separately. |
-| `crates/ext/src/host.rs` | Expose explicit runner classification at the existing binding seam. |
-| `crates/ext-subagent/src/lib.rs` | Select agent runners through the shared SDK runner type. |
-| `crates/llm/src/conversation.rs` | Decode persisted rich messages and assemble bounded exchange windows in their owning crate. |
-| `crates/llm/src/spec/read.rs` | Share message and response field readers. |
-| `crates/llm/src/spec/read/tests.rs` | Verify every message role and opaque provider state survives decoding. |
-| `crates/protocol/src/publication.rs` | Encode frozen authority and compact thread envelopes without copied child ids. |
-| `docs/perf/build-tuning.md` | Record measured size, dependency choice and the production line-count exception. |
-
-Re-review files outside the original manifest: `crates/llm/src/conversation.rs`
-and `crates/llm/src/lib.rs` own bounded message assembly and its exported
-policy, keeping message serialization in the owning crate.
+Side threads derive their id from the owner session and thread key with the
+`uuid` crate's namespace ids (`v5`, backed by the maintained `sha1_smol`), so
+no writable foreign id is ever stored in copied history. The release binary
+with persistent threads measured 3948 KiB (`mise run size`, build-std) against
+3915 KiB before them, the `v5` feature included; a second hash
+implementation would not be smaller.
