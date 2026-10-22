@@ -257,6 +257,10 @@ Do not treat a historical result as a current budget pass.
 `mise run size` checks shipped bytes and fixture exclusion. `budgets` checks
 cold first reply, attach latency, idle RSS and quiet shell execution on an
 isolated release build. `startup` compares process launch against its floor.
+The supervisor's no-polling invariant uses explicit future polling and a fixed
+runtime clock: queued notifications are consumed before asserting that the
+next wait is the idle deadline.
+
 Timing runs require a quiet machine. CI also runs fmt, clippy, nextest,
 dependency checks, fuzzing, Miri and the Apple facade/app lane. Windows has
 a native build/lint lane with required workspace and daemon acceptance

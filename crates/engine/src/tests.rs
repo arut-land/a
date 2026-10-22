@@ -110,27 +110,6 @@ impl Daemon {
     }
 }
 
-/// Whether anything happened in the daemon within `within`: an event
-/// emitted, a session changed.
-fn anything_within(daemon: &Daemon, within: Duration) -> bool {
-    let (mut pulsed, mut events) = (daemon.pulse.count(), super::EVENTS.1.count());
-    let timeout = rt::Reactor::AsyncIo.sleep(within);
-    rt::block_on(rt::or(
-        async {
-            rt::or(
-                daemon.pulse.changed(&mut pulsed),
-                super::EVENTS.1.changed(&mut events),
-            )
-            .await;
-            true
-        },
-        async {
-            timeout.await;
-            false
-        },
-    ))
-}
-
 /// Whether the catalog marks session `id` busy, as the next daemon reads it.
 fn marked(home: &Home, id: SessionId) -> bool {
     let store = Jsonl::open(home.sessions_dir()).unwrap();
@@ -889,15 +868,6 @@ impl Recorder {
             .filter(|e| e.name == name)
             .count()
     }
-
-    fn of(&self, session: SessionId) -> Vec<rt::Event> {
-        let session = session.to_string();
-        crate::lock(&self.0)
-            .iter()
-            .filter(|e| e.session.as_ref() == Some(&session))
-            .cloned()
-            .collect()
-    }
 }
 
 impl rt::EventSink for Recorder {
@@ -912,57 +882,82 @@ impl rt::EventSink for Recorder {
 #[test]
 fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     use super::{EVENTS, Exit, Lifecycle};
+    use std::future::Future;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Waker};
+
+    struct Timers(rt::Threads, Mutex<Vec<Duration>>, Instant);
+    impl rt::Runtime for Timers {
+        fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+            self.0.spawn(task);
+        }
+        fn spawn_blocking(
+            &self,
+            class: rt::BlockingClass,
+            bytes: usize,
+            work: Box<dyn FnOnce() + Send>,
+        ) -> rt::BoxFuture<'static, std::io::Result<()>> {
+            self.0.spawn_blocking(class, bytes, work)
+        }
+        fn spawn_flush(
+            &self,
+            work: Box<dyn FnOnce() + Send>,
+        ) -> rt::BoxFuture<'static, std::io::Result<()>> {
+            self.0.spawn_flush(work)
+        }
+        fn reactor(&self) -> rt::Reactor {
+            self.0.reactor()
+        }
+        fn sleep(&self, duration: Duration) -> rt::BoxFuture<'static, ()> {
+            super::lock(&self.1).push(duration);
+            Box::pin(std::future::pending())
+        }
+        fn now(&self) -> Instant {
+            self.2
+        }
+    }
 
     let (root, home) = home("supervise");
-    std::fs::create_dir_all(&root).unwrap();
     let config = Config {
         idle: Duration::from_secs(3600),
-        hibernate: Duration::from_millis(300),
         ..echo()
     };
-    let daemon = Daemon::load(&home, &config).unwrap();
+    let runtime = Arc::new(Timers(
+        rt::Threads::default(),
+        Mutex::new(Vec::new()),
+        Instant::now(),
+    ));
+    let daemon = Daemon::load_on(&home, &config, &runtime).unwrap();
     let exit = Exit {
         home: home.clone(),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
     };
     let life = Lifecycle::new("test".into(), home.runtime());
-    let supervisor = std::sync::Arc::clone(&daemon);
-    daemon.shared.rt.spawn(Box::pin(async move {
-        supervisor.supervise(&life, &config, exit).await;
-    }));
-    daemon.wait("the first look", PATIENCE, || EVENTS.count("wake") > 0);
-
-    let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
-    let id = attachment.session().id;
-    attachment.session().submit("$ true").unwrap();
-    settle(&daemon);
-    let ended = attachment.session().ended();
-    let detached = Instant::now();
-    drop(attachment);
-    let hibernated = || daemon.slots()[0].live().is_none();
-    daemon.wait("hibernation", PATIENCE, hibernated);
-    let after = detached.elapsed();
-    // The actor's end, which it tells the supervisor, is the last news.
-    rt::block_on(ended.wait());
-    while anything_within(&daemon, Duration::from_millis(100)) {}
-    let wakes = EVENTS.count("wake");
-
-    // Nothing is due for an hour: nothing wakes the supervisor.
-    let quiet = !anything_within(&daemon, Duration::from_millis(500));
-    let idle_wakes = EVENTS.count("wake") - wakes;
-    let names: Vec<_> = (EVENTS.of(id).iter().map(|e| e.name))
-        .filter(|&name| name != "commit")
-        .collect();
-    std::fs::remove_dir_all(&root).unwrap();
-    assert!(quiet, "late supervisor news: {:?}", crate::lock(&EVENTS.0));
-
-    assert!(
-        after >= Duration::from_millis(300),
-        "hibernated after {after:?}"
-    );
-    assert_eq!(idle_wakes, 0);
-    assert!(wakes < 20, "{wakes} wakes for one turn");
-    assert_eq!(names, ["load", "busy", "effect", "settled", "hibernate"]);
+    {
+        // Owning the polls distinguishes queued news from unsolicited wakes,
+        // regardless of how long a worker would take to consume that news.
+        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit));
+        let mut cx = Context::from_waker(Waker::noop());
+        let before = EVENTS.count("wake");
+        assert!(supervisor.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(EVENTS.count("wake") - before, 1);
+        for expected in 2..=3 {
+            daemon.pulse.notify();
+            daemon.pulse.notify();
+            assert_eq!(EVENTS.count("wake") - before, expected - 1);
+            assert!(supervisor.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(EVENTS.count("wake") - before, expected);
+            // A spurious poll consumes no news and starts no new iteration.
+            assert!(supervisor.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(EVENTS.count("wake") - before, expected);
+        }
+        daemon.jobs.notify();
+        assert!(supervisor.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(EVENTS.count("wake") - before, 4);
+        assert_eq!(*super::lock(&runtime.1), [config.idle; 4]);
+    }
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

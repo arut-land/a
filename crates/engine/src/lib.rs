@@ -347,7 +347,7 @@ impl Daemon {
         Ok(owner)
     }
 
-    fn load_on(home: &Home, config: &Config, runtime: &Arc<rt::Threads>) -> io::Result<Owner> {
+    fn load_on(home: &Home, config: &Config, runtime: &Arc<impl rt::Runtime>) -> io::Result<Owner> {
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
         let catalog = Catalog::open(home.catalog_file(), &*store)?;
         catalog.start(Arc::clone(runtime) as Arc<dyn rt::Runtime>);
@@ -1000,7 +1000,7 @@ impl Daemon {
         let mut pulsed = self.pulse.count();
         let mut jobs = self.jobs.count();
         loop {
-            let now = Instant::now();
+            let now = self.shared.rt.now();
             event(|| rt::Event {
                 name: "wake",
                 session: None,
@@ -1046,7 +1046,7 @@ impl Daemon {
             let sleep = async {
                 match next {
                     Some(at) => {
-                        let until = at.saturating_duration_since(Instant::now());
+                        let until = at.saturating_duration_since(self.shared.rt.now());
                         self.shared.rt.sleep(until).await;
                     }
                     None => std::future::pending().await,
