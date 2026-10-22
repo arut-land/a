@@ -56,8 +56,10 @@ and each crate's `//!` comment supplying the details.
 - **Dependencies need a measured reason.** Prefer a maintained crate over
   hand-rolling; hand-roll only when measurements show no crate fits the
   memory, CPU or reliability needs, and record the comparison in
-  `docs/perf`. Binary size is measured and reported, not a constraint:
-  never hand-roll or bend the architecture to save bytes.
+  `docs/perf`. Binary size is measured and reported, not a hard cap:
+  never hand-roll or bend the architecture to save bytes, and never take
+  a crate whose size or dependency tree is out of proportion to what it
+  gives.
 - **Large serde types decode in their owning crate** (`protocol::Decode`,
   `llm::Response::from_value`): release builds do not share generic
   instantiations across crates. No internally tagged enum inside another.
