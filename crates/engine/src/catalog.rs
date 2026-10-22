@@ -256,37 +256,44 @@ impl Catalog {
         let state = Arc::clone(&self.state);
         let rt = Arc::clone(runtime);
         runtime.spawn(Box::pin(async move {
-            rt::unblock(&*rt, move || {
-                let mut image = lock(&writer.gate);
-                loop {
-                    if writer.closed.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let pending = {
-                        let mut state = lock(&state);
-                        if state.pending.is_empty() {
-                            writer.scheduled.store(false, Ordering::Release);
-                            break;
+            // Clean owns the final image; a queued best-effort writer may reach
+            // admission only after shutdown has closed the blocking pool.
+            let _ = rt
+                .spawn_blocking(
+                    rt::BlockingClass::Storage,
+                    rt::STORAGE_BYTES,
+                    Box::new(move || {
+                        let mut image = lock(&writer.gate);
+                        loop {
+                            if writer.closed.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let pending = {
+                                let mut state = lock(&state);
+                                if state.pending.is_empty() {
+                                    writer.scheduled.store(false, Ordering::Release);
+                                    break;
+                                }
+                                std::mem::take(&mut state.pending)
+                            };
+                            image.lines += pending.len();
+                            image
+                                .records
+                                .extend(pending.iter().map(|(&id, record)| (id, record.clone())));
+                            let compact = image.lines > 2 * image.records.len() + 64;
+                            let records = if compact {
+                                image.lines = image.records.len();
+                                &image.records
+                            } else {
+                                &pending
+                            };
+                            if let Err(e) = writer.persist(records, compact) {
+                                catalog_fault(&e);
+                            }
                         }
-                        std::mem::take(&mut state.pending)
-                    };
-                    image.lines += pending.len();
-                    image
-                        .records
-                        .extend(pending.iter().map(|(&id, record)| (id, record.clone())));
-                    let compact = image.lines > 2 * image.records.len() + 64;
-                    let records = if compact {
-                        image.lines = image.records.len();
-                        &image.records
-                    } else {
-                        &pending
-                    };
-                    if let Err(e) = writer.persist(records, compact) {
-                        catalog_fault(&e);
-                    }
-                }
-            })
-            .await;
+                    }),
+                )
+                .await;
         }));
     }
 }
@@ -398,6 +405,56 @@ fn catalog_fault(error: &io::Error) {
 mod tests {
     use super::*;
     use crate::store::Memory;
+
+    #[test]
+    fn a_queued_catalog_write_can_reach_admission_after_shutdown() {
+        #[derive(Default)]
+        struct Held {
+            runtime: rt::Threads,
+            task: Mutex<Option<rt::BoxFuture<'static, ()>>>,
+        }
+
+        impl rt::Runtime for Held {
+            fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+                assert!(lock(&self.task).replace(task).is_none());
+            }
+
+            fn spawn_blocking(
+                &self,
+                class: rt::BlockingClass,
+                bytes: usize,
+                work: Box<dyn FnOnce() + Send>,
+            ) -> rt::BoxFuture<'static, io::Result<()>> {
+                self.runtime.spawn_blocking(class, bytes, work)
+            }
+
+            fn spawn_flush(
+                &self,
+                work: Box<dyn FnOnce() + Send>,
+            ) -> rt::BoxFuture<'static, io::Result<()>> {
+                self.runtime.spawn_flush(work)
+            }
+
+            fn reactor(&self) -> rt::Reactor {
+                self.runtime.reactor()
+            }
+        }
+
+        let catalog = Catalog::memory();
+        let runtime = Arc::new(Held::default());
+        catalog.start(runtime.clone());
+        let record = Record::new(Header {
+            id: SessionId::new(),
+            workspace: "/w".into(),
+            parent: None,
+        });
+        catalog.record(record.clone());
+        catalog.clean().unwrap();
+        runtime.runtime.shutdown();
+        let queued = lock(&runtime.task).take().expect("queued catalog write");
+        rt::block_on(queued);
+        assert_eq!(catalog.records(), [record]);
+    }
 
     #[test]
     fn coalescing_persists_the_last_revision_before_clean() {
