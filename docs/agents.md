@@ -230,44 +230,47 @@ per owning call. See [side-calls.md](side-calls.md) for the full contract.
 
 `ext-metrics` folds the engine's generic execution metadata for all daemon
 conversations by `AttemptId { executing_session, call, attempt }`. The driver
-takes the monotonic start in memory when it sends the request.
-Execution metadata rides on the existing result or retry settlement in the
-same commit; recording metrics adds no entries or flushes. Facts freeze the
-resolved
-model, role, runner, agent, side classification, wall-clock correlation and
-monotonic clock epoch. Unsettled intents retain unknown
-usage and duration per attempt, even after a later retry succeeds. Attempt
-counts distinguish `executed` from `ambiguous`: a crash cannot prove whether
-an intent was sent. No start fact is recorded. Cancellation after sending
-settles one executed attempt with measured duration and unknown usage. Usage
-counts are captured in `llm` before reply serialization,
-including failed finishes; missing counts remain unknown. No elapsed duration
-is reconstructed by subtracting clocks across a restart.
+takes the monotonic start in memory when it sends the request. Execution
+metadata rides on the existing result, retry or interruption settlement in
+the same commit; recording metrics adds no entries or flushes. Facts freeze
+the resolved model, role, runner, agent, side classification, wall-clock
+correlation and monotonic clock epoch.
+
+Unsettled intents retain unknown usage and duration per attempt, even after
+a later retry succeeds. Attempt counts distinguish `executed` from `ambiguous`:
+a crash cannot prove whether an intent was sent. No start fact is recorded.
+Cancellation after sending settles one executed attempt with measured duration
+and unknown usage. Usage counts are captured in `llm` before reply
+serialization, including failed finishes; missing counts remain unknown. No
+elapsed duration is reconstructed by subtracting clocks across a restart.
 
 `/metrics` queries the current ownership subtree. Its optional JSON argument
 is a price table `[version, currency, models]`, where `models` is a list of
-`[model, rates]` pairs sorted at query admission. Each rate array has ten
-signed nanocurrency rates in `llm::Count::ALL` order. Input/output counts
-include their subsets, so cache
-rates are adjustments to the inclusive input rate. Every nonzero coefficient
-requires an observed count. No built-in price is assumed. A recorded charge
-in the selected currency takes precedence. Missing rates, counts or duration
-increase `UsageTotal.missing`; `known` is only the observed portion.
+`[model, rates]` pairs sorted at query admission. Each rate array has ten signed
+nanocurrency rates in `llm::Count::ALL` order. Input/output counts include their
+subsets, so cache rates are adjustments to the inclusive input rate. Every
+nonzero coefficient requires an observed count. No built-in price is assumed.
+A recorded charge in the selected currency takes precedence. Missing rates,
+counts or duration increase `UsageTotal.missing`; `known` is only the observed
+portion.
 
-Own totals include only attempts executed in that conversation. The log service selects subtree
-ids by following immutable ownership edges once; aggregation reuses those ids, and copied fork facts and cached
-replies add no spend. Projection API filters select agent and side/main dimensions without
+Own totals include only attempts executed in that conversation. The log
+service selects subtree ids by following immutable ownership edges once;
+aggregation reuses those ids. Copied fork facts and cached replies add no
+spend. Projection API filters select agent and side/main dimensions without
 changing the facts. Critical elapsed time is the envelope of measured intervals
 within each clock epoch, separately from summed call durations. Multiple epochs
 and unfinished intervals report incomplete coverage; wall clocks never fill
-the gaps. Disposable in-memory folds retain conversation/sequence/epoch cursors.
-Reads
+the gaps.
+
+Disposable in-memory folds retain conversation/sequence/epoch cursors. Reads
 seek to the covered line, validate it and decode only the suffix; replaced
-coverage resets the fold. Copied history is excluded at the history-policy
-boundary. Unrelated entries advance the cursor without changing accounting.
-Queries aggregate cached facts with the supplied versioned prices; results are
-not cached. Repricing changes no execution fact. No durable accumulator is maintained;
-query replies are ordinary tool outcomes and are never counted as execution.
+coverage resets the fold. Prefix and suffix reads share line validation.
+Copied history is excluded at the history-policy boundary. Unrelated entries
+advance the cursor without changing accounting. Queries aggregate cached facts
+with the supplied versioned prices; results are not cached. Repricing changes
+no execution fact. No durable accumulator is maintained; query replies are
+ordinary tool outcomes and are never counted as execution.
 
 ## Layer boundaries and future modes
 

@@ -251,26 +251,8 @@ impl LogStore for Jsonl {
     }
 
     fn prefix(&self, id: SessionId, seq: u64) -> io::Result<Vec<Entry>> {
-        let mut reader = BufReader::new(File::open(self.path(id)?)?);
-        let mut line = Vec::new();
-        reader.read_until(b'\n', &mut line)?;
-        if !unseal(&mut line) {
-            return Err(io::Error::other("unreadable session header"));
-        }
-        let mut entries = Vec::new();
-        let mut history = History::default();
-        for _ in 1..=seq {
-            line.clear();
-            reader.read_until(b'\n', &mut line)?;
-            if !unseal(&mut line) {
-                return Err(io::Error::other("incomplete or damaged session prefix"));
-            }
-            let entry = history
-                .decode(&line)
-                .map_err(|why| io::Error::other(why.to_string()))?;
-            entries.push(entry);
-        }
-        Ok(entries)
+        self.suffix(id, &mut ext::LogCursor::default(), seq)
+            .map(|(_, entries)| entries)
     }
 
     fn suffix(
@@ -308,10 +290,10 @@ impl LogStore for Jsonl {
             epoch: cursor.epoch.0,
         };
         let mut entries = Vec::new();
+        let mut offset = reader.stream_position()?;
         while history.seq < through {
-            let offset = reader.stream_position()?;
             line.clear();
-            reader.read_until(b'\n', &mut line)?;
+            let bytes = reader.read_until(b'\n', &mut line)? as u64;
             if !unseal(&mut line) {
                 return Err(io::Error::other("incomplete or damaged session suffix"));
             }
@@ -323,6 +305,7 @@ impl LogStore for Jsonl {
                 epoch: entry.epoch,
                 offset,
             };
+            offset += bytes;
             entries.push(entry);
         }
         Ok((reset, entries))
