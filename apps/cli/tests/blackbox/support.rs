@@ -244,6 +244,9 @@ impl Isolated {
         let output = TestProcess::spawn(&mut self.command(args))
             .collect(deadline())
             .unwrap();
+        if std::env::var_os("A_TEST_PROCESS_TRACE").is_some() {
+            eprintln!("{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        }
         assert!(
             output.status.success(),
             "{args:?}: {}",

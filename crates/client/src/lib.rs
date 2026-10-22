@@ -455,7 +455,20 @@ impl Daemon {
                 Endpoint::Ssh(host) => (None, remote::open(host, &self.staged)?),
             };
             let first = first(&conn)?;
-            match hello(&mut conn, &self.staged.id, client, &first) {
+            let began = std::time::Instant::now();
+            let trace = std::env::var_os("A_TEST_PROCESS_TRACE").is_some();
+            if trace {
+                eprintln!("hello begin pid={}", std::process::id());
+            }
+            let greeting = hello(&mut conn, &self.staged.id, client, &first);
+            if trace {
+                eprintln!(
+                    "hello end pid={} elapsed={:?}",
+                    std::process::id(),
+                    began.elapsed()
+                );
+            }
+            match greeting {
                 Ok(Greeting::Mismatch(theirs)) => return Err(self.mismatch(theirs)),
                 Ok(Greeting::Welcome) => {
                     if let Some(stream) = &stream {

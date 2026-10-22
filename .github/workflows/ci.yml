@@ -181,6 +181,7 @@ jobs:
       CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
       NEXTEST_PROFILE: windows
       A_TEST_PROCESS_TRACE: 1
+      NEXTEST_SUCCESS_OUTPUT: immediate
     defaults:
       run:
         shell: bash
