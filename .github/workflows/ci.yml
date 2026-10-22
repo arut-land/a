@@ -194,7 +194,7 @@ jobs:
           install_args: rust mr-boxington cargo:cargo-nextest
       - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
       - run: mise exec -- cargo build -p a
-      - run: mise exec -- cargo nextest run --workspace --no-tests=fail
+      - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
       - run: mise run acceptance
 
   # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
