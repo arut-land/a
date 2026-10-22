@@ -420,16 +420,20 @@ impl SessionClient {
             Cmd::Open(target) => Ok(self.open(target)),
             Cmd::Fork(seq) => match self.view.session {
                 Some(session) => self.offer().map(|offer| {
-                    offer.0.send(ClientMsg::Attach {
-                        target: Target::Fork {
-                            session: session.to_string(),
-                            seq,
-                        },
-                        workspace: PathBuf::new(),
-                        since: 0,
-                        env: None,
-                        decl: protocol::ClientDecl::default(),
-                    })
+                    offer
+                        .0
+                        .send(ClientMsg::Attach {
+                            target: Target::Fork {
+                                session: session.to_string(),
+                                seq,
+                            },
+                            workspace: PathBuf::new(),
+                            since: 0,
+                            env: None,
+                            decl: protocol::ClientDecl::default(),
+                        })
+                        .into_iter()
+                        .collect()
                 }),
                 None => Err(Notice::NotConnected),
             },
@@ -458,13 +462,7 @@ impl SessionClient {
 
     /// Sends `msg` once the connection is up, numbered if it is a
     /// mutation.
-    fn send(&mut self, msg: ClientMsg) -> Vec<Effect> {
-        let mut out = Vec::new();
-        self.put(msg, &mut out);
-        out
-    }
-
-    fn put(&mut self, mut msg: ClientMsg, out: &mut Vec<Effect>) {
+    fn send(&mut self, mut msg: ClientMsg) -> Option<Effect> {
         if let Some(seq @ None) = msg.client_seq_mut() {
             self.seq += 1;
             *seq = Some(self.seq);
@@ -473,9 +471,10 @@ impl SessionClient {
             if is_mutation(&msg) {
                 self.unanswered.push_back(msg.clone());
             }
-            out.push(Effect::Io(Io::Send(msg)));
+            Some(Effect::Io(Io::Send(msg)))
         } else {
             self.queued.push(msg);
+            None
         }
     }
 
@@ -504,7 +503,7 @@ impl SessionClient {
                 );
                 self.go(Link::Replaying { welcome, remote }, &mut out);
                 for msg in std::mem::take(&mut self.queued) {
-                    self.put(msg, &mut out);
+                    out.extend(self.send(msg));
                 }
             }
             EventKind::Msg(msg) => self.msg(&msg, &mut out),
@@ -544,7 +543,8 @@ impl SessionClient {
                 return;
             }
             DaemonMsg::Ack { client_seq } => {
-                self.unanswered.retain(|m| !numbered(m, *client_seq));
+                self.unanswered
+                    .retain(|m| m.client_seq() != Some(*client_seq));
                 return;
             }
             DaemonMsg::Rejected {
@@ -553,7 +553,7 @@ impl SessionClient {
                 let at = self
                     .unanswered
                     .iter()
-                    .position(|m| numbered(m, *client_seq));
+                    .position(|m| m.client_seq() == Some(*client_seq));
                 let refused = at.and_then(|at| self.unanswered.remove(at));
                 if let (Some(again), Rejection::Draining) = (refused, reason) {
                     self.queued.push(again);
@@ -705,7 +705,7 @@ impl Offer<'_> {
         ) {
             return Err(Notice::Backpressure);
         }
-        Ok(self.0.send(msg))
+        Ok(self.0.send(msg).into_iter().collect())
     }
 
     fn view(&self) -> Result<(), Notice> {
@@ -730,10 +730,6 @@ pub(crate) const fn is_mutation(msg: &ClientMsg) -> bool {
         msg,
         ClientMsg::Input { .. } | ClientMsg::Approve { .. } | ClientMsg::Interrupt { .. }
     )
-}
-
-const fn numbered(msg: &ClientMsg, seq: u64) -> bool {
-    matches!(msg.client_seq(), Some(s) if s == seq)
 }
 
 #[cfg(test)]
