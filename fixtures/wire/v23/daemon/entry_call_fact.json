@@ -1,0 +1,1 @@
+{"t":"entry","seq":11,"epoch":0,"execution":[["00000000-0000-0000-0000-00000000000a",8,1],"openai:m","session","agent","loop",false,1000,"00000000-0000-0000-0000-00000000000a",10,20,{"input":10},["USD",100]],"kind":"model_result","call":8,"outcome":{"status":"interrupted"}}

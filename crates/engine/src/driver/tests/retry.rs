@@ -325,7 +325,7 @@ fn an_interrupted_retry_keeps_only_its_own_text() {
 }
 
 #[test]
-fn every_provider_retry_has_one_durable_start_and_completion() {
+fn every_provider_retry_has_one_execution_settlement() {
     let http = Flaky::new([Reply::Status(429, &[]), Reply::Events(text_reply())]);
     let session = fixture(quick().with(&ext_metrics::Metrics).unwrap(), &http).start(&[]);
     session.submit("hi").unwrap();
@@ -334,26 +334,24 @@ fn every_provider_retry_has_one_durable_start_and_completion() {
     session.halt();
     let facts: Vec<_> = log
         .iter()
-        .filter_map(|entry| match &entry.body {
-            Body::Fact {
-                fact: protocol::ExtensionFact::Call(fact),
-            } => Some(fact),
-            _ => None,
+        .filter_map(|entry| {
+            entry
+                .execution
+                .as_ref()
+                .and_then(|j| protocol::CallFact::from_json(j).ok())
         })
         .collect();
     assert_eq!(http.sent(), 2);
-    assert_eq!(facts.len(), 4);
-    for (attempt, pair) in facts.as_chunks::<2>().0.iter().enumerate() {
-        assert_eq!(pair[0].id, pair[1].id);
-        assert_eq!(usize::from(pair[0].id.attempt), attempt);
-        assert_eq!(pair[0].id.executing_session, session.id);
-        assert!(pair[0].elapsed_ns.is_none());
-        assert!(pair[1].elapsed_ns.is_some());
-        assert!(!pair[0].side);
+    assert_eq!(facts.len(), 2);
+    for (attempt, fact) in facts.iter().enumerate() {
+        assert_eq!(usize::from(fact.id.attempt), attempt);
+        assert_eq!(fact.id.executing_session, session.id);
+        assert!(fact.elapsed_ns.is_some());
+        assert!(!fact.side);
     }
-    assert!(facts[1].usage.is_none());
+    assert!(facts[0].usage.is_none());
     assert!(
-        facts[3]
+        facts[1]
             .usage
             .as_ref()
             .unwrap()

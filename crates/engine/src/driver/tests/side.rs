@@ -558,21 +558,21 @@ fn retry_policy_applies_to_side_calls_without_reentering_compaction() {
     let executed = log_of(&executor);
     let attempts: Vec<_> = executed
         .iter()
-        .filter_map(|entry| match &entry.body {
-            Body::Fact {
-                fact: protocol::ExtensionFact::Call(fact),
-            } => Some(fact),
-            _ => None,
+        .filter_map(|entry| {
+            entry
+                .execution
+                .as_ref()
+                .and_then(|j| protocol::CallFact::from_json(j).ok())
         })
         .collect();
-    assert_eq!(attempts.len(), 4);
+    assert_eq!(attempts.len(), 2);
     assert!(
         attempts
             .iter()
             .all(|f| f.side && f.id.executing_session == executor.id)
     );
     assert_eq!(attempts[0].id.attempt, 0);
-    assert_eq!(attempts[2].id.attempt, 1);
+    assert_eq!(attempts[1].id.attempt, 1);
     let failure = executed
         .iter()
         .find_map(|e| match &e.body {

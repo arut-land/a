@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 22;
+pub const PROTO: u32 = 23;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 22;
+pub const PROTO_MIN: u32 = 23;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -247,13 +247,20 @@ pub struct Entry {
     /// The lease its writer held: a store refuses the appends of a writer
     /// whose lease was superseded.
     pub epoch: Epoch,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<Json>,
     #[serde(flatten)]
     pub body: Body,
 }
 
 impl Entry {
     pub const fn new(seq: Seq, epoch: Epoch, body: Body) -> Self {
-        Self { seq, epoch, body }
+        Self {
+            seq,
+            epoch,
+            execution: None,
+            body,
+        }
     }
 }
 
@@ -480,25 +487,24 @@ kinds! {
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionFact {
     Annotation(Annotation),
-    Call(Box<CallFact>),
 }
 
 /// Execution identity stays qualified when history is copied into another log.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AttemptId {
     pub executing_session: SessionId,
     pub call: CallId,
     pub attempt: u16,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Charge {
     pub currency: String,
     pub nanos: u64,
 }
 
-/// Start and completion share an identity; an absent completion is unknown work.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Execution observations belong to an existing settlement, never an admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallFact {
     pub id: AttemptId,
     pub model: String,
@@ -512,6 +518,73 @@ pub struct CallFact {
     pub elapsed_ns: Option<u64>,
     pub usage: Option<Json>,
     pub charge: Option<Charge>,
+}
+
+impl CallFact {
+    pub fn to_json(&self) -> serde_json::Result<Json> {
+        Json::encode(&(
+            (self.id.executing_session, self.id.call, self.id.attempt),
+            &self.model,
+            &self.role,
+            &self.runner,
+            &self.agent,
+            self.side,
+            self.unix_ms,
+            self.clock_epoch,
+            self.start_ns,
+            self.elapsed_ns,
+            &self.usage,
+            self.charge.as_ref().map(|c| (&c.currency, c.nanos)),
+        ))
+    }
+
+    pub fn from_json(json: &Json) -> serde_json::Result<Self> {
+        let (
+            (executing_session, call, attempt),
+            model,
+            role,
+            runner,
+            agent,
+            side,
+            unix_ms,
+            clock_epoch,
+            start_ns,
+            elapsed_ns,
+            usage,
+            charge,
+        ) = json.parse::<(
+            (SessionId, CallId, u16),
+            String,
+            Json,
+            String,
+            String,
+            bool,
+            u64,
+            SessionId,
+            u64,
+            Option<u64>,
+            Option<Json>,
+            Option<(String, u64)>,
+        )>()?;
+        Ok(Self {
+            id: AttemptId {
+                executing_session,
+                call,
+                attempt,
+            },
+            model,
+            role,
+            runner,
+            agent,
+            side,
+            unix_ms,
+            clock_epoch,
+            start_ns,
+            elapsed_ns,
+            usage,
+            charge: charge.map(|(currency, nanos)| Charge { currency, nanos }),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

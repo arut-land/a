@@ -1,5 +1,5 @@
 use super::*;
-use protocol::{AttemptId, CallId, Entry, Epoch, Json, Seq};
+use protocol::{AttemptId, Body, CallId, Entry, Epoch, Json, Seq};
 
 fn fact(session: SessionId, attempt: u16, start: u64, elapsed: Option<u64>) -> CallFact {
     CallFact {
@@ -36,13 +36,18 @@ fn log(session: SessionId, parent: Option<SessionId>, facts: Vec<CallFact>) -> e
             .into_iter()
             .enumerate()
             .map(|(i, fact)| {
-                Entry::new(
+                let mut entry = Entry::new(
                     Seq::new(i as u64 + 1).unwrap(),
                     Epoch(0),
-                    Body::Fact {
-                        fact: ExtensionFact::Call(Box::new(fact)),
+                    Body::ModelResult {
+                        call: fact.id.call,
+                        r#for: None,
+                        outcome: protocol::Outcome::Interrupted { output: None },
+                        failure: None,
                     },
-                )
+                );
+                entry.execution = Some(fact.to_json().unwrap());
+                entry
             })
             .collect(),
     }
@@ -58,14 +63,11 @@ fn prices() -> Prices {
 fn retries_count_each_executed_attempt_once() {
     let id = SessionId::new();
     let first = fact(id, 0, 0, Some(10));
-    let mut start = first.clone();
-    start.elapsed_ns = None;
-    start.usage = None;
     let mut p = Projection::default();
     p.fold(&log(
         id,
         None,
-        vec![start, first.clone(), first, fact(id, 1, 10, Some(10))],
+        vec![first.clone(), first, fact(id, 1, 10, Some(10))],
     ));
     let total = p.own(id, &prices());
     assert_eq!(total.attempts, 2);
@@ -198,19 +200,15 @@ fn repricing_changes_no_execution_fact() {
 #[test]
 fn metrics_rebuild_equals_incremental_fold() {
     let id = SessionId::new();
-    let first = log(id, None, vec![fact(id, 0, 0, None)]);
+    let first = log(id, None, vec![fact(id, 0, 0, Some(10))]);
     let full = log(
         id,
         None,
-        vec![
-            fact(id, 0, 0, None),
-            fact(id, 0, 0, Some(10)),
-            fact(id, 1, 10, Some(20)),
-        ],
+        vec![fact(id, 0, 0, Some(10)), fact(id, 1, 10, Some(20))],
     );
     let mut incremental = Projection::default();
     incremental.fold(&first);
-    assert_eq!(incremental.own(id, &prices()).call_ns.missing, 1);
+    assert_eq!(incremental.own(id, &prices()).call_ns.known, 10);
     incremental.fold(&full);
     let mut rebuilt = Projection::default();
     rebuilt.fold(&full);
@@ -294,4 +292,28 @@ fn replaced_sequence_coverage_invalidates_cached_facts() {
     replacement.entries[0].epoch = Epoch(1);
     p.fold(&replacement);
     assert_eq!(p.own(id, &prices()).call_ns.known, 20);
+}
+
+#[test]
+fn an_unsettled_intent_has_unknown_spend_without_claiming_execution() {
+    let id = SessionId::new();
+    let mut prefix = log(id, None, vec![]);
+    prefix.entries.push(Entry::new(
+        Seq::new(1).unwrap(),
+        Epoch(0),
+        Body::ModelCall {
+            model: "test".into(),
+            attempt: 0,
+            choice: protocol::ToolChoice::Auto,
+            r#for: None,
+            purpose: None,
+            request: None,
+        },
+    ));
+    let mut projection = Projection::default();
+    projection.fold(&prefix);
+    let total = projection.own(id, &prices());
+    assert_eq!(total.attempts, 0);
+    assert_eq!(total.usage[0].missing, 1);
+    assert_eq!(total.call_ns.missing, 1);
 }

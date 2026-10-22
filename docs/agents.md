@@ -230,11 +230,12 @@ per owning call. See [side-calls.md](side-calls.md) for the full contract.
 
 `ext-metrics` registers the SDK's `CallFacts` recording service for all daemon
 conversations and folds generic call facts by `AttemptId { executing_session,
-call, attempt }`. The driver commits a start before polling each provider
-attempt and a completion before reporting its result. Facts freeze the resolved
+call, attempt }`. The driver takes the monotonic start in memory when it sends the request.
+Execution metadata rides on the existing result or retry settlement in the
+same commit; recording metrics adds no entries or flushes. Facts freeze the resolved
 model, role, runner, agent, side classification, wall-clock correlation and
-monotonic clock epoch. An interrupted or crashed attempt without completion
-retains unknown usage and duration. Failed finishes retain observed provider
+monotonic clock epoch. An intent without execution settlement retains unknown usage and duration
+without claiming an executed attempt. No start fact is recorded. Failed finishes retain observed provider
 usage. No elapsed duration is reconstructed by subtracting clocks across a
 restart.
 

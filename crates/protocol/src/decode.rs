@@ -419,6 +419,7 @@ pub(crate) struct EntryFields {
     pub(crate) publication: Option<publication::Publication>,
     pub(crate) seq: Option<u64>,
     pub(crate) epoch: Option<u32>,
+    pub(crate) execution: Option<Json>,
     pub(crate) kind: Option<Tag>,
     pub(crate) text: Option<String>,
     pub(crate) mode: Option<Mode>,
@@ -646,6 +647,7 @@ impl EntryFields {
         Ok(Entry {
             seq: need(self.seq.take(), "seq")?,
             epoch: need(self.epoch.take(), "epoch")?,
+            execution: self.execution.take(),
             body: Body::read(self)?,
         })
     }
@@ -745,6 +747,7 @@ fn unknown_entry(bytes: &[u8]) -> Option<Entry> {
     Some(Entry {
         seq: tags.seq,
         epoch: tags.epoch,
+        execution: None,
         body: Body::Unknown {
             kind: tags.kind,
             raw: serde_json::from_slice(bytes).ok()?,

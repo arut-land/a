@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use ext::{Args, Cx, Extension, Registrar, Tool};
-use protocol::{Body, CallFact, CallId, ExtensionFact, SessionId};
+use protocol::{Body, CallFact, CallId, SessionId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -75,6 +75,7 @@ struct Conversation {
     parent: Option<SessionId>,
     covered: (u64, protocol::Epoch),
     facts: Vec<CallFact>,
+    uncertain: Vec<CallId>,
 }
 
 impl Projection {
@@ -85,6 +86,7 @@ impl Projection {
                 parent: prefix.parent,
                 covered: (0, protocol::Epoch(0)),
                 facts: Vec::new(),
+                uncertain: Vec::new(),
             }
         });
         if log.covered.0 != 0
@@ -95,6 +97,7 @@ impl Projection {
         {
             log.covered = (0, protocol::Epoch(0));
             log.facts.clear();
+            log.uncertain.clear();
             self.cached = None;
         }
         for entry in &prefix.entries {
@@ -103,17 +106,29 @@ impl Projection {
             }
             log.covered = (entry.seq.get(), entry.epoch);
             self.cached = None;
-            if let Body::Fact {
-                fact: ExtensionFact::Call(fact),
-            } = &entry.body
+            match &entry.body {
+                Body::ModelCall { r#for: None, .. } => log.uncertain.push(CallId(entry.seq)),
+                Body::ModelResult { call, outcome, .. }
+                    if entry.execution.is_some()
+                        || !matches!(outcome, protocol::Outcome::Interrupted { .. }) =>
+                {
+                    log.uncertain.retain(|id| id != call)
+                }
+                Body::Decision {
+                    call: Some(call),
+                    d: protocol::Verdict::Retry { .. },
+                    ..
+                } => log.uncertain.retain(|id| id != call),
+                _ => {}
+            }
+            if let Some(fact) = entry
+                .execution
+                .as_ref()
+                .and_then(|j| CallFact::from_json(j).ok())
                 && fact.id.executing_session == prefix.session
             {
                 match log.facts.binary_search_by_key(&fact.id, |f| f.id) {
-                    // A repeated start cannot erase a completed observation.
-                    Ok(i) if log.facts[i].elapsed_ns.is_none() => {
-                        log.facts[i] = fact.as_ref().clone();
-                    }
-                    Err(i) => log.facts.insert(i, fact.as_ref().clone()),
+                    Err(i) => log.facts.insert(i, fact.clone()),
                     Ok(_) => {}
                 }
             }
@@ -182,6 +197,26 @@ impl Projection {
                 }
             } else {
                 total.critical_ns.missing += 1;
+            }
+        }
+        for (session, log) in &self.logs {
+            if *session == root
+                || descendants
+                    && std::iter::successors(Some(*session), |id| self.logs.get(id)?.parent)
+                        .take(self.logs.len() + 1)
+                        .any(|id| id == root)
+            {
+                let missing = log
+                    .uncertain
+                    .iter()
+                    .filter(|id| filter.call.is_none_or(|c| c == **id))
+                    .count() as u64;
+                for count in &mut total.usage {
+                    count.missing += missing;
+                }
+                total.cost.missing += missing;
+                total.call_ns.missing += missing;
+                total.critical_ns.missing += missing;
             }
         }
         total.critical_ns.missing += epochs.len().saturating_sub(1) as u64;

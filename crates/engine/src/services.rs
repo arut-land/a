@@ -352,62 +352,48 @@ impl ext::Logs for SessionLogs {
 }
 
 impl Session {
-    pub(super) async fn begin_attempt(
+    pub(super) fn execution(
         &self,
         cx: &Cx,
-        call: CallId,
         attempt: u16,
-        model: &str,
-    ) -> Result<Option<protocol::CallFact>, ext::MutationError> {
-        if self
-            .shared
-            .registry
-            .get()
-            .service::<ext::CallFacts>()
-            .is_none()
-        {
-            return Ok(None);
-        }
-        let (epoch, start) = attempt_clock();
-        let (role, runner, agent, side) = {
-            let spawn = lock(&self.spawn);
-            spawn.as_ref().map_or_else(
-                || {
-                    (
-                        ext::ModelRole::Session,
-                        "agent",
-                        self.shared
-                            .models
-                            .settings
-                            .agent(&self.workspace)
-                            .unwrap_or_else(|| ext::LOOP.into()),
-                        false,
-                    )
-                },
-                |s| {
-                    (
-                        s.request.runner.role().clone(),
-                        if s.request.runner.agent().is_none() {
-                            "model_only"
-                        } else {
-                            "agent"
-                        },
-                        s.request.runner.agent().unwrap_or("model_only").into(),
-                        s.request.runner.agent().is_none(),
-                    )
-                },
-            )
+        model: String,
+        started: Option<std::time::Instant>,
+        result: &super::Replied,
+    ) -> Option<protocol::CallFact> {
+        let started = started?;
+        self.shared.registry.get().service::<ext::CallFacts>()?;
+        let (epoch, clock) = attempt_clock();
+        let spawn = lock(&self.spawn);
+        let runner = spawn.as_ref().map(|s| &s.request.runner);
+        let side = runner.is_some_and(|r| r.agent().is_none());
+        let usage = match result {
+            super::Replied::Done(output) => llm::Response::from_json(output.raw())
+                .ok()
+                .and_then(|r| Json::encode(&r.usage).ok()),
+            super::Replied::Failed(error) => {
+                error.usage.as_deref().and_then(|u| Json::encode(u).ok())
+            }
+            super::Replied::Interrupted(_) => None,
         };
-        let fact = protocol::CallFact {
+        Some(protocol::CallFact {
             id: protocol::AttemptId {
                 executing_session: self.id,
-                call,
+                call: cx.call,
                 attempt,
             },
-            model: model.into(),
-            role: Json::encode(&role).map_err(|e| ext::MutationError::Encoding(e.to_string()))?,
-            runner: runner.into(),
-            agent,
+            model,
+            role: Json::encode(runner.map_or(&ext::ModelRole::Session, ext::Runner::role)).ok()?,
+            runner: if side { "model_only" } else { "agent" }.into(),
+            agent: runner.and_then(ext::Runner::agent).map_or_else(
+                || {
+                    self.shared
+                        .models
+                        .settings
+                        .agent(&self.workspace)
+                        .unwrap_or_else(|| ext::LOOP.into())
+                },
+                str::to_owned,
+            ),
             side,
             unix_ms: u64::try_from(
                 std::time::SystemTime::now()
@@ -415,61 +401,24 @@ impl Session {
                     .unwrap_or_default()
                     .as_millis(),
             )
-            .unwrap_or(u64::MAX),
+            .ok()?,
             clock_epoch: *epoch,
-            start_ns: u64::try_from(
+            start_ns: u64::try_from(started.saturating_duration_since(*clock).as_nanos()).ok()?,
+            elapsed_ns: u64::try_from(
                 self.shared
                     .rt
                     .now()
-                    .saturating_duration_since(*start)
+                    .saturating_duration_since(started)
                     .as_nanos(),
             )
-            .unwrap_or(u64::MAX),
-            elapsed_ns: None,
-            usage: None,
+            .ok(),
+            usage,
             charge: None,
-        };
-        cx.fact(protocol::ExtensionFact::Call(Box::new(fact.clone())))
-            .await?;
-        Ok(Some(fact))
-    }
-
-    pub(super) async fn end_attempt(
-        &self,
-        cx: &Cx,
-        fact: Option<protocol::CallFact>,
-        result: &super::Replied,
-    ) {
-        let Some(mut fact) = fact else {
-            return;
-        };
-        // Only durations measured in this invocation can complete its start fact.
-        let (_, start) = attempt_clock();
-        fact.elapsed_ns = u64::try_from(
-            self.shared
-                .rt
-                .now()
-                .saturating_duration_since(*start)
-                .as_nanos(),
-        )
-        .ok()
-        .and_then(|end| end.checked_sub(fact.start_ns));
-        match result {
-            super::Replied::Done(output) => {
-                fact.usage = llm::Response::from_json(output.raw())
-                    .ok()
-                    .and_then(|r| Json::encode(&r.usage).ok());
-            }
-            super::Replied::Failed(error) => {
-                fact.usage = error.usage.as_deref().and_then(|u| Json::encode(u).ok());
-            }
-            super::Replied::Interrupted(_) => {}
-        }
-        let _ = cx.fact(protocol::ExtensionFact::Call(Box::new(fact))).await;
+        })
     }
 }
 
-fn attempt_clock() -> &'static (SessionId, std::time::Instant) {
+pub(super) fn attempt_clock() -> &'static (SessionId, std::time::Instant) {
     static CLOCK: std::sync::OnceLock<(SessionId, std::time::Instant)> = std::sync::OnceLock::new();
     CLOCK.get_or_init(|| (SessionId::new(), std::time::Instant::now()))
 }

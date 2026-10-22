@@ -12,6 +12,7 @@ pub(super) enum SideFact {
         attempt: u16,
         failure: Json,
         after_ms: u64,
+        execution: Option<protocol::CallFact>,
     },
     Done {
         outcome: Outcome,
@@ -84,14 +85,18 @@ impl Actor {
                 attempt,
                 failure,
                 after_ms,
-            } => kernel::SideEvent::Retry {
-                side,
-                by,
-                attempt,
-                failure,
-                after_ms,
-                ticket,
-            },
+                execution,
+            } => {
+                self.projection.executions.extend(execution);
+                kernel::SideEvent::Retry {
+                    side,
+                    by,
+                    attempt,
+                    failure,
+                    after_ms,
+                    ticket,
+                }
+            }
             SideFact::Done { outcome, failure } => kernel::SideEvent::Done {
                 side,
                 outcome,
@@ -292,6 +297,7 @@ pub(super) async fn run_side(
     messages: llm::Messages,
     model: &Result<Model, llm::Error>,
     origin: &ContextOrigin,
+    execution: &mut Option<protocol::CallFact>,
 ) -> Replied {
     let (id, cancel, fence) = (origin.id, &origin.cancel, origin.fence);
     let start = session.shared.rt.now();
@@ -313,20 +319,22 @@ pub(super) async fn run_side(
         let name = model
             .as_ref()
             .map_or_else(|_| cx.model.to_string(), Model::name);
-        let Ok(fact) = session.begin_attempt(cx, id, attempt, &name).await else {
-            return Replied::Interrupted(None);
-        };
+        let mut started = None;
         let mut quiet = |_: &str| {};
         let result = contain(async {
             match (provider, &model) {
-                (Some(provider), _) => replied(provider.reply(side, &request.messages).await),
-                (None, Ok(model)) => reply(model, &request, cancel, &mut quiet).await,
+                (Some(provider), _) => {
+                    let _ = super::services::attempt_clock();
+                    started = Some(session.shared.rt.now());
+                    replied(provider.reply(side, &request.messages).await)
+                }
+                (None, Ok(model)) => reply(model, &request, cancel, &mut quiet, &mut started).await,
                 (None, Err(error)) => (Replied::Failed(error.clone()), None),
             }
         })
         .await
         .0;
-        session.end_attempt(cx, fact, &result).await;
+        *execution = session.execution(cx, attempt, name, started, &result);
         let after = match &result {
             Replied::Failed(error) => cx.service::<dyn ext::SideRetry>().and_then(|retry| {
                 retry
@@ -369,6 +377,7 @@ pub(super) async fn run_side(
                     attempt,
                     failure,
                     after_ms: u64::try_from(after.as_millis()).unwrap_or(u64::MAX),
+                    execution: execution.take(),
                 },
                 done,
             },

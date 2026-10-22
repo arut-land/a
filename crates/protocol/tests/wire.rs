@@ -308,10 +308,11 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
         ),
         sample(
             "entry_call_fact",
-            entry(
-                11,
-                Body::Fact {
-                    fact: protocol::ExtensionFact::Call(Box::new(protocol::CallFact {
+            DaemonMsg::Entry(Entry {
+                seq: Seq::new(11).unwrap(),
+                epoch: Epoch(0),
+                execution: Some(
+                    (protocol::CallFact {
                         id: protocol::AttemptId {
                             executing_session: SESSION,
                             call: call(8),
@@ -331,9 +332,17 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                             currency: "USD".into(),
                             nanos: 100,
                         }),
-                    })),
+                    })
+                    .to_json()
+                    .unwrap(),
+                ),
+                body: Body::ModelResult {
+                    call: call(8),
+                    r#for: None,
+                    outcome: Outcome::Interrupted { output: None },
+                    failure: None,
                 },
-            ),
+            }),
         ),
         sample(
             "entry_annotation",
@@ -475,6 +484,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         Entry {
             seq: Seq::new(2).unwrap(),
             epoch: Epoch(0),
+            execution: None,
             body: Body::ToolCall {
                 invoke: None,
                 tool: "bash".into(),

@@ -1211,6 +1211,76 @@ fn delegated_results_wait_for_their_own_durable_prefix() {
     session.halt();
 }
 
+#[test]
+fn metrics_add_no_flushes_to_provider_execution() {
+    let mut counts = Vec::new();
+    for metrics in [false, true] {
+        let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
+        let mut registry = Registry::default().with(&Harbor).unwrap();
+        if metrics {
+            registry = registry.with(&ext_metrics::Metrics).unwrap();
+        }
+        let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
+        let fixture = Fixture::on(
+            Arc::clone(&faulty) as _,
+            ext::LOOP,
+            registry,
+            openai(&Script::new(&replies)),
+        );
+        let session = fixture.create();
+        settle(&session);
+        let before = faulty.flushes();
+        session.submit("hello").unwrap();
+        settle(&session);
+        counts.push(faulty.flushes() - before);
+        session.halt();
+    }
+    assert_eq!(counts[1], counts[0], "without/with metrics: {counts:?}");
+}
+
+#[test]
+fn cancelled_before_provider_send_adds_no_executed_attempt() {
+    struct CancelBeforeSend;
+    impl Extension for CancelBeforeSend {
+        const NAME: &'static str = "cancel-before-send";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut Registrar) {
+            r.on::<point::Step>(|cx, _| {
+                cx.cx().unwrap().cancel.set();
+                Rewrite::Pass
+            });
+        }
+    }
+    let script = Script::new(&[retry::text_reply()]);
+    let fixture = Fixture::new(
+        ext::LOOP,
+        Registry::default()
+            .with(&ext_metrics::Metrics)
+            .and_then(|r| r.with(&CancelBeforeSend))
+            .unwrap(),
+        openai(&script),
+    );
+    let session = fixture.create();
+    session.submit("hello").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert!(lock(&script.sent).is_empty());
+    assert!(log.iter().all(|e| e.execution.is_none()));
+    let mut projection = ext_metrics::Projection::default();
+    projection.fold(&ext::LogPrefix {
+        session: session.id,
+        parent: None,
+        entries: log,
+    });
+    let prices = ext_metrics::Prices {
+        version: "unpriced".into(),
+        currency: "USD".into(),
+        models: BTreeMap::new(),
+    };
+    assert_eq!(projection.own(session.id, &prices).attempts, 0);
+}
+
 struct StaleProcess;
 impl ext::RunningProcess for StaleProcess {
     fn id(&self) -> u32 {

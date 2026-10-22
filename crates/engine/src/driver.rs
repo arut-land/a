@@ -386,6 +386,7 @@ enum Completion {
         call: CallId,
         replied: Replied,
         message: Option<llm::Assistant>,
+        execution: Option<protocol::CallFact>,
     },
     SideFact {
         side: CallId,
@@ -1320,7 +1321,9 @@ impl Actor {
                         call,
                         replied,
                         message,
+                        execution,
                     } => {
+                        self.projection.executions.extend(execution);
                         if let Replied::Failed(error) = &replied {
                             provider_error(self.live.id, error);
                         }
@@ -1685,6 +1688,25 @@ impl Actor {
             immediate,
             admitted,
         } = plan;
+        for entry in &mut appends {
+            let call = match &entry.body {
+                Body::ModelResult { call, .. }
+                | Body::Decision {
+                    call: Some(call),
+                    d: protocol::Verdict::Retry { .. } | protocol::Verdict::SideRetry { .. },
+                    ..
+                } => Some(*call),
+                _ => None,
+            };
+            if let Some(i) = self
+                .projection
+                .executions
+                .iter()
+                .position(|f| Some(f.id.call) == call)
+            {
+                entry.execution = self.projection.executions.remove(i).to_json().ok();
+            }
+        }
         let mut after = admitted;
         let busy = immediate.iter().rev().find_map(|work| match work {
             Effect::MarkBusy(busy) => Some(*busy),
@@ -2325,6 +2347,7 @@ impl Actor {
         let cancel = handle.cancel.clone();
         let origin = handle.clone();
         handle.spawn(&*self.live.session.shared.rt, async move {
+            let mut execution = None;
             let (replied, message) = match prepared {
                 InFlight::Prepared(prepared) => match *prepared {
                     Ok((model, request, attempt)) => {
@@ -2332,13 +2355,18 @@ impl Actor {
                         let cx = live.session.cx(origin.clone(), &registry);
                         let resolved = model.origin(&request);
                         let name = format!("{}:{}", resolved.provider, resolved.model);
-                        let Ok(fact) = live.session.begin_attempt(&cx, call, attempt, &name).await
-                        else {
-                            return;
-                        };
-                        let result =
-                            contain(Box::pin(reply(&model, &request, &cancel, &mut deltas))).await;
-                        live.session.end_attempt(&cx, fact, &result.0).await;
+                        let mut started = None;
+                        let result = contain(Box::pin(reply(
+                            &model,
+                            &request,
+                            &cancel,
+                            &mut deltas,
+                            &mut started,
+                        )))
+                        .await;
+                        execution = live
+                            .session
+                            .execution(&cx, attempt, name, started, &result.0);
                         result
                     }
                     Err(error) => (
@@ -2358,6 +2386,7 @@ impl Actor {
                             messages,
                             &model,
                             &origin,
+                            &mut execution,
                         )),
                     );
                     let replied = first(running, live.session.shared.rt.sleep(turn.budget.timeout))
@@ -2374,6 +2403,7 @@ impl Actor {
                     call,
                     replied,
                     message,
+                    execution,
                 },
             );
         });
@@ -2609,10 +2639,13 @@ async fn reply(
     request: &llm::Request,
     cancel: &Cancel,
     deltas: &mut (dyn FnMut(&str) + Send),
+    started: &mut Option<Instant>,
 ) -> (Replied, Option<llm::Assistant>) {
     // Sent once polled, as an interrupt meanwhile finds it.
     let mut events = None;
     let reading = async {
+        let _ = services::attempt_clock();
+        *started = Some(Instant::now());
         let events = events.insert(model.send(request));
         crate::model::read(events, deltas).await
     };
