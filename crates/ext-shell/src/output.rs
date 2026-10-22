@@ -100,6 +100,7 @@ impl Output {
             ..
         } = self;
         clean.finish(&mut |piece| view.push(piece));
+        let full = Some(file.to_path_buf());
         if kind == Kind::Binary {
             return Rendered {
                 text: format!(
@@ -107,14 +108,14 @@ impl Output {
                     file.display()
                 ),
                 truncated: true,
-                full: Some(file.to_path_buf()),
+                full,
             };
         }
         let truncated = view.cut;
         Rendered {
             text: view.render(file),
             truncated,
-            full: truncated.then(|| file.to_path_buf()),
+            full: full.filter(|_| truncated),
         }
     }
 }
