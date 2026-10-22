@@ -272,17 +272,7 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
     // Watched before anything can write to it: a write before the watch
     // raises no edge, and would be read only once the command exits.
     let written = rt::Async::for_reading(&runtime(cx)?.reactor(), sys::write_watch(&log)?)?;
-    let child = cx
-        .service::<dyn Processes>()
-        .ok_or_else(|| io::Error::other("no process provider"))?
-        .spawn(
-            cx,
-            LaunchSpec {
-                process: spawn,
-                output: ProcessOutput::File(file),
-            },
-        )
-        .await?;
+    let child = launch(cx, spawn, file).await?;
     let pgid = child.id();
     cx.spawned(pgid, false);
     let limit = input.timeout.unwrap_or(TIMEOUT).clamp(1, MAX_TIMEOUT);
@@ -339,17 +329,7 @@ async fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
     let started = runtime(cx)?.now();
     let (file, log) = create_private(log)?;
     let cwd = spawn.cwd.clone();
-    let child = cx
-        .service::<dyn Processes>()
-        .ok_or_else(|| io::Error::other("no process provider"))?
-        .spawn(
-            cx,
-            LaunchSpec {
-                process: spawn,
-                output: ProcessOutput::File(file),
-            },
-        )
-        .await?;
+    let child = launch(cx, spawn, file).await?;
     let pgid = child.id();
     child.detach(cx);
     Ok(Ran {
@@ -358,6 +338,19 @@ async fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
         background: Some(Job { pgid, log }),
         ..Ran::default()
     })
+}
+
+async fn launch(cx: &Cx, process: Spawn, file: File) -> io::Result<OwnedProcess> {
+    cx.service::<dyn Processes>()
+        .ok_or_else(|| io::Error::other("no process provider"))?
+        .spawn(
+            cx,
+            LaunchSpec {
+                process,
+                output: ProcessOutput::File(file),
+            },
+        )
+        .await
 }
 
 /// The process for `command`, as the `spawn` hooks leave it: bash without
