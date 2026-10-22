@@ -486,10 +486,12 @@ struct Probe {
     /// The entries loads read, and the snapshots kept, by what they cover.
     read: Arc<AtomicUsize>,
     snapshots: Arc<Mutex<Vec<u64>>>,
+    observe_write: Arc<Mutex<Option<Box<WriteObserver>>>>,
 }
 
 /// A batch handed to a log, and whether it was made durable.
 type Written = (Vec<Entry>, bool);
+type WriteObserver = dyn Fn(&[Entry], bool) + Send + Sync;
 
 struct Probed(Box<dyn Log>, Probe);
 
@@ -504,7 +506,15 @@ impl Probed {
         lock(&self.1.batches).push(entries.len());
 
         lock(&self.1.written).push((entries.to_vec(), durable));
-        self.0.append_all(entries, lines)
+        let observe = lock(&self.1.observe_write);
+        if let Some(observe) = &*observe {
+            observe(entries, false);
+        }
+        self.0.append_all(entries, lines)?;
+        if let Some(observe) = &*observe {
+            observe(entries, true);
+        }
+        Ok(())
     }
 }
 
@@ -2007,10 +2017,10 @@ fn one_fsync_per_burst() {
     assert_eq!(*lock(&probe.batches), [1, 2, 10]);
 }
 
-/// The busy mark is set and cleared in the blocking hop of the commit
-/// that starts and ends the work: before its entries, and after them.
+/// A crash must see busy before work is logged, and settled only after
+/// its result is logged.
 #[test]
-fn the_busy_mark_rides_its_commit() {
+fn busy_is_set_before_work_is_written_and_cleared_after_its_result() {
     let probe = Probe::default();
     let fixture = Fixture::on(
         Arc::new(probe.clone()),
@@ -2020,18 +2030,34 @@ fn the_busy_mark_rides_its_commit() {
     );
     let session = fixture.create();
     settle(&session);
-    let (hops, commits) = (fixture.hops(), lock(&probe.batches).len());
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let writes = Arc::clone(&observed);
+    let shared = Arc::downgrade(&fixture.0);
+    *lock(&probe.observe_write) = Some(Box::new(move |entries, after| {
+        for entry in entries {
+            let starts = match entry.body {
+                Body::Input { .. } => true,
+                Body::ToolResult { .. } => false,
+                _ => continue,
+            };
+            let shared = shared.upgrade().unwrap();
+            lock(&writes).push((starts, after, lock(&shared.catalog.marks).clone()));
+        }
+    }));
     session.submit("$ true").unwrap();
     finished(&session, 3);
     settle(&session);
-    let (hops, commits) = (fixture.hops() - hops, lock(&probe.batches).len() - commits);
     session.halt();
-    assert_eq!(*lock(&fixture.0.catalog.marks), [true, false]);
     assert_eq!(
-        hops,
-        commits + 1,
-        "only launch may add a hop to the {commits} commits"
+        *lock(&observed),
+        [
+            (true, false, vec![true]),
+            (true, true, vec![true]),
+            (false, false, vec![true]),
+            (false, true, vec![true]),
+        ]
     );
+    assert_eq!(*lock(&fixture.0.catalog.marks), [true, false]);
 }
 
 /// Progress and extension state are written as they come, and made
