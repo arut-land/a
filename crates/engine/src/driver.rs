@@ -2276,84 +2276,91 @@ impl Actor {
         });
     }
 
-    /// Prepares the request of model call `call`, attempt `attempt`: the
-    /// transcript before it with the tools `choice` lets it call, as the
-    /// `step` point leaves it. What the point decided goes to the kernel
-    /// to log; the request waits here until the kernel has it sent, unless
-    /// a handler answered it, in which case the answer is the reply.
     async fn prepare(&mut self, call: CallId, attempt: u16, choice: ToolChoice) {
-        if self.live.session.model_only() {
-            self.prepare_thread(call).await;
-            return;
+        let (mut decisions, mut answered) = (Vec::new(), None);
+        let prepared = if self.live.session.model_only() {
+            self.prepare_thread(call).await
+        } else {
+            match self.live.session.model(&self.registry) {
+                Ok(model) => self.request(call, &model).await.map(|mut request| {
+                    request.tool_choice = match choice {
+                        ToolChoice::Auto => llm::ToolChoice::Auto,
+                        ToolChoice::None => llm::ToolChoice::None,
+                    };
+                    let (decided, answer) = self.bound.step(call, &mut request);
+                    decisions = decided;
+                    answered = answer.map(|(by, response)| {
+                        let (replied, message) = replied(response);
+                        self.projection.replied = message.map(|m| (call, m));
+                        (by, replied)
+                    });
+                    InFlight::Prepared(Box::new(Ok((model, request, attempt))))
+                }),
+                Err(error) => Err(error),
+            }
+        };
+        if answered.is_none() {
+            self.inflight.insert(
+                call,
+                prepared.unwrap_or_else(|error| InFlight::Prepared(Box::new(Err(error)))),
+            );
         }
-        let prepared = match self.live.session.model(&self.registry) {
-            Ok(model) => self
-                .request(call, &model)
-                .await
-                .map(|request| (model, request)),
-            Err(error) => Err(error),
-        };
-        let (decisions, answered) = match prepared {
-            Ok((model, mut request)) => {
-                request.tool_choice = match choice {
-                    ToolChoice::Auto => llm::ToolChoice::Auto,
-                    ToolChoice::None => llm::ToolChoice::None,
-                };
-                let (decisions, answered) = self.bound.step(call, &mut request);
-                let answered = answered.map(|(by, response)| {
-                    let (replied, message) = replied(response);
-                    self.projection.replied = message.map(|m| (call, m));
-                    (by, replied)
-                });
-                if answered.is_none() {
-                    let prepared = InFlight::Prepared(Box::new(Ok((model, request, attempt))));
-                    self.inflight.insert(call, prepared);
-                }
-                (decisions, answered)
-            }
-            Err(error) => {
-                self.inflight
-                    .insert(call, InFlight::Prepared(Box::new(Err(error))));
-                (Vec::new(), None)
-            }
-        };
-        let prepared = Event::Prepared {
-            call,
-            decisions,
-            answered,
-        };
         self.live.session.emit(
             self.live.session.fence.load(Ordering::SeqCst),
-            Completion::Event(prepared),
+            Completion::Event(Event::Prepared {
+                call,
+                decisions,
+                answered,
+            }),
         );
     }
 
     fn send(&mut self, call: CallId) {
-        if self.live.session.model_only() {
-            self.send_thread(call);
-            return;
-        }
-        let Some(InFlight::Prepared(prepared)) = self.inflight.remove(&call) else {
+        let Some(prepared @ (InFlight::Prepared(_) | InFlight::Thread(_))) =
+            self.inflight.remove(&call)
+        else {
             return;
         };
         self.inflight.insert(call, InFlight::Model);
         let live = Arc::clone(&self.live);
+        let registry = Arc::clone(&self.registry);
         let fence = live.session.fence.load(Ordering::SeqCst);
         let handle = live.session.origin(call, fence).expect("actor generation");
         let cancel = handle.cancel.clone();
+        let origin = handle.clone();
         handle.spawn(&*self.live.session.shared.rt, async move {
-            let (replied, message) = match *prepared {
-                Ok((model, request, attempt)) => {
-                    let mut deltas = |text: &str| live.delta(call, attempt, text, fence);
-                    let replying: BoxFuture<'_, _> =
-                        Box::pin(reply(&model, &request, &cancel, &mut deltas));
-                    contain(replying).await
+            let (replied, message) = match prepared {
+                InFlight::Prepared(prepared) => match *prepared {
+                    Ok((model, request, attempt)) => {
+                        let mut deltas = |text: &str| live.delta(call, attempt, text, fence);
+                        contain(Box::pin(reply(&model, &request, &cancel, &mut deltas))).await
+                    }
+                    Err(error) => (
+                        Replied::Failed(llm::Error::new(llm::Kind::InvalidRequest, error)),
+                        None,
+                    ),
+                },
+                InFlight::Thread(prepared) => {
+                    let (turn, messages, model) = *prepared;
+                    let cx = live.session.cx(origin.clone(), &registry);
+                    let running = unless(
+                        &cancel,
+                        Box::pin(side::run_side(
+                            &live.session,
+                            &cx,
+                            &turn,
+                            messages,
+                            &model,
+                            &origin,
+                        )),
+                    );
+                    let replied = first(running, live.session.shared.rt.sleep(turn.budget.timeout))
+                        .await
+                        .flatten()
+                        .unwrap_or(Replied::Interrupted(None));
+                    (replied, None)
                 }
-                // Said so the user can fix it; sending again would not.
-                Err(error) => {
-                    let error = llm::Error::new(llm::Kind::InvalidRequest, error);
-                    (Replied::Failed(error), None)
-                }
+                _ => unreachable!(),
             };
             live.session.emit(
                 fence,

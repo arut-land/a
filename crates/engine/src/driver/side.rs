@@ -488,124 +488,62 @@ impl super::Daemon {
 }
 
 impl Actor {
-    pub(super) async fn prepare_thread(&mut self, call: CallId) {
-        let prepared = async {
-            let seq = protocol::Seq::new(self.core.ledger().turn_start())
-                .ok_or("model-only turn has no admitted input")?;
-            let mut entry = self.indexed_entry(seq).await.map_err(|e| e.to_string())?;
-            if let Body::Take { input } = entry.body {
-                entry = self.indexed_entry(input).await.map_err(|e| e.to_string())?;
-            }
-            let (text, keyed) = match &entry.body {
-                Body::Enqueue { envelope } => (envelope.payload.as_str(), true),
-                Body::Input { text, .. } => (text.as_str(), false),
-                _ => return Err("model-only turn has no admitted input".into()),
-            };
-            let (turn, prefix) = keyed
-                .then(|| ext::ModelTurn::from_intent(text).ok())
-                .flatten()
-                .unwrap_or_else(|| {
-                    let spawn = lock(&self.live.session.spawn);
-                    let spawn = spawn.as_ref().expect("model-only authority");
-                    let mut turn = ext::ModelTurn::new::<ext::ModelOnly>(
-                        ext::ThreadKey {
-                            extension: spawn.request.owner.clone(),
-                            purpose: spawn.request.purpose.clone(),
-                            owner_scope: ext::OwnerScope::Session,
-                        },
-                        ext::TurnKey(call.get().to_string()),
-                        spawn.request.runner.role().clone(),
-                        ext::SideContext::None,
-                        [llm::Message::user(text)].into_iter().collect(),
-                    );
-                    turn.budget = spawn.request.budget;
-                    (turn, None)
-                });
-            let mut messages = self.conversation(call).await.map_err(|e| e.to_string())?;
-            let context = if let Some(seq) = prefix {
-                let parent = self.live.parent.ok_or("model-only context has no owner")?;
-                let shared = Arc::clone(&self.live.session.shared);
-                rt::unblock(&*self.live.session.shared.rt, move || {
-                    shared
-                        .owner_image(parent.session, seq.get() - 1)
-                        .map(super::projection::OwnerImage::project)
-                })
-                .await
-                .map_err(|e| e.to_string())?
-            } else {
-                llm::Messages::default()
-            };
-            let policy = lock(&self.live.session.spawn)
-                .as_ref()
-                .and_then(|spawn| spawn.request.runner.context_policy())
-                .ok_or("model-only context policy is missing")?;
-            messages = policy.assemble(&messages, &context, &turn.messages)?;
-            let model = self
-                .live
-                .session
-                .model(&self.registry)
-                .map_err(|error| llm::Error::new(llm::Kind::InvalidRequest, error));
-            Ok::<_, String>((turn, messages, model))
+    pub(super) async fn prepare_thread(&mut self, call: CallId) -> Result<super::InFlight, String> {
+        let seq = protocol::Seq::new(self.core.ledger().turn_start())
+            .ok_or("model-only turn has no admitted input")?;
+        let mut entry = self.indexed_entry(seq).await.map_err(|e| e.to_string())?;
+        if let Body::Take { input } = entry.body {
+            entry = self.indexed_entry(input).await.map_err(|e| e.to_string())?;
         }
-        .await;
-        self.inflight.insert(
-            call,
-            match prepared {
-                Ok(prepared) => super::InFlight::Thread(Box::new(prepared)),
-                Err(error) => super::InFlight::Prepared(Box::new(Err(error))),
-            },
-        );
-        self.live.session.emit(
-            self.live.session.fence.load(super::Ordering::SeqCst),
-            super::Completion::Event(Event::Prepared {
-                call,
-                decisions: Vec::new(),
-                answered: None,
-            }),
-        );
-    }
-
-    pub(super) fn send_thread(&mut self, call: CallId) {
-        let Some(prepared) = self.inflight.remove(&call) else {
-            return;
+        let (text, keyed) = match &entry.body {
+            Body::Enqueue { envelope } => (envelope.payload.as_str(), true),
+            Body::Input { text, .. } => (text.as_str(), false),
+            _ => return Err("model-only turn has no admitted input".into()),
         };
-        let session = Arc::clone(&self.live.session);
-        let registry = Arc::clone(&self.registry);
-        let handle = session
-            .origin(call, session.fence.load(super::Ordering::SeqCst))
-            .expect("actor generation");
-        let cancel = handle.cancel.clone();
-        let fence = handle.fence;
-        let cx = session.cx(handle.clone(), &registry);
-        let origin = handle.clone();
-        self.inflight.insert(call, super::InFlight::Model);
-        handle.spawn(&*Arc::clone(&session.shared.rt), async move {
-            let result = match prepared {
-                super::InFlight::Thread(prepared) => {
-                    let (turn, messages, model) = *prepared;
-                    let running = unless(
-                        &cancel,
-                        Box::pin(run_side(&session, &cx, &turn, messages, &model, &origin)),
-                    );
-                    first(running, session.shared.rt.sleep(turn.budget.timeout))
-                        .await
-                        .flatten()
-                        .unwrap_or(Replied::Interrupted(None))
-                }
-                super::InFlight::Prepared(prepared) => Replied::Failed(llm::Error::new(
-                    llm::Kind::InvalidRequest,
-                    prepared.err().unwrap_or_default(),
-                )),
-                _ => return,
-            };
-            session.emit(
-                fence,
-                super::Completion::Replied {
-                    call,
-                    replied: result,
-                    message: None,
-                },
-            );
-        });
+        let (turn, prefix) = keyed
+            .then(|| ext::ModelTurn::from_intent(text).ok())
+            .flatten()
+            .unwrap_or_else(|| {
+                let spawn = lock(&self.live.session.spawn);
+                let spawn = spawn.as_ref().expect("model-only authority");
+                let mut turn = ext::ModelTurn::new::<ext::ModelOnly>(
+                    ext::ThreadKey {
+                        extension: spawn.request.owner.clone(),
+                        purpose: spawn.request.purpose.clone(),
+                        owner_scope: ext::OwnerScope::Session,
+                    },
+                    ext::TurnKey(call.get().to_string()),
+                    spawn.request.runner.role().clone(),
+                    ext::SideContext::None,
+                    [llm::Message::user(text)].into_iter().collect(),
+                );
+                turn.budget = spawn.request.budget;
+                (turn, None)
+            });
+        let mut messages = self.conversation(call).await.map_err(|e| e.to_string())?;
+        let context = if let Some(seq) = prefix {
+            let parent = self.live.parent.ok_or("model-only context has no owner")?;
+            let shared = Arc::clone(&self.live.session.shared);
+            rt::unblock(&*self.live.session.shared.rt, move || {
+                shared
+                    .owner_image(parent.session, seq.get() - 1)
+                    .map(super::projection::OwnerImage::project)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            llm::Messages::default()
+        };
+        let policy = lock(&self.live.session.spawn)
+            .as_ref()
+            .and_then(|spawn| spawn.request.runner.context_policy())
+            .ok_or("model-only context policy is missing")?;
+        messages = policy.assemble(&messages, &context, &turn.messages)?;
+        let model = self
+            .live
+            .session
+            .model(&self.registry)
+            .map_err(|error| llm::Error::new(llm::Kind::InvalidRequest, error));
+        Ok(super::InFlight::Thread(Box::new((turn, messages, model))))
     }
 }
