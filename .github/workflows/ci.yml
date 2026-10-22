@@ -198,17 +198,37 @@ jobs:
       - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
       - run: mise exec -- cargo build -p a
       - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
-      - run: |
-          load_pids=()
-          for worker in {1..4}; do
-            bash -c 'while :; do :; done' &
-            load_pids+=("$!")
-          done
-          trap 'kill "${load_pids[@]}"' EXIT
-          for attempt in {1..10}; do
-            echo "Windows acceptance pass $attempt under CPU load"
-            mise run acceptance
-          done
+      - shell: pwsh
+        run: |
+          Get-MpComputerStatus | Select-Object AMEngineVersion, RealTimeProtectionEnabled
+          $recordingPath = Join-Path $env:RUNNER_TEMP 'a-defender.etl'
+          $recording = Start-Job -ArgumentList $recordingPath -ScriptBlock {
+            param($path)
+            New-MpPerformanceRecording -RecordTo $path -Seconds 90
+          }
+          $workers = 1..4 | ForEach-Object {
+            Start-Process pwsh -NoNewWindow -PassThru -ArgumentList '-NoProfile', '-Command', 'while($true){}'
+          }
+          $acceptanceExit = 0
+          try {
+            foreach ($attempt in 1..10) {
+              Write-Host "Windows acceptance pass $attempt under CPU load"
+              & mise run acceptance
+              if ($LASTEXITCODE -ne 0) {
+                $acceptanceExit = $LASTEXITCODE
+                break
+              }
+            }
+          } finally {
+            foreach ($worker in $workers) {
+              if (-not $worker.HasExited) { $worker.Kill(); $worker.WaitForExit() }
+            }
+            $recording | Wait-Job -Timeout 100 | Receive-Job -ErrorAction Continue
+            if (Test-Path $recordingPath) {
+              Get-MpPerformanceReport -Path $recordingPath -TopFiles 20 -TopScansPerFile 5 -TopProcesses 10 -TopScans 20
+            }
+          }
+          exit $acceptanceExit
 
   # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
   # reducer vectors and a live session through it in Swift, then the app
