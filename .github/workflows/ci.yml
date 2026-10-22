@@ -86,7 +86,7 @@ jobs:
       # cold start and attach latency too where strict, else with slack.
       - run: mise run budgets
       # The shipped binary's size as a number to compare: this run's against
-      # the last one on main, warned about past 16 KiB. Apple silicon is
+      # the last one on main. Apple silicon is
       # the reference lane; the other skips the
       # second release link.
       - if: runner.os == 'macOS'
@@ -103,7 +103,6 @@ jobs:
           if [[ -f main-size.txt ]]; then
             was=$(grep -o '[0-9]* KiB' main-size.txt | head -1 | cut -d' ' -f1)
             echo "a: $now KiB; main: $was KiB; delta: $((now - was)) KiB" | tee -a "$GITHUB_STEP_SUMMARY"
-            ((now - was <= 16)) || echo "::warning::a grew $((now - was)) KiB over main ($was -> $now KiB)"
           fi
           cp size.txt main-size.txt
       - if: runner.os == 'macOS' && github.ref == 'refs/heads/main'

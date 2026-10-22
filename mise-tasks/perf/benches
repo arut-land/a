@@ -29,7 +29,9 @@ def main():
     loader.exec_module(workloads)
     output = build / "measurements"
     output.mkdir(exist_ok=True)
-    env = dict(os.environ, A_SESSION_LOG=str(transcript))
+    env = dict(os.environ, A_SESSION_LOG=str(transcript),
+               A_PERF_PYTHON=sys.executable,
+               A_PERF_PROCESS=str(Path(__file__).resolve().parents[2] / "scripts/perf/process.py"))
     budget_result = None
     if args.blackbox:
         env.update(A_BIN=str(build / ("a.exe" if os.name == "nt" else "a")), A_STRICT_BUDGETS="1")
