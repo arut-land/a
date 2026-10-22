@@ -43,6 +43,10 @@ debug = "line-tables-only"
 split-debuginfo = "packed"
 strip = "symbols"
 
+# JSON serves every wire frame and durable log entry.
+[profile.release.package.serde_json]
+opt-level = 1
+
 # cargo-bolero (`mise run fuzz`): optimized, and LLVM throughout for
 # libFuzzer's coverage instrumentation.
 [profile.fuzz]
