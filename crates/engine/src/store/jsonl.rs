@@ -366,7 +366,7 @@ impl LogStore for Jsonl {
         let other = index.header()?;
         index.recall()?;
         let snapshot = Snap::read(&index.path).filter(|snap| index.places(snap));
-        let placed = index.resume(0);
+        let placed = std::mem::take(&mut index.ends_mut().ends);
         let mut history = History::default();
         if let Some(snap) = snapshot {
             let damage = index.scan(other, &mut history, snap.covers, |_| {})?;
@@ -378,7 +378,7 @@ impl LogStore for Jsonl {
                     image: snap.image,
                 })
             {
-                index.resume(0);
+                index.ends_mut().ends.clear();
                 history = History::default();
             }
         }
@@ -401,7 +401,11 @@ impl LogStore for Jsonl {
             index.file.set_len(index.end())?;
             sys::sync_data(&index.file)?;
         }
-        let agreed = placed.agreed(&index.read().ends);
+        let agreed = placed
+            .iter()
+            .zip(&index.read().ends)
+            .take_while(|(a, b)| a == b)
+            .count();
         index.persist(agreed);
         let epoch = self.leases.acquire(id, history.epoch);
         Ok(index.loaded(
@@ -610,20 +614,6 @@ impl Index {
         })
     }
 
-    /// Keeps the lines up to entry `covers`, the snapshot's, as placed, so
-    /// the scan starts after them (at the first entry for 0), and hands
-    /// back the rest of what the index placed, for the scan to bear out.
-    fn resume(&mut self, covers: u64) -> Placed {
-        let ends = &mut self.ends_mut().ends;
-        let at = usize::try_from(covers)
-            .unwrap_or(usize::MAX)
-            .min(ends.len());
-        Placed {
-            at,
-            after: ends.split_off(at),
-        }
-    }
-
     /// Writes to `<id>.idx` what it lacks of the lines indexed now, the
     /// first `agreed` of which it holds already, and keeps it open to go
     /// on appending.
@@ -685,24 +675,6 @@ impl Index {
             };
             return Ok(other.or((!torn).then_some(damaged)));
         }
-    }
-}
-
-/// What `<id>.idx` placed past where a load's scan starts.
-struct Placed {
-    at: usize,
-    after: Vec<u64>,
-}
-
-impl Placed {
-    /// How many of `ends`, as the scan left them, the file holds already:
-    /// the lines before the scan, and those after it that it bore out.
-    fn agreed(&self, ends: &[u64]) -> usize {
-        let scanned = ends.get(self.at..).unwrap_or_default();
-        let same = (scanned.iter().zip(&self.after))
-            .take_while(|(a, b)| a == b)
-            .count();
-        self.at + same
     }
 }
 
