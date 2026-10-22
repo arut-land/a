@@ -290,7 +290,7 @@ impl LogStore for Jsonl {
             &mut line,
             &mut history,
             through,
-            &mut |entry, end| {
+            |entry, end| {
                 *cursor = ext::LogCursor {
                     seq: entry.seq.get(),
                     epoch: entry.epoch,
@@ -618,7 +618,7 @@ impl Index {
             &mut Vec::new(),
             history,
             through,
-            &mut |entry, end| {
+            |entry, end| {
                 ends.ends.push(end);
                 each(entry);
             },
@@ -633,7 +633,7 @@ fn scan(
     line: &mut Vec<u8>,
     history: &mut History,
     through: u64,
-    each: &mut dyn FnMut(Entry, u64),
+    mut each: impl FnMut(Entry, u64),
 ) -> io::Result<Option<ReadOnly>> {
     let mut end = reader.stream_position()?;
     while history.seq < through {
