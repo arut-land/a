@@ -197,7 +197,7 @@ impl ext::Models for CallPorts {
         side: ext::ModelTurn,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
-            let session = Arc::clone(&self.session);
+            let session = &self.session;
             let (sent, answer) = oneshot::channel();
             let origin = self.origin.clone();
             if !origin.current(&session)
@@ -206,6 +206,7 @@ impl ext::Models for CallPorts {
             {
                 return Err(llm::Error::incomplete());
             }
+            let session = Arc::clone(session);
             let registry = Arc::clone(&self.registry);
             let runtime = Arc::clone(&session.shared.rt);
             runtime.spawn(Box::pin(async move {
@@ -252,7 +253,7 @@ async fn side_call(
         let key = side.identity();
         let (owner, thread, cancel, registry) = (
             Arc::clone(session),
-            admitted.thread.clone(),
+            admitted.thread,
             cancel.clone(),
             Arc::clone(registry),
         );

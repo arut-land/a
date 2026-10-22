@@ -356,7 +356,7 @@ impl ext::Sessions for CallPorts {
         request: ext::Detached<ext::Spawn>,
     ) -> BoxFuture<'a, Result<ext::ConversationHandle, SpawnRefusal>> {
         Box::pin(async move {
-            let session = Arc::clone(&self.session);
+            let session = &self.session;
             if !self.origin.current(&session) {
                 return Err(SpawnRefusal::Interrupted);
             }
@@ -390,7 +390,7 @@ impl ext::Sessions for CallPorts {
         request: ext::Awaited<ext::Spawn>,
     ) -> BoxFuture<'a, Result<Outcome, SpawnRefusal>> {
         Box::pin(async move {
-            let session = Arc::clone(&self.session);
+            let session = &self.session;
             if !self.origin.current(&session) {
                 return Err(SpawnRefusal::Interrupted);
             }

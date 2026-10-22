@@ -102,7 +102,7 @@ impl CallPorts {
         message: ext::SendMessage,
     ) -> BoxFuture<'_, Result<(), InboxRefusal>> {
         Box::pin(async move {
-            let session = Arc::clone(&self.session);
+            let session = &self.session;
             if !self.origin.current(&session) {
                 return Err(InboxRefusal::Interrupted);
             }
