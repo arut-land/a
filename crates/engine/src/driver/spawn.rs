@@ -356,13 +356,13 @@ impl ext::Sessions for CallPorts {
         request: ext::Detached<ext::Spawn>,
     ) -> BoxFuture<'a, Result<ext::ConversationHandle, SpawnRefusal>> {
         Box::pin(async move {
-            let session = Arc::clone(&self.session);
-            if !self.origin.current(&session) {
+            let session = &self.session;
+            if !self.origin.current(session) {
                 return Err(SpawnRefusal::Interrupted);
             }
             let (reply, result) = oneshot::channel();
             self.origin.send(
-                &session,
+                session,
                 ContextRequest::Child {
                     request: request.0,
                     reply: SpawnReply::Detached(reply),
@@ -390,13 +390,13 @@ impl ext::Sessions for CallPorts {
         request: ext::Awaited<ext::Spawn>,
     ) -> BoxFuture<'a, Result<Outcome, SpawnRefusal>> {
         Box::pin(async move {
-            let session = Arc::clone(&self.session);
-            if !self.origin.current(&session) {
+            let session = &self.session;
+            if !self.origin.current(session) {
                 return Err(SpawnRefusal::Interrupted);
             }
             let (reply, result) = oneshot::channel();
             self.origin.send(
-                &session,
+                session,
                 ContextRequest::Child {
                     request: request.0,
                     reply: SpawnReply::Awaited(reply),

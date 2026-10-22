@@ -197,15 +197,16 @@ impl ext::Models for CallPorts {
         side: ext::ModelTurn,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
-            let session = Arc::clone(&self.session);
+            let session = &self.session;
             let (sent, answer) = oneshot::channel();
             let origin = self.origin.clone();
-            if !origin.current(&session)
+            if !origin.current(session)
                 && (!side.is_background()
                     || origin.fence != session.fence.load(super::Ordering::SeqCst))
             {
                 return Err(llm::Error::incomplete());
             }
+            let session = Arc::clone(session);
             let registry = Arc::clone(&self.registry);
             let runtime = Arc::clone(&session.shared.rt);
             runtime.spawn(Box::pin(async move {
@@ -252,7 +253,7 @@ async fn side_call(
         let key = side.identity();
         let (owner, thread, cancel, registry) = (
             Arc::clone(session),
-            admitted.thread.clone(),
+            admitted.thread,
             cancel.clone(),
             Arc::clone(registry),
         );
@@ -530,9 +531,7 @@ impl Actor {
             let parent = self.live.parent.ok_or("model-only context has no owner")?;
             let shared = Arc::clone(&self.live.session.shared);
             rt::unblock(&*self.live.session.shared.rt, move || {
-                shared
-                    .owner_image(parent.session, seq.get() - 1)
-                    .map(super::projection::OwnerImage::project)
+                shared.owner_image(parent.session, seq.get() - 1)
             })
             .await
             .map_err(|e| e.to_string())?

@@ -102,14 +102,14 @@ impl CallPorts {
         message: ext::SendMessage,
     ) -> BoxFuture<'_, Result<(), InboxRefusal>> {
         Box::pin(async move {
-            let session = Arc::clone(&self.session);
-            if !self.origin.current(&session) {
+            let session = &self.session;
+            if !self.origin.current(session) {
                 return Err(InboxRefusal::Interrupted);
             }
             let envelope = message.envelope(session.id, self.origin.id);
             let (reply, result) = oneshot::channel();
             self.origin
-                .send(&session, ContextRequest::Send { envelope, reply });
+                .send(session, ContextRequest::Send { envelope, reply });
             result.await.unwrap_or(Err(InboxRefusal::Interrupted))
         })
     }

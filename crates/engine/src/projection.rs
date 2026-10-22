@@ -5,18 +5,12 @@ use super::{
     Ordering, Outbox, SNAPSHOT_GAP, SessionView, Transcript, io, lock,
 };
 
-/// A prefix coupled to the authority admitted by its own session.
-pub(super) struct OwnerImage {
-    entries: Vec<Entry>,
-    registry: Arc<super::Registry>,
-}
-
 impl super::Shared {
     pub(super) fn owner_image(
         &self,
         owner: super::SessionId,
         through: u64,
-    ) -> io::Result<OwnerImage> {
+    ) -> io::Result<llm::Messages> {
         let header = self
             .catalog
             .get(owner)
@@ -34,14 +28,8 @@ impl super::Shared {
         } else {
             current
         };
-        Ok(OwnerImage { entries, registry })
-    }
-}
-
-impl OwnerImage {
-    pub(super) fn project(self) -> llm::Messages {
-        let system = self.registry.system_prompt();
-        Transcript::of(&self.entries, Arc::clone(&self.registry), system).into_messages()
+        let system = registry.system_prompt();
+        Ok(Transcript::of(&entries, Arc::clone(&registry), system).into_messages())
     }
 }
 

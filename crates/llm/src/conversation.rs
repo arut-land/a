@@ -1,17 +1,6 @@
-//! A conversation as requests send it: its messages shared by every request
-//! that carries them, growing at their end, and what each protocol encoded
-//! of them kept beside them, so a message is encoded once however many
-//! requests send it.
-//!
-//! A protocol encodes a conversation as a left fold ([`Fold`]): each
-//! message, as [`Prepare`] passes it on for the target, extends the wire
-//! items; the items no later message can change are written as bytes
-//! there and then, once, and the rest stay open in the fold. What a
-//! conversation keeps per encoding is the fold after its last message and
-//! the settled bytes. A request for a conversation that grew since folds
-//! only the new messages; one that changed before its end (an edit, an
-//! insertion) folds from the start. Either way the bytes are the ones
-//! folding from the start makes.
+//! Shared conversations cache each protocol's fold and settled bytes.
+//! Appends encode only new messages; edits invalidate the affected prefix.
+//! Cached and fresh folds must produce identical bytes.
 
 use std::any::Any;
 use std::fmt;
@@ -27,8 +16,7 @@ use crate::prepare::Prepare;
 use crate::protocol::Target;
 use crate::spec::{Message, SmolStr};
 
-/// How many encodings of one conversation it keeps: the target it is sent
-/// to, and one more for a request that goes elsewhere meanwhile.
+/// Keep the current target and one alternate without unbounded cache growth.
 const KEPT: usize = 2;
 
 /// Marks each version of a message: a message pushed, inserted or changed
@@ -74,15 +62,12 @@ impl Messages {
         list.marks.insert(at, mark());
     }
 
-    /// The last message, to change.
     pub fn last_mut(&mut self) -> Option<&mut Message> {
         let list = self.list();
         *list.marks.last_mut()? = mark();
         list.messages.last_mut()
     }
 
-    /// Whether the first `len` messages are those an encoding of `len`
-    /// messages ending in `mark` folded.
     fn holds(&self, len: usize, mark: u64) -> bool {
         len.checked_sub(1)
             .is_some_and(|last| self.0.marks.get(last) == Some(&mark))
@@ -209,15 +194,12 @@ fn exchanges(messages: &[Message]) -> impl DoubleEndedIterator<Item = &[Message]
 
 /// A protocol's encoding of a conversation, a prepared message at a time.
 pub(crate) trait Fold: Clone + Send + 'static {
-    /// What else the encoding reads: the quirks and model, and anything
-    /// the request says that shapes its messages. An encoding kept for
-    /// another one is not this one's.
+    /// Encodings are reusable only with the same request context.
     type Cx: PartialEq + Send + 'static;
 
     fn cx(&self) -> &Self::Cx;
 
-    /// Folds message `at` of the prepared conversation; the items no later
-    /// message can change go to `out`, in order.
+    /// Only items no later message can change may settle into `out`.
     fn push(&mut self, at: usize, message: &Message, out: &mut Settled) -> Result<(), Error>;
 }
 
@@ -233,8 +215,6 @@ impl<F: Fold> Step for F {
     }
 }
 
-/// One encoding kept, beside its fold: the first `len` messages folded,
-/// the last of them marked `mark`.
 struct Kept {
     provider: SmolStr,
     model: SmolStr,
@@ -244,7 +224,6 @@ struct Kept {
     settled: Vec<Shared>,
 }
 
-/// An encoding kept and its fold, a [`Fold`] of some protocol.
 type Encoding = (Kept, Box<dyn Any + Send>);
 
 #[cfg(test)]
@@ -254,8 +233,6 @@ thread_local! {
 }
 
 impl Kept {
-    /// The encoding of `messages` kept for `target` whose fold `fits`, or
-    /// a new one.
     fn take(
         messages: &Messages,
         target: &Target<'_>,
@@ -283,8 +260,6 @@ impl Kept {
         (new, None)
     }
 
-    /// Folds the messages of `messages` past those this encoding folded,
-    /// into `fold`; what settles is written to one buffer, shared once.
     fn grow(
         &mut self,
         messages: &Messages,
@@ -301,8 +276,6 @@ impl Kept {
         Ok(())
     }
 
-    /// Keeps this encoding, with its `fold`, first among those of
-    /// `messages`; what the request goes on with is a copy.
     fn keep(mut self, messages: &Messages, fold: Box<dyn Any + Send>) -> (Prepare, Vec<Shared>) {
         let copy = (self.pass.clone(), self.settled.clone());
         if let Some(&mark) = messages.0.marks.last() {
@@ -315,22 +288,7 @@ impl Kept {
     }
 }
 
-/// The conversation's end, for this request only: what `pass` held goes
-/// to `fold`, and the bytes of what then settles join `settled`.
-fn end(
-    mut pass: Prepare,
-    mut settled: Vec<Shared>,
-    fold: &mut dyn Step,
-) -> Result<Vec<Shared>, Error> {
-    let mut bytes = Settled::default();
-    pass.finish(fold, &mut bytes)?;
-    settled.extend(bytes.shared());
-    Ok(settled)
-}
-
-/// Items that settled, as JSON separated by commas: each written once,
-/// from whatever the protocol holds it as, into the buffer the requests
-/// then share.
+/// Sharing settled JSON avoids reserializing it on subsequent requests.
 #[derive(Default)]
 pub(crate) struct Settled(Vec<u8>);
 
@@ -343,15 +301,11 @@ impl Settled {
         let _ = serde_json::to_writer(&mut self.0, item);
     }
 
-    /// The run written, shared; none when nothing settled.
     fn shared(self) -> Option<Shared> {
         (!self.0.is_empty()).then(|| self.0.into())
     }
 }
 
-/// `messages` folded by `fold` for `target`, from what was kept of them
-/// when it is still theirs: the fold after the conversation's end, and the
-/// items it settled, as bytes.
 pub(crate) fn fold<F: Fold>(
     messages: &Messages,
     target: &Target<'_>,
@@ -367,18 +321,16 @@ pub(crate) fn fold<F: Fold>(
         _ => fold,
     };
     kept.grow(messages, target, &mut state)?;
-    let (pass, settled) = kept.keep(messages, Box::new(state.clone()));
-    let settled = end(pass, settled, &mut state)?;
+    let (mut pass, mut settled) = kept.keep(messages, Box::new(state.clone()));
+    let mut bytes = Settled::default();
+    pass.finish(&mut state, &mut bytes)?;
+    settled.extend(bytes.shared());
     Ok((state, settled))
 }
 
-/// An array of a body written from shared bytes: a conversation encoded
-/// for one request, or the request's tool definitions. The items its fold
-/// makes only for this request (`head` and `tail`) go around the bytes it
-/// settled.
+/// Request-specific items surround shared, previously settled JSON.
 #[derive(Debug)]
 pub struct History {
-    /// The body field the items are.
     pub key: &'static str,
     pub head: Vec<Value>,
     /// Runs of items, separated by commas; none is empty.
@@ -400,8 +352,6 @@ impl History {
         }
     }
 
-    /// Writes the items as a JSON array to `out`, the settled bytes as they
-    /// are.
     pub(crate) fn write(&self, out: &mut Pieces) {
         out.byte(b'[');
         let mut first = true;
@@ -431,11 +381,8 @@ impl History {
     }
 }
 
-/// Bytes a kept encoding and the requests that carry it share.
 pub(crate) type Shared = Arc<[u8]>;
 
-/// A body being written: what is written now, and the shared bytes it
-/// takes as they are.
 #[derive(Default)]
 pub(crate) struct Pieces {
     done: Vec<Shared>,
@@ -451,7 +398,6 @@ impl Pieces {
         self.buf.extend_from_slice(text.as_bytes());
     }
 
-    /// A comma before every element but the first.
     pub(crate) fn comma(&mut self, first: &mut bool) {
         if !std::mem::take(first) {
             self.byte(b',');

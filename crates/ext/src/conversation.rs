@@ -65,23 +65,14 @@ impl Serialize for Runner {
 }
 impl<'de> Deserialize<'de> for Runner {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let json = protocol::Json::deserialize(d)?;
-        Self::from_json(&json).map_err(serde::de::Error::custom)
-    }
-}
-impl Runner {
-    fn from_json(json: &protocol::Json) -> serde_json::Result<Self> {
         let (agent, role, context): (Option<String>, ModelRole, Option<ContextPolicy>) =
-            json.parse()?;
+            Deserialize::deserialize(d)?;
         Ok(match agent {
             Some(agent) => Self::Agent { agent, role },
             None => Self::ModelOnly {
                 role,
-                context: context.ok_or_else(|| {
-                    <serde_json::Error as serde::de::Error>::custom(
-                        "missing model-only context policy",
-                    )
-                })?,
+                context: context
+                    .ok_or_else(|| serde::de::Error::custom("missing model-only context policy"))?,
             },
         })
     }
