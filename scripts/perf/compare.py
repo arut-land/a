@@ -72,7 +72,7 @@ def main():
     paired_path = args.result.with_name("paired.json")
     if paired_path.exists():
         paired = json.loads(paired_path.read_text())
-        lines += ["## Same-runner reference", "", f'Reference: `{paired["reference_revision"]}`. Five alternating AB/BA rounds; builds finish before these windows. Large JSON results per process: {paired["large_json_results"]}.', "",
+        lines += ["## Same-runner reference", "", f'Reference: `{paired["reference_revision"]}`. Five alternating AB/BA rounds; builds finish before these windows. Driver turns per process: {paired["driver_turns"]}; large JSON results: {paired["large_json_results"]}.', "",
                   "| Axis | Reference median | Candidate median | Delta |", "| --- | ---: | ---: | --- |"]
         for name, value in paired["roles"]["candidate"].items():
             value = distribution(value["samples"])

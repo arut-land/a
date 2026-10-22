@@ -184,6 +184,7 @@ def summarize(output, source, variant, runner):
                 if len(data["results"]) > 1 and path.stem != "startup":
                     key += f"-{index}"
                 for field, unit, scale in [("time_wall_clock", "ms", 1000), ("time_cpu", "cpu_ms", 1000),
+                                           ("time_user", "user_ms", 1000), ("time_system", "kernel_ms", 1000),
                                            ("memory_peak_resident", "rss_kib", 1 / 1024)]:
                     values = [sample[field]["value"] * scale for sample in result["measurements"] if field in sample]
                     if values:
@@ -273,10 +274,13 @@ def paired(output, source, reference):
                 env = dict(os.environ)
                 if name == "large_json":
                     env["A_BENCH_JSON_RESULTS"] = "200"
+                elif name == "driver":
+                    env["A_BENCH_DRIVER_TURNS"] = "250"
                 run(["hyperfine", "-N", "--warmup", "1", "--runs", str(runs), "--metrics", "all",
                      "--export-json", path, workloads.command(argv)], env=env)
                 result = json.loads(path.read_text())["results"][0]
                 for field, unit, scale in [("time_wall_clock", "ms", 1000), ("time_cpu", "cpu_ms", 1000),
+                                           ("time_user", "user_ms", 1000), ("time_system", "kernel_ms", 1000),
                                            ("memory_peak_resident", "rss_kib", 1 / 1024)]:
                     samples = [sample[field]["value"] * scale for sample in result["measurements"] if field in sample]
                     if samples:
@@ -286,7 +290,7 @@ def paired(output, source, reference):
                     record = measure_windows(argv, env=env)
                     (saved / (name + "-native.json")).write_text(json.dumps(record))
                     values[role].setdefault(name + "_rss_kib", []).append(record["peak_rss_kib"])
-    result = dict(large_json_results=200, reference_revision=reference, candidate_revision=subprocess.check_output(
+    result = dict(driver_turns=500, large_json_results=200, reference_revision=reference, candidate_revision=subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(), order=orders, roles={})
     for role, observed in values.items():
         observed["size_kib"] = [(builds[role] / ("a" + SUFFIX)).stat().st_size / 1024]
@@ -296,6 +300,7 @@ def paired(output, source, reference):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--phase", choices=["all", "build", "measure", "paired"], default="all")
     parser.add_argument("--source", type=Path, default=ROOT)
     parser.add_argument("--output", type=Path, default=ROOT / "target/hosted-perf")
     parser.add_argument("--variant", default="{}", help='JSON: {"rustflags": [...], "config": [...]}')
@@ -307,12 +312,18 @@ def main():
     output, source = args.output.resolve(), args.source.resolve()
     output.mkdir(parents=True, exist_ok=True)
     variant = json.loads(args.variant or "{}")
-    build(source, output, variant, benchmarks=not args.build_only)
-    if args.bloat:
-        bloat(source, output)
-    if args.build_only:
+    if args.phase in ["all", "build"]:
+        build(source, output, variant, benchmarks=not args.build_only)
+        if args.bloat:
+            bloat(source, output)
+    if args.build_only or args.phase == "build":
         return
     os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
+    if args.phase == "paired":
+        if not args.paired_ref:
+            parser.error("paired measurements require --paired-ref")
+        paired(output, source, args.paired_ref)
+        return
     workloads = load_task("workloads")
     run(["hyperfine", "-N", "--warmup", "10", "--runs", "100", "--metrics", "all",
          "--export-json", output / "startup.json", workloads.command([str(output / ("a" + SUFFIX)), "--version"]),
@@ -327,7 +338,7 @@ def main():
     try:
         summarize(output, source, variant, args.runner)
     finally:
-        if args.paired_ref:
+        if args.phase == "all" and args.paired_ref:
             paired(output, source, args.paired_ref)
 
 

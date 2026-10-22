@@ -137,12 +137,13 @@ fn bench_loading_a_long_log() {
 #[test]
 #[ignore = "a measurement"]
 fn bench_turns_under_each_barrier_setting() {
-    const TURNS: usize = 50;
+    let turns: usize = std::env::var("A_BENCH_DRIVER_TURNS").map_or(50, |n| n.parse().unwrap());
+    assert!(turns > 0);
     let turn = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     for barriers in [kernel::Barriers::Step, kernel::Barriers::Effects] {
         let dir = std::env::temp_dir().join(format!("a-bench-turns-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let replies: Vec<String> = (0..TURNS).flat_map(|_| turn.iter().cloned()).collect();
+        let replies: Vec<String> = (0..turns).flat_map(|_| turn.iter().cloned()).collect();
         let tools = Registry::default().with(&Harbor).unwrap();
         let mut fixture = Fixture::on(
             Arc::new(Jsonl::open(&dir).unwrap()),
@@ -154,7 +155,7 @@ fn bench_turns_under_each_barrier_setting() {
         let session = fixture.create();
         settle(&session);
         let start = Instant::now();
-        let times: Vec<Duration> = (0..TURNS)
+        let times: Vec<Duration> = (0..turns)
             .map(|n| {
                 let start = Instant::now();
                 session.submit(&format!("Call the tool. ({n})")).unwrap();
@@ -166,7 +167,7 @@ fn bench_turns_under_each_barrier_setting() {
         let entries = log_of(&session).len();
         session.halt();
         eprintln!(
-            "{barriers:?}: a turn takes {:?} (median of {TURNS}); {:.0} entries a second",
+            "{barriers:?}: a turn takes {:?} (median of {turns}); {:.0} entries a second",
             median(times),
             f64::from(u32::try_from(entries).unwrap()) / all.as_secs_f64(),
         );

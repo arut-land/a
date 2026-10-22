@@ -9,7 +9,8 @@ def snapshot(pid, threads=False):
     process = psutil.Process(pid)
     cpu = process.cpu_times()
     result = {"rss_kib": process.memory_info().rss / 1024,
-              "cpu_seconds": cpu.user + cpu.system}
+              "cpu_seconds": cpu.user + cpu.system,
+              "user_seconds": cpu.user, "kernel_seconds": cpu.system}
     if threads:
         result["threads"] = [dict(id=t.id, user_seconds=t.user_time, kernel_seconds=t.system_time)
                              for t in process.threads()]
@@ -68,9 +69,11 @@ def measure_windows(argv, **kwargs):
         if not kernel.GetProcessTimes(handle, *[ctypes.byref(value) for value in times]):
             raise ctypes.WinError(ctypes.get_last_error())
         assert child.returncode == 0, (argv, child.returncode)
-        cpu = sum((value.dwHighDateTime << 32) + value.dwLowDateTime for value in times[2:]) / 10_000_000
+        kernel_seconds, user_seconds = [((value.dwHighDateTime << 32) + value.dwLowDateTime) / 10_000_000
+                                        for value in times[2:]]
         assert memory.peak > 0, "Windows must report a real peak working set"
-        return dict(wall_seconds=elapsed, cpu_seconds=cpu, peak_rss_kib=memory.peak / 1024)
+        return dict(wall_seconds=elapsed, cpu_seconds=user_seconds + kernel_seconds,
+                    user_seconds=user_seconds, kernel_seconds=kernel_seconds, peak_rss_kib=memory.peak / 1024)
     finally:
         if child.poll() is None:
             child.kill()

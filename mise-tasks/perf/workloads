@@ -51,6 +51,7 @@ def fresh_new(binary, env, workspace):
             _, status, usage = os.wait4(child.pid, 0)
             child.returncode = os.waitstatus_to_exitcode(status)
             result = dict(cpu_seconds=usage.ru_utime + usage.ru_stime,
+                          user_seconds=usage.ru_utime, kernel_seconds=usage.ru_stime,
                           peak_rss_kib=usage.ru_maxrss / (1024 if sys.platform == "darwin" else 1))
         else:
             child.wait()

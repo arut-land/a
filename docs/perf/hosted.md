@@ -44,7 +44,9 @@ through exit and query `GetProcessMemoryInfo` for lifetime peak working set
 and `GetProcessTimes` for CPU. Hyperfine does not support Windows peak RSS;
 these native observations are stored separately and supply that report axis. psutil 7.2.2
 provides native RSS/working-set and accumulated user+kernel CPU counters,
-including Windows, for the idle daemon and line client. It is a measurement
+including Windows, for the idle daemon and line client. CPU reports separate
+user and kernel time as well as their total; a reduction in one workload must
+not conceal a regression in another. It is a measurement
 dependency, not a shipped Rust dependency. `/proc` and macOS resident sets
 include shared resident pages; Windows uses working set, not private bytes.
 Do not compare memory values between OSes as if they shared one definition.
@@ -106,9 +108,9 @@ runtime budget pass. Full measurements remain the default.
 For tuning, `paired_ref` additionally builds a reference revision on the same
 runner. Reference builds omit the protocol and TUI bench executables, which
 these paired windows do not use. Five alternating AB/BA rounds measure startup, cold reply, attach,
-idle RSS/CPU, driver turns and large JSON. Paired JSON batches use 200 results
+idle RSS/CPU, driver turns and large JSON. Paired driver batches use 500 turns (250 per barrier); JSON batches use 200 results
 to reduce native CPU counter quantization; the full suite retains its original
-20-result workload. Each role uses fresh isolated
+20-result JSON and 100-turn driver workloads. Each role uses fresh isolated
 homes. All builds finish before these paired windows. Both raw observations
 and `paired.json` remain in the artifact, with a second summary table. Use
 this comparison when different hosted CPUs or storage obscure a small change.
