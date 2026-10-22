@@ -1,3 +1,8 @@
 [profile.windows]
 # A blocked native operation must fail the test instead of stalling CI.
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.windows.overrides]]
+# This stress invariant performs 1,001 sequential model turns in a debug build.
+filter = "test(title_regeneration_keeps_owner_context_out_of_thread_history)"
+slow-timeout = { period = "60s", terminate-after = 10 }
