@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use protocol::view::{Item, Kind, SessionView};
 use protocol::{Seq, SessionId};
 
@@ -14,25 +12,24 @@ pub enum ReplyEvent<'a> {
 pub struct ReplyStream {
     session: Option<SessionId>,
     settled: u64,
-    open: HashMap<Seq, String>,
+    open: Option<(Seq, String)>,
 }
 
 impl ReplyStream {
     pub fn project<'a>(&mut self, view: &'a SessionView) -> Vec<ReplyEvent<'a>> {
         let mut events = Vec::new();
         if self.session != view.session {
-            events.extend(self.open.drain().map(|_| ReplyEvent::End));
+            events.extend(self.open.take().map(|_| ReplyEvent::End));
             self.session = view.session;
             self.settled = 0;
         }
-        self.open.retain(|seq, _| {
-            let present = view.items.iter().any(|item| item.key() == *seq);
-            if !present {
-                events.push(ReplyEvent::End);
-                self.settled = self.settled.max(seq.get());
-            }
-            present
-        });
+        if let Some((seq, _)) = &self.open
+            && !view.items.iter().any(|item| item.key() == *seq)
+        {
+            events.push(ReplyEvent::End);
+            self.settled = self.settled.max(seq.get());
+            self.open = None;
+        }
         for item in &view.items {
             if item.key().get() <= self.settled
                 || !matches!(item.present().kind, Kind::Reply | Kind::Assistant)
@@ -52,7 +49,7 @@ impl ReplyStream {
             if text.is_empty() && !item.settled() {
                 break;
             }
-            let mut printed = self.open.remove(&item.key()).unwrap_or_else(|| {
+            let mut printed = self.open.take().map(|(_, text)| text).unwrap_or_else(|| {
                 events.push(ReplyEvent::Start);
                 String::new()
             });
@@ -70,7 +67,7 @@ impl ReplyStream {
                 events.push(ReplyEvent::End);
                 self.settled = item.key().get();
             } else {
-                self.open.insert(item.key(), printed);
+                self.open = Some((item.key(), printed));
                 // Preserve transcript order: an ended frontier cannot pass an open reply.
                 break;
             }
@@ -419,7 +416,7 @@ mod tests {
                 ]
             );
             assert_eq!(stream.project(&view), []);
-            assert!(stream.open.contains_key(&call.0));
+            assert_eq!(stream.open.as_ref().map(|(seq, _)| *seq), Some(call.0));
             view.fold(&DaemonMsg::Snapshot(Box::new(
                 reply(view.session.unwrap(), Status::Done, replacement).snapshot(),
             )));
@@ -495,7 +492,7 @@ mod tests {
                 stream.project(&view),
                 [ReplyEvent::Start, ReplyEvent::Text("done"), ReplyEvent::End]
             );
-            assert_eq!(stream.open.len(), 0);
+            assert!(stream.open.is_none());
             assert_eq!(stream.settled, seq);
         }
         let Item::Reply { call, status, .. } = &mut view.items[0] else {
@@ -507,11 +504,11 @@ mod tests {
             stream.project(&view),
             [ReplyEvent::Start, ReplyEvent::Text("done")]
         );
-        assert_eq!(stream.open.len(), 1);
+        assert!(stream.open.is_some());
         let mut departed = SessionView::default();
         departed.session = Some(SessionId::new());
         assert_eq!(stream.project(&departed), [ReplyEvent::End]);
-        assert_eq!(stream.open.len(), 0);
+        assert!(stream.open.is_none());
         assert_eq!(stream.settled, 0);
     }
 
@@ -541,7 +538,7 @@ mod tests {
                 ReplyEvent::End
             ]
         );
-        assert_eq!(stream.open.len(), 0);
+        assert!(stream.open.is_none());
         assert_eq!(stream.settled, 2);
     }
 }
