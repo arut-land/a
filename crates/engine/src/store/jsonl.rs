@@ -279,23 +279,27 @@ impl LogStore for Jsonl {
                 return Err(io::Error::other("unreadable session header"));
             }
         }
-        let start = reader.stream_position()?;
-        drop(reader);
         let mut history = History {
             seq: cursor.seq,
             epoch: cursor.epoch.0,
         };
         let mut entries = Vec::new();
-        let mut offset = start;
-        let damage = scan(&file, start, &mut history, through, &mut |entry, end| {
-            *cursor = ext::LogCursor {
-                seq: entry.seq.get(),
-                epoch: entry.epoch,
-                offset,
-            };
-            offset = end;
-            entries.push(entry);
-        })?;
+        let mut offset = reader.stream_position()?;
+        let damage = scan(
+            &mut reader,
+            &mut line,
+            &mut history,
+            through,
+            &mut |entry, end| {
+                *cursor = ext::LogCursor {
+                    seq: entry.seq.get(),
+                    epoch: entry.epoch,
+                    offset,
+                };
+                offset = end;
+                entries.push(entry);
+            },
+        )?;
         if damage.is_some() || history.seq != through {
             return Err(io::Error::other("incomplete or damaged session suffix"));
         }
@@ -606,36 +610,40 @@ impl Index {
         through: u64,
         mut each: impl FnMut(Entry),
     ) -> io::Result<Option<ReadOnly>> {
-        let start = self.end();
+        let mut reader = BufReader::with_capacity(64 * 1024, &self.file);
+        reader.seek(SeekFrom::Start(self.end()))?;
         let ends = self.ends.get_mut().unwrap_or_else(PoisonError::into_inner);
-        scan(&self.file, start, history, through, &mut |entry, end| {
-            ends.ends.push(end);
-            each(entry);
-        })
+        scan(
+            &mut reader,
+            &mut Vec::new(),
+            history,
+            through,
+            &mut |entry, end| {
+                ends.ends.push(end);
+                each(entry);
+            },
+        )
         .map(|damage| other.or(damage))
     }
 }
 
 /// Reading a prefix never repairs it; only load decides whether to trim a torn tail.
 fn scan(
-    file: &File,
-    mut end: u64,
+    reader: &mut BufReader<&File>,
+    line: &mut Vec<u8>,
     history: &mut History,
     through: u64,
     each: &mut dyn FnMut(Entry, u64),
 ) -> io::Result<Option<ReadOnly>> {
-    let mut file = file;
-    file.seek(SeekFrom::Start(end))?;
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
-    let mut line = Vec::new();
+    let mut end = reader.stream_position()?;
     while history.seq < through {
         line.clear();
-        let n = reader.read_until(b'\n', &mut line)?;
+        let n = reader.read_until(b'\n', line)?;
         if n == 0 {
             return Ok(None);
         }
-        let sealed = unseal(&mut line);
-        if let Some(entry) = sealed.then(|| history.decode(&line).ok()).flatten() {
+        let sealed = unseal(line);
+        if let Some(entry) = sealed.then(|| history.decode(line).ok()).flatten() {
             end += n as u64;
             each(entry, end);
         } else {
