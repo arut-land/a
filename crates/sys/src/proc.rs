@@ -745,8 +745,11 @@ mod imp {
     }
 
     #[cfg(not(target_vendor = "apple"))]
-    pub(crate) fn has_members(_pgid: process::Pid) -> bool {
-        true
+    pub(crate) fn has_members(pgid: process::Pid) -> bool {
+        !matches!(
+            process::test_kill_process_group(pgid),
+            Err(rustix::io::Errno::SRCH)
+        )
     }
 
     pub fn signal_process(pid: u32, signal: Signal) -> io::Result<()> {
