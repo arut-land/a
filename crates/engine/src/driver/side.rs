@@ -496,28 +496,31 @@ impl Actor {
             if let Body::Take { input } = entry.body {
                 entry = self.indexed_entry(input).await.map_err(|e| e.to_string())?;
             }
-            let text = match &entry.body {
-                Body::Enqueue { envelope } => envelope.payload.as_str(),
-                Body::Input { text, .. } => text.as_str(),
+            let (text, keyed) = match &entry.body {
+                Body::Enqueue { envelope } => (envelope.payload.as_str(), true),
+                Body::Input { text, .. } => (text.as_str(), false),
                 _ => return Err("model-only turn has no admitted input".into()),
             };
-            let (turn, prefix) = ext::ModelTurn::from_intent(text).unwrap_or_else(|_| {
-                let spawn = lock(&self.live.session.spawn);
-                let spawn = spawn.as_ref().expect("model-only authority");
-                let mut turn = ext::ModelTurn::new::<ext::ModelOnly>(
-                    ext::ThreadKey {
-                        extension: spawn.request.owner.clone(),
-                        purpose: spawn.request.purpose.clone(),
-                        owner_scope: ext::OwnerScope::Session,
-                    },
-                    ext::TurnKey(call.get().to_string()),
-                    spawn.request.runner.role().clone(),
-                    ext::SideContext::None,
-                    llm::Messages::default(),
-                );
-                turn.budget = spawn.request.budget;
-                (turn, None)
-            });
+            let (turn, prefix) = keyed
+                .then(|| ext::ModelTurn::from_intent(text).ok())
+                .flatten()
+                .unwrap_or_else(|| {
+                    let spawn = lock(&self.live.session.spawn);
+                    let spawn = spawn.as_ref().expect("model-only authority");
+                    let mut turn = ext::ModelTurn::new::<ext::ModelOnly>(
+                        ext::ThreadKey {
+                            extension: spawn.request.owner.clone(),
+                            purpose: spawn.request.purpose.clone(),
+                            owner_scope: ext::OwnerScope::Session,
+                        },
+                        ext::TurnKey(call.get().to_string()),
+                        spawn.request.runner.role().clone(),
+                        ext::SideContext::None,
+                        [llm::Message::user(text)].into_iter().collect(),
+                    );
+                    turn.budget = spawn.request.budget;
+                    (turn, None)
+                });
             let mut messages = self.conversation(call).await.map_err(|e| e.to_string())?;
             let context = if let Some(seq) = prefix {
                 let parent = self.live.parent.ok_or("model-only context has no owner")?;

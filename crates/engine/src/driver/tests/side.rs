@@ -1849,3 +1849,53 @@ fn owner_sequence_context_survives_context_edits() {
     assert!(actual.contains("summary"), "{actual}");
     assert!(actual.contains("after edit"), "{actual}");
 }
+
+#[test]
+fn a_plain_model_only_input_is_never_dropped_by_the_context_bound() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::default()
+        .with(&ext_title::Title)
+        .unwrap()
+        .with(&TitleHistory(Arc::clone(&captured)))
+        .unwrap();
+    let fixture = fixture(registry, &http);
+    let session = fixture.start(&[]);
+    session.submit("source task").unwrap();
+    until(&session, "initial title", |log| {
+        SessionView::from_log(session.id, "/w".into(), log)
+            .side("title")
+            .is_some()
+    });
+    settle(&session);
+    let child = fixture
+        .2
+        .loaded()
+        .into_iter()
+        .find(|live| live.parent.is_some_and(|p| p.session == session.id))
+        .unwrap();
+    let before = lock(&captured).len();
+    child.submit(&"current instruction ".repeat(1000)).unwrap();
+    settle(&child);
+    let after = lock(&captured).len();
+    let failure = log_of(&child)
+        .into_iter()
+        .rev()
+        .find_map(|entry| match entry.body {
+            Body::ModelResult {
+                failure: Some(failure),
+                ..
+            } => Some(failure),
+            _ => None,
+        })
+        .expect("mandatory input failure");
+    assert_eq!(
+        llm::Error::from_json(failure.raw()).unwrap().kind,
+        llm::Kind::InvalidRequest
+    );
+    session.halt();
+    assert_eq!(
+        after, before,
+        "an oversized mandatory raw input should fail before calling the provider"
+    );
+}
