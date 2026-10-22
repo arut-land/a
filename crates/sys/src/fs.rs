@@ -244,31 +244,53 @@ pub fn order_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Creates missing directories and durably publishes each new name.
-/// Existing directories are left intact; callers must use this at creation,
-/// rather than trying to flush a Windows directory after adding names to it.
+/// Unix reestablishes every ancestor's parent barrier even for existing names:
+/// an earlier mkdir may have succeeded while its publication failed.
+/// Windows publishes new names through write-through rename instead.
 pub fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
-    if dir.is_dir() {
-        return Ok(());
-    }
+    create_directories(dir, &|path| path.is_dir(), &create_directory)
+}
+
+fn create_directories(
+    dir: &Path,
+    exists: &impl Fn(&Path) -> bool,
+    publish: &impl Fn(&Path, bool) -> io::Result<()>,
+) -> io::Result<()> {
     if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-        create_dir_all_durable(parent)?;
+        create_directories(parent, exists, publish)?;
     }
+    publish(dir, exists(dir))
+}
+
+fn create_directory(dir: &Path, existing: bool) -> io::Result<()> {
     #[cfg(unix)]
     {
-        match fs::create_dir(dir) {
-            Ok(()) => sync_dir(
-                dir.parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or(Path::new(".")),
-            ),
-            Err(_) if dir.is_dir() => Ok(()),
-            Err(error) => Err(error),
+        if !existing {
+            match fs::create_dir(dir) {
+                Ok(()) => {}
+                Err(_) if dir.is_dir() => {}
+                Err(error) => return Err(error),
+            }
         }
+        sync_dir(
+            dir.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(if dir.is_absolute() {
+                    dir
+                } else {
+                    Path::new(".")
+                }),
+        )
     }
     #[cfg(windows)]
     {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Existence follows the atomic write-through publication, unlike mkdir
+        // followed by a separate parent barrier on Unix.
+        if existing {
+            return Ok(());
+        }
         let pending = loop {
             let pending = dir.with_file_name(format!(
                 ".a-directory-{}-{}",
@@ -948,5 +970,55 @@ mod publication_tests {
         assert!(publish(&root.join("missing"), &path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"old");
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod directory_retry_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+
+    #[test]
+    fn retrying_directory_creation_reestablishes_every_parent_publication() {
+        struct Disk {
+            names: HashSet<std::path::PathBuf>,
+            durable: HashSet<std::path::PathBuf>,
+            failures: usize,
+        }
+        let sessions = Path::new("sessions");
+        let session = sessions.join("id");
+        let derived = session.join("derived");
+        let disk = RefCell::new(Disk {
+            names: [sessions.to_owned()].into(),
+            durable: [sessions.to_owned()].into(),
+            failures: 2,
+        });
+        let exists = |path: &Path| disk.borrow().names.contains(path);
+        let publish = |path: &Path, _existing: bool| {
+            let mut disk = disk.borrow_mut();
+            disk.names.insert(path.to_owned());
+            if path == session && disk.failures != 0 {
+                disk.failures -= 1;
+                return Err(io::Error::other("parent barrier failed after mkdir"));
+            }
+            disk.durable.insert(path.to_owned());
+            Ok(())
+        };
+        assert!(create_directories(&session, &exists, &publish).is_err());
+        assert!(exists(&session));
+        assert!(!disk.borrow().durable.contains(&session));
+        assert!(create_directories(&derived, &exists, &publish).is_err());
+        assert!(
+            !exists(&derived),
+            "a failed ancestor barrier must prevent child publication"
+        );
+        create_directories(&derived, &exists, &publish).unwrap();
+        let disk = disk.borrow();
+        assert!(
+            disk.durable.contains(&session),
+            "a committed child must survive losing all unflushed names"
+        );
+        assert!(disk.durable.contains(&derived));
     }
 }
