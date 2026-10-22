@@ -67,9 +67,11 @@ for backend in tiny facade subscriber; do
     features=(--no-default-features)
     if [[ $backend != tiny ]]; then features+=(--features "$backend"); fi
     cargo build --release --manifest-path "$probe/Cargo.toml" "${features[@]}"
+    binary="$probe/target/release/a-logging-probe"
+    [[ ! -e $binary.exe ]] || binary+=.exe
     printf '%s: ' "$backend"
-    wc -c < "$probe/target/release/a-logging-probe"
-    for trial in 1 2 3 4 5; do "$probe/target/release/a-logging-probe"; done
+    wc -c < "$binary"
+    for trial in 1 2 3 4 5; do "$binary"; done
 done
 cargo tree --manifest-path "$probe/Cargo.toml" --features subscriber -e normal --prefix none -f '{p}' > "$probe/tree"
 if rg '^tokio v' "$probe/tree"; then exit 1; fi
