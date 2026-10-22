@@ -39,6 +39,13 @@ struct Shared<T> {
 }
 
 impl<T> Shared<T> {
+    fn wake(&self, queue: &mut Queue<T>) {
+        if let Some(waker) = queue.waker.take() {
+            waker.wake();
+        }
+        self.ready.notify_one();
+    }
+
     // A panicking holder leaves the queue whole, so poisoning is ignored.
     fn queue(&self) -> MutexGuard<'_, Queue<T>> {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
@@ -105,10 +112,7 @@ impl<T> Post<T> {
         queue.bytes = 0;
         queue.ended = true;
         queue.first.push_back((0, item));
-        if let Some(waker) = queue.waker.take() {
-            waker.wake();
-        }
-        self.0.ready.notify_one();
+        self.0.wake(&mut queue);
     }
 
     fn post(&self, item: T, first: bool) -> Result<(), T> {
@@ -130,10 +134,7 @@ impl<T> Post<T> {
             queue.items.push_back((bytes, item));
         }
         queue.bytes += bytes;
-        if let Some(waker) = queue.waker.take() {
-            waker.wake();
-        }
-        self.0.ready.notify_one();
+        self.0.wake(&mut queue);
         Ok(())
     }
 }
@@ -150,10 +151,7 @@ impl<T> Drop for Post<T> {
         let mut queue = self.0.queue();
         queue.posts -= 1;
         if queue.posts == 0 {
-            if let Some(waker) = queue.waker.take() {
-                waker.wake();
-            }
-            self.0.ready.notify_one();
+            self.0.wake(&mut queue);
         }
     }
 }
