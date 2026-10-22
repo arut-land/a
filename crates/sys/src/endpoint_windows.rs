@@ -558,6 +558,9 @@ impl Write for &Stream {
     }
     fn flush(&mut self) -> io::Result<()> {
         let connection = &self.0;
+        if connection.write_closed.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
         let mut write = lock(&connection.write);
         if let Some(op) = write.as_mut() {
             op.finish(connection.nonblocking.load(Ordering::Acquire), None)?;
@@ -728,6 +731,33 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         drop(server); // Drop must join cancellation before releasing the pending buffer.
+    }
+
+    #[test]
+    fn a_closed_write_direction_never_waits_for_pending_completion() {
+        let home = home("closed-write");
+        let listener = home.bind().unwrap();
+        let _client = connect_pipe(&listener.0.path, None).unwrap();
+        let mut server = accept(&listener.0).unwrap();
+        stream_nonblocking(&server, true).unwrap();
+        loop {
+            match server.write(&[0; 8192]) {
+                Ok(_) => {}
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                    break;
+                }
+            }
+        }
+        shutdown(&server, Shutdown::Write).unwrap();
+        assert_eq!(
+            server.flush().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            server.write(b"later").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]
