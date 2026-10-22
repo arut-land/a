@@ -166,7 +166,6 @@ impl Actor {
             let spawn = ext::Spawn::from(&side);
             let frozen = self.freeze_spawn(of, spawn, false, &registry).await;
             protocol::publication::ThreadImage {
-                conversation: protocol::SessionId::new(),
                 turn,
                 authority: frozen.into_json().ok()?,
             }
@@ -282,7 +281,7 @@ async fn side_call(
         && let Some(daemon) = session.shared.daemon.upgrade()
     {
         cancel.set();
-        daemon.interrupt(admitted.thread.conversation);
+        daemon.interrupt(side.thread.conversation(session.id));
     }
     let (outcome, answer) = sided(session.id, result);
     let failure = answer.as_ref().err().and_then(|e| Json::encode(e).ok());
@@ -460,13 +459,13 @@ impl super::Daemon {
                     ext::OwnerScope::Session => CallId::new(1).unwrap(),
                     ext::OwnerScope::Call(call) => call,
                 },
-                purpose: Json::encode(&(key.thread, key.turn))
+                purpose: Json::encode(&(&key.thread, key.turn))
                     .map_err(std::io::Error::other)?
                     .raw()
                     .into(),
             };
             let header = crate::store::Header {
-                id: image.conversation,
+                id: turn.thread.conversation(owner.id),
                 workspace: owner.workspace.to_path_buf(),
                 parent: Some(crate::store::Parent {
                     session: owner.id,

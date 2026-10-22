@@ -159,7 +159,6 @@ mod tests {
                 purpose: Some(side.thread.purpose.clone()),
                 request: Some(
                     protocol::publication::ThreadImage {
-                        conversation: child,
                         turn: side.intent(&llm::Messages::default()).unwrap(),
                         authority: Json::null(),
                     }

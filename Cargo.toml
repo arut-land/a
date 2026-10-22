@@ -49,7 +49,7 @@ serde = { version = "1", default-features = false, features = ["std", "derive"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 ureq = { version = "3", default-features = false }
 usage-rs = { version = "=7.1.0", default-features = false, features = ["help", "diagnostics", "completions"] }
-uuid = { version = "1", default-features = false, features = ["std", "v7", "serde"] }
+uuid = { version = "1", default-features = false, features = ["std", "v5", "v7", "serde"] }
 
 [workspace.lints.rust]
 # deny, not forbid: `sys` opts out for OS calls, and tests may opt out locally

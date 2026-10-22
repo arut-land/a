@@ -27,10 +27,9 @@ pub struct SpawnImage {
     pub image: Vec<Json>,
 }
 
-/// Side audit facts identify the executing conversation without exposing its authority.
+/// Execution identity belongs to the owner, never to copied audit history.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ThreadImage {
-    pub conversation: crate::SessionId,
     pub turn: Json,
     pub authority: Json,
 }

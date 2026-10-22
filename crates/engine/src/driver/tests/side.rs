@@ -1219,14 +1219,22 @@ fn title_regeneration_appends_to_the_same_thread() {
         })
         .collect();
     assert_eq!(images.len(), 3);
-    assert!(
-        images
-            .iter()
-            .all(|image| image.conversation == images[0].conversation)
-    );
+    assert!(images.iter().all(|image| {
+        ext::SideIdentity::from_intent(&image.to_json().unwrap())
+            .unwrap()
+            .thread
+            == ext::SideIdentity::from_intent(&images[0].to_json().unwrap())
+                .unwrap()
+                .thread
+    }));
     let child = fixture
         .2
-        .slot(images[0].conversation)
+        .slot(
+            ext::SideIdentity::from_intent(&images[0].to_json().unwrap())
+                .unwrap()
+                .thread
+                .conversation(session.id),
+        )
         .unwrap()
         .live()
         .unwrap();
@@ -1438,4 +1446,61 @@ fn cancelled_queued_turns_never_reappear_after_restart() {
                 && matches!(e.body, Body::ModelCall { .. }))
     );
     recovered.halt();
+}
+
+#[test]
+fn forked_title_regeneration_never_writes_the_sources_thread() {
+    let http = Flaky::new((0..4).map(|_| Reply::Events(text_reply())));
+    let fixture = fixture(
+        Registry::default()
+            .with(&ext_title::Title)
+            .unwrap()
+            .with(&ext_fork::Fork)
+            .unwrap(),
+        &http,
+    );
+    let session = fixture.start(&[]);
+    session.submit("source task").unwrap();
+    until(&session, "initial title", |log| {
+        SessionView::from_log(session.id, "/w".into(), log)
+            .side("title")
+            .is_some()
+    });
+    settle(&session);
+    let child = fixture
+        .2
+        .loaded()
+        .into_iter()
+        .find(|live| live.parent.is_some_and(|p| p.session == session.id))
+        .unwrap();
+    let before = log_of(&child);
+    let header = fixture
+        .0
+        .store
+        .headers()
+        .unwrap()
+        .into_iter()
+        .find(|header| header.id == session.id)
+        .unwrap();
+    let source_log = log_of(&session);
+    let fork = copy_history(
+        &header,
+        source_log.last().unwrap().seq,
+        SessionId::new(),
+        &fixture.0,
+    )
+    .unwrap();
+    let slot = fixture.2.new_slot(fork.clone()).unwrap();
+    let branch = Live::start(&fork, &fixture.0, Open::Load, Owner::None).unwrap();
+    let branch = fixture.2.started(&slot, Ok(branch)).unwrap();
+    branch.submit("/title fork title").unwrap();
+    settle(&branch);
+    let after = log_of(&child);
+    branch.halt();
+    session.halt();
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "the fork appended work to the source-owned thread"
+    );
 }

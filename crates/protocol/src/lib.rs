@@ -88,6 +88,10 @@ impl SessionId {
         Self(Uuid::now_v7())
     }
 
+    pub fn owned(self, key: &str) -> Self {
+        Self(Uuid::new_v5(&self.0, key.as_bytes()))
+    }
+
     /// Short form for display: the random tail of the `UUIDv7`.
     pub const fn short(self) -> Short {
         Short(self)

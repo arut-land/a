@@ -220,6 +220,10 @@ pub struct SideIdentity {
 }
 
 impl ThreadKey {
+    pub fn conversation(&self, owner: protocol::SessionId) -> protocol::SessionId {
+        owner.owned(llm::Json::encode(self).expect("thread key encodes").raw())
+    }
+
     pub fn new<E: crate::Extension>(purpose: &str, owner_scope: OwnerScope) -> Self {
         Self {
             extension: E::NAME.into(),
@@ -455,7 +459,6 @@ mod tests {
         session.thread.owner_scope = OwnerScope::Session;
         assert_ne!(session.identity(), identity);
         let intent = protocol::publication::ThreadImage {
-            conversation: protocol::SessionId::new(),
             turn: session.intent(&llm::Messages::default()).unwrap(),
             authority: llm::Json::null(),
         }

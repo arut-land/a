@@ -672,7 +672,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         sample("entry_ack", entry(2, Body::Ack { envelope_id: envelope().id, refusal: None })),
         sample("entry_inbox_full", entry(2, Body::Ack { envelope_id: envelope().id, refusal: Some(protocol::InboxRefusal::Full) })),
         sample("entry_spawned_model_only", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::ModelOnly, authority: protocol::Json::null(), image: Vec::new() }.to_json().unwrap() })),
-        sample("entry_model_thread", entry(2, Body::ModelCall { model: "example:model".into(), attempt: 0, choice: protocol::ToolChoice::None, r#for: CallId::new(1), purpose: Some("example".into()), request: Some(protocol::publication::ThreadImage { conversation: SESSION, turn: protocol::Json::null(), authority: protocol::Json::null() }.to_json().unwrap()) })),
+        sample("entry_model_thread", entry(2, Body::ModelCall { model: "example:model".into(), attempt: 0, choice: protocol::ToolChoice::None, r#for: CallId::new(1), purpose: Some("example".into()), request: Some(protocol::publication::ThreadImage { turn: protocol::Json::null(), authority: protocol::Json::null() }.to_json().unwrap()) })),
         sample("entry_spawned", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::Agent, authority: protocol::Json::null(), image: Vec::new() }.to_json().unwrap() })),
         sample(
             "entry_watch",
