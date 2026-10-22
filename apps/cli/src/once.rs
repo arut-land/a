@@ -107,10 +107,10 @@ pub fn run(
             driver.pump(&mut (), once.client.detach());
             return ended;
         }
-        let Some(input) = rx.recv() else {
+        let Some(event) = rx.recv() else {
             return Ok(Ended::Failed.into());
         };
-        effects = match input {
+        effects = match event {
             Input::Client(event) => once.client.step(event),
             Input::Busy => return Err(client::Error::Busy.into()),
             Input::Stdin(text) => {
