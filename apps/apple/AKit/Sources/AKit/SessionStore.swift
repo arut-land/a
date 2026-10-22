@@ -192,7 +192,7 @@ public final class SessionStore {
             switch change {
             case .attached(_, _, let reset) where reset:
                 count = 0
-            case .snapshot(let items):
+            case .snapshot(_, _, let items):
                 count = items.count
             case .added(let index, _):
                 guard Int(index) <= count else { return }
@@ -223,8 +223,9 @@ public final class SessionStore {
                 streaming?.text += text
             case .synced(let recap):
                 self.recap = recap
-            case .snapshot(let snapshot):
-                items = snapshot
+            case .snapshot(let session, let workspace, let snapshot):
+                (sessionId, self.workspace, items) = (session, workspace, snapshot)
+                attachment = session.map { .attached(id: $0) } ?? .detached
             case .activity, .draining:
                 break
             case .mismatch(_, let message):

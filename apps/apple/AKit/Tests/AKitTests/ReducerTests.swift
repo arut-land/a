@@ -58,6 +58,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     #expect(store.recap == snapshot.recap, "\(name)")
     #expect((store.rev, store.seq) == (snapshot.rev, snapshot.seq), "\(name)")
     #expect(store.sessionId == snapshot.session, "\(name)")
+    #expect(store.workspace == snapshot.workspace, "\(name)")
     #expect(store.turn == snapshot.turn, "\(name)")
 }
 
@@ -230,7 +231,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     let next = reducer.snapshot().items[1]
     let invalid: [[ViewChange]] = [
         [.added(index: 2, item: next)],
-        [.snapshot(items: []), .updated(index: 0, item: item)],
+        [.snapshot(session: nil, workspace: "", items: []), .updated(index: 0, item: item)],
         [.attached(session: "discarded", workspace: "/discarded", reset: true), .updated(index: 0, item: item)],
         [.added(index: 1, item: next), .updated(index: 2, item: item)],
     ]

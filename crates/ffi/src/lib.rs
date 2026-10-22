@@ -405,8 +405,10 @@ pub enum ViewChange {
     Synced {
         recap: Option<RecapInfo>,
     },
-    /// The daemon sent the whole view: the items are these now.
+    /// The daemon replaced the log-derived view, including its identity.
     Snapshot {
+        session: Option<String>,
+        workspace: String,
         items: Vec<DisplayItem>,
     },
     /// The daemon is restarting for an upgrade; the session reconnects.
@@ -718,6 +720,8 @@ impl ViewChange {
                 recap: view.recap.as_ref().map(Into::into),
             },
             Change::Snapshot => Self::Snapshot {
+                session: view.session.map(|s| s.to_string()),
+                workspace: view.workspace.display().to_string(),
                 items: view
                     .items
                     .iter()
