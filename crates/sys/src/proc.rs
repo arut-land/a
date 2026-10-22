@@ -927,12 +927,9 @@ mod tests {
     #[test]
     fn an_exit_watch_turns_readable_when_its_process_exits() {
         use rustix::event::{PollFd, PollFlags, Timespec, poll};
-        let readable = |fd: &std::os::fd::OwnedFd, ms: i64| {
+        let readable = |fd: &std::os::fd::OwnedFd, ms: u64| {
             let mut fds = [PollFd::new(fd, PollFlags::IN)];
-            let timeout = Timespec {
-                tv_sec: 0,
-                tv_nsec: ms * 1_000_000,
-            };
+            let timeout = Timespec::try_from(std::time::Duration::from_millis(ms)).unwrap();
             poll(&mut fds, Some(&timeout)).unwrap() == 1
         };
         let mut cmd = Command::new("sh");
