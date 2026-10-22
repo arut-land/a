@@ -66,12 +66,24 @@ impl Runtime {
     /// copied again, so an older `a` that keeps being run
     /// costs a lookup, not a copy.
     pub fn stage(&self, exe: &Path) -> io::Result<Staged> {
+        let trace = std::env::var_os("A_TEST_PROCESS_TRACE").is_some();
+        let began = std::time::Instant::now();
+        if trace {
+            eprintln!("stage begin pid={}", std::process::id());
+        }
         let exe = fs::canonicalize(exe)?;
         let known = self.id_in_runtime(&exe).or_else(|| self.stamped(&exe));
         let id = match known {
             Some(id) if self.current().as_ref() == Some(&id) || self.outranked(&id) => id,
             known => {
                 let _lock = self.lock()?;
+                if trace {
+                    eprintln!(
+                        "stage locked pid={} elapsed={:?}",
+                        std::process::id(),
+                        began.elapsed()
+                    );
+                }
                 let id = match known.filter(|id| self.is_staged(id)) {
                     Some(id) => id,
                     None => self.copy_in(&exe)?,
@@ -83,6 +95,13 @@ impl Runtime {
         let exe = Some(self.dir.join(&id).join(EXE))
             .filter(|staged| staged.is_file())
             .unwrap_or(exe);
+        if trace {
+            eprintln!(
+                "stage end pid={} elapsed={:?}",
+                std::process::id(),
+                began.elapsed()
+            );
+        }
         Ok(Staged { id, exe })
     }
 
@@ -128,7 +147,26 @@ impl Runtime {
     /// Copies `exe` to `runtime/<id>/a` through a temporary file, checks the
     /// copy's hash, and renames it into place.
     fn copy_in(&self, exe: &Path) -> io::Result<String> {
+        let trace = std::env::var_os("A_TEST_PROCESS_TRACE").is_some();
+        let began = std::time::Instant::now();
+        let phase = |name: &str| {
+            if trace {
+                eprintln!(
+                    "stage phase={name} pid={} elapsed={:?}",
+                    std::process::id(),
+                    began.elapsed()
+                );
+            }
+        };
+        if trace {
+            eprintln!(
+                "stage bytes={} pid={}",
+                fs::metadata(exe)?.len(),
+                std::process::id()
+            );
+        }
         let hash = content_hash(File::open(exe)?)?;
+        phase("hashed");
         let id = format!("{VERSION}+{hash:016x}");
         let dir = self.dir.join(&id);
         let target = dir.join(EXE);
@@ -141,9 +179,11 @@ impl Runtime {
             options.mode(0o755);
             let mut file = options.open(&tmp)?;
             io::copy(&mut File::open(exe)?, &mut file)?;
+            phase("copied");
             // The build's own time orders builds of one version.
             file.set_modified(fs::metadata(exe)?.modified()?)?;
             file.sync_all()?;
+            phase("synced");
             if content_hash(File::open(&tmp)?)? != hash {
                 let _ = fs::remove_file(&tmp);
                 return Err(io::Error::new(
@@ -151,11 +191,14 @@ impl Runtime {
                     "the staged copy does not match its source",
                 ));
             }
+            phase("verified");
             fs::rename(&tmp, &target)?;
+            phase("renamed");
         }
         let stamp = self.stamp(exe)?;
         fs::create_dir_all(stamp.parent().unwrap_or(&self.dir))?;
         replace_reference(&id, &stamp)?;
+        phase("stamped");
         Ok(id)
     }
 
