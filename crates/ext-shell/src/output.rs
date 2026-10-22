@@ -125,7 +125,6 @@ impl Output {
 #[derive(Default)]
 struct View {
     head: String,
-    head_lines: usize,
     tail: VecDeque<String>,
     tail_bytes: usize,
     bytes: usize,
@@ -145,8 +144,7 @@ impl View {
             return;
         }
         self.head.push_str(piece);
-        self.head_lines += ends;
-        if self.head.len() > HEAD + TAIL || self.head_lines > LINES {
+        if self.head.len() > HEAD + TAIL || self.lines > LINES {
             self.split();
         }
     }
@@ -157,28 +155,22 @@ impl View {
         self.cut = true;
         let all = std::mem::take(&mut self.head);
         let mut lines = all.split_inclusive('\n');
-        self.head_lines = 0;
-        for line in lines.by_ref() {
+        for (head_lines, line) in lines.by_ref().enumerate() {
             let room = HEAD - self.head.len();
-            if line.len() > room || self.head_lines == LINES / 2 {
+            if line.len() > room || head_lines == LINES / 2 {
                 if self.head.is_empty() {
                     let cut = line.floor_char_boundary(room);
                     self.head.push_str(&line[..cut]);
-                    self.tail_bytes += line.len() - cut;
                     self.tail.push_back(line[cut..].to_owned());
                 } else {
-                    self.tail_bytes += line.len();
                     self.tail.push_back(line.to_owned());
                 }
                 break;
             }
             self.head.push_str(line);
-            self.head_lines += 1;
         }
-        for line in lines {
-            self.tail_bytes += line.len();
-            self.tail.push_back(line.to_owned());
-        }
+        self.tail.extend(lines.map(str::to_owned));
+        self.tail_bytes = all.len() - self.head.len();
         self.trim();
     }
 
@@ -209,7 +201,7 @@ impl View {
         if !self.cut {
             return self.head;
         }
-        let shown_lines = self.head_lines + self.tail.len();
+        let shown_lines = self.head.matches('\n').count() + self.tail.len();
         let shown = self.head.len() + self.tail_bytes;
         let mut text = self.head;
         if !text.ends_with('\n') {

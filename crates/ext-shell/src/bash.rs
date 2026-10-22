@@ -27,7 +27,6 @@ use std::time::{Duration, Instant};
 
 use protocol::{Card, Environment, Mark};
 use serde::{Deserialize, Serialize};
-use sys::Signal;
 
 pub use crate::output::OUTPUT_CAP;
 use crate::output::{Live, Output, Rendered, create_private, private_dir};
@@ -272,17 +271,7 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
     // Watched before anything can write to it: a write before the watch
     // raises no edge, and would be read only once the command exits.
     let written = rt::Async::for_reading(&runtime(cx)?.reactor(), sys::write_watch(&log)?)?;
-    let child = cx
-        .service::<dyn Processes>()
-        .ok_or_else(|| io::Error::other("no process provider"))?
-        .spawn(
-            cx,
-            LaunchSpec {
-                process: spawn,
-                output: ProcessOutput::File(file),
-            },
-        )
-        .await?;
+    let child = launch(cx, spawn, file).await?;
     let pgid = child.id();
     cx.spawned(pgid, false);
     let limit = input.timeout.unwrap_or(TIMEOUT).clamp(1, MAX_TIMEOUT);
@@ -339,17 +328,7 @@ async fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
     let started = runtime(cx)?.now();
     let (file, log) = create_private(log)?;
     let cwd = spawn.cwd.clone();
-    let child = cx
-        .service::<dyn Processes>()
-        .ok_or_else(|| io::Error::other("no process provider"))?
-        .spawn(
-            cx,
-            LaunchSpec {
-                process: spawn,
-                output: ProcessOutput::File(file),
-            },
-        )
-        .await?;
+    let child = launch(cx, spawn, file).await?;
     let pgid = child.id();
     child.detach(cx);
     Ok(Ran {
@@ -358,6 +337,19 @@ async fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
         background: Some(Job { pgid, log }),
         ..Ran::default()
     })
+}
+
+async fn launch(cx: &Cx, process: Spawn, file: File) -> io::Result<OwnedProcess> {
+    cx.service::<dyn Processes>()
+        .ok_or_else(|| io::Error::other("no process provider"))?
+        .spawn(
+            cx,
+            LaunchSpec {
+                process,
+                output: ProcessOutput::File(file),
+            },
+        )
+        .await
 }
 
 /// The process for `command`, as the `spawn` hooks leave it: bash without
@@ -476,30 +468,20 @@ impl Run {
     /// The next state at `now`, and the signal to send the group to get
     /// there. The shell's exit ends any state but its own; a stop starts
     /// only while it runs.
-    fn step(self, now: Instant, seen: Seen) -> (Self, Option<Signal>) {
+    fn step(self, now: Instant, seen: Seen) -> (Self, Option<ProcessSignal>) {
+        let exited = |status, why| {
+            (
+                Self::Exited {
+                    status,
+                    why,
+                    at: now,
+                },
+                None,
+            )
+        };
         match (self, seen.exited) {
-            (Self::Running { .. }, Some(status)) => {
-                let why = None;
-                (
-                    Self::Exited {
-                        status,
-                        why,
-                        at: now,
-                    },
-                    None,
-                )
-            }
-            (Self::Stopping { why, .. }, Some(status)) => {
-                let why = Some(why);
-                (
-                    Self::Exited {
-                        status,
-                        why,
-                        at: now,
-                    },
-                    None,
-                )
-            }
+            (Self::Running { .. }, Some(status)) => exited(status, None),
+            (Self::Stopping { why, .. }, Some(status)) => exited(status, Some(why)),
             (Self::Running { deadline }, None) => {
                 let why = if seen.cancelled {
                     Stop::Aborted
@@ -511,7 +493,7 @@ impl Run {
                     return (self, None);
                 };
                 let kill = KillPhase::Term { at: now };
-                (Self::Stopping { why, kill }, Some(Signal::Terminate))
+                (Self::Stopping { why, kill }, Some(ProcessSignal::Terminate))
             }
             (
                 Self::Stopping {
@@ -521,7 +503,7 @@ impl Run {
                 None,
             ) if now >= at + GRACE => {
                 let kill = KillPhase::Killed;
-                (Self::Stopping { why, kill }, Some(Signal::Kill))
+                (Self::Stopping { why, kill }, Some(ProcessSignal::Kill))
             }
             (Self::Exited { .. }, _) | (Self::Stopping { .. }, None) => (self, None),
         }
@@ -632,10 +614,7 @@ async fn supervise(
         let signal;
         (run, signal) = run.step(now, seen);
         if let Some(signal) = signal {
-            let _ = child.signal(match signal {
-                Signal::Terminate => ProcessSignal::Terminate,
-                _ => ProcessSignal::Kill,
-            });
+            let _ = child.signal(signal);
         }
         if let Run::Exited { status, why, at } = run {
             let quiet = now >= heard.max(at) + IDLE;
