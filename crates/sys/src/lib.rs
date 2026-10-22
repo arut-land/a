@@ -45,9 +45,9 @@ pub use memory::small_footprint;
 pub use platform::{Arch, Os, Platform};
 pub use proc::{
     AdoptLockError, Child, ContainedChild, DaemonLock, ExitWatch, GroupId, InheritedNumber,
-    OwnedGroup, Pass, Passed, ProcessPipe, RecordedProcess, adopt_lock, boot_id, daemon_ready,
-    detach_session, exit_signal, exit_watch, find_bash, process_started, signal_process,
-    spawn_daemon, spawn_group, spawn_stdio,
+    OutputCapture, OwnedGroup, Pass, Passed, ProcessPipe, RecordedProcess, adopt_lock, boot_id,
+    daemon_ready, detach_session, exit_signal, exit_watch, find_bash, process_started,
+    signal_process, spawn_daemon, spawn_group, spawn_group_captured, spawn_stdio,
 };
 pub use runtime::{Runtime, Staged, VERSION};
 pub use signals::{Signals, reraise};

@@ -164,6 +164,13 @@ impl Drop for OwnedGroup {
 pub struct ContainedChild {
     pub child: Child,
     pub group: OwnedGroup,
+    pub capture: Option<OutputCapture>,
+}
+
+/// Output that must be copied asynchronously to its spill file before completion.
+pub struct OutputCapture {
+    pub reader: ProcessPipe,
+    pub file: File,
 }
 
 impl std::ops::Deref for ContainedChild {
@@ -237,10 +244,23 @@ pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<ContainedChild
     {
         let child = imp::spawn_group(cmd, output)?;
         let group = OwnedGroup::new(&child);
-        Ok(ContainedChild { child, group })
+        Ok(ContainedChild {
+            child,
+            group,
+            capture: None,
+        })
     }
     #[cfg(windows)]
     imp::spawn_group(cmd, output)
+}
+
+/// Captures output where direct file writes cannot wake live followers.
+/// The caller must drain `capture` before reporting process completion.
+pub fn spawn_group_captured(cmd: &mut Command, output: File) -> io::Result<ContainedChild> {
+    #[cfg(unix)]
+    return spawn_group(cmd, output);
+    #[cfg(windows)]
+    imp::spawn_group_captured(cmd, output)
 }
 
 /// An inherited daemon record whose identity and exclusive lock were verified.
@@ -1014,7 +1034,15 @@ pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(ContainedChild, ProcessPipe
         let input = File::from(OwnedFd::from(child.stdin.take().unwrap()));
         let output = File::from(OwnedFd::from(child.stdout.take().unwrap()));
         let group = OwnedGroup::new(&child);
-        Ok((ContainedChild { child, group }, input, output))
+        Ok((
+            ContainedChild {
+                child,
+                group,
+                capture: None,
+            },
+            input,
+            output,
+        ))
     }
     #[cfg(windows)]
     imp::spawn_stdio(cmd)

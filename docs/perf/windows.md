@@ -53,10 +53,13 @@ the old daemon, whose successor re-listens after the old process exits.
 Shell execution uses Git for Windows Bash with redirected output and no
 console. Native paths, extended-length/UNC prefixes, shell working-directory
 reports and Windows daemon environment variables are handled in `sys`.
-Directory-change notifications wake output followers without periodic
-file polling. Spill output uses WRITE_THROUGH so last-write notifications
-arrive while the writer is still open; shell directory reports canonicalize
-to the same extended paths as workspace discovery. Each shell enters an unnamed kill-on-close job through the
+Shell output enters an overlapped pipe, then rt copies bounded chunks to its
+spill file on storage workers and signals file-identity keyed follower events.
+NTFS directory notifications can wait until the writer closes, so they cannot
+provide live progress. A quiet process holds no copying worker and causes no
+polling; process completion also waits for the captured bytes. Unix retains
+direct file output and native file notifications. Shell directory reports
+canonicalize to the same extended paths as workspace discovery. Each shell enters an unnamed kill-on-close job through the
 process creation job-list attribute, before any shell code can create descendants. Only the
 daemon retains the job handle, so daemon death kills the whole tree. There
 is no terminal/ConPTY: shell tools have no interactive stdin, as on Unix.

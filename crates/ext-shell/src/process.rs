@@ -131,13 +131,17 @@ async fn launch(
                     .envs(&launch.process.env)
                     .current_dir(&launch.process.cwd);
                 let (contained, pipes) = match launch.output {
-                    ProcessOutput::File(file) => (sys::spawn_group(&mut cmd, file)?, None),
+                    ProcessOutput::File(file) => (sys::spawn_group_captured(&mut cmd, file)?, None),
                     ProcessOutput::Stdio => {
                         let (child, input, output) = sys::spawn_stdio(&mut cmd)?;
                         (child, Some((input, output)))
                     }
                 };
-                let sys::ContainedChild { child, group } = contained;
+                let sys::ContainedChild {
+                    child,
+                    group,
+                    capture,
+                } = contained;
                 let live = Arc::new(Live {
                     id: child.id(),
                     group: Mutex::new(Some(group)),
@@ -145,12 +149,12 @@ async fn launch(
                     exited: Flag::default(),
                     ended: Flag::default(),
                 });
-                Ok::<_, io::Error>((Reap(Some(child), live), pipes))
+                Ok::<_, io::Error>((Reap(Some(child), live), pipes, capture))
             })());
         }),
     )
     .await?;
-    let (mut owned, pipes) = received
+    let (mut owned, pipes, capture) = received
         .await
         .ok_or_else(|| io::Error::other("process launch stopped"))??;
     let live = Arc::clone(&owned.1);
@@ -180,16 +184,65 @@ async fn launch(
     } else {
         (None, None)
     };
-    rt.spawn(Box::pin(async move {
-        if let Some(watch) = watch
-            && watch.readable_result().await.is_err()
-        {
-            return;
-        }
-        owned.complete();
-        let _ = descendants(&reactor, &owned.1).await;
-    }));
+    rt.spawn(Box::pin(reap_output(
+        owned,
+        watch,
+        reactor,
+        capture,
+        cx.clone(),
+    )));
     Ok(OwnedProcess::new(live, input, output))
+}
+
+async fn reap_output(
+    mut owned: Reap,
+    watch: Option<rt::Async<sys::ExitWatch>>,
+    reactor: rt::Reactor,
+    capture: Option<sys::OutputCapture>,
+    cx: Cx,
+) {
+    let capturing = Arc::clone(&owned.1);
+    let copying = async {
+        if let Some(capture) = capture {
+            let result = async {
+                let input = rt::Async::read_pipe(&reactor, capture.reader)?;
+                rt::capture_output(
+                    cx.service::<dyn rt::Runtime>().unwrap(),
+                    input,
+                    capture.file,
+                    sys::fs::output_written,
+                )
+                .await
+            }
+            .await;
+            if result.is_err() {
+                lock(&capturing.group).take();
+            }
+            result
+        } else {
+            Ok(())
+        }
+    };
+    let reaping = async {
+        let result = async {
+            if let Some(watch) = watch {
+                watch.readable_result().await?;
+            }
+            owned.complete();
+            descendants(&reactor, &owned.1).await
+        }
+        .await;
+        if result.is_err() {
+            lock(&owned.1.group).take();
+        }
+        result
+    };
+    // Process completion includes every byte already accepted from stdout.
+    // Retain containment until both capture and descendant observation end.
+    let (copied, _) = rt::zip(copying, reaping).await;
+    if let Err(error) = copied {
+        *lock(&owned.1.status) = Some(Err(error));
+    }
 }
 
 // A leader can exit first. Failed descendant watches must revoke containment.

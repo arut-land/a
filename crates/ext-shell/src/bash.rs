@@ -619,15 +619,19 @@ async fn supervise(
         if let Run::Exited { status, why, at } = run {
             let quiet = now >= heard.max(at) + IDLE;
             if !behind && (!child.alive() || quiet || now >= at + LINGER) {
-                // What was written meanwhile, up to the cap.
-                let rest = OUTPUT_CAP.saturating_sub(output.bytes()).min(READ);
-                follow(&mut file, &mut buf, rest, |chunk| output.push(chunk))?;
                 let mut lingering = child.alive();
                 // A command that was stopped leaves nothing behind.
                 if lingering && why.is_some() {
                     let _ = child.signal(ProcessSignal::Kill);
                     lingering = false;
                 }
+                if !lingering {
+                    // Exit can precede the final captured bytes reaching the file.
+                    child.ended().await;
+                    child.try_wait()?;
+                }
+                let rest = OUTPUT_CAP.saturating_sub(output.bytes()).min(READ);
+                follow(&mut file, &mut buf, rest, |chunk| output.push(chunk))?;
                 return Ok(Finished {
                     status,
                     stopped: why,

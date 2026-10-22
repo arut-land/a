@@ -429,23 +429,6 @@ pub fn private_file() -> OpenOptions {
     open
 }
 
-/// A private output whose writes must notify followers before it closes.
-pub fn private_output() -> OpenOptions {
-    let open = private_file();
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_WRITE_THROUGH;
-        // Directory notifications observe last-write changes when cached
-        // writes reach disk, not necessarily when WriteFile returns.
-        let mut open = open;
-        open.custom_flags(FILE_FLAG_WRITE_THROUGH);
-        open
-    }
-    #[cfg(unix)]
-    open
-}
-
 /// Creates `dir` and its parents, entered only by their owner (mode 0700),
 /// and makes an existing `dir` so.
 pub fn private_dir(dir: &Path) -> io::Result<()> {
@@ -566,50 +549,89 @@ pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
     Ok(WriteWatch { fd, _file: file })
 }
 
-/// A directory change notification: writes to any output in this session's
-/// spill directory wake its followers, which recheck their own files.
+/// Completion of spill-file writes copied from a contained process's pipe.
+/// NTFS directory notifications can wait until the writer closes its file.
 #[cfg(windows)]
-pub struct WriteWatch(Option<std::os::windows::io::OwnedHandle>);
+pub struct WriteWatch {
+    key: (u32, u64),
+    event: std::sync::Arc<std::os::windows::io::OwnedHandle>,
+}
+
+#[cfg(windows)]
+type OutputWaiters =
+    std::collections::HashMap<(u32, u64), Vec<std::sync::Weak<std::os::windows::io::OwnedHandle>>>;
+
+#[cfg(windows)]
+fn output_waiters() -> &'static std::sync::Mutex<OutputWaiters> {
+    static WAITERS: std::sync::OnceLock<std::sync::Mutex<OutputWaiters>> =
+        std::sync::OnceLock::new();
+    WAITERS.get_or_init(Default::default)
+}
+
+#[cfg(windows)]
+fn output_key(file: &File) -> io::Result<(u32, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    let meta = file.metadata()?;
+    meta.volume_serial_number()
+        .zip(meta.file_index())
+        .ok_or_else(|| io::Error::other("output has no file identity"))
+}
 
 #[cfg(windows)]
 impl std::os::windows::io::AsHandle for WriteWatch {
     fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
-        self.0.as_ref().unwrap().as_handle()
+        self.event.as_handle()
     }
 }
 
 #[cfg(windows)]
 impl Drop for WriteWatch {
     fn drop(&mut self) {
-        use std::os::windows::io::IntoRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::FindCloseChangeNotification;
-        if let Some(handle) = self.0.take() {
-            // SAFETY: notification handles need their matching close API,
-            // after rt has unregistered the wait on this owned source.
-            unsafe { FindCloseChangeNotification(handle.into_raw_handle()) };
+        let mut waiters = output_waiters()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(events) = waiters.get_mut(&self.key) {
+            events.retain(|event| !event.ptr_eq(&std::sync::Arc::downgrade(&self.event)));
+            if events.is_empty() {
+                waiters.remove(&self.key);
+            }
         }
     }
 }
 
 #[cfg(windows)]
 pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FindFirstChangeNotificationW,
-    };
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output has no directory"))?;
-    let path = crate::windows::wide(parent.as_os_str());
-    // SAFETY: path is NUL-terminated and lives across the call. WriteWatch
-    // uses FindCloseChangeNotification instead of dropping the OwnedHandle.
-    let handle = crate::windows::owned(unsafe {
-        FindFirstChangeNotificationW(
-            path.as_ptr(),
-            0,
-            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
-        )
-    })?;
-    Ok(WriteWatch(Some(handle)))
+    let key = output_key(&File::open(path)?)?;
+    let event = std::sync::Arc::new(crate::windows::event()?);
+    output_waiters()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key)
+        .or_default()
+        .push(std::sync::Arc::downgrade(&event));
+    Ok(WriteWatch { key, event })
+}
+
+/// Signals only after the copied output is readable from its spill file.
+pub fn output_written(file: &File) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::SetEvent;
+        let key = output_key(file)?;
+        let waiters = output_waiters()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(events) = waiters.get(&key) {
+            for event in events.iter().filter_map(std::sync::Weak::upgrade) {
+                // SAFETY: the upgraded event stays owned throughout the call.
+                crate::windows::ok(unsafe { SetEvent(event.as_raw_handle()) })?;
+            }
+        }
+    }
+    #[cfg(unix)]
+    let _ = file;
+    Ok(())
 }
 
 impl WriteWatch {
@@ -618,15 +640,9 @@ impl WriteWatch {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
-            use windows_sys::Win32::System::Threading::WaitForSingleObject;
-            let handle = self.0.as_ref().unwrap().as_raw_handle();
-            // SAFETY: the watch owns this handle; rearm only after a signal.
-            unsafe {
-                if WaitForSingleObject(handle, 0) == 0 {
-                    FindNextChangeNotification(handle);
-                }
-            }
+            use windows_sys::Win32::System::Threading::ResetEvent;
+            // SAFETY: this watch owns the event, reset before reading output.
+            unsafe { ResetEvent(self.event.as_raw_handle()) };
         }
         #[cfg(target_os = "linux")]
         {
@@ -869,24 +885,28 @@ mod publication_tests {
 
     #[cfg(windows)]
     #[test]
-    fn output_writes_notify_followers_before_the_writer_closes() {
+    fn completed_output_writes_wake_each_follower_before_the_writer_closes() {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
         let root = std::env::temp_dir().join(format!("a-output-notify-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("output");
-        let mut file = private_output().open(&path).unwrap();
-        let watch = write_watch(&path).unwrap();
+        let mut file = private_file().open(&path).unwrap();
+        let watches = [write_watch(&path).unwrap(), write_watch(&path).unwrap()];
         for _ in 0..2 {
-            watch.clear();
+            for watch in &watches {
+                watch.clear();
+            }
             file.write_all(b"progress\n").unwrap();
-            // SAFETY: the watch owns this notification handle throughout the wait.
-            let signalled =
-                unsafe { WaitForSingleObject(watch.0.as_ref().unwrap().as_raw_handle(), 5000) };
-            assert_eq!(signalled, WAIT_OBJECT_0);
+            output_written(&file).unwrap();
+            for watch in &watches {
+                // SAFETY: the watch owns this event throughout the wait.
+                let signalled = unsafe { WaitForSingleObject(watch.event.as_raw_handle(), 5000) };
+                assert_eq!(signalled, WAIT_OBJECT_0);
+            }
         }
-        drop(watch);
+        drop(watches);
         drop(file);
         fs::remove_dir_all(root).unwrap();
     }

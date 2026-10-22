@@ -252,3 +252,87 @@ impl<T: Source> Async<T> {
         }
     }
 }
+
+/// Copies captured process output without keeping a blocking worker while idle.
+pub async fn capture_output<T: Source + Send + Sync>(
+    runtime: &dyn crate::Runtime,
+    input: Async<T>,
+    mut file: std::fs::File,
+    copied: fn(&std::fs::File) -> io::Result<()>,
+) -> io::Result<()>
+where
+    for<'a> &'a T: io::Read,
+{
+    use std::io::{Read as _, Write as _};
+    let mut buffer = vec![0; 64 << 10];
+    loop {
+        let read = input.read_with(|mut input| input.read(&mut buffer)).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        let (state, result) = crate::unblock_with(
+            runtime,
+            crate::BlockingClass::Storage,
+            buffer.len(),
+            move || {
+                let result = file.write_all(&buffer[..read]).and_then(|()| copied(&file));
+                ((file, buffer), result)
+            },
+        )
+        .await;
+        (file, buffer) = state;
+        result?;
+    }
+}
+
+#[cfg(all(test, windows, feature = "threads"))]
+mod capture_tests {
+    use super::*;
+    use crate::Runtime as _;
+    use std::{fs, process::Command};
+
+    #[test]
+    fn captured_output_wakes_followers_before_exit_and_drains_past_pipe_capacity() {
+        let runtime = crate::Threads::new(1);
+        let root = std::env::temp_dir().join(format!("a-captured-output-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        for (case, command, expected) in [
+            ("live", "printf progress; sleep 600", b"progress".to_vec()),
+            ("drain", "printf '%*s' 1048576 ''", vec![b' '; 1 << 20]),
+        ] {
+            let path = root.join(case);
+            let file = sys::fs::private_file().open(&path).unwrap();
+            let watch =
+                Async::for_reading(&runtime.reactor(), sys::write_watch(&path).unwrap()).unwrap();
+            let mut command_line =
+                Command::new(sys::find_bash(std::env::var("PATH").ok().as_deref()).unwrap());
+            command_line.args(["-c", command]).envs(std::env::vars_os());
+            let mut child = sys::spawn_group_captured(&mut command_line, file).unwrap();
+            let capture = child.capture.take().unwrap();
+            let input = Async::read_pipe(&runtime.reactor(), capture.reader).unwrap();
+            let copying = capture_output(&runtime, input, capture.file, sys::fs::output_written);
+            let observing = async {
+                if case == "live" {
+                    watch.readable_result().await.unwrap();
+                    assert_eq!(fs::read(&path).unwrap(), expected);
+                    assert!(child.try_wait().unwrap().is_none());
+                    child.group.signal(sys::Signal::Kill).unwrap();
+                }
+            };
+            crate::block_on(crate::or(
+                async {
+                    let (copied, ()) = crate::zip(copying, observing).await;
+                    copied.unwrap();
+                },
+                async {
+                    runtime.sleep(Duration::from_secs(10)).await;
+                    panic!("captured output did not complete");
+                },
+            ));
+            child.wait().unwrap();
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            drop(watch);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
