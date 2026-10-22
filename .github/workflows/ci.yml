@@ -56,6 +56,7 @@ jobs:
       # black-box M1 acceptance tests in apps/cli/tests/blackbox (budgets run
       # with CI slack). Live-model tests stay #[ignore]d; there are no secrets.
       - run: mise run check
+      - run: python3 -m unittest discover -s scripts/perf -p 'test_*.py'
       # The Windows build, cross-linted: no platform cfg above `sys`/`rt`.
       - if: runner.os == 'Linux'
         run: mise run check:windows

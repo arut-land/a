@@ -151,7 +151,12 @@ fi
 CARGO_TARGET_DIR=target/fixtures cargo build-release -p a --features fixtures
 f=target/fixtures/release/a; [[ -e $f.exe ]] && f+=.exe
 b=$(wc -c < "$f"); echo "a (fixtures): $((b / 1024)) KiB of 4096 KiB"; ((b <= 4194304))
-A_BIN="$PWD/$f" A_STRICT_BUDGETS=${A_STRICT_BUDGETS:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)} cargo nextest run -p a --test blackbox -E 'test(/^budgets::/)' --run-ignored ignored-only --test-threads 1 --no-capture --no-tests=fail
+if [[ ${OS:-} == Windows_NT ]]; then
+  cargo build-release -p a --example perf-attach
+  python3 scripts/perf/budget-task.py "$PWD/$f" "$PWD/target/release/examples/perf-attach.exe"
+else
+  A_BIN="$PWD/$f" A_STRICT_BUDGETS=${A_STRICT_BUDGETS:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)} cargo nextest run -p a --test blackbox -E 'test(/^budgets::/)' --run-ignored ignored-only --test-threads 1 --no-capture --no-tests=fail
+fi
 # The process-wide wake counter needs its own executable, run alone.
 CARGO_TARGET_DIR=target/fixtures cargo nextest run --release -p ext-shell --test quiet --run-ignored ignored-only --test-threads 1 --no-capture --no-tests=fail
 '''

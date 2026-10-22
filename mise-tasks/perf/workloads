@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 
 
 def load(output, label):
@@ -28,14 +29,33 @@ def load(output, label):
 
 def fresh_new(binary, env, workspace):
     started = time.perf_counter()
-    subprocess.run([binary, "new"], env=env, cwd=workspace,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   check=True, timeout=30)
-    return dict(wall_seconds=time.perf_counter() - started)
+    child = subprocess.Popen([binary, "new"], env=env, cwd=workspace,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    watchdog = threading.Timer(30, child.kill)
+    watchdog.start()
+    try:
+        if hasattr(os, "wait4"):
+            _, status, usage = os.wait4(child.pid, 0)
+            child.returncode = os.waitstatus_to_exitcode(status)
+            result = dict(cpu_seconds=usage.ru_utime + usage.ru_stime,
+                          peak_rss_kib=usage.ru_maxrss / (1024 if sys.platform == "darwin" else 1))
+        else:
+            child.wait()
+            result = {}
+        result["wall_seconds"] = time.perf_counter() - started
+        if child.returncode:
+            raise subprocess.CalledProcessError(child.returncode, child.args)
+        return result
+    finally:
+        watchdog.cancel()
+        if child.poll() is None:
+            child.kill()
+            child.wait()
 
 
 def command(argv):
-    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    # Hyperfine -N uses shell_words on every OS, including Windows.
+    return shlex.join(argv)
 
 
 def main():
@@ -55,7 +75,7 @@ def main():
         "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "binary": binary,
     }) + "\n")
-    with tempfile.TemporaryDirectory(prefix="a-perf-workloads-") as directory:
+    with tempfile.TemporaryDirectory(prefix="a-perf-workloads-", dir=os.environ.get("RUNNER_TEMP")) as directory:
         root = Path(directory)
         home, workspace = root / "home", root / "workspace"
         home.mkdir()
@@ -87,7 +107,7 @@ def main():
             load(output, "fresh-home-new:before")
             fresh = []
             for _ in range(args.runs):
-                with tempfile.TemporaryDirectory(prefix="a-perf-fresh-") as fresh_dir:
+                with tempfile.TemporaryDirectory(prefix="a-perf-fresh-", dir=os.environ.get("RUNNER_TEMP")) as fresh_dir:
                     fresh_env = dict(env, A_HOME=fresh_dir)
                     Path(fresh_dir, "config.toml").write_text(
                         '[daemon]\nagent = "echo"\nidle_secs = 120\n'

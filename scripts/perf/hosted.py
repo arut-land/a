@@ -73,8 +73,8 @@ def build(source, output, variant):
     run(["rustc", ROOT / "scripts/perf/floor.rs", "-O", "-o", output / ("floor" + SUFFIX)], cwd=source)
 
 
-def budgets(output, runs):
-    binary = str(output / ("a-fixtures" + SUFFIX))
+def budgets(output, binary=None, probe=None):
+    binary = str(binary or output / ("a-fixtures" + SUFFIX))
     cold, rss, cpu, client_cpu, attach_p50, attach_p99 = [], [], [], [], [], []
     root = os.environ.get("RUNNER_TEMP")
     for trial in range(5):
@@ -107,7 +107,7 @@ def budgets(output, runs):
                 session = cli("new").stdout.decode().strip()
                 for n in range(10):
                     cli("-p", f"message {n}", "resume", session)
-                result = cli_probe(output, session, env, home)
+                result = cli_probe(output, session, env, home, probe)
                 samples = sorted(result)
                 attach_p50.append(statistics.median(samples))
                 attach_p99.append(samples[495])
@@ -126,14 +126,14 @@ def budgets(output, runs):
         ("idle_rss_kib", rss), ("idle_daemon_cpu_ms", cpu), ("idle_line_client_cpu_ms", client_cpu)]}
 
 
-def cli_probe(output, session, env, home):
-    result = run([output / ("perf-attach" + SUFFIX), session], env=env, cwd=home,
+def cli_probe(output, session, env, home, probe=None):
+    result = run([probe or output / ("perf-attach" + SUFFIX), session], env=env, cwd=home,
                  capture_output=True, text=True, timeout=60)
     return json.loads(result.stdout)
 
 
 def summarize(output, source, variant, runner):
-    metrics = budgets(output, 5)
+    metrics = budgets(output)
     for path in sorted(output.rglob("*.json")):
         data = json.loads(path.read_text())
         if isinstance(data, dict) and "results" in data:

@@ -31,7 +31,7 @@ def main():
     env = dict(os.environ, A_SESSION_LOG=str(transcript))
     budget_result = None
     if args.blackbox:
-        env.update(A_BIN=str(build / "a"), A_STRICT_BUDGETS="1")
+        env.update(A_BIN=str(build / ("a.exe" if os.name == "nt" else "a")), A_STRICT_BUDGETS="1")
         workloads.load(output, "budgets:before")
         budget_result = subprocess.run(
             [str(args.blackbox.resolve(strict=True)), "budgets::", "--ignored",

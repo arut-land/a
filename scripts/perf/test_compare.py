@@ -1,5 +1,9 @@
 """Decision rules must not manufacture gains from absent or noisy measurements."""
 import unittest
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import shlex
 
 from compare import compare
 
@@ -14,6 +18,14 @@ class Comparison(unittest.TestCase):
         self.assertIn("within noise", compare(quiet, noisy))
         self.assertIn("within noise", compare(noisy, quiet))
         self.assertIn("outside observed spread", compare(quiet, dict(median=12, p10=12, p90=12)))
+
+    def test_windows_paths_survive_hyperfines_posix_tokenizer(self):
+        loader = importlib.machinery.SourceFileLoader("workloads", str(Path(__file__).resolve().parents[2] / "mise-tasks/perf/workloads"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        workloads = importlib.util.module_from_spec(spec)
+        loader.exec_module(workloads)
+        tokens = [r"D:\a\path with spaces\a.exe", "-p", 'echo "日本語"']
+        self.assertEqual(shlex.split(workloads.command(tokens)), tokens)
 
     def test_zero_cpu_still_reports_an_absolute_regression(self):
         value = compare(dict(median=15.625, p10=15.625, p90=15.625), dict(median=0, p10=0, p90=0))
