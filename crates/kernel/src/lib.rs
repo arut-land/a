@@ -217,22 +217,26 @@ pub enum SideEvent {
         background: bool,
         ticket: Ticket,
     },
-    /// A retry of a side request: the failure and delay commit before
-    /// the driver may send again. No main-turn state is involved.
-    Retry {
+    /// A settlement commits before its caller is acknowledged.
+    Fact {
         side: CallId,
+        fact: SideFact,
+        ticket: Ticket,
+    },
+}
+
+/// Side execution reports the same payload to the driver and the kernel.
+#[derive(Debug)]
+pub enum SideFact {
+    Retry {
         by: String,
         attempt: u16,
         failure: Json,
         after_ms: u64,
-        ticket: Ticket,
     },
-    /// Side request `side` ended.
     Done {
-        side: CallId,
         outcome: Outcome,
         failure: Option<Json>,
-        ticket: Ticket,
     },
 }
 

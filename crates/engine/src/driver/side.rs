@@ -3,21 +3,8 @@
 use super::{
     Actor, Arc, Body, BoxFuture, CallId, CallPorts, Cancel, ContextOrigin, ContextRequest, Cx,
     Event, Json, Model, Msg, Opened, Outcome, PendingSide, Phase, Replied, Session, SideAdmitted,
-    Ticket, contain, first, lock, oneshot, replied, reply,
+    SideFact, Ticket, contain, first, lock, oneshot, replied, reply,
 };
-
-pub(super) enum SideFact {
-    Retry {
-        by: String,
-        attempt: u16,
-        failure: Json,
-        after_ms: u64,
-    },
-    Done {
-        outcome: Outcome,
-        failure: Option<Json>,
-    },
-}
 
 impl Actor {
     // Successful settlement revokes mutation authority, but a background
@@ -78,27 +65,7 @@ impl Actor {
     ) -> Event {
         let ticket = self.ticket();
         self.replies.clients.insert(ticket, done);
-        Event::Side(match fact {
-            SideFact::Retry {
-                by,
-                attempt,
-                failure,
-                after_ms,
-            } => kernel::SideEvent::Retry {
-                side,
-                by,
-                attempt,
-                failure,
-                after_ms,
-                ticket,
-            },
-            SideFact::Done { outcome, failure } => kernel::SideEvent::Done {
-                side,
-                outcome,
-                failure,
-                ticket,
-            },
-        })
+        Event::Side(kernel::SideEvent::Fact { side, fact, ticket })
     }
 
     #[allow(clippy::too_many_lines)]

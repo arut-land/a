@@ -44,7 +44,7 @@ use crate::model::{Model, Models};
 use crate::outbox::{FrameLog, Outbox};
 use crate::transcript::Transcript;
 use crate::{Daemon, lock};
-use side::SideFact;
+use kernel::SideFact;
 
 #[path = "journal.rs"]
 mod journal;
