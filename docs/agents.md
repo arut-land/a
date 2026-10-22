@@ -186,7 +186,8 @@ cancellation or deadlines, not a hidden scheduler heuristic.
 
 Model-only kinds declare `ModelOnlyKind::CONTEXT` in source. The frozen
 runner applies its exchange window and byte ceiling to the assembled request,
-including owner context, while retaining system and current instructions.
+including owner context, while retaining the admitted kind's system prompt
+and current instructions. Other system messages expire with their exchanges.
 Projection uses the owner's admitted image; recovery consumes inbox work
 only with typed evidence of a matching durable interrupted sender result.
 

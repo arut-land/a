@@ -161,11 +161,10 @@ impl<'de> Deserialize<'de> for ContextPolicy {
 impl ContextPolicy {
     pub fn assemble(
         self,
-        history: &Messages,
-        owner: &Messages,
+        history: &[Message],
+        owner: &[Message],
         current: &Messages,
     ) -> Result<Messages, String> {
-        let history = &history[..history.len().saturating_sub(current.len())];
         let mut used = crate::Json::encode(current)
             .map_err(|e| e.to_string())?
             .raw()
@@ -200,10 +199,11 @@ impl ContextPolicy {
 }
 
 fn exchanges(messages: &[Message]) -> impl DoubleEndedIterator<Item = &[Message]> {
-    messages.chunk_by(|previous, next| {
-        !matches!(previous, Message::Assistant(reply) if reply.tool_calls().next().is_none())
-            && !(matches!(next, Message::System(_) | Message::User(_))
-                && !matches!(previous, Message::System(_)))
+    messages.chunk_by(|previous, next| match (previous, next) {
+        (Message::System(_), _) => true,
+        (Message::Assistant(reply), _) if reply.tool_calls().next().is_none() => false,
+        (_, Message::System(_) | Message::User(_)) => false,
+        _ => true,
     })
 }
 

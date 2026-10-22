@@ -3,7 +3,7 @@
 use super::{
     Actor, Arc, Body, BoxFuture, CallId, CallPorts, Cancel, ContextOrigin, ContextRequest, Cx,
     Event, Json, Model, Msg, Opened, Outcome, PendingSide, Phase, Replied, Session, SideAdmitted,
-    Ticket, contain, first, lock, oneshot, replied, reply, unless,
+    Ticket, contain, first, lock, oneshot, replied, reply,
 };
 
 pub(super) enum SideFact {
@@ -502,7 +502,10 @@ impl Actor {
                 turn.budget = spawn.request.budget;
                 (turn, None)
             });
-        let mut messages = self.conversation(call).await.map_err(|e| e.to_string())?;
+        let history = self
+            .conversation(CallId(seq))
+            .await
+            .map_err(|e| e.to_string())?;
         let context = if let Some(seq) = prefix {
             let parent = self.live.parent.ok_or("model-only context has no owner")?;
             let shared = Arc::clone(&self.live.session.shared);
@@ -520,7 +523,13 @@ impl Actor {
             .as_ref()
             .and_then(|spawn| spawn.request.runner.context_policy())
             .ok_or("model-only context policy is missing")?;
-        messages = policy.assemble(&messages, &context, &turn.messages)?;
+        let system = self.registry.system_prompt();
+        let current = (!system.is_empty())
+            .then(|| llm::Message::system(system))
+            .into_iter()
+            .chain(turn.messages.iter().cloned())
+            .collect();
+        let messages = policy.assemble(&history, &context, &current)?;
         let model = self
             .live
             .session

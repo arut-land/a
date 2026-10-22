@@ -1914,9 +1914,6 @@ fn old_judge_system_prompts_do_not_exhaust_the_mandatory_context() {
         history.push(llm::Message::user("old question"));
         history.push(llm::Message::assistant("yes"));
     }
-    for message in current.iter() {
-        history.push(message.clone());
-    }
     let policy = ext::ContextPolicy {
         exchanges: 2,
         bytes: 1024,
@@ -1970,7 +1967,6 @@ fn request_bounds_keep_pairs_whole_and_the_current_instruction_last() {
         llm::Message::assistant("recent assistant"),
     ]
     .into_iter()
-    .chain(current.iter().cloned())
     .collect();
     let owner: llm::Messages = [
         llm::Message::user("owner user"),
@@ -1999,5 +1995,48 @@ fn request_bounds_keep_pairs_whole_and_the_current_instruction_last() {
             );
         }
         assert!(!contains(llm::Message::user("owner user")));
+    }
+}
+
+struct KindText(String);
+impl Extension for KindText {
+    const NAME: &'static str = "kind-text";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.text(ext::Text::system("kind", 0, self.0.clone()));
+    }
+}
+
+#[test]
+fn model_only_kind_system_instructions_are_mandatory() {
+    for system in ["kind instruction".into(), "kind instruction ".repeat(1000)] {
+        let http = Flaky::new([Reply::Events(text_reply())]);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let registry = Registry::default()
+            .with(&ext_title::Title)
+            .unwrap()
+            .with(&KindText(system.clone()))
+            .unwrap()
+            .with(&TitleHistory(Arc::clone(&captured)))
+            .unwrap();
+        let fixture = fixture(registry, &http);
+        let session = fixture.start(&[]);
+        session.submit("source task").unwrap();
+        let log = until(&session, "title outcome", |log| {
+            log.iter()
+                .any(|entry| matches!(entry.body, Body::ModelResult { r#for: Some(_), .. }))
+        });
+        settle(&session);
+        session.halt();
+        if system.len() > 8192 {
+            assert!(lock(&captured).is_empty());
+            assert!(log.iter().any(|entry| matches!(&entry.body, Body::ModelResult { r#for: Some(_), failure: Some(failure), .. }
+                if llm::Error::from_json(failure.raw()).unwrap().kind == llm::Kind::InvalidRequest)));
+        } else {
+            let captured = lock(&captured);
+            assert!(
+                matches!(captured[0].first(), Some(llm::Message::System(prompt)) if prompt.text() == system)
+            );
+        }
     }
 }

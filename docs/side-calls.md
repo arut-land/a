@@ -53,8 +53,11 @@ registry, including registrations excluded from the child.
 message-byte ceiling in source. Admission freezes it with the runner;
 configuration cannot select it. Title keeps two recent exchanges and at most
 8192 serialized message bytes, including owner context. System and current
-instructions always survive; oversized mandatory instructions fail before
-provider execution. Optional context is removed in whole exchanges. Request
+instructions from the admitted kind and current turn always survive; oversized
+mandatory instructions fail with `InvalidRequest` before provider execution.
+Systems belonging to older exchanges expire with those exchanges. History ends
+before the admitted input; keyed and plain inputs are explicit current
+instructions. Optional context is removed in whole exchanges. Request
 bounds never prune durable exchanges or keyed outcomes.
 
 The parent's side `ModelCall` records the thread identity, frozen authority

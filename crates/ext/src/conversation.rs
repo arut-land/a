@@ -265,7 +265,6 @@ mod tests {
             llm::Message::assistant("recent reply"),
         ]
         .into_iter()
-        .chain(current.iter().cloned())
         .collect();
         let owner: llm::Messages = [
             llm::Message::system("owner system"),
