@@ -28,6 +28,10 @@ def load(output, label):
 
 
 def fresh_new(binary, env, workspace):
+    if os.name == "nt":
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/perf"))
+        from process import measure_windows
+        return measure_windows([binary, "new"], env=env, cwd=workspace)
     started = time.perf_counter()
     child = subprocess.Popen([binary, "new"], env=env, cwd=workspace,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -71,6 +75,7 @@ def main():
     args = parser.parse_args()
     if args.runs < 2:
         parser.error("--runs must be at least two")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/perf"))
     binary = str(args.binary.resolve(strict=True))
     output = (args.output / args.label).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -103,6 +108,14 @@ def main():
                 argv += ["--prepare", prepare]
             subprocess.run([*argv, command],
                            env=env, cwd=workspace, check=True)
+            if os.name == "nt":
+                from process import measure_windows
+                samples = []
+                for _ in range(5):
+                    if prepare:
+                        subprocess.run(prepare, shell=True, env=env, cwd=workspace, check=True)
+                    samples.append(measure_windows(shlex.split(command), env=env, cwd=workspace))
+                (output / (name + "-native.json")).write_text(json.dumps({"native_samples": samples}))
             load(output, name + ":after")
 
         cmd = command([binary])

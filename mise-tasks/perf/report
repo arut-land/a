@@ -58,6 +58,8 @@ def main():
                         values["peak_rss_kib"] = median(x["peak_rss_kib"] for x in data)
                 else:
                     values = dict(samples=len(data), wall_ms=round(median(data) * 1000, 6))
+            elif "native_samples" in data:
+                continue
             else:
                 values = metrics(data["results"][0])
             append(variant, kind + "." + path.stem, size, values, load, path.stem)

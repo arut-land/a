@@ -154,6 +154,9 @@ def summarize(output, source, variant, runner):
                     values = [sample[field]["value"] * scale for sample in result["measurements"] if field in sample]
                     if values:
                         metrics[key + "_" + unit] = distribution(values)
+        elif isinstance(data, dict) and "native_samples" in data:
+            metrics[path.stem.removesuffix("-native") + "_rss_kib"] = distribution([
+                sample["peak_rss_kib"] for sample in data["native_samples"]])
         elif path.stem == "fresh-home-new":
             metrics["fresh_home_new_ms"] = distribution([x["wall_seconds"] * 1000 for x in data])
     floor = metrics["process_floor_ms"]["median"]
@@ -201,6 +204,10 @@ def main():
     run(["hyperfine", "-N", "--warmup", "10", "--runs", "100", "--metrics", "all",
          "--export-json", output / "startup.json", workloads.command([str(output / ("a" + SUFFIX)), "--version"]),
          workloads.command([str(output / ("floor" + SUFFIX))])])
+    if os.name == "nt":
+        from process import measure_windows
+        samples = [measure_windows([str(output / ("a" + SUFFIX)), "--version"]) for _ in range(5)]
+        (output / "startup-native.json").write_text(json.dumps({"native_samples": samples}))
     run([sys.executable, ROOT / "mise-tasks/perf/workloads", output / ("a-fixtures" + SUFFIX), "cli",
          "--runs", "20", "--output", output])
     run([sys.executable, ROOT / "mise-tasks/perf/benches", output, output / "cli/transcript.jsonl", "--runs", "5"])

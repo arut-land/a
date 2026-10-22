@@ -35,7 +35,11 @@ mbx 1.24.1 publishes no Intel macOS executable. Windows ARM installs native
 Hyperfine and mbx from the checked-in mise lockfile. Release and benchmark
 builds use LLVM; they do not need a Cranelift component.
 
-Hyperfine 2.0.0 collects wall time, process CPU and peak RSS. psutil 7.2.2
+Hyperfine 2.0.0 collects wall time, process CPU and Unix peak RSS.
+On Windows, five separate launches per workload retain the child handle
+through exit and query `GetProcessMemoryInfo` for lifetime peak working set
+and `GetProcessTimes` for CPU. Hyperfine does not support Windows peak RSS;
+these native observations are stored separately and supply that report axis. psutil 7.2.2
 provides native RSS/working-set and accumulated user+kernel CPU counters,
 including Windows, for the idle daemon and line client. It is a measurement
 dependency, not a shipped Rust dependency. `/proc` and macOS resident sets

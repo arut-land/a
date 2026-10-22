@@ -3,6 +3,7 @@
 import argparse
 import importlib.machinery
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shlex
@@ -52,6 +53,11 @@ def main():
             subprocess.run(["hyperfine", "-N", "--warmup", "1", "-r", str(args.runs),
                             "--metrics", "all", "--show-output", "--export-json",
                             str(output / (name + ".json")), command], check=True, env=env)
+            if os.name == "nt":
+                sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/perf"))
+                from process import measure_windows
+                samples = [measure_windows(shlex.split(command), env=env) for _ in range(5)]
+                (output / (name + "-native.json")).write_text(json.dumps({"native_samples": samples}))
             workloads.load(output, name + ":after")
     if budget_result is not None:
         budget_result.check_returncode()
