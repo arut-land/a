@@ -59,7 +59,13 @@ linker override. `CARGO_BUILD_JOBS=2` applies throughout.
 | z and safe ICF, still bundled TLS | 5267344 | 5143 |
 | Native TLS with its default roots, s and safe ICF | 4651464 | 4542 |
 | Native TLS without bundled roots, z, safe ICF, RELR; serde_json still at 3 | 4212112 | 4113 |
-| Same shared z profile throughout, including serde_json | 4170768 | 4073 |
+| Same shared z profile throughout, including serde_json (final shutdown/allocator fixes) | 4171152 | 4073 |
+
+On macOS arm64, `mise run size` on a fresh clone measures the shipped binary
+at 3229824 bytes (3154 KiB), down from 4029 KiB before these changes. Its
+fixture scan and the unchanged 4 MiB cap pass.
+The 3170 KiB fixtures build also passes strict macOS budgets: cold reply
+median 30.2 ms, replay attach p99 296 microseconds and idle daemon 9344 KiB RSS.
 
 The final profile is the same on every target. The previous serde_json-at-3
 exception no longer fits the Linux cap; its earlier throughput comparison is
@@ -93,8 +99,8 @@ count. Other platforms keep their allocator; an external tool's allocator is
 initialized normally on exec.
 
 The resulting native arm64 fixtures build is 3509 KiB. `mise run budgets`
-passes with strict latency: cold reply median 2.44 ms, 21-entry replay attach
-p99 288 microseconds, idle daemon 8700 KiB RSS, no client CPU in the three-second
+passes with strict latency: cold reply median 2.78 ms, 21-entry replay attach
+p99 354 microseconds, idle daemon 8568 KiB RSS, no client CPU in the three-second
 idle window, and the first-paint and quiet-command wake gates unchanged.
 These runtime numbers are native arm64 VM measurements; the x86_64 number
 above is a cross-linked binary size, not an emulated latency result.
