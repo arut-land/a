@@ -111,8 +111,7 @@ pub struct Projection {
 #[derive(Default)]
 struct Conversation {
     covered: ext::LogCursor,
-    facts: Vec<CallFact>,
-    uncertain: Vec<(CallId, u16)>,
+    attempts: BTreeMap<(CallId, u16), Option<CallFact>>,
 }
 
 impl Projection {
@@ -120,8 +119,7 @@ impl Projection {
     pub fn fold(&mut self, prefix: &ext::LogPrefix) {
         let log = self.logs.entry(prefix.session).or_default();
         if prefix.reset {
-            log.facts.clear();
-            log.uncertain.clear();
+            log.attempts.clear();
         }
         let after = if prefix.reset { 0 } else { log.covered.seq };
         for entry in &prefix.entries {
@@ -138,7 +136,9 @@ impl Projection {
                     attempt,
                     ..
                 } => {
-                    log.uncertain.push((CallId(entry.seq), *attempt));
+                    log.attempts
+                        .entry((CallId(entry.seq), *attempt))
+                        .or_default();
                 }
                 Body::Decision {
                     call: Some(call),
@@ -146,27 +146,33 @@ impl Projection {
                         protocol::Verdict::Retry { attempt, .. }
                         | protocol::Verdict::SideRetry { attempt, .. },
                     ..
-                } if log.uncertain.iter().any(|(id, _)| id == call) => {
-                    log.uncertain.push((*call, *attempt));
+                } if log
+                    .attempts
+                    .iter()
+                    .any(|((id, _), fact)| id == call && fact.is_none()) =>
+                {
+                    log.attempts.entry((*call, *attempt)).or_default();
                 }
                 Body::ModelResult { call, outcome, .. }
                     if entry.execution.is_none()
                         && !matches!(outcome, protocol::Outcome::Interrupted { .. }) =>
                 {
-                    if let Some(i) = log.uncertain.iter().rposition(|(id, _)| id == call) {
-                        log.uncertain.remove(i);
+                    if let Some((&key, _)) = log
+                        .attempts
+                        .iter()
+                        .rev()
+                        .find(|((id, _), fact)| id == call && fact.is_none())
+                    {
+                        log.attempts.remove(&key);
                     }
                 }
                 _ => {}
             }
-            if let Some(fact) = &fact {
-                log.uncertain
-                    .retain(|id| *id != (fact.id.call, fact.id.attempt));
-            }
-            if let Some(fact) = fact
-                && let Err(i) = log.facts.binary_search_by_key(&fact.id, |f| f.id)
-            {
-                log.facts.insert(i, fact);
+            if let Some(fact) = fact {
+                log.attempts
+                    .entry((fact.id.call, fact.id.attempt))
+                    .or_default()
+                    .get_or_insert(fact);
             }
         }
         if prefix.reset || prefix.cursor.seq >= log.covered.seq {
@@ -197,7 +203,7 @@ impl Projection {
             if !selected.contains(session) {
                 continue;
             }
-            for fact in &log.facts {
+            for fact in log.attempts.values().flatten() {
                 if filter.agent.as_deref().is_some_and(|a| a != fact.agent)
                     || filter.side.is_some_and(|s| s != fact.side)
                     || filter.call.is_some_and(|c| c != fact.id.call)
@@ -230,9 +236,9 @@ impl Projection {
                 }
             }
             let missing = log
-                .uncertain
+                .attempts
                 .iter()
-                .filter(|(id, _)| filter.call.is_none_or(|c| c == *id))
+                .filter(|((id, _), fact)| fact.is_none() && filter.call.is_none_or(|c| c == *id))
                 .count() as u64;
             total.attempts.ambiguous += missing;
             for count in &mut total.usage {
