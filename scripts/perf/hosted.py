@@ -74,8 +74,7 @@ def build(source, output, variant):
         executables = [record["executable"] for line in result.stdout.splitlines()
                        if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
         assert len(executables) == 1, executables
-        # Task filenames are intentionally extensionless; CreateProcess accepts PE files.
-        shutil.copy2(executables[0], output / (package + "-bench"))
+        shutil.copy2(executables[0], output / (package + "-bench" + SUFFIX))
     run(["rustc", ROOT / "scripts/perf/floor.rs", "-O", "-o", output / ("floor" + SUFFIX)], cwd=source)
 
 
@@ -159,6 +158,9 @@ def summarize(output, source, variant, runner):
                 sample["peak_rss_kib"] for sample in data["native_samples"]])
         elif path.stem == "fresh-home-new":
             metrics["fresh_home_new_ms"] = distribution([x["wall_seconds"] * 1000 for x in data])
+            if all("cpu_seconds" in x for x in data):
+                metrics["fresh_home_new_cpu_ms"] = distribution([x["cpu_seconds"] * 1000 for x in data])
+                metrics["fresh_home_new_rss_kib"] = distribution([x["peak_rss_kib"] for x in data])
     floor = metrics["process_floor_ms"]["median"]
     metrics["cold_reply_over_floor_ms"] = distribution([
         max(0, value - floor) for value in metrics["cold_reply_ms"]["samples"]])

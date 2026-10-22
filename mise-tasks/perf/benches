@@ -47,7 +47,7 @@ def main():
         if package not in args.packages.split(","):
             continue
         for name in filters:
-            binary = (build / (package + "-bench")).resolve(strict=True)
+            binary = (build / (package + "-bench" + (".exe" if os.name == "nt" else ""))).resolve(strict=True)
             command = workloads.command([str(binary), name, "--ignored", "--nocapture", "--test-threads=1"])
             workloads.load(output, name + ":before")
             subprocess.run(["hyperfine", "-N", "--warmup", "1", "-r", str(args.runs),

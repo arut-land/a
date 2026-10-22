@@ -82,7 +82,7 @@ def main():
             for line in result.stdout.splitlines():
                 record = json.loads(line)
                 if record.get("executable") and record.get("profile", {}).get("test"):
-                    saved = output / (package + "-bench")
+                    saved = output / (package + "-bench" + suffix)
                     shutil.copy2(record["executable"], saved)
                     if Path(record["executable"] + ".dSYM").exists():
                         shutil.copytree(record["executable"] + ".dSYM", str(saved) + ".dSYM",
