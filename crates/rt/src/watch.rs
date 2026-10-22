@@ -210,11 +210,13 @@ mod tests {
             let paths = recv
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .expect("filesystem event");
-            watcher.refresh().unwrap();
+            // A stale descendant event cannot acknowledge root replacement;
+            // rearming for unrelated events can discard the one we await.
             if paths
                 .iter()
-                .any(|p| p == path || (!exact && (path.starts_with(p) || p.starts_with(path))))
+                .any(|p| p == path || (!exact && path.starts_with(p)))
             {
+                watcher.refresh().unwrap();
                 return;
             }
         }
