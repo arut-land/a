@@ -84,7 +84,8 @@ impl Transcript {
                 &entries.iter().map(Borrow::borrow).collect::<Vec<_>>(),
                 false,
             ),
-            Self::empty(registry, system),
+            registry,
+            system,
         )
     }
 
@@ -108,8 +109,7 @@ impl Transcript {
         if let Body::Spawned { intent } = &e.body {
             if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
                 self.model_only = image.runner == RunnerKind::ModelOnly;
-                let messages = project(image.image, Self::empty(Arc::clone(&self.registry), ""))
-                    .into_context();
+                let messages = project(image.image, Arc::clone(&self.registry), "").into_context();
                 self.inherit(&messages, e.seq);
             }
         } else if let Some(value) = context_fact(&e.body) {
@@ -347,22 +347,15 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
     image
 }
 
-fn project(image: ContextImage, root: Transcript) -> Transcript {
+fn project(image: ContextImage, registry: Arc<Registry>, system: &str) -> Transcript {
     let mut layers: Vec<_> = image.scopes.iter().map(|_| Vec::new()).collect();
     for input in image.inputs {
         layers[input.scope].push(input);
     }
-    let mut root = Some(root);
     let mut inherited = HashMap::new();
     for (scope, inputs) in layers.into_iter().enumerate().rev() {
-        let mut transcript = if scope == 0 {
-            root.take().expect("root reduced once")
-        } else {
-            Transcript::empty(
-                Arc::clone(&root.as_ref().expect("root reduced last").registry),
-                "",
-            )
-        };
+        let mut transcript =
+            Transcript::empty(Arc::clone(&registry), if scope == 0 { system } else { "" });
         transcript.model_only = image.scopes[scope] == RunnerKind::ModelOnly;
         for input in inputs {
             if let ContextValue::Inherited(child) = input.value {
@@ -379,7 +372,7 @@ fn project(image: ContextImage, root: Transcript) -> Transcript {
         }
         inherited.insert(scope, transcript.into_context());
     }
-    root.expect("empty context")
+    Transcript::empty(registry, system)
 }
 
 #[cfg(test)]
