@@ -1,5 +1,9 @@
 # Build tuning: backlog and evidence
 
+The current native workload comparison, profile experiments and retained
+settings are in [release measurements](tuning.md). Historical numbers below
+do not establish a current budget pass.
+
 What we tried, what we deferred, and what we rejected for compile time, binary
 size, startup, CPU and RSS. Rejected items are kept on purpose: most were
 rejected because the binary was tiny (485 KB) when we measured, and several will

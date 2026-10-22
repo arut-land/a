@@ -10,27 +10,25 @@ which folded every load from the first entry.
 
 ## Load: snapshot plus suffix
 
-A session at rest with 64 KiB or more of log past its newest snapshot
-takes one (`derived/<id>.snap`: the ledger and the extensions' states,
-CRC'd, of this build and these extensions); `derived/<id>.idx` holds where
-each line ends, so a load places the lines before the snapshot without
-reading them and folds only the rest.
+Each session keeps `log.jsonl`, `derived/log.idx` and `derived/log.snap`
+in its own directory under `sessions/<id>/`; child sessions use
+`children/<id>/` beneath their parent. The disposable index stores line-end
+offsets. The CRC-protected snapshot contains the ledger and extension states,
+its covered sequence and log offset, and build/extension identity. A session
+at rest snapshots after at least 64 KiB beyond its previous snapshot.
 
-| Log | Before, whole | Now, whole | Now, from its snapshot |
-| --- | --- | --- | --- |
-| 15 600 entries, 8.4 MiB | 18–22 ms | 19–21 ms | 0.14–0.16 ms |
-| 100 000 entries, 54 MiB | 116 ms | 117 ms | 0.24 ms |
+Loading validates seals, decoding and sequence/epoch ordering through the
+covered prefix before offering a snapshot for restoration. Its sequence and
+offset must match that validated prefix. An accepted snapshot skips folding
+the prefix; loading still reads and decodes it, then folds the suffix.
+An unusable snapshot falls back to whole-log folding. Sealed damage preserves
+the log and permits only its validated prefix, read-only; only an unsealed
+torn final line may be discarded.
 
-Medians of five warm loads, the page cache holding the log. A load from a
-snapshot reads one line per check (the snapshot's entry, the index's last)
-and the suffix; the index is 8 bytes an entry, read whole (800 KB at 100k).
-
-Resident memory: a load folds each entry and drops it, before as now, so
-what a loaded session holds is its index in memory, 8 bytes an entry; the
-benches' in-process RSS delta (≤ 112 KiB either way) is below what the
-allocator keeps from the bench's own setup, so it bounds nothing finer.
-What a snapshot saves is reading the log at all: 54 MiB of page cache and
-its decoding at 100k entries.
+The [current measurements](tuning.md) include this validation: a 15,600-entry,
+8,606 KiB log took 54.47 ms whole or 31.24 ms with its snapshot on the final
+build (medians of five warm loads on the contended Apple M3 host). The
+earlier sub-millisecond snapshot observations predate prefix validation.
 
 ## Commits: `[daemon] durability`
 

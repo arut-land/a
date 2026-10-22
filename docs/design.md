@@ -123,9 +123,10 @@ At rest, fully synced, after enough additional log data, a root session writes
 the ledger and extension fold images to `sessions/<id>/derived/log.snap`.
 A neighboring `.idx` records line offsets. A snapshot must match the build
 and extension set, and its covered entry must agree with the log. Otherwise
-load folds the whole log. The indexed prefix avoids a full checksum scan;
-index-assisted reads are not an integrity audit of that prefix. `derived/`
-is disposable. See [session measurements](perf/sessions.md).
+load folds the whole log. Loading validates the covered prefix's seals and
+ordering before restoring the image: a snapshot saves folding that prefix,
+rather than reading and decoding it. `derived/` is disposable. See
+[session measurements](perf/sessions.md).
 
 `Core::resume` handles recovery after load, failed commit, registry reload
 or contained panic. A fresh agent per turn makes its state reconstructible
@@ -296,8 +297,9 @@ for the distributed design. Each needs its own contract and measurements.
   forks accept unfinished prefixes by recording interruptions?
 - How much can shared flush epochs amortize the stronger Apple power-loss
   guarantee under realistic concurrent workloads on a quiet machine?
-- When should indexed replay verify all skipped lines? Catalog rebuilds and
-  failed-commit recovery still have whole-log paths worth measuring.
+- Can snapshot prefix validation avoid fully decoding every payload without
+  weakening damaged-log detection? Catalog rebuilds and failed-commit recovery
+  also have whole-log paths worth measuring.
 - What are daemon RSS and cancellation behavior under real provider/tool
   load, beyond idle and synthetic workloads?
 - Which runtime-extension capabilities and isolation should MCP and future
