@@ -109,11 +109,11 @@ async fn awaited_task(
     let mut spawn = ext::Spawn::new::<Subagent>(
         purpose,
         input.prompt.clone(),
-        ext::Runner {
+        ext::Runner::Agent {
             agent: input
                 .kind
                 .clone()
-                .unwrap_or_else(|| sessions.runner().agent),
+                .unwrap_or_else(|| sessions.runner().agent().unwrap_or(ext::LOOP).into()),
             role: ext::ModelRole::Session,
         },
         ext::DepthBudget::new(8),

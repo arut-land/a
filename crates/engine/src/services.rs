@@ -25,31 +25,6 @@ impl Session {
         }))
     }
 
-    pub(super) fn role_model(
-        &self,
-        role: &ext::ModelRole,
-        registry: &Registry,
-    ) -> Result<String, String> {
-        match role {
-            ext::ModelRole::Session => self.model_named(registry).map(|(m, _)| m),
-            ext::ModelRole::Fast => self
-                .shared
-                .models
-                .settings
-                .fast_model(&self.workspace)
-                .and_then(|m| m.map_or_else(|| self.model_named(registry).map(|(m, _)| m), Ok)),
-            ext::ModelRole::Named(role) => registry
-                .service::<dyn ext::ModelRoles>()
-                .ok_or_else(|| format!("no model service resolves role {role}"))?
-                .model(
-                    role,
-                    &lock(&self.state_view()),
-                    &self.shared.models.settings,
-                    &self.workspace,
-                ),
-        }
-    }
-
     pub(super) fn model(&self, registry: &Registry) -> Result<Model, String> {
         if let Some(image) = lock(&self.spawn).as_ref() {
             let route = image.routing.as_ref().map_err(Clone::clone)?;
@@ -135,7 +110,7 @@ pub(super) fn bind(registry: &Arc<Registry>, session: &Arc<Session>) -> Arc<Boun
     let settings = &session.shared.models.settings;
     let agent = lock(&session.spawn)
         .as_ref()
-        .map(|i| i.request.agent.clone())
+        .and_then(|i| i.request.runner.agent().map(str::to_owned))
         .or_else(|| settings.agent(&session.workspace));
     let viewed = Arc::new(Viewed {
         session: Arc::clone(session),
@@ -276,5 +251,50 @@ impl ext::Layers for SessionLayers {
     fn model(&self, workspace: &Path) -> Result<(String, String), String> {
         let session = self.0.upgrade().ok_or("the session is gone")?;
         ext::Layers::model(&session.shared.models.settings, workspace)
+    }
+}
+
+struct ModelOnlyBinding {
+    registry: Arc<Registry>,
+    model: String,
+}
+impl ext::host::Binding for ModelOnlyBinding {
+    fn agent(&self) -> Box<dyn ext::Agent> {
+        Box::new(ext::ModelOnly)
+    }
+    fn runner(&self) -> protocol::publication::RunnerKind {
+        protocol::publication::RunnerKind::ModelOnly
+    }
+    fn installed(&self) -> Vec<protocol::Installed> {
+        self.registry.installed()
+    }
+    fn callable(&self, _: &str) -> Option<ext::Callable> {
+        None
+    }
+    fn model(&self) -> String {
+        self.model.clone()
+    }
+}
+
+pub(super) fn binding(
+    bound: &Arc<Bound<Viewed>>,
+    session: &Arc<Session>,
+    registry: &Arc<Registry>,
+) -> Arc<dyn ext::host::Binding> {
+    if session.model_only() {
+        Arc::new(ModelOnlyBinding {
+            registry: Arc::clone(registry),
+            model: session.model_spec(registry),
+        })
+    } else {
+        Arc::clone(bound) as _
+    }
+}
+
+impl Session {
+    pub(super) fn model_only(&self) -> bool {
+        lock(&self.spawn)
+            .as_ref()
+            .is_some_and(|i| matches!(i.request.runner, ext::Runner::ModelOnly { .. }))
     }
 }

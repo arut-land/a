@@ -239,7 +239,11 @@ impl Actor {
                 Some((tool, input)) => point.with_tool(ext::point::ToolUse { tool, input }),
                 None => point,
             };
-            for reaction in hooks.observe(point, e) {
+            for reaction in (!session.model_only())
+                .then(|| hooks.observe(point, e))
+                .into_iter()
+                .flatten()
+            {
                 if let Some(work) = reaction.work {
                     self.admissions.push(super::Guarded {
                         admission: Admission {
@@ -374,13 +378,18 @@ impl Actor {
         let frames = Arc::clone(&self.live.frames);
         let registry = Arc::clone(&self.registry);
         let pending: Vec<_> = self.pending_entries().collect();
+        let model_only = self.live.session.model_only();
         let (transcript, messages) = rt::unblock_with(
             &*self.live.session.shared.rt,
             Cpu,
             rt::STORAGE_BYTES,
             move || {
                 let entries: Vec<_> = frames.entries()?.into_iter().chain(pending).collect();
-                let system = registry.system_prompt();
+                let system = if model_only {
+                    ""
+                } else {
+                    registry.system_prompt()
+                };
                 let transcript =
                     Transcript::of(entries.iter().cloned(), Arc::clone(&registry), system);
                 let messages = transcript.before(call.get()).cloned().unwrap_or_else(|| {

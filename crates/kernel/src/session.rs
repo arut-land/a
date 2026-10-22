@@ -1,5 +1,6 @@
 //! The turn and call state machine: one [`Core`] per session.
 
+use protocol::publication::RunnerKind;
 use std::collections::VecDeque;
 use std::mem;
 use std::sync::Arc;
@@ -283,6 +284,11 @@ impl Core {
                         Requirement::Durable
                     })
                 }
+                Work::Prepare { .. } | Work::Send { .. }
+                    if self.registry.runner() == RunnerKind::ModelOnly =>
+                {
+                    Some(Requirement::Durable)
+                }
                 Work::Prepare { .. }
                 | Work::Send { .. }
                 | Work::Sleep { .. }
@@ -366,6 +372,11 @@ impl Core {
     }
 
     fn enqueue(&mut self, envelope: protocol::Envelope, ticket: Ticket, fx: &mut StepPlan) {
+        if self.registry.runner() == RunnerKind::ModelOnly
+            && !self.fold.ledger.received(&envelope.id)
+        {
+            self.owned_cancelled = false;
+        }
         let result = if self.owned_cancelled {
             Err(protocol::InboxRefusal::Unavailable)
         } else if self.fold.ledger.received(&envelope.id) {
@@ -560,6 +571,10 @@ impl Core {
                 attempt,
                 phase: ModelPhase::Streaming,
             } if sent == call => {
+                let failure = match &replied {
+                    Replied::Failed(error) => Json::encode(error).ok(),
+                    _ => None,
+                };
                 let outcome = match replied {
                     Replied::Failed(error) => {
                         if self.retry(call, attempt, &error, fx) {
@@ -574,7 +589,19 @@ impl Core {
                 self.turn = Turn::Acting {
                     open: SmallVec::new(),
                 };
-                self.settle(call, outcome, fx);
+                if self.registry.runner() == RunnerKind::ModelOnly && failure.is_some() {
+                    self.append(
+                        fx,
+                        Body::ModelResult {
+                            call,
+                            r#for: None,
+                            outcome,
+                            failure,
+                        },
+                    );
+                } else {
+                    self.settle(call, outcome, fx);
+                }
             }
             Turn::Stopping { open, .. } if open.contains(&call) => {
                 self.close(call);
@@ -716,11 +743,9 @@ impl Core {
         ticket: Ticket,
         fx: &mut StepPlan,
     ) {
-        let open = self
-            .fold
-            .ledger
-            .call(side)
-            .is_some_and(|o| matches!(o.call, Call::Side { .. }));
+        let open = self.fold.ledger.call(side).is_some_and(|o| {
+            matches!(o.call, Call::Side { .. }) || self.registry.runner() == RunnerKind::ModelOnly
+        });
         if open {
             self.decide(Some(side), by, decision, fx);
         }
@@ -1057,6 +1082,7 @@ impl Core {
     /// next action, or a shared call alongside the shared calls open;
     /// once it stopped, what the `on_stop` point gives it; then queued
     /// input, and children's results.
+    #[allow(clippy::too_many_lines)]
     fn advance(&mut self, fx: &mut StepPlan) {
         loop {
             self.admit_queued(fx);
@@ -1097,8 +1123,12 @@ impl Core {
                         },
                     );
                 }
+                let queued = !self.fold.ledger.untaken().is_empty();
                 while let Some(input) = self.fold.ledger.untaken().front().map(|q| q.seq) {
                     self.append(fx, Body::Take { input });
+                }
+                if queued {
+                    self.append(fx, Body::Interrupt { origin: None });
                 }
                 self.fold.asked.clear();
                 self.fold.stepped = false;
@@ -1110,7 +1140,7 @@ impl Core {
                     self.fold.asked.front(),
                     Some(Next::Agent(Action::CallModel { .. }))
                 );
-            if next_request {
+            if next_request && self.registry.runner() == RunnerKind::Agent {
                 if let Some((child, outcome)) = self.deferred.pop_front() {
                     self.fire(child, &outcome, fx);
                     continue;
@@ -1574,7 +1604,13 @@ impl Core {
         }
         for (call, kind, phase) in open {
             match kind {
-                Call::Model { attempt, .. } => self.restart(call, attempt, fx),
+                Call::Model { attempt, .. } => {
+                    if self.registry.runner() == RunnerKind::Agent {
+                        self.restart(call, attempt, fx);
+                    } else {
+                        self.settle(call, Outcome::Interrupted { output: None }, fx);
+                    }
+                }
                 Call::Tool {
                     invoke: Some(key), ..
                 } => {

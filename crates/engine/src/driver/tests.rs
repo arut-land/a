@@ -229,7 +229,36 @@ fn with_home(script: &Arc<Script>, path: &Path) -> Models {
     }
 }
 
-struct Fixture(Arc<Shared>, Arc<Counting>);
+struct Fixture(Arc<Shared>, Arc<Counting>, Arc<Daemon>);
+
+struct TestingLive(Arc<Live>, Arc<Daemon>);
+impl std::ops::Deref for TestingLive {
+    type Target = Arc<Live>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl TestingLive {
+    fn halt(&self) {
+        self.0.halt();
+        self.1.wait("owned admissions drained", PATIENCE, || {
+            self.1.slots().iter().all(|slot| {
+                !slot.header.parent.is_some_and(|p| p.session == self.0.id)
+                    || !matches!(*lock(&slot.residency), crate::Residency::Loading { .. })
+            })
+        });
+        for live in self.1.loaded() {
+            if live.parent.is_some_and(|p| p.session == self.0.id) {
+                live.halt();
+            }
+        }
+    }
+}
+impl Drop for TestingLive {
+    fn drop(&mut self) {
+        self.halt();
+    }
+}
 
 /// The runtime sessions under test run on, counting its blocking hops.
 struct Counting(rt::Threads, AtomicUsize);
@@ -274,6 +303,18 @@ impl Extension for Agents {
 }
 
 impl Fixture {
+    fn configure(self, configure: impl FnOnce(&mut Shared)) -> Self {
+        let Self(shared, runtime, daemon) = self;
+        drop(shared);
+        let mut daemon = Arc::try_unwrap(daemon).ok().expect("unstarted fixture");
+        configure(Arc::get_mut(&mut daemon.shared).unwrap());
+        let daemon = Arc::new_cyclic(|weak| {
+            Arc::get_mut(&mut daemon.shared).unwrap().daemon = weak.clone();
+            daemon
+        });
+        Self(Arc::clone(&daemon.shared), runtime, daemon)
+    }
+
     fn new(agent: &str, registry: Registry, models: Models) -> Self {
         Self::on(Arc::new(Memory::default()), agent, registry, models)
     }
@@ -289,8 +330,8 @@ impl Fixture {
         // One worker: no effect may hold it.
         let counting = Arc::new(Counting(rt::Threads::new(1), AtomicUsize::new(0)));
         let rt: rt::Rt = Arc::clone(&counting) as _;
-        Self(
-            Arc::new(Shared {
+        let daemon = Arc::new_cyclic(|daemon| Daemon {
+            shared: Arc::new(Shared {
                 http_clients: std::sync::OnceLock::new(),
                 rt,
                 store,
@@ -298,13 +339,21 @@ impl Fixture {
                 registry: ext::host::Current::new(registry),
                 models,
                 barriers: kernel::Barriers::default(),
-                build: "test".to_owned(),
+                build: "test".into(),
                 spill: std::env::temp_dir().join(format!("a-spill-{}", std::process::id())),
                 loaded: Mutex::default(),
-                daemon: Weak::new(),
+                daemon: daemon.clone(),
             }),
-            counting,
-        )
+            slots: Mutex::default(),
+            admission: Mutex::new(true),
+            clients: AtomicUsize::new(0),
+            pulse: rt::Notify::new(),
+            jobs: rt::Notify::new(),
+            watchers: Mutex::default(),
+            stopping: Mutex::default(),
+            started: 0,
+        });
+        Self(Arc::clone(&daemon.shared), counting, daemon)
     }
 
     /// The blocking hops taken so far.
@@ -321,20 +370,24 @@ impl Fixture {
     }
 
     /// A new session.
-    fn create(&self) -> Arc<Live> {
-        Live::start(&Self::header(), &self.0, Open::Create, Owner::None).unwrap()
+    fn create(&self) -> TestingLive {
+        let header = Self::header();
+        let slot = self.2.new_slot(header.clone()).unwrap();
+        let live = Live::start(&header, &self.0, Open::Create, Owner::None).unwrap();
+        let live = self.2.started(&slot, Ok(live)).unwrap();
+        TestingLive(live, Arc::clone(&self.2))
     }
 
     /// A session whose log holds `entries`, started as after a crash, once
     /// it has recovered.
-    fn start(&self, entries: &[Entry]) -> Arc<Live> {
+    fn start(&self, entries: &[Entry]) -> TestingLive {
         let session = self.load(entries);
         settle(&session);
         session
     }
 
     /// [`Fixture::start`], without waiting for recovery.
-    fn load(&self, entries: &[Entry]) -> Arc<Live> {
+    fn load(&self, entries: &[Entry]) -> TestingLive {
         let header = Self::header();
         let mut created = self.0.store.create(&header).unwrap();
         for e in entries {
@@ -342,7 +395,10 @@ impl Fixture {
             created.writer.append_raw(std::slice::from_ref(&e)).unwrap();
         }
         drop(created);
-        Live::start(&header, &self.0, Open::Load, Owner::None).unwrap()
+        let slot = self.2.new_slot(header.clone()).unwrap();
+        let live = Live::start(&header, &self.0, Open::Load, Owner::None).unwrap();
+        let live = self.2.started(&slot, Ok(live)).unwrap();
+        TestingLive(live, Arc::clone(&self.2))
     }
 }
 
@@ -2379,7 +2435,7 @@ fn loading_cannot_wait_on_its_own_exhausted_pool() {
         rt::Threads::configured(config),
         AtomicUsize::new(0),
     ));
-    Arc::get_mut(&mut fixture.0).unwrap().rt = runtime.clone();
+    fixture = fixture.configure(|shared| shared.rt = runtime.clone());
     fixture.1 = runtime.clone();
     let header = Fixture::header();
     let mut log = store.create(&header).unwrap();
@@ -2435,8 +2491,9 @@ fn calls_share_transport_pools_but_not_origin_authority() {
     session.cancelled(old.call);
     assert!(!old_origin.current(&session));
     assert!(current_origin.current(&session));
-    let side = ext::Side::new::<Agents>(
-        "authority",
+    let side = ext::ModelTurn::new(
+        ext::ThreadKey::new::<Agents>("authority", ext::OwnerScope::Call(old.call)),
+        ext::TurnKey("initial".into()),
         ext::ModelRole::Session,
         ext::SideContext::None,
         llm::Messages::default(),

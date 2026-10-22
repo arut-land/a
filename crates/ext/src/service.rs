@@ -166,7 +166,7 @@ pub trait Models: Send + Sync {
     fn call<'a>(
         &'a self,
         cx: &'a Cx,
-        side: Side,
+        side: ModelTurn,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>>;
 }
 
@@ -196,121 +196,98 @@ pub enum SideContext {
     BeforeOwner,
 }
 
-/// Replay identity excludes prompts, budgets and model routing.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SideIdentity {
+/// A stable owned conversation, independent of any one provider turn.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ThreadKey {
     pub extension: String,
     pub purpose: String,
-    pub scope: SideScope,
+    pub owner_scope: OwnerScope,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SideScope {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum OwnerScope {
     Session,
     Call(protocol::CallId),
 }
 
-impl SideIdentity {
-    pub fn from_intent(of: protocol::CallId, intent: &llm::Json) -> serde_json::Result<Self> {
-        #[derive(serde::Deserialize)]
-        struct Fields {
-            owner: String,
-            purpose: String,
-            session_key: bool,
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TurnKey(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize)]
+pub struct SideIdentity {
+    pub thread: ThreadKey,
+    pub turn: TurnKey,
+}
+
+impl ThreadKey {
+    pub fn new<E: crate::Extension>(purpose: &str, owner_scope: OwnerScope) -> Self {
+        Self {
+            extension: E::NAME.into(),
+            purpose: purpose.into(),
+            owner_scope,
         }
-        #[derive(serde::Deserialize)]
-        struct Intent {
-            request: Fields,
-        }
-        let Intent { request } = intent.parse()?;
-        Ok(Self {
-            extension: request.owner,
-            purpose: request.purpose,
-            scope: if request.session_key {
-                SideScope::Session
-            } else {
-                SideScope::Call(of)
-            },
-        })
     }
 }
 
-/// A side request whose result the caller needs before continuing.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct Side {
-    pub purpose: String,
-    owner: String,
+impl SideIdentity {
+    pub fn from_intent(intent: &llm::Json) -> serde_json::Result<Self> {
+        let image = protocol::publication::ThreadImage::from_json(intent)?;
+        let (identity, _): (Self, serde::de::IgnoredAny) = image.turn.parse()?;
+        Ok(identity)
+    }
+}
+
+/// A keyed response in an owned conversation, outside its parent's transcript.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ModelTurn {
+    pub thread: ThreadKey,
+    pub turn: TurnKey,
     pub role: ModelRole,
     pub messages: llm::Messages,
     pub context: SideContext,
     pub budget: Budget,
     background: bool,
-    session_key: bool,
     while_waiting: bool,
 }
 
-impl Side {
-    pub fn identity(&self, of: protocol::CallId) -> SideIdentity {
+impl ModelTurn {
+    pub fn identity(&self) -> SideIdentity {
         SideIdentity {
-            extension: self.owner.clone(),
-            purpose: self.purpose.clone(),
-            scope: if self.session_key {
-                SideScope::Session
-            } else {
-                SideScope::Call(of)
-            },
+            thread: self.thread.clone(),
+            turn: self.turn.clone(),
         }
     }
 
-    /// Reuse this purpose across owners, for session metadata such as a title.
-    #[must_use]
-    pub fn once_per_session(mut self) -> Self {
-        self.session_key = true;
-        self
-    }
-
-    /// The prompt and its selected transcript stay separate in the intent.
     pub fn intent(&self, transcript: &llm::Messages) -> Result<llm::Json, String> {
-        #[derive(serde::Serialize)]
-        struct Intent<'a> {
-            request: &'a Side,
-            transcript: &'a llm::Messages,
-        }
-        llm::Json::encode(&Intent {
-            request: self,
-            transcript,
-        })
-        .map_err(|e| e.to_string())
+        llm::Json::encode(&(self, transcript)).map_err(|e| e.to_string())
     }
 
     pub const fn is_while_waiting(&self) -> bool {
         self.while_waiting
     }
-
     pub const fn is_background(&self) -> bool {
         self.background
     }
 
-    pub fn new<E: crate::Extension>(
-        purpose: &str,
+    pub fn new(
+        thread: ThreadKey,
+        turn: TurnKey,
         role: ModelRole,
         context: SideContext,
         messages: llm::Messages,
     ) -> Self {
         Self {
-            purpose: purpose.to_owned(),
-            owner: E::NAME.to_owned(),
+            thread,
+            turn,
             role,
             messages,
             context,
             budget: Budget::default(),
             background: false,
-            session_key: false,
             while_waiting: false,
         }
     }
 
-    /// A background request cannot be awaited for a model result.
     pub fn background(mut self) -> Background {
         self.background = true;
         Background(self)
@@ -324,7 +301,7 @@ impl Side {
 /// let result = models.call(cx, background);
 /// # }
 /// ```
-pub struct Background(Side);
+pub struct Background(ModelTurn);
 
 impl Background {
     /// Scope optional work to the owner's current question. Answering the
@@ -429,7 +406,7 @@ pub trait Sessions: Send + Sync {
 pub trait SideProvider: Send + Sync {
     fn reply<'a>(
         &'a self,
-        side: &'a Side,
+        side: &'a ModelTurn,
         messages: &'a llm::Messages,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>>;
 }
@@ -449,32 +426,44 @@ mod tests {
     fn side_identity_depends_only_on_extension_purpose_and_owner_scope() {
         let of = protocol::CallId::new(1).unwrap();
         let other = protocol::CallId::new(2).unwrap();
-        let mut side = Side::new::<Owner>(
-            "summary",
+        let mut side = ModelTurn::new(
+            ThreadKey::new::<Owner>("summary", OwnerScope::Call(of)),
+            TurnKey("initial".into()),
             ModelRole::Fast,
             SideContext::None,
             llm::Messages::default(),
         );
-        let identity = side.identity(of);
+        let identity = side.identity();
         side.messages
             .push(llm::Message::user("prompt".repeat(1 << 18)));
         side.context = SideContext::BeforeOwner;
         side.role = ModelRole::Session;
-        assert_eq!(side.identity(of), identity);
-        assert_ne!(side.identity(other), identity);
+        assert_eq!(side.identity(), identity);
+        side.thread.owner_scope = OwnerScope::Call(other);
+        assert_ne!(side.identity(), identity);
+        side.thread.owner_scope = OwnerScope::Call(of);
         let mut renamed = side.clone();
-        renamed.owner = "another-extension".into();
-        assert_ne!(renamed.identity(of), identity);
+        renamed.thread.extension = "another-extension".into();
+        assert_ne!(renamed.identity(), identity);
         renamed = side.clone();
-        renamed.purpose = "another-purpose".into();
-        assert_ne!(renamed.identity(of), identity);
-        let session = side.once_per_session();
-        assert_eq!(session.identity(of), session.identity(other));
-        assert_ne!(session.identity(of), identity);
-        let intent = session.intent(&llm::Messages::default()).unwrap();
+        renamed.thread.purpose = "another-purpose".into();
+        assert_ne!(renamed.identity(), identity);
+        renamed = side.clone();
+        renamed.turn = TurnKey("next".into());
+        assert_ne!(renamed.identity(), identity);
+        let mut session = side;
+        session.thread.owner_scope = OwnerScope::Session;
+        assert_ne!(session.identity(), identity);
+        let intent = protocol::publication::ThreadImage {
+            conversation: protocol::SessionId::new(),
+            turn: session.intent(&llm::Messages::default()).unwrap(),
+            authority: llm::Json::null(),
+        }
+        .to_json()
+        .unwrap();
         assert_eq!(
-            SideIdentity::from_intent(of, &intent).unwrap(),
-            session.identity(of)
+            SideIdentity::from_intent(&intent).unwrap(),
+            session.identity()
         );
     }
 }

@@ -138,7 +138,7 @@ fn bench_turns_under_each_barrier_setting() {
             tools,
             openai(&Script::new(&replies)),
         );
-        Arc::get_mut(&mut fixture.0).unwrap().barriers = barriers;
+        fixture = fixture.configure(|shared| shared.barriers = barriers);
         let session = fixture.create();
         settle(&session);
         let start = Instant::now();

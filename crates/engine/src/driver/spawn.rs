@@ -1,7 +1,7 @@
 //! Admission freezes authority before any child is created.
 use super::{
-    Actor, Arc, Body, BoxFuture, CallId, CallPorts, Child, ContextRequest, Cx, Deserialize, Event,
-    InFlight, Json, Live, Open, Outcome, Registry, Serialize, SessionId, Shared, lock, oneshot, or,
+    Actor, Arc, Body, BoxFuture, CallId, CallPorts, Child, ContextRequest, Cx, Event, InFlight,
+    Json, Live, Open, Outcome, Registry, SessionId, Shared, lock, oneshot, or,
 };
 use crate::store::Header;
 use ext::{DepthBudget, SpawnRefusal};
@@ -29,8 +29,7 @@ pub(crate) struct SpawnAuthority {
     pub purpose: String,
     pub prompt: String,
     pub prefix: Option<(SessionId, protocol::Seq)>,
-    pub agent: String,
-    pub role: Json,
+    pub runner: ext::Runner,
     pub depth: DepthBudget,
     pub budget: ext::Budget,
 }
@@ -45,55 +44,34 @@ impl From<ext::Spawn> for SpawnAuthority {
                 ext::ContextSource::Fresh => None,
                 ext::ContextSource::Prefix { session, seq } => Some((session, seq)),
             },
-            agent: request.runner.agent,
-            role: Json::encode(&request.runner.role).expect("model role encodes"),
+            runner: request.runner,
             depth: request.depth,
             budget: request.budget,
         }
     }
 }
 
-impl Serialize for SpawnAuthority {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        (
-            &self.owner,
-            &self.purpose,
-            &self.prompt,
-            &self.prefix,
-            &self.agent,
-            &self.role,
-            self.depth,
-            self.budget,
-        )
-            .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for SpawnAuthority {
-    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        let (owner, purpose, prompt, prefix, agent, role, depth, budget) =
-            Deserialize::deserialize(decoder)?;
-        Ok(Self {
-            owner,
-            purpose,
-            prompt,
-            prefix,
-            agent,
-            role,
-            depth,
-            budget,
-        })
-    }
-}
-
 impl SpawnIntent {
     pub(crate) fn into_json(self) -> Result<Json, serde_json::Error> {
         protocol::publication::SpawnImage {
+            runner: if matches!(self.request.runner, ext::Runner::ModelOnly { .. }) {
+                protocol::publication::RunnerKind::ModelOnly
+            } else {
+                protocol::publication::RunnerKind::Agent
+            },
             authority: Json::encode(&(
                 self.awaited,
                 self.admitted_at,
                 self.call,
-                self.request,
+                (
+                    self.request.owner,
+                    self.request.purpose,
+                    self.request.prompt,
+                    self.request.prefix,
+                    self.request.runner,
+                    self.request.depth,
+                    self.request.budget,
+                ),
                 self.model,
                 self.routing,
                 self.installed,
@@ -112,7 +90,7 @@ impl SpawnIntent {
             awaited,
             admitted_at,
             call,
-            request,
+            (owner, purpose, prompt, prefix, runner, depth, budget),
             model,
             routing,
             installed,
@@ -124,7 +102,15 @@ impl SpawnIntent {
             awaited,
             admitted_at,
             call,
-            request,
+            request: SpawnAuthority {
+                owner,
+                purpose,
+                prompt,
+                prefix,
+                runner,
+                depth,
+                budget,
+            },
             model,
             routing,
             installed,
@@ -223,7 +209,9 @@ impl Actor {
             }
         }
 
-        let frozen = self.freeze_spawn(call, request, awaited).await;
+        let frozen = self
+            .freeze_spawn(call, request, awaited, &Arc::clone(&self.registry))
+            .await;
         let input = frozen.request.prompt.clone();
         let intent = frozen.into_json().expect("spawn intent encodes");
         let child = SessionId::new();
@@ -284,11 +272,13 @@ impl Actor {
         }
     }
 
-    async fn freeze_spawn(
+    #[allow(clippy::too_many_lines)]
+    pub(super) async fn freeze_spawn(
         &mut self,
         call: CallId,
         mut request: ext::Spawn,
         awaited: bool,
+        registry: &Registry,
     ) -> SpawnIntent {
         let allowance = lock(&self.live.session.spawn)
             .as_ref()
@@ -296,23 +286,24 @@ impl Actor {
         let depth = request.depth.intersect(allowance).descend();
         let mut refusal = depth.as_ref().err().cloned();
         request.depth = depth.unwrap_or(DepthBudget::new(0));
-        let kind = self.registry.kind(&request.runner.agent);
+        let agent = request.runner.agent();
+        let kind = agent.and_then(|name| registry.kind(name));
         let (inherit, inherit_settings) = kind.unwrap_or_default();
-        if kind.is_none() {
+        if agent.is_some() && kind.is_none() {
             refusal = Some(SpawnRefusal::Unavailable(format!(
                 "unknown child agent {}",
-                request.runner.agent
+                agent.unwrap_or_default()
             )));
         }
-        let child = self.registry.select(inherit, None);
+        let child = registry.select(inherit, None);
         if let Err(error) = &child {
             refusal = Some(SpawnRefusal::Unavailable(error.to_string()));
         }
         let child = child.unwrap_or_default();
-        if !child.agents().any(|name| name == request.runner.agent) {
+        if agent.is_some_and(|agent| !child.agents().any(|name| name == agent)) {
             refusal = Some(SpawnRefusal::Unavailable(format!(
                 "agent {} is not inheritable",
-                request.runner.agent
+                agent.unwrap_or_default()
             )));
         }
         let extensions = child
@@ -326,14 +317,18 @@ impl Actor {
         {
             refusal = Some(SpawnRefusal::Unavailable(error));
         }
-        child.kind_settings(&request.runner.agent, &mut states);
+        if let Some(agent) = agent {
+            child.kind_settings(agent, &mut states);
+        }
         let settings = states.settings_image().unwrap_or_else(|error| {
             refusal = Some(SpawnRefusal::Unavailable(error));
             ext::Checkpoint::default()
         });
-        let selected = self.child_model(&request.runner.role, &child, &states);
-        if matches!(request.runner.role, ext::ModelRole::Named(_))
-            && let Err(error) = &selected
+        let selected = self.child_model(request.runner.role(), &child, &states);
+        if let Err(error) = &selected
+            && (matches!(request.runner.role(), ext::ModelRole::Named(_))
+                || matches!(request.runner, ext::Runner::ModelOnly { .. })
+                    && child.service::<dyn ext::SideProvider>().is_none())
         {
             refusal = Some(SpawnRefusal::Unavailable(error.clone()));
         }
@@ -345,7 +340,7 @@ impl Actor {
             .model(&session.workspace, env.as_deref(), &model)
             .map(|m| m.freeze());
         let mut image = Vec::new();
-        let installed = self.registry.installed();
+        let installed = registry.installed();
         if let ext::ContextSource::Prefix { session, seq } = request.context {
             if session != self.live.id || seq.get() > self.journal.ordered_seq {
                 refusal = Some(SpawnRefusal::Unavailable(
@@ -425,10 +420,10 @@ impl ext::Sessions for CallPorts {
         let session = &self.session;
         let agent = lock(&session.spawn)
             .as_ref()
-            .map(|i| i.request.agent.clone())
+            .and_then(|i| i.request.runner.agent().map(str::to_owned))
             .or_else(|| session.shared.models.settings.agent(&session.workspace))
             .unwrap_or_else(|| ext::LOOP.into());
-        ext::Runner {
+        ext::Runner::Agent {
             agent,
             role: ext::ModelRole::Session,
         }
@@ -516,7 +511,11 @@ pub(super) fn restore(
         None
     };
     let registry = if let Some(image) = &image {
-        super::recorded_registry(shared, source, Some(&image.installed))?
+        if source.is_none() && current.installed() == image.installed {
+            current
+        } else {
+            super::recorded_registry(shared, source, Some(&image.installed))?
+        }
     } else {
         match (source, open) {
             (Some(source), Open::Load) => super::load_registry(header, shared, source)?,

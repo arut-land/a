@@ -311,7 +311,7 @@ enum Opened {
 
 struct SideAdmitted {
     id: CallId,
-    messages: llm::Messages,
+    thread: protocol::publication::ThreadImage,
     limited: bool,
     cancel: Cancel,
 }
@@ -409,7 +409,7 @@ struct PendingSide {
     cancel: Cancel,
     origin: ContextOrigin,
     reply: oneshot::Sender<Opened>,
-    messages: llm::Messages,
+    thread: protocol::publication::ThreadImage,
     limited: bool,
 }
 
@@ -435,8 +435,8 @@ enum ContextRequest {
         reply: spawn::SpawnReply,
     },
     Side {
-        model: String,
-        side: ext::Side,
+        registry: Arc<Registry>,
+        side: ext::ModelTurn,
         reply: oneshot::Sender<Opened>,
     },
     Own {
@@ -494,18 +494,34 @@ impl Live {
         open: Open,
         owner: Owner,
     ) -> io::Result<Arc<Self>> {
+        Self::start_in(header, shared, open, owner, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn start_in(
+        header: &Header,
+        shared: &Arc<Shared>,
+        open: Open,
+        owner: Owner,
+        admitted: Option<Arc<Registry>>,
+    ) -> io::Result<Arc<Self>> {
         let source = shared.source(&header.workspace)?;
         let snapshot = source
             .as_ref()
             .map_or_else(|| shared.registry.snapshot(), |source| source.snapshot());
         let generation = snapshot.id;
-        let (registry, image) =
-            spawn::restore(header, shared, open, source.as_ref(), snapshot.registry)?;
+        let (registry, image) = spawn::restore(
+            header,
+            shared,
+            open,
+            source.as_ref(),
+            admitted.unwrap_or(snapshot.registry),
+        )?;
         let (tx, rx) = channel::unbounded();
         let session = Session::new(header, shared, Arc::new(tx), &registry);
         *lock(&session.spawn) = image;
         let bound = bind(&registry, &session);
-        let binding = Arc::clone(&bound) as Arc<dyn Binding>;
+        let binding = services::binding(&bound, &session, &registry);
         let (mut loaded, folding) = Folding::open(header, shared, open, &binding, &registry)?;
         // A process restart can read cache-resident entries that no client
         // has seen. Replaying them makes the same promise as a live commit.
@@ -559,7 +575,9 @@ impl Live {
             ended: Flag::default(),
             session: Arc::clone(&session),
         });
-        registry.hooks().session_start(&bound.point());
+        if !session.model_only() {
+            registry.hooks().session_start(&bound.point());
+        }
         let actor = Actor {
             live: Arc::clone(&live),
             core,
@@ -937,6 +955,7 @@ enum InFlight {
     /// decisions about it are logged in between. `Err` is why there is no
     /// model to send it to.
     Prepared(Box<Result<(Model, llm::Request, u16), String>>),
+    Thread(Box<(ext::ModelTurn, llm::Messages, Result<Model, llm::Error>)>),
     /// A model call sent; it reports once, with [`Completion::Replied`].
     Model,
     /// Side work must report before the session closes its writer.
@@ -1001,7 +1020,7 @@ impl Actor {
         let shared = Arc::clone(&self.live.session.shared);
         let newest = snapshot.registry;
         let bound = bind(&newest, &self.live.session);
-        let binding = Arc::clone(&bound) as Arc<dyn Binding>;
+        let binding = services::binding(&bound, &self.live.session, &newest);
         let frames = Arc::clone(&self.live.frames);
         let pending: Vec<Entry> = self.pending_entries().collect();
         let registry = Arc::clone(&newest);
@@ -1091,6 +1110,7 @@ impl Actor {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run(mut self, mail: channel::Receiver<Msg>, first: StepPlan) {
         let _ = self.carry(first).await;
         let mut next = None;
@@ -1188,7 +1208,9 @@ impl Actor {
             shared.catalog.record(listing);
         })
         .await;
-        self.registry.hooks().session_end(&self.bound.point());
+        if !self.live.session.model_only() {
+            self.registry.hooks().session_end(&self.bound.point());
+        }
         // Closed and let go before the end is told: a reload never makes
         // a second writer, and what is told the end holds the last of it.
         let ended = self.live.ended.clone();
@@ -1385,8 +1407,12 @@ impl Actor {
                 .open_spawn(call, request, reply)
                 .await
                 .map(|event| (event, None)),
-            ContextRequest::Side { model, side, reply } => self
-                .open_side(origin.clone(), model, side, reply)
+            ContextRequest::Side {
+                registry,
+                side,
+                reply,
+            } => self
+                .open_side(origin.clone(), registry, side, reply)
                 .await
                 .map(|event| (event, None)),
             ContextRequest::Own { process } => {
@@ -2185,6 +2211,10 @@ impl Actor {
     /// to log; the request waits here until the kernel has it sent, unless
     /// a handler answered it, in which case the answer is the reply.
     async fn prepare(&mut self, call: CallId, attempt: u16, choice: ToolChoice) {
+        if self.live.session.model_only() {
+            self.prepare_thread(call).await;
+            return;
+        }
         let prepared = match self.live.session.model(&self.registry) {
             Ok(model) => self
                 .request(call, &model)
@@ -2228,6 +2258,10 @@ impl Actor {
     }
 
     fn send(&mut self, call: CallId) {
+        if self.live.session.model_only() {
+            self.send_thread(call);
+            return;
+        }
         let Some(InFlight::Prepared(prepared)) = self.inflight.remove(&call) else {
             return;
         };

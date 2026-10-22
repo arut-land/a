@@ -269,7 +269,7 @@ impl Extension for ControlledSleep {
 }
 
 struct ManualSession {
-    session: Arc<Live>,
+    session: TestingLive,
     actor: rt::BoxFuture<'static, ()>,
     runtime: Arc<Manual>,
     faulty: Arc<Faulty>,
@@ -304,7 +304,7 @@ impl ManualSession {
             actor: Mutex::default(),
             timers: Mutex::default(),
         });
-        Arc::get_mut(&mut fixture.0).unwrap().rt = Arc::clone(&manual) as _;
+        fixture = fixture.configure(|shared| shared.rt = Arc::clone(&manual) as _);
         let session = fixture.create();
         let mut actor = lock(&manual.actor).take().unwrap();
         let (reply, received) = oneshot::channel();
@@ -1129,7 +1129,7 @@ fn final_sync_publishes_activity_after_its_entries() {
         actor: Mutex::default(),
         timers: Mutex::default(),
     });
-    Arc::get_mut(&mut fixture.0).unwrap().rt = Arc::clone(&manual) as _;
+    fixture = fixture.configure(|shared| shared.rt = Arc::clone(&manual) as _);
     let session = fixture.create();
     let mut actor = lock(&manual.actor).take().unwrap();
     let (reply, _) = oneshot::channel();
@@ -1455,8 +1455,12 @@ fn admitted_calls_never_resolve_services_from_a_newer_registry() {
     .into_iter()
     .enumerate()
     {
-        let side = ext::Side::new::<Routes>(
-            &format!("route-{index}"),
+        let side = ext::ModelTurn::new(
+            ext::ThreadKey::new::<Routes>(
+                &format!("route-{index}"),
+                ext::OwnerScope::Call(cx.call),
+            ),
+            ext::TurnKey("initial".into()),
             role,
             ext::SideContext::None,
             llm::Messages::default(),

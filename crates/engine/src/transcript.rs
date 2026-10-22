@@ -12,6 +12,7 @@ use protocol::{Body, CallId, Entry, Outcome, Seq, Verdict};
 /// Provider replies remain intact; live updates and recovery share projection rules.
 pub struct Transcript {
     messages: Messages,
+    model_only: bool,
     /// Where the next context message goes: after the system prompt and
     /// the context before it.
     context: usize,
@@ -97,6 +98,7 @@ impl Transcript {
         Self {
             context: messages.len(),
             messages,
+            model_only: false,
             calls: HashMap::new(),
             answered: Vec::new(),
             waiting: HashMap::new(),
@@ -111,6 +113,7 @@ impl Transcript {
         let message = match context_fact(&e.body) {
             Some(ContextFact::Inherited(intent)) => {
                 if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
+                    self.model_only = image.runner == protocol::publication::RunnerKind::ModelOnly;
                     let messages =
                         ContextImage::new(image.entries().into_iter().map(Cow::Owned).collect())
                             .project(Self::empty(Arc::clone(&self.registry), ""))
@@ -129,6 +132,18 @@ impl Transcript {
                 return;
             }
             Some(ContextFact::Taken(input)) => match self.waiting.remove(&input) {
+                Some(text) if self.model_only => {
+                    if let Ok((turn, prefix)) =
+                        serde_json::from_str::<(ext::ModelTurn, Messages)>(&text)
+                    {
+                        for message in prefix.iter().chain(turn.messages.iter()) {
+                            self.messages.push(message.clone());
+                        }
+                        self.last = e.seq.get();
+                        return;
+                    }
+                    Message::user(text)
+                }
                 Some(text) => Message::user(text),
                 None => return,
             },
@@ -297,6 +312,10 @@ impl<'a> ContextImage<'a> {
                 }
                 if let Body::Spawned { intent } = &entry.body {
                     if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
+                        if image.runner == protocol::publication::RunnerKind::ModelOnly {
+                            inputs.push(ContextInput::Entry(entry));
+                            continue;
+                        }
                         inputs.push(ContextInput::Inherited {
                             seq: entry.seq,
                             layer: pending.len(),

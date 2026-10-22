@@ -262,12 +262,16 @@ fn end(patches: &[Patch]) -> &str {
 }
 
 /// Clients the daemon counts on each session.
-fn clients(env: &Env) -> Vec<u32> {
+fn clients(env: &Env, session: &str) -> Vec<u32> {
     let mut conn = env.connect();
     conn.send(&ClientMsg::List);
     let mut list = SessionList::default();
     while !list.fold(&conn.recv()) {}
-    list.sessions.iter().map(|s| s.clients).collect()
+    list.sessions
+        .iter()
+        .filter(|s| s.id.to_string() == session)
+        .map(|s| s.clients)
+        .collect()
 }
 
 const TAB: &str = "0123456789abcdef0123456789abcdef";
@@ -387,7 +391,7 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
         "{:?}",
         events.patches[0]
     );
-    wait_for("the tab to attach", || clients(&env) == [1]);
+    wait_for("the tab to attach", || clients(&env, &session) == [1]);
 
     let sent = web.call("/api/send", TAB, "hello web");
     assert_eq!(sent.status(), 200, "{}", sent.0);
@@ -442,12 +446,12 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     // Closing the tab detaches its client; stopping `a web` leaves the
     // daemon and its session running.
     drop(events);
-    wait_for("the tab to detach", || clients(&env) == [0]);
+    wait_for("the tab to detach", || clients(&env, &session) == [0]);
     assert_eq!(web.call("/api/send", TAB, "anyone there?").status(), 404);
     let pid = env.pid();
     drop(web);
     assert!(pid.is_some());
-    assert_eq!(clients(&env), [0]);
+    assert_eq!(clients(&env, &session), [0]);
     assert_eq!(env.pid(), pid);
 }
 
@@ -531,7 +535,7 @@ fn a_tab_rides_out_a_daemon_upgrade() {
     env.run(&["ls"]);
     let second = env.pid().unwrap();
     assert_ne!(second, first);
-    wait_for("the tab to attach again", || clients(&env) == [1]);
+    wait_for("the tab to attach again", || clients(&env, &session) == [1]);
     let shown_before = events.patches.len();
     assert_eq!(web.call("/api/send", TAB, "after").status(), 200);
     events.until("the echo after", |p| {

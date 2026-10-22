@@ -13,11 +13,35 @@ pub struct Publication {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Publications(BTreeMap<u64, Vec<Publication>>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunnerKind {
+    Agent,
+    ModelOnly,
+}
+
 /// Context is decoded here so reducers need not understand engine authority.
 #[derive(Serialize, Deserialize)]
 pub struct SpawnImage {
+    pub runner: RunnerKind,
     pub authority: Json,
     pub image: Vec<Json>,
+}
+
+/// Side audit facts identify the executing conversation without exposing its authority.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ThreadImage {
+    pub conversation: crate::SessionId,
+    pub turn: Json,
+    pub authority: Json,
+}
+
+impl ThreadImage {
+    pub fn from_json(json: &Json) -> serde_json::Result<Self> {
+        json.parse()
+    }
+    pub fn to_json(&self) -> serde_json::Result<Json> {
+        Json::encode(self)
+    }
 }
 
 impl SpawnImage {

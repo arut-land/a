@@ -75,9 +75,10 @@ fn turn_flushes_are_input_unsafe_work_and_final_publication() {
                 registry,
                 openai(&Script::new(&replies)),
             );
-            let shared = Arc::get_mut(&mut fixture.0).unwrap();
-            shared.rt = Arc::new(NoTimers(rt::Threads::new(1)));
-            shared.barriers = barriers;
+            fixture = fixture.configure(|shared| {
+                shared.rt = Arc::new(NoTimers(rt::Threads::new(1)));
+                shared.barriers = barriers;
+            });
             let session = fixture.create();
             settle(&session);
             let before = faulty.flushes();
@@ -101,7 +102,7 @@ fn pipeline(registry: Registry) -> (Fixture, Arc<Faulty>, Arc<Script>) {
         registry,
         openai(&script),
     );
-    Arc::get_mut(&mut fixture.0).unwrap().rt = Arc::new(NoTimers(rt::Threads::new(1)));
+    fixture = fixture.configure(|shared| shared.rt = Arc::new(NoTimers(rt::Threads::new(1))));
     (fixture, faulty, script)
 }
 
@@ -561,13 +562,17 @@ fn stale_request<'a>(
             origin.send(
                 session,
                 ContextRequest::Side {
-                    side: ext::Side::new::<HeldHarbor>(
-                        "stale side",
+                    registry: session.shared.registry.get(),
+                    side: ext::ModelTurn::new(
+                        ext::ThreadKey::new::<HeldHarbor>(
+                            "stale side",
+                            ext::OwnerScope::Call(old.call),
+                        ),
+                        ext::TurnKey("initial".into()),
                         ext::ModelRole::Session,
                         ext::SideContext::None,
                         llm::Messages::default(),
                     ),
-                    model: "none".into(),
                     reply,
                 },
             );
@@ -578,7 +583,7 @@ fn stale_request<'a>(
                     request: ext::Spawn::new::<HeldHarbor>(
                         "stale",
                         "stale child".into(),
-                        ext::Runner {
+                        ext::Runner::Agent {
                             agent: ext::LOOP.into(),
                             role: ext::ModelRole::Session,
                         },
@@ -611,7 +616,7 @@ fn stale_request<'a>(
                     ext::Spawn::new::<HeldHarbor>(
                         "stale",
                         "stale child".into(),
-                        ext::Runner {
+                        ext::Runner::Agent {
                             agent: ext::LOOP.into(),
                             role: ext::ModelRole::Session,
                         },
@@ -623,8 +628,9 @@ fn stale_request<'a>(
         })
     } else {
         Box::pin(async move {
-            let side = ext::Side::new::<HeldHarbor>(
-                "stale side",
+            let side = ext::ModelTurn::new(
+                ext::ThreadKey::new::<HeldHarbor>("stale side", ext::OwnerScope::Call(old.call)),
+                ext::TurnKey("initial".into()),
                 ext::ModelRole::Session,
                 ext::SideContext::None,
                 [llm::Message::user("stale request")].into_iter().collect(),
@@ -744,8 +750,9 @@ fn an_unadmitted_side_call_cannot_outlive_its_cancelled_parent() {
     let ack = enqueue(&session, "hello");
     input.started();
     let (cx, release) = started_harbor(&starts);
-    let side = ext::Side::new::<HeldHarbor>(
-        "cancelled side",
+    let side = ext::ModelTurn::new(
+        ext::ThreadKey::new::<HeldHarbor>("cancelled side", ext::OwnerScope::Call(cx.call)),
+        ext::TurnKey("initial".into()),
         ext::ModelRole::Session,
         ext::SideContext::None,
         [llm::Message::user("Say hi.")].into_iter().collect(),

@@ -233,7 +233,7 @@ mod tests {
                 ("settings", 1),
                 ("subagent", 1),
                 ("retry", 1),
-                ("title", 2)
+                ("title", 3)
             ]
         );
         assert_eq!(

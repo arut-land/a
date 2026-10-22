@@ -131,7 +131,7 @@ impl ext::Provides<dyn ext::SideProvider> for Fixtures {}
 impl ext::SideProvider for Fixtures {
     fn reply<'a>(
         &'a self,
-        side: &'a ext::Side,
+        side: &'a ext::ModelTurn,
         _: &'a llm::Messages,
     ) -> ext::BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
@@ -139,7 +139,7 @@ impl ext::SideProvider for Fixtures {
                 message: llm::Assistant {
                     content: vec![llm::AssistantPart::Text(llm::Text::new(format!(
                         "fixture {}",
-                        side.purpose
+                        side.thread.purpose
                     )))],
                     origin: None,
                 },

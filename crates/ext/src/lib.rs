@@ -49,7 +49,9 @@ mod state;
 pub mod testing;
 mod tool;
 
-pub use agent::{Action, Actions, Agent, AgentKind, Inheritance, Input, actions_from_json};
+pub use agent::{
+    Action, Actions, Agent, AgentKind, Inheritance, Input, ModelOnly, actions_from_json,
+};
 pub use assemble::{Need, Provides};
 pub use ext::{DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
 pub use flag::{Cancel, Flag};
@@ -63,9 +65,9 @@ pub use protocol::{Annotation, AnnotationLifetime, ExtensionFact};
 pub use schema::Schema;
 pub use service::{
     Background, Budget, CwdOf, InboxAccess, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec,
-    Models, OwnedProcess, ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes,
-    RunningProcess, Sessions, Side, SideContext, SideIdentity, SideProvider, SideRetry, SideScope,
-    SpawnError,
+    ModelTurn, Models, OwnedProcess, OwnerScope, ProcessLease, ProcessOutput, ProcessPipe,
+    ProcessSignal, Processes, RunningProcess, Sessions, SideContext, SideIdentity, SideProvider,
+    SideRetry, SpawnError, ThreadKey, TurnKey,
 };
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};

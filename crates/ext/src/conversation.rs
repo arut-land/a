@@ -34,9 +34,23 @@ pub enum ContextSource {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Runner {
-    pub agent: String,
-    pub role: ModelRole,
+pub enum Runner {
+    Agent { agent: String, role: ModelRole },
+    ModelOnly { role: ModelRole },
+}
+
+impl Runner {
+    pub fn agent(&self) -> Option<&str> {
+        match self {
+            Self::Agent { agent, .. } => Some(agent),
+            Self::ModelOnly { .. } => None,
+        }
+    }
+    pub fn role(&self) -> &ModelRole {
+        match self {
+            Self::Agent { role, .. } | Self::ModelOnly { role } => role,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,6 +89,22 @@ impl Spawn {
     }
     pub fn detached(self) -> Detached<Self> {
         Detached(self)
+    }
+}
+
+impl From<&crate::ModelTurn> for Spawn {
+    fn from(turn: &crate::ModelTurn) -> Self {
+        Self {
+            owner: turn.thread.extension.clone(),
+            purpose: turn.thread.purpose.clone(),
+            prompt: String::new(),
+            context: ContextSource::Fresh,
+            runner: Runner::ModelOnly {
+                role: turn.role.clone(),
+            },
+            depth: DepthBudget::new(u16::MAX),
+            budget: turn.budget,
+        }
     }
 }
 

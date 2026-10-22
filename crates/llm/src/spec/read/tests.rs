@@ -168,3 +168,26 @@ fn an_origin_names_a_protocol_the_crate_speaks() {
     assert_eq!(origin.protocol, crate::ProtocolKey::OpenaiChat);
     assert_eq!(origin.protocol.as_str(), "openai.chat");
 }
+
+#[test]
+fn persistent_messages_preserve_all_roles_parts_and_provider_state() {
+    let reply = Response::from_json(&every_part().to_string()).unwrap();
+    let messages: crate::Messages = [
+        crate::Message::system("system"),
+        crate::Message::user("user"),
+        crate::Message::Assistant(reply.message),
+        crate::Message::Tool(crate::ToolMessage {
+            results: vec![crate::ToolResult {
+                id: "c1".into(),
+                name: "bash".into(),
+                output: crate::Output::Json(crate::Json::encode(&json!({"x":1})).unwrap()),
+                error: false,
+                meta: crate::Meta::new(),
+            }],
+        }),
+    ]
+    .into_iter()
+    .collect();
+    let encoded = serde_json::to_string(&messages).unwrap();
+    assert_eq!(crate::Messages::from_json(&encoded).unwrap(), messages);
+}

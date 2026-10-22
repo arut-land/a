@@ -428,7 +428,7 @@ pub(crate) fn spawn_intent(call: u64, prompt: &str) -> Json {
         request: ext::Spawn::new::<ext_subagent::Subagent>(
             "task",
             prompt.into(),
-            ext::Runner {
+            ext::Runner::Agent {
                 agent: ext_fixtures::ECHO.into(),
                 role: ext::ModelRole::Session,
             },
@@ -1626,7 +1626,7 @@ fn recursive_children_keep_the_admitted_runner_and_decreasing_budget() {
             panic!("{log:?}")
         };
         let value = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
-        assert_eq!(value.request.agent, ext_fixtures::ECHO);
+        assert_eq!(value.request.runner.agent(), Some(ext_fixtures::ECHO));
         assert_eq!(value.installed, daemon.shared.registry.get().installed());
         depths.push(value.request.depth.remaining());
     }
@@ -2126,7 +2126,7 @@ mod inheritance {
             let request = ext::Spawn::new::<Kinds>(
                 "role",
                 "spawn done".into(),
-                ext::Runner {
+                ext::Runner::Agent {
                     agent: agent.into(),
                     role,
                 },
@@ -2245,7 +2245,7 @@ mod inheritance {
                 panic!("missing authority")
             };
             let frozen = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
-            if frozen.request.agent == Fresh::NAME {
+            if frozen.request.runner.agent() == Some(Fresh::NAME) {
                 assert!(
                     !frozen
                         .extensions
@@ -2256,7 +2256,7 @@ mod inheritance {
             if frozen.request.owner == Kinds::NAME {
                 assert_eq!(
                     frozen.model,
-                    if frozen.request.agent == Fresh::NAME {
+                    if frozen.request.runner.agent() == Some(Fresh::NAME) {
                         "test:base"
                     } else {
                         "test:parent"
@@ -2279,7 +2279,7 @@ mod inheritance {
                 panic!("missing authority")
             };
             let intent = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
-            if intent.request.agent == Fresh::NAME {
+            if intent.request.runner.agent() == Some(Fresh::NAME) {
                 attachment.session().submit("call compact {}").unwrap();
                 settle(&daemon);
                 let log = bodies(&*daemon.shared.store, header.id);

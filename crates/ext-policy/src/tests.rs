@@ -16,9 +16,9 @@ impl Models for Judge {
     fn call<'a>(
         &'a self,
         _: &'a Cx,
-        side: Side,
+        side: ModelTurn,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
-        assert_eq!(&*side.purpose, "judge");
+        assert_eq!(&*side.thread.purpose, "judge");
         let reply = self.0.map(|text| llm::Response {
             message: llm::Assistant {
                 content: vec![llm::AssistantPart::Text(llm::Text::new(text))],
@@ -201,11 +201,11 @@ impl Models for Descriptions {
     fn call<'a>(
         &'a self,
         _: &'a Cx,
-        side: Side,
+        side: ModelTurn,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         assert!(side.is_background());
         assert!(side.is_while_waiting());
-        assert_eq!(side.purpose, "approval-description");
+        assert_eq!(side.thread.purpose, "approval-description");
         Box::pin(async {
             Ok(llm::Response {
                 message: llm::Assistant {

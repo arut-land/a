@@ -1333,6 +1333,7 @@ fn view_publications_follow_edits_to_inherited_context() {
         Epoch(0),
         Body::Spawned {
             intent: protocol::publication::SpawnImage {
+                runner: protocol::publication::RunnerKind::Agent,
                 authority: Json::encode(&"execution authority").unwrap(),
                 image: inherited,
             }

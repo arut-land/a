@@ -944,6 +944,11 @@ pub trait Binding: Send + Sync {
     /// A new agent, of the kind the session runs.
     fn agent(&self) -> Box<dyn Agent>;
 
+    /// Ambiguous provider attempts require explicit new spend in model-only runners.
+    fn runner(&self) -> protocol::publication::RunnerKind {
+        protocol::publication::RunnerKind::Agent
+    }
+
     /// What the agent asks at its decisions: the handlers at the loop
     /// points. Pure, as the agent is: a load asks them again.
     fn loop_points(&self) -> &dyn LoopPoints {

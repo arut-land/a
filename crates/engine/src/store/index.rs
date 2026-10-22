@@ -12,6 +12,7 @@ pub(crate) struct Index {
     through: u64,
     fence: u64,
     sides: HashMap<ext::SideIdentity, CallId>,
+    threads: HashMap<ext::ThreadKey, CallId>,
     results: HashMap<CallId, (Seq, bool)>,
     interrupt: u64,
     watches: Vec<(SessionId, Seq)>,
@@ -41,14 +42,17 @@ impl Index {
         }
         match &entry.body {
             Body::ModelCall {
-                r#for: Some(of),
+                r#for: Some(_),
                 request: Some(request),
                 purpose: Some(purpose),
                 ..
             } => {
-                if let Ok(identity) = ext::SideIdentity::from_intent(*of, request)
-                    && identity.purpose == *purpose
+                if let Ok(identity) = ext::SideIdentity::from_intent(request)
+                    && identity.thread.purpose == *purpose
                 {
+                    self.threads
+                        .entry(identity.thread.clone())
+                        .or_insert(CallId(entry.seq));
                     self.sides.entry(identity).or_insert(CallId(entry.seq));
                 }
             }
@@ -69,6 +73,10 @@ impl Index {
             _ => {}
         }
         self.through = entry.seq.get();
+    }
+
+    pub(crate) fn thread(&self, key: &ext::ThreadKey) -> Option<CallId> {
+        self.threads.get(key).copied()
     }
 
     pub(crate) fn side(&self, identity: &ext::SideIdentity) -> Option<CallId> {
@@ -123,15 +131,15 @@ mod tests {
     use crate::store::{Header, Jsonl, LogStore};
     use protocol::{Envelope, EnvelopeId, Epoch, Json, Outcome, ToolChoice};
 
-    fn history() -> (Vec<Entry>, ext::Side, SessionId, Envelope) {
+    fn history() -> (Vec<Entry>, ext::ModelTurn, SessionId, Envelope) {
         let child = SessionId::new();
-        let side = ext::Side::new::<ext_title::Title>(
-            "index",
+        let side = ext::ModelTurn::new(
+            ext::ThreadKey::new::<ext_title::Title>("index", ext::OwnerScope::Session),
+            ext::TurnKey("initial".into()),
             ext::ModelRole::Fast,
             ext::SideContext::None,
             llm::Messages::default(),
-        )
-        .once_per_session();
+        );
         let owner = CallId::new(1).unwrap();
         let envelope = Envelope {
             id: EnvelopeId {
@@ -148,8 +156,16 @@ mod tests {
                 attempt: 0,
                 choice: ToolChoice::default(),
                 r#for: Some(owner),
-                purpose: Some(side.purpose.clone()),
-                request: Some(side.intent(&llm::Messages::default()).unwrap()),
+                purpose: Some(side.thread.purpose.clone()),
+                request: Some(
+                    protocol::publication::ThreadImage {
+                        conversation: child,
+                        turn: side.intent(&llm::Messages::default()).unwrap(),
+                        authority: Json::null(),
+                    }
+                    .to_json()
+                    .unwrap(),
+                ),
             },
             Body::ModelResult {
                 call: owner,
@@ -223,10 +239,7 @@ mod tests {
             let mut index = Index::default();
             index.update(&frames, 0).unwrap();
             let owner = CallId::new(1).unwrap();
-            assert_eq!(
-                index.side(&side.identity(CallId::new(99).unwrap())),
-                Some(owner)
-            );
+            assert_eq!(index.side(&side.identity()), Some(owner));
             let result = index.result(owner, frames.seq()).unwrap();
             let before = index.entry(&frames, result).unwrap();
             for n in 9..=12 {
@@ -270,7 +283,7 @@ mod tests {
         }
         let mut ignored = Index::default();
         ignored.apply(&incomplete);
-        assert_eq!(ignored.side(&side.identity(CallId::new(1).unwrap())), None);
+        assert_eq!(ignored.side(&side.identity()), None);
         let mut live = Index::default();
         for entry in &entries {
             live.apply(entry);
@@ -278,10 +291,7 @@ mod tests {
         let mut rebuilt = Index::default();
         rebuilt.update(&frames, 0).unwrap();
         let owner = CallId::new(1).unwrap();
-        assert_eq!(
-            live.side(&side.identity(owner)),
-            rebuilt.side(&side.identity(owner))
-        );
+        assert_eq!(live.side(&side.identity()), rebuilt.side(&side.identity()));
         for seq in [
             live.result(owner, frames.seq()).unwrap(),
             live.fired(child).unwrap(),

@@ -1,14 +1,13 @@
 # Conversations and agents
 
 This document specifies the conversation primitives for composable agents.
-Side threads and the metrics projection are follow-up work, not part of the
-initial implementation.
+The metrics projection remains follow-up work.
 
 Implementation status: typed awaited and detached spawning, immutable prefix
 images, inherited registrations, nested storage, durable inbox transport and
 depth enforcement are implemented. `ext-subagent` supplies `task`, `fork_task`
-and `background_task`. Side threads, named channels, questions and metrics
-remain follow-up compositions. The current inbox access policy permits parent
+and `background_task`. Persistent model-only side threads power title, compact
+and judge. Named channels, questions and metrics remain follow-up compositions. The current inbox access policy permits parent
 and child edges; `InboxAccess` is the extension seam for other policies.
 
 A conversation owns an ordered log, an inbox and a
@@ -183,18 +182,36 @@ membership and question presentation; the engine only validates the issued
 routing capability and performs durable transport. Cyclic waits need explicit
 cancellation or deadlines, not a hidden scheduler heuristic.
 
-## Side threads (follow-up)
+## Side threads
 
-A side thread uses the same conversation identity, context source, role,
-ownership and inbox types, with a model-only runner instead of an agent loop.
-It has no tools unless an extension explicitly supplies an agent runner.
-`(extension, purpose, owner scope)` selects the thread; each request has its
-own turn key. Title regeneration appends a new turn to the title thread,
-including previous exchanges. Retrying the same turn key reuses its outcome;
-requesting a new title creates a new turn, not a new thread. Awaited and
-background types retain their existing distinction. Side results stay outside
-the main transcript. Migrate `Side` and `Models` onto these primitives in a
-follow-up, deleting the one-shot-only implementation then.
+`Runner::Agent` selects a registered kind; `Runner::ModelOnly` performs one
+response per inbox input and offers no tools or agent-loop hooks. Both use
+owned conversation storage, frozen generation/route/settings authority, depth
+budgets and generation-scoped work. The public spawn image identifies the
+runner without making reducers decode execution authority.
+
+`ThreadKey { extension, purpose, owner_scope }` selects a persistent owned
+conversation. `ThreadKey::new::<E>` namespaces the purpose by extension type and requires
+an explicit session or call owner scope. `ModelTurn::new` takes this thread
+key and a turn key. Each request supplies a `TurnKey`. Reusing a turn key returns
+its committed outcome; a new key appends an inbox input to the existing
+thread, including previous exchanges. Awaited `Models::call` and `Background`
+remain distinct types. Inbox admission and taking are durable; turns execute
+in order rather than steering or merging another turn's input.
+
+The parent retains explicitly side-classified intent/result facts, including
+the executing conversation identity, for extension consumers and client
+views. These facts and replies never enter the parent's model transcript.
+The child logs its own attempts and results. Open parent requests and
+ambiguous model-only attempts recover as interrupted, including crashes in
+retry backoff. Recovery never initiates new spend for an existing key.
+Explicit new keys can continue a thread after interruption.
+
+Title's initial background request uses a stable initial key. `/title`
+regenerates it, and `/title <instructions>` supplies naming instructions;
+each command uses its owning call as a new turn key in the same thread.
+Compaction and judge likewise continue session-scoped threads with one key
+per owning call. See [side-calls.md](side-calls.md) for the full contract.
 
 ## Metrics (follow-up)
 

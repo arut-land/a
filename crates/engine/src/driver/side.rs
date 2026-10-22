@@ -32,7 +32,7 @@ impl Actor {
     pub(super) async fn admit_side(&mut self, ticket: Ticket, side: Option<CallId>) {
         if let Some(PendingSide {
             reply,
-            messages,
+            thread,
             limited,
             cancel,
             origin,
@@ -62,7 +62,7 @@ impl Actor {
                 self.inflight.insert(id, super::InFlight::Side);
                 Opened::Fresh(SideAdmitted {
                     id,
-                    messages,
+                    thread,
                     limited,
                     cancel,
                 })
@@ -101,11 +101,12 @@ impl Actor {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn open_side(
         &mut self,
         origin: ContextOrigin,
-        model: String,
-        side: ext::Side,
+        registry: Arc<ext::host::Registry>,
+        side: ext::ModelTurn,
         reply: oneshot::Sender<Opened>,
     ) -> Option<Event> {
         let of = origin.id;
@@ -120,7 +121,7 @@ impl Actor {
             return None;
         }
         self.indexed().await.ok()?;
-        if let Some(id) = self.journal.index.side(&side.identity(of)) {
+        if let Some(id) = self.journal.index.side(&side.identity()) {
             let cached = if let Some(seq) = self.journal.index.result(id, self.live.frames.seq()) {
                 match self.indexed_entry(seq).await.ok()?.body {
                     Body::ModelResult {
@@ -148,14 +149,32 @@ impl Actor {
             ext::SideContext::BeforeOwner => self.conversation(of).await.ok()?,
             ext::SideContext::None => llm::Messages::default(),
         };
-        let Ok(request) = side.intent(&conversation) else {
-            reply.send(Opened::Closed);
-            return None;
+        let turn = side.intent(&conversation).ok()?;
+        let identity = side.identity();
+        let thread = if let Some(first) = self.journal.index.thread(&identity.thread) {
+            let Body::ModelCall {
+                request: Some(request),
+                ..
+            } = self.indexed_entry(first.0).await.ok()?.body
+            else {
+                return None;
+            };
+            let mut image = protocol::publication::ThreadImage::from_json(&request).ok()?;
+            image.turn = turn;
+            image
+        } else {
+            let spawn = ext::Spawn::from(&side);
+            let frozen = self.freeze_spawn(of, spawn, false, &registry).await;
+            protocol::publication::ThreadImage {
+                conversation: protocol::SessionId::new(),
+                turn,
+                authority: frozen.into_json().ok()?,
+            }
         };
-        let mut messages = conversation;
-        for message in side.messages.iter() {
-            messages.push(message.clone());
-        }
+        let model = super::spawn::SpawnIntent::from_json(&thread.authority)
+            .ok()?
+            .model;
+        let request = thread.to_json().ok()?;
         let limited = self
             .core
             .ledger()
@@ -173,13 +192,13 @@ impl Actor {
                 cancel: Cancel::default(),
                 origin,
                 reply,
-                messages,
+                thread,
                 limited,
             },
         );
         Some(Event::Side(kernel::SideEvent::Open {
             of,
-            purpose: side.purpose,
+            purpose: side.thread.purpose,
             model,
             request,
             background,
@@ -191,8 +210,8 @@ impl Actor {
 impl ext::Models for CallPorts {
     fn call<'a>(
         &'a self,
-        cx: &'a Cx,
-        side: ext::Side,
+        _cx: &'a Cx,
+        side: ext::ModelTurn,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
             let session = Arc::clone(&self.session);
@@ -204,11 +223,10 @@ impl ext::Models for CallPorts {
             {
                 return Err(llm::Error::incomplete());
             }
-            let cx = cx.clone();
             let registry = Arc::clone(&self.registry);
             let runtime = Arc::clone(&session.shared.rt);
             runtime.spawn(Box::pin(async move {
-                sent.send(side_call(&session, &cx, origin, side, &registry).await);
+                sent.send(side_call(&session, origin, side, &registry).await);
             }));
             answer
                 .await
@@ -219,29 +237,16 @@ impl ext::Models for CallPorts {
 
 async fn side_call(
     session: &Arc<Session>,
-    cx: &Cx,
     origin: ContextOrigin,
-    side: ext::Side,
-    registry: &ext::host::Registry,
+    side: ext::ModelTurn,
+    registry: &Arc<ext::host::Registry>,
 ) -> Result<llm::Response, llm::Error> {
     let invalid = |e: String| llm::Error::new(llm::Kind::InvalidRequest, e);
-    let routed = session.role_model(&side.role, registry);
-    let model = routed
-        .and_then(|spec| {
-            let env = lock(&session.env).clone();
-            session
-                .shared
-                .models
-                .model(&session.workspace, env.as_deref(), &spec)
-        })
-        .map_err(invalid);
     let (asking, opened) = oneshot::channel();
     origin.send(
         session,
         ContextRequest::Side {
-            model: model
-                .as_ref()
-                .map_or_else(|_| "unresolved".into(), Model::name),
+            registry: Arc::clone(registry),
             side: side.clone(),
             reply: asking,
         },
@@ -254,21 +259,31 @@ async fn side_call(
     };
     let id = admitted.id;
     let cancel = admitted.cancel.clone();
-    let work: BoxFuture<'_, Replied> = Box::pin(run_side(
-        session,
-        cx,
-        &side,
-        admitted,
-        &model,
-        &cancel,
-        origin.fence,
-    ));
     let work = async {
-        unless(&cancel, work)
-            .await
-            .unwrap_or(Replied::Interrupted(None))
+        if admitted.limited {
+            return Replied::Failed(invalid("four side calls are already running".into()));
+        }
+        let Some(daemon) = session.shared.daemon.upgrade() else {
+            return Replied::Interrupted(None);
+        };
+        let (owner, thread, cancel, registry) = (
+            Arc::clone(session),
+            admitted.thread.clone(),
+            cancel.clone(),
+            Arc::clone(registry),
+        );
+        rt::spawn(&*session.shared.rt, async move {
+            Box::pin(daemon.model_turn(&owner, origin.id, thread, &cancel, &registry)).await
+        })
+        .await
     };
     let result = first(work, session.shared.rt.sleep(side.budget.timeout)).await;
+    if (result.is_none() || cancel.is_set())
+        && let Some(daemon) = session.shared.daemon.upgrade()
+    {
+        cancel.set();
+        daemon.interrupt(admitted.thread.conversation);
+    }
     let (outcome, answer) = sided(session.id, result);
     let failure = answer.as_ref().err().and_then(|e| Json::encode(e).ok());
     let (done, committed) = oneshot::channel();
@@ -286,29 +301,16 @@ async fn side_call(
     }
 }
 
-async fn run_side(
+pub(super) async fn run_side(
     session: &Arc<Session>,
     cx: &Cx,
-    side: &ext::Side,
-    admitted: SideAdmitted,
+    side: &ext::ModelTurn,
+    messages: llm::Messages,
     model: &Result<Model, llm::Error>,
-    cancel: &Cancel,
-    fence: u64,
+    origin: &ContextOrigin,
 ) -> Replied {
-    let SideAdmitted {
-        id,
-        messages,
-        limited,
-        ..
-    } = admitted;
+    let (id, cancel, fence) = (origin.id, &origin.cancel, origin.fence);
     let start = session.shared.rt.now();
-
-    if limited {
-        return Replied::Failed(llm::Error::new(
-            llm::Kind::InvalidRequest,
-            "four side calls are already running",
-        ));
-    }
     let provider = cx.service::<dyn ext::SideProvider>();
     if provider.is_none()
         && let Err(error) = &model
@@ -321,6 +323,7 @@ async fn run_side(
         ..llm::Request::default()
     };
     request.generation.max_output_tokens = Some(side.budget.max_tokens);
+    request.tool_choice = llm::ToolChoice::None;
     let mut attempt = 0u16;
     loop {
         let mut quiet = |_: &str| {};
@@ -431,4 +434,206 @@ pub(super) fn sided(
     };
     let answer = answer.inspect_err(|error| super::provider_error(session, error));
     (outcome, answer)
+}
+
+impl super::Daemon {
+    async fn model_turn(
+        &self,
+        owner: &Arc<Session>,
+        call: CallId,
+        image: protocol::publication::ThreadImage,
+        cancel: &Cancel,
+        registry: &Arc<ext::host::Registry>,
+    ) -> Replied {
+        let result = async {
+            let authority = super::spawn::SpawnIntent::from_json(&image.authority)
+                .map_err(std::io::Error::other)?;
+            if let Some(refusal) = authority.refusal {
+                return Err(std::io::Error::other(format!("{refusal:?}")));
+            }
+            let (turn, _): (ext::ModelTurn, llm::Messages) =
+                image.turn.parse().map_err(std::io::Error::other)?;
+            let key = turn.identity();
+            let id = protocol::EnvelopeId {
+                sender: owner.id,
+                call: match key.thread.owner_scope {
+                    ext::OwnerScope::Session => CallId::new(1).unwrap(),
+                    ext::OwnerScope::Call(call) => call,
+                },
+                purpose: Json::encode(&(key.thread, key.turn))
+                    .map_err(std::io::Error::other)?
+                    .raw()
+                    .into(),
+            };
+            let header = crate::store::Header {
+                id: image.conversation,
+                workspace: owner.workspace.to_path_buf(),
+                parent: Some(crate::store::Parent {
+                    session: owner.id,
+                    call: call.get(),
+                }),
+            };
+            let live = self
+                .owned_conversation(header, image.authority, Some(Arc::clone(registry)))
+                .await?;
+            if let Some(env) = lock(&owner.env).clone() {
+                live.set_env(env)?;
+            }
+            if cancel.is_set() {
+                return Ok(Replied::Interrupted(None));
+            }
+            live.enqueue(protocol::Envelope {
+                id: id.clone(),
+                destination: live.id,
+                payload: image.turn.raw().into(),
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+            let mut changed = live.session.changed.count();
+            let (mut through, mut input, mut taken, mut model) = (0, None, false, None);
+            loop {
+                let frames = Arc::clone(&live.frames);
+                let entries =
+                    rt::unblock(&*owner.shared.rt, move || frames.entries_after(through)).await?;
+                for entry in entries {
+                    through = entry.seq.get();
+                    match entry.body {
+                        Body::Enqueue { envelope } if envelope.id == id => input = Some(entry.seq),
+                        Body::Take { input: seq } if Some(seq) == input => taken = true,
+                        Body::ModelCall { r#for: None, .. } if taken && model.is_none() => {
+                            model = Some(CallId(entry.seq));
+                        }
+                        Body::ModelResult {
+                            call,
+                            outcome,
+                            failure,
+                            ..
+                        } if Some(call) == model => {
+                            return Ok(replied(side_answer(outcome, failure)).0);
+                        }
+                        _ => {}
+                    }
+                }
+                if live.ended.is_set() {
+                    return Ok(Replied::Interrupted(None));
+                }
+                if unless(cancel, live.session.changed.changed(&mut changed))
+                    .await
+                    .is_none()
+                {
+                    live.cancel_owned();
+                    return Ok(Replied::Interrupted(None));
+                }
+            }
+        }
+        .await;
+        result.unwrap_or_else(|error: std::io::Error| {
+            Replied::Failed(llm::Error::new(llm::Kind::Other, error.to_string()))
+        })
+    }
+}
+
+impl Actor {
+    pub(super) async fn prepare_thread(&mut self, call: CallId) {
+        let prepared = async {
+            let seq = protocol::Seq::new(self.core.ledger().turn_start())
+                .ok_or("model-only turn has no admitted input")?;
+            let mut entry = self.indexed_entry(seq).await.map_err(|e| e.to_string())?;
+            if let Body::Take { input } = entry.body {
+                entry = self.indexed_entry(input).await.map_err(|e| e.to_string())?;
+            }
+            let text = match &entry.body {
+                Body::Enqueue { envelope } => envelope.payload.as_str(),
+                Body::Input { text, .. } => text.as_str(),
+                _ => return Err("model-only turn has no admitted input".into()),
+            };
+            let turn = serde_json::from_str::<(ext::ModelTurn, llm::Messages)>(text).map_or_else(
+                |_| {
+                    let spawn = lock(&self.live.session.spawn);
+                    let spawn = spawn.as_ref().expect("model-only authority");
+                    let mut turn = ext::ModelTurn::new(
+                        ext::ThreadKey {
+                            extension: spawn.request.owner.clone(),
+                            purpose: spawn.request.purpose.clone(),
+                            owner_scope: ext::OwnerScope::Session,
+                        },
+                        ext::TurnKey(call.get().to_string()),
+                        spawn.request.runner.role().clone(),
+                        ext::SideContext::None,
+                        llm::Messages::default(),
+                    );
+                    turn.budget = spawn.request.budget;
+                    turn
+                },
+                |(turn, _)| turn,
+            );
+            let messages = self.conversation(call).await.map_err(|e| e.to_string())?;
+            let model = self
+                .live
+                .session
+                .model(&self.registry)
+                .map_err(|error| llm::Error::new(llm::Kind::InvalidRequest, error));
+            Ok::<_, String>((turn, messages, model))
+        }
+        .await;
+        self.inflight.insert(
+            call,
+            match prepared {
+                Ok(prepared) => super::InFlight::Thread(Box::new(prepared)),
+                Err(error) => super::InFlight::Prepared(Box::new(Err(error))),
+            },
+        );
+        self.live.session.emit(
+            self.live.session.fence.load(super::Ordering::SeqCst),
+            super::Completion::Event(Event::Prepared {
+                call,
+                decisions: Vec::new(),
+                answered: None,
+            }),
+        );
+    }
+
+    pub(super) fn send_thread(&mut self, call: CallId) {
+        let Some(prepared) = self.inflight.remove(&call) else {
+            return;
+        };
+        let session = Arc::clone(&self.live.session);
+        let registry = Arc::clone(&self.registry);
+        let handle = session
+            .origin(call, session.fence.load(super::Ordering::SeqCst))
+            .expect("actor generation");
+        let cancel = handle.cancel.clone();
+        let fence = handle.fence;
+        let cx = session.cx(handle.clone(), &registry);
+        let origin = handle.clone();
+        self.inflight.insert(call, super::InFlight::Model);
+        handle.spawn(&*Arc::clone(&session.shared.rt), async move {
+            let result = match prepared {
+                super::InFlight::Thread(prepared) => {
+                    let (turn, messages, model) = *prepared;
+                    let running = unless(
+                        &cancel,
+                        Box::pin(run_side(&session, &cx, &turn, messages, &model, &origin)),
+                    );
+                    first(running, session.shared.rt.sleep(turn.budget.timeout))
+                        .await
+                        .flatten()
+                        .unwrap_or(Replied::Interrupted(None))
+                }
+                super::InFlight::Prepared(prepared) => Replied::Failed(llm::Error::new(
+                    llm::Kind::InvalidRequest,
+                    prepared.err().unwrap_or_default(),
+                )),
+                _ => return,
+            };
+            session.emit(
+                fence,
+                super::Completion::Replied {
+                    call,
+                    replied: result,
+                    message: None,
+                },
+            );
+        });
+    }
 }

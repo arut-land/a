@@ -43,6 +43,82 @@ impl Response {
     }
 }
 
+impl crate::Messages {
+    pub fn from_json(text: &str) -> serde_json::Result<Self> {
+        #[derive(Deserialize)]
+        struct Stored {
+            role: String,
+            content: Option<Json>,
+            origin: Option<OptionalOrigin>,
+            #[serde(default)]
+            results: Vec<StoredTool>,
+        }
+        #[derive(Deserialize)]
+        struct StoredText {
+            text: String,
+            #[serde(default)]
+            meta: State,
+        }
+        #[derive(Deserialize)]
+        struct StoredTool {
+            id: SmolStr,
+            name: SmolStr,
+            output: OutputFields,
+            #[serde(default)]
+            error: bool,
+            #[serde(default)]
+            meta: State,
+        }
+        let messages: Vec<Stored> = serde_json::from_str(text)?;
+        messages
+            .into_iter()
+            .map(|message| {
+                let content = || required(message.content.as_ref(), "content");
+                Ok(match message.role.as_str() {
+                    "system" => super::Message::System(super::System {
+                        content: content()?
+                            .parse::<Vec<StoredText>>()?
+                            .into_iter()
+                            .map(|p| Text {
+                                text: p.text,
+                                meta: p.meta.0,
+                            })
+                            .collect(),
+                    }),
+                    "user" => super::Message::User(super::User {
+                        content: content()?
+                            .parse::<Vec<UserFields>>()?
+                            .into_iter()
+                            .map(UserFields::build)
+                            .collect::<Result<_>>()?,
+                    }),
+                    "assistant" => super::Message::Assistant(Assistant {
+                        content: content()?.parse::<Content>()?.0,
+                        origin: message.origin.and_then(|o| o.0),
+                    }),
+                    "tool" => super::Message::Tool(super::ToolMessage {
+                        results: message
+                            .results
+                            .into_iter()
+                            .map(|r| {
+                                Ok(ToolResult {
+                                    id: r.id,
+                                    name: r.name,
+                                    output: r.output.build()?,
+                                    error: r.error,
+                                    meta: r.meta.0,
+                                })
+                            })
+                            .collect::<Result<_>>()?,
+                    }),
+                    role => return Err(unknown(role, &["system", "user", "assistant", "tool"])),
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Self::from)
+    }
+}
+
 /// A call's arguments, which are an object.
 fn object(input: Json) -> Result<Json> {
     if input.raw().starts_with('{') {

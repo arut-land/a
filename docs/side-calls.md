@@ -1,148 +1,95 @@
-# Side model calls
+# Model-only side threads
 
-Extensions ask models through `ext::Models`. A side call belongs to the
-session but is not an agent turn: its prompt and response never enter the
-main transcript. Title, compact, and policy's judge use this service.
+Extensions use `ext::Models` to continue owned conversations outside their
+main transcript. Title, compact, policy judge and approval descriptions use
+this service. It admits `ModelTurn` requests onto `Runner::ModelOnly`;
+there is no separate one-shot provider path.
 
-## SDK contract
+## Identity and types
 
-`Side::new::<Extension>(purpose, role, context, messages)` constructs an
-awaited request. `models.call(&cx, side).await` returns a committed response
-or a typed `llm::Error`. A gate, recovery handler, or tool explicitly waits
-by awaiting that future. `side.background().start(cx)` instead produces a
-`Reaction` for an observer. `Background` cannot be passed to the awaited
-API. Its result is available in the log and client view, not as a future
-that could accidentally hold up the main turn.
+`ModelTurn::new(thread_key, turn_key, role, context, messages)`
+constructs an awaited request. `models.call(&cx, turn).await` returns only
+after the result commits. `turn.background().start(cx)` creates an observer
+reaction instead. `Background` cannot be passed to the awaited API and
+exposes no model-result future. `while_waiting()` scopes optional annotation
+work to an unanswered question.
 
-The request offers no provider model id, tools, or mutable transcript:
+`ThreadKey { extension, purpose, owner_scope }` identifies the owned
+conversation. `ThreadKey::new::<Extension>(purpose, owner_scope)` supplies the namespace
+and requires an explicit session or call scope.
+The caller supplies a `TurnKey` independently of the prompt, budget and
+route. Repeating that key reuses the committed result, even after restart
+or derived-index eviction. Concurrent consumers share admission and result.
+A different key explicitly authorizes a new response in the same thread.
 
-- `ModelRole::Session` resolves the session's settings, including its
-  `/model` override. `Fast` resolves `fast_model` in the workspace config,
-  then the home config, then the session model. Extensions choose intent;
-  configuration chooses a concrete provider and model.
-- `SideContext::None` exposes only the extension's messages.
-  `BeforeOwner` exposes the effective transcript strictly before the
-  owning call, including its system prompt and prior context edits.
-  The driver freezes this prefix when admitting the request. Later input
-  and edits cannot change an in-flight request.
-- The prompt and selected transcript are recorded separately in the
-  intent. Execution appends the prompt to that prefix, retaining the
-  provider encoding cache. Only normal extension outputs such as
-  `cx.edit` can change the main context.
+A thread has a normal conversation id and nested storage under its owner.
+Its frozen spawn authority uses the same registration intersection,
+settings, source-generation restoration, model role, routing and depth
+allowance as an agent child. No configuration selects runner semantics.
+Model-only runners have no tools, agent-loop hooks or recursive recovery
+handlers. A provider tool request cannot become executable work.
 
-A durable identity consists of the registering extension's name, purpose,
-and owning call id. `once_per_session()` removes the owner from that key;
-use it for session metadata. Reusing a key means asking for the same fact,
-even if the prompt or routing configuration has since changed. Distinct
-operations need distinct purposes. The namespace comes from the extension
-type, and registry installation already requires unique extension names.
-Concurrent consumers of one key share its intent and committed result.
+## Context and execution
 
-## Durability and recovery
+`ModelRole::Session`, `Fast` and extension-defined roles resolve through the
+admitted registry and settings. Thread admission freezes the concrete route;
+later settings or generation changes cannot widen it.
 
-The driver admits a request through the existing side-call kernel event.
-`ModelCall` records the owner, purpose, resolved model, and an opaque
-`request` payload encoded by the SDK: extension identity, role, context
-selection, prompt, frozen transcript, lifecycle, key scope, and budget.
-The intent crosses a durable admission barrier before the provider is
-polled, including when safe parent work starts before a shared flush.
-Duplicate consumers also share intents still awaiting that flush.
+`SideContext::None` supplies only the extension messages. `BeforeOwner`
+freezes the effective parent transcript strictly before the owning call.
+The selected transcript and extension messages stay separate in the turn
+payload, retaining rich messages and opaque provider state. Each new turn
+appends those messages after the thread's previous exchanges. Its inbox
+input is enqueued, deduplicated and taken durably before influencing a
+request. Concurrent new turns are processed in order, without merging or
+steering the active turn. Live and recovered context use the same reducer.
 
-`ModelResult` carries the side owner in its own `for` field, so its
-classification survives removal of the intent by compaction or other edits.
-The transcript excludes side results directly without retaining a table of
-intents. Forks copy this classification with the result. Skill publications
-follow a different rule: their identity is sealed with their context text,
-and compaction removes both from effective context. Reloading republishes
-the instructions from the recorded catalog, including in a fork after the
-source files vanish. Neither the catalog image nor side replies become
-model context merely by surviving in history. The result records the complete response and usage, or an outcome plus
-an optional structured `llm::Error` in `failure`. The LLM crate owns error
-decoding. The result crosses a barrier before the awaited consumer is
-released. Duplicate consumers are released by durable publication. A
-failed commit cannot acknowledge a result.
+The parent's side `ModelCall` records the thread identity, frozen authority
+and turn payload. `ModelResult.for` explicitly classifies the result as
+side work even if edits remove its intent. The child owns provider attempts
+and committed responses. Neither parent audit facts nor side replies become
+main model context; normal extension edits can change that context.
 
-Loading a completed request returns that fact without calling a provider.
-Loading an open request records `Outcome::Interrupted`: a process crash
-cannot tell whether the provider charged for or completed a request.
-Side calls therefore use the conservative, non-repeatable recovery class.
-The owning safe tool or gate can run again, but its side request receives
-the recorded interruption. No automatic recovery re-spends on an ambiguous
-attempt. An extension can explicitly request new work under a new key.
+## Durability, interruption and limits
 
-Known failures are different from an ambiguous crash. `ext-retry` provides
-`SideRetry` using the same retry classification, limits, provider delay,
-and capped jittered backoff as its main-request handler. Before another
-attempt, the driver commits a `SideRetry` decision containing the typed
-failure, next attempt number, and delay. All attempts use the same frozen
-request. Live failures, including attempts followed by a successful retry, also emit
-`ext-logging` provider classifications: session UUID, error kind, status, and
-retryability only. Cancellation and cached replay emit no provider failure.
-Provider messages, bodies, request IDs, prompts, and responses never enter
-daemon diagnostics.
+Admission commits before any provider is polled. Child model attempts and
+retry decisions also cross durable barriers. A consumer is released only
+after the parent result commits; failed commits cannot acknowledge success.
+Open parent requests and ambiguous child attempts recover as interrupted,
+including crashes during backoff. Recovery never repeats ambiguous spend.
+An extension may continue the thread under an explicit new key.
 
-Side retries do not enter the main `RequestError` handlers: an
-overflow while summarising cannot recursively start another compaction.
-A crash during backoff also records interruption instead of repeating.
+`SideRetry` owns retry classification and backoff. Known failures may retry
+with the same frozen input, after a committed decision. They do not enter
+main `RequestError` handlers, so an overflow while summarizing cannot
+recursively compact. Typed failures retain provider classifications without
+putting prompts, credentials or provider bodies in diagnostics.
 
-No new kernel effect is needed. Side events carry lifecycle facts; existing
-`Append`, `Commit`, `Reply`, `Side`, and `Cancel` effects provide durability
-and ownership. Routing, request construction, provider execution, limits,
-and retry policy remain outside the kernel. The additional retry event
-only commits a decision and acknowledges its barrier.
+Each owner admits at most four active side requests. Excess work receives
+a logged typed failure. Each turn has a positive output-token limit and a
+timeout covering inbox wait, provider attempts and backoff. Output tokens
+are capped per attempt; these allowances are not aggregate currency caps.
 
-## Limits, cancellation, and cost
+A successful owning call leaves background work running. Owner failure,
+explicit interruption, generation retirement and shutdown cancel outstanding
+work. Cancellation wins over late success. Dropping a consumer future does
+not abandon admitted work. A persistent thread can accept explicit new work
+after cancellation has drained its old inbox.
 
-Each session executes at most four side calls concurrently, counting
-backoffs against that limit. Excess requests get an intent and a logged
-`InvalidRequest` failure rather than an unbounded queue. A request has a
-positive output-token limit (`NonZeroU32`) and a
-wall-clock timeout covering provider execution, retries, and backoffs.
-The token cap applies per attempt; retries can spend more than one cap.
-This is not a currency or aggregate-token quota.
+## Extensions and protocol
 
-A side call has its own cancellation token registered when its intent is
-created, before that intent waits for durability. Admission consumes that
-same token; draining, cancellation, or a settled side call refuses admission
-without creating a replacement cancellation scope.
-Its owning call's cancellation stops awaited and background work; an
-explicit interrupt also cancels open side calls. A successful owner may
-finish before background work is admitted. Admission still checks its
-original generation and rejects work after an interrupt. That work remains registered with the
-session, so shutdown cancels it even after its owner is forgotten. Dropping
-a consumer future does not abandon an admitted request: the engine task
-still records its terminal result. Provider futures run through the same
-panic containment as main requests.
+Title's initial background turn uses the session-wide `initial` key.
+`/title` regenerates it; `/title <instructions>` supplies naming instructions.
+Each explicit command appends a turn keyed by its owning call. Client views
+show the latest successful title. No duplicate title fold is maintained.
 
-Clients already reduce purpose-labelled model calls to separate reply
-items, each with its own usage and status. The main transcript excludes
-these calls. The final provider response supplies usage; failed attempts
-without a usage response cannot be assigned a measured token cost.
-The log retains their typed failure and retry facts instead.
+Compaction and judge use session-scoped threads and owning-call turn keys.
+Compaction records its completion mark after its context edit. Approval
+descriptions retain call-scoped threads and question-scoped cancellation.
 
-## Extensions and fixtures
-
-Title requests `Fast` in the background with a session-wide key. There is
-no separate `titled` mark that can commit before its request. Re-observation
-or a later model call reuses the existing fact. It may complete after the
-main response without keeping that turn waiting. Open side calls alone
-do not make the session activity `Running`; the daemon still retains them
-as work to cancel and drain on shutdown.
-
-Compaction awaits `Session` with `BeforeOwner`, then writes the summary
-through its normal context edit. It records its completion mark after the
-edit, so a crash cannot leave a mark that suppresses an uncommitted edit.
-A repeated edit is harmless, and the summary's side-call key prevents a
-second model charge. Policy's judge awaits `Fast` with no transcript.
-
-`SideProvider` is the SDK's optional alternate transport. The fixtures
-extension supplies deterministic responses (`fixture <purpose>`), still
-behind the real intent/result barriers and cancellation. Release builds
-exclude this provider. Driver tests also replay the existing recorded
-provider cassettes through `Flaky`; no provider wire fixtures are invented
-or modified.
-
-The wire format adds request and typed-failure payloads and the side-retry
-verdict; its version lives in `protocol::PROTO`. Its wire corpus and shared
-view vectors are generated by their existing tests. There is no
-compatibility adapter for older logs.
+`SideProvider` is an optional test transport supplied by `ext-fixtures`.
+It runs inside the same model-only executor, inbox, barriers and cancellation
+as real providers; release builds exclude it. Tests reuse recorded provider
+cassettes without editing them. Protocol envelopes identify runner kind and
+thread ownership; the wire corpus and view vectors are generated by their
+tests under the new `protocol::PROTO`, without compatibility adapters.

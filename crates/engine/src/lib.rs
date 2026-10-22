@@ -726,26 +726,7 @@ impl Daemon {
         budget.timeout = budget
             .timeout
             .saturating_sub(admitted.admitted_at.elapsed().unwrap_or_default());
-        let live = if let Some(slot) = self.slot(header.id) {
-            self.live(&slot).await?
-        } else {
-            let slot = self.new_slot(header.clone())?;
-            let shared = Arc::clone(&self.shared);
-            let imported = header.clone();
-            let imported = rt::unblock(&*self.shared.rt, move || {
-                let entry = Entry::new(
-                    protocol::Seq::new(1).unwrap(),
-                    protocol::Epoch(0),
-                    Body::Spawned { intent },
-                );
-                shared.catalog.import(&*shared.store, &imported, &[entry])
-            })
-            .await;
-            if let Err(error) = imported {
-                return self.started(&slot, Err(error)).map(|_| ());
-            }
-            self.start(&slot, Open::Load).await?
-        };
+        let live = self.owned_conversation(header, intent, None).await?;
         if !live.has_input() {
             if let Some(env) = env {
                 live.set_env(env)?;
@@ -758,6 +739,61 @@ impl Daemon {
         }
         live.bound(budget);
         Ok(())
+    }
+
+    async fn owned_conversation(
+        &self,
+        header: Header,
+        intent: Json,
+        admitted: Option<Arc<ext::host::Registry>>,
+    ) -> io::Result<Arc<Live>> {
+        let (slot, fresh) = {
+            let admission = lock(&self.admission);
+            if !*admission {
+                return Err(io::Error::other("the daemon is shutting down"));
+            }
+            let mut slots = lock(&self.slots);
+            if let Some(slot) = slots.iter().find(|slot| slot.header.id == header.id) {
+                (Arc::clone(slot), false)
+            } else {
+                let slot = Slot::new(
+                    header.clone(),
+                    Residency::Loading {
+                        finished: Flag::default(),
+                        waiters: Vec::new(),
+                        last: fresh(&header),
+                    },
+                );
+                slots.push(Arc::clone(&slot));
+                (slot, true)
+            }
+        };
+        let live = if fresh {
+            let shared = Arc::clone(&self.shared);
+            let imported = header.clone();
+            let imported = rt::unblock(&*self.shared.rt, move || {
+                let entry = Entry::new(
+                    protocol::Seq::new(1).unwrap(),
+                    protocol::Epoch(0),
+                    Body::Spawned { intent },
+                );
+                shared.catalog.import(&*shared.store, &imported, &[entry])
+            })
+            .await;
+            if let Err(error) = imported {
+                return self.started(&slot, Err(error));
+            }
+            let shared = Arc::clone(&self.shared);
+            let loaded = rt::unblock(&*self.shared.rt, move || {
+                let owner = shared.owner(&header)?;
+                Live::start_in(&header, &shared, Open::Load, owner, admitted)
+            })
+            .await;
+            self.started(&slot, loaded)?
+        } else {
+            self.live(&slot).await?
+        };
+        Ok(live)
     }
 
     async fn deliver(&self, envelope: protocol::Envelope) -> Result<(), protocol::InboxRefusal> {

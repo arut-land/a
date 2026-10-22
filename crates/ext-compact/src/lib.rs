@@ -15,8 +15,8 @@
 
 use ext::point::{RequestError, Step};
 use ext::{
-    Answer, Args, Configured, Cx, Extension, Fold, Later, PointCx, Recover, Refused, Registrar,
-    Rewrite, Side, Table, Tool,
+    Answer, Args, Configured, Cx, Extension, Fold, Later, ModelTurn, PointCx, Recover, Refused,
+    Registrar, Rewrite, Table, Tool,
 };
 use protocol::{Audience, CallId, Seq};
 use serde::{Deserialize, Serialize};
@@ -133,8 +133,9 @@ fn estimate(request: &llm::Request) -> u64 {
 async fn compact(cx: &Cx, call: CallId) -> Result<String, String> {
     let models = cx.models().ok_or("this engine asks no model aside")?;
     let ask = [llm::Message::user(SUMMARY)].into_iter().collect();
-    let side = Side::new::<Compact>(
-        "compact",
+    let side = ModelTurn::new(
+        ext::ThreadKey::new::<Compact>("compact", ext::OwnerScope::Session),
+        ext::TurnKey(cx.call.get().to_string()),
         ext::ModelRole::Session,
         ext::SideContext::BeforeOwner,
         ask,

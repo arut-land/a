@@ -22,8 +22,9 @@ impl Extension for Aside {
             };
             Answer::Later(ext::Later::new(async move {
                 let models = cx.models()?;
-                let side = ext::Side::new::<Aside>(
-                    "test",
+                let side = ext::ModelTurn::new(
+                    ext::ThreadKey::new::<Aside>("test", ext::OwnerScope::Call(cx.call)),
+                    ext::TurnKey("initial".into()),
                     ext::ModelRole::Session,
                     ext::SideContext::None,
                     [llm::Message::user("Say hi.")].into_iter().collect(),
@@ -53,7 +54,7 @@ fn sides(log: &[Entry]) -> Vec<(CallId, u64, &str)> {
 /// with its reply; neither is the conversation's, and the call goes on as
 /// its handler said.
 #[test]
-fn a_side_call_is_logged_as_its_own_call() {
+fn side_threads_never_enter_the_main_transcript() {
     let http = Flaky::new([
         Reply::Status(429, &[]),
         Reply::Events(text_reply()),
@@ -313,12 +314,16 @@ impl Tool for Probe {
             );
             return Ok("edited".into());
         }
-        let side = ext::Side::new::<Probes>(
-            "probe",
+        let mut side = ext::ModelTurn::new(
+            ext::ThreadKey::new::<Probes>("probe", ext::OwnerScope::Call(cx.call)),
+            ext::TurnKey("initial".into()),
             ext::ModelRole::Session,
             ext::SideContext::None,
             [llm::Message::user("Say hi.")].into_iter().collect(),
         );
+        if args.args == "session" {
+            side.thread.owner_scope = ext::OwnerScope::Session;
+        }
         if args.args == "background" {
             let work = side.background().start(cx.clone()).work.unwrap();
             let completed = cx.service::<BackgroundCompletion>().map(|s| s.0.clone());
@@ -397,7 +402,7 @@ fn probes(http: &Arc<Flaky>, registry: Registry) -> Fixture {
 }
 
 #[test]
-fn replay_never_calls_a_side_model_again() {
+fn repeating_a_turn_key_never_calls_the_provider_again() {
     let http = Flaky::new([Reply::Events(text_reply())]);
     let session = probes(&http, Registry::default()).start(&[]);
     session.submit("1").unwrap();
@@ -426,15 +431,43 @@ fn replay_never_calls_a_side_model_again() {
 }
 
 #[test]
-fn crash_mid_side_call_recovers_as_interrupted_without_spending_again() {
+fn ambiguous_recovery_never_re_spends() {
     let http = Flaky::new([Reply::Hang(String::new())]);
     let session = probes(&http, Registry::default()).start(&[]);
     session.submit("1").unwrap();
     http.wait_sent(1);
     let prefix = log_of(&session);
+    let child = session
+        .1
+        .loaded()
+        .into_iter()
+        .find(|live| live.parent.is_some_and(|p| p.session == session.id))
+        .unwrap();
+    let child_header = Header {
+        id: child.id,
+        workspace: child.workspace.clone(),
+        parent: child.parent,
+    };
+    let child_prefix = log_of(&child);
     session.halt();
     let replay = Flaky::new([]);
-    let session = probes(&replay, Registry::default()).start(&prefix);
+    let recovered = probes(&replay, Registry::default());
+    recovered
+        .0
+        .store
+        .import(&child_header, &child_prefix)
+        .unwrap();
+    let child = Live::start(&child_header, &recovered.0, Open::Load, Owner::Present).unwrap();
+    settle(&child);
+    assert!(log_of(&child).iter().any(|e| matches!(
+        e.body,
+        Body::ModelResult {
+            outcome: Outcome::Interrupted { .. },
+            ..
+        }
+    )));
+    child.halt();
+    let session = recovered.start(&prefix);
     let log = log_of(&session);
     session.halt();
     assert_eq!(replay.sent(), 0);
@@ -499,8 +532,14 @@ fn retry_policy_applies_to_side_calls_without_reentering_compaction() {
     let log = log_of(&session);
     session.halt();
     assert_eq!(http.sent(), 2);
+    let executor = session
+        .1
+        .loaded()
+        .into_iter()
+        .find(|live| live.parent.is_some_and(|p| p.session == session.id))
+        .unwrap();
     let failures: Vec<_> = ext_logging::testing::pending().into_iter().filter(|fact| {
-        matches!(fact, ext_logging::Fact::ProviderError { session: id, .. } if *id == session.id)
+        matches!(fact, ext_logging::Fact::ProviderError { session: id, .. } if *id == executor.id)
     }).collect();
     assert!(
         matches!(
@@ -515,7 +554,8 @@ fn retry_policy_applies_to_side_calls_without_reentering_compaction() {
         "{failures:?}"
     );
     assert_eq!(sides(&log).len(), 1);
-    let failure = log
+    let executed = log_of(&executor);
+    let failure = executed
         .iter()
         .find_map(|e| match &e.body {
             Body::Decision {
@@ -653,17 +693,13 @@ fn a_fast_role_uses_config_and_logs_its_prompt_separately_from_context() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(intent["request"]["role"], "Fast");
+    assert_eq!(intent["turn"][0]["role"], "Fast");
     assert!(
-        !intent["request"]["messages"]
+        !intent["turn"][0]["messages"]
             .to_string()
             .contains("my distinct task")
     );
-    assert!(
-        intent["transcript"]
-            .to_string()
-            .contains("my distinct task")
-    );
+    assert!(intent["turn"][1].to_string().contains("my distinct task"));
     let view = SessionView::from_log(SessionId::new(), "/w".into(), &log);
     assert!(view.items.iter().any(|i| matches!(i,
         protocol::view::Item::Reply { purpose: Some(p), usage: Some(_), .. } if p == "title")));
@@ -675,7 +711,7 @@ struct FailResultCommit(Arc<crate::store::Faulty>);
 impl ext::SideProvider for FailResultCommit {
     fn reply<'a>(
         &'a self,
-        side: &'a ext::Side,
+        side: &'a ext::ModelTurn,
         messages: &'a llm::Messages,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
@@ -788,7 +824,7 @@ struct DelayedSide(Flag);
 impl ext::SideProvider for DelayedSide {
     fn reply<'a>(
         &'a self,
-        side: &'a ext::Side,
+        side: &'a ext::ModelTurn,
         messages: &'a llm::Messages,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
@@ -857,6 +893,7 @@ fn a_background_result_stays_out_of_context_after_its_intent_is_compacted() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn compacted_forks_keep_loaded_skills_in_context_and_background_results_out() {
     let home = std::env::temp_dir().join(format!("a-side-skills-{}", SessionId::new()));
     let workspace = home.join("ws");
@@ -892,7 +929,9 @@ fn compacted_forks_keep_loaded_skills_in_context_and_background_results_out() {
         workspace,
         ..Fixture::header()
     };
+    let slot = fixture.2.new_slot(header.clone()).unwrap();
     let session = Live::start(&header, &fixture.0, Open::Create, Owner::None).unwrap();
+    fixture.2.started(&slot, Ok(Arc::clone(&session))).unwrap();
     let load = |session: &Arc<Live>, expected: &str| {
         session.submit("/review").unwrap();
         settle(session);
@@ -1026,11 +1065,11 @@ struct HeldDescription {
 impl ext::SideProvider for HeldDescription {
     fn reply<'a>(
         &'a self,
-        side: &'a ext::Side,
+        side: &'a ext::ModelTurn,
         messages: &'a llm::Messages,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
-            assert_eq!(side.purpose, "approval-description");
+            assert_eq!(side.thread.purpose, "approval-description");
             assert!(matches!(side.role, ext::ModelRole::Fast));
             assert!(matches!(side.context, ext::SideContext::None));
             assert!(side.is_while_waiting());
@@ -1141,4 +1180,262 @@ impl Tool for ApprovalWork {
         self.0.wait().await;
         Ok("done".into())
     }
+}
+
+#[test]
+fn title_regeneration_appends_to_the_same_thread() {
+    let http = Flaky::new((0..4).map(|_| Reply::Events(text_reply())));
+    let fixture = fixture(Registry::default().with(&ext_title::Title).unwrap(), &http);
+    let session = fixture.start(&[]);
+    session.submit("my distinct task").unwrap();
+    until(&session, "initial title", |log| {
+        SessionView::from_log(session.id, "/w".into(), log)
+            .side("title")
+            .is_some()
+    });
+    settle(&session);
+    let initial = fixture
+        .2
+        .loaded()
+        .into_iter()
+        .find(|live| live.parent.is_some_and(|p| p.session == session.id))
+        .unwrap();
+    fixture.2.slot(initial.id).unwrap().unload();
+    rt::block_on(initial.ended.wait());
+    session.submit("/title").unwrap();
+    settle(&session);
+    session.submit("/title call it harbor work").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    let images: Vec<_> = log
+        .iter()
+        .filter_map(|e| match &e.body {
+            Body::ModelCall {
+                r#for: Some(_),
+                request: Some(request),
+                ..
+            } => Some(protocol::publication::ThreadImage::from_json(request).unwrap()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(images.len(), 3);
+    assert!(
+        images
+            .iter()
+            .all(|image| image.conversation == images[0].conversation)
+    );
+    let child = fixture
+        .2
+        .slot(images[0].conversation)
+        .unwrap()
+        .live()
+        .unwrap();
+    let log = log_of(&child);
+    assert_eq!(
+        log.iter()
+            .filter(|e| matches!(e.body, Body::Enqueue { .. }))
+            .count(),
+        3
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|e| matches!(
+                e.body,
+                Body::ModelResult {
+                    outcome: Outcome::Done { .. },
+                    ..
+                }
+            ))
+            .count(),
+        3
+    );
+    assert_eq!(http.sent(), 4);
+    session.halt();
+}
+
+struct TitleHistory(Arc<Mutex<Vec<llm::Messages>>>);
+impl ext::SideProvider for TitleHistory {
+    fn reply<'a>(
+        &'a self,
+        turn: &'a ext::ModelTurn,
+        messages: &'a llm::Messages,
+    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        lock(&self.0).push(messages.clone());
+        ext::SideProvider::reply(&ext_fixtures::Fixtures, turn, messages)
+    }
+}
+impl Extension for TitleHistory {
+    const NAME: &'static str = "title-history";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn ext::SideProvider>(Arc::new(Self(Arc::clone(&self.0))));
+    }
+}
+
+#[test]
+fn new_title_turn_sees_previous_exchanges() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::default()
+        .with(&ext_title::Title)
+        .unwrap()
+        .with(&TitleHistory(Arc::clone(&messages)))
+        .unwrap();
+    let session = fixture(registry, &http).start(&[]);
+    session.submit("my distinct task").unwrap();
+    until(&session, "initial title", |log| {
+        SessionView::from_log(session.id, "/w".into(), log)
+            .side("title")
+            .is_some()
+    });
+    settle(&session);
+    session.submit("/title use a shorter name").unwrap();
+    settle(&session);
+    let messages = lock(&messages);
+    assert_eq!(messages.len(), 2);
+    let regenerated = format!("{:?}", messages[1]);
+    assert!(
+        messages[1]
+            .iter()
+            .any(|m| matches!(m, llm::Message::Assistant(a) if a.text() == "fixture title")),
+        "{regenerated}"
+    );
+    assert!(regenerated.contains("my distinct task"), "{regenerated}");
+    assert!(regenerated.contains("use a shorter name"), "{regenerated}");
+    session.halt();
+}
+
+#[test]
+fn model_only_threads_offer_no_tools() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let session = probes(&http, Registry::default().with(&Harbor).unwrap()).start(&[]);
+    session.submit("1").unwrap();
+    settle(&session);
+    let bodies = http.bodies();
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0]
+            .get("tools")
+            .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)),
+        "{}",
+        bodies[0]
+    );
+    assert!(
+        !log_of(&session)
+            .iter()
+            .any(|e| matches!(&e.body, Body::ToolCall { tool, .. } if tool == HarborLabel::NAME))
+    );
+    session.halt();
+}
+
+#[test]
+fn successful_owner_completion_keeps_background_work_but_interrupt_cancels_it() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("background").unwrap();
+    http.wait_sent(1);
+    settle(&session);
+    let log = log_of(&session);
+    assert!(log.iter().any(|e| matches!(
+        e.body,
+        Body::ToolResult {
+            outcome: Outcome::Done { .. },
+            ..
+        }
+    )));
+    assert!(
+        !log.iter()
+            .any(|e| matches!(e.body, Body::ModelResult { .. }))
+    );
+    session.interrupt_now();
+    until(&session, "side cancelled", |log| {
+        log.iter().any(|e| {
+            matches!(
+                e.body,
+                Body::ModelResult {
+                    outcome: Outcome::Interrupted { .. },
+                    ..
+                }
+            )
+        })
+    });
+    assert_eq!(http.sent(), 1);
+    session.halt();
+}
+
+#[test]
+fn session_turn_keys_are_reused_across_distinct_owners() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    for _ in 0..2 {
+        session.submit("session").unwrap();
+        settle(&session);
+    }
+    let log = log_of(&session);
+    assert_eq!(http.sent(), 1);
+    assert_eq!(sides(&log).len(), 1);
+    assert_eq!(
+        log.iter()
+            .filter(|e| matches!(
+                e.body,
+                Body::ToolResult {
+                    outcome: Outcome::Done { .. },
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+    session.halt();
+}
+
+#[test]
+fn cancelled_queued_turns_never_reappear_after_restart() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("background").unwrap();
+    http.wait_sent(1);
+    let child = session
+        .1
+        .loaded()
+        .into_iter()
+        .find(|live| live.parent.is_some_and(|p| p.session == session.id))
+        .unwrap();
+    rt::block_on(child.enqueue(protocol::Envelope {
+        id: protocol::EnvelopeId {
+            sender: session.id,
+            call: CallId::new(999).unwrap(),
+            purpose: "queued".into(),
+        },
+        destination: child.id,
+        payload: "queued work".into(),
+    }))
+    .unwrap();
+    session.interrupt_now();
+    let prefix = until(&child, "queued work discarded", |log| {
+        log.iter()
+            .filter(|e| matches!(e.body, Body::Take { .. }))
+            .count()
+            == 2
+            && matches!(log.last().map(|e| &e.body), Some(Body::Interrupt { .. }))
+    });
+    let header = Header {
+        id: child.id,
+        workspace: child.workspace.clone(),
+        parent: child.parent,
+    };
+    session.halt();
+    let replay = Flaky::new([]);
+    let fixture = probes(&replay, Registry::default());
+    fixture.0.store.import(&header, &prefix).unwrap();
+    let recovered = Live::start(&header, &fixture.0, Open::Load, Owner::Present).unwrap();
+    settle(&recovered);
+    assert_eq!(replay.sent(), 0);
+    assert!(
+        !log_of(&recovered)
+            .iter()
+            .any(|e| e.seq.get() > prefix.last().unwrap().seq.get()
+                && matches!(e.body, Body::ModelCall { .. }))
+    );
+    recovered.halt();
 }

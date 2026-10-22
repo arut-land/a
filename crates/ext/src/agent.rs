@@ -111,3 +111,18 @@ pub trait AgentKind: Send + Sync + 'static {
     fn settings(_states: &mut crate::States) {}
     fn make() -> Box<dyn Agent>;
 }
+
+/// One response per inbox input; provider tool requests cannot become actions.
+pub struct ModelOnly;
+impl Agent for ModelOnly {
+    fn step(&mut self, input: Input, _: &dyn LoopPoints) -> Actions {
+        match input {
+            Input::User { .. } => [Action::CallModel {
+                choice: ToolChoice::None,
+            }]
+            .into_iter()
+            .collect(),
+            _ => Actions::new(),
+        }
+    }
+}
