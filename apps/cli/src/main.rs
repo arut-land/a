@@ -296,7 +296,7 @@ impl Repl {
     }
 
     fn link(&mut self) -> Option<io::Result<()>> {
-        match self.client.link().clone() {
+        match self.client.link() {
             Link::Replaying { .. } | Link::Live { .. } => {
                 self.live = true;
                 self.read_stdin();
@@ -306,7 +306,7 @@ impl Repl {
             }
             Link::Reconnecting { .. } => eprintln!("[daemon upgraded; reconnecting]"),
             Link::Wedged(d) => {
-                report(&d);
+                report(d);
                 if !io::stdin().is_terminal() {
                     return Some(Err(io::Error::new(io::ErrorKind::TimedOut, RESTART)));
                 }
@@ -320,7 +320,7 @@ impl Repl {
             Link::Ended(End::Lost(why)) if self.live => {
                 return Some(Err(io::Error::other(format!("daemon disconnected: {why}"))));
             }
-            Link::Ended(End::Lost(why)) => return Some(Err(why.into())),
+            Link::Ended(End::Lost(why)) => return Some(Err(why.clone().into())),
             Link::Connecting | Link::Draining => {}
         }
         None
