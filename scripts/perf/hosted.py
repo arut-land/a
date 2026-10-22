@@ -6,11 +6,13 @@ import json
 import os
 from pathlib import Path
 import platform
+import queue
 import shutil
 import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 from process import snapshot
@@ -22,7 +24,10 @@ SUFFIX = ".exe" if os.name == "nt" else ""
 
 def run(argv, **kwargs):
     print("+", argv, flush=True)
-    return subprocess.run(list(map(str, argv)), check=True, **kwargs)
+    argv = list(map(str, argv))
+    if argv[0] == "cargo" and "PERF_CARGO" in os.environ:
+        argv[0] = os.environ["PERF_CARGO"]
+    return subprocess.run(argv, check=True, **kwargs)
 
 
 def load_task(name):
@@ -87,8 +92,9 @@ def budgets(output, runs):
                 started = time.perf_counter()
                 client = subprocess.Popen([binary], env=env, cwd=home, stdin=subprocess.PIPE,
                                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                # The outer workflow timeout also bounds a missing first reply.
-                assert client.stdout.readline().startswith(b"[session")
+                first = queue.Queue()
+                threading.Thread(target=lambda: first.put(client.stdout.readline()), daemon=True).start()
+                assert first.get(timeout=60).startswith(b"[session")
                 cold.append((time.perf_counter() - started) * 1000)
                 pid = int((home / "run/daemon.pid").read_text().splitlines()[0])
                 time.sleep(3)
@@ -132,7 +138,9 @@ def summarize(output, source, variant, runner):
         data = json.loads(path.read_text())
         if isinstance(data, dict) and "results" in data:
             for index, result in enumerate(data["results"]):
-                key = path.stem + (f"-{index}" if len(data["results"]) > 1 else "")
+                key = (["startup", "process_floor"][index] if path.stem == "startup" else path.stem)
+                if len(data["results"]) > 1 and path.stem != "startup":
+                    key += f"-{index}"
                 for field, unit, scale in [("time_wall_clock", "ms", 1000), ("time_cpu", "cpu_ms", 1000),
                                            ("memory_peak_resident", "rss_kib", 1 / 1024)]:
                     values = [sample[field]["value"] * scale for sample in result["measurements"] if field in sample]
@@ -140,6 +148,9 @@ def summarize(output, source, variant, runner):
                         metrics[key + "_" + unit] = distribution(values)
         elif path.stem == "fresh-home-new":
             metrics["fresh_home_new_ms"] = distribution([x["wall_seconds"] * 1000 for x in data])
+    floor = metrics["process_floor_ms"]["median"]
+    metrics["cold_reply_over_floor_ms"] = distribution([
+        max(0, value - floor) for value in metrics["cold_reply_ms"]["samples"]])
     binary = (output / ("a" + SUFFIX)).read_bytes()
     assert b"Waits for a number of seconds." not in binary
     assert b"Edits a text file by exact replacement." in binary
@@ -149,7 +160,10 @@ def summarize(output, source, variant, runner):
                   revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
                   workflow_revision=os.environ.get("GITHUB_SHA"), variant=variant,
                   toolchain=subprocess.check_output(["rustc", "-vV"], text=True),
-                  idle_window_seconds=10, metrics=metrics)
+                  idle_window_seconds=10,
+                  cargo_config=(source / ".cargo/config.toml").read_text(),
+                  cargo_profiles=(source / ".cargo/profiles.toml").read_text(),
+                  metrics=metrics)
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     # Keep measurements even when a hard budget fails.
     failures = []

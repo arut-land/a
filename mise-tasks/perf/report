@@ -13,7 +13,7 @@ FIELDS = ("variant", "workload", "samples", "binary_bytes", "wall_ms", "cpu_ms",
 
 def loads(directory):
     path = directory / "load.jsonl"
-    return {record["label"]: record["load"][0]
+    return {record["label"]: (record["load"][0] if record["load"] else "")
             for record in map(json.loads, path.read_text().splitlines())} if path.exists() else {}
 
 
@@ -52,9 +52,10 @@ def main():
             if path.stem == "fresh-home-new":
                 if isinstance(data[0], dict):
                     values = dict(samples=len(data),
-                                  wall_ms=round(median(x["wall_seconds"] for x in data) * 1000, 6),
-                                  cpu_ms=round(median(x["cpu_seconds"] for x in data) * 1000, 6),
-                                  peak_rss_kib=median(x["peak_rss_kib"] for x in data))
+                                  wall_ms=round(median(x["wall_seconds"] for x in data) * 1000, 6))
+                    if all("cpu_seconds" in x for x in data):
+                        values["cpu_ms"] = round(median(x["cpu_seconds"] for x in data) * 1000, 6)
+                        values["peak_rss_kib"] = median(x["peak_rss_kib"] for x in data)
                 else:
                     values = dict(samples=len(data), wall_ms=round(median(data) * 1000, 6))
             else:

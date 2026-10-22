@@ -14,4 +14,4 @@ def snapshot(pid):
 
 if __name__ == "__main__":
     record = snapshot(int(sys.argv[1]))
-    print(record["rss_kib"] if len(sys.argv) > 2 else json.dumps(record))
+    print(int(record["rss_kib"]) if len(sys.argv) > 2 else json.dumps(record))

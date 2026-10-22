@@ -42,6 +42,8 @@ jobs:
     outputs:
       runners: ${{ steps.select.outputs.runners }}
     steps:
+      - uses: actions/checkout@v7
+      - run: python3 -m unittest discover -s scripts/perf -p 'test_*.py'
       - id: select
         env:
           SELECTED: ${{ inputs.runner || 'all' }}
@@ -96,9 +98,15 @@ jobs:
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src
       - uses: jdx/mise-action@v5
         with:
-          install_args: mr-boxington hyperfine ${{ runner.os == 'Linux' && 'mold' || '' }}
+          install_args: hyperfine ${{ matrix.runner != 'macos-15-intel' && 'mr-boxington' || '' }} ${{ runner.os == 'Linux' && 'mold' || '' }}
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
+      # mbx publishes no Intel macOS executable; cache Cargo's native build there.
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.runner == 'macos-15-intel'
+        with:
+          workspaces: measured -> target/perf-build
+          cache-all-crates: true
       - name: Install the same measurement harness into the source checkout
         run: |
           python - <<'PY'
@@ -109,7 +117,12 @@ jobs:
       - name: Build, then measure one variant
         env:
           PERF_VARIANT: ${{ inputs.variant || '{}' }}
-        run: mise exec -- python scripts/perf/hosted.py --source measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
+        run: |
+          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
+            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --source measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
+          else
+            mise exec -- python scripts/perf/hosted.py --source measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
+          fi
       - name: Compare with main
         if: always()
         env:

@@ -32,8 +32,8 @@ fn rss() -> u64 {
     String::from_utf8(out.stdout)
         .unwrap()
         .trim()
-        .parse::<f64>()
-        .unwrap() as u64
+        .parse()
+        .unwrap()
 }
 
 fn median(mut times: Vec<Duration>) -> Duration {
