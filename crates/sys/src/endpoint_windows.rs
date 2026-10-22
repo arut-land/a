@@ -741,8 +741,8 @@ mod tests {
         let mut server = accept(&listener.0).unwrap();
         stream_nonblocking(&server, true).unwrap();
         loop {
-            match server.write(&[0; 8192]) {
-                Ok(_) => {}
+            match server.write_all(&[0; 8192]) {
+                Ok(()) => {}
                 Err(error) => {
                     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
                     break;
