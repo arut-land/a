@@ -627,8 +627,7 @@ async fn supervise(
                 }
                 if !lingering {
                     // Exit can precede the final captured bytes reaching the file.
-                    child.ended().await;
-                    child.try_wait()?;
+                    child.output_drained().await?;
                 }
                 let rest = OUTPUT_CAP.saturating_sub(output.bytes()).min(READ);
                 follow(&mut file, &mut buf, rest, |chunk| output.push(chunk))?;

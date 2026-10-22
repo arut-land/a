@@ -56,6 +56,8 @@ pub trait RunningProcess: Send + Sync {
     fn alive(&self) -> bool;
     fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>>;
     fn wait(&self) -> BoxFuture<'_, std::io::Result<std::process::ExitStatus>>;
+    /// Captured stdout has reached its output file, independently of process reaping.
+    fn output_drained(&self) -> BoxFuture<'_, std::io::Result<()>>;
     fn ended(&self) -> BoxFuture<'_, ()>;
 }
 

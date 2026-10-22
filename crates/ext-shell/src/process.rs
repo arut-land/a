@@ -20,6 +20,8 @@ struct Live {
     group: Mutex<Option<sys::OwnedGroup>>,
     status: Mutex<Option<io::Result<ExitStatus>>>,
     exited: Flag,
+    copied: Flag,
+    captured: Mutex<Option<io::Result<()>>>,
     ended: Flag,
 }
 
@@ -57,6 +59,17 @@ impl RunningProcess for Live {
                 .ok_or_else(|| io::Error::other("missing process status"))
         })
     }
+    fn output_drained(&self) -> BoxFuture<'_, io::Result<()>> {
+        Box::pin(async {
+            self.copied.wait().await;
+            lock(&self.captured)
+                .as_ref()
+                .expect("capture completed")
+                .as_ref()
+                .copied()
+                .map_err(|e| io::Error::new(e.kind(), e.to_string()))
+        })
+    }
     fn ended(&self) -> BoxFuture<'_, ()> {
         Box::pin(self.ended.wait())
     }
@@ -78,6 +91,8 @@ impl Drop for Reap {
         // Also covers failed registration and a runtime dropping its task.
         lock(&self.1.group).take();
         self.complete();
+        lock(&self.1.captured).get_or_insert_with(|| Err(io::ErrorKind::Interrupted.into()));
+        self.1.copied.set();
         self.1.ended.set();
     }
 }
@@ -147,6 +162,8 @@ async fn launch(
                     group: Mutex::new(Some(group)),
                     status: Mutex::default(),
                     exited: Flag::default(),
+                    copied: Flag::default(),
+                    captured: Mutex::default(),
                     ended: Flag::default(),
                 });
                 Ok::<_, io::Error>((Reap(Some(child), live), pipes, capture))
@@ -202,10 +219,11 @@ async fn reap_output(
     cx: Cx,
 ) {
     let capturing = Arc::clone(&owned.1);
-    let copying = async {
-        if let Some(capture) = capture {
+    let copy_reactor = reactor.clone();
+    let copying = async move {
+        let result = if let Some(capture) = capture {
             let result = async {
-                let input = rt::Async::read_pipe(&reactor, capture.reader)?;
+                let input = rt::Async::read_pipe(&copy_reactor, capture.reader)?;
                 rt::capture_output(
                     cx.service::<dyn rt::Runtime>().unwrap(),
                     input,
@@ -221,7 +239,11 @@ async fn reap_output(
             result
         } else {
             Ok(())
-        }
+        };
+        // The call's admission must not live as long as detached descendants.
+        drop(cx);
+        *lock(&capturing.captured) = Some(result);
+        capturing.copied.set();
     };
     let reaping = async {
         let result = async {
@@ -239,10 +261,7 @@ async fn reap_output(
     };
     // Process completion includes every byte already accepted from stdout.
     // Retain containment until both capture and descendant observation end.
-    let (copied, _) = rt::zip(copying, reaping).await;
-    if let Err(error) = copied {
-        *lock(&owned.1.status) = Some(Err(error));
-    }
+    let _ = rt::zip(copying, reaping).await;
 }
 
 // A leader can exit first. Failed descendant watches must revoke containment.

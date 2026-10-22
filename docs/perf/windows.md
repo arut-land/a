@@ -57,7 +57,9 @@ Shell output enters an overlapped pipe, then rt copies bounded chunks to its
 spill file on storage workers and signals file-identity keyed follower events.
 NTFS directory notifications can wait until the writer closes, so they cannot
 provide live progress. A quiet process holds no copying worker and causes no
-polling; process completion also waits for the captured bytes. Unix retains
+polling. Shell output draining completes independently of descendant reaping,
+so a final output read cannot lose bytes or make cancellation wait for process
+cleanup. Unix retains
 direct file output and native file notifications. Shell directory reports
 canonicalize to the same extended paths as workspace discovery. Each shell enters an unnamed kill-on-close job through the
 process creation job-list attribute, before any shell code can create descendants. Only the
