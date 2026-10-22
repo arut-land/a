@@ -16,6 +16,7 @@ import threading
 import time
 
 from process import snapshot
+from stats import distribution
 
 ROOT = Path(__file__).resolve().parents[2]
 STD = ["-Zbuild-std=std,panic_unwind", "-Zbuild-std-features=panic-unwind,optimize_for_size"]
@@ -63,13 +64,6 @@ def windows_image(binary):
     dependencies = [line.strip() for line in headers.splitlines() if line.strip().lower().endswith(".dll")]
     assert dependencies, "dumpbin must report real PE imports"
     return dict(headers=headers, dependencies=dependencies)
-
-
-def distribution(samples):
-    samples = sorted(samples)
-    return dict(median=statistics.median(samples), min=min(samples), max=max(samples),
-                p10=samples[int((len(samples) - 1) * .1)],
-                p90=samples[int((len(samples) - 1) * .9)], samples=samples)
 
 
 def build(source, output, variant, benchmarks=True):

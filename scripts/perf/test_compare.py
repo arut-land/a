@@ -8,6 +8,7 @@ import os
 import sys
 
 from compare import compare
+from stats import distribution
 
 
 class Comparison(unittest.TestCase):
@@ -36,6 +37,12 @@ class Comparison(unittest.TestCase):
         self.assertGreater(result["peak_rss_kib"], 0)
         self.assertGreater(result["wall_seconds"], 0)
         self.assertGreaterEqual(result["cpu_seconds"], 0)
+
+    def test_five_sample_spreads_do_not_hide_a_single_cpu_tick(self):
+        sample = distribution([0, 0, 0, 0, 15.625])
+        self.assertEqual(sample["median"], 0)
+        self.assertEqual(sample["p90"], 15.625)
+        self.assertEqual(sample["max"], 15.625)
 
     def test_zero_cpu_still_reports_an_absolute_regression(self):
         value = compare(dict(median=15.625, p10=15.625, p90=15.625), dict(median=0, p10=0, p90=0))

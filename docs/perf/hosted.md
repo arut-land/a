@@ -72,12 +72,15 @@ five p99 estimates. Idle CPU zero means no increment at the OS counter's
 resolution, not a claim about instructions below that resolution.
 
 `result.json` preserves raw samples, median, min/max and p10/p90 for every
-axis. Each lane uploads its shipped binary, JSON, workload/load records and `summary.md` for
+axis. Spreads use nearest-rank percentiles, so a five-observation cohort's
+p10/p90 includes its min/max. Each lane uploads its shipped binary, JSON, workload/load records and `summary.md` for
 30 days, including measurements from budget failures. Its job summary shows
 the same table. Missing measurements stay absent.
 
 The comparison downloads the matching lane from the latest successful
-`main` perf run through the GitHub API. A missing main artifact is reported
+`main` perf run through the GitHub API. Build-only runs and dispatches with
+source or compiler overrides cannot become the automatic baseline. Statistics
+are recomputed from raw observations before comparison. A missing main artifact is reported
 explicitly. `baseline_run` selects a bootstrap run while the workflow is
 being introduced. Schemas and architectures must match. A delta no larger
 than either run's p10–p90 spread is labeled **within noise**; this conservative
