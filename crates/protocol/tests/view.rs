@@ -1317,13 +1317,12 @@ fn view_snapshots_preserve_skill_and_mcp_publications() {
 
 fn inherited_publications() -> Entry {
     let key = Json::encode(&"loaded-publication").unwrap();
-    let inherited = protocol::publication::ContextImage {
-        scopes: vec![protocol::publication::RunnerKind::Agent],
+    let inherited = vec![protocol::publication::ContextLayer {
+        runner: protocol::publication::RunnerKind::Agent,
         inputs: ["skills", "mcp-schemas"]
             .into_iter()
             .zip(1..)
             .map(|(namespace, seq)| protocol::publication::ContextInput {
-                scope: 0,
                 seq: Seq::new(seq).unwrap(),
                 value: protocol::publication::ContextValue::Context {
                     text: "execution context".into(),
@@ -1334,7 +1333,7 @@ fn inherited_publications() -> Entry {
                 },
             })
             .collect(),
-    };
+    }];
     Entry::new(
         Seq::new(1).unwrap(),
         Epoch(0),

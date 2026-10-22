@@ -51,7 +51,7 @@ fn envelope() -> protocol::Envelope {
 
 fn context_image() -> protocol::publication::ContextImage {
     use protocol::publication::{
-        ContextImage, ContextInput, ContextValue, Publication, RunnerKind,
+        ContextImage, ContextInput, ContextLayer, ContextValue, Publication, RunnerKind,
     };
     let values = [
         ContextValue::Inherited(1),
@@ -77,24 +77,27 @@ fn context_image() -> protocol::publication::ContextImage {
             outcome: Outcome::Interrupted { output: None },
         },
     ];
-    let mut inputs: Vec<_> = values
+    let inputs: Vec<_> = values
         .into_iter()
         .zip(1..)
         .map(|(value, seq)| ContextInput {
-            scope: 0,
             seq: Seq::new(seq).unwrap(),
             value,
         })
         .collect();
-    inputs.push(ContextInput {
-        scope: 1,
-        seq: Seq::new(1).unwrap(),
-        value: ContextValue::User("ancestor".into()),
-    });
-    ContextImage {
-        scopes: vec![RunnerKind::Agent, RunnerKind::ModelOnly],
-        inputs,
-    }
+    vec![
+        ContextLayer {
+            runner: RunnerKind::Agent,
+            inputs,
+        },
+        ContextLayer {
+            runner: RunnerKind::ModelOnly,
+            inputs: vec![ContextInput {
+                seq: Seq::new(1).unwrap(),
+                value: ContextValue::User("ancestor".into()),
+            }],
+        },
+    ]
 }
 
 fn client_samples() -> Vec<Sample<ClientMsg>> {

@@ -1663,7 +1663,7 @@ fn a_prefix_child_is_admitted_inside_its_unfinished_owning_turn() {
         panic!("{child:?}")
     };
     let image = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
-    assert!(image.image.inputs.iter().any(
+    assert!(image.image.iter().flat_map(|layer| &layer.inputs).any(
         |e| matches!(&e.value, protocol::publication::ContextValue::User(text) if text == "before")
     ));
     assert!(

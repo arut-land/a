@@ -13,8 +13,9 @@ pub struct Publication {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Publications(BTreeMap<u64, Vec<Publication>>);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunnerKind {
+    #[default]
     Agent,
     ModelOnly,
 }
@@ -28,15 +29,16 @@ pub struct SpawnImage {
 }
 
 /// Scope indices qualify local sequence numbers without nesting spawn envelopes.
+pub type ContextImage = Vec<ContextLayer>;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ContextImage {
-    pub scopes: Vec<RunnerKind>,
+pub struct ContextLayer {
+    pub runner: RunnerKind,
     pub inputs: Vec<ContextInput>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextInput {
-    pub scope: usize,
     pub seq: Seq,
     pub value: ContextValue,
 }
@@ -85,19 +87,20 @@ impl ThreadImage {
 impl SpawnImage {
     pub fn from_json(json: &Json) -> Result<Self, serde_json::Error> {
         let image: Self = json.parse()?;
-        let mut owners = vec![false; image.image.scopes.len()];
-        let mut positions = vec![0; owners.len()];
-        for input in &image.image.inputs {
-            let invalid = input.scope >= owners.len() || input.seq.get() <= positions[input.scope];
-            if invalid {
-                return Err(serde::de::Error::custom("invalid context position"));
-            }
-            positions[input.scope] = input.seq.get();
-            if let ContextValue::Inherited(child) = input.value {
-                if child <= input.scope || child >= owners.len() || owners[child] {
-                    return Err(serde::de::Error::custom("invalid inherited scope"));
+        let mut owners = vec![false; image.image.len()];
+        for (scope, layer) in image.image.iter().enumerate() {
+            let mut position = 0;
+            for input in &layer.inputs {
+                if input.seq.get() <= position {
+                    return Err(serde::de::Error::custom("invalid context position"));
                 }
-                owners[child] = true;
+                position = input.seq.get();
+                if let ContextValue::Inherited(child) = input.value {
+                    if child <= scope || child >= owners.len() || owners[child] {
+                        return Err(serde::de::Error::custom("invalid inherited scope"));
+                    }
+                    owners[child] = true;
+                }
             }
         }
         if owners.iter().skip(1).any(|owned| !owned) {
@@ -120,11 +123,11 @@ impl Publications {
                 entry.seq.get(),
                 image
                     .image
-                    .inputs
-                    .iter()
+                    .into_iter()
+                    .flat_map(|layer| layer.inputs)
                     .filter_map(|input| {
-                        if let ContextValue::Context { publication, .. } = &input.value {
-                            publication.clone()
+                        if let ContextValue::Context { publication, .. } = input.value {
+                            publication
                         } else {
                             None
                         }

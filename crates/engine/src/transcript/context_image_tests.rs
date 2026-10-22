@@ -88,8 +88,8 @@ fn a_prefix_projects_edits_and_publications_without_executable_ownership() {
     let image = context_image(&entries);
     assert!(
         image
-            .inputs
             .iter()
+            .flat_map(|layer| &layer.inputs)
             .all(|input| !matches!(input.value, ContextValue::ToolCall { .. }))
     );
     let registry = Arc::new(Registry::default());
@@ -212,11 +212,11 @@ fn pending_exchanges_never_become_child_work() {
 
 fn recursive_scope(image: &ContextImage, scope: usize, registry: &Arc<Registry>) -> Transcript {
     let mut transcript = Transcript::empty(registry.clone(), "");
-    let Some(runner) = image.scopes.get(scope) else {
+    let Some(layer) = image.get(scope) else {
         return transcript;
     };
-    transcript.model_only = *runner == RunnerKind::ModelOnly;
-    for input in image.inputs.iter().filter(|input| input.scope == scope) {
+    transcript.model_only = layer.runner == RunnerKind::ModelOnly;
+    for input in &layer.inputs {
         if let ContextValue::Inherited(child) = input.value {
             let messages = recursive_scope(image, child, registry).into_context();
             transcript.inherit(&messages, input.seq);
@@ -314,7 +314,7 @@ fn normalized_context_equals_recursive_projection() {
             expected
         );
         let image = context_image(&entries);
-        assert!(image.inputs.iter().all(
+        assert!(image.iter().flat_map(|layer| &layer.inputs).all(
             |input| !matches!(&input.value, ContextValue::Assistant(text) if text.is_empty())
         ));
         let child = entry(
@@ -507,15 +507,12 @@ fn identical_local_sequences_and_provider_ids_remain_in_their_scopes() {
         entries = child;
     }
     let image = context_image(&entries);
-    assert_eq!(image.scopes.len(), 3);
+    assert_eq!(image.len(), 3);
     assert_eq!(
         image
-            .inputs
             .iter()
-            .filter(|i| i.seq.get() == 3)
-            .map(|i| i.scope)
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
+            .filter(|layer| layer.inputs.iter().any(|i| i.seq.get() == 3))
+            .count(),
         3
     );
 }

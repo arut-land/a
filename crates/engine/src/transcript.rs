@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use ext::host::Registry;
 use llm::{Assistant, Message, Messages, ToolMessage, ToolResult};
-use protocol::publication::{ContextImage, ContextInput, ContextValue, RunnerKind};
+use protocol::publication::{ContextImage, ContextInput, ContextLayer, ContextValue, RunnerKind};
 use protocol::{Body, CallId, Entry, Outcome, Seq, Verdict};
 
 /// Provider replies remain intact; live updates and recovery share projection rules.
@@ -287,10 +287,7 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
             _ => None,
         })
         .collect();
-    let mut image = ContextImage {
-        scopes: vec![RunnerKind::Agent],
-        inputs: Vec::new(),
-    };
+    let mut image = vec![ContextLayer::default()];
     for e in entries {
         let value = if let Some((from, _, text)) = edits
             .iter()
@@ -305,25 +302,23 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
             };
             ContextValue::User(text.clone())
         } else if let Body::Spawned { intent } = &e.body {
-            let Ok(spawn) = protocol::publication::SpawnImage::from_json(intent) else {
+            let Ok(mut spawn) = protocol::publication::SpawnImage::from_json(intent) else {
                 continue;
             };
-            image.scopes[0] = spawn.runner;
-            let offset = image.scopes.len();
-            if spawn.image.scopes.is_empty() {
-                image.scopes.push(RunnerKind::Agent);
+            image[0].runner = spawn.runner;
+            let offset = image.len();
+            if spawn.image.is_empty() {
+                image.push(ContextLayer::default());
             } else {
-                image.scopes.extend(spawn.image.scopes);
-            }
-            image
-                .inputs
-                .extend(spawn.image.inputs.into_iter().map(|mut input| {
-                    input.scope += offset;
-                    if let ContextValue::Inherited(scope) = &mut input.value {
-                        *scope += offset;
+                for layer in &mut spawn.image {
+                    for input in &mut layer.inputs {
+                        if let ContextValue::Inherited(scope) = &mut input.value {
+                            *scope += offset;
+                        }
                     }
-                    input
-                }));
+                }
+                image.extend(spawn.image);
+            }
             ContextValue::Inherited(offset)
         } else {
             let Some(value) = context_fact(&e.body) else {
@@ -338,26 +333,18 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
             }
             value
         };
-        image.inputs.push(ContextInput {
-            scope: 0,
-            seq: e.seq,
-            value,
-        });
+        image[0].inputs.push(ContextInput { seq: e.seq, value });
     }
     image
 }
 
 fn project(image: ContextImage, registry: Arc<Registry>, system: &str) -> Transcript {
-    let mut layers: Vec<_> = image.scopes.iter().map(|_| Vec::new()).collect();
-    for input in image.inputs {
-        layers[input.scope].push(input);
-    }
     let mut inherited = HashMap::new();
-    for (scope, inputs) in layers.into_iter().enumerate().rev() {
+    for (scope, layer) in image.into_iter().enumerate().rev() {
         let mut transcript =
             Transcript::empty(Arc::clone(&registry), if scope == 0 { system } else { "" });
-        transcript.model_only = image.scopes[scope] == RunnerKind::ModelOnly;
-        for input in inputs {
+        transcript.model_only = layer.runner == RunnerKind::ModelOnly;
+        for input in layer.inputs {
             if let ContextValue::Inherited(child) = input.value {
                 transcript.inherit(
                     &inherited.remove(&child).expect("inherited scope reduced"),
