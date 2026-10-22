@@ -42,7 +42,8 @@ def main():
         workloads.load(output, "budgets:after")
     for package, filters in [
         ("engine", ["bench_loading_a_long_log", "bench_turns_under_each_barrier_setting",
-                    "bench_concurrent_session_commits", "bench_large_tool_result"]),
+                    "bench_concurrent_session_commits", "bench_large_tool_result",
+                    "concurrent_session_sizing"]),
         ("protocol", ["attach_to_a_logged_session"]),
         ("tui", ["render_cost"]),
     ]:
@@ -52,9 +53,13 @@ def main():
             binary = (build / (package + "-bench" + (".exe" if os.name == "nt" else ""))).resolve(strict=True)
             command = workloads.command([str(binary), name, "--ignored", "--nocapture", "--test-threads=1"])
             workloads.load(output, name + ":before")
-            subprocess.run(["hyperfine", "-N", "--warmup", "1", "-r", str(args.runs),
-                            "--metrics", "all", "--show-output", "--export-json",
-                            str(output / (name + ".json")), command], check=True, env=env)
+            result = subprocess.run(["hyperfine", "-N", "--warmup", "1", "-r", str(args.runs),
+                                     "--metrics", "all", "--show-output", "--export-json",
+                                     str(output / (name + ".json")), command], env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            (output / (name + "-output.json")).write_text(json.dumps({"output": result.stdout}))
+            print(result.stdout, flush=True)
+            result.check_returncode()
             if os.name == "nt":
                 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/perf"))
                 from process import measure_windows

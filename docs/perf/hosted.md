@@ -69,7 +69,10 @@ never addresses the user's default home.
 The CLI workload generates its transcript through the engine's encoder.
 The engine driver executes 100 recorded turns across the step/effects barrier
 settings; concurrency, 15,600-entry reload, large JSON, protocol codec/reducer
-and 6,000-item TUI rendering retain their existing workload definitions.
+and 6,000-item TUI rendering retain their existing workload definitions. The
+concurrent runtime sizing workload also measures 24 file-backed sessions with
+two, four and seven workers over six alternating rounds. Benchmark output,
+including the inner worker and latency observations, is retained in JSON.
 Blocking workers retire after ten seconds idle; CPU settling excludes this finite startup work. Process-level driver time includes setup and replay. Attach p99 is calculated
 from 500 samples per daemon; the report gives the median and spread of the
 five p99 estimates. Idle CPU zero means no increment at the OS counter's
