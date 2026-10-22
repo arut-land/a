@@ -172,7 +172,7 @@ async fn write_all(io: &Async<Stream>, mut bytes: &[u8]) -> io::Result<()> {
             n => bytes = &bytes[n..],
         }
     }
-    Ok(())
+    io.flush().await
 }
 
 /// Writes what `outbox` hands out until it closes, as many frames as are

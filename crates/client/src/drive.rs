@@ -640,6 +640,13 @@ impl AsyncTransport {
             Self::Pipe(io) => io.write_with(|mut io| io.write(bytes)).await,
         }
     }
+    #[allow(clippy::match_same_arms)]
+    async fn flush(&self) -> io::Result<()> {
+        match self {
+            Self::Local(io) => io.flush().await,
+            Self::Pipe(io) => io.flush().await,
+        }
+    }
 }
 
 struct AsyncConnection {
@@ -709,7 +716,7 @@ impl AsyncConnection {
             }
             remaining = &remaining[written..];
         }
-        Ok(())
+        self.writer.flush().await
     }
 
     async fn line(&self, buffered: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {

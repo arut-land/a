@@ -67,6 +67,11 @@ enum Inner<T: Source> {
         complete_write: fn(&T) -> io::Result<()>,
         io: T,
     },
+    #[cfg(test)]
+    FakeCompletion {
+        io: T,
+        complete_write: fn(&T) -> io::Result<()>,
+    },
     /// A handle that is signalled, as a process is when it exits.
     #[cfg(windows)]
     Signal(async_io::os::windows::Waitable<T>),
@@ -178,6 +183,8 @@ impl<T: Source> Async<T> {
     pub fn get_ref(&self) -> &T {
         match &self.0 {
             Inner::AsyncIo(io) => io.get_ref(),
+            #[cfg(test)]
+            Inner::FakeCompletion { io, .. } => io,
             #[cfg(windows)]
             Inner::Signal(handle) => handle.get_ref(),
             #[cfg(windows)]
@@ -207,14 +214,22 @@ impl<T: Source> Async<T> {
         self.retry(false, op).await
     }
 
-    /// As [`Async::read_with`], for writing.
+    /// Returns accepted bytes without a cancellation point after submission.
+    /// Use [`Async::flush`] to await completion of accepted writes.
     pub async fn write_with<R>(&self, op: impl FnMut(&T) -> io::Result<R>) -> io::Result<R> {
-        let result = self.retry(true, op).await?;
-        #[cfg(windows)]
-        if let Inner::Completion { complete_write, .. } = &self.0 {
-            self.retry(true, complete_write).await?;
-        }
-        Ok(result)
+        self.retry(true, op).await
+    }
+
+    /// Completes accepted writes without resubmitting their buffers.
+    pub async fn flush(&self) -> io::Result<()> {
+        self.retry(true, |_| match &self.0 {
+            #[cfg(windows)]
+            Inner::Completion { complete_write, .. } => complete_write(self.get_ref()),
+            #[cfg(test)]
+            Inner::FakeCompletion { complete_write, .. } => complete_write(self.get_ref()),
+            _ => Ok(()),
+        })
+        .await
     }
 
     async fn retry<R>(
@@ -241,6 +256,8 @@ impl<T: Source> Async<T> {
             // `poll_readable`, which takes a new one each poll: an
             // already-ready descriptor would race the reactor for it,
             // spinning both.
+            #[cfg(test)]
+            Inner::FakeCompletion { .. } => std::future::pending().await,
             Inner::AsyncIo(io) if write => io.writable().await,
             Inner::AsyncIo(io) => io.readable().await,
             #[cfg(windows)]
@@ -334,5 +351,101 @@ mod capture_tests {
             drop(watch);
         }
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod acknowledgement_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+
+    struct Submitted {
+        // Source's descriptor is unused: fake readiness never signals.
+        #[cfg(unix)]
+        descriptor: std::fs::File,
+        bytes: Mutex<Vec<u8>>,
+        completed: std::sync::atomic::AtomicBool,
+        blocked: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(unix)]
+    impl std::os::fd::AsFd for Submitted {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.descriptor.as_fd()
+        }
+    }
+
+    impl Write for &Submitted {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.blocked.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.completed.load(std::sync::atomic::Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+    }
+
+    fn submitted() -> Async<Submitted> {
+        Async(Inner::FakeCompletion {
+            io: Submitted {
+                #[cfg(unix)]
+                descriptor: std::fs::File::open(std::env::current_exe().unwrap()).unwrap(),
+                bytes: Mutex::new(Vec::new()),
+                completed: std::sync::atomic::AtomicBool::new(false),
+                blocked: std::sync::atomic::AtomicBool::new(true),
+            },
+            complete_write: |mut io| io.flush(),
+        })
+    }
+
+    #[test]
+    fn accepted_bytes_are_returned_before_cancellation_can_retry_them() {
+        let io = submitted();
+        let mut cancelled = Box::pin(io.write_with(|mut io| io.write(b"frame")));
+        assert!(
+            cancelled
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(cancelled);
+        assert!(io.get_ref().bytes.lock().unwrap().is_empty());
+        io.get_ref()
+            .blocked
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut write = Box::pin(io.write_with(|mut io| io.write(b"frame")));
+        let result = write.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        drop(write);
+        assert!(
+            matches!(result, Poll::Ready(Ok(5))),
+            "accepted bytes must be acknowledged in the submitting poll: {result:?}"
+        );
+        assert_eq!(*io.get_ref().bytes.lock().unwrap(), b"frame");
+        let mut flush = Box::pin(io.flush());
+        assert!(
+            flush
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(flush);
+        io.get_ref()
+            .completed
+            .store(true, std::sync::atomic::Ordering::Release);
+        crate::block_on(io.flush()).unwrap();
+        assert_eq!(
+            *io.get_ref().bytes.lock().unwrap(),
+            b"frame",
+            "retrying a cancelled flush must not submit the frame again"
+        );
     }
 }

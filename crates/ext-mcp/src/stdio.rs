@@ -135,6 +135,13 @@ impl Client {
             }
             remaining = &remaining[written..];
         }
+        self.child
+            .input
+            .as_ref()
+            .unwrap()
+            .flush()
+            .await
+            .map_err(|e| io(&e))?;
         let mut incoming = crate::incoming::Incoming::new(id);
         loop {
             let (value, bytes) = incoming.wait(cx, self.read()).await?;

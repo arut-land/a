@@ -65,6 +65,8 @@ pub trait ProcessPipe: Send + Sync {
     fn read<'a>(&'a self, bytes: &'a mut [u8]) -> BoxFuture<'a, std::io::Result<usize>>;
     fn write<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, std::io::Result<usize>>;
     fn try_write(&self, bytes: &[u8]) -> std::io::Result<usize>;
+    /// Completes accepted writes before the caller reports a flushed request.
+    fn flush(&self) -> BoxFuture<'_, std::io::Result<()>>;
 }
 
 pub struct OwnedProcess {

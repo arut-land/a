@@ -308,6 +308,9 @@ impl ext::ProcessPipe for Pipe {
     fn try_write(&self, bytes: &[u8]) -> io::Result<usize> {
         self.0.get_ref().write(bytes)
     }
+    fn flush(&self) -> BoxFuture<'_, io::Result<()>> {
+        Box::pin(self.0.flush())
+    }
 }
 
 #[cfg(test)]
