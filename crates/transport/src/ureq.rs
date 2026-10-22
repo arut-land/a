@@ -205,7 +205,7 @@ struct Abort(Mutex<Line>);
 
 #[derive(Default)]
 struct Line {
-    socket: Option<(u64, TcpStream)>,
+    socket: Option<(u64, Arc<TcpStream>)>,
     /// Whether the caller went away: a socket registered later is shut at
     /// once.
     abandoned: bool,
@@ -216,12 +216,14 @@ impl Abort {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn register(&self, id: u64, socket: &TcpStream) {
+    fn register(&self, id: u64, socket: &Arc<TcpStream>) {
         let mut line = self.line();
         if line.abandoned {
             let _ = socket.shutdown(Shutdown::Both);
         } else if line.socket.as_ref().is_none_or(|(at, _)| *at != id) {
-            line.socket = socket.try_clone().ok().map(|handle| (id, handle));
+            // Cancellation targets the same socket performing the blocking
+            // read, rather than a separately duplicated Winsock descriptor.
+            line.socket = Some((id, Arc::clone(socket)));
         }
     }
 
@@ -294,7 +296,7 @@ impl<In: Transport> Connector<In> for Tcp {
 
 struct Socket {
     id: u64,
-    stream: TcpStream,
+    stream: Arc<TcpStream>,
     buffers: LazyBuffers,
     read: Option<Duration>,
     write: Option<Duration>,
@@ -305,7 +307,7 @@ impl Socket {
         static IDS: AtomicU64 = AtomicU64::new(0);
         Self {
             id: IDS.fetch_add(1, Ordering::Relaxed),
-            stream,
+            stream: Arc::new(stream),
             buffers,
             read: None,
             write: None,
@@ -351,7 +353,7 @@ impl Transport for Socket {
         let stream = &self.stream;
         retime(timeout, &mut self.write, |t| stream.set_write_timeout(t))?;
         let output = &self.buffers.output()[..amount];
-        (&self.stream)
+        (&*self.stream)
             .write_all(output)
             .map_err(|e| expired(e, timeout))
     }
@@ -361,7 +363,7 @@ impl Transport for Socket {
         let stream = &self.stream;
         retime(timeout, &mut self.read, |t| stream.set_read_timeout(t))?;
         let input = self.buffers.input_append_buf();
-        let read = (&self.stream)
+        let read = (&*self.stream)
             .read(input)
             .map_err(|e| expired(e, timeout))?;
         self.buffers.input_appended(read);
@@ -372,7 +374,7 @@ impl Transport for Socket {
         let probe = || -> io::Result<bool> {
             self.stream.set_nonblocking(true)?;
             let open = matches!(
-                (&self.stream).read(&mut [0]),
+                (&*self.stream).read(&mut [0]),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock
             );
             self.stream.set_nonblocking(false)?;
