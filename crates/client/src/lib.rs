@@ -1062,7 +1062,7 @@ mod tests {
             let daemon = Record::current("1.2.3+0123456789abcdef");
             fs::write(home.daemon_pid_file(), daemon.to_string()).unwrap();
             let held = File::open(home.daemon_pid_file()).unwrap();
-            held.lock().unwrap();
+            sys::fs::lock(&held).unwrap();
             let listener = home.bind().unwrap();
             let (release, released) = std::sync::mpsc::channel();
             let peer = thread::spawn(move || {

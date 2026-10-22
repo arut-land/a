@@ -573,6 +573,19 @@ mod tests {
             std::env::temp_dir().join(format!("a-server-overload-{}", protocol::SessionId::new()));
         std::fs::create_dir_all(&root).unwrap();
         let home = sys::Home::from(root.clone());
+        std::fs::create_dir_all(home.run_dir()).unwrap();
+        let owner = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(home.daemon_pid_file())
+            .unwrap();
+        sys::fs::lock(&owner).unwrap();
+        Write::write_all(
+            &mut &owner,
+            sys::crash::Record::current("test").to_string().as_bytes(),
+        )
+        .unwrap();
         let listener = home.bind().unwrap();
         let peer = home.endpoint().connect().unwrap();
         let stream = listener.accept().unwrap();

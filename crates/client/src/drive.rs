@@ -848,6 +848,7 @@ mod tests {
         home: sys::Home,
         daemon: Daemon,
         listener: sys::Listener,
+        _owner: std::fs::File,
         root: std::path::PathBuf,
     }
 
@@ -859,11 +860,21 @@ mod tests {
             let exe = root.join("a");
             std::fs::write(&exe, "never run").unwrap();
             let staged = home.runtime().stage(&exe).unwrap();
+            std::fs::create_dir_all(home.run_dir()).unwrap();
+            let owner = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(home.daemon_pid_file())
+                .unwrap();
+            sys::fs::lock(&owner).unwrap();
+            write!(&owner, "{}", sys::crash::Record::current("test")).unwrap();
             let listener = home.bind().unwrap();
             Self {
                 daemon: Daemon::local(home.clone(), staged),
                 home,
                 listener,
+                _owner: owner,
                 root,
             }
         }
