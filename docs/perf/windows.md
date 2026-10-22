@@ -118,7 +118,7 @@ Cross-account denial and physical power-loss persistence require a suitable
 Windows host. Windows release size, idle RSS and latency budgets have not
 been measured on a quiet host.
 On the Apple silicon development host (2026-10-22), `mise run size` measured
-the shipped binary at 3,170 KiB against the 4,096 KiB cap, with fixture
+the shipped binary at 3,170 KiB, with fixture
 exclusion verified. This is an Apple measurement, not a Windows performance
 claim.
 

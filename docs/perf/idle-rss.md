@@ -182,7 +182,7 @@ satisfying the creation/replacement regression.
   passed**, 30 intentionally skipped.
 - `acceptance`: **23 passed**; `test:web`: **6 passed**; `apple:test`: **16 passed**.
 - `check:windows`, `check:no-tokio`, `machete`, `deny`: passed.
-- `mise run size`: **3,705 KiB before**, **3,721 KiB after**, below 4,096 KiB;
+- `mise run size`: **3,705 KiB before**, **3,721 KiB after**;
   fixture exclusion passes. The difference includes the intervening C08 and
   Apple main integration, not just this fix.
 
@@ -196,7 +196,7 @@ wake check. Security scanning remained active; no latency result is claimed
 to be a portable or noise-free bound. Every reported budget line:
 
 ```text
-a (fixtures): 3737 KiB of 4096 KiB
+a (fixtures): 3737 KiB
 cold start to first daemon reply: median 31.852ms, min 25.255208ms, max 41.898083ms; process floor 1.951083ms
 idle: daemon 9728 KiB RSS; terminal client 0ns of CPU in 3 s, 8464 KiB RSS
 attach with a 21-entry replay: min 119.375µs, p50 129.625µs, p95 143.083µs, p99 179.541µs
