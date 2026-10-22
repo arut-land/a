@@ -303,6 +303,15 @@ impl Cx {
             .or_else(|| self.services.get::<S>())
     }
 
+    /// Retains only service `S`, without the call's admission or authority.
+    pub fn service_arc<S: ?Sized + 'static>(&self) -> Option<Arc<S>> {
+        self.host
+            .registry()
+            .service_arc::<S>()
+            .or_else(|| self.services.get_arc::<S>())
+            .cloned()
+    }
+
     /// The call's session, as handlers at decision points see it.
     pub fn point(&self) -> PointCx<'_> {
         PointCx::new(self).about(self.call)

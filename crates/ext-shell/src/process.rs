@@ -206,7 +206,7 @@ async fn launch(
         watch,
         reactor,
         capture,
-        cx.clone(),
+        cx.service_arc::<dyn rt::Runtime>().expect("runtime"),
     )));
     Ok(OwnedProcess::new(live, input, output))
 }
@@ -216,7 +216,7 @@ async fn reap_output(
     watch: Option<rt::Async<sys::ExitWatch>>,
     reactor: rt::Reactor,
     capture: Option<sys::OutputCapture>,
-    cx: Cx,
+    runtime: rt::Rt,
 ) {
     let capturing = Arc::clone(&owned.1);
     let copy_reactor = reactor.clone();
@@ -224,13 +224,7 @@ async fn reap_output(
         let result = if let Some(capture) = capture {
             let result = async {
                 let input = rt::Async::read_pipe(&copy_reactor, capture.reader)?;
-                rt::capture_output(
-                    cx.service::<dyn rt::Runtime>().unwrap(),
-                    input,
-                    capture.file,
-                    sys::fs::output_written,
-                )
-                .await
+                rt::capture_output(&*runtime, input, capture.file, sys::fs::output_written).await
             }
             .await;
             if result.is_err() {
@@ -240,8 +234,6 @@ async fn reap_output(
         } else {
             Ok(())
         };
-        // The call's admission must not live as long as detached descendants.
-        drop(cx);
         *lock(&capturing.captured) = Some(result);
         capturing.copied.set();
     };
