@@ -203,18 +203,19 @@ Thread ids use the existing UUID crate's namespace derivation (`v5`, with
 its maintained `sha1_smol` backend), so an owner and thread key determine the
 id without storing a writable foreign conversation id in copied history.
 The measurements include that dependency; a second hash implementation is
-unnecessary. Admission also rejects an existing id owned by another session.
+unnecessary. The executing address is derived from the caller's session,
+never read from a copied record.
 
 The 1000-regeneration probe bounds the last request to fewer than 3100
 messages and child history to less than 2 MB. The child keeps 2002 own
 instruction/reply messages and no copies of the owner's original input.
 
-Production Rust grows by 213 lines during review, or 730 over main,
+Production Rust grows by 210 lines during review, or 727 over main,
 excluding test files and inline test modules. This exceeds the original
-500-line estimate by 230: the original implementation was 17 lines over,
-and review requires 213 additional lines. Those changes comprise engine
+500-line estimate by 227: the original implementation was 17 lines over,
+and review requires 210 additional lines. Those changes comprise engine
 ownership/recovery, per-turn projection and shared committed reply delivery
-(+177), typed SDK codecs (+81), generic kernel recovery (+10), and protocol
+(+174), typed SDK codecs (+81), generic kernel recovery (+10), and protocol
 ownership derivation (+5), offset by merging the message readers (-60).
 
 Files outside the original F01 manifest:

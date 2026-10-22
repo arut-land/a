@@ -1509,16 +1509,6 @@ fn forked_title_regeneration_never_writes_the_sources_thread() {
     branch.submit("/title fork title").unwrap();
     settle(&branch);
     let after = log_of(&child);
-    let claimed = Header {
-        id: child.id,
-        workspace: child.workspace.clone(),
-        parent: Some(Parent {
-            session: branch.id,
-            call: 1,
-        }),
-    };
-    assert!(rt::block_on(fixture.2.owned_conversation(claimed, Json::null(), None)).is_err());
-
     branch.halt();
     session.halt();
     assert_eq!(

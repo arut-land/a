@@ -754,9 +754,6 @@ impl Daemon {
             }
             let mut slots = lock(&self.slots);
             if let Some(slot) = slots.iter().find(|slot| slot.header.id == header.id) {
-                if slot.header.parent.map(|p| p.session) != header.parent.map(|p| p.session) {
-                    return Err(io::Error::other("conversation belongs to another owner"));
-                }
                 (Arc::clone(slot), false)
             } else {
                 let slot = Slot::new(
