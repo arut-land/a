@@ -17,7 +17,7 @@ macro_rules! say {
 
 macro_rules! errln {
     ($($arg:tt)*) => {
-        $crate::write(std::io::stderr().lock(), format_args!("{}\n", format_args!($($arg)*)))
+        $crate::write(std::io::stderr().lock(), 1, format_args!("{}\n", format_args!($($arg)*)))
     };
 }
 
@@ -92,12 +92,18 @@ const STDOUT_GONE: i32 = 141;
 /// -1`) ends `a` there, quietly, as SIGPIPE ends a C program; a session it
 /// was attached to goes on in the daemon.
 fn out(args: fmt::Arguments<'_>) {
-    write(io::stdout().lock(), args);
+    write(io::stdout().lock(), 0, args);
 }
 
-fn write(mut output: impl Write + IsTerminal, args: fmt::Arguments<'_>) {
+fn write(mut output: impl Write + IsTerminal, stream: usize, args: fmt::Arguments<'_>) {
+    static TERMINALS: std::sync::LazyLock<std::sync::Mutex<[client::Sanitizer; 2]>> =
+        std::sync::LazyLock::new(Default::default);
     let written = if output.is_terminal() {
-        write!(output, "{}", client::sanitize(&args.to_string()))
+        let text = TERMINALS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[stream]
+            .push(args.to_string().as_bytes());
+        output.write_all(text.as_bytes())
     } else {
         output.write_fmt(args)
     };

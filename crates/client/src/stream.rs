@@ -11,83 +11,154 @@ pub enum ReplyEvent<'a> {
 }
 
 #[derive(Default)]
-pub struct ReplyStream(HashMap<(Option<SessionId>, Seq), (usize, bool)>);
+pub struct ReplyStream {
+    session: Option<SessionId>,
+    settled: u64,
+    open: HashMap<(Seq, u16), String>,
+}
 
 impl ReplyStream {
     pub fn project<'a>(&mut self, view: &'a SessionView) -> Vec<ReplyEvent<'a>> {
         let mut events = Vec::new();
+        if self.session != view.session {
+            events.extend(self.open.drain().map(|_| ReplyEvent::End));
+            self.session = view.session;
+            self.settled = 0;
+        }
+        self.open.retain(|(seq, _), _| {
+            let present = view.items.iter().any(|item| item.key() == *seq);
+            if !present {
+                events.push(ReplyEvent::End);
+                self.settled = self.settled.max(seq.get());
+            }
+            present
+        });
         for item in &view.items {
-            if !matches!(item.present().kind, Kind::Reply | Kind::Assistant) {
+            if item.key().get() <= self.settled
+                || !matches!(item.present().kind, Kind::Reply | Kind::Assistant)
+            {
                 continue;
             }
+            let prior = self
+                .open
+                .keys()
+                .find(|(seq, _)| *seq == item.key())
+                .copied();
+            let live = view
+                .streaming
+                .as_ref()
+                .filter(|s| s.call.0 == item.key() && !item.settled());
             let text = match item {
-                Item::Reply { call, text, .. } if !item.settled() => view
-                    .streaming
-                    .as_ref()
-                    .filter(|s| s.call == *call)
-                    .map_or(text.as_str(), |s| s.text.as_str()),
-                Item::Reply { text, .. } | Item::Assistant { text, .. } => text,
+                Item::Reply { text, .. } | Item::Assistant { text, .. } => {
+                    live.map_or(text.as_str(), |s| s.text.as_str())
+                }
                 _ => continue,
             };
             if text.is_empty() && !item.settled() {
-                continue;
+                break;
             }
-            let (emitted, ended) = self.0.entry((view.session, item.key())).or_insert_with(|| {
-                events.push(ReplyEvent::Start);
-                (0, false)
-            });
-            if *ended {
-                continue;
-            }
-            if let Some(suffix) = text.get(*emitted..)
-                && !suffix.is_empty()
-            {
-                events.push(ReplyEvent::Text(suffix));
-                *emitted = text.len();
+            let attempt = live.map_or(prior.map_or(0, |(_, attempt)| attempt), |s| s.attempt);
+            let mut printed = prior
+                .and_then(|key| self.open.remove(&key))
+                .unwrap_or_else(|| {
+                    events.push(ReplyEvent::Start);
+                    String::new()
+                });
+            if let Some(suffix) = text.strip_prefix(printed.as_str()) {
+                if !suffix.is_empty() {
+                    events.push(ReplyEvent::Text(suffix));
+                    printed.push_str(suffix);
+                }
+            } else if !printed.starts_with(text) {
+                events.extend([ReplyEvent::End, ReplyEvent::Start, ReplyEvent::Text(text)]);
+                printed.clear();
+                printed.push_str(text);
             }
             if item.settled() {
                 events.push(ReplyEvent::End);
-                *ended = true;
+                self.settled = item.key().get();
+            } else {
+                self.open.insert((item.key(), attempt), printed);
+                // Preserve transcript order: an ended frontier cannot pass an open reply.
+                break;
             }
         }
         events
     }
 }
 
-/// `text` without terminal escapes or control characters (a command's
-/// colored output would otherwise drive the terminal), tabs as spaces.
-pub fn sanitize(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.chars().any(|c| c.is_control() && c != '\n') {
-        return text.into();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\n' => out.push('\n'),
-            '\t' => out.push_str("    "),
-            // CSI: parameters and intermediates, then one final byte.
-            '\x1b' if chars.peek() == Some(&'[') => {
-                chars.next();
-                for c in chars.by_ref() {
-                    if ('\x40'..='\x7e').contains(&c) {
-                        break;
+#[derive(Default)]
+enum Escape {
+    #[default]
+    Text,
+    Esc,
+    Csi,
+    Osc,
+    OscEsc,
+}
+
+#[derive(Default)]
+pub struct Sanitizer {
+    escape: Escape,
+    pending: Vec<u8>,
+}
+
+impl Sanitizer {
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.extend_from_slice(bytes);
+        let mut consumed = 0;
+        let mut out = String::with_capacity(pending.len());
+        while consumed < pending.len() {
+            let (text, invalid) = match std::str::from_utf8(&pending[consumed..]) {
+                Ok(text) => (text, None),
+                Err(error) => (
+                    std::str::from_utf8(&pending[consumed..consumed + error.valid_up_to()])
+                        .unwrap(),
+                    error.error_len(),
+                ),
+            };
+            for c in text.chars().chain(invalid.map(|_| '�')) {
+                self.escape = match (&self.escape, c) {
+                    (Escape::Text, '\x1b') => Escape::Esc,
+                    (Escape::Text | Escape::Esc, '\u{009b}') | (Escape::Esc, '[') => Escape::Csi,
+                    (Escape::Text | Escape::Esc, '\u{009d}') | (Escape::Esc, ']') => Escape::Osc,
+                    (Escape::Text, '\t') => {
+                        out.push_str("    ");
+                        Escape::Text
                     }
-                }
-            }
-            // OSC: up to BEL or ST.
-            '\x1b' if chars.peek() == Some(&']') => {
-                while let Some(c) = chars.next() {
-                    if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
-                        break;
+                    (Escape::Text, c) => {
+                        if c == '\n' || !c.is_control() {
+                            out.push(c);
+                        }
+                        Escape::Text
                     }
-                }
+                    (Escape::Esc, _) => Escape::Text,
+                    (Escape::Csi, '@'..='~') | (Escape::Osc, '\x07') | (Escape::OscEsc, '\\') => {
+                        Escape::Text
+                    }
+                    (Escape::Osc | Escape::OscEsc, '\x1b') => Escape::OscEsc,
+                    (Escape::OscEsc | Escape::Osc, _) => Escape::Osc,
+                    (Escape::Csi, _) => Escape::Csi,
+                };
             }
-            c if c.is_control() => {}
-            c => out.push(c),
+            consumed += text.len() + invalid.unwrap_or(0);
+            if invalid.is_none() {
+                break;
+            }
         }
+        self.pending.extend_from_slice(&pending[consumed..]);
+        out
     }
-    out.into()
+}
+
+/// One complete text value; terminal writers retain a [`Sanitizer`] across writes.
+pub fn sanitize(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().any(|c| c.is_control() && c != '\n') {
+        Sanitizer::default().push(text.as_bytes()).into()
+    } else {
+        text.into()
+    }
 }
 
 #[cfg(test)]
@@ -200,7 +271,6 @@ mod tests {
             [ReplyEvent::Text("lo"), ReplyEvent::End]
         );
         assert_eq!(stream.project(&view), []);
-        assert_eq!(stream.project(&view), []);
     }
     #[test]
     fn a_submission_recovered_before_its_first_delta_still_emits_its_reply() {
@@ -288,7 +358,14 @@ mod tests {
                 ReplyEvent::End
             ]
         );
-        assert_eq!(stream.project(&first), []);
+        assert_eq!(
+            stream.project(&first),
+            [
+                ReplyEvent::Start,
+                ReplyEvent::Text("first session"),
+                ReplyEvent::End
+            ]
+        );
     }
 
     #[test]
@@ -319,5 +396,160 @@ mod tests {
         assert_eq!(stream.project(&view), []);
         view.fold(&DaemonMsg::Snapshot(Box::new(snapshot)));
         assert_eq!(stream.project(&view), []);
+    }
+
+    #[test]
+    fn retry_replacement_cannot_drop_a_unicode_reply_at_an_old_byte_offset() {
+        for (first, replacement) in [("a", "é"), ("hello", "world"), ("é", "a")] {
+            let call = CallId::new(1).unwrap();
+            let mut view = reply(SessionId::new(), Status::Running, "");
+            let mut stream = ReplyStream::default();
+            view.fold(&DaemonMsg::Delta {
+                call,
+                text: first.into(),
+                attempt: 0,
+            });
+            assert_eq!(
+                stream.project(&view),
+                [ReplyEvent::Start, ReplyEvent::Text(first)]
+            );
+            view.fold(&DaemonMsg::Delta {
+                call,
+                text: replacement.into(),
+                attempt: 1,
+            });
+            assert_eq!(
+                stream.project(&view),
+                [
+                    ReplyEvent::End,
+                    ReplyEvent::Start,
+                    ReplyEvent::Text(replacement)
+                ]
+            );
+            assert_eq!(stream.project(&view), []);
+            assert!(stream.open.contains_key(&(call.0, 1)));
+            view.fold(&DaemonMsg::Snapshot(Box::new(
+                reply(view.session.unwrap(), Status::Done, replacement).snapshot(),
+            )));
+            assert_eq!(stream.project(&view), [ReplyEvent::End]);
+            assert_eq!(stream.project(&view), []);
+        }
+    }
+
+    #[test]
+    fn an_identical_retry_can_rebuild_its_prefix_without_duplicate_output() {
+        let call = CallId::new(1).unwrap();
+        let mut view = reply(SessionId::new(), Status::Running, "");
+        let mut stream = ReplyStream::default();
+        view.fold(&DaemonMsg::Delta {
+            call,
+            text: "héllo".into(),
+            attempt: 0,
+        });
+        assert_eq!(
+            stream.project(&view),
+            [ReplyEvent::Start, ReplyEvent::Text("héllo")]
+        );
+        for text in ["h", "é", "llo"] {
+            view.fold(&DaemonMsg::Delta {
+                call,
+                text: text.into(),
+                attempt: 1,
+            });
+            assert_eq!(stream.project(&view), []);
+        }
+        view.fold(&DaemonMsg::Snapshot(Box::new(
+            reply(view.session.unwrap(), Status::Done, "héllo").snapshot(),
+        )));
+        assert_eq!(stream.project(&view), [ReplyEvent::End]);
+    }
+
+    #[test]
+    fn split_escape_sequences_have_the_same_visible_output_as_unsplit() {
+        for raw in [
+            "\x1b[31mhéllo\x1b[0m",
+            "\x1b]0;hidden\x07héllo",
+            "\x1b]hidden\x1b\\世界\t!\n",
+        ] {
+            let expected = sanitize(raw);
+            for boundary in 0..=raw.len() {
+                let mut sanitizer = Sanitizer::default();
+                let actual = sanitizer.push(&raw.as_bytes()[..boundary])
+                    + &sanitizer.push(&raw.as_bytes()[boundary..]);
+                assert_eq!(actual, expected, "split at byte {boundary}");
+                assert_eq!(sanitizer.pending.len(), 0);
+            }
+            let mut sanitizer = Sanitizer::default();
+            let actual: String = raw
+                .as_bytes()
+                .iter()
+                .map(|byte| sanitizer.push(&[*byte]))
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn ended_replies_leave_only_a_frontier_and_departed_sessions_leave_no_state() {
+        let session = SessionId::new();
+        let mut stream = ReplyStream::default();
+        let mut view = reply(session, Status::Done, "done");
+        for seq in 1..=1000 {
+            let Item::Reply { call, .. } = &mut view.items[0] else {
+                unreachable!()
+            };
+            *call = CallId::new(seq).unwrap();
+            assert_eq!(
+                stream.project(&view),
+                [ReplyEvent::Start, ReplyEvent::Text("done"), ReplyEvent::End]
+            );
+            assert_eq!(stream.open.len(), 0);
+            assert_eq!(stream.settled, seq);
+        }
+        let Item::Reply { call, status, .. } = &mut view.items[0] else {
+            unreachable!()
+        };
+        *call = CallId::new(1001).unwrap();
+        *status = Status::Running;
+        assert_eq!(
+            stream.project(&view),
+            [ReplyEvent::Start, ReplyEvent::Text("done")]
+        );
+        assert_eq!(stream.open.len(), 1);
+        let mut departed = SessionView::default();
+        departed.session = Some(SessionId::new());
+        assert_eq!(stream.project(&departed), [ReplyEvent::End]);
+        assert_eq!(stream.open.len(), 0);
+        assert_eq!(stream.settled, 0);
+    }
+
+    #[test]
+    fn the_settled_frontier_never_passes_an_open_reply() {
+        let mut view = reply(SessionId::new(), Status::Running, "first");
+        view.items.push(Item::Assistant {
+            seq: Seq::new(2).unwrap(),
+            text: "second".into(),
+        });
+        let mut stream = ReplyStream::default();
+        assert_eq!(
+            stream.project(&view),
+            [ReplyEvent::Start, ReplyEvent::Text("first")]
+        );
+        assert_eq!(stream.settled, 0);
+        let Item::Reply { status, .. } = &mut view.items[0] else {
+            unreachable!()
+        };
+        *status = Status::Done;
+        assert_eq!(
+            stream.project(&view),
+            [
+                ReplyEvent::End,
+                ReplyEvent::Start,
+                ReplyEvent::Text("second"),
+                ReplyEvent::End
+            ]
+        );
+        assert_eq!(stream.open.len(), 0);
+        assert_eq!(stream.settled, 2);
     }
 }

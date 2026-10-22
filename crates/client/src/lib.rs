@@ -15,7 +15,7 @@ mod remote;
 mod session;
 mod stream;
 mod submission;
-pub use stream::{ReplyEvent, ReplyStream, sanitize};
+pub use stream::{ReplyEvent, ReplyStream, Sanitizer, sanitize};
 pub use submission::{Submission, SubmissionId, SubmissionState};
 mod watch;
 
