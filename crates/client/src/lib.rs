@@ -263,20 +263,15 @@ fn attaching(
     attach: &Attach,
     origin: impl FnOnce() -> io::Result<Environment>,
 ) -> io::Result<ClientMsg> {
-    let (workspace, env) = match &attach.env {
-        Env::Keep => (attach.workspace.clone().unwrap_or_default(), None),
-        Env::Origin => {
-            let env = origin()?;
-            (
-                attach.workspace.clone().unwrap_or_else(|| env.cwd.clone()),
-                Some(env),
-            )
-        }
-        Env::Given(env) => (
-            attach.workspace.clone().unwrap_or_else(|| env.cwd.clone()),
-            Some(env.clone()),
-        ),
+    let env = match &attach.env {
+        Env::Keep => None,
+        Env::Origin => Some(origin()?),
+        Env::Given(env) => Some(env.clone()),
     };
+    let workspace = attach
+        .workspace
+        .clone()
+        .unwrap_or_else(|| env.as_ref().map(|env| env.cwd.clone()).unwrap_or_default());
     Ok(ClientMsg::Attach {
         target: attach.target.clone(),
         workspace,
