@@ -1,1 +1,1 @@
-{"t":"entry","seq":1,"epoch":0,"kind":"spawned","intent":{"runner":"ModelOnly","authority":null,"image":{"scopes":[],"inputs":[]}}}
+{"t":"entry","seq":1,"epoch":0,"kind":"spawned","intent":["ModelOnly",null,[]]}

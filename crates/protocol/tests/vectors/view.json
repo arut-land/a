@@ -245,7 +245,7 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"epoch\":0,\"intent\":{\"authority\":\"execution authority\",\"image\":{\"inputs\":[{\"scope\":0,\"seq\":1,\"value\":{\"Context\":{\"publication\":{\"key\":\"loaded-publication\",\"namespace\":\"skills\"},\"text\":\"execution context\"}}},{\"scope\":0,\"seq\":2,\"value\":{\"Context\":{\"publication\":{\"key\":\"loaded-publication\",\"namespace\":\"mcp-schemas\"},\"text\":\"execution context\"}}}],\"scopes\":[\"Agent\"]},\"runner\":\"Agent\"},\"kind\":\"spawned\",\"seq\":1,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"intent\":[\"Agent\",\"execution authority\",[[\"Agent\",[[1,{\"Context\":[\"execution context\",{\"key\":\"loaded-publication\",\"namespace\":\"skills\"}]}],[2,{\"Context\":[\"execution context\",{\"key\":\"loaded-publication\",\"namespace\":\"mcp-schemas\"}]}]]]]],\"kind\":\"spawned\",\"seq\":1,\"t\":\"entry\"}",
       "{\"items\":[],\"seq\":1,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"publications\":{\"1\":[{\"key\":\"loaded-publication\",\"namespace\":\"skills\"},{\"key\":\"loaded-publication\",\"namespace\":\"mcp-schemas\"}]},\"queued\":[],\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"kind\":\"context\",\"publication\":{\"key\":\"later-publication\",\"namespace\":\"mcp-schemas\"},\"seq\":2,\"t\":\"entry\",\"text\":\"later schema\"}",
       "{\"seq\":2,\"t\":\"synced\"}"
@@ -259,43 +259,41 @@
       },
       {
         "epoch": 0,
-        "intent": {
-          "authority": "execution authority",
-          "image": {
-            "inputs": [
-              {
-                "scope": 0,
-                "seq": 1,
-                "value": {
-                  "Context": {
-                    "publication": {
-                      "key": "loaded-publication",
-                      "namespace": "skills"
-                    },
-                    "text": "execution context"
+        "intent": [
+          "Agent",
+          "execution authority",
+          [
+            [
+              "Agent",
+              [
+                [
+                  1,
+                  {
+                    "Context": [
+                      "execution context",
+                      {
+                        "key": "loaded-publication",
+                        "namespace": "skills"
+                      }
+                    ]
                   }
-                }
-              },
-              {
-                "scope": 0,
-                "seq": 2,
-                "value": {
-                  "Context": {
-                    "publication": {
-                      "key": "loaded-publication",
-                      "namespace": "mcp-schemas"
-                    },
-                    "text": "execution context"
+                ],
+                [
+                  2,
+                  {
+                    "Context": [
+                      "execution context",
+                      {
+                        "key": "loaded-publication",
+                        "namespace": "mcp-schemas"
+                      }
+                    ]
                   }
-                }
-              }
-            ],
-            "scopes": [
-              "Agent"
+                ]
+              ]
             ]
-          },
-          "runner": "Agent"
-        },
+          ]
+        ],
         "kind": "spawned",
         "seq": 1,
         "t": "entry"

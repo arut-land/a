@@ -264,7 +264,7 @@ fn context_edits(
         .collect()
 }
 
-/// Edits are resolved in their owning scope before inherited inputs are rebased.
+/// Edits stay in their owning layer; only inherited anchors are rebased.
 pub(crate) fn context_image(entries: &[Entry]) -> ContextImage {
     normalize(&entries.iter().collect::<Vec<_>>(), true)
 }

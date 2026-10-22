@@ -75,10 +75,10 @@ a tool fork its current context while its owning turn is unfinished. It is
 separate from the ordinary fork command's rest-point policy. Pending tool
 calls do not become executable work or unmatched provider tool exchanges in
 the child's context. The spawn envelope stores a flat typed `ContextImage`
-separately from frozen execution authority. Each input has a scope index and a
-local sequence number;
-inherited anchors reference other scopes, whose runner kinds preserve input
-interpretation. Scope indices are rebased when images are composed. No inherited
+separately from frozen execution authority. Flat typed layers own their inputs'
+sequence spaces and runner kinds; explicit anchors refer to other layers.
+Only anchor indices are rebased when images are composed. Positional records
+keep decoding in the protocol crate without field-map visitors. No inherited
 envelope or encoded ledger entry survives composition. These inputs are never
 installed in the child's executable log. Unfinished tool intents and queued
 inputs are excluded, and unmatched provider exchanges
