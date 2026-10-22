@@ -180,6 +180,7 @@ jobs:
       # Cranelift does not support it on Windows.
       CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
       NEXTEST_PROFILE: windows
+      A_TEST_PROCESS_TRACE: 1
     defaults:
       run:
         shell: bash

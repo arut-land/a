@@ -118,55 +118,65 @@ impl TestProcess {
     }
 
     pub fn collect(mut self, deadline: Instant) -> io::Result<Output> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(16);
         // Both readers start before waiting; either pipe can fill independently.
-        let mut streams = [Some(Vec::new()), Some(Vec::new())];
+        let mut streams = [Vec::new(), Vec::new()];
+        let mut eof = [true, true];
         for (index, reader) in std::mem::take(&mut self.readers).into_iter().enumerate() {
             let Some(mut reader) = reader else { continue };
-            streams[index] = None;
+            eof[index] = false;
             let tx = tx.clone();
             std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                let result = reader.read_to_end(&mut bytes);
-                let _ = tx.send((index, result.map(|_| bytes)));
+                let mut bytes = [0; 8192];
+                loop {
+                    let result = match reader.read(&mut bytes) {
+                        Ok(n) => Ok(bytes[..n].to_vec()),
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => Err(error),
+                    };
+                    let done = result.as_ref().map_or(true, Vec::is_empty);
+                    if tx.send((index, result)).is_err() || done {
+                        break;
+                    }
+                }
             });
         }
         drop(tx);
         loop {
             while let Ok((index, result)) = rx.try_recv() {
-                streams[index] = Some(result?);
+                let bytes = result?;
+                eof[index] = bytes.is_empty();
+                streams[index].extend(bytes);
             }
             let status = self.child.try_wait()?;
             if let Some(status) = status
-                && streams.iter().all(Option::is_some)
+                && eof.iter().all(|&eof| eof)
             {
                 let [stdout, stderr] = streams;
                 return Ok(Output {
                     status,
-                    stdout: stdout.unwrap(),
-                    stderr: stderr.unwrap(),
+                    stdout,
+                    stderr,
                 });
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "test process collection deadline: pid={} command={} status={status:?} stdout={} stderr={}",
+                        "test process collection deadline: pid={} command={} status={status:?} stdout={} stderr={}\nstdout tail: {}\nstderr tail: {}",
                         match &self.child {
                             Process::Piped(child) => child.id(),
                             Process::Contained(child) => child.id(),
                         },
                         self.command,
-                        if streams[0].is_some() {
-                            "eof"
-                        } else {
-                            "pending"
-                        },
-                        if streams[1].is_some() {
-                            "eof"
-                        } else {
-                            "pending"
-                        },
+                        if eof[0] { "eof" } else { "pending" },
+                        if eof[1] { "eof" } else { "pending" },
+                        String::from_utf8_lossy(
+                            &streams[0][streams[0].len().saturating_sub(4096)..]
+                        ),
+                        String::from_utf8_lossy(
+                            &streams[1][streams[1].len().saturating_sub(4096)..]
+                        ),
                     ),
                 ));
             }

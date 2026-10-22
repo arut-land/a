@@ -66,6 +66,11 @@ impl Runtime {
     /// copied again, so an older `a` that keeps being run
     /// costs a lookup, not a copy.
     pub fn stage(&self, exe: &Path) -> io::Result<Staged> {
+        let trace = std::env::var_os("A_TEST_PROCESS_TRACE").is_some();
+        let began = std::time::Instant::now();
+        if trace {
+            eprintln!("stage begin pid={}", std::process::id());
+        }
         let exe = fs::canonicalize(exe)?;
         let known = self.id_in_runtime(&exe).or_else(|| self.stamped(&exe));
         let id = match known {
@@ -83,6 +88,13 @@ impl Runtime {
         let exe = Some(self.dir.join(&id).join(EXE))
             .filter(|staged| staged.is_file())
             .unwrap_or(exe);
+        if trace {
+            eprintln!(
+                "stage end pid={} elapsed={:?}",
+                std::process::id(),
+                began.elapsed()
+            );
+        }
         Ok(Staged { id, exe })
     }
 
