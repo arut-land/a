@@ -11,16 +11,12 @@ on:
         type: choice
         options: [macos-latest, macos-15-intel]
         default: macos-latest
-      measure_refs:
-        description: 'JSON array of full commit SHAs to measure on Linux'
-        type: string
-        default: '[]'
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.macos_runner || 'macos-latest' }}-${{ inputs.measure_refs && inputs.measure_refs != '[]' && 'measurements' || 'validation' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.macos_runner || 'macos-latest' }}
   cancel-in-progress: true
 
 env:
@@ -105,12 +101,12 @@ jobs:
       - *mise
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
-      # Idle daemon RSS (10 MiB) and the size cap (4 MiB) are held exactly;
-      # cold start and attach latency too where strict, else with slack.
+      # Idle daemon RSS (10 MiB) is held exactly; cold start and attach
+      # latency too where strict, else with slack.
       - run: mise run budgets
       # The shipped binary's size as a number to compare: this run's against
-      # the last one on main, warned about past 16 KiB (the cap stays the
-      # gate). Apple silicon is the reference lane; the other skips the
+      # the last one on main, warned about past 16 KiB. Apple silicon is
+      # the reference lane; the other skips the
       # second release link.
       - if: runner.os == 'macOS'
         run: mise run size | grep -o 'a:.*KiB' | tee size.txt
@@ -248,32 +244,3 @@ jobs:
           install_args: rust ${{ (runner.os != 'macOS' || runner.arch != 'X64') && 'mr-boxington' || '' }} github:boltffi/boltffi aqua:yonaskolb/XcodeGen
       - run: mise run apple:test
       - run: mise run apple:build
-
-  measurements:
-    if: github.event_name == 'workflow_dispatch' && inputs.measure_refs != '[]'
-    strategy:
-      fail-fast: false
-      matrix:
-        revision: ${{ fromJSON(inputs.measure_refs) }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ matrix.revision }}
-      - *mbx-dir
-      - *cache
-      - *mise
-      - run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
-      - run: mise run size
-      - name: Record exact shipped bytes and source lines
-        shell: bash
-        run: |
-          revision=$(git rev-parse HEAD)
-          bytes=$(wc -c < target/release/a | tr -d ' ')
-          lines=$(git ls-files '*.rs' | xargs cat | wc -l | tr -d ' ')
-          echo "$revision,$lines,$bytes" | tee measurement.csv
-          echo "Revision: $revision; Rust lines: $lines; shipped bytes: $bytes" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v5
-        with:
-          name: measurement-${{ matrix.revision }}
-          path: measurement.csv

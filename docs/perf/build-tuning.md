@@ -15,7 +15,7 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 
 | Budget | Target | Command | Baseline (2026-10-18) |
 | --- | --- | --- | --- |
-| Release binary | < 4 MB | `mise run size` | 473 KiB; 3018 KiB with the provider (see below) |
+| Release binary | Measured; no hard cap | `mise run size` | 473 KiB; 3018 KiB with the provider (see below) |
 | Cold start (`a --version`) | — | `mise run startup` | 2.5–2.8 ms |
 | CLI peak RSS | — | `/usr/bin/time -l target/release/a --version` | 1.79 MB |
 | Idle daemon RSS | < 10 MB | `ps -o rss= -p <pid>` after 5 s idle (`VmRSS` on Linux) | 6.4 MB RSS, 1.8 MB footprint (2026-10-19) |

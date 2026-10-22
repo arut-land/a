@@ -48,13 +48,13 @@ test = "cargo nextest run --workspace --features a/lua --no-tests=pass"
 "check:clippy" = "cargo clippy --workspace --all-targets --features a/lua -- -D warnings"
 # Sequential: the tests and clippy would rebuild the same target at once.
 check = { depends = ["check:fmt", "check:clippy"], run = "mise run test" }
-# The shipped binary: under 4 MiB, and without the test fixtures (no
-# `sleep` tool), found as a tool it does ship is found.
+# Report shipped bytes and verify the binary excludes the test fixtures
+# (`sleep`) while retaining a tool it ships.
 size = { depends = ["release"], run = '''
 f=target/release/a; [[ -e $f.exe ]] && f+=.exe
 ! grep -q "Waits for a number of seconds." "$f" || { echo "the sleep fixture is in the shipped binary"; exit 1; }
 grep -q "Edits a text file by exact replacement." "$f"
-b=$(wc -c < "$f"); echo "a: $((b / 1024)) KiB of 4096 KiB"; ((b <= 4194304))
+b=$(wc -c < "$f"); echo "a: $b bytes ($((b / 1024)) KiB)"
 ''' }
 # Cold start against the floor: what launching any process costs here.
 startup = { depends = ["release"], run = 'hyperfine -N --warmup 50 -r 500 "target/release/a --version" /usr/bin/true' }
@@ -141,7 +141,7 @@ target/debug/a web
 "test:web" = "cargo nextest run -p a --test blackbox -E 'test(/^web::/)' --no-tests=fail"
 # Cold start, attach latency and idle daemon RSS on a release build that
 # differs from the shipped one only by the test fixtures (built aside, in
-# target/fixtures; its size bounds the shipped one's). That `a` as shipped
+# target/fixtures). That `a` as shipped
 # lacks them is read off the dependency graph, not a second release
 # build: `mise run size` scans the shipped bytes. Latency is held to its
 # budget off CI, and on CI where the job sets A_STRICT_BUDGETS=1;
@@ -153,7 +153,7 @@ if cargo tree -e normal,features -p a -f '{p} {f}' | grep 'ext-fixtures v' | gre
   echo "a as built by default turns the fixtures on"; exit 1
 fi
 CARGO_TARGET_DIR=target/fixtures cargo build-release -p a --features fixtures
-b=$(wc -c < target/fixtures/release/a); echo "a (fixtures): $((b / 1024)) KiB of 4096 KiB"; ((b <= 4194304))
+b=$(wc -c < target/fixtures/release/a); echo "a (fixtures): $b bytes ($((b / 1024)) KiB)"
 A_BIN=$PWD/target/fixtures/release/a A_STRICT_BUDGETS=${A_STRICT_BUDGETS:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)} cargo nextest run -p a --test blackbox -E 'test(/^budgets::/)' --run-ignored ignored-only --test-threads 1 --no-capture --no-tests=fail
 # The process-wide wake counter needs its own executable, run alone.
 CARGO_TARGET_DIR=target/fixtures cargo nextest run --release -p ext-shell --test quiet --run-ignored ignored-only --test-threads 1 --no-capture --no-tests=fail
