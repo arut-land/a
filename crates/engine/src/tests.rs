@@ -2195,7 +2195,7 @@ mod inheritance {
                 panic!("missing spawn authority")
             };
             let frozen = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
-            if frozen.request.owner == Kinds::NAME {
+            if frozen.request.owner() == Kinds::NAME {
                 assert_eq!(frozen.model, "test:kind");
                 let mut states = registry(&config).unwrap().states();
                 states.restore_settings(&frozen.settings).unwrap();
@@ -2253,7 +2253,7 @@ mod inheritance {
                         .any(|name| name == ext_compact::Compact::NAME)
                 );
             }
-            if frozen.request.owner == Kinds::NAME {
+            if frozen.request.owner() == Kinds::NAME {
                 assert_eq!(
                     frozen.model,
                     if frozen.request.runner.agent() == Some(Fresh::NAME) {

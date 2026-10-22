@@ -508,7 +508,7 @@ impl Actor {
                 let spawn = spawn.as_ref().expect("model-only authority");
                 let mut turn = ext::ModelTurn::new::<ext::ModelOnly>(
                     ext::ThreadKey {
-                        extension: spawn.request.owner.clone(),
+                        extension: spawn.request.owner().into(),
                         purpose: spawn.request.purpose.clone(),
                         owner_scope: ext::OwnerScope::Session,
                     },

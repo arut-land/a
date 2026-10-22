@@ -12,7 +12,7 @@ pub(crate) struct SpawnIntent {
     pub awaited: bool,
     pub admitted_at: std::time::SystemTime,
     pub call: CallId,
-    pub request: SpawnAuthority,
+    pub request: ext::Spawn,
     pub model: String,
     pub routing: Result<crate::model::FrozenRoute, String>,
     pub installed: Vec<protocol::Installed>,
@@ -20,35 +20,6 @@ pub(crate) struct SpawnIntent {
     pub extensions: Vec<String>,
     pub settings: ext::Checkpoint,
     pub refusal: Option<SpawnRefusal>,
-}
-
-/// The admitted authority needs no request codec or unresolved runner machinery.
-#[derive(Clone)]
-pub(crate) struct SpawnAuthority {
-    pub owner: String,
-    pub purpose: String,
-    pub prompt: String,
-    pub prefix: Option<(SessionId, protocol::Seq)>,
-    pub runner: ext::Runner,
-    pub depth: DepthBudget,
-    pub budget: ext::Budget,
-}
-
-impl From<ext::Spawn> for SpawnAuthority {
-    fn from(request: ext::Spawn) -> Self {
-        Self {
-            owner: request.owner().into(),
-            purpose: request.purpose,
-            prompt: request.prompt,
-            prefix: match request.context {
-                ext::ContextSource::Fresh => None,
-                ext::ContextSource::Prefix { session, seq } => Some((session, seq)),
-            },
-            runner: request.runner,
-            depth: request.depth,
-            budget: request.budget,
-        }
-    }
 }
 
 impl SpawnIntent {
@@ -63,15 +34,7 @@ impl SpawnIntent {
                 self.awaited,
                 self.admitted_at,
                 self.call,
-                (
-                    self.request.owner,
-                    self.request.purpose,
-                    self.request.prompt,
-                    self.request.prefix,
-                    self.request.runner,
-                    self.request.depth,
-                    self.request.budget,
-                ),
+                self.request.to_json()?,
                 self.model,
                 self.routing,
                 self.installed,
@@ -90,7 +53,7 @@ impl SpawnIntent {
             awaited,
             admitted_at,
             call,
-            (owner, purpose, prompt, prefix, runner, depth, budget),
+            request,
             model,
             routing,
             installed,
@@ -102,15 +65,7 @@ impl SpawnIntent {
             awaited,
             admitted_at,
             call,
-            request: SpawnAuthority {
-                owner,
-                purpose,
-                prompt,
-                prefix,
-                runner,
-                depth,
-                budget,
-            },
+            request: ext::Spawn::from_json(&request)?,
             model,
             routing,
             installed,
@@ -234,7 +189,7 @@ impl Actor {
             .find(|link| {
                 SpawnIntent::from_json(&link.intent).is_ok_and(|i| {
                     i.call == call
-                        && i.request.owner == request.owner()
+                        && i.request.owner() == request.owner()
                         && i.request.purpose == request.purpose
                 })
             })
@@ -374,7 +329,7 @@ impl Actor {
             awaited,
             admitted_at: std::time::SystemTime::now(),
             call,
-            request: request.into(),
+            request,
             model,
             routing,
             installed,

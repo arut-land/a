@@ -107,7 +107,7 @@ impl Runner {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Spawn {
     owner: String,
     pub purpose: String,
@@ -119,6 +119,31 @@ pub struct Spawn {
 }
 
 impl Spawn {
+    pub fn to_json(&self) -> serde_json::Result<protocol::Json> {
+        protocol::Json::encode(&(
+            &self.owner,
+            &self.purpose,
+            &self.prompt,
+            &self.context,
+            &self.runner,
+            self.depth,
+            self.budget,
+        ))
+    }
+
+    pub fn from_json(json: &protocol::Json) -> serde_json::Result<Self> {
+        let (owner, purpose, prompt, context, runner, depth, budget) = json.parse()?;
+        Ok(Self {
+            owner,
+            purpose,
+            prompt,
+            context,
+            runner,
+            depth,
+            budget,
+        })
+    }
+
     pub fn new<E: Extension>(
         purpose: &str,
         prompt: String,
