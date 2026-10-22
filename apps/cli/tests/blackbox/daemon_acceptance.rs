@@ -166,6 +166,7 @@ fn timeout_reaps_only_the_test_process_tree() {
         let mut command = Command::new(sys::find_bash(None).unwrap());
         command
             .args(["-c", "sleep 600 & echo ready; wait"])
+            .envs(std::env::vars_os())
             .env("A_HOME", env.home.root());
         command
     };
