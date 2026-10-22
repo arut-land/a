@@ -88,6 +88,13 @@ Idle RSS must remain below 10,240 KiB and idle CPU must have no counter
 increment. The existing CI's strict Linux latency, terminal first-paint,
 PTY-client idle and quiet-shell wake gates remain separate validation.
 
+For tuning, `paired_ref` additionally builds a reference revision on the same
+runner. Five alternating AB/BA rounds measure startup, cold reply, attach,
+idle RSS/CPU, driver turns and large JSON. Each role uses fresh isolated
+homes. All builds finish before these paired windows. Both raw observations
+and `paired.json` remain in the artifact, with a second summary table. Use
+this comparison when different hosted CPUs or storage obscure a small change.
+
 ## Reproduce
 
 Use separate `perf/<name>` branches for single-variable source/config changes.
@@ -101,6 +108,8 @@ gh workflow run perf.yml -R arut-land/a --ref codex-ciperf \
 gh workflow run perf.yml -R arut-land/a --ref codex-ciperf -f source_ref=main
 # With a successful bootstrap artifact, compare a final run to that run ID:
 gh workflow run perf.yml -R arut-land/a --ref codex-ciperf -f baseline_run=RUN_ID
+gh workflow run perf.yml -R arut-land/a --ref perf/x86-v2 \
+  -f runner=ubuntu-latest -f paired_ref=BASE_REVISION
 gh run view RUN_ID -R arut-land/a --log-failed
 gh run download RUN_ID -R arut-land/a -n perf-ubuntu-latest
 ```

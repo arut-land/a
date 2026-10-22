@@ -17,6 +17,10 @@ on:
         description: 'Source revision (empty uses this workflow revision); main bootstraps a baseline'
         default: ''
         type: string
+      paired_ref:
+        description: 'Optional reference source revision for interleaved same-runner tuning'
+        default: ''
+        type: string
       baseline_run:
         description: 'Optional bootstrap baseline run ID; otherwise latest successful main'
         default: ''
@@ -27,7 +31,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: perf-${{ github.ref }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.variant || '{}' }}
+  group: perf-${{ github.ref }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.variant || '{}' }}
   cancel-in-progress: false
 
 env:
@@ -125,11 +129,12 @@ jobs:
       - name: Build, then measure one variant
         env:
           PERF_VARIANT: ${{ inputs.variant || '{}' }}
+          PAIRED_REF: ${{ inputs.paired_ref }}
         run: |
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
-            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
+            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PAIRED_REF"
           else
-            mise exec -- python scripts/perf/hosted.py --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
+            mise exec -- python scripts/perf/hosted.py --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PAIRED_REF"
           fi
       - name: Compare with main
         if: always()

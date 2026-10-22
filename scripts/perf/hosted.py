@@ -78,11 +78,11 @@ def build(source, output, variant):
     run(["rustc", ROOT / "scripts/perf/floor.rs", "-O", "-o", output / ("floor" + SUFFIX)], cwd=source)
 
 
-def budgets(output, binary=None, probe=None):
+def budgets(output, binary=None, probe=None, samples=5):
     binary = str(binary or output / ("a-fixtures" + SUFFIX))
     cold, rss, cpu, client_cpu, attach_p50, attach_p99 = [], [], [], [], [], []
     root = os.environ.get("RUNNER_TEMP")
-    for trial in range(5):
+    for trial in range(samples):
         with tempfile.TemporaryDirectory(prefix="a-hosted-", dir=root) as directory:
             home = Path(directory)
             (home / "config.toml").write_text('[daemon]\nagent = "echo"\nidle_secs = 120\n')
@@ -190,12 +190,67 @@ def summarize(output, source, variant, runner):
         raise RuntimeError("; ".join(failures))
 
 
+def paired(output, source, reference):
+    reference_source = source.parent / "reference"
+    run(["git", "worktree", "add", "--detach", reference_source, reference], cwd=source)
+    for path in ["apps/cli/examples/perf-attach.rs", "crates/engine/src/driver/tests/bench.rs"]:
+        shutil.copy2(ROOT / path, reference_source / path)
+    root = output / "paired"
+    root.mkdir(exist_ok=True)
+    reference_output = root / "reference"
+    reference_output.mkdir(exist_ok=True)
+    build(reference_source, reference_output, {})
+    builds = dict(reference=reference_output, candidate=output)
+    values = {role: {} for role in builds}
+    orders = []
+    workloads = load_task("workloads")
+    for trial in range(5):
+        order = ["reference", "candidate"] if trial % 2 == 0 else ["candidate", "reference"]
+        orders.append(order)
+        for role in order:
+            saved = root / f"{trial}-{role}"
+            saved.mkdir(exist_ok=True)
+            directory = builds[role]
+            observed = budgets(saved, directory / ("a-fixtures" + SUFFIX),
+                               directory / ("perf-attach" + SUFFIX), samples=1)
+            for name, value in observed.items():
+                values[role].setdefault(name, []).extend(value["samples"])
+            for name, argv, runs in [
+                ("startup", [str(directory / ("a" + SUFFIX)), "--version"], 20),
+                ("driver", [str(directory / ("engine-bench" + SUFFIX)), "bench_turns_under_each_barrier_setting",
+                            "--ignored", "--nocapture", "--test-threads=1"], 1),
+                ("large_json", [str(directory / ("engine-bench" + SUFFIX)), "bench_large_tool_result",
+                                "--ignored", "--nocapture", "--test-threads=1"], 1),
+            ]:
+                path = saved / (name + ".json")
+                run(["hyperfine", "-N", "--warmup", "1", "--runs", str(runs), "--metrics", "all",
+                     "--export-json", path, workloads.command(argv)])
+                result = json.loads(path.read_text())["results"][0]
+                for field, unit, scale in [("time_wall_clock", "ms", 1000), ("time_cpu", "cpu_ms", 1000),
+                                           ("memory_peak_resident", "rss_kib", 1 / 1024)]:
+                    samples = [sample[field]["value"] * scale for sample in result["measurements"] if field in sample]
+                    if samples:
+                        values[role].setdefault(name + "_" + unit, []).extend(samples)
+                if os.name == "nt":
+                    from process import measure_windows
+                    record = measure_windows(argv)
+                    (saved / (name + "-native.json")).write_text(json.dumps(record))
+                    values[role].setdefault(name + "_rss_kib", []).append(record["peak_rss_kib"])
+    result = dict(reference_revision=reference, candidate_revision=subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(), order=orders, roles={})
+    for role, observed in values.items():
+        observed["size_kib"] = [(builds[role] / ("a" + SUFFIX)).stat().st_size / 1024]
+        result["roles"][role] = {name: distribution(samples) for name, samples in observed.items()}
+    (output / "paired.json").write_text(json.dumps(result, indent=2) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, default=ROOT)
     parser.add_argument("--output", type=Path, default=ROOT / "target/hosted-perf")
     parser.add_argument("--variant", default="{}", help='JSON: {"rustflags": [...], "config": [...]}')
     parser.add_argument("--runner", required=True)
+    parser.add_argument("--paired-ref", default="", help="optional reference revision on this same runner")
     args = parser.parse_args()
     output, source = args.output.resolve(), args.source.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -213,7 +268,11 @@ def main():
     run([sys.executable, ROOT / "mise-tasks/perf/workloads", output / ("a-fixtures" + SUFFIX), "cli",
          "--runs", "20", "--output", output])
     run([sys.executable, ROOT / "mise-tasks/perf/benches", output, output / "cli/transcript.jsonl", "--runs", "5"])
-    summarize(output, source, variant, args.runner)
+    try:
+        summarize(output, source, variant, args.runner)
+    finally:
+        if args.paired_ref:
+            paired(output, source, args.paired_ref)
 
 
 if __name__ == "__main__":
