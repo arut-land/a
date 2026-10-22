@@ -20,7 +20,8 @@ pub struct Loader {
 
 impl Loader {
     pub fn new(home: &Path, config: sys::config::Exts) -> Result<Self, Refused> {
-        let home = home.canonicalize().map_err(|e| Refused(e.to_string()))?;
+        // A fresh home may not have been created yet; source directories are optional.
+        let home = std::path::absolute(home).map_err(|e| Refused(e.to_string()))?;
         let table = config.table("lua");
         let read = |key, default| {
             table
@@ -245,6 +246,18 @@ mod tests {
     fn spawn() -> Spawn {
         let rt: rt::Rt = Arc::new(rt::Threads::default());
         Arc::new(move |task| rt.spawn(task))
+    }
+
+    #[test]
+    fn missing_optional_source_directories_prepare_an_empty_layer() {
+        let rig = ext::testing::Rig::new("lua-missing-home", Registry::default());
+        let home = rig.dir.join("home");
+        let loader = Loader::new(&home, sys::config::Exts::default()).unwrap();
+        let layer = loader
+            .prepare(&rig.workspace(), &Registry::default(), None, true)
+            .unwrap();
+        assert!(layer.registrations.is_empty());
+        assert!(!home.exists());
     }
 
     #[test]

@@ -10,24 +10,27 @@ use ext::{Configured, DynExtension, Name, Refused, Registrar, Table, Tier};
 
 /// Tiering and dependency validation apply equally to linked and source registrations.
 pub fn registry(config: &Config) -> Result<Registry, Refused> {
+    let home = sys::Home::from_env().map_err(|e| Refused(e.to_string()))?;
+    registry_at(config, &home)
+}
+
+fn registry_at(config: &Config, _home: &sys::Home) -> Result<Registry, Refused> {
     let registry = linked(config)?;
     let mut layers: Vec<Arc<dyn GenerationLayer>> = Vec::new();
     #[cfg(feature = "lua")]
     if !config.ext.disable.iter().any(|name| name == "lua") {
-        let home = sys::Home::from_env().map_err(|e| Refused(e.to_string()))?;
         layers.push(Arc::new(ext_lua::Loader::new(
-            home.root(),
+            _home.root(),
             config.ext.clone(),
         )?));
     }
     #[cfg(feature = "skills")]
     if !config.ext.disable.iter().any(|name| name == "skills") {
-        let home = sys::Home::from_env().map_err(|e| Refused(e.to_string()))?;
         let skills =
             configured::<ext_skills::Skills>(config)?.reserving(client::COMMANDS.iter().flat_map(
                 |command| std::iter::once(command.name).chain(command.aliases.iter().copied()),
             ));
-        layers.push(Arc::new(ext_skills::Loader::new(home.root(), skills)));
+        layers.push(Arc::new(ext_skills::Loader::new(_home.root(), skills)));
     }
     let coordinator = Arc::new(Coordinator::new(registry.clone(), layers));
     registry.with_in(Tier::Pre, &coordinator)
@@ -144,6 +147,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn registry(config: &Config) -> Result<Registry, Refused> {
+        let rig = ext::testing::Rig::new(&SessionId::new().to_string(), Registry::default());
+        super::registry_at(config, &sys::Home::from(rig.dir.join("home")))
+    }
 
     /// A session no handler reads.
     struct Bare;
@@ -396,7 +404,7 @@ mod tests {
         assert_eq!(tools.get("edit").unwrap().replay(), Replay::Unsafe);
         assert_eq!(tools.get("sleep").unwrap().replay(), Replay::Safe);
         // Only the echo agent brings the fixtures.
-        let shipped = super::registry(&config(&[], None)).unwrap();
+        let shipped = registry(&config(&[], None)).unwrap();
         assert!(shipped.tools().get("sleep").is_none());
         assert_eq!(
             shipped.agents().collect::<Vec<_>>(),
