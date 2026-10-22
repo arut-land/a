@@ -48,6 +48,9 @@ pub fn event() -> io::Result<OwnedHandle> {
 pub trait CompletionSource {
     fn completion_events(&self) -> io::Result<[OwnedHandle; 2]>;
     fn nonblocking(&self) -> io::Result<()>;
+    fn complete_write(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<T: CompletionSource> CompletionSource for &T {
@@ -56,6 +59,9 @@ impl<T: CompletionSource> CompletionSource for &T {
     }
     fn nonblocking(&self) -> io::Result<()> {
         T::nonblocking(self)
+    }
+    fn complete_write(&self) -> io::Result<()> {
+        T::complete_write(self)
     }
 }
 

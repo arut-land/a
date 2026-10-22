@@ -276,6 +276,9 @@ impl CompletionSource for Stream {
     fn nonblocking(&self) -> io::Result<()> {
         stream_nonblocking(self, true)
     }
+    fn complete_write(&self) -> io::Result<()> {
+        (&*self).flush()
+    }
 }
 
 pub fn connect(path: &Path) -> io::Result<Stream> {
@@ -537,27 +540,29 @@ impl Write for &Stream {
             return Ok(0);
         }
         let mut write = lock(&connection.write);
-        if write.is_none() {
-            let mut op = Operation::new(
-                Arc::clone(&connection.file),
-                duplicate(&connection.write_event)?,
-                bytes[..bytes.len().min(64 << 10)].to_vec(),
-            )?;
-            op.submit(true)?;
-            *write = Some(op);
+        if let Some(op) = write.as_mut() {
+            op.finish(connection.nonblocking.load(Ordering::Acquire), None)?;
+            *write = None;
         }
-        let op = write.as_mut().unwrap();
-        if !bytes.starts_with(&op.buffer) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "pending pipe write was replaced",
-            ));
-        }
-        let length = op.finish(connection.nonblocking.load(Ordering::Acquire), None)?;
-        *write = None;
-        Ok(length)
+        let mut op = Operation::new(
+            Arc::clone(&connection.file),
+            duplicate(&connection.write_event)?,
+            bytes[..bytes.len().min(64 << 10)].to_vec(),
+        )?;
+        op.submit(true)?;
+        let accepted = op.buffer.len();
+        // Report owned bytes once, when accepted. WouldBlock on a later
+        // write consumes none of its buffer, which may differ on retry.
+        *write = Some(op);
+        Ok(accepted)
     }
     fn flush(&mut self) -> io::Result<()> {
+        let connection = &self.0;
+        let mut write = lock(&connection.write);
+        if let Some(op) = write.as_mut() {
+            op.finish(connection.nonblocking.load(Ordering::Acquire), None)?;
+            *write = None;
+        }
         Ok(())
     }
 }
@@ -572,7 +577,7 @@ impl Write for Stream {
         (&*self).write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        (&*self).flush()
     }
 }
 

@@ -64,6 +64,7 @@ enum Inner<T: Source> {
     #[cfg(windows)]
     Completion {
         events: [async_io::os::windows::Waitable<std::os::windows::io::OwnedHandle>; 2],
+        complete_write: fn(&T) -> io::Result<()>,
         io: T,
     },
     /// A handle that is signalled, as a process is when it exits.
@@ -126,6 +127,7 @@ impl<T: sys::CompletionSource> Async<T> {
                         async_io::os::windows::Waitable::new(read)?,
                         async_io::os::windows::Waitable::new(write)?,
                     ],
+                    complete_write: T::complete_write,
                     io,
                 }))
             }
@@ -207,7 +209,12 @@ impl<T: Source> Async<T> {
 
     /// As [`Async::read_with`], for writing.
     pub async fn write_with<R>(&self, op: impl FnMut(&T) -> io::Result<R>) -> io::Result<R> {
-        self.retry(true, op).await
+        let result = self.retry(true, op).await?;
+        #[cfg(windows)]
+        if let Inner::Completion { complete_write, .. } = &self.0 {
+            self.retry(true, complete_write).await?;
+        }
+        Ok(result)
     }
 
     async fn retry<R>(
