@@ -51,7 +51,7 @@ fn envelope() -> protocol::Envelope {
 
 fn context_image() -> protocol::publication::ContextImage {
     use protocol::publication::{
-        ContextImage, ContextInput, ContextLayer, ContextValue, Publication, RunnerKind,
+        ContextInput, ContextLayer, ContextValue, Publication, RunnerKind,
     };
     let values = [
         ContextValue::Inherited(1),
@@ -59,23 +59,20 @@ fn context_image() -> protocol::publication::ContextImage {
         ContextValue::Queued("consumed input".into()),
         ContextValue::Taken(Seq::new(3).unwrap()),
         ContextValue::Assistant("answer".into()),
-        ContextValue::Context {
-            text: "published context".into(),
-            publication: Some(Publication {
+        ContextValue::Context(
+            "published context".into(),
+            Some(Publication {
                 namespace: "skills".into(),
                 key: protocol::Json::encode("review").unwrap(),
             }),
-        },
+        ),
         ContextValue::Child(Outcome::Interrupted { output: None }),
         ContextValue::Reply(protocol::Json::null()),
-        ContextValue::ToolCall {
-            id: "provider-id".into(),
-            tool: "example".into(),
-        },
-        ContextValue::ToolResult {
-            call: CallId::new(9).unwrap(),
-            outcome: Outcome::Interrupted { output: None },
-        },
+        ContextValue::ToolCall("provider-id".into(), "example".into()),
+        ContextValue::ToolResult(
+            CallId::new(9).unwrap(),
+            Outcome::Interrupted { output: None },
+        ),
     ];
     let inputs: Vec<_> = values
         .into_iter()

@@ -90,7 +90,7 @@ fn a_prefix_projects_edits_and_publications_without_executable_ownership() {
         image
             .iter()
             .flat_map(|ContextLayer(_, inputs)| inputs)
-            .all(|input| !matches!(input.1, ContextValue::ToolCall { .. }))
+            .all(|input| !matches!(input.1, ContextValue::ToolCall(..)))
     );
     let registry = Arc::new(Registry::default());
     let expected = Transcript::of(&entries, registry.clone(), "").into_context();

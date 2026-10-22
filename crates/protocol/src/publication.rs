@@ -44,20 +44,11 @@ pub enum ContextValue {
     Queued(String),
     Taken(Seq),
     Assistant(String),
-    Context {
-        text: String,
-        publication: Option<Publication>,
-    },
+    Context(String, Option<Publication>),
     Child(Outcome),
     Reply(Json),
-    ToolCall {
-        id: String,
-        tool: String,
-    },
-    ToolResult {
-        call: CallId,
-        outcome: Outcome,
-    },
+    ToolCall(String, String),
+    ToolResult(CallId, Outcome),
 }
 
 /// Execution identity belongs to the owner, never to copied audit history.
@@ -124,7 +115,7 @@ impl Publications {
                     .into_iter()
                     .flat_map(|ContextLayer(_, inputs)| inputs)
                     .filter_map(|ContextInput(_, value)| {
-                        if let ContextValue::Context { publication, .. } = value {
+                        if let ContextValue::Context(_, publication) = value {
                             publication
                         } else {
                             None

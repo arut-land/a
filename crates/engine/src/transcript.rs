@@ -44,10 +44,9 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
         Body::Enqueue { envelope } => ContextValue::Queued(envelope.payload.clone()),
         Body::Take { input } => ContextValue::Taken(*input),
         Body::Assistant { text } => ContextValue::Assistant(text.clone()),
-        Body::Context { text, publication } => ContextValue::Context {
-            text: text.clone(),
-            publication: publication.clone(),
-        },
+        Body::Context { text, publication } => {
+            ContextValue::Context(text.clone(), publication.clone())
+        }
         Body::Fired { outcome, .. } => ContextValue::Child(outcome.clone()),
         Body::ModelResult {
             r#for: None,
@@ -56,14 +55,8 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
         } => ContextValue::Reply(output.clone()),
         Body::ToolCall {
             tool, id: Some(id), ..
-        } => ContextValue::ToolCall {
-            id: id.clone(),
-            tool: tool.clone(),
-        },
-        Body::ToolResult { call, outcome, .. } => ContextValue::ToolResult {
-            call: *call,
-            outcome: outcome.clone(),
-        },
+        } => ContextValue::ToolCall(id.clone(), tool.clone()),
+        Body::ToolResult { call, outcome, .. } => ContextValue::ToolResult(*call, outcome.clone()),
         _ => return None,
     })
 }
@@ -147,7 +140,7 @@ impl Transcript {
                 None => return,
             },
             ContextValue::Assistant(text) => Message::assistant(text),
-            ContextValue::Context { text, .. } => {
+            ContextValue::Context(text, _) => {
                 self.messages.insert(self.context, Message::user(text));
                 self.context += 1;
                 self.last = seq.get();
@@ -164,11 +157,11 @@ impl Transcript {
                     Err(_) => return,
                 }
             }
-            ContextValue::ToolCall { id, tool } => {
+            ContextValue::ToolCall(id, tool) => {
                 self.calls.insert(CallId(seq), (id, tool));
                 return;
             }
-            ContextValue::ToolResult { call, outcome } => {
+            ContextValue::ToolResult(call, outcome) => {
                 let Some((id, tool)) = self.calls.remove(&call) else {
                     return;
                 };
@@ -325,7 +318,7 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
                 continue;
             };
             match &value {
-                ContextValue::ToolCall { .. } if inherited && !completed.contains(&e.seq) => {
+                ContextValue::ToolCall(..) if inherited && !completed.contains(&e.seq) => {
                     continue;
                 }
                 ContextValue::Queued(_) if inherited && !completed.contains(&e.seq) => continue,

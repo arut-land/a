@@ -1325,13 +1325,13 @@ fn inherited_publications() -> Entry {
             .map(|(namespace, seq)| {
                 protocol::publication::ContextInput(
                     Seq::new(seq).unwrap(),
-                    protocol::publication::ContextValue::Context {
-                        text: "execution context".into(),
-                        publication: Some(Publication {
+                    protocol::publication::ContextValue::Context(
+                        "execution context".into(),
+                        Some(Publication {
                             namespace: namespace.into(),
                             key: key.clone(),
                         }),
-                    },
+                    ),
                 )
             })
             .collect(),
