@@ -56,11 +56,10 @@ fn main() {
     let home = sys::Home::from(std::path::PathBuf::from(
         std::env::var_os("A_HOME").expect("isolated A_HOME"),
     ));
-    let id = std::env::args()
-        .nth(1)
-        .expect("session id")
-        .parse()
-        .unwrap();
+    let id = attach(
+        &home,
+        Target::Prefix(std::env::args().nth(1).expect("session id")),
+    );
     let times: Vec<_> = (0..500)
         .map(|_| {
             let start = Instant::now();
