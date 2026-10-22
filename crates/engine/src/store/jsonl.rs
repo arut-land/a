@@ -77,11 +77,7 @@ impl Jsonl {
                 .create_new(true)
                 .write(true)
                 .open(&pending)?;
-            let mut line = format!(r#"{{"format":{FORMAT},"#).into_bytes();
-            let at = line.len();
-            serde_json::to_writer(&mut line, header)?;
-            line.remove(at);
-            seal(&mut line, 0);
+            let mut line = header_line(header)?;
             file.write_all(&line)?;
             let mut history = History::default();
             for entry in entries {
@@ -162,6 +158,15 @@ impl Jsonl {
     }
 }
 
+fn header_line(header: &Header) -> io::Result<Vec<u8>> {
+    let mut line = format!(r#"{{"format":{FORMAT},"#).into_bytes();
+    let at = line.len();
+    serde_json::to_writer(&mut line, header)?;
+    line.remove(at);
+    seal(&mut line, 0);
+    Ok(line)
+}
+
 fn discover(root: &Path) -> io::Result<HashMap<SessionId, PathBuf>> {
     let mut paths = HashMap::new();
     let mut pending = vec![root.to_owned()];
@@ -237,11 +242,7 @@ impl LogStore for Jsonl {
     /// Unix can share the directory barrier with the first entry.
     fn create(&self, header: &Header) -> io::Result<Loaded> {
         let path = self.prepare(header)?;
-        let mut line = format!(r#"{{"format":{FORMAT},"#).into_bytes();
-        let at = line.len();
-        serde_json::to_writer(&mut line, header)?;
-        line.remove(at);
-        seal(&mut line, 0);
+        let line = header_line(header)?;
         let (file, publication) = sys::fs::open_log(&path, Some(&line))?;
         self.domain.check(&file)?;
         let index = Index::new(file, path, line.len() as u64);
