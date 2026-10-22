@@ -93,12 +93,15 @@ truncate; it preserves the append handle and read cursor.
 Windows directory `FlushFileBuffers` has no persistence contract used here.
 `sync_dir` returns Unsupported; directory creation publishes each missing
 ancestor from an exclusive sibling with a same-volume write-through rename.
-Existing directories retain their contents. Unix creates directories and
-flushes their parents, including existing ancestors: existence cannot certify
-a previous attempt whose mkdir succeeded but parent barrier failed. A failed
-ancestor barrier prevents publishing descendants on every retry. These
-operations precede session log commits. The guarantee requires local storage
-and devices that honor flushes.
+Existing directories retain their contents. Opening the store establishes its
+sessions root once beneath the caller-owned home. Session creation stops at
+that durable root, or at a parent session whose log proves its directory was
+published. Unix reissues the nearest existing name's parent barrier before
+creating descendants: mkdir may have succeeded while its barrier failed.
+Ancestors above the anchor are never opened or synced. The disposable
+`derived` cache shares Unix's first-log barrier. These operations precede
+session log commits. The guarantee requires local storage and devices that
+honor flushes.
 
 ## Validation and measurements
 
@@ -117,3 +120,23 @@ On the Apple silicon development host (2026-10-22), `mise run size` measured
 the shipped binary at 3,170 KiB against the 4,096 KiB cap, with fixture
 exclusion verified. This is an Apple measurement, not a Windows performance
 claim.
+
+On the same Apple/APFS host, release workspace builds measured `a new` as
+follows (milliseconds). Each build used separate homes at equal path depths
+and an empty workspace. Warm samples used already running daemons; cold
+samples used fresh homes. Execution order rotated between samples, with no
+concurrent builds or tests. Setup and daemon stop were outside the timing.
+
+| Implementation | Warm median / p95 (300 samples) | Cold median / p95 (30 samples) |
+| --- | ---: | ---: |
+| main (`491e966`) | 23.58 / 26.90 | 181.75 / 192.19 |
+| Ancestor traversal (`a81e9ed`) | 26.22 / 30.39 | 201.07 / 223.45 |
+| Anchored publication | 23.56 / 26.63 | 191.13 / 204.67 |
+
+Warm session creation matches main in this sample; cold creation includes
+startup and remains about 5% above main. Counting directory barriers in the
+creation path, root sessions use one immediate parent barrier instead of
+main's two; nested children use two, as on main. The first-log barrier is
+unchanged. Store opening establishes its anchor once instead of repeating
+ancestor-wide barriers for each session. These are local measurements, not
+Windows performance results.
