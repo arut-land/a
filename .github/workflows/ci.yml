@@ -231,7 +231,16 @@ jobs:
       - uses: actions/checkout@v7
       - *native-cargo
       - if: runner.arch == 'X64'
-        run: sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+        name: Use native Apple architecture
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          path = Path('crates/ffi/boltffi.toml')
+          path.write_text(path.read_text().replace('macos_architectures = ["arm64"]', 'macos_architectures = ["x86_64"]'))
+          path = Path('mise.toml')
+          path.write_text(path.read_text().replace('platform=macOS,arch=arm64', 'platform=macOS,arch=x86_64'))
+          PYTHON
       - *mbx-dir
       - *cache
       - uses: jdx/mise-action@v5
