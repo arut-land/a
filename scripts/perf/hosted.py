@@ -215,6 +215,17 @@ def summarize(output, source, variant, runner):
         raise RuntimeError("; ".join(failures))
 
 
+def bloat(source, output):
+    env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"))
+    for label, extra in [("crates", ["--crates"]), ("functions", ["-n", "100"] )]:
+        result = run(["cargo", "bloat", "--release", "-p", "a", *STD,
+                      "--config", 'profile.release.debug="line-tables-only"',
+                      "--config", 'profile.release.strip="symbols"',
+                      "--message-format=json", *extra], cwd=source, env=env,
+                     stdout=subprocess.PIPE, text=True)
+        (output / ("bloat-" + label + ".json")).write_text(result.stdout)
+
+
 def paired(output, source, reference):
     reference_source = source.parent / "reference"
     run(["git", "fetch", "--no-tags", "--depth=1", "origin", reference], cwd=source)
@@ -279,11 +290,14 @@ def main():
     parser.add_argument("--runner", required=True)
     parser.add_argument("--paired-ref", default="", help="optional reference revision on this same runner")
     parser.add_argument("--build-only", action="store_true", help="diagnose a build variant without timing")
+    parser.add_argument("--bloat", action="store_true", help="also collect crate/function size attribution")
     args = parser.parse_args()
     output, source = args.output.resolve(), args.source.resolve()
     output.mkdir(parents=True, exist_ok=True)
     variant = json.loads(args.variant or "{}")
     build(source, output, variant, benchmarks=not args.build_only)
+    if args.bloat:
+        bloat(source, output)
     if args.build_only:
         assert (output / ("a" + SUFFIX)).stat().st_size <= 4096 * 1024, "shipped size exceeds 4096 KiB"
         return

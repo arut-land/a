@@ -17,6 +17,10 @@ on:
         description: 'Source revision (empty uses this workflow revision); main bootstraps a baseline'
         default: ''
         type: string
+      bloat:
+        description: 'Collect native crate/function size attribution'
+        default: false
+        type: boolean
       build_only:
         description: 'Build and inspect a size/linker candidate without runtime measurements'
         default: false
@@ -113,7 +117,7 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           working_directory: harness
-          install_args: hyperfine ${{ matrix.runner != 'macos-15-intel' && 'mr-boxington' || '' }} ${{ runner.os == 'Linux' && 'mold' || '' }}
+          install_args: ${{ inputs.bloat && 'cargo:cargo-bloat' || '' }} hyperfine ${{ matrix.runner != 'macos-15-intel' && 'mr-boxington' || '' }} ${{ runner.os == 'Linux' && 'mold' || '' }}
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
       # mbx publishes no Intel macOS executable; cache Cargo's native build there.
@@ -135,9 +139,11 @@ jobs:
           PERF_VARIANT: ${{ inputs.variant || '{}' }}
           PAIRED_REF: ${{ inputs.paired_ref }}
           BUILD_ONLY: ${{ inputs.build_only }}
+          BLOAT: ${{ inputs.bloat }}
         run: |
           extra=()
           if [[ "$BUILD_ONLY" == true ]]; then extra+=(--build-only); fi
+          if [[ "$BLOAT" == true ]]; then extra+=(--bloat); fi
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
             PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PAIRED_REF" "${extra[@]}"
           else
