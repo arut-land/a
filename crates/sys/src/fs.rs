@@ -278,11 +278,12 @@ fn create_directories(
     if dir == anchor {
         return Ok(());
     }
-    if !exists(dir) {
+    let existing = exists(dir);
+    if !existing {
         let parent = dir.parent().ok_or(io::ErrorKind::InvalidInput)?;
         create_directories(anchor, parent, exists, publish)?;
     }
-    publish(dir, exists(dir))
+    publish(dir, existing)
 }
 
 fn create_directory(dir: &Path, existing: bool) -> io::Result<()> {
@@ -1021,6 +1022,30 @@ mod directory_retry_tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashSet;
+
+    #[test]
+    fn each_directory_publication_uses_one_existence_query() {
+        let anchor = Path::new("sessions");
+        let dir = anchor.join("id");
+        let present = std::cell::Cell::new(false);
+        let queries = std::cell::Cell::new(0);
+        let publications = RefCell::new(Vec::new());
+        let exists = |path: &Path| {
+            assert_eq!(path, dir);
+            queries.set(queries.get() + 1);
+            present.get()
+        };
+        let publish = |path: &Path, existing| {
+            assert_eq!(path, dir);
+            publications.borrow_mut().push(existing);
+            present.set(true);
+            Ok(())
+        };
+        create_directories(anchor, &dir, &exists, &publish).unwrap();
+        create_directories(anchor, &dir, &exists, &publish).unwrap();
+        assert_eq!(*publications.borrow(), [false, true]);
+        assert_eq!(queries.get(), 2);
+    }
 
     #[test]
     fn session_publication_stops_at_the_nearest_durable_anchor() {
