@@ -9,32 +9,24 @@ use unicode_width::UnicodeWidthChar;
 /// and bright black. Never RGB and never a background, so light and dark
 /// themes both read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Color {
     #[default]
-    Reset,
-    Red,
-    Green,
-    Yellow,
-    Blue,
-    Magenta,
-    Cyan,
-    DarkGray,
+    Reset = 39,
+    Red = 31,
+    Green = 32,
+    Yellow = 33,
+    Blue = 34,
+    Magenta = 35,
+    Cyan = 36,
+    DarkGray = 90,
 }
 
 impl Color {
     /// The SGR parameter that sets it as the foreground; a background is
     /// 10 more.
     pub const fn sgr(self) -> u16 {
-        match self {
-            Self::Reset => 39,
-            Self::Red => 31,
-            Self::Green => 32,
-            Self::Yellow => 33,
-            Self::Blue => 34,
-            Self::Magenta => 35,
-            Self::Cyan => 36,
-            Self::DarkGray => 90,
-        }
+        self as u16
     }
 }
 
