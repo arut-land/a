@@ -499,7 +499,7 @@ mod tests {
         use std::pin::pin;
         use std::task::Poll;
 
-        let (_session, home, root, listener) = fixture();
+        let (_session, home, root, listener, _owner) = fixture();
         let runtime = Threads::configured(rt::Config::for_cores(1));
         let (entered, waiting) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -519,26 +519,39 @@ mod tests {
             Poll::Ready(())
         }));
         release.send(()).unwrap();
-        assert!(rt::block_on(reading).pid.is_none());
+        assert_eq!(rt::block_on(reading).pid, Some(std::process::id()));
         drop(listener);
         home.endpoint().remove();
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn fixture() -> (Session, Home, PathBuf, sys::Listener) {
+    fn fixture() -> (Session, Home, PathBuf, sys::Listener, std::fs::File) {
         let root = std::env::temp_dir().join(format!("a-ffi-order-{}", SessionId::new()));
         std::fs::create_dir_all(&root).unwrap();
         let home = Home::from(root.join("home"));
         let exe = root.join("a");
         std::fs::write(&exe, "never run").unwrap();
         let staged = home.runtime().stage(&exe).unwrap();
+        std::fs::create_dir_all(home.run_dir()).unwrap();
+        let owner = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(home.daemon_pid_file())
+            .unwrap();
+        sys::fs::lock(&owner).unwrap();
+        std::io::Write::write_all(
+            &mut &owner,
+            sys::crash::Record::current("test").to_string().as_bytes(),
+        )
+        .unwrap();
         let listener = home.bind().unwrap();
         let session = Session::new(&Client {
             daemon: Daemon::local(home.clone(), staged),
             home: home.clone(),
             vars: Vec::new(),
         });
-        (session, home, root, listener)
+        (session, home, root, listener, owner)
     }
 
     fn paused_input(
@@ -556,7 +569,7 @@ mod tests {
 
     #[test]
     fn reconnect_preserves_mutation_order() {
-        let (session, home, root, listener) = fixture();
+        let (session, home, root, listener, _owner) = fixture();
         session
             .open(OpenTarget::Id {
                 id: SessionId::new().to_string(),
@@ -658,7 +671,7 @@ mod tests {
 
     #[test]
     fn reconnect_replay_is_pumped_before_newly_numbered_input() {
-        let (session, home, root, listener) = fixture();
+        let (session, home, root, listener, _owner) = fixture();
         let id = SessionId::new();
         session.open(OpenTarget::Id { id: id.to_string() }).unwrap();
         let mut peer = listener.accept().unwrap();

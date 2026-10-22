@@ -56,6 +56,8 @@ pub trait RunningProcess: Send + Sync {
     fn alive(&self) -> bool;
     fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>>;
     fn wait(&self) -> BoxFuture<'_, std::io::Result<std::process::ExitStatus>>;
+    /// Captured stdout has reached its output file, independently of process reaping.
+    fn output_drained(&self) -> BoxFuture<'_, std::io::Result<()>>;
     fn ended(&self) -> BoxFuture<'_, ()>;
 }
 
@@ -63,6 +65,8 @@ pub trait ProcessPipe: Send + Sync {
     fn read<'a>(&'a self, bytes: &'a mut [u8]) -> BoxFuture<'a, std::io::Result<usize>>;
     fn write<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, std::io::Result<usize>>;
     fn try_write(&self, bytes: &[u8]) -> std::io::Result<usize>;
+    /// Completes accepted writes before the caller reports a flushed request.
+    fn flush(&self) -> BoxFuture<'_, std::io::Result<()>>;
 }
 
 pub struct OwnedProcess {

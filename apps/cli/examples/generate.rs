@@ -195,7 +195,19 @@ fn completions_and_the_man_page_are_generated_from_the_spec() {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join(name.rsplit('/').next().unwrap());
         std::fs::write(&file, &text).unwrap();
-        if let Ok(status) = Command::new(program).arg(flag).arg(&file).status() {
+        let program = if *program == "bash" {
+            let Some(bash) = sys::find_bash(std::env::var("PATH").ok().as_deref()) else {
+                continue;
+            };
+            bash
+        } else {
+            (*program).to_owned()
+        };
+        if let Ok(status) = Command::new(program)
+            .arg(flag)
+            .arg(sys::shell_path(&file).as_ref())
+            .status()
+        {
             assert!(status.success(), "{name} does not parse:\n{text}");
         }
     }

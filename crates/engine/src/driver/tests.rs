@@ -1204,9 +1204,14 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
     let log = finished(&resumed, 2);
     resumed.halt();
 
+    // A slow shell may stream progress before finishing the same call.
+    let settled: Vec<_> = bodies(&log)
+        .into_iter()
+        .filter(|body| !matches!(body, Body::Progress { .. }))
+        .collect();
     assert!(
         matches!(
-            &bodies(&log)[..],
+            &settled[..],
             [
                 Body::Input { .. },
                 Body::ToolCall { .. },

@@ -124,6 +124,9 @@ impl crate::CompletionSource for Stream {
     fn nonblocking(&self) -> io::Result<()> {
         self.set_nonblocking(true)
     }
+    fn complete_write(&self) -> io::Result<()> {
+        (&*self).flush()
+    }
 }
 
 #[cfg(windows)]

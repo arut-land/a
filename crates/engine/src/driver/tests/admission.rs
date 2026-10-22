@@ -1300,6 +1300,9 @@ impl ext::RunningProcess for StaleProcess {
     fn wait(&self) -> BoxFuture<'_, io::Result<std::process::ExitStatus>> {
         Box::pin(std::future::pending())
     }
+    fn output_drained(&self) -> BoxFuture<'_, io::Result<()>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
     fn ended(&self) -> BoxFuture<'_, ()> {
         Box::pin(std::future::pending())
     }

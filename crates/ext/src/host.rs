@@ -79,11 +79,14 @@ impl SessionServices {
     }
 
     pub(crate) fn get<S: ?Sized + 'static>(&self) -> Option<&S> {
+        self.get_arc::<S>().map(AsRef::as_ref)
+    }
+
+    pub(crate) fn get_arc<S: ?Sized + 'static>(&self) -> Option<&Arc<S>> {
         let ty = TypeId::of::<S>();
         (self.0.iter())
             .find(|(t, _)| *t == ty)
             .and_then(|(_, s)| s.downcast_ref::<Arc<S>>())
-            .map(|s| &**s)
     }
 }
 
@@ -451,11 +454,14 @@ impl Registry {
 
     /// Service `S`, if an extension provides it.
     pub fn service<S: ?Sized + 'static>(&self) -> Option<&S> {
+        self.service_arc::<S>().map(AsRef::as_ref)
+    }
+
+    pub(crate) fn service_arc<S: ?Sized + 'static>(&self) -> Option<&Arc<S>> {
         self.installed
             .iter()
             .flat_map(|i| &i.made.services)
             .find_map(|s| s.service.downcast_ref::<Arc<S>>())
-            .map(|s| &**s)
     }
 
     /// The directory a session's commands run in, as the [`CwdOf`] service

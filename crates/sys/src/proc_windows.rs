@@ -120,6 +120,17 @@ pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<ContainedChild
     child
 }
 
+pub fn spawn_group_captured(cmd: &mut Command, output: File) -> io::Result<ContainedChild> {
+    let input = File::open("NUL")?;
+    let (reader, writer) = crate::endpoint::imp::process_pipe()?;
+    let mut child = spawn_job(cmd, [&input, &writer, &writer])?;
+    child.capture = Some(super::OutputCapture {
+        reader,
+        file: output,
+    });
+    Ok(child)
+}
+
 pub fn spawn_stdio(
     cmd: &mut Command,
 ) -> io::Result<(ContainedChild, crate::Stream, crate::Stream)> {
@@ -160,7 +171,11 @@ fn spawn_job(
         id: GroupId(child.id()),
         handle: job,
     };
-    Ok(ContainedChild { child, group })
+    Ok(ContainedChild {
+        child,
+        group,
+        capture: None,
+    })
 }
 
 pub(super) fn members(job: &OwnedHandle) -> Vec<u32> {
@@ -214,7 +229,18 @@ pub(super) fn terminate_group(job: &OwnedHandle) -> io::Result<()> {
 
 pub fn process_started(pid: u32) -> Option<u64> {
     // SAFETY: scalar inputs, checked owned result.
-    let process = owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) }).ok()?;
+    let process =
+        owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid) })
+            .ok()?;
+    // Retained handles keep an exited process object queryable. A signalled
+    // process is gone even while its creation time remains available.
+    // SAFETY: this owned process handle includes SYNCHRONIZE access.
+    if unsafe {
+        windows_sys::Win32::System::Threading::WaitForSingleObject(process.as_raw_handle(), 0)
+    } != windows_sys::Win32::Foundation::WAIT_TIMEOUT
+    {
+        return None;
+    }
     created_at(&process).ok()
 }
 
@@ -441,6 +467,17 @@ mod tests {
         let token = process_started(std::process::id()).unwrap();
         assert_ne!(token, 0);
         assert_eq!(process_started(std::process::id()), Some(token));
+    }
+    #[test]
+    fn exited_process_objects_retained_by_handles_are_not_live() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/D", "/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        let retained = exit_watch(child.id()).unwrap();
+        child.wait().unwrap();
+        assert!(process_started(child.id()).is_none());
+        drop(retained);
     }
 }
 

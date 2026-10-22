@@ -1091,6 +1091,7 @@ fn uncertain_import_never_leaves_a_clean_catalog() {
         ImportStep::Published,
     ] {
         let dir = temp_dir();
+        fs::create_dir(&dir).unwrap();
         let inner = Arc::new(Jsonl::open(dir.join("sessions")).unwrap());
         let store = Faulty::new(inner.clone());
         let catalog_path = dir.join("catalog");
@@ -1121,6 +1122,7 @@ fn uncertain_import_never_leaves_a_clean_catalog() {
 fn a_successful_import_survives_a_clean_catalog_restart() {
     use crate::catalog::Catalog;
     let dir = temp_dir();
+    fs::create_dir(&dir).unwrap();
     let store = Jsonl::open(dir.join("sessions")).unwrap();
     let path = dir.join("catalog");
     let catalog = Catalog::open(path.clone(), &store).unwrap();

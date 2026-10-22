@@ -144,14 +144,14 @@ pub struct Writer {
     child: Option<sys::ContainedChild>,
 }
 
-enum Transport {
-    Local(Stream),
-    Pipe(sys::ProcessPipe),
+enum Transport<L = Stream, P = sys::ProcessPipe> {
+    Local(L),
+    Pipe(P),
 }
 
 // Pipe and socket types coincide on some targets.
 #[allow(clippy::match_same_arms)]
-impl Read for Transport {
+impl<L: Read, P: Read> Read for Transport<L, P> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Local(io) => io.read(bytes),
@@ -161,7 +161,7 @@ impl Read for Transport {
 }
 
 #[allow(clippy::match_same_arms)]
-impl Write for Transport {
+impl<L: Write, P: Write> Write for Transport<L, P> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self {
             Self::Local(io) => io.write(bytes),
@@ -169,7 +169,10 @@ impl Write for Transport {
         }
     }
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        match self {
+            Self::Local(io) => io.flush(),
+            Self::Pipe(io) => io.flush(),
+        }
     }
 }
 
@@ -1062,7 +1065,7 @@ mod tests {
             let daemon = Record::current("1.2.3+0123456789abcdef");
             fs::write(home.daemon_pid_file(), daemon.to_string()).unwrap();
             let held = File::open(home.daemon_pid_file()).unwrap();
-            held.lock().unwrap();
+            sys::fs::lock(&held).unwrap();
             let listener = home.bind().unwrap();
             let (release, released) = std::sync::mpsc::channel();
             let peer = thread::spawn(move || {
@@ -1103,6 +1106,58 @@ mod tests {
             assert_eq!(observed["pid"], daemon.pid);
             assert_eq!(observed["started"], daemon.started);
             assert_eq!(observed["reason"], "unresponsive");
+        }
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Pending {
+        accepted: Vec<u8>,
+        delivered: Vec<u8>,
+        stalled: bool,
+    }
+    impl Write for Pending {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.accepted.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.stalled {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.delivered.append(&mut self.accepted);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn transport_flush_delivers_accepted_bytes_and_preserves_flush_errors() {
+        for mut transport in [
+            Transport::Local(Pending {
+                stalled: true,
+                ..Pending::default()
+            }),
+            Transport::Pipe(Pending {
+                stalled: true,
+                ..Pending::default()
+            }),
+        ] {
+            transport.write_all(b"frame").unwrap();
+            assert_eq!(
+                transport.flush().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            let (Transport::Local(io) | Transport::Pipe(io)) = &mut transport;
+            assert_eq!(io.delivered, b"");
+            io.stalled = false;
+            transport.flush().unwrap();
+            let (Transport::Local(io) | Transport::Pipe(io)) = &transport;
+            assert_eq!(io.delivered, b"frame");
+            assert_eq!(io.accepted, b"");
         }
     }
 }

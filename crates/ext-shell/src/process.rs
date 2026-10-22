@@ -20,6 +20,8 @@ struct Live {
     group: Mutex<Option<sys::OwnedGroup>>,
     status: Mutex<Option<io::Result<ExitStatus>>>,
     exited: Flag,
+    copied: Flag,
+    captured: Mutex<Option<io::Result<()>>>,
     ended: Flag,
 }
 
@@ -57,6 +59,17 @@ impl RunningProcess for Live {
                 .ok_or_else(|| io::Error::other("missing process status"))
         })
     }
+    fn output_drained(&self) -> BoxFuture<'_, io::Result<()>> {
+        Box::pin(async {
+            self.copied.wait().await;
+            lock(&self.captured)
+                .as_ref()
+                .expect("capture completed")
+                .as_ref()
+                .copied()
+                .map_err(|e| io::Error::new(e.kind(), e.to_string()))
+        })
+    }
     fn ended(&self) -> BoxFuture<'_, ()> {
         Box::pin(self.ended.wait())
     }
@@ -78,6 +91,8 @@ impl Drop for Reap {
         // Also covers failed registration and a runtime dropping its task.
         lock(&self.1.group).take();
         self.complete();
+        lock(&self.1.captured).get_or_insert_with(|| Err(io::ErrorKind::Interrupted.into()));
+        self.1.copied.set();
         self.1.ended.set();
     }
 }
@@ -131,26 +146,32 @@ async fn launch(
                     .envs(&launch.process.env)
                     .current_dir(&launch.process.cwd);
                 let (contained, pipes) = match launch.output {
-                    ProcessOutput::File(file) => (sys::spawn_group(&mut cmd, file)?, None),
+                    ProcessOutput::File(file) => (sys::spawn_group_captured(&mut cmd, file)?, None),
                     ProcessOutput::Stdio => {
                         let (child, input, output) = sys::spawn_stdio(&mut cmd)?;
                         (child, Some((input, output)))
                     }
                 };
-                let sys::ContainedChild { child, group } = contained;
+                let sys::ContainedChild {
+                    child,
+                    group,
+                    capture,
+                } = contained;
                 let live = Arc::new(Live {
                     id: child.id(),
                     group: Mutex::new(Some(group)),
                     status: Mutex::default(),
                     exited: Flag::default(),
+                    copied: Flag::default(),
+                    captured: Mutex::default(),
                     ended: Flag::default(),
                 });
-                Ok::<_, io::Error>((Reap(Some(child), live), pipes))
+                Ok::<_, io::Error>((Reap(Some(child), live), pipes, capture))
             })());
         }),
     )
     .await?;
-    let (mut owned, pipes) = received
+    let (mut owned, pipes, capture) = received
         .await
         .ok_or_else(|| io::Error::other("process launch stopped"))??;
     let live = Arc::clone(&owned.1);
@@ -180,16 +201,59 @@ async fn launch(
     } else {
         (None, None)
     };
-    rt.spawn(Box::pin(async move {
-        if let Some(watch) = watch
-            && watch.readable_result().await.is_err()
-        {
-            return;
-        }
-        owned.complete();
-        let _ = descendants(&reactor, &owned.1).await;
-    }));
+    rt.spawn(Box::pin(reap_output(
+        owned,
+        watch,
+        reactor,
+        capture,
+        cx.service_arc::<dyn rt::Runtime>().expect("runtime"),
+    )));
     Ok(OwnedProcess::new(live, input, output))
+}
+
+async fn reap_output(
+    mut owned: Reap,
+    watch: Option<rt::Async<sys::ExitWatch>>,
+    reactor: rt::Reactor,
+    capture: Option<sys::OutputCapture>,
+    runtime: rt::Rt,
+) {
+    let capturing = Arc::clone(&owned.1);
+    let copy_reactor = reactor.clone();
+    let copying = async move {
+        let result = if let Some(capture) = capture {
+            let result = async {
+                let input = rt::Async::read_pipe(&copy_reactor, capture.reader)?;
+                rt::capture_output(&*runtime, input, capture.file, sys::fs::output_written).await
+            }
+            .await;
+            if result.is_err() {
+                lock(&capturing.group).take();
+            }
+            result
+        } else {
+            Ok(())
+        };
+        *lock(&capturing.captured) = Some(result);
+        capturing.copied.set();
+    };
+    let reaping = async {
+        let result = async {
+            if let Some(watch) = watch {
+                watch.readable_result().await?;
+            }
+            owned.complete();
+            descendants(&reactor, &owned.1).await
+        }
+        .await;
+        if result.is_err() {
+            lock(&owned.1.group).take();
+        }
+        result
+    };
+    // Process completion includes every byte already accepted from stdout.
+    // Retain containment until both capture and descendant observation end.
+    let _ = rt::zip(copying, reaping).await;
 }
 
 // A leader can exit first. Failed descendant watches must revoke containment.
@@ -235,6 +299,9 @@ impl ext::ProcessPipe for Pipe {
     }
     fn try_write(&self, bytes: &[u8]) -> io::Result<usize> {
         self.0.get_ref().write(bytes)
+    }
+    fn flush(&self) -> BoxFuture<'_, io::Result<()>> {
+        Box::pin(self.0.flush())
     }
 }
 

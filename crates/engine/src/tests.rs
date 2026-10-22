@@ -38,6 +38,7 @@ impl Daemon {
 fn home(name: &str) -> (PathBuf, Home) {
     let root = std::env::temp_dir().join(format!("a-engine-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).unwrap();
     (root.clone(), Home::from(root))
 }
 
@@ -947,12 +948,13 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     let wakes = EVENTS.count("wake");
 
     // Nothing is due for an hour: nothing wakes the supervisor.
-    assert!(!anything_within(&daemon, Duration::from_millis(500)));
+    let quiet = !anything_within(&daemon, Duration::from_millis(500));
     let idle_wakes = EVENTS.count("wake") - wakes;
     let names: Vec<_> = (EVENTS.of(id).iter().map(|e| e.name))
         .filter(|&name| name != "commit")
         .collect();
     std::fs::remove_dir_all(&root).unwrap();
+    assert!(quiet, "late supervisor news: {:?}", crate::lock(&EVENTS.0));
 
     assert!(
         after >= Duration::from_millis(300),

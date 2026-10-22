@@ -308,6 +308,18 @@ mod tests {
                 stream.read_exact(&mut byte).unwrap();
                 head.push(byte[0]);
             }
+            // Closing with an unread request body can reset TCP and discard
+            // the redirect before the client receives it.
+            let head = std::str::from_utf8(&head).unwrap();
+            let length: usize = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            stream.read_exact(&mut vec![0; length]).unwrap();
             stream.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
             drop(stream);
             listener.set_nonblocking(true).unwrap();

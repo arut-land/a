@@ -123,6 +123,32 @@ fn final_path(file: &File) -> io::Result<std::path::PathBuf> {
     }
 }
 
+/// Trims a log without changing its append-only handle or its read cursor.
+pub fn truncate(file: &File, len: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    return file.set_len(len);
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+        };
+        // Append-only access deliberately excludes FILE_WRITE_DATA, which
+        // SetEndOfFile needs. Reopen the same file, without a pathname race.
+        // SAFETY: file owns the source handle; the returned handle is checked.
+        let handle = crate::windows::owned(unsafe {
+            ReOpenFile(
+                file.as_raw_handle(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+            )
+        })?;
+        File::from(handle).set_len(len)
+    }
+}
+
 /// Orders earlier writes before later commits. Apple keeps them in the
 /// drive cache until a cache flush covers the promise made to a client or
 /// an external effect; other platforms already flush here.
@@ -217,6 +243,102 @@ pub fn order_dir(dir: &Path) -> io::Result<()> {
     sync_dir(dir)
 }
 
+/// Publishes directories below an already durable anchor, without opening its
+/// ancestors. Names below it must be created through this operation: a child's
+/// existence then proves its ancestors were published before it was created.
+/// The nearest existing name still needs its barrier in case mkdir succeeded
+/// but publication failed on an earlier attempt.
+pub fn create_dir_all_durable(anchor: &Path, dir: &Path) -> io::Result<()> {
+    let relative = dir
+        .strip_prefix(anchor)
+        .map_err(|_| io::ErrorKind::InvalidInput)?;
+    if relative
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let existing = if anchor.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        anchor
+    };
+    if !existing.is_dir() {
+        return Err(io::ErrorKind::NotFound.into());
+    }
+    create_directories(anchor, dir, &|path| path.is_dir(), &create_directory)
+}
+
+fn create_directories(
+    anchor: &Path,
+    dir: &Path,
+    exists: &impl Fn(&Path) -> bool,
+    publish: &impl Fn(&Path, bool) -> io::Result<()>,
+) -> io::Result<()> {
+    if dir == anchor {
+        return Ok(());
+    }
+    if !exists(dir) {
+        let parent = dir.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        create_directories(anchor, parent, exists, publish)?;
+    }
+    publish(dir, exists(dir))
+}
+
+fn create_directory(dir: &Path, existing: bool) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if !existing {
+            match fs::create_dir(dir) {
+                Ok(()) => {}
+                Err(_) if dir.is_dir() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        sync_dir(
+            dir.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(if dir.is_absolute() {
+                    dir
+                } else {
+                    Path::new(".")
+                }),
+        )
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Existence follows the atomic write-through publication, unlike mkdir
+        // followed by a separate parent barrier on Unix.
+        if existing {
+            return Ok(());
+        }
+        let pending = loop {
+            let pending = dir.with_file_name(format!(
+                ".a-directory-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&pending) {
+                Ok(()) => break pending,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        };
+        // A unique sibling avoids sharing staging state with another creator.
+        // WRITE_THROUGH publishes the directory before files beneath it commit.
+        let result = move_file(&pending, dir, false);
+        if result.is_err() {
+            let _ = fs::remove_dir(&pending);
+        }
+        match result {
+            Err(_) if dir.is_dir() => Ok(()),
+            result => result,
+        }
+    }
+}
+
 /// Makes directory entries durable on platforms with a directory barrier.
 /// Windows callers must publish names with `publish` instead.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -245,8 +367,19 @@ fn move_file(from: &Path, to: &Path, replacing: bool) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
-    let from = crate::windows::wide(from.as_os_str());
-    let to = crate::windows::wide(to.as_os_str());
+    // Canonical parents supply extended-length paths without following the
+    // final component: a rename moves a link itself, never its target.
+    let absolute = |path: &Path| -> io::Result<std::path::PathBuf> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Ok(parent
+            .canonicalize()?
+            .join(path.file_name().ok_or(io::ErrorKind::InvalidInput)?))
+    };
+    let from = crate::windows::wide(absolute(from)?.as_os_str());
+    let to = crate::windows::wide(absolute(to)?.as_os_str());
     // WRITE_THROUGH waits for the move on disk; COPY_ALLOWED is deliberately
     // absent so publication cannot degrade to a cross-volume copy/delete.
     // Microsoft does not document FlushFileBuffers as a directory barrier.
@@ -461,50 +594,89 @@ pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
     Ok(WriteWatch { fd, _file: file })
 }
 
-/// A directory change notification: writes to any output in this session's
-/// spill directory wake its followers, which recheck their own files.
+/// Completion of spill-file writes copied from a contained process's pipe.
+/// NTFS directory notifications can wait until the writer closes its file.
 #[cfg(windows)]
-pub struct WriteWatch(Option<std::os::windows::io::OwnedHandle>);
+pub struct WriteWatch {
+    key: (u32, u64),
+    event: std::sync::Arc<std::os::windows::io::OwnedHandle>,
+}
+
+#[cfg(windows)]
+type OutputWaiters =
+    std::collections::HashMap<(u32, u64), Vec<std::sync::Weak<std::os::windows::io::OwnedHandle>>>;
+
+#[cfg(windows)]
+fn output_waiters() -> &'static std::sync::Mutex<OutputWaiters> {
+    static WAITERS: std::sync::OnceLock<std::sync::Mutex<OutputWaiters>> =
+        std::sync::OnceLock::new();
+    WAITERS.get_or_init(Default::default)
+}
+
+#[cfg(windows)]
+fn output_key(file: &File) -> io::Result<(u32, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    let meta = file.metadata()?;
+    meta.volume_serial_number()
+        .zip(meta.file_index())
+        .ok_or_else(|| io::Error::other("output has no file identity"))
+}
 
 #[cfg(windows)]
 impl std::os::windows::io::AsHandle for WriteWatch {
     fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
-        self.0.as_ref().unwrap().as_handle()
+        self.event.as_handle()
     }
 }
 
 #[cfg(windows)]
 impl Drop for WriteWatch {
     fn drop(&mut self) {
-        use std::os::windows::io::IntoRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::FindCloseChangeNotification;
-        if let Some(handle) = self.0.take() {
-            // SAFETY: notification handles need their matching close API,
-            // after rt has unregistered the wait on this owned source.
-            unsafe { FindCloseChangeNotification(handle.into_raw_handle()) };
+        let mut waiters = output_waiters()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(events) = waiters.get_mut(&self.key) {
+            events.retain(|event| !event.ptr_eq(&std::sync::Arc::downgrade(&self.event)));
+            if events.is_empty() {
+                waiters.remove(&self.key);
+            }
         }
     }
 }
 
 #[cfg(windows)]
 pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FindFirstChangeNotificationW,
-    };
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output has no directory"))?;
-    let path = crate::windows::wide(parent.as_os_str());
-    // SAFETY: path is NUL-terminated and lives across the call. WriteWatch
-    // uses FindCloseChangeNotification instead of dropping the OwnedHandle.
-    let handle = crate::windows::owned(unsafe {
-        FindFirstChangeNotificationW(
-            path.as_ptr(),
-            0,
-            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
-        )
-    })?;
-    Ok(WriteWatch(Some(handle)))
+    let key = output_key(&File::open(path)?)?;
+    let event = std::sync::Arc::new(crate::windows::event()?);
+    output_waiters()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key)
+        .or_default()
+        .push(std::sync::Arc::downgrade(&event));
+    Ok(WriteWatch { key, event })
+}
+
+/// Signals only after the copied output is readable from its spill file.
+pub fn output_written(file: &File) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::SetEvent;
+        let key = output_key(file)?;
+        let waiters = output_waiters()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(events) = waiters.get(&key) {
+            for event in events.iter().filter_map(std::sync::Weak::upgrade) {
+                // SAFETY: the upgraded event stays owned throughout the call.
+                crate::windows::ok(unsafe { SetEvent(event.as_raw_handle()) })?;
+            }
+        }
+    }
+    #[cfg(unix)]
+    let _ = file;
+    Ok(())
 }
 
 impl WriteWatch {
@@ -513,15 +685,9 @@ impl WriteWatch {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
-            use windows_sys::Win32::System::Threading::WaitForSingleObject;
-            let handle = self.0.as_ref().unwrap().as_raw_handle();
-            // SAFETY: the watch owns this handle; rearm only after a signal.
-            unsafe {
-                if WaitForSingleObject(handle, 0) == 0 {
-                    FindNextChangeNotification(handle);
-                }
-            }
+            use windows_sys::Win32::System::Threading::ResetEvent;
+            // SAFETY: this watch owns the event, reset before reading output.
+            unsafe { ResetEvent(self.event.as_raw_handle()) };
         }
         #[cfg(target_os = "linux")]
         {
@@ -738,6 +904,26 @@ mod lock_tests {
 mod publication_tests {
     use super::*;
     use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    // Search-only 0111 mode is a Unix permission contract.
+    #[cfg(unix)]
+    #[test]
+    fn durable_store_creation_preserves_access_through_search_only_ancestors() {
+        let root =
+            std::env::temp_dir().join(format!("a-review-search-only-{}", std::process::id()));
+        let ancestor = root.join("search-only");
+        let home = ancestor.join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o111)).unwrap();
+
+        let result = create_dir_all_durable(&home, &home.join("sessions"));
+
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(result.is_ok(), "store creation failed: {result:?}");
+    }
 
     #[test]
     fn a_published_log_has_its_complete_header_before_appends() {
@@ -762,6 +948,62 @@ mod publication_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn completed_output_writes_wake_each_follower_before_the_writer_closes() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        let root = std::env::temp_dir().join(format!("a-output-notify-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("output");
+        let mut file = private_file().open(&path).unwrap();
+        let watches = [write_watch(&path).unwrap(), write_watch(&path).unwrap()];
+        for _ in 0..2 {
+            for watch in &watches {
+                watch.clear();
+            }
+            file.write_all(b"progress\n").unwrap();
+            output_written(&file).unwrap();
+            for watch in &watches {
+                // SAFETY: the watch owns this event throughout the wait.
+                let signalled = unsafe { WaitForSingleObject(watch.event.as_raw_handle(), 5000) };
+                assert_eq!(signalled, WAIT_OBJECT_0);
+            }
+        }
+        drop(watches);
+        drop(file);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trimming_a_log_tail_preserves_append_only_writes() {
+        let root = std::env::temp_dir().join(format!("a-trim-log-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("log");
+        let (mut file, _) = open_log(&path, Some(b"header\n")).unwrap();
+        file.write_all(b"torn").unwrap();
+        truncate(&file, 7).unwrap();
+        read_exact_at(&file, &mut [0; 2], 0).unwrap();
+        file.write_all(b"entry\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"header\nentry\n");
+        drop(file);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn durable_directory_creation_preserves_existing_contents_and_rejects_files() {
+        let root = std::env::temp_dir().join(format!("a-durable-directory-{}", std::process::id()));
+        let nested = root.join("children").join("space café");
+        create_dir_all_durable(&std::env::temp_dir(), &nested).unwrap();
+        let file = nested.join("kept");
+        fs::write(&file, b"contents").unwrap();
+        create_dir_all_durable(&std::env::temp_dir(), &nested).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"contents");
+        assert!(create_dir_all_durable(&std::env::temp_dir(), &file.join("child")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn failed_publication_never_replaces_the_existing_name() {
         let root = std::env::temp_dir().join(format!("a-publish-failure-{}", std::process::id()));
@@ -771,5 +1013,93 @@ mod publication_tests {
         assert!(publish(&root.join("missing"), &path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"old");
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod directory_retry_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+
+    #[test]
+    fn session_publication_stops_at_the_nearest_durable_anchor() {
+        let anchor = Path::new("home/sessions");
+        let session = anchor.join("id");
+        let child = session.join("children/child");
+        let home = Path::new("home");
+        let names = RefCell::new(HashSet::from([home.to_owned()]));
+        let barriers = RefCell::new(Vec::new());
+        let exists = |path: &Path| names.borrow().contains(path);
+        let publish = |path: &Path, _existing: bool| {
+            names.borrow_mut().insert(path.to_owned());
+            barriers
+                .borrow_mut()
+                .push(path.parent().unwrap().to_owned());
+            Ok(())
+        };
+        create_directories(home, anchor, &exists, &publish).unwrap();
+        assert_eq!(*barriers.borrow(), [home]);
+        barriers.borrow_mut().clear();
+        create_directories(anchor, &session, &exists, &publish).unwrap();
+        assert_eq!(*barriers.borrow(), [anchor]);
+        barriers.borrow_mut().clear();
+        // A published parent session is the anchor for its own children.
+        create_directories(&session, &child, &exists, &publish).unwrap();
+        assert_eq!(
+            *barriers.borrow(),
+            [session.clone(), session.join("children")]
+        );
+        barriers.borrow_mut().clear();
+        create_directories(&session, &child, &exists, &publish).unwrap();
+        assert_eq!(*barriers.borrow(), [session.join("children")]);
+    }
+
+    #[test]
+    fn retrying_directory_creation_reestablishes_every_parent_publication() {
+        struct Disk {
+            names: HashSet<std::path::PathBuf>,
+            durable: HashSet<std::path::PathBuf>,
+            failures: usize,
+        }
+        let sessions = Path::new("sessions");
+        let session = sessions.join("id");
+        let derived = session.join("derived");
+        let disk = RefCell::new(Disk {
+            names: [sessions.to_owned()].into(),
+            durable: [sessions.to_owned()].into(),
+            failures: 2,
+        });
+        let exists = |path: &Path| disk.borrow().names.contains(path);
+        let publish = |path: &Path, _existing: bool| {
+            let mut disk = disk.borrow_mut();
+            assert!(path.starts_with(sessions));
+            assert_ne!(
+                path, sessions,
+                "the durable anchor must never be republished"
+            );
+            disk.names.insert(path.to_owned());
+            if path == session && disk.failures != 0 {
+                disk.failures -= 1;
+                return Err(io::Error::other("parent barrier failed after mkdir"));
+            }
+            disk.durable.insert(path.to_owned());
+            Ok(())
+        };
+        assert!(create_directories(sessions, &session, &exists, &publish).is_err());
+        assert!(exists(&session));
+        assert!(!disk.borrow().durable.contains(&session));
+        assert!(create_directories(sessions, &derived, &exists, &publish).is_err());
+        assert!(
+            !exists(&derived),
+            "a failed ancestor barrier must prevent child publication"
+        );
+        create_directories(sessions, &derived, &exists, &publish).unwrap();
+        let disk = disk.borrow();
+        assert!(
+            disk.durable.contains(&session),
+            "a committed child must survive losing all unflushed names"
+        );
+        assert!(disk.durable.contains(&derived));
     }
 }

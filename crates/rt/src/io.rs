@@ -64,7 +64,13 @@ enum Inner<T: Source> {
     #[cfg(windows)]
     Completion {
         events: [async_io::os::windows::Waitable<std::os::windows::io::OwnedHandle>; 2],
+        complete_write: fn(&T) -> io::Result<()>,
         io: T,
+    },
+    #[cfg(test)]
+    FakeCompletion {
+        io: T,
+        complete_write: fn(&T) -> io::Result<()>,
     },
     /// A handle that is signalled, as a process is when it exits.
     #[cfg(windows)]
@@ -126,6 +132,7 @@ impl<T: sys::CompletionSource> Async<T> {
                         async_io::os::windows::Waitable::new(read)?,
                         async_io::os::windows::Waitable::new(write)?,
                     ],
+                    complete_write: T::complete_write,
                     io,
                 }))
             }
@@ -176,6 +183,8 @@ impl<T: Source> Async<T> {
     pub fn get_ref(&self) -> &T {
         match &self.0 {
             Inner::AsyncIo(io) => io.get_ref(),
+            #[cfg(test)]
+            Inner::FakeCompletion { io, .. } => io,
             #[cfg(windows)]
             Inner::Signal(handle) => handle.get_ref(),
             #[cfg(windows)]
@@ -205,9 +214,22 @@ impl<T: Source> Async<T> {
         self.retry(false, op).await
     }
 
-    /// As [`Async::read_with`], for writing.
+    /// Returns accepted bytes without a cancellation point after submission.
+    /// Use [`Async::flush`] to await completion of accepted writes.
     pub async fn write_with<R>(&self, op: impl FnMut(&T) -> io::Result<R>) -> io::Result<R> {
         self.retry(true, op).await
+    }
+
+    /// Completes accepted writes without resubmitting their buffers.
+    pub async fn flush(&self) -> io::Result<()> {
+        self.retry(true, |_| match &self.0 {
+            #[cfg(windows)]
+            Inner::Completion { complete_write, .. } => complete_write(self.get_ref()),
+            #[cfg(test)]
+            Inner::FakeCompletion { complete_write, .. } => complete_write(self.get_ref()),
+            _ => Ok(()),
+        })
+        .await
     }
 
     async fn retry<R>(
@@ -234,6 +256,8 @@ impl<T: Source> Async<T> {
             // `poll_readable`, which takes a new one each poll: an
             // already-ready descriptor would race the reactor for it,
             // spinning both.
+            #[cfg(test)]
+            Inner::FakeCompletion { .. } => std::future::pending().await,
             Inner::AsyncIo(io) if write => io.writable().await,
             Inner::AsyncIo(io) => io.readable().await,
             #[cfg(windows)]
@@ -243,5 +267,185 @@ impl<T: Source> Async<T> {
             #[cfg(windows)]
             Inner::Completion { events, .. } => events[usize::from(write)].ready().await,
         }
+    }
+}
+
+/// Copies captured process output without keeping a blocking worker while idle.
+pub async fn capture_output<T: Source + Send + Sync>(
+    runtime: &dyn crate::Runtime,
+    input: Async<T>,
+    mut file: std::fs::File,
+    copied: fn(&std::fs::File) -> io::Result<()>,
+) -> io::Result<()>
+where
+    for<'a> &'a T: io::Read,
+{
+    use std::io::{Read as _, Write as _};
+    let mut buffer = vec![0; 64 << 10];
+    loop {
+        let read = input.read_with(|mut input| input.read(&mut buffer)).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        let (state, result) = crate::unblock_with(
+            runtime,
+            crate::BlockingClass::Storage,
+            buffer.len(),
+            move || {
+                let result = file.write_all(&buffer[..read]).and_then(|()| copied(&file));
+                ((file, buffer), result)
+            },
+        )
+        .await;
+        (file, buffer) = state;
+        result?;
+    }
+}
+
+#[cfg(all(test, windows, feature = "threads"))]
+mod capture_tests {
+    use super::*;
+    use crate::Runtime as _;
+    use std::{fs, process::Command};
+
+    #[test]
+    fn captured_output_wakes_followers_before_exit_and_drains_past_pipe_capacity() {
+        let runtime = crate::Threads::new(1);
+        let root = std::env::temp_dir().join(format!("a-captured-output-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        for (case, command, expected) in [
+            ("live", "printf progress; sleep 600", b"progress".to_vec()),
+            ("drain", "printf '%*s' 1048576 ''", vec![b' '; 1 << 20]),
+        ] {
+            let path = root.join(case);
+            let file = sys::fs::private_file().open(&path).unwrap();
+            let watch =
+                Async::for_reading(&runtime.reactor(), sys::write_watch(&path).unwrap()).unwrap();
+            let mut command_line =
+                Command::new(sys::find_bash(std::env::var("PATH").ok().as_deref()).unwrap());
+            command_line.args(["-c", command]).envs(std::env::vars_os());
+            let mut child = sys::spawn_group_captured(&mut command_line, file).unwrap();
+            let capture = child.capture.take().unwrap();
+            let input = Async::read_pipe(&runtime.reactor(), capture.reader).unwrap();
+            let copying = capture_output(&runtime, input, capture.file, sys::fs::output_written);
+            let observing = async {
+                if case == "live" {
+                    watch.readable_result().await.unwrap();
+                    assert_eq!(fs::read(&path).unwrap(), expected);
+                    assert!(child.try_wait().unwrap().is_none());
+                    child.group.signal(sys::Signal::Kill).unwrap();
+                }
+            };
+            crate::block_on(crate::or(
+                async {
+                    let (copied, ()) = crate::zip(copying, observing).await;
+                    copied.unwrap();
+                },
+                async {
+                    runtime.sleep(Duration::from_secs(10)).await;
+                    panic!("captured output did not complete");
+                },
+            ));
+            child.wait().unwrap();
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            drop(watch);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod acknowledgement_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+
+    struct Submitted {
+        // Source's descriptor is unused: fake readiness never signals.
+        #[cfg(unix)]
+        descriptor: std::fs::File,
+        bytes: Mutex<Vec<u8>>,
+        completed: std::sync::atomic::AtomicBool,
+        blocked: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(unix)]
+    impl std::os::fd::AsFd for Submitted {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.descriptor.as_fd()
+        }
+    }
+
+    impl Write for &Submitted {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.blocked.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.completed.load(std::sync::atomic::Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+    }
+
+    fn submitted() -> Async<Submitted> {
+        Async(Inner::FakeCompletion {
+            io: Submitted {
+                #[cfg(unix)]
+                descriptor: std::fs::File::open(std::env::current_exe().unwrap()).unwrap(),
+                bytes: Mutex::new(Vec::new()),
+                completed: std::sync::atomic::AtomicBool::new(false),
+                blocked: std::sync::atomic::AtomicBool::new(true),
+            },
+            complete_write: |mut io| io.flush(),
+        })
+    }
+
+    #[test]
+    fn accepted_bytes_are_returned_before_cancellation_can_retry_them() {
+        let io = submitted();
+        let mut cancelled = Box::pin(io.write_with(|mut io| io.write(b"frame")));
+        assert!(
+            cancelled
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(cancelled);
+        assert!(io.get_ref().bytes.lock().unwrap().is_empty());
+        io.get_ref()
+            .blocked
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut write = Box::pin(io.write_with(|mut io| io.write(b"frame")));
+        let result = write.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        drop(write);
+        assert!(
+            matches!(result, Poll::Ready(Ok(5))),
+            "accepted bytes must be acknowledged in the submitting poll: {result:?}"
+        );
+        assert_eq!(*io.get_ref().bytes.lock().unwrap(), b"frame");
+        let mut flush = Box::pin(io.flush());
+        assert!(
+            flush
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(flush);
+        io.get_ref()
+            .completed
+            .store(true, std::sync::atomic::Ordering::Release);
+        crate::block_on(io.flush()).unwrap();
+        assert_eq!(
+            *io.get_ref().bytes.lock().unwrap(),
+            b"frame",
+            "retrying a cancelled flush must not submit the frame again"
+        );
     }
 }

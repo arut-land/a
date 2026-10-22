@@ -640,6 +640,13 @@ impl AsyncTransport {
             Self::Pipe(io) => io.write_with(|mut io| io.write(bytes)).await,
         }
     }
+    #[allow(clippy::match_same_arms)]
+    async fn flush(&self) -> io::Result<()> {
+        match self {
+            Self::Local(io) => io.flush().await,
+            Self::Pipe(io) => io.flush().await,
+        }
+    }
 }
 
 struct AsyncConnection {
@@ -709,7 +716,7 @@ impl AsyncConnection {
             }
             remaining = &remaining[written..];
         }
-        Ok(())
+        self.writer.flush().await
     }
 
     async fn line(&self, buffered: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
@@ -848,6 +855,7 @@ mod tests {
         home: sys::Home,
         daemon: Daemon,
         listener: sys::Listener,
+        _owner: std::fs::File,
         root: std::path::PathBuf,
     }
 
@@ -859,11 +867,21 @@ mod tests {
             let exe = root.join("a");
             std::fs::write(&exe, "never run").unwrap();
             let staged = home.runtime().stage(&exe).unwrap();
+            std::fs::create_dir_all(home.run_dir()).unwrap();
+            let owner = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(home.daemon_pid_file())
+                .unwrap();
+            sys::fs::lock(&owner).unwrap();
+            write!(&owner, "{}", sys::crash::Record::current("test")).unwrap();
             let listener = home.bind().unwrap();
             Self {
                 daemon: Daemon::local(home.clone(), staged),
                 home,
                 listener,
+                _owner: owner,
                 root,
             }
         }

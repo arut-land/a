@@ -1,228 +1,142 @@
 # Windows daemon platform
 
+## Transport and completion
+
 The transport uses byte-mode local named pipes selected by the locked daemon
-record. Each process generation has its own pipe name, including hashes of
-both the home directory's file identity and the current process token's
-user SID, so case variants and junction aliases find the same daemon. Every
-instance has an explicit protected DACL containing one allow ACE for that SID, rejects
-remote clients, and the first instance refuses an existing pipe name.
-Clients query the server process's token SID before writing a hello. The
-name's hashes select an endpoint; they do not authorize access.
+record. Each generation's pipe name includes the home directory's file
+identity, the current token's user SID, PID and process creation time. Case
+variants and junction aliases therefore find the same daemon. The record
+must be locked; clients reject stale identities and verify the pipe server's
+PID and SID before writing a hello. Every pipe instance has a protected DACL
+allowing only that SID, rejects remote clients, and the first instance refuses
+an existing name. Name hashes select an endpoint; they do not authorize access.
 
-`async-io` 2.6.0 provides Windows socket polling and `Waitable` handles. Its
-waitable implementation uses the Windows thread pool, alongside polling's
-IOCP socket reactor. It does not submit named-pipe operations. `sys` submits
-`ReadFile`, `WriteFile` and `ConnectNamedPipe` with overlapped I/O and one
-manual-reset event per direction. `rt` registers duplicate event handles
-with `Waitable`; no blocking worker, timer, or dedicated thread waits for
-an idle connection. The operation owns its pinned OVERLAPPED and buffer,
-including across cancelled futures. Dropping an operation cancels it and
-waits for completion before freeing either allocation.
+`async-io` 2.6.0 supplies Windows socket polling and thread-pool-backed
+`Waitable` handles. `sys` submits overlapped `ReadFile`, `WriteFile` and
+`ConnectNamedPipe` operations with manual-reset events; `rt` registers
+duplicate event handles. An idle connection needs no blocking worker, timer
+or dedicated thread. Each operation owns its pinned OVERLAPPED and buffer.
+Dropping it cancels and joins the operation before freeing either allocation.
 
-The only added external dependency is a direct Windows-only use of
-`windows-sys` 0.61.2, already present with `windows-link` 0.2.1 in the locked
-Windows graph. Cargo.lock adds no package or version. These bindings avoid
-hand-maintaining Win32 ABI layouts, constants and imports. `interprocess`
-2.x supplies synchronous pipes but its asynchronous named pipes require
-Tokio, which this binary cannot link. Reusing async-io's waitable support
-avoids a second executor or reactor. No Windows size, RSS or latency
-measurement is possible on the local Apple host; native measurements remain
-an owner/CI follow-up, not evidence for a performance claim.
+Writes return the accepted count in the submitting poll, without awaiting
+completion afterward. A later would-block consumes none of the next buffer.
+A separate flush completes accepted writes, including a frame's final chunk;
+cancelling and retrying that flush never resubmits bytes. Synchronous client
+transports delegate flush to their stream. Async client, daemon and MCP
+writers flush at their message boundaries.
 
-Windows daemon startup uses a re-listen handshake under `start.lock`.
-After checking the daemon lock, the starter closes its record handle,
-launches the child with `DETACHED_PROCESS`, and waits at most ten seconds for the child's binding acknowledgement through its
-stdout pipe. No daemon transport or lock handle is inherited. The child
-claims the record before acknowledging readiness, then starts accepting; clients wait for its hello.
-Unix retains the bound-descriptor handoff and backlog connection.
+The Win32 bindings use `windows-sys` 0.61.2 and `windows-link` 0.2.1, already
+in the dependency graph. They avoid hand-maintained ABI layouts.
+`interprocess` 2.x requires Tokio for asynchronous named pipes; reusing
+async-io's waitable support fits the runtime seam without another executor.
 
-Record locks cover one byte far beyond the record's contents. Windows
-byte locks would otherwise prevent clients reading the identity that
-justifies stopping a wedged daemon. Start time comes from `GetProcessTimes`;
-stop verifies that token before terminating a nonresponding process.
+## Process ownership
 
-Windows staging uses atomic reference files for `current` and stamps,
-rather than symlinks requiring developer mode or elevation. Staged builds
-are executable `.exe` files. A running executable that Windows refuses to
-remove is left for a later prune. The existing upgrade lifecycle drains
-the old daemon, whose successor re-listens after the old process exits.
+Daemon startup uses a re-listen handshake under `start.lock`. The starter
+closes its record handle, launches the child with `DETACHED_PROCESS`, and
+waits at most ten seconds for a stdout binding acknowledgement. The child
+locks and publishes its identity before acknowledging readiness, then accepts
+clients. Each successor owns a distinct pipe namespace even while an older
+client retains a handle. Unix uses the bound-descriptor handoff.
+
+Daemon and shell creation own child stdio duplicates and use
+`CreateProcessW` with an explicit `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
+No transport, lock or unrelated inheritable handle can leak into a child.
+The shell's creation attributes assign an unnamed kill-on-close job before
+user code can create descendants. Only the daemon retains that job handle.
+MCP child stdio uses the same allowlisted spawn path, with synchronous child
+ends and overlapped parent ends. Argument escaping has portable tests.
+
+Record locks cover a byte beyond the record's contents so readers can obtain
+the identity needed to stop a wedged daemon. Fallback stop retains one
+query-and-terminate handle across identity validation and both stop attempts;
+it never reopens a PID. Missing or mismatched creation tokens are rejected.
+Console callbacks signal a process-lifetime event registered through `rt`,
+without a polling thread or callback/handle-close reuse race.
+
+## Shell output and staging
 
 Shell execution uses Git for Windows Bash with redirected output and no
-console. Native paths, extended-length/UNC prefixes, shell working-directory
-reports and Windows daemon environment variables are handled in `sys`.
-Directory-change notifications wake output followers without periodic
-file polling. Each shell enters an unnamed kill-on-close job through the
-process creation job-list attribute, before any shell code can create descendants. Only the
-daemon retains the job handle, so daemon death kills the whole tree. There
-is no terminal/ConPTY: shell tools have no interactive stdin, as on Unix.
+console. Native paths, extended-length and UNC prefixes, shell directory
+reports and daemon environment variables are handled in `sys`. Each shell
+enters its job at creation; there is no terminal or interactive shell stdin.
 
-Native CI runs workspace nextest and the portable daemon acceptance tests
-without an advisory failure allowance. It alone can validate Win32 linking,
-DACL contents, pipe completion/cancellation, handle wakeups, record locking,
-no-console detach, job containment, Windows staging/upgrade, crash recovery,
-and shell execution in paths with spaces and non-ASCII characters. A second
-account denial test and physical power-cut durability testing need a suitable
-Windows host; ordinary CI and cross-lint cannot prove those. Miri on Unix
-cannot execute Windows FFI or validate kernel buffer lifetimes. Portable
-path/staging/locking tests run locally; supported sys tests run under Miri.
+Captured output enters an overlapped pipe. `rt` copies bounded 64 KiB chunks
+to the spill file on storage workers and signals file-identity-keyed follower
+events. NTFS directory notifications can wait until close and cannot provide
+live progress. A quiet process holds no copying worker and causes no polling.
+Output draining completes independently of descendant reaping. The copier
+retains the runtime service, without retaining a call's context or admission.
+Unix uses direct file output and native file notifications.
 
-## Invariants exercised
-
-The portable black-box tests in
-[`daemon_acceptance.rs`](../../apps/cli/tests/blackbox/daemon_acceptance.rs)
-run on Unix and in the native Windows lane:
-
-- `concurrent_starters_share_one_daemon_and_stop_releases_its_lock`
-- `committed_turns_survive_a_daemon_restart`
-- `an_unclean_exit_releases_the_endpoint_and_recovers_committed_sessions`
-- `shell_paths_with_spaces_and_non_ascii_reach_the_native_directory`
-- `two_installs_upgrade_once_and_the_older_client_never_downgrades`
-
-Windows sys tests cover kernel-specific contracts:
-
-- `alternate_spellings_of_one_home_find_the_same_pipe`
-- `a_listener_has_one_owner_and_accepts_multiple_independent_clients`
-- `a_cancelled_read_keeps_its_buffer_and_completion_until_observed`
-- `shutdown_wakes_a_blocked_clone_without_waiting_for_the_peer`
-- `the_pipe_dacl_grants_access_only_to_the_current_token_sid`
-- `daemon_death_kills_the_whole_job_tree`
-- `process_identity_is_stable_and_not_a_pid_alone`
-- `extended_and_unc_paths_keep_their_shell_meaning`
-
-Portable sys invariants include
-`a_locked_record_remains_readable_and_excludes_other_writers` and
-`shell_directory_reports_roundtrip_spaces_unicode_and_line_endings`;
-both pass under Miri on Unix. The existing staging tests now run on Windows
-as well. Client tests for stopped-process identity and releasing a timed-out
-lock waiter also run on Windows through the shared lock seam.
-
-## Local validation (2026-10-21)
-
-On the Apple development host, the merged tree through main `0b9292f`
-passed `mise run check` (944 tests, 28 skipped), acceptance (18), web (6),
-and Apple (10). Windows cross-clippy, machete, dependency deny, and the
-no-Tokio check passed. Native Windows linking and execution have not run
-locally; the required CI lane is the gate for those results.
-
-The two portable path/lock invariants above passed under Miri. The full
-prescribed Miri task still stops at the existing unsupported
-`CFStringCreateWithCString` call in `sys::awake`. Windows kernel FFI and
-completion-buffer lifetimes cannot be checked by that Unix Miri run.
-
-`mise run size` measured 3,007 KiB before and after the Windows work alone.
-After merging main's fork implementation and protocol 7, it measured
-3,039 KiB, including fixture exclusion, below the 4,096 KiB cap. All builds
-used `CARGO_BUILD_JOBS=3`. Budgets and startup timing were deliberately not
-run on this shared machine; the coordinator runs them on a quiet host.
-
-## Explicit process inheritance
-
-Daemon and shell creation now own three child stdio duplicates and use
-`CreateProcessW` with an explicit `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
-The shell's attribute list also assigns its kill-on-close job before user
-code runs. No other inheritable handle in the parent is eligible. This
-uses the existing windows-sys bindings; no package is added.
-
-The pinned standard library duplicates stdio inside `Command::spawn`,
-which prevents an external allowlist from naming the actual child stdio.
-The sys seam therefore owns native creation and its child handle, while
-Unix retains std::process::Child. The command carries an explicit environment
-and argv; MS C argument escaping is shared with pure Unix/Miri tests.
-The API takes the output file separately, eliminating hidden stdio state.
-
-`a_cold_clients_output_reaches_eof_while_the_daemon_stays_alive` exercises
-cold-start capture on every platform with a bounded EOF wait. Native
-`a_shell_never_inherits_an_unrelated_inheritable_pipe` keeps a shell alive
-while an unrelated inheritable pipe must reach EOF.
-
-Pipe discovery uses the existing locked daemon record. The physical pipe name
-includes the home identity, SID hash, PID and process creation time. Only the
-lock holder publishes that record, before acknowledging startup; clients reject
-stale process identities and verify the pipe server's PID and SID. Each
-successor therefore creates its own namespace with FIRST_PIPE_INSTANCE even
-when a client retains a previous generation's handle. No extra discovery file
-or compatibility path is needed. The portable retained-client acceptance test
-covers graceful restart; native CI exercises the Windows namespace lifetime.
+Windows staging uses atomic reference files for `current` and stamps instead
+of privileged symlinks. Staged executables have the `.exe` suffix. Files
+Windows refuses to remove while running remain for a later prune. Upgrades
+drain the old daemon before the successor re-listens.
 
 ## Durable namespace publication
 
-Flushed files are published on NTFS with same-volume MoveFileExW using
-REPLACE_EXISTING and WRITE_THROUGH. File content flush precedes the rename;
-completion waits for the move on disk. No cross-volume copy fallback is
-allowed. Imports, catalog rewrites and dirty markers use this path. A new
-Windows log publishes its flushed header before handing out an append
-handle and a Publication receipt; Unix retains its deferred name barrier.
-Removing the catalog dirty marker durably renames it to an ignored tombstone
-before deleting that tombstone. A crash can leave garbage, not a clean
-catalog paired with an unpublished rewrite.
+Flushed files are published on local NTFS with same-volume `MoveFileExW`,
+`REPLACE_EXISTING` and `WRITE_THROUGH`. Content flush precedes the rename;
+completion waits for the move on disk. Canonical parent paths retain the
+extended-length prefix without following the final component. No cross-volume
+copy fallback is allowed. Imports, catalog rewrites and dirty markers use
+this path. A new log publishes its flushed header before exposing an append
+handle and publication receipt.
 
-Directory FlushFileBuffers with BACKUP_SEMANTICS has no documented persistence
-contract used here. Windows sync_dir returns Unsupported, rather than silently
-certifying a name. The guarantee assumes local NTFS and devices honoring
-flushes. Native CI exercises the operation and error paths; power-loss
-persistence still requires a storage test. This changes no dependency and adds
-one header flush/publication per new Windows session, without changing Unix's
-shared first-entry barrier. No Windows performance measurement is claimed.
+Removing a catalog dirty marker durably renames it to an ignored tombstone
+before deleting the tombstone. A crash can leave garbage, never a clean
+catalog paired with an unpublished rewrite. Torn-tail repair reopens the same
+file with write-data access because append-only Windows handles cannot
+truncate; it preserves the append handle and read cursor.
 
-## Stop target ownership
+Windows directory `FlushFileBuffers` has no persistence contract used here.
+`sync_dir` returns Unsupported; directory creation publishes each missing
+ancestor from an exclusive sibling with a same-volume write-through rename.
+Existing directories retain their contents. Opening the store establishes its
+sessions root once beneath the caller-owned home. Session creation stops at
+that durable root, or at a parent session whose log proves its directory was
+published. Unix reissues the nearest existing name's parent barrier before
+creating descendants: mkdir may have succeeded while its barrier failed.
+Ancestors above the anchor are never opened or synced. The disposable
+`derived` cache shares Unix's first-log barrier. These operations precede
+session log commits. The guarantee requires local storage and devices that
+honor flushes.
 
-Fallback stop opens one query+terminate process handle, validates the recorded
-creation token through that handle, and keeps it across both stop attempts.
-Termination never reopens the PID. Missing or mismatched Windows tokens are
-rejected. The existing portable impostor-record test protects the public stop
-path; the native handle test retains the verified target after exit, starts a
-successor and confirms a second signal cannot affect that successor.
+## Validation and measurements
 
-## Main integration
+Native Windows CI runs workspace nextest with `--no-fail-fast` and portable
+daemon acceptance. It exercises Win32 linking, DACL inspection, completion,
+shutdown wakeups, locks, handle inheritance, job containment, staging, daemon
+restart and crash recovery, plus shell paths containing spaces and Unicode.
+Portable fakes deterministically test cancellation before and after write
+acceptance, cancelled flush retries, synchronous flush errors, and retries
+after a directory publication barrier fails. Unix Miri covers supported
+`sys` operations; it cannot execute Windows kernel FFI.
 
-Main through b6a11da uses protocol 8 and adds a daemon signal listener and MCP
-stdio. Windows console callbacks now signal a process-lifetime event registered
-through rt; detached processes can wait without a console or a polling thread.
-The permanently owned event avoids callback/handle-close reuse races.
-MCP also uses the contained, explicitly allowlisted native spawn path. Its
-parent stdio uses overlapped private pipes and the same completion ownership
-as daemon transport; inherited child stdio remains synchronous. Unix keeps
-ordinary readiness pipes. No extra package, worker thread or timer is added.
-Native CI must execute these integration paths as well as the five fixes.
+Cross-account denial and physical power-loss persistence require a suitable
+Windows host. No Windows size, RSS or latency measurement has been collected.
+On the Apple silicon development host (2026-10-22), `mise run size` measured
+the shipped binary at 3,170 KiB against the 4,096 KiB cap, with fixture
+exclusion verified. This is an Apple measurement, not a Windows performance
+claim.
 
-## Review validation (2026-10-21)
+On the same Apple/APFS host, release workspace builds measured `a new` as
+follows (milliseconds). Each build used separate homes at equal path depths
+and an empty workspace. Warm samples used already running daemons; cold
+samples used fresh homes. Execution order rotated between samples, with no
+concurrent builds or tests. Setup and daemon stop were outside the timing.
 
-All five review findings have separate fix commits. Discovery additionally
-requires the published record lock to be held: an exited process object can
-remain queryable while a handle retains it. The native
-`an_unlocked_record_never_discovers_a_retained_generation` test holds an old
-client handle while proving an unlocked identity is no longer discoverable.
+| Implementation | Warm median / p95 (300 samples) | Cold median / p95 (30 samples) |
+| --- | ---: | ---: |
+| main (`491e966`) | 23.58 / 26.90 | 181.75 / 192.19 |
+| Ancestor traversal (`a81e9ed`) | 26.22 / 30.39 | 201.07 / 223.45 |
+| Anchored publication | 23.56 / 26.63 | 191.13 / 204.67 |
 
-Merged main through 5b577df, including protocol 9; this Windows work changes
-no wire encoding or corpus. Local validation on the Apple host passed:
-
-- `check`: fmt, clippy and 1,026 tests (28 skipped).
-- `acceptance`: 20 tests, including
-  `a_cold_clients_output_reaches_eof_while_the_daemon_stays_alive` and
-  `a_successor_starts_while_an_old_client_keeps_its_handle`.
-- `check:windows`: cross-clippy across workspace targets, excluding optional
-  vendored Lua as the existing task specifies.
-- `machete`, `check:no-tokio`, `deny`, `test:web` (6) and `apple:test` (10).
-- Portable Miri: `failed_publication_never_replaces_the_existing_name`,
-  `empty_spaces_quotes_and_trailing_slashes_keep_their_argument`,
-  `a_locked_record_remains_readable_and_excludes_other_writers` and
-  `shell_directory_reports_roundtrip_spaces_unicode_and_line_endings`.
-
-The full prescribed Miri task still cannot emulate the existing CoreFoundation
-awake call. The complete new-log publication invariant passes natively on Unix,
-but Miri cannot emulate Apple's F_BARRIERFSYNC command. Windows-only unsafe
-FFI cannot execute under this Unix Miri target.
-
-Review baseline shipped size was 3,039 KiB; after the fixes and newer main
-merges it is 3,398 KiB, below 4,096 KiB, with fixture exclusion passing. These
-are Apple measurements, not Windows size or latency evidence. Builds used
-CARGO_BUILD_JOBS=3; shared-machine budgets/startup were deliberately not run.
-
-Only native Windows CI can execute the handle allowlists and EOF isolation,
-abandoned-connect recycling, retained-client restart, write-through publication
-and Win32 failure propagation, same-handle identity/termination, console-event
-wakeups, and overlapped MCP stdio/job cleanup. It must also prove linking,
-DACL inspection/SID checks, no-console startup, locking and staged upgrades.
-The CI lane has not been run or pushed from this host. Cross-account denial,
-physical power-loss persistence and Windows performance measurements still
-require an appropriate native host; ordinary CI cannot certify those results.
+Warm session creation matches main in this sample; cold creation includes
+startup and remains about 5% above main. Counting directory barriers in the
+creation path, root sessions use one immediate parent barrier instead of
+main's two; nested children use two, as on main. The first-log barrier is
+unchanged. Store opening establishes its anchor once instead of repeating
+ancestor-wide barriers for each session. These are local measurements, not
+Windows performance results.

@@ -71,7 +71,8 @@ fn request(port: u16) -> http::Request<Payload> {
 }
 
 /// Reads one request's head and body off `reader`.
-fn read_request(reader: &mut BufReader<TcpStream>) {
+fn read_request(reader: &mut BufReader<TcpStream>) -> String {
+    let mut headers = String::new();
     let mut length = 0;
     loop {
         let mut line = String::new();
@@ -82,8 +83,11 @@ fn read_request(reader: &mut BufReader<TcpStream>) {
         if line == "\r\n" {
             break;
         }
+        headers.push_str(&line.to_ascii_lowercase());
     }
+    // Closing with unread request bytes can reset TCP and discard the reply.
     reader.read_exact(&mut vec![0; length]).unwrap();
+    headers
 }
 
 /// A server for one connection: it reads a request, says so on `got`,
@@ -229,15 +233,7 @@ fn credentials_never_cross_transport_scopes() {
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut headers = String::new();
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
-                }
-                headers.push_str(&line.to_ascii_lowercase());
-            }
+            let headers = read_request(&mut reader);
             match credential {
                 Some(value) => assert!(headers.contains(&format!("authorization: {value}\r\n"))),
                 None => assert!(!headers.contains("authorization:")),

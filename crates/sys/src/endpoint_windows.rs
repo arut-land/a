@@ -276,6 +276,9 @@ impl CompletionSource for Stream {
     fn nonblocking(&self) -> io::Result<()> {
         stream_nonblocking(self, true)
     }
+    fn complete_write(&self) -> io::Result<()> {
+        (&*self).flush()
+    }
 }
 
 pub fn connect(path: &Path) -> io::Result<Stream> {
@@ -537,27 +540,32 @@ impl Write for &Stream {
             return Ok(0);
         }
         let mut write = lock(&connection.write);
-        if write.is_none() {
-            let mut op = Operation::new(
-                Arc::clone(&connection.file),
-                duplicate(&connection.write_event)?,
-                bytes[..bytes.len().min(64 << 10)].to_vec(),
-            )?;
-            op.submit(true)?;
-            *write = Some(op);
+        if let Some(op) = write.as_mut() {
+            op.finish(connection.nonblocking.load(Ordering::Acquire), None)?;
+            *write = None;
         }
-        let op = write.as_mut().unwrap();
-        if !bytes.starts_with(&op.buffer) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "pending pipe write was replaced",
-            ));
-        }
-        let length = op.finish(connection.nonblocking.load(Ordering::Acquire), None)?;
-        *write = None;
-        Ok(length)
+        let mut op = Operation::new(
+            Arc::clone(&connection.file),
+            duplicate(&connection.write_event)?,
+            bytes[..bytes.len().min(64 << 10)].to_vec(),
+        )?;
+        op.submit(true)?;
+        let accepted = op.buffer.len();
+        // Report owned bytes once, when accepted. WouldBlock on a later
+        // write consumes none of its buffer, which may differ on retry.
+        *write = Some(op);
+        Ok(accepted)
     }
     fn flush(&mut self) -> io::Result<()> {
+        let connection = &self.0;
+        if connection.write_closed.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let mut write = lock(&connection.write);
+        if let Some(op) = write.as_mut() {
+            op.finish(connection.nonblocking.load(Ordering::Acquire), None)?;
+            *write = None;
+        }
         Ok(())
     }
 }
@@ -572,7 +580,7 @@ impl Write for Stream {
         (&*self).write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        (&*self).flush()
     }
 }
 
@@ -723,6 +731,33 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         drop(server); // Drop must join cancellation before releasing the pending buffer.
+    }
+
+    #[test]
+    fn a_closed_write_direction_never_waits_for_pending_completion() {
+        let home = home("closed-write");
+        let listener = home.bind().unwrap();
+        let _client = connect_pipe(&listener.0.path, None).unwrap();
+        let mut server = accept(&listener.0).unwrap();
+        stream_nonblocking(&server, true).unwrap();
+        loop {
+            match server.write_all(&[0; 8192]) {
+                Ok(()) => {}
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                    break;
+                }
+            }
+        }
+        shutdown(&server, Shutdown::Write).unwrap();
+        assert_eq!(
+            server.flush().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            server.write(b"later").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]

@@ -32,9 +32,11 @@ pub struct Jsonl {
 }
 
 impl Jsonl {
+    /// The caller owns the existing parent directory; opening establishes the
+    /// store's durable anchor once, before any session can be published.
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
+        sys::fs::create_dir_all_durable(dir.parent().unwrap_or(&dir), &dir)?;
         let paths = HashMap::new();
         let domain = sys::fs::FlushDomain::of(&dir)?;
         Ok(Self {
@@ -115,7 +117,7 @@ impl Jsonl {
     }
 
     fn prepare(&self, header: &Header) -> io::Result<PathBuf> {
-        let base = if let Some(parent) = header.parent {
+        let anchor = if let Some(parent) = header.parent {
             let path = self.path(parent.session)?;
             if !path.is_file() {
                 return Err(io::Error::new(
@@ -123,17 +125,21 @@ impl Jsonl {
                     "parent log is absent",
                 ));
             }
-            path.parent().unwrap().join("children")
+            // A log is created only after publishing its directory. Its presence
+            // lets child creation stop here rather than revisit older sessions.
+            path.parent().unwrap().to_owned()
         } else {
             self.dir.clone()
         };
-        fs::create_dir_all(&base)?;
-        if let Some(parent) = base.parent() {
-            sys::fs::sync_dir(parent)?;
-        }
+        let base = if header.parent.is_some() {
+            anchor.join("children")
+        } else {
+            anchor.clone()
+        };
         let dir = base.join(header.id.to_string());
+        sys::fs::create_dir_all_durable(&anchor, &dir)?;
+        // This cache is disposable. Unix's first log barrier also publishes it.
         fs::create_dir_all(dir.join(DERIVED))?;
-        sys::fs::sync_dir(&base)?;
         let path = dir.join("log.jsonl");
         let mut paths = self.paths.write().unwrap_or_else(PoisonError::into_inner);
         if let Some(known) = paths.get(&header.id)
@@ -381,7 +387,7 @@ impl LogStore for Jsonl {
                 rule: ext_logging::Rule::CutTornTail,
                 offset: index.end(),
             });
-            index.file.set_len(index.end())?;
+            sys::fs::truncate(&index.file, index.end())?;
             sys::sync_data(&index.file)?;
         }
         let agreed = placed
@@ -778,7 +784,7 @@ impl JsonlLog {
         let end = self.index.end();
         let file = &self.index.file;
         if self.torn {
-            file.set_len(end)?;
+            sys::fs::truncate(file, end)?;
             self.torn = false;
         }
         let written = (|| {
@@ -801,7 +807,7 @@ impl JsonlLog {
                 Ok(())
             }
             Err(e) => {
-                self.torn = file.set_len(end).is_err();
+                self.torn = sys::fs::truncate(file, end).is_err();
                 Err(e)
             }
         }

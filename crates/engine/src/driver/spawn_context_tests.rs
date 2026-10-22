@@ -26,6 +26,7 @@ fn normalization_never_changes_frozen_settings_or_authority() {
 #[test]
 fn context_survives_removal_of_ancestor_files() {
     let root = std::env::temp_dir().join(format!("a-context-image-{}", SessionId::new()));
+    std::fs::create_dir(&root).unwrap();
     let ancestors = root.join("ancestors");
     let children = root.join("children");
     let ancestor_store = Jsonl::open(&ancestors).unwrap();
