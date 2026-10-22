@@ -243,21 +243,44 @@ pub fn order_dir(dir: &Path) -> io::Result<()> {
     sync_dir(dir)
 }
 
-/// Creates missing directories and durably publishes each new name.
-/// Unix reestablishes every ancestor's parent barrier even for existing names:
-/// an earlier mkdir may have succeeded while its publication failed.
-/// Windows publishes new names through write-through rename instead.
-pub fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
-    create_directories(dir, &|path| path.is_dir(), &create_directory)
+/// Publishes directories below an already durable anchor, without opening its
+/// ancestors. Names below it must be created through this operation: a child's
+/// existence then proves its ancestors were published before it was created.
+/// The nearest existing name still needs its barrier in case mkdir succeeded
+/// but publication failed on an earlier attempt.
+pub fn create_dir_all_durable(anchor: &Path, dir: &Path) -> io::Result<()> {
+    let relative = dir
+        .strip_prefix(anchor)
+        .map_err(|_| io::ErrorKind::InvalidInput)?;
+    if relative
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let existing = if anchor.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        anchor
+    };
+    if !existing.is_dir() {
+        return Err(io::ErrorKind::NotFound.into());
+    }
+    create_directories(anchor, dir, &|path| path.is_dir(), &create_directory)
 }
 
 fn create_directories(
+    anchor: &Path,
     dir: &Path,
     exists: &impl Fn(&Path) -> bool,
     publish: &impl Fn(&Path, bool) -> io::Result<()>,
 ) -> io::Result<()> {
-    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-        create_directories(parent, exists, publish)?;
+    if dir == anchor {
+        return Ok(());
+    }
+    if !exists(dir) {
+        let parent = dir.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        create_directories(anchor, parent, exists, publish)?;
     }
     publish(dir, exists(dir))
 }
@@ -881,6 +904,26 @@ mod lock_tests {
 mod publication_tests {
     use super::*;
     use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    // Search-only 0111 mode is a Unix permission contract.
+    #[cfg(unix)]
+    #[test]
+    fn durable_store_creation_preserves_access_through_search_only_ancestors() {
+        let root =
+            std::env::temp_dir().join(format!("a-review-search-only-{}", std::process::id()));
+        let ancestor = root.join("search-only");
+        let home = ancestor.join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o111)).unwrap();
+
+        let result = create_dir_all_durable(&home, &home.join("sessions"));
+
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(result.is_ok(), "store creation failed: {result:?}");
+    }
 
     #[test]
     fn a_published_log_has_its_complete_header_before_appends() {
@@ -952,12 +995,12 @@ mod publication_tests {
     fn durable_directory_creation_preserves_existing_contents_and_rejects_files() {
         let root = std::env::temp_dir().join(format!("a-durable-directory-{}", std::process::id()));
         let nested = root.join("children").join("space café");
-        create_dir_all_durable(&nested).unwrap();
+        create_dir_all_durable(&std::env::temp_dir(), &nested).unwrap();
         let file = nested.join("kept");
         fs::write(&file, b"contents").unwrap();
-        create_dir_all_durable(&nested).unwrap();
+        create_dir_all_durable(&std::env::temp_dir(), &nested).unwrap();
         assert_eq!(fs::read(&file).unwrap(), b"contents");
-        assert!(create_dir_all_durable(&file.join("child")).is_err());
+        assert!(create_dir_all_durable(&std::env::temp_dir(), &file.join("child")).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -980,6 +1023,39 @@ mod directory_retry_tests {
     use std::collections::HashSet;
 
     #[test]
+    fn session_publication_stops_at_the_nearest_durable_anchor() {
+        let anchor = Path::new("home/sessions");
+        let session = anchor.join("id");
+        let child = session.join("children/child");
+        let home = Path::new("home");
+        let names = RefCell::new(HashSet::from([home.to_owned()]));
+        let barriers = RefCell::new(Vec::new());
+        let exists = |path: &Path| names.borrow().contains(path);
+        let publish = |path: &Path, _existing: bool| {
+            names.borrow_mut().insert(path.to_owned());
+            barriers
+                .borrow_mut()
+                .push(path.parent().unwrap().to_owned());
+            Ok(())
+        };
+        create_directories(home, anchor, &exists, &publish).unwrap();
+        assert_eq!(*barriers.borrow(), [home]);
+        barriers.borrow_mut().clear();
+        create_directories(anchor, &session, &exists, &publish).unwrap();
+        assert_eq!(*barriers.borrow(), [anchor]);
+        barriers.borrow_mut().clear();
+        // A published parent session is the anchor for its own children.
+        create_directories(&session, &child, &exists, &publish).unwrap();
+        assert_eq!(
+            *barriers.borrow(),
+            [session.clone(), session.join("children")]
+        );
+        barriers.borrow_mut().clear();
+        create_directories(&session, &child, &exists, &publish).unwrap();
+        assert_eq!(*barriers.borrow(), [session.join("children")]);
+    }
+
+    #[test]
     fn retrying_directory_creation_reestablishes_every_parent_publication() {
         struct Disk {
             names: HashSet<std::path::PathBuf>,
@@ -997,6 +1073,11 @@ mod directory_retry_tests {
         let exists = |path: &Path| disk.borrow().names.contains(path);
         let publish = |path: &Path, _existing: bool| {
             let mut disk = disk.borrow_mut();
+            assert!(path.starts_with(sessions));
+            assert_ne!(
+                path, sessions,
+                "the durable anchor must never be republished"
+            );
             disk.names.insert(path.to_owned());
             if path == session && disk.failures != 0 {
                 disk.failures -= 1;
@@ -1005,15 +1086,15 @@ mod directory_retry_tests {
             disk.durable.insert(path.to_owned());
             Ok(())
         };
-        assert!(create_directories(&session, &exists, &publish).is_err());
+        assert!(create_directories(sessions, &session, &exists, &publish).is_err());
         assert!(exists(&session));
         assert!(!disk.borrow().durable.contains(&session));
-        assert!(create_directories(&derived, &exists, &publish).is_err());
+        assert!(create_directories(sessions, &derived, &exists, &publish).is_err());
         assert!(
             !exists(&derived),
             "a failed ancestor barrier must prevent child publication"
         );
-        create_directories(&derived, &exists, &publish).unwrap();
+        create_directories(sessions, &derived, &exists, &publish).unwrap();
         let disk = disk.borrow();
         assert!(
             disk.durable.contains(&session),
