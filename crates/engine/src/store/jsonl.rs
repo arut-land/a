@@ -13,28 +13,16 @@ use super::{
     Snapshot, Writer, span,
 };
 
-/// The format of the files this build writes, which the header line names:
-/// a file in another is kept as it is.
+/// A different header format makes the log read-only.
 pub(crate) const FORMAT: u32 = 1;
 
-/// One conversation directory per session, with owned children nested below it.
-/// The append-only `log.jsonl` contains the header on the
-/// first line, one entry per line after it. Sessions share their drive-cache
-/// flusher; a single writer per directory is the daemon lock's job.
+/// Owned children nest below their parent's conversation directory.
+/// The daemon lock excludes concurrent writers; sessions share a cache flusher.
 ///
-/// Every line is sealed with a checksum of itself ([`seal`]), so what a load
-/// cuts depends only on whether a line is whole, never on whether this
-/// build understands it: a sealed line is never cut, a last line that is not
-/// is the tail a crash tore and is cut, and one before the last means the
-/// file was damaged otherwise, so it is kept as it is.
-///
-/// Derived from each log and never synced, two files in `derived/` spare
-/// the next load its length: `log.idx`, where each line ends, and
-/// `log.snap`, the newest snapshot. Either is used only as far as it
-/// agrees with the log, and a load without them reads the log whole, so
-/// the directory may be deleted at any time. Being apart, writing them
-/// leaves the logs' directory as it was, which the catalog reads the age
-/// of.
+/// Checksums distinguish torn tails from sealed entries this build cannot
+/// decode: only an unsealed final line may be cut. Other damage is read-only.
+/// Disposable indexes and snapshots live in `derived/` so updating them does
+/// not change the directory age used by the catalog.
 pub struct Jsonl {
     dir: PathBuf,
     paths: RwLock<HashMap<SessionId, PathBuf>>,
@@ -193,10 +181,8 @@ fn discover(root: &Path) -> io::Result<HashMap<SessionId, PathBuf>> {
     Ok(paths)
 }
 
-/// Where the files derived from the logs are kept, in their directory.
 const DERIVED: &str = "derived";
 
-/// The log's derived file of extension `ext`.
 fn beside(log: &Path, ext: &str) -> PathBuf {
     let name = Path::new(log.file_name().unwrap_or_default()).with_extension(ext);
     log.with_file_name(DERIVED).join(name)
@@ -348,12 +334,8 @@ impl LogStore for Jsonl {
         Ok(headers)
     }
 
-    /// Entries end where [`Index::scan`] stops. A torn tail, a crash
-    /// mid-append never acknowledged, is cut off before any line is indexed
-    /// past it, so the next append starts on a fresh line and no read lands
-    /// in what was cut; a file kept as it is is not touched.
-    ///
-    /// A snapshot may skip replay only after its covered entries validate.
+    /// Snapshots skip replay only after their covered entries validate.
+    /// Cutting an unindexed torn tail leaves the next append on a fresh line.
     fn load(
         &self,
         id: SessionId,
@@ -445,28 +427,19 @@ impl LogStore for Jsonl {
     }
 }
 
-/// Where each committed line of a session file is, so that a line is read
-/// back with one positioned read when asked for, from the OS's page cache
-/// rather than the daemon's memory: 8 bytes an entry. Only lines read whole
-/// and terminated are indexed, and only those appended in full after them.
-/// The same 8 bytes an entry go to `<id>.idx` as they are indexed, never
-/// synced, so the next load places the lines it does not read.
+/// Eight bytes per complete entry allow positioned reads from the page cache
+/// without retaining payloads. The disposable sidecar avoids rescanning offsets.
 struct Index {
     file: File,
-    /// The log's path: its sidecars are named after it.
     path: PathBuf,
-    /// Where the header line ends.
     start: u64,
     ends: RwLock<Ends>,
 }
 
 struct Ends {
-    /// Where each entry's line ends, newline included: entry `seq`'s at
-    /// `seq - 1`.
+    /// Entry `seq` ends at `seq - 1`, including its newline.
     ends: Vec<u64>,
-    /// `<id>.idx`, open for appending the ends of lines appended; `None`
-    /// once a write to it failed, and the next load scans the lines it
-    /// lacks.
+    /// Failed sidecar writes disable persistence; the next load rebuilds it.
     idx: Option<File>,
 }
 
@@ -483,9 +456,6 @@ impl Index {
         }
     }
 
-    /// The lines indexed and an appender continuing them, whose entries up
-    /// to `seq` are committed: one that refuses to, for a file kept as it
-    /// is.
     fn loaded(
         self,
         seq: u64,
@@ -522,13 +492,10 @@ impl Index {
         self.ends.get_mut().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Where the last line indexed ends: where the next is appended.
     fn end(&self) -> u64 {
         self.read().ends.last().copied().unwrap_or(self.start)
     }
 
-    /// Indexes the lines of `lines`, appended at the end, in memory and in
-    /// `<id>.idx`.
     fn extend(&self, lines: &[u8]) {
         let at = self.end();
         let mut ends = self.ends.write().unwrap_or_else(PoisonError::into_inner);
@@ -542,8 +509,6 @@ impl Index {
         }
     }
 
-    /// Reads the header line, the first: where the entries start, and why
-    /// the file is kept as it is if its format is another.
     fn header(&mut self) -> io::Result<Option<ReadOnly>> {
         #[derive(Deserialize)]
         struct Format {
@@ -559,10 +524,8 @@ impl Index {
         Ok((format != FORMAT).then_some(ReadOnly::Format { version: format }))
     }
 
-    /// Takes up `<id>.idx` as far as the file bears it out: its ends must
-    /// rise from after the header to no further than the file goes, and
-    /// the last line it places must be a sealed entry numbered as it says;
-    /// else none of it is used. These offsets cannot certify log ordering.
+    /// Offsets must rise within the file and end at the claimed sealed entry.
+    /// This validates positions, not log ordering.
     fn recall(&mut self) -> io::Result<()> {
         let path = beside(&self.path, "idx");
         let mut ends: Vec<u64> = fs::read(&path).map_or_else(
@@ -592,7 +555,6 @@ impl Index {
         Ok(())
     }
 
-    /// Entry `at + 1`, read where `ends` places its line, if it is there.
     fn entry(&self, ends: &[u64], at: usize) -> Option<Entry> {
         let from = at.checked_sub(1).map_or(self.start, |i| ends[i]);
         let mut line = vec![0; usize::try_from(ends[at].checked_sub(from)?).ok()?];
@@ -600,8 +562,6 @@ impl Index {
         unseal(&mut line).then(|| Entry::from_json(&line).ok())?
     }
 
-    /// Whether the index places `snap`: its line ends where the snapshot
-    /// says, and holds the entry it covers.
     fn places(&self, snap: &Snap) -> bool {
         let ends = &self.read().ends;
         let at = usize::try_from(snap.covers)
@@ -615,9 +575,6 @@ impl Index {
         })
     }
 
-    /// Writes to `<id>.idx` what it lacks of the lines indexed now, the
-    /// first `agreed` of which it holds already, and keeps it open to go
-    /// on appending.
     fn persist(&self, agreed: usize) {
         let path = beside(&self.path, "idx");
         let mut ends = self.ends.write().unwrap_or_else(PoisonError::into_inner);
@@ -636,12 +593,8 @@ impl Index {
         ends.idx = written.ok();
     }
 
-    /// Reads the file from where the last line indexed ends, line by line,
-    /// indexing and handing `each` every entry up to the first line that
-    /// is not a sealed entry this build reads. Stopping at the last line,
-    /// unsealed, is cutting a torn tail; stopping anywhere else, or in a
-    /// file of another format (`other`), is keeping the file as it is,
-    /// for the reason returned.
+    /// Only an unsealed final line is a torn tail. Other failures preserve
+    /// the log read-only, including a header from another format.
     fn scan(
         &mut self,
         other: Option<ReadOnly>,
@@ -679,14 +632,11 @@ impl Index {
     }
 }
 
-/// `ends`, 8 bytes each, as `<id>.idx` holds them.
 fn little_endian(ends: &[u64]) -> Vec<u8> {
     ends.iter().flat_map(|end| end.to_le_bytes()).collect()
 }
 
 impl Lines for Index {
-    /// One positioned read for the lot: the lines lie end to end, each
-    /// unsealed as it is handed over.
     fn read(&self, seqs: RangeInclusive<u64>, limit: usize, out: &mut Vec<u8>) -> io::Result<u64> {
         let (from, to, count) = {
             let ends = &self.read().ends;
@@ -718,14 +668,12 @@ struct Snap {
 }
 
 impl Snap {
-    /// The snapshot beside `log`, if there is one and it is whole.
     fn read(log: &Path) -> Option<Self> {
         let mut line = fs::read(beside(log, "snap")).ok()?;
         unseal(&mut line).then(|| serde_json::from_slice(&line).ok())?
     }
 
-    /// Written beside `log` whole or not at all: into a file of its own,
-    /// renamed into place.
+    /// Rename keeps readers from seeing a partial snapshot.
     fn write(&self, log: &Path) -> io::Result<()> {
         let mut line = serde_json::to_vec(self)?;
         seal(&mut line, 0);
@@ -750,13 +698,10 @@ struct JsonlLog {
 }
 
 impl Log for JsonlLog {
-    /// One write and one sync for the lot, which makes what was only
-    /// written before it durable too.
     fn append_all(&mut self, _: &[Entry], lines: &Encoded) -> io::Result<()> {
         self.write(&sealed(lines), true)
     }
 
-    /// Ordered without waiting for a drive-cache flush.
     fn write_all(&mut self, _: &[Entry], lines: &Encoded) -> io::Result<()> {
         self.write(&sealed(lines), false)
     }
@@ -789,8 +734,6 @@ impl Log for JsonlLog {
         self.read_only
     }
 
-    /// Placed where the line of the entry it covers ends, which must be
-    /// indexed: one it does not is not committed.
     fn snapshot(&mut self, snapshot: &Snapshot) -> io::Result<()> {
         let offset = {
             let ends = &self.index.read().ends;
@@ -811,7 +754,6 @@ impl Log for JsonlLog {
     }
 }
 
-/// `lines`, each sealed, as the file stores them.
 fn sealed(lines: &Encoded) -> Vec<u8> {
     let mut out = Vec::new();
     for line in lines.lines() {
@@ -872,7 +814,6 @@ impl JsonlLog {
 const CRC: &[u8] = br#","crc":""#;
 const SEAL: usize = CRC.len() + 8 + br#""}"#.len();
 
-/// Seals the JSON object `line` holds from `at` on, a line of its own.
 pub(crate) fn seal(line: &mut Vec<u8>, at: usize) {
     debug_assert_eq!(line.last(), Some(&b'}'), "a line is a JSON object");
     line.pop();
@@ -914,7 +855,6 @@ fn unseal_run(out: &mut Vec<u8>, at: usize) {
     out.truncate(to);
 }
 
-/// `crc` as 8 lower-case hex digits.
 fn hex(crc: u32) -> [u8; 8] {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     std::array::from_fn(|i| DIGITS[(crc >> (28 - 4 * i) & 0xf) as usize])
