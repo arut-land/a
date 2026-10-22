@@ -555,6 +555,7 @@ impl Conn<'_> {
 mod tests {
     use super::*;
     use rt::Runtime as _;
+    use std::io::Write;
 
     #[test]
     fn ready_incoming_frames_yield_before_reading_another_batch() {
