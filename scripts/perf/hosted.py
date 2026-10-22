@@ -1,0 +1,189 @@
+"""Build before timing; retain every observation for same-runner comparisons."""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+
+from process import snapshot
+
+ROOT = Path(__file__).resolve().parents[2]
+STD = ["-Zbuild-std=std,panic_unwind", "-Zbuild-std-features=panic-unwind,optimize_for_size"]
+SUFFIX = ".exe" if os.name == "nt" else ""
+
+
+def run(argv, **kwargs):
+    print("+", argv, flush=True)
+    return subprocess.run(list(map(str, argv)), check=True, **kwargs)
+
+
+def load_task(name):
+    loader = importlib.machinery.SourceFileLoader(name, str(ROOT / "mise-tasks/perf" / name))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def distribution(samples):
+    samples = sorted(samples)
+    return dict(median=statistics.median(samples), min=min(samples), max=max(samples),
+                p10=samples[int((len(samples) - 1) * .1)],
+                p90=samples[int((len(samples) - 1) * .9)], samples=samples)
+
+
+def build(source, output, variant):
+    config = list(variant.get("config", []))
+    flags = variant.get("rustflags", [])
+    if flags:
+        config.append("profile.release.rustflags=" + json.dumps(["-Cllvm-args=-addrsig", *flags]))
+    overrides = [arg for value in config for arg in ("--config", value)]
+    env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
+               CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
+    release = Path(env["CARGO_TARGET_DIR"]) / "release"
+    for fixture in [False, True]:
+        run(["cargo", "build-release", "-p", "a", *(["--features", "fixtures"] if fixture else []),
+             *overrides], cwd=source, env=env)
+        name = "a-fixtures" if fixture else "a"
+        shutil.copy2(release / ("a" + SUFFIX), output / (name + SUFFIX))
+    run(["cargo", "build-release", "-p", "a", "--example", "perf-attach", *overrides], cwd=source, env=env)
+    shutil.copy2(release / "examples" / ("perf-attach" + SUFFIX), output / ("perf-attach" + SUFFIX))
+    for package, target in [("engine", ["--lib"]), ("protocol", ["--test", "bench"]), ("tui", ["--lib"])]:
+        result = run(["cargo", "test", "--release", *STD, "-p", package, *target,
+                      "--no-run", "--message-format=json", *overrides], cwd=source, env=env,
+                     stdout=subprocess.PIPE, text=True)
+        executables = [record["executable"] for line in result.stdout.splitlines()
+                       if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
+        assert len(executables) == 1, executables
+        # Task filenames are intentionally extensionless; CreateProcess accepts PE files.
+        shutil.copy2(executables[0], output / (package + "-bench"))
+    run(["rustc", ROOT / "scripts/perf/floor.rs", "-O", "-o", output / ("floor" + SUFFIX)], cwd=source)
+
+
+def budgets(output, runs):
+    binary = str(output / ("a-fixtures" + SUFFIX))
+    cold, rss, cpu, client_cpu, attach_p50, attach_p99 = [], [], [], [], [], []
+    root = os.environ.get("RUNNER_TEMP")
+    for trial in range(5):
+        with tempfile.TemporaryDirectory(prefix="a-hosted-", dir=root) as directory:
+            home = Path(directory)
+            (home / "config.toml").write_text('[daemon]\nagent = "echo"\nidle_secs = 120\n')
+            env = dict(os.environ, A_HOME=str(home), A_TUI="plain")
+            env.pop("A_HOST", None)
+            client = None
+            def cli(*args):
+                return run([binary, *args], env=env, cwd=home, capture_output=True, timeout=60)
+            try:
+                cli("ls")
+                cli("daemon", "stop")
+                started = time.perf_counter()
+                client = subprocess.Popen([binary], env=env, cwd=home, stdin=subprocess.PIPE,
+                                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                # The outer workflow timeout also bounds a missing first reply.
+                assert client.stdout.readline().startswith(b"[session")
+                cold.append((time.perf_counter() - started) * 1000)
+                pid = int((home / "run/daemon.pid").read_text().splitlines()[0])
+                time.sleep(3)
+                before = [snapshot(p)["cpu_seconds"] for p in (pid, client.pid)]
+                time.sleep(10)
+                after = [snapshot(p) for p in (pid, client.pid)]
+                rss.append(after[0]["rss_kib"])
+                cpu.append((after[0]["cpu_seconds"] - before[0]) * 1000)
+                client_cpu.append((after[1]["cpu_seconds"] - before[1]) * 1000)
+                session = cli("new").stdout.decode().strip()
+                for n in range(10):
+                    cli("-p", f"message {n}", "resume", session)
+                result = cli_probe(output, session, env, home)
+                samples = sorted(result)
+                attach_p50.append(statistics.median(samples))
+                attach_p99.append(samples[495])
+                (output / f"attach-{trial}.json").write_text(json.dumps(samples))
+            finally:
+                if client:
+                    client.stdin.close()
+                    try:
+                        client.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        client.kill()
+                        client.wait()
+                cli("daemon", "stop")
+    return {name: distribution(values) for name, values in [
+        ("cold_reply_ms", cold), ("attach_p50_ms", attach_p50), ("attach_p99_ms", attach_p99),
+        ("idle_rss_kib", rss), ("idle_daemon_cpu_ms", cpu), ("idle_line_client_cpu_ms", client_cpu)]}
+
+
+def cli_probe(output, session, env, home):
+    result = run([output / ("perf-attach" + SUFFIX), session], env=env, cwd=home,
+                 capture_output=True, text=True, timeout=60)
+    return json.loads(result.stdout)
+
+
+def summarize(output, source, variant, runner):
+    metrics = budgets(output, 5)
+    for path in sorted(output.rglob("*.json")):
+        data = json.loads(path.read_text())
+        if isinstance(data, dict) and "results" in data:
+            for index, result in enumerate(data["results"]):
+                key = path.stem + (f"-{index}" if len(data["results"]) > 1 else "")
+                for field, unit, scale in [("time_wall_clock", "ms", 1000), ("time_cpu", "cpu_ms", 1000),
+                                           ("memory_peak_resident", "rss_kib", 1 / 1024)]:
+                    values = [sample[field]["value"] * scale for sample in result["measurements"] if field in sample]
+                    if values:
+                        metrics[key + "_" + unit] = distribution(values)
+        elif path.stem == "fresh-home-new":
+            metrics["fresh_home_new_ms"] = distribution([x["wall_seconds"] * 1000 for x in data])
+    binary = (output / ("a" + SUFFIX)).read_bytes()
+    assert b"Waits for a number of seconds." not in binary
+    assert b"Edits a text file by exact replacement." in binary
+    metrics["size_kib"] = distribution([len(binary) / 1024])
+    metrics["fixture_size_kib"] = distribution([(output / ("a-fixtures" + SUFFIX)).stat().st_size / 1024])
+    result = dict(schema=1, runner=runner, platform=platform.platform(), machine=platform.machine(),
+                  revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
+                  workflow_revision=os.environ.get("GITHUB_SHA"), variant=variant,
+                  toolchain=subprocess.check_output(["rustc", "-vV"], text=True),
+                  idle_window_seconds=10, metrics=metrics)
+    (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    # Keep measurements even when a hard budget fails.
+    failures = []
+    if len(binary) > 4096 * 1024:
+        failures.append("shipped size exceeds 4096 KiB")
+    if metrics["idle_rss_kib"]["max"] >= 10240:
+        failures.append("idle daemon RSS reaches 10240 KiB")
+    if metrics["idle_daemon_cpu_ms"]["max"] > 0 or metrics["idle_line_client_cpu_ms"]["max"] > 0:
+        failures.append("idle CPU is nonzero (OS counter resolution)")
+    if failures:
+        raise RuntimeError("; ".join(failures))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", type=Path, default=ROOT)
+    parser.add_argument("--output", type=Path, default=ROOT / "target/hosted-perf")
+    parser.add_argument("--variant", default="{}", help='JSON: {"rustflags": [...], "config": [...]}')
+    parser.add_argument("--runner", required=True)
+    args = parser.parse_args()
+    output, source = args.output.resolve(), args.source.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    variant = json.loads(args.variant or "{}")
+    build(source, output, variant)
+    os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
+    workloads = load_task("workloads")
+    run(["hyperfine", "-N", "--warmup", "10", "--runs", "100", "--metrics", "all",
+         "--export-json", output / "startup.json", workloads.command([str(output / ("a" + SUFFIX)), "--version"]),
+         workloads.command([str(output / ("floor" + SUFFIX))])])
+    run([sys.executable, ROOT / "mise-tasks/perf/workloads", output / ("a-fixtures" + SUFFIX), "cli",
+         "--runs", "20", "--output", output])
+    run([sys.executable, ROOT / "mise-tasks/perf/benches", output, output / "cli/transcript.jsonl", "--runs", "5"])
+    summarize(output, source, variant, args.runner)
+
+
+if __name__ == "__main__":
+    main()

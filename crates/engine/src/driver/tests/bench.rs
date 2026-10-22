@@ -13,15 +13,27 @@ use super::*;
 
 /// The process's resident set, in KiB.
 fn rss() -> u64 {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .unwrap();
+    let out = if let Ok(python) = std::env::var("A_PERF_PYTHON") {
+        std::process::Command::new(python)
+            .args([
+                &std::env::var("A_PERF_PROCESS").unwrap(),
+                &std::process::id().to_string(),
+                "rss",
+            ])
+            .output()
+            .unwrap()
+    } else {
+        std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap()
+    };
+    assert!(out.status.success());
     String::from_utf8(out.stdout)
         .unwrap()
         .trim()
-        .parse()
-        .unwrap()
+        .parse::<f64>()
+        .unwrap() as u64
 }
 
 fn median(mut times: Vec<Duration>) -> Duration {

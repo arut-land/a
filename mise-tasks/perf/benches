@@ -47,9 +47,9 @@ def main():
             continue
         for name in filters:
             binary = (build / (package + "-bench")).resolve(strict=True)
-            command = shlex.join([str(binary), name, "--ignored", "--nocapture", "--test-threads=1"])
+            command = workloads.command([str(binary), name, "--ignored", "--nocapture", "--test-threads=1"])
             workloads.load(output, name + ":before")
-            subprocess.run(["mise", "exec", "hyperfine@2.0.0", "--", "hyperfine", "-N", "--warmup", "1", "-r", str(args.runs),
+            subprocess.run(["hyperfine", "-N", "--warmup", "1", "-r", str(args.runs),
                             "--metrics", "all", "--show-output", "--export-json",
                             str(output / (name + ".json")), command], check=True, env=env)
             workloads.load(output, name + ":after")

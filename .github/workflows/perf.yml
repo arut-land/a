@@ -1,0 +1,131 @@
+name: perf
+
+on:
+  push:
+    branches: [main, 'perf/**']
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'One variant as JSON: {"rustflags": ["-Ctarget-cpu=x86-64-v2"], "config": ["profile.release.package.serde_json.opt-level=2"]}'
+        default: '{}'
+        type: string
+      runner:
+        description: 'Runner label, or all'
+        default: all
+        type: string
+      source_ref:
+        description: 'Source revision (empty uses this workflow revision); main bootstraps a baseline'
+        default: ''
+        type: string
+      baseline_run:
+        description: 'Optional bootstrap baseline run ID; otherwise latest successful main'
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: perf-${{ github.ref }}-${{ inputs.runner || 'all' }}-${{ inputs.variant || '{}' }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  MISE_AUTO_INSTALL: false
+  # Hosted jobs can use the runner; the shared development host uses two.
+  CARGO_BUILD_JOBS: 4
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      runners: ${{ steps.select.outputs.runners }}
+    steps:
+      - id: select
+        env:
+          SELECTED: ${{ inputs.runner || 'all' }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          runners = ['ubuntu-latest', 'ubuntu-24.04-arm', 'windows-latest', 'windows-11-arm', 'macos-latest', 'macos-15-intel']
+          selected = os.environ['SELECTED']
+          assert selected == 'all' or selected in runners, selected
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('runners=' + json.dumps(runners if selected == 'all' else [selected]) + '\n')
+          PY
+
+  measure:
+    needs: matrix
+    name: perf (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.matrix.outputs.runners) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          path: measured
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Native accounting and toolchain
+        run: |
+          python -m pip install psutil==7.2.2
+          channel=$(python -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ${{ runner.temp }}/mbx/actions
+          key: perf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}
+          restore-keys: perf-${{ runner.os }}-${{ runner.arch }}-
+      # ARM Windows has no Cranelift component; release and benches use LLVM.
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: mr-boxington hyperfine ${{ runner.os == 'Linux' && 'mold' || '' }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
+      - name: Install the same measurement harness into the source checkout
+        run: |
+          python - <<'PY'
+          import shutil
+          for path in ['apps/cli/examples/perf-attach.rs', 'crates/engine/src/driver/tests/bench.rs']:
+              shutil.copy2(path, 'measured/' + path)
+          PY
+      - name: Build, then measure one variant
+        env:
+          PERF_VARIANT: ${{ inputs.variant || '{}' }}
+        run: mise exec -- python scripts/perf/hosted.py --source measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
+      - name: Compare with main
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_RUN: ${{ inputs.baseline_run }}
+        run: |
+          if [[ -f target/hosted-perf/result.json ]]; then
+            python scripts/perf/compare.py target/hosted-perf/result.json --baseline-run "$BASELINE_RUN"
+          fi
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: perf-${{ matrix.runner }}
+          path: |
+            target/hosted-perf/**/*.json
+            target/hosted-perf/**/*.jsonl
+            target/hosted-perf/**/*.md
+          if-no-files-found: error
+          retention-days: 30
