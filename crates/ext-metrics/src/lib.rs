@@ -1,6 +1,7 @@
 //! Accounting is a disposable projection of qualified execution facts. Prices
 //! are supplied at query time; copying context never transfers execution.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use ext::{Args, Cx, Extension, Registrar, Tool};
@@ -104,9 +105,10 @@ pub struct Filter {
 
 #[derive(Default)]
 pub struct Projection {
-    logs: Vec<(SessionId, Conversation)>,
+    logs: BTreeMap<SessionId, Conversation>,
 }
 
+#[derive(Default)]
 struct Conversation {
     covered: ext::LogCursor,
     facts: Vec<CallFact>,
@@ -116,27 +118,7 @@ struct Conversation {
 impl Projection {
     #[inline(never)]
     pub fn fold(&mut self, prefix: &ext::LogPrefix) {
-        let index = match self
-            .logs
-            .binary_search_by_key(&prefix.session, |(id, _)| *id)
-        {
-            Ok(i) => i,
-            Err(i) => {
-                self.logs.insert(
-                    i,
-                    (
-                        prefix.session,
-                        Conversation {
-                            covered: ext::LogCursor::default(),
-                            facts: Vec::new(),
-                            uncertain: Vec::new(),
-                        },
-                    ),
-                );
-                i
-            }
-        };
-        let log = &mut self.logs[index].1;
+        let log = self.logs.entry(prefix.session).or_default();
         if prefix.reset {
             log.facts.clear();
             log.uncertain.clear();
