@@ -113,7 +113,7 @@ impl Transcript {
                 self.inherit(&messages, e.seq);
             }
         } else if let Some(value) = context_fact(&e.body) {
-            self.apply_input(e.seq, &value, fresh);
+            self.apply_input(e.seq, value, fresh);
         }
     }
 
@@ -125,14 +125,14 @@ impl Transcript {
         self.last = seq.get();
     }
 
-    fn apply_input(&mut self, seq: Seq, value: &ContextValue, fresh: Option<Assistant>) {
+    fn apply_input(&mut self, seq: Seq, value: ContextValue, fresh: Option<Assistant>) {
         let message = match value {
-            ContextValue::User(text) => Message::user(text.to_owned()),
+            ContextValue::User(text) => Message::user(text),
             ContextValue::Queued(text) => {
-                self.waiting.insert(seq, text.to_owned());
+                self.waiting.insert(seq, text);
                 return;
             }
-            ContextValue::Taken(input) => match self.waiting.remove(input) {
+            ContextValue::Taken(input) => match self.waiting.remove(&input) {
                 Some(text) if self.model_only => {
                     if let Ok((turn, _)) = ext::ModelTurn::from_intent(&text) {
                         for message in turn.messages.iter() {
@@ -146,15 +146,14 @@ impl Transcript {
                 Some(text) => Message::user(text),
                 None => return,
             },
-            ContextValue::Assistant(text) => Message::assistant(text.to_owned()),
+            ContextValue::Assistant(text) => Message::assistant(text),
             ContextValue::Context { text, .. } => {
-                self.messages
-                    .insert(self.context, Message::user(text.to_owned()));
+                self.messages.insert(self.context, Message::user(text));
                 self.context += 1;
                 self.last = seq.get();
                 return;
             }
-            ContextValue::Child(outcome) => Message::user(ext::child_result(outcome)),
+            ContextValue::Child(outcome) => Message::user(ext::child_result(&outcome)),
             ContextValue::Reply(output) => {
                 let reply = match fresh {
                     Some(message) => Ok(message),
@@ -166,15 +165,14 @@ impl Transcript {
                 }
             }
             ContextValue::ToolCall { id, tool } => {
-                self.calls
-                    .insert(CallId(seq), (id.to_owned(), tool.to_owned()));
+                self.calls.insert(CallId(seq), (id, tool));
                 return;
             }
             ContextValue::ToolResult { call, outcome } => {
-                let Some((id, tool)) = self.calls.remove(call) else {
+                let Some((id, tool)) = self.calls.remove(&call) else {
                     return;
                 };
-                let (output, error) = self.registry.tools().to_model(&tool, outcome);
+                let (output, error) = self.registry.tools().to_model(&tool, &outcome);
                 let result = ToolResult {
                     id: id.into(),
                     name: tool.into(),
@@ -185,11 +183,11 @@ impl Transcript {
                 self.last = seq.get();
                 // Only a tool message changes to take the result.
                 if let Some(Message::Tool(answers)) = self.messages.last_mut() {
-                    let at = self.answered.partition_point(|&seq| seq < *call);
-                    self.answered.insert(at, *call);
+                    let at = self.answered.partition_point(|&seq| seq < call);
+                    self.answered.insert(at, call);
                     answers.results.insert(at, result);
                 } else {
-                    self.answered = vec![*call];
+                    self.answered = vec![call];
                     self.messages.push(Message::Tool(ToolMessage {
                         results: vec![result],
                     }));
@@ -378,7 +376,7 @@ fn project(image: ContextImage, root: Transcript) -> Transcript {
                     input.seq,
                 );
             } else {
-                transcript.apply_input(input.seq, &input.value, None);
+                transcript.apply_input(input.seq, input.value, None);
             }
         }
         if scope == 0 {

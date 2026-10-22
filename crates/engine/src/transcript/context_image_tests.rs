@@ -221,7 +221,7 @@ fn recursive_scope(image: &ContextImage, scope: usize, registry: &Arc<Registry>)
             let messages = recursive_scope(image, child, registry).into_context();
             transcript.inherit(&messages, input.seq);
         } else {
-            transcript.apply_input(input.seq, &input.value, None);
+            transcript.apply_input(input.seq, input.value.clone(), None);
         }
     }
     transcript
