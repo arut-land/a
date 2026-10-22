@@ -57,5 +57,11 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Pinned upstream fix for native TLS without an unused Mozilla certificate bundle.
-allow-git = ["https://github.com/algesten/ureq"]
+# Require immutable revisions for the two upstream fixes.
+required-git-spec = "rev"
+allow-git = [
+    # Native TLS without an unused Mozilla certificate bundle.
+    "https://github.com/algesten/ureq",
+    # Scheduler state must outlive wakes racing executor destruction.
+    "https://github.com/smol-rs/async-executor",
+]

@@ -15,7 +15,8 @@ watch = ["dep:notify"]
 # Already linked by async-io; producer wake never waits on registration.
 atomic-waker = "1"
 notify = { version = "8", optional = true }
-async-executor = { version = "1", optional = true }
+# Scheduler state must outlive wakes racing executor destruction (upstream #164).
+async-executor = { git = "https://github.com/smol-rs/async-executor", rev = "96a1f6a19ceb828c8eb8a10cb4b40daefdbdb945", optional = true }
 # The reactor and timers: one thread waiting
 # in kqueue, epoll or IOCP (through polling) until something is due.
 async-io = "2"
