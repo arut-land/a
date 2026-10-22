@@ -63,6 +63,7 @@ impl Process {
 pub struct TestProcess {
     child: Process,
     readers: [Option<Box<dyn Read + Send>>; 2],
+    command: String,
 }
 
 impl From<Child> for TestProcess {
@@ -81,19 +82,23 @@ impl From<Child> for TestProcess {
         Self {
             child: Process::Piped(child),
             readers,
+            command: "command unavailable (adopted child)".into(),
         }
     }
 }
 
 impl TestProcess {
     pub fn spawn(command: &mut Command) -> Self {
-        Self::from(
+        let description = describe(command);
+        let mut process = Self::from(
             command
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .unwrap(),
-        )
+        );
+        process.command = description;
+        process
     }
 
     pub fn group(&self) -> &sys::OwnedGroup {
@@ -108,6 +113,7 @@ impl TestProcess {
         Self {
             child: Process::Contained(child),
             readers: [None, None],
+            command: describe(command),
         }
     }
 
@@ -130,7 +136,8 @@ impl TestProcess {
             while let Ok((index, result)) = rx.try_recv() {
                 streams[index] = Some(result?);
             }
-            if let Some(status) = self.child.try_wait()?
+            let status = self.child.try_wait()?;
+            if let Some(status) = status
                 && streams.iter().all(Option::is_some)
             {
                 let [stdout, stderr] = streams;
@@ -143,12 +150,38 @@ impl TestProcess {
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "test process collection deadline",
+                    format!(
+                        "test process collection deadline: pid={} command={} status={status:?} stdout={} stderr={}",
+                        match &self.child {
+                            Process::Piped(child) => child.id(),
+                            Process::Contained(child) => child.id(),
+                        },
+                        self.command,
+                        if streams[0].is_some() {
+                            "eof"
+                        } else {
+                            "pending"
+                        },
+                        if streams[1].is_some() {
+                            "eof"
+                        } else {
+                            "pending"
+                        },
+                    ),
                 ));
             }
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+}
+
+fn describe(command: &Command) -> String {
+    format!(
+        "{:?} {:?} cwd={:?}",
+        command.get_program(),
+        command.get_args().collect::<Vec<_>>(),
+        command.get_current_dir(),
+    )
 }
 
 impl Drop for TestProcess {
