@@ -51,6 +51,20 @@ def hardware():
                 image_version=os.environ.get("ImageVersion"), python=sys.version)
 
 
+def windows_image(binary):
+    tool = shutil.which("dumpbin")
+    if tool is None:
+        installer = Path(os.environ["ProgramFiles(x86)"]) / "Microsoft Visual Studio/Installer/vswhere.exe"
+        location = subprocess.check_output([str(installer), "-latest", "-property", "installationPath"], text=True).strip()
+        native = "arm64" if platform.machine().lower() == "arm64" else "x64"
+        tools = sorted((Path(location) / "VC/Tools/MSVC").glob(f"*/bin/Host*/{native}/dumpbin.exe"), reverse=True)
+        tool = str(tools[0])
+    headers = subprocess.check_output([tool, "/nologo", "/headers", "/dependents", str(binary)], text=True, errors="replace")
+    dependencies = [line.strip() for line in headers.splitlines() if line.strip().lower().endswith(".dll")]
+    assert dependencies, "dumpbin must report real PE imports"
+    return dict(headers=headers, dependencies=dependencies)
+
+
 def distribution(samples):
     samples = sorted(samples)
     return dict(median=statistics.median(samples), min=min(samples), max=max(samples),
@@ -77,6 +91,7 @@ def build(source, output, variant):
         variant=variant,
         shipped_bytes=(output / ("a" + SUFFIX)).stat().st_size,
         fixture_bytes=(output / ("a-fixtures" + SUFFIX)).stat().st_size,
+        windows_image=windows_image(output / ("a" + SUFFIX)) if os.name == "nt" else None,
     ), indent=2) + "\n")
     run(["cargo", "build-release", "-p", "a", "--example", "perf-attach", *overrides], cwd=source, env=env)
     shutil.copy2(release / "examples" / ("perf-attach" + SUFFIX), output / ("perf-attach" + SUFFIX))
@@ -189,6 +204,7 @@ def summarize(output, source, variant, runner):
                   idle_window_seconds=10, cpu_settle_seconds=15, rss_settle_seconds=3,
                   cargo_config=(source / ".cargo/config.toml").read_text(),
                   cargo_profiles=(source / ".cargo/profiles.toml").read_text(),
+                  windows_image=windows_image(output / ("a" + SUFFIX)) if os.name == "nt" else None,
                   metrics=metrics)
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     # Keep measurements even when a hard budget fails.
