@@ -89,6 +89,10 @@ Idle RSS must remain below 10,240 KiB and idle CPU must have no counter
 increment. The existing CI's strict Linux latency, terminal first-paint,
 PTY-client idle and quiet-shell wake gates remain separate validation.
 
+`build_only` stops after the two release builds and records size, sections and
+imports for linker experiments that cannot fit the cap. It does not claim a
+runtime budget pass. Full measurements remain the default.
+
 For tuning, `paired_ref` additionally builds a reference revision on the same
 runner. Five alternating AB/BA rounds measure startup, cold reply, attach,
 idle RSS/CPU, driver turns and large JSON. Each role uses fresh isolated

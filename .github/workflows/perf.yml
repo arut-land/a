@@ -17,6 +17,10 @@ on:
         description: 'Source revision (empty uses this workflow revision); main bootstraps a baseline'
         default: ''
         type: string
+      build_only:
+        description: 'Build and inspect a size/linker candidate without runtime measurements'
+        default: false
+        type: boolean
       paired_ref:
         description: 'Optional reference source revision for interleaved same-runner tuning'
         default: ''
@@ -31,7 +35,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: perf-${{ github.ref }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.variant || '{}' }}
+  group: perf-${{ github.ref }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.variant || '{}' }}
   cancel-in-progress: false
 
 env:
@@ -130,11 +134,14 @@ jobs:
         env:
           PERF_VARIANT: ${{ inputs.variant || '{}' }}
           PAIRED_REF: ${{ inputs.paired_ref }}
+          BUILD_ONLY: ${{ inputs.build_only }}
         run: |
+          extra=()
+          if [[ "$BUILD_ONLY" == true ]]; then extra+=(--build-only); fi
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
-            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PAIRED_REF"
+            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PAIRED_REF" "${extra[@]}"
           else
-            mise exec -- python scripts/perf/hosted.py --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PAIRED_REF"
+            mise exec -- python scripts/perf/hosted.py --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PAIRED_REF" "${extra[@]}"
           fi
       - name: Compare with main
         if: always()
@@ -144,6 +151,14 @@ jobs:
         run: |
           if [[ -f target/hosted-perf/result.json ]]; then
             python scripts/perf/compare.py target/hosted-perf/result.json --baseline-run "$BASELINE_RUN"
+          elif [[ -f target/hosted-perf/build.json ]]; then
+            python - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          result = json.loads(Path('target/hosted-perf/build.json').read_text())
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+              stream.write(f"Build observation: {result['shipped_bytes'] / 1024:.3f} KiB. Runtime metrics were not completed.\n")
+          PYTHON
           fi
       - uses: actions/upload-artifact@v5
         if: always()

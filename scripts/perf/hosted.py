@@ -72,7 +72,7 @@ def distribution(samples):
                 p90=samples[int((len(samples) - 1) * .9)], samples=samples)
 
 
-def build(source, output, variant):
+def build(source, output, variant, benchmarks=True):
     config = list(variant.get("config", []))
     flags = variant.get("rustflags", [])
     if flags:
@@ -93,6 +93,8 @@ def build(source, output, variant):
         fixture_bytes=(output / ("a-fixtures" + SUFFIX)).stat().st_size,
         windows_image=windows_image(output / ("a" + SUFFIX)) if os.name == "nt" else None,
     ), indent=2) + "\n")
+    if not benchmarks:
+        return
     run(["cargo", "build-release", "-p", "a", "--example", "perf-attach", *overrides], cwd=source, env=env)
     shutil.copy2(release / "examples" / ("perf-attach" + SUFFIX), output / ("perf-attach" + SUFFIX))
     for package, target in [("engine", ["--lib"]), ("protocol", ["--test", "bench"]), ("tui", ["--lib"])]:
@@ -282,11 +284,15 @@ def main():
     parser.add_argument("--variant", default="{}", help='JSON: {"rustflags": [...], "config": [...]}')
     parser.add_argument("--runner", required=True)
     parser.add_argument("--paired-ref", default="", help="optional reference revision on this same runner")
+    parser.add_argument("--build-only", action="store_true", help="diagnose a build variant without timing")
     args = parser.parse_args()
     output, source = args.output.resolve(), args.source.resolve()
     output.mkdir(parents=True, exist_ok=True)
     variant = json.loads(args.variant or "{}")
-    build(source, output, variant)
+    build(source, output, variant, benchmarks=not args.build_only)
+    if args.build_only:
+        assert (output / ("a" + SUFFIX)).stat().st_size <= 4096 * 1024, "shipped size exceeds 4096 KiB"
+        return
     os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
     workloads = load_task("workloads")
     run(["hyperfine", "-N", "--warmup", "10", "--runs", "100", "--metrics", "all",
