@@ -281,7 +281,7 @@ struct Query(Mutex<Projection>);
 
 impl Query {
     #[inline(never)]
-    fn finish(&self, prices: Prices, logs: Vec<ext::LogPrefix>) -> Result<Total, String> {
+    fn finish(&self, prices: &Prices, logs: Vec<ext::LogPrefix>) -> Result<Total, String> {
         let mut projection = self.0.lock().map_err(|e| e.to_string())?;
         let selected: Vec<_> = logs
             .into_iter()
@@ -290,7 +290,7 @@ impl Query {
                 log.session
             })
             .collect();
-        Ok(projection.subtree(&selected, &prices))
+        Ok(projection.subtree(&selected, prices))
     }
 }
 
@@ -310,7 +310,7 @@ impl Tool for Query {
             .ok_or("no log reader")?
             .read(cx.session, true, cursors)
             .await?;
-        self.finish(prices, logs)
+        self.finish(&prices, logs)
     }
 }
 

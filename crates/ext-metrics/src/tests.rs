@@ -93,13 +93,20 @@ fn unknown_usage_is_never_zero() {
     let mut f = fact(id, 0, 0, None);
     f.usage = None;
     let mut p = Projection::default();
-    p.fold(&log(id, vec![f]));
+    p.fold(&log(id, vec![f, fact(id, 1, 10, Some(10))]));
     let total = p.own(id, &prices());
     assert_eq!(
         total.usage[0],
         UsageTotal {
-            known: 0,
+            known: 10,
             missing: 1
+        }
+    );
+    assert_eq!(
+        total.attempts,
+        Attempts {
+            executed: 2,
+            ambiguous: 0
         }
     );
     assert_eq!(total.cost.missing, 1);
@@ -486,6 +493,21 @@ fn successful_recovery_keeps_the_crashed_attempts_usage_unknown() {
             missing: 1
         }
     );
+    let mut incremental = Projection::default();
+    for entry in prefix.entries {
+        incremental.fold(&ext::LogPrefix {
+            session: id,
+            cursor: ext::LogCursor {
+                seq: entry.seq.get(),
+                epoch: entry.epoch,
+                offset: 0,
+            },
+            entries: vec![entry],
+            reset: false,
+            inherited_through: 0,
+        });
+    }
+    assert_eq!(incremental.own(id, &prices()), total);
 }
 
 #[test]
