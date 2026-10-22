@@ -9,7 +9,7 @@ default = ["threads"]
 # The built-in runtime: async-executor's workers and a blocking pool of
 # our own (the `blocking` crate's polls every 500 ms while idle).
 threads = ["dep:async-executor"]
-watch = ["dep:notify"]
+watch = ["dep:notify", "dep:windows-file-watcher"]
 
 [dependencies]
 # Already linked by async-io; producer wake never waits on registration.
@@ -29,6 +29,9 @@ rustix.workspace = true
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 sys = { path = "../sys" }
+
+[target.'cfg(windows)'.dependencies]
+windows-file-watcher = { version = "0.2.6", optional = true }
 
 [lints]
 workspace = true
