@@ -122,25 +122,7 @@ impl Actor {
         }
         self.indexed().await.ok()?;
         if let Some(id) = self.journal.index.side(&side.identity()) {
-            let cached = if let Some(seq) = self.journal.index.result(id, self.live.frames.seq()) {
-                match self.indexed_entry(seq).await.ok()?.body {
-                    Body::ModelResult {
-                        outcome, failure, ..
-                    } => Some(Opened::Cached { outcome, failure }),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            if let Some(cached) = cached {
-                reply.send(cached);
-            } else if let Some(waiters) = self.replies.invoked.get_mut(&id) {
-                waiters.push(super::Waiter::Model(reply));
-            } else {
-                self.replies
-                    .invoked
-                    .insert(id, vec![super::Waiter::Model(reply)]);
-            }
+            self.await_reply(id, super::Waiter::Model(reply)).await;
             return None;
         }
         if self.phase != Phase::Serving {

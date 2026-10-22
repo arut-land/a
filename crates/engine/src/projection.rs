@@ -70,7 +70,7 @@ struct Invocation {
     key: protocol::Invocation,
     tool: String,
     input: super::Json,
-    result: Option<(protocol::Seq, protocol::Outcome, Option<protocol::Card>)>,
+    completed: bool,
 }
 
 impl Invocations {
@@ -92,20 +92,16 @@ impl Invocations {
                         key: key.clone(),
                         tool: tool.clone(),
                         input: input.clone(),
-                        result: None,
+                        completed: false,
                     },
                 );
                 return Some(CallId(entry.seq));
             }
-            Body::ToolResult {
-                call,
-                outcome,
-                card,
-            } => {
+            Body::ToolResult { call, .. } => {
                 self.calls
                     .retain(|_, invocation| invocation.key.parent != *call);
                 if let Some(invocation) = self.calls.get_mut(call) {
-                    invocation.result = Some((entry.seq, outcome.clone(), card.clone()));
+                    invocation.completed = true;
                 }
             }
             _ => {}
@@ -151,20 +147,36 @@ impl Invocations {
     pub(super) fn completed(&self, call: CallId) -> bool {
         self.calls
             .get(&call)
-            .is_some_and(|invocation| invocation.result.is_some())
+            .is_some_and(|invocation| invocation.completed)
     }
+}
 
-    fn result(&self, call: CallId, durable: u64) -> Option<super::Called> {
-        let (seq, outcome, card) = self.calls.get(&call)?.result.as_ref()?;
-        (seq.get() <= durable).then(|| super::Called {
-            outcome: outcome.clone(),
-            card: card.clone(),
-        })
+impl super::Waiter {
+    fn reply(self, body: &Body) {
+        let interrupted = protocol::Outcome::Interrupted { output: None };
+        let (outcome, failure, card) = match body {
+            Body::ToolResult { outcome, card, .. } => (outcome, None, card.as_ref()),
+            Body::ModelResult {
+                outcome, failure, ..
+            } => (outcome, failure.as_ref(), None),
+            Body::Interrupt { .. } => (&interrupted, None, None),
+            _ => unreachable!("committed result"),
+        };
+        match self {
+            Self::Tool(reply) => reply.send(super::Called {
+                outcome: outcome.clone(),
+                card: card.cloned(),
+            }),
+            Self::Model(reply) => reply.send(super::Opened::Cached {
+                outcome: outcome.clone(),
+                failure: failure.cloned(),
+            }),
+        }
     }
 }
 
 impl Actor {
-    pub(super) fn invocation_reply(
+    pub(super) async fn invocation_reply(
         &mut self,
         ticket: super::Ticket,
         result: Result<CallId, String>,
@@ -172,23 +184,23 @@ impl Actor {
         if let Some((reply, _)) = self.replies.invocations.remove(&ticket) {
             match result {
                 Ok(call) => {
-                    if let Some(result) = self
-                        .projection
-                        .invocations
-                        .result(call, self.journal.durable_seq)
-                    {
-                        self.replies.contexts.remove(&call);
-                        reply.send(result);
-                    } else {
-                        self.replies
-                            .invoked
-                            .entry(call)
-                            .or_default()
-                            .push(super::Waiter::Tool(reply));
+                    if self.indexed().await.is_ok() {
+                        self.await_reply(call, super::Waiter::Tool(reply)).await;
                     }
                 }
                 Err(error) => reply.send(super::Called::failed(error)),
             }
+        }
+    }
+
+    pub(super) async fn await_reply(&mut self, call: CallId, waiter: super::Waiter) {
+        if let Some(seq) = self.journal.index.result(call, self.journal.durable_seq) {
+            if let Ok(entry) = self.indexed_entry(seq).await {
+                self.replies.contexts.remove(&call);
+                waiter.reply(&entry.body);
+            }
+        } else {
+            self.replies.invoked.entry(call).or_default().push(waiter);
         }
     }
 
@@ -198,43 +210,19 @@ impl Actor {
         }
         for (e, line) in entries.iter().zip(lines.lines()) {
             self.journal.index.apply(e);
-            let result = match &e.body {
-                Body::ToolResult {
-                    call,
-                    outcome,
-                    card,
-                } => Some((*call, outcome, None, card.clone())),
-                Body::ModelResult {
-                    call,
-                    outcome,
-                    failure,
-                    ..
-                } => Some((*call, outcome, failure.clone(), None)),
-                Body::Interrupt { .. } => Some((
-                    CallId(e.seq),
-                    &protocol::Outcome::Interrupted { output: None },
-                    None,
-                    None,
-                )),
+            let call = match &e.body {
+                Body::ToolResult { call, .. } | Body::ModelResult { call, .. } => Some(*call),
+                Body::Interrupt { .. } => Some(CallId(e.seq)),
                 _ => None,
             };
-            if let Some((call, outcome, failure, card)) = result {
+            if let Some(call) = call {
                 let mut waiters = self.replies.invoked.remove(&call).unwrap_or_default();
                 if let Some(input) = self.journal.index.input(call) {
                     waiters.extend(self.replies.invoked.remove(&input).unwrap_or_default());
                 }
                 self.replies.contexts.remove(&call);
                 for waiter in waiters {
-                    match waiter {
-                        super::Waiter::Tool(reply) => reply.send(super::Called {
-                            outcome: outcome.clone(),
-                            card: card.clone(),
-                        }),
-                        super::Waiter::Model(reply) => reply.send(super::Opened::Cached {
-                            outcome: outcome.clone(),
-                            failure: failure.clone(),
-                        }),
-                    }
+                    waiter.reply(&e.body);
                 }
             }
             // One too large for the tail is not framed: followers read it.
@@ -472,7 +460,7 @@ mod tests {
     use protocol::{Audience, Epoch, Json, Outcome, Seq};
 
     #[test]
-    fn delegated_results_remain_cached_across_checkpoints() {
+    fn delegated_completion_identity_survives_checkpoints() {
         let parent = CallId::new(1).unwrap();
         let call = CallId::new(2).unwrap();
         let input = Json::encode(&"input").unwrap();
@@ -518,8 +506,7 @@ mod tests {
                 restored.request(parent, "effect", "write", &input),
                 Ok(Some(call))
             );
-            assert!(restored.result(call, 2).is_none());
-            assert_eq!(restored.result(call, 3).unwrap().outcome, outcome);
+            assert!(restored.completed(call));
             let end = Entry::new(
                 Seq::new(4).unwrap(),
                 Epoch(0),
@@ -531,7 +518,8 @@ mod tests {
             );
             restored.fold(&end);
             completed.fold(&end);
-            assert_eq!(restored.result(call, 4), completed.result(call, 4));
+            assert!(!restored.completed(call));
+            assert!(!completed.completed(call));
             assert!(
                 restored
                     .request(parent, "effect", "write", &input)

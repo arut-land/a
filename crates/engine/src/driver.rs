@@ -1605,12 +1605,12 @@ impl Actor {
                         if let Some(call) =
                             found.filter(|call| self.projection.invocations.completed(*call))
                         {
-                            self.invocation_reply(*ticket, Ok(call));
+                            self.invocation_reply(*ticket, Ok(call)).await;
                             continue;
                         }
                     }
                     Err(error) => {
-                        self.invocation_reply(*ticket, Err(error));
+                        self.invocation_reply(*ticket, Err(error)).await;
                         continue;
                     }
                 }
@@ -2037,7 +2037,7 @@ impl Actor {
             return;
         }
         match effect {
-            Effect::Invocation { ticket, result } => self.invocation_reply(ticket, result),
+            Effect::Invocation { ticket, result } => self.invocation_reply(ticket, result).await,
             Effect::Delivery { ticket, result } => {
                 respond(&mut self.replies.deliveries, ticket, result);
             }

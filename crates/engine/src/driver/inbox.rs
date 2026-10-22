@@ -14,34 +14,7 @@ impl Actor {
         let Some(input) = self.journal.index.enqueued(&id) else {
             return;
         };
-        if let Some(seq) = self.journal.index.result(input, self.journal.durable_seq) {
-            let cached = match self.indexed_entry(seq).await {
-                Ok(protocol::Entry {
-                    body:
-                        protocol::Body::ModelResult {
-                            outcome, failure, ..
-                        },
-                    ..
-                }) => Some(super::Opened::Cached { outcome, failure }),
-                Ok(protocol::Entry {
-                    body: protocol::Body::Interrupt { .. },
-                    ..
-                }) => Some(super::Opened::Cached {
-                    outcome: protocol::Outcome::Interrupted { output: None },
-                    failure: None,
-                }),
-                _ => None,
-            };
-            if let Some(cached) = cached {
-                reply.send(cached);
-                return;
-            }
-        }
-        self.replies
-            .invoked
-            .entry(input)
-            .or_default()
-            .push(super::Waiter::Model(reply));
+        self.await_reply(input, super::Waiter::Model(reply)).await;
     }
 
     pub(super) fn delivery_ticket(
