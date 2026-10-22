@@ -2,7 +2,7 @@
 //! it sees.
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ext::host::Registry;
@@ -207,7 +207,7 @@ impl Transcript {
     pub fn into_context(self) -> Messages {
         let mut messages: Vec<_> = self.messages.iter().cloned().collect();
         let mut requested = HashMap::new();
-        let mut answered: HashMap<usize, std::collections::HashSet<_>> = HashMap::new();
+        let mut answered: HashMap<usize, HashSet<_>> = HashMap::new();
         for (at, message) in messages.iter_mut().enumerate() {
             match message {
                 Message::Assistant(a) => {
@@ -271,15 +271,16 @@ pub(crate) fn context_image(entries: &[Entry]) -> ContextImage {
 
 fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
     let edits = context_edits(entries.iter().copied());
-    let completed: std::collections::HashSet<_> = entries
-        .iter()
-        .take(if inherited { entries.len() } else { 0 })
-        .filter_map(|e| match &e.body {
-            Body::ToolResult { call, .. } => Some(call.0),
-            Body::Take { input } => Some(*input),
-            _ => None,
-        })
-        .collect();
+    let completed = inherited.then(|| {
+        entries
+            .iter()
+            .filter_map(|e| match &e.body {
+                Body::ToolResult { call, .. } => Some(call.0),
+                Body::Take { input } => Some(*input),
+                _ => None,
+            })
+            .collect::<HashSet<_>>()
+    });
     let mut image = vec![ContextLayer::default()];
     for e in entries {
         let value = if let Some((from, _, text)) = edits
@@ -317,12 +318,11 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
             let Some(value) = context_fact(&e.body) else {
                 continue;
             };
-            match &value {
-                ContextValue::ToolCall(..) if inherited && !completed.contains(&e.seq) => {
-                    continue;
-                }
-                ContextValue::Queued(_) if inherited && !completed.contains(&e.seq) => continue,
-                _ => {}
+            if completed.as_ref().is_some_and(|done| {
+                matches!(value, ContextValue::ToolCall(..) | ContextValue::Queued(_))
+                    && !done.contains(&e.seq)
+            }) {
+                continue;
             }
             value
         };
