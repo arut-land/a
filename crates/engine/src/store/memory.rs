@@ -3,7 +3,7 @@ use std::io;
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use protocol::{Entry, SessionId};
+use protocol::{Decode, Entry, SessionId};
 
 use super::{
     Encoded, Header, History, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Snapshot,
@@ -83,6 +83,45 @@ impl LogStore for Memory {
             return Err(io::ErrorKind::NotFound.into());
         }
         Ok(entries)
+    }
+
+    fn suffix(
+        &self,
+        id: SessionId,
+        cursor: &mut ext::LogCursor,
+        through: u64,
+    ) -> io::Result<(bool, Vec<Entry>)> {
+        let shared = self.shared(id)?;
+        let lines = lock(&shared.lines);
+        let reset = cursor.seq != 0
+            && (cursor.seq > through
+                || lines
+                    .get(cursor.seq as usize - 1)
+                    .and_then(|line| Entry::from_json(line).ok())
+                    .is_none_or(|e| (e.seq.get(), e.epoch) != (cursor.seq, cursor.epoch)));
+        if reset {
+            *cursor = ext::LogCursor::default();
+        }
+        let mut history = History {
+            seq: cursor.seq,
+            epoch: cursor.epoch.0,
+        };
+        let mut entries = Vec::new();
+        for seq in cursor.seq..through {
+            let line = lines
+                .get(usize::try_from(seq).map_err(io::Error::other)?)
+                .ok_or(io::ErrorKind::NotFound)?;
+            let entry = history
+                .decode(line)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            *cursor = ext::LogCursor {
+                seq: entry.seq.get(),
+                epoch: entry.epoch,
+                offset: 0,
+            };
+            entries.push(entry);
+        }
+        Ok((reset, entries))
     }
 
     fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()> {

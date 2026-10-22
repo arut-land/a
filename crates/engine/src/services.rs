@@ -306,6 +306,7 @@ impl ext::Logs for SessionLogs {
         &self,
         root: SessionId,
         descendants: bool,
+        cursors: Vec<(SessionId, ext::LogCursor)>,
     ) -> BoxFuture<'_, Result<Vec<ext::LogPrefix>, String>> {
         let shared = Arc::clone(&self.0);
         Box::pin(async move {
@@ -335,13 +336,38 @@ impl ext::Logs for SessionLogs {
                             .iter()
                             .find(|r| r.header.id == session)
                             .ok_or("missing conversation")?;
+                        let mut cursor = cursors
+                            .iter()
+                            .find(|(id, _)| *id == session)
+                            .map_or_default(|(_, c)| *c);
+                        let (reset, entries) = shared
+                            .store
+                            .suffix(session, &mut cursor, record.entries)
+                            .map_err(|e| e.to_string())?;
+                        let namespace = shared
+                            .registry
+                            .get()
+                            .service::<dyn ext::host::HistoryPolicy>()
+                            .map(ext::host::HistoryPolicy::namespace);
+                        let inherited_through = entries
+                            .iter()
+                            .rev()
+                            .find_map(|e| match (&e.body, &namespace) {
+                                (protocol::Body::Ext { ext, state, .. }, Some(n))
+                                    if ext == &*n.ext && state == &*n.state =>
+                                {
+                                    Some(e.seq.get())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or(0);
                         Ok(ext::LogPrefix {
                             session,
                             parent: record.header.parent.map(|p| p.session),
-                            entries: shared
-                                .store
-                                .prefix(session, record.entries)
-                                .map_err(|e| e.to_string())?,
+                            entries,
+                            cursor,
+                            reset,
+                            inherited_through,
                         })
                     })
                     .collect()

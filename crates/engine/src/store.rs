@@ -285,6 +285,15 @@ pub trait LogStore: Send + Sync {
     /// recovering a torn tail, or touching any derived files.
     fn prefix(&self, id: SessionId, seq: u64) -> io::Result<Vec<Entry>>;
 
+    /// Validates the covered line, then reads only new entries. A replaced
+    /// covered prefix resets the cursor; cached folds must discard its facts.
+    fn suffix(
+        &self,
+        id: SessionId,
+        cursor: &mut ext::LogCursor,
+        through: u64,
+    ) -> io::Result<(bool, Vec<Entry>)>;
+
     /// Publishes a complete imported history atomically. A failed import
     /// must never expose a partial session through `headers`.
     fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()>;

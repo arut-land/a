@@ -73,7 +73,7 @@ pub struct Projection {
 
 struct Conversation {
     parent: Option<SessionId>,
-    covered: (u64, protocol::Epoch),
+    covered: ext::LogCursor,
     facts: Vec<CallFact>,
     uncertain: Vec<CallId>,
 }
@@ -84,28 +84,21 @@ impl Projection {
             self.cached = None;
             Conversation {
                 parent: prefix.parent,
-                covered: (0, protocol::Epoch(0)),
+                covered: ext::LogCursor::default(),
                 facts: Vec::new(),
                 uncertain: Vec::new(),
             }
         });
-        if log.covered.0 != 0
-            && !prefix
-                .entries
-                .iter()
-                .any(|e| (e.seq.get(), e.epoch) == log.covered)
-        {
-            log.covered = (0, protocol::Epoch(0));
+        if prefix.reset {
             log.facts.clear();
             log.uncertain.clear();
             self.cached = None;
         }
         for entry in &prefix.entries {
-            if entry.seq.get() <= log.covered.0 {
+            if entry.seq.get() <= prefix.inherited_through {
                 continue;
             }
-            log.covered = (entry.seq.get(), entry.epoch);
-            self.cached = None;
+            let before = log.uncertain.len();
             match &entry.body {
                 Body::ModelCall { r#for: None, .. } => log.uncertain.push(CallId(entry.seq)),
                 Body::ModelResult { call, outcome, .. }
@@ -121,6 +114,9 @@ impl Projection {
                 } => log.uncertain.retain(|id| id != call),
                 _ => {}
             }
+            if before != log.uncertain.len() {
+                self.cached = None;
+            }
             if let Some(fact) = entry
                 .execution
                 .as_ref()
@@ -128,11 +124,22 @@ impl Projection {
                 && fact.id.executing_session == prefix.session
             {
                 match log.facts.binary_search_by_key(&fact.id, |f| f.id) {
-                    Err(i) => log.facts.insert(i, fact.clone()),
+                    Err(i) => {
+                        log.facts.insert(i, fact);
+                        self.cached = None;
+                    }
                     Ok(_) => {}
                 }
             }
         }
+        log.covered = prefix.cursor;
+    }
+
+    pub fn cursors(&self) -> Vec<(SessionId, ext::LogCursor)> {
+        self.logs
+            .iter()
+            .map(|(id, log)| (*id, log.covered))
+            .collect()
     }
 
     pub fn own(&mut self, session: SessionId, prices: &Prices) -> Total {
@@ -278,10 +285,11 @@ impl Tool for Query {
         } else {
             serde_json::from_str(args).map_err(|e| e.to_string())?
         };
+        let cursors = self.0.lock().map_err(|e| e.to_string())?.cursors();
         let logs = cx
             .service::<dyn ext::Logs>()
             .ok_or("no log reader")?
-            .read(cx.session, selection.subtree)
+            .read(cx.session, selection.subtree, cursors)
             .await?;
         let mut projection = self.0.lock().map_err(|e| e.to_string())?;
         for log in &logs {

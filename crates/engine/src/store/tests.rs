@@ -92,6 +92,7 @@ macro_rules! conformance {
             each_load_leases_a_newer_epoch,
             reading_entries_leaves_the_writer_alone,
             load_reads_only_the_suffix,
+            covered_cursors_read_only_new_entries_and_reset_on_replacement,
             a_stale_or_corrupt_snapshot_is_ignored,
         );)*
     };
@@ -1235,4 +1236,30 @@ fn nested_children_remain_addressable_after_the_catalog_is_lost() {
     assert_eq!(reopened.prefix(grandchild.id, 1).unwrap(), [entry]);
     let catalog = crate::catalog::Catalog::open(dir.join("sessions.idx"), &reopened).unwrap();
     assert_eq!(catalog.get(grandchild.id).unwrap().header, grandchild);
+}
+
+fn covered_cursors_read_only_new_entries_and_reset_on_replacement(store: &dyn LogStore) {
+    let header = header("/w");
+    let mut loaded = store.create(&header).unwrap();
+    let first = append(&mut loaded, 1..=3);
+    let mut cursor = ext::LogCursor::default();
+    let (reset, entries) = store.suffix(header.id, &mut cursor, 3).unwrap();
+    assert!(!reset);
+    assert_eq!(entries, first);
+    assert_eq!(cursor.seq, 3);
+    let covered = cursor;
+    assert_eq!(
+        store.suffix(header.id, &mut cursor, 3).unwrap(),
+        (false, Vec::new())
+    );
+    assert_eq!(cursor, covered);
+    let next = append(&mut loaded, 4..=5);
+    assert_eq!(
+        store.suffix(header.id, &mut cursor, 5).unwrap(),
+        (false, next)
+    );
+    cursor.epoch = Epoch(cursor.epoch.0 + 1);
+    let (reset, entries) = store.suffix(header.id, &mut cursor, 5).unwrap();
+    assert!(reset);
+    assert_eq!(entries.len(), 5);
 }

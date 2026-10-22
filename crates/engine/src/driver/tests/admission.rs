@@ -1272,6 +1272,9 @@ fn cancelled_before_provider_send_adds_no_executed_attempt() {
         session: session.id,
         parent: None,
         entries: log,
+        cursor: ext::LogCursor::default(),
+        reset: true,
+        inherited_through: 0,
     });
     let prices = ext_metrics::Prices {
         version: "unpriced".into(),

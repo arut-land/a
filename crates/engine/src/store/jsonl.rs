@@ -273,6 +273,61 @@ impl LogStore for Jsonl {
         Ok(entries)
     }
 
+    fn suffix(
+        &self,
+        id: SessionId,
+        cursor: &mut ext::LogCursor,
+        through: u64,
+    ) -> io::Result<(bool, Vec<Entry>)> {
+        let mut reader = BufReader::new(File::open(self.path(id)?)?);
+        let mut line = Vec::new();
+        let mut reset = false;
+        if cursor.seq != 0 {
+            reader.seek(SeekFrom::Start(cursor.offset))?;
+            reader.read_until(b'\n', &mut line)?;
+            let covered = unseal(&mut line)
+                .then(|| Entry::from_json(&line).ok())
+                .flatten();
+            if cursor.seq > through
+                || covered.is_none_or(|e| (e.seq.get(), e.epoch) != (cursor.seq, cursor.epoch))
+            {
+                *cursor = ext::LogCursor::default();
+                reset = true;
+            }
+        }
+        if cursor.seq == 0 {
+            reader.seek(SeekFrom::Start(0))?;
+            line.clear();
+            reader.read_until(b'\n', &mut line)?;
+            if !unseal(&mut line) {
+                return Err(io::Error::other("unreadable session header"));
+            }
+        }
+        let mut history = History {
+            seq: cursor.seq,
+            epoch: cursor.epoch.0,
+        };
+        let mut entries = Vec::new();
+        while history.seq < through {
+            let offset = reader.stream_position()?;
+            line.clear();
+            reader.read_until(b'\n', &mut line)?;
+            if !unseal(&mut line) {
+                return Err(io::Error::other("incomplete or damaged session suffix"));
+            }
+            let entry = history
+                .decode(&line)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            *cursor = ext::LogCursor {
+                seq: entry.seq.get(),
+                epoch: entry.epoch,
+                offset,
+            };
+            entries.push(entry);
+        }
+        Ok((reset, entries))
+    }
+
     fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()> {
         self.import_with(header, entries, |_| Ok(()))
     }

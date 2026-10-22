@@ -2083,6 +2083,7 @@ fn metrics_queries_read_owned_attempts_from_committed_prefixes() {
         &services::SessionLogs(Arc::clone(&executor.session.shared)),
         session.id,
         true,
+        Vec::new(),
     ))
     .unwrap();
     let mut projection = ext_metrics::Projection::default();
@@ -2100,4 +2101,12 @@ fn metrics_queries_read_owned_attempts_from_committed_prefixes() {
     assert_eq!(total.usage[0].missing, 1);
     assert!(total.usage[0].known > 0);
     assert_eq!(total.call_ns.missing, 0);
+    let suffixes = rt::block_on(ext::Logs::read(
+        &services::SessionLogs(Arc::clone(&executor.session.shared)),
+        session.id,
+        true,
+        projection.cursors(),
+    ))
+    .unwrap();
+    assert!(suffixes.iter().all(|p| p.entries.is_empty() && !p.reset));
 }

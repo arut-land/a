@@ -255,8 +255,11 @@ replies add no spend. Filters select agent and side/main dimensions without
 changing the facts. Critical elapsed time is the envelope of measured intervals
 within each clock epoch, separately from summed call durations. Multiple epochs
 and unfinished intervals report incomplete coverage; wall clocks never fill
-the gaps. Disposable in-memory folds track covered sequences per conversation;
-query caches also include the complete versioned price table and selection.
+the gaps. Disposable in-memory folds retain conversation/sequence/epoch cursors. Reads
+seek to the covered line, validate it and decode only the suffix; replaced
+coverage resets the fold. Copied history is excluded at the history-policy
+boundary. Unrelated entries advance the cursor without invalidating accounting
+results. Query caches include the versioned price table and selection.
 Repricing changes no execution fact. No durable accumulator is maintained;
 query replies are ordinary tool outcomes and are never counted as execution.
 

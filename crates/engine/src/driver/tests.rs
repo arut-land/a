@@ -532,6 +532,14 @@ impl LogStore for Probe {
     fn prefix(&self, id: SessionId, seq: u64) -> io::Result<Vec<Entry>> {
         self.store.prefix(id, seq)
     }
+    fn suffix(
+        &self,
+        id: SessionId,
+        cursor: &mut ext::LogCursor,
+        through: u64,
+    ) -> io::Result<(bool, Vec<Entry>)> {
+        self.store.suffix(id, cursor, through)
+    }
     fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()> {
         self.store.import(header, entries)
     }

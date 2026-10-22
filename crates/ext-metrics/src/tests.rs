@@ -32,6 +32,12 @@ fn log(session: SessionId, parent: Option<SessionId>, facts: Vec<CallFact>) -> e
     ext::LogPrefix {
         session,
         parent,
+        cursor: ext::LogCursor {
+            seq: facts.len() as u64,
+            ..ext::LogCursor::default()
+        },
+        reset: true,
+        inherited_through: 0,
         entries: facts
             .into_iter()
             .enumerate()
@@ -209,7 +215,11 @@ fn metrics_rebuild_equals_incremental_fold() {
     let mut incremental = Projection::default();
     incremental.fold(&first);
     assert_eq!(incremental.own(id, &prices()).call_ns.known, 10);
-    incremental.fold(&full);
+    let mut suffix = log(id, None, vec![fact(id, 1, 10, Some(20))]);
+    suffix.entries[0].seq = Seq::new(2).unwrap();
+    suffix.cursor.seq = 2;
+    suffix.reset = false;
+    incremental.fold(&suffix);
     let mut rebuilt = Projection::default();
     rebuilt.fold(&full);
     assert_eq!(incremental.own(id, &prices()), rebuilt.own(id, &prices()));
@@ -316,4 +326,62 @@ fn an_unsettled_intent_has_unknown_spend_without_claiming_execution() {
     assert_eq!(total.attempts, 0);
     assert_eq!(total.usage[0].missing, 1);
     assert_eq!(total.call_ns.missing, 1);
+}
+
+#[test]
+fn unrelated_suffixes_preserve_the_accounting_cache() {
+    let id = SessionId::new();
+    let mut projection = Projection::default();
+    projection.fold(&log(id, None, vec![fact(id, 0, 0, Some(10))]));
+    let before = projection.own(id, &prices());
+    let suffix = ext::LogPrefix {
+        session: id,
+        parent: None,
+        reset: false,
+        inherited_through: 0,
+        cursor: ext::LogCursor {
+            seq: 2,
+            ..ext::LogCursor::default()
+        },
+        entries: vec![Entry::new(
+            Seq::new(2).unwrap(),
+            Epoch(0),
+            Body::Assistant {
+                text: "unrelated".into(),
+            },
+        )],
+    };
+    projection.fold(&suffix);
+    assert!(projection.cached.is_some());
+    assert_eq!(projection.cursors()[0].1.seq, 2);
+    assert_eq!(projection.own(id, &prices()), before);
+}
+
+#[test]
+fn copied_interrupted_intents_do_not_create_unknown_spend() {
+    let id = SessionId::new();
+    let mut prefix = log(id, None, vec![fact(id, 0, 0, Some(10))]);
+    prefix.entries.insert(
+        0,
+        Entry::new(
+            Seq::new(1).unwrap(),
+            Epoch(0),
+            Body::ModelCall {
+                model: "test".into(),
+                attempt: 0,
+                choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: None,
+                request: None,
+            },
+        ),
+    );
+    prefix.entries[1].seq = Seq::new(3).unwrap();
+    prefix.inherited_through = 2;
+    prefix.cursor.seq = 3;
+    let mut projection = Projection::default();
+    projection.fold(&prefix);
+    let total = projection.own(id, &prices());
+    assert_eq!(total.attempts, 1);
+    assert_eq!(total.usage[0].missing, 0);
 }

@@ -115,13 +115,24 @@ pub trait Logs: Send + Sync {
         &self,
         root: protocol::SessionId,
         descendants: bool,
+        cursors: Vec<(protocol::SessionId, LogCursor)>,
     ) -> BoxFuture<'_, Result<Vec<LogPrefix>, String>>;
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogCursor {
+    pub seq: u64,
+    pub epoch: protocol::Epoch,
+    pub offset: u64,
 }
 
 pub struct LogPrefix {
     pub session: protocol::SessionId,
     pub parent: Option<protocol::SessionId>,
     pub entries: Vec<protocol::Entry>,
+    pub cursor: LogCursor,
+    pub reset: bool,
+    pub inherited_through: u64,
 }
 
 /// Registering this service requests durable generic provider-attempt facts.

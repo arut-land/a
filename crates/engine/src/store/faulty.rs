@@ -147,6 +147,15 @@ impl LogStore for Faulty {
         self.inner.prefix(id, seq)
     }
 
+    fn suffix(
+        &self,
+        id: SessionId,
+        cursor: &mut ext::LogCursor,
+        through: u64,
+    ) -> io::Result<(bool, Vec<Entry>)> {
+        self.inner.suffix(id, cursor, through)
+    }
+
     fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()> {
         self.inner.import_checked(header, entries, &mut |step| {
             let mut failure = lock(&self.state.fail_import);
