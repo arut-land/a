@@ -196,7 +196,11 @@ jobs:
       - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
       - run: mise exec -- cargo build -p a
       - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
-      - run: mise run acceptance
+      - run: |
+          for attempt in {1..10}; do
+            echo "Windows acceptance pass $attempt"
+            mise run acceptance
+          done
 
   # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
   # reducer vectors and a live session through it in Swift, then the app

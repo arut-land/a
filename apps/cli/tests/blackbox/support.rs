@@ -177,8 +177,8 @@ impl TestProcess {
 
 fn describe(command: &Command) -> String {
     format!(
-        "{:?} {:?} cwd={:?}",
-        command.get_program(),
+        "{} {:?} cwd={:?}",
+        command.get_program().display(),
         command.get_args().collect::<Vec<_>>(),
         command.get_current_dir(),
     )
