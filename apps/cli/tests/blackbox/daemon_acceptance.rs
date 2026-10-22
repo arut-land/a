@@ -10,16 +10,10 @@ use std::time::{Duration, Instant};
 fn concurrent_starters_share_one_daemon_and_stop_releases_its_lock() {
     let env = Isolated::new("concurrent");
     let clients: Vec<_> = (0..8)
-        .map(|_| env.command(&["ls"]).spawn().unwrap())
+        .map(|_| TestProcess::spawn(&mut env.command(&["ls"])))
         .collect();
     for child in clients {
-        assert!(
-            TestProcess::from(child)
-                .collect(deadline())
-                .unwrap()
-                .status
-                .success()
-        );
+        assert!(child.collect(deadline()).unwrap().status.success());
     }
     let pid = env.pid();
     env.run(&["ls"]);
@@ -104,14 +98,8 @@ fn two_installs_upgrade_once_and_the_older_client_never_downgrades() {
 #[test]
 fn a_cold_clients_output_reaches_eof_while_the_daemon_stays_alive() {
     let env = Isolated::new("stdio-eof");
-    let child = env
-        .command(&["ls"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
     assert!(
-        TestProcess::from(child)
+        TestProcess::spawn(&mut env.command(&["ls"]))
             .collect(deadline())
             .unwrap()
             .status
@@ -230,11 +218,47 @@ fn every_case_uses_an_isolated_home() {
 }
 
 #[test]
+fn fixture_homes_use_the_runner_scratch_directory() {
+    let scratch = crate::support::isolated_root("runner-scratch");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "daemon_acceptance::process_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("A_TEST_PROCESS", "root")
+        .env("RUNNER_TEMP", &scratch)
+        .env("A_HOME", &scratch);
+    let result = TestProcess::spawn(&mut command).collect(deadline());
+    crate::support::remove_home(&scratch);
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 #[ignore = "subprocess fixture for process collection"]
 fn process_fixture() {
     use std::io::Write;
-    if std::env::var("A_TEST_PROCESS").as_deref() == Ok("output") {
-        io::stdout().write_all(&vec![b'o'; 1_048_576]).unwrap();
-        io::stderr().write_all(&vec![b'e'; 1_048_576]).unwrap();
+    match std::env::var("A_TEST_PROCESS").as_deref() {
+        Ok("output") => {
+            io::stdout().write_all(&vec![b'o'; 1_048_576]).unwrap();
+            io::stderr().write_all(&vec![b'e'; 1_048_576]).unwrap();
+        }
+        Ok("root") => {
+            let root = crate::support::isolated_root("scratch-child");
+            let parent = root.parent().unwrap().to_owned();
+            crate::support::remove_home(&root);
+            assert_eq!(
+                parent,
+                std::path::PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap())
+            );
+        }
+        _ => {}
     }
 }

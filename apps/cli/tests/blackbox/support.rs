@@ -16,7 +16,9 @@ pub fn deadline() -> Instant {
 
 pub fn isolated_root(name: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = std::env::temp_dir().join(format!(
+    // CI scratch storage avoids slow durable writes in the OS temp directory.
+    let base = std::env::var_os("RUNNER_TEMP").map_or_else(std::env::temp_dir, PathBuf::from);
+    let root = base.join(format!(
         "a-acc-{name}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -63,6 +65,7 @@ impl Process {
 pub struct TestProcess {
     child: Process,
     readers: [Option<Box<dyn Read + Send>>; 2],
+    command: String,
 }
 
 impl From<Child> for TestProcess {
@@ -81,19 +84,23 @@ impl From<Child> for TestProcess {
         Self {
             child: Process::Piped(child),
             readers,
+            command: "command unavailable (adopted child)".into(),
         }
     }
 }
 
 impl TestProcess {
     pub fn spawn(command: &mut Command) -> Self {
-        Self::from(
+        let description = describe(command);
+        let mut process = Self::from(
             command
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .unwrap(),
-        )
+        );
+        process.command = description;
+        process
     }
 
     pub fn group(&self) -> &sys::OwnedGroup {
@@ -108,47 +115,89 @@ impl TestProcess {
         Self {
             child: Process::Contained(child),
             readers: [None, None],
+            command: describe(command),
         }
     }
 
     pub fn collect(mut self, deadline: Instant) -> io::Result<Output> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(16);
         // Both readers start before waiting; either pipe can fill independently.
-        let mut streams = [Some(Vec::new()), Some(Vec::new())];
+        let mut streams = [Vec::new(), Vec::new()];
+        let mut eof = [true, true];
         for (index, reader) in std::mem::take(&mut self.readers).into_iter().enumerate() {
             let Some(mut reader) = reader else { continue };
-            streams[index] = None;
+            eof[index] = false;
             let tx = tx.clone();
             std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                let result = reader.read_to_end(&mut bytes);
-                let _ = tx.send((index, result.map(|_| bytes)));
+                let mut bytes = [0; 8192];
+                loop {
+                    let result = match reader.read(&mut bytes) {
+                        Ok(n) => Ok(bytes[..n].to_vec()),
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => Err(error),
+                    };
+                    let done = result.as_ref().map_or(true, Vec::is_empty);
+                    if tx.send((index, result)).is_err() || done {
+                        break;
+                    }
+                }
             });
         }
         drop(tx);
         loop {
-            while let Ok((index, result)) = rx.try_recv() {
-                streams[index] = Some(result?);
+            // Continuous output must not postpone checking the deadline.
+            for _ in 0..16 {
+                let Ok((index, result)) = rx.try_recv() else {
+                    break;
+                };
+                let bytes = result?;
+                eof[index] = bytes.is_empty();
+                streams[index].extend(bytes);
             }
-            if let Some(status) = self.child.try_wait()?
-                && streams.iter().all(Option::is_some)
+            let status = self.child.try_wait()?;
+            if let Some(status) = status
+                && eof.iter().all(|&eof| eof)
             {
                 let [stdout, stderr] = streams;
                 return Ok(Output {
                     status,
-                    stdout: stdout.unwrap(),
-                    stderr: stderr.unwrap(),
+                    stdout,
+                    stderr,
                 });
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "test process collection deadline",
+                    format!(
+                        "test process collection deadline: pid={} command={} status={status:?} stdout={} stderr={}\nstdout tail: {}\nstderr tail: {}",
+                        match &self.child {
+                            Process::Piped(child) => child.id(),
+                            Process::Contained(child) => child.id(),
+                        },
+                        self.command,
+                        if eof[0] { "eof" } else { "pending" },
+                        if eof[1] { "eof" } else { "pending" },
+                        String::from_utf8_lossy(
+                            &streams[0][streams[0].len().saturating_sub(4096)..]
+                        ),
+                        String::from_utf8_lossy(
+                            &streams[1][streams[1].len().saturating_sub(4096)..]
+                        ),
+                    ),
                 ));
             }
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+}
+
+fn describe(command: &Command) -> String {
+    format!(
+        "{} {:?} cwd={:?}",
+        command.get_program().display(),
+        command.get_args().collect::<Vec<_>>(),
+        command.get_current_dir(),
+    )
 }
 
 impl Drop for TestProcess {
@@ -239,8 +288,45 @@ impl Isolated {
 
 impl Drop for Isolated {
     fn drop(&mut self) {
-        let _ = TestProcess::spawn(&mut self.command(&["daemon", "stop"])).collect(deadline());
+        if let Err(error) =
+            TestProcess::spawn(&mut self.command(&["daemon", "stop"])).collect(deadline())
+        {
+            eprintln!(
+                "stopping isolated daemon at {}: {error}",
+                self.home.root().display()
+            );
+        }
         self.home.endpoint().remove();
         remove_home(self.home.root());
     }
+}
+
+#[test]
+fn a_collection_timeout_distinguishes_an_exited_child_from_an_open_stream() {
+    struct GatedReader(mpsc::Receiver<()>);
+    impl Read for GatedReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_a"));
+    command.arg("--version");
+    let mut process = TestProcess::spawn(&mut command);
+    let Process::Piped(child) = &mut process.child else {
+        unreachable!();
+    };
+    let pid = child.id();
+    child.wait().unwrap();
+    let (release, gate) = mpsc::channel();
+    process.readers = [Some(Box::new(GatedReader(gate))), None];
+    let error = process.collect(Instant::now()).unwrap_err();
+    drop(release);
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    let message = error.to_string();
+    assert!(message.contains(&format!("pid={pid}")), "{message}");
+    assert!(message.contains("--version"), "{message}");
+    assert!(message.contains("status=Some("), "{message}");
+    assert!(message.contains("stdout=pending stderr=eof"), "{message}");
 }

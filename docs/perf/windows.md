@@ -115,7 +115,8 @@ after a directory publication barrier fails. Unix Miri covers supported
 `sys` operations; it cannot execute Windows kernel FFI.
 
 Cross-account denial and physical power-loss persistence require a suitable
-Windows host. No Windows size, RSS or latency measurement has been collected.
+Windows host. Windows release size, idle RSS and latency budgets have not
+been measured on a quiet host.
 On the Apple silicon development host (2026-10-22), `mise run size` measured
 the shipped binary at 3,170 KiB against the 4,096 KiB cap, with fixture
 exclusion verified. This is an Apple measurement, not a Windows performance
@@ -140,3 +141,18 @@ main's two; nested children use two, as on main. The first-log barrier is
 unchanged. Store opening establishes its anchor once instead of repeating
 ancestor-wide barriers for each session. These are local measurements, not
 Windows performance results.
+
+## Acceptance homes and collection
+
+Black-box homes live under `RUNNER_TEMP` when it is set, and under the OS
+temp directory otherwise. On windows-latest runners, flushing the staged
+16 MiB executable took a 45 ms median in OS temp (`C:`) against 6 ms in
+runner scratch (`D:`), with single flushes in OS temp up to eight seconds
+([paired run](https://github.com/arut-land/a/actions/runs/39828170409/job/119996915133)).
+
+Collecting a test process keeps its 30-second limit. A timeout names the
+PID, command, working directory, exit status, whether each output stream
+reached EOF, and the last 4 KiB of each, so an exited child holding an open
+pipe is told apart from one still running. One timeout across all cold-start
+cases (run 39802542241) was not reproduced under CPU or I/O load and remains
+unattributed; the report above is what a recurrence will show.
