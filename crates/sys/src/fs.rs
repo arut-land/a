@@ -656,7 +656,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("a-sys-watch-{}", std::process::id()));
         let mut file = File::create(&path).unwrap();
         let watch = write_watch(&path).unwrap();
-        let readable = |ms: i64| {
+        let readable = |ms: u64| {
             let timeout = Timespec::try_from(std::time::Duration::from_millis(ms)).unwrap();
             let mut fds = [PollFd::new(&watch, PollFlags::IN)];
             poll(&mut fds, Some(&timeout)).unwrap() == 1
