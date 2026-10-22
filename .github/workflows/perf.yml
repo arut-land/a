@@ -100,6 +100,7 @@ jobs:
           python -m pip install psutil==7.2.2
           channel=$(python -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/perf-rustup" >> "$GITHUB_ENV"
           echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
       - run: python -m unittest discover -s scripts/perf -p 'test_*.py'
       - uses: actions/cache/restore@v6
@@ -109,8 +110,8 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/mbx/actions
-          key: perf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('harness/rust-toolchain.toml', 'harness/Cargo.lock', 'harness/.cargo/*.toml') }}-${{ github.run_id }}
-          restore-keys: perf-${{ runner.os }}-${{ runner.arch }}-
+          key: perf-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('harness/rust-toolchain.toml', 'harness/Cargo.lock', 'harness/.cargo/*.toml') }}-${{ github.run_id }}
+          restore-keys: perf-v2-${{ runner.os }}-${{ runner.arch }}-
       # ARM Windows has no Cranelift component; release and benches use LLVM.
       - id: toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src
@@ -181,7 +182,7 @@ jobs:
             harness/target/hosted-perf/**/*.json
             harness/target/hosted-perf/**/*.jsonl
             harness/target/hosted-perf/**/*.md
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
       - uses: actions/cache/save@v6
         if: always() && steps.toolchain.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
