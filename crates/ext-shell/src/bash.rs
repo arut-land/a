@@ -569,7 +569,6 @@ async fn supervise(
 ) -> io::Result<Finished> {
     let mut file = File::open(log)?;
     let rt = runtime(cx)?;
-    let reactor = rt.reactor();
     let mut buf = vec![0; 64 * 1024];
     let (mut output, mut live) = (Output::default(), Live::default());
     let start = rt.now();
@@ -606,7 +605,7 @@ async fn supervise(
         })?;
         behind = read == READ;
         if read > 0 {
-            reactor.yield_now().await;
+            rt::yield_now().await;
         }
         let now = rt.now();
         if read > 0 {
