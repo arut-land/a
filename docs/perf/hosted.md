@@ -106,7 +106,9 @@ runtime budget pass. Full measurements remain the default.
 For tuning, `paired_ref` additionally builds a reference revision on the same
 runner. Reference builds omit the protocol and TUI bench executables, which
 these paired windows do not use. Five alternating AB/BA rounds measure startup, cold reply, attach,
-idle RSS/CPU, driver turns and large JSON. Each role uses fresh isolated
+idle RSS/CPU, driver turns and large JSON. Paired JSON batches use 200 results
+to reduce native CPU counter quantization; the full suite retains its original
+20-result workload. Each role uses fresh isolated
 homes. All builds finish before these paired windows. Both raw observations
 and `paired.json` remain in the artifact, with a second summary table. Use
 this comparison when different hosted CPUs or storage obscure a small change.

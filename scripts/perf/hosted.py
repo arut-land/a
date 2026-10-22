@@ -270,8 +270,11 @@ def paired(output, source, reference):
                                 "--ignored", "--nocapture", "--test-threads=1"], 1),
             ]:
                 path = saved / (name + ".json")
+                env = dict(os.environ)
+                if name == "large_json":
+                    env["A_BENCH_JSON_RESULTS"] = "200"
                 run(["hyperfine", "-N", "--warmup", "1", "--runs", str(runs), "--metrics", "all",
-                     "--export-json", path, workloads.command(argv)])
+                     "--export-json", path, workloads.command(argv)], env=env)
                 result = json.loads(path.read_text())["results"][0]
                 for field, unit, scale in [("time_wall_clock", "ms", 1000), ("time_cpu", "cpu_ms", 1000),
                                            ("memory_peak_resident", "rss_kib", 1 / 1024)]:
@@ -280,10 +283,10 @@ def paired(output, source, reference):
                         values[role].setdefault(name + "_" + unit, []).extend(samples)
                 if os.name == "nt":
                     from process import measure_windows
-                    record = measure_windows(argv)
+                    record = measure_windows(argv, env=env)
                     (saved / (name + "-native.json")).write_text(json.dumps(record))
                     values[role].setdefault(name + "_rss_kib", []).append(record["peak_rss_kib"])
-    result = dict(reference_revision=reference, candidate_revision=subprocess.check_output(
+    result = dict(large_json_results=200, reference_revision=reference, candidate_revision=subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(), order=orders, roles={})
     for role, observed in values.items():
         observed["size_kib"] = [(builds[role] / ("a" + SUFFIX)).stat().st_size / 1024]

@@ -269,8 +269,11 @@ fn bench_large_tool_result() {
     );
     let session = fixture.create();
     settle(&session);
+    // Longer batches reduce quantization in native process CPU counters.
+    let rounds: usize = std::env::var("A_BENCH_JSON_RESULTS").map_or(20, |n| n.parse().unwrap());
+    assert!(rounds > 0);
     let mut times = Vec::new();
-    for _ in 0..20 {
+    for _ in 0..rounds {
         let start = Instant::now();
         session.submit("call large {}").unwrap();
         settle(&session);
@@ -281,9 +284,9 @@ fn bench_large_tool_result() {
         .iter()
         .filter(|e| matches!(e.body, Body::ToolResult { .. }))
         .count();
-    assert_eq!(results, 20);
+    assert_eq!(results, rounds);
     eprintln!(
-        "large JSON tool result: {:?} (median of 20), {} entries",
+        "large JSON tool result: {:?} (median of {rounds}), {} entries",
         median(times),
         entries.len()
     );
