@@ -13,6 +13,13 @@ const TITLE: &str = "Name this conversation in at most six words, for a list of 
 
 pub struct Title;
 
+impl ext::ModelOnlyKind for Title {
+    const CONTEXT: ext::ContextPolicy = ext::ContextPolicy {
+        exchanges: 2,
+        bytes: 8192,
+    };
+}
+
 impl Configured for Title {
     fn configure(_: &impl Table) -> Result<Self, Refused> {
         Ok(Self)
@@ -46,7 +53,7 @@ impl Extension for Title {
 }
 
 fn turn(key: TurnKey, prompt: String) -> ModelTurn {
-    let mut turn = ModelTurn::new(
+    let mut turn = ModelTurn::new::<Title>(
         ext::ThreadKey::new::<Title>(PURPOSE, ext::OwnerScope::Session),
         key,
         ext::ModelRole::Fast,

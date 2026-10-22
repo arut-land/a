@@ -139,6 +139,92 @@ impl<'de> Deserialize<'de> for Messages {
     }
 }
 
+/// Source-owned bounds apply to requests, never to durable exchanges or outcomes.
+#[derive(Clone, Copy, Debug)]
+pub struct ContextPolicy {
+    pub exchanges: u16,
+    pub bytes: u32,
+}
+
+impl Serialize for ContextPolicy {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (self.exchanges, self.bytes).serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for ContextPolicy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (exchanges, bytes) = Deserialize::deserialize(deserializer)?;
+        Ok(Self { exchanges, bytes })
+    }
+}
+
+impl ContextPolicy {
+    pub fn assemble(
+        self,
+        history: &Messages,
+        owner: &Messages,
+        current: &Messages,
+    ) -> Result<Messages, String> {
+        let history = &history[..history.len().saturating_sub(current.len())];
+        let system = |m: &&Message| matches!(m, Message::System(_));
+        let mandatory: Vec<_> = history
+            .iter()
+            .chain(owner.iter())
+            .filter(system)
+            .chain(current.iter())
+            .collect();
+        let mut used = crate::Json::encode(&mandatory)
+            .map_err(|e| e.to_string())?
+            .raw()
+            .len();
+        if used > self.bytes as usize {
+            return Err("model-only instructions exceed the context ceiling".into());
+        }
+        let mut select = |messages: &[Message], owner: bool| -> Result<Vec<Message>, String> {
+            let mut end = messages.len();
+            let mut selected = Vec::new();
+            for _ in 0..self.exchanges {
+                if end == 0 {
+                    break;
+                }
+                let start = (1..end)
+                    .rfind(|&i| {
+                        if owner {
+                            matches!(messages[i], Message::User(_))
+                        } else {
+                            matches!(messages[i - 1], Message::Assistant(_))
+                        }
+                    })
+                    .unwrap_or(0);
+                let group: Vec<_> = messages[start..end].iter().filter(|m| !system(m)).collect();
+                let bytes = crate::Json::encode(&group)
+                    .map_err(|e| e.to_string())?
+                    .raw()
+                    .len();
+                if used + bytes > self.bytes as usize {
+                    break;
+                }
+                used += bytes;
+                selected.push(group);
+                end = start;
+            }
+            Ok(selected.into_iter().rev().flatten().cloned().collect())
+        };
+        // Owner context has priority over older thread exchanges.
+        let context = select(owner, true)?;
+        let exchanges = select(history, false)?;
+        Ok(history
+            .iter()
+            .chain(owner.iter())
+            .filter(system)
+            .cloned()
+            .chain(exchanges)
+            .chain(context)
+            .chain(current.iter().cloned())
+            .collect())
+    }
+}
+
 /// A protocol's encoding of a conversation, a prepared message at a time.
 pub(crate) trait Fold: Clone + Send + 'static {
     /// What else the encoding reads: the quirks and model, and anything

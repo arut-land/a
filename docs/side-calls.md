@@ -7,7 +7,7 @@ there is no separate one-shot provider path.
 
 ## Identity and types
 
-`ModelTurn::new(thread_key, turn_key, role, context, messages)`
+`ModelTurn::new::<Kind>(thread_key, turn_key, role, context, messages)`
 constructs an awaited request. `models.call(&cx, turn).await` returns only
 after the result commits. `turn.background().start(cx)` creates an observer
 reaction instead. `Background` cannot be passed to the awaited API and
@@ -46,6 +46,16 @@ replies enter thread history; owner prefixes never accumulate there. Its inbox
 input is enqueued, deduplicated and taken durably before influencing a
 request. Concurrent new turns are processed in order, without merging or
 steering the active turn. Live and recovered context use the same reducer.
+Projection accepts an owner image coupling that prefix to its own admitted
+registry, including registrations excluded from the child.
+
+`ModelOnlyKind::CONTEXT` declares a recent-exchange window and an assembled
+message-byte ceiling in source. Admission freezes it with the runner;
+configuration cannot select it. Title keeps two recent exchanges and at most
+8192 serialized message bytes, including owner context. System and current
+instructions always survive; oversized mandatory instructions fail before
+provider execution. Optional context is removed in whole exchanges. Request
+bounds never prune durable exchanges or keyed outcomes.
 
 The parent's side `ModelCall` records the thread identity, frozen authority
 and turn payload. `ModelResult.for` explicitly classifies the result as
@@ -60,7 +70,10 @@ retry decisions also cross durable barriers. A consumer is released only
 after the parent result commits; failed commits cannot acknowledge success.
 Open parent requests and ambiguous child attempts recover as interrupted,
 including crashes during backoff. For every owned conversation, recovery
-terminally resolves inbox inputs whose sending request was interrupted.
+terminally resolves inbox inputs only with positive evidence of a matching
+sender request's durable interrupted result. `CancelledInput` carries the
+owner and fact sequence justifying resolution. Missing owners, open requests
+and absent results do not prove abandonment.
 Existing take and interrupt facts terminally consume abandoned inputs
 without removing their dedup identities, even before a provider attempt
 exists. Recovery never repeats ambiguous spend.

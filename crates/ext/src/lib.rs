@@ -39,8 +39,8 @@ pub mod point;
 pub mod schema;
 mod service;
 pub use conversation::{
-    Awaited, ContextSource, ConversationHandle, DepthBudget, Detached, Runner, SendMessage, Spawn,
-    SpawnRefusal,
+    Awaited, ContextPolicy, ContextSource, ConversationHandle, DepthBudget, Detached,
+    ModelOnlyKind, Runner, SendMessage, Spawn, SpawnRefusal,
 };
 mod settings;
 pub mod shape;

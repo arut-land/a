@@ -22,7 +22,7 @@ mod writer;
 
 pub use accumulate::Accumulator;
 pub use client::{Events, generate, origin, stream};
-pub use conversation::History;
+pub use conversation::{ContextPolicy, History};
 pub use error::{Error, Kind};
 pub use http::Http;
 pub use json::parse_partial_arguments;

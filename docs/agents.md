@@ -184,6 +184,12 @@ cancellation or deadlines, not a hidden scheduler heuristic.
 
 ## Side threads
 
+Model-only kinds declare `ModelOnlyKind::CONTEXT` in source. The frozen
+runner applies its exchange window and byte ceiling to the assembled request,
+including owner context, while retaining system and current instructions.
+Projection uses the owner's admitted image; recovery consumes inbox work
+only with typed evidence of a matching durable interrupted sender result.
+
 `Runner::Agent` selects a registered kind; `Runner::ModelOnly` performs one
 response per inbox input and offers no tools or agent-loop hooks. Both use
 owned conversation storage, frozen generation/route/settings authority, depth
@@ -255,11 +261,11 @@ crates choose modes and policy.
 | Child asks parent | Tool composition: question and correlated reply fold in an `ext-*` crate |
 | Sibling chat | Policy and tool composition over durable inboxes addressed by conversation id |
 | Named channels | Needs SDK contracts for channel identity, admission, membership and recipient snapshots; current destinations are conversation ids |
-| Different agent/model | Tool composition: select a registered agent and model role; runner selection currently supports agents only |
+| Different agent/model | Tool composition: select a registered agent and model role; select `Runner::Agent` or `Runner::ModelOnly` |
 | Recursive same agent | Tool composition: inherit task registration; depth budget descends |
 | Root-only extension | Rust declaration or Lua `a.inherit(false)` excludes the whole generation |
 | Resumable/forkable children | Common store/catalog paths and existing fork policy |
-| Model-only side threads | Needs SDK runner and lifecycle contracts; current side model calls do not implement conversations |
+| Model-only side threads | Owned conversations over `Runner::ModelOnly`, keyed turns and source-declared request bounds |
 | Usage/cost views | Future metrics fold over call facts and ownership edges |
 
 Implementation must prove replay identity, terminal-result uniqueness across

@@ -33,15 +33,34 @@ pub enum ContextSource {
     Prefix { session: SessionId, seq: Seq },
 }
 
+pub use llm::ContextPolicy;
+
+pub trait ModelOnlyKind {
+    const CONTEXT: ContextPolicy;
+}
+
+impl ModelOnlyKind for crate::ModelOnly {
+    const CONTEXT: ContextPolicy = ContextPolicy {
+        exchanges: 8,
+        bytes: 65536,
+    };
+}
+
 #[derive(Clone, Debug)]
 pub enum Runner {
-    Agent { agent: String, role: ModelRole },
-    ModelOnly { role: ModelRole },
+    Agent {
+        agent: String,
+        role: ModelRole,
+    },
+    ModelOnly {
+        role: ModelRole,
+        context: ContextPolicy,
+    },
 }
 
 impl Serialize for Runner {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        (self.agent(), self.role()).serialize(s)
+        (self.agent(), self.role(), self.context_policy()).serialize(s)
     }
 }
 impl<'de> Deserialize<'de> for Runner {
@@ -52,15 +71,29 @@ impl<'de> Deserialize<'de> for Runner {
 }
 impl Runner {
     fn from_json(json: &protocol::Json) -> serde_json::Result<Self> {
-        let (agent, role) = json.parse()?;
+        let (agent, role, context): (Option<String>, ModelRole, Option<ContextPolicy>) =
+            json.parse()?;
         Ok(match agent {
             Some(agent) => Self::Agent { agent, role },
-            None => Self::ModelOnly { role },
+            None => Self::ModelOnly {
+                role,
+                context: context.ok_or_else(|| {
+                    <serde_json::Error as serde::de::Error>::custom(
+                        "missing model-only context policy",
+                    )
+                })?,
+            },
         })
     }
 }
 
 impl Runner {
+    pub fn context_policy(&self) -> Option<ContextPolicy> {
+        match self {
+            Self::Agent { .. } => None,
+            Self::ModelOnly { context, .. } => Some(*context),
+        }
+    }
     pub fn agent(&self) -> Option<&str> {
         match self {
             Self::Agent { agent, .. } => Some(agent),
@@ -69,7 +102,7 @@ impl Runner {
     }
     pub fn role(&self) -> &ModelRole {
         match self {
-            Self::Agent { role, .. } | Self::ModelOnly { role } => role,
+            Self::Agent { role, .. } | Self::ModelOnly { role, .. } => role,
         }
     }
 }
@@ -122,6 +155,7 @@ impl From<&crate::ModelTurn> for Spawn {
             context: ContextSource::Fresh,
             runner: Runner::ModelOnly {
                 role: turn.role.clone(),
+                context: turn.context_policy(),
             },
             depth: DepthBudget::new(u16::MAX),
             budget: turn.budget,
@@ -193,6 +227,55 @@ impl SendMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn context_bounds_keep_instructions_and_whole_exchanges() {
+        let current: llm::Messages = [llm::Message::user("current instruction")]
+            .into_iter()
+            .collect();
+        let history: llm::Messages = [
+            llm::Message::system("thread system"),
+            llm::Message::user("old instruction"),
+            llm::Message::assistant("old reply"),
+            llm::Message::user("recent instruction"),
+            llm::Message::assistant("recent reply"),
+        ]
+        .into_iter()
+        .chain(current.iter().cloned())
+        .collect();
+        let owner: llm::Messages = [
+            llm::Message::system("owner system"),
+            llm::Message::user("x".repeat(4096)),
+        ]
+        .into_iter()
+        .collect();
+        let policy = ContextPolicy {
+            exchanges: 1,
+            bytes: 512,
+        };
+        let assembled = policy.assemble(&history, &owner, &current).unwrap();
+        assert_eq!(
+            assembled,
+            [
+                llm::Message::system("thread system"),
+                llm::Message::system("owner system"),
+                llm::Message::user("recent instruction"),
+                llm::Message::assistant("recent reply"),
+                llm::Message::user("current instruction")
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(protocol::Json::encode(&assembled).unwrap().raw().len() <= 512);
+        assert!(
+            ContextPolicy {
+                exchanges: 1,
+                bytes: 1
+            }
+            .assemble(&history, &owner, &current)
+            .is_err()
+        );
+    }
+
     #[test]
     fn descending_and_intersection_never_increase_allowance() {
         for parent in 0..32 {

@@ -563,7 +563,7 @@ fn stale_request<'a>(
                 session,
                 ContextRequest::Side {
                     registry: session.shared.registry.get(),
-                    side: ext::ModelTurn::new(
+                    side: ext::ModelTurn::new::<ext::ModelOnly>(
                         ext::ThreadKey::new::<HeldHarbor>(
                             "stale side",
                             ext::OwnerScope::Call(old.call),
@@ -628,7 +628,7 @@ fn stale_request<'a>(
         })
     } else {
         Box::pin(async move {
-            let side = ext::ModelTurn::new(
+            let side = ext::ModelTurn::new::<ext::ModelOnly>(
                 ext::ThreadKey::new::<HeldHarbor>("stale side", ext::OwnerScope::Call(old.call)),
                 ext::TurnKey("initial".into()),
                 ext::ModelRole::Session,
@@ -750,7 +750,7 @@ fn an_unadmitted_side_call_cannot_outlive_its_cancelled_parent() {
     let ack = enqueue(&session, "hello");
     input.started();
     let (cx, release) = started_harbor(&starts);
-    let side = ext::ModelTurn::new(
+    let side = ext::ModelTurn::new::<ext::ModelOnly>(
         ext::ThreadKey::new::<HeldHarbor>("cancelled side", ext::OwnerScope::Call(cx.call)),
         ext::TurnKey("initial".into()),
         ext::ModelRole::Session,

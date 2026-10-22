@@ -2491,7 +2491,7 @@ fn calls_share_transport_pools_but_not_origin_authority() {
     session.cancelled(old.call);
     assert!(!old_origin.current(&session));
     assert!(current_origin.current(&session));
-    let side = ext::ModelTurn::new(
+    let side = ext::ModelTurn::new::<ext::ModelOnly>(
         ext::ThreadKey::new::<Agents>("authority", ext::OwnerScope::Call(old.call)),
         ext::TurnKey("initial".into()),
         ext::ModelRole::Session,

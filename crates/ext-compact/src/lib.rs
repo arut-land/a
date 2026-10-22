@@ -133,7 +133,7 @@ fn estimate(request: &llm::Request) -> u64 {
 async fn compact(cx: &Cx, call: CallId) -> Result<String, String> {
     let models = cx.models().ok_or("this engine asks no model aside")?;
     let ask = [llm::Message::user(SUMMARY)].into_iter().collect();
-    let side = ModelTurn::new(
+    let side = ModelTurn::new::<ext::ModelOnly>(
         ext::ThreadKey::new::<Compact>("compact", ext::OwnerScope::Session),
         ext::TurnKey(cx.call.get().to_string()),
         ext::ModelRole::Session,

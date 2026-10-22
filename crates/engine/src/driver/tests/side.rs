@@ -22,7 +22,7 @@ impl Extension for Aside {
             };
             Answer::Later(ext::Later::new(async move {
                 let models = cx.models()?;
-                let side = ext::ModelTurn::new(
+                let side = ext::ModelTurn::new::<ext::ModelOnly>(
                     ext::ThreadKey::new::<Aside>("test", ext::OwnerScope::Call(cx.call)),
                     ext::TurnKey("initial".into()),
                     ext::ModelRole::Session,
@@ -314,7 +314,7 @@ impl Tool for Probe {
             );
             return Ok("edited".into());
         }
-        let mut side = ext::ModelTurn::new(
+        let mut side = ext::ModelTurn::new::<ext::ModelOnly>(
             ext::ThreadKey::new::<Probes>("probe", ext::OwnerScope::Call(cx.call)),
             ext::TurnKey("initial".into()),
             ext::ModelRole::Session,
@@ -1573,14 +1573,14 @@ fn recovered_side_inbox_never_spends_an_abandoned_turn() {
         "a turn already interrupted by parent recovery spent on child reload"
     );
 }
-struct TitleLengths(Arc<Mutex<Vec<usize>>>);
+struct TitleLengths(Arc<Mutex<Vec<(usize, usize)>>>);
 impl ext::SideProvider for TitleLengths {
     fn reply<'a>(
         &'a self,
         turn: &'a ext::ModelTurn,
         messages: &'a llm::Messages,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
-        lock(&self.0).push(messages.len());
+        lock(&self.0).push((messages.len(), Json::encode(messages).unwrap().raw().len()));
         ext::SideProvider::reply(&ext_fixtures::Fixtures, turn, messages)
     }
 }
@@ -1631,20 +1631,16 @@ fn title_regeneration_keeps_owner_context_out_of_thread_history() {
         })
         .count();
     let lengths = lock(&lengths);
-    eprintln!(
-        "title requests={} first_messages={} last_messages={} source_copies={} child_entries={} child_json_bytes={}",
-        lengths.len(),
-        lengths[0],
-        lengths.last().unwrap(),
-        copies,
-        entries.len(),
-        Json::encode(&entries).unwrap().raw().len()
-    );
     session.halt();
     assert_eq!(lengths.len(), 1001);
     assert_eq!(copies, 0);
     assert_eq!(messages.len(), 2002);
-    assert!(*lengths.last().unwrap() < 3100);
+    assert!(
+        lengths
+            .iter()
+            .all(|&(messages, bytes)| messages <= 8 && bytes <= 8192)
+    );
+    assert!(lengths[10..].iter().all(|length| *length == lengths[10]));
     assert!(Json::encode(&entries).unwrap().raw().len() < 2_000_000);
 }
 

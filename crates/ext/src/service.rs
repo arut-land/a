@@ -274,6 +274,7 @@ pub struct ModelTurn {
     pub budget: Budget,
     background: bool,
     while_waiting: bool,
+    context_policy: crate::ContextPolicy,
 }
 
 impl serde::Serialize for ModelRole {
@@ -310,6 +311,10 @@ impl ModelTurn {
         serde_json::from_slice(text.as_bytes())
     }
 
+    pub fn context_policy(&self) -> crate::ContextPolicy {
+        self.context_policy
+    }
+
     pub fn identity(&self) -> SideIdentity {
         SideIdentity {
             thread: self.thread.clone(),
@@ -328,7 +333,7 @@ impl ModelTurn {
         self.background
     }
 
-    pub fn new(
+    pub fn new<K: crate::ModelOnlyKind>(
         thread: ThreadKey,
         turn: TurnKey,
         role: ModelRole,
@@ -344,6 +349,7 @@ impl ModelTurn {
             budget: Budget::default(),
             background: false,
             while_waiting: false,
+            context_policy: K::CONTEXT,
         }
     }
 
@@ -485,7 +491,7 @@ mod tests {
     fn side_identity_depends_only_on_extension_purpose_and_owner_scope() {
         let of = protocol::CallId::new(1).unwrap();
         let other = protocol::CallId::new(2).unwrap();
-        let mut side = ModelTurn::new(
+        let mut side = ModelTurn::new::<crate::ModelOnly>(
             ThreadKey::new::<Owner>("summary", OwnerScope::Call(of)),
             TurnKey("initial".into()),
             ModelRole::Fast,

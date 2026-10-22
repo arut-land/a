@@ -504,7 +504,7 @@ impl Actor {
             let (turn, prefix) = ext::ModelTurn::from_intent(text).unwrap_or_else(|_| {
                 let spawn = lock(&self.live.session.spawn);
                 let spawn = spawn.as_ref().expect("model-only authority");
-                let mut turn = ext::ModelTurn::new(
+                let mut turn = ext::ModelTurn::new::<ext::ModelOnly>(
                     ext::ThreadKey {
                         extension: spawn.request.owner.clone(),
                         purpose: spawn.request.purpose.clone(),
@@ -519,25 +519,24 @@ impl Actor {
                 (turn, None)
             });
             let mut messages = self.conversation(call).await.map_err(|e| e.to_string())?;
-            if let Some(seq) = prefix {
+            let context = if let Some(seq) = prefix {
                 let parent = self.live.parent.ok_or("model-only context has no owner")?;
                 let shared = Arc::clone(&self.live.session.shared);
-                let context = rt::unblock(&*self.live.session.shared.rt, move || {
+                rt::unblock(&*self.live.session.shared.rt, move || {
                     shared
                         .owner_image(parent.session, seq.get() - 1)
-                        .map(|image| image.project())
+                        .map(super::projection::OwnerImage::project)
                 })
                 .await
-                .map_err(|e| e.to_string())?;
-                let history = messages.len().saturating_sub(turn.messages.len());
-                messages = messages
-                    .iter()
-                    .take(history)
-                    .chain(context.iter())
-                    .chain(turn.messages.iter())
-                    .cloned()
-                    .collect();
-            }
+                .map_err(|e| e.to_string())?
+            } else {
+                llm::Messages::default()
+            };
+            let policy = lock(&self.live.session.spawn)
+                .as_ref()
+                .and_then(|spawn| spawn.request.runner.context_policy())
+                .ok_or("model-only context policy is missing")?;
+            messages = policy.assemble(&messages, &context, &turn.messages)?;
             let model = self
                 .live
                 .session

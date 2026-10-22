@@ -1455,7 +1455,7 @@ fn admitted_calls_never_resolve_services_from_a_newer_registry() {
     .into_iter()
     .enumerate()
     {
-        let side = ext::ModelTurn::new(
+        let side = ext::ModelTurn::new::<ext::ModelOnly>(
             ext::ThreadKey::new::<Routes>(
                 &format!("route-{index}"),
                 ext::OwnerScope::Call(cx.call),
