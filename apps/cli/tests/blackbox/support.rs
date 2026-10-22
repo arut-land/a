@@ -143,7 +143,11 @@ impl TestProcess {
         }
         drop(tx);
         loop {
-            while let Ok((index, result)) = rx.try_recv() {
+            // Continuous output must not postpone checking the deadline.
+            for _ in 0..16 {
+                let Ok((index, result)) = rx.try_recv() else {
+                    break;
+                };
                 let bytes = result?;
                 eof[index] = bytes.is_empty();
                 streams[index].extend(bytes);

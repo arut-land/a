@@ -199,8 +199,14 @@ jobs:
       - run: mise exec -- cargo build -p a
       - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
       - run: |
+          load_pids=()
+          for worker in {1..4}; do
+            bash -c 'while :; do :; done' &
+            load_pids+=("$!")
+          done
+          trap 'kill "${load_pids[@]}"' EXIT
           for attempt in {1..10}; do
-            echo "Windows acceptance pass $attempt"
+            echo "Windows acceptance pass $attempt under CPU load"
             mise run acceptance
           done
 
