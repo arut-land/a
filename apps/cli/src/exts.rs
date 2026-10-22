@@ -153,7 +153,7 @@ mod tests {
 
     fn isolated_registry(config: &Config) -> Result<Registry, Refused> {
         let rig = ext::testing::Rig::new(&SessionId::new().to_string(), Registry::default());
-        super::registry_at(config, &sys::Home::from(rig.dir.join("home")))
+        registry_at(config, &sys::Home::from(rig.dir.join("home")))
     }
 
     /// A session no handler reads.
