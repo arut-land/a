@@ -4,7 +4,7 @@
 //! runtime's reactor, so neither a request nor an open tab holds a thread.
 
 use std::future::poll_fn;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::pin::pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -386,12 +386,23 @@ fn head(status: StatusCode, headers: &HeaderMap) -> Vec<u8> {
     head
 }
 
+/// Writes all of `bytes`, waiting whenever the socket is full.
+async fn write(stream: &Stream, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match stream.write_with(|mut s| s.write(bytes)).await? {
+            0 => return Err(io::ErrorKind::WriteZero.into()),
+            n => bytes = &bytes[n..],
+        }
+    }
+    Ok(())
+}
+
 async fn send_whole(stream: &Stream, response: Response<Vec<u8>>) -> io::Result<()> {
     let (parts, body) = response.into_parts();
     let mut bytes = head(parts.status, &parts.headers);
     bytes.extend_from_slice(format!("content-length: {}\r\n\r\n", body.len()).as_bytes());
     bytes.extend_from_slice(&body);
-    stream.write_all(&bytes).await
+    write(stream, &bytes).await
 }
 
 /// Writes each batch of events as soon as `live` has it, until it ends or
@@ -404,7 +415,7 @@ async fn send_events(stream: &Stream, mut live: Box<Live>) -> io::Result<()> {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
     let mut bytes = head(StatusCode::OK, &headers);
     bytes.extend_from_slice(b"\r\n");
-    stream.write_all(&bytes).await?;
+    write(stream, &bytes).await?;
     let mut probe = [0; 1];
     let mut closed = pin!(read(stream, &mut probe));
     loop {
@@ -420,7 +431,7 @@ async fn send_events(stream: &Stream, mut live: Box<Live>) -> io::Result<()> {
         };
         // The stream ended, or the browser left.
         let Some(events) = next else { return Ok(()) };
-        stream.write_all(&events).await?;
+        write(stream, &events).await?;
     }
 }
 

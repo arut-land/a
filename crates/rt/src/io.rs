@@ -2,7 +2,7 @@
 //! run on: its timers, and descriptors registered with it, whose operations
 //! wait for readiness instead of blocking a thread.
 
-use std::io::{self, Write as _};
+use std::io;
 use std::time::Duration;
 
 use crate::BoxFuture;
@@ -206,20 +206,6 @@ impl<T: Source> Async<T> {
     /// Use [`Async::flush`] to await completion of accepted writes.
     pub async fn write_with<R>(&self, op: impl FnMut(&T) -> io::Result<R>) -> io::Result<R> {
         self.retry(true, op).await
-    }
-
-    /// Writes a whole batch and completes every accepted write before returning.
-    pub async fn write_all(&self, mut bytes: &[u8]) -> io::Result<()>
-    where
-        for<'a> &'a T: io::Write,
-    {
-        while !bytes.is_empty() {
-            match self.write_with(|mut io| io.write(bytes)).await? {
-                0 => return Err(io::ErrorKind::WriteZero.into()),
-                n => bytes = &bytes[n..],
-            }
-        }
-        self.flush().await
     }
 
     /// Completes accepted writes without resubmitting their buffers.
