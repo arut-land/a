@@ -479,6 +479,7 @@ pub struct Load<'a> {
     /// groups the session owned are left over, to kill.
     pub fresh: bool,
     pub owner: Owner,
+    pub abandoned: &'a [Seq],
     /// Whether the session was marked busy.
     pub busy: bool,
     /// The log was just created: its first entry records the extensions

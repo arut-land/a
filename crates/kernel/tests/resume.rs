@@ -15,6 +15,7 @@ const BUSY_LOAD: Load<'static> = Load {
     boot: Some("boot-1"),
     fresh: true,
     owner: Owner::None,
+    abandoned: &[],
     busy: true,
     created: false,
 };
@@ -438,4 +439,62 @@ fn a_failed_commit_is_resume() {
         .count();
     assert_eq!(calls, 1, "{:#?}", s.log);
     assert_eq!(*s.core.turn(), kernel::Turn::Idle);
+}
+
+#[test]
+fn abandoned_inbox_work_is_terminal_for_every_owned_conversation() {
+    let envelope = protocol::Envelope {
+        id: protocol::EnvelopeId {
+            sender: protocol::SessionId::new(),
+            call: CallId::new(1).unwrap(),
+            purpose: "task".into(),
+        },
+        destination: protocol::SessionId::new(),
+        payload: "hi".into(),
+    };
+    for taken in [false, true] {
+        let mut entries = log([Body::Enqueue {
+            envelope: envelope.clone(),
+        }]);
+        if taken {
+            entries.extend(
+                log([Body::Take {
+                    input: Seq::new(1).unwrap(),
+                }])
+                .into_iter()
+                .map(|mut e| {
+                    e.seq = Seq::new(2).unwrap();
+                    e
+                }),
+            );
+        }
+        let load = Load {
+            owner: Owner::Present,
+            abandoned: &[Seq::new(1).unwrap()],
+            ..Load::default()
+        };
+        let (session, fx) = Session::resume(Reg::modeled().arc(), entries, &load);
+        assert!(!work(&fx).any(|w| matches!(w, Work::Prepare { .. } | Work::Send { .. })));
+        assert!(session.log.iter().any(|e| matches!(
+            e.body,
+            Body::InboxResult {
+                outcome: Outcome::Interrupted { .. },
+                ..
+            }
+        )));
+        let (mut session, fx) = Session::resume(
+            Reg::modeled().arc(),
+            session.log,
+            &Load {
+                owner: Owner::Present,
+                ..Load::default()
+            },
+        );
+        assert!(!work(&fx).any(|w| matches!(w, Work::Prepare { .. } | Work::Send { .. })));
+        let fx = session.step(kernel::Event::Enqueue {
+            envelope: envelope.clone(),
+            ticket: kernel::Ticket(1),
+        });
+        assert!(!work(&fx).any(|w| matches!(w, Work::Prepare { .. } | Work::Send { .. })));
+    }
 }

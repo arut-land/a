@@ -1504,3 +1504,59 @@ fn forked_title_regeneration_never_writes_the_sources_thread() {
         "the fork appended work to the source-owned thread"
     );
 }
+#[test]
+fn recovered_side_inbox_never_spends_an_abandoned_turn() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("1").unwrap();
+    http.wait_sent(1);
+    let parent_prefix = log_of(&session);
+    let child = session
+        .1
+        .loaded()
+        .into_iter()
+        .find(|live| live.parent.is_some_and(|p| p.session == session.id))
+        .unwrap();
+    let header = Header {
+        id: child.id,
+        workspace: child.workspace.clone(),
+        parent: child.parent,
+    };
+    let child_prefix: Vec<_> = log_of(&child)
+        .into_iter()
+        .take_while(|entry| !matches!(entry.body, Body::ModelCall { .. }))
+        .collect();
+    assert!(
+        child_prefix
+            .iter()
+            .any(|entry| matches!(entry.body, Body::Enqueue { .. }))
+    );
+    session.halt();
+    let replay = Flaky::new([Reply::Events(text_reply())]);
+    let recovered = probes(&replay, Registry::default());
+    recovered.0.store.import(&header, &child_prefix).unwrap();
+    let parent_header = Header {
+        id: session.id,
+        workspace: session.workspace.clone(),
+        parent: None,
+    };
+    recovered
+        .0
+        .store
+        .import(&parent_header, &parent_prefix)
+        .unwrap();
+    let slot = recovered.2.new_slot(parent_header.clone()).unwrap();
+    let owner = Live::start(&parent_header, &recovered.0, Open::Load, Owner::None).unwrap();
+    let owner = recovered.2.started(&slot, Ok(owner)).unwrap();
+    settle(&owner);
+    let owner_state = recovered.0.owner(&header).unwrap();
+    let child = Live::start(&header, &recovered.0, Open::Load, owner_state).unwrap();
+    settle(&child);
+    let spent = replay.sent();
+    child.halt();
+    owner.halt();
+    assert_eq!(
+        spent, 0,
+        "a turn already interrupted by parent recovery spent on child reload"
+    );
+}

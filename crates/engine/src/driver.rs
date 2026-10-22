@@ -106,6 +106,31 @@ impl Shared {
 }
 
 impl Shared {
+    fn abandoned(&self, ledger: &Ledger) -> io::Result<Vec<protocol::Seq>> {
+        let mut abandoned = Vec::new();
+        for (&seq, id) in ledger.pending_inputs() {
+            let entries = if let Some(live) = self
+                .daemon
+                .upgrade()
+                .and_then(|d| d.slot(id.sender))
+                .and_then(|s| s.live())
+            {
+                live.frames.entries()?
+            } else if let Some(record) = self.catalog.get(id.sender) {
+                self.store.prefix(id.sender, record.entries)?
+            } else {
+                abandoned.push(seq);
+                continue;
+            };
+            if entries.iter().any(|e| matches!(&e.body,
+                Body::ModelResult { call, outcome: Outcome::Interrupted { .. }, .. }
+                | Body::ToolResult { call, outcome: Outcome::Interrupted { .. }, .. } if *call == id.call)) {
+                abandoned.push(seq);
+            }
+        }
+        Ok(abandoned)
+    }
+
     pub(crate) fn owner(&self, header: &Header) -> io::Result<Owner> {
         let Some(mut parent) = header.parent else {
             return Ok(Owner::None);
@@ -547,7 +572,13 @@ impl Live {
         let fresh = lock(&shared.loaded).insert(header.id);
         let listed = (shared.catalog.get(header.id)).unwrap_or_else(|| Record::new(header.clone()));
         let busy = listed.busy;
+        let abandoned = if header.parent.is_some() {
+            shared.abandoned(core.ledger())?
+        } else {
+            Vec::new()
+        };
         let load = Load {
+            abandoned: &abandoned,
             boot: sys::boot_id(),
             fresh,
             owner,

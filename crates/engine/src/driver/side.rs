@@ -272,7 +272,7 @@ async fn side_call(
             Arc::clone(registry),
         );
         rt::spawn(&*session.shared.rt, async move {
-            Box::pin(daemon.model_turn(&owner, origin.id, thread, &cancel, &registry)).await
+            Box::pin(daemon.model_turn(&owner, admitted.id, thread, &cancel, &registry)).await
         })
         .await
     };
@@ -455,10 +455,7 @@ impl super::Daemon {
             let key = turn.identity();
             let id = protocol::EnvelopeId {
                 sender: owner.id,
-                call: match key.thread.owner_scope {
-                    ext::OwnerScope::Session => CallId::new(1).unwrap(),
-                    ext::OwnerScope::Call(call) => call,
-                },
+                call,
                 purpose: Json::encode(&(&key.thread, key.turn))
                     .map_err(std::io::Error::other)?
                     .raw()

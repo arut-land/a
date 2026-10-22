@@ -1125,7 +1125,29 @@ impl Core {
                 }
                 let queued = !self.fold.ledger.untaken().is_empty();
                 while let Some(input) = self.fold.ledger.untaken().front().map(|q| q.seq) {
-                    self.append(fx, Body::Take { input });
+                    if self.fold.ledger.enqueued(input) {
+                        self.append(
+                            fx,
+                            Body::InboxResult {
+                                input,
+                                outcome: Outcome::Interrupted { output: None },
+                                failure: None,
+                            },
+                        );
+                    } else {
+                        self.append(fx, Body::Take { input });
+                    }
+                }
+                let inputs = self.fold.ledger.active_inputs().to_vec();
+                for input in inputs {
+                    self.append(
+                        fx,
+                        Body::InboxResult {
+                            input,
+                            outcome: Outcome::Interrupted { output: None },
+                            failure: None,
+                        },
+                    );
                 }
                 if queued {
                     self.append(fx, Body::Interrupt { origin: None });
@@ -1172,6 +1194,22 @@ impl Core {
             if let Some((by, text)) = stopped {
                 self.decide(None, &by, Verdict::OnStop { text }, fx);
                 continue;
+            }
+            let inputs = self.fold.ledger.active_inputs().to_vec();
+            for input in inputs {
+                self.append(
+                    fx,
+                    Body::InboxResult {
+                        input,
+                        outcome: self
+                            .fold
+                            .ledger
+                            .result()
+                            .cloned()
+                            .unwrap_or(Outcome::Interrupted { output: None }),
+                        failure: self.fold.ledger.failure().cloned(),
+                    },
+                );
             }
             self.turn = Turn::Idle;
             if let Some(input) = self.fold.ledger.untaken().front().map(|q| q.seq) {
@@ -1587,6 +1625,23 @@ impl Core {
         if self.owned_cancelled {
             self.cancel_recovered(fx);
             return;
+        }
+        let active_abandoned = load
+            .abandoned
+            .iter()
+            .any(|seq| self.fold.ledger.active_inputs().contains(seq));
+        if active_abandoned {
+            self.cancel_recovered(fx);
+        }
+        for &input in load.abandoned {
+            self.append(
+                fx,
+                Body::InboxResult {
+                    input,
+                    outcome: Outcome::Interrupted { output: None },
+                    failure: None,
+                },
+            );
         }
         self.relink(fx);
         // A command cut off is not run again.
