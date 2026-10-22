@@ -35,7 +35,9 @@ hyperfine = "2.0.0"
 
 [wrappers.cargo]
 command = "mbx"
-env = { MBX_CARGO_SHIM_MODE = "1" }
+# Windows build-script launchers fall through to mbx's CLI in 1.24.1.
+# Keep compiler caching, but leave build-script execution to Cargo there.
+env = { MBX_CARGO_SHIM_MODE = "1", MBX_BUILD_SCRIPT_EXECUTION = "{{ os() != 'windows' }}" }
 
 [tasks]
 build = "cargo build --workspace"
