@@ -240,16 +240,19 @@ mod tests {
 
     #[test]
     fn reads_the_variables() {
+        let current = std::env::current_dir().unwrap();
+        let root = current.ancestors().last().unwrap();
+        let ceilings = std::env::join_paths([Path::new("relative"), root]).unwrap();
         let git = GitEnv::from_vars(|name| match name {
             "GIT_DIR" => Some("".into()),
             "GIT_WORK_TREE" => Some("/w".into()),
-            "GIT_CEILING_DIRECTORIES" => Some("relative:/".into()),
+            "GIT_CEILING_DIRECTORIES" => Some(ceilings.clone()),
             "GIT_DISCOVERY_ACROSS_FILESYSTEM" => Some("True".into()),
             _ => None,
         });
         assert_eq!(git.dir, None);
         assert_eq!(git.work_tree, Some(PathBuf::from("/w")));
-        assert_eq!(git.ceilings, vec![canonical(Path::new("/"))]);
+        assert_eq!(git.ceilings, vec![canonical(root)]);
         assert!(git.across_filesystems);
     }
 }

@@ -223,7 +223,7 @@ impl View {
 /// can enter, never opening one that exists: at `path`, or at `path` with
 /// a number added when that is taken.
 pub fn create_private(path: &Path) -> io::Result<(File, PathBuf)> {
-    let open = sys::fs::private_file();
+    let open = sys::fs::private_output();
     if let Some(parent) = path.parent() {
         private_dir(parent)?;
     }

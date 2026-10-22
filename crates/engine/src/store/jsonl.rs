@@ -376,7 +376,7 @@ impl LogStore for Jsonl {
                 rule: ext_logging::Rule::CutTornTail,
                 offset: index.end(),
             });
-            index.file.set_len(index.end())?;
+            sys::fs::truncate(&index.file, index.end())?;
             sys::sync_data(&index.file)?;
         }
         let agreed = placed
@@ -773,7 +773,7 @@ impl JsonlLog {
         let end = self.index.end();
         let file = &self.index.file;
         if self.torn {
-            file.set_len(end)?;
+            sys::fs::truncate(file, end)?;
             self.torn = false;
         }
         let written = (|| {
@@ -796,7 +796,7 @@ impl JsonlLog {
                 Ok(())
             }
             Err(e) => {
-                self.torn = file.set_len(end).is_err();
+                self.torn = sys::fs::truncate(file, end).is_err();
                 Err(e)
             }
         }

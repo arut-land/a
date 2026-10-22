@@ -17,7 +17,10 @@ manual-reset event per direction. `rt` registers duplicate event handles
 with `Waitable`; no blocking worker, timer, or dedicated thread waits for
 an idle connection. The operation owns its pinned OVERLAPPED and buffer,
 including across cancelled futures. Dropping an operation cancels it and
-waits for completion before freeing either allocation.
+waits for completion before freeing either allocation. Writes acknowledge owned
+bytes once on submission; a later would-block consumes none of the next
+buffer. The rt write operation also awaits the completion receipt, including
+the final chunk, so a transport flush never acknowledges pending bytes.
 
 The only added external dependency is a direct Windows-only use of
 `windows-sys` 0.61.2, already present with `windows-link` 0.2.1 in the locked
@@ -51,7 +54,9 @@ Shell execution uses Git for Windows Bash with redirected output and no
 console. Native paths, extended-length/UNC prefixes, shell working-directory
 reports and Windows daemon environment variables are handled in `sys`.
 Directory-change notifications wake output followers without periodic
-file polling. Each shell enters an unnamed kill-on-close job through the
+file polling. Spill output uses WRITE_THROUGH so last-write notifications
+arrive while the writer is still open; shell directory reports canonicalize
+to the same extended paths as workspace discovery. Each shell enters an unnamed kill-on-close job through the
 process creation job-list attribute, before any shell code can create descendants. Only the
 daemon retains the job handle, so daemon death kills the whole tree. There
 is no terminal/ConPTY: shell tools have no interactive stdin, as on Unix.
@@ -148,8 +153,10 @@ covers graceful restart; native CI exercises the Windows namespace lifetime.
 
 Flushed files are published on NTFS with same-volume MoveFileExW using
 REPLACE_EXISTING and WRITE_THROUGH. File content flush precedes the rename;
-completion waits for the move on disk. No cross-volume copy fallback is
-allowed. Imports, catalog rewrites and dirty markers use this path. A new
+completion waits for the move on disk. Canonical parent paths retain the
+extended-length prefix without following the final component, so deeply nested
+child sessions do not hit Win32's traditional path limit. No cross-volume copy
+fallback is allowed. Imports, catalog rewrites and dirty markers use this path. A new
 Windows log publishes its flushed header before handing out an append
 handle and a Publication receipt; Unix retains its deferred name barrier.
 Removing the catalog dirty marker durably renames it to an ignored tombstone
@@ -164,7 +171,9 @@ an exclusively created sibling with a same-volume WRITE_THROUGH rename.
 Existing directories and their contents remain intact. This covers both root
 sessions and nested child sessions before their logs can commit. Unix creates
 the directories and flushes their parents. The guarantee assumes local NTFS
-and devices honoring flushes. Native CI exercises the operation and error paths; power-loss
+and devices honoring flushes. Torn-tail repair reopens the same file handle
+with write-data access: an append-only handle cannot truncate on Windows.
+The append handle and its read cursor remain unchanged. Native CI exercises the operation and error paths; power-loss
 persistence still requires a storage test. This changes no dependency and adds
 one header flush/publication per new Windows session, without changing Unix's
 shared first-entry barrier. No Windows performance measurement is claimed.

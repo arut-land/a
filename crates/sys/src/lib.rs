@@ -201,10 +201,15 @@ pub fn shell_directory(text: &str) -> PathBuf {
             && bytes[1].is_ascii_alphabetic()
             && bytes[2] == b'/'
         {
-            return PathBuf::from(format!("{}:{}", char::from(bytes[1]), &text[2..]));
+            let path = PathBuf::from(format!("{}:{}", char::from(bytes[1]), &text[2..]));
+            return path.canonicalize().unwrap_or(path);
         }
     }
-    PathBuf::from(text)
+    let path = PathBuf::from(text);
+    #[cfg(windows)]
+    return path.canonicalize().unwrap_or(path);
+    #[cfg(unix)]
+    path
 }
 
 /// The shell builtin that reports a directory in the host's path syntax.

@@ -123,6 +123,32 @@ fn final_path(file: &File) -> io::Result<std::path::PathBuf> {
     }
 }
 
+/// Trims a log without changing its append-only handle or its read cursor.
+pub fn truncate(file: &File, len: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    return file.set_len(len);
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+        };
+        // Append-only access deliberately excludes FILE_WRITE_DATA, which
+        // SetEndOfFile needs. Reopen the same file, without a pathname race.
+        // SAFETY: file owns the source handle; the returned handle is checked.
+        let handle = crate::windows::owned(unsafe {
+            ReOpenFile(
+                file.as_raw_handle(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+            )
+        })?;
+        File::from(handle).set_len(len)
+    }
+}
+
 /// Orders earlier writes before later commits. Apple keeps them in the
 /// drive cache until a cache flush covers the promise made to a client or
 /// an external effect; other platforms already flush here.
@@ -296,8 +322,19 @@ fn move_file(from: &Path, to: &Path, replacing: bool) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
-    let from = crate::windows::wide(from.as_os_str());
-    let to = crate::windows::wide(to.as_os_str());
+    // Canonical parents supply extended-length paths without following the
+    // final component: a rename moves a link itself, never its target.
+    let absolute = |path: &Path| -> io::Result<std::path::PathBuf> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Ok(parent
+            .canonicalize()?
+            .join(path.file_name().ok_or(io::ErrorKind::InvalidInput)?))
+    };
+    let from = crate::windows::wide(absolute(from)?.as_os_str());
+    let to = crate::windows::wide(absolute(to)?.as_os_str());
     // WRITE_THROUGH waits for the move on disk; COPY_ALLOWED is deliberately
     // absent so publication cannot degrade to a cross-volume copy/delete.
     // Microsoft does not document FlushFileBuffers as a directory barrier.
@@ -389,6 +426,23 @@ pub fn private_file() -> OpenOptions {
     open.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    open
+}
+
+/// A private output whose writes must notify followers before it closes.
+pub fn private_output() -> OpenOptions {
+    let open = private_file();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_WRITE_THROUGH;
+        // Directory notifications observe last-write changes when cached
+        // writes reach disk, not necessarily when WriteFile returns.
+        let mut open = open;
+        open.custom_flags(FILE_FLAG_WRITE_THROUGH);
+        open
+    }
+    #[cfg(unix)]
     open
 }
 
@@ -810,6 +864,45 @@ mod publication_tests {
         drop(file);
         remove_durable(&path).unwrap();
         assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_writes_notify_followers_before_the_writer_closes() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        let root = std::env::temp_dir().join(format!("a-output-notify-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("output");
+        let mut file = private_output().open(&path).unwrap();
+        let watch = write_watch(&path).unwrap();
+        for _ in 0..2 {
+            watch.clear();
+            file.write_all(b"progress\n").unwrap();
+            // SAFETY: the watch owns this notification handle throughout the wait.
+            let signalled =
+                unsafe { WaitForSingleObject(watch.0.as_ref().unwrap().as_raw_handle(), 5000) };
+            assert_eq!(signalled, WAIT_OBJECT_0);
+        }
+        drop(watch);
+        drop(file);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trimming_a_log_tail_preserves_append_only_writes() {
+        let root = std::env::temp_dir().join(format!("a-trim-log-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("log");
+        let (mut file, _) = open_log(&path, Some(b"header\n")).unwrap();
+        file.write_all(b"torn").unwrap();
+        truncate(&file, 7).unwrap();
+        read_exact_at(&file, &mut [0; 2], 0).unwrap();
+        file.write_all(b"entry\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"header\nentry\n");
+        drop(file);
         fs::remove_dir_all(root).unwrap();
     }
 
