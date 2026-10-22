@@ -982,14 +982,22 @@ fn compacted_forks_keep_loaded_skills_in_context_and_background_results_out() {
         session.submit("/review").unwrap();
         settle(session);
         let log = log_of(session);
+        // A background result may be published after the foreground skill result.
+        let call = log
+            .iter()
+            .rev()
+            .find(|entry| matches!(&entry.body, Body::ToolCall { tool, .. } if tool == "review"))
+            .unwrap()
+            .seq;
         let output = log
             .iter()
             .rev()
             .find_map(|e| match &e.body {
                 Body::ToolResult {
+                    call: result,
                     outcome: Outcome::Done { output },
                     ..
-                } => Some(output),
+                } if result.0 == call => Some(output),
                 _ => None,
             })
             .unwrap();
