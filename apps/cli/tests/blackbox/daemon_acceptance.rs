@@ -218,11 +218,47 @@ fn every_case_uses_an_isolated_home() {
 }
 
 #[test]
+fn fixture_homes_use_the_runner_scratch_directory() {
+    let scratch = crate::support::isolated_root("runner-scratch");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "daemon_acceptance::process_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("A_TEST_PROCESS", "root")
+        .env("RUNNER_TEMP", &scratch)
+        .env("A_HOME", &scratch);
+    let result = TestProcess::spawn(&mut command).collect(deadline());
+    crate::support::remove_home(&scratch);
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 #[ignore = "subprocess fixture for process collection"]
 fn process_fixture() {
     use std::io::Write;
-    if std::env::var("A_TEST_PROCESS").as_deref() == Ok("output") {
-        io::stdout().write_all(&vec![b'o'; 1_048_576]).unwrap();
-        io::stderr().write_all(&vec![b'e'; 1_048_576]).unwrap();
+    match std::env::var("A_TEST_PROCESS").as_deref() {
+        Ok("output") => {
+            io::stdout().write_all(&vec![b'o'; 1_048_576]).unwrap();
+            io::stderr().write_all(&vec![b'e'; 1_048_576]).unwrap();
+        }
+        Ok("root") => {
+            let root = crate::support::isolated_root("scratch-child");
+            let parent = root.parent().unwrap().to_owned();
+            crate::support::remove_home(&root);
+            assert_eq!(
+                parent,
+                std::path::PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap())
+            );
+        }
+        _ => {}
     }
 }

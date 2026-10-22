@@ -200,17 +200,63 @@ jobs:
       - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
       - shell: pwsh
         run: |
-          Get-MpComputerStatus | Select-Object AMEngineVersion, RealTimeProtectionEnabled
-          $recordingPath = Join-Path $env:RUNNER_TEMP 'a-defender.etl'
-          $recording = Start-Job -ArgumentList $recordingPath -ScriptBlock {
-            param($path)
-            New-MpPerformanceRecording -RecordTo $path -Seconds 90
-          }
           $workers = 1..4 | ForEach-Object {
             Start-Process pwsh -NoNewWindow -PassThru -ArgumentList '-NoProfile', '-Command', 'while($true){}'
           }
           $acceptanceExit = 0
           try {
+            $image = [IO.File]::ReadAllBytes((Resolve-Path 'target/debug/a.exe'))
+            $systemTemp = [IO.Path]::GetTempPath()
+            Write-Host "OS temp=$systemTemp runner scratch=$env:RUNNER_TEMP image bytes=$($image.Length)"
+            foreach ($round in 1..3) {
+              $locations = @($systemTemp, $env:RUNNER_TEMP)
+              if ($round % 2 -eq 0) { [array]::Reverse($locations) }
+              foreach ($location in $locations) {
+                $path = Join-Path $location ('a-flush-probe-' + [guid]::NewGuid())
+                $file = [IO.File]::Open($path, [IO.FileMode]::CreateNew)
+                try {
+                  $file.Write($image, 0, $image.Length)
+                  $clock = [Diagnostics.Stopwatch]::StartNew()
+                  $file.Flush($true)
+                  Write-Host "flush round=$round base=$location elapsed=$($clock.Elapsed.TotalMilliseconds) ms"
+                } finally {
+                  $file.Dispose()
+                  Remove-Item $path
+                }
+              }
+            }
+            $padded = Join-Path $env:RUNNER_TEMP ('a-padded-' + [guid]::NewGuid() + '.exe')
+            [IO.File]::WriteAllBytes($padded, $image)
+            $padding = [IO.File]::OpenWrite($padded)
+            $padding.SetLength(64 * 1024 * 1024)
+            $padding.Dispose()
+            $previousHome = $env:A_HOME
+            try {
+              foreach ($location in @($systemTemp, $env:RUNNER_TEMP)) {
+                $probeHome = Join-Path $location ('a-collection-probe-' + [guid]::NewGuid())
+                New-Item -ItemType Directory $probeHome | Out-Null
+                $env:A_HOME = $probeHome
+                try {
+                  $stdout = Join-Path $probeHome 'stdout'
+                  $stderr = Join-Path $probeHome 'stderr'
+                  $clock = [Diagnostics.Stopwatch]::StartNew()
+                  $process = Start-Process $padded -ArgumentList 'ls' -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+                  $completed = $process.WaitForExit(30000)
+                  if (-not $completed) { $process.Kill() }
+                  $process.WaitForExit()
+                  Write-Host "collection probe pid=$($process.Id) home=$probeHome completedWithin30s=$completed elapsed=$($clock.Elapsed.TotalMilliseconds) ms"
+                  Get-Content $stderr
+                } finally {
+                  if (Test-Path (Join-Path $probeHome 'run/daemon.pid')) {
+                    & ./target/debug/a.exe daemon stop
+                  }
+                  Remove-Item $probeHome -Recurse -Force
+                }
+              }
+            } finally {
+              $env:A_HOME = $previousHome
+              Remove-Item $padded
+            }
             foreach ($attempt in 1..10) {
               Write-Host "Windows acceptance pass $attempt under CPU load"
               & mise run acceptance
@@ -222,10 +268,6 @@ jobs:
           } finally {
             foreach ($worker in $workers) {
               if (-not $worker.HasExited) { $worker.Kill(); $worker.WaitForExit() }
-            }
-            $recording | Wait-Job -Timeout 100 | Receive-Job -ErrorAction Continue
-            if (Test-Path $recordingPath) {
-              Get-MpPerformanceReport -Path $recordingPath -TopFiles 20 -TopScansPerFile 5 -TopProcesses 10 -TopScans 20
             }
           }
           exit $acceptanceExit

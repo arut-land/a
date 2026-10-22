@@ -16,7 +16,9 @@ pub fn deadline() -> Instant {
 
 pub fn isolated_root(name: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = std::env::temp_dir().join(format!(
+    // Durable staging must not contend with the runner's system-disk flushes.
+    let base = std::env::var_os("RUNNER_TEMP").map_or_else(std::env::temp_dir, PathBuf::from);
+    let root = base.join(format!(
         "a-acc-{name}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
