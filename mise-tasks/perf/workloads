@@ -104,10 +104,20 @@ def main():
         env.pop("A_MODE", None)
 
         def run(*argv):
-            return subprocess.run(
+            result = subprocess.run(
                 [binary, *argv], cwd=workspace, env=env, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
             )
+            if result.returncode:
+                failure = dict(argv=list(argv), returncode=result.returncode,
+                               stdout=result.stdout.decode(errors="replace"),
+                               stderr=result.stderr.decode(errors="replace"),
+                               logs={str(p.relative_to(home)): p.read_text(errors="replace")
+                                     for p in home.rglob("*.log")})
+                (output / "failed-command.json").write_text(json.dumps(failure, indent=2))
+                print(json.dumps(failure), file=sys.stderr, flush=True)
+            result.check_returncode()
+            return result
 
         def bench(name, command, prepare=None):
             load(output, name + ":before")

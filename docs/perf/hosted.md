@@ -49,7 +49,9 @@ include shared resident pages; Windows uses working set, not private bytes.
 Do not compare memory values between OSes as if they shared one definition.
 
 All daemons use isolated homes and stop through their own binary and `A_HOME`.
-Only directly owned client processes can be killed on a timeout. The tool
+Collection waits for the captured daemon PID to exit before deleting its home;
+Windows retains executable image mappings through process exit. Only directly
+owned client processes can be killed on a timeout. The tool
 never addresses the user's default home.
 
 ## Samples and comparisons
@@ -118,7 +120,7 @@ gh workflow run perf.yml -R arut-land/a --ref codex-ciperf -f source_ref=main
 # With a successful bootstrap artifact, compare a final run to that run ID:
 gh workflow run perf.yml -R arut-land/a --ref codex-ciperf -f baseline_run=RUN_ID
 gh workflow run perf.yml -R arut-land/a --ref perf/x86-v2 \
-  -f runner=ubuntu-latest -f paired_ref=BASE_REVISION
+  -f runner=ubuntu-latest -f paired_ref=FULL_40_CHARACTER_REVISION
 gh run view RUN_ID -R arut-land/a --log-failed
 gh run download RUN_ID -R arut-land/a -n perf-ubuntu-latest
 ```

@@ -33,6 +33,8 @@ def run(argv, **kwargs):
     except subprocess.CalledProcessError as error:
         if error.stdout:
             print(error.stdout, flush=True)
+        if error.stderr:
+            print(error.stderr, file=sys.stderr, flush=True)
         raise
 
 
