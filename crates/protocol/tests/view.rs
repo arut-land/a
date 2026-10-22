@@ -599,6 +599,14 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 msg(DaemonMsg::Synced { seq: 3 }),
             ]
         }),
+        ("flat inherited publications survive snapshots and later publications", {
+            let spawned = inherited_publications();
+            let view = SessionView::from_log(SESSION, "/w".into(), [&spawned]);
+            vec![attached(), msg(DaemonMsg::Entry(spawned)), msg(DaemonMsg::Snapshot(Box::new(view.snapshot()))),
+                entry(2, Body::Context { text: "later schema".into(), publication: Some(Publication { namespace: "mcp-schemas".into(), key: Json::encode("later-publication").unwrap() }) }),
+                msg(DaemonMsg::Synced { seq: 2 }),
+            ]
+        }),
         ("owned_invocation", vec![
             attached(), entry(1, input("run")),
             entry(2, Body::ToolCall { invoke: None, tool: "owner".into(), input: Json::null(), id: None, card: None, by: Audience::Model }),
@@ -1307,28 +1315,27 @@ fn view_snapshots_preserve_skill_and_mcp_publications() {
     }
 }
 
-#[test]
-fn view_publications_follow_edits_to_inherited_context() {
+fn inherited_publications() -> Entry {
     let key = Json::encode(&"loaded-publication").unwrap();
-    let inherited: Vec<_> = ["skills", "mcp-schemas"]
-        .into_iter()
-        .zip(1..)
-        .map(|(namespace, seq)| {
-            Json::encode(&Entry::new(
-                Seq::new(seq).unwrap(),
-                Epoch(0),
-                Body::Context {
+    let inherited = protocol::publication::ContextImage {
+        scopes: vec![protocol::publication::RunnerKind::Agent],
+        inputs: ["skills", "mcp-schemas"]
+            .into_iter()
+            .zip(1..)
+            .map(|(namespace, seq)| protocol::publication::ContextInput {
+                scope: 0,
+                seq: Seq::new(seq).unwrap(),
+                value: protocol::publication::ContextValue::Context {
                     text: "execution context".into(),
                     publication: Some(Publication {
                         namespace: namespace.into(),
                         key: key.clone(),
                     }),
                 },
-            ))
-            .unwrap()
-        })
-        .collect();
-    let spawned = Entry::new(
+            })
+            .collect(),
+    };
+    Entry::new(
         Seq::new(1).unwrap(),
         Epoch(0),
         Body::Spawned {
@@ -1340,7 +1347,13 @@ fn view_publications_follow_edits_to_inherited_context() {
             .to_json()
             .unwrap(),
         },
-    );
+    )
+}
+
+#[test]
+fn view_publications_follow_edits_to_inherited_context() {
+    let key = Json::encode(&"loaded-publication").unwrap();
+    let spawned = inherited_publications();
     let view = SessionView::from_log(SESSION, "/w".into(), [spawned]);
     let encoded = serde_json::to_vec(&DaemonMsg::Snapshot(Box::new(view.snapshot()))).unwrap();
     assert!(!String::from_utf8_lossy(&encoded).contains("execution"));

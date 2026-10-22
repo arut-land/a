@@ -74,10 +74,12 @@ process groups, watches or pending actions into the child's kernel. This lets
 a tool fork its current context while its owning turn is unfinished. It is
 separate from the ordinary fork command's rest-point policy. Pending tool
 calls do not become executable work or unmatched provider tool exchanges in
-the child's context. The image stores transcript projection inputs inside the
-spawn authority,
-rather than installing those entries in the child's executable log. Unfinished
-tool intents and queued inputs are excluded, and unmatched provider exchanges
+the child's context. The spawn envelope stores a flat typed `ContextImage`
+separately from frozen execution authority. Each input has a scope index and a local sequence number;
+inherited anchors reference other scopes, whose runner kinds preserve input
+interpretation. Scope indices are rebased when images are composed. No inherited
+envelope or encoded ledger entry survives composition. These inputs are never
+installed in the child's executable log. Unfinished tool intents and queued inputs are excluded, and unmatched provider exchanges
 are removed after projection. Edits beginning at an excluded ledger entry keep
 an inert position for their replacement, preserving summaries without ownership.
 Keeping projection inputs preserves provider state and uses the same reducer for live and recovered context. Effective skill

@@ -1,4 +1,3 @@
-use protocol::Decode;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -419,7 +418,7 @@ pub(crate) fn spawn_intent(call: u64, prompt: &str) -> Json {
         installed: extensions(&ext_policy::Policy::default())
             .unwrap()
             .installed(),
-        image: Vec::new(),
+        image: Default::default(),
         extensions: extensions(&ext_policy::Policy::default())
             .unwrap()
             .inherited()
@@ -1664,9 +1663,9 @@ fn a_prefix_child_is_admitted_inside_its_unfinished_owning_turn() {
         panic!("{child:?}")
     };
     let image = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
-    assert!(
-        image.image.iter().any(|e| matches!(Entry::from_json(e.raw().as_bytes()).unwrap().body, Body::Input { text, .. } if text == "before"))
-    );
+    assert!(image.image.inputs.iter().any(
+        |e| matches!(&e.value, protocol::publication::ContextValue::User(text) if text == "before")
+    ));
     assert!(
         fired(&bodies(&*daemon.shared.store, parent.session().id))
             .iter()
