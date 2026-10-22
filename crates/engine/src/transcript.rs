@@ -80,7 +80,7 @@ impl Transcript {
     ) -> Self {
         let entries: Vec<_> = entries.into_iter().collect();
         project(
-            normalize(entries.iter().map(|e| e.borrow()), false),
+            normalize(entries.iter().map(Borrow::borrow), false),
             Self::empty(registry, system),
         )
     }
@@ -107,14 +107,14 @@ impl Transcript {
                 self.model_only = image.runner == RunnerKind::ModelOnly;
                 let messages = project(image.image, Self::empty(Arc::clone(&self.registry), ""))
                     .into_context();
-                self.inherit(messages, e.seq);
+                self.inherit(&messages, e.seq);
             }
         } else if let Some(value) = context_fact(&e.body) {
             self.apply_input(e.seq, &value, fresh);
         }
     }
 
-    fn inherit(&mut self, messages: Messages, seq: Seq) {
+    fn inherit(&mut self, messages: &Messages, seq: Seq) {
         for message in messages.iter() {
             self.messages.push(message.clone());
         }
@@ -193,7 +193,7 @@ impl Transcript {
                 }
                 return;
             }
-            _ => return,
+            ContextValue::Inherited(_) => return,
         };
         self.messages.push(message);
         self.last = seq.get();
@@ -372,7 +372,7 @@ fn project(image: ContextImage, root: Transcript) -> Transcript {
         for input in inputs {
             if let ContextValue::Inherited(child) = input.value {
                 transcript.inherit(
-                    inherited.remove(&child).expect("inherited scope reduced"),
+                    &inherited.remove(&child).expect("inherited scope reduced"),
                     input.seq,
                 );
             } else {

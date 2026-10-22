@@ -219,7 +219,7 @@ fn recursive_scope(image: &ContextImage, scope: usize, registry: &Arc<Registry>)
     for input in image.inputs.iter().filter(|input| input.scope == scope) {
         if let ContextValue::Inherited(child) = input.value {
             let messages = recursive_scope(image, child, registry).into_context();
-            transcript.inherit(messages, input.seq);
+            transcript.inherit(&messages, input.seq);
         } else {
             transcript.apply_input(input.seq, &input.value, None);
         }

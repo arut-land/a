@@ -418,7 +418,7 @@ pub(crate) fn spawn_intent(call: u64, prompt: &str) -> Json {
         installed: extensions(&ext_policy::Policy::default())
             .unwrap()
             .installed(),
-        image: Default::default(),
+        image: protocol::publication::ContextImage::default(),
         extensions: extensions(&ext_policy::Policy::default())
             .unwrap()
             .inherited()
