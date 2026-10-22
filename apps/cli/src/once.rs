@@ -149,7 +149,7 @@ impl Once {
         }
         let text = input(self.prompt.as_deref(), self.stdin.as_deref());
         if text.is_empty() {
-            eprintln!("a: nothing to send: give a prompt with -p, or on stdin");
+            errln!("a: nothing to send: give a prompt with -p, or on stdin");
             self.end(Ended::Usage);
             return Vec::new();
         }
@@ -182,8 +182,8 @@ impl Once {
 
     fn link(&mut self) {
         match self.client.link().clone() {
-            Link::Reconnecting { .. } => eprintln!("[daemon upgraded; reconnecting]"),
-            Link::Draining => eprintln!("[waiting for the previous daemon to finish its work]"),
+            Link::Reconnecting { .. } => errln!("[daemon upgraded; reconnecting]"),
+            Link::Draining => errln!("[waiting for the previous daemon to finish its work]"),
             Link::Wedged(d) => {
                 crate::report(&d);
                 self.fail(io::Error::new(io::ErrorKind::TimedOut, crate::RESTART));
@@ -228,7 +228,7 @@ impl Once {
                 self.fail(io::Error::other(message.clone()));
             }
             Change::Mismatch { supported } => {
-                eprintln!("[{}]", protocol::view::mismatch_line(*supported));
+                errln!("[{}]", protocol::view::mismatch_line(*supported));
             }
             Change::Updated {
                 index,
@@ -262,7 +262,7 @@ impl Once {
         }
         match status {
             Status::Failed { .. } => {
-                eprintln!("a: {}", p.status);
+                errln!("a: {}", p.status);
                 self.failed = true;
             }
             Status::Interrupted => self.end(Ended::Interrupted),
@@ -296,10 +296,12 @@ impl Once {
                 _ => None,
             });
             match approval {
-                Some((tool, title, explanation)) => eprintln!(
-                    "a: {tool} ({title}) waits for approval in session {id}.\n{explanation}"
-                ),
-                None => eprintln!("a: the turn waits for an answer in session {id}: {answer}"),
+                Some((tool, title, explanation)) => {
+                    errln!(
+                        "a: {tool} ({title}) waits for approval in session {id}.\n{explanation}"
+                    );
+                }
+                None => errln!("a: the turn waits for an answer in session {id}: {answer}"),
             }
             self.end(Ended::Waiting);
         } else {
@@ -334,7 +336,7 @@ impl Renderer for Once {
                     }
                     self.settle();
                 }
-                Show::Notice(notice) => eprintln!("[{notice}]"),
+                Show::Notice(notice) => errln!("[{notice}]"),
                 Show::Link => self.link(),
                 Show::Sessions => {}
             }

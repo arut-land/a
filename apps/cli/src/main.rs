@@ -15,6 +15,12 @@ macro_rules! say {
     };
 }
 
+macro_rules! errln {
+    ($($arg:tt)*) => {
+        $crate::write(std::io::stderr().lock(), format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
 mod args;
 mod exts;
 mod once;
@@ -86,13 +92,16 @@ const STDOUT_GONE: i32 = 141;
 /// -1`) ends `a` there, quietly, as SIGPIPE ends a C program; a session it
 /// was attached to goes on in the daemon.
 fn out(args: fmt::Arguments<'_>) {
-    let mut stdout = io::stdout().lock();
-    let written = if stdout.is_terminal() {
-        write!(stdout, "{}", client::sanitize(&args.to_string()))
+    write(io::stdout().lock(), args);
+}
+
+fn write(mut output: impl Write + IsTerminal, args: fmt::Arguments<'_>) {
+    let written = if output.is_terminal() {
+        write!(output, "{}", client::sanitize(&args.to_string()))
     } else {
-        stdout.write_fmt(args)
+        output.write_fmt(args)
     };
-    if let Err(e) = written.and_then(|()| stdout.flush())
+    if let Err(e) = written.and_then(|()| output.flush())
         && e.kind() == io::ErrorKind::BrokenPipe
     {
         std::process::exit(STDOUT_GONE);
@@ -368,14 +377,14 @@ fn prompt() {
 
 /// What a client can tell of a daemon that does not answer.
 fn report(d: &client::Diagnosis) {
-    eprintln!(
+    errln!(
         "! {} is not responding after {}s",
         d.who(),
         client::HELLO_TIMEOUT.as_secs()
     );
-    eprintln!("  log: {}", client::sanitize(&d.log.display().to_string()));
+    errln!("  log: {}", d.log.display());
     if let Some(note) = d.crash_note() {
-        eprintln!("  {}", client::sanitize(&note));
+        errln!("  {}", note);
     }
 }
 

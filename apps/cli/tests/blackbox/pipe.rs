@@ -55,6 +55,26 @@ fn pipe_output_to_a_tty_cannot_inject_terminal_controls() {
     );
 }
 
+#[test]
+fn pipe_approval_diagnostics_cannot_inject_terminal_controls() {
+    let env = Env::new("pipe-tty-approval-controls");
+    env.ext("policy", "ask = [\"bash\"]");
+    let mut term = env.tty(
+        &["-p", "$ echo \x1b]0;injected-title\x07héllo 世界"],
+        80,
+        24,
+    );
+    assert_eq!(term.wait().code(), Some(3));
+    term.wait_for("waits for approval");
+    let output = term.bytes();
+    assert!(
+        !output
+            .windows(b"\x1b]0;injected-title\x07".len())
+            .any(|w| w == b"\x1b]0;injected-title\x07"),
+        "approval diagnostics wrote an OSC command to the terminal: {output:?}"
+    );
+}
+
 /// The short id of the one session `a ls` lists.
 fn only_session(env: &Env) -> String {
     let listed = env.run(&["ls"]);
