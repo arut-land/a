@@ -49,9 +49,9 @@ impl ReplyStream {
             if text.is_empty() && !item.settled() {
                 break;
             }
-            let mut printed = self.open.take().map(|(_, text)| text).unwrap_or_else(|| {
+            let (_, mut printed) = self.open.take().unwrap_or_else(|| {
                 events.push(ReplyEvent::Start);
-                String::new()
+                (item.key(), String::new())
             });
             if let Some(suffix) = text.strip_prefix(printed.as_str()) {
                 if !suffix.is_empty() {

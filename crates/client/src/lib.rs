@@ -271,7 +271,7 @@ fn attaching(
     let workspace = attach
         .workspace
         .clone()
-        .unwrap_or_else(|| env.as_ref().map(|env| env.cwd.clone()).unwrap_or_default());
+        .unwrap_or_else(|| env.as_ref().map_or_default(|env| env.cwd.clone()));
     Ok(ClientMsg::Attach {
         target: attach.target.clone(),
         workspace,
