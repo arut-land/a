@@ -254,7 +254,9 @@ impl LogStore for Jsonl {
         cursor: &mut ext::LogCursor,
         through: u64,
     ) -> io::Result<(bool, Vec<Entry>)> {
-        let mut reader = BufReader::new(File::open(self.path(id)?)?);
+        let path = self.path(id)?;
+        let file = File::open(&path)?;
+        let mut reader = BufReader::new(&file);
         let mut line = Vec::new();
         let mut reset = false;
         if cursor.seq != 0 {
@@ -278,28 +280,25 @@ impl LogStore for Jsonl {
                 return Err(io::Error::other("unreadable session header"));
             }
         }
+        let start = reader.stream_position()?;
+        drop(reader);
+        let mut index = Index::new(file, path, start);
         let mut history = History {
             seq: cursor.seq,
             epoch: cursor.epoch.0,
         };
         let mut entries = Vec::new();
-        let mut offset = reader.stream_position()?;
-        while history.seq < through {
-            line.clear();
-            let bytes = reader.read_until(b'\n', &mut line)? as u64;
-            if !unseal(&mut line) {
-                return Err(io::Error::other("incomplete or damaged session suffix"));
-            }
-            let entry = history
-                .decode(&line)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+        let damage = index.scan(None, &mut history, through, |entry| entries.push(entry))?;
+        if damage.is_some() || history.seq != through {
+            return Err(io::Error::other("incomplete or damaged session suffix"));
+        }
+        if let Some(entry) = entries.last() {
+            let ends = index.read();
             *cursor = ext::LogCursor {
                 seq: entry.seq.get(),
                 epoch: entry.epoch,
-                offset,
+                offset: ends.ends.iter().rev().nth(1).copied().unwrap_or(start),
             };
-            offset += bytes;
-            entries.push(entry);
         }
         Ok((reset, entries))
     }
