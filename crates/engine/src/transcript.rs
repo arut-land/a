@@ -280,14 +280,9 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
     let edits = context_edits(entries.iter().copied());
     let completed: std::collections::HashSet<_> = entries
         .iter()
+        .filter(|_| inherited)
         .filter_map(|e| match &e.body {
             Body::ToolResult { call, .. } => Some(call.0),
-            _ => None,
-        })
-        .collect();
-    let taken: std::collections::HashSet<_> = entries
-        .iter()
-        .filter_map(|e| match &e.body {
             Body::Take { input } => Some(*input),
             _ => None,
         })
@@ -338,7 +333,7 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
                 ContextValue::ToolCall { .. } if inherited && !completed.contains(&e.seq) => {
                     continue;
                 }
-                ContextValue::Queued(_) if inherited && !taken.contains(&e.seq) => continue,
+                ContextValue::Queued(_) if inherited && !completed.contains(&e.seq) => continue,
                 _ => {}
             }
             value
