@@ -106,7 +106,11 @@ impl Shared {
 }
 
 impl Shared {
-    fn abandoned(&self, header: &Header, ledger: &Ledger) -> io::Result<Vec<protocol::Seq>> {
+    fn abandoned(
+        &self,
+        header: &Header,
+        ledger: &Ledger,
+    ) -> io::Result<Vec<kernel::CancelledInput>> {
         let mut abandoned = Vec::new();
         let entries = self.store.prefix(header.id, ledger.seq())?;
         let active = entries
@@ -136,15 +140,13 @@ impl Shared {
             } else if let Some(record) = self.catalog.get(id.sender) {
                 self.store.prefix(id.sender, record.entries)?
             } else {
-                abandoned.push(seq);
                 continue;
             };
-            if !entries.iter().any(|e| {
-                matches!(&e.body,
-                Body::ModelResult { call, outcome: Outcome::Done { .. }, .. }
-                | Body::ToolResult { call, outcome: Outcome::Done { .. }, .. } if *call == id.call)
-            }) {
-                abandoned.push(seq);
+            if let Some(cancelled) = entries
+                .iter()
+                .find_map(|fact| kernel::CancelledInput::interrupted(entry, fact))
+            {
+                abandoned.push(cancelled);
             }
         }
         Ok(abandoned)

@@ -1647,3 +1647,42 @@ fn title_regeneration_keeps_owner_context_out_of_thread_history() {
     assert!(*lengths.last().unwrap() < 3100);
     assert!(Json::encode(&entries).unwrap().raw().len() < 2_000_000);
 }
+
+#[test]
+fn a_live_sender_is_not_an_abandoned_inbox_owner() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let fixture = probes(&http, Registry::default());
+    let session = fixture.start(&[]);
+    session.submit("1").unwrap();
+    http.wait_sent(1);
+    let child = fixture
+        .2
+        .loaded()
+        .into_iter()
+        .find(|live| live.parent.is_some_and(|p| p.session == session.id))
+        .unwrap();
+    let prefix: Vec<_> = log_of(&child)
+        .into_iter()
+        .take_while(|entry| !matches!(entry.body, Body::ModelCall { .. }))
+        .collect();
+    let mut ledger = Ledger::default();
+    for entry in &prefix {
+        ledger.apply(entry);
+    }
+    let header = Header {
+        id: child.id,
+        workspace: child.workspace.clone(),
+        parent: child.parent,
+    };
+    let abandoned = fixture.0.abandoned(&header, &ledger).unwrap();
+    assert!(
+        !log_of(&session)
+            .iter()
+            .any(|entry| matches!(entry.body, Body::Interrupt { .. }))
+    );
+    session.halt();
+    assert!(
+        abandoned.is_empty(),
+        "a live sender was treated as interrupted: {abandoned:?}"
+    );
+}

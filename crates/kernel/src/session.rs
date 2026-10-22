@@ -1590,7 +1590,8 @@ impl Core {
         }
         if !load.abandoned.is_empty() {
             self.cancel_recovered(fx);
-            for &input in load.abandoned {
+            for cancelled in load.abandoned {
+                let input = cancelled.input;
                 if self.fold.ledger.untaken().iter().any(|q| q.seq == input) {
                     self.append(fx, Body::Take { input });
                 }

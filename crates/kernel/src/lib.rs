@@ -469,6 +469,39 @@ pub enum Owner {
     Cancelled,
 }
 
+/// An admitted input whose sender durably interrupted the matching request.
+#[derive(Clone, Debug)]
+pub struct CancelledInput {
+    input: Seq,
+    pub owner: SessionId,
+    pub fact: Seq,
+}
+
+impl CancelledInput {
+    pub fn interrupted(input: &Entry, fact: &Entry) -> Option<Self> {
+        let protocol::Body::Enqueue { envelope } = &input.body else {
+            return None;
+        };
+        match &fact.body {
+            protocol::Body::ModelResult {
+                call,
+                outcome: Outcome::Interrupted { .. },
+                ..
+            }
+            | protocol::Body::ToolResult {
+                call,
+                outcome: Outcome::Interrupted { .. },
+                ..
+            } if *call == envelope.id.call => Some(Self {
+                input: input.seq,
+                owner: envelope.id.sender,
+                fact: fact.seq,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// How a session's log is resumed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Load<'a> {
@@ -479,7 +512,7 @@ pub struct Load<'a> {
     /// groups the session owned are left over, to kill.
     pub fresh: bool,
     pub owner: Owner,
-    pub abandoned: &'a [Seq],
+    pub abandoned: &'a [CancelledInput],
     /// Whether the session was marked busy.
     pub busy: bool,
     /// The log was just created: its first entry records the extensions

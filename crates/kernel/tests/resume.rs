@@ -462,9 +462,16 @@ fn abandoned_inbox_work_is_terminal_for_every_owned_conversation() {
             });
         }
         let entries = log(bodies);
+        let fact = log(vec![Body::ModelResult {
+            call: envelope.id.call,
+            outcome: Outcome::Interrupted { output: None },
+            r#for: None,
+            failure: None,
+        }]);
+        let cancelled = kernel::CancelledInput::interrupted(&entries[0], &fact[0]).unwrap();
         let load = Load {
             owner: Owner::Present,
-            abandoned: &[Seq::new(1).unwrap()],
+            abandoned: &[cancelled],
             ..Load::default()
         };
         let (session, fx) = Session::resume(Reg::modeled().arc(), entries, &load);
