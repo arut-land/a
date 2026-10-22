@@ -56,7 +56,7 @@ impl Json {
 
 impl From<Box<RawValue>> for Json {
     fn from(raw: Box<RawValue>) -> Self {
-        let raw = if raw.get().bytes().any(|b| matches!(b, b'\n' | b'\r')) {
+        let raw = if memchr::memchr2(b'\n', b'\r', raw.get().as_bytes()).is_some() {
             // Raw CR/LF cannot occur inside a valid JSON string. RawValue's
             // safe constructor validates the replacement without building a tree.
             RawValue::from_string(raw.get().replace(['\n', '\r'], " "))
