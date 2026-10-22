@@ -1686,3 +1686,170 @@ fn a_live_sender_is_not_an_abandoned_inbox_owner() {
         "a live sender was treated as interrupted: {abandoned:?}"
     );
 }
+
+struct OwnerOnlyText;
+impl Extension for OwnerOnlyText {
+    const NAME: &'static str = "owner-only-text";
+    const VERSION: u32 = 1;
+    const INHERIT: bool = false;
+    fn contribute(&self, r: &mut Registrar) {
+        r.text(ext::Text::system(
+            "owner-context",
+            0,
+            "owner transcript instruction",
+        ));
+    }
+}
+
+#[test]
+fn before_owner_uses_the_owners_transcript_registry() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::default()
+        .with(&ext_title::Title)
+        .unwrap()
+        .with(&OwnerOnlyText)
+        .unwrap()
+        .with(&TitleHistory(Arc::clone(&captured)))
+        .unwrap();
+    let fixture = fixture(registry, &http);
+    let session = fixture.start(&[]);
+    session.submit("source task").unwrap();
+    until(&session, "initial title", |log| {
+        SessionView::from_log(session.id, "/w".into(), log)
+            .side("title")
+            .is_some()
+    });
+    settle(&session);
+    let actual = format!("{:?}", lock(&captured));
+    session.halt();
+    assert!(
+        actual.contains("owner transcript instruction"),
+        "the owner's system context was lost: {actual}"
+    );
+}
+
+#[test]
+fn forks_of_forks_keep_title_threads_separate() {
+    let http = Flaky::new((0..6).map(|_| Reply::Events(text_reply())));
+    let fixture = fixture(
+        Registry::default()
+            .with(&ext_title::Title)
+            .unwrap()
+            .with(&ext_fork::Fork)
+            .unwrap(),
+        &http,
+    );
+    let session = fixture.start(&[]);
+    session.submit("source task").unwrap();
+    until(&session, "initial title", |log| {
+        SessionView::from_log(session.id, "/w".into(), log)
+            .side("title")
+            .is_some()
+    });
+    settle(&session);
+    let fork = |source: &Live| {
+        let header = fixture
+            .0
+            .store
+            .headers()
+            .unwrap()
+            .into_iter()
+            .find(|h| h.id == source.id)
+            .unwrap();
+        let log = log_of(source);
+        let fork = copy_history(
+            &header,
+            log.last().unwrap().seq,
+            SessionId::new(),
+            &fixture.0,
+        )
+        .unwrap();
+        let slot = fixture.2.new_slot(fork.clone()).unwrap();
+        let live = Live::start(&fork, &fixture.0, Open::Load, Owner::None).unwrap();
+        fixture.2.started(&slot, Ok(live)).unwrap()
+    };
+    let branch = fork(&session);
+    branch.submit("/title branch").unwrap();
+    settle(&branch);
+    let source_children: Vec<_> = fixture
+        .2
+        .loaded()
+        .into_iter()
+        .filter(|l| l.parent.is_some())
+        .map(|l| (l.id, log_of(&l)))
+        .collect();
+    let grandchild = fork(&branch);
+    grandchild.submit("/title grandchild").unwrap();
+    settle(&grandchild);
+    for (id, before) in source_children {
+        assert_eq!(log_of(&fixture.2.slot(id).unwrap().live().unwrap()), before);
+    }
+    assert!(
+        fixture
+            .2
+            .loaded()
+            .into_iter()
+            .any(|l| l.parent.is_some_and(|p| p.session == grandchild.id))
+    );
+    grandchild.halt();
+    branch.halt();
+    session.halt();
+}
+
+#[test]
+fn an_in_flight_title_cannot_be_copied_into_a_fork() {
+    let http = Flaky::new([Reply::Events(text_reply()), Reply::Hang(String::new())]);
+    let fixture = fixture(
+        Registry::default()
+            .with(&ext_title::Title)
+            .unwrap()
+            .with(&ext_fork::Fork)
+            .unwrap(),
+        &http,
+    );
+    let session = fixture.start(&[]);
+    session.submit("source task").unwrap();
+    http.wait_sent(2);
+    settle(&session);
+    let header = fixture
+        .0
+        .store
+        .headers()
+        .unwrap()
+        .into_iter()
+        .find(|h| h.id == session.id)
+        .unwrap();
+    let log = log_of(&session);
+    let result = copy_history(
+        &header,
+        log.last().unwrap().seq,
+        SessionId::new(),
+        &fixture.0,
+    );
+    session.halt();
+    assert!(matches!(result, Err(protocol::ForkError::Unfinished)));
+}
+
+#[test]
+fn owner_sequence_context_survives_context_edits() {
+    let http = Flaky::new([]);
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::default()
+        .with(&ext_title::Title)
+        .unwrap()
+        .with(&TitleHistory(Arc::clone(&captured)))
+        .unwrap();
+    let fixture = probes(&http, registry);
+    let session = fixture.start(&[]);
+    session.submit("1").unwrap();
+    settle(&session);
+    session.submit("edit").unwrap();
+    settle(&session);
+    session.submit("/title after edit").unwrap();
+    settle(&session);
+    let actual = format!("{:?}", lock(&captured).last().unwrap());
+    session.halt();
+    assert!(actual.contains("summary"), "{actual}");
+    assert!(actual.contains("after edit"), "{actual}");
+}

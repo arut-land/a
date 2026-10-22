@@ -521,18 +521,11 @@ impl Actor {
             let mut messages = self.conversation(call).await.map_err(|e| e.to_string())?;
             if let Some(seq) = prefix {
                 let parent = self.live.parent.ok_or("model-only context has no owner")?;
-                let store = Arc::clone(&self.live.session.shared.store);
-                let registry = Arc::clone(&self.registry);
+                let shared = Arc::clone(&self.live.session.shared);
                 let context = rt::unblock(&*self.live.session.shared.rt, move || {
-                    let entries = store.prefix(parent.session, seq.get() - 1)?;
-                    Ok::<_, std::io::Error>(
-                        crate::transcript::Transcript::of(
-                            &entries,
-                            Arc::clone(&registry),
-                            registry.system_prompt(),
-                        )
-                        .into_messages(),
-                    )
+                    shared
+                        .owner_image(parent.session, seq.get() - 1)
+                        .map(|image| image.project())
                 })
                 .await
                 .map_err(|e| e.to_string())?;

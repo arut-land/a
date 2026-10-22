@@ -5,6 +5,46 @@ use super::{
     Ordering, Outbox, SNAPSHOT_GAP, SessionView, Transcript, io, lock,
 };
 
+/// A prefix coupled to the authority admitted by its own session.
+pub(super) struct OwnerImage {
+    entries: Vec<Entry>,
+    registry: Arc<super::Registry>,
+}
+
+impl super::Shared {
+    pub(super) fn owner_image(
+        &self,
+        owner: super::SessionId,
+        through: u64,
+    ) -> io::Result<OwnerImage> {
+        let header = self
+            .catalog
+            .get(owner)
+            .ok_or_else(|| io::Error::other("missing context owner"))?
+            .header;
+        let entries = self.store.prefix(owner, through)?;
+        let source = self.source(&header.workspace)?;
+        let installed = entries.iter().rev().find_map(|e| match &e.body {
+            Body::Extensions { installed } => Some(installed.as_slice()),
+            _ => None,
+        });
+        let current = super::recorded_registry(self, source.as_ref(), installed)?;
+        let registry = if header.parent.is_some() {
+            super::spawn::restore(&header, self, super::Open::Load, source.as_ref(), current)?.0
+        } else {
+            current
+        };
+        Ok(OwnerImage { entries, registry })
+    }
+}
+
+impl OwnerImage {
+    pub(super) fn project(self) -> llm::Messages {
+        let system = self.registry.system_prompt();
+        Transcript::of(&self.entries, Arc::clone(&self.registry), system).into_messages()
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Projection {
     pub(super) transcript: Option<Transcript>,
