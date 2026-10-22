@@ -14,13 +14,16 @@ pub fn registry(config: &Config) -> Result<Registry, Refused> {
     registry_at(config, &home)
 }
 
-fn registry_at(config: &Config, _home: &sys::Home) -> Result<Registry, Refused> {
+fn registry_at(
+    config: &Config,
+    #[allow(unused_variables)] home: &sys::Home,
+) -> Result<Registry, Refused> {
     let registry = linked(config)?;
     let mut layers: Vec<Arc<dyn GenerationLayer>> = Vec::new();
     #[cfg(feature = "lua")]
     if !config.ext.disable.iter().any(|name| name == "lua") {
         layers.push(Arc::new(ext_lua::Loader::new(
-            _home.root(),
+            home.root(),
             config.ext.clone(),
         )?));
     }
@@ -30,7 +33,7 @@ fn registry_at(config: &Config, _home: &sys::Home) -> Result<Registry, Refused> 
             configured::<ext_skills::Skills>(config)?.reserving(client::COMMANDS.iter().flat_map(
                 |command| std::iter::once(command.name).chain(command.aliases.iter().copied()),
             ));
-        layers.push(Arc::new(ext_skills::Loader::new(_home.root(), skills)));
+        layers.push(Arc::new(ext_skills::Loader::new(home.root(), skills)));
     }
     let coordinator = Arc::new(Coordinator::new(registry.clone(), layers));
     registry.with_in(Tier::Pre, &coordinator)
@@ -148,7 +151,7 @@ mod tests {
 
     use super::*;
 
-    fn registry(config: &Config) -> Result<Registry, Refused> {
+    fn isolated_registry(config: &Config) -> Result<Registry, Refused> {
         let rig = ext::testing::Rig::new(&SessionId::new().to_string(), Registry::default());
         super::registry_at(config, &sys::Home::from(rig.dir.join("home")))
     }
@@ -208,7 +211,7 @@ mod tests {
 
     #[test]
     fn every_extension_registers_as_any_other() {
-        let registry = registry(&config(&["bash"], None)).unwrap();
+        let registry = isolated_registry(&config(&["bash"], None)).unwrap();
         assert_eq!(
             tools(&registry),
             [
@@ -272,7 +275,7 @@ mod tests {
     #[test]
     fn removing_an_extension_removes_its_tool_and_nothing_else() {
         let config = config(&["bash"], None);
-        let all = registry(&config).unwrap();
+        let all = isolated_registry(&config).unwrap();
         let paragraphs = |r: &Registry| -> Vec<String> {
             r.system_prompt().split("\n\n").map(str::to_owned).collect()
         };
@@ -299,7 +302,7 @@ mod tests {
                 },
                 ..config.clone()
             };
-            let rest = registry(&without);
+            let rest = isolated_registry(&without);
             if name == "policy-floor" {
                 // The operator's floor is guarded: nothing of the user's
                 // takes it away.
@@ -357,7 +360,7 @@ mod tests {
     }
 
     fn registry_refused(config: &Config) -> String {
-        match registry(config) {
+        match isolated_registry(config) {
             Ok(_) => panic!("installed"),
             Err(refused) => refused.0,
         }
@@ -373,7 +376,7 @@ mod tests {
             None,
             "mode = \"auto\"\n[ext.prompt]\nsystem = \"Be terse.\"\n[ext.loop]\nmax_steps = 3\n[ext.retry]\nattempts = 2\n",
         );
-        let registry = registry(&config).unwrap();
+        let registry = isolated_registry(&config).unwrap();
         assert!(registry.system_prompt().starts_with("Be terse."));
         assert_eq!(gate(&registry, "bash", &mut Decided::new()), Gate::Run);
         let bad = configured(&[], None, "mode = \"sometimes\"\n");
@@ -398,13 +401,13 @@ mod tests {
 
     #[test]
     fn replay_policy_is_per_tool() {
-        let registry = registry(&config(&[], Some(ext_fixtures::ECHO))).unwrap();
+        let registry = isolated_registry(&config(&[], Some(ext_fixtures::ECHO))).unwrap();
         let tools = registry.tools();
         assert_eq!(tools.get("bash").unwrap().replay(), Replay::Unsafe);
         assert_eq!(tools.get("edit").unwrap().replay(), Replay::Unsafe);
         assert_eq!(tools.get("sleep").unwrap().replay(), Replay::Safe);
         // Only the echo agent brings the fixtures.
-        let shipped = registry(&config(&[], None)).unwrap();
+        let shipped = isolated_registry(&config(&[], None)).unwrap();
         assert!(shipped.tools().get("sleep").is_none());
         assert_eq!(
             shipped.agents().collect::<Vec<_>>(),
@@ -462,7 +465,7 @@ mod tests {
     #[test]
     fn request_error_kinds_partition() {
         let config = config(&[], None);
-        let all = registry(&config).unwrap();
+        let all = isolated_registry(&config).unwrap();
         let names: Vec<String> = all.extensions().map(|(n, _)| n.to_owned()).collect();
         for kind in KINDS {
             assert!(listed(kind));
@@ -482,7 +485,7 @@ mod tests {
                         },
                         ..config.clone()
                     };
-                    let alone = registry(&alone).ok()?;
+                    let alone = isolated_registry(&alone).ok()?;
                     answers(&alone, kind)
                 })
                 .collect();
@@ -534,7 +537,7 @@ mod tests {
 
     #[test]
     fn schemas_describe_objects_that_name_their_required_inputs() {
-        let registry = registry(&config(&[], Some(ext_fixtures::ECHO))).unwrap();
+        let registry = isolated_registry(&config(&[], Some(ext_fixtures::ECHO))).unwrap();
         for spec in registry.tools().specs() {
             let schema = &spec.schema;
             assert_eq!(schema["type"], "object", "{}", spec.name);
