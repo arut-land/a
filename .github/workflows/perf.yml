@@ -117,7 +117,12 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           working_directory: harness
-          install_args: ${{ inputs.bloat && 'cargo:cargo-bloat' || '' }} hyperfine ${{ matrix.runner != 'macos-15-intel' && 'mr-boxington' || '' }} ${{ runner.os == 'Linux' && 'mold' || '' }}
+          install_args: hyperfine ${{ matrix.runner != 'macos-15-intel' && 'mr-boxington' || '' }} ${{ runner.os == 'Linux' && 'mold' || '' }}
+      - if: inputs.bloat
+        name: Install native size attribution tool
+        run: |
+          rustup run "$RUSTUP_TOOLCHAIN" cargo install cargo-bloat --version 0.12.1 --locked --root "$RUNNER_TEMP/perf-tools"
+          echo "$RUNNER_TEMP/perf-tools/bin" >> "$GITHUB_PATH"
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
       # mbx publishes no Intel macOS executable; cache Cargo's native build there.

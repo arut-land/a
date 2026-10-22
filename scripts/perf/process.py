@@ -37,7 +37,7 @@ def measure_windows(argv, **kwargs):
     kernel.GetProcessTimes.argtypes = [wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4]
     kernel.GetProcessTimes.restype = wintypes.BOOL
     started = time.perf_counter()
-    child = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+    child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
     try:
         child.wait(timeout=120)
         elapsed = time.perf_counter() - started
