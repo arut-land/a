@@ -85,9 +85,23 @@ fi
 # (on macOS) sets no file times, nor modes, so the tests that need those are skipped.
 # Awake calls IOKit on macOS and spawns systemd-inhibit on Linux; neither FFI
 # path is supported by Miri (Linux spawn first needs SOCK_SEQPACKET socketpair).
+# Crash-hook subprocesses, exit watches and signal registration also need native
+# process/signal FFI; AF_UNIX listeners and directory fsync are unsupported too.
+# Inherited descriptor duplication uses unsupported O_NONBLOCK on /proc/self/fd.
+# Their invariant tests run in the ordinary native suite.
 "test:miri" = '''
 cargo miri test -p rt --lib threads::tests::task_wak
-MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p sys --lib -- --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version --skip tests::a_group_leader --skip tests::kills --skip fs::tests --skip awake::tests
+# macOS process identity uses proc_pidinfo/sysctl, which Miri cannot interpret.
+extra=()
+if [[ $(uname -s) == Darwin ]]; then
+  extra=(--skip a_record_reads_back_and_knows_its_process --skip the_reaper_writes_its_record_from_the_start --skip the_boot_id_is_the_kernels_and_stable)
+fi
+MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p sys --lib -- \
+  --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version \
+  --skip tests::a_group_leader --skip tests::kills --skip fs::tests --skip awake::tests \
+  --skip panic_content_cannot_enter_a_bounded_report --skip an_exit_watch_turns_readable \
+  --skip signals:: --skip endpoint::tests --skip fs::publication_tests \
+  --skip adopted_daemon_lock_excludes_an_independent_opener "${extra[@]}"
 '''
 # Coverage-guided fuzzing (libFuzzer) of protocol and skill frontmatter.
 # Crashes land beside the target in __fuzz__, replayed by ordinary tests;
