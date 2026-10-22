@@ -90,14 +90,15 @@ jobs:
           channel=$(python -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
           echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
-      - uses: actions/cache@v6
+      - uses: actions/cache/restore@v6
+        id: cache
         with:
           path: |
             ~/.rustup/toolchains
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/mbx/actions
-          key: perf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('harness/rust-toolchain.toml', 'harness/Cargo.lock', 'harness/.cargo/*.toml') }}
+          key: perf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('harness/rust-toolchain.toml', 'harness/Cargo.lock', 'harness/.cargo/*.toml') }}-${{ github.run_id }}
           restore-keys: perf-${{ runner.os }}-${{ runner.arch }}-
       # ARM Windows has no Cranelift component; release and benches use LLVM.
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src
@@ -113,6 +114,7 @@ jobs:
         with:
           workspaces: measured -> target/perf-build
           cache-all-crates: true
+          cache-on-failure: true
       - name: Install the same measurement harness into the source checkout
         run: |
           python - <<'PY'
@@ -148,3 +150,12 @@ jobs:
             harness/target/hosted-perf/**/*.md
           if-no-files-found: error
           retention-days: 30
+      - uses: actions/cache/save@v6
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ${{ runner.temp }}/mbx/actions
+          key: ${{ steps.cache.outputs.cache-primary-key }}
