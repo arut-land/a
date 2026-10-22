@@ -21,7 +21,16 @@ pub struct Loader {
 impl Loader {
     pub fn new(home: &Path, config: sys::config::Exts) -> Result<Self, Refused> {
         // A fresh home may not have been created yet; source directories are optional.
-        let home = std::path::absolute(home).map_err(|e| Refused(e.to_string()))?;
+        let home = home
+            .canonicalize()
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    std::path::absolute(home)
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(|e| Refused(e.to_string()))?;
         let table = config.table("lua");
         let read = |key, default| {
             table
