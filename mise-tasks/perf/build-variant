@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+#MISE description="Build and save a single-variable release experiment without editing production profiles"
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
+
+VARIANTS = {
+    "z": [],
+    "s": ['profile.release.opt-level="s"'],
+    "3": ['profile.release.opt-level=3'],
+    "thin": ['profile.release.lto="thin"'],
+    "cgu16": ['profile.release.codegen-units=16'],
+    "debug0": ['profile.release.debug=false'],
+    "unstripped": ['profile.release.strip="none"'],
+    "abort": ['profile.release.panic="abort"'],
+    "apple-m1": ['profile.release.rustflags=["-Cllvm-args=-addrsig","-Ctarget-cpu=apple-m1"]'],
+    "pgo-generate": [],
+    "pgo-use": [],
+    "serde_json-s": ['profile.release.package.serde_json.opt-level="s"'],
+    "serde_json2": ['profile.release.package.serde_json.opt-level=2'],
+    **{name + "3": [f'profile.release.package.{name}.opt-level=3']
+       for name in ("serde_json", "json", "protocol", "llm", "engine", "tui")},
+    **{name + "-s": [f'profile.release.package.{name}.opt-level="s"']
+       for name in ("json", "protocol", "llm", "engine", "tui")},
+}
+STD = ["-Zbuild-std=std,panic_unwind",
+       "-Zbuild-std-features=panic-unwind,optimize_for_size"]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("variant", choices=VARIANTS)
+    parser.add_argument("--label", help="save a code experiment separately under the same profile")
+    parser.add_argument("--output", type=Path, default=Path("target/perf-variants"))
+    parser.add_argument("--tests", nargs="?", const="engine,tui,protocol",
+                        help="also save test binaries (comma-separated packages; all three by default)")
+    parser.add_argument("--profile-data", type=Path, default=Path("target/perf-pgo"))
+    args = parser.parse_args()
+    output = (args.output / (args.label or args.variant)).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "source.diff").write_bytes(subprocess.check_output(["git", "diff", "--binary"]))
+    env = dict(os.environ)
+    env.setdefault("CARGO_BUILD_JOBS", "4")
+    env["CARGO_TARGET_DIR"] = str(args.output.resolve() / "build")
+    settings = list(VARIANTS[args.variant])
+    if args.variant.startswith("pgo-"):
+        profile = args.profile_data.resolve()
+        profile.mkdir(parents=True, exist_ok=True)
+        if args.variant == "pgo-generate":
+            raw = profile / "raw"
+            raw.mkdir(parents=True, exist_ok=True)
+            flag = "-Cprofile-generate=" + str(raw)
+        else:
+            flag = "-Cprofile-use=" + str((profile / "merged.profdata").resolve(strict=True))
+        settings.append("profile.release.rustflags=" + json.dumps(["-Cllvm-args=-addrsig", flag]))
+    config = [arg for setting in settings for arg in ("--config", setting)]
+    subprocess.run(["cargo", "build-release", "-p", "a", "--features", "fixtures", *config],
+                   env=env, check=True)
+    binary = Path(env["CARGO_TARGET_DIR"]) / "release" / "a"
+    shutil.copy2(binary, output / "a")
+    if Path(str(binary) + ".dSYM").exists():
+        shutil.copytree(str(binary) + ".dSYM", output / "a.dSYM", dirs_exist_ok=True)
+    metadata = dict(variant=args.variant, config=settings,
+                    revision=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+                    bytes=binary.stat().st_size)
+    if args.tests:
+        metadata["tests"] = []
+        for package, target in [("engine", ["--lib"]), ("tui", ["--lib"]),
+                                ("protocol", ["--test", "bench"])]:
+            if package not in args.tests.split(","):
+                continue
+            result = subprocess.run(
+                ["cargo", "test", "--release", *STD, "-p", package, *target,
+                 "--no-run", "--message-format=json", *config],
+                env=env, check=True, stdout=subprocess.PIPE, text=True,
+            )
+            for line in result.stdout.splitlines():
+                record = json.loads(line)
+                if record.get("executable") and record.get("profile", {}).get("test"):
+                    saved = output / (package + "-bench")
+                    shutil.copy2(record["executable"], saved)
+                    if Path(record["executable"] + ".dSYM").exists():
+                        shutil.copytree(record["executable"] + ".dSYM", str(saved) + ".dSYM",
+                                        dirs_exist_ok=True)
+                    metadata["tests"].append(str(saved))
+    (output / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(json.dumps(metadata), flush=True)
+
+
+if __name__ == "__main__":
+    main()

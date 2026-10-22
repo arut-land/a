@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+#MISE description="Run saved release engine, JSON and TUI workloads with load and process metrics"
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("build", type=Path)
+    parser.add_argument("transcript", type=Path)
+    parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--blackbox", type=Path)
+    parser.add_argument("--packages", default="engine,protocol,tui")
+    args = parser.parse_args()
+    transcript = args.transcript.resolve(strict=True)
+    build = args.build.resolve(strict=True)
+    loader = importlib.machinery.SourceFileLoader("workloads", str(Path(__file__).with_name("workloads")))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    workloads = importlib.util.module_from_spec(spec)
+    loader.exec_module(workloads)
+    output = build / "measurements"
+    output.mkdir(exist_ok=True)
+    env = dict(os.environ, A_SESSION_LOG=str(transcript))
+    budget_result = None
+    if args.blackbox:
+        env.update(A_BIN=str(build / "a"), A_STRICT_BUDGETS="1")
+        workloads.load(output, "budgets:before")
+        budget_result = subprocess.run(
+            [str(args.blackbox.resolve(strict=True)), "budgets::", "--ignored",
+             "--nocapture", "--test-threads=1"], check=False, env=env)
+        workloads.load(output, "budgets:after")
+    for package, filters in [
+        ("engine", ["bench_loading_a_long_log", "bench_turns_under_each_barrier_setting",
+                    "bench_concurrent_session_commits", "bench_large_tool_result"]),
+        ("protocol", ["attach_to_a_logged_session"]),
+        ("tui", ["render_cost"]),
+    ]:
+        if package not in args.packages.split(","):
+            continue
+        for name in filters:
+            binary = (build / (package + "-bench")).resolve(strict=True)
+            command = shlex.join([str(binary), name, "--ignored", "--nocapture", "--test-threads=1"])
+            workloads.load(output, name + ":before")
+            subprocess.run(["mise", "exec", "hyperfine@2.0.0", "--", "hyperfine", "-N", "--warmup", "1", "-r", str(args.runs),
+                            "--metrics", "all", "--show-output", "--export-json",
+                            str(output / (name + ".json")), command], check=True, env=env)
+            workloads.load(output, name + ":after")
+    if budget_result is not None:
+        budget_result.check_returncode()
+
+
+if __name__ == "__main__":
+    main()

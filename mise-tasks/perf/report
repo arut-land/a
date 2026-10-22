@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+#MISE description="Regenerate the tuning CSV from saved builds, workload JSON and load records"
+import argparse
+import csv
+import json
+from pathlib import Path
+from statistics import median
+
+
+FIELDS = ("variant", "workload", "samples", "binary_bytes", "wall_ms", "cpu_ms",
+          "peak_rss_kib", "instructions", "load1_before", "load1_after")
+
+
+def loads(directory):
+    path = directory / "load.jsonl"
+    return {record["label"]: record["load"][0]
+            for record in map(json.loads, path.read_text().splitlines())} if path.exists() else {}
+
+
+def metrics(result):
+    measurements = result["measurements"]
+
+    def value(name, scale=1):
+        values = [sample[name]["value"] for sample in measurements if name in sample]
+        return round(median(values) * scale, 6) if values else ""
+
+    return dict(samples=len(measurements), wall_ms=value("time_wall_clock", 1000),
+                cpu_ms=value("time_cpu", 1000), peak_rss_kib=value("memory_peak_resident", 1 / 1024),
+                instructions=value("instructions"))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--builds", type=Path, default=Path("target/perf-variants"))
+    parser.add_argument("--observations", type=Path, default=Path("target/perf-tuning"))
+    parser.add_argument("--output", type=Path, default=Path("docs/perf/tuning.csv"))
+    args = parser.parse_args()
+    rows = []
+    sizes = {}
+
+    def append(variant, workload, size, values, load, label):
+        rows.append(dict(variant=variant, workload=workload, binary_bytes=size, **values,
+                         load1_before=load.get(label + ":before", ""),
+                         load1_after=load.get(label + ":after", "")))
+
+    def collect(directory, variant, kind, size):
+        load = loads(directory)
+        for path in sorted(directory.glob("*.json")):
+            if path.name == "binary.json":
+                continue
+            data = json.loads(path.read_text())
+            if path.stem == "fresh-home-new":
+                if isinstance(data[0], dict):
+                    values = dict(samples=len(data),
+                                  wall_ms=round(median(x["wall_seconds"] for x in data) * 1000, 6),
+                                  cpu_ms=round(median(x["cpu_seconds"] for x in data) * 1000, 6),
+                                  peak_rss_kib=median(x["peak_rss_kib"] for x in data))
+                else:
+                    values = dict(samples=len(data), wall_ms=round(median(data) * 1000, 6))
+            else:
+                values = metrics(data["results"][0])
+            append(variant, kind + "." + path.stem, size, values, load, path.stem)
+
+    builds = sorted(args.builds.glob("*/build.json"))
+    if not builds:
+        raise SystemExit("no saved build.json files; run perf:build-variant first")
+    for path in builds:
+        if path.parent.name == "pgo-generate":
+            continue
+        name = path.parent.name
+        variant = "main" if name == "z" else name
+        sizes[variant] = json.loads(path.read_text())["bytes"]
+        collect(args.observations / "workloads" / ("main-repeat" if name == "z" else name),
+                variant, "cli", sizes[variant])
+        collect(path.parent / "measurements", variant, "bench", sizes[variant])
+
+    nano = args.observations / "workloads/nano-off"
+    if nano.exists():
+        collect(nano, "nano-off", "cli", json.loads((nano / "binary.json").read_text())["bytes"])
+
+    load = loads(args.observations)
+    for name, workload in [("paired-version-forward", "paired.version-forward"),
+                           ("paired-version-reverse", "paired.version-reverse"),
+                           ("paired-concurrency", "paired.concurrent")]:
+        path = args.observations / (name + ".json")
+        if path.exists():
+            for result in json.loads(path.read_text())["results"]:
+                variant = "main" if "/z/" in result["command"] else "final"
+                append(variant, workload, sizes[variant], metrics(result), load, name)
+    for variant in ("main", "final"):
+        name = variant + "-attach-resources"
+        path = args.observations / (name + ".json")
+        if path.exists():
+            result = json.loads(path.read_text())["results"][0]
+            append(variant, "bench.attach_500_client", sizes[variant], metrics(result), load, name)
+
+    with args.output.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=FIELDS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"{args.output}: {len(rows)} observations")
+
+
+if __name__ == "__main__":
+    main()

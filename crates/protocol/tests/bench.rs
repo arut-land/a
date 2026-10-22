@@ -75,8 +75,9 @@ fn attach_to_a_logged_session() {
     };
     let entries: Vec<Entry> = lines
         .iter()
-        .filter_map(|line| Entry::from_json(line.as_bytes()).ok())
+        .map(|line| Entry::from_json(line.as_bytes()).expect("every benchmark entry decodes"))
         .collect();
+    assert!(!entries.is_empty(), "the benchmark needs a nonempty log");
     let replies = entries
         .iter()
         .filter(|e| matches!(e.body, Body::ModelResult { .. }))

@@ -82,7 +82,7 @@ fn bench_loading_a_long_log() {
     let bytes = std::fs::metadata(dir.join(format!("{}/log.jsonl", header.id)))
         .unwrap()
         .len();
-    let derived = dir.join("derived");
+    let derived = dir.join(header.id.to_string()).join("derived");
     let load = |whole: bool| {
         if whole {
             std::fs::remove_dir_all(&derived).unwrap();
@@ -221,4 +221,62 @@ fn bench_concurrent_session_commits() {
         drop(fixture);
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+/// A large JSON value through tool encoding, durable storage and replay.
+#[test]
+#[ignore = "a measurement"]
+fn bench_large_tool_result() {
+    struct Large;
+    impl Tool for Large {
+        type In = Nothing;
+        type Out = String;
+        const NAME: &'static str = "large";
+        const DESCRIPTION: &'static str = "Return a large result.";
+        const REPLAY: Replay = Replay::Safe;
+
+        fn call(&self, _: &Nothing, _: &Cx) -> Result<String, String> {
+            Ok("quoted \"text\" \\ 日本語\n".repeat(40_000))
+        }
+    }
+    struct Tools;
+    impl Extension for Tools {
+        const NAME: &'static str = "large";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut Registrar) {
+            r.tool(Large);
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("a-bench-json-{}", std::process::id()));
+    let store = Arc::new(Jsonl::open(&dir).unwrap());
+    let fixture = Fixture::on(
+        Arc::clone(&store) as _,
+        ext_fixtures::ECHO,
+        Registry::default().with(&Tools).unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    settle(&session);
+    let mut times = Vec::new();
+    for _ in 0..20 {
+        let start = Instant::now();
+        session.submit("call large {}").unwrap();
+        settle(&session);
+        times.push(start.elapsed());
+    }
+    let entries = log_of(&session);
+    let results = entries
+        .iter()
+        .filter(|e| matches!(e.body, Body::ToolResult { .. }))
+        .count();
+    assert_eq!(results, 20);
+    eprintln!(
+        "large JSON tool result: {:?} (median of 20), {} entries",
+        median(times),
+        entries.len()
+    );
+    session.halt();
+    drop(fixture);
+    drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
 }

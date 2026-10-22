@@ -15,7 +15,13 @@ import termios
 import time
 
 
-def sample(binary, output, label, run):
+def cpu_time(pid):
+    text = subprocess.check_output(["ps", "-o", "time=", "-p", str(pid)], text=True)
+    minutes, seconds = text.strip().split(":")
+    return float(minutes) * 60 + float(seconds)
+
+
+def sample(binary, output, label, run, idle_seconds):
     with tempfile.TemporaryDirectory(prefix="a-rss-") as directory:
         root = Path(directory)
         home, workspace = root / "home", root / "ws"
@@ -59,7 +65,21 @@ def sample(binary, output, label, run):
                 raise RuntimeError(f"expected one staged daemon: {daemons}")
             pid = daemons[0]
             rss = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)]))
-            print(f"{label} sample {run}: {rss} KiB", flush=True)
+            print(f"{label} sample {run}: {rss} KiB; load={os.getloadavg()}", flush=True)
+            if idle_seconds:
+                before = [cpu_time(p) for p in (pid, client.pid)]
+                load_before = os.getloadavg()
+                started = time.monotonic()
+                # No sampling/profiling during the idle interval.
+                time.sleep(idle_seconds)
+                elapsed = time.monotonic() - started
+                used = [cpu_time(p) - t for p, t in zip((pid, client.pid), before)]
+                record = dict(label=label, run=run, seconds=elapsed,
+                              daemon_cpu_seconds=used[0], client_cpu_seconds=used[1],
+                              load_before=load_before, load_after=os.getloadavg())
+                print(json.dumps(record), flush=True)
+                with (output / "idle.jsonl").open("a") as log:
+                    log.write(json.dumps(record) + "\n")
             # Profilers run after the RSS observation, never during its window.
             if run == 0:
                 for command in (
@@ -91,13 +111,18 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("label")
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--idle-seconds", type=float, default=0,
+                        help="measure CPU on the first sample over this window (ps: 10 ms resolution)")
     parser.add_argument("--output", type=Path, default=Path("target/rss"))
     args = parser.parse_args()
     if args.samples < 1:
         parser.error("--samples must be positive")
+    if args.idle_seconds < 0:
+        parser.error("--idle-seconds must not be negative")
     args.output.mkdir(parents=True, exist_ok=True)
     binary = str(args.binary.resolve())
-    rss = [sample(binary, args.output, args.label, run) for run in range(args.samples)]
+    rss = [sample(binary, args.output, args.label, run, args.idle_seconds if run == 0 else 0)
+           for run in range(args.samples)]
     with (args.output / "samples.jsonl").open("a") as log:
         log.write(json.dumps({"commit": args.label, "rss": rss, "bytes": os.stat(binary).st_size}) + "\n")
 

@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+#MISE description="Measure release CLI workloads and machine load in isolated homes"
+"""Run after building: no compilation or profiling overlaps a timing window."""
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def load(output, label):
+    record = {
+        "label": label,
+        "time": time.time(),
+        "load": os.getloadavg(),
+        "uptime": subprocess.check_output(["uptime"], text=True).strip(),
+        "consumers": subprocess.check_output(
+            ["ps", "-Ao", "pid,pcpu,pmem,comm", "-r"], text=True
+        ).splitlines()[:11],
+    }
+    print(json.dumps(record), flush=True)
+    with (output / "load.jsonl").open("a") as stream:
+        stream.write(json.dumps(record) + "\n")
+
+
+def fresh_new(binary, env, workspace):
+    def timed_out(_signal, _frame):
+        raise TimeoutError("fresh new exceeded 30 seconds")
+
+    previous = signal.signal(signal.SIGALRM, timed_out)
+    child = None
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 30)
+        started = time.perf_counter()
+        child = subprocess.Popen([binary, "new"], env=env, cwd=workspace,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _, status, usage = os.wait4(child.pid, 0)
+        elapsed = time.perf_counter() - started
+        child.returncode = os.waitstatus_to_exitcode(status)
+        if child.returncode:
+            raise subprocess.CalledProcessError(child.returncode, child.args)
+        return dict(wall_seconds=elapsed, cpu_seconds=usage.ru_utime + usage.ru_stime,
+                    peak_rss_kib=usage.ru_maxrss / (1024 if sys.platform == "darwin" else 1))
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("label")
+    parser.add_argument("--runs", type=int, default=30)
+    parser.add_argument("--output", type=Path, default=Path("target/perf-workloads"))
+    args = parser.parse_args()
+    if args.runs < 2:
+        parser.error("--runs must be at least two")
+    binary = str(args.binary.resolve(strict=True))
+    output = (args.output / args.label).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "binary.json").write_text(json.dumps({
+        "bytes": os.stat(binary).st_size,
+        "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "binary": binary,
+    }) + "\n")
+    with tempfile.TemporaryDirectory(prefix="a-perf-workloads-") as directory:
+        root = Path(directory)
+        home, workspace = root / "home", root / "workspace"
+        home.mkdir()
+        workspace.mkdir()
+        (home / "config.toml").write_text('[daemon]\nagent = "echo"\nidle_secs = 120\n')
+        env = dict(os.environ, A_HOME=str(home))
+        env.pop("A_HOST", None)
+        env.pop("A_MODE", None)
+
+        def run(*argv):
+            return subprocess.run(
+                [binary, *argv], cwd=workspace, env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30,
+            )
+
+        def bench(name, command, prepare=None):
+            load(output, name + ":before")
+            argv = ["hyperfine", "-N", "--warmup", "3", "-r", str(args.runs),
+                    "--metrics", "all", "--export-json", str(output / (name + ".json"))]
+            if prepare:
+                argv += ["--prepare", prepare]
+            subprocess.run(["mise", "exec", "hyperfine@2.0.0", "--", *argv, command],
+                           env=env, cwd=workspace, check=True)
+            load(output, name + ":after")
+
+        cmd = shlex.quote(binary)
+        try:
+            bench("version", cmd + " --version")
+            load(output, "fresh-home-new:before")
+            fresh = []
+            for _ in range(args.runs):
+                with tempfile.TemporaryDirectory(prefix="a-perf-fresh-") as fresh_dir:
+                    fresh_env = dict(env, A_HOME=fresh_dir)
+                    Path(fresh_dir, "config.toml").write_text(
+                        '[daemon]\nagent = "echo"\nidle_secs = 120\n'
+                    )
+                    try:
+                        fresh.append(fresh_new(binary, fresh_env, workspace))
+                    finally:
+                        subprocess.run([binary, "daemon", "stop"], env=fresh_env,
+                                       check=True, capture_output=True, timeout=30)
+            (output / "fresh-home-new.json").write_text(json.dumps(fresh) + "\n")
+            load(output, "fresh-home-new:after")
+            # Stage once so the OS's first scan of a new executable is separate.
+            run("ls")
+            bench("cold-daemon-new", cmd + " new", cmd + " daemon stop")
+            bench("warm-new", cmd + " new")
+            assert run("-p", "perf echo").stdout.strip() == b"perf echo"
+            bench("echo", cmd + " -p 'perf echo'")
+            # The shell extension creates and logs a real tool result. The echo
+            # agent avoids provider/network variance; policy uses its normal path.
+            bench("big-tool-result", cmd + " --mode auto -p '$ python3 -c \"print(chr(120)*1048576)\"'")
+            session = run("new").stdout.decode().strip()
+            payload = ("**transcript** `json` 日本語 \\\"\n" * 512)
+            for _ in range(64):
+                assert run("-p", payload, "resume", session).stdout.decode().strip() == payload.strip()
+            # Generate through the engine's encoder, never hand-write wire data.
+            logs = [path for path in (home / "sessions").glob("*/log.jsonl")
+                    if path.parent.name.endswith(session)]
+            assert len(logs) == 1, (session, logs)
+            shutil.copy2(logs[0], output / "transcript.jsonl")
+            bench("long-transcript", cmd + " -p tail resume " + shlex.quote(session))
+        finally:
+            run("daemon", "stop")
+
+
+if __name__ == "__main__":
+    main()

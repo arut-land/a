@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+#MISE description="Train and build a PGO candidate on isolated CLI, driver, JSON, load and TUI workloads"
+"""An experiment, not the release build. Profiles are local to this toolchain/host."""
+import json
+import os
+from pathlib import Path
+import subprocess
+
+
+def main():
+    sysroot = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip())
+    host = next(line.split(": ", 1)[1] for line in subprocess.check_output(
+        ["rustc", "-vV"], text=True).splitlines() if line.startswith("host: "))
+    profdata = sysroot / "lib/rustlib" / host / "bin/llvm-profdata"
+    if not profdata.is_file():
+        raise SystemExit("PGO needs `mise exec -- rustup component add llvm-tools` first")
+    root = Path("target/perf-pgo").resolve()
+    raw = root / "raw"
+    raw.mkdir(parents=True, exist_ok=True)
+    # Remove fallback profiles left by older builds as well as collected profiles.
+    for path in root.glob("*.profraw"):
+        path.unlink()
+    for path in raw.glob("*.profraw"):
+        path.unlink()
+    env = dict(os.environ, LLVM_PROFILE_FILE=str(raw / "%m-%p.profraw"))
+
+    def run(*argv):
+        subprocess.run(["mise", "run", *argv], env=env, check=True)
+
+    run("perf:build-variant", "pgo-generate", "--tests", "--profile-data", str(root))
+    # Instrumented build scripts and proc macros are not runtime training.
+    for path in raw.glob("*.profraw"):
+        path.unlink()
+    build = Path("target/perf-variants/pgo-generate")
+    run("perf:workloads", str(build / "a"), "train", "--runs", "5", "--output", str(root))
+    run("perf:benches", str(build), str(root / "train/transcript.jsonl"), "--runs", "2")
+    profiles = sorted(raw.glob("*.profraw"))
+    assert profiles, "training must produce profiles"
+    # Daemon startup clears LLVM_PROFILE_FILE and uses the compiled fallback.
+    daemon_profiles = [path for path in profiles if path.name.startswith("default_")]
+    assert daemon_profiles and all(path.stat().st_size for path in daemon_profiles), \
+        "training must collect daemon fallback profiles in raw/"
+    subprocess.run([str(profdata), "merge", "-o", str(root / "merged.profdata"),
+                    *map(str, profiles)], check=True)
+    (root / "training.json").write_text(json.dumps(dict(
+        host=host, toolchain=str(sysroot), profiles=len(profiles),
+        daemon_profiles=[path.name for path in daemon_profiles],
+        revision=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+    ), indent=2) + "\n")
+    run("perf:build-variant", "pgo-use", "--tests", "--profile-data", str(root))
+
+
+if __name__ == "__main__":
+    main()
