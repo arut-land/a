@@ -26,8 +26,13 @@ fn the_full_screen_client_shows_replies_and_answers_approvals_by_click() {
     );
 
     term.send(b"$ echo ran > ran.txt\r");
-    let screen = term.wait_for("Do you want to proceed? $ echo ran > ran.txt");
-    assert!(screen.find("? waiting for approval").is_some());
+    let screen = term.wait_until("approval controls ready to click", |screen| {
+        screen
+            .find("Do you want to proceed? $ echo ran > ran.txt")
+            .is_some()
+            && screen.find("? waiting for approval").is_some()
+            && screen.find("1. Yes").is_some()
+    });
     let ran = env.ws.join("ran.txt");
     assert!(!ran.exists(), "ran before it was approved");
     // The approval bar's own choice, on the row under its question.
