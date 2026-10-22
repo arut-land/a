@@ -978,6 +978,7 @@ fn compacted_forks_keep_loaded_skills_in_context_and_background_results_out() {
     let slot = fixture.2.new_slot(header.clone()).unwrap();
     let session = Live::start(&header, &fixture.0, Open::Create, Owner::None).unwrap();
     fixture.2.started(&slot, Ok(Arc::clone(&session))).unwrap();
+    let session = TestingLive(session, Arc::clone(&fixture.2));
     let load = |session: &Arc<Live>, expected: &str| {
         session.submit("/review").unwrap();
         settle(session);
