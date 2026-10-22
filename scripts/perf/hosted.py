@@ -59,6 +59,12 @@ def build(source, output, variant):
              *overrides], cwd=source, env=env)
         name = "a-fixtures" if fixture else "a"
         shutil.copy2(release / ("a" + SUFFIX), output / (name + SUFFIX))
+    (output / "build.json").write_text(json.dumps(dict(
+        revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
+        variant=variant,
+        shipped_bytes=(output / ("a" + SUFFIX)).stat().st_size,
+        fixture_bytes=(output / ("a-fixtures" + SUFFIX)).stat().st_size,
+    ), indent=2) + "\n")
     run(["cargo", "build-release", "-p", "a", "--example", "perf-attach", *overrides], cwd=source, env=env)
     shutil.copy2(release / "examples" / ("perf-attach" + SUFFIX), output / ("perf-attach" + SUFFIX))
     for package, target in [("engine", ["--lib"]), ("protocol", ["--test", "bench"]), ("tui", ["--lib"])]:
@@ -98,10 +104,12 @@ def budgets(output, binary=None, probe=None):
                 cold.append((time.perf_counter() - started) * 1000)
                 pid = int((home / "run/daemon.pid").read_text().splitlines()[0])
                 time.sleep(3)
+                rss.append(snapshot(pid)["rss_kib"])
+                # Blocking workers retire after ten idle seconds; CPU measures steady idle.
+                time.sleep(12)
                 before = [snapshot(p)["cpu_seconds"] for p in (pid, client.pid)]
                 time.sleep(10)
                 after = [snapshot(p) for p in (pid, client.pid)]
-                rss.append(after[0]["rss_kib"])
                 cpu.append((after[0]["cpu_seconds"] - before[0]) * 1000)
                 client_cpu.append((after[1]["cpu_seconds"] - before[1]) * 1000)
                 session = cli("new").stdout.decode().strip()
@@ -160,7 +168,7 @@ def summarize(output, source, variant, runner):
                   revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
                   workflow_revision=os.environ.get("GITHUB_SHA"), variant=variant,
                   toolchain=subprocess.check_output(["rustc", "-vV"], text=True),
-                  idle_window_seconds=10,
+                  idle_window_seconds=10, cpu_settle_seconds=15, rss_settle_seconds=3,
                   cargo_config=(source / ".cargo/config.toml").read_text(),
                   cargo_profiles=(source / ".cargo/profiles.toml").read_text(),
                   metrics=metrics)

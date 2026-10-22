@@ -61,7 +61,7 @@ def main():
         delta = compare(value, previous)
         comparisons[name] = delta
         lines.append(f'| {name} | {value["median"]:.3f} | {value["p10"]:.3f}–{value["p90"]:.3f} | {delta} |')
-    lines += ["", "Idle CPU is accumulated OS user+kernel time over 10 seconds in each of five fresh homes. Zero means no counter increment at OS resolution. Client is the line REPL; native terminal first-paint/PTY gates remain in CI.", ""]
+    lines += ["", "Idle CPU is accumulated OS user+kernel time over 10 seconds after 15 seconds settling in each of five fresh homes. RSS is sampled at three seconds. Zero means no counter increment at OS resolution. Client is the line REPL; native terminal first-paint/PTY gates remain in CI.", ""]
     summary = "\n".join(lines)
     args.result.with_name("summary.md").write_text(summary)
     args.result.with_name("comparison.json").write_text(json.dumps(dict(baseline_run=run_id, axes=comparisons), indent=2))

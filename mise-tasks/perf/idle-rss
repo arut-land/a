@@ -30,12 +30,14 @@ def sample(binary, idle_seconds):
             assert first.get(timeout=30).startswith(b"[session")
             pid = int((home / "run/daemon.pid").read_text().splitlines()[0])
             time.sleep(3)
+            rss = snapshot(pid)["rss_kib"]
+            time.sleep(12)
             before = [snapshot(p)["cpu_seconds"] for p in (pid, client.pid)]
             started = time.monotonic()
             time.sleep(idle_seconds)
             elapsed = time.monotonic() - started
             after = [snapshot(p) for p in (pid, client.pid)]
-            return dict(rss=after[0]["rss_kib"], seconds=elapsed,
+            return dict(rss=rss, seconds=elapsed,
                         daemon_cpu_seconds=after[0]["cpu_seconds"] - before[0],
                         client_cpu_seconds=after[1]["cpu_seconds"] - before[1])
         finally:

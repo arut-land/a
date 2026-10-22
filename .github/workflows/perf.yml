@@ -27,7 +27,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: perf-${{ github.ref }}-${{ inputs.runner || 'all' }}-${{ inputs.variant || '{}' }}
+  group: perf-${{ github.ref }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.variant || '{}' }}
   cancel-in-progress: false
 
 env:

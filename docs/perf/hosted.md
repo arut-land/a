@@ -53,7 +53,7 @@ never addresses the user's default home.
 | Startup | 10 warmups, 100 launches each of shipped `a --version` and a native empty Rust executable |
 | Cold first reply | Five fresh homes; stage once, stop, then line REPL spawn through first session line |
 | Attach | Five independent daemons; ten recorded echo turns; 500 connect/hello/attach/replays each, through `Synced` |
-| Idle | Five homes; three seconds settling, then ten seconds with no profiling; daemon RSS and both processes' CPU |
+| Idle | Five homes; daemon RSS at three seconds; CPU after fifteen seconds settling, then ten seconds with no profiling |
 | CLI workloads | Three warmups, twenty runs: version, fresh-home/new, cold/warm new, echo, 1 MiB shell output, long transcript |
 | Engine/JSON/TUI benches | One warmup, five runs per saved release benchmark executable |
 
@@ -61,7 +61,7 @@ The CLI workload generates its transcript through the engine's encoder.
 The engine driver executes 100 recorded turns across the step/effects barrier
 settings; concurrency, 15,600-entry reload, large JSON, protocol codec/reducer
 and 6,000-item TUI rendering retain their existing workload definitions.
-Process-level driver time includes setup and replay. Attach p99 is calculated
+Blocking workers retire after ten seconds idle; CPU settling excludes this finite startup work. Process-level driver time includes setup and replay. Attach p99 is calculated
 from 500 samples per daemon; the report gives the median and spread of the
 five p99 estimates. Idle CPU zero means no increment at the OS counter's
 resolution, not a claim about instructions below that resolution.

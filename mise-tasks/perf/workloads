@@ -53,6 +53,10 @@ def fresh_new(binary, env, workspace):
             child.wait()
 
 
+def shell_command(argv):
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
 def command(argv):
     # Hyperfine -N uses shell_words on every OS, including Windows.
     return shlex.join(argv)
@@ -121,7 +125,7 @@ def main():
             load(output, "fresh-home-new:after")
             # Stage once so the OS's first scan of a new executable is separate.
             run("ls")
-            bench("cold-daemon-new", cmd + " new", cmd + " daemon stop")
+            bench("cold-daemon-new", cmd + " new", shell_command([binary, "daemon", "stop"]))
             bench("warm-new", cmd + " new")
             assert run("-p", "perf echo").stdout.strip() == b"perf echo"
             bench("echo", command([binary, "-p", "perf echo"]))
