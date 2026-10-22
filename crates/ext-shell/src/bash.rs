@@ -13,7 +13,8 @@
 //! never through the daemon's memory: the supervisor follows the file,
 //! woken by its writes, keeping only what the model is shown, and the file
 //! is kept as the whole output when that was cut. A command whose output
-//! passes [`OUTPUT_CAP`] is stopped.
+//! passes [`OUTPUT_CAP`] is stopped. Cancellation before or during process
+//! launch reports an aborted command, as cancellation during supervision does.
 
 use ext::{LaunchSpec, OwnedProcess, ProcessOutput, ProcessSignal, Processes};
 use std::collections::BTreeMap;
@@ -249,6 +250,19 @@ fn model_text(ran: &Ran) -> String {
 }
 
 async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result<Ran> {
+    match execute(input, cx, progress).await {
+        // Launch can observe cancellation after the initial check, before
+        // bash has a process to supervise and mark aborted.
+        Err(error) if error.kind() == io::ErrorKind::Interrupted && cx.cancel.is_set() => Ok(Ran {
+            aborted: true,
+            cwd: cx.dir(),
+            ..Ran::default()
+        }),
+        result => result,
+    }
+}
+
+async fn execute(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result<Ran> {
     let started = runtime(cx)?.now();
     let dir = cx.dir();
     // An interrupted turn's call starts nothing.

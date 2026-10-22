@@ -383,6 +383,43 @@ fn a_call_cancelled_before_it_starts_spawns_nothing() {
 }
 
 #[test]
+fn cancellation_during_launch_is_aborted_for_foreground_and_background_calls() {
+    struct CancelSpawn(ext::Cancel);
+    impl Extension for CancelSpawn {
+        const NAME: &'static str = "cancel-spawn";
+        const VERSION: u32 = 1;
+
+        fn contribute(&self, r: &mut Registrar) {
+            let cancel = self.0.clone();
+            r.on::<ext::point::Spawn>(move |_, _| {
+                cancel.set();
+                Rewrite::Pass
+            });
+        }
+    }
+
+    for background in [false, true] {
+        let cancel = ext::Cancel::default();
+        let registry = Registry::default()
+            .with(&crate::Shell)
+            .and_then(|r| r.with(&CancelSpawn(cancel.clone())))
+            .unwrap();
+        let mut rig = Rig::new("cancel-during-launch", registry);
+        rig.cancel = cancel.clone();
+        // The spawn hook runs after bash's initial cancellation check.
+        let ran = bash(
+            &rig,
+            &json!({ "command": "sleep 100", "background": background }),
+        );
+        assert!(cancel.is_set());
+        assert!(ran.aborted, "{ran:?}");
+        assert!(ran.background.is_none());
+        assert!(rig.spawned.lock().unwrap().is_empty());
+        assert_eq!(model(&ran), "(no output)\n[aborted]");
+    }
+}
+
+#[test]
 fn a_background_command_returns_at_once_with_its_log() {
     let rig = rig("background");
     let started = Instant::now();
