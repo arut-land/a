@@ -1,6 +1,6 @@
 use super::*;
-use protocol::{Decode, Epoch, Json, Mode, SessionId};
-fn spawn_image(image: Vec<Json>) -> Json {
+use protocol::{Epoch, Json, Mode, SessionId};
+fn spawn_image(image: ContextImage) -> Json {
     let intent = crate::tests::spawn_intent(1, "");
     let mut intent = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
     intent.image = image;
@@ -86,14 +86,11 @@ fn a_prefix_projects_edits_and_publications_without_executable_ownership() {
         ),
     ];
     let image = context_image(&entries);
-    let inherited: Vec<_> = image
-        .iter()
-        .map(|j| Entry::from_json(j.raw().as_bytes()).unwrap())
-        .collect();
     assert!(
-        inherited
+        image
             .iter()
-            .all(|e| !matches!(e.body, Body::Watch { .. } | Body::ToolCall { .. }))
+            .flat_map(|ContextLayer(_, inputs)| inputs)
+            .all(|input| !matches!(input.1, ContextValue::ToolCall(..)))
     );
     let registry = Arc::new(Registry::default());
     let expected = Transcript::of(&entries, registry.clone(), "").into_context();
@@ -213,6 +210,23 @@ fn pending_exchanges_never_become_child_work() {
     );
 }
 
+fn recursive_scope(image: &ContextImage, scope: usize, registry: &Arc<Registry>) -> Transcript {
+    let mut transcript = Transcript::empty(registry.clone(), "");
+    let Some(ContextLayer(runner, inputs)) = image.get(scope) else {
+        return transcript;
+    };
+    transcript.model_only = *runner == RunnerKind::ModelOnly;
+    for ContextInput(seq, value) in inputs {
+        if let ContextValue::Inherited(child) = *value {
+            let messages = recursive_scope(image, child, registry).into_context();
+            transcript.inherit(&messages, *seq);
+        } else {
+            transcript.apply_input(*seq, value.clone(), None);
+        }
+    }
+    transcript
+}
+
 fn recursive_projection(entries: &[Entry], registry: &Arc<Registry>) -> Transcript {
     let mut transcript = Transcript::empty(registry.clone(), "");
     let edits = context_edits(entries);
@@ -230,7 +244,7 @@ fn recursive_projection(entries: &[Entry], registry: &Arc<Registry>) -> Transcri
             None => {
                 if let Body::Spawned { intent } = &e.body {
                     let image = protocol::publication::SpawnImage::from_json(intent).unwrap();
-                    let messages = recursive_projection(&image.entries(), registry).into_context();
+                    let messages = recursive_scope(&image.image, 0, registry).into_context();
                     for message in messages.iter() {
                         transcript.messages.push(message.clone());
                     }
@@ -300,7 +314,12 @@ fn normalized_context_equals_recursive_projection() {
             expected
         );
         let image = context_image(&entries);
-        assert!(image.iter().all(|j| !matches!(Entry::from_json(j.raw().as_bytes()).unwrap().body, Body::Assistant { ref text } if text.is_empty())));
+        assert!(
+            image
+                .iter()
+                .flat_map(|ContextLayer(_, inputs)| inputs)
+                .all(|input| !matches!(&input.1, ContextValue::Assistant(text) if text.is_empty()))
+        );
         let child = entry(
             1,
             Body::Spawned {
@@ -435,4 +454,137 @@ fn tool_entry(seq: u64, id: &str) -> Entry {
             by: protocol::Audience::Model,
         },
     )
+}
+
+#[test]
+fn identical_local_sequences_and_provider_ids_remain_in_their_scopes() {
+    let registry = Arc::new(Registry::default());
+    let reply = llm::Response {
+        message: Assistant {
+            content: vec![llm::AssistantPart::ToolCall(llm::ToolCall {
+                id: "same-id".into(),
+                name: "task".into(),
+                input: Json::null(),
+                invalid: None,
+                provider_executed: false,
+                meta: llm::Meta::new(),
+            })],
+            origin: None,
+        },
+        finish: llm::Finish::new(llm::Reason::ToolCalls, None),
+        usage: llm::Usage::default(),
+        id: None,
+        model: None,
+        meta: llm::Meta::new(),
+    };
+    let exchange = |text: &str| {
+        vec![
+            response_entry(2, &reply),
+            tool_entry(3, "same-id"),
+            entry(
+                4,
+                Body::ToolResult {
+                    call: CallId::new(3).unwrap(),
+                    outcome: Outcome::Done {
+                        output: Json::encode(text).unwrap(),
+                    },
+                    card: None,
+                },
+            ),
+        ]
+    };
+    let mut entries = exchange("ancestor answer");
+    let mut expected = Transcript::of(&entries, registry.clone(), "").into_context();
+    for text in ["child answer", "grandchild answer"] {
+        let mut child = vec![entry(
+            1,
+            Body::Spawned {
+                intent: spawn_image(context_image(&entries)),
+            },
+        )];
+        child.extend(exchange(text));
+        let own = Transcript::of(exchange(text), registry.clone(), "").into_context();
+        expected = expected.iter().chain(own.iter()).cloned().collect();
+        let actual = Transcript::of(&child, registry.clone(), "").into_context();
+        assert_eq!(actual, expected);
+        entries = child;
+    }
+    let image = context_image(&entries);
+    assert_eq!(image.len(), 3);
+    assert_eq!(
+        image
+            .iter()
+            .filter(|layer| layer.1.iter().any(|i| i.0.get() == 3))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn model_only_inputs_keep_their_interpretation_across_agent_scopes() {
+    let turn = ext::ModelTurn::new::<ext::ModelOnly>(
+        ext::ThreadKey::new::<ext_title::Title>(
+            "test",
+            ext::OwnerScope::Call(CallId::new(1).unwrap()),
+        ),
+        ext::TurnKey("turn".into()),
+        ext::ModelRole::Session,
+        ext::SideContext::None,
+        Messages::from_iter([
+            Message::system("side instructions"),
+            Message::user("side input"),
+        ]),
+    );
+    let mut intent =
+        crate::driver::spawn::SpawnIntent::from_json(&crate::tests::spawn_intent(1, "")).unwrap();
+    intent.request.runner = ext::Runner::ModelOnly {
+        role: ext::ModelRole::Session,
+        context: <ext::ModelOnly as ext::ModelOnlyKind>::CONTEXT,
+    };
+    let entries = vec![
+        entry(
+            1,
+            Body::Spawned {
+                intent: intent.into_json().unwrap(),
+            },
+        ),
+        entry(
+            2,
+            Body::Input {
+                text: turn.intent(None).unwrap().raw().into(),
+                mode: Mode::Queue,
+                taken: false,
+                origin: None,
+            },
+        ),
+        entry(
+            3,
+            Body::Take {
+                input: Seq::new(2).unwrap(),
+            },
+        ),
+    ];
+    let registry = Arc::new(Registry::default());
+    let expected = turn.messages;
+    assert_eq!(
+        Transcript::of(&entries, registry.clone(), "").into_context(),
+        expected
+    );
+    let mut image = context_image(&entries);
+    for _ in 0..3 {
+        let child = entry(
+            1,
+            Body::Spawned {
+                intent: spawn_image(image),
+            },
+        );
+        let mut live = Transcript::empty(registry.clone(), "");
+        live.apply(&child, None);
+        assert_eq!(live.into_context(), expected);
+        assert_eq!(
+            Transcript::of([&child], registry.clone(), "").into_context(),
+            expected
+        );
+        image = context_image(std::slice::from_ref(&child));
+    }
 }
