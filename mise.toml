@@ -83,9 +83,11 @@ fi
 "check:windows" = "cargo clippy --workspace --exclude ext-lua --all-targets --target x86_64-pc-windows-msvc -- -D warnings"
 # Miri over sys and rt's executor lifetime boundary. Miri runs no processes and
 # (on macOS) sets no file times, nor modes, so the tests that need those are skipped.
+# Awake calls IOKit on macOS and spawns systemd-inhibit on Linux; neither FFI
+# path is supported by Miri (Linux spawn first needs SOCK_SEQPACKET socketpair).
 "test:miri" = '''
 cargo miri test -p rt --lib threads::tests::task_wak
-MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p sys --lib -- --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version --skip tests::a_group_leader --skip tests::kills --skip fs::tests
+MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p sys --lib -- --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version --skip tests::a_group_leader --skip tests::kills --skip fs::tests --skip awake::tests
 '''
 # Coverage-guided fuzzing (libFuzzer) of protocol and skill frontmatter.
 # Crashes land beside the target in __fuzz__, replayed by ordinary tests;
