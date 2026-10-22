@@ -315,19 +315,6 @@ impl Kept {
     }
 }
 
-/// The conversation's end, for this request only: what `pass` held goes
-/// to `fold`, and the bytes of what then settles join `settled`.
-fn end(
-    mut pass: Prepare,
-    mut settled: Vec<Shared>,
-    fold: &mut dyn Step,
-) -> Result<Vec<Shared>, Error> {
-    let mut bytes = Settled::default();
-    pass.finish(fold, &mut bytes)?;
-    settled.extend(bytes.shared());
-    Ok(settled)
-}
-
 /// Items that settled, as JSON separated by commas: each written once,
 /// from whatever the protocol holds it as, into the buffer the requests
 /// then share.
@@ -367,8 +354,10 @@ pub(crate) fn fold<F: Fold>(
         _ => fold,
     };
     kept.grow(messages, target, &mut state)?;
-    let (pass, settled) = kept.keep(messages, Box::new(state.clone()));
-    let settled = end(pass, settled, &mut state)?;
+    let (mut pass, mut settled) = kept.keep(messages, Box::new(state.clone()));
+    let mut bytes = Settled::default();
+    pass.finish(&mut state, &mut bytes)?;
+    settled.extend(bytes.shared());
     Ok((state, settled))
 }
 
