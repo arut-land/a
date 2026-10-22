@@ -221,59 +221,67 @@ pub(crate) async fn handle(
         _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE, None),
     };
     let outbox = Outbox::new();
-    daemon.shared.rt.spawn(Box::pin(write_out(
+    let writer = write_out(
         Arc::clone(&io),
         outbox.clone(),
         Arc::clone(&daemon.shared.rt),
-    )));
-    // Whatever the client sent behind a hello that is not welcomed is read
-    // and dropped, never acted on.
-    let result = match (verdict, Versions::OURS.common(theirs)) {
-        (Verdict::Welcome, Some(proto)) => {
-            let _registered = life.register(outbox.clone());
-            let mut conn = Conn {
-                daemon,
-                life,
-                outbox: &outbox,
-                // One that does not name itself is one client for as long
-                // as its connection lasts.
-                client: client.unwrap_or_default(),
-                attached: None,
-                decl: ClientDecl::default(),
+    );
+    // A writer must not outlive the connection and its blocking admission.
+    let (result, ()) = rt::zip(
+        async {
+            // Whatever the client sent behind a hello that is not welcomed is read
+            // and dropped, never acted on.
+            let result = match (verdict, Versions::OURS.common(theirs)) {
+                (Verdict::Welcome, Some(proto)) => {
+                    let _registered = life.register(outbox.clone());
+                    let mut conn = Conn {
+                        daemon,
+                        life,
+                        outbox: &outbox,
+                        // One that does not name itself is one client for as long
+                        // as its connection lasts.
+                        client: client.unwrap_or_default(),
+                        attached: None,
+                        decl: ClientDecl::default(),
+                    };
+                    conn.reply(&DaemonMsg::Welcome {
+                        proto,
+                        build: life.build.clone(),
+                        caps,
+                        commands: driver::commands(&daemon.shared.registry.get()),
+                    });
+                    conn.serve(&mut frames).await
+                }
+                (Verdict::Drain, _) => {
+                    life.drain();
+                    daemon.pulse.notify();
+                    reply(&outbox, &DaemonMsg::Draining);
+                    // Held open until we exit: the client's cue to reconnect.
+                    frames.drain().await;
+                    Ok(())
+                }
+                _ => {
+                    ext_logging::emit(ext_logging::Fact::Mismatch {
+                        min: theirs.min,
+                        max: theirs.max,
+                    });
+                    reply(
+                        &outbox,
+                        &DaemonMsg::Mismatch {
+                            supported: PROTO,
+                            min: Versions::OURS.min_field(),
+                        },
+                    );
+                    within(&daemon.shared.rt.reactor(), REFUSED_GRACE, frames.drain()).await;
+                    Ok(())
+                }
             };
-            conn.reply(&DaemonMsg::Welcome {
-                proto,
-                build: life.build.clone(),
-                caps,
-                commands: driver::commands(&daemon.shared.registry.get()),
-            });
-            conn.serve(&mut frames).await
-        }
-        (Verdict::Drain, _) => {
-            life.drain();
-            daemon.pulse.notify();
-            reply(&outbox, &DaemonMsg::Draining);
-            // Held open until we exit: the client's cue to reconnect.
-            frames.drain().await;
-            Ok(())
-        }
-        _ => {
-            ext_logging::emit(ext_logging::Fact::Mismatch {
-                min: theirs.min,
-                max: theirs.max,
-            });
-            reply(
-                &outbox,
-                &DaemonMsg::Mismatch {
-                    supported: PROTO,
-                    min: Versions::OURS.min_field(),
-                },
-            );
-            within(&daemon.shared.rt.reactor(), REFUSED_GRACE, frames.drain()).await;
-            Ok(())
-        }
-    };
-    outbox.close();
+            outbox.close();
+            result
+        },
+        writer,
+    )
+    .await;
     result
 }
 

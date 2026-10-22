@@ -30,6 +30,8 @@ pub use flush::{FlushEpoch, FlushLeader, FlushRequest, Flusher, unblock_flush};
 /// race in the engine and the extensions is one of these.
 pub use futures_lite::future::or;
 pub use futures_lite::future::yield_now;
+/// Polls both futures to completion within their owner's lifetime.
+pub use futures_lite::future::zip;
 pub use io::{Async, Reactor, Source};
 pub use notify::Notify;
 #[cfg(feature = "threads")]

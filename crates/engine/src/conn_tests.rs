@@ -58,18 +58,23 @@ impl Fixture {
     }
 
     /// A client connection, served as the daemon serves one.
-    fn connect(&self) -> Peer {
+    fn connect(&self) -> Peer<'_> {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let (daemon, life) = (Arc::clone(&self.daemon), Arc::clone(&self.life));
         let rt = Arc::clone(&daemon.shared.rt);
+        let finished = ext::Flag::default();
+        let done = finished.clone();
         rt.spawn(Box::pin(async move {
             let _ = handle(&daemon, &life, theirs.into()).await;
+            done.set();
         }));
         ours.set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         Peer {
             reader: BufReader::new(ours.try_clone().unwrap()),
             writer: ours,
+            finished,
+            _owner: &self.daemon,
         }
     }
 }
@@ -92,12 +97,21 @@ impl Drop for Fixture {
     }
 }
 
-struct Peer {
+struct Peer<'a> {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    finished: ext::Flag,
+    _owner: &'a Owner,
 }
 
-impl Peer {
+impl Drop for Peer<'_> {
+    fn drop(&mut self) {
+        let _ = self.writer.shutdown(std::net::Shutdown::Both);
+        rt::block_on(self.finished.wait());
+    }
+}
+
+impl Peer<'_> {
     fn send(&mut self, msg: &ClientMsg) {
         write_frame(&mut self.writer, msg).unwrap();
     }
