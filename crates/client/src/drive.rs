@@ -84,6 +84,8 @@ const MUTATION_SLOTS: usize = crate::session::UNANSWERED + 1;
 struct Outbox {
     state: Mutex<Queued>,
     ready: rt::Notify,
+    stop: rt::Notify,
+    epoch: AtomicU64,
 }
 
 #[derive(Default)]
@@ -114,7 +116,7 @@ impl Request {
 }
 
 impl Outbox {
-    fn send(&self, epoch: &AtomicU64, request: Request) -> Result<(), Error> {
+    fn send(&self, request: Request) -> Result<(), Error> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.closed {
             return Err(Error::Closed);
@@ -158,14 +160,14 @@ impl Outbox {
         }
         if replace {
             state.items.clear();
-            epoch.fetch_add(1, Ordering::AcqRel);
+            self.epoch.fetch_add(1, Ordering::AcqRel);
         } else if coalesced {
             state.items.retain(|(_, _, item)| !item.environment());
         }
         if !matches!(&request, Request::Io(io) if matches!(&**io, Io::Hangup)) {
             state
                 .items
-                .push_back((epoch.load(Ordering::Acquire), bytes, request));
+                .push_back((self.epoch.load(Ordering::Acquire), bytes, request));
         }
         drop(state);
         self.ready.notify();
@@ -200,14 +202,12 @@ impl Outbox {
 struct Handle {
     daemon: Daemon,
     tx: Arc<Outbox>,
-    stop: Arc<rt::Notify>,
-    epoch: Arc<AtomicU64>,
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.stop.notify();
+        self.tx.epoch.fetch_add(1, Ordering::AcqRel);
+        self.tx.stop.notify();
         self.tx.close();
     }
 }
@@ -230,14 +230,9 @@ impl Driver {
 
     pub fn start(self, rt: Rt, daemon: Daemon) -> ClientHandle {
         let rx = Arc::new(Outbox::default());
-        let tx = rx.clone();
-        let stop = Arc::new(rt::Notify::new());
-        let epoch = Arc::new(AtomicU64::new(0));
         let handle = ClientHandle(Arc::new(Handle {
             daemon: daemon.clone(),
-            tx,
-            stop: stop.clone(),
-            epoch: epoch.clone(),
+            tx: rx.clone(),
         }));
         let weak = Arc::downgrade(&handle.0);
         let runtime = rt;
@@ -248,7 +243,7 @@ impl Driver {
                 Some(command) => Some(command),
                 None => rx.recv().await,
             } {
-                if generation != epoch.load(Ordering::Acquire) {
+                if generation != rx.epoch.load(Ordering::Acquire) {
                     continue;
                 }
                 let Request::Io(command) = command else {
@@ -261,11 +256,11 @@ impl Driver {
                 } = *command
                 {
                     let client = attach.client;
-                    let cancelled = || epoch.load(Ordering::Acquire) != generation;
+                    let cancelled = || rx.epoch.load(Ordering::Acquire) != generation;
                     loop {
                         pending = rt::or(
                             async {
-                                stop.until(cancelled).await;
+                                rx.stop.until(cancelled).await;
                                 None
                             },
                             self.connection(
@@ -284,7 +279,11 @@ impl Driver {
                         if !self.watch || cancelled() {
                             break;
                         }
-                        rt::or(stop.until(cancelled), runtime.sleep(Duration::from_secs(1))).await;
+                        rt::or(
+                            rx.stop.until(cancelled),
+                            runtime.sleep(Duration::from_secs(1)),
+                        )
+                        .await;
                         if cancelled() {
                             break;
                         }
@@ -297,11 +296,11 @@ impl Driver {
 
     fn emit(&self, handle: &Weak<Handle>, conn: ConnId, generation: u64, kind: EventKind) -> bool {
         if let Some(handle) = handle.upgrade()
-            && handle.epoch.load(Ordering::Acquire) == generation
+            && handle.tx.epoch.load(Ordering::Acquire) == generation
         {
             let handle = ClientHandle(handle);
             (self.sink)(&handle, Event { conn, kind });
-            return handle.0.epoch.load(Ordering::Acquire) == generation;
+            return handle.0.tx.epoch.load(Ordering::Acquire) == generation;
         }
         false
     }
@@ -527,7 +526,7 @@ impl ClientHandle {
     /// Resolves once preceding, unsuperseded sends reached the transport, or it closed.
     pub async fn flush(&self) -> Result<(), Error> {
         let (done, sent) = rt::oneshot::channel();
-        self.0.tx.send(&self.0.epoch, Request::Flush(done))?;
+        self.0.tx.send(Request::Flush(done))?;
         sent.await.ok_or(Error::Closed)
     }
 
@@ -535,9 +534,9 @@ impl ClientHandle {
     /// takes the latest value; mutations are refused without changing their order.
     pub fn io(&self, io: Io) -> Result<(), Error> {
         let revokes = matches!(io, Io::Hangup | Io::Connect { .. });
-        let result = self.0.tx.send(&self.0.epoch, Request::Io(Box::new(io)));
+        let result = self.0.tx.send(Request::Io(Box::new(io)));
         if revokes {
-            self.0.stop.notify();
+            self.0.tx.stop.notify();
         }
         result
     }
@@ -788,17 +787,13 @@ mod tests {
     #[test]
     fn numbered_mutations_always_fit_the_transport_admission() {
         let queue = Outbox::default();
-        let epoch = AtomicU64::new(0);
         let env = Environment::new(
             ".".into(),
             [("DATA".into(), "x".repeat(10 << 20).into())],
             false,
         );
         queue
-            .send(
-                &epoch,
-                Request::Io(Box::new(Io::Send(ClientMsg::Environment(env)))),
-            )
+            .send(Request::Io(Box::new(Io::Send(ClientMsg::Environment(env)))))
             .unwrap();
         let mut client = crate::SessionClient::new(crate::Env::Keep);
         client.open(Target::New);
@@ -823,7 +818,7 @@ mod tests {
             .unwrap();
         assert!(matches!(&io, Io::Send(msg) if msg.client_seq() == Some(1)));
         assert_eq!(
-            queue.send(&epoch, Request::Io(Box::new(io))),
+            queue.send(Request::Io(Box::new(io))),
             Ok(()),
             "a numbered mutation must not be stranded by a second admission check"
         );
@@ -832,8 +827,7 @@ mod tests {
     #[test]
     fn cancellation_progresses_under_saturation() {
         let outbox = Outbox::default();
-        let epoch = AtomicU64::new(0);
-        let send = |msg| outbox.send(&epoch, Request::Io(Box::new(Io::Send(msg))));
+        let send = |msg| outbox.send(Request::Io(Box::new(Io::Send(msg))));
         for _ in 0..MUTATION_SLOTS - 1 {
             send(ClientMsg::input("input")).unwrap();
         }
@@ -845,25 +839,18 @@ mod tests {
         let outbox = Outbox::default();
         let large = "x".repeat(crate::QueueBudget::default().bytes / 3);
         outbox
-            .send(
-                &epoch,
-                Request::Io(Box::new(Io::Send(ClientMsg::input(large.clone())))),
-            )
+            .send(Request::Io(Box::new(Io::Send(ClientMsg::input(
+                large.clone(),
+            )))))
             .unwrap();
         assert_eq!(
-            outbox.send(
-                &epoch,
-                Request::Io(Box::new(Io::Send(ClientMsg::input(large))))
-            ),
+            outbox.send(Request::Io(Box::new(Io::Send(ClientMsg::input(large))))),
             Err(Error::Busy)
         );
         outbox
-            .send(
-                &epoch,
-                Request::Io(Box::new(Io::Send(ClientMsg::Interrupt {
-                    client_seq: Some(2),
-                }))),
-            )
+            .send(Request::Io(Box::new(Io::Send(ClientMsg::Interrupt {
+                client_seq: Some(2),
+            }))))
             .unwrap();
     }
 
@@ -1013,38 +1000,31 @@ mod tests {
     #[test]
     fn control_backlog_cannot_consume_the_mutation_window() {
         let queue = Outbox::default();
-        let epoch = AtomicU64::new(0);
         for _ in 0..CONTROL_SLOTS {
             queue
-                .send(&epoch, Request::Io(Box::new(Io::Send(ClientMsg::List))))
+                .send(Request::Io(Box::new(Io::Send(ClientMsg::List))))
                 .unwrap();
         }
         assert_eq!(
-            queue.send(&epoch, Request::Io(Box::new(Io::Send(ClientMsg::List)))),
+            queue.send(Request::Io(Box::new(Io::Send(ClientMsg::List)))),
             Err(Error::Busy)
         );
         for seq in 1..MUTATION_SLOTS {
             queue
-                .send(
-                    &epoch,
-                    Request::Io(Box::new(Io::Send(ClientMsg::Input {
-                        text: seq.to_string(),
-                        mode: protocol::Mode::default(),
-                        client_seq: Some(seq as u64),
-                    }))),
-                )
+                .send(Request::Io(Box::new(Io::Send(ClientMsg::Input {
+                    text: seq.to_string(),
+                    mode: protocol::Mode::default(),
+                    client_seq: Some(seq as u64),
+                }))))
                 .unwrap();
         }
         queue
-            .send(
-                &epoch,
-                Request::Io(Box::new(Io::Send(ClientMsg::Interrupt {
-                    client_seq: Some(MUTATION_SLOTS as u64),
-                }))),
-            )
+            .send(Request::Io(Box::new(Io::Send(ClientMsg::Interrupt {
+                client_seq: Some(MUTATION_SLOTS as u64),
+            }))))
             .unwrap();
         assert_eq!(
-            queue.send(&epoch, Request::Io(Box::new(Io::Send(large_input())))),
+            queue.send(Request::Io(Box::new(Io::Send(large_input())))),
             Err(Error::Busy)
         );
         for _ in 0..CONTROL_SLOTS {
@@ -1061,8 +1041,7 @@ mod tests {
     #[test]
     fn rejected_replacements_preserve_queued_work_and_the_connection_epoch() {
         let queue = Outbox::default();
-        let epoch = AtomicU64::new(0);
-        let send = |io| queue.send(&epoch, Request::Io(Box::new(io)));
+        let send = |io| queue.send(Request::Io(Box::new(io)));
         send(Io::Send(ClientMsg::Environment(Environment::new(
             "kept".into(),
             Vec::new(),
@@ -1090,7 +1069,7 @@ mod tests {
             }),
             Err(Error::Busy)
         );
-        assert_eq!(epoch.load(Ordering::Acquire), 0);
+        assert_eq!(queue.epoch.load(Ordering::Acquire), 0);
         let state = queue.state.lock().unwrap();
         assert_eq!(state.items.len(), 2);
         assert!(
@@ -1098,20 +1077,18 @@ mod tests {
         );
         drop(state);
         send(Io::Hangup).unwrap();
-        assert_eq!(epoch.load(Ordering::Acquire), 1);
+        assert_eq!(queue.epoch.load(Ordering::Acquire), 1);
     }
 
     #[test]
     fn environment_replacement_keeps_only_the_latest_value() {
         let queue = Outbox::default();
-        let epoch = AtomicU64::new(0);
         for (dir, result) in [("first", Ok(())), ("latest", Err(Error::Busy))] {
             let environment = Environment::new(dir.into(), Vec::new(), false);
             assert_eq!(
-                queue.send(
-                    &epoch,
-                    Request::Io(Box::new(Io::Send(ClientMsg::Environment(environment))))
-                ),
+                queue.send(Request::Io(Box::new(Io::Send(ClientMsg::Environment(
+                    environment
+                ))))),
                 result
             );
         }
