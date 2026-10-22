@@ -569,24 +569,23 @@ impl SessionClient {
         let Some(update) = update else {
             return;
         };
-        match &update.change {
+        let link_changed = match &update.change {
             Change::Synced => {
                 if let Link::Replaying { welcome, remote } = self.link {
                     self.link = Link::Live { welcome, remote };
                 }
-                out.push(Effect::Show(Show::View(update)));
-                out.push(Effect::Show(Show::Link));
-                return;
+                true
             }
             Change::Draining => {
                 self.link = Link::Draining;
-                out.push(Effect::Show(Show::View(update)));
-                out.push(Effect::Show(Show::Link));
-                return;
+                true
             }
-            _ => {}
-        }
+            _ => false,
+        };
         out.push(Effect::Show(Show::View(update)));
+        if link_changed {
+            out.push(Effect::Show(Show::Link));
+        }
     }
 
     /// Reattaches to the current target, resuming the view only when it
