@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       measure_refs:
-        description: 'JSON array of revisions to measure on Apple silicon'
+        description: 'JSON array of full commit SHAs to measure on Apple silicon'
         type: string
         default: '[]'
 
@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.measure_refs && inputs.measure_refs != '[]' && 'measurements' || 'validation' }}
   cancel-in-progress: true
 
 env:
