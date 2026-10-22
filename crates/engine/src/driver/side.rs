@@ -200,7 +200,7 @@ impl ext::Models for CallPorts {
             let session = &self.session;
             let (sent, answer) = oneshot::channel();
             let origin = self.origin.clone();
-            if !origin.current(&session)
+            if !origin.current(session)
                 && (!side.is_background()
                     || origin.fence != session.fence.load(super::Ordering::SeqCst))
             {
