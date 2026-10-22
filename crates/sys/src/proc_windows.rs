@@ -45,11 +45,6 @@ pub fn adopt_lock(_file: File, _home: &crate::Home) -> Result<File, super::Adopt
 pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::Result<Child> {
     // Windows byte locks belong to processes. The start lock remains held
     // by the client until binding is acknowledged, serializing re-listen.
-    let trace = std::env::var_os("A_TEST_PROCESS_TRACE").is_some();
-    let began = std::time::Instant::now();
-    if trace {
-        eprintln!("daemon spawn begin pid={}", std::process::id());
-    }
     drop(lock);
     cmd.arg("--detached")
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
@@ -77,13 +72,6 @@ pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::R
         None,
         DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
     )?;
-    if trace {
-        eprintln!(
-            "daemon created child={} elapsed={:?}",
-            child.id(),
-            began.elapsed()
-        );
-    }
     drop(writer);
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let reader = std::thread::spawn(move || {
@@ -98,13 +86,6 @@ pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::R
             )
         })
         .and_then(std::convert::identity);
-    if trace {
-        eprintln!(
-            "daemon readiness child={} elapsed={:?} result={ready:?}",
-            child.id(),
-            began.elapsed()
-        );
-    }
     if let Err(error) = ready {
         let _ = child.kill();
         let _ = child.wait();

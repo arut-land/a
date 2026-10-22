@@ -16,7 +16,7 @@ pub fn deadline() -> Instant {
 
 pub fn isolated_root(name: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    // Durable staging must not contend with the runner's system-disk flushes.
+    // CI scratch storage avoids slow durable writes in the OS temp directory.
     let base = std::env::var_os("RUNNER_TEMP").map_or_else(std::env::temp_dir, PathBuf::from);
     let root = base.join(format!(
         "a-acc-{name}-{}-{}",
@@ -250,9 +250,6 @@ impl Isolated {
         let output = TestProcess::spawn(&mut self.command(args))
             .collect(deadline())
             .unwrap();
-        if std::env::var_os("A_TEST_PROCESS_TRACE").is_some() {
-            eprintln!("{args:?}: {}", String::from_utf8_lossy(&output.stderr));
-        }
         assert!(
             output.status.success(),
             "{args:?}: {}",
@@ -291,7 +288,14 @@ impl Isolated {
 
 impl Drop for Isolated {
     fn drop(&mut self) {
-        let _ = TestProcess::spawn(&mut self.command(&["daemon", "stop"])).collect(deadline());
+        if let Err(error) =
+            TestProcess::spawn(&mut self.command(&["daemon", "stop"])).collect(deadline())
+        {
+            eprintln!(
+                "stopping isolated daemon at {}: {error}",
+                self.home.root().display()
+            );
+        }
         self.home.endpoint().remove();
         remove_home(self.home.root());
     }

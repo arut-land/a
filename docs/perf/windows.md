@@ -140,3 +140,42 @@ main's two; nested children use two, as on main. The first-log barrier is
 unchanged. Store opening establishes its anchor once instead of repeating
 ancestor-wide barriers for each session. These are local measurements, not
 Windows performance results.
+
+## Acceptance collection investigation
+
+[Run 39802542241, attempt 1](https://github.com/arut-land/a/actions/runs/39802542241/job/119907653995)
+failed four cold-start acceptance cases at their 30-second collection limit;
+nextest cancelled the other six. The collector recorded neither child status
+nor pipe state, so that log cannot identify the original blocking operation.
+
+On 2026-10-22, temporary startup instrumentation in native Windows CI isolated
+the observed long waits to executable staging. A 16,611,328-byte image took
+about 70 ms to hash and copy, followed by an eight-second `File::sync_all()`
+wait before any daemon was spawned. Defender real-time protection was disabled
+on that runner. Daemon creation, acknowledgement and hello remained below a
+second. See the [staging trace](https://github.com/arut-land/a/actions/runs/39825686721/job/119988247032).
+
+A [paired run](https://github.com/arut-land/a/actions/runs/39828170409/job/119996915133)
+with four CPU workers alternated three flush samples per location on the same
+runner. OS temp was `C:\Users\runneradmin\AppData\Local\Temp`; runner scratch
+was `D:\a\_temp`. Flushing the same 16,594,432-byte image measured:
+
+| Location | Minimum | Median | Maximum |
+| --- | ---: | ---: | ---: |
+| OS temp | 34.95 ms | 44.85 ms | 46.50 ms |
+| Runner scratch | 6.09 ms | 6.22 ms | 6.39 ms |
+
+Acceptance homes now prefer `RUNNER_TEMP`, retaining unique directories and
+ordinary OS temp outside CI. The placement invariant runs in a subprocess with
+an explicitly supplied scratch directory; it fails with the old selection.
+Collection still has a 30-second limit and reports PID, command, working
+directory, exit status, both EOF states and output tails. A gated reader tests
+the distinction between an exited child and an open output stream.
+
+Ten repetitions after relocation passed all 110 acceptance cases under CPU
+load. A padded 64 MiB executable completed within 30 seconds in both locations
+(1.50 s in OS temp, 0.60 s in scratch). These experiments establish staging
+flush latency as an observed bottleneck, but did not reproduce the historical
+collection timeout or prove its exact cause. No production process handling or
+durability guarantee was changed. Temporary instrumentation and load probes
+were removed after measurement.

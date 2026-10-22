@@ -180,8 +180,6 @@ jobs:
       # Cranelift does not support it on Windows.
       CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
       NEXTEST_PROFILE: windows
-      A_TEST_PROCESS_TRACE: 1
-      NEXTEST_SUCCESS_OUTPUT: immediate
     defaults:
       run:
         shell: bash
@@ -198,79 +196,7 @@ jobs:
       - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
       - run: mise exec -- cargo build -p a
       - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
-      - shell: pwsh
-        run: |
-          $workers = 1..4 | ForEach-Object {
-            Start-Process pwsh -NoNewWindow -PassThru -ArgumentList '-NoProfile', '-Command', 'while($true){}'
-          }
-          $acceptanceExit = 0
-          try {
-            $image = [IO.File]::ReadAllBytes((Resolve-Path 'target/debug/a.exe'))
-            $systemTemp = [IO.Path]::GetTempPath()
-            Write-Host "OS temp=$systemTemp runner scratch=$env:RUNNER_TEMP image bytes=$($image.Length)"
-            foreach ($round in 1..3) {
-              $locations = @($systemTemp, $env:RUNNER_TEMP)
-              if ($round % 2 -eq 0) { [array]::Reverse($locations) }
-              foreach ($location in $locations) {
-                $path = Join-Path $location ('a-flush-probe-' + [guid]::NewGuid())
-                $file = [IO.File]::Open($path, [IO.FileMode]::CreateNew)
-                try {
-                  $file.Write($image, 0, $image.Length)
-                  $clock = [Diagnostics.Stopwatch]::StartNew()
-                  $file.Flush($true)
-                  Write-Host "flush round=$round base=$location elapsed=$($clock.Elapsed.TotalMilliseconds) ms"
-                } finally {
-                  $file.Dispose()
-                  Remove-Item $path
-                }
-              }
-            }
-            $padded = Join-Path $env:RUNNER_TEMP ('a-padded-' + [guid]::NewGuid() + '.exe')
-            [IO.File]::WriteAllBytes($padded, $image)
-            $padding = [IO.File]::OpenWrite($padded)
-            $padding.SetLength(64 * 1024 * 1024)
-            $padding.Dispose()
-            $previousHome = $env:A_HOME
-            try {
-              foreach ($location in @($systemTemp, $env:RUNNER_TEMP)) {
-                $probeHome = Join-Path $location ('a-collection-probe-' + [guid]::NewGuid())
-                New-Item -ItemType Directory $probeHome | Out-Null
-                $env:A_HOME = $probeHome
-                try {
-                  $stdout = Join-Path $probeHome 'stdout'
-                  $stderr = Join-Path $probeHome 'stderr'
-                  $clock = [Diagnostics.Stopwatch]::StartNew()
-                  $process = Start-Process $padded -ArgumentList 'ls' -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-                  $completed = $process.WaitForExit(30000)
-                  if (-not $completed) { $process.Kill() }
-                  $process.WaitForExit()
-                  Write-Host "collection probe pid=$($process.Id) home=$probeHome completedWithin30s=$completed elapsed=$($clock.Elapsed.TotalMilliseconds) ms"
-                  Get-Content $stderr
-                } finally {
-                  if (Test-Path (Join-Path $probeHome 'run/daemon.pid')) {
-                    & ./target/debug/a.exe daemon stop
-                  }
-                  Remove-Item $probeHome -Recurse -Force
-                }
-              }
-            } finally {
-              $env:A_HOME = $previousHome
-              Remove-Item $padded
-            }
-            foreach ($attempt in 1..10) {
-              Write-Host "Windows acceptance pass $attempt under CPU load"
-              & mise run acceptance
-              if ($LASTEXITCODE -ne 0) {
-                $acceptanceExit = $LASTEXITCODE
-                break
-              }
-            }
-          } finally {
-            foreach ($worker in $workers) {
-              if (-not $worker.HasExited) { $worker.Kill(); $worker.WaitForExit() }
-            }
-          }
-          exit $acceptanceExit
+      - run: mise run acceptance
 
   # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
   # reducer vectors and a live session through it in Swift, then the app
