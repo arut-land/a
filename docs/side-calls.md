@@ -52,9 +52,9 @@ registry, including registrations excluded from the child.
 `ModelOnlyKind::CONTEXT` declares a recent-exchange window and an assembled
 message-byte ceiling in source. Admission freezes it with the runner;
 configuration cannot select it. Title keeps two recent exchanges and at most
-8192 serialized message bytes, including owner context. System and current
-instructions from the admitted kind and current turn always survive; oversized
-mandatory instructions fail with `InvalidRequest` before provider execution.
+8192 serialized message bytes, including owner context. The admitted kind's
+system prompt and the current input always survive. Oversized mandatory
+instructions fail with `InvalidRequest` before provider execution.
 Systems belonging to older exchanges expire with those exchanges. History ends
 before the admitted input; keyed and plain inputs are explicit current
 instructions. Optional context is removed in whole exchanges. Request

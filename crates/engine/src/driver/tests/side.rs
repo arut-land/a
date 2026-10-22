@@ -1984,7 +1984,7 @@ fn request_bounds_keep_pairs_whole_and_the_current_instruction_last() {
         };
         assert_eq!(messages.last(), current.last());
         assert!(Json::encode(&messages).unwrap().raw().len() <= bytes as usize);
-        let contains = |message: llm::Message| messages.iter().any(|m| *m == message);
+        let contains = |message: llm::Message| messages.contains(&message);
         for (user, assistant) in [
             ("older user", "older assistant"),
             ("recent user", "recent assistant"),

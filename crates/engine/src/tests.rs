@@ -433,8 +433,7 @@ pub(crate) fn spawn_intent(call: u64, prompt: &str) -> Json {
                 role: ext::ModelRole::Session,
             },
             ext::DepthBudget::new(7),
-        )
-        .into(),
+        ),
         model: "none".into(),
         routing: Err("no model".into()),
         installed: extensions(&ext_policy::Policy::default())

@@ -192,15 +192,16 @@ were used.
 | F01 before lifecycle review | 3996 KiB |
 | First ownership, recovery and retention review | 3948 KiB |
 | Positive recovery evidence, owner authority and bounded requests | 3964 KiB |
+| Mandatory current instructions and shared lifecycle/codec/reply paths | 3948 KiB |
 
-The latest review adds 16 KiB and leaves 132 KiB under the 4096 KiB cap.
-It retains 32 KiB of the original size reduction; the earlier goal of giving
-back half the 81 KiB growth is now missed by 9 KiB after the additional
-recovery, authority and bounded-context requirements. Message decoding
-shares byte-based field readers. SDK turn, runner and role codecs live in
-their owning crate. Request assembly and message serialization live together
-in `llm`; context policies have a compact tuple codec. Thread envelopes use
-tuples and committed replies share the actor's delivery path.
+The final review removes 16 KiB, recovering 48 KiB of the original 81 KiB
+growth and leaving 148 KiB under the 4096 KiB cap. Message decoding shares
+byte-based field readers. SDK turn, runner and role codecs live in their
+owning crate. Spawn admission and recovery share one SDK spec codec rather
+than copying fields into an engine authority type. Request assembly and
+message serialization live together in `llm`; context policies use tuples.
+Preparation, dispatch and committed reply delivery share their existing
+lifecycle paths, and invocation metadata no longer duplicates result payloads.
 
 Thread ids use the existing UUID crate's namespace derivation (`v5`, with
 its maintained `sha1_smol` backend), so an owner and thread key determine the
@@ -210,18 +211,23 @@ unnecessary. The executing address is derived from the caller's session,
 never read from a copied record.
 
 The 1000-regeneration probe requires constant request length and serialized
-bytes after warmup, at most eight messages and 8192 bytes. Durable child
+bytes after warmup, at most ten messages and 8192 bytes. Durable child
 history still contains 2002 own instruction/reply messages, no owner input
-copies, and less than 2 MB of log data. System and current instructions
-survive request trimming; mandatory instructions above the ceiling fail
-before a provider call.
+copies, and less than 2 MB of log data. Historical system instructions expire
+with their exchanges. The admitted kind's system prompt and the explicit
+current input survive request trimming; mandatory instructions above the
+ceiling fail with `InvalidRequest` before a provider call.
 
-Production Rust grows by 201 lines in this re-review, or 905 over main,
-excluding test files and trailing inline test modules. This exceeds the
-original 500-line estimate by 405: the earlier work added 704 lines, and
-this review adds typed interruption evidence (+34 kernel), owner-authority
-projection (+34 engine), source-owned policy declarations and turn admission
-(+47 SDK/title), and bounded assembly with its compact codec (+86 LLM).
+Production Rust shrinks by 138 lines in the final review, leaving 767 over
+main, excluding test files and trailing inline test modules. The original
+500-line estimate is still exceeded by 267: the initial implementation added
+517 lines, the first lifecycle review added 187, and the authority/bounds
+review added 201 before these 138 deletions. The retained work implements
+owner-derived identity, typed recovery evidence, admitted owner projection,
+request bounds and shared durable conversation delivery. The simplification
+cuts remove separate prepare/send wrappers, the duplicate `SpawnAuthority`,
+three result lookup/wait paths, invocation result payloads and the selector's
+separate owner/history branches and historical-system scans.
 
 Files outside the original F01 manifest:
 
@@ -238,7 +244,7 @@ Files outside the original F01 manifest:
 | `crates/engine/src/transcript.rs` | Retain only thread exchanges and project per-turn owner context separately. |
 | `crates/ext/src/host.rs` | Expose explicit runner classification at the existing binding seam. |
 | `crates/ext-subagent/src/lib.rs` | Select agent runners through the shared SDK runner type. |
-| `crates/llm/src/conversation.rs` | Decode persisted rich messages through their owning codec. |
+| `crates/llm/src/conversation.rs` | Decode persisted rich messages and assemble bounded exchange windows in their owning crate. |
 | `crates/llm/src/spec/read.rs` | Share message and response field readers. |
 | `crates/llm/src/spec/read/tests.rs` | Verify every message role and opaque provider state survives decoding. |
 | `crates/protocol/src/publication.rs` | Encode frozen authority and compact thread envelopes without copied child ids. |
