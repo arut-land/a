@@ -15,6 +15,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  # Each job installs its own tools; task execution must not install the rest.
+  MISE_AUTO_INSTALL: false
 
 jobs:
   check:
@@ -44,6 +47,8 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
       - &mise
         uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington cargo:cargo-nextest ${{ runner.os == 'Linux' && 'mold' || '' }}
       # The no-polling acceptance test traces the client's syscalls.
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends strace
@@ -113,14 +118,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - *mise
+      - <<: *mise
+        with:
+          install_args: rust mr-boxington cargo:cargo-deny
       - run: mise run deny
 
   machete:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - *mise
+      - <<: *mise
+        with:
+          install_args: cargo:cargo-machete
       - run: mise run machete
 
   # Nothing `a` builds depends on tokio.
@@ -128,7 +137,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - *mise
+      - <<: *mise
+        with:
+          install_args: rust mr-boxington
       - run: mise run check:no-tokio
 
   # Coverage-guided fuzzing of the framer, the JSON decoders and the view
@@ -139,7 +150,9 @@ jobs:
       - uses: actions/checkout@v7
       - *mbx-dir
       - *cache
-      - *mise
+      - <<: *mise
+        with:
+          install_args: rust mr-boxington mold cargo:cargo-bolero
       - run: mise run fuzz --time 30s
       - if: failure()
         uses: actions/upload-artifact@v5
@@ -153,7 +166,9 @@ jobs:
       - uses: actions/checkout@v7
       - *mbx-dir
       - *cache
-      - *mise
+      - <<: *mise
+        with:
+          install_args: rust mr-boxington mold
       - run: mise run test:miri
 
   windows:
@@ -168,7 +183,9 @@ jobs:
       - uses: actions/checkout@v7
       - *mbx-dir
       - *cache
-      - *mise
+      - <<: *mise
+        with:
+          install_args: rust mr-boxington cargo:cargo-nextest
       - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
       - run: mise exec -- cargo build -p a
       - run: mise exec -- cargo nextest run --workspace --no-tests=fail
@@ -183,6 +200,8 @@ jobs:
       - uses: actions/checkout@v7
       - *mbx-dir
       - *cache
-      - *mise
+      - <<: *mise
+        with:
+          install_args: rust mr-boxington github:boltffi/boltffi aqua:yonaskolb/XcodeGen
       - run: mise run apple:test
       - run: mise run apple:build
