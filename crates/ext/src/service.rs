@@ -289,11 +289,7 @@ impl std::fmt::Display for ModelRole {
 
 impl serde::Serialize for ModelRole {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Session => s.serialize_str("session"),
-            Self::Fast => s.serialize_str("fast"),
-            Self::Named(name) => s.collect_str(&format_args!("named:{name}")),
-        }
+        s.collect_str(self)
     }
 }
 impl ModelRole {
