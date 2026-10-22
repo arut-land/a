@@ -70,6 +70,7 @@ machete = "cargo machete"
 # of the tokio-rs org are fine): not the workspace's, nor `a` as built by
 # default, web UI included.
 "check:no-tokio" = '''
+mkdir -p target
 cargo tree -e normal --target all --workspace --prefix none -f '{p}' > target/no-tokio.txt
 if grep -E '^tokio v' target/no-tokio.txt; then
   echo "a crate depends on tokio: cargo tree -i tokio shows which"
