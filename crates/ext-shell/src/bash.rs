@@ -470,29 +470,19 @@ impl Run {
     /// there. The shell's exit ends any state but its own; a stop starts
     /// only while it runs.
     fn step(self, now: Instant, seen: Seen) -> (Self, Option<Signal>) {
+        let exited = |status, why| {
+            (
+                Self::Exited {
+                    status,
+                    why,
+                    at: now,
+                },
+                None,
+            )
+        };
         match (self, seen.exited) {
-            (Self::Running { .. }, Some(status)) => {
-                let why = None;
-                (
-                    Self::Exited {
-                        status,
-                        why,
-                        at: now,
-                    },
-                    None,
-                )
-            }
-            (Self::Stopping { why, .. }, Some(status)) => {
-                let why = Some(why);
-                (
-                    Self::Exited {
-                        status,
-                        why,
-                        at: now,
-                    },
-                    None,
-                )
-            }
+            (Self::Running { .. }, Some(status)) => exited(status, None),
+            (Self::Stopping { why, .. }, Some(status)) => exited(status, Some(why)),
             (Self::Running { deadline }, None) => {
                 let why = if seen.cancelled {
                     Stop::Aborted
