@@ -177,6 +177,11 @@ Ten repetitions after relocation passed all 110 acceptance cases under CPU
 load. A padded 64 MiB executable completed within 30 seconds in both locations
 (1.50 s in OS temp, 0.60 s in scratch). These experiments establish staging
 flush latency as an observed bottleneck, but did not reproduce the historical
-collection timeout or prove its exact cause. No production process handling or
+collection timeout or prove its exact cause. A subsequent
+[I/O-load probe](https://github.com/arut-land/a/actions/runs/39835135359/job/120021347205)
+kept four workers overwriting and flushing separate 64 MiB files in OS temp.
+Four cold clients per location still collected within the limit: the OS-temp
+wave took 4.05 s and the scratch wave 1.48 s. This also failed to reproduce the
+historical timeout. No production process handling or
 durability guarantee was changed. Temporary instrumentation and load probes
 were removed after measurement.

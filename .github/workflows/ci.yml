@@ -1,115 +1,214 @@
 name: CI
+
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
+
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
+  CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
+  # Each job installs its own tools; task execution must not install the rest.
   MISE_AUTO_INSTALL: false
-  CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
-  A_TEST_PROCESS_TRACE: 1
+
 jobs:
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 15
-    defaults:
-      run:
-        shell: bash
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Apple silicon and x86_64 Linux.
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
-      - run: echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
-      - uses: actions/cache@v6
+      # mbx (the cargo wrapper in mise.toml) keeps compiled crates in its own
+      # store; caching that store and the toolchain is what makes reruns fast.
+      - &mbx-dir
+        shell: bash
+        run: echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
+      - &cache
+        uses: actions/cache@v6
         with:
           path: |
             ~/.rustup/toolchains
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/mbx/actions
-          key: cargo-${{ runner.os }}-windows-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}
-          restore-keys: cargo-${{ runner.os }}-windows-
+          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
+      - &mise
+        uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington cargo:cargo-nextest ${{ runner.os == 'Linux' && 'mold' || '' }}
+      # The no-polling acceptance test traces the client's syscalls.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev strace
+      # fmt, clippy -D warnings, then every test: unit, llm parity, and the
+      # black-box M1 acceptance tests in apps/cli/tests/blackbox (budgets run
+      # with CI slack). Live-model tests stay #[ignore]d; there are no secrets.
+      - run: mise run check
+      # The Windows build, cross-linted: no platform cfg above `sys`/`rt`.
+      - if: runner.os == 'Linux'
+        run: mise run check:windows
+
+  budgets:
+    name: budgets (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            strict: 0
+          # Latency is held to the design's budgets on one lane.
+          - os: ubuntu-latest
+            strict: 1
+    runs-on: ${{ matrix.os }}
+    env:
+      A_STRICT_BUDGETS: ${{ matrix.strict }}
+    steps:
+      - uses: actions/checkout@v7
+      - *mbx-dir
+      - *cache
+      - *mise
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
+      # Idle daemon RSS (10 MiB) and the size cap (4 MiB) are held exactly;
+      # cold start and attach latency too where strict, else with slack.
+      - run: mise run budgets
+      # The shipped binary's size as a number to compare: this run's against
+      # the last one on main, warned about past 16 KiB (the cap stays the
+      # gate). Apple silicon is the reference lane; the other skips the
+      # second release link.
+      - if: runner.os == 'macOS'
+        run: mise run size | grep -o 'a:.*KiB' | tee size.txt
+      - if: runner.os == 'macOS'
+        uses: actions/cache/restore@v6
+        with:
+          path: main-size.txt
+          key: size-main-${{ github.sha }}
+          restore-keys: size-main-
+      - if: runner.os == 'macOS'
+        run: |
+          now=$(grep -o '[0-9]* KiB' size.txt | head -1 | cut -d' ' -f1)
+          if [[ -f main-size.txt ]]; then
+            was=$(grep -o '[0-9]* KiB' main-size.txt | head -1 | cut -d' ' -f1)
+            echo "a: $now KiB; main: $was KiB; delta: $((now - was)) KiB" | tee -a "$GITHUB_STEP_SUMMARY"
+            ((now - was <= 16)) || echo "::warning::a grew $((now - was)) KiB over main ($was -> $now KiB)"
+          fi
+          cp size.txt main-size.txt
+      - if: runner.os == 'macOS' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: main-size.txt
+          key: size-main-${{ github.sha }}
+      - if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v5
+        with:
+          name: size
+          path: size.txt
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington cargo:cargo-deny
+      - run: mise run deny
+
+  machete:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington cargo:cargo-machete
+      - run: mise run machete
+
+  # Nothing `a` builds depends on tokio.
+  no-tokio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
       - uses: jdx/mise-action@v5
         with:
           install_args: rust mr-boxington
+      - run: mise run check:no-tokio
+
+  # Coverage-guided fuzzing of the framer, the JSON decoders and the view
+  # reducer, briefly: a regression gate, not a campaign.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - *mbx-dir
+      - *cache
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington mold cargo:cargo-bolero
+      - run: mise run fuzz --time 30s
+      - if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: fuzz-crashes
+          path: crates/protocol/tests/__fuzz__/*/crashes
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - *mbx-dir
+      - *cache
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington mold
+      - run: mise run test:miri
+
+  windows:
+    runs-on: windows-latest
+    env:
+      # Session panic isolation and the test harness require unwinding;
+      # Cranelift does not support it on Windows.
+      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+      NEXTEST_PROFILE: windows
+    defaults:
+      run:
+        shell: bash
+    # Native completion, security, job containment, and daemon acceptance.
+    steps:
+      # Recorded wire/provider fixtures must keep their checked-in bytes.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - *mbx-dir
+      - *cache
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington cargo:cargo-nextest
+      - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
       - run: mise exec -- cargo build -p a
-      - shell: pwsh
-        run: |
-          $systemTemp = [IO.Path]::GetTempPath()
-          Write-Host "OS temp=$systemTemp scratch=$env:RUNNER_TEMP"
-          $exe = (Resolve-Path 'target/debug/a.exe').Path
-          & $exe --version
-          $workerScript = Join-Path $env:RUNNER_TEMP 'a-io-worker.ps1'
-          @'
-          param([string]$loadPath)
-          $bytes = New-Object byte[] (64 * 1024 * 1024)
-          [Random]::new(1).NextBytes($bytes)
-          $file = [IO.File]::Open($loadPath, [IO.FileMode]::CreateNew)
-          try {
-            while ($true) {
-              $file.Position = 0
-              $file.Write($bytes, 0, $bytes.Length)
-              $file.Flush($true)
-            }
-          } finally { $file.Dispose() }
-          '@ | Set-Content $workerScript
-          $workers = @()
-          $probes = @()
-          $previousHome = $env:A_HOME
-          try {
-            foreach ($worker in 1..4) {
-              $loadPath = Join-Path $systemTemp ('a-io-load-' + [guid]::NewGuid())
-              $process = Start-Process pwsh -NoNewWindow -PassThru -ArgumentList '-NoProfile', '-File', $workerScript, $loadPath
-              $workers += @{ Process = $process; Path = $loadPath }
-            }
-            $ready = [Diagnostics.Stopwatch]::StartNew()
-            while (@($workers | Where-Object { -not (Test-Path $_.Path) -or (Get-Item $_.Path).Length -lt 67108864 }).Count -gt 0) {
-              if ($ready.Elapsed.TotalSeconds -gt 30) { throw 'I/O workers never became ready' }
-              Start-Sleep -Milliseconds 20
-            }
-            foreach ($location in @($systemTemp, $env:RUNNER_TEMP)) {
-              $wave = @()
-              foreach ($client in 1..4) {
-                $probeRoot = Join-Path $location ('a-io-probe-' + [guid]::NewGuid())
-                New-Item -ItemType Directory $probeRoot | Out-Null
-                $env:A_HOME = $probeRoot
-                $errorFile = Join-Path $probeRoot 'stderr'
-                $process = Start-Process $exe -ArgumentList 'ls' -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $probeRoot 'stdout') -RedirectStandardError $errorFile
-                $probe = @{ Process = $process; Home = $probeRoot; ErrorFile = $errorFile }
-                $wave += $probe
-                $probes += $probe
-              }
-              $clock = [Diagnostics.Stopwatch]::StartNew()
-              foreach ($probe in $wave) {
-                $remaining = [Math]::Max(0, 30000 - [int]$clock.Elapsed.TotalMilliseconds)
-                $completed = $probe.Process.WaitForExit($remaining)
-                Write-Host "collection pid=$($probe.Process.Id) home=$($probe.Home) completedWithin30s=$completed elapsed=$($clock.Elapsed.TotalMilliseconds) ms"
-                if (-not $completed) { $probe.Process.Kill() }
-                if ($probe.Process.WaitForExit(1000)) { $probe.Process.WaitForExit() }
-                Get-Content $probe.ErrorFile
-              }
-            }
-          } finally {
-            foreach ($worker in $workers) {
-              if (-not $worker.Process.HasExited) { $worker.Process.Kill() }
-            }
-            foreach ($worker in $workers) {
-              $worker.Process.WaitForExit()
-              Remove-Item $worker.Path -Force -ErrorAction Continue
-            }
-            foreach ($probe in $probes) {
-              if (-not $probe.Process.HasExited) { $probe.Process.Kill() }
-              $probe.Process.WaitForExit()
-              $env:A_HOME = $probe.Home
-              if (Test-Path (Join-Path $probe.Home 'run/daemon.pid')) { & $exe daemon stop }
-              $cleanup = [Diagnostics.Stopwatch]::StartNew()
-              while (Test-Path $probe.Home) {
-                try { Remove-Item $probe.Home -Recurse -Force -ErrorAction Stop }
-                catch {
-                  if ($cleanup.Elapsed.TotalSeconds -gt 30) { throw }
-                  Start-Sleep -Milliseconds 20
-                }
-              }
-            }
-            $env:A_HOME = $previousHome
-            Remove-Item $workerScript
-          }
+      - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
+      - run: mise run acceptance
+
+  # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
+  # reducer vectors and a live session through it in Swift, then the app
+  # built headless with xcodebuild.
+  apple:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - *mbx-dir
+      - *cache
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington github:boltffi/boltffi aqua:yonaskolb/XcodeGen
+      - run: mise run apple:test
+      - run: mise run apple:build
