@@ -77,6 +77,28 @@ maintaining a local TLS implementation or carrying an unused certificate bundle.
 A hermetic transport test observes an actual TLS ClientHello without requiring
 network access or provider credentials.
 
+### Idle glibc arenas
+
+On the same Ubuntu VM, the default allocator left 8 MiB of anonymous huge
+pages across four mostly empty arenas before a session was opened. With a
+terminal attached the daemon reached 16676 KiB RSS. Direct foreground daemon
+comparisons measured 6412 KiB with one arena and 8432 KiB with two, versus
+14596 KiB with the default policy. Shared OpenSSL mappings were not the
+large private allocation.
+
+`sys::small_footprint` applies glibc's `mallopt(M_ARENA_MAX, 2)` at CLI startup,
+before workers exist. It preserves two allocation arenas and per-thread caches
+without adding an allocator dependency or scaling the idle floor with worker
+count. Other platforms keep their allocator; an external tool's allocator is
+initialized normally on exec.
+
+The resulting native arm64 fixtures build is 3509 KiB. `mise run budgets`
+passes with strict latency: cold reply median 2.44 ms, 21-entry replay attach
+p99 288 microseconds, idle daemon 8700 KiB RSS, no client CPU in the three-second
+idle window, and the first-paint and quiet-command wake gates unchanged.
+These runtime numbers are native arm64 VM measurements; the x86_64 number
+above is a cross-linked binary size, not an emulated latency result.
+
 ## Deferred: adopt when the trigger fires
 
 | Idea | Trigger | Expected effect | Evidence |

@@ -20,6 +20,7 @@ pub mod fs;
 pub mod install;
 pub mod log;
 mod login;
+mod memory;
 mod platform;
 mod proc;
 mod runtime;
@@ -40,6 +41,7 @@ pub use desktop::open_browser;
 pub use endpoint::{Endpoint, Listener, Stream};
 pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
+pub use memory::small_footprint;
 pub use platform::{Arch, Os, Platform};
 pub use proc::{
     AdoptLockError, Child, ContainedChild, DaemonLock, ExitWatch, GroupId, InheritedNumber,

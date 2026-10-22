@@ -40,6 +40,7 @@ use sys::Home;
 use crate::args::{Args, Cmd, Daemon};
 
 fn main() -> ExitCode {
+    sys::small_footprint();
     // Help, the version, completion requests and usage errors (status 2)
     // end the process here.
     let args = Args::parse();
