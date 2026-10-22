@@ -22,7 +22,10 @@ route. Repeating that key reuses the committed result, even after restart
 or derived-index eviction. Concurrent consumers share admission and result.
 A different key explicitly authorizes a new response in the same thread.
 
-A thread has a normal conversation id and nested storage under its owner.
+A thread has a conversation id derived from its current session owner and
+thread key. Copied audit history carries no executable child id; a fork
+starts its own thread with fresh exchanges. UUID namespace derivation uses
+the existing UUID dependency rather than a second identity mechanism.
 Its frozen spawn authority uses the same registration intersection,
 settings, source-generation restoration, model role, routing and depth
 allowance as an agent child. No configuration selects runner semantics.
@@ -36,10 +39,10 @@ admitted registry and settings. Thread admission freezes the concrete route;
 later settings or generation changes cannot widen it.
 
 `SideContext::None` supplies only the extension messages. `BeforeOwner`
-freezes the effective parent transcript strictly before the owning call.
-The selected transcript and extension messages stay separate in the turn
-payload, retaining rich messages and opaque provider state. Each new turn
-appends those messages after the thread's previous exchanges. Its inbox
+records the owner sequence strictly before the owning call. Execution
+projects that immutable owner prefix once as a per-turn input, retaining
+rich messages and opaque provider state. Only extension instructions and
+replies enter thread history; owner prefixes never accumulate there. Its inbox
 input is enqueued, deduplicated and taken durably before influencing a
 request. Concurrent new turns are processed in order, without merging or
 steering the active turn. Live and recovered context use the same reducer.
@@ -56,7 +59,10 @@ Admission commits before any provider is polled. Child model attempts and
 retry decisions also cross durable barriers. A consumer is released only
 after the parent result commits; failed commits cannot acknowledge success.
 Open parent requests and ambiguous child attempts recover as interrupted,
-including crashes during backoff. Recovery never repeats ambiguous spend.
+including crashes during backoff. For every owned conversation, recovery
+terminally resolves inbox inputs whose sending request was interrupted.
+Durable inbox outcomes preserve dedup identities even before a provider
+attempt exists. Recovery never repeats ambiguous spend.
 An extension may continue the thread under an explicit new key.
 
 `SideRetry` owns retry classification and backoff. Known failures may retry

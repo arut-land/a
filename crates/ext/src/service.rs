@@ -255,6 +255,10 @@ pub struct ModelTurn {
 }
 
 impl ModelTurn {
+    pub fn from_intent(text: &str) -> serde_json::Result<(Self, Option<protocol::Seq>)> {
+        serde_json::from_slice(text.as_bytes())
+    }
+
     pub fn identity(&self) -> SideIdentity {
         SideIdentity {
             thread: self.thread.clone(),
@@ -262,8 +266,8 @@ impl ModelTurn {
         }
     }
 
-    pub fn intent(&self, transcript: &llm::Messages) -> Result<llm::Json, String> {
-        llm::Json::encode(&(self, transcript)).map_err(|e| e.to_string())
+    pub fn intent(&self, prefix: Option<protocol::Seq>) -> Result<llm::Json, String> {
+        llm::Json::encode(&(self, prefix)).map_err(|e| e.to_string())
     }
 
     pub const fn is_while_waiting(&self) -> bool {
@@ -459,7 +463,7 @@ mod tests {
         session.thread.owner_scope = OwnerScope::Session;
         assert_ne!(session.identity(), identity);
         let intent = protocol::publication::ThreadImage {
-            turn: session.intent(&llm::Messages::default()).unwrap(),
+            turn: session.intent(None).unwrap(),
             authority: llm::Json::null(),
         }
         .to_json()

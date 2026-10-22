@@ -1560,3 +1560,77 @@ fn recovered_side_inbox_never_spends_an_abandoned_turn() {
         "a turn already interrupted by parent recovery spent on child reload"
     );
 }
+struct TitleLengths(Arc<Mutex<Vec<usize>>>);
+impl ext::SideProvider for TitleLengths {
+    fn reply<'a>(
+        &'a self,
+        turn: &'a ext::ModelTurn,
+        messages: &'a llm::Messages,
+    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        lock(&self.0).push(messages.len());
+        ext::SideProvider::reply(&ext_fixtures::Fixtures, turn, messages)
+    }
+}
+impl Extension for TitleLengths {
+    const NAME: &'static str = "title-lengths";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn ext::SideProvider>(Arc::new(Self(Arc::clone(&self.0))));
+    }
+}
+
+#[test]
+fn title_regeneration_keeps_owner_context_out_of_thread_history() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let lengths = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::default()
+        .with(&ext_title::Title)
+        .unwrap()
+        .with(&TitleLengths(Arc::clone(&lengths)))
+        .unwrap();
+    let fixture = fixture(registry, &http);
+    let session = fixture.start(&[]);
+    session.submit("source task").unwrap();
+    until(&session, "initial title", |log| {
+        SessionView::from_log(session.id, "/w".into(), log)
+            .side("title")
+            .is_some()
+    });
+    settle(&session);
+    for _ in 0..1000 {
+        session.submit("/title").unwrap();
+        settle(&session);
+    }
+    let child = fixture
+        .2
+        .loaded()
+        .into_iter()
+        .find(|live| live.parent.is_some_and(|p| p.session == session.id))
+        .unwrap();
+    let entries = log_of(&child);
+    let messages = Transcript::of(&entries, Arc::new(Registry::default()), "").into_messages();
+    let copies = messages
+        .iter()
+        .filter(|message| {
+            matches!(message,
+        llm::Message::User(user) if user.content.iter().any(|part| matches!(part,
+            llm::UserPart::Text(text) if text.text == "source task")))
+        })
+        .count();
+    let lengths = lock(&lengths);
+    eprintln!(
+        "title requests={} first_messages={} last_messages={} source_copies={} child_entries={} child_json_bytes={}",
+        lengths.len(),
+        lengths[0],
+        lengths.last().unwrap(),
+        copies,
+        entries.len(),
+        Json::encode(&entries).unwrap().raw().len()
+    );
+    session.halt();
+    assert_eq!(lengths.len(), 1001);
+    assert_eq!(copies, 0);
+    assert_eq!(messages.len(), 2002);
+    assert!(*lengths.last().unwrap() < 3100);
+    assert!(Json::encode(&entries).unwrap().raw().len() < 2_000_000);
+}

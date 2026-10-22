@@ -159,7 +159,7 @@ mod tests {
                 purpose: Some(side.thread.purpose.clone()),
                 request: Some(
                     protocol::publication::ThreadImage {
-                        turn: side.intent(&llm::Messages::default()).unwrap(),
+                        turn: side.intent(None).unwrap(),
                         authority: Json::null(),
                     }
                     .to_json()

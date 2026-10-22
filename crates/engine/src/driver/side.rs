@@ -145,11 +145,11 @@ impl Actor {
             reply.send(Opened::Closed);
             return None;
         }
-        let conversation = match side.context {
-            ext::SideContext::BeforeOwner => self.conversation(of).await.ok()?,
-            ext::SideContext::None => llm::Messages::default(),
+        let prefix = match side.context {
+            ext::SideContext::BeforeOwner => Some(of.0),
+            ext::SideContext::None => None,
         };
-        let turn = side.intent(&conversation).ok()?;
+        let turn = side.intent(prefix).ok()?;
         let identity = side.identity();
         let thread = if let Some(first) = self.journal.index.thread(&identity.thread) {
             let Body::ModelCall {
@@ -450,8 +450,8 @@ impl super::Daemon {
             if let Some(refusal) = authority.refusal {
                 return Err(std::io::Error::other(format!("{refusal:?}")));
             }
-            let (turn, _): (ext::ModelTurn, llm::Messages) =
-                image.turn.parse().map_err(std::io::Error::other)?;
+            let (turn, _) =
+                ext::ModelTurn::from_intent(image.turn.raw()).map_err(std::io::Error::other)?;
             let key = turn.identity();
             let id = protocol::EnvelopeId {
                 sender: owner.id,
@@ -543,7 +543,7 @@ impl Actor {
                 Body::Input { text, .. } => text.as_str(),
                 _ => return Err("model-only turn has no admitted input".into()),
             };
-            let turn = serde_json::from_str::<(ext::ModelTurn, llm::Messages)>(text).map_or_else(
+            let (turn, prefix) = ext::ModelTurn::from_intent(text).map_or_else(
                 |_| {
                     let spawn = lock(&self.live.session.spawn);
                     let spawn = spawn.as_ref().expect("model-only authority");
@@ -559,11 +559,37 @@ impl Actor {
                         llm::Messages::default(),
                     );
                     turn.budget = spawn.request.budget;
-                    turn
+                    (turn, None)
                 },
-                |(turn, _)| turn,
+                |decoded| decoded,
             );
-            let messages = self.conversation(call).await.map_err(|e| e.to_string())?;
+            let mut messages = self.conversation(call).await.map_err(|e| e.to_string())?;
+            if let Some(seq) = prefix {
+                let parent = self.live.parent.ok_or("model-only context has no owner")?;
+                let store = Arc::clone(&self.live.session.shared.store);
+                let registry = Arc::clone(&self.registry);
+                let context = rt::unblock(&*self.live.session.shared.rt, move || {
+                    let entries = store.prefix(parent.session, seq.get() - 1)?;
+                    Ok::<_, std::io::Error>(
+                        crate::transcript::Transcript::of(
+                            &entries,
+                            Arc::clone(&registry),
+                            registry.system_prompt(),
+                        )
+                        .into_messages(),
+                    )
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+                let history = messages.len().saturating_sub(turn.messages.len());
+                messages = messages
+                    .iter()
+                    .take(history)
+                    .chain(context.iter())
+                    .chain(turn.messages.iter())
+                    .cloned()
+                    .collect();
+            }
             let model = self
                 .live
                 .session

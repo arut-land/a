@@ -133,10 +133,8 @@ impl Transcript {
             }
             Some(ContextFact::Taken(input)) => match self.waiting.remove(&input) {
                 Some(text) if self.model_only => {
-                    if let Ok((turn, prefix)) =
-                        serde_json::from_str::<(ext::ModelTurn, Messages)>(&text)
-                    {
-                        for message in prefix.iter().chain(turn.messages.iter()) {
+                    if let Ok((turn, _)) = ext::ModelTurn::from_intent(&text) {
+                        for message in turn.messages.iter() {
                             self.messages.push(message.clone());
                         }
                         self.last = e.seq.get();
