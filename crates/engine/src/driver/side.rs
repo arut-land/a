@@ -530,9 +530,7 @@ impl Actor {
             let parent = self.live.parent.ok_or("model-only context has no owner")?;
             let shared = Arc::clone(&self.live.session.shared);
             rt::unblock(&*self.live.session.shared.rt, move || {
-                shared
-                    .owner_image(parent.session, seq.get() - 1)
-                    .map(super::projection::OwnerImage::project)
+                shared.owner_image(parent.session, seq.get() - 1)
             })
             .await
             .map_err(|e| e.to_string())?
