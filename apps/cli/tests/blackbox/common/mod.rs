@@ -73,7 +73,7 @@ struct Group {
 /// The watchdog: `$1` is the group, `$2` the `a` to stop daemons with,
 /// `$3` the homes.
 const WATCHDOG: &str = r#"read -r _
-kill -KILL -- "-$1"
+kill -KILL "-$1"
 while read -r home; do A_HOME="$home" "$2" daemon stop >/dev/null 2>&1; done < "$3"
 "#;
 
