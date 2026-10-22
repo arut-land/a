@@ -243,7 +243,7 @@ impl TestingLive {
         self.0.halt();
         self.1.wait("owned admissions drained", PATIENCE, || {
             self.1.slots().iter().all(|slot| {
-                !slot.header.parent.is_some_and(|p| p.session == self.0.id)
+                slot.header.parent.is_none_or(|p| p.session != self.0.id)
                     || !matches!(*lock(&slot.residency), crate::Residency::Loading { .. })
             })
         });

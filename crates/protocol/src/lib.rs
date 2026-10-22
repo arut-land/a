@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 21;
+pub const PROTO: u32 = 22;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 21;
+pub const PROTO_MIN: u32 = 22;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -79,7 +79,7 @@ pub mod view;
 
 pub use json::Json;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(pub Uuid);
 
@@ -480,6 +480,38 @@ kinds! {
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionFact {
     Annotation(Annotation),
+    Call(Box<CallFact>),
+}
+
+/// Execution identity stays qualified when history is copied into another log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AttemptId {
+    pub executing_session: SessionId,
+    pub call: CallId,
+    pub attempt: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Charge {
+    pub currency: String,
+    pub nanos: u64,
+}
+
+/// Start and completion share an identity; an absent completion is unknown work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallFact {
+    pub id: AttemptId,
+    pub model: String,
+    pub role: Json,
+    pub runner: String,
+    pub agent: String,
+    pub side: bool,
+    pub unix_ms: u64,
+    pub clock_epoch: SessionId,
+    pub start_ns: u64,
+    pub elapsed_ns: Option<u64>,
+    pub usage: Option<Json>,
+    pub charge: Option<Charge>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

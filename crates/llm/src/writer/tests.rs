@@ -776,3 +776,21 @@ fn field_merges_include_the_destination_container_in_the_depth_limit() {
     );
     assert_eq!(w.core.get(0).unwrap().item, json!({}));
 }
+
+#[test]
+fn failed_finish_preserves_observed_usage() {
+    let usage = Usage {
+        input: Some(42),
+        output: None,
+        ..Usage::default()
+    };
+    let (_, response) = run(
+        Writer::new("test"),
+        End {
+            usage,
+            ..End::default()
+        },
+        |_| Ok(()),
+    );
+    assert_eq!(response.unwrap_err().usage.as_deref(), Some(&usage));
+}

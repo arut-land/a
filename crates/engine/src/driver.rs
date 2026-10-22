@@ -1623,23 +1623,19 @@ impl Actor {
                         }
                     }
                     if let Some(done) = done {
-                        let entry = more
-                            .appends
-                            .iter()
-                            .rev()
-                            .find(|entry| {
-                                matches!(
-                                    entry.body,
-                                    Body::Ext { .. }
-                                        | Body::Context {
-                                            publication: Some(_),
-                                            ..
-                                        }
-                                )
-                            })
-                            .cloned();
+                        let entry = more.appends.iter().rev().find(|entry| {
+                            matches!(
+                                entry.body,
+                                Body::Ext { .. }
+                                    | Body::Fact { .. }
+                                    | Body::Context {
+                                        publication: Some(_),
+                                        ..
+                                    }
+                            )
+                        });
                         if let Some(entry) = entry {
-                            acknowledgements.push((entry, done));
+                            acknowledgements.push((entry.clone(), done));
                         } else {
                             done.send(Err(ext::MutationError::Rejected(
                                 "kernel rejected mutation".into(),
@@ -2333,7 +2329,17 @@ impl Actor {
                 InFlight::Prepared(prepared) => match *prepared {
                     Ok((model, request, attempt)) => {
                         let mut deltas = |text: &str| live.delta(call, attempt, text, fence);
-                        contain(Box::pin(reply(&model, &request, &cancel, &mut deltas))).await
+                        let cx = live.session.cx(origin.clone(), &registry);
+                        let resolved = model.origin(&request);
+                        let name = format!("{}:{}", resolved.provider, resolved.model);
+                        let Ok(fact) = live.session.begin_attempt(&cx, call, attempt, &name).await
+                        else {
+                            return;
+                        };
+                        let result =
+                            contain(Box::pin(reply(&model, &request, &cancel, &mut deltas))).await;
+                        live.session.end_attempt(&cx, fact, &result.0).await;
+                        result
                     }
                     Err(error) => (
                         Replied::Failed(llm::Error::new(llm::Kind::InvalidRequest, error)),
@@ -2504,6 +2510,7 @@ impl Session {
                 SessionServices::default()
                     .with::<dyn ext::Layers>(Arc::new(SessionLayers(session.clone())))
                     .with::<dyn rt::Runtime>(Arc::clone(&shared.rt))
+                    .with::<dyn ext::Logs>(Arc::new(services::SessionLogs(Arc::clone(shared))))
                     .with::<dyn transport::HttpClients>(Arc::clone(
                         shared.http_clients.get_or_init(|| {
                             Arc::new(transport::Clients::new(Arc::clone(&shared.rt)))

@@ -323,3 +323,43 @@ fn an_interrupted_retry_keeps_only_its_own_text() {
         "{output:?}"
     );
 }
+
+#[test]
+fn every_provider_retry_has_one_durable_start_and_completion() {
+    let http = Flaky::new([Reply::Status(429, &[]), Reply::Events(text_reply())]);
+    let session = fixture(quick().with(&ext_metrics::Metrics).unwrap(), &http).start(&[]);
+    session.submit("hi").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    let facts: Vec<_> = log
+        .iter()
+        .filter_map(|entry| match &entry.body {
+            Body::Fact {
+                fact: protocol::ExtensionFact::Call(fact),
+            } => Some(fact),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(http.sent(), 2);
+    assert_eq!(facts.len(), 4);
+    for (attempt, pair) in facts.as_chunks::<2>().0.iter().enumerate() {
+        assert_eq!(pair[0].id, pair[1].id);
+        assert_eq!(usize::from(pair[0].id.attempt), attempt);
+        assert_eq!(pair[0].id.executing_session, session.id);
+        assert!(pair[0].elapsed_ns.is_none());
+        assert!(pair[1].elapsed_ns.is_some());
+        assert!(!pair[0].side);
+    }
+    assert!(facts[1].usage.is_none());
+    assert!(
+        facts[3]
+            .usage
+            .as_ref()
+            .unwrap()
+            .parse::<llm::Usage>()
+            .unwrap()
+            .input
+            .is_some()
+    );
+}

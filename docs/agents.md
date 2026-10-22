@@ -1,14 +1,15 @@
 # Conversations and agents
 
 This document specifies the conversation primitives for composable agents.
-The metrics projection remains follow-up work.
+Metrics are derived from qualified provider-attempt facts.
 
 Implementation status: typed awaited and detached spawning, immutable prefix
 images, inherited registrations, nested storage, durable inbox transport and
 depth enforcement are implemented. `ext-subagent` supplies `task`, `fork_task`
 and `background_task`. Persistent model-only side threads power title, compact
-and judge. Named channels, questions and metrics remain follow-up compositions. The current inbox access policy permits parent
-and child edges; `InboxAccess` is the extension seam for other policies.
+and judge. Named channels and questions remain follow-up compositions. The
+current inbox access policy permits parent and child edges; `InboxAccess` is
+the extension seam for other policies.
 
 A conversation owns an ordered log, an inbox and a
 runner. Main sessions, child agents and side threads differ in their runner
@@ -225,24 +226,38 @@ each command uses its owning call as a new turn key in the same thread.
 Compaction and judge likewise continue session-scoped threads with one key
 per owning call. See [side-calls.md](side-calls.md) for the full contract.
 
-## Metrics (follow-up)
+## Metrics
 
-Fold immutable call intents, attempt decisions and results by conversation id
-and call id. Record resolved model, role, runner kind and start/end times with
-the call facts; use monotonic elapsed durations supplied by the driver, with
-wall-clock timestamps only for correlation. Sum measured provider usage per
-attempt, and mark missing usage unknown rather than zero. Cost uses an
-explicit price-table version or recorded provider charge, so repricing is a
-separate query. Retries count as separate attempts; cached replay counts no
-new work. Main versus side is a runner classification on the intent and result,
-not inferred from which entries survive context editing.
+`ext-metrics` registers the SDK's `CallFacts` recording service for all daemon
+conversations and folds generic call facts by `AttemptId { executing_session,
+call, attempt }`. The driver commits a start before polling each provider
+attempt and a completion before reporting its result. Facts freeze the resolved
+model, role, runner, agent, side classification, wall-clock correlation and
+monotonic clock epoch. An interrupted or crashed attempt without completion
+retains unknown usage and duration. Failed finishes retain observed provider
+usage. No elapsed duration is reconstructed by subtracting clocks across a
+restart.
 
-Own totals sum only calls executed in that conversation. Subtree totals walk
-ownership edges and count each descendant once; fork provenance adds no
-ownership edge and copied history adds no spend. Report critical-path elapsed
-time separately from summed call time, since children can overlap. No mutable
-usage or cost counters are stored. Snapshots may cache a fold with its covered
-sequence and price-table identity.
+`/metrics` queries the current ownership subtree; its optional JSON argument
+selects `subtree`, `agent`, `side`, `call` and `prices`. A price table supplies
+`version`, `currency` and `models`: model names map to ten signed nanocurrency
+rates in
+`llm::Count::ALL` order. Input/output counts include their subsets, so cache
+rates are adjustments to the inclusive input rate. Every nonzero coefficient
+requires an observed count. No built-in price is assumed. A recorded charge
+in the selected currency takes precedence. Missing rates, counts or duration
+increase `UsageTotal.missing`; `known` is only the observed portion.
+
+Own totals include only attempts executed in that conversation. Subtree
+queries follow immutable ownership edges once; copied fork facts and cached
+replies add no spend. Filters select agent and side/main dimensions without
+changing the facts. Critical elapsed time is the envelope of measured intervals
+within each clock epoch, separately from summed call durations. Multiple epochs
+and unfinished intervals report incomplete coverage; wall clocks never fill
+the gaps. Disposable in-memory folds track covered sequences per conversation;
+query caches also include the complete versioned price table and selection.
+Repricing changes no execution fact. No durable accumulator is maintained;
+query replies are ordinary tool outcomes and are never counted as execution.
 
 ## Layer boundaries and future modes
 

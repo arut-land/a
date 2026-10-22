@@ -298,3 +298,178 @@ impl Session {
             .is_some_and(|i| matches!(i.request.runner, ext::Runner::ModelOnly { .. }))
     }
 }
+
+pub(super) struct SessionLogs(pub Arc<super::Shared>);
+
+impl ext::Logs for SessionLogs {
+    fn read(
+        &self,
+        root: SessionId,
+        descendants: bool,
+    ) -> BoxFuture<'_, Result<Vec<ext::LogPrefix>, String>> {
+        let shared = Arc::clone(&self.0);
+        Box::pin(async move {
+            rt::unblock(&*self.0.rt, move || {
+                let records = shared.catalog.records();
+                let mut ids = std::collections::BTreeSet::from([root]);
+                if descendants {
+                    loop {
+                        let before = ids.len();
+                        for record in &records {
+                            if record
+                                .header
+                                .parent
+                                .is_some_and(|p| ids.contains(&p.session))
+                            {
+                                ids.insert(record.header.id);
+                            }
+                        }
+                        if ids.len() == before {
+                            break;
+                        }
+                    }
+                }
+                ids.into_iter()
+                    .map(|session| {
+                        let record = records
+                            .iter()
+                            .find(|r| r.header.id == session)
+                            .ok_or("missing conversation")?;
+                        Ok(ext::LogPrefix {
+                            session,
+                            parent: record.header.parent.map(|p| p.session),
+                            entries: shared
+                                .store
+                                .prefix(session, record.entries)
+                                .map_err(|e| e.to_string())?,
+                        })
+                    })
+                    .collect()
+            })
+            .await
+        })
+    }
+}
+
+impl Session {
+    pub(super) async fn begin_attempt(
+        &self,
+        cx: &Cx,
+        call: CallId,
+        attempt: u16,
+        model: &str,
+    ) -> Result<Option<protocol::CallFact>, ext::MutationError> {
+        if self
+            .shared
+            .registry
+            .get()
+            .service::<ext::CallFacts>()
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let (epoch, start) = attempt_clock();
+        let (role, runner, agent, side) = {
+            let spawn = lock(&self.spawn);
+            spawn.as_ref().map_or_else(
+                || {
+                    (
+                        ext::ModelRole::Session,
+                        "agent",
+                        self.shared
+                            .models
+                            .settings
+                            .agent(&self.workspace)
+                            .unwrap_or_else(|| ext::LOOP.into()),
+                        false,
+                    )
+                },
+                |s| {
+                    (
+                        s.request.runner.role().clone(),
+                        if s.request.runner.agent().is_none() {
+                            "model_only"
+                        } else {
+                            "agent"
+                        },
+                        s.request.runner.agent().unwrap_or("model_only").into(),
+                        s.request.runner.agent().is_none(),
+                    )
+                },
+            )
+        };
+        let fact = protocol::CallFact {
+            id: protocol::AttemptId {
+                executing_session: self.id,
+                call,
+                attempt,
+            },
+            model: model.into(),
+            role: Json::encode(&role).map_err(|e| ext::MutationError::Encoding(e.to_string()))?,
+            runner: runner.into(),
+            agent,
+            side,
+            unix_ms: u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+            clock_epoch: *epoch,
+            start_ns: u64::try_from(
+                self.shared
+                    .rt
+                    .now()
+                    .saturating_duration_since(*start)
+                    .as_nanos(),
+            )
+            .unwrap_or(u64::MAX),
+            elapsed_ns: None,
+            usage: None,
+            charge: None,
+        };
+        cx.fact(protocol::ExtensionFact::Call(Box::new(fact.clone())))
+            .await?;
+        Ok(Some(fact))
+    }
+
+    pub(super) async fn end_attempt(
+        &self,
+        cx: &Cx,
+        fact: Option<protocol::CallFact>,
+        result: &super::Replied,
+    ) {
+        let Some(mut fact) = fact else {
+            return;
+        };
+        // Only durations measured in this invocation can complete its start fact.
+        let (_, start) = attempt_clock();
+        fact.elapsed_ns = u64::try_from(
+            self.shared
+                .rt
+                .now()
+                .saturating_duration_since(*start)
+                .as_nanos(),
+        )
+        .ok()
+        .and_then(|end| end.checked_sub(fact.start_ns));
+        match result {
+            super::Replied::Done(output) => {
+                fact.usage = llm::Response::from_json(output.raw())
+                    .ok()
+                    .and_then(|r| Json::encode(&r.usage).ok());
+            }
+            super::Replied::Failed(error) => {
+                fact.usage = error.usage.as_deref().and_then(|u| Json::encode(u).ok());
+            }
+            super::Replied::Interrupted(_) => {}
+        }
+        let _ = cx.fact(protocol::ExtensionFact::Call(Box::new(fact))).await;
+    }
+}
+
+fn attempt_clock() -> &'static (SessionId, std::time::Instant) {
+    static CLOCK: std::sync::OnceLock<(SessionId, std::time::Instant)> = std::sync::OnceLock::new();
+    CLOCK.get_or_init(|| (SessionId::new(), std::time::Instant::now()))
+}

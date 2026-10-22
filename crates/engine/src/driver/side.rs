@@ -310,6 +310,12 @@ pub(super) async fn run_side(
     request.tool_choice = llm::ToolChoice::None;
     let mut attempt = 0u16;
     loop {
+        let name = model
+            .as_ref()
+            .map_or_else(|_| cx.model.to_string(), Model::name);
+        let Ok(fact) = session.begin_attempt(cx, id, attempt, &name).await else {
+            return Replied::Interrupted(None);
+        };
         let mut quiet = |_: &str| {};
         let result = contain(async {
             match (provider, &model) {
@@ -320,6 +326,7 @@ pub(super) async fn run_side(
         })
         .await
         .0;
+        session.end_attempt(cx, fact, &result).await;
         let after = match &result {
             Replied::Failed(error) => cx.service::<dyn ext::SideRetry>().and_then(|retry| {
                 retry

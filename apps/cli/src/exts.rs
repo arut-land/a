@@ -67,7 +67,7 @@ fn linked(config: &Config) -> Result<Registry, Refused> {
     let built = built.with(Tier::Post, &configured::<ext_retry::Retry>(config)?)?;
     #[cfg(feature = "title")]
     let built = built.with(Tier::Post, &configured::<ext_title::Title>(config)?)?;
-    let mut built = built;
+    let mut built = built.with(Tier::Post, &ext_metrics::Metrics)?;
     if config.agent.as_deref() == Some(ext_fixtures::ECHO)
         && let Some(fixtures) = ext_fixtures::extension()
     {
@@ -233,7 +233,8 @@ mod tests {
                 ("settings", 1),
                 ("subagent", 1),
                 ("retry", 1),
-                ("title", 3)
+                ("title", 3),
+                ("metrics", 1)
             ]
         );
         assert_eq!(

@@ -109,6 +109,24 @@ pub fn child_result(outcome: &Outcome) -> String {
     text
 }
 
+/// Committed log prefixes and immutable ownership, without acquiring writer leases.
+pub trait Logs: Send + Sync {
+    fn read(
+        &self,
+        root: protocol::SessionId,
+        descendants: bool,
+    ) -> BoxFuture<'_, Result<Vec<LogPrefix>, String>>;
+}
+
+pub struct LogPrefix {
+    pub session: protocol::SessionId,
+    pub parent: Option<protocol::SessionId>,
+    pub entries: Vec<protocol::Entry>,
+}
+
+/// Registering this service requests durable generic provider-attempt facts.
+pub struct CallFacts;
+
 #[cfg(test)]
 mod tests {
     use super::*;

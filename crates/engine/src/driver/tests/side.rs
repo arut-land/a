@@ -525,6 +525,7 @@ fn retry_policy_applies_to_side_calls_without_reentering_compaction() {
             base: Duration::ZERO,
             ..ext_retry::Retry::default()
         })
+        .and_then(|r| r.with(&ext_metrics::Metrics))
         .unwrap();
     let session = probes(&http, registry).start(&[]);
     session.submit("1").unwrap();
@@ -555,6 +556,23 @@ fn retry_policy_applies_to_side_calls_without_reentering_compaction() {
     );
     assert_eq!(sides(&log).len(), 1);
     let executed = log_of(&executor);
+    let attempts: Vec<_> = executed
+        .iter()
+        .filter_map(|entry| match &entry.body {
+            Body::Fact {
+                fact: protocol::ExtensionFact::Call(fact),
+            } => Some(fact),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempts.len(), 4);
+    assert!(
+        attempts
+            .iter()
+            .all(|f| f.side && f.id.executing_session == executor.id)
+    );
+    assert_eq!(attempts[0].id.attempt, 0);
+    assert_eq!(attempts[2].id.attempt, 1);
     let failure = executed
         .iter()
         .find_map(|e| match &e.body {
@@ -2039,4 +2057,47 @@ fn model_only_kind_system_instructions_are_mandatory() {
             );
         }
     }
+}
+
+#[test]
+fn metrics_queries_read_owned_attempts_from_committed_prefixes() {
+    let http = Flaky::new([Reply::Status(429, &[]), Reply::Events(text_reply())]);
+    let registry = Registry::default()
+        .with(&ext_retry::Retry {
+            base: Duration::ZERO,
+            ..ext_retry::Retry::default()
+        })
+        .and_then(|r| r.with(&ext_metrics::Metrics))
+        .unwrap();
+    let session = probes(&http, registry).start(&[]);
+    session.submit("1").unwrap();
+    settle(&session);
+    session.halt();
+    let executor = session
+        .1
+        .loaded()
+        .into_iter()
+        .find(|live| live.parent.is_some_and(|p| p.session == session.id))
+        .unwrap();
+    let prefixes = rt::block_on(ext::Logs::read(
+        &services::SessionLogs(Arc::clone(&executor.session.shared)),
+        session.id,
+        true,
+    ))
+    .unwrap();
+    let mut projection = ext_metrics::Projection::default();
+    for prefix in &prefixes {
+        projection.fold(prefix);
+    }
+    let prices = ext_metrics::Prices {
+        version: "unpriced".into(),
+        currency: "USD".into(),
+        models: BTreeMap::new(),
+    };
+    assert_eq!(projection.own(session.id, &prices).attempts, 0);
+    let total = projection.subtree(session.id, &prices);
+    assert_eq!(total.attempts, 2);
+    assert_eq!(total.usage[0].missing, 1);
+    assert!(total.usage[0].known > 0);
+    assert_eq!(total.call_ns.missing, 0);
 }

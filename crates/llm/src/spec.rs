@@ -723,35 +723,6 @@ impl Usage {
     }
 }
 
-/// Usage across calls: each count sums what the calls reported, and stays
-/// `None` only when none did.
-impl std::ops::Add for Usage {
-    type Output = Self;
-
-    fn add(mut self, mut other: Self) -> Self {
-        for count in Count::ALL {
-            let (a, b) = (*self.count(count), *other.count(count));
-            *self.count(count) = match (a, b) {
-                (None, None) => None,
-                (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
-            };
-        }
-        self
-    }
-}
-
-impl std::ops::AddAssign for Usage {
-    fn add_assign(&mut self, other: Self) {
-        *self = *self + other;
-    }
-}
-
-impl std::iter::Sum for Usage {
-    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-        iter.fold(Self::default(), |sum, usage| sum + usage)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {

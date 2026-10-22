@@ -15,6 +15,7 @@ dependencies = [
  "ext-fork",
  "ext-lua",
  "ext-mcp",
+ "ext-metrics",
  "ext-policy",
  "ext-prompt",
  "ext-retry",
@@ -480,6 +481,7 @@ dependencies = [
  "ext-fixtures",
  "ext-fork",
  "ext-logging",
+ "ext-metrics",
  "ext-policy",
  "ext-prompt",
  "ext-retry",
@@ -642,6 +644,17 @@ dependencies = [
  "sha2",
  "sys",
  "transport",
+]
+
+[[package]]
+name = "ext-metrics"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "llm",
+ "protocol",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

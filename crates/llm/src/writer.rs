@@ -1291,7 +1291,11 @@ impl<S: Default> Writer<S> {
     /// fails, as does one that ends with a call left open short of the
     /// output limit.
     pub fn end(&mut self, end: End) -> Result<Flow, Error> {
-        self.core.end(end)
+        let usage = end.usage;
+        self.core.end(end).map_err(|mut error| {
+            error.usage = Some(Box::new(usage));
+            error
+        })
     }
 
     /// The text the open item at `index` streamed so far, set as its item's

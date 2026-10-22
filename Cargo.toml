@@ -19,6 +19,7 @@ ext-edit = { path = "crates/ext-edit" }
 ext-fork = { path = "crates/ext-fork" }
 ext-fixtures = { path = "crates/ext-fixtures" }
 ext-logging = { path = "crates/ext-logging" }
+ext-metrics = { path = "crates/ext-metrics" }
 ext-mcp = { path = "crates/ext-mcp" }
 ext-lua = { path = "crates/ext-lua" }
 ext-policy = { path = "crates/ext-policy" }

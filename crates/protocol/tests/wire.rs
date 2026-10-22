@@ -307,6 +307,35 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
             ),
         ),
         sample(
+            "entry_call_fact",
+            entry(
+                11,
+                Body::Fact {
+                    fact: protocol::ExtensionFact::Call(Box::new(protocol::CallFact {
+                        id: protocol::AttemptId {
+                            executing_session: SESSION,
+                            call: call(8),
+                            attempt: 1,
+                        },
+                        model: "openai:m".into(),
+                        role: protocol::Json::encode(&"session").unwrap(),
+                        runner: "agent".into(),
+                        agent: "loop".into(),
+                        side: false,
+                        unix_ms: 1000,
+                        clock_epoch: SESSION,
+                        start_ns: 10,
+                        elapsed_ns: Some(20),
+                        usage: Some(protocol::Json::encode(&json!({"input": 10})).unwrap()),
+                        charge: Some(protocol::Charge {
+                            currency: "USD".into(),
+                            nanos: 100,
+                        }),
+                    })),
+                },
+            ),
+        ),
+        sample(
             "entry_annotation",
             entry(
                 11,

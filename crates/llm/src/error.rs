@@ -46,6 +46,8 @@ pub struct Error {
     /// The provider's error body, bounded.
     pub body: Option<String>,
     pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Box<crate::Usage>>,
 }
 
 /// Error bodies and frames quoted in messages are cut to this many bytes.
@@ -64,6 +66,7 @@ impl Error {
             retry_after: None,
             body: None,
             request_id: None,
+            usage: None,
         }
     }
 

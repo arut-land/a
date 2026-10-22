@@ -9,6 +9,7 @@ rt.workspace = true
 client.workspace = true
 engine.workspace = true
 ext.workspace = true
+ext-metrics.workspace = true
 # The extensions: see `exts`. Each is a feature, every one on but the
 # fixtures, which are empty unless turned on.
 ext-compact = { workspace = true, optional = true }
