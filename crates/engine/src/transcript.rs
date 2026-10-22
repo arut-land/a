@@ -280,7 +280,7 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
     let edits = context_edits(entries.iter().copied());
     let completed: std::collections::HashSet<_> = entries
         .iter()
-        .filter(|_| inherited)
+        .take(if inherited { entries.len() } else { 0 })
         .filter_map(|e| match &e.body {
             Body::ToolResult { call, .. } => Some(call.0),
             Body::Take { input } => Some(*input),
