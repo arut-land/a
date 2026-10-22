@@ -3,6 +3,47 @@ use super::{Actor, Arc, BoxFuture, CallPorts, ContextRequest, Live, Msg, Ticket,
 use protocol::{Envelope, InboxRefusal};
 
 impl Actor {
+    pub(super) async fn envelope_reply(
+        &mut self,
+        id: protocol::EnvelopeId,
+        reply: oneshot::Sender<super::Opened>,
+    ) {
+        if self.indexed().await.is_err() {
+            return;
+        }
+        let Some(input) = self.journal.index.enqueued(&id) else {
+            return;
+        };
+        if let Some(seq) = self.journal.index.result(input, self.journal.durable_seq) {
+            let cached = match self.indexed_entry(seq).await {
+                Ok(protocol::Entry {
+                    body:
+                        protocol::Body::ModelResult {
+                            outcome, failure, ..
+                        },
+                    ..
+                }) => Some(super::Opened::Cached { outcome, failure }),
+                Ok(protocol::Entry {
+                    body: protocol::Body::Interrupt { .. },
+                    ..
+                }) => Some(super::Opened::Cached {
+                    outcome: protocol::Outcome::Interrupted { output: None },
+                    failure: None,
+                }),
+                _ => None,
+            };
+            if let Some(cached) = cached {
+                reply.send(cached);
+                return;
+            }
+        }
+        self.replies
+            .invoked
+            .entry(input)
+            .or_default()
+            .push(super::Waiter::Model(reply));
+    }
+
     pub(super) fn delivery_ticket(
         &mut self,
         reply: oneshot::Sender<Result<(), InboxRefusal>>,
@@ -54,6 +95,27 @@ impl Actor {
 }
 
 impl Live {
+    pub(crate) async fn exchange(
+        &self,
+        envelope: Envelope,
+        cancel: &ext::Cancel,
+    ) -> std::io::Result<(protocol::Outcome, Option<protocol::Json>)> {
+        let id = envelope.id.clone();
+        self.enqueue(envelope)
+            .await
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        let (reply, result) = oneshot::channel();
+        self.send(Msg::AwaitEnvelope { id, reply });
+        if let Some(Some(super::Opened::Cached { outcome, failure })) =
+            super::unless(cancel, result).await
+        {
+            Ok((outcome, failure))
+        } else {
+            self.cancel_owned();
+            Ok((protocol::Outcome::Interrupted { output: None }, None))
+        }
+    }
+
     pub(crate) async fn enqueue(&self, envelope: Envelope) -> Result<(), InboxRefusal> {
         let (reply, result) = oneshot::channel();
         self.send(Msg::Enqueue { envelope, reply });

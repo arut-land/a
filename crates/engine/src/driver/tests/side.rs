@@ -688,25 +688,28 @@ fn a_fast_role_uses_config_and_logs_its_prompt_separately_from_context() {
                 ..
             } if p == "title" => {
                 assert_eq!(model, "openai:side-fast");
-                Some(request.parse::<Value>().unwrap())
+                Some(protocol::publication::ThreadImage::from_json(request).unwrap())
             }
             _ => None,
         })
         .unwrap();
-    assert_eq!(intent["turn"][0]["role"], "Fast");
+    let (turn, prefix) = ext::ModelTurn::from_intent(intent.turn.raw()).unwrap();
+    assert!(matches!(turn.role, ext::ModelRole::Fast));
     assert!(
-        !intent["turn"][0]["messages"]
-            .to_string()
+        !Json::encode(&turn.messages)
+            .unwrap()
+            .raw()
             .contains("my distinct task")
     );
-    assert!(intent["turn"][1].to_string().contains("my distinct task"));
+    assert!(prefix.is_some());
+    assert!(!intent.turn.raw().contains("my distinct task"));
     let view = SessionView::from_log(SessionId::new(), "/w".into(), &log);
     assert!(view.items.iter().any(|i| matches!(i,
         protocol::view::Item::Reply { purpose: Some(p), usage: Some(_), .. } if p == "title")));
     std::fs::remove_file(path).unwrap();
 }
 
-struct FailResultCommit(Arc<crate::store::Faulty>);
+struct FailResultCommit(Arc<crate::store::Faulty>, Arc<AtomicUsize>);
 
 impl ext::SideProvider for FailResultCommit {
     fn reply<'a>(
@@ -716,7 +719,9 @@ impl ext::SideProvider for FailResultCommit {
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
             let reply = ext::SideProvider::reply(&ext_fixtures::Fixtures, side, messages).await;
-            self.0.fail_next_sync(crate::store::SyncFailure::Discard);
+            if self.1.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.0.fail_next_sync(crate::store::SyncFailure::Discard);
+            }
             reply
         })
     }
@@ -726,17 +731,21 @@ impl Extension for FailResultCommit {
     const NAME: &'static str = "fail-side-result";
     const VERSION: u32 = 1;
     fn contribute(&self, r: &mut Registrar) {
-        r.provide::<dyn ext::SideProvider>(Arc::new(Self(Arc::clone(&self.0))));
+        r.provide::<dyn ext::SideProvider>(Arc::new(Self(
+            Arc::clone(&self.0),
+            Arc::clone(&self.1),
+        )));
     }
 }
 
 #[test]
 fn a_failed_result_commit_cannot_release_a_successful_side_reply() {
     let faulty = Arc::new(crate::store::Faulty::new(Arc::new(Memory::default())));
+    let calls = Arc::new(AtomicUsize::new(0));
     let registry = Registry::default()
         .with(&Probes)
         .unwrap()
-        .with(&FailResultCommit(Arc::clone(&faulty)))
+        .with(&FailResultCommit(Arc::clone(&faulty), Arc::clone(&calls)))
         .unwrap();
     let harness = Fixture::on(faulty, "probes", registry, openai(&Script::new(&[])));
     let session = harness.start(&[]);
@@ -744,6 +753,7 @@ fn a_failed_result_commit_cannot_release_a_successful_side_reply() {
     settle(&session);
     let log = log_of(&session);
     session.halt();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(sides(&log).len(), 1);
     assert!(log.iter().any(|e| matches!(
         e.body,
@@ -1014,7 +1024,7 @@ fn side_failures_keep_classification_without_provider_content() {
         error.body = Some(secret.into());
         error.request_id = Some(secret.into());
         assert!(
-            super::super::side::sided(session, Some(Replied::Failed(error)))
+            super::super::side::sided(session, Some(Err(error)))
                 .1
                 .is_err()
         );
@@ -1047,9 +1057,12 @@ fn side_failures_keep_classification_without_provider_content() {
 fn cancellation_is_not_reported_as_a_side_provider_failure() {
     let session = SessionId::new();
     assert!(
-        super::super::side::sided(session, Some(Replied::Interrupted(None)))
-            .1
-            .is_err()
+        super::super::side::sided(
+            session,
+            Some(Ok((Outcome::Interrupted { output: None }, None)))
+        )
+        .1
+        .is_err()
     );
     assert!(!ext_logging::testing::pending().iter().any(|fact| {
         matches!(fact, ext_logging::Fact::ProviderError { session: id, .. } if *id == session)
@@ -1496,6 +1509,16 @@ fn forked_title_regeneration_never_writes_the_sources_thread() {
     branch.submit("/title fork title").unwrap();
     settle(&branch);
     let after = log_of(&child);
+    let claimed = Header {
+        id: child.id,
+        workspace: child.workspace.clone(),
+        parent: Some(Parent {
+            session: branch.id,
+            call: 1,
+        }),
+    };
+    assert!(rt::block_on(fixture.2.owned_conversation(claimed, Json::null(), None)).is_err());
+
     branch.halt();
     session.halt();
     assert_eq!(

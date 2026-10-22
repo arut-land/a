@@ -191,3 +191,19 @@ fn persistent_messages_preserve_all_roles_parts_and_provider_state() {
     let encoded = serde_json::to_string(&messages).unwrap();
     assert_eq!(crate::Messages::from_json(&encoded).unwrap(), messages);
 }
+
+#[test]
+fn conversation_decoding_preserves_every_role_and_provider_state() {
+    let response = every_part();
+    let mut assistant = response["message"].clone();
+    assistant["role"] = json!("assistant");
+    let messages = json!([
+        {"role": "system", "content": [{"text": "instructions", "meta": {"opaque": {"x": 1}}}]},
+        {"role": "user", "content": [{"type": "text", "text": "task"}, {"type": "media", "media_type": "image/png", "source": {"type": "data", "data": "AAAA"}}]},
+        assistant,
+        {"role": "tool", "results": [{"id": "c1", "name": "bash", "output": {"type": "json", "value": {"ok": true}}, "error": true, "meta": {"opaque": [1, 2]}}]},
+    ]);
+    let decoded = crate::Messages::from_json(&messages.to_string()).unwrap();
+    let expected: Vec<crate::Message> = serde_json::from_value(messages).unwrap();
+    assert_eq!(decoded.iter().cloned().collect::<Vec<_>>(), expected);
+}

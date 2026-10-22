@@ -134,10 +134,12 @@ impl Actor {
             };
             if let Some(cached) = cached {
                 reply.send(cached);
-            } else if let Some(waiters) = self.side_waiters.get_mut(&id) {
-                waiters.push(reply);
+            } else if let Some(waiters) = self.replies.invoked.get_mut(&id) {
+                waiters.push(super::Waiter::Model(reply));
             } else {
-                self.side_waiters.insert(id, vec![reply]);
+                self.replies
+                    .invoked
+                    .insert(id, vec![super::Waiter::Model(reply)]);
             }
             return None;
         }
@@ -260,11 +262,12 @@ async fn side_call(
     let cancel = admitted.cancel.clone();
     let work = async {
         if admitted.limited {
-            return Replied::Failed(invalid("four side calls are already running".into()));
+            return Err(invalid("four side calls are already running".into()));
         }
         let Some(daemon) = session.shared.daemon.upgrade() else {
-            return Replied::Interrupted(None);
+            return Ok((Outcome::Interrupted { output: None }, None));
         };
+        let key = side.identity();
         let (owner, thread, cancel, registry) = (
             Arc::clone(session),
             admitted.thread.clone(),
@@ -272,7 +275,7 @@ async fn side_call(
             Arc::clone(registry),
         );
         rt::spawn(&*session.shared.rt, async move {
-            Box::pin(daemon.model_turn(&owner, admitted.id, thread, &cancel, &registry)).await
+            Box::pin(daemon.model_turn(&owner, admitted.id, key, thread, &cancel, &registry)).await
         })
         .await
     };
@@ -401,37 +404,33 @@ fn side_answer(outcome: Outcome, failure: Option<Json>) -> Result<llm::Response,
     }
 }
 
-/// What a side request's reply, or its timing out, is logged as and
-/// answered with.
 pub(super) fn sided(
     session: protocol::SessionId,
-    replied: Option<Replied>,
+    result: Option<Result<(Outcome, Option<Json>), llm::Error>>,
 ) -> (Outcome, Result<llm::Response, llm::Error>) {
-    let (outcome, answer) = match replied {
-        Some(Replied::Done(output)) => {
-            let answer = llm::Response::from_json(output.raw())
-                .map_err(|e| llm::Error::new(llm::Kind::Decode, e.to_string()));
-            (Outcome::Done { output }, answer)
+    let result = result.unwrap_or_else(|| {
+        Err(llm::Error::new(
+            llm::Kind::Transport,
+            "the side request timed out",
+        ))
+    });
+    let (outcome, answer) = match result {
+        Ok((outcome, failure)) => {
+            let answer = side_answer(outcome.clone(), failure);
+            (outcome, answer)
         }
-        Some(Replied::Failed(error)) => {
-            let failed = Outcome::Failed {
+        Err(error) => (
+            Outcome::Failed {
                 error: error.to_string(),
-            };
-            (failed, Err(error))
-        }
-        Some(Replied::Interrupted(output)) => {
-            let error = llm::Error::new(llm::Kind::Incomplete, "the call ended first");
-            return (Outcome::Interrupted { output }, Err(error));
-        }
-        None => {
-            let error = llm::Error::new(llm::Kind::Transport, "the side request timed out");
-            let failed = Outcome::Failed {
-                error: error.to_string(),
-            };
-            (failed, Err(error))
-        }
+            },
+            Err(error),
+        ),
     };
-    let answer = answer.inspect_err(|error| super::provider_error(session, error));
+    if !matches!(outcome, Outcome::Interrupted { .. })
+        && let Err(error) = &answer
+    {
+        super::provider_error(session, error);
+    }
     (outcome, answer)
 }
 
@@ -440,29 +439,24 @@ impl super::Daemon {
         &self,
         owner: &Arc<Session>,
         call: CallId,
+        key: ext::SideIdentity,
         image: protocol::publication::ThreadImage,
         cancel: &Cancel,
         registry: &Arc<ext::host::Registry>,
-    ) -> Replied {
+    ) -> Result<(Outcome, Option<Json>), llm::Error> {
         let result = async {
             let authority = super::spawn::SpawnIntent::from_json(&image.authority)
                 .map_err(std::io::Error::other)?;
             if let Some(refusal) = authority.refusal {
                 return Err(std::io::Error::other(format!("{refusal:?}")));
             }
-            let (turn, _) =
-                ext::ModelTurn::from_intent(image.turn.raw()).map_err(std::io::Error::other)?;
-            let key = turn.identity();
             let id = protocol::EnvelopeId {
                 sender: owner.id,
                 call,
-                purpose: Json::encode(&(&key.thread, key.turn))
-                    .map_err(std::io::Error::other)?
-                    .raw()
-                    .into(),
+                purpose: key.to_json().map_err(std::io::Error::other)?.raw().into(),
             };
             let header = crate::store::Header {
-                id: turn.thread.conversation(owner.id),
+                id: key.thread.conversation(owner.id),
                 workspace: owner.workspace.to_path_buf(),
                 parent: Some(crate::store::Parent {
                     session: owner.id,
@@ -476,56 +470,20 @@ impl super::Daemon {
                 live.set_env(env)?;
             }
             if cancel.is_set() {
-                return Ok(Replied::Interrupted(None));
+                return Ok((Outcome::Interrupted { output: None }, None));
             }
-            live.enqueue(protocol::Envelope {
-                id: id.clone(),
-                destination: live.id,
-                payload: image.turn.raw().into(),
-            })
+            live.exchange(
+                protocol::Envelope {
+                    id,
+                    destination: live.id,
+                    payload: image.turn.raw().into(),
+                },
+                cancel,
+            )
             .await
-            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
-            let mut changed = live.session.changed.count();
-            let (mut through, mut input, mut taken, mut model) = (0, None, false, None);
-            loop {
-                let frames = Arc::clone(&live.frames);
-                let entries =
-                    rt::unblock(&*owner.shared.rt, move || frames.entries_after(through)).await?;
-                for entry in entries {
-                    through = entry.seq.get();
-                    match entry.body {
-                        Body::Enqueue { envelope } if envelope.id == id => input = Some(entry.seq),
-                        Body::Take { input: seq } if Some(seq) == input => taken = true,
-                        Body::ModelCall { r#for: None, .. } if taken && model.is_none() => {
-                            model = Some(CallId(entry.seq));
-                        }
-                        Body::ModelResult {
-                            call,
-                            outcome,
-                            failure,
-                            ..
-                        } if Some(call) == model => {
-                            return Ok(replied(side_answer(outcome, failure)).0);
-                        }
-                        _ => {}
-                    }
-                }
-                if live.ended.is_set() {
-                    return Ok(Replied::Interrupted(None));
-                }
-                if unless(cancel, live.session.changed.changed(&mut changed))
-                    .await
-                    .is_none()
-                {
-                    live.cancel_owned();
-                    return Ok(Replied::Interrupted(None));
-                }
-            }
         }
         .await;
-        result.unwrap_or_else(|error: std::io::Error| {
-            Replied::Failed(llm::Error::new(llm::Kind::Other, error.to_string()))
-        })
+        result.map_err(|error: std::io::Error| llm::Error::new(llm::Kind::Other, error.to_string()))
     }
 }
 
@@ -543,26 +501,23 @@ impl Actor {
                 Body::Input { text, .. } => text.as_str(),
                 _ => return Err("model-only turn has no admitted input".into()),
             };
-            let (turn, prefix) = ext::ModelTurn::from_intent(text).map_or_else(
-                |_| {
-                    let spawn = lock(&self.live.session.spawn);
-                    let spawn = spawn.as_ref().expect("model-only authority");
-                    let mut turn = ext::ModelTurn::new(
-                        ext::ThreadKey {
-                            extension: spawn.request.owner.clone(),
-                            purpose: spawn.request.purpose.clone(),
-                            owner_scope: ext::OwnerScope::Session,
-                        },
-                        ext::TurnKey(call.get().to_string()),
-                        spawn.request.runner.role().clone(),
-                        ext::SideContext::None,
-                        llm::Messages::default(),
-                    );
-                    turn.budget = spawn.request.budget;
-                    (turn, None)
-                },
-                |decoded| decoded,
-            );
+            let (turn, prefix) = ext::ModelTurn::from_intent(text).unwrap_or_else(|_| {
+                let spawn = lock(&self.live.session.spawn);
+                let spawn = spawn.as_ref().expect("model-only authority");
+                let mut turn = ext::ModelTurn::new(
+                    ext::ThreadKey {
+                        extension: spawn.request.owner.clone(),
+                        purpose: spawn.request.purpose.clone(),
+                        owner_scope: ext::OwnerScope::Session,
+                    },
+                    ext::TurnKey(call.get().to_string()),
+                    spawn.request.runner.role().clone(),
+                    ext::SideContext::None,
+                    llm::Messages::default(),
+                );
+                turn.budget = spawn.request.budget;
+                (turn, None)
+            });
             let mut messages = self.conversation(call).await.map_err(|e| e.to_string())?;
             if let Some(seq) = prefix {
                 let parent = self.live.parent.ok_or("model-only context has no owner")?;

@@ -14,9 +14,6 @@ pub struct Ledger {
     /// The seq of the last entry folded.
     seq: u64,
     received: Vec<Seq>,
-    pending_inputs: BTreeMap<Seq, crate::EnvelopeId>,
-    active_inputs: Vec<Seq>,
-    failure: Option<Json>,
     identities: BTreeMap<String, BTreeSet<(u128, u64)>>,
     outbox: Vec<crate::Envelope>,
     acknowledgements: Vec<(crate::EnvelopeId, Option<crate::InboxRefusal>)>,
@@ -211,14 +208,6 @@ impl Ledger {
         self.publications.apply(e);
         let (seq, body) = (e.seq, &e.body);
         self.seq = seq.get();
-        if let Body::ModelResult {
-            r#for: None,
-            failure,
-            ..
-        } = body
-        {
-            self.failure = failure.clone();
-        }
         match body {
             Body::Outbox { envelope } => {
                 if self.acknowledged(&envelope.id).is_none()
@@ -248,7 +237,6 @@ impl Ledger {
                     .insert((envelope.id.sender.0.as_u128(), envelope.id.call.0.get()))
                 {
                     self.received.push(seq);
-                    self.pending_inputs.insert(seq, envelope.id.clone());
                     self.untaken.push_back(Queued {
                         seq,
                         text: envelope.payload.clone(),
@@ -273,15 +261,7 @@ impl Ledger {
                     });
                 }
             }
-            Body::InboxResult { input, .. } => {
-                self.pending_inputs.remove(input);
-                self.active_inputs.retain(|seq| seq != input);
-                self.untaken.retain(|q| q.seq != *input);
-            }
             Body::Take { input } => {
-                if self.pending_inputs.contains_key(input) {
-                    self.active_inputs.push(*input);
-                }
                 if let Some(at) = self.untaken.iter().position(|q| q.seq == *input)
                     && let Some(q) = self.untaken.remove(at)
                     && !q.steer
@@ -510,17 +490,6 @@ impl Ledger {
             .iter()
             .filter(|(_, open)| open.phase.asking())
             .map(|(call, _)| call)
-    }
-
-    pub fn pending_inputs(&self) -> &BTreeMap<Seq, crate::EnvelopeId> {
-        &self.pending_inputs
-    }
-
-    pub fn active_inputs(&self) -> &[Seq] {
-        &self.active_inputs
-    }
-    pub fn failure(&self) -> Option<&Json> {
-        self.failure.as_ref()
     }
 
     pub fn untaken(&self) -> &VecDeque<Queued> {

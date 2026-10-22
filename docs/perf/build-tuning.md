@@ -179,3 +179,61 @@ and build-std release builds; only the final link is never cached.
 - mise does not use `codegen-units = 1`; it went back to 16 (mise#12505).
 - "aube" is a Node package manager, not mbx (jdx/mr-boxington).
 - Deno's ICF saved 3.77 MB, not the 6 MB in its config comment (deno#34478).
+
+## Persistent model-only threads (F01)
+
+The release measurements use `CARGO_BUILD_JOBS=2 mise run size`, including
+build-std and the normal shipping feature set. No budget or startup runs
+were used.
+
+| State | Release binary |
+| --- | ---: |
+| Main before F01 | 3915 KiB |
+| F01 before lifecycle review | 3996 KiB |
+| Reviewed ownership, recovery and retention changes | 3948 KiB |
+
+The review recovers 48 KiB of the original 81 KiB growth and leaves 148 KiB
+under the 4096 KiB cap. Message decoding shares one set of byte-based field
+readers. SDK turn, runner and role codecs live in their owning crate. Thread
+envelopes use tuples, committed replies share the actor's existing delivery
+path, and derived indexes retain compact position rows. Recovery consumes
+abandoned inputs through existing take and interrupt facts.
+
+Thread ids use the existing UUID crate's namespace derivation (`v5`, with
+its maintained `sha1_smol` backend), so an owner and thread key determine the
+id without storing a writable foreign conversation id in copied history.
+The measurements include that dependency; a second hash implementation is
+unnecessary. Admission also rejects an existing id owned by another session.
+
+The 1000-regeneration probe bounds the last request to fewer than 3100
+messages and child history to less than 2 MB. The child keeps 2002 own
+instruction/reply messages and no copies of the owner's original input.
+
+Production Rust grows by 213 lines during review, or 730 over main,
+excluding test files and inline test modules. This exceeds the original
+500-line estimate by 230: the original implementation was 17 lines over,
+and review requires 213 additional lines. Those changes comprise engine
+ownership/recovery, per-turn projection and shared committed reply delivery
+(+177), typed SDK codecs (+81), generic kernel recovery (+10), and protocol
+ownership derivation (+5), offset by merging the message readers (-60).
+
+Files outside the original F01 manifest:
+
+| File | Reason |
+| --- | --- |
+| `Cargo.toml`, `Cargo.lock` | Enable UUID namespace derivation for session-owned thread ids. |
+| `apps/cli/src/exts.rs` | Check the title extension's new source version. |
+| `apps/cli/tests/blackbox/web.rs` | Count attachments for the selected session when owned threads also appear in listings. |
+| `crates/engine/src/driver.rs` | Admit runners, restore model-only bindings after faults, and supply generic recovery with abandoned input sequences. |
+| `crates/engine/src/driver/inbox.rs` | Await committed conversation replies through the actor. |
+| `crates/engine/src/projection.rs` | Share committed reply delivery across tool, model and inbox consumers. |
+| `crates/engine/src/services.rs` | Bind model-only conversations without tools or loop hooks. |
+| `crates/engine/src/store/index.rs` | Index thread identities, input aliases and committed outcomes without payload retention. |
+| `crates/engine/src/transcript.rs` | Retain only thread exchanges and project per-turn owner context separately. |
+| `crates/ext/src/host.rs` | Expose explicit runner classification at the existing binding seam. |
+| `crates/ext-subagent/src/lib.rs` | Select agent runners through the shared SDK runner type. |
+| `crates/llm/src/conversation.rs` | Decode persisted rich messages through their owning codec. |
+| `crates/llm/src/spec/read.rs` | Share message and response field readers. |
+| `crates/llm/src/spec/read/tests.rs` | Verify every message role and opaque provider state survives decoding. |
+| `crates/protocol/src/publication.rs` | Encode frozen authority and compact thread envelopes without copied child ids. |
+| `docs/perf/build-tuning.md` | Record measured size, dependency choice and the production line-count exception. |

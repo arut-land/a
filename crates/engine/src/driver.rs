@@ -106,9 +106,26 @@ impl Shared {
 }
 
 impl Shared {
-    fn abandoned(&self, ledger: &Ledger) -> io::Result<Vec<protocol::Seq>> {
+    fn abandoned(&self, header: &Header, ledger: &Ledger) -> io::Result<Vec<protocol::Seq>> {
         let mut abandoned = Vec::new();
-        for (&seq, id) in ledger.pending_inputs() {
+        let entries = self.store.prefix(header.id, ledger.seq())?;
+        let active = entries
+            .iter()
+            .rev()
+            .take_while(|e| !matches!(e.body, Body::Interrupt { .. }))
+            .find_map(|e| match e.body {
+                Body::Take { input } => Some(input),
+                _ => None,
+            });
+        for entry in &entries {
+            let Body::Enqueue { envelope } = &entry.body else {
+                continue;
+            };
+            let seq = entry.seq;
+            if Some(seq) != active && !ledger.untaken().iter().any(|q| q.seq == seq) {
+                continue;
+            }
+            let id = &envelope.id;
             let entries = if let Some(live) = self
                 .daemon
                 .upgrade()
@@ -122,9 +139,11 @@ impl Shared {
                 abandoned.push(seq);
                 continue;
             };
-            if entries.iter().any(|e| matches!(&e.body,
-                Body::ModelResult { call, outcome: Outcome::Interrupted { .. }, .. }
-                | Body::ToolResult { call, outcome: Outcome::Interrupted { .. }, .. } if *call == id.call)) {
+            if !entries.iter().any(|e| {
+                matches!(&e.body,
+                Body::ModelResult { call, outcome: Outcome::Done { .. }, .. }
+                | Body::ToolResult { call, outcome: Outcome::Done { .. }, .. } if *call == id.call)
+            }) {
                 abandoned.push(seq);
             }
         }
@@ -374,6 +393,10 @@ enum Completion {
 }
 
 enum Msg {
+    AwaitEnvelope {
+        id: protocol::EnvelopeId,
+        reply: oneshot::Sender<Opened>,
+    },
     Enqueue {
         envelope: protocol::Envelope,
         reply: oneshot::Sender<Result<(), protocol::InboxRefusal>>,
@@ -481,7 +504,8 @@ impl Msg {
         }
         matches!(
             self,
-            Self::Attach(..)
+            Self::AwaitEnvelope { .. }
+                | Self::Attach(..)
                 | Self::Context {
                     request: ContextRequest::Side { .. } | ContextRequest::Child { .. },
                     ..
@@ -572,8 +596,8 @@ impl Live {
         let fresh = lock(&shared.loaded).insert(header.id);
         let listed = (shared.catalog.get(header.id)).unwrap_or_else(|| Record::new(header.clone()));
         let busy = listed.busy;
-        let abandoned = if header.parent.is_some() {
-            shared.abandoned(core.ledger())?
+        let abandoned = if header.parent.is_some() && loaded.writer.read_only().is_none() {
+            shared.abandoned(header, core.ledger())?
         } else {
             Vec::new()
         };
@@ -622,7 +646,6 @@ impl Live {
             delivery_queue: std::collections::VecDeque::new(),
             detached: Vec::new(),
             sides: BTreeMap::default(),
-            side_waiters: BTreeMap::default(),
             waiting_sides: Vec::new(),
             tickets: 0,
             phase: Phase::Serving,
@@ -917,7 +940,6 @@ struct Actor {
     inflight: BTreeMap<CallId, InFlight>,
 
     replies: Replies,
-    side_waiters: BTreeMap<CallId, Vec<oneshot::Sender<Opened>>>,
     detached: Vec<(
         SessionId,
         oneshot::Sender<Result<ext::ConversationHandle, ext::SpawnRefusal>>,
@@ -944,11 +966,16 @@ struct Actor {
     projection: Projection,
 }
 
+enum Waiter {
+    Tool(oneshot::Sender<Called>),
+    Model(oneshot::Sender<Opened>),
+}
+
 #[derive(Default)]
 struct Replies {
     invocations: BTreeMap<Ticket, (oneshot::Sender<Called>, ext::point::InvocationContext)>,
     contexts: BTreeMap<CallId, ext::point::InvocationContext>,
-    invoked: BTreeMap<CallId, Vec<oneshot::Sender<Called>>>,
+    invoked: BTreeMap<CallId, Vec<Waiter>>,
     clients: BTreeMap<Ticket, oneshot::Sender<Result<(), String>>>,
     deliveries: BTreeMap<Ticket, oneshot::Sender<Result<(), protocol::InboxRefusal>>>,
 }
@@ -1254,6 +1281,7 @@ impl Actor {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn take(
         &mut self,
         msg: Msg,
@@ -1324,6 +1352,10 @@ impl Actor {
                 Event::Environment(logged)
             }
             Msg::Context { origin, request } => return self.context(&origin, request).await,
+            Msg::AwaitEnvelope { id, reply } => {
+                self.envelope_reply(id, reply).await;
+                return None;
+            }
             Msg::Enqueue { envelope, reply } => {
                 let ticket = self.delivery_ticket(reply);
                 Event::Enqueue { envelope, ticket }
@@ -1857,11 +1889,12 @@ impl Actor {
         Box::pin(self.resume()).await;
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn resume(&mut self) {
         recovery(self.live.id, ext_logging::Rule::ReloadAfterFault);
         self.abandon_generation().await;
         self.bound = bind(&self.registry, &self.live.session);
-        let bound = Arc::clone(&self.bound) as Arc<dyn Binding>;
+        let bound = services::binding(&self.bound, &self.live.session, &self.registry);
         let header = Header {
             id: self.live.id,
             workspace: self.live.workspace.clone(),
@@ -1878,19 +1911,24 @@ impl Actor {
                 .writer
                 .sync()
                 .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e))?;
-            io::Result::Ok((loaded, folding, shared.owner(&header)?))
+            let abandoned = if header.parent.is_some() && loaded.writer.read_only().is_none() {
+                shared.abandoned(&header, folding.core.ledger())?
+            } else {
+                Vec::new()
+            };
+            io::Result::Ok((loaded, folding, shared.owner(&header)?, abandoned))
         })
         .await;
         let reloaded = match reloaded {
-            Ok((mut loaded, folding, owner)) => loaded
+            Ok((mut loaded, folding, owner, abandoned)) => loaded
                 .writer
                 .flushed(&*self.live.session.shared.rt)
                 .await
                 .inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Reload, e))
-                .map(|()| (loaded, folding, owner)),
+                .map(|()| (loaded, folding, owner, abandoned)),
             Err(error) => Err(error),
         };
-        let (loaded, folding, owner) = match reloaded {
+        let (loaded, folding, owner, abandoned) = match reloaded {
             Ok(reloaded) => reloaded,
             Err(e) => {
                 eprintln!("session {}: reloading: {e}", self.live.id.short());
@@ -1936,6 +1974,7 @@ impl Actor {
         let load = Load {
             boot: sys::boot_id(),
             busy: self.live.has_work(),
+            abandoned: &abandoned,
             owner,
             ..Load::default()
         };
@@ -1981,7 +2020,6 @@ impl Actor {
         self.delivery_queue.clear();
         self.transport_active = false;
         self.sides.clear();
-        self.side_waiters.clear();
         self.inflight.clear();
         self.journal.unsynced.clear();
         self.journal.waiting_sync.clear();

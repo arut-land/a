@@ -1,17 +1,10 @@
-//! [`Response::from_json`]: a logged reply read from its text, each field
-//! once. The derived `Deserialize` buffers each internally tagged part in
-//! serde's `Content`, copying its strings twice (that code cost ~50 KiB),
-//! and cannot keep provider state as the text it is. Here a part is one
-//! flat set of every kind's fields, its `type` choosing which it takes, and
-//! state stays the text the log holds. Objects are read field by field
-//! ([`Fields`]), so each type of value is read by one copy of code
-//! whatever object holds it. A field reads as the derived `Deserialize`
-//! reads it for the kind that takes it; a field of another kind must still
-//! be of its own type.
+//! Shared field readers avoid buffering tagged parts and preserve opaque
+//! provider state exactly as the log recorded it. All owning codecs use
+//! byte readers so response and conversation decoding share instantiations.
 
 use std::fmt;
 
-use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
+use serde::de::{Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::Error;
 use serde_json::value::RawValue;
@@ -29,7 +22,7 @@ type Result<T> = std::result::Result<T, Error>;
 impl Response {
     /// A reply as this crate writes it, read from its text.
     pub fn from_json(text: &str) -> serde_json::Result<Self> {
-        let mut json = serde_json::Deserializer::from_str(text);
+        let mut json = serde_json::Deserializer::from_slice(text.as_bytes());
         let reply: Reply = fields(&mut json)?;
         json.end()?;
         Ok(Self {
@@ -45,77 +38,13 @@ impl Response {
 
 impl crate::Messages {
     pub fn from_json(text: &str) -> serde_json::Result<Self> {
-        #[derive(Deserialize)]
-        struct Stored {
-            role: String,
-            content: Option<Json>,
-            origin: Option<OptionalOrigin>,
-            #[serde(default)]
-            results: Vec<StoredTool>,
+        let messages: Vec<Message> = serde_json::from_slice(text.as_bytes())?;
+        let mut built = Self::default();
+        for mut message in messages {
+            let role = required(message.role.take(), "role")?;
+            built.push(message.build(&role)?);
         }
-        #[derive(Deserialize)]
-        struct StoredText {
-            text: String,
-            #[serde(default)]
-            meta: State,
-        }
-        #[derive(Deserialize)]
-        struct StoredTool {
-            id: SmolStr,
-            name: SmolStr,
-            output: OutputFields,
-            #[serde(default)]
-            error: bool,
-            #[serde(default)]
-            meta: State,
-        }
-        let messages: Vec<Stored> = serde_json::from_str(text)?;
-        messages
-            .into_iter()
-            .map(|message| {
-                let content = || required(message.content.as_ref(), "content");
-                Ok(match message.role.as_str() {
-                    "system" => super::Message::System(super::System {
-                        content: content()?
-                            .parse::<Vec<StoredText>>()?
-                            .into_iter()
-                            .map(|p| Text {
-                                text: p.text,
-                                meta: p.meta.0,
-                            })
-                            .collect(),
-                    }),
-                    "user" => super::Message::User(super::User {
-                        content: content()?
-                            .parse::<Vec<UserFields>>()?
-                            .into_iter()
-                            .map(UserFields::build)
-                            .collect::<Result<_>>()?,
-                    }),
-                    "assistant" => super::Message::Assistant(Assistant {
-                        content: content()?.parse::<Content>()?.0,
-                        origin: message.origin.and_then(|o| o.0),
-                    }),
-                    "tool" => super::Message::Tool(super::ToolMessage {
-                        results: message
-                            .results
-                            .into_iter()
-                            .map(|r| {
-                                Ok(ToolResult {
-                                    id: r.id,
-                                    name: r.name,
-                                    output: r.output.build()?,
-                                    error: r.error,
-                                    meta: r.meta.0,
-                                })
-                            })
-                            .collect::<Result<_>>()?,
-                    }),
-                    role => return Err(unknown(role, &["system", "user", "assistant", "tool"])),
-                })
-            })
-            .collect::<Result<Vec<_>>>()
-            .map(Self::from)
+        Ok(built)
     }
 }
 
@@ -156,7 +85,6 @@ read_as_fields!(
     UsageFields,
     Part,
     OutputFields,
-    UserFields,
     SourceFields
 );
 
@@ -179,11 +107,12 @@ impl<'de> Fields<'de> for Reply {
         match key {
             "message" => {
                 let message: Message = next(map)?;
-                let content = required(message.content, "content").map_err(A::Error::custom)?;
-                self.message = Some(Assistant {
-                    content: content.0,
-                    origin: message.origin.and_then(|origin| origin.0),
-                });
+                let super::Message::Assistant(assistant) =
+                    message.build("assistant").map_err(A::Error::custom)?
+                else {
+                    unreachable!()
+                };
+                self.message = Some(assistant);
             }
             "finish" => {
                 let finish: FinishFields = next(map)?;
@@ -201,7 +130,9 @@ impl<'de> Fields<'de> for Reply {
 
 #[derive(Default)]
 struct Message {
-    content: Option<Content>,
+    role: Option<SmolStr>,
+    content: Option<Vec<Part>>,
+    results: Vec<Part>,
     origin: Option<OptionalOrigin>,
 }
 
@@ -212,11 +143,48 @@ impl<'de> Fields<'de> for Message {
         map: &mut A,
     ) -> std::result::Result<bool, A::Error> {
         match key {
+            "role" => self.role = Some(next(map)?),
+            "results" => self.results = next(map)?,
             "content" => self.content = Some(next(map)?),
             "origin" => self.origin = Some(next(map)?),
             _ => return Ok(false),
         }
         Ok(true)
+    }
+}
+
+impl Message {
+    fn build(self, role: &str) -> Result<super::Message> {
+        let mut message = match role {
+            "system" => super::Message::System(super::System {
+                content: Vec::new(),
+            }),
+            "user" => super::Message::User(super::User {
+                content: Vec::new(),
+            }),
+            "assistant" => super::Message::Assistant(Assistant {
+                content: Vec::new(),
+                origin: self.origin.and_then(|o| o.0),
+            }),
+            "tool" => super::Message::Tool(super::ToolMessage {
+                results: Vec::new(),
+            }),
+            role => return Err(unknown(role, &["system", "user", "assistant", "tool"])),
+        };
+        let parts = if role == "tool" {
+            self.results
+        } else {
+            required(self.content, "content")?
+        };
+        for part in parts {
+            match &mut message {
+                super::Message::System(system) => system.content.push(part.text()?),
+                super::Message::User(user) => user.content.push(part.user()?),
+                super::Message::Assistant(assistant) => assistant.content.push(part.build()?),
+                super::Message::Tool(tool) => tool.results.push(part.tool_result()?),
+            }
+        }
+        Ok(message)
     }
 }
 
@@ -331,33 +299,6 @@ impl<'de> Fields<'de> for UsageFields {
     }
 }
 
-/// A message's parts, each built as it is read, in a list of their number.
-struct Content(Vec<AssistantPart>);
-
-impl<'de> Deserialize<'de> for Content {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        struct Read;
-        impl<'de> Visitor<'de> for Read {
-            type Value = Content;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a sequence")
-            }
-            fn visit_seq<A: SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> std::result::Result<Content, A::Error> {
-                let mut parts = Vec::new();
-                while let Some(part) = seq.next_element::<Part>()? {
-                    parts.push(part.build().map_err(A::Error::custom)?);
-                }
-                parts.shrink_to_fit();
-                Ok(Content(parts))
-            }
-        }
-        d.deserialize_seq(Read)
-    }
-}
-
 /// Provider state, each key's value kept as its text.
 #[derive(Default)]
 struct State(Meta);
@@ -432,6 +373,21 @@ impl<'de> Fields<'de> for Part {
 }
 
 impl Part {
+    fn text(self) -> Result<Text> {
+        Ok(Text {
+            text: required(self.text, "text")?,
+            meta: self.meta.unwrap_or_default().0,
+        })
+    }
+    fn tool_result(self) -> Result<ToolResult> {
+        Ok(ToolResult {
+            id: required(self.id, "id")?,
+            name: required(self.name, "name")?,
+            output: required(self.output, "output")?.build()?,
+            error: self.error.unwrap_or(false),
+            meta: self.meta.unwrap_or_default().0,
+        })
+    }
     fn build(self) -> Result<AssistantPart> {
         const KINDS: &[&str] = &[
             "text",
@@ -441,35 +397,45 @@ impl Part {
             "media",
             "opaque",
         ];
-        let meta = self.meta.unwrap_or_default().0;
-        Ok(match required(self.kind, "type")?.as_str() {
-            "text" => AssistantPart::Text(Text {
-                text: required(self.text, "text")?,
-                meta,
-            }),
+        let mut part = self;
+        let kind = required(part.kind.take(), "type")?;
+        if kind == "text" {
+            return Ok(AssistantPart::Text(part.text()?));
+        }
+        if kind == "tool_result" {
+            return Ok(AssistantPart::ToolResult(part.tool_result()?));
+        }
+        let Self {
+            text,
+            redacted,
+            id,
+            name,
+            input,
+            invalid,
+            provider_executed,
+            media_type,
+            source,
+            meta,
+            ..
+        } = part;
+        let meta = meta.unwrap_or_default().0;
+        Ok(match kind.as_str() {
             "reasoning" => AssistantPart::Reasoning(Reasoning {
-                text: self.text.unwrap_or_default(),
-                redacted: self.redacted.unwrap_or(false),
+                text: text.unwrap_or_default(),
+                redacted: redacted.unwrap_or(false),
                 meta,
             }),
             "tool_call" => AssistantPart::ToolCall(ToolCall {
-                id: required(self.id, "id")?,
-                name: required(self.name, "name")?,
-                input: object(required(self.input, "input")?)?,
-                invalid: self.invalid,
-                provider_executed: self.provider_executed.unwrap_or(false),
-                meta,
-            }),
-            "tool_result" => AssistantPart::ToolResult(ToolResult {
-                id: required(self.id, "id")?,
-                name: required(self.name, "name")?,
-                output: required(self.output, "output")?.build()?,
-                error: self.error.unwrap_or(false),
+                id: required(id, "id")?,
+                name: required(name, "name")?,
+                input: object(required(input, "input")?)?,
+                invalid,
+                provider_executed: provider_executed.unwrap_or(false),
                 meta,
             }),
             "media" => AssistantPart::Media(Media {
-                media_type: required(self.media_type, "media_type")?,
-                source: required(self.source, "source")?.build()?,
+                media_type: required(media_type, "media_type")?,
+                source: required(source, "source")?.build()?,
                 meta,
             }),
             "opaque" => AssistantPart::Opaque(Opaque { meta }),
@@ -506,49 +472,23 @@ impl OutputFields {
         let kind = required(self.kind, "type")?;
         let value = required(self.value, "value")?;
         Ok(match kind.as_str() {
-            "text" => Output::Text(serde_json::from_str(value.get())?),
+            "text" => Output::Text(serde_json::from_slice(value.get().as_bytes())?),
             "json" => Output::Json(Json::from(value)),
             "content" => {
-                let parts: Vec<UserFields> = serde_json::from_str(value.get())?;
-                let parts = parts.into_iter().map(UserFields::build);
-                let mut parts = parts.collect::<Result<Vec<_>>>()?;
-                parts.shrink_to_fit();
-                Output::Content(parts)
+                let parts: Vec<Part> = serde_json::from_slice(value.get().as_bytes())?;
+                let mut content = Vec::new();
+                for part in parts {
+                    content.push(part.user()?);
+                }
+                Output::Content(content)
             }
             kind => return Err(unknown(kind, KINDS)),
         })
     }
 }
 
-#[derive(Default)]
-struct UserFields {
-    kind: Option<SmolStr>,
-    text: Option<String>,
-    media_type: Option<SmolStr>,
-    source: Option<SourceFields>,
-    meta: Option<State>,
-}
-
-impl<'de> Fields<'de> for UserFields {
-    fn field<A: MapAccess<'de>>(
-        &mut self,
-        key: &str,
-        map: &mut A,
-    ) -> std::result::Result<bool, A::Error> {
-        match key {
-            "type" => self.kind = Some(next(map)?),
-            "text" => self.text = next(map)?,
-            "media_type" => self.media_type = next(map)?,
-            "source" => self.source = next(map)?,
-            "meta" => self.meta = Some(next(map)?),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
-}
-
-impl UserFields {
-    fn build(self) -> Result<UserPart> {
+impl Part {
+    fn user(self) -> Result<UserPart> {
         let meta = self.meta.unwrap_or_default().0;
         Ok(match required(self.kind, "type")?.as_str() {
             "text" => UserPart::Text(Text {

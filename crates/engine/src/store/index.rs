@@ -1,6 +1,5 @@
 //! Derived identities retain log positions; payload eviction never changes replay.
 
-use std::collections::HashMap;
 use std::io;
 
 use protocol::{Body, CallId, Decode, Entry, Seq, SessionId};
@@ -11,12 +10,14 @@ use crate::outbox::FrameLog;
 pub(crate) struct Index {
     through: u64,
     fence: u64,
-    sides: HashMap<ext::SideIdentity, CallId>,
-    threads: HashMap<ext::ThreadKey, CallId>,
-    results: HashMap<CallId, (Seq, bool)>,
+    sides: Vec<(ext::SideIdentity, CallId)>,
+    results: Vec<(CallId, (Seq, bool))>,
+    enqueues: Vec<(protocol::EnvelopeId, CallId)>,
+    input: Option<CallId>,
+    inputs: Vec<(CallId, CallId)>,
     interrupt: u64,
     watches: Vec<(SessionId, Seq)>,
-    fired: HashMap<Seq, Seq>,
+    fired: Vec<(Seq, Seq)>,
     hot: Option<(Seq, Vec<u8>)>,
 }
 
@@ -37,7 +38,7 @@ impl Index {
     }
 
     pub(crate) fn apply(&mut self, entry: &Entry) {
-        if entry.seq.get() <= self.through {
+        if entry.seq.get() != self.through + 1 {
             return;
         }
         match &entry.body {
@@ -49,57 +50,112 @@ impl Index {
             } => {
                 if let Ok(identity) = ext::SideIdentity::from_intent(request)
                     && identity.thread.purpose == *purpose
+                    && self.side(&identity).is_none()
                 {
-                    self.threads
-                        .entry(identity.thread.clone())
-                        .or_insert(CallId(entry.seq));
-                    self.sides.entry(identity).or_insert(CallId(entry.seq));
+                    self.sides.push((identity, CallId(entry.seq)));
                 }
             }
             Body::ModelResult { call, outcome, .. } | Body::ToolResult { call, outcome, .. } => {
-                self.results
-                    .entry(*call)
-                    .or_insert((entry.seq, matches!(outcome, protocol::Outcome::Done { .. })));
+                let done = matches!(outcome, protocol::Outcome::Done { .. });
+                if let Some(input) = self.input(*call) {
+                    self.resolve(input, entry.seq, done);
+                }
+                self.resolve(*call, entry.seq, done);
             }
-            Body::Interrupt { .. } => self.interrupt = entry.seq.get(),
+            Body::Enqueue { envelope } => {
+                if !self.enqueues.iter().any(|(id, _)| *id == envelope.id) {
+                    self.enqueues.push((envelope.id.clone(), CallId(entry.seq)));
+                }
+            }
+            Body::Input { taken: true, .. } => self.input = None,
+            Body::Take { input } => {
+                self.input = Some(CallId(*input));
+            }
+            Body::ModelCall { r#for: None, .. } => {
+                if let Some(input) = self.input {
+                    self.inputs.push((CallId(entry.seq), input));
+                }
+            }
+            Body::Interrupt { .. } => {
+                self.interrupt = entry.seq.get();
+                if let Some(input) = self.input.take() {
+                    self.inputs.push((CallId(entry.seq), input));
+                    self.resolve(input, entry.seq, false);
+                }
+            }
             Body::Watch { child } => {
                 if let Err(at) = self.watches.binary_search_by_key(&child.0, |(id, _)| id.0) {
                     self.watches.insert(at, (*child, entry.seq));
                 }
             }
             Body::Fired { watch, .. } => {
-                self.fired.entry(*watch).or_insert(entry.seq);
+                if let Err(at) = self.fired.binary_search_by_key(watch, |(watch, _)| *watch) {
+                    self.fired.insert(at, (*watch, entry.seq));
+                }
             }
             _ => {}
         }
         self.through = entry.seq.get();
     }
 
+    fn resolve(&mut self, call: CallId, seq: Seq, done: bool) {
+        if let Err(at) = self.results.binary_search_by_key(&call, |(call, _)| *call) {
+            self.results.insert(at, (call, (seq, done)));
+        }
+    }
+
+    fn completed(&self, call: CallId) -> Option<&(Seq, bool)> {
+        self.results
+            .binary_search_by_key(&call, |(call, _)| *call)
+            .ok()
+            .map(|at| &self.results[at].1)
+    }
+
+    pub(crate) fn input(&self, call: CallId) -> Option<CallId> {
+        self.inputs
+            .binary_search_by_key(&call, |(call, _)| *call)
+            .ok()
+            .map(|at| self.inputs[at].1)
+    }
+
+    pub(crate) fn enqueued(&self, id: &protocol::EnvelopeId) -> Option<CallId> {
+        self.enqueues
+            .iter()
+            .find_map(|(key, call)| (key == id).then_some(*call))
+    }
+
     pub(crate) fn thread(&self, key: &ext::ThreadKey) -> Option<CallId> {
-        self.threads.get(key).copied()
+        self.sides
+            .iter()
+            .find_map(|(identity, call)| (&identity.thread == key).then_some(*call))
     }
 
     pub(crate) fn side(&self, identity: &ext::SideIdentity) -> Option<CallId> {
-        self.sides.get(identity).copied()
+        self.sides
+            .iter()
+            .find_map(|(key, call)| (key == identity).then_some(*call))
     }
 
     pub(crate) fn result(&self, call: CallId, durable: u64) -> Option<Seq> {
-        self.results
-            .get(&call)
+        self.completed(call)
             .map(|(seq, _)| *seq)
             .filter(|seq| seq.get() <= durable)
     }
 
     pub(crate) fn succeeded(&self, of: CallId) -> bool {
-        of.0.get() > self.interrupt && self.results.get(&of).is_some_and(|(_, done)| *done)
+        of.0.get() > self.interrupt && self.completed(of).is_some_and(|(_, done)| *done)
     }
 
     pub(crate) fn fired(&self, child: SessionId) -> Option<Seq> {
         self.watches
             .binary_search_by_key(&child.0, |(id, _)| id.0)
             .ok()
-            .and_then(|at| self.fired.get(&self.watches[at].1))
-            .copied()
+            .and_then(|at| {
+                self.fired
+                    .binary_search_by_key(&self.watches[at].1, |(watch, _)| *watch)
+                    .ok()
+            })
+            .map(|at| self.fired[at].1)
     }
 
     pub(crate) fn entry(&mut self, frames: &FrameLog, seq: Seq) -> io::Result<Entry> {

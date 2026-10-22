@@ -200,9 +200,14 @@ remain distinct types. Inbox admission and taking are durable; turns execute
 in order rather than steering or merging another turn's input.
 
 The parent retains explicitly side-classified intent/result facts, including
-the executing conversation identity, for extension consumers and client
-views. These facts and replies never enter the parent's model transcript.
-The child logs its own attempts and results. Open parent requests and
+the thread key, for extension consumers and client views. Conversation ids
+are derived from the current session owner; forks start fresh threads and
+cannot address a source-owned log. These facts and replies never enter the parent's model transcript.
+The child stores its own instructions, attempts and replies. Per-turn owner
+context is a sequence reference projected at execution, never retained in
+thread history. Inbox completion uses the same committed reply delivery as
+other calls. Recovery terminally resolves abandoned inbox inputs for every
+owned conversation, preserving dedup identities. Open parent requests and
 ambiguous model-only attempts recover as interrupted, including crashes in
 retry backoff. Recovery never initiates new spend for an existing key.
 Explicit new keys can continue a thread after interruption.

@@ -183,10 +183,6 @@ impl Fold {
                     outcome: outcome.clone(),
                 })
             }
-            Body::InboxResult { input, .. } if self.ledger.active_inputs().contains(input) => {
-                self.asked.clear();
-                None
-            }
             // What the turn asked for and had not started is dropped.
             Body::Interrupt { .. } => {
                 self.asked.clear();

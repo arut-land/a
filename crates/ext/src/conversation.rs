@@ -33,10 +33,31 @@ pub enum ContextSource {
     Prefix { session: SessionId, seq: Seq },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum Runner {
     Agent { agent: String, role: ModelRole },
     ModelOnly { role: ModelRole },
+}
+
+impl Serialize for Runner {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        (self.agent(), self.role()).serialize(s)
+    }
+}
+impl<'de> Deserialize<'de> for Runner {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let json = protocol::Json::deserialize(d)?;
+        Self::from_json(&json).map_err(serde::de::Error::custom)
+    }
+}
+impl Runner {
+    fn from_json(json: &protocol::Json) -> serde_json::Result<Self> {
+        let (agent, role) = json.parse()?;
+        Ok(match agent {
+            Some(agent) => Self::Agent { agent, role },
+            None => Self::ModelOnly { role },
+        })
+    }
 }
 
 impl Runner {

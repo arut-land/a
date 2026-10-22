@@ -754,6 +754,9 @@ impl Daemon {
             }
             let mut slots = lock(&self.slots);
             if let Some(slot) = slots.iter().find(|slot| slot.header.id == header.id) {
+                if slot.header.parent.map(|p| p.session) != header.parent.map(|p| p.session) {
+                    return Err(io::Error::other("conversation belongs to another owner"));
+                }
                 (Arc::clone(slot), false)
             } else {
                 let slot = Slot::new(
@@ -858,7 +861,6 @@ impl Daemon {
     /// read.
     fn list(&self) -> Vec<SessionSummary> {
         let mut sessions: Vec<SessionSummary> = self.slots().iter().map(|s| s.summary()).collect();
-        // Ids are UUIDv7: they order by creation.
         sessions.sort_by_key(|s| std::cmp::Reverse(s.id.0));
         sessions
     }

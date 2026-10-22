@@ -28,7 +28,7 @@ pub struct SpawnImage {
 }
 
 /// Execution identity belongs to the owner, never to copied audit history.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct ThreadImage {
     pub turn: Json,
     pub authority: Json,
@@ -36,10 +36,11 @@ pub struct ThreadImage {
 
 impl ThreadImage {
     pub fn from_json(json: &Json) -> serde_json::Result<Self> {
-        json.parse()
+        let (turn, authority) = json.parse()?;
+        Ok(Self { turn, authority })
     }
     pub fn to_json(&self) -> serde_json::Result<Json> {
-        Json::encode(self)
+        Json::encode(&(&self.turn, &self.authority))
     }
 }
 

@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 18;
+pub const PROTO: u32 = 19;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 18;
+pub const PROTO_MIN: u32 = 19;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -88,11 +88,12 @@ impl SessionId {
         Self(Uuid::now_v7())
     }
 
+    #[must_use]
     pub fn owned(self, key: &str) -> Self {
         Self(Uuid::new_v5(&self.0, key.as_bytes()))
     }
 
-    /// Short form for display: the random tail of the `UUIDv7`.
+    /// Short form for display: the UUID tail.
     pub const fn short(self) -> Short {
         Short(self)
     }
@@ -278,7 +279,6 @@ kinds! {
         /// Waiting input `input` was taken up: it starts a turn, or a
         /// `steer` is given to the running one.
         Take "take" { input: Seq } = Durable;
-        InboxResult "inbox_result" { input: Seq, outcome: Outcome, failure: Option<Json> = default } = Durable;
         /// The reply of an agent that is not a model's.
         Assistant "assistant" { text: String } = Durable;
         /// Facts about where the session runs (its directory, the workspace's

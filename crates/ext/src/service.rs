@@ -171,7 +171,7 @@ pub trait Models: Send + Sync {
 }
 
 /// Routing intent, never a provider model id.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub enum ModelRole {
     Session,
     Fast,
@@ -204,10 +204,28 @@ pub struct ThreadKey {
     pub owner_scope: OwnerScope,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OwnerScope {
     Session,
     Call(protocol::CallId),
+}
+
+impl serde::Serialize for OwnerScope {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(
+            &match self {
+                Self::Session => None,
+                Self::Call(call) => Some(*call),
+            },
+            s,
+        )
+    }
+}
+impl<'de> serde::Deserialize<'de> for OwnerScope {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        <Option<protocol::CallId> as serde::Deserialize>::deserialize(d)
+            .map(|call| call.map_or(Self::Session, Self::Call))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -234,6 +252,10 @@ impl ThreadKey {
 }
 
 impl SideIdentity {
+    pub fn to_json(&self) -> serde_json::Result<llm::Json> {
+        llm::Json::encode(&(&self.thread, &self.turn))
+    }
+
     pub fn from_intent(intent: &llm::Json) -> serde_json::Result<Self> {
         let image = protocol::publication::ThreadImage::from_json(intent)?;
         let (identity, _): (Self, serde::de::IgnoredAny) = image.turn.parse()?;
@@ -252,6 +274,35 @@ pub struct ModelTurn {
     pub budget: Budget,
     background: bool,
     while_waiting: bool,
+}
+
+impl serde::Serialize for ModelRole {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Session => s.serialize_str("session"),
+            Self::Fast => s.serialize_str("fast"),
+            Self::Named(name) => s.collect_str(&format_args!("named:{name}")),
+        }
+    }
+}
+impl ModelRole {
+    fn from_word(mut role: String) -> Result<Self, String> {
+        match role.as_str() {
+            "session" => Ok(Self::Session),
+            "fast" => Ok(Self::Fast),
+            _ if role.starts_with("named:") => {
+                role.drain(..6);
+                Ok(Self::Named(role))
+            }
+            _ => Err("invalid model role".into()),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for ModelRole {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let role = <String as serde::Deserialize>::deserialize(d)?;
+        Self::from_word(role).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ModelTurn {

@@ -61,8 +61,9 @@ after the parent result commits; failed commits cannot acknowledge success.
 Open parent requests and ambiguous child attempts recover as interrupted,
 including crashes during backoff. For every owned conversation, recovery
 terminally resolves inbox inputs whose sending request was interrupted.
-Durable inbox outcomes preserve dedup identities even before a provider
-attempt exists. Recovery never repeats ambiguous spend.
+Existing take and interrupt facts terminally consume abandoned inputs
+without removing their dedup identities, even before a provider attempt
+exists. Recovery never repeats ambiguous spend.
 An extension may continue the thread under an explicit new key.
 
 `SideRetry` owns retry classification and backoff. Known failures may retry

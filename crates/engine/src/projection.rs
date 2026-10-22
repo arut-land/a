@@ -2,7 +2,7 @@
 
 use super::{
     Activity, Actor, Admission, Admitted, Arc, Body, CallId, Cpu, DaemonMsg, Encoded, Entry, Frame,
-    Opened, Ordering, Outbox, SNAPSHOT_GAP, SessionView, Transcript, io, lock,
+    Ordering, Outbox, SNAPSHOT_GAP, SessionView, Transcript, io, lock,
 };
 
 #[derive(Default)]
@@ -140,7 +140,11 @@ impl Actor {
                         self.replies.contexts.remove(&call);
                         reply.send(result);
                     } else {
-                        self.replies.invoked.entry(call).or_default().push(reply);
+                        self.replies
+                            .invoked
+                            .entry(call)
+                            .or_default()
+                            .push(super::Waiter::Tool(reply));
                     }
                 }
                 Err(error) => reply.send(super::Called::failed(error)),
@@ -153,34 +157,44 @@ impl Actor {
             view.extend(entries);
         }
         for (e, line) in entries.iter().zip(lines.lines()) {
-            if let Body::ToolResult {
-                call,
-                outcome,
-                card,
-            } = &e.body
-                && let Some(waiters) = self.replies.invoked.remove(call)
-            {
-                self.replies.contexts.remove(call);
-                for waiter in waiters {
-                    waiter.send(super::Called {
-                        outcome: outcome.clone(),
-                        card: card.clone(),
-                    });
+            self.journal.index.apply(e);
+            let result = match &e.body {
+                Body::ToolResult {
+                    call,
+                    outcome,
+                    card,
+                } => Some((*call, outcome, None, card.clone())),
+                Body::ModelResult {
+                    call,
+                    outcome,
+                    failure,
+                    ..
+                } => Some((*call, outcome, failure.clone(), None)),
+                Body::Interrupt { .. } => Some((
+                    CallId(e.seq),
+                    &protocol::Outcome::Interrupted { output: None },
+                    None,
+                    None,
+                )),
+                _ => None,
+            };
+            if let Some((call, outcome, failure, card)) = result {
+                let mut waiters = self.replies.invoked.remove(&call).unwrap_or_default();
+                if let Some(input) = self.journal.index.input(call) {
+                    waiters.extend(self.replies.invoked.remove(&input).unwrap_or_default());
                 }
-            }
-            if let Body::ModelResult {
-                call,
-                outcome,
-                failure,
-                ..
-            } = &e.body
-                && let Some(waiters) = self.side_waiters.remove(call)
-            {
+                self.replies.contexts.remove(&call);
                 for waiter in waiters {
-                    waiter.send(Opened::Cached {
-                        outcome: outcome.clone(),
-                        failure: failure.clone(),
-                    });
+                    match waiter {
+                        super::Waiter::Tool(reply) => reply.send(super::Called {
+                            outcome: outcome.clone(),
+                            card: card.clone(),
+                        }),
+                        super::Waiter::Model(reply) => reply.send(super::Opened::Cached {
+                            outcome: outcome.clone(),
+                            failure: failure.clone(),
+                        }),
+                    }
                 }
             }
             // One too large for the tail is not framed: followers read it.
