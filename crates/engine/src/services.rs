@@ -364,7 +364,6 @@ impl ext::Logs for SessionLogs {
                             .unwrap_or(0);
                         Ok(ext::LogPrefix {
                             session,
-                            parent: record.header.parent.map(|p| p.session),
                             entries,
                             cursor,
                             reset,

@@ -108,7 +108,6 @@ pub struct Projection {
 }
 
 struct Conversation {
-    parent: Option<SessionId>,
     covered: ext::LogCursor,
     facts: Vec<CallFact>,
     uncertain: Vec<(CallId, u16)>,
@@ -128,7 +127,6 @@ impl Projection {
                     (
                         prefix.session,
                         Conversation {
-                            parent: prefix.parent,
                             covered: ext::LogCursor::default(),
                             facts: Vec::new(),
                             uncertain: Vec::new(),
@@ -201,39 +199,20 @@ impl Projection {
             .collect()
     }
 
-    fn selected(&self, session: SessionId, root: SessionId, descendants: bool) -> bool {
-        session == root
-            || descendants
-                && std::iter::successors(Some(session), |id| {
-                    self.logs
-                        .binary_search_by_key(id, |(id, _)| *id)
-                        .ok()
-                        .and_then(|i| self.logs[i].1.parent)
-                })
-                .take(self.logs.len() + 1)
-                .any(|id| id == root)
+    pub fn own(&self, session: SessionId, prices: &Prices) -> Total {
+        self.query(&[session], &Filter::default(), prices)
     }
 
-    pub fn own(&mut self, session: SessionId, prices: &Prices) -> Total {
-        self.query(session, false, &Filter::default(), prices)
-    }
-
-    pub fn subtree(&mut self, root: SessionId, prices: &Prices) -> Total {
-        self.query(root, true, &Filter::default(), prices)
+    pub fn subtree(&self, selected: &[SessionId], prices: &Prices) -> Total {
+        self.query(selected, &Filter::default(), prices)
     }
 
     #[inline(never)]
-    pub fn query(
-        &mut self,
-        root: SessionId,
-        descendants: bool,
-        filter: &Filter,
-        prices: &Prices,
-    ) -> Total {
+    pub fn query(&self, selected: &[SessionId], filter: &Filter, prices: &Prices) -> Total {
         let mut total = Total::default();
         let mut epochs = Vec::<(SessionId, u64, u64)>::new();
         for (session, log) in &self.logs {
-            if !self.selected(*session, root, descendants) {
+            if !selected.contains(session) {
                 continue;
             }
             for fact in &log.facts {
@@ -302,17 +281,16 @@ struct Query(Mutex<Projection>);
 
 impl Query {
     #[inline(never)]
-    fn finish(
-        &self,
-        session: SessionId,
-        prices: Prices,
-        logs: Vec<ext::LogPrefix>,
-    ) -> Result<Total, String> {
+    fn finish(&self, prices: Prices, logs: Vec<ext::LogPrefix>) -> Result<Total, String> {
         let mut projection = self.0.lock().map_err(|e| e.to_string())?;
-        for log in logs {
-            projection.fold(&log);
-        }
-        Ok(projection.query(session, true, &Filter::default(), &prices))
+        let selected: Vec<_> = logs
+            .into_iter()
+            .map(|log| {
+                projection.fold(&log);
+                log.session
+            })
+            .collect();
+        Ok(projection.subtree(&selected, &prices))
     }
 }
 
@@ -332,7 +310,7 @@ impl Tool for Query {
             .ok_or("no log reader")?
             .read(cx.session, true, cursors)
             .await?;
-        self.finish(cx.session, prices, logs)
+        self.finish(prices, logs)
     }
 }
 

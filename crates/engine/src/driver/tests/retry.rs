@@ -375,7 +375,6 @@ fn cancellation_after_send_counts_one_executed_attempt() {
     let mut projection = ext_metrics::Projection::default();
     projection.fold(&ext::LogPrefix {
         session: session.id,
-        parent: None,
         entries: log,
         cursor: ext::LogCursor::default(),
         reset: true,

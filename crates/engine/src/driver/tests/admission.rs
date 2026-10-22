@@ -1270,7 +1270,6 @@ fn cancelled_before_provider_send_adds_no_executed_attempt() {
     let mut projection = ext_metrics::Projection::default();
     projection.fold(&ext::LogPrefix {
         session: session.id,
-        parent: None,
         entries: log,
         cursor: ext::LogCursor::default(),
         reset: true,

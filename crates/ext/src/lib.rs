@@ -109,7 +109,7 @@ pub fn child_result(outcome: &Outcome) -> String {
     text
 }
 
-/// Committed log prefixes and immutable ownership, without acquiring writer leases.
+/// Committed suffixes selected by immutable ownership, without writer leases.
 pub trait Logs: Send + Sync {
     fn read(
         &self,
@@ -128,7 +128,6 @@ pub struct LogCursor {
 
 pub struct LogPrefix {
     pub session: protocol::SessionId,
-    pub parent: Option<protocol::SessionId>,
     pub entries: Vec<protocol::Entry>,
     pub cursor: LogCursor,
     pub reset: bool,

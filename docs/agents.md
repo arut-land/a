@@ -254,8 +254,8 @@ requires an observed count. No built-in price is assumed. A recorded charge
 in the selected currency takes precedence. Missing rates, counts or duration
 increase `UsageTotal.missing`; `known` is only the observed portion.
 
-Own totals include only attempts executed in that conversation. Subtree
-queries follow immutable ownership edges once; copied fork facts and cached
+Own totals include only attempts executed in that conversation. The log service selects subtree
+ids by following immutable ownership edges once; aggregation reuses those ids, and copied fork facts and cached
 replies add no spend. Projection API filters select agent and side/main dimensions without
 changing the facts. Critical elapsed time is the envelope of measured intervals
 within each clock epoch, separately from summed call durations. Multiple epochs

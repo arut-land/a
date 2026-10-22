@@ -2114,7 +2114,10 @@ fn metrics_queries_read_owned_attempts_from_committed_prefixes() {
         models: Vec::new(),
     };
     assert_eq!(projection.own(session.id, &prices).attempts.executed, 0);
-    let total = projection.subtree(session.id, &prices);
+    let total = projection.subtree(
+        &prefixes.iter().map(|p| p.session).collect::<Vec<_>>(),
+        &prices,
+    );
     assert_eq!(total.attempts.executed, 2);
     assert_eq!(total.usage[0].missing, 1);
     assert!(total.usage[0].known > 0);

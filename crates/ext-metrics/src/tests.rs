@@ -31,10 +31,9 @@ fn fact(session: SessionId, attempt: u16, start: u64, elapsed: Option<u64>) -> C
         charge: None,
     }
 }
-fn log(session: SessionId, parent: Option<SessionId>, facts: Vec<CallFact>) -> ext::LogPrefix {
+fn log(session: SessionId, facts: Vec<CallFact>) -> ext::LogPrefix {
     ext::LogPrefix {
         session,
-        parent,
         cursor: ext::LogCursor {
             seq: facts.len() as u64,
             ..ext::LogCursor::default()
@@ -75,7 +74,6 @@ fn retries_count_each_executed_attempt_once() {
     let mut p = Projection::default();
     p.fold(&log(
         id,
-        None,
         vec![first.clone(), first, fact(id, 1, 10, Some(10))],
     ));
     let total = p.own(id, &prices());
@@ -95,7 +93,7 @@ fn unknown_usage_is_never_zero() {
     let mut f = fact(id, 0, 0, None);
     f.usage = None;
     let mut p = Projection::default();
-    p.fold(&log(id, None, vec![f]));
+    p.fold(&log(id, vec![f]));
     let total = p.own(id, &prices());
     assert_eq!(
         total.usage[0],
@@ -112,11 +110,11 @@ fn cached_replay_and_copied_forks_add_no_spend() {
     let id = SessionId::new();
     let fork = SessionId::new();
     let f = fact(id, 0, 0, Some(10));
-    let original = log(id, None, vec![f.clone()]);
+    let original = log(id, vec![f.clone()]);
     let mut p = Projection::default();
     p.fold(&original);
     p.fold(&original);
-    p.fold(&log(fork, None, vec![f]));
+    p.fold(&log(fork, vec![f]));
     assert_eq!(p.own(id, &prices()).attempts.executed, 1);
     assert_eq!(p.own(fork, &prices()).attempts.executed, 0);
 }
@@ -126,19 +124,23 @@ fn subtree_totals_count_descendants_once() {
     let child = SessionId::new();
     let grandchild = SessionId::new();
     let mut p = Projection::default();
-    for (id, parent) in [(root, None), (child, Some(root)), (grandchild, Some(child))] {
+    for id in [root, child, grandchild] {
         let mut f = fact(id, 0, 0, Some(10));
         f.side = id == grandchild;
-        let prefix = log(id, parent, vec![f]);
+        let prefix = log(id, vec![f]);
         p.fold(&prefix);
         p.fold(&prefix);
     }
-    assert_eq!(p.subtree(root, &prices()).attempts.executed, 3);
+    assert_eq!(
+        p.subtree(&[root, child, grandchild, child], &prices())
+            .attempts
+            .executed,
+        3
+    );
     assert_eq!(p.own(root, &prices()).attempts.executed, 1);
     assert_eq!(
         p.query(
-            root,
-            true,
+            &[root, child, grandchild],
             &Filter {
                 side: Some(true),
                 ..Filter::default()
@@ -151,8 +153,7 @@ fn subtree_totals_count_descendants_once() {
     );
     assert_eq!(
         p.query(
-            root,
-            true,
+            &[root, child, grandchild],
             &Filter {
                 agent: Some("other".into()),
                 ..Filter::default()
@@ -170,14 +171,12 @@ fn overlap_changes_critical_path_but_not_summed_call_time() {
     let mut p = Projection::default();
     p.fold(&log(
         id,
-        None,
         vec![fact(id, 0, 0, Some(10)), fact(id, 1, 10, Some(10))],
     ));
     let sequential = p.own(id, &prices());
     let mut p = Projection::default();
     p.fold(&log(
         id,
-        None,
         vec![fact(id, 0, 0, Some(10)), fact(id, 1, 0, Some(10))],
     ));
     let overlap = p.own(id, &prices());
@@ -188,7 +187,7 @@ fn overlap_changes_critical_path_but_not_summed_call_time() {
 #[test]
 fn repricing_changes_no_execution_fact() {
     let id = SessionId::new();
-    let prefix = log(id, None, vec![fact(id, 0, 0, Some(10))]);
+    let prefix = log(id, vec![fact(id, 0, 0, Some(10))]);
     let encoded = Json::encode(&prefix.entries).unwrap();
     let mut p = Projection::default();
     p.fold(&prefix);
@@ -205,22 +204,21 @@ fn repricing_changes_no_execution_fact() {
         currency: "USD".into(),
         nanos: 7,
     });
-    p.fold(&log(id, None, vec![fact(id, 0, 0, Some(10)), charged]));
+    p.fold(&log(id, vec![fact(id, 0, 0, Some(10)), charged]));
     assert_eq!(p.own(id, &new).cost.known, second.cost.known + 7);
 }
 #[test]
 fn metrics_rebuild_equals_incremental_fold() {
     let id = SessionId::new();
-    let first = log(id, None, vec![fact(id, 0, 0, Some(10))]);
+    let first = log(id, vec![fact(id, 0, 0, Some(10))]);
     let full = log(
         id,
-        None,
         vec![fact(id, 0, 0, Some(10)), fact(id, 1, 10, Some(20))],
     );
     let mut incremental = Projection::default();
     incremental.fold(&first);
     assert_eq!(incremental.own(id, &prices()).call_ns.known, 10);
-    let mut suffix = log(id, None, vec![fact(id, 1, 10, Some(20))]);
+    let mut suffix = log(id, vec![fact(id, 1, 10, Some(20))]);
     suffix.entries[0].seq = Seq::new(2).unwrap();
     suffix.cursor.seq = 2;
     suffix.reset = false;
@@ -237,7 +235,6 @@ fn restart_gaps_remain_unknown() {
     restarted.clock_epoch = SessionId::new();
     p.fold(&log(
         id,
-        None,
         vec![fact(id, 0, 0, Some(10)), restarted, fact(id, 2, 0, None)],
     ));
     let total = p.own(id, &prices());
@@ -290,11 +287,10 @@ fn pricing_adjustments_require_observed_subsets() {
         Some(10)
     );
     let mut p = Projection::default();
-    p.fold(&log(id, None, vec![f]));
+    p.fold(&log(id, vec![f]));
     assert_eq!(
         p.query(
-            id,
-            false,
+            &[id],
             &Filter {
                 call: CallId::new(2),
                 ..Filter::default()
@@ -311,9 +307,9 @@ fn pricing_adjustments_require_observed_subsets() {
 fn replaced_sequence_coverage_invalidates_cached_facts() {
     let id = SessionId::new();
     let mut p = Projection::default();
-    p.fold(&log(id, None, vec![fact(id, 0, 0, Some(10))]));
+    p.fold(&log(id, vec![fact(id, 0, 0, Some(10))]));
     assert_eq!(p.own(id, &prices()).call_ns.known, 10);
-    let mut replacement = log(id, None, vec![fact(id, 0, 0, Some(20))]);
+    let mut replacement = log(id, vec![fact(id, 0, 0, Some(20))]);
     replacement.entries[0].epoch = Epoch(1);
     p.fold(&replacement);
     assert_eq!(p.own(id, &prices()).call_ns.known, 20);
@@ -322,7 +318,7 @@ fn replaced_sequence_coverage_invalidates_cached_facts() {
 #[test]
 fn an_unsettled_intent_has_unknown_spend_without_claiming_execution() {
     let id = SessionId::new();
-    let mut prefix = log(id, None, vec![]);
+    let mut prefix = log(id, vec![]);
     prefix.entries.push(Entry::new(
         Seq::new(1).unwrap(),
         Epoch(0),
@@ -353,11 +349,10 @@ fn an_unsettled_intent_has_unknown_spend_without_claiming_execution() {
 fn unrelated_suffixes_advance_coverage_without_changing_accounting() {
     let id = SessionId::new();
     let mut projection = Projection::default();
-    projection.fold(&log(id, None, vec![fact(id, 0, 0, Some(10))]));
+    projection.fold(&log(id, vec![fact(id, 0, 0, Some(10))]));
     let before = projection.own(id, &prices());
     let suffix = ext::LogPrefix {
         session: id,
-        parent: None,
         reset: false,
         inherited_through: 0,
         cursor: ext::LogCursor {
@@ -380,7 +375,7 @@ fn unrelated_suffixes_advance_coverage_without_changing_accounting() {
 #[test]
 fn copied_interrupted_intents_do_not_create_unknown_spend() {
     let id = SessionId::new();
-    let mut prefix = log(id, None, vec![fact(id, 0, 0, Some(10))]);
+    let mut prefix = log(id, vec![fact(id, 0, 0, Some(10))]);
     prefix.entries.insert(
         0,
         Entry::new(
@@ -409,7 +404,7 @@ fn copied_interrupted_intents_do_not_create_unknown_spend() {
 #[test]
 fn overlapping_suffixes_do_not_duplicate_uncertain_intents() {
     let id = SessionId::new();
-    let mut prefix = log(id, None, vec![]);
+    let mut prefix = log(id, vec![]);
     prefix.entries.push(Entry::new(
         Seq::new(1).unwrap(),
         Epoch(0),
@@ -433,7 +428,7 @@ fn overlapping_suffixes_do_not_duplicate_uncertain_intents() {
 #[test]
 fn successful_recovery_keeps_the_crashed_attempts_usage_unknown() {
     let id = SessionId::new();
-    let mut prefix = log(id, None, vec![fact(id, 1, 10, Some(10))]);
+    let mut prefix = log(id, vec![fact(id, 1, 10, Some(10))]);
     prefix.entries[0].seq = Seq::new(3).unwrap();
     prefix.entries.splice(
         0..0,
@@ -508,7 +503,7 @@ fn supplied_prices_are_sorted_and_duplicates_are_rejected() {
 #[test]
 fn unreadable_settlement_metadata_preserves_uncertainty() {
     let id = SessionId::new();
-    let mut prefix = log(id, None, vec![]);
+    let mut prefix = log(id, vec![]);
     prefix.entries = vec![
         Entry::new(
             Seq::new(1).unwrap(),
@@ -544,7 +539,7 @@ fn unreadable_settlement_metadata_preserves_uncertainty() {
 #[test]
 fn a_retry_without_execution_settlement_remains_unknown_after_restart() {
     let id = SessionId::new();
-    let mut prefix = log(id, None, vec![fact(id, 0, 0, Some(10))]);
+    let mut prefix = log(id, vec![fact(id, 0, 0, Some(10))]);
     prefix.entries[0].seq = Seq::new(2).unwrap();
     prefix.entries[0].body = Body::Decision {
         call: CallId::new(1),
