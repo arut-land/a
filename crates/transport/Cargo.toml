@@ -8,11 +8,10 @@ publish.workspace = true
 # An HTTP client over ureq, run through the `rt` runtime; with neither TLS
 # feature it speaks plain http only.
 ureq = ["dep:ureq", "dep:rt"]
-# Which TLS it speaks is chosen where `a` is assembled, by target, so no
-# platform is named here. The OS's (Security.framework, SChannel): no
-# bundled crypto. ureq's connector needs its `native-tls` feature, which
-# links webpki's roots though the platform verifier never reads them.
-tls-native = ["ureq", "ureq/native-tls"]
+# Binaries select TLS features; this library makes no platform choice.
+# Host crypto and trust (Security.framework, SChannel, OpenSSL), without a
+# bundled crypto implementation or duplicate certificate bundle.
+tls-native = ["ureq", "ureq/native-tls-no-default"]
 # rustls with the platform verifier. Not `rustls`, which adds webpki-roots:
 # Mozilla's roots, linked because ureq matches on `RootCerts` at run time
 # though the platform verifier never reads them (129 KiB on macOS).

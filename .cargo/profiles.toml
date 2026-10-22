@@ -32,22 +32,17 @@ opt-level = 1
 
 # panic stays unwind so a panicking session actor cannot take the daemon down.
 #
-# Size and speed by architecture, not by level: everything at s, which
-# the measurements in docs/perf/build-tuning.md hold to within noise of 3
-# on every path but the one below. std (build-std) is at s too, alloc
-# included: the terminal client's frame no longer allocates per span
-# (docs/tui.md), which was what alloc at 3 bought.
+# The same size profile on every target. Linux measurements and the native
+# TLS comparison are in docs/perf.
 [profile.release]
-opt-level = "s"
+# LLVM-only metadata for safe ELF folding; dev uses Cranelift.
+rustflags = ["-Cllvm-args=-addrsig"]
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
 split-debuginfo = "packed"
 strip = "symbols"
-
-# The wire: serde_json frames every message and parses every log entry.
-[profile.release.package.serde_json]
-opt-level = 3
 
 # cargo-bolero (`mise run fuzz`): optimized, and LLVM throughout for
 # libFuzzer's coverage instrumentation.

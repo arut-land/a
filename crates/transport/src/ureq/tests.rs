@@ -113,6 +113,41 @@ fn next_chunk(body: &mut crate::Body) -> Option<io::Result<Vec<u8>>> {
     }))
 }
 
+#[cfg(feature = "tls-native")]
+#[test]
+fn https_starts_tls_without_a_bundled_certificate_store() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let peer = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "HTTPS never connected");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut header = [0; 3];
+        stream.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..2], &[22, 3], "a TLS handshake record");
+    });
+    let (http, _) = client();
+    let request = http::Request::get(format!("https://{address}/"))
+        .body(Payload::default())
+        .unwrap();
+    // The peer closes during TLS: an ordinary transport error, never a feature panic.
+    assert!(rt::block_on(http.send(request)).is_err());
+    peer.join().unwrap();
+}
+
 #[test]
 fn dropping_a_request_waiting_for_its_head_closes_the_connection() {
     let (http, returned) = client();

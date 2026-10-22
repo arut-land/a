@@ -37,7 +37,6 @@ ignore = true
 multiple-versions = "deny"
 skip = [
     { crate = "windows-sys@0.60.2", reason = "notify 8 pins 0.60; sys and the async reactor use 0.61. The watcher backend does not exchange Windows types with them" },
-    { crate = "getrandom@0.2.17", reason = "ring pins 0.2; uuid and tempfile are on 0.4" },
     { crate = "syn@2.0.119", reason = "hypertext-macros (web) is on syn 2; serde_derive, usage-derive, thiserror-impl and ext-derive on 3. Goes when hypertext moves" },
 ]
 wildcards = "deny"
@@ -51,10 +50,12 @@ deny = [
     { crate = "async-std", reason = "the engine runs on rt" },
     { crate = "hyper", reason = "ureq is the HTTP client" },
     { crate = "reqwest", reason = "ureq is the HTTP client" },
-    # TLS is native on Apple and Windows, rustls elsewhere.
+    # The optional rustls transport uses ring; the binary uses native TLS.
     { crate = "aws-lc-sys", reason = "rustls uses ring" },
 ]
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# Pinned upstream fix for native TLS without an unused Mozilla certificate bundle.
+allow-git = ["https://github.com/algesten/ureq"]

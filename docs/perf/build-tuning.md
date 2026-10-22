@@ -31,18 +31,57 @@ subscription fix are recorded in [idle-rss.md](idle-rss.md).
 | Release: fat LTO, `codegen-units = 1`, `strip = "symbols"`, packed split debuginfo | `.cargo/profiles.toml` | Matches uv, ruff, mise, Deno. Thin LTO measured +14% size |
 | `panic = "unwind"` in release | `.cargo/profiles.toml` | A panicking session actor must not kill the daemon |
 | `cargo build-release` adds `-Zbuild-std=std,panic_unwind` | `.cargo/config.toml` | No gain today; makes size levers stronger (see experiments) |
-| Linux: clang + mold | `.cargo/config.toml`, `mise.toml` | Link time. Untested until Linux CI |
+| Linux: clang + mold, safe ICF and RELR | `.cargo/config.toml`, `mise.toml` | Measured on Ubuntu arm64 and cross-linked for x86_64; see the first-CI comparison below |
 | Windows MSVC: `+crt-static`, `/STACK:8388608` | `.cargo/config.toml` | No VC++ runtime dependency (uv, ruff, Deno, Zed, oxc, ripgrep). Untested until Windows CI |
 | mbx (mr-boxington) cargo wrapper | `mise.toml` | Shared compile cache across checkouts and worktrees |
-| Native TLS on Apple and Windows (`ureq` `native-tls`), rustls + platform verifier elsewhere | `crates/provider/Cargo.toml` | 3968 → 3179 KiB on macOS: drops ring, rustls, webpki |
-| Release `opt-level = "s"` for everything, `3` for `serde_json` | `.cargo/profiles.toml` | Grown crate by crate from "cold crates at s" (3179 → 3018 KiB, startup unchanged at 3.4 vs 3.5 ± 0.2 ms) through protocol (decode and encode under 5% slower, −92 KiB), llm (decoders ~6% per frame, −160 KiB), engine/ext/client/sys/rt (−160 KiB, no measured daemon CPU change), tui (delta frame ~45 µs at s and 3 alike, docs/tui.md), std via build-std (−13 KiB), the toml crates and ureq/usage-argv at z (−32 KiB over 3). Flipped to one default on 2026-10-20: 2846 → 2717 KiB on macOS (the crates never listed, url's and native-tls's dependencies, uuid, hypertext, ratatui-core's among them, shrank more than z → s cost; 25 entries → 2, and a new crate needs none). serde_json frames every message: on a recorded 123-entry, 609 KiB chat session (`crates/protocol/tests/bench.rs`, fastest of 10, median of 5 runs) decoding the log takes 284 µs at 3 and 316 µs at s (+11%), encoding it 131 and 173 µs (+32%), for 32 KiB of binary (2846 vs 2813 KiB); the view's fold, which serde_json does not run, 69 and 71 µs (2026-10-21). `alloc` was the other exception (the terminal client's frame allocated per span) until the client's own grid and `SmolStr` rows: with those, `alloc` at s and at 3 measure the same on every `render_cost` row (docs/tui.md), and the exception went (−65 KiB, 2026-10-20) |
+| Native TLS and platform roots on every target, without bundled roots | `apps/cli/Cargo.toml`, `crates/transport/Cargo.toml` | Linux bundled crypto exceeded the cap; the pinned upstream ureq fix enables its no-bundle connector |
+| Release `opt-level = "z"` for everything | `.cargo/profiles.toml` | The Linux cap now requires z throughout (comparison below). Earlier tuning, through 2026-10-21: grown crate by crate from "cold crates at s" (3179 → 3018 KiB, startup unchanged at 3.4 vs 3.5 ± 0.2 ms) through protocol (decode and encode under 5% slower, −92 KiB), llm (decoders ~6% per frame, −160 KiB), engine/ext/client/sys/rt (−160 KiB, no measured daemon CPU change), tui (delta frame ~45 µs at s and 3 alike, docs/tui.md), std via build-std (−13 KiB), the toml crates and ureq/usage-argv at z (−32 KiB over 3). Flipped to one default on 2026-10-20: 2846 → 2717 KiB on macOS (the crates never listed, url's and native-tls's dependencies, uuid, hypertext, ratatui-core's among them, shrank more than z → s cost; 25 entries → 2, and a new crate needs none). serde_json frames every message: on a recorded 123-entry, 609 KiB chat session (`crates/protocol/tests/bench.rs`, fastest of 10, median of 5 runs) decoding the log takes 284 µs at 3 and 316 µs at s (+11%), encoding it 131 and 173 µs (+32%), for 32 KiB of binary (2846 vs 2813 KiB); the view's fold, which serde_json does not run, 69 and 71 µs (2026-10-21). `alloc` was the other exception (the terminal client's frame allocated per span) until the client's own grid and `SmolStr` rows: with those, `alloc` at s and at 3 measure the same on every `render_cost` row (docs/tui.md), and the exception went (−65 KiB, 2026-10-20) |
+
+## First CI: Linux size (2026-10-22)
+
+The first x86_64 Ubuntu CI fixtures binary was 5486 KiB. Fat LTO, symbol
+stripping and the size-optimized rebuilt standard library were already active;
+this was executable code and unwind data, not embedded debuginfo. Linux alone
+bundled rustls/ring. Its ELF also needed safe folding and compact relative
+relocations to fit the same cap.
+
+Measured with nightly-2026-10-17 in an Ubuntu 26.04 arm64 Lima VM, cross-linked
+for x86_64 with GCC 15 and mold 3.0.0. These are fixtures builds; each retains
+panic unwinding, fat LTO, one codegen unit, stripping and build-std. The exact
+commands are the `build-release` alias with `--target x86_64-unknown-linux-gnu`,
+`CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc` and the corresponding Cargo
+linker override. `CARGO_BUILD_JOBS=2` applies throughout.
+
+| Variant | Bytes | KiB |
+| --- | ---: | ---: |
+| Reproduced baseline | 5622672 | 5490 |
+| Safe ICF and address-significance metadata | 5473296 | 5345 |
+| z and safe ICF, still bundled TLS | 5267344 | 5143 |
+| Native TLS with its default roots, s and safe ICF | 4651464 | 4542 |
+| Native TLS without bundled roots, z, safe ICF, RELR; serde_json still at 3 | 4212112 | 4113 |
+| Same shared z profile throughout, including serde_json | 4170768 | 4073 |
+
+The final profile is the same on every target. The previous serde_json-at-3
+exception no longer fits the Linux cap; its earlier throughput comparison is
+preserved above. Safe ICF preserves address identity and needs LLVM's addrsig
+metadata. That metadata is release-only because Cranelift rejects LLVM options.
+Unrestricted ICF, function outlining and inlining-threshold changes did not
+solve the cap and are not enabled.
+
+Native TLS delegates crypto and trust to the host, as on macOS and Windows.
+The Linux GNU build requires OpenSSL 3 (`libssl.so.3`, `libcrypto.so.3`) and a
+RELR-capable loader (glibc 2.36 or newer). Building it needs clang, pkg-config
+and libssl-dev; both Linux compilation jobs install them explicitly. The ureq
+revision is pinned to its upstream no-default-connector fix rather than
+maintaining a local TLS implementation or carrying an unused certificate bundle.
+A hermetic transport test observes an actual TLS ClientHello without requiring
+network access or provider credentials.
 
 ## Deferred: adopt when the trigger fires
 
 | Idea | Trigger | Expected effect | Evidence |
 | --- | --- | --- | --- |
 | Release `opt-level = "s"` for cold code, `3` for deps and hot crates | Binary > ~2 MB | Zed: macOS −33%, Windows −28.5% (speed not measured); Deno uses `z` + ~55 hot crates at 3 | zed#65168, deno `Cargo.toml` |
-| Linux `-Clink-arg=-Wl,--icf=safe -Cllvm-args=-addrsig` (release only, CI) | Linux CI exists | Zed Linux −23.5% with symbol stripping; Deno −3.77 MB | zed#65169, deno#34478 |
 | Strip with `--strip-unneeded` after uploading symbols | Crash reporting exists | Part of Zed's Linux win | zed#65169 |
 | macOS chained fixups (`MACOSX_DEPLOYMENT_TARGET = "13.0"`) | Minimum macOS chosen | Deno startup 9.8 → 9.0 ms. Here: fixups emitted, +16 KB, no startup change | deno#35409 |
 | `-Ctarget-cpu=apple-m1` for `aarch64-apple-darwin` only | Hot CPU paths exist | Unmeasured; nushell and Bun do it (every arm64 Mac is ≥ M1) | — |
@@ -63,7 +102,7 @@ subscription fix are recorded in [idle-rss.md](idle-rss.md).
 ## Notes from adding the LLM provider (2026-10-18)
 
 - Size before the provider: 473 KiB. With rig-core + ureq + rustls: 3968 KiB (std 626K, rig_core 394K, rustls 316K, serde_json 177K, ring 132K).
-- `ureq`'s TLS module is gated on its full `native-tls` feature; `native-tls-no-default` builds but panics at runtime ("feature is not enabled: native-tls"). The full feature also links `webpki-root-certs` (~213 KiB) although `RootCerts::PlatformVerifier` never uses it. Revisit if ureq gates the roots separately.
+- The published ureq 3.4.2 gates its connector on full `native-tls`, so `native-tls-no-default` panics. Full native TLS also links an unused Mozilla root bundle (~213 KiB). The 2026-10-22 build pins [the upstream gate fix](https://github.com/algesten/ureq/commit/8fcd72a7881354400c432157e1a60222d61efc5c) and selects platform roots without the bundle.
 - Dev builds compile workspace crates with Cranelift, which cannot unwind on macOS arm64: a panic aborts the process instead of unwinding. Release (LLVM) unwinds, and the engine wraps every effect in `catch_unwind`. Revisit if Cranelift gains unwinding here, or build `engine` with LLVM in dev if dev aborts become a problem.
 
 ## Own provider layer instead of rig (2026-10-18)

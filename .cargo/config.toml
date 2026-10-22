@@ -2,6 +2,7 @@ include = [{ path = "profiles.toml" }]
 
 [unstable]
 codegen-backend = true
+profile-rustflags = true
 
 # Unwind tables valid at calls only, which is where a panic unwinds from:
 # without epilogue CFI, ld64 encodes most frames compactly instead of
@@ -12,7 +13,15 @@ rustflags = ["-Zthreads=8", "-Zuse-sync-unwind=yes"]
 # Target rustflags replace build.rustflags, so they are repeated here.
 [target.'cfg(target_os = "linux")']
 linker = "clang"
-rustflags = ["-Zthreads=8", "-Zuse-sync-unwind=yes", "-Clink-arg=-fuse-ld=mold"]
+# Preserve address identity when folding code; compact relative relocations
+# need glibc >= 2.36 (or a loader with equivalent RELR support).
+rustflags = [
+    "-Zthreads=8",
+    "-Zuse-sync-unwind=yes",
+    "-Clink-arg=-fuse-ld=mold",
+    "-Clink-arg=-Wl,--icf=safe",
+    "-Clink-arg=-Wl,--pack-dyn-relocs=relr",
+]
 
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-Zthreads=8", "-Ctarget-feature=+crt-static", "-Clink-arg=/STACK:8388608"]
