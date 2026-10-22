@@ -111,7 +111,8 @@ pub struct Projection {
 #[derive(Default)]
 struct Conversation {
     covered: ext::LogCursor,
-    attempts: BTreeMap<(CallId, u16), Option<CallFact>>,
+    facts: Vec<CallFact>,
+    uncertain: Vec<(CallId, u16)>,
 }
 
 impl Projection {
@@ -119,9 +120,9 @@ impl Projection {
     pub fn fold(&mut self, prefix: &ext::LogPrefix) {
         let log = self.logs.entry(prefix.session).or_default();
         if prefix.reset {
-            log.attempts.clear();
+            *log = Conversation::default();
         }
-        let after = if prefix.reset { 0 } else { log.covered.seq };
+        let after = log.covered.seq;
         for entry in &prefix.entries {
             if entry.seq.get() <= after.max(prefix.inherited_through) {
                 continue;
@@ -136,9 +137,7 @@ impl Projection {
                     attempt,
                     ..
                 } => {
-                    log.attempts
-                        .entry((CallId(entry.seq), *attempt))
-                        .or_default();
+                    log.uncertain.push((CallId(entry.seq), *attempt));
                 }
                 Body::Decision {
                     call: Some(call),
@@ -146,36 +145,28 @@ impl Projection {
                         protocol::Verdict::Retry { attempt, .. }
                         | protocol::Verdict::SideRetry { attempt, .. },
                     ..
-                } if log
-                    .attempts
-                    .iter()
-                    .any(|((id, _), fact)| id == call && fact.is_none()) =>
-                {
-                    log.attempts.entry((*call, *attempt)).or_default();
+                } if log.uncertain.iter().any(|(id, _)| id == call) => {
+                    log.uncertain.push((*call, *attempt));
                 }
                 Body::ModelResult { call, outcome, .. }
                     if entry.execution.is_none()
                         && !matches!(outcome, protocol::Outcome::Interrupted { .. }) =>
                 {
-                    if let Some((&key, _)) = log
-                        .attempts
-                        .iter()
-                        .rev()
-                        .find(|((id, _), fact)| id == call && fact.is_none())
-                    {
-                        log.attempts.remove(&key);
+                    if let Some(i) = log.uncertain.iter().rposition(|(id, _)| id == call) {
+                        log.uncertain.remove(i);
                     }
                 }
                 _ => {}
             }
             if let Some(fact) = fact {
-                log.attempts
-                    .entry((fact.id.call, fact.id.attempt))
-                    .or_default()
-                    .get_or_insert(fact);
+                log.uncertain
+                    .retain(|id| *id != (fact.id.call, fact.id.attempt));
+                if let Err(i) = log.facts.binary_search_by_key(&fact.id, |f| f.id) {
+                    log.facts.insert(i, fact);
+                }
             }
         }
-        if prefix.reset || prefix.cursor.seq >= log.covered.seq {
+        if prefix.cursor.seq >= log.covered.seq {
             log.covered = prefix.cursor;
         }
     }
@@ -203,7 +194,7 @@ impl Projection {
             if !selected.contains(session) {
                 continue;
             }
-            for fact in log.attempts.values().flatten() {
+            for fact in &log.facts {
                 if filter.agent.as_deref().is_some_and(|a| a != fact.agent)
                     || filter.side.is_some_and(|s| s != fact.side)
                     || filter.call.is_some_and(|c| c != fact.id.call)
@@ -236,9 +227,9 @@ impl Projection {
                 }
             }
             let missing = log
-                .attempts
+                .uncertain
                 .iter()
-                .filter(|((id, _), fact)| fact.is_none() && filter.call.is_none_or(|c| c == *id))
+                .filter(|(id, _)| filter.call.is_none_or(|c| c == *id))
                 .count() as u64;
             total.attempts.ambiguous += missing;
             for count in &mut total.usage {
