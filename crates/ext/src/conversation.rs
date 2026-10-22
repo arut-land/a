@@ -256,8 +256,6 @@ mod tests {
         assert_eq!(
             assembled,
             [
-                llm::Message::system("thread system"),
-                llm::Message::system("owner system"),
                 llm::Message::user("recent instruction"),
                 llm::Message::assistant("recent reply"),
                 llm::Message::user("current instruction")

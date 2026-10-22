@@ -166,38 +166,17 @@ impl ContextPolicy {
         current: &Messages,
     ) -> Result<Messages, String> {
         let history = &history[..history.len().saturating_sub(current.len())];
-        let system = |m: &&Message| matches!(m, Message::System(_));
-        let mandatory: Vec<_> = history
-            .iter()
-            .chain(owner.iter())
-            .filter(system)
-            .chain(current.iter())
-            .collect();
-        let mut used = crate::Json::encode(&mandatory)
+        let mut used = crate::Json::encode(current)
             .map_err(|e| e.to_string())?
             .raw()
             .len();
         if used > self.bytes as usize {
             return Err("model-only instructions exceed the context ceiling".into());
         }
-        let mut select = |messages: &[Message], owner: bool| -> Result<Vec<Message>, String> {
-            let mut end = messages.len();
+        let mut select = |messages: &[Message]| -> Result<Vec<Message>, String> {
             let mut selected = Vec::new();
-            for _ in 0..self.exchanges {
-                if end == 0 {
-                    break;
-                }
-                let start = (1..end)
-                    .rfind(|&i| {
-                        if owner {
-                            matches!(messages[i], Message::User(_))
-                        } else {
-                            matches!(messages[i - 1], Message::Assistant(_))
-                        }
-                    })
-                    .unwrap_or(0);
-                let group: Vec<_> = messages[start..end].iter().filter(|m| !system(m)).collect();
-                let bytes = crate::Json::encode(&group)
+            for exchange in exchanges(messages).rev().take(self.exchanges.into()) {
+                let bytes = crate::Json::encode(exchange)
                     .map_err(|e| e.to_string())?
                     .raw()
                     .len();
@@ -205,24 +184,27 @@ impl ContextPolicy {
                     break;
                 }
                 used += bytes;
-                selected.push(group);
-                end = start;
+                selected.push(exchange);
             }
             Ok(selected.into_iter().rev().flatten().cloned().collect())
         };
         // Owner context has priority over older thread exchanges.
-        let context = select(owner, true)?;
-        let exchanges = select(history, false)?;
+        let context = select(owner)?;
+        let history = select(history)?;
         Ok(history
-            .iter()
-            .chain(owner.iter())
-            .filter(system)
-            .cloned()
-            .chain(exchanges)
+            .into_iter()
             .chain(context)
             .chain(current.iter().cloned())
             .collect())
     }
+}
+
+fn exchanges(messages: &[Message]) -> impl DoubleEndedIterator<Item = &[Message]> {
+    messages.chunk_by(|previous, next| {
+        !matches!(previous, Message::Assistant(reply) if reply.tool_calls().next().is_none())
+            && !(matches!(next, Message::System(_) | Message::User(_))
+                && !matches!(previous, Message::System(_)))
+    })
 }
 
 /// A protocol's encoding of a conversation, a prepared message at a time.

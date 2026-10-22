@@ -1638,7 +1638,7 @@ fn title_regeneration_keeps_owner_context_out_of_thread_history() {
     assert!(
         lengths
             .iter()
-            .all(|&(messages, bytes)| messages <= 8 && bytes <= 8192)
+            .all(|&(messages, bytes)| messages <= 10 && bytes <= 8192)
     );
     assert!(lengths[10..].iter().all(|length| *length == lengths[10]));
     assert!(Json::encode(&entries).unwrap().raw().len() < 2_000_000);
@@ -1898,4 +1898,106 @@ fn a_plain_model_only_input_is_never_dropped_by_the_context_bound() {
         after, before,
         "an oversized mandatory raw input should fail before calling the provider"
     );
+}
+
+#[test]
+fn old_judge_system_prompts_do_not_exhaust_the_mandatory_context() {
+    let current: llm::Messages = [
+        llm::Message::system("judge instruction"),
+        llm::Message::user("current question"),
+    ]
+    .into_iter()
+    .collect();
+    let mut history = llm::Messages::default();
+    for _ in 0..1000 {
+        history.push(llm::Message::system("judge instruction"));
+        history.push(llm::Message::user("old question"));
+        history.push(llm::Message::assistant("yes"));
+    }
+    for message in current.iter() {
+        history.push(message.clone());
+    }
+    let policy = ext::ContextPolicy {
+        exchanges: 2,
+        bytes: 1024,
+    };
+    let result = policy.assemble(&history, &llm::Messages::default(), &current);
+    assert!(
+        result.is_ok(),
+        "old system instructions escaped the exchange window: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn huge_owner_context_cannot_displace_current_title_instructions_or_escape_the_ceiling() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::default()
+        .with(&ext_title::Title)
+        .unwrap()
+        .with(&TitleHistory(Arc::clone(&captured)))
+        .unwrap();
+    let fixture = fixture(registry, &http);
+    let session = fixture.start(&[]);
+    session
+        .submit(&"huge owner context ".repeat(10_000))
+        .unwrap();
+    until(&session, "initial title", |log| {
+        SessionView::from_log(session.id, "/w".into(), log)
+            .side("title")
+            .is_some()
+    });
+    settle(&session);
+    let messages = lock(&captured).last().unwrap().clone();
+    session.halt();
+    assert!(Json::encode(&messages).unwrap().raw().len() <= 8192);
+    assert!(messages.iter().any(
+        |m| matches!(m, llm::Message::User(user) if user.content.iter().any(|p| matches!(p,
+        llm::UserPart::Text(text) if text.text.contains("Name this conversation"))))
+    ));
+}
+
+#[test]
+fn request_bounds_keep_pairs_whole_and_the_current_instruction_last() {
+    let current: llm::Messages = [llm::Message::user("mandatory current instruction")]
+        .into_iter()
+        .collect();
+    let history: llm::Messages = [
+        llm::Message::user("older user"),
+        llm::Message::assistant("older assistant"),
+        llm::Message::user("recent user"),
+        llm::Message::assistant("recent assistant"),
+    ]
+    .into_iter()
+    .chain(current.iter().cloned())
+    .collect();
+    let owner: llm::Messages = [
+        llm::Message::user("owner user"),
+        llm::Message::assistant("x".repeat(100_000)),
+    ]
+    .into_iter()
+    .collect();
+    for bytes in (32..1024).step_by(16) {
+        let policy = ext::ContextPolicy {
+            exchanges: 2,
+            bytes,
+        };
+        let Ok(messages) = policy.assemble(&history, &owner, &current) else {
+            continue;
+        };
+        assert_eq!(messages.last(), current.last());
+        assert!(Json::encode(&messages).unwrap().raw().len() <= bytes as usize);
+        let contains = |message: llm::Message| messages.iter().any(|m| *m == message);
+        for (user, assistant) in [
+            ("older user", "older assistant"),
+            ("recent user", "recent assistant"),
+        ] {
+            assert_eq!(
+                contains(llm::Message::user(user)),
+                contains(llm::Message::assistant(assistant))
+            );
+        }
+        assert!(!contains(llm::Message::user("owner user")));
+    }
 }
