@@ -89,8 +89,8 @@ fn a_prefix_projects_edits_and_publications_without_executable_ownership() {
     assert!(
         image
             .iter()
-            .flat_map(|layer| &layer.inputs)
-            .all(|input| !matches!(input.value, ContextValue::ToolCall { .. }))
+            .flat_map(|ContextLayer(_, inputs)| inputs)
+            .all(|input| !matches!(input.1, ContextValue::ToolCall { .. }))
     );
     let registry = Arc::new(Registry::default());
     let expected = Transcript::of(&entries, registry.clone(), "").into_context();
@@ -212,16 +212,16 @@ fn pending_exchanges_never_become_child_work() {
 
 fn recursive_scope(image: &ContextImage, scope: usize, registry: &Arc<Registry>) -> Transcript {
     let mut transcript = Transcript::empty(registry.clone(), "");
-    let Some(layer) = image.get(scope) else {
+    let Some(ContextLayer(runner, inputs)) = image.get(scope) else {
         return transcript;
     };
-    transcript.model_only = layer.runner == RunnerKind::ModelOnly;
-    for input in &layer.inputs {
-        if let ContextValue::Inherited(child) = input.value {
+    transcript.model_only = *runner == RunnerKind::ModelOnly;
+    for ContextInput(seq, value) in inputs {
+        if let ContextValue::Inherited(child) = *value {
             let messages = recursive_scope(image, child, registry).into_context();
-            transcript.inherit(&messages, input.seq);
+            transcript.inherit(&messages, *seq);
         } else {
-            transcript.apply_input(input.seq, input.value.clone(), None);
+            transcript.apply_input(*seq, value.clone(), None);
         }
     }
     transcript
@@ -314,9 +314,12 @@ fn normalized_context_equals_recursive_projection() {
             expected
         );
         let image = context_image(&entries);
-        assert!(image.iter().flat_map(|layer| &layer.inputs).all(
-            |input| !matches!(&input.value, ContextValue::Assistant(text) if text.is_empty())
-        ));
+        assert!(
+            image
+                .iter()
+                .flat_map(|ContextLayer(_, inputs)| inputs)
+                .all(|input| !matches!(&input.1, ContextValue::Assistant(text) if text.is_empty()))
+        );
         let child = entry(
             1,
             Body::Spawned {
@@ -511,7 +514,7 @@ fn identical_local_sequences_and_provider_ids_remain_in_their_scopes() {
     assert_eq!(
         image
             .iter()
-            .filter(|layer| layer.inputs.iter().any(|i| i.seq.get() == 3))
+            .filter(|layer| layer.1.iter().any(|i| i.0.get() == 3))
             .count(),
         3
     );

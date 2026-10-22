@@ -305,14 +305,14 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
             let Ok(mut spawn) = protocol::publication::SpawnImage::from_json(intent) else {
                 continue;
             };
-            image[0].runner = spawn.runner;
+            image[0].0 = spawn.runner;
             let offset = image.len();
             if spawn.image.is_empty() {
                 image.push(ContextLayer::default());
             } else {
-                for layer in &mut spawn.image {
-                    for input in &mut layer.inputs {
-                        if let ContextValue::Inherited(scope) = &mut input.value {
+                for ContextLayer(_, inputs) in &mut spawn.image {
+                    for ContextInput(_, value) in inputs {
+                        if let ContextValue::Inherited(scope) = value {
                             *scope += offset;
                         }
                     }
@@ -333,25 +333,25 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
             }
             value
         };
-        image[0].inputs.push(ContextInput { seq: e.seq, value });
+        image[0].1.push(ContextInput(e.seq, value));
     }
     image
 }
 
 fn project(image: ContextImage, registry: Arc<Registry>, system: &str) -> Transcript {
     let mut inherited = HashMap::new();
-    for (scope, layer) in image.into_iter().enumerate().rev() {
+    for (scope, ContextLayer(runner, inputs)) in image.into_iter().enumerate().rev() {
         let mut transcript =
             Transcript::empty(Arc::clone(&registry), if scope == 0 { system } else { "" });
-        transcript.model_only = layer.runner == RunnerKind::ModelOnly;
-        for input in layer.inputs {
-            if let ContextValue::Inherited(child) = input.value {
+        transcript.model_only = runner == RunnerKind::ModelOnly;
+        for ContextInput(seq, value) in inputs {
+            if let ContextValue::Inherited(child) = value {
                 transcript.inherit(
                     &inherited.remove(&child).expect("inherited scope reduced"),
-                    input.seq,
+                    seq,
                 );
             } else {
-                transcript.apply_input(input.seq, input.value, None);
+                transcript.apply_input(seq, value, None);
             }
         }
         if scope == 0 {

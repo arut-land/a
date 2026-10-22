@@ -80,23 +80,17 @@ fn context_image() -> protocol::publication::ContextImage {
     let inputs: Vec<_> = values
         .into_iter()
         .zip(1..)
-        .map(|(value, seq)| ContextInput {
-            seq: Seq::new(seq).unwrap(),
-            value,
-        })
+        .map(|(value, seq)| ContextInput(Seq::new(seq).unwrap(), value))
         .collect();
     vec![
-        ContextLayer {
-            runner: RunnerKind::Agent,
-            inputs,
-        },
-        ContextLayer {
-            runner: RunnerKind::ModelOnly,
-            inputs: vec![ContextInput {
-                seq: Seq::new(1).unwrap(),
-                value: ContextValue::User("ancestor".into()),
-            }],
-        },
+        ContextLayer(RunnerKind::Agent, inputs),
+        ContextLayer(
+            RunnerKind::ModelOnly,
+            vec![ContextInput(
+                Seq::new(1).unwrap(),
+                ContextValue::User("ancestor".into()),
+            )],
+        ),
     ]
 }
 

@@ -2,10 +2,7 @@ use super::*;
 
 #[test]
 fn malformed_scope_graphs_and_positions_are_rejected_before_projection() {
-    let input = |seq, value| ContextInput {
-        seq: Seq::new(seq).unwrap(),
-        value,
-    };
+    let input = |seq, value| ContextInput(Seq::new(seq).unwrap(), value);
     for (scopes, inputs) in [
         (
             vec![RunnerKind::Agent],
@@ -37,13 +34,15 @@ fn malformed_scope_graphs_and_positions_are_rejected_before_projection() {
             image: scopes
                 .into_iter()
                 .enumerate()
-                .map(|(scope, runner)| ContextLayer {
-                    runner,
-                    inputs: if scope == 0 {
-                        inputs.clone()
-                    } else {
-                        Vec::new()
-                    },
+                .map(|(scope, runner)| {
+                    ContextLayer(
+                        runner,
+                        if scope == 0 {
+                            inputs.clone()
+                        } else {
+                            Vec::new()
+                        },
+                    )
                 })
                 .collect(),
         };

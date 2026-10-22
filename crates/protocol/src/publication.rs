@@ -21,7 +21,6 @@ pub enum RunnerKind {
 }
 
 /// Context is decoded here so reducers need not understand engine authority.
-#[derive(Serialize, Deserialize)]
 pub struct SpawnImage {
     pub runner: RunnerKind,
     pub authority: Json,
@@ -32,16 +31,10 @@ pub struct SpawnImage {
 pub type ContextImage = Vec<ContextLayer>;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ContextLayer {
-    pub runner: RunnerKind,
-    pub inputs: Vec<ContextInput>,
-}
+pub struct ContextLayer(pub RunnerKind, pub Vec<ContextInput>);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ContextInput {
-    pub seq: Seq,
-    pub value: ContextValue,
-}
+pub struct ContextInput(pub Seq, pub ContextValue);
 
 /// Only projection facts can cross this boundary; no executable ledger is copied.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,16 +79,21 @@ impl ThreadImage {
 
 impl SpawnImage {
     pub fn from_json(json: &Json) -> Result<Self, serde_json::Error> {
-        let image: Self = json.parse()?;
+        let (runner, authority, image): (RunnerKind, Json, ContextImage) = json.parse()?;
+        let image = Self {
+            runner,
+            authority,
+            image,
+        };
         let mut owners = vec![false; image.image.len()];
-        for (scope, layer) in image.image.iter().enumerate() {
+        for (scope, ContextLayer(_, inputs)) in image.image.iter().enumerate() {
             let mut position = 0;
-            for input in &layer.inputs {
-                if input.seq.get() <= position {
+            for ContextInput(seq, value) in inputs {
+                if seq.get() <= position {
                     return Err(serde::de::Error::custom("invalid context position"));
                 }
-                position = input.seq.get();
-                if let ContextValue::Inherited(child) = input.value {
+                position = seq.get();
+                if let ContextValue::Inherited(child) = *value {
                     if child <= scope || child >= owners.len() || owners[child] {
                         return Err(serde::de::Error::custom("invalid inherited scope"));
                     }
@@ -110,7 +108,7 @@ impl SpawnImage {
     }
 
     pub fn to_json(&self) -> Result<Json, serde_json::Error> {
-        Json::encode(self)
+        Json::encode(&(self.runner, &self.authority, &self.image))
     }
 }
 
@@ -124,9 +122,9 @@ impl Publications {
                 image
                     .image
                     .into_iter()
-                    .flat_map(|layer| layer.inputs)
-                    .filter_map(|input| {
-                        if let ContextValue::Context { publication, .. } = input.value {
+                    .flat_map(|ContextLayer(_, inputs)| inputs)
+                    .filter_map(|ContextInput(_, value)| {
+                        if let ContextValue::Context { publication, .. } = value {
                             publication
                         } else {
                             None
