@@ -94,20 +94,9 @@ struct Queued {
     closed: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Admission {
-    Mutation,
-    Metadata,
-}
-
 impl Request {
-    fn admission(&self) -> Admission {
-        match self {
-            Self::Io(io) if matches!(&**io, Io::Send(msg) if crate::session::is_mutation(msg)) => {
-                Admission::Mutation
-            }
-            _ => Admission::Metadata,
-        }
+    fn mutation(&self) -> bool {
+        matches!(self, Self::Io(io) if matches!(&**io, Io::Send(msg) if crate::session::is_mutation(msg)))
     }
 
     fn environment(&self) -> bool {
@@ -136,25 +125,26 @@ impl Outbox {
             },
             Request::Flush(_) => 0,
         };
-        let admission = request.admission();
+        let mutation = request.mutation();
         let kept = |item: &Request| {
-            !(replace || coalesced && item.environment()) && item.admission() == admission
+            !(replace || coalesced && item.environment()) && item.mutation() == mutation
         };
-        let retained: usize = state
+        let (retained, requests) = state
             .items
             .iter()
             .filter(|(_, _, item)| kept(item))
-            .map(|(_, bytes, _)| bytes)
-            .sum();
+            .fold((0usize, 0), |(bytes, count), (_, size, _)| {
+                (bytes + size, count + 1)
+            });
         let control = matches!(&request, Request::Io(io) if matches!(&**io, Io::Send(ClientMsg::Interrupt { .. })));
-        let budget = match admission {
-            Admission::Mutation => crate::session::MUTATION_BUDGET,
-            Admission::Metadata => crate::QueueBudget {
-                requests: CONTROL_SLOTS + 1,
-                ..crate::session::MUTATION_BUDGET
+        let budget = crate::QueueBudget {
+            requests: if mutation {
+                crate::session::MUTATION_BUDGET.requests
+            } else {
+                CONTROL_SLOTS + 1
             },
+            ..crate::session::MUTATION_BUDGET
         };
-        let requests = state.items.iter().filter(|(_, _, item)| kept(item)).count();
         if !budget.admits(retained.saturating_add(bytes), requests, control) {
             return Err(Error::Busy);
         }
