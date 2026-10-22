@@ -13,7 +13,7 @@ import threading
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/perf"))
-from process import snapshot
+from process import snapshot, stop_daemon
 
 
 def sample(binary, idle_seconds):
@@ -47,8 +47,7 @@ def sample(binary, idle_seconds):
             except subprocess.TimeoutExpired:
                 client.kill()
                 client.wait()
-            subprocess.run([binary, "daemon", "stop"], env=env, check=True,
-                           capture_output=True, timeout=30)
+            stop_daemon(binary, env, home)
 
 
 def main():

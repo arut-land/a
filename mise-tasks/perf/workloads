@@ -14,6 +14,15 @@ import time
 import threading
 
 
+PROCESS = Path(__file__).resolve().parents[2] / "scripts/perf/process.py"
+
+
+def stop_daemon(binary, env, cwd):
+    sys.path.insert(0, str(PROCESS.parent))
+    from process import stop_daemon as stop
+    stop(binary, env, cwd)
+
+
 def load(output, label):
     import psutil
     record = {
@@ -132,13 +141,12 @@ def main():
                     try:
                         fresh.append(fresh_new(binary, fresh_env, workspace))
                     finally:
-                        subprocess.run([binary, "daemon", "stop"], env=fresh_env,
-                                       check=True, capture_output=True, timeout=30)
+                        stop_daemon(binary, fresh_env, workspace)
             (output / "fresh-home-new.json").write_text(json.dumps(fresh) + "\n")
             load(output, "fresh-home-new:after")
             # Stage once so the OS's first scan of a new executable is separate.
             run("ls")
-            bench("cold-daemon-new", cmd + " new", shell_command([binary, "daemon", "stop"]))
+            bench("cold-daemon-new", cmd + " new", shell_command([sys.executable, str(PROCESS), "stop", binary]))
             bench("warm-new", cmd + " new")
             assert run("-p", "perf echo").stdout.strip() == b"perf echo"
             bench("echo", command([binary, "-p", "perf echo"]))
@@ -156,7 +164,7 @@ def main():
             shutil.copy2(logs[0], output / "transcript.jsonl")
             bench("long-transcript", command([binary, "-p", "tail", "resume", session]))
         finally:
-            run("daemon", "stop")
+            stop_daemon(binary, env, workspace)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 
-from process import snapshot
+from process import snapshot, stop_daemon
 from stats import distribution
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,7 +28,12 @@ def run(argv, **kwargs):
     argv = list(map(str, argv))
     if argv[0] == "cargo" and "PERF_CARGO" in os.environ:
         argv[0] = os.environ["PERF_CARGO"]
-    return subprocess.run(argv, check=True, **kwargs)
+    try:
+        return subprocess.run(argv, check=True, **kwargs)
+    except subprocess.CalledProcessError as error:
+        if error.stdout:
+            print(error.stdout, flush=True)
+        raise
 
 
 def load_task(name):
@@ -117,7 +122,7 @@ def budgets(output, binary=None, probe=None, samples=5):
                 return run([binary, *args], env=env, cwd=home, capture_output=True, timeout=60)
             try:
                 cli("ls")
-                cli("daemon", "stop")
+                stop_daemon(binary, env, home)
                 started = time.perf_counter()
                 client = subprocess.Popen([binary], env=env, cwd=home, stdin=subprocess.PIPE,
                                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -151,7 +156,7 @@ def budgets(output, binary=None, probe=None, samples=5):
                     except subprocess.TimeoutExpired:
                         client.kill()
                         client.wait()
-                cli("daemon", "stop")
+                stop_daemon(binary, env, home)
     return {name: distribution(values) for name, values in [
         ("cold_reply_ms", cold), ("attach_p50_ms", attach_p50), ("attach_p99_ms", attach_p99),
         ("idle_rss_kib", rss), ("idle_daemon_cpu_ms", cpu), ("idle_line_client_cpu_ms", client_cpu)]}

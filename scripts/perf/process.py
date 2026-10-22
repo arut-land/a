@@ -12,9 +12,22 @@ def snapshot(pid):
             "cpu_seconds": cpu.user + cpu.system}
 
 
-if __name__ == "__main__":
-    record = snapshot(int(sys.argv[1]))
-    print(int(record["rss_kib"]) if len(sys.argv) > 2 else json.dumps(record))
+def stop_daemon(binary, env, cwd=None):
+    """Wait for this isolated daemon to release its staged executable on Windows."""
+    from pathlib import Path
+    import subprocess
+
+    pidfile = Path(env["A_HOME"]) / "run/daemon.pid"
+    daemon = None
+    if pidfile.exists():
+        try:
+            daemon = psutil.Process(int(pidfile.read_text().splitlines()[0]))
+        except psutil.NoSuchProcess:
+            pass
+    subprocess.run([str(binary), "daemon", "stop"], env=env, cwd=cwd,
+                   capture_output=True, check=True, timeout=60)
+    if daemon is not None:
+        daemon.wait(timeout=60)
 
 
 def measure_windows(argv, **kwargs):
@@ -58,3 +71,12 @@ def measure_windows(argv, **kwargs):
         if child.poll() is None:
             child.kill()
             child.wait()
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "stop":
+        import os
+        stop_daemon(sys.argv[2], os.environ)
+    else:
+        record = snapshot(int(sys.argv[1]))
+        print(int(record["rss_kib"]) if len(sys.argv) > 2 else json.dumps(record))
