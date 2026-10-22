@@ -6,6 +6,11 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      macos_runner:
+        description: 'Hosted macOS runner'
+        type: choice
+        options: [macos-latest, macos-15-intel]
+        default: macos-latest
       measure_refs:
         description: 'JSON array of full commit SHAs to measure on Linux'
         type: string
@@ -15,7 +20,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.measure_refs && inputs.measure_refs != '[]' && 'measurements' || 'validation' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.macos_runner || 'macos-latest' }}-${{ inputs.measure_refs && inputs.measure_refs != '[]' && 'measurements' || 'validation' }}
   cancel-in-progress: true
 
 env:
@@ -26,13 +31,13 @@ env:
 
 jobs:
   check:
-    name: check (${{ matrix.os }})
+    name: check (${{ matrix.os == 'macos-latest' && inputs.macos_runner || matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         # Apple silicon and x86_64 Linux.
         os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && inputs.macos_runner || matrix.os }}
     steps:
       - uses: actions/checkout@v7
       # mbx (the cargo wrapper in mise.toml) keeps compiled crates in its own
@@ -66,7 +71,7 @@ jobs:
         run: mise run check:windows
 
   budgets:
-    name: budgets (${{ matrix.os }})
+    name: budgets (${{ matrix.os == 'macos-latest' && inputs.macos_runner || matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -76,7 +81,7 @@ jobs:
           # Latency is held to the design's budgets on one lane.
           - os: ubuntu-latest
             strict: 1
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && inputs.macos_runner || matrix.os }}
     env:
       A_STRICT_BUDGETS: ${{ matrix.strict }}
     steps:
@@ -207,7 +212,7 @@ jobs:
   # reducer vectors and a live session through it in Swift, then the app
   # built headless with xcodebuild.
   apple:
-    runs-on: macos-latest
+    runs-on: ${{ inputs.macos_runner || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v7
       - *mbx-dir
