@@ -657,10 +657,7 @@ mod tests {
         let mut file = File::create(&path).unwrap();
         let watch = write_watch(&path).unwrap();
         let readable = |ms: i64| {
-            let timeout = Timespec {
-                tv_sec: 0,
-                tv_nsec: ms * 1_000_000,
-            };
+            let timeout = Timespec::try_from(std::time::Duration::from_millis(ms)).unwrap();
             let mut fds = [PollFd::new(&watch, PollFlags::IN)];
             poll(&mut fds, Some(&timeout)).unwrap() == 1
         };
