@@ -293,7 +293,7 @@ pub(super) async fn run_side(
     messages: llm::Messages,
     model: &Result<Model, llm::Error>,
     origin: &ContextOrigin,
-    execution: &mut Option<Json>,
+    observed: &mut super::Observation,
 ) -> Replied {
     let (id, cancel, fence) = (origin.id, &origin.cancel, origin.fence);
     let start = session.shared.rt.now();
@@ -315,7 +315,11 @@ pub(super) async fn run_side(
         let name = model
             .as_ref()
             .map_or_else(|_| cx.model.to_string(), Model::name);
-        let mut observed = super::Observation::default();
+        *observed = super::Observation {
+            attempt,
+            model: name,
+            ..super::Observation::default()
+        };
         let mut quiet = |_: &str| {};
         let result = contain(async {
             match (provider, &model) {
@@ -329,15 +333,12 @@ pub(super) async fn run_side(
                     };
                     replied(response)
                 }
-                (None, Ok(model)) => {
-                    reply(model, &request, cancel, &mut quiet, &mut observed).await
-                }
+                (None, Ok(model)) => reply(model, &request, cancel, &mut quiet, observed).await,
                 (None, Err(error)) => (Replied::Failed(error.clone()), None),
             }
         })
         .await
         .0;
-        *execution = session.execution(cx, attempt, name, observed, "model_only".into());
         let after = match &result {
             Replied::Failed(error) => cx.service::<dyn ext::SideRetry>().and_then(|retry| {
                 retry
@@ -381,7 +382,7 @@ pub(super) async fn run_side(
                     failure,
                     after_ms: u64::try_from(after.as_millis()).unwrap_or(u64::MAX),
                 },
-                execution: execution.take(),
+                execution: session.execution(cx, std::mem::take(observed), "model_only".into()),
                 done,
             },
         });

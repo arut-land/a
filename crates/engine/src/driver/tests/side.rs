@@ -101,9 +101,27 @@ fn a_side_call_dies_with_its_call() {
     session.submit("hi").unwrap();
     until(&session, "asked aside", |log| !sides(log).is_empty());
     http.wait_sent(2);
+    let child = session
+        .1
+        .loaded()
+        .into_iter()
+        .find(|live| live.parent.is_some_and(|p| p.session == session.id))
+        .unwrap();
     session.interrupt_now();
     settle(&session);
     let log = log_of(&session);
+    until(&child, "side execution settled", |log| {
+        log.iter().any(|e| e.execution.is_some())
+    });
+    let facts: Vec<_> = log_of(&child)
+        .iter()
+        .filter_map(|e| e.execution.as_ref())
+        .map(|j| protocol::CallFact::from_json(j).unwrap())
+        .collect();
+    assert_eq!(facts.len(), 1);
+    assert!(facts[0].side);
+    assert!(facts[0].elapsed_ns.is_some_and(|ns| ns > 0));
+    assert!(facts[0].usage.is_none());
     session.halt();
 
     let (side, ..) = sides(&log)[0];

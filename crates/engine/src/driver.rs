@@ -2369,7 +2369,11 @@ impl Actor {
                         let cx = live.session.cx(origin.clone(), &registry);
                         let resolved = model.origin(&request);
                         let name = format!("{}:{}", resolved.provider, resolved.model);
-                        let mut observed = Observation::default();
+                        let mut observed = Observation {
+                            attempt,
+                            model: name,
+                            ..Observation::default()
+                        };
                         let result = contain(Box::pin(reply(
                             &model,
                             &request,
@@ -2378,7 +2382,7 @@ impl Actor {
                             &mut observed,
                         )))
                         .await;
-                        execution = live.session.execution(&cx, attempt, name, observed, agent);
+                        execution = live.session.execution(&cx, observed, agent);
                         result
                     }
                     Err(error) => (
@@ -2389,6 +2393,7 @@ impl Actor {
                 InFlight::Thread(prepared) => {
                     let (turn, messages, model) = *prepared;
                     let cx = live.session.cx(origin.clone(), &registry);
+                    let mut observed = Observation::default();
                     let running = unless(
                         &cancel,
                         Box::pin(side::run_side(
@@ -2398,13 +2403,17 @@ impl Actor {
                             messages,
                             &model,
                             &origin,
-                            &mut execution,
+                            &mut observed,
                         )),
                     );
                     let replied = first(running, live.session.shared.rt.sleep(turn.budget.timeout))
                         .await
                         .flatten()
                         .unwrap_or(Replied::Interrupted(None));
+                    if matches!(replied, Replied::Interrupted(_)) {
+                        observed.usage = None;
+                    }
+                    execution = live.session.execution(&cx, observed, "model_only".into());
                     (replied, None)
                 }
                 _ => unreachable!(),
@@ -2648,6 +2657,8 @@ async fn first<T>(work: impl Future<Output = T>, stop: impl Future<Output = ()>)
 
 #[derive(Default)]
 struct Observation {
+    attempt: u16,
+    model: String,
     started: Option<Instant>,
     usage: Option<Json>,
 }

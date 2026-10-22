@@ -383,8 +383,6 @@ impl Session {
     pub(super) fn execution(
         &self,
         cx: &Cx,
-        attempt: u16,
-        model: String,
         observed: super::Observation,
         agent: String,
     ) -> Option<Json> {
@@ -397,9 +395,9 @@ impl Session {
             id: protocol::AttemptId {
                 executing_session: self.id,
                 call: cx.call,
-                attempt,
+                attempt: observed.attempt,
             },
-            model,
+            model: observed.model,
             role: runner
                 .map_or(&ext::ModelRole::Session, ext::Runner::role)
                 .to_string(),
