@@ -158,8 +158,13 @@ catalog paired with an unpublished rewrite.
 
 Directory FlushFileBuffers with BACKUP_SEMANTICS has no documented persistence
 contract used here. Windows sync_dir returns Unsupported, rather than silently
-certifying a name. The guarantee assumes local NTFS and devices honoring
-flushes. Native CI exercises the operation and error paths; power-loss
+certifying a name. Session directory creation instead uses
+`create_dir_all_durable`: missing ancestors are published in order, each from
+an exclusively created sibling with a same-volume WRITE_THROUGH rename.
+Existing directories and their contents remain intact. This covers both root
+sessions and nested child sessions before their logs can commit. Unix creates
+the directories and flushes their parents. The guarantee assumes local NTFS
+and devices honoring flushes. Native CI exercises the operation and error paths; power-loss
 persistence still requires a storage test. This changes no dependency and adds
 one header flush/publication per new Windows session, without changing Unix's
 shared first-entry barrier. No Windows performance measurement is claimed.

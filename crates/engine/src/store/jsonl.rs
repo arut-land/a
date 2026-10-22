@@ -34,7 +34,7 @@ pub struct Jsonl {
 impl Jsonl {
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
+        sys::fs::create_dir_all_durable(&dir)?;
         let paths = HashMap::new();
         let domain = sys::fs::FlushDomain::of(&dir)?;
         Ok(Self {
@@ -127,13 +127,8 @@ impl Jsonl {
         } else {
             self.dir.clone()
         };
-        fs::create_dir_all(&base)?;
-        if let Some(parent) = base.parent() {
-            sys::fs::sync_dir(parent)?;
-        }
         let dir = base.join(header.id.to_string());
-        fs::create_dir_all(dir.join(DERIVED))?;
-        sys::fs::sync_dir(&base)?;
+        sys::fs::create_dir_all_durable(&dir.join(DERIVED))?;
         let path = dir.join("log.jsonl");
         let mut paths = self.paths.write().unwrap_or_else(PoisonError::into_inner);
         if let Some(known) = paths.get(&header.id)

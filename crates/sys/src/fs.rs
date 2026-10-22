@@ -217,6 +217,57 @@ pub fn order_dir(dir: &Path) -> io::Result<()> {
     sync_dir(dir)
 }
 
+/// Creates missing directories and durably publishes each new name.
+/// Existing directories are left intact; callers must use this at creation,
+/// rather than trying to flush a Windows directory after adding names to it.
+pub fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        create_dir_all_durable(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        match fs::create_dir(dir) {
+            Ok(()) => sync_dir(
+                dir.parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new(".")),
+            ),
+            Err(_) if dir.is_dir() => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let pending = loop {
+            let pending = dir.with_file_name(format!(
+                ".a-directory-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&pending) {
+                Ok(()) => break pending,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        };
+        // A unique sibling avoids sharing staging state with another creator.
+        // WRITE_THROUGH publishes the directory before files beneath it commit.
+        let result = move_file(&pending, dir, false);
+        if result.is_err() {
+            let _ = fs::remove_dir(&pending);
+        }
+        match result {
+            Err(_) if dir.is_dir() => Ok(()),
+            result => result,
+        }
+    }
+}
+
 /// Makes directory entries durable on platforms with a directory barrier.
 /// Windows callers must publish names with `publish` instead.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -759,6 +810,19 @@ mod publication_tests {
         drop(file);
         remove_durable(&path).unwrap();
         assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn durable_directory_creation_preserves_existing_contents_and_rejects_files() {
+        let root = std::env::temp_dir().join(format!("a-durable-directory-{}", std::process::id()));
+        let nested = root.join("children").join("space café");
+        create_dir_all_durable(&nested).unwrap();
+        let file = nested.join("kept");
+        fs::write(&file, b"contents").unwrap();
+        create_dir_all_durable(&nested).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"contents");
+        assert!(create_dir_all_durable(&file.join("child")).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
