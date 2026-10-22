@@ -192,6 +192,8 @@ def summarize(output, source, variant, runner):
 
 def paired(output, source, reference):
     reference_source = source.parent / "reference"
+    run(["git", "fetch", "--no-tags", "--depth=1", "origin", reference], cwd=source)
+    reference = subprocess.check_output(["git", "rev-parse", "FETCH_HEAD"], cwd=source, text=True).strip()
     run(["git", "worktree", "add", "--detach", reference_source, reference], cwd=source)
     for path in ["apps/cli/examples/perf-attach.rs", "crates/engine/src/driver/tests/bench.rs"]:
         shutil.copy2(ROOT / path, reference_source / path)
