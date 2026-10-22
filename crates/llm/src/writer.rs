@@ -1293,7 +1293,7 @@ impl<S: Default> Writer<S> {
     pub fn end(&mut self, end: End) -> Result<Flow, Error> {
         let usage = end.usage;
         self.core.end(end).map_err(|mut error| {
-            error.usage = Some(Box::new(usage));
+            error.usage = Some(Box::new(usage.counts()));
             error
         })
     }

@@ -14,15 +14,15 @@ pub struct Accumulator {
     /// The parts by index, in index order. A reply holds few, and a list
     /// costs less code than a map.
     parts: Vec<(u32, Building)>,
-    finish: Option<Finished>,
+    pub(crate) finish: Option<Finished>,
     id: Option<SmolStr>,
     model: Option<SmolStr>,
 }
 
 #[derive(Debug)]
-struct Finished {
+pub(crate) struct Finished {
     finish: Finish,
-    usage: Usage,
+    pub(crate) usage: Usage,
     meta: Meta,
     order: Option<Vec<u32>>,
 }

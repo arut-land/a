@@ -96,7 +96,7 @@ impl LogStore for Memory {
         let reset = cursor.seq != 0
             && (cursor.seq > through
                 || lines
-                    .get(cursor.seq as usize - 1)
+                    .get(usize::try_from(cursor.seq - 1).map_err(io::Error::other)?)
                     .and_then(|line| Entry::from_json(line).ok())
                     .is_none_or(|e| (e.seq.get(), e.epoch) != (cursor.seq, cursor.epoch)));
         if reset {

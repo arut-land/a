@@ -386,11 +386,12 @@ enum Completion {
         call: CallId,
         replied: Replied,
         message: Option<llm::Assistant>,
-        execution: Option<protocol::CallFact>,
+        execution: Option<Json>,
     },
     SideFact {
         side: CallId,
         fact: SideFact,
+        execution: Option<Json>,
         done: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -1316,14 +1317,26 @@ impl Actor {
                         self.pump_delivery();
                         Event::Delivered { id, result, ticket }
                     }
-                    Completion::SideFact { side, fact, done } => self.side_fact(side, fact, done),
+                    Completion::SideFact {
+                        side,
+                        fact,
+                        execution,
+                        done,
+                    } => {
+                        self.projection
+                            .executions
+                            .extend(execution.map(|fact| (side, fact)));
+                        self.side_fact(side, fact, done)
+                    }
                     Completion::Replied {
                         call,
                         replied,
                         message,
                         execution,
                     } => {
-                        self.projection.executions.extend(execution);
+                        self.projection
+                            .executions
+                            .extend(execution.map(|fact| (call, fact)));
                         if let Replied::Failed(error) = &replied {
                             provider_error(self.live.id, error);
                         }
@@ -1702,9 +1715,9 @@ impl Actor {
                 .projection
                 .executions
                 .iter()
-                .position(|f| Some(f.id.call) == call)
+                .position(|(id, _)| Some(*id) == call)
             {
-                entry.execution = self.projection.executions.remove(i).to_json().ok();
+                entry.execution = Some(self.projection.executions.remove(i).1);
             }
         }
         let mut after = admitted;
@@ -2346,6 +2359,7 @@ impl Actor {
         let handle = live.session.origin(call, fence).expect("actor generation");
         let cancel = handle.cancel.clone();
         let origin = handle.clone();
+        let agent = self.bound.agent_name().to_owned();
         handle.spawn(&*self.live.session.shared.rt, async move {
             let mut execution = None;
             let (replied, message) = match prepared {
@@ -2355,18 +2369,16 @@ impl Actor {
                         let cx = live.session.cx(origin.clone(), &registry);
                         let resolved = model.origin(&request);
                         let name = format!("{}:{}", resolved.provider, resolved.model);
-                        let mut started = None;
+                        let mut observed = Observation::default();
                         let result = contain(Box::pin(reply(
                             &model,
                             &request,
                             &cancel,
                             &mut deltas,
-                            &mut started,
+                            &mut observed,
                         )))
                         .await;
-                        execution = live
-                            .session
-                            .execution(&cx, attempt, name, started, &result.0);
+                        execution = live.session.execution(&cx, attempt, name, observed, agent);
                         result
                     }
                     Err(error) => (
@@ -2634,23 +2646,39 @@ async fn first<T>(work: impl Future<Output = T>, stop: impl Future<Output = ()>)
     .await
 }
 
+#[derive(Default)]
+struct Observation {
+    started: Option<Instant>,
+    usage: Option<Json>,
+}
+
 async fn reply(
     model: &Model,
     request: &llm::Request,
     cancel: &Cancel,
     deltas: &mut (dyn FnMut(&str) + Send),
-    started: &mut Option<Instant>,
+    observed: &mut Observation,
 ) -> (Replied, Option<llm::Assistant>) {
     // Sent once polled, as an interrupt meanwhile finds it.
     let mut events = None;
     let reading = async {
         let _ = services::attempt_clock();
-        *started = Some(Instant::now());
         let events = events.insert(model.send(request));
+        observed.started = events.started();
         crate::model::read(events, deltas).await
     };
     let reading: BoxFuture<'_, _> = Box::pin(reading);
-    let Some(read) = unless(cancel, reading).await else {
+    let read = unless(cancel, reading).await;
+    observed.usage = events
+        .as_ref()
+        .and_then(llm::Events::usage_json)
+        .or_else(|| {
+            read.as_ref()
+                .and_then(|r| r.as_ref().err())
+                .and_then(llm::Error::usage_json)
+        });
+    let Some(read) = read else {
+        observed.started = None;
         let text = events.and_then(llm::Events::interrupted);
         return (Replied::Interrupted(text), None);
     };

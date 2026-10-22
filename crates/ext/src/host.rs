@@ -1070,6 +1070,13 @@ impl<V: View + Send + Sync + 'static> Bound<V> {
         &self.registry
     }
 
+    pub fn agent_name(&self) -> &str {
+        self.agent
+            .as_deref()
+            .filter(|name| self.registry.agents.iter().any(|a| &*a.name == *name))
+            .unwrap_or(crate::LOOP)
+    }
+
     pub fn view(&self) -> &Arc<V> {
         &self.view
     }

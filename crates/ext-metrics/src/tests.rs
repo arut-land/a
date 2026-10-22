@@ -9,7 +9,7 @@ fn fact(session: SessionId, attempt: u16, start: u64, elapsed: Option<u64>) -> C
             attempt,
         },
         model: "test".into(),
-        role: Json::encode(&"session").unwrap(),
+        role: "session".into(),
         runner: "agent".into(),
         agent: "loop".into(),
         side: false,
@@ -18,11 +18,14 @@ fn fact(session: SessionId, attempt: u16, start: u64, elapsed: Option<u64>) -> C
         start_ns: start,
         elapsed_ns: elapsed,
         usage: Some(
-            Json::encode(&llm::Usage {
-                input: Some(10),
-                output: Some(2),
-                ..llm::Usage::default()
-            })
+            llm::Usage::encode_counts(
+                &llm::Usage {
+                    input: Some(10),
+                    output: Some(2),
+                    ..llm::Usage::default()
+                }
+                .counts(),
+            )
             .unwrap(),
         ),
         charge: None,
@@ -62,7 +65,7 @@ fn prices() -> Prices {
     Prices {
         version: "test-v1".into(),
         currency: "USD".into(),
-        models: BTreeMap::from([("test".into(), [1, 2, 0, 0, 0, 0, 0, 0, 0, 0])]),
+        models: Vec::from([("test".into(), [1, 2, 0, 0, 0, 0, 0, 0, 0, 0])]),
     }
 }
 #[test]
@@ -190,7 +193,7 @@ fn repricing_changes_no_execution_fact() {
     let first = p.own(id, &prices());
     let mut new = prices();
     new.version = "test-v2".into();
-    new.models.get_mut("test").unwrap()[0] = 3;
+    new.models[0].1[0] = 3;
     let second = p.own(id, &new);
     assert_eq!(second.cost.known - first.cost.known, 20);
     assert_eq!(second.usage, first.usage);
@@ -257,22 +260,31 @@ fn pricing_adjustments_require_observed_subsets() {
     let id = SessionId::new();
     let mut f = fact(id, 0, 0, Some(10));
     let mut table = prices();
-    table.models.get_mut("test").unwrap()[2] = -1;
+    table.models[0].1[2] = -1;
     assert_eq!(
-        table.cost(&f, f.usage.as_ref().unwrap().parse().unwrap()),
+        table.cost(
+            &f,
+            llm::Usage::decode_counts(f.usage.as_ref().unwrap()).unwrap()
+        ),
         None
     );
     f.usage = Some(
-        Json::encode(&llm::Usage {
-            input: Some(10),
-            output: Some(2),
-            cache_read: Some(4),
-            ..llm::Usage::default()
-        })
+        llm::Usage::encode_counts(
+            &llm::Usage {
+                input: Some(10),
+                output: Some(2),
+                cache_read: Some(4),
+                ..llm::Usage::default()
+            }
+            .counts(),
+        )
         .unwrap(),
     );
     assert_eq!(
-        table.cost(&f, f.usage.as_ref().unwrap().parse().unwrap()),
+        table.cost(
+            &f,
+            llm::Usage::decode_counts(f.usage.as_ref().unwrap()).unwrap()
+        ),
         Some(10)
     );
     let mut p = Projection::default();
@@ -384,4 +396,137 @@ fn copied_interrupted_intents_do_not_create_unknown_spend() {
     let total = projection.own(id, &prices());
     assert_eq!(total.attempts, 1);
     assert_eq!(total.usage[0].missing, 0);
+}
+
+#[test]
+fn overlapping_suffixes_do_not_duplicate_uncertain_intents() {
+    let id = SessionId::new();
+    let mut prefix = log(id, None, vec![]);
+    prefix.entries.push(Entry::new(
+        Seq::new(1).unwrap(),
+        Epoch(0),
+        Body::ModelCall {
+            model: "test".into(),
+            attempt: 0,
+            choice: protocol::ToolChoice::Auto,
+            r#for: None,
+            purpose: None,
+            request: None,
+        },
+    ));
+    prefix.cursor.seq = 1;
+    prefix.reset = false;
+    let mut projection = Projection::default();
+    projection.fold(&prefix);
+    projection.fold(&prefix);
+    assert_eq!(projection.own(id, &prices()).usage[0].missing, 1);
+}
+
+#[test]
+fn supplied_prices_are_sorted_and_duplicates_are_rejected() {
+    let selection = Selection::parse(
+        r#"{"prices":["v1","USD",[["z",[0,0,0,0,0,0,0,0,0,0]],["a",[0,0,0,0,0,0,0,0,0,0]]]]}"#,
+    )
+    .unwrap();
+    assert_eq!(selection.prices.models[0].0, "a");
+    assert!(
+        Selection::parse(
+            r#"{"prices":["v1","USD",[["a",[0,0,0,0,0,0,0,0,0,0]],["a",[0,0,0,0,0,0,0,0,0,0]]]]}"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn unreadable_settlement_metadata_preserves_uncertainty() {
+    let id = SessionId::new();
+    let mut prefix = log(id, None, vec![]);
+    prefix.entries = vec![
+        Entry::new(
+            Seq::new(1).unwrap(),
+            Epoch(0),
+            Body::ModelCall {
+                model: "test".into(),
+                attempt: 0,
+                choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: None,
+                request: None,
+            },
+        ),
+        Entry::new(
+            Seq::new(2).unwrap(),
+            Epoch(0),
+            Body::ModelResult {
+                call: CallId::new(1).unwrap(),
+                r#for: None,
+                outcome: protocol::Outcome::Interrupted { output: None },
+                failure: None,
+            },
+        ),
+    ];
+    prefix.entries[1].execution = Some(Json::encode(&["unreadable"]).unwrap());
+    let mut projection = Projection::default();
+    projection.fold(&prefix);
+    let total = projection.own(id, &prices());
+    assert_eq!(total.attempts, 0);
+    assert_eq!(total.usage[0].missing, 1);
+}
+
+#[test]
+fn a_retry_without_execution_settlement_remains_unknown_after_restart() {
+    let id = SessionId::new();
+    let mut prefix = log(id, None, vec![fact(id, 0, 0, Some(10))]);
+    prefix.entries[0].seq = Seq::new(2).unwrap();
+    prefix.entries[0].body = Body::Decision {
+        call: CallId::new(1),
+        by: "retry".into(),
+        d: protocol::Verdict::Retry {
+            attempt: 1,
+            error: "retryable".into(),
+        },
+    };
+    prefix.entries.insert(
+        0,
+        Entry::new(
+            Seq::new(1).unwrap(),
+            Epoch(0),
+            Body::ModelCall {
+                model: "test".into(),
+                attempt: 0,
+                choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: None,
+                request: None,
+            },
+        ),
+    );
+    prefix.entries.push(Entry::new(
+        Seq::new(3).unwrap(),
+        Epoch(1),
+        Body::ModelResult {
+            call: CallId::new(1).unwrap(),
+            r#for: None,
+            outcome: protocol::Outcome::Interrupted { output: None },
+            failure: None,
+        },
+    ));
+    let mut projection = Projection::default();
+    projection.fold(&prefix);
+    let total = projection.own(id, &prices());
+    assert_eq!(total.attempts, 1);
+    assert_eq!(
+        total.usage[0],
+        UsageTotal {
+            known: 10,
+            missing: 1
+        }
+    );
+    assert_eq!(
+        total.call_ns,
+        UsageTotal {
+            known: 10,
+            missing: 1
+        }
+    );
 }

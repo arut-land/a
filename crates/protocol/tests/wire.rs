@@ -319,7 +319,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                             attempt: 1,
                         },
                         model: "openai:m".into(),
-                        role: protocol::Json::encode(&"session").unwrap(),
+                        role: "session".into(),
                         runner: "agent".into(),
                         agent: "loop".into(),
                         side: false,
@@ -327,7 +327,21 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                         clock_epoch: SESSION,
                         start_ns: 10,
                         elapsed_ns: Some(20),
-                        usage: Some(protocol::Json::encode(&json!({"input": 10})).unwrap()),
+                        usage: Some(
+                            protocol::Json::encode(&[
+                                Some(10),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            ])
+                            .unwrap(),
+                        ),
                         charge: Some(protocol::Charge {
                             currency: "USD".into(),
                             nanos: 100,

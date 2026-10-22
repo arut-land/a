@@ -792,5 +792,8 @@ fn failed_finish_preserves_observed_usage() {
         },
         |_| Ok(()),
     );
-    assert_eq!(response.unwrap_err().usage.as_deref(), Some(&usage));
+    assert_eq!(
+        response.unwrap_err().usage.as_deref().copied(),
+        Some(usage.counts())
+    );
 }

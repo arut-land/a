@@ -350,14 +350,45 @@ fn every_provider_retry_has_one_execution_settlement() {
         assert!(!fact.side);
     }
     assert!(facts[0].usage.is_none());
-    assert!(
-        facts[1]
-            .usage
-            .as_ref()
-            .unwrap()
-            .parse::<llm::Usage>()
-            .unwrap()
-            .input
-            .is_some()
+    assert!(llm::Usage::decode_counts(facts[1].usage.as_ref().unwrap()).unwrap()[0].is_some());
+}
+
+#[test]
+fn cancellation_after_send_leaves_execution_unknown() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let session = fixture(quick(), &http).start(&[]);
+    session.submit("hi").unwrap();
+    http.wait_sent(1);
+    session.interrupt_now();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 1);
+    assert!(log.iter().all(|e| e.execution.is_none()));
+    let mut projection = ext_metrics::Projection::default();
+    projection.fold(&ext::LogPrefix {
+        session: session.id,
+        parent: None,
+        entries: log,
+        cursor: ext::LogCursor::default(),
+        reset: true,
+        inherited_through: 0,
+    });
+    let total = projection.own(
+        session.id,
+        &ext_metrics::Prices {
+            version: "unpriced".into(),
+            currency: "USD".into(),
+            models: Vec::new(),
+        },
     );
+    assert_eq!(total.attempts, 0);
+    assert_eq!(
+        total.call_ns,
+        ext_metrics::UsageTotal {
+            known: 0,
+            missing: 1
+        }
+    );
+    assert!(total.usage.iter().all(|u| u.missing == 1));
 }

@@ -46,14 +46,22 @@ pub struct Error {
     /// The provider's error body, bounded.
     pub body: Option<String>,
     pub request_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Box<crate::Usage>>,
+    /// Settlement metadata owns spend; replaying an error cannot transfer it.
+    #[serde(skip)]
+    pub usage: Option<Box<[Option<u64>; 10]>>,
 }
 
 /// Error bodies and frames quoted in messages are cut to this many bytes.
 const QUOTE: usize = 2000;
 
 impl Error {
+    #[inline(never)]
+    pub fn usage_json(&self) -> Option<crate::Json> {
+        self.usage
+            .as_deref()
+            .and_then(|u| crate::Usage::encode_counts(u).ok())
+    }
+
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }

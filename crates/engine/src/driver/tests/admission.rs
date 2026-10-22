@@ -1279,7 +1279,7 @@ fn cancelled_before_provider_send_adds_no_executed_attempt() {
     let prices = ext_metrics::Prices {
         version: "unpriced".into(),
         currency: "USD".into(),
-        models: BTreeMap::new(),
+        models: Vec::new(),
     };
     assert_eq!(projection.own(session.id, &prices).attempts, 0);
 }

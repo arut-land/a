@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 23;
+pub const PROTO: u32 = 24;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 23;
+pub const PROTO_MIN: u32 = 24;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -294,8 +294,8 @@ kinds! {
         /// system prompt stays the same across sessions and cacheable.
         Context "context" { text: String, publication: Option<publication::Publication> = default } = Durable;
         // ── calls: each intent is logged before the effect it names ────
-        /// The committed intent to ask a model for a reply; a retry is an
-        /// intent of its own, its `attempt` one more. With `choice` none the
+        /// The committed intent to ask a model for a reply. A retry decision
+        /// commits before this call can be sent again. With `choice` none the
         /// model is offered the tools but may call none: a turn's last call.
         /// A side request an extension makes on behalf of call `for` (to
         /// compact, judge, title) names it and its `purpose`: its reply is
@@ -508,10 +508,11 @@ pub struct Charge {
 pub struct CallFact {
     pub id: AttemptId,
     pub model: String,
-    pub role: Json,
+    pub role: String,
     pub runner: String,
     pub agent: String,
     pub side: bool,
+    /// Wall time at settlement; never used to reconstruct elapsed time.
     pub unix_ms: u64,
     pub clock_epoch: SessionId,
     pub start_ns: u64,
@@ -521,6 +522,7 @@ pub struct CallFact {
 }
 
 impl CallFact {
+    #[inline(never)]
     pub fn to_json(&self) -> serde_json::Result<Json> {
         Json::encode(&(
             (self.id.executing_session, self.id.call, self.id.attempt),
@@ -538,6 +540,7 @@ impl CallFact {
         ))
     }
 
+    #[inline(never)]
     pub fn from_json(json: &Json) -> serde_json::Result<Self> {
         let (
             (executing_session, call, attempt),
@@ -555,7 +558,7 @@ impl CallFact {
         ) = json.parse::<(
             (SessionId, CallId, u16),
             String,
-            Json,
+            String,
             String,
             String,
             bool,

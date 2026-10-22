@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
+use std::time::Instant;
 
 use crate::accumulate::Accumulator;
 use crate::error::{Error, Kind};
@@ -25,15 +26,21 @@ pub fn stream(http: &dyn Http, provider: &Provider, request: &Request) -> Events
         provider,
         model: &request.model,
     };
+    let mut started = None;
     let state = match provider.request(&request.model, request) {
-        Ok(http_request) => State::Sending {
-            reply: http.send(http_request),
-            decoder: provider.protocol.decoder(&target, request),
-        },
+        Ok(http_request) => {
+            let decoder = provider.protocol.decoder(&target, request);
+            started = Some(Instant::now());
+            State::Sending {
+                reply: http.send(http_request),
+                decoder,
+            }
+        }
         Err(error) => State::Failed(Some(error)),
     };
     Events {
         state,
+        started,
         protocol: Arc::clone(&provider.protocol),
         reply: Accumulator::new(),
         read: None,
@@ -64,6 +71,7 @@ pub fn origin(provider: &Provider, model: &str) -> Origin {
 
 pub struct Events {
     state: State,
+    started: Option<Instant>,
     protocol: Arc<dyn crate::protocol::Protocol>,
     /// The reply the events read so far build.
     reply: Accumulator,
@@ -72,6 +80,20 @@ pub struct Events {
 }
 
 impl Events {
+    /// A locally rejected request never crosses the HTTP send boundary.
+    pub fn started(&self) -> Option<Instant> {
+        self.started
+    }
+
+    #[inline(never)]
+    pub fn usage_json(&self) -> Option<crate::Json> {
+        let usage = match self.read.as_ref() {
+            Some(Event::Finish { usage, .. }) => usage,
+            _ => &self.reply.finish.as_ref()?.usage,
+        };
+        crate::Usage::encode_counts(&usage.counts()).ok()
+    }
+
     /// The reply's next event, lent until the next read; `None` once the
     /// reply ended or failed.
     pub async fn next(&mut self) -> Option<Result<&Event, Error>> {
@@ -286,5 +308,46 @@ impl Reader {
                 Err(error) => self.failure = Some(error),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::responses;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Counted(AtomicUsize);
+    impl Http for Counted {
+        fn send(
+            &self,
+            _: http::Request<crate::http::Payload>,
+        ) -> BoxFuture<'static, io::Result<crate::http::Response>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Err(io::Error::other("test transport")) })
+        }
+    }
+
+    #[test]
+    fn locally_rejected_requests_have_no_execution_start() {
+        let http = Counted(AtomicUsize::new(0));
+        let provider = Provider::new(
+            "openai",
+            "http://recorded",
+            crate::Auth::None,
+            responses::Responses::new(responses::HOSTS[0].1),
+        );
+        let mut request = Request {
+            model: "test".into(),
+            messages: [crate::Message::user("hello")].into_iter().collect(),
+            ..Request::default()
+        };
+        assert!(stream(&http, &provider, &request).started().is_some());
+        assert_eq!(http.0.load(Ordering::Relaxed), 1);
+        request
+            .headers
+            .push(("invalid\nheader".into(), "value".into()));
+        assert!(stream(&http, &provider, &request).started().is_none());
+        assert_eq!(http.0.load(Ordering::Relaxed), 1);
     }
 }

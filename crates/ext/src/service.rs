@@ -277,6 +277,16 @@ pub struct ModelTurn {
     context_policy: crate::ContextPolicy,
 }
 
+impl std::fmt::Display for ModelRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Session => f.write_str("session"),
+            Self::Fast => f.write_str("fast"),
+            Self::Named(name) => write!(f, "named:{name}"),
+        }
+    }
+}
+
 impl serde::Serialize for ModelRole {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {

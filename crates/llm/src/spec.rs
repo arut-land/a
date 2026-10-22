@@ -679,6 +679,21 @@ impl Count {
 }
 
 impl Usage {
+    #[inline(never)]
+    pub fn encode_counts(counts: &[Option<u64>; 10]) -> serde_json::Result<Json> {
+        Json::encode(counts)
+    }
+
+    #[inline(never)]
+    pub fn decode_counts(json: &Json) -> serde_json::Result<[Option<u64>; 10]> {
+        json.parse()
+    }
+
+    #[inline(never)]
+    pub fn counts(mut self) -> [Option<u64>; 10] {
+        Count::ALL.map(|count| *self.count(count))
+    }
+
     /// The field `count` names.
     pub fn count(&mut self, count: Count) -> &mut Option<u64> {
         match count {

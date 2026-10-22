@@ -52,7 +52,7 @@ pub(super) struct Projection {
     /// The message of the reply model call `.0` just had, until its
     /// result commits.
     pub(super) replied: Option<(CallId, llm::Assistant)>,
-    pub(super) executions: Vec<protocol::CallFact>,
+    pub(super) executions: Vec<(CallId, super::Json)>,
     pub(super) snapshot: Option<(u64, Option<Frame>)>,
     /// The view a far attach is sent, kept in step with each commit from
     /// the first time one is asked for: no attach folds the whole log.

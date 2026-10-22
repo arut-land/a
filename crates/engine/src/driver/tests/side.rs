@@ -2093,7 +2093,7 @@ fn metrics_queries_read_owned_attempts_from_committed_prefixes() {
     let prices = ext_metrics::Prices {
         version: "unpriced".into(),
         currency: "USD".into(),
-        models: BTreeMap::new(),
+        models: Vec::new(),
     };
     assert_eq!(projection.own(session.id, &prices).attempts, 0);
     let total = projection.subtree(session.id, &prices);

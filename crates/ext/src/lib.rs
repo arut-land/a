@@ -135,9 +135,6 @@ pub struct LogPrefix {
     pub inherited_through: u64,
 }
 
-/// Registering this service requests durable generic provider-attempt facts.
-pub struct CallFacts;
-
 #[cfg(test)]
 mod tests {
     use super::*;

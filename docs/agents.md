@@ -228,22 +228,26 @@ per owning call. See [side-calls.md](side-calls.md) for the full contract.
 
 ## Metrics
 
-`ext-metrics` registers the SDK's `CallFacts` recording service for all daemon
-conversations and folds generic call facts by `AttemptId { executing_session,
-call, attempt }`. The driver takes the monotonic start in memory when it sends the request.
+`ext-metrics` folds the engine's generic execution metadata for all daemon
+conversations by `AttemptId { executing_session, call, attempt }`. The driver
+takes the monotonic start in memory when it sends the request.
 Execution metadata rides on the existing result or retry settlement in the
-same commit; recording metrics adds no entries or flushes. Facts freeze the resolved
+same commit; recording metrics adds no entries or flushes. Facts freeze the
+resolved
 model, role, runner, agent, side classification, wall-clock correlation and
-monotonic clock epoch. An intent without execution settlement retains unknown usage and duration
-without claiming an executed attempt. No start fact is recorded. Failed finishes retain observed provider
-usage. No elapsed duration is reconstructed by subtracting clocks across a
-restart.
+monotonic clock epoch. An intent without execution settlement retains unknown
+usage and duration without claiming an executed attempt. No start fact is
+recorded. Cancellation leaves an intent without execution settlement. Usage
+counts are captured in `llm` before reply serialization,
+including failed finishes; missing counts remain unknown. No elapsed duration
+is reconstructed by subtracting clocks across a restart.
 
 `/metrics` queries the current ownership subtree; its optional JSON argument
 selects `subtree`, `agent`, `side`, `call` and `prices`. A price table supplies
-`version`, `currency` and `models`: model names map to ten signed nanocurrency
-rates in
-`llm::Count::ALL` order. Input/output counts include their subsets, so cache
+`prices` as `[version, currency, models]`, where `models` is a list of
+`[model, rates]` pairs sorted at query admission. Each rate array has ten
+signed nanocurrency rates in `llm::Count::ALL` order. Input/output counts
+include their subsets, so cache
 rates are adjustments to the inclusive input rate. Every nonzero coefficient
 requires an observed count. No built-in price is assumed. A recorded charge
 in the selected currency takes precedence. Missing rates, counts or duration
@@ -255,7 +259,8 @@ replies add no spend. Filters select agent and side/main dimensions without
 changing the facts. Critical elapsed time is the envelope of measured intervals
 within each clock epoch, separately from summed call durations. Multiple epochs
 and unfinished intervals report incomplete coverage; wall clocks never fill
-the gaps. Disposable in-memory folds retain conversation/sequence/epoch cursors. Reads
+the gaps. Disposable in-memory folds retain conversation/sequence/epoch cursors.
+Reads
 seek to the covered line, validate it and decode only the suffix; replaced
 coverage resets the fold. Copied history is excluded at the history-policy
 boundary. Unrelated entries advance the cursor without invalidating accounting
@@ -286,7 +291,7 @@ crates choose modes and policy.
 | Root-only extension | Rust declaration or Lua `a.inherit(false)` excludes the whole generation |
 | Resumable/forkable children | Common store/catalog paths and existing fork policy |
 | Model-only side threads | Owned conversations over `Runner::ModelOnly`, keyed turns and source-declared request bounds |
-| Usage/cost views | Future metrics fold over call facts and ownership edges |
+| Usage/cost views | `ext-metrics` derives totals from execution settlements and ownership edges |
 
 Implementation must prove replay identity, terminal-result uniqueness across
 cancel/reload, inbox order and consumption, inheritance exclusion, exact prefix

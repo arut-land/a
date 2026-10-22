@@ -312,7 +312,7 @@ impl ext::Logs for SessionLogs {
         Box::pin(async move {
             rt::unblock(&*self.0.rt, move || {
                 let records = shared.catalog.records();
-                let mut ids = std::collections::BTreeSet::from([root]);
+                let mut ids = vec![root];
                 if descendants {
                     loop {
                         let before = ids.len();
@@ -321,8 +321,9 @@ impl ext::Logs for SessionLogs {
                                 .header
                                 .parent
                                 .is_some_and(|p| ids.contains(&p.session))
+                                && !ids.contains(&record.header.id)
                             {
-                                ids.insert(record.header.id);
+                                ids.push(record.header.id);
                             }
                         }
                         if ids.len() == before {
@@ -330,6 +331,11 @@ impl ext::Logs for SessionLogs {
                         }
                     }
                 }
+                let namespace = shared
+                    .registry
+                    .get()
+                    .service::<dyn ext::host::HistoryPolicy>()
+                    .map(ext::host::HistoryPolicy::namespace);
                 ids.into_iter()
                     .map(|session| {
                         let record = records
@@ -344,11 +350,6 @@ impl ext::Logs for SessionLogs {
                             .store
                             .suffix(session, &mut cursor, record.entries)
                             .map_err(|e| e.to_string())?;
-                        let namespace = shared
-                            .registry
-                            .get()
-                            .service::<dyn ext::host::HistoryPolicy>()
-                            .map(ext::host::HistoryPolicy::namespace);
                         let inherited_through = entries
                             .iter()
                             .rev()
@@ -378,48 +379,32 @@ impl ext::Logs for SessionLogs {
 }
 
 impl Session {
+    #[inline(never)]
     pub(super) fn execution(
         &self,
         cx: &Cx,
         attempt: u16,
         model: String,
-        started: Option<std::time::Instant>,
-        result: &super::Replied,
-    ) -> Option<protocol::CallFact> {
-        let started = started?;
-        self.shared.registry.get().service::<ext::CallFacts>()?;
+        observed: super::Observation,
+        agent: String,
+    ) -> Option<Json> {
+        let started = observed.started?;
         let (epoch, clock) = attempt_clock();
         let spawn = lock(&self.spawn);
         let runner = spawn.as_ref().map(|s| &s.request.runner);
         let side = runner.is_some_and(|r| r.agent().is_none());
-        let usage = match result {
-            super::Replied::Done(output) => llm::Response::from_json(output.raw())
-                .ok()
-                .and_then(|r| Json::encode(&r.usage).ok()),
-            super::Replied::Failed(error) => {
-                error.usage.as_deref().and_then(|u| Json::encode(u).ok())
-            }
-            super::Replied::Interrupted(_) => None,
-        };
-        Some(protocol::CallFact {
+        protocol::CallFact {
             id: protocol::AttemptId {
                 executing_session: self.id,
                 call: cx.call,
                 attempt,
             },
             model,
-            role: Json::encode(runner.map_or(&ext::ModelRole::Session, ext::Runner::role)).ok()?,
+            role: runner
+                .map_or(&ext::ModelRole::Session, ext::Runner::role)
+                .to_string(),
             runner: if side { "model_only" } else { "agent" }.into(),
-            agent: runner.and_then(ext::Runner::agent).map_or_else(
-                || {
-                    self.shared
-                        .models
-                        .settings
-                        .agent(&self.workspace)
-                        .unwrap_or_else(|| ext::LOOP.into())
-                },
-                str::to_owned,
-            ),
+            agent,
             side,
             unix_ms: u64::try_from(
                 std::time::SystemTime::now()
@@ -438,9 +423,11 @@ impl Session {
                     .as_nanos(),
             )
             .ok(),
-            usage,
+            usage: observed.usage,
             charge: None,
-        })
+        }
+        .to_json()
+        .ok()
     }
 }
 

@@ -47,3 +47,12 @@ fn limit_errors_never_retry() {
             .is_retryable()
     );
 }
+
+#[test]
+fn replayed_errors_never_transfer_execution_usage() {
+    let mut error = Error::incomplete();
+    error.usage = Some(Box::new([Some(7); 10]));
+    assert!(error.usage_json().is_some());
+    let json = crate::Json::encode(&error).unwrap();
+    assert!(Error::from_json(json.raw()).unwrap().usage.is_none());
+}
