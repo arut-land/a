@@ -115,7 +115,8 @@ after a directory publication barrier fails. Unix Miri covers supported
 `sys` operations; it cannot execute Windows kernel FFI.
 
 Cross-account denial and physical power-loss persistence require a suitable
-Windows host. No Windows size, RSS or latency measurement has been collected.
+Windows host. Windows release size, idle RSS and latency budgets have not
+been measured on a quiet host.
 On the Apple silicon development host (2026-10-22), `mise run size` measured
 the shipped binary at 3,170 KiB against the 4,096 KiB cap, with fixture
 exclusion verified. This is an Apple measurement, not a Windows performance
