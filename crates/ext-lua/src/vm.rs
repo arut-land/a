@@ -46,6 +46,18 @@ impl Default for Limits {
     }
 }
 
+#[cfg(not(test))]
+fn now() -> Instant {
+    Instant::now()
+}
+
+#[cfg(test)]
+fn now() -> Instant {
+    // Descheduling must not spend a unit test's execution budget.
+    static TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *TIME.get_or_init(Instant::now)
+}
+
 struct Budget {
     left: AtomicU64,
     until: Mutex<Instant>,
@@ -56,7 +68,7 @@ impl Budget {
     fn new(limits: Limits) -> Arc<Self> {
         Arc::new(Self {
             left: AtomicU64::new(limits.instructions),
-            until: Mutex::new(Instant::now() + limits.slice),
+            until: Mutex::new(now() + limits.slice),
             remaining: Mutex::new(limits.slice),
         })
     }
@@ -72,13 +84,13 @@ impl Budget {
                 self.check()?;
                 return run();
             }
-            let start = Instant::now();
+            let start = now();
             *locked(&self.until) = start + *locked(&self.remaining);
             lua.set_app_data(Arc::clone(self));
             let result = catch_unwind(AssertUnwindSafe(|| self.check().and_then(|_| run())));
             lua.remove_app_data::<Arc<Budget>>();
             let mut remaining = locked(&self.remaining);
-            *remaining = remaining.saturating_sub(start.elapsed());
+            *remaining = remaining.saturating_sub(now().duration_since(start));
             if remaining.is_zero() {
                 return Err(mlua::Error::runtime("lua execution budget exhausted"));
             }
@@ -99,7 +111,7 @@ impl Budget {
     }
 
     fn check_time(&self) -> mlua::Result<VmState> {
-        if Instant::now() >= *locked(&self.until) {
+        if now() >= *locked(&self.until) {
             Err(mlua::Error::runtime("lua execution budget exhausted"))
         } else {
             Ok(VmState::Continue)
@@ -1425,7 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn preparation_limits_apply_during_compilation() {
+    fn preparation_rejects_oversized_source_expired_deadlines_and_exhausted_instructions() {
         let limits = Limits::default();
         let source = " ".repeat(limits.memory / 4 + 1);
         assert!(
@@ -1435,15 +1447,13 @@ mod tests {
                 .0
                 .contains("preparation source")
         );
-        let limits = Limits {
-            slice: Duration::from_nanos(1),
-            ..limits
-        };
+        let budget = Budget::new(limits);
+        *locked(&budget.until) = now();
         assert!(
-            Mod::load("deadline", "return", &[], limits)
+            Mod::compile("deadline", "return", &[], limits, false, &budget)
                 .err()
                 .unwrap()
-                .0
+                .to_string()
                 .contains("budget")
         );
         let limits = Limits {
@@ -1821,10 +1831,7 @@ mod tests {
             if args.args == "park" {
                 return std::future::pending().await;
             }
-            cx.service::<dyn rt::Runtime>()
-                .unwrap()
-                .sleep(Duration::from_millis(60))
-                .await;
+            cx.service::<ext::Flag>().unwrap().wait().await;
             Ok(true)
         }
     }
@@ -1835,6 +1842,7 @@ mod tests {
         const VERSION: u32 = 1;
         fn contribute(&self, r: &mut Registrar) {
             r.tool(Wait);
+            r.provide(Arc::new(ext::Flag::default()));
             if self.0 {
                 r.on::<ext::point::Permission>(|_, _| protocol::Permission::Deny);
             }
@@ -1842,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn delegated_effects_require_a_capability_and_policy_and_yield_to_the_runtime() {
+    fn delegated_effects_require_capability_and_policy_and_suspend_until_completion() {
         let source = tool("return cx.tool('wait','wait',{args=''})");
         let denied = Rig::new(
             "lua-no-grant",
@@ -1868,18 +1876,12 @@ mod tests {
         );
         let cx = rig.cx();
         let input = Json::encode(&json!({})).unwrap();
-        let runtime = cx.service::<dyn rt::Runtime>().unwrap();
-        let timer_won = rt::block_on(rt::or(
-            async {
-                rig.registry.tools().run("test", &input, None, &cx).await;
-                false
-            },
-            async {
-                runtime.sleep(Duration::from_millis(5)).await;
-                true
-            },
-        ));
-        assert!(timer_won);
+        let release = cx.service::<ext::Flag>().unwrap();
+        let mut call = Box::pin(rig.registry.tools().run("test", &input, None, &cx));
+        let mut context = std::task::Context::from_waker(Waker::noop());
+        assert!(call.as_mut().poll(&mut context).is_pending());
+        release.set();
+        assert!(matches!(rt::block_on(call).outcome, Outcome::Done { .. }));
         assert_eq!(rig.done("test", &json!({})), true);
     }
 }
