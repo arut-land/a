@@ -178,7 +178,7 @@ jobs:
             mise exec -- python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
           fi
       - name: Measure alternating reference and candidate rounds
-        if: always() && steps.build.outcome == 'success' && env.PERF_REFERENCE != '' && env.PERF_BUILD_ONLY != 'true'
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.PERF_REFERENCE != '' && env.PERF_BUILD_ONLY != 'true' }}
         run: |
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
             PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase paired --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
