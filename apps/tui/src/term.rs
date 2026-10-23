@@ -47,6 +47,7 @@ impl Terminal {
     /// buffer and the mouse (inline keeps the terminal's own scrolling and
     /// selection).
     pub fn enter(viewport: Viewport) -> io::Result<Self> {
+        let cooked = RawMode::enter()?;
         static HOOK: Once = Once::new();
         HOOK.call_once(|| {
             let previous = std::panic::take_hook();
@@ -55,7 +56,6 @@ impl Terminal {
                 previous(info);
             }));
         });
-        let cooked = RawMode::enter()?;
         *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some((viewport, cooked));
         let guard = Self(());
         let mut out = io::stdout().lock();
@@ -126,6 +126,7 @@ fn end(signal: Signal) -> ! {
         let _ = given.send(());
     });
     let _ = wait.recv_timeout(GIVE_BACK);
+    sys::terminal::restore();
     sys::reraise(signal)
 }
 

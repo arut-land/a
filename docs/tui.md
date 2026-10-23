@@ -10,6 +10,25 @@ own scrolling and selection). `A_TUI=plain`, a pipe on stdout, or
 exits instead: see [cli.md](cli.md). `NO_COLOR` draws attributes without
 colours.
 
+Terminal modes belong to an owned `sys::terminal` lease. Unix uses termios
+and an indefinite poll over stdin and the signal pipe. Ctrl-Z and SIGTSTP
+give back cooked input, paste/mouse modes and the alternate screen before
+stopping the client. Continuing in the foreground re-enters raw mode and
+redraws the whole viewport; a background continue stops again without
+taking the terminal from the shell. SIGWINCH and SIGCONT invalidate the
+screen. Background reads request suspension rather than appearing as EOF;
+background writes yield to job control. The line REPL leaves Unix cooked
+mode and its terminal-driver job control intact.
+
+Windows uses the actual console handles, saved input/output modes and
+UTF-8 code pages. VT output and input are enabled, QuickEdit and line/echo
+input are disabled, and processed input routes Ctrl-C and Ctrl-Break through
+the console control handler. Input waits indefinitely on the console and
+the signal event; native resize records invalidate the viewport. The line
+REPL changes only console output/encoding, preserving cooked input. A
+redirected side stays byte-oriented. Guards and panic hooks restore modes
+and code pages; termination restores them even if screen cleanup times out.
+
 ## What it shows
 
 Everything comes from the shared reducer, `protocol::view::SessionView`:

@@ -19,23 +19,28 @@ fn panic_hook() {
     HOOK.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            if let Some(raw) = RAW
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                let _ = raw.restore();
-            }
-            if let Some(line) = LINE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                let _ = line.restore();
-            }
+            restore();
             previous(info);
         }));
     });
+}
+
+/// Restore all terminal modes before an exit that bypasses Rust destructors.
+pub fn restore() {
+    if let Some(raw) = RAW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        let _ = raw.restore();
+    }
+    if let Some(line) = LINE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        let _ = line.restore();
+    }
 }
 
 pub struct LineMode(std::sync::Arc<imp::LineMode>);
