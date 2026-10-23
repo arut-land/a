@@ -285,7 +285,8 @@ impl Transaction<'_> {
         let cancel = self.cancel.clone();
         self.run(
             Storage,
-            limits.file + content.len() + limits.diff_bytes * 2,
+            // Verification holds both bounded metadata values alongside the result.
+            limits.file * 2 + content.len() + limits.diff_bytes * 2,
             move || {
                 let mut edited = edited;
                 edited.publication =

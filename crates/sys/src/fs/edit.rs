@@ -1069,15 +1069,9 @@ fn preserved_metadata_matches(source: &File, snapshot: &File, limit: usize) -> i
     #[cfg(target_os = "linux")]
     let names = |file: &File| linux_xattrs(file, 0, limit);
     let (before, copied) = (names(source)?, names(snapshot)?);
-    let sorted = |names: &[u8]| -> Vec<Vec<u8>> {
-        let mut names: Vec<_> = names
-            .split_inclusive(|b| *b == 0)
-            .map(<[u8]>::to_vec)
-            .collect();
-        names.sort_unstable();
-        names
-    };
-    if sorted(&before) != sorted(&copied) {
+    // Equal counts plus a successful lookup of every source name establish equal
+    // name sets without allocating another copy or a per-attribute search index.
+    if before.split_inclusive(|b| *b == 0).count() != copied.split_inclusive(|b| *b == 0).count() {
         return Ok(false);
     }
     let mut remaining = limit - before.len();
