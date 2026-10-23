@@ -12,6 +12,8 @@ WatchEvent carries changes, overflow, rescan requests and unavailable
 subscriptions. Uncertainty invalidates all roots, including events without
 paths; refresh rearms subscriptions before source inventory is captured.
 Root parents remain watched so creation and replacement stay observable.
+Events retain canonical paths alongside configured alias spellings so
+overlapping canonical and aliased roots all invalidate.
 Unavailable subscriptions and failed rearms schedule rescan callbacks with
 exponential backoff from 100 ms to five seconds, independently of further
 filesystem events. A successful refresh cancels recovery; dropping the

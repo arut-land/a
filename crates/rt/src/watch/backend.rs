@@ -13,32 +13,18 @@ impl Backend {
     pub fn new(_: &Spawn, wanted: &BTreeMap<PathBuf, bool>, changed: &Changed) -> io::Result<Self> {
         use notify::Watcher as _;
         let changed = changed.clone();
-        let mut aliases: Vec<_> = wanted
+        let aliases: Vec<_> = wanted
             .keys()
             .filter_map(|path| {
                 let resolved = path.canonicalize().ok()?;
                 (resolved != *path).then(|| (resolved, path.clone()))
             })
             .collect();
-        aliases.sort_by_key(|(resolved, _)| std::cmp::Reverse(resolved.components().count()));
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
                 Ok(event) if event.need_rescan() => changed(WatchEvent::Rescan),
                 Ok(event) if !matches!(event.kind, notify::EventKind::Access(_)) => {
-                    let paths = event
-                        .paths
-                        .into_iter()
-                        .map(|path| {
-                            aliases
-                                .iter()
-                                .find_map(|(resolved, original)| {
-                                    path.strip_prefix(resolved)
-                                        .ok()
-                                        .map(|relative| original.join(relative))
-                                })
-                                .unwrap_or(path)
-                        })
-                        .collect();
+                    let paths = event_paths(event.paths, &aliases);
                     changed(WatchEvent::Changed(paths));
                 }
                 Err(error) => changed(WatchEvent::Unavailable(io::Error::other(error))),
@@ -60,6 +46,41 @@ impl Backend {
         }
         paths.commit().map_err(io::Error::other)?;
         Ok(Self { _watcher: watcher })
+    }
+}
+
+#[cfg(not(windows))]
+fn event_paths(mut paths: Vec<PathBuf>, aliases: &[(PathBuf, PathBuf)]) -> Vec<PathBuf> {
+    // A parent alias can cover a different canonical root. Preserve both
+    // spellings so neither root loses events or ancestor invalidation.
+    for index in 0..paths.len() {
+        for (resolved, original) in aliases {
+            if let Ok(relative) = paths[index].strip_prefix(resolved) {
+                let rewritten = original.join(relative);
+                paths.push(rewritten);
+            }
+        }
+    }
+    paths
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_roots_under_aliased_parents_remain_observable() {
+        let aliases = vec![(PathBuf::from("/real"), PathBuf::from("/alias"))];
+        let paths = event_paths(
+            vec![PathBuf::from("/real/project/skills/review/SKILL.md")],
+            &aliases,
+        );
+        let event = WatchEvent::Changed(paths);
+        assert!(event.affects(&[
+            PathBuf::from("/alias/missing"),
+            PathBuf::from("/real/project/skills"),
+        ]));
+        assert!(event.affects(&[PathBuf::from("/alias/project/skills")]));
     }
 }
 
