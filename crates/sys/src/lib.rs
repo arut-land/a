@@ -24,11 +24,12 @@ mod memory;
 mod platform;
 mod proc;
 mod runtime;
+pub mod shell;
 mod signals;
 pub mod terminal;
 #[cfg(windows)]
 mod windows;
-#[cfg(all(test, not(windows)))]
+#[cfg(any(test, windows))]
 mod windows_quote;
 mod workspace;
 
@@ -240,14 +241,14 @@ pub fn shell_directory(text: &str) -> PathBuf {
 }
 
 /// The shell builtin that reports a directory in the host's path syntax.
-pub const fn shell_pwd() -> &'static str {
+pub fn shell_pwd() -> &'static str {
     #[cfg(unix)]
     {
         "pwd -P"
     }
     #[cfg(windows)]
     {
-        "pwd -W"
+        shell::ExecutionFacts::current().cwd_command
     }
 }
 
