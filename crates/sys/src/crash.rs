@@ -9,6 +9,8 @@
 //! daemon that died without exiting: killed, aborted, or crashed by a
 //! signal. A panic hook also writes the reason, when there is one.
 
+mod image;
+
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -294,7 +296,7 @@ pub fn install(dir: PathBuf, build: Build) {
 }
 
 /// Even an adversarial panic cannot enlarge a report or add text fields.
-pub const MAX_REPORT: usize = 16 << 10;
+pub const MAX_REPORT: usize = 32 << 10;
 const DEEP: usize = 128;
 
 #[derive(Serialize)]
@@ -315,6 +317,7 @@ struct Callsite {
 struct Frame {
     image: u64,
     offset: u64,
+    identity: Option<image::Identity>,
 }
 
 struct Frames {
@@ -362,9 +365,20 @@ fn describe(info: &PanicHookInfo<'_>, build: Build) -> Report {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn stack() -> Frames {
-    Frames::default()
+    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+    let mut ips = [std::ptr::null_mut(); DEEP];
+    // SAFETY: ips has room for exactly DEEP addresses; no symbolization or DbgHelp state.
+    let len =
+        unsafe { RtlCaptureStackBackTrace(0, DEEP as u32, ips.as_mut_ptr(), std::ptr::null_mut()) }
+            as usize;
+    let mut frames = Frames::default();
+    for ip in &ips[..len] {
+        frames.frames[frames.len] = image::frame(*ip);
+        frames.len += 1;
+    }
+    frames
 }
 
 // No symbolization: only numeric image fingerprints and offsets cross the
@@ -398,6 +412,7 @@ fn stack() -> Frames {
         frames.frames[frames.len] = Frame {
             image,
             offset: ip.saturating_sub(info.dli_fbase as usize) as u64,
+            identity: found.then(|| image::of(info.dli_fbase as usize)).flatten(),
         };
         frames.len += 1;
         if frames.len < DEEP { 0 } else { 5 }
@@ -738,6 +753,7 @@ mod tests {
                 frames: [Frame {
                     image: u64::MAX,
                     offset: u64::MAX,
+                    identity: Some(image::Identity::ElfBuildId(image::Hex::maximal())),
                 }; DEEP],
                 len: DEEP,
             },
@@ -789,7 +805,13 @@ mod tests {
         assert!(value["build"]["fingerprint"].is_null());
         assert!(value["callsite"]["file"].is_u64());
         assert!(value["callsite"]["line"].is_u64());
-        for frame in value["frames"].as_array().unwrap() {
+        let frames = value["frames"].as_array().unwrap();
+        assert!(!frames.is_empty());
+        assert!(
+            frames.iter().any(|frame| !frame["identity"].is_null()),
+            "no native image identity: {report}"
+        );
+        for frame in frames {
             assert!(frame["image"].is_u64() && frame["offset"].is_u64());
         }
     }

@@ -407,7 +407,11 @@ pub fn install(rt: &rt::Rt, path: PathBuf) {
             keep: KEEP,
             repair: None,
         };
-        logger.run(rt, move |line| file.write(line));
+        let native = sys::log::Native::default();
+        logger.run(rt, move |line| {
+            native.write(line);
+            file.write(line)
+        });
     }
 }
 

@@ -38,16 +38,37 @@ Detached stderr goes to the null device so arbitrary library diagnostics
 cannot bypass the typed API. A manually launched daemon can still show
 console errors.
 
+Native delivery supplements the same readable local file. With `A_HOME` set,
+no native sink is opened. Otherwise Linux connects a nonblocking datagram socket
+to `/run/systemd/journal/socket` and sends native journal entries with
+`SYSLOG_IDENTIFIER=a`, priority notice and the sealed JSON record as `MESSAGE`.
+A missing journal or a full socket never delays local delivery. macOS uses
+unified logging under subsystem `land.arut.a`, category `daemon`, at default
+level with a static public string template. Windows uses the manifest-free
+TraceLogging provider `land.arut.a.daemon`, event `Fact`, field `Json` at
+informational level. Native enabled checks precede native string conversion;
+the local record is encoded once regardless. Native transport has no worker,
+retry queue, timer or idle wake. It is best effort, and its failures do not
+contribute to the local file's write-failure count.
+
 Crash reports under `crash/` use a separate closed JSON shape: validated
 numeric build identity, pid and time, `panic` or `unclean_exit`, numeric
-callsite fingerprint/line/column, and at most 128 numeric image fingerprints
-and frame offsets. No panic payload, thread name, symbol, image name or source
-path crosses that boundary, including debug builds and reaper reports. The
-panic hook replaces the default formatter. Unix captures numeric frames;
-other platforms currently leave the frame array empty. Fingerprints use the
-same FNV identity scheme as workspace correlation; the build's debug info
-can resolve frame offsets offline. Each report is capped at 16 KiB and the
-newest 20 reports are retained (at most 320 KiB).
+callsite fingerprint/line/column, and at most 128 frames. Each frame carries
+an image fingerprint, image-relative offset and optional native identity:
+Linux ELF GNU build-id, macOS Mach-O LC_UUID, or Windows PE timestamp,
+image size and optional CodeView RSDS GUID bytes/age. Hex fields preserve
+native byte order; the RSDS GUID's first three fields use Windows little-endian
+GUID layout. Identities come from the loader's mapped image, so a moved,
+replaced or deleted executable path cannot change the report's identity.
+Missing native identity is explicit rather than substituted with a path.
+Windows captures frames with `RtlCaptureStackBackTrace` and pins each module
+while reading its PE metadata; it does not initialize DbgHelp or symbolize.
+Unix unwinds without symbolization. No panic payload, thread name, symbol,
+image name, PDB filename or source path crosses the report boundary, including
+debug builds and reaper reports. The panic hook replaces the default formatter;
+it is not a fatal-signal handler. Each report is capped at 32 KiB and the newest
+20 reports are retained (at most 640 KiB). A reaped unexplained exit has no
+frames: the reaper must not attribute its own image identity to a dead daemon.
 
 Startup facts can enter the bounded queue before configuration is loaded.
 The daemon installs one writer only after acquiring its home lock. A
