@@ -22,19 +22,18 @@ Read the diff, trace each changed path, and report concrete defects.
 Consult references/checklist.md beside this file if needed.
 ```
 
-The frontmatter uses a bounded YAML subset with required text fields `name` and
-`description`. Names contain 1–64 lower-case ASCII letters, digits or internal
-hyphens. Descriptions are nonempty, at most 1024 bytes after whitespace is
-folded. Single- and double-quoted scalars and YAML folded/literal descriptions
-work. Unknown metadata is ignored, not interpreted as permissions. Duplicate
-required fields, missing fields, collection values for required fields and malformed
-subset syntax reject the candidate with a typed error and file line number.
-Metadata supports indented maps, scalar lists and single-line flow collections;
-nesting is limited to 16. Plain scalars, single quotes (including doubled quotes),
-double quotes with JSON escapes, comments, and `>`/`|` descriptions are supported.
-Quoted block-map keys, multiline plain/quoted scalars, tags, anchors, aliases and directives
-are outside the subset and rejected. Block chomping and indentation indicators
-are accepted; all description whitespace is folded before indexing. Delimiters are lines containing `---`; LF and CRLF work.
+The frontmatter uses YAML with required text fields `name` and `description`.
+Names contain 1–64 lower-case ASCII letters, digits or internal hyphens.
+Descriptions are nonempty, at most 1024 bytes after whitespace is folded.
+`yaml-rust2` parses syntax as events; headers are limited to 8192 bytes and
+16 levels of nesting. No YAML tree or alias expansion is constructed.
+Unknown metadata is validated and ignored, never interpreted as permissions.
+Duplicate keys in any mapping, non-scalar keys, missing required fields,
+collections or null for required fields, tags, anchors and aliases reject the
+candidate with a typed error and file line number. Quoted keys, multiline
+scalars, YAML escapes, flow collections and folded/literal blocks are supported.
+All description whitespace is folded before indexing. Delimiters are lines
+containing `---`; LF and CRLF work.
 The parser choice and measurements are in [perf/skills.md](perf/skills.md).
 
 Only names and descriptions enter the model's index. `skill({"name":"review"})`

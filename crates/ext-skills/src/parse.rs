@@ -4,37 +4,46 @@ use std::path::Path;
 mod yaml;
 use yaml::{Error, Kind, header};
 
-/// Discovery reads only top-level identity lines. Invalid descriptions or
-/// unrelated metadata in a losing file cannot reject a winning skill.
+/// Discovery parses only identity entries. Other header failures remain raw
+/// observations until capture and debounce have validated the winning inputs.
 pub(crate) fn identity(source: &[u8]) -> Result<String, Error> {
-    let mut lines = source.split(|b| *b == b'\n');
-    if lines
-        .next()
-        .and_then(|line| std::str::from_utf8(line).ok())
-        .is_none_or(|line| line.trim_end() != "---")
-    {
+    let mut lines = source.split_inclusive(|b| *b == b'\n');
+    let opening = lines.next().ok_or_else(|| Error::new(1, Kind::Delimiter))?;
+    if !std::str::from_utf8(opening).is_ok_and(|line| line.trim_end() == "---") {
         return Err(Error::new(1, Kind::Delimiter));
     }
-    let mut name = None;
-    for (index, line) in lines.enumerate() {
+    let mut end = opening.len();
+    for line in lines {
         if std::str::from_utf8(line).is_ok_and(|line| line.trim_end() == "---") {
             break;
         }
-        let Some(rest) = line.strip_prefix(b"name:") else {
-            continue;
-        };
-        if name.is_some() {
-            return Err(Error::new(index + 2, Kind::Duplicate));
-        }
-        let rest = std::str::from_utf8(rest).map_err(|_| Error::new(index + 2, Kind::Syntax))?;
-        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-            return Err(Error::new(index + 2, Kind::Syntax));
-        }
-        let value = yaml::scalar(yaml::comment(rest.trim_start()).trim_end(), index + 2)?;
-        validate_name(&value, index + 2)?;
-        name = Some(value);
+        end += line.len();
     }
-    name.ok_or_else(|| Error::new(2, Kind::Missing))
+    // Replacement characters cannot make a valid ASCII skill identity. Bad
+    // bytes in unrelated metadata must not obscure an otherwise readable name.
+    let header = String::from_utf8_lossy(&source[opening.len()..end]);
+    let indent = header
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let mut offset = 0;
+    for line in header.split_inclusive('\n') {
+        if line.len() - line.trim_start().len() == indent
+            && let Ok(Some(name)) = yaml::identity(&header[offset..], true)
+        {
+            validate_name(&name, 2)?;
+            return Ok(name);
+        }
+        offset += line.len();
+    }
+    // Flow mappings can put the name after another entry on the same line.
+    if let Ok(Some(name)) = yaml::identity(&header, false) {
+        validate_name(&name, 2)?;
+        return Ok(name);
+    }
+    Err(Error::new(2, Kind::Missing))
 }
 
 fn validate_name(name: &str, line: usize) -> Result<(), Error> {

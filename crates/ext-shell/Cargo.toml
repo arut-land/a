@@ -16,6 +16,7 @@ sys.workspace = true
 vte = { version = "0.15", default-features = false }
 
 [dev-dependencies]
+tempfile = { version = "3", default-features = false }
 ext = { workspace = true, features = ["testing"] }
 
 [lints]
