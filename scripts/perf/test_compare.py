@@ -14,6 +14,18 @@ from stats import distribution
 
 
 class Comparison(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("psutil"), "native accounting runs in each perf job")
+    def test_process_accounting_never_requests_a_macos_debug_task_port(self):
+        from process import snapshot
+        process = mock.Mock()
+        process.cpu_times.return_value = mock.Mock(user=1, system=2)
+        process.memory_info.return_value = mock.Mock(rss=4096)
+        with mock.patch("psutil.Process", return_value=process), mock.patch("sys.platform", "darwin"):
+            result = snapshot(1, threads=True)
+        process.threads.assert_not_called()
+        self.assertEqual(result["cpu_seconds"], 3)
+        self.assertEqual(result["rss_kib"], 4)
+
     def test_artifact_redirects_never_forward_github_tokens_to_storage(self):
         import urllib.request
         request = urllib.request.Request("https://api.github.com/artifact", headers={"Authorization": "Bearer test"})
