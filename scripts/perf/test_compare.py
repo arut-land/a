@@ -14,6 +14,25 @@ from stats import distribution
 
 
 class Comparison(unittest.TestCase):
+    def test_captured_output_does_not_wait_for_an_inheriting_descendant(self):
+        import tempfile
+        import psutil
+        from process import run_timed
+        code = "import pathlib, subprocess, sys; p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); pathlib.Path(sys.argv[1]).write_text(str(p.pid)); print('complete')"
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / "owned.pid"
+            try:
+                result = run_timed([sys.executable, "-c", code, str(pidfile)], timeout=5,
+                                   capture_output=True, text=True)
+                self.assertEqual(result.stdout, "complete\n")
+                self.assertEqual(result.stderr, "")
+            finally:
+                if pidfile.exists():
+                    try:
+                        psutil.Process(int(pidfile.read_text())).kill()
+                    except psutil.NoSuchProcess:
+                        pass
+
     def test_an_absent_baseline_never_becomes_zero(self):
         self.assertEqual(compare(dict(median=3, p10=2, p90=4), None), "no baseline")
 

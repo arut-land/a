@@ -22,8 +22,25 @@ def run_timed(argv, timeout=300, check=True, **kwargs):
     import subprocess
 
     if kwargs.pop("capture_output", False):
-        kwargs["stdout"] = subprocess.PIPE
-        kwargs["stderr"] = subprocess.PIPE
+        import tempfile
+        text = any(kwargs.get(key) for key in ("text", "universal_newlines", "encoding", "errors"))
+        options = dict(mode="w+" if text else "w+b",
+                       encoding=kwargs.get("encoding"), errors=kwargs.get("errors"))
+        # An inherited pipe writer must not extend a completed command's lifetime.
+        with tempfile.TemporaryFile(**options) as out, tempfile.TemporaryFile(**options) as err:
+            try:
+                result = run_timed(argv, timeout, check=False, stdout=out, stderr=err, **kwargs)
+            except subprocess.TimeoutExpired as error:
+                out.seek(0)
+                err.seek(0)
+                error.output, error.stderr = out.read(), err.read()
+                raise
+            out.seek(0)
+            err.seek(0)
+            result.stdout, result.stderr = out.read(), err.read()
+        if check:
+            result.check_returncode()
+        return result
     child = subprocess.Popen(argv, **kwargs)
     try:
         owner = psutil.Process(child.pid)
