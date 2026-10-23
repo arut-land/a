@@ -100,7 +100,16 @@ impl SpawnPlan<'_> {
         let program = resolve(cmd.get_program(), &environment, cmd.get_current_dir())?;
         let mut line = command_line(program.as_os_str(), cmd.get_args())?;
         let mut environment = environment_block(environment)?;
-        let directory = cmd.get_current_dir().map(|dir| wide(dir.as_os_str()));
+        let directory = cmd
+            .get_current_dir()
+            .map(|dir| {
+                let encoded = wide(dir.as_os_str());
+                if encoded[..encoded.len() - 1].contains(&0) {
+                    return Err(io::ErrorKind::InvalidInput.into());
+                }
+                Ok::<_, io::Error>(encoded)
+            })
+            .transpose()?;
         let handles = [
             inheritable(io[0])?,
             inheritable(io[1])?,
@@ -368,6 +377,38 @@ use quoting::quote;
 mod tests {
     use super::*;
     use std::os::windows::ffi::OsStringExt;
+
+    #[test]
+    fn an_embedded_nul_cannot_select_a_different_working_directory() {
+        let null = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("NUL")
+            .unwrap();
+        let mut command = Command::new(
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe"),
+        );
+        let mut directory = std::env::temp_dir().into_os_string();
+        directory.push(OsString::from_wide(&[0, u16::from(b'x')]));
+        command
+            .args(["/D", "/C", "exit 0"])
+            .envs(std::env::vars_os())
+            .current_dir(directory);
+        let result = SpawnPlan {
+            command: &command,
+            io: [&null, &null, &null],
+            job: None,
+            flags: windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+            environment: SpawnEnvironment::Exact,
+        }
+        .spawn();
+        if let Ok(mut child) = result {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("truncated directory was accepted");
+        }
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn environment_names_use_native_case_without_losing_wchar_identity() {
