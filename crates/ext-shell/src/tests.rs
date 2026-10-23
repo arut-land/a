@@ -235,7 +235,6 @@ fn powershell_preserves_status_errors_unicode_cwd_and_no_input() {
                 "PowerShell result: exit {:?}; timeout {:?}",
                 ran.exit, ran.timed_out
             );
-            eprintln!("{}", ran.output);
             assert!(ran.timed_out.is_none(), "{command}: {}", ran.output);
             ran
         };
