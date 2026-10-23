@@ -101,3 +101,29 @@ The observed tempfile cost is 9.10 µs/pair; the small RSS difference is not a
 memory-saving claim. Exclusive creation and workspace ownership remove real
 collision/deletion failure modes. Both implementations have zero idle work,
 and neither helper is linked into the shipped executable.
+
+## Shipped size and paired runtime resources
+
+[Hosted paired run](https://github.com/arut-land/a/actions/runs/39977920802)
+compares production revision `28458988` with main
+`065b9331ade244b56e27cb7e457cb8d9a75fcbf0`. Each native runner alternates
+reference/candidate order for five rounds. Size excludes fixtures; idle and
+loaded workloads use deterministic fixtures. The default catalog is empty, so
+header-decoding CPU is assessed separately by the corpus probe above.
+
+| Native target | Main bytes | Candidate bytes | Delta bytes |
+| --- | ---: | ---: | ---: |
+| aarch64-unknown-linux-gnu | 3626792 | 3668904 | +42112 |
+| x86_64-unknown-linux-gnu | 4207520 | 4260512 | +52992 |
+
+Median candidate-minus-reference deltas (observations, not speedup claims):
+
+| Native target | Startup ms | Startup CPU ms | Cold reply ms | Attach p50 ms | Idle RSS KiB | Driver CPU ms | Driver peak RSS KiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| aarch64-unknown-linux-gnu | +0.018 | +0.010 | +0.340 | -0.008 | +36.000 | +17.897 | +200.000 |
+| x86_64-unknown-linux-gnu | -0.011 | -0.008 | -0.036 | +0.014 | -32.000 | +18.542 | +32.000 |
+
+Both Linux targets measure zero daemon and idle line-client CPU in both roles.
+Idle RSS changes are +36 KiB on ARM64 and −32 KiB on x86_64, with no consistent
+memory regression across these samples. Raw distributions, including p10–p90,
+all loaded workloads and all five rounds, remain in each target's artifact.
