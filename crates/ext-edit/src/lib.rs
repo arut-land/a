@@ -11,7 +11,8 @@
 //! the original. Other publication paths first move and verify the original, then
 //! use no-replace publication; the receipt reports that readers may see an absent
 //! target during that interval. Conflicts restore without replacing an arriving
-//! file; contention retains displaced data and reports its recovery path.
+//! file. After a visible swap, rollback retains the displaced version and reports
+//! its recovery path, preserving writes to that briefly visible replacement.
 
 use ext::{Configured, CwdOf, Extension, Need, Refused, Registrar, Table, Text, Tool as _};
 

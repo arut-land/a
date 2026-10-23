@@ -393,25 +393,19 @@ impl EditTransaction {
                     self.verify_displaced(&mut displaced, &staged.file, before)
                 });
             if checked.is_err() {
-                // A rollback must never discard a second writer's version.
-                // Verify both sides; retain unexpected displaced data for recovery.
+                // Once visible, even our inode may contain someone else's metadata.
+                // Retain every displaced version instead of deleting on rollback.
+                let recovery = staged.retain();
                 if self.open_source().is_ok_and(|mut current| {
                     same_object(&current, &staged.file).unwrap_or(false)
                         && signature(&current)
                             .is_ok_and(|now| moved_signature(now) == moved_signature(published))
                         && check_bytes(&mut current, bytes).is_ok()
-                }) && {
-                    before_rollback();
-                    staged.exchange(&self.name).unwrap_or(false)
-                } && staged.displaced().is_ok_and(|mut displaced| {
-                    same_object(&displaced, &staged.file).unwrap_or(false)
-                        && signature(&displaced)
-                            .is_ok_and(|now| moved_signature(now) == moved_signature(published))
-                        && check_bytes(&mut displaced, bytes).is_ok()
                 }) {
-                    return Err(EditError::Conflict(EditConflict::Changed));
+                    before_rollback();
+                    let _ = staged.exchange(&self.name);
                 }
-                return Err(EditError::Conflict(EditConflict::Recovery(staged.retain())));
+                return Err(EditError::Conflict(EditConflict::Recovery(recovery)));
             }
             return Ok(PublicationProtection::ExchangeVerified);
         }
@@ -1793,6 +1787,15 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[cfg(unix)]
+    fn reclaim_recovery(result: Result<EditReceipt, EditError>, expected: &[u8]) {
+        let Err(EditError::Conflict(EditConflict::Recovery(path))) = result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     struct Workspace(PathBuf);
 
     impl Workspace {
@@ -2676,10 +2679,7 @@ mod tests {
                     fs::write(work.target(), b"theirs").unwrap();
                 },
             );
-            assert!(
-                matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
-                "{result:?}"
-            );
+            reclaim_recovery(result, b"ours");
             assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
             work.only_target_remains();
         }
@@ -2753,6 +2753,46 @@ mod tests {
             fs::remove_dir(path.parent().unwrap()).unwrap();
             work.only_target_remains();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_retains_metadata_written_to_the_visible_replacement() {
+        use rustix::fs::{XattrFlags, fgetxattr, fsetxattr};
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let transaction = work.capture();
+        let mut staged = transaction.stage(&|_| false).unwrap();
+        staged.file.write_all(b"ours").unwrap();
+        preserve_metadata(&transaction.source.as_ref().unwrap().0, &staged.file).unwrap();
+        transaction.revalidate().unwrap();
+        fs::write(work.target(), b"first writer").unwrap();
+        let result = transaction.commit(
+            &mut staged,
+            b"ours",
+            true,
+            || {
+                fsetxattr(
+                    File::open(work.target()).unwrap(),
+                    c"user.a-edit",
+                    b"second metadata",
+                    XattrFlags::empty(),
+                )
+                .unwrap()
+            },
+            || {},
+        );
+        let Err(EditError::Conflict(EditConflict::Recovery(path))) = result else {
+            panic!("{result:?}");
+        };
+        drop(staged);
+        assert_eq!(fs::read(work.target()).unwrap(), b"first writer");
+        assert_eq!(fs::read(&path).unwrap(), b"ours");
+        let mut value = [0; 32];
+        let size = fgetxattr(File::open(&path).unwrap(), c"user.a-edit", &mut value[..]).unwrap();
+        assert_eq!(&value[..size], b"second metadata");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        work.only_target_remains();
     }
 
     #[cfg(windows)]
@@ -2876,10 +2916,14 @@ mod tests {
                     fsetxattr(&source, c"user.a-edit", b"after!", XattrFlags::empty()).unwrap();
                 },
             );
-            assert!(
-                matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
-                "{result:?}"
-            );
+            if exchange {
+                reclaim_recovery(result, b"ours");
+            } else {
+                assert!(
+                    matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
+                    "{result:?}"
+                );
+            }
             assert_eq!(fs::read(work.target()).unwrap(), b"original");
             let mut value = [0; 32];
             let count = fgetxattr(
@@ -2914,10 +2958,7 @@ mod tests {
                     .unwrap();
             },
         );
-        assert!(
-            matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
-            "{result:?}"
-        );
+        reclaim_recovery(result, b"ours");
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
         let mut bytes = [0; 32];
         let count = rustix::fs::fgetxattr(
@@ -3030,10 +3071,7 @@ mod tests {
                 );
             },
         );
-        assert!(
-            matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
-            "{result:?}"
-        );
+        reclaim_recovery(result, b"ours");
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
         let output = std::process::Command::new("/bin/ls")
             .arg("-le")
