@@ -1,0 +1,128 @@
+name: watch fixture memory
+on:
+  push:
+    branches: [codex-w1watch]
+    paths: [.github/workflows/watch-fixture-memory.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04-arm, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 4
+      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+      RUSTUP_TOOLCHAIN: nightly-2026-10-17
+      MISE_AUTO_INSTALL: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 416af1e2868c64938b97445ab088919989ffdf87
+          path: measured
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - shell: bash
+        run: |
+          echo "RUSTUP_HOME=$RUNNER_TEMP/perf-rustup" >> "$GITHUB_ENV"
+          echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
+      - uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ${{ runner.temp }}/mbx/actions
+          key: probe-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: perf-v2-${{ runner.os }}-${{ runner.arch }}-
+      - shell: bash
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src
+      - uses: jdx/mise-action@v5
+        with:
+          working_directory: measured
+          install_args: ${{ runner.os == 'Linux' && 'mr-boxington mold' || 'hyperfine' }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
+      - uses: Swatinem/rust-cache@v2
+        if: runner.os == 'macOS'
+        with:
+          workspaces: measured -> target/perf-build
+          cache-all-crates: true
+          cache-on-failure: true
+      - name: Build the exact reference and reviewed fixture binaries
+        shell: bash
+        run: |
+          mkdir built
+          for role in reference candidate; do
+            if [[ "$role" == reference ]]; then revision=0d531a42a8c87275edf13f984a5928ff104d45fe; else revision=416af1e2868c64938b97445ab088919989ffdf87; fi
+            git -C measured checkout "$revision"
+            (cd measured && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/measured/target/perf-build" mise exec -- cargo build-release -p a --features fixtures)
+            cp measured/target/perf-build/release/a "built/$role-a"
+          done
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          expected = {'Linux': [3606312, 3626536], 'macOS': [3891392, 3912032]}[os.environ['RUNNER_OS']]
+          assert [Path(f'built/{r}-a').stat().st_size for r in ['reference','candidate']] == expected
+          PY
+      - run: pip install psutil==7.2.2
+      - name: Attribute resident memory
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, queue, subprocess, tempfile, threading, time
+          import psutil
+          out = pathlib.Path('rss-probe'); out.mkdir()
+          samples = []
+          for trial in range(5):
+            for role in (['reference', 'candidate'] if trial % 2 == 0 else ['candidate', 'reference']):
+              binary = pathlib.Path('built', role+'-a').resolve(); binary.chmod(0o755)
+              with tempfile.TemporaryDirectory(prefix='a-rss-', dir=os.environ['RUNNER_TEMP']) as tmp:
+                home = pathlib.Path(tmp)
+                (home / 'config.toml').write_text('[daemon]\nagent = \"echo\"\nidle_secs = 120\n')
+                env = dict(os.environ, A_HOME=tmp, A_TUI='plain'); env.pop('A_HOST', None)
+                child = subprocess.Popen([str(binary)], env=env, cwd=tmp, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                  first = queue.Queue()
+                  threading.Thread(target=lambda: first.put(child.stdout.readline()), daemon=True).start()
+                  line = first.get(timeout=60)
+                  assert line.startswith(b'[session'), (line, child.poll())
+                  pid = int((home / 'run/daemon.pid').read_text().splitlines()[0])
+                  begun = time.monotonic()
+                  time.sleep(3)
+                  process = psutil.Process(pid)
+                  record = dict(role=role, trial=trial, rss_kib=process.memory_info().rss/1024)
+                  print(role, trial, pid, record['rss_kib'], flush=True)
+                  if os.uname().sysname == 'Linux':
+                    maps = process.memory_maps(grouped=False)
+                    record['groups'] = {}
+                    for region in maps:
+                      group = 'binary-code' if region.path == process.exe() and 'x' in region.perms else ('binary-data' if region.path == process.exe() else ('anonymous' if region.path.startswith('[') else 'libraries'))
+                      values = record['groups'].setdefault(group, dict(rss=0, private_dirty=0, private_clean=0))
+                      for k in values: values[k] += getattr(region, k)
+                    (out/f'{role}-{trial}-smaps.txt').write_text(pathlib.Path(f'/proc/{pid}/smaps').read_text())
+                  else:
+                    vm = subprocess.run(['vmmap', '-summary', str(pid)], capture_output=True, text=True, timeout=20)
+                    (out/f'{role}-{trial}-vmmap.txt').write_text(vm.stdout+vm.stderr)
+                  record['threads_at_3s'] = process.num_threads()
+                  time.sleep(max(0, 15-(time.monotonic()-begun)))
+                  record['rss_at_15s_kib'] = process.memory_info().rss/1024
+                  record['threads_at_15s'] = process.num_threads()
+                  samples.append(record)
+                  (out/'samples.json').write_text(json.dumps(samples, indent=2))
+                finally:
+                  child.stdin.close()
+                  try: child.wait(timeout=15)
+                  except subprocess.TimeoutExpired: child.kill(); child.wait()
+                  subprocess.run([str(binary), 'daemon', 'stop'], env=env, cwd=tmp, capture_output=True, timeout=30)
+          (out/'samples.json').write_text(json.dumps(samples, indent=2))
+          PY
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: fixture-rss-probe-${{ matrix.runner }}
+          path: rss-probe/
