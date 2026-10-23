@@ -1617,14 +1617,16 @@ pub(super) fn accessible_links(file: &File) -> io::Result<u32> {
     use windows_sys::Wdk::Storage::FileSystem::{
         FILE_STANDARD_LINK_INFORMATION, FileStandardLinkInformation, NtQueryInformationFile,
     };
-    let mut information = FILE_STANDARD_LINK_INFORMATION::default();
+    #[repr(C, align(8))]
+    struct Aligned(FILE_STANDARD_LINK_INFORMATION);
+    let mut information = Aligned(FILE_STANDARD_LINK_INFORMATION::default());
     let mut status = windows_sys::Win32::System::IO::IO_STATUS_BLOCK::default();
     // SAFETY: file owns its handle; both outputs have the advertised writable size.
     let result = unsafe {
         NtQueryInformationFile(
             file.as_raw_handle(),
             &raw mut status,
-            (&raw mut information).cast(),
+            (&raw mut information.0).cast(),
             u32::try_from(size_of::<FILE_STANDARD_LINK_INFORMATION>())
                 .expect("fixed structure size"),
             FileStandardLinkInformation,
@@ -1640,7 +1642,7 @@ pub(super) fn accessible_links(file: &File) -> io::Result<u32> {
             io::Error::from_raw_os_error(code)
         });
     }
-    Ok(information.NumberOfAccessibleLinks)
+    Ok(information.0.NumberOfAccessibleLinks)
 }
 
 #[cfg(windows)]

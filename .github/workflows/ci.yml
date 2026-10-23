@@ -20,6 +20,22 @@ env:
   MISE_AUTO_INSTALL: false
 
 jobs:
+  edit-publication-arm64:
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v7
+      - shell: pwsh
+        run: |
+          $toolchain = (Get-Content rust-toolchain.toml -Raw) -replace 'components = \[.*\]', 'components = ["rust-src"]'
+          Set-Content rust-toolchain.toml $toolchain
+          $profiles = (Get-Content .cargo/profiles.toml -Raw).Replace('codegen-backend = "cranelift"', 'codegen-backend = "llvm"')
+          Set-Content .cargo/profiles.toml $profiles
+          Remove-Item mise.lock
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington cargo:cargo-nextest
+      - run: mise exec -- cargo nextest run -p sys -p ext-edit -E 'test(fs::edit::tests) | package(ext-edit)' --no-tests=fail --no-fail-fast
+
   check:
     name: check (${{ matrix.os }})
     strategy:
