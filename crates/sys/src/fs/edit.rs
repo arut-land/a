@@ -425,20 +425,22 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::macos::fs::MetadataExt;
-        // Copy ACLs and xattrs through handles, including resource forks and
-        // quarantine. STAT is handled explicitly to retain the edit's mtime.
+        let modified = destination.metadata()?.modified()?;
+        // Copy birth time, ACLs and xattrs through handles, including resource
+        // forks and quarantine. The content edit gets its own modification time.
         // SAFETY: both descriptors remain owned; null selects default state.
         if unsafe {
             libc::fcopyfile(
                 source.as_raw_fd(),
                 destination.as_raw_fd(),
                 std::ptr::null_mut(),
-                libc::COPYFILE_ACL | libc::COPYFILE_XATTR,
+                libc::COPYFILE_METADATA,
             )
         } != 0
         {
             return Err(io::Error::last_os_error());
         }
+        destination.set_modified(modified)?;
         // Flags such as hidden/immutable must not disappear on safe-save.
         // SAFETY: destination owns the descriptor and flags came from stat.
         if unsafe { libc::fchflags(destination.as_raw_fd(), metadata.st_flags()) } != 0 {
@@ -452,17 +454,32 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn copy_xattrs(source: &File, destination: &File) -> io::Result<()> {
-    use rustix::fs::{XattrFlags, fgetxattr, flistxattr, fsetxattr};
-    let size = match flistxattr(source, &mut [][..]) {
+    use rustix::fs::{XattrFlags, fgetxattr, flistxattr, fremovexattr, fsetxattr};
+    let size = match flistxattr(source, &mut [0u8; 0][..]) {
         Ok(size) => size,
         Err(rustix::io::Errno::NOTSUP) => return Ok(()),
         Err(error) => return Err(error.into()),
     };
     let mut names = vec![0; size];
     let length = flistxattr(source, names.as_mut_slice())?;
-    for name in names[..length].split(|b| *b == 0).filter(|s| !s.is_empty()) {
+    let names = &names[..length];
+    // A directory's current default ACL may differ from the one under which
+    // the source was created. Never retain extra inherited permissions.
+    let size = flistxattr(destination, &mut [0u8; 0][..])?;
+    let mut inherited = vec![0; size];
+    let length = flistxattr(destination, inherited.as_mut_slice())?;
+    for name in inherited[..length]
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+    {
+        if !names.split(|b| *b == 0).any(|source| source == name) {
+            let name = std::ffi::CString::new(name).map_err(|_| io::ErrorKind::InvalidData)?;
+            fremovexattr(destination, &name)?;
+        }
+    }
+    for name in names.split(|b| *b == 0).filter(|s| !s.is_empty()) {
         let name = std::ffi::CString::new(name).map_err(|_| io::ErrorKind::InvalidData)?;
-        let size = fgetxattr(source, &name, &mut [][..])?;
+        let size = fgetxattr(source, &name, &mut [0u8; 0][..])?;
         let mut value = vec![0; size];
         let length = fgetxattr(source, &name, value.as_mut_slice())?;
         fsetxattr(destination, &name, &value[..length], XattrFlags::empty())?;
@@ -487,26 +504,36 @@ fn rename(
     match renameat_with(parent, pending, parent, &transaction.name, flags) {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::NOTSUP) => {
-            if replacing {
-                Ok(rustix::fs::renameat(
-                    parent,
-                    pending,
-                    parent,
-                    &transaction.name,
-                )?)
-            } else {
-                // linkat publishes exclusively even without extended rename.
-                // Pending's destructor removes the second link afterward.
-                Ok(rustix::fs::linkat(
-                    parent,
-                    pending,
-                    parent,
-                    &transaction.name,
-                    rustix::fs::AtFlags::empty(),
-                )?)
-            }
+            rename_fallback(transaction, pending, replacing)
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn rename_fallback(
+    transaction: &EditTransaction,
+    pending: &std::ffi::OsStr,
+    replacing: bool,
+) -> io::Result<()> {
+    let parent = &transaction.parent;
+    if replacing {
+        Ok(rustix::fs::renameat(
+            parent,
+            pending,
+            parent,
+            &transaction.name,
+        )?)
+    } else {
+        // linkat publishes exclusively even without extended rename.
+        // Pending's destructor removes the second link afterward.
+        Ok(rustix::fs::linkat(
+            parent,
+            pending,
+            parent,
+            &transaction.name,
+            rustix::fs::AtFlags::empty(),
+        )?)
     }
 }
 
@@ -667,6 +694,17 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
         OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
         UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
+    use windows_sys::Win32::Storage::FileSystem::SetFileTime;
+    let creation = windows_information(source)?.ftCreationTime;
+    // SAFETY: destination owns the handle; null preserves access/write times.
+    crate::windows::ok(unsafe {
+        SetFileTime(
+            destination.as_raw_handle(),
+            &raw const creation,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    })?;
     let (mut owner, mut group, mut dacl, mut descriptor) = (
         std::ptr::null_mut(),
         std::ptr::null_mut(),
@@ -766,7 +804,7 @@ fn rename(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -988,6 +1026,151 @@ mod tests {
         transaction.publish(b"edited", false).unwrap();
         assert_eq!(fs::read(parent.join("file")).unwrap(), b"unrelated");
         assert_eq!(fs::read(moved.join("file")).unwrap(), b"edited");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_publication_is_exclusive_even_after_the_last_check() {
+        let work = Workspace::new();
+        let transaction = work.capture();
+        let (name, mut file) = transaction.stage().unwrap();
+        let pending = Pending {
+            transaction: &transaction,
+            name,
+        };
+        file.write_all(b"ours").unwrap();
+        transaction.revalidate().unwrap();
+        fs::write(work.target(), b"theirs").unwrap();
+        assert_eq!(
+            rename_fallback(&transaction, &pending.name, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
+        drop(pending);
+        work.only_target_remains();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn posix_acls_are_preserved_without_adding_inherited_access() {
+        use rustix::fs::{XattrFlags, fgetxattr, fsetxattr};
+        // Linux's POSIX ACL xattr ABI: version, then (tag, permissions, id).
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (1u16, 6u16, u32::MAX),
+            (2, 4, 42),
+            (4, 4, u32::MAX),
+            (16, 4, u32::MAX),
+            (32, 0, u32::MAX),
+        ] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(permissions.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let source = File::open(work.target()).unwrap();
+        fsetxattr(
+            &source,
+            c"system.posix_acl_access",
+            &acl,
+            XattrFlags::empty(),
+        )
+        .unwrap();
+        work.capture().publish(b"new", false).unwrap();
+        let mut copied = [0; 128];
+        let count = fgetxattr(
+            File::open(work.target()).unwrap(),
+            c"system.posix_acl_access",
+            &mut copied[..],
+        )
+        .unwrap();
+        assert_eq!(&copied[..count], acl);
+
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        fsetxattr(
+            File::open(&work.0).unwrap(),
+            c"system.posix_acl_default",
+            &acl,
+            XattrFlags::empty(),
+        )
+        .unwrap();
+        work.capture().publish(b"new", false).unwrap();
+        assert_eq!(
+            fgetxattr(
+                File::open(work.target()).unwrap(),
+                c"system.posix_acl_access",
+                &mut copied[..]
+            )
+            .unwrap_err(),
+            rustix::io::Errno::NODATA
+        );
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn macos_access_control_entries_survive_safe_save() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone deny execute"])
+            .arg(work.target())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let entries = || {
+            let output = std::process::Command::new("/bin/ls")
+                .arg("-le")
+                .arg(work.target())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let before = entries();
+        assert!(before.contains("deny execute"));
+        work.capture().publish(b"new", false).unwrap();
+        assert_eq!(entries(), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_windows_dacls_survive_safe_save() {
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+        };
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let security = crate::windows::Security::user_only().unwrap();
+        let path = crate::windows::wide(work.target().as_os_str());
+        // SAFETY: security owns the descriptor and path is terminated.
+        crate::windows::ok(unsafe {
+            SetFileSecurityW(
+                path.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                security.descriptor(),
+            )
+        })
+        .unwrap();
+        let entries = || {
+            let output = std::process::Command::new("icacls.exe")
+                .arg(work.target())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout
+        };
+        let before = entries();
+        work.capture().publish(b"new", false).unwrap();
+        assert_eq!(entries(), before);
     }
 
     #[cfg(windows)]
