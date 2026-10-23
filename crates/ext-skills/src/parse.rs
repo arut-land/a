@@ -29,18 +29,18 @@ pub(crate) fn identity(source: &[u8]) -> Result<String, Error> {
         .min()
         .unwrap_or(0);
     let mut offset = 0;
-    for line in header.split_inclusive('\n') {
+    for (index, line) in header.split_inclusive('\n').enumerate() {
         if line.len() - line.trim_start().len() == indent
-            && let Ok(Some(name)) = yaml::identity(&header[offset..], true)
+            && let Ok(Some((name, line))) = yaml::identity(&header[offset..], true)
         {
-            validate_name(&name, 2)?;
+            validate_name(&name, line + index)?;
             return Ok(name);
         }
         offset += line.len();
     }
     // Flow mappings can put the name after another entry on the same line.
-    if let Ok(Some(name)) = yaml::identity(&header, false) {
-        validate_name(&name, 2)?;
+    if let Ok(Some((name, line))) = yaml::identity(&header, false) {
+        validate_name(&name, line)?;
         return Ok(name);
     }
     Err(Error::new(2, Kind::Missing))

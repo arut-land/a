@@ -79,7 +79,7 @@ pub(super) fn header(source: &str) -> Result<Header, Error> {
     })
 }
 
-pub(super) fn identity(source: &str, first: bool) -> Result<Option<String>, Error> {
+pub(super) fn identity(source: &str, first: bool) -> Result<Option<(String, usize)>, Error> {
     use yaml_rust2::parser::Event;
     let mut p = HeaderParser {
         parser: yaml_rust2::parser::Parser::new_from_str(source),
@@ -100,7 +100,7 @@ pub(super) fn identity(source: &str, first: bool) -> Result<Option<String>, Erro
         let key = HeaderParser::scalar(event, line)?;
         if key.as_deref() == Some("name") {
             let (event, line) = p.next()?;
-            return HeaderParser::scalar(event, line);
+            return HeaderParser::scalar(event, line).map(|name| name.map(|name| (name, line)));
         }
         if first {
             return Ok(None);

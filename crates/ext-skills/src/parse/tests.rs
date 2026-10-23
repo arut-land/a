@@ -195,4 +195,7 @@ fn identity_discovery_keeps_yaml_names_independent_of_other_metadata() {
         identity(b"---\ndescription: \xff\n\"name\": review\n---\n").unwrap(),
         "review"
     );
+    let error =
+        identity(b"---\n# comment\ndescription: [unfinished\nname: INVALID\n---\n").unwrap_err();
+    assert_eq!(error.line, 4);
 }
