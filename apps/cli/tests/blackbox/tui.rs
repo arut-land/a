@@ -249,3 +249,35 @@ fn the_terminal_is_cooked_while_suspended_and_redrawn_after_continue() {
         assert!(term.cooked());
     }
 }
+
+#[test]
+fn suspension_and_termination_restore_a_terminal_that_does_not_drain() {
+    use rustix::process::{WaitOptions, waitpid};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let env = Env::new("tui-suspend-unread");
+    let mut term = env.tty(&[], 400, 250);
+    term.wait_for("● live");
+    term.send(&vec![b'x'; 100_000]);
+    term.send(b"\r");
+    term.wait_for(&"x".repeat(300));
+    term.go_deaf_drawing(b"\x0c");
+    let pid = Pid::from_child(&term.child);
+    let (send, stopped) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(waitpid(Some(pid), WaitOptions::UNTRACED));
+    });
+    kill_process(pid, Signal::TSTP).unwrap();
+    let (_, status) = stopped
+        .recv_timeout(Duration::from_secs(10))
+        .expect("suspension waited for a terminal that does not drain")
+        .unwrap()
+        .unwrap();
+    assert!(status.stopped());
+    assert!(term.cooked());
+    kill_process(pid, Signal::CONT).unwrap();
+    kill_process(pid, Signal::TERM).unwrap();
+    assert_eq!(term.wait().signal(), Some(Signal::TERM.as_raw()));
+    assert!(term.cooked());
+}

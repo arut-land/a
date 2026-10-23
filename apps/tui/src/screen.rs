@@ -308,6 +308,13 @@ impl<W: Write> Screen<W> {
 }
 
 /// `ESC [ n final`.
+impl Screen<Stdout> {
+    pub fn close_terminal(&mut self) -> io::Result<()> {
+        self.out = Stdout::restoring();
+        self.close()
+    }
+}
+
 fn csi(bytes: &mut Vec<u8>, n: u16, fin: u8) {
     bytes.extend_from_slice(b"\x1b[");
     num(bytes, n);

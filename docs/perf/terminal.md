@@ -7,7 +7,7 @@ REPL restores console state directly in its control callback as well as on
 normal return, a broken output pipe and panic; Unix cooked input needs no
 additional waiter.
 
-Crossterm was considered as the maintained terminal implementation. Its
+The maintained crossterm terminal library's
 [documented raw-mode contract](https://docs.rs/crossterm/latest/crossterm/terminal/)
 disables terminal-driver Ctrl-C processing. This client's Windows contract
 instead retains processed input and receives Ctrl-C through the existing
@@ -30,8 +30,11 @@ require console mode changes.
 Unix output checks foreground ownership and blocks SIGTTOU only around
 cleanup or an owned write, preventing restarted writes from trapping the
 renderer after the shell changes foreground jobs. The renderer serializes
-restoration and suspension; an acknowledged suspend event parks the input
-reader until ownership has been reacquired. The stop is directed to the
+restoration and suspension. An owned pause guard disables stdin while
+leaving signal delivery active until ownership has been reacquired.
+Nonblocking output waits on readiness and a dedicated suspend wake pipe;
+screen cleanup has a single deadline. The saved file status flags are
+restored with termios. The stop is directed to the
 calling thread, which cannot re-enter raw mode before being continued. There is no tcsetpgrp that
 could take the foreground from the shell.
 

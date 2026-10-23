@@ -1,18 +1,21 @@
 //! Terminal modes, dimensions and input readiness behind one platform seam.
 
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::Signal;
 
-pub use imp::{InputReader, OutputGuard, is_foreground, size, suspend};
+pub use imp::{InputReader, OutputGuard, is_foreground, output_interrupted, size, suspend};
 
 /// A panic restores modes before the previous hook prints diagnostics, even
 /// with a codegen backend that does not unwind through every frame.
-pub struct RawMode(std::sync::Arc<imp::RawMode>);
+pub struct RawMode(Arc<imp::RawMode>);
 
-static RAW: std::sync::Mutex<Option<std::sync::Arc<imp::RawMode>>> = std::sync::Mutex::new(None);
+static RAW: std::sync::Mutex<Option<Arc<imp::RawMode>>> = std::sync::Mutex::new(None);
 
-static LINE: std::sync::Mutex<Option<std::sync::Arc<imp::LineMode>>> = std::sync::Mutex::new(None);
+static LINE: std::sync::Mutex<Option<Arc<imp::LineMode>>> = std::sync::Mutex::new(None);
 
 fn panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
@@ -43,7 +46,7 @@ pub fn restore() {
     }
 }
 
-pub struct LineMode(std::sync::Arc<imp::LineMode>);
+pub struct LineMode(Arc<imp::LineMode>);
 
 impl LineMode {
     pub fn enter() -> io::Result<Self> {
@@ -54,7 +57,7 @@ impl LineMode {
         if held.is_some() {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
-        let line = std::sync::Arc::new(imp::LineMode::enter()?);
+        let line = Arc::new(imp::LineMode::enter()?);
         *held = Some(line.clone());
         Ok(Self(line))
     }
@@ -65,10 +68,7 @@ impl Drop for LineMode {
         let mut held = LINE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if held
-            .as_ref()
-            .is_some_and(|line| std::sync::Arc::ptr_eq(line, &self.0))
-        {
+        if held.as_ref().is_some_and(|line| Arc::ptr_eq(line, &self.0)) {
             held.take();
         }
         let _ = self.0.restore();
@@ -84,7 +84,7 @@ impl RawMode {
         if held.is_some() {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
-        let raw = std::sync::Arc::new(imp::RawMode::enter()?);
+        let raw = Arc::new(imp::RawMode::enter()?);
         *held = Some(raw.clone());
         Ok(Self(raw))
     }
@@ -102,10 +102,7 @@ impl Drop for RawMode {
         let mut held = RAW
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if held
-            .as_ref()
-            .is_some_and(|raw| std::sync::Arc::ptr_eq(raw, &self.0))
-        {
+        if held.as_ref().is_some_and(|raw| Arc::ptr_eq(raw, &self.0)) {
             held.take();
         }
         let _ = self.0.restore();
@@ -122,15 +119,86 @@ pub enum Input {
     Closed,
 }
 
+/// Pausing stdin never pauses signal delivery. The guard wakes the reader
+/// when the renderer has reacquired the terminal, without an idle timer.
+#[derive(Clone)]
+pub struct InputControl {
+    paused: Arc<AtomicBool>,
+    wake: crate::signals::Wake,
+}
+
+impl InputControl {
+    fn new(signals: &crate::Signals) -> Self {
+        Self {
+            paused: Arc::new(AtomicBool::new(false)),
+            wake: signals.waker(),
+        }
+    }
+
+    pub fn pause(&self) -> Option<ResumeInput> {
+        if !JOB_CONTROL || self.paused.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        Some(ResumeInput {
+            control: self.clone(),
+            _output: OutputInterrupt::acquire(),
+        })
+    }
+
+    fn paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+}
+
+pub struct ResumeInput {
+    control: InputControl,
+    _output: OutputInterrupt,
+}
+
+/// Hold this guard until the control event has been folded by the renderer.
+#[must_use]
+pub struct OutputInterrupt(());
+
+impl OutputInterrupt {
+    pub fn acquire() -> Self {
+        imp::interrupt_output();
+        Self(())
+    }
+}
+
+impl Drop for OutputInterrupt {
+    fn drop(&mut self) {
+        imp::release_output();
+    }
+}
+
+impl Drop for ResumeInput {
+    fn drop(&mut self) {
+        self.control.paused.store(false, Ordering::Release);
+        self.control.wake.wake();
+    }
+}
+
 /// Unbuffered output keeps a frame in one write even when it holds newlines.
 #[derive(Default)]
-pub struct Stdout(());
+pub struct Stdout {
+    restore_until: Option<Instant>,
+}
+
+impl Stdout {
+    /// Cleanup gets one deadline, including partial writes, independently of
+    /// a terminal emulator that has stopped reading.
+    pub fn restoring() -> Self {
+        Self {
+            restore_until: Some(Instant::now() + Duration::from_millis(500)),
+        }
+    }
+}
 
 impl Write for Stdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        imp::write_stdout(buf)
+        imp::write_stdout(buf, self.restore_until.is_none(), self.restore_until)
     }
-
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -139,12 +207,18 @@ impl Write for Stdout {
 #[cfg(unix)]
 mod imp {
     use std::io;
+    use std::os::fd::OwnedFd;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use rustix::event::{PollFd, PollFlags, poll};
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
     use rustix::io::Errno;
+    use rustix::io::{FdFlags, fcntl_setfd};
     use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
 
-    use super::Input;
+    use super::{Input, InputControl};
     use crate::Signals;
 
     /// Cooked Unix input already belongs to the terminal driver's job control.
@@ -160,7 +234,64 @@ mod imp {
         }
     }
 
-    pub struct RawMode(Termios);
+    pub struct RawMode {
+        cooked: Termios,
+        output_flags: OFlags,
+    }
+
+    struct OutputWake {
+        read: OwnedFd,
+        write: OwnedFd,
+    }
+    // A renderer may still be waiting when a termination thread restores
+    // modes; process lifetime prevents descriptor reuse under that wait.
+    static OUTPUT_WAKE: OnceLock<OutputWake> = OnceLock::new();
+    static INTERRUPTED: AtomicUsize = AtomicUsize::new(0);
+
+    fn output_wake() -> io::Result<&'static OutputWake> {
+        if OUTPUT_WAKE.get().is_none() {
+            let (read, write) = rustix::pipe::pipe()?;
+            for fd in [&read, &write] {
+                fcntl_setfd(fd, FdFlags::CLOEXEC)?;
+                fcntl_setfl(fd, fcntl_getfl(fd)? | OFlags::NONBLOCK)?;
+            }
+            let _ = OUTPUT_WAKE.set(OutputWake { read, write });
+        }
+        Ok(OUTPUT_WAKE.get().unwrap())
+    }
+
+    pub(super) fn interrupt_output() {
+        if INTERRUPTED.fetch_add(1, Ordering::AcqRel) == 0 {
+            wake_output();
+        }
+    }
+
+    fn wake_output() {
+        if let Some(wake) = OUTPUT_WAKE.get() {
+            let _ = rustix::io::write(&wake.write, &[1]);
+        }
+    }
+
+    pub fn output_interrupted() -> bool {
+        INTERRUPTED.load(Ordering::Acquire) != 0
+    }
+
+    fn drain_output_wake() {
+        if let Some(wake) = OUTPUT_WAKE.get() {
+            let mut buf = [0; 1024];
+            while matches!(rustix::io::read(&wake.read, &mut buf), Ok(1..)) {}
+        }
+    }
+
+    pub(super) fn release_output() {
+        if INTERRUPTED.fetch_sub(1, Ordering::AcqRel) == 1 {
+            drain_output_wake();
+            // A new event may have arrived while its wake byte was drained.
+            if output_interrupted() {
+                wake_output();
+            }
+        }
+    }
 
     impl Drop for RawMode {
         fn drop(&mut self) {
@@ -171,32 +302,45 @@ mod imp {
     impl RawMode {
         pub fn enter() -> io::Result<Self> {
             foreground()?;
+            output_wake()?;
             let stdin = rustix::stdio::stdin();
+            let output_flags = fcntl_getfl(rustix::stdio::stdout())?;
             let cooked = tcgetattr(stdin)?;
             let mut raw = cooked.clone();
             raw.make_raw();
             tcsetattr(stdin, OptionalActions::Now, &raw)?;
-            Ok(Self(cooked))
+            let saved = Self {
+                cooked,
+                output_flags,
+            };
+            fcntl_setfl(rustix::stdio::stdout(), output_flags | OFlags::NONBLOCK)?;
+            Ok(saved)
         }
 
         pub fn restore_input(&self) -> io::Result<()> {
-            self.restore()
-        }
-
-        pub fn restore(&self) -> io::Result<()> {
             let _output = OutputGuard::enter()?;
             Ok(tcsetattr(
                 rustix::stdio::stdin(),
                 OptionalActions::Now,
-                &self.0,
+                &self.cooked,
             )?)
+        }
+
+        pub fn restore(&self) -> io::Result<()> {
+            let mode = self.restore_input();
+            let flags = fcntl_setfl(rustix::stdio::stdout(), self.output_flags);
+            mode?;
+            Ok(flags?)
         }
     }
 
     /// Cleanup output must be possible after the shell takes the foreground.
     /// Normal writes check ownership first, then block TTOU across the syscall
     /// so a racing foreground change cannot trap `write_all` in signal retries.
-    pub struct OutputGuard(libc::sigset_t);
+    pub struct OutputGuard {
+        mask: libc::sigset_t,
+        thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
 
     impl OutputGuard {
         pub fn enter() -> io::Result<Self> {
@@ -210,7 +354,10 @@ mod imp {
                 if error != 0 {
                     return Err(io::Error::from_raw_os_error(error));
                 }
-                Ok(Self(old))
+                Ok(Self {
+                    mask: old,
+                    thread: std::marker::PhantomData,
+                })
             }
         }
     }
@@ -219,7 +366,11 @@ mod imp {
         fn drop(&mut self) {
             // SAFETY: restores this thread's saved mask without changing peers.
             unsafe {
-                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const self.0, std::ptr::null_mut());
+                libc::pthread_sigmask(
+                    libc::SIG_SETMASK,
+                    &raw const self.mask,
+                    std::ptr::null_mut(),
+                );
             }
         }
     }
@@ -264,25 +415,76 @@ mod imp {
         Ok((size.ws_col, size.ws_row))
     }
 
-    pub fn write_stdout(buf: &[u8]) -> io::Result<usize> {
-        let _output = OutputGuard::enter()?;
-        if !is_foreground()? {
-            return Err(io::ErrorKind::WouldBlock.into());
+    pub fn write_stdout(
+        buf: &[u8],
+        interruptible: bool,
+        deadline: Option<Instant>,
+    ) -> io::Result<usize> {
+        let stdout = rustix::stdio::stdout();
+        loop {
+            if interruptible && (output_interrupted() || !is_foreground()?) {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let output = OutputGuard::enter()?;
+            match rustix::io::write(stdout, buf) {
+                Ok(n) => return Ok(n),
+                Err(Errno::INTR) => continue,
+                Err(Errno::AGAIN) => {}
+                Err(error) => return Err(error.into()),
+            }
+            drop(output);
+            let Some(wake) = OUTPUT_WAKE.get() else {
+                return Err(io::ErrorKind::WouldBlock.into());
+            };
+            let mut fds = [
+                PollFd::new(&stdout, PollFlags::OUT),
+                PollFd::new(&wake.read, PollFlags::IN),
+            ];
+            let timeout = if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                Some(rustix::event::Timespec {
+                    tv_sec: remaining.as_secs().try_into().unwrap_or(i64::MAX),
+                    tv_nsec: remaining.subsec_nanos().into(),
+                })
+            } else {
+                None
+            };
+            let polled = if interruptible {
+                &mut fds[..]
+            } else {
+                &mut fds[..1]
+            };
+            match poll(polled, timeout.as_ref()) {
+                Ok(0) => return Err(io::ErrorKind::TimedOut.into()),
+                Ok(_) | Err(Errno::INTR) => {}
+                Err(error) => return Err(error.into()),
+            }
+            if interruptible && !fds[1].revents().is_empty() {
+                drain_output_wake();
+            }
         }
-        Ok(rustix::io::write(rustix::stdio::stdout(), buf)?)
     }
 
     pub struct InputReader {
         signals: Signals,
+        control: InputControl,
         open: bool,
     }
 
     impl InputReader {
-        pub const fn new(signals: Signals) -> Self {
+        pub fn new(signals: Signals) -> Self {
             Self {
+                control: InputControl::new(&signals),
                 signals,
                 open: true,
             }
+        }
+
+        pub fn control(&self) -> InputControl {
+            self.control.clone()
         }
 
         /// A disconnected renderer still needs termination signals handled.
@@ -297,7 +499,7 @@ mod imp {
                     PollFd::new(&self.signals, PollFlags::IN),
                     PollFd::new(&stdin, PollFlags::IN),
                 ];
-                let polled = if self.open {
+                let polled = if self.open && !self.control.paused() {
                     &mut fds[..]
                 } else {
                     &mut fds[..1]
@@ -310,7 +512,7 @@ mod imp {
                 if !fds[0].revents().is_empty() {
                     return Ok(Input::Signals(self.signals.take()));
                 }
-                if self.open && !fds[1].revents().is_empty() {
+                if self.open && !self.control.paused() && !fds[1].revents().is_empty() {
                     if let Ok(group) = rustix::termios::tcgetpgrp(stdin)
                         && group != rustix::process::getpgrp()
                     {
@@ -377,6 +579,7 @@ mod tests {
                 assert_ne!(libc::ioctl(0, libc::TIOCSCTTY as _, 0), -1);
             }
             let before = rustix::termios::tcgetattr(rustix::stdio::stdin()).unwrap();
+            let output_flags = rustix::fs::fcntl_getfl(rustix::stdio::stdout()).unwrap();
             let _raw = RawMode::enter().unwrap();
             let raw = rustix::termios::tcgetattr(rustix::stdio::stdin()).unwrap();
             assert!(
@@ -389,6 +592,10 @@ mod tests {
                 assert_modes(
                     &before,
                     &rustix::termios::tcgetattr(rustix::stdio::stdin()).unwrap(),
+                );
+                assert_eq!(
+                    rustix::fs::fcntl_getfl(rustix::stdio::stdout()).unwrap(),
+                    output_flags
                 );
                 eprintln!("terminal modes restored before process exit");
             }));
@@ -562,7 +769,7 @@ mod tests {
 
     fn wait_stopped(pid: rustix::process::Pid) {
         use rustix::process::{WaitOptions, waitpid};
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some((_, state)) =
                 waitpid(Some(pid), WaitOptions::UNTRACED | WaitOptions::NOHANG).unwrap()
@@ -573,15 +780,15 @@ mod tests {
                 );
                 return;
             }
-            assert!(std::time::Instant::now() < deadline, "the job did not stop");
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            assert!(Instant::now() < deadline, "the job did not stop");
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
     fn wait_marker(lines: &std::sync::mpsc::Receiver<String>, marker: &str) {
         loop {
             let line = lines
-                .recv_timeout(std::time::Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(10))
                 .unwrap_or_else(|error| panic!("waiting for {marker}: {error}"));
             if line.contains(marker) {
                 return;

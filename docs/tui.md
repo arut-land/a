@@ -13,7 +13,9 @@ colours.
 Terminal modes belong to an owned `sys::terminal` lease. Unix uses termios
 and an indefinite poll over stdin and the signal pipe. Ctrl-Z and SIGTSTP
 give back cooked input, paste/mouse modes and the alternate screen before
-stopping the client. Continuing in the foreground re-enters raw mode and
+stopping the client. Nonblocking output waits on readiness and a suspend
+wake source; an unread terminal cannot prevent suspension or termination.
+Continuing in the foreground re-enters raw mode and
 redraws the whole viewport; a background continue stops again without
 taking the terminal from the shell. SIGWINCH and SIGCONT invalidate the
 screen. Background reads request suspension rather than appearing as EOF;

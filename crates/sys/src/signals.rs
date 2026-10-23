@@ -2,6 +2,7 @@
 //! An exclusive lease prevents competing consumers from stealing shutdown.
 //! Windows console control events wake a permanently owned manual-reset event.
 
+pub(crate) use imp::Wake;
 pub use imp::{Signals, reraise};
 
 #[cfg(windows)]
@@ -30,6 +31,18 @@ mod imp {
     static SOURCE: OnceLock<Source> = OnceLock::new();
 
     pub struct Signals(&'static Source);
+
+    #[derive(Clone, Copy)]
+    pub(crate) struct Wake(&'static Source);
+
+    impl Wake {
+        pub(crate) fn wake(self) {
+            // SAFETY: the source owns its event for the process lifetime.
+            unsafe {
+                SetEvent(self.0.event.as_raw_handle());
+            }
+        }
+    }
 
     impl AsHandle for Signals {
         fn as_handle(&self) -> BorrowedHandle<'_> {
@@ -72,6 +85,10 @@ mod imp {
     }
 
     impl Signals {
+        pub(crate) fn waker(&self) -> Wake {
+            Wake(self.0)
+        }
+
         pub fn catch(signals: &[Signal]) -> io::Result<Self> {
             if SOURCE.get().is_none() {
                 let source = Source {
@@ -192,6 +209,15 @@ mod imp {
 
     pub struct Signals(SignalLease);
 
+    #[derive(Clone, Copy)]
+    pub(crate) struct Wake(&'static Source);
+
+    impl Wake {
+        pub(crate) fn wake(self) {
+            let _ = rustix::io::write(&self.0.write, &[1]);
+        }
+    }
+
     fn bit(signal: Signal) -> u32 {
         match signal {
             Signal::Terminate => 1,
@@ -207,6 +233,10 @@ mod imp {
     }
 
     impl Signals {
+        pub(crate) fn waker(&self) -> Wake {
+            Wake(self.0.source)
+        }
+
         pub fn catch(signals: &[Signal]) -> io::Result<Self> {
             if signals.contains(&Signal::Kill) {
                 return Err(io::ErrorKind::InvalidInput.into());

@@ -15,7 +15,7 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 
-use super::Input;
+use super::{Input, InputControl};
 use crate::{Signal, Signals, windows::ok};
 
 pub struct RawMode {
@@ -122,7 +122,17 @@ pub fn size() -> io::Result<(u16, u16)> {
     ))
 }
 
-pub fn write_stdout(buf: &[u8]) -> io::Result<usize> {
+pub(super) fn interrupt_output() {}
+pub fn output_interrupted() -> bool {
+    false
+}
+pub(super) fn release_output() {}
+
+pub fn write_stdout(
+    buf: &[u8],
+    _interruptible: bool,
+    _deadline: Option<std::time::Instant>,
+) -> io::Result<usize> {
     let mut written = 0;
     // SAFETY: stdout is borrowed through the call; the input slice and count
     // remain valid. WriteFile keeps redirected output byte-oriented too.
@@ -140,6 +150,7 @@ pub fn write_stdout(buf: &[u8]) -> io::Result<usize> {
 
 pub struct InputReader {
     signals: Signals,
+    control: InputControl,
     open: bool,
     pending: VecDeque<u8>,
     high: Option<u16>,
@@ -148,11 +159,16 @@ pub struct InputReader {
 impl InputReader {
     pub fn new(signals: Signals) -> Self {
         Self {
+            control: InputControl::new(&signals),
             signals,
             open: true,
             pending: VecDeque::new(),
             high: None,
         }
+    }
+
+    pub fn control(&self) -> InputControl {
+        self.control.clone()
     }
 
     pub fn close_input(&mut self) {
@@ -179,7 +195,16 @@ impl InputReader {
             ];
             // SAFETY: both borrowed handles outlive the infinite, event-driven wait.
             let ready = unsafe {
-                WaitForMultipleObjects(if self.open { 2 } else { 1 }, handles.as_ptr(), 0, INFINITE)
+                WaitForMultipleObjects(
+                    if self.open && !self.control.paused() {
+                        2
+                    } else {
+                        1
+                    },
+                    handles.as_ptr(),
+                    0,
+                    INFINITE,
+                )
             };
             match ready {
                 0 => continue,

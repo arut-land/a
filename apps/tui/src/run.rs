@@ -25,7 +25,7 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
             size_of::<Event>()
                 + match event {
                     Event::Client(event) => event.retained_bytes(),
-                    Event::Input(super::keys::Input::Paste(text)) => text.len(),
+                    Event::Input(super::keys::Input::Paste(text), _) => text.len(),
                     _ => 0,
                 }
         },
@@ -66,8 +66,7 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
     // raw; the input thread reads them.
     let signals = Signals::catch(&term::SIGNALS)?;
     let terminal = Terminal::enter(viewport)?;
-    term::spawn_input(tx, signals);
-    terminal.show()?;
+    let input = term::spawn_input(tx.clone(), signals);
     let mut screen = Screen::new(viewport, Stdout::default());
     // no-color.org: set and not empty.
     if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
@@ -77,6 +76,10 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
         driver,
         app,
         screen,
+        terminal,
+        input,
+        post: tx,
+        shown: false,
     };
     // The first frame goes out before the daemon is even reached, or the
     // git root walked up to.
@@ -86,9 +89,8 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
         .in_workspace(sys::workspace_of(&std::env::current_dir()?));
     client.driver.pump(&mut client.app, first);
     let exit = client.run(&rx);
-    let _ = client.screen.close();
+    let _ = client.screen.close_terminal();
     drop(client);
-    drop(terminal);
     match exit? {
         Exit::Detached => {
             // The terminal may be gone (that is one way to detach).
@@ -117,6 +119,10 @@ struct Client {
     driver: client::ClientHandle,
     app: App,
     screen: Screen,
+    terminal: Terminal,
+    input: sys::terminal::InputControl,
+    post: client::Post<Event>,
+    shown: bool,
 }
 
 impl Client {
@@ -145,16 +151,17 @@ impl Client {
                 .take(client::PUMP_BATCH)
             {
                 match event {
-                    Event::Suspend(done) => {
+                    Event::Suspend(resume) => {
                         term::suspend()?;
+                        self.shown = false;
                         self.screen.resume();
-                        let _ = done.send(());
+                        drop(resume);
                         whole = true;
                     }
-                    Event::Input(input) => effects.extend(self.app.input(input)),
-                    Event::Resized => whole = true,
+                    Event::Input(input, _output) => effects.extend(self.app.input(input)),
+                    Event::Resized(_output) => whole = true,
                     Event::Tick => self.app.tick(),
-                    Event::InputClosed => effects.push(Effect::Detach),
+                    Event::InputClosed(_output) => effects.push(Effect::Detach),
                     Event::Client(event) => {
                         let stepped = self.app.client.step(event);
                         self.driver.pump(&mut self.app, stepped);
@@ -203,13 +210,23 @@ impl Client {
     fn draw(&mut self) -> io::Result<()> {
         loop {
             if !sys::terminal::is_foreground()? {
-                term::suspend()?;
-                self.screen.resume();
+                term::request_suspend(&self.post, &self.input);
+                return Ok(());
             }
-            match self.screen.draw(&mut self.app, term::size()?) {
+            let drawn = if self.shown {
+                self.screen.draw(&mut self.app, term::size()?)
+            } else {
+                self.terminal.show().and_then(|()| {
+                    self.shown = true;
+                    self.screen.draw(&mut self.app, term::size()?)
+                })
+            };
+            match drawn {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    term::suspend()?;
-                    self.screen.resume();
+                    self.screen.invalidate();
+                    if sys::terminal::output_interrupted() {
+                        return Ok(());
+                    }
                 }
                 result => return result,
             }

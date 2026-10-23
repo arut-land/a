@@ -59,13 +59,13 @@ pub fn viewport() -> Option<Viewport> {
 
 /// What wakes the event loop.
 enum Event {
-    Input(keys::Input),
+    Input(keys::Input, Option<sys::terminal::OutputInterrupt>),
     /// The terminal changed size.
-    Resized,
+    Resized(sys::terminal::OutputInterrupt),
     /// Give the terminal back before job-control stop.
-    Suspend(std::sync::mpsc::SyncSender<()>),
+    Suspend(sys::terminal::ResumeInput),
     /// stdin closed: the terminal is gone.
-    InputClosed,
+    InputClosed(sys::terminal::OutputInterrupt),
     /// From the session client's driver.
     Client(client::Event),
     /// The working indicator's clock; only ever waited for while a turn

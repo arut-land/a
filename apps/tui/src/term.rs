@@ -62,7 +62,7 @@ impl Terminal {
     }
 
     pub fn show(&self) -> io::Result<()> {
-        let mut out = io::stdout().lock();
+        let mut out = sys::terminal::Stdout::default();
         if self.viewport == Viewport::Full {
             out.write_all(ENTER_FULL)?;
         }
@@ -86,9 +86,7 @@ pub fn suspend() -> io::Result<()> {
         restore();
         sys::terminal::suspend()?;
         // Ownership remains with the original Terminal guard.
-        let resumed = Terminal::enter(viewport)?;
-        resumed.show()?;
-        std::mem::forget(resumed);
+        std::mem::forget(Terminal::enter(viewport)?);
     }
     Ok(())
 }
@@ -106,7 +104,7 @@ fn restore() {
     if let Some((viewport, cooked)) = held {
         let _output = sys::terminal::OutputGuard::enter();
         let _ = cooked.restore_input();
-        let mut out = io::stdout().lock();
+        let mut out = sys::terminal::Stdout::restoring();
         let _ = out.write_all(LEAVE);
         if viewport == Viewport::Full {
             let _ = out.write_all(LEAVE_FULL);
@@ -140,14 +138,16 @@ fn end(signal: Signal) -> ! {
 }
 
 /// Reads the terminal and `signals` on a thread of its own. It blocks in
-/// `poll` with no timeout: an idle client never wakes. What it posts goes
+/// a native wait with no timeout: an idle client never wakes. What it posts goes
 /// ahead of the daemon's backlog in the inbox: a key or a resize is folded
 /// before a replay still queued. Once stdin is gone it goes on reading the
 /// signals, which are caught for as long as the process lives: the client
 /// may yet have a while to go, and a SIGTERM must end it all the same.
-pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
+pub fn spawn_input(tx: client::Post<Event>, signals: Signals) -> sys::terminal::InputControl {
+    let mut reader = InputReader::new(signals);
+    let control = reader.control();
+    let input_control = control.clone();
     thread::spawn(move || {
-        let mut reader = InputReader::new(signals);
         let mut decoder = Decoder::default();
         let mut buf = [0; 4096];
         let mut open = true;
@@ -165,33 +165,39 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
                         ) {
                             suspended = true;
                         } else if signal == Signal::Interrupt {
-                            let _ = tx.send_first(Event::Input(super::keys::Input::Key(
-                                super::keys::Key::Ctrl('c'),
-                            )));
+                            let _ = send_input(
+                                &tx,
+                                super::keys::Input::Key(super::keys::Key::Ctrl('c')),
+                            );
                         } else {
                             end(signal);
                         }
                     }
                     if suspended {
-                        request_suspend(&tx);
+                        request_suspend(&tx, &input_control);
                     }
-                    if resized && open && tx.send_first(Event::Resized).is_err() {
+                    if resized
+                        && open
+                        && tx
+                            .send_first(Event::Resized(sys::terminal::OutputInterrupt::acquire()))
+                            .is_err()
+                    {
                         open = false;
                         reader.close_input();
                     }
                 }
                 Input::Closed => {
                     open = false;
-                    let _ = tx.send(Event::InputClosed);
+                    let _ = tx.send(Event::InputClosed(sys::terminal::OutputInterrupt::acquire()));
                 }
                 Input::Bytes(n) => {
                     // A full buffer may end in the start of an escape sequence.
                     for input in decoder.feed(&buf[..n], n == buf.len()) {
                         if input == super::keys::Input::Key(super::keys::Key::Ctrl('z')) {
-                            request_suspend(&tx);
+                            request_suspend(&tx, &input_control);
                             continue;
                         }
-                        if tx.send_first(Event::Input(input)).is_err() {
+                        if !send_input(&tx, input) {
                             open = false;
                             reader.close_input();
                             break;
@@ -201,12 +207,18 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
             }
         }
     });
+    control
 }
 
 // Keep the reader away from cooked input while the shell owns the terminal.
-fn request_suspend(tx: &client::Post<Event>) {
-    let (done, wait) = mpsc::sync_channel(0);
-    if tx.send_first(Event::Suspend(done)).is_ok() {
-        let _ = wait.recv();
+pub fn request_suspend(tx: &client::Post<Event>, control: &sys::terminal::InputControl) {
+    if let Some(resume) = control.pause() {
+        let _ = tx.send_first(Event::Suspend(resume));
     }
+}
+
+fn send_input(tx: &client::Post<Event>, input: super::keys::Input) -> bool {
+    let output = (input == super::keys::Input::Key(super::keys::Key::Ctrl('c')))
+        .then(sys::terminal::OutputInterrupt::acquire);
+    tx.send_first(Event::Input(input, output)).is_ok()
 }
