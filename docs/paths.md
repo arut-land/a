@@ -53,7 +53,9 @@ isolated instances pass `A_HOME`; native instances pass the resolved XDG bases
 on Linux and use native directory lookup on macOS/Windows. Native launches do
 not turn their state directory into an isolated `A_HOME`. Extension and skill
 loaders use the configuration root, while endpoint ownership uses the durable
-state root. There is no migration from older layouts.
+state root. SSH bootstrap uses the same backend to resolve the matching
+host's build directory, including that host's `A_HOME` or XDG overrides.
+There is no migration from older layouts.
 
 Executable staging remains `data/runtime` and retains its existing publication
 behavior. Installer-owned executable identity and avoiding routine staging are

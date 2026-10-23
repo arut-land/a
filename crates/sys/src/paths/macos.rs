@@ -1,14 +1,16 @@
-use super::*;
+use super::{Command, InstallLayout, PathBuf, Paths, io};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 
 pub(crate) fn temporary_dir() -> io::Result<PathBuf> {
     // confstr is independent of an app's inherited TMPDIR/login environment.
+    // SAFETY: a null buffer with length zero queries the required allocation.
     let size = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
     if size == 0 {
         return Err(io::Error::last_os_error());
     }
     let mut bytes = vec![0u8; size];
+    // SAFETY: bytes is writable for the full size supplied to confstr.
     let written = unsafe {
         libc::confstr(
             libc::_CS_DARWIN_USER_TEMP_DIR,
@@ -49,6 +51,10 @@ pub(super) fn resolve() -> io::Result<Paths> {
 }
 
 pub(super) fn daemon_env(_: &Paths, _: &mut Command) {}
+
+pub(super) fn remote_runtime_script() -> &'static str {
+    r#"a_runtime="$HOME/Library/Application Support/dev.a/runtime""#
+}
 
 #[cfg(test)]
 mod tests {

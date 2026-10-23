@@ -29,14 +29,21 @@ pub fn open(host: &str, staged: &Staged) -> io::Result<Connection> {
         return Ok(conn);
     }
     install(host, staged)?;
-    let installed = format!(r#"exec "$HOME/.a/runtime/{}/a" bridge {token}"#, staged.id);
+    let installed = format!(
+        "{}\nexec \"$a_runtime/{}/a\" bridge {token}",
+        sys::Paths::remote_runtime_script(),
+        staged.id
+    );
     bridge(host, &installed, &token)?
         .ok_or_else(|| io::Error::other(format!("the `a` installed on {host} does not run")))
 }
 
 pub(crate) fn find_script(token: &str) -> String {
     format!(
-        r#"if command -v a >/dev/null 2>&1; then exec a bridge {token}; elif [ -x "$HOME/.a/runtime/current/a" ]; then exec "$HOME/.a/runtime/current/a" bridge {token}; else exit {NOT_FOUND}; fi"#
+        r#"if command -v a >/dev/null 2>&1; then exec a bridge {token}; fi
+{}
+if [ -x "$a_runtime/current/a" ]; then exec "$a_runtime/current/a" bridge {token}; else exit {NOT_FOUND}; fi"#,
+        sys::Paths::remote_runtime_script()
     )
 }
 
@@ -89,7 +96,7 @@ pub(crate) fn launch(host: &str, script: &str) -> io::Result<Connection> {
     })
 }
 
-/// Copies this build to `~/.a/runtime/<id>/a` on `host`; a host of another
+/// Copies this build to the host layout's `runtime/<id>/a`; a host of another
 /// OS or architecture is refused.
 pub(crate) fn install(host: &str, staged: &Staged) -> io::Result<()> {
     let uname = command("A_SSH", "ssh")
@@ -104,8 +111,28 @@ pub(crate) fn install(host: &str, staged: &Staged) -> io::Result<()> {
             "`a` is not installed on {host}, and this build is for {here}, not {uname:?}; install `a` there and retry"
         )));
     }
-    let dir = format!(".a/runtime/{}", staged.id);
-    run(command("A_SSH", "ssh").args([host, &format!("mkdir -p '{dir}'")]))?;
+    let prepare = format!(
+        "{}\nmkdir -p \"$a_runtime/{}\" && cd \"$a_runtime/{}\" && pwd -P",
+        sys::Paths::remote_runtime_script(),
+        staged.id,
+        staged.id
+    );
+    let prepared = command("A_SSH", "ssh")
+        .arg(host)
+        .arg(sh(&prepare))
+        .stdin(Stdio::null())
+        .output()?;
+    if !prepared.status.success() {
+        return Err(io::Error::other(format!(
+            "ssh {host}: cannot prepare runtime directory: {}",
+            String::from_utf8_lossy(&prepared.stderr).trim_end()
+        )));
+    }
+    let dir = String::from_utf8(prepared.stdout)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let dir = dir.strip_suffix('\n').ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "ssh: missing runtime directory")
+    })?;
     let mut scp = command("A_SCP", "scp");
     scp.arg("-q")
         .arg(&staged.exe)

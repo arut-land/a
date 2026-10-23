@@ -1,4 +1,4 @@
-use super::*;
+use super::{Command, InstallLayout, Path, PathBuf, Paths, io};
 
 fn base(value: Option<PathBuf>, home: &Path, fallback: &str) -> PathBuf {
     value
@@ -40,6 +40,13 @@ pub(super) fn daemon_env(paths: &Paths, command: &mut Command) {
         command.env(key, dir.parent().expect("application subdirectory"));
     }
     command.env("XDG_RUNTIME_DIR", &paths.runtime);
+}
+
+pub(super) fn remote_runtime_script() -> &'static str {
+    r#"case "$XDG_DATA_HOME" in
+/*) a_runtime="$XDG_DATA_HOME/a/runtime" ;;
+*) a_runtime="$HOME/.local/share/a/runtime" ;;
+esac"#
 }
 
 #[cfg(test)]

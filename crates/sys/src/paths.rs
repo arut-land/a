@@ -73,6 +73,20 @@ impl Paths {
         }
     }
 
+    /// A POSIX bootstrap on a host matching this build sets `a_runtime` using
+    /// that host's environment, never the connecting client's home.
+    pub fn remote_runtime_script() -> String {
+        format!(
+            r#"if [ "${{A_HOME+x}}" = x ]; then
+[ -n "$A_HOME" ] || exit 1
+a_runtime="$A_HOME/runtime"
+else
+{}
+fi"#,
+            native::remote_runtime_script()
+        )
+    }
+
     pub fn layout(&self) -> &InstallLayout {
         &self.layout
     }
@@ -220,6 +234,50 @@ mod tests {
                 root.display()
             );
         }
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn remote_bootstrap_and_native_resolution_choose_the_same_build_directory() {
+        use std::os::unix::ffi::OsStrExt;
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "{}\nprintf '%s' \"$a_runtime\"",
+                Paths::remote_runtime_script()
+            ))
+            .env_remove("A_HOME")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let native = native::resolve().unwrap();
+        assert_eq!(output.stdout, native.runtime().dir().as_os_str().as_bytes());
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn remote_bootstrap_honors_isolation_and_refuses_an_empty_override() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::env::temp_dir().join("a paths café");
+        let script = format!(
+            "{}\nprintf '%s' \"$a_runtime\"",
+            Paths::remote_runtime_script()
+        );
+        let output = Command::new("sh")
+            .args(["-c", &script])
+            .env("A_HOME", &root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, root.join("runtime").as_os_str().as_bytes());
+        assert!(
+            !Command::new("sh")
+                .args(["-c", &script])
+                .env("A_HOME", "")
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[test]

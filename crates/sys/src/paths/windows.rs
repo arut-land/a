@@ -1,4 +1,4 @@
-use super::*;
+use super::{Command, InstallLayout, PathBuf, Paths, io};
 use std::os::windows::ffi::OsStringExt;
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::Shell::{
@@ -7,14 +7,19 @@ use windows_sys::Win32::UI::Shell::{
 
 fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
     let mut raw = std::ptr::null_mut();
+    // SAFETY: id is a valid GUID and raw is a writable output pointer. A null
+    // token selects the current user and requires no COM initialization.
     let result = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw) };
     if result < 0 {
+        // SAFETY: the API owns this allocation; CoTaskMemFree accepts null.
         unsafe { CoTaskMemFree(raw.cast()) };
         return Err(io::Error::other(format!(
             "SHGetKnownFolderPath failed: {result:#x}"
         )));
     }
     let mut len = 0;
+    // SAFETY: a successful call returns a NUL-terminated wide string allocated
+    // by COM. Copy it before freeing the allocation with its matching allocator.
     unsafe {
         while *raw.add(len) != 0 {
             len += 1;
@@ -42,6 +47,12 @@ pub(super) fn resolve() -> io::Result<Paths> {
 }
 
 pub(super) fn daemon_env(_: &Paths, _: &mut Command) {}
+
+pub(super) fn remote_runtime_script() -> &'static str {
+    // Native Windows bootstrap is not a POSIX/uname protocol. Connections
+    // still work through an explicitly installed `a` on the remote PATH.
+    "exit 127"
+}
 
 #[cfg(test)]
 mod tests {

@@ -79,10 +79,7 @@ cd '{remote}' && exec env A_HOME='{remote}/.a' HOME='{remote}' PATH=/usr/bin:/bi
             remote = remote.display(),
         ),
     );
-    let scp = env.script(
-        "scp",
-        &format!(r#"cp "$2" '{}'/"${{3#*:}}""#, remote.display()),
-    );
+    let scp = env.script("scp", r#"cp "$2" "${3#*:}""#);
     let mut cmd = env.cmd(&["--host", "box"]);
     cmd.env("A_SSH", ssh)
         .env("A_SCP", scp)
