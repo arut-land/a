@@ -6,6 +6,8 @@ from pathlib import Path
 import shlex
 import os
 import sys
+import subprocess
+from unittest import mock
 
 from compare import compare
 from stats import distribution
@@ -37,6 +39,28 @@ class Comparison(unittest.TestCase):
         self.assertGreater(result["peak_rss_kib"], 0)
         self.assertGreater(result["wall_seconds"], 0)
         self.assertGreaterEqual(result["cpu_seconds"], 0)
+
+    @unittest.skipUnless(os.name == "nt", "native owned-process cleanup")
+    def test_timeouts_stop_owned_descendants_and_leave_unrelated_processes_alive(self):
+        from process import run_timed
+        code = "import subprocess, sys, time; p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); print(p.pid, flush=True); time.sleep(60)"
+        parent = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            import psutil
+            descendant = psutil.Process(int(parent.stdout.readline()))
+            with mock.patch("subprocess.Popen", return_value=parent):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    run_timed(["owned command"], timeout=.1)
+            descendant.wait(timeout=5)
+            self.assertIsNotNone(parent.poll())
+            self.assertIsNone(unrelated.poll())
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+            parent.wait()
+            unrelated.kill()
+            unrelated.wait()
 
     def test_five_sample_spreads_do_not_hide_a_single_cpu_tick(self):
         sample = distribution([0, 0, 0, 0, 15.625])

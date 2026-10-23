@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 
-from process import snapshot, stop_daemon
+from process import snapshot, stop_daemon, run_timed
 from stats import distribution
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,8 +29,8 @@ def run(argv, **kwargs):
     if argv[0] == "cargo" and "PERF_CARGO" in os.environ:
         argv[0] = os.environ["PERF_CARGO"]
     try:
-        return subprocess.run(argv, check=True, **kwargs)
-    except subprocess.CalledProcessError as error:
+        return (run_timed if argv[0] == "hyperfine" else subprocess.run)(argv, check=True, **kwargs)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         if error.stdout:
             print(error.stdout, flush=True)
         if error.stderr:
@@ -154,6 +154,12 @@ def budgets(output, binary=None, probe=None, samples=5):
                 attach_p50.append(statistics.median(samples))
                 attach_p99.append(samples[495])
                 (output / f"attach-{trial}.json").write_text(json.dumps(samples))
+            except Exception:
+                # Retain the daemon's own explanation before its isolated home disappears.
+                for path in (home / "logs").glob("*"):
+                    if path.is_file():
+                        shutil.copy2(path, output / f"failed-{trial}-{path.name}")
+                raise
             finally:
                 if client:
                     client.stdin.close()
@@ -251,6 +257,22 @@ def paired(output, source, reference):
     builds = dict(reference=reference_output, candidate=output)
     values = {role: {} for role in builds}
     orders = []
+    completed = {role: 0 for role in builds}
+    candidate_revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
+    for role in builds:
+        values[role]["size_kib"] = [(builds[role] / ("a" + SUFFIX)).stat().st_size / 1024]
+
+    def checkpoint():
+        result = dict(driver_turns=500, large_json_results=200,
+                      reference_revision=reference, candidate_revision=candidate_revision,
+                      completed_rounds=completed, order=orders,
+                      roles={role: {name: distribution(samples) for name, samples in observed.items()}
+                             for role, observed in values.items()})
+        temporary = output / "paired.json.tmp"
+        temporary.write_text(json.dumps(result, indent=2) + "\n")
+        temporary.replace(output / "paired.json")
+
+    checkpoint()
     workloads = load_task("workloads")
     for trial in range(5):
         order = ["reference", "candidate"] if trial % 2 == 0 else ["candidate", "reference"]
@@ -290,12 +312,8 @@ def paired(output, source, reference):
                     record = measure_windows(argv, env=env)
                     (saved / (name + "-native.json")).write_text(json.dumps(record))
                     values[role].setdefault(name + "_rss_kib", []).append(record["peak_rss_kib"])
-    result = dict(driver_turns=500, large_json_results=200, reference_revision=reference, candidate_revision=subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(), order=orders, roles={})
-    for role, observed in values.items():
-        observed["size_kib"] = [(builds[role] / ("a" + SUFFIX)).stat().st_size / 1024]
-        result["roles"][role] = {name: distribution(samples) for name, samples in observed.items()}
-    (output / "paired.json").write_text(json.dumps(result, indent=2) + "\n")
+            completed[role] += 1
+            checkpoint()
 
 
 def main():
@@ -310,6 +328,8 @@ def main():
     parser.add_argument("--bloat", action="store_true", help="also collect crate/function size attribution")
     args = parser.parse_args()
     output, source = args.output.resolve(), args.source.resolve()
+    if args.phase in ["all", "build"] and output.exists() and any(output.iterdir()):
+        parser.error("measurement output must be empty; select a new --output directory")
     output.mkdir(parents=True, exist_ok=True)
     variant = json.loads(args.variant or "{}")
     if args.phase in ["all", "build"]:

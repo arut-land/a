@@ -114,7 +114,7 @@ def main():
                                stdout=result.stdout.decode(errors="replace"),
                                stderr=result.stderr.decode(errors="replace"),
                                logs={str(p.relative_to(home)): p.read_text(errors="replace")
-                                     for p in home.rglob("*.log")})
+                                     for p in (home / "logs").glob("*") if p.is_file()})
                 (output / "failed-command.json").write_text(json.dumps(failure, indent=2))
                 print(json.dumps(failure), file=sys.stderr, flush=True)
             result.check_returncode()
@@ -126,8 +126,8 @@ def main():
                     "--metrics", "all", "--export-json", str(output / (name + ".json"))]
             if prepare:
                 argv += ["--prepare", prepare]
-            subprocess.run([*argv, command],
-                           env=env, cwd=workspace, check=True)
+            from process import run_timed
+            run_timed([*argv, command], env=env, cwd=workspace)
             if os.name == "nt":
                 from process import measure_windows
                 samples = []

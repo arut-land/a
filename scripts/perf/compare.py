@@ -72,12 +72,14 @@ def main():
     paired_path = args.result.with_name("paired.json")
     if paired_path.exists():
         paired = json.loads(paired_path.read_text())
-        lines += ["## Same-runner reference", "", f'Reference: `{paired["reference_revision"]}`. Five alternating AB/BA rounds; builds finish before these windows. Driver turns per process: {paired["driver_turns"]}; large JSON results: {paired["large_json_results"]}.', "",
+        lines += ["## Same-runner reference", "", f'Reference: `{paired["reference_revision"]}`. Planned five alternating AB/BA rounds; completed: {paired["completed_rounds"]}. Builds finish before these windows. Driver turns per process: {paired["driver_turns"]}; large JSON results: {paired["large_json_results"]}.', "",
                   "| Axis | Reference median | Candidate median | Delta |", "| --- | ---: | ---: | --- |"]
         for name, value in paired["roles"]["candidate"].items():
             value = distribution(value["samples"])
-            previous = distribution(paired["roles"]["reference"][name]["samples"])
-            lines.append(f'| {name} | {previous["median"]:.3f} | {value["median"]:.3f} | {compare(value, previous)} |')
+            previous_samples = paired["roles"]["reference"].get(name)
+            previous = distribution(previous_samples["samples"]) if previous_samples else None
+            previous_median = f'{previous["median"]:.3f}' if previous else "—"
+            lines.append(f'| {name} | {previous_median} | {value["median"]:.3f} | {compare(value, previous)} |')
         lines += [""]
     summary = "\n".join(lines)
     args.result.with_name("summary.md").write_text(summary)

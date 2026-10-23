@@ -21,6 +21,7 @@ portable RSS adapter. Provider cassettes and encoded fixtures are unchanged.
 
 ## Build and accounting
 
+Build, measurement and optional reference rounds are separate job steps.
 Builds finish before timing starts. Both binaries use `cargo build-release`:
 size-optimized rebuilt std, unwinding, fat LTO, one codegen unit, stripped
 symbols and the source checkout's native linker flags. The default binary
@@ -53,8 +54,9 @@ Do not compare memory values between OSes as if they shared one definition.
 
 All daemons use isolated homes and stop through their own binary and `A_HOME`.
 Collection waits for the captured daemon PID to exit before deleting its home;
-Windows retains executable image mappings through process exit. Only directly
-owned client processes can be killed on a timeout. The tool
+Windows retains executable image mappings through process exit. A failed graceful stop is recorded and only that captured daemon PID can be
+terminated. Measured commands have a five-minute deadline; cleanup stops only
+the owned command and its descendants. The tool
 never addresses the user's default home.
 
 ## Samples and comparisons
@@ -114,6 +116,9 @@ to reduce native CPU counter quantization; the full suite retains its original
 homes. All builds finish before these paired windows. Both raw observations
 and `paired.json` remain in the artifact, with a second summary table. Use
 this comparison when different hosted CPUs or storage obscure a small change.
+Each completed role is checkpointed atomically with its completed-round count.
+A failed reference leaves partial observations explicitly incomplete; daemon
+JSONL logs are retained on command failures.
 
 ## Reproduce
 

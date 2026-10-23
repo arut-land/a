@@ -21,6 +21,8 @@ def main():
     parser.add_argument("--blackbox", type=Path)
     parser.add_argument("--packages", default="engine,protocol,tui")
     args = parser.parse_args()
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/perf"))
+    from process import run_timed
     transcript = args.transcript.resolve(strict=True)
     build = args.build.resolve(strict=True)
     loader = importlib.machinery.SourceFileLoader("workloads", str(Path(__file__).with_name("workloads")))
@@ -53,10 +55,10 @@ def main():
             binary = (build / (package + "-bench" + (".exe" if os.name == "nt" else ""))).resolve(strict=True)
             command = workloads.command([str(binary), name, "--ignored", "--nocapture", "--test-threads=1"])
             workloads.load(output, name + ":before")
-            result = subprocess.run(["hyperfine", "-N", "--warmup", "1", "-r", str(args.runs),
+            result = run_timed(["hyperfine", "-N", "--warmup", "1", "-r", str(args.runs),
                                      "--metrics", "all", "--show-output", "--export-json",
                                      str(output / (name + ".json")), command], env=env,
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
             (output / (name + "-output.json")).write_text(json.dumps({"output": result.stdout}))
             print(result.stdout, flush=True)
             result.check_returncode()
