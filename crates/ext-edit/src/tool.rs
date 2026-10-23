@@ -275,6 +275,7 @@ impl Transaction<'_> {
                     publication: sys::fs::EditReceipt {
                         visible: false,
                         durability: sys::fs::Durability::NotRequested,
+                        protection: sys::fs::PublicationProtection::RevalidatedRename,
                     },
                 };
                 Ok((transaction, content, edited, hash))
@@ -719,7 +720,7 @@ mod tests {
         };
         assert_eq!(
             output.parse::<Value>().unwrap()["publication"],
-            json!({"visible": true, "durability": "not_requested"})
+            json!({"visible": true, "durability": "not_requested", "protection": "exclusive_create"})
         );
         let Outcome::Done { output } = change(&rig, "notes.txt", &[("two", "2")]) else {
             panic!()

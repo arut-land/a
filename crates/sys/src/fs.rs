@@ -8,7 +8,9 @@ use std::path::Path;
 
 mod edit;
 mod staging;
-pub use edit::{Durability, EditConflict, EditError, EditReceipt, EditTransaction};
+pub use edit::{
+    Durability, EditConflict, EditError, EditReceipt, EditTransaction, PublicationProtection,
+};
 
 /// Why discovery skipped a candidate instead of opening arbitrary filesystem objects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

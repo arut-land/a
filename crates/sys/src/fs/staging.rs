@@ -14,14 +14,13 @@ pub(super) struct Directory<'a> {
     #[cfg(unix)]
     pub name: OsString,
     pub file: File,
-    #[cfg(windows)]
+    #[cfg(unix)]
+    retain: bool,
     pub path: std::path::PathBuf,
 }
 
 impl<'a> Directory<'a> {
     pub fn create(parent: &'a File, path: &Path) -> io::Result<Self> {
-        #[cfg(unix)]
-        let _ = path;
         loop {
             let name = super::edit::temporary_name();
             #[cfg(unix)]
@@ -57,14 +56,14 @@ impl<'a> Directory<'a> {
                     return Err(io::ErrorKind::PermissionDenied.into());
                 }
             }
-            #[cfg(windows)]
             let path = path.join(&name);
             let directory = Self {
                 parent,
                 #[cfg(unix)]
                 name,
                 file,
-                #[cfg(windows)]
+                #[cfg(unix)]
+                retain: false,
                 path,
             };
             #[cfg(unix)]
@@ -86,6 +85,9 @@ impl Drop for Directory<'_> {
         #[cfg(unix)]
         {
             use rustix::fs::{AtFlags, fstat, statat, unlinkat};
+            if self.retain {
+                return;
+            }
             if let (Ok(ours), Ok(named)) = (
                 fstat(&self.file),
                 statat(self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW),
@@ -104,8 +106,6 @@ pub(super) struct Staged<'a> {
     // Close the child before removing its directory on Windows.
     pub file: File,
     pub directory: Directory<'a>,
-    #[cfg(target_os = "linux")]
-    anonymous: bool,
     #[cfg(windows)]
     published: bool,
 }
@@ -113,38 +113,6 @@ pub(super) struct Staged<'a> {
 impl<'a> Staged<'a> {
     #[cfg(unix)]
     pub fn create(directory: Directory<'a>) -> io::Result<Self> {
-        #[cfg(target_os = "linux")]
-        let anonymous = {
-            use rustix::fs::{Mode, OFlags, openat};
-            openat(
-                &directory.file,
-                ".",
-                OFlags::RDWR | OFlags::CLOEXEC | OFlags::TMPFILE,
-                Mode::RUSR | Mode::WUSR,
-            )
-        };
-        #[cfg(target_os = "linux")]
-        match anonymous {
-            Ok(file) => {
-                return Ok(Self {
-                    file: File::from(file),
-                    directory,
-                    anonymous: true,
-                });
-            }
-            Err(
-                rustix::io::Errno::NOTSUP
-                | rustix::io::Errno::INVAL
-                | rustix::io::Errno::ISDIR
-                | rustix::io::Errno::NOSYS,
-            ) => {}
-            Err(error) => return Err(error.into()),
-        }
-        Self::named(directory)
-    }
-
-    #[cfg(unix)]
-    pub fn named(directory: Directory<'a>) -> io::Result<Self> {
         use rustix::fs::{Mode, OFlags, openat};
         let flags = OFlags::RDWR | OFlags::CLOEXEC;
         let mode = Mode::RUSR | Mode::WUSR;
@@ -156,12 +124,7 @@ impl<'a> Staged<'a> {
         )?);
         #[cfg(target_vendor = "apple")]
         super::edit::access_acl(None, &file)?;
-        Ok(Self {
-            file,
-            directory,
-            #[cfg(target_os = "linux")]
-            anonymous: false,
-        })
+        Ok(Self { file, directory })
     }
 
     #[cfg(windows)]
@@ -177,9 +140,42 @@ impl<'a> Staged<'a> {
         })
     }
 
+    #[cfg(unix)]
+    pub fn exchange(&mut self, name: &OsStr) -> io::Result<bool> {
+        use rustix::fs::{RenameFlags, renameat_with};
+        match renameat_with(
+            &self.directory.file,
+            CONTENT,
+            self.directory.parent,
+            name,
+            RenameFlags::EXCHANGE,
+        ) {
+            Ok(()) => Ok(true),
+            Err(
+                rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::NOTSUP,
+            ) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn displaced(&self) -> io::Result<File> {
+        use rustix::fs::{Mode, OFlags, openat};
+        Ok(File::from(openat(
+            &self.directory.file,
+            CONTENT,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?))
+    }
+
+    #[cfg(unix)]
+    pub fn retain(&mut self) -> std::path::PathBuf {
+        self.directory.retain = true;
+        self.directory.path.join(CONTENT)
+    }
+
     pub fn publish(&mut self, name: &OsStr, replacing: bool) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        self.link()?;
         #[cfg(unix)]
         {
             use rustix::fs::{RenameFlags, renameat_with};
@@ -210,42 +206,8 @@ impl<'a> Staged<'a> {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    fn link(&mut self) -> io::Result<()> {
-        if self.anonymous {
-            use rustix::fs::{AtFlags, CWD, linkat};
-            use std::os::fd::AsRawFd;
-            match linkat(
-                &self.file,
-                "",
-                &self.directory.file,
-                CONTENT,
-                AtFlags::EMPTY_PATH,
-            ) {
-                Ok(()) => {}
-                Err(rustix::io::Errno::PERM | rustix::io::Errno::NOENT) => {
-                    // Unprivileged AT_EMPTY_PATH needs the procfs fd alias on
-                    // kernels that require CAP_DAC_READ_SEARCH for that flag.
-                    let path = format!("/proc/self/fd/{}", self.file.as_raw_fd());
-                    linkat(
-                        CWD,
-                        path,
-                        &self.directory.file,
-                        CONTENT,
-                        AtFlags::SYMLINK_FOLLOW,
-                    )?;
-                }
-                Err(error) => return Err(error.into()),
-            }
-            self.anonymous = false;
-        }
-        Ok(())
-    }
-
     #[cfg(unix)]
     pub fn fallback(&mut self, name: &OsStr, replacing: bool) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        self.link()?;
         let source = &self.directory.file;
         let target = self.directory.parent;
         if replacing {
@@ -260,7 +222,10 @@ impl<'a> Staged<'a> {
 impl Drop for Staged<'_> {
     fn drop(&mut self) {
         #[cfg(unix)]
-        let _ = rustix::fs::unlinkat(&self.directory.file, CONTENT, rustix::fs::AtFlags::empty());
+        if !self.directory.retain {
+            let _ =
+                rustix::fs::unlinkat(&self.directory.file, CONTENT, rustix::fs::AtFlags::empty());
+        }
         #[cfg(windows)]
         if !self.published {
             delete(&self.file);
@@ -330,7 +295,9 @@ pub(super) fn relative(
             &raw mut status,
             std::ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | if directory { 0 } else { FILE_SHARE_DELETE },
+            FILE_SHARE_READ
+                | if create { FILE_SHARE_WRITE } else { 0 }
+                | if directory { 0 } else { FILE_SHARE_DELETE },
             if create { FILE_CREATE } else { FILE_OPEN },
             FILE_SYNCHRONOUS_IO_NONALERT
                 | FILE_OPEN_REPARSE_POINT

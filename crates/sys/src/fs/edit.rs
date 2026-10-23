@@ -1,7 +1,9 @@
 //! Safe-save publication. Final-component links and multiply linked files are
 //! rejected: replacing either would silently change which object is edited.
-//! Revalidation detects observed concurrent changes, but no supported OS offers
-//! a pathname/content compare-and-swap against uncooperative writers.
+//! Exchange-capable Unix filesystems verify the displaced version and roll back
+//! conflicts, retaining unexpected rollback data for recovery. Plain-rename
+//! fallbacks and write-denying source handles report their weaker protection.
+//! These facilities do not provide a pathname/content compare-and-swap.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -13,11 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use super::staging::{Directory, Staged};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditConflict {
     Busy,
     Changed,
     Appeared,
+    Recovery(PathBuf),
 }
 
 #[derive(Debug)]
@@ -68,13 +71,24 @@ pub enum Durability {
     Failed(String),
 }
 
+/// The strongest conflict check completed by the filesystem, separately from durability.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationProtection {
+    ExclusiveCreate,
+    ExchangeVerified,
+    WriteDenied,
+    RevalidatedRename,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditReceipt {
     pub visible: bool,
     pub durability: Durability,
+    pub protection: PublicationProtection,
 }
 
-/// Owns a nonblocking edit lease, the source and its parent until publication or abort.
+/// Owns the captured source and parent until publication or abort.
 pub struct EditTransaction {
     parent: File,
     #[cfg(windows)]
@@ -128,12 +142,13 @@ impl EditTransaction {
             }
             Err(error) => return Err(error),
         };
-        edit_lease(&file)?;
+        let signature = signature(&file)?;
+        #[cfg(target_vendor = "apple")]
+        mac_xattrs(&file, file.metadata()?.len(), limit)?;
         #[cfg(windows)]
         {
             transaction.stream_bytes = stream_bytes(&file, limit)?;
         }
-        let signature = signature(&file)?;
         let mut bytes = Vec::new();
         (&mut file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
         if bytes.len() > limit {
@@ -183,7 +198,10 @@ impl EditTransaction {
         #[cfg(windows)]
         let file =
             super::staging::relative(&self.parent, &self.name, false, false).map_err(|error| {
-                if error.raw_os_error() == Some(267) || error.kind() == io::ErrorKind::IsADirectory
+                if error.raw_os_error() == Some(32) {
+                    EditError::Conflict(EditConflict::Busy)
+                } else if error.raw_os_error() == Some(267)
+                    || error.kind() == io::ErrorKind::IsADirectory
                 {
                     EditError::NotRegular
                 } else {
@@ -208,19 +226,8 @@ impl EditTransaction {
                     return Err(EditError::Conflict(EditConflict::Changed));
                 }
                 let original = self.original.as_deref().expect("source has captured bytes");
-                let mut at = 0;
-                let mut buffer = [0; 8192];
-                loop {
-                    let count = current.read(&mut buffer)?;
-                    if count == 0 {
-                        break;
-                    }
-                    if original.get(at..at + count) != Some(&buffer[..count]) {
-                        return Err(EditError::Conflict(EditConflict::Changed));
-                    }
-                    at += count;
-                }
-                if at != original.len() || *before != signature(&current)? {
+                check_bytes(&mut current, original)?;
+                if *before != signature(&current)? {
                     return Err(EditError::Conflict(EditConflict::Changed));
                 }
                 Ok(())
@@ -241,7 +248,7 @@ impl EditTransaction {
         durable: bool,
         should_cancel: &(dyn Fn(u64) -> bool + Sync),
     ) -> Result<EditReceipt, EditError> {
-        self.publish_with_sync(bytes, durable, File::sync_all, should_cancel)
+        self.publish_with_sync(bytes, durable, File::sync_all, should_cancel, || {})
     }
 
     fn publish_with_sync(
@@ -250,6 +257,7 @@ impl EditTransaction {
         durable: bool,
         sync_parent: impl FnOnce(&File) -> io::Result<()>,
         should_cancel: &(dyn Fn(u64) -> bool + Sync),
+        before_commit: impl FnOnce(),
     ) -> Result<EditReceipt, EditError> {
         #[cfg(windows)]
         if durable {
@@ -277,6 +285,15 @@ impl EditTransaction {
         }
         check_cancel(should_cancel, 0)?;
         self.revalidate()?;
+        #[cfg(target_vendor = "apple")]
+        let metadata_content = self
+            .original
+            .as_ref()
+            .map_or(bytes.len(), |original| original.len().max(bytes.len()));
+        #[cfg(target_vendor = "apple")]
+        if let Some((source, _)) = &self.source {
+            mac_xattrs(source, metadata_content as u64, self.limit)?;
+        }
         let mut staged = self
             .stage(should_cancel)
             .map_err(|error| match error.kind() {
@@ -293,6 +310,15 @@ impl EditTransaction {
         staged.file.set_len(bytes.len() as u64)?;
         check_cancel(should_cancel, copied)?;
         if let Some((source, _)) = &self.source {
+            #[cfg(target_vendor = "apple")]
+            copy_mac_xattrs(
+                source,
+                &staged.file,
+                metadata_content,
+                self.limit,
+                &mut copied,
+                should_cancel,
+            )?;
             preserve_metadata(source, &staged.file)?;
         }
         if durable {
@@ -300,12 +326,8 @@ impl EditTransaction {
         }
         self.revalidate()?;
         check_cancel(should_cancel, copied)?;
-        match staged.publish(&self.name, self.source.is_some()) {
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(EditError::Conflict(EditConflict::Appeared));
-            }
-            result => result?,
-        }
+        before_commit();
+        let protection = self.commit(&mut staged, bytes, true, || {}, || {})?;
         let durability = if durable {
             match sync_parent(&self.parent) {
                 Ok(()) => Durability::Confirmed,
@@ -317,7 +339,81 @@ impl EditTransaction {
         Ok(EditReceipt {
             visible: true,
             durability,
+            protection,
         })
+    }
+
+    fn commit(
+        &self,
+        staged: &mut Staged<'_>,
+        bytes: &[u8],
+        exchange: bool,
+        after_exchange: impl FnOnce(),
+        before_rollback: impl FnOnce(),
+    ) -> Result<PublicationProtection, EditError> {
+        #[cfg(windows)]
+        let _ = (bytes, exchange, after_exchange, before_rollback);
+        #[cfg(unix)]
+        let published = signature(&staged.file)?;
+        #[cfg(unix)]
+        if let Some((_, before)) = &self.source
+            && exchange
+            && staged.exchange(&self.name).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    EditError::Conflict(EditConflict::Changed)
+                } else {
+                    EditError::from(error)
+                }
+            })?
+        {
+            after_exchange();
+            let checked = (|| {
+                let mut displaced = staged.displaced()?;
+                if moved_signature(*before) != moved_signature(signature(&displaced)?) {
+                    return Err(EditError::Conflict(EditConflict::Changed));
+                }
+                check_bytes(
+                    &mut displaced,
+                    self.original.as_deref().expect("captured source"),
+                )?;
+                Ok(())
+            })();
+            if checked.is_err() {
+                // A rollback must never discard a second writer's version.
+                // Verify both sides; retain unexpected displaced data for recovery.
+                if self.open_source().is_ok_and(|mut current| {
+                    same_object(&current, &staged.file).unwrap_or(false)
+                        && signature(&current)
+                            .is_ok_and(|now| moved_signature(now) == moved_signature(published))
+                        && check_bytes(&mut current, bytes).is_ok()
+                }) && {
+                    before_rollback();
+                    staged.exchange(&self.name).unwrap_or(false)
+                } && staged.displaced().is_ok_and(|mut displaced| {
+                    same_object(&displaced, &staged.file).unwrap_or(false)
+                        && signature(&displaced)
+                            .is_ok_and(|now| moved_signature(now) == moved_signature(published))
+                        && check_bytes(&mut displaced, bytes).is_ok()
+                }) {
+                    return Err(EditError::Conflict(EditConflict::Changed));
+                }
+                return Err(EditError::Conflict(EditConflict::Recovery(staged.retain())));
+            }
+            return Ok(PublicationProtection::ExchangeVerified);
+        }
+        match staged.publish(&self.name, self.source.is_some()) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(EditError::Conflict(EditConflict::Appeared));
+            }
+            result => result?,
+        }
+        if self.source.is_none() {
+            return Ok(PublicationProtection::ExclusiveCreate);
+        }
+        #[cfg(unix)]
+        return Ok(PublicationProtection::RevalidatedRename);
+        #[cfg(windows)]
+        Ok(PublicationProtection::WriteDenied)
     }
 
     fn stage(&self, should_cancel: &(dyn Fn(u64) -> bool + Sync)) -> io::Result<Staged<'_>> {
@@ -336,25 +432,38 @@ impl EditTransaction {
     }
 }
 
+fn check_bytes(current: &mut File, original: &[u8]) -> Result<(), EditError> {
+    let mut at = 0;
+    let mut buffer = [0; 8192];
+    loop {
+        let count = current.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        if original.get(at..at + count) != Some(&buffer[..count]) {
+            return Err(EditError::Conflict(EditConflict::Changed));
+        }
+        at += count;
+    }
+    if at != original.len() {
+        return Err(EditError::Conflict(EditConflict::Changed));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn moved_signature(mut signature: Signature) -> Signature {
+    // Rename changes ctime itself; identity, mtime, mode and bytes must still match.
+    signature.5 = 0;
+    signature.6 = 0;
+    signature
+}
+
 fn check_cancel(should_cancel: &(dyn Fn(u64) -> bool + Sync), copied: u64) -> io::Result<()> {
     if should_cancel(copied) {
         Err(io::Error::new(io::ErrorKind::Interrupted, "edit cancelled"))
     } else {
         Ok(())
-    }
-}
-
-fn edit_lease(file: &File) -> Result<(), EditError> {
-    match super::try_lock(file) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            Err(EditError::Conflict(EditConflict::Busy))
-        }
-        #[cfg(windows)]
-        Err(error) if error.raw_os_error() == Some(33) => {
-            Err(EditError::Conflict(EditConflict::Busy))
-        }
-        Err(error) => Err(error.into()),
     }
 }
 
@@ -487,15 +596,16 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
     {
         use std::os::macos::fs::MetadataExt;
         let modified = destination.metadata()?.modified()?;
-        // Copy xattrs and stat through handles, including resource forks and
-        // quarantine. The content edit gets its own modification time.
+        // Resource forks use bounded positioned IO before STAT: fcopyfile's
+        // descriptor-based fork copying does not deliver per-chunk callbacks.
+        // The content edit gets its own modification time.
         // SAFETY: both descriptors remain owned; null selects default state.
         if unsafe {
             libc::fcopyfile(
                 source.as_raw_fd(),
                 destination.as_raw_fd(),
                 std::ptr::null_mut(),
-                libc::COPYFILE_STAT | libc::COPYFILE_XATTR,
+                libc::COPYFILE_STAT,
             )
         } != 0
         {
@@ -540,6 +650,150 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
     destination.set_permissions(metadata.permissions())?;
     #[cfg(target_vendor = "apple")]
     access_acl(Some(source), destination)?;
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn mac_xattrs(source: &File, content: u64, limit: usize) -> io::Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    // Count names as metadata too; this bounds enumeration and empty attributes.
+    let mut remaining = (limit as u64)
+        .checked_sub(content)
+        .ok_or(io::ErrorKind::FileTooLarge)?;
+    // SAFETY: a null output asks only for the required buffer size.
+    let length = unsafe { libc::flistxattr(source.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
+    let length = mac_count(length)?;
+    remaining = remaining
+        .checked_sub(length as u64)
+        .ok_or(io::ErrorKind::FileTooLarge)?;
+    let mut names = vec![0u8; length];
+    // SAFETY: names owns the advertised writable byte buffer.
+    let length = unsafe {
+        libc::flistxattr(
+            source.as_raw_fd(),
+            names.as_mut_ptr().cast(),
+            names.len(),
+            0,
+        )
+    };
+    let length = mac_count(length)?;
+    if length > names.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            "edit metadata changed",
+        ));
+    }
+    names.truncate(length);
+    for name in names.split_inclusive(|byte| *byte == 0) {
+        let name =
+            std::ffi::CStr::from_bytes_with_nul(name).map_err(|_| io::ErrorKind::InvalidData)?;
+        // SAFETY: the name is terminated; null asks for size without reading data.
+        let length = unsafe {
+            libc::fgetxattr(
+                source.as_raw_fd(),
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+            )
+        };
+        remaining = remaining
+            .checked_sub(mac_count(length)? as u64)
+            .ok_or(io::ErrorKind::FileTooLarge)?;
+    }
+    Ok(names)
+}
+
+#[cfg(target_vendor = "apple")]
+fn mac_count(value: libc::ssize_t) -> io::Result<usize> {
+    if value < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(value.cast_unsigned())
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn copy_mac_xattrs(
+    source: &File,
+    destination: &File,
+    content: usize,
+    limit: usize,
+    copied: &mut u64,
+    should_cancel: &(dyn Fn(u64) -> bool + Sync),
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let names = mac_xattrs(source, content as u64, limit)?;
+    let mut remaining = limit - content - names.len();
+    for name in names.split_inclusive(|byte| *byte == 0) {
+        let name =
+            std::ffi::CStr::from_bytes_with_nul(name).map_err(|_| io::ErrorKind::InvalidData)?;
+        check_cancel(should_cancel, *copied)?;
+        // SAFETY: the source and terminated name remain live through the query.
+        let size = mac_count(unsafe {
+            libc::fgetxattr(
+                source.as_raw_fd(),
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+            )
+        })?;
+        remaining = remaining
+            .checked_sub(size)
+            .ok_or(io::ErrorKind::FileTooLarge)?;
+        let fork = name == c"com.apple.ResourceFork";
+        // Only resource forks support positioned xattr IO. Ordinary attributes
+        // must fit in one bounded allocation; forks never allocate their size.
+        let mut value = vec![0u8; if fork { size.min(65536) } else { size }];
+        let mut at = 0usize;
+        loop {
+            check_cancel(should_cancel, *copied)?;
+            let count = (size - at).min(value.len());
+            let position = u32::try_from(at).map_err(|_| io::ErrorKind::FileTooLarge)?;
+            // SAFETY: the buffer covers count; position is supported for forks
+            // and is zero for an ordinary attribute's single operation.
+            let read = mac_count(unsafe {
+                libc::fgetxattr(
+                    source.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    count,
+                    position,
+                    0,
+                )
+            })?;
+            if read != count {
+                return Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    "edit metadata changed",
+                ));
+            }
+            // SAFETY: exactly count initialized bytes are supplied to the owned file.
+            if unsafe {
+                libc::fsetxattr(
+                    destination.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    count,
+                    position,
+                    0,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            *copied += count as u64;
+            at += count;
+            check_cancel(should_cancel, *copied)?;
+            if at == size {
+                break;
+            }
+        }
+    }
+    let _ = remaining;
     Ok(())
 }
 
@@ -1135,13 +1389,14 @@ mod tests {
             .capture()
             .publish(b"replacement", false, &|_| false)
             .unwrap();
-        assert_eq!(
-            receipt,
-            EditReceipt {
-                visible: true,
-                durability: Durability::NotRequested
-            }
-        );
+        assert!(receipt.visible);
+        assert_eq!(receipt.durability, Durability::NotRequested);
+        assert!(matches!(
+            receipt.protection,
+            PublicationProtection::ExchangeVerified
+                | PublicationProtection::WriteDenied
+                | PublicationProtection::RevalidatedRename
+        ));
         let mut old = String::new();
         reader.read_to_string(&mut old).unwrap();
         assert_eq!(old, "original");
@@ -1160,6 +1415,7 @@ mod tests {
         work.only_target_remains();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_concurrent_in_place_writer_is_a_conflict() {
         let work = Workspace::new();
@@ -1193,19 +1449,17 @@ mod tests {
     }
 
     #[test]
-    fn cooperating_edits_never_capture_the_same_version_concurrently() {
+    fn competing_edits_of_one_version_never_both_commit() {
         let work = Workspace::new();
         fs::write(work.target(), b"original").unwrap();
         let first = work.capture();
-        assert!(matches!(
-            EditTransaction::capture(&work.target(), 32),
-            Err(EditError::Conflict(EditConflict::Busy))
-        ));
+        let second = work.capture();
         first.publish(b"first", false, &|_| false).unwrap();
-        work.capture()
-            .publish(b"second", false, &|_| false)
-            .unwrap();
-        assert_eq!(fs::read(work.target()).unwrap(), b"second");
+        assert!(matches!(
+            second.publish(b"second", false, &|_| false),
+            Err(EditError::Conflict(EditConflict::Changed))
+        ));
+        assert_eq!(fs::read(work.target()).unwrap(), b"first");
         work.only_target_remains();
     }
 
@@ -1340,11 +1594,10 @@ mod tests {
     #[test]
     fn staging_substitution_never_publishes_an_unrelated_object() {
         use std::os::unix::fs::symlink;
-        for (fallback, replacing, named) in [false, true].into_iter().flat_map(|fallback| {
-            [false, true].into_iter().flat_map(move |replacing| {
-                [false, true].map(move |named| (fallback, replacing, named))
-            })
-        }) {
+        for (fallback, replacing) in [false, true]
+            .into_iter()
+            .flat_map(|fallback| [false, true].map(move |replacing| (fallback, replacing)))
+        {
             let work = Workspace::new();
             if replacing {
                 fs::write(work.target(), b"original").unwrap();
@@ -1352,11 +1605,7 @@ mod tests {
             let victim = work.0.join("victim");
             fs::write(&victim, b"unrelated").unwrap();
             let transaction = work.capture();
-            let mut staged = if named {
-                Staged::named(Directory::create(&transaction.parent, &work.0).unwrap()).unwrap()
-            } else {
-                transaction.stage(&|_| false).unwrap()
-            };
+            let mut staged = transaction.stage(&|_| false).unwrap();
             let public = work.0.join(&staged.directory.name);
             fs::rename(&public, work.0.join("displaced")).unwrap();
             symlink(&victim, &public).unwrap();
@@ -1482,6 +1731,7 @@ mod tests {
                 true,
                 |_| Err(io::Error::other("injected directory flush failure")),
                 &|_| false,
+                || {},
             )
             .unwrap();
         assert!(receipt.visible);
@@ -1503,7 +1753,7 @@ mod tests {
         let moved = work.0.join("moved");
         fs::create_dir(&parent).unwrap();
         fs::write(parent.join("file"), b"original").unwrap();
-        let transaction = EditTransaction::capture(&parent.join("file"), 32).unwrap();
+        let transaction = EditTransaction::capture(&parent.join("file"), 4096).unwrap();
         fs::rename(&parent, &moved).unwrap();
         fs::create_dir(&parent).unwrap();
         fs::write(parent.join("file"), b"unrelated").unwrap();
@@ -1528,7 +1778,7 @@ mod tests {
             fs::write(parent.join("file"), b"original").unwrap();
         }
         symlink(&first, &alias).unwrap();
-        let transaction = EditTransaction::capture(&alias.join("file"), 32).unwrap();
+        let transaction = EditTransaction::capture(&alias.join("file"), 4096).unwrap();
         fs::remove_file(&alias).unwrap();
         symlink(&second, &alias).unwrap();
         assert!(matches!(
@@ -1860,20 +2110,248 @@ mod tests {
         fs::remove_file(sentinel).unwrap();
         work.only_target_remains();
     }
+    #[cfg(target_vendor = "apple")]
+    fn resource_fork(path: &Path, bytes: &[u8]) {
+        use std::os::fd::AsRawFd;
+        let file = File::open(path).unwrap();
+        // SAFETY: the owned file, terminated name and complete input remain live.
+        assert_eq!(
+            // SAFETY: the owned descriptor, name and input buffer remain live.
+            unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    c"com.apple.ResourceFork".as_ptr(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn resource_forks_count_toward_capture_and_publication_limits() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        resource_fork(&work.target(), &vec![b'f'; 12 << 20]);
+        assert!(matches!(
+            EditTransaction::capture(&work.target(), 1 << 20),
+            Err(EditError::TooLarge)
+        ));
+        let transaction = EditTransaction::capture(&work.target(), 16 << 20).unwrap();
+        assert!(matches!(
+            transaction.publish(&vec![b'x'; 5 << 20], false, &|_| false),
+            Err(EditError::TooLarge)
+        ));
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        work.only_target_remains();
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn cancellation_in_a_resource_fork_copy_reclaims_staging() {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::AtomicBool;
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        resource_fork(&work.target(), &vec![b'f'; 12 << 20]);
+        let transaction = EditTransaction::capture(&work.target(), 16 << 20).unwrap();
+        let observed = AtomicBool::new(false);
+        let result = transaction.publish(b"replacement", false, &|copied| {
+            if copied > 65536 {
+                observed.store(true, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        });
+        assert!(
+            observed.load(Ordering::Relaxed),
+            "a fork chunk must reach the cancellation probe"
+        );
+        assert!(matches!(result, Err(EditError::Cancelled)));
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        let file = File::open(work.target()).unwrap();
+        // SAFETY: a null output only queries the original fork's size.
+        assert_eq!(
+            // SAFETY: a null buffer only queries metadata size.
+            unsafe {
+                libc::fgetxattr(
+                    file.as_raw_fd(),
+                    c"com.apple.ResourceFork".as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                )
+            },
+            12 << 20
+        );
+        work.only_target_remains();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editing_does_not_require_a_source_flock_or_write_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        fs::set_permissions(work.target(), fs::Permissions::from_mode(0o444)).unwrap();
+        let external = File::open(work.target()).unwrap();
+        super::super::try_lock(&external).unwrap();
+        let transaction = work.capture();
+        transaction
+            .publish(b"replacement", false, &|_| false)
+            .unwrap();
+        assert_eq!(fs::read(work.target()).unwrap(), b"replacement");
+        work.only_target_remains();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writers_in_the_final_window_are_detected_and_restored() {
+        for replacing in [false, true] {
+            let work = Workspace::new();
+            fs::write(work.target(), b"original").unwrap();
+            let transaction = work.capture();
+            let result =
+                transaction.publish_with_sync(b"ours", false, File::sync_all, &|_| false, || {
+                    if replacing {
+                        fs::remove_file(work.target()).unwrap();
+                    }
+                    fs::write(work.target(), b"theirs").unwrap();
+                });
+            assert!(
+                matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
+                "{result:?}"
+            );
+            assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
+            work.only_target_remains();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_rename_is_reported_as_weaker_conflict_protection() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let transaction = work.capture();
+        let mut staged = transaction.stage(&|_| false).unwrap();
+        staged.file.write_all(b"ours").unwrap();
+        transaction.revalidate().unwrap();
+        assert_eq!(
+            transaction
+                .commit(&mut staged, b"ours", false, || {}, || {})
+                .unwrap(),
+            PublicationProtection::RevalidatedRename
+        );
+        drop(staged);
+        assert_eq!(fs::read(work.target()).unwrap(), b"ours");
+        work.only_target_remains();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_races_retain_every_displaced_writer_version() {
+        for during_rollback in [false, true] {
+            let work = Workspace::new();
+            fs::write(work.target(), b"original").unwrap();
+            let transaction = work.capture();
+            let mut staged = transaction.stage(&|_| false).unwrap();
+            staged.file.write_all(b"ours").unwrap();
+            transaction.revalidate().unwrap();
+            fs::write(work.target(), b"first writer").unwrap();
+            let inject = || fs::write(work.target(), b"second writer").unwrap();
+            let result = transaction.commit(
+                &mut staged,
+                b"ours",
+                true,
+                || {
+                    if !during_rollback {
+                        inject();
+                    }
+                },
+                || {
+                    if during_rollback {
+                        inject();
+                    }
+                },
+            );
+            let Err(EditError::Conflict(EditConflict::Recovery(path))) = result else {
+                panic!("{result:?}");
+            };
+            drop(staged);
+            let target = fs::read(work.target()).unwrap();
+            let retained = fs::read(&path).unwrap();
+            assert!(
+                (target == b"first writer" && retained == b"second writer")
+                    || (target == b"second writer" && retained == b"first writer")
+            );
+            fs::remove_file(&path).unwrap();
+            fs::remove_dir(path.parent().unwrap()).unwrap();
+            work.only_target_remains();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_source_guard_blocks_existing_and_final_window_writers() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(work.target())
+            .unwrap();
+        assert!(matches!(
+            EditTransaction::capture(&work.target(), 32),
+            Err(EditError::Conflict(EditConflict::Busy))
+        ));
+        drop(writer);
+        let transaction = work.capture();
+        let receipt = transaction
+            .publish_with_sync(b"ours", false, File::sync_all, &|_| false, || {
+                assert!(
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(work.target())
+                        .is_err()
+                );
+            })
+            .unwrap();
+        assert_eq!(receipt.protection, PublicationProtection::WriteDenied);
+        assert_eq!(fs::read(work.target()).unwrap(), b"ours");
+        work.only_target_remains();
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn staging_works_with_tmpfile_but_without_procfs_or_link_capability() {
-        const TEST: &str = "fs::edit::tests::staging_works_with_tmpfile_but_without_procfs_or_link_capability";
+        use std::os::unix::fs::PermissionsExt;
+        #[repr(C)]
+        struct Header {
+            version: u32,
+            pid: i32,
+        }
+        const TEST: &str =
+            "fs::edit::tests::staging_works_with_tmpfile_but_without_procfs_or_link_capability";
         if let Some(root) = std::env::var_os("A_EDIT_CHROOT") {
+            use rustix::fs::{AtFlags, CWD, Mode, OFlags, linkat, openat};
             use std::os::fd::AsRawFd;
             use std::os::unix::ffi::OsStrExt;
-            use rustix::fs::{openat, linkat, AtFlags, Mode, OFlags, CWD};
             let root = std::ffi::CString::new(root.as_bytes()).unwrap();
             // SAFETY: this child runs only this test; root is its isolated fixture.
             assert_eq!(unsafe { libc::chroot(root.as_ptr()) }, 0);
             std::env::set_current_dir("/").unwrap();
             assert!(!Path::new("/proc").exists());
-            let anonymous = openat(CWD, ".", OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC, Mode::RUSR | Mode::WUSR).unwrap();
+            let anonymous = openat(
+                CWD,
+                ".",
+                OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
             let transaction = EditTransaction::capture(Path::new("/target"), 128).unwrap();
             let mut staged = transaction.stage(&|_| false).unwrap();
             // Transfer our objects before dropping credentials. This also makes
@@ -1884,15 +2362,36 @@ mod tests {
             }
             // SAFETY: drop this isolated child's group/user privileges permanently.
             assert_eq!(unsafe { libc::setgid(65534) }, 0);
+            // SAFETY: this child permanently drops its remaining user privileges.
             assert_eq!(unsafe { libc::setuid(65534) }, 0);
-            #[repr(C)]
-            struct Header { version: u32, pid: i32 }
-            let header = Header { version: 0x2008_0522, pid: 0 };
+            let header = Header {
+                version: 0x2008_0522,
+                pid: 0,
+            };
             let mut capabilities = [0u32; 6];
             // SAFETY: these are the Linux v3 capget header and two data records.
-            assert_eq!(unsafe { libc::syscall(libc::SYS_capget, &raw const header, capabilities.as_mut_ptr()) }, 0);
+            assert_eq!(
+                // SAFETY: capget writes exactly the two initialized data records.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_capget,
+                        &raw const header,
+                        capabilities.as_mut_ptr(),
+                    )
+                },
+                0
+            );
             assert_eq!(capabilities[0] | capabilities[3], 0);
-            assert!(matches!(linkat(&anonymous, "", &staged.directory.file, "probe", AtFlags::EMPTY_PATH), Err(rustix::io::Errno::NOENT | rustix::io::Errno::PERM)));
+            assert!(matches!(
+                linkat(
+                    &anonymous,
+                    "",
+                    &staged.directory.file,
+                    "probe",
+                    AtFlags::EMPTY_PATH
+                ),
+                Err(rustix::io::Errno::NOENT | rustix::io::Errno::PERM)
+            ));
             staged.file.write_all(b"published").unwrap();
             staged.publish(&transaction.name, false).unwrap();
             drop(staged);
@@ -1901,8 +2400,9 @@ mod tests {
             assert_eq!(fs::read_dir("/").unwrap().count(), 0);
             return;
         }
-        if std::env::var_os("GITHUB_ACTIONS").is_none() { return; }
-        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("GITHUB_ACTIONS").is_none() {
+            return;
+        }
         let work = Workspace::new();
         fs::set_permissions(&work.0, fs::Permissions::from_mode(0o777)).unwrap();
         let result = std::process::Command::new("sudo")
@@ -1910,8 +2410,13 @@ mod tests {
             .arg(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])
             .env("A_EDIT_CHROOT", &work.0)
-            .output().unwrap();
-        assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
-
 }

@@ -4,13 +4,14 @@
 //!
 //! Storage workers capture a [`sys::fs::EditTransaction`], CPU workers match
 //! replacements and build the diff, then storage workers publish the result.
-//! A private staging namespace shields content until publication. Windows
-//! bounds the aggregate stream bytes and observes cancellation during copying.
-//! Publication replaces a regular file's name, preserving its metadata; links
-//! are rejected. The receipt promises atomic visibility, not power-loss
-//! durability. Identity and byte revalidation detect observed changes, without
-//! claiming compare-and-swap against an uncooperative writer in the final
-//! check/rename interval. New names are published exclusively.
+//! A private staging namespace shields content until publication. Metadata and
+//! stream copying are bounded and observe cancellation. Links are rejected.
+//! Receipts distinguish visibility, durability and conflict protection:
+//! exchange-and-verify, write denial, exclusive creation or revalidated rename.
+//! Exchange conflicts roll back when safe; rollback contention retains displaced
+//! data and reports its recovery path. A swap can be briefly visible before a
+//! conflict rolls back. Writes to old descriptors after a swap are not serialized,
+//! and neither the fallback nor write denial is a pathname compare-and-swap.
 
 use ext::{Configured, CwdOf, Extension, Need, Refused, Registrar, Table, Text, Tool as _};
 
@@ -27,12 +28,12 @@ impl Configured for Edit {
 
 impl Extension for Edit {
     const NAME: &'static str = "edit";
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
     type Needs = (Need<dyn CwdOf>, ());
 
     fn contribute(&self, r: &mut Registrar) {
         r.tool(tool::Edit)
             .fold::<tool::Seen>()
-            .text(Text::system("edit", 20, "`edit` changes a file by exact replacement: each `old` must appear exactly once in the file as it was before the call, so include enough of the text around it, and the edits of one call must not overlap. One edit with an empty `old` writes the whole file. Look at a file before editing it: an edit to a file that changed since this session last edited it fails until you look again. Edits atomically replace regular files, preserving metadata; symbolic links and multiple hard links are rejected. Observed concurrent changes cause a conflict; inspect the file and retry. Publication confirms visibility without promising power-loss durability.").for_tool(tool::Edit::NAME));
+            .text(Text::system("edit", 20, "`edit` changes a file by exact replacement: each `old` must appear exactly once in the file as it was before the call, so include enough of the text around it, and the edits of one call must not overlap. One edit with an empty `old` writes the whole file. Look at a file before editing it: an edit to a file that changed since this session last edited it fails until you look again. Edits atomically replace regular files, preserving metadata; symbolic links and multiple hard links are rejected. Observed concurrent changes cause a conflict; inspect the file and retry. The receipt identifies filesystem conflict protection; revalidated rename has a final check/rename window, and write denial does not exclude pathname replacement. An exchange conflict can be briefly visible before rollback; rollback contention reports retained data for recovery. Publication confirms visibility without promising power-loss durability.").for_tool(tool::Edit::NAME));
     }
 }
