@@ -10,7 +10,6 @@ default = ["threads"]
 # our own (the `blocking` crate's polls every 500 ms while idle).
 threads = ["dep:async-executor"]
 watch = ["dep:notify"]
-resource-allocations = []
 
 [dependencies]
 # Already linked by async-io; producer wake never waits on registration.
@@ -30,11 +29,6 @@ futures-lite = { version = "2", default-features = false }
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
-
-[dev-dependencies]
-stats_alloc = "0.1"
-futures-channel = "0.3"
-async-channel = "2"
 
 [lints]
 workspace = true
