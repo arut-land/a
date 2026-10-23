@@ -69,7 +69,7 @@ impl Dialect for PowerShell {
             // the next process's working directory. Explicit exit still runs finally.
             let _ = writeln!(
                 script,
-                "if ($PWD.Provider.Name -eq 'FileSystem') {{ [System.IO.File]::WriteAllText({}, $PWD.ProviderPath, [System.Text.UTF8Encoding]::new($false)) }}",
+                "try {{ if ($PWD.Provider.Name -eq 'FileSystem') {{ [System.IO.File]::WriteAllText({}, $PWD.ProviderPath, [System.Text.UTF8Encoding]::new($false)) }} }} catch {{ }}",
                 ps_quote(report)
             );
         }
