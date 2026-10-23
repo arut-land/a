@@ -120,6 +120,8 @@ header-decoding CPU is assessed separately by the corpus probe above.
 | x86_64-unknown-linux-gnu | 4207520 | 4260512 | +52992 |
 | aarch64-pc-windows-msvc | 4763136 | 4811264 | +48128 |
 | x86_64-pc-windows-msvc | 5411840 | 5468160 | +56320 |
+| aarch64-apple-darwin | 3263568 | 3296896 | +33328 |
+| x86_64-apple-darwin | 3908296 | 3957584 | +49288 |
 
 Median candidate-minus-reference deltas (observations, not speedup claims):
 
@@ -129,6 +131,8 @@ Median candidate-minus-reference deltas (observations, not speedup claims):
 | x86_64-unknown-linux-gnu | -0.011 | -0.008 | -0.036 | +0.014 | -32.000 | +18.542 | +32.000 |
 | aarch64-pc-windows-msvc | -0.069 | +0.000 | -3.939 | +0.022 | +0.000 | -109.375 | +36.000 |
 | x86_64-pc-windows-msvc | +0.248 | +0.000 | -0.622 | +0.016 | +32.000 | -62.500 | -256.000 |
+| aarch64-apple-darwin | +0.702 | +0.642 | +1.336 | -0.002 | +0.000 | +16.740 | -144.000 |
+| x86_64-apple-darwin | +0.307 | +0.167 | +9.076 | +0.032 | +40.000 | +715.450 | +8556.000 |
 
 | Native target | Large JSON CPU ms delta | Large JSON peak RSS KiB delta | Idle daemon CPU ms (main → candidate) | Idle line-client CPU ms (main → candidate) |
 | --- | ---: | ---: | ---: | ---: |
@@ -136,8 +140,18 @@ Median candidate-minus-reference deltas (observations, not speedup claims):
 | x86_64-unknown-linux-gnu | +46.727 | -120.000 | 0.000 → 0.000 | 0.000 → 0.000 |
 | aarch64-pc-windows-msvc | -46.875 | +56.000 | 0.000 → 0.000 | 0.000 → 0.000 |
 | x86_64-pc-windows-msvc | -187.500 | -56.000 | 0.000 → 0.000 | 0.000 → 0.000 |
+| aarch64-apple-darwin | +9.991 | -144.000 | 0.000 → 0.000 | 0.000 → 0.000 |
+| x86_64-apple-darwin | +1231.377 | -7484.000 | 0.000 → 0.000 | 0.000 → 0.000 |
 
 Short Windows startup CPU samples round to zero at the accounting clock's
 resolution; they are not proof of free startup. All other deltas should also
 be read with their distributions, not as performance wins. Raw p10–p90,
 all loaded workloads and all five rounds remain in each target's artifact.
+
+The largest driver median shift is Intel macOS: +715.45 ms CPU and +8556 KiB
+peak RSS. Both lie within the observed p10–p90 spreads (reference/candidate CPU
+spans 2663/2231 ms; RSS spans 12552/22492 KiB). The ARM macOS startup median
+increases 0.702 ms within a 1.96 ms candidate spread. These hosted observations
+do not establish a stable regression or improvement; the parser CPU comparison
+uses repeated corpus decoding rather than attributing empty-catalog startup to
+YAML work that did not execute.
