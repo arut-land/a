@@ -79,7 +79,7 @@ def main():
         delta = compare(value, previous)
         comparisons[name] = delta
         lines.append(f'| {name} | {value["median"]:.3f} | {value["p10"]:.3f}–{value["p90"]:.3f} | {value["min"]:.3f}–{value["max"]:.3f} | {delta} |')
-    lines += ["", "Idle CPU is accumulated OS user+kernel time over 10 seconds after 15 seconds settling in each of five fresh homes. RSS is sampled at three seconds. Zero means no counter increment at OS resolution. Client is the line REPL; native terminal first-paint/PTY gates remain in CI.", ""]
+    lines += ["", "Idle CPU is accumulated OS user+kernel time over 10 seconds after 15 seconds settling in each of five fresh homes. RSS is sampled at three seconds. Zero means no counter increment at OS resolution. Client is the line REPL; Unix terminal first-paint/PTY gates run separately in this workflow.", ""]
     paired_path = args.result.with_name("paired.json")
     if paired_path.exists():
         paired = json.loads(paired_path.read_text())

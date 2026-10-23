@@ -76,7 +76,7 @@ def windows_image(binary):
     return dict(headers=headers, dependencies=dependencies)
 
 
-def build(source, output, variant, benchmarks=True, packages=("engine", "protocol", "tui")):
+def build(source, output, variant, benchmarks=True, packages=("engine", "protocol", "llm", "tui")):
     config = list(variant.get("config", []))
     flags = variant.get("rustflags", [])
     if flags:
@@ -101,7 +101,8 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
         return
     run(["cargo", "build-release", "-p", "a", "--example", "perf-attach", *overrides], cwd=source, env=env)
     shutil.copy2(release / "examples" / ("perf-attach" + SUFFIX), output / ("perf-attach" + SUFFIX))
-    for package, target in [("engine", ["--lib"]), ("protocol", ["--test", "bench"]), ("tui", ["--lib"])]:
+    for package, target in [("engine", ["--lib"]), ("protocol", ["--test", "bench"]),
+                            ("llm", ["--test", "bench"]), ("tui", ["--lib"])]:
         if package not in packages:
             continue
         result = run(["cargo", "test", "--release", *STD, "-p", package, *target,
@@ -271,7 +272,7 @@ def paired(output, source, reference):
     root.mkdir(exist_ok=True)
     reference_output = root / "reference"
     reference_output.mkdir(exist_ok=True)
-    build(reference_source, reference_output, {}, packages=("engine",))
+    build(reference_source, reference_output, {}, packages=("engine", "llm"))
     builds = dict(reference=reference_output, candidate=output)
     values = {role: {} for role in builds}
     orders = []
@@ -309,6 +310,8 @@ def paired(output, source, reference):
                             "--ignored", "--nocapture", "--test-threads=1"], 1),
                 ("large_json", [str(directory / ("engine-bench" + SUFFIX)), "bench_large_tool_result",
                                 "--ignored", "--nocapture", "--test-threads=1"], 1),
+                ("llm_decode", [str(directory / ("llm-bench" + SUFFIX)), "decode_recorded",
+                                "--exact", "--ignored", "--nocapture", "--test-threads=1"], 1),
             ]:
                 path = saved / (name + ".json")
                 env = dict(os.environ)

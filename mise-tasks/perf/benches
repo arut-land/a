@@ -21,7 +21,7 @@ def main():
     parser.add_argument("transcript", type=Path)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--blackbox", type=Path)
-    parser.add_argument("--packages", default="engine,protocol,tui")
+    parser.add_argument("--packages", default="engine,protocol,llm,tui")
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/perf"))
     from process import run_timed
@@ -49,6 +49,7 @@ def main():
                     "bench_concurrent_session_commits", "bench_large_tool_result",
                     "concurrent_session_sizing"]),
         ("protocol", ["attach_to_a_logged_session"]),
+        ("llm", ["decode_recorded"]),
         ("tui", ["render_cost"]),
     ]:
         if package not in args.packages.split(","):

@@ -20,7 +20,6 @@ metadata = dict(revision=subprocess.check_output(["git", "rev-parse", "HEAD"], c
 for package, target, scenarios in [
     ("engine", ["--lib"], ["bench_turns_under_each_barrier_setting", "bench_large_tool_result"]),
     ("llm", ["--test", "bench"], ["decode_recorded"]),
-    ("protocol", ["--test", "bench"], ["attach_to_a_logged_session"]),
 ]:
     result = run(["cargo", "test", "--release", *STD, "-p", package, *target, "--no-run",
                   "--message-format=json", *[arg for config in metadata["config"] for arg in ("--config", config)]],
