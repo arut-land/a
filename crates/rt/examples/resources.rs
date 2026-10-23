@@ -65,6 +65,21 @@ fn main() {
         tx.unbounded_send(black_box(42u64)).unwrap();
         black_box(rx.try_recv().unwrap());
     });
+    measure("custom-bounded", || {
+        let (tx, rx) = rt::channel::bounded(2);
+        tx.send(black_box(42u64)).unwrap();
+        black_box(rx.try_recv());
+    });
+    measure("async-bounded", || {
+        let (tx, rx) = async_channel::bounded(2);
+        tx.send_blocking(black_box(42u64)).unwrap();
+        black_box(rx.try_recv().unwrap());
+    });
+    measure("futures-bounded", || {
+        let (mut tx, mut rx) = futures_channel::mpsc::channel(1);
+        tx.try_send(black_box(42u64)).unwrap();
+        black_box(rx.try_recv().unwrap());
+    });
     for batch in [1, 64, 1024] {
         let (tx, rx) = rt::channel::unbounded();
         pipeline(&format!("custom-unbounded-{batch}"), batch, || {

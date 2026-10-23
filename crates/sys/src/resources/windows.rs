@@ -1,4 +1,3 @@
-
 use windows_sys::Win32::System::{
     JobObjects::{
         JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_MIN_MAX_RATE,
@@ -42,7 +41,8 @@ pub(super) fn parallelism(mut count: usize) -> usize {
             } else {
                 rate.Anonymous.CpuRate as usize
             };
-            // CPU rate is a fraction of host capacity, not the affinity subset.
+            // An immediate job rate bounds host capacity. Parent-job rates
+            // require parent handles and are not exposed by this query.
             let host = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) as usize;
             count = count.min((host * maximum / 10_000).max(1));
         }
