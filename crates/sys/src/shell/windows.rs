@@ -246,6 +246,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shell_startup_probe() {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, WaitForSingleObject};
+        let Some(paths) = std::env::var_os("A_TEST_POWERSHELL") else {
+            return;
+        };
+        let executable = std::env::split_paths(&paths).last().unwrap();
+        for script in [
+            "Get-Variable PSStyle -ErrorAction Ignore; exit 37",
+            "Write-Output 'ok'; exit 37",
+            "Set-Location -LiteralPath $env:TEMP; exit 37",
+        ] {
+            for mode in ["inherit", "clear", "system", "noautoload"] {
+                let script = if mode == "noautoload" {
+                    format!("$PSModuleAutoLoadingPreference = 'None'; {script}")
+                } else {
+                    script.to_owned()
+                };
+                let mut command = Command::new(&executable);
+                command
+                    .args([
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        &script,
+                    ])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .current_dir(std::env::temp_dir());
+                if mode == "clear" {
+                    command.env_remove("PSModulePath");
+                }
+                if mode == "system" {
+                    command.env("PSModulePath", executable.parent().unwrap().join("Modules"));
+                }
+                let mut child = command.spawn().unwrap();
+                // SAFETY: the child owns the process handle for the bounded wait.
+                let timeout = unsafe { WaitForSingleObject(child.as_raw_handle(), 10000) } == 258;
+                if timeout {
+                    child.kill().unwrap();
+                }
+                let output = child.wait_with_output().unwrap();
+                eprintln!(
+                    "native {} {mode} {script:?}: timeout {timeout} exit {:?} out {:?} err {:?}",
+                    std::env::consts::ARCH,
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn system_bash_is_never_a_native_shell_candidate() {
         let root = std::env::temp_dir().join(format!("a-shell-discovery-{}", std::process::id()));
         let system = root.join("System32");
