@@ -32,4 +32,4 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           install_args: rust mr-boxington cargo:cargo-nextest
-      - run: mise exec -- cargo nextest run -p sys -p rt --features rt/watch -E 'test(watch::) | test(directory_watch::)' --no-fail-fast
+      - run: mise exec -- cargo nextest run -p sys -p rt --features rt/watch -E 'test(watch::) | test(directory_watch::)' --stress-count 200
