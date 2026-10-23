@@ -180,17 +180,13 @@ mod tests {
         let second = Awake::hold("another test hold").expect("an independent power request");
         let mut flags = 0;
         // SAFETY: the hold owns a live handle and flags is writable.
-        assert_ne!(
-            unsafe { GetHandleInformation(first.0.0.as_raw_handle(), &raw mut flags) },
-            0
-        );
+        let live = unsafe { GetHandleInformation(first.0.0.as_raw_handle(), &raw mut flags) };
+        assert_ne!(live, 0);
         assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
         drop(first);
         // SAFETY: dropping another hold cannot close this one's handle.
-        assert_ne!(
-            unsafe { GetHandleInformation(second.0.0.as_raw_handle(), &raw mut flags) },
-            0
-        );
+        let live = unsafe { GetHandleInformation(second.0.0.as_raw_handle(), &raw mut flags) };
+        assert_ne!(live, 0);
     }
 
     #[cfg(any(windows, target_vendor = "apple"))]
