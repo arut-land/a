@@ -252,35 +252,58 @@ mod tests {
     #[test]
     fn shell_startup_probe() {
         use std::os::windows::io::AsRawHandle;
-        use std::process::Command;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
         if std::env::var_os("A_TEST_POWERSHELL").is_none() {
             return;
         }
-        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
-        let powershell = system.join("WindowsPowerShell/v1.0/powershell.exe");
-        for machine in ["arm64", "amd64"] {
-            let mut command = Command::new(system.join("cmd.exe"));
-            command.args(["/d", "/c", "start", "", "/b", "/wait", "/machine", machine]);
-            command.arg(&powershell).args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::WriteLine('bits=' + [IntPtr]::Size); [Console]::WriteLine('arch=' + $env:PROCESSOR_ARCHITECTURE); Write-Output 'ok'; exit 37"])
-                .envs(std::env::vars_os()).current_dir(std::env::temp_dir());
-            let path = std::env::temp_dir().join(format!(
-                "a-shell-machine-{}-{machine}.log",
-                std::process::id()
-            ));
-            eprintln!("machine probe {machine}");
+        let executable = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        for (mode, prefix) in [
+            (
+                "path-after-startup",
+                "$env:PSModulePath = $PSHOME + '\\Modules'; ",
+            ),
+            ("cache-disabled", ""),
+            (
+                "explicit-core",
+                "Import-Module ($PSHOME + '\\Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop; ",
+            ),
+            ("version-expression", ""),
+        ] {
+            let body = if mode == "version-expression" {
+                "Write-Output $PSVersionTable.PSVersion.ToString(); exit 37"
+            } else {
+                "Write-Output 'ok'; exit 37"
+            };
+            let script = format!("[Console]::WriteLine($PSHOME); {prefix}{body}");
+            let mut command = std::process::Command::new(&executable);
+            command
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &script,
+                ])
+                .envs(std::env::vars_os())
+                .current_dir(std::env::temp_dir());
+            if mode == "cache-disabled" {
+                command.env("PSModuleAnalysisCachePath", "NUL");
+            }
+            let path = std::env::temp_dir()
+                .join(format!("a-shell-module-{}-{mode}.log", std::process::id()));
             let mut child =
                 crate::spawn_group(&mut command, std::fs::File::create(&path).unwrap()).unwrap();
             let watch = child.child.exit_watch().unwrap();
             // SAFETY: the owned watch remains live for the bounded wait.
-            let timeout = unsafe { WaitForSingleObject(watch.as_raw_handle(), 15000) } == 258;
+            let timeout = unsafe { WaitForSingleObject(watch.as_raw_handle(), 10000) } == 258;
             if timeout {
                 child.group.signal(crate::Signal::Kill).unwrap();
             }
             let status = child.child.wait().unwrap();
             drop(child);
             eprintln!(
-                "machine {machine}: timeout {timeout} exit {:?} out {:?}",
+                "module probe {mode}: timeout {timeout} exit {:?} out {:?}",
                 status.code(),
                 std::fs::read_to_string(&path)
             );
