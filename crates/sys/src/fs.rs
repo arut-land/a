@@ -381,11 +381,9 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     };
-    let written = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| publish(&tmp, path));
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
+    let written = written.and_then(|()| publish(&tmp, path));
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }

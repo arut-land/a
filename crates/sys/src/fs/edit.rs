@@ -6,9 +6,7 @@
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
-use std::path::Path;
-#[cfg(windows)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -70,7 +68,6 @@ pub struct EditReceipt {
 /// Retains the original handle and a pinned parent until publication or abort.
 pub struct EditTransaction {
     parent: File,
-    #[cfg(windows)]
     directory: PathBuf,
     name: OsString,
     source: Option<(File, Signature)>,
@@ -99,7 +96,6 @@ impl EditTransaction {
         let parent = open_parent(&directory)?;
         let mut transaction = Self {
             parent,
-            #[cfg(windows)]
             directory,
             name,
             source: None,
@@ -179,6 +175,11 @@ impl EditTransaction {
     }
 
     fn revalidate(&self) -> Result<(), EditError> {
+        let parent =
+            open_parent(&self.directory).map_err(|_| EditError::Conflict(EditConflict::Changed))?;
+        if !same_object(&self.parent, &parent)? {
+            return Err(EditError::Conflict(EditConflict::Changed));
+        }
         match (&self.source, self.open_source()) {
             (None, Err(EditError::Io(error))) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             (None, _) => Err(EditError::Conflict(EditConflict::Appeared)),
@@ -293,6 +294,20 @@ impl EditTransaction {
                 Err(error) => return Err(error),
             }
         }
+    }
+}
+
+fn same_object(left: &File, right: &File) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (left, right) = (left.metadata()?, right.metadata()?);
+        Ok((left.dev(), left.ino()) == (right.dev(), right.ino()))
+    }
+    #[cfg(windows)]
+    {
+        let (left, right) = (signature(left)?, signature(right)?);
+        Ok((left.volume, left.identity) == (right.volume, right.identity))
     }
 }
 
@@ -629,102 +644,150 @@ fn signature(file: &File) -> io::Result<Signature> {
 
 #[cfg(windows)]
 fn stage_windows(transaction: &EditTransaction, name: &std::ffi::OsStr) -> io::Result<File> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-        SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SetSecurityDescriptorControl,
-    };
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::{
-        COPY_FILE_COPY_SYMLINK, CREATE_NEW, CopyFileExW, CreateFileW, DELETE,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC, WRITE_OWNER,
+        COPY_FILE_COPY_SYMLINK, COPY_FILE_FAIL_IF_EXISTS, CopyFileExW, DELETE, WRITE_DAC,
+        WRITE_OWNER,
     };
     let destination = transaction.directory.join(name);
-    let target = crate::windows::wide(destination.as_os_str());
-    let mut descriptor = std::ptr::null_mut();
-    if let Some((source, _)) = &transaction.source {
-        // SAFETY: source owns its handle; the returned descriptor is freed below.
-        let status = unsafe {
-            GetSecurityInfo(
-                source.as_raw_handle(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &raw mut descriptor,
-            )
-        };
-        if status != 0 {
-            return Err(io::Error::from_raw_os_error(status.cast_signed()));
-        }
-        // The temporary file must not gain new ACEs from a directory whose
-        // inheritance policy changed since the original file was created.
-        // SAFETY: descriptor is the owned, mutable result of GetSecurityInfo.
-        let protected = crate::windows::ok(unsafe {
-            SetSecurityDescriptorControl(descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
-        });
-        if let Err(error) = protected {
-            // SAFETY: GetSecurityInfo allocated the descriptor with LocalAlloc.
-            unsafe {
-                LocalFree(descriptor);
-            }
-            return Err(error);
-        }
-    }
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).expect("fixed structure size"),
-        lpSecurityDescriptor: descriptor,
-        bInheritHandle: 0,
+    let access = GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
+    let Some((source, _)) = &transaction.source else {
+        return fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .access_mode(access)
+            .open(destination);
     };
-    // Denying delete sharing pins the exclusively created staging name during
-    // CopyFileEx. Its initial access policy is the source's, before any bytes.
-    // SAFETY: path and descriptor remain valid through CreateFileW; the handle is checked.
-    let opened = crate::windows::owned(unsafe {
-        CreateFileW(
-            target.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &raw const attributes,
-            CREATE_NEW,
-            FILE_FLAG_OPEN_REPARSE_POINT,
+    let context = std::sync::Mutex::new(CopyContext {
+        source,
+        destination: None,
+        error: None,
+    });
+    let from = crate::windows::wide(transaction.directory.join(&transaction.name).as_os_str());
+    let to = crate::windows::wide(destination.as_os_str());
+    // The first stream-switch callback applies the source access policy before
+    // content is copied. Keeping only attribute/security access during copying
+    // avoids conflicting with CopyFileEx's data-sharing contract.
+    // SAFETY: paths and context live through this synchronous call; the callback
+    // retains owned reopened handles rather than the copier's borrowed handles.
+    let copied = crate::windows::ok(unsafe {
+        CopyFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            Some(copy_progress),
+            (&raw const context).cast(),
             std::ptr::null_mut(),
+            COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_COPY_SYMLINK,
         )
     });
-    if !descriptor.is_null() {
-        // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
-        unsafe {
-            LocalFree(descriptor);
-        }
-    }
-    let file = File::from(opened?);
-    if transaction.source.is_some() {
-        let source =
-            crate::windows::wide(transaction.directory.join(&transaction.name).as_os_str());
-        // CopyFileEx retains attributes, EAs and alternate streams. The destination
-        // is already exclusively owned and cannot be renamed or replaced here.
-        // SAFETY: paths are terminated and alive; optional callback/state are null.
-        let result = crate::windows::ok(unsafe {
-            CopyFileExW(
-                source.as_ptr(),
-                target.as_ptr(),
-                None,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                COPY_FILE_COPY_SYMLINK,
-            )
-        });
-        if let Err(error) = result {
-            drop(file);
+    let mut context = context
+        .into_inner()
+        .map_err(|_| io::Error::other("native copy callback panicked"))?;
+    if let Err(error) = copied {
+        let error = context.error.take().unwrap_or(error);
+        let owned = context.destination.is_some();
+        drop(context);
+        if owned {
             remove_pending(&destination);
-            // Only CREATE_NEW collisions may retry with another staging name.
-            // A changed source link can make the copy itself report EEXIST.
-            return Err(io::Error::other(error));
+        }
+        // Only exclusive-create collisions may retry with a fresh name.
+        return if error.kind() == io::ErrorKind::AlreadyExists && !owned {
+            Err(error)
+        } else {
+            Err(io::Error::other(error))
+        };
+    }
+    let Some(keeper) = context.destination else {
+        remove_pending(&destination);
+        return Err(io::Error::other("native copy omitted its stream callback"));
+    };
+    // Reopen the pinned object after the copier closes its data handle. This
+    // grants DELETE for handle-based publication without reopening a pathname.
+    match reopen(keeper.as_raw_handle(), access) {
+        Ok(file) => Ok(file),
+        Err(error) => {
+            drop(keeper);
+            remove_pending(&destination);
+            Err(error)
         }
     }
-    Ok(file)
+}
+
+#[cfg(windows)]
+struct CopyContext<'a> {
+    source: &'a File,
+    destination: Option<File>,
+    error: Option<io::Error>,
+}
+
+#[cfg(windows)]
+fn reopen(handle: windows_sys::Win32::Foundation::HANDLE, access: u32) -> io::Result<File> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+    };
+    // SAFETY: callers keep the borrowed handle alive; the returned handle is checked and owned.
+    Ok(File::from(crate::windows::owned(unsafe {
+        ReOpenFile(
+            handle,
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    })?))
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn copy_progress(
+    _: i64,
+    _: i64,
+    _: i64,
+    _: i64,
+    _: u32,
+    reason: u32,
+    source: windows_sys::Win32::Foundation::HANDLE,
+    destination: windows_sys::Win32::Foundation::HANDLE,
+    data: *const std::ffi::c_void,
+) -> u32 {
+    use windows_sys::Win32::Storage::FileSystem::{
+        CALLBACK_STREAM_SWITCH, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES, PROGRESS_CANCEL,
+        PROGRESS_CONTINUE, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    };
+    if reason != CALLBACK_STREAM_SWITCH {
+        return PROGRESS_CONTINUE;
+    }
+    // SAFETY: context lives until CopyFileEx returns. A mutex also permits
+    // callback delivery from native workers without aliasing mutable state.
+    let context = unsafe { &*data.cast::<std::sync::Mutex<CopyContext<'_>>>() };
+    let Ok(mut context) = context.lock() else {
+        return PROGRESS_CANCEL;
+    };
+    if context.destination.is_none() {
+        let result = (|| {
+            let copied_source = reopen(source, FILE_READ_ATTRIBUTES)?;
+            if !same_object(context.source, &copied_source)? {
+                return Err(io::Error::other("edit source changed during native copy"));
+            }
+            let keeper = reopen(
+                destination,
+                FILE_READ_ATTRIBUTES
+                    | FILE_WRITE_ATTRIBUTES
+                    | READ_CONTROL
+                    | WRITE_DAC
+                    | WRITE_OWNER,
+            )?;
+            copy_access_policy(context.source, &keeper, true)?;
+            context.destination = Some(keeper);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            context.error = Some(error);
+            return PROGRESS_CANCEL;
+        }
+    }
+    PROGRESS_CONTINUE
 }
 
 #[cfg(windows)]
@@ -747,15 +810,6 @@ fn remove_pending(path: &Path) {
 #[cfg(windows)]
 fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
-    };
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetSecurityDescriptorControl,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-        UNPROTECTED_DACL_SECURITY_INFORMATION,
-    };
     use windows_sys::Win32::Storage::FileSystem::SetFileTime;
     let creation = windows_information(source)?.ftCreationTime;
     // SAFETY: destination owns the handle; null preserves access/write times.
@@ -767,6 +821,21 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
             std::ptr::null(),
         )
     })?;
+    copy_access_policy(source, destination, false)
+}
+
+#[cfg(windows)]
+fn copy_access_policy(source: &File, destination: &File, protect: bool) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetSecurityDescriptorControl,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
     let (mut owner, mut group, mut dacl, mut descriptor) = (
         std::ptr::null_mut(),
         std::ptr::null_mut(),
@@ -801,7 +870,7 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
             &raw mut revision,
         ))
         .and_then(|()| {
-            let protection = if control & SE_DACL_PROTECTED != 0 {
+            let protection = if protect || control & SE_DACL_PROTECTED != 0 {
                 PROTECTED_DACL_SECURITY_INFORMATION
             } else {
                 UNPROTECTED_DACL_SECURITY_INFORMATION
@@ -920,6 +989,17 @@ mod tests {
         reader.read_to_string(&mut old).unwrap();
         assert_eq!(old, "original");
         assert_eq!(fs::read(work.target()).unwrap(), b"replacement");
+        work.only_target_remains();
+    }
+
+    #[test]
+    fn empty_files_and_shorter_replacements_have_exact_contents() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"").unwrap();
+        for content in [b"longer content".as_slice(), b"x", b""] {
+            work.capture().publish(content, false).unwrap();
+            assert_eq!(fs::read(work.target()).unwrap(), content);
+        }
         work.only_target_remains();
     }
 
@@ -1095,7 +1175,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn replacing_the_parent_cannot_redirect_a_transaction() {
+    fn replacing_the_parent_is_a_conflict_without_redirecting_the_write() {
         let work = Workspace::new();
         let parent = work.0.join("parent");
         let moved = work.0.join("moved");
@@ -1105,9 +1185,12 @@ mod tests {
         fs::rename(&parent, &moved).unwrap();
         fs::create_dir(&parent).unwrap();
         fs::write(parent.join("file"), b"unrelated").unwrap();
-        transaction.publish(b"edited", false).unwrap();
+        assert!(matches!(
+            transaction.publish(b"edited", false),
+            Err(EditError::Conflict(EditConflict::Changed))
+        ));
         assert_eq!(fs::read(parent.join("file")).unwrap(), b"unrelated");
-        assert_eq!(fs::read(moved.join("file")).unwrap(), b"edited");
+        assert_eq!(fs::read(moved.join("file")).unwrap(), b"original");
     }
 
     #[cfg(unix)]
