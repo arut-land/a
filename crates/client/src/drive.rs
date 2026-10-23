@@ -923,7 +923,7 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            self.home.endpoint().remove();
+            self.listener.retirement().unwrap().retire().unwrap();
             std::fs::remove_dir_all(&self.root).unwrap();
         }
     }

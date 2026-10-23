@@ -50,6 +50,6 @@ fn adoption_never_double_closes() {
     drop(listener.accept().unwrap());
     assert!(sys::Listener::adopt(original.try_clone().unwrap(), &home.endpoint()).is_err());
     assert!(original.metadata().is_ok());
-    home.endpoint().remove();
+    listener.retirement().unwrap().retire().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }

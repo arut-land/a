@@ -833,7 +833,7 @@ mod tests {
                 Err(e) => panic!("{e}"),
             }
         }
-        home.endpoint().remove();
+        listener.retirement().unwrap().retire().unwrap();
         std::fs::remove_dir_all(&root).unwrap();
         assert!(taken >= 64 << 10, "{taken} bytes before it would block");
     }

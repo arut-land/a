@@ -77,7 +77,7 @@ pub struct Listener {
     state: Mutex<Accept>,
     event: OwnedHandle,
     nonblocking: AtomicBool,
-    _claim: Arc<Mutex<Option<File>>>,
+    claim: Arc<Mutex<Option<File>>>,
     retirement_taken: AtomicBool,
 }
 
@@ -139,7 +139,7 @@ pub fn bind(path: &Path, _link: &Path) -> io::Result<Listener> {
         .open(path.with_extension("endpoint-lock"))?;
     let name = generation(&crate::crash::Record::current(""), root)?;
     let listener = listener(instance(&name, true)?, &name)?;
-    *lock(&listener._claim) = Some(claim);
+    *lock(&listener.claim) = Some(claim);
     Ok(listener)
 }
 
@@ -152,7 +152,7 @@ fn listener(file: Arc<File>, path: &Path) -> io::Result<Listener> {
         }),
         event: event()?,
         nonblocking: AtomicBool::new(false),
-        _claim: Arc::new(Mutex::new(None)),
+        claim: Arc::new(Mutex::new(None)),
         retirement_taken: AtomicBool::new(false),
     })
 }
@@ -182,12 +182,14 @@ pub fn retirement(listener: &Listener) -> io::Result<Retirement> {
             "endpoint retirement already taken",
         ));
     }
-    Ok(Retirement(Arc::clone(&listener._claim)))
+    Ok(Retirement(Arc::clone(&listener.claim)))
 }
 
 #[allow(clippy::unnecessary_wraps, reason = "Unix unlinks its socket")]
 pub fn retire(retirement: Retirement) -> io::Result<()> {
-    lock(&retirement.0).take();
+    let Retirement(claim) = retirement;
+    lock(&claim).take();
+    drop(claim);
     Ok(())
 }
 
