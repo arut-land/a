@@ -2057,6 +2057,8 @@ version = "0.0.0"
 dependencies = [
  "dispatch2",
  "libc",
+ "objc2-core-foundation",
+ "objc2-io-kit",
  "rustix",
  "serde",
  "serde_json",

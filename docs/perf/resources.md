@@ -53,10 +53,15 @@ parent handles and cannot be discovered through the public current-job query;
 this is an approximation in nested quota hierarchies. No thread is pinned to a
 guessed performance or efficiency core.
 
-Windows and macOS disk classification uses maintained `sysinfo` with only its
-`disk` feature and kind refresh enabled. It owns the native IOCTL and IOKit
-integration; process sampling, periodic refresh, capacity and I/O-rate refresh
-are disabled. The longest canonical mount prefix selects the store's disk.
+Windows disk classification uses maintained `sysinfo` with only its `disk`
+feature and kind refresh enabled. The longest canonical mount prefix selects
+the store's disk; process, capacity and I/O-rate refresh are disabled. macOS
+uses `statfs` for that mount and maintained `objc2-io-kit`/Core Foundation
+bindings to find its backing medium through the IOKit parent tree. An initial
+all-mount `sysinfo` implementation increased Apple silicon idle RSS from 8656
+to 10608 KiB and cold reply latency by 42% in the paired hosted trial below;
+the selected-device query avoids CFURL's process caches. Unknown media remains
+explicit rather than guessing that a virtual or network mount is an SSD.
 
 macOS blocking jobs use scoped user-initiated QoS; catalog recovery temporarily
 uses utility QoS. The thread-bound guard restores the enclosing class even when
@@ -167,6 +172,7 @@ Idle RSS is sampled after three seconds. Idle CPU is a ten-second native counter
 
 | Target | Shipped bytes, main → candidate | Idle RSS, KiB main → candidate | Idle CPU, ms main → candidate | Cold reply delta | Attach p99 delta |
 | --- | ---: | ---: | ---: | ---: | ---: |
+| macOS aarch64 | 3,263,568 → 3,316,016 | 8656 → 10608 | 0.000 → 0.000 | +41.61% | +47.79% |
 | Linux aarch64 GNU | 3,626,792 → 3,663,272 | 6300 → 6332 | 0.000 → 0.000 | +0.05% | -0.46% |
 | Linux x86_64 GNU | 4,207,520 → 4,248,480 | 7312 → 7392 | 0.000 → 0.000 | +2.36% | -0.20% |
 | Windows aarch64 | 4,763,136 → 4,816,896 | 9648 → 9728 | 0.000 → 0.000 | +2.24% | -5.16% |
@@ -174,6 +180,7 @@ Idle RSS is sampled after three seconds. Idle CPU is a ten-second native counter
 
 | Target | Driver CPU delta | Driver peak RSS delta | Large-JSON CPU delta | Large-JSON peak RSS delta | Decode control CPU delta |
 | --- | ---: | ---: | ---: | ---: | ---: |
+| macOS aarch64 | +2.62% | +0.08% | +12.58% | -0.01% | -17.25% |
 | Linux aarch64 GNU | +0.87% | -0.01% | +1.67% | -0.80% | +2.27% |
 | Linux x86_64 GNU | +3.73% | -0.03% | +1.45% | +0.06% | +1.43% |
 | Windows aarch64 | +1.95% | +0.01% | +0.60% | +0.02% | -0.72% |

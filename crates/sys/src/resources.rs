@@ -85,7 +85,11 @@ pub fn storage(path: &Path) -> Storage {
         }
         Storage::Unknown
     }
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::storage(path)
+    }
+    #[cfg(windows)]
     {
         let Ok(path) = path.canonicalize() else {
             return Storage::Unknown;
@@ -184,6 +188,8 @@ unsafe extern "C" {
     fn pthread_set_qos_class_self_np(class: u32, relative: i32) -> i32;
 }
 
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod windows;
 

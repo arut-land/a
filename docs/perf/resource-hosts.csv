@@ -1,4 +1,5 @@
 runner,platform,machine,hardware
+macos-latest,macOS-26.6.2-arm64-arm-64bit-Mach-O,arm64,"{""cores"": 3, ""image"": ""macos26"", ""image_version"": ""20261013.0424.1"", ""processor"": ""Apple M1 (Virtual)"", ""python"": ""3.13.16 (v3.13.16:cbc944f4bc5, Sep 30 2026, 16:01:51) [Clang 21.0.0 (clang-2100.1.1.101)]""}"
 ubuntu-24.04-arm,Linux-6.17.0-1022-azure-aarch64-with-glibc2.39,aarch64,"{""cores"": 4, ""image"": ""ubuntu24-arm64"", ""image_version"": ""20261023.149.3"", ""processor"": ""aarch64"", ""python"": ""3.13.16 (main, Oct  1 2026, 02:38:15) [GCC 13.3.0]""}"
 ubuntu-latest,Linux-6.17.0-1022-azure-x86_64-with-glibc2.39,x86_64,"{""cores"": 4, ""image"": ""ubuntu24"", ""image_version"": ""20261012.334.1"", ""processor"": ""AMD EPYC 9V74 80-Core Processor"", ""python"": ""3.13.16 (main, Oct  1 2026, 02:37:54) [GCC 13.3.0]""}"
 windows-11-arm,Windows-11-10.0.26200-SP0,ARM64,"{""cores"": 4, ""image"": ""win11-vs2026-arm64"", ""image_version"": ""20261021.192.1"", ""processor"": ""ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION"", ""python"": ""3.13.16 (tags/v3.13.16:cbc944f, Sep 30 2026, 19:45:15) [MSC v.1944 64 bit (ARM64)]""}"
