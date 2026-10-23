@@ -169,11 +169,13 @@ Idle RSS is sampled after three seconds. Idle CPU is a ten-second native counter
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Linux aarch64 GNU | 3,626,792 → 3,663,272 | 6300 → 6332 | 0.000 → 0.000 | +0.05% | -0.46% |
 | Linux x86_64 GNU | 4,207,520 → 4,248,480 | 7312 → 7392 | 0.000 → 0.000 | +2.36% | -0.20% |
+| Windows aarch64 | 4,763,136 → 4,816,896 | 9648 → 9728 | 0.000 → 0.000 | +2.24% | -5.16% |
 
 | Target | Driver CPU delta | Driver peak RSS delta | Large-JSON CPU delta | Large-JSON peak RSS delta | Decode control CPU delta |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Linux aarch64 GNU | +0.87% | -0.01% | +1.67% | -0.80% | +2.27% |
 | Linux x86_64 GNU | +3.73% | -0.03% | +1.45% | +0.06% | +1.43% |
+| Windows aarch64 | +1.95% | +0.01% | +0.60% | +0.02% | -0.72% |
 
 The decode control uses unchanged provider-decoder code. The tables retain small shifts rather than classifying every median difference as a performance win or loss. The many-core ceiling is a concurrency bound; these three/four-CPU VMs do not establish physical many-core throughput.
 
