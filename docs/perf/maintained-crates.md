@@ -51,7 +51,7 @@ exclusivity also verifies default disposition restoration and CLOEXEC.
 
 Use `tempfile` 3.27 with default features disabled in test infrastructure.
 The shared extension rig owns a `TempDir` until its process cleanup completes.
-Store and acceptance helpers use exclusive temporary directory creation and
+Store, engine, client, FFI, shell-output and crash-test helpers use exclusive temporary directory creation and
 transfer cleanup ownership with `keep()`: stores already own cleanup, and the
 acceptance harness must stop daemons and retry Windows handle release before
 removing homes. CI's RUNNER_TEMP preference remains explicit.
@@ -75,7 +75,7 @@ claim follows from test-helper timings.
 
 The acceptance harness retains its cross-process warm-up lock: its stable name
 coordinates different test processes, unlike a temporary isolated directory.
-Other individual tests still using incidental paths are not a new shared helper.
+Path/backend-specific fixtures and watcher fixtures remain with their owning sessions; individual incidental paths are not a new shared temporary-directory abstraction.
 
 ## Custom pieces retained for non-size reasons
 
@@ -87,3 +87,17 @@ producer work limits (see [logging.md](logging.md)); log/tracing do not provide
 that contract alone. The MCP subset implements byte/page limits and cancellation
 on the existing transport (see [mcp.md](mcp.md)). None is retained because a
 maintained crate adds executable bytes. This change does not modify those seams.
+
+## Hosted temporary-directory observation
+
+Linux x86_64, five rounds of 10,000 create/drop pairs:
+
+| Helper | Probe bytes | ns/pair | Sampled RSS KiB |
+| --- | ---: | ---: | ---: |
+| temp-custom | 93776 | 46401 | 1868 |
+| temp-maintained | 108976 | 55499 | 1824 |
+
+The observed tempfile cost is 9.10 µs/pair; the small RSS difference is not a
+memory-saving claim. Exclusive creation and workspace ownership remove real
+collision/deletion failure modes. Both implementations have zero idle work,
+and neither helper is linked into the shipped executable.

@@ -368,6 +368,7 @@ dependencies = [
  "rt",
  "serde_json",
  "sys",
+ "tempfile",
 ]
 
 [[package]]
@@ -714,6 +715,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sys",
+ "tempfile",
  "vte",
 ]
 
@@ -770,6 +772,7 @@ dependencies = [
  "rt",
  "serde_json",
  "sys",
+ "tempfile",
  "uuid",
 ]
 
@@ -2052,6 +2055,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "toml_edit 0.25.17+spec-1.1.0",
  "windows-sys 0.61.2",
 ]

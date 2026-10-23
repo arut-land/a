@@ -47,3 +47,30 @@ reported per native target; no local release builds or timing runs are used.
 Sources: [yaml-rust2 event API](https://docs.rs/yaml-rust2/0.13.0/yaml_rust2/parser/struct.Parser.html),
 [saphyr](https://docs.rs/saphyr/0.2.2/saphyr/),
 [serde_yaml_ng](https://docs.rs/serde_yaml_ng/0.10.0/serde_yaml_ng/).
+
+## Hosted parser observations
+
+Linux x86_64, nightly-2026-10-17, five rounds per candidate, all 17 recorded
+headers matched. The table reports median ns/header and median sampled peak
+process RSS; executable bytes are exact standalone probe sizes. These do not
+replace the full shipped-binary measurements.
+
+| Parser | Probe bytes | ns/header | Sampled RSS KiB |
+| --- | ---: | ---: | ---: |
+| custom | 145688 | 4825 | 1888 |
+| event | 182872 | 14354 | 1940 |
+| serde | 226128 | 11111 | 2012 |
+| yaml | 223120 | 14615 | 1984 |
+| saphyr | 228696 | 16277 | 2004 |
+
+The event adapter adds 9.53 µs/header and 52 KiB sampled RSS versus the custom
+subset on this runner. Its standalone executable grows 37,184 bytes. The
+maintained parser costs more CPU than the subset, but removes bespoke YAML
+syntax handling while keeping explicit resource admission. For occasional
+bounded header decoding, this is proportionate. The tree loader retains more
+metadata, and serde_yaml_ng's smaller CPU time does not supply the same
+application rejection boundary.
+
+The enabled production graph adds four packages: yaml-rust2, arraydeque,
+hashlink and foldhash. hashbrown was already resolved. The complete standalone
+normal dependency trees are in the workflow JSON artifact.

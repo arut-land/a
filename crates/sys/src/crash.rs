@@ -468,8 +468,11 @@ mod tests {
     use super::*;
 
     fn home(name: &str) -> Home {
-        let root = std::env::temp_dir().join(format!("a-crash-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = tempfile::Builder::new()
+            .prefix(&format!("a-crash-{name}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         fs::create_dir_all(root.join("run")).unwrap();
         Home::from(root)
     }
