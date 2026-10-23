@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 mod backend;
 
@@ -43,6 +44,7 @@ pub struct Watcher {
     recursive: Option<backend::Backend>,
     watched: BTreeMap<PathBuf, bool>,
     spawn: Spawn,
+    recovery: Arc<Recovery>,
     #[cfg(target_os = "macos")]
     parents: Vec<Parent>,
 }
@@ -53,21 +55,54 @@ impl Watcher {
         roots: impl IntoIterator<Item = impl AsRef<Path>>,
         changed: impl Fn(WatchEvent) + Send + Sync + 'static,
     ) -> io::Result<Self> {
+        let changed: Changed = Arc::new(changed);
+        let recovery = Arc::new(Recovery {
+            spawn: spawn.clone(),
+            changed: changed.clone(),
+            timer: Mutex::default(),
+            closed: AtomicBool::new(false),
+        });
         let mut watcher = Self {
             roots: roots.into_iter().map(|p| p.as_ref().to_owned()).collect(),
-            changed: Arc::new(changed),
+            changed,
             invalidated: Arc::new(AtomicBool::new(true)),
             recursive: None,
             watched: BTreeMap::new(),
             spawn,
+            recovery,
             #[cfg(target_os = "macos")]
             parents: Vec::new(),
         };
-        watcher.refresh()?;
+        let _ = watcher.refresh();
         Ok(watcher)
     }
 
     pub fn refresh(&mut self) -> io::Result<()> {
+        self.refresh_using(backend::Backend::new)
+    }
+
+    fn refresh_using(
+        &mut self,
+        mut arm: impl FnMut(&Spawn, &BTreeMap<PathBuf, bool>, &Changed) -> io::Result<backend::Backend>,
+    ) -> io::Result<()> {
+        let result = self.rearm(&mut arm);
+        match &result {
+            Ok(()) => self.recovery.healthy(),
+            Err(error) if self.recovery.start() => {
+                (self.changed)(WatchEvent::Unavailable(io::Error::new(
+                    error.kind(),
+                    error.to_string(),
+                )));
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    fn rearm(
+        &mut self,
+        arm: &mut impl FnMut(&Spawn, &BTreeMap<PathBuf, bool>, &Changed) -> io::Result<backend::Backend>,
+    ) -> io::Result<()> {
         for _ in 0..8 {
             let (wanted, parents) = self.paths();
             if !self.invalidated.swap(false, Ordering::AcqRel) && wanted == self.watched {
@@ -80,7 +115,7 @@ impl Watcher {
                 let watcher = if wanted.is_empty() {
                     None
                 } else {
-                    let watcher = backend::Backend::new(&self.spawn, &wanted, &changed)?;
+                    let watcher = arm(&self.spawn, &wanted, &changed)?;
                     Some(watcher)
                 };
                 #[cfg(target_os = "macos")]
@@ -145,6 +180,7 @@ impl Watcher {
         let roots = Arc::clone(&self.roots);
         let invalidated = Arc::clone(&self.invalidated);
         let changed = Arc::clone(&self.changed);
+        let recovery = self.recovery.clone();
         Arc::new(move |event| {
             let rearm = match &event {
                 WatchEvent::Changed(paths) => paths
@@ -155,8 +191,71 @@ impl Watcher {
             if rearm {
                 invalidated.store(true, Ordering::Release);
             }
+            if matches!(event, WatchEvent::Unavailable(_)) {
+                let _ = recovery.start();
+            }
             changed(event);
         })
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.recovery.closed.store(true, Ordering::Release);
+        self.recovery.healthy();
+    }
+}
+
+struct Recovery {
+    spawn: Spawn,
+    changed: Changed,
+    timer: Mutex<Option<Arc<crate::Wakeup>>>,
+    closed: AtomicBool,
+}
+
+impl Recovery {
+    fn healthy(&self) {
+        if let Some(stop) = self.timer.lock().unwrap().take() {
+            stop.notify();
+        }
+    }
+
+    fn start(self: &Arc<Self>) -> bool {
+        let mut timer = self.timer.lock().unwrap();
+        if timer.is_some() || self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        let stop = Arc::new(crate::Wakeup::new());
+        *timer = Some(stop.clone());
+        let weak = Arc::downgrade(self);
+        (self.spawn)(Box::pin(async move {
+            let mut delay = Duration::from_millis(100);
+            loop {
+                let due = crate::or(
+                    async {
+                        crate::Reactor::AsyncIo.sleep(delay).await;
+                        true
+                    },
+                    async {
+                        stop.wait().await;
+                        false
+                    },
+                )
+                .await;
+                if !due {
+                    break;
+                }
+                let Some(recovery) = weak.upgrade() else {
+                    break;
+                };
+                if recovery.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                (recovery.changed)(WatchEvent::Rescan);
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+        }));
+        true
     }
 }
 
@@ -285,6 +384,66 @@ mod tests {
         fs::write(&path, "observable").unwrap();
         changed(&mut watcher, &recv, &path, true);
         drop(watcher);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unavailable_subscriptions_retry_failed_rearms_without_filesystem_callbacks() {
+        let root = std::env::temp_dir().join(format!("a-watch-recover-{}", std::process::id()));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let runtime: crate::Rt = Arc::new(crate::Threads::new(1));
+        let (send, recv) = mpsc::channel();
+        let mut watcher = Watcher::new(
+            Arc::new(move |task| runtime.spawn(task)),
+            [&root],
+            move |event| {
+                let _ = send.send(event);
+            },
+        )
+        .unwrap();
+        watcher.callback()(WatchEvent::Unavailable(io::Error::other("lost watch")));
+        assert!(matches!(
+            recv.recv_timeout(Duration::from_secs(3)).unwrap(),
+            WatchEvent::Unavailable(_)
+        ));
+        assert!(
+            watcher
+                .refresh_using(|_, _, _| Err(io::Error::new(io::ErrorKind::WouldBlock, "busy")))
+                .is_err()
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if matches!(
+                recv.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap(),
+                WatchEvent::Rescan
+            ) {
+                break;
+            }
+        }
+        watcher.refresh().unwrap();
+        assert!(watcher.recovery.timer.lock().unwrap().is_none());
+        let no_rescan = || {
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while let Ok(event) =
+                recv.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                assert!(!matches!(event, WatchEvent::Rescan));
+            }
+        };
+        no_rescan();
+        let path = root.join("nested/after-recovery");
+        fs::write(&path, "observed").unwrap();
+        changed(&mut watcher, &recv, &path, true);
+        let recovery = watcher.recovery.clone();
+        watcher.callback()(WatchEvent::Unavailable(io::Error::other(
+            "cancel pending retry",
+        )));
+        let _ = recv.recv_timeout(Duration::from_secs(3)).unwrap();
+        drop(watcher);
+        assert!(recovery.timer.lock().unwrap().is_none());
+        no_rescan();
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -715,13 +715,27 @@ fn generation_adoption_rearms_deferred_sync_for_later_mutations() {
 }
 
 #[test]
-fn a_restored_fold_replays_changes_missing_from_the_checkpoint() {
+fn a_generation_omitting_a_fold_retains_its_value_through_a_checkpoint() {
     let mut h = ManualSession::with_registry(reload_registry(1, 1, false));
     let _ack = h.note();
     h.complete();
     h.snapshot();
     h.replace(Registry::default().with(&Agents).unwrap());
     h.snapshot();
+    let states = h.session.session.state_view();
+    assert!(!lock(&states).registered("test", "value"));
+    let image = lock(&states).image().unwrap();
+    assert_eq!(
+        image
+            .folds
+            .iter()
+            .find(|f| f.ext == "test" && f.state == "value")
+            .unwrap()
+            .image
+            .parse::<u64>()
+            .unwrap(),
+        1
+    );
     h.replace(reload_registry(1, 1, false));
     h.request("adopt");
     h.assert_replay(&reload_registry(1, 1, false));

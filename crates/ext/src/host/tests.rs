@@ -546,6 +546,7 @@ struct TestLayer {
     value: std::sync::atomic::AtomicU32,
     scans: std::sync::atomic::AtomicUsize,
     fail: std::sync::atomic::AtomicBool,
+    busy: std::sync::atomic::AtomicBool,
     changed: Mutex<Option<Arc<Changed>>>,
     during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -563,15 +564,18 @@ impl GenerationLayer for TestLayer {
         _: &Registry,
         _: Option<&PreparedLayer>,
         _: bool,
-    ) -> Result<PreparedLayer, Refused> {
+    ) -> Result<PreparedLayer, PrepareError> {
         use std::sync::atomic::Ordering::SeqCst;
         self.scans.fetch_add(1, SeqCst);
         let during = self.during.lock().unwrap().take();
         if let Some(during) = during {
             during();
         }
+        if self.busy.load(SeqCst) {
+            return Err(PrepareError::Retry(Refused("source busy".into())));
+        }
         if self.fail.load(SeqCst) {
-            return Err(Refused("invalid source".into()));
+            return Err(Refused("invalid source".into()).into());
         }
         Ok(PreparedLayer {
             inputs: Arc::new(()),
@@ -583,6 +587,9 @@ impl GenerationLayer for TestLayer {
                 }),
             )],
         })
+    }
+    fn delay(&self, duration: Duration) -> BoxFuture<'static, ()> {
+        rt::Reactor::AsyncIo.sleep(duration)
     }
     fn restore(&self, own_image: &[Installed]) -> Result<Registrations, Refused> {
         let [image] = own_image else {
@@ -733,6 +740,46 @@ fn event_bursts_schedule_one_pending_rebuild() {
     drop(retained);
     drop(workspace);
     assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn transient_reads_recover_without_another_callback_and_stop_when_healthy_or_dropped() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let layer = Arc::new(TestLayer {
+        name: "recover",
+        ..TestLayer::default()
+    });
+    let coordinator = Coordinator::new(Registry::default(), vec![layer.clone()]);
+    let runtime: rt::Rt = Arc::new(rt::Threads::new(1));
+    let (send, recv) = std::sync::mpsc::channel();
+    let workspace = coordinator
+        .open(
+            Path::new("/recover"),
+            Arc::new(move |task| runtime.spawn(task)),
+            Arc::new(move |work| {
+                let _ = send.send(work);
+            }),
+        )
+        .unwrap();
+    let changed = layer.changed.lock().unwrap().clone().unwrap();
+    layer.value.store(1, SeqCst);
+    layer.busy.store(true, SeqCst);
+    changed();
+    for _ in 0..3 {
+        recv.recv_timeout(Duration::from_secs(3)).unwrap()();
+        assert_eq!(workspace.snapshot().id, 1);
+    }
+    layer.busy.store(false, SeqCst); // Releasing a sharing conflict emits no callback.
+    recv.recv_timeout(Duration::from_secs(3)).unwrap()();
+    assert_eq!(workspace.snapshot().id, 2);
+    assert!(recv.recv_timeout(Duration::from_millis(500)).is_err());
+    layer.busy.store(true, SeqCst);
+    changed();
+    recv.recv_timeout(Duration::from_secs(3)).unwrap()();
+    let weak = Arc::downgrade(&workspace);
+    drop(workspace);
+    assert!(weak.upgrade().is_none());
+    assert!(recv.recv_timeout(Duration::from_millis(300)).is_err());
 }
 
 #[test]

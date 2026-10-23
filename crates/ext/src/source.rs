@@ -1,40 +1,51 @@
 //! Source preparation with injected inventory, capture and waiting operations.
 use crate::Refused;
 
+/// Retry only unsettled observations and transient I/O, never rejected content.
+#[derive(Debug)]
+pub enum Error {
+    Retry(Refused),
+    Rejected(Refused),
+}
+
+impl From<Refused> for Error {
+    fn from(error: Refused) -> Self {
+        Self::Rejected(error)
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retry(error) | Self::Rejected(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
 /// The window coalesces editor writes; it is not proof that a writer closed.
 /// Compare effective inputs, never notification counts: unrelated activity
 /// must not prevent a settled source from making progress.
 pub fn prepare<S: PartialEq, T>(
-    mut capture: impl FnMut() -> Result<S, Refused>,
-    mut wait: impl FnMut(Option<&S>),
+    mut capture: impl FnMut() -> Result<S, Error>,
+    mut wait: impl FnMut(&S),
     mut compile: impl FnMut(&S) -> Result<T, Refused>,
-) -> Result<T, Refused> {
-    let mut before = capture();
-    loop {
-        wait(before.as_ref().ok());
-        let after = capture();
-        if !same(&before, &after) {
-            before = after;
-            continue;
-        }
-        let result = before
-            .as_ref()
-            .map_err(|e| Refused(e.0.clone()))
-            .and_then(&mut compile);
-        let checked = capture();
-        if same(&before, &checked) {
-            return result;
-        }
-        before = checked;
+) -> Result<T, Error> {
+    let before = capture()?;
+    wait(&before);
+    if before != capture()? {
+        return Err(Error::Retry(Refused(
+            "sources changed during capture".into(),
+        )));
     }
-}
-
-fn same<T: PartialEq>(a: &Result<T, Refused>, b: &Result<T, Refused>) -> bool {
-    match (a, b) {
-        (Ok(a), Ok(b)) => a == b,
-        (Err(a), Err(b)) => a.0 == b.0,
-        _ => false,
+    let result = compile(&before);
+    if before != capture()? {
+        return Err(Error::Retry(Refused(
+            "sources changed during compilation".into(),
+        )));
     }
+    result.map_err(Error::Rejected)
 }
 
 #[cfg(test)]
@@ -43,30 +54,18 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
-    fn changes_during_capture_and_failed_compilation_are_retried() {
-        let revision = Cell::new(0);
-        let captures = Cell::new(0);
-        let result = prepare(
-            || {
-                let n = captures.get();
-                captures.set(n + 1);
-                if n == 0 {
-                    return Err(Refused("torn utf-8".into()));
-                }
-                Ok(revision.get())
-            },
-            |_| {},
-            |value| {
-                if *value == 0 {
-                    revision.set(1);
-                    Err(Refused("partial source".into()))
-                } else {
-                    Ok(*value)
-                }
-            },
-        )
-        .unwrap();
-        assert_eq!(result, 1);
+    fn identical_transient_failures_still_require_recovery() {
+        for _ in 0..3 {
+            assert!(matches!(
+                prepare(
+                    || Err::<u32, _>(Error::Retry(Refused("sharing violation".into()))),
+                    |_| {},
+                    |_| Ok(()),
+                ),
+                Err(Error::Retry(_))
+            ));
+        }
+        assert_eq!(prepare(|| Ok(42), |_| {}, |value| Ok(*value)).unwrap(), 42);
     }
 
     #[test]

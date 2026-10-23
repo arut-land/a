@@ -21,6 +21,13 @@ the last working generation and reports an error; invalid mods at first load
 are warned about and omitted. `/lua-reload` prepares edits explicitly and
 acknowledges completion. Workspace subscriptions end with their last session.
 
+Fold identity is the mod name and fold name. A generation that omits a fold,
+including one captured while a source is partially saved or absent, retains
+its serialized value and rejection decisions for the session lifetime.
+Checkpoints include retained values. Registering the same identity again
+reattaches its value; incompatible values reject adoption. Retention keeps
+no old reducer or VM and ends when the session is disposed.
+
 Use `[ext] disable = ["name"]` in the home config to omit a mod or a compiled
 extension. `disable = ["lua"]` omits the loader. Config changes take effect on
 daemon restart; source edits take effect without restarting.

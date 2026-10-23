@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ext::host::{Changed, GenerationLayer, PreparedLayer, Registrations, Registry, Spawn};
+use ext::source::Error as PrepareError;
 use ext::{Extension, Refused, Tier};
 
 use crate::{Catalog, Skill, Skills, parse};
 
-type Files = Vec<(PathBuf, sys::source::Source)>;
+type Files = BTreeMap<String, (PathBuf, sys::source::Source)>;
 
 #[derive(PartialEq)]
 struct Inputs {
@@ -66,7 +67,10 @@ impl GenerationLayer for Loader {
         })
         .map_err(|e| Refused(e.to_string()))?;
         Ok(Box::new(move || {
-            watcher.refresh().map_err(|e| Refused(e.to_string()))
+            // Failure is a typed watch event; the watcher owns recovery even
+            // when the current source inventory can already be prepared.
+            let _ = watcher.refresh();
+            Ok(())
         }))
     }
 
@@ -76,11 +80,11 @@ impl GenerationLayer for Loader {
         base: &Registry,
         previous: Option<&PreparedLayer>,
         _: bool,
-    ) -> Result<PreparedLayer, Refused> {
+    ) -> Result<PreparedLayer, PrepareError> {
         ext::source::prepare(
             || self.capture(workspace),
-            |files: Option<&Files>| {
-                if files.is_none_or(|files| !files.is_empty()) {
+            |files: &Files| {
+                if !files.is_empty() {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             },
@@ -121,11 +125,16 @@ impl GenerationLayer for Loader {
         )
     }
 
-    fn validate(&self, workspace: &Path, prepared: &PreparedLayer) -> Result<bool, Refused> {
+    fn delay(&self, duration: std::time::Duration) -> ext::BoxFuture<'static, ()> {
+        rt::Reactor::AsyncIo.sleep(duration)
+    }
+
+    fn validate(&self, workspace: &Path, prepared: &PreparedLayer) -> Result<bool, PrepareError> {
+        let files = self.capture(workspace)?;
         Ok(prepared
             .inputs
             .downcast_ref::<Inputs>()
-            .is_some_and(|p| self.capture(workspace).is_ok_and(|files| files == p.files)))
+            .is_some_and(|p| files == p.files))
     }
 
     fn restore(&self, own_image: &[protocol::Installed]) -> Result<Registrations, Refused> {
@@ -148,46 +157,86 @@ impl GenerationLayer for Loader {
     }
 }
 
-fn scan(root: &Path, found: &mut Files) -> Result<(), Refused> {
+fn inventory(
+    root: &Path,
+    found: &mut BTreeMap<String, (PathBuf, PathBuf)>,
+) -> Result<(), PrepareError> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Refused(format!("{}: {e}", root.display()))),
+        Err(e) => return Err(source_error(root, &e)),
     };
     let mut paths = Vec::new();
     for entry in entries.take(4097) {
-        paths.push(entry.map_err(|e| Refused(e.to_string()))?.path());
+        paths.push(entry.map_err(|e| source_error(root, &e))?.path());
     }
     if paths.len() > 4096 {
-        return Err(Refused("skill root exceeds 4096 entries".into()));
+        return Err(Refused("skill root exceeds 4096 entries".into()).into());
     }
     paths.sort();
+    let mut names = std::collections::BTreeSet::new();
     for directory in paths {
         let path = directory.join("SKILL.md");
-        match sys::source::Source::read(root, &path, 64 * 1024) {
-            Ok(Some(source)) => {
-                found.push((directory, source));
-                if found.iter().map(|(_, source)| source.len()).sum::<usize>() > 1024 * 1024 {
-                    return Err(Refused("skill source exceeds 1 MiB".into()));
-                }
-            }
-            Ok(None) => {}
+        let prefix = match sys::source::prefix(root, &path, 8256) {
+            Ok(Some(prefix)) => prefix,
+            Ok(None) => continue,
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) => {}
-            Err(e) => return Err(Refused(format!("{}: {e}", path.display()))),
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(source_error(&path, &e)),
+        };
+        // Identity lives in frontmatter, not the package directory. Ignore the
+        // shadowed body and its native version while resolving precedence.
+        let mut end = 0;
+        let mut delimiters = 0;
+        for line in prefix.split_inclusive(|b| *b == b'\n') {
+            end += line.len();
+            if line.trim_ascii() == b"---" {
+                delimiters += 1;
+                if delimiters == 2 {
+                    break;
+                }
+            }
         }
+        let header = std::str::from_utf8(&prefix[..end]).map_err(|e| Refused(e.to_string()))?;
+        let (name, _) = parse::parse(header, &directory)
+            .map_err(|e| Refused(format!("{}: {e}", path.display())))?;
+        if !names.insert(name.clone()) {
+            return Err(Refused(format!("duplicate skill {name}")).into());
+        }
+        found.insert(name, (root.to_owned(), directory));
     }
     Ok(())
 }
 
 impl Loader {
-    fn capture(&self, workspace: &Path) -> Result<Files, Refused> {
-        let mut files = Vec::new();
+    fn capture(&self, workspace: &Path) -> Result<Files, PrepareError> {
+        let mut winners = BTreeMap::new();
         for root in self.roots(workspace) {
-            scan(&root, &mut files)?;
+            inventory(&root, &mut winners)?;
+        }
+        let mut files = Files::new();
+        let mut bytes = 0;
+        for (name, (root, directory)) in winners {
+            let path = directory.join("SKILL.md");
+            let source = sys::source::Source::read(&root, &path, 64 * 1024)
+                .map_err(|e| source_error(&path, &e))?
+                .ok_or_else(|| {
+                    PrepareError::Retry(Refused(format!(
+                        "{} vanished during capture",
+                        path.display()
+                    )))
+                })?;
+            bytes += source.len();
+            if bytes > 1024 * 1024 {
+                return Err(Refused("skill source exceeds 1 MiB".into()).into());
+            }
+            files.insert(name, (directory, source));
         }
         Ok(files)
     }
@@ -195,20 +244,14 @@ impl Loader {
 
 fn catalog(files: &Files) -> Result<BTreeMap<String, Skill>, Refused> {
     let mut found = BTreeMap::new();
-    let mut names = std::collections::BTreeSet::new();
-    let mut root = None;
-    for (directory, source) in files {
-        if root != directory.parent() {
-            names.clear();
-            root = directory.parent();
-        }
+    for (expected, (directory, source)) in files {
         let (name, skill) = parse::parse(
             source.text().map_err(|e| Refused(e.to_string()))?,
             directory,
         )
         .map_err(|e| Refused(format!("{}: {e}", directory.display())))?;
-        if !names.insert(name.clone()) {
-            return Err(Refused(format!("duplicate skill {name}")));
+        if &name != expected {
+            return Err(Refused("skill identity changed during capture".into()));
         }
         found.insert(name, skill);
         if found
@@ -230,6 +273,16 @@ fn catalog(files: &Files) -> Result<BTreeMap<String, Skill>, Refused> {
         }
     }
     Ok(found)
+}
+
+fn source_error(path: &Path, error: &std::io::Error) -> PrepareError {
+    let retry = sys::source::retryable(error);
+    let message = Refused(format!("{}: {error}", path.display()));
+    if retry {
+        PrepareError::Retry(message)
+    } else {
+        PrepareError::Rejected(message)
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +348,56 @@ mod tests {
             loader.roots(&rig.workspace()).last(),
             Some(&rig.workspace().join(".a/skills"))
         );
+    }
+
+    #[test]
+    fn shadowed_body_writes_cannot_starve_a_settled_workspace_edit() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let rig = Rig::new("skills-shadowed-writes", Registry::default());
+        let home = rig.dir.join("skills/different-directory");
+        let local = rig.workspace().join(".a/skills/review");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        let header = "---\nname: review\ndescription: Review\n---\n";
+        let shadowed = home.join("SKILL.md");
+        fs::write(&shadowed, format!("{header}{}", "x".repeat(64))).unwrap();
+        fs::write(local.join("SKILL.md"), format!("{header}old")).unwrap();
+        let loader = Loader::new(&rig.dir, Skills::default());
+        let previous = loader
+            .prepare(&rig.workspace(), &Registry::default(), None, false)
+            .unwrap();
+        fs::write(local.join("SKILL.md"), format!("{header}settled")).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let writer_stop = stop.clone();
+        let writer_writes = writes.clone();
+        let task = std::thread::spawn(move || {
+            let mut file = fs::OpenOptions::new().write(true).open(shadowed).unwrap();
+            while !writer_stop.load(Ordering::Acquire) {
+                file.seek(SeekFrom::Start(header.len() as u64)).unwrap();
+                file.write_all(
+                    format!("{:064}", writer_writes.fetch_add(1, Ordering::Relaxed)).as_bytes(),
+                )
+                .unwrap();
+                std::thread::yield_now();
+            }
+        });
+        let result = loader.prepare(
+            &rig.workspace(),
+            &Registry::default(),
+            Some(&previous),
+            false,
+        );
+        stop.store(true, Ordering::Release);
+        task.join().unwrap();
+        let prepared = result.unwrap();
+        assert!(writes.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            prepared.inputs.downcast_ref::<Inputs>().unwrap().catalog["review"].body,
+            "settled"
+        );
+        assert!(loader.validate(&rig.workspace(), &prepared).unwrap());
     }
 
     #[test]

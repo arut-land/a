@@ -6,6 +6,9 @@ Put each skill in `$A_HOME/skills/<directory>/SKILL.md` or the workspace's
 `.a/skills/<directory>/SKILL.md`. The frontmatter name is its identity and
 command name. Workspace definitions override home definitions. Discovery is
 one directory deep, sorted by path; duplicate names within one root are errors.
+Discovery reads bounded frontmatter to resolve identities and precedence before
+capturing winning sources. Changes to a shadowed body cannot delay a settled
+workspace definition.
 A skill cannot replace an installed callable, including `skill` itself, or
 a client-owned command such as `/help` or `/new`. The CLI supplies that reserved
 namespace from the shared client command table.

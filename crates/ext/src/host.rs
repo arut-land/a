@@ -3,10 +3,12 @@
 //! the registry as the kernel binds it to a session. Extensions need none
 //! of it.
 
+use crate::source::Error as PrepareError;
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::time::Duration;
 
 use protocol::{Audience, CallId, Card, Environment, Installed, Json, Outcome, Seq, SessionId};
 
@@ -653,8 +655,10 @@ pub trait GenerationLayer: Send + Sync {
         base: &Registry,
         previous: Option<&PreparedLayer>,
         initial: bool,
-    ) -> Result<PreparedLayer, Refused>;
-    fn validate(&self, _workspace: &Path, _prepared: &PreparedLayer) -> Result<bool, Refused> {
+    ) -> Result<PreparedLayer, PrepareError>;
+    /// Injects the runtime timer; the coordinator cancels it on events or drop.
+    fn delay(&self, duration: Duration) -> BoxFuture<'static, ()>;
+    fn validate(&self, _workspace: &Path, _prepared: &PreparedLayer) -> Result<bool, PrepareError> {
         Ok(true)
     }
     fn restore(&self, own_image: &[Installed]) -> Result<Registrations, Refused>;
@@ -683,11 +687,20 @@ struct Workspace {
     current: Current,
     opened: OnceLock<Result<(), String>>,
     preparing: Mutex<Vec<PreparedLayer>>,
-    pending: Mutex<(bool, bool)>,
+    pending: Mutex<Preparation>,
+    spawn: Spawn,
     watches: Mutex<Vec<Box<Refresh>>>,
     changed: Arc<Changed>,
     rebuild: Arc<Rebuild>,
     updates: Updates,
+}
+
+#[derive(Default)]
+struct Preparation {
+    running: bool,
+    dirty: bool,
+    attempts: u32,
+    retry: Option<Cancel>,
 }
 
 impl Coordinator {
@@ -736,14 +749,26 @@ impl Sources for Coordinator {
                 current: Current::new((*self.base).clone()),
                 opened: OnceLock::new(),
                 preparing: Mutex::default(),
-                pending: Mutex::new((false, false)),
+                pending: Mutex::default(),
+                spawn: spawn.clone(),
                 watches: Mutex::default(),
                 updates: Updates::default(),
                 rebuild: Arc::new(move || {
-                    refresh
+                    let workspace = refresh
                         .upgrade()
-                        .ok_or_else(|| Refused("workspace closed".into()))?
-                        .rebuild(false)
+                        .ok_or_else(|| Refused("workspace closed".into()))?;
+                    let result = workspace.rebuild(false);
+                    if matches!(result, Err(PrepareError::Retry(_))) {
+                        workspace.retry();
+                    }
+                    if result.is_ok() {
+                        let mut pending = lock(&workspace.pending);
+                        pending.attempts = 0;
+                        if let Some(cancel) = pending.retry.take() {
+                            cancel.set();
+                        }
+                    }
+                    result.map_err(|e| Refused(e.to_string()))
                 }),
                 changed: Arc::new(move || {
                     if let Some(workspace) = weak.upgrade() {
@@ -759,7 +784,14 @@ impl Sources for Coordinator {
                 let watch = layer.watch(path, spawn.clone(), workspace.changed.clone())?;
                 lock(&workspace.watches).push(watch);
             }
-            workspace.rebuild(true)
+            match workspace.rebuild(true) {
+                Ok(()) => Ok(()),
+                Err(PrepareError::Rejected(error)) => Err(error),
+                Err(PrepareError::Retry(_)) => {
+                    workspace.retry();
+                    Ok(())
+                }
+            }
         })();
         let _ = workspace
             .opened
@@ -797,62 +829,106 @@ impl Workspace {
         Ok(registry)
     }
 
-    fn rebuild(&self, initial: bool) -> Result<(), Refused> {
+    fn rebuild(&self, initial: bool) -> Result<(), PrepareError> {
         let mut previous = lock(&self.preparing);
         for watch in lock(&self.watches).iter_mut() {
             watch()?;
         }
-        loop {
-            let mut registry = (*self.base).clone();
-            let mut prepared = Vec::new();
-            for (index, layer) in self.layers.iter().enumerate() {
-                let next = layer.prepare(&self.path, &registry, previous.get(index), initial)?;
-                registry = self.compose_layer(registry, &**layer, next.registrations.clone())?;
-                prepared.push(next);
-            }
-            if self
-                .layers
-                .iter()
-                .zip(&prepared)
-                .map(|(layer, prepared)| layer.validate(&self.path, prepared))
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|valid| !valid)
-            {
-                continue;
-            }
-            *previous = prepared;
-            if registry.installed() != self.current.snapshot().registry.installed() {
-                self.current.replace(registry);
-                self.updates.notify();
-            }
-            break;
+        let mut registry = (*self.base).clone();
+        let mut prepared = Vec::new();
+        for (index, layer) in self.layers.iter().enumerate() {
+            let next = layer.prepare(
+                &self.path,
+                &registry,
+                previous.get(index),
+                initial || previous.is_empty(),
+            )?;
+            registry = self.compose_layer(registry, &**layer, next.registrations.clone())?;
+            prepared.push(next);
+        }
+        if self
+            .layers
+            .iter()
+            .zip(&prepared)
+            .map(|(layer, prepared)| layer.validate(&self.path, prepared))
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|valid| !valid)
+        {
+            return Err(PrepareError::Retry(Refused(
+                "sources changed before publication".into(),
+            )));
+        }
+        *previous = prepared;
+        if registry.installed() != self.current.snapshot().registry.installed() {
+            self.current.replace(registry);
+            self.updates.notify();
         }
         Ok(())
     }
 
-    fn changed(self: &Arc<Self>, prepare: &Prepare) {
+    fn retry(self: &Arc<Self>) {
         let mut pending = lock(&self.pending);
-        pending.1 = true;
-        if pending.0 {
+        if pending.retry.is_some() || pending.running || pending.dirty {
             return;
         }
-        pending.0 = true;
+        let delay = Duration::from_millis((100 << pending.attempts.min(6)).min(5000));
+        pending.attempts = pending.attempts.saturating_add(1);
+        let cancel = Cancel::default();
+        pending.retry = Some(cancel.clone());
+        drop(pending);
+        let wait = self.layers[0].delay(delay);
+        let weak = Arc::downgrade(self);
+        (self.spawn)(Box::pin(async move {
+            if cancel.until(wait).await.is_some()
+                && let Some(workspace) = weak.upgrade()
+            {
+                (workspace.changed)();
+            }
+        }));
+    }
+
+    fn changed(self: &Arc<Self>, prepare: &Prepare) {
+        let mut pending = lock(&self.pending);
+        if let Some(cancel) = pending.retry.take() {
+            cancel.set();
+        }
+        pending.dirty = true;
+        if pending.running {
+            return;
+        }
+        pending.running = true;
         drop(pending);
         let weak = Arc::downgrade(self);
         prepare(Box::new(move || {
             while let Some(workspace) = weak.upgrade() {
-                lock(&workspace.pending).1 = false;
-                if let Err(error) = workspace.rebuild(false) {
-                    eprintln!("warning: {error}");
-                }
+                lock(&workspace.pending).dirty = false;
+                let result = workspace.rebuild(false);
                 let mut pending = lock(&workspace.pending);
-                if !pending.1 {
-                    pending.0 = false;
+                if result.is_ok() {
+                    pending.attempts = 0;
+                }
+                if !pending.dirty {
+                    pending.running = false;
+                    drop(pending);
+                    if let Err(error) = result {
+                        match error {
+                            PrepareError::Retry(_) => workspace.retry(),
+                            PrepareError::Rejected(error) => eprintln!("warning: {error}"),
+                        }
+                    }
                     break;
                 }
             }
         }));
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        if let Some(cancel) = lock(&self.pending).retry.take() {
+            cancel.set();
+        }
     }
 }
 
@@ -1066,6 +1142,12 @@ enum ContextCapture {
     Ready(Option<String>),
 }
 
+#[derive(Default)]
+struct BoundCache {
+    parsed: Vec<(CallId, Json, Parsed)>,
+    context: ContextCapture,
+}
+
 /// A registry generation bound to a session: the [`Binding`] the kernel
 /// drives, over the session as its points read it (`V`). Pure glue: the
 /// engine supplies the view and the agent's name, and tests bind real
@@ -1078,8 +1160,7 @@ pub struct Bound<V> {
     /// Each open tool call's input as its tool read it at its intent, with
     /// the text it was read from: its run is given it rather than reading
     /// it again, unless the gate rewrote it.
-    parsed: Arc<Mutex<Vec<(CallId, Json, Parsed)>>>,
-    context: Arc<Mutex<ContextCapture>>,
+    cache: Arc<Mutex<BoundCache>>,
 }
 
 impl<V> Clone for Bound<V> {
@@ -1088,8 +1169,7 @@ impl<V> Clone for Bound<V> {
             registry: Arc::clone(&self.registry),
             view: Arc::clone(&self.view),
             agent: self.agent.clone(),
-            parsed: Arc::clone(&self.parsed),
-            context: Arc::clone(&self.context),
+            cache: Arc::clone(&self.cache),
         }
     }
 }
@@ -1100,15 +1180,14 @@ impl<V: View + Send + Sync + 'static> Bound<V> {
             registry,
             view,
             agent,
-            parsed: Arc::default(),
-            context: Arc::default(),
+            cache: Arc::default(),
         }
     }
 
     /// Capture source-backed context on admitted workers before a kernel step.
     pub fn prepare_context(&self) {
         let context = self.read_context();
-        *lock(&self.context) = ContextCapture::Ready(context);
+        lock(&self.cache).context = ContextCapture::Ready(context);
     }
 
     fn read_context(&self) -> Option<String> {
@@ -1165,7 +1244,8 @@ impl<V: View + Send + Sync + 'static> Bound<V> {
     /// Call `call`'s input as read at its intent, if it was and the call
     /// runs on `input` still.
     pub fn take_parsed(&self, call: CallId, input: &Json) -> Option<Parsed> {
-        let mut parsed = self.parsed.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cache = lock(&self.cache);
+        let parsed = &mut cache.parsed;
         let at = parsed.iter().position(|(c, _, _)| *c == call)?;
         let (_, read, parsed) = parsed.swap_remove(at);
         (read == *input).then_some(parsed)
@@ -1173,7 +1253,7 @@ impl<V: View + Send + Sync + 'static> Bound<V> {
 
     /// Forgets what was read for call `call`: it settled.
     pub fn settled(&self, call: CallId) {
-        (self.parsed.lock().unwrap_or_else(PoisonError::into_inner)).retain(|(c, _, _)| *c != call);
+        lock(&self.cache).parsed.retain(|(c, _, _)| *c != call);
     }
 
     /// The gate of call `call` once the `approve` handler it waits on
@@ -1267,7 +1347,7 @@ impl<V: View + Send + Sync + 'static> Binding for Bound<V> {
     }
 
     fn context(&self) -> Option<String> {
-        let prepared = std::mem::take(&mut *lock(&self.context));
+        let prepared = std::mem::take(&mut lock(&self.cache).context);
         match prepared {
             ContextCapture::Ready(context) => context,
             ContextCapture::Pending => self.read_context(),
@@ -1278,11 +1358,7 @@ impl<V: View + Send + Sync + 'static> Binding for Bound<V> {
         let tool = self.registry.tools().get(tool)?;
         let parsed = tool.parse(input).ok()?;
         let card = tool.present(&parsed);
-        (self.parsed.lock().unwrap_or_else(PoisonError::into_inner)).push((
-            call,
-            input.clone(),
-            parsed,
-        ));
+        lock(&self.cache).parsed.push((call, input.clone(), parsed));
         card
     }
 

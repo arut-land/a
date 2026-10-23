@@ -1095,7 +1095,7 @@ impl Actor {
             rt::STORAGE_BYTES,
             move || {
                 let start = Instant::now();
-                let ((), folding) =
+                let ((), mut folding) =
                     Folding::rebuild(&binding, &registry, &shared, |restore, each| {
                         let after = snapshot
                             .filter(|s| restore(s.clone()))
@@ -1129,10 +1129,8 @@ impl Actor {
                         }
                         Ok(())
                     })?;
-                folding
-                    .states
-                    .validate(&lock(&live))
-                    .map_err(io::Error::other)?;
+                let live = lock(&live);
+                folding.states.adopt(&live).map_err(io::Error::other)?;
                 Ok::<_, io::Error>(folding.states)
             },
         )

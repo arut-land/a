@@ -5,34 +5,50 @@ source trees and kqueue vnode subscriptions for their parents. Windows
 uses overlapped ReadDirectoryChangesW requests awaited through the runtime's
 waitable-event reactor. Each request owns a DWORD-aligned 16 KiB buffer and
 an OVERLAPPED allocation until completion or joined cancellation. There is
-no notification thread or periodic wait on Windows.
+no notification thread or periodic wait on Windows. This avoids notify 8.2's
+100 ms idle wait and also surfaces zero-byte overflow and terminal read errors.
 
 WatchEvent carries changes, overflow, rescan requests and unavailable
 subscriptions. Uncertainty invalidates all roots, including events without
 paths; refresh rearms subscriptions before source inventory is captured.
 Root parents remain watched so creation and replacement stay observable.
+Unavailable subscriptions and failed rearms schedule rescan callbacks with
+exponential backoff from 100 ms to five seconds, independently of further
+filesystem events. A successful refresh cancels recovery; dropping the
+watcher cancels pending recovery and native requests. Healthy watches have
+no timer.
 
 Lua resolves home/workspace precedence before opening winning sources.
-Skills follows links only within configured roots and watches descendant
-targets as well as SKILL.md entries. Source reads and pathname revalidation
-use sys's bounded, nonblocking regular-file opens. Snapshot identity includes
-native file identity, size, modification time and, on Unix, change time.
-Bytes and failed reads are retained before UTF-8 decoding.
+Skills inventories frontmatter identities before capturing winning files;
+shadowed bodies and native versions do not participate in comparisons.
+Links may resolve only within configured roots, and descendant target edits
+invalidate the inventory. Source reads and pathname revalidation use sys's
+bounded, nonblocking regular-file opens. Snapshot identity includes native
+file identity, size, modification time and, on Unix, change time. Bytes are
+captured before UTF-8 decoding.
 
-The I/O-free ext source driver captures inputs, waits an injected 100 ms
-window, compares captures, compiles and revalidates, including failed
-compilations. The host validates all layers again before publication. A
-failed preparation retains the current registry and folded state. Empty
-source sets skip the window. Settled sources leave no recurring timer.
-File-follow opens, bounded reads and initial source-backed prompt context
-use admitted Storage work before the kernel is stepped.
+The I/O-free ext source driver injects capture, wait and compile operations.
+It coalesces writes over a 100 ms window and revalidates after compilation.
+Each admitted preparation attempt is bounded; changed inputs and transient
+I/O failures return a typed retry instead of holding a worker in a loop.
+The coordinator schedules cancellable retries with exponential backoff from
+100 ms to five seconds. Native sharing/locking conflicts remain retryable
+even when successive errors have the same text. Stable rejected content or
+permanent source errors retain the working registry and stop recovery until
+a new event. Closing a workspace cancels its timer; queued work retains only
+a weak owner. Settled sources leave no recurring timer.
 
-The window is a debounce, not a writer-completion signal. A writer paused
-with valid partial content can outlast it. Native notifications are advisory;
-no finite sequence of reads proves that an in-place writer has finished or
-that a future change will generate a notification. An agreed inventory also cannot distinguish an intentional source removal
-from a temporary rename gap. A generation requires its effective input set
-to settle during capture; continuously changing effective inputs can delay
-that generation. Atomic replacement or an explicit writer completion
-protocol is required when the stronger publication guarantee matters. Permanent watch
-or filesystem failure is reported; it cannot guarantee eventual reload.
+A quiet window is a debounce, not a writer-completion signal. Valid partial
+sources and temporary absence may publish generations with fewer commands.
+Folded values are keyed by mod and fold name: adopting a generation that
+omits a fold retains its serialized image and rejection decisions for the
+session lifetime. The value is included in checkpoints and reattached when
+a later generation registers that identity. Retention holds no old reducer
+or Lua VM. An incompatible restored value rejects adoption. A returned fold
+can then accept new changes normally; removing a registration never clears
+its value. Session disposal ends retention.
+
+File-follow opens, bounded reads and output rendering, cwd-report reads,
+and initial source-backed prompt context use admitted Storage work. File
+following reuses a fixed 64 KiB buffer. Prompt context shares the existing
+per-binding cache allocation with parsed tool inputs.

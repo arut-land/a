@@ -5,6 +5,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use ext::host::{Changed, GenerationLayer, PreparedLayer, Rebuild, Registrations, Registry, Spawn};
+use ext::source::Error as PrepareError;
 use ext::{Extension, Refused, Registrar, Tier};
 
 use crate::{Limits, Mod};
@@ -79,7 +80,10 @@ impl GenerationLayer for Loader {
         })
         .map_err(|e| Refused(e.to_string()))?;
         Ok(Box::new(move || {
-            watcher.refresh().map_err(|e| Refused(e.to_string()))
+            // Failure is a typed watch event; the watcher owns recovery even
+            // when the current source inventory can already be prepared.
+            let _ = watcher.refresh();
+            Ok(())
         }))
     }
     fn prepare(
@@ -88,11 +92,11 @@ impl GenerationLayer for Loader {
         base: &Registry,
         previous: Option<&PreparedLayer>,
         initial: bool,
-    ) -> Result<PreparedLayer, Refused> {
+    ) -> Result<PreparedLayer, PrepareError> {
         ext::source::prepare(
             || self.capture(workspace),
-            |files: Option<&Files>| {
-                if files.is_none_or(|files| !files.is_empty()) {
+            |files: &Files| {
+                if !files.is_empty() {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             },
@@ -100,7 +104,11 @@ impl GenerationLayer for Loader {
         )
     }
 
-    fn validate(&self, workspace: &Path, prepared: &PreparedLayer) -> Result<bool, Refused> {
+    fn delay(&self, duration: Duration) -> ext::BoxFuture<'static, ()> {
+        rt::Reactor::AsyncIo.sleep(duration)
+    }
+
+    fn validate(&self, workspace: &Path, prepared: &PreparedLayer) -> Result<bool, PrepareError> {
         Ok(prepared.inputs.downcast_ref::<Files>() == Some(&self.capture(workspace)?))
     }
 
@@ -154,7 +162,7 @@ impl Extension for Reload {
 }
 
 impl Loader {
-    fn capture(&self, workspace: &Path) -> Result<Files, Refused> {
+    fn capture(&self, workspace: &Path) -> Result<Files, PrepareError> {
         let mut paths = BTreeMap::new();
         inventory(&self.home.join("ext"), &mut paths)?;
         inventory(&workspace.join(".a/ext"), &mut paths)?;
@@ -162,11 +170,11 @@ impl Loader {
         let mut found = Files::new();
         for (name, (root, path)) in paths {
             let source = sys::source::Source::read(&root, &path, 256 * 1024)
-                .map_err(|e| Refused(format!("{}: {e}", path.display())))?
+                .map_err(|e| source_error(&path, &e))?
                 .ok_or_else(|| Refused(format!("{} is not a regular source", path.display())))?;
             found.insert(name, source);
             if found.values().map(sys::source::Source::len).sum::<usize>() > 1024 * 1024 {
-                return Err(Refused("lua workspace source exceeds 1 MiB".into()));
+                return Err(Refused("lua workspace source exceeds 1 MiB".into()).into());
             }
         }
         Ok(found)
@@ -257,22 +265,25 @@ fn same_content(left: &Files, right: &Files) -> bool {
     })
 }
 
-fn inventory(dir: &Path, found: &mut BTreeMap<String, (PathBuf, PathBuf)>) -> Result<(), Refused> {
+fn inventory(
+    dir: &Path,
+    found: &mut BTreeMap<String, (PathBuf, PathBuf)>,
+) -> Result<(), PrepareError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Refused(format!("{}: {e}", dir.display()))),
+        Err(e) => return Err(source_error(dir, &e)),
     };
     for (count, entry) in entries.enumerate() {
         if count >= 4096 {
-            return Err(Refused("lua directory exceeds 4096 entries".into()));
+            return Err(Refused("lua directory exceeds 4096 entries".into()).into());
         }
-        let entry = entry.map_err(|e| Refused(e.to_string()))?;
+        let entry = entry.map_err(|e| source_error(dir, &e))?;
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "lua")
             || !entry
                 .file_type()
-                .map_err(|e| Refused(e.to_string()))?
+                .map_err(|e| source_error(dir, &e))?
                 .is_file()
         {
             continue;
@@ -282,13 +293,21 @@ fn inventory(dir: &Path, found: &mut BTreeMap<String, (PathBuf, PathBuf)>) -> Re
         };
         // Source and mod counts bound both compilation and aggregate VM memory.
         if found.len() >= 128 && !found.contains_key(name) {
-            return Err(Refused(
-                "at most 128 lua mods may be loaded per workspace".into(),
-            ));
+            return Err(Refused("at most 128 lua mods may be loaded per workspace".into()).into());
         }
         found.insert(name.to_owned(), (dir.to_owned(), path));
     }
     Ok(())
+}
+
+fn source_error(path: &Path, error: &std::io::Error) -> PrepareError {
+    let retry = sys::source::retryable(error);
+    let message = Refused(format!("{}: {error}", path.display()));
+    if retry {
+        PrepareError::Retry(message)
+    } else {
+        PrepareError::Rejected(message)
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +402,59 @@ mod tests {
             .prepare(&rig.workspace(), &Registry::default(), Some(&first), false)
             .unwrap();
         assert_eq!(recovered.registrations.len(), 1);
+    }
+
+    #[test]
+    fn partial_and_deleted_sources_reattach_the_same_fold_value_when_restored() {
+        use std::io::Write;
+        let rig = ext::testing::Rig::new("lua-fold-retention", Registry::default());
+        let directory = rig.dir.join("ext");
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("test.lua");
+        let full = "a.fold{name='count',initial=0,apply=function(s,c) return s+c end}";
+        fs::write(&file, full).unwrap();
+        let loader = Loader::new(&rig.dir, sys::config::Exts::default()).unwrap();
+        let registry = |layer: PreparedLayer| {
+            layer
+                .registrations
+                .into_iter()
+                .fold(Registry::default(), |registry, (tier, module)| {
+                    registry.with_dyn(tier, &*module).unwrap()
+                })
+        };
+        let prepare = || {
+            registry(
+                loader
+                    .prepare(&rig.workspace(), &Registry::default(), None, false)
+                    .unwrap(),
+            )
+            .states()
+        };
+        let mut states = prepare();
+        states.fold("test", "count", &protocol::Json::encode(&42).unwrap());
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&file)
+            .unwrap();
+        writer
+            .write_all(b"a.text{name='prefix',text='partial'}")
+            .unwrap();
+        writer.flush().unwrap();
+        let mut partial = prepare(); // The writer remains open beyond the debounce.
+        partial.adopt(&states).unwrap();
+        assert!(!partial.registered("test", "count"));
+        drop(writer);
+        fs::remove_file(&file).unwrap();
+        let mut absent = prepare();
+        absent.adopt(&partial).unwrap();
+        assert!(!absent.registered("test", "count"));
+        fs::write(&file, full).unwrap();
+        let mut restored = prepare();
+        restored.adopt(&absent).unwrap();
+        assert_eq!(restored.erased("test", "count").unwrap().raw(), "42");
+        restored.fold("test", "count", &protocol::Json::encode(&1).unwrap());
+        assert_eq!(restored.erased("test", "count").unwrap().raw(), "43");
     }
 
     #[test]

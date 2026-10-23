@@ -47,9 +47,8 @@ impl Version {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source {
-    before: Version,
-    after: Version,
-    bytes: Result<Vec<u8>, String>,
+    version: Version,
+    bytes: Vec<u8>,
 }
 
 impl Source {
@@ -63,22 +62,28 @@ impl Source {
         let before = Version::of(&file.metadata()?)?;
         let mut bytes = Vec::new();
         // Retain failed bytes and version observations before decoding UTF-8.
-        let result = (&file).take(limit as u64 + 1).read_to_end(&mut bytes);
+        (&file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
         let after = Version::of(&file.metadata()?)?;
-        let bytes = match result {
-            Err(error) => Err(error.to_string()),
-            Ok(_) if bytes.len() > limit => Err(format!("source exceeds {limit} bytes")),
-            Ok(_) => Ok(bytes),
-        };
+        if before != after {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "source changed during capture",
+            ));
+        }
+        if bytes.len() > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("source exceeds {limit} bytes"),
+            ));
+        }
         Ok(Some(Self {
-            before,
-            after,
+            version: after,
             bytes,
         }))
     }
 
     pub fn len(&self) -> usize {
-        self.bytes.as_ref().map_or(0, Vec::len)
+        self.bytes.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -86,18 +91,35 @@ impl Source {
     }
 
     pub fn text(&self) -> io::Result<&str> {
-        if self.before != self.after {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "source changed during capture",
-            ));
-        }
-        let bytes = self
-            .bytes
-            .as_ref()
-            .map_err(|error| io::Error::other(error.clone()))?;
-        std::str::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        std::str::from_utf8(&self.bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
+}
+
+/// Inventory may inspect a bounded prefix to resolve names before capturing
+/// winning files. Its bytes carry no version or writer-completion assertion.
+pub fn prefix(root: &Path, path: &Path, limit: usize) -> io::Result<Option<Vec<u8>>> {
+    let file = match crate::fs::open_regular_within(root, path)? {
+        crate::fs::RegularFile::Open(file) => file,
+        crate::fs::RegularFile::Skipped(_) => return Ok(None),
+    };
+    let mut bytes = Vec::new();
+    file.take(limit as u64).read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+/// Native sharing/locking conflicts may disappear without a filesystem event.
+pub fn retryable(error: &io::Error) -> bool {
+    let retryable = matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::ResourceBusy
+            | io::ErrorKind::ExecutableFileBusy
+    );
+    #[cfg(windows)]
+    let retryable = retryable || matches!(error.raw_os_error(), Some(32 | 33 | 170));
+    retryable
 }
 
 #[cfg(all(test, unix, not(miri)))]
@@ -137,6 +159,38 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, "settled").unwrap();
         assert_ne!(Source::read(&root, &path, 64).unwrap().unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod sharing_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn a_sharing_conflict_is_retryable_until_the_handle_is_released() {
+        let root = std::env::temp_dir().join(format!("a-source-sharing-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("source");
+        std::fs::write(&path, "settled").unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        for _ in 0..3 {
+            assert!(retryable(&Source::read(&root, &path, 64).unwrap_err()));
+        }
+        drop(writer);
+        assert_eq!(
+            Source::read(&root, &path, 64)
+                .unwrap()
+                .unwrap()
+                .text()
+                .unwrap(),
+            "settled"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
