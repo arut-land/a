@@ -23,6 +23,6 @@ impl Extension for Edit {
     fn contribute(&self, r: &mut Registrar) {
         r.tool(tool::Edit)
             .fold::<tool::Seen>()
-            .text(Text::system("edit", 20, "`edit` changes a file by exact replacement: each `old` must appear exactly once in the file as it was before the call, so include enough of the text around it, and the edits of one call must not overlap. One edit with an empty `old` writes the whole file. Look at a file before editing it: an edit to a file that changed since this session last edited it fails until you look again.").for_tool(tool::Edit::NAME));
+            .text(Text::system("edit", 20, "`edit` changes a file by exact replacement: each `old` must appear exactly once in the file as it was before the call, so include enough of the text around it, and the edits of one call must not overlap. One edit with an empty `old` writes the whole file. Look at a file before editing it: an edit to a file that changed since this session last edited it fails until you look again. Edits atomically replace regular files, preserving metadata; symbolic links and multiple hard links are rejected. Observed concurrent changes cause a conflict; inspect the file and retry. Publication confirms visibility without promising power-loss durability.").for_tool(tool::Edit::NAME));
     }
 }

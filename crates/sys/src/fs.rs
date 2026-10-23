@@ -6,6 +6,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::Path;
 
+mod edit;
+pub use edit::{Durability, EditConflict, EditError, EditReceipt, EditTransaction};
+
 /// Why discovery skipped a candidate instead of opening arbitrary filesystem objects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectedFile {
@@ -358,16 +361,24 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
 /// Replaces `path` with `bytes`, readable only by this user, so a reader
 /// sees the old file or the new one, never a torn or world-readable one.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = dir.join(format!(".{name}.{}", std::process::id()));
-    let _ = fs::remove_file(&tmp);
-    let mut file = private_file().open(&tmp)?;
+    let (tmp, mut file) = loop {
+        let tmp = dir.join(edit::temporary_name());
+        match private_file().open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    };
     let written = file
         .write_all(bytes)
         .and_then(|()| file.sync_all())
-        .and_then(|()| replace(&tmp, path));
+        .and_then(|()| publish(&tmp, path));
+    drop(file);
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }
