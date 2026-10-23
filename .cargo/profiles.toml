@@ -36,7 +36,7 @@ opt-level = 1
 [profile.release]
 # LLVM-only metadata for safe ELF folding; dev uses Cranelift.
 rustflags = ["-Cllvm-args=-addrsig"]
-opt-level = "z"
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
