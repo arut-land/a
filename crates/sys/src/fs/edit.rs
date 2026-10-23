@@ -453,15 +453,15 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
     {
         use std::os::macos::fs::MetadataExt;
         let modified = destination.metadata()?.modified()?;
-        // Copy birth time, ACLs and xattrs through handles, including resource
-        // forks and quarantine. The content edit gets its own modification time.
+        // Copy xattrs and stat through handles, including resource forks and
+        // quarantine. The content edit gets its own modification time.
         // SAFETY: both descriptors remain owned; null selects default state.
         if unsafe {
             libc::fcopyfile(
                 source.as_raw_fd(),
                 destination.as_raw_fd(),
                 std::ptr::null_mut(),
-                libc::COPYFILE_METADATA,
+                libc::COPYFILE_STAT | libc::COPYFILE_XATTR,
             )
         } != 0
         {
@@ -503,7 +503,47 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
     }
     #[cfg(target_os = "linux")]
     copy_xattrs(source, destination)?;
-    destination.set_permissions(metadata.permissions())
+    destination.set_permissions(metadata.permissions())?;
+    #[cfg(target_vendor = "apple")]
+    copy_acl(source, destination)?;
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn copy_acl(source: &File, destination: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn acl_get_fd(fd: libc::c_int) -> *mut std::ffi::c_void;
+        fn acl_init(count: libc::c_int) -> *mut std::ffi::c_void;
+        fn acl_set_fd(fd: libc::c_int, acl: *mut std::ffi::c_void) -> libc::c_int;
+        fn acl_free(acl: *mut std::ffi::c_void) -> libc::c_int;
+    }
+    // copyfile may return success after an ACL failure. Apply the access policy
+    // with checked calls, replacing any ACL inherited by the staging file.
+    // SAFETY: source owns its descriptor; the returned ACL is freed below.
+    let mut acl = unsafe { acl_get_fd(source.as_raw_fd()) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(error);
+        }
+        // SAFETY: an empty ACL removes inherited access; zero entries is valid.
+        acl = unsafe { acl_init(0) };
+        if acl.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: destination owns its descriptor and acl is live until acl_free.
+    let result = if unsafe { acl_set_fd(destination.as_raw_fd(), acl) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    // SAFETY: acl_get_fd or acl_init allocated this object; neither setter owns it.
+    unsafe {
+        acl_free(acl);
+    }
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -1347,6 +1387,29 @@ mod tests {
         assert!(before.contains("deny execute"));
         work.capture().publish(b"new", false).unwrap();
         assert_eq!(entries(), before);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn safe_save_does_not_add_newly_inherited_macos_access() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow execute,file_inherit"])
+            .arg(&work.0)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        work.capture().publish(b"new", false).unwrap();
+        let output = std::process::Command::new("/bin/ls")
+            .arg("-le")
+            .arg(work.target())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("allow execute"), "{text}");
+        assert_eq!(fs::read(work.target()).unwrap(), b"new");
     }
 
     #[cfg(windows)]
