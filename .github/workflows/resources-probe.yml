@@ -1,0 +1,31 @@
+name: resources probe
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_BUILD_JOBS: 4
+      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+      RUSTUP_TOOLCHAIN: nightly-2026-10-17
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: ${{ runner.os == 'Linux' && 'mold' || '' }}
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - run: cargo test -p sys resources::tests && cargo test -p rt --lib
+      - run: cargo run --release -p rt --example resources | tee resources.txt
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: resources-${{ matrix.runner }}
+          path: resources.txt

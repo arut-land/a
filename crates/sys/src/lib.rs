@@ -23,6 +23,7 @@ mod login;
 mod memory;
 mod platform;
 mod proc;
+pub mod resources;
 mod runtime;
 mod signals;
 pub mod terminal;
