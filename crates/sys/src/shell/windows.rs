@@ -126,6 +126,15 @@ pub(super) fn discover() -> ExecutionFacts {
     let program_files = std::env::var_os("ProgramW6432")
         .or_else(|| std::env::var_os("ProgramFiles"))
         .map(PathBuf::from);
+    resolve(bash, search.as_deref(), program_files.as_deref(), &windows)
+}
+
+fn resolve(
+    bash: Option<PathBuf>,
+    search: Option<&str>,
+    program_files: Option<&Path>,
+    windows: &Path,
+) -> ExecutionFacts {
     let (dialect, executable, mut syntax, paths) = if let Some(path) = bash {
         (
             Dialect::Bash,
@@ -134,7 +143,7 @@ pub(super) fn discover() -> ExecutionFacts {
             "native Bash paths: C:/dir and runtime POSIX paths; native tools use Windows drive/UNC paths",
         )
     } else {
-        let (path, syntax) = powershell(search.as_deref(), program_files.as_deref(), &windows);
+        let (path, syntax) = powershell(search, program_files, windows);
         (
             Dialect::PowerShell,
             path,
@@ -229,6 +238,14 @@ mod tests {
         );
         assert!(first_bash([system.join("bash.exe")], &root).is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_bash_selects_only_the_powershell_identity() {
+        let facts = resolve(None, Some(""), None, Path::new(r"C:\Windows"));
+        assert_eq!(facts.dialect, Dialect::PowerShell);
+        assert_eq!(facts.tool(), "powershell");
+        assert!(facts.syntax.contains("5.1"));
     }
 
     #[test]

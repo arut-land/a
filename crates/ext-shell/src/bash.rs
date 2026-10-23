@@ -44,7 +44,7 @@ pub type Bash = ShellTool<crate::dialect::Bash>;
 pub type PowerShell = ShellTool<crate::dialect::PowerShell>;
 
 impl<D: crate::dialect::Dialect> ShellTool<D> {
-    pub fn new(facts: &'static sys::shell::ExecutionFacts) -> Self {
+    pub(crate) fn new(facts: &'static sys::shell::ExecutionFacts) -> Self {
         Self {
             facts,
             description: format!("{}\n{}", D::DESCRIPTION, facts.context()),
@@ -207,7 +207,7 @@ fn note(ran: &Ran) -> String {
         note.push(format!("stopped past {} MiB of output", limit >> 20));
     }
     match (&ran.background, &ran.signal, ran.exit) {
-        (Some(job), ..) => note.push(format!("in the background, pgid {}", job.pgid)),
+        (Some(job), ..) => note.push(format!("in the background, job {}", job.pgid)),
         (_, Some(signal), _) => note.push(format!("killed by {signal}")),
         (_, _, Some(code)) => note.push(format!("exit {code}")),
         _ => {}
@@ -244,7 +244,7 @@ fn model_text(ran: &Ran) -> String {
     };
     if let Some(job) = &ran.background {
         trailer(format!(
-            "[running in the background: pgid {}; output: {}]",
+            "[running in the background: job {}; output: {}]",
             job.pgid,
             job.log.display()
         ));
@@ -254,7 +254,7 @@ fn model_text(ran: &Ran) -> String {
         trailer("(no output)".to_owned());
     }
     if let Some(pgid) = ran.lingering {
-        trailer(format!("[background processes still running: pgid {pgid}]"));
+        trailer(format!("[background processes still running: job {pgid}]"));
     }
     if ran.aborted {
         trailer("[aborted]".to_owned());
@@ -403,24 +403,6 @@ async fn launch(cx: &Cx, process: Spawn, file: File) -> io::Result<OwnedProcess>
             },
         )
         .await
-}
-
-#[cfg(test)]
-fn spawn(
-    cx: &Cx,
-    command: &str,
-    dir: &Path,
-    env: BTreeMap<String, String>,
-    report: Option<&Path>,
-) -> io::Result<Spawn> {
-    spawn_with::<crate::dialect::Bash>(
-        sys::shell::ExecutionFacts::current(),
-        cx,
-        command,
-        dir,
-        env,
-        report,
-    )
 }
 
 fn spawn_with<D: crate::dialect::Dialect>(

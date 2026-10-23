@@ -219,10 +219,15 @@ fn powershell_preserves_status_errors_unicode_cwd_and_no_input() {
         for (command, code) in [
             ("exit 37", 37),
             ("cmd.exe /c exit 7", 1),
+            ("cmd.exe /c exit 7; exit $LASTEXITCODE", 7),
             ("cmd.exe /c exit 7; Write-Output 'ok'", 0),
             ("Write-Error 'problem'; Write-Output 'ok'", 0),
             ("Write-Error 'problem'", 1),
             ("throw 'problem'", 1),
+            (
+                "try { throw 'handled' } catch { Write-Output 'handled' }",
+                0,
+            ),
             ("return", 0),
             ("", 0),
             ("Read-Host 'input'", 1),
