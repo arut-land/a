@@ -190,6 +190,7 @@ impl States {
     /// Missing registrations retain only their serialized value, never an old
     /// reducer or VM. Retention ends with the session, or when reattached.
     pub fn adopt(&mut self, live: &Self) -> Result<(), String> {
+        self.validate(live)?;
         for held in &mut self.held {
             if let Some(image) = live
                 .retained
@@ -211,7 +212,7 @@ impl States {
                 self.retained.push(held.image()?);
             }
         }
-        self.validate(live)
+        Ok(())
     }
 
     /// Only declared settings of registrations present in the child travel.

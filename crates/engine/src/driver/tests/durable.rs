@@ -718,6 +718,7 @@ fn generation_adoption_rearms_deferred_sync_for_later_mutations() {
 fn a_generation_omitting_a_fold_retains_its_value_through_a_checkpoint() {
     let mut h = ManualSession::with_registry(reload_registry(1, 1, false));
     let _ack = h.note();
+    let _second = h.note();
     h.complete();
     h.snapshot();
     h.replace(Registry::default().with(&Agents).unwrap());
@@ -734,8 +735,11 @@ fn a_generation_omitting_a_fold_retains_its_value_through_a_checkpoint() {
             .image
             .parse::<u64>()
             .unwrap(),
-        1
+        2
     );
+    h.replace(reload_registry(2, 1, true));
+    h.request("reject incompatible replay");
+    assert!(!lock(&h.session.session.state_view()).registered("test", "value"));
     h.replace(reload_registry(1, 1, false));
     h.request("adopt");
     h.assert_replay(&reload_registry(1, 1, false));
