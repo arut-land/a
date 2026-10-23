@@ -7,8 +7,7 @@
 //! atomically publishes the socket pathname for clients with other environments;
 //! Linux uses a validated XDG runtime directory, an existing private
 //! `/run/user/UID`, or a private `/tmp/a-UID` fallback. Pathname sockets retain
-//! filesystem access control. macOS prefers Darwin user temp, with a short private
-//! `/tmp/a-UID` fallback.
+//! filesystem access control. macOS uses the private `/tmp/a-UID` directory.
 //! Windows claims the home with an exclusive file handle before creating a
 //! first-instance, local-only pipe with a user-SID-only DACL. Accepted and
 //! connected peers are checked before constructing `OwnedConnection`.
@@ -641,20 +640,8 @@ mod imp {
             &PathBuf::from(format!("/run/user/{}", geteuid().as_raw())),
             fallback,
         );
-        #[cfg(target_os = "macos")]
-        {
-            crate::paths::darwin_temporary_dir()
-                .ok()
-                .map(|dir| dir.join("a"))
-                .filter(|dir| {
-                    dir.join("0000000000000000.sock")
-                        .as_os_str()
-                        .as_encoded_bytes()
-                        .len()
-                        < 104
-                })
-                .unwrap_or(fallback)
-        }
+        #[cfg(not(target_os = "linux"))]
+        fallback
     }
 
     #[cfg(target_os = "linux")]

@@ -16,7 +16,12 @@ reading configuration does not require a writable home.
 | Temporary files | Runtime directory `a-tmp` | Darwin user temporary directory `dev.a` | LocalAppData `a/temp` |
 
 Windows resolves LocalAppData with `SHGetKnownFolderPath`, including redirected
-folders. Configuration contains provider keys and machine-specific tool paths,
+folders. Resolution opens the shell-folders and COM Windows API contracts through
+`libloading`, using a System32-only search. It copies the returned path, frees the
+COM allocation, then releases both library references. There are no static
+Shell32 or COM imports for path resolution; isolated `A_HOME` resolution does not
+open either contract. A fresh-process invariant checks that native resolution
+retains neither Shell32, Ole32 nor Combase. Configuration contains provider keys and machine-specific tool paths,
 so it stays local alongside state, builds, caches and diagnostics. RoamingAppData
 is reserved for explicitly portable, secret-free preferences; there are no such
 preferences in this layout. macOS obtains its
@@ -37,8 +42,8 @@ private `/run/user/UID`, or `/tmp/a-UID`. It verifies ownership, directory type,
 permissions and socket pathname length. A missing runtime directory works
 without logind, including Alpine/musl and headless containers. A `noexec` mount
 can hold sockets; executable staging uses the data directory instead. macOS
-prefers a short private directory under its Darwin user temporary directory,
-with the endpoint backend's short private `/tmp/a-UID` fallback when necessary.
+uses the endpoint backend's private `/tmp/a-UID` directory for IPC; its Darwin
+user temporary directory serves temporary files.
 Endpoint claims, peer checks and published address discovery remain owned by
 the endpoint backend. Named pipes on Windows have no filesystem socket path.
 

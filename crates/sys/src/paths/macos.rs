@@ -2,7 +2,7 @@ use super::{Command, InstallLayout, Locations, PathBuf, Paths, io};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 
-pub(crate) fn temporary_dir() -> io::Result<PathBuf> {
+fn temporary_dir() -> io::Result<PathBuf> {
     // confstr is independent of an app's inherited TMPDIR/login environment.
     // SAFETY: a null buffer with length zero queries the required allocation.
     let size = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };

@@ -1,8 +1,5 @@
 //! Native directory purposes, resolved once at the client/daemon boundary.
 
-#[cfg(target_os = "macos")]
-pub(crate) use native::temporary_dir as darwin_temporary_dir;
-
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
