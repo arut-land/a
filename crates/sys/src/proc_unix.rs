@@ -473,7 +473,7 @@ impl Drop for Attributes {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
 
@@ -515,8 +515,8 @@ mod tests {
             .spawn()
             .unwrap();
         let lease = super::super::ProcessLease::new(&child);
-        // SAFETY: deliberate foreign-reaper fault injection for this test's child.
         assert_eq!(
+            // SAFETY: deliberate foreign-reaper fault injection for this test's child.
             unsafe { libc::waitpid(child.id().cast_signed(), std::ptr::null_mut(), 0) },
             child.id().cast_signed()
         );
@@ -592,6 +592,9 @@ mod tests {
     }
 }
 
-#[cfg(all(target_os = "linux", any(not(target_env = "gnu"), test)))]
+#[cfg(all(
+    target_os = "linux",
+    any(not(target_env = "gnu"), all(test, not(miri)))
+))]
 #[path = "proc_linux.rs"]
 mod linux;

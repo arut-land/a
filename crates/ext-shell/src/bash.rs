@@ -601,17 +601,8 @@ async fn supervise(
             rt::or(writes, rt::or(exits, rt::or(cancelled, sleep))).await?;
         }
         written.get_ref().clear();
-        let (state, read) =
-            rt::unblock_with(rt, rt::BlockingClass::Storage, 256 << 10, move || {
-                let read = follow(&mut file, &mut buf, READ, |chunk| {
-                    output.push(chunk);
-                    live.push(chunk);
-                });
-                ((file, buf, output, live), read)
-            })
-            .await;
-        (file, buf, output, live) = state;
-        let read = read?;
+        let read;
+        (file, buf, output, live, read) = follow_chunk(rt, file, buf, output, live).await?;
         behind = read == READ;
         if read > 0 {
             rt::yield_now().await;
@@ -668,6 +659,23 @@ async fn supervise(
             }
         }
     }
+}
+
+async fn follow_chunk(
+    rt: &dyn rt::Runtime,
+    mut file: File,
+    mut buf: Vec<u8>,
+    mut output: Output,
+    mut live: Live,
+) -> io::Result<(File, Vec<u8>, Output, Live, u64)> {
+    rt::unblock_with(rt, rt::BlockingClass::Storage, 256 << 10, move || {
+        let read = follow(&mut file, &mut buf, READ, |chunk| {
+            output.push(chunk);
+            live.push(chunk);
+        })?;
+        Ok((file, buf, output, live, read))
+    })
+    .await
 }
 
 /// Reads what `file` has past where it was last read, up to `most` bytes,

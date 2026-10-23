@@ -3,6 +3,9 @@ on:
   push:
     branches: [codex-w1process]
   workflow_dispatch:
+concurrency:
+  group: process-probe-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:

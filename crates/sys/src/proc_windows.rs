@@ -266,6 +266,7 @@ fn created_at(process: &OwnedHandle) -> io::Result<u64> {
     Ok(u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime))
 }
 
+#[cfg(test)]
 pub fn exit_watch(pid: u32) -> io::Result<OwnedHandle> {
     // SAFETY: scalar inputs; checked handle transferred to the caller.
     owned(unsafe { OpenProcess(0x0010_0000, 0, pid) }).map_err(|error| {
@@ -275,6 +276,30 @@ pub fn exit_watch(pid: u32) -> io::Result<OwnedHandle> {
             error
         }
     })
+}
+
+pub fn member_watch(job: &OwnedHandle, pid: u32) -> io::Result<Option<ExitWatch>> {
+    // The query and membership check use the same retained process object.
+    // SAFETY: scalar access flags and ID; the returned handle is checked and owned.
+    let process = match owned(unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid)
+    }) {
+        Ok(process) => process,
+        Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER.cast_signed()) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut member = 0;
+    // SAFETY: both native objects remain owned; member is a writable BOOL.
+    ok(unsafe {
+        windows_sys::Win32::System::JobObjects::IsProcessInJob(
+            process.as_raw_handle(),
+            job.as_raw_handle(),
+            &raw mut member,
+        )
+    })?;
+    Ok((member != 0).then_some(process))
 }
 
 /// The verified kernel object stays owned across both stop attempts.
@@ -405,6 +430,32 @@ mod tests {
     }
 
     #[test]
+    fn a_job_cannot_watch_a_process_in_another_job() {
+        let launch = || {
+            let mut command = Command::new("cmd.exe");
+            command
+                .args(["/D", "/C", "ping -n 60 127.0.0.1 >NUL"])
+                .envs(std::env::vars_os());
+            spawn_group(
+                &mut command,
+                File::options().write(true).open("NUL").unwrap(),
+            )
+            .unwrap()
+        };
+        let mut first = launch();
+        let mut second = launch();
+        assert!(
+            member_watch(&first.group.handle, second.id())
+                .unwrap()
+                .is_none()
+        );
+        first.group.signal(Signal::Kill).unwrap();
+        second.group.signal(Signal::Kill).unwrap();
+        first.wait().unwrap();
+        second.wait().unwrap();
+    }
+
+    #[test]
     fn unicode_environment_and_working_directory_survive_native_creation() {
         use std::os::windows::ffi::OsStrExt;
         let root = std::env::temp_dir().join(format!("a-process-世界-{}", std::process::id()));
@@ -423,10 +474,12 @@ mod tests {
         let mut child = spawn_group(&mut command, File::create(&path).unwrap()).unwrap();
         assert!(child.wait().unwrap().success());
         let bytes = std::fs::read(&path).unwrap();
+        let (units, trailing) = bytes.as_chunks::<2>();
+        assert_eq!(trailing, [] as [u8; 0]);
         let text = String::from_utf16(
-            &bytes
-                .chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            &units
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
                 .collect::<Vec<_>>(),
         )
         .unwrap();

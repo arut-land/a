@@ -128,10 +128,10 @@ impl Exec<'_> {
                     failed(self.error);
                 }
             }
-            if let Some(directory) = self.directory {
-                if libc::chdir(directory.as_ptr()) < 0 {
-                    failed(self.error);
-                }
+            if let Some(directory) = self.directory
+                && libc::chdir(directory.as_ptr()) < 0
+            {
+                failed(self.error);
             }
             if self.session {
                 if libc::setsid() < 0 {
@@ -255,7 +255,7 @@ impl Drop for Mask {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use std::ffi::CString;

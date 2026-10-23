@@ -124,6 +124,21 @@ impl ProcessLease {
         }
     }
 
+    /// Opens exit notifications only for members verified under this live lease.
+    pub fn exit_watches(&self) -> io::Result<Vec<ExitWatch>> {
+        let mut watches = Vec::new();
+        for pid in self.members()? {
+            #[cfg(unix)]
+            let watch = imp::member_watch(self.id.0, pid);
+            #[cfg(windows)]
+            let watch = imp::member_watch(&self.handle, pid);
+            if let Some(watch) = watch? {
+                watches.push(watch);
+            }
+        }
+        Ok(watches)
+    }
+
     pub fn alive(&self) -> bool {
         self.members().map_or(true, |members| !members.is_empty())
     }
@@ -319,13 +334,6 @@ pub fn adopt_lock(file: File, home: &crate::Home) -> Result<DaemonLock, AdoptLoc
 /// Leaves the spawning terminal's session so its hangup never reaches us.
 pub fn detach_session() -> io::Result<()> {
     imp::detach_session()
-}
-
-/// A handle that turns readable once process `pid` has exited (reaped or
-/// not): a pidfd on Linux, a kqueue of its own elsewhere. `NotFound` when
-/// it is already gone.
-pub fn exit_watch(pid: u32) -> io::Result<ExitWatch> {
-    imp::exit_watch(pid)
 }
 
 /// When the OS says process `pid` started, in its own units: equal for one
@@ -636,6 +644,19 @@ mod imp {
         Ok(queue)
     }
 
+    pub fn member_watch(group: u32, member: u32) -> io::Result<Option<ExitWatch>> {
+        let watch = match exit_watch(member) {
+            Ok(watch) => watch,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match process::getpgid(Some(pid(member)?)) {
+            Ok(actual) if actual.as_raw_nonzero().get().cast_unsigned() == group => Ok(Some(watch)),
+            Ok(_) | Err(rustix::io::Errno::SRCH) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn gone(errno: rustix::io::Errno) -> io::Error {
         if errno == rustix::io::Errno::SRCH {
             io::ErrorKind::NotFound.into()
@@ -886,6 +907,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn only_a_live_lease_can_kill_its_group() {
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 30 & sleep 30"]);
@@ -1015,7 +1037,7 @@ fn spawn_stdio_role(
         let child_input = File::from(OwnedFd::from(child_input));
         let child_output = File::from(OwnedFd::from(child_output));
         let error = if terminal {
-            File::from(rustix::io::dup(io::stderr())?)
+            File::from(std::os::fd::AsFd::as_fd(&io::stderr()).try_clone_to_owned()?)
         } else {
             File::options().write(true).open("/dev/null")?
         };

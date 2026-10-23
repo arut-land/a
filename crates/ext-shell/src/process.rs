@@ -329,20 +329,16 @@ async fn descendants(
 ) -> io::Result<()> {
     loop {
         let owner = Arc::clone(live);
-        let members = rt::unblock_with(runtime, rt::BlockingClass::Storage, 0, move || {
+        let watches = rt::unblock_with(runtime, rt::BlockingClass::Storage, 0, move || {
             lock(&owner.group)
                 .as_ref()
-                .map_or_else(|| Ok(Vec::new()), sys::ProcessLease::members)
+                .map_or_else(|| Ok(Vec::new()), sys::ProcessLease::exit_watches)
         })
         .await?;
-        let mut watches = Vec::new();
-        for pid in members {
-            match sys::exit_watch(pid).and_then(|w| rt::Async::for_reading(reactor, w)) {
-                Ok(watch) => watches.push(watch),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
+        let watches = watches
+            .into_iter()
+            .map(|watch| rt::Async::for_reading(reactor, watch))
+            .collect::<io::Result<Vec<_>>>()?;
         if watches.is_empty() {
             return Ok(());
         }
@@ -402,6 +398,43 @@ mod tests {
             },
             output: ProcessOutput::Stdio,
         }
+    }
+
+    #[test]
+    fn outstanding_launches_are_bounded_and_completion_releases_capacity() {
+        let rig = Rig::new("process-capacity", Registry::default());
+        let cx = rig.cx();
+        rt::block_on(async {
+            let mut children = Vec::new();
+            for _ in 0..MAX_PROCESSES {
+                children.push(
+                    Provider
+                        .spawn(&cx, spec(&cx, "read -r line"))
+                        .await
+                        .unwrap(),
+                );
+            }
+            let refused = Provider
+                .spawn(&cx, spec(&cx, "read -r line"))
+                .await
+                .err()
+                .expect("capacity was exceeded");
+            assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+            let child = children.pop().unwrap();
+            let completion = Arc::clone(&child.process);
+            drop(child);
+            completion.ended().await;
+            let replacement = Provider
+                .spawn(&cx, spec(&cx, "read -r line"))
+                .await
+                .unwrap();
+            drop(replacement);
+            for child in children {
+                let completion = Arc::clone(&child.process);
+                drop(child);
+                completion.ended().await;
+            }
+        });
     }
 
     #[test]
