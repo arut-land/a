@@ -1443,8 +1443,10 @@ fn stage_windows(
         WRITE_OWNER,
     };
     let access = GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
-    let _source_pin = pin_copy_directory(&transaction.parent)?;
-    let _staging_pin = pin_copy_directory(&directory.file)?;
+    let _source_pin = pin_copy_directory(&transaction.parent)
+        .map_err(|e| io::Error::new(e.kind(), format!("pin source directory: {e}")))?;
+    let _staging_pin = pin_copy_directory(&directory.file)
+        .map_err(|e| io::Error::new(e.kind(), format!("pin staging directory: {e}")))?;
     if !same_object(&transaction.parent, &open_parent(&transaction.directory)?)?
         || !same_object(&directory.file, &open_parent(&directory.path)?)?
     {
