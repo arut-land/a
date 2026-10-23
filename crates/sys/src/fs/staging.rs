@@ -10,25 +10,11 @@ use std::path::Path;
 pub(super) const CONTENT: &str = "content";
 pub(super) const ORIGINAL: &str = "original";
 
-#[cfg(windows)]
-pub(super) struct DirectoryHandle(Option<File>);
-
-#[cfg(windows)]
-impl std::ops::Deref for DirectoryHandle {
-    type Target = File;
-    fn deref(&self) -> &File {
-        self.0.as_ref().expect("directory is pinned until cleanup")
-    }
-}
-
 pub(super) struct Directory<'a> {
     parent: &'a File,
     #[cfg(unix)]
     pub name: OsString,
-    #[cfg(unix)]
     pub file: File,
-    #[cfg(windows)]
-    pub file: DirectoryHandle,
     retain: bool,
     pub path: std::path::PathBuf,
 }
@@ -75,10 +61,7 @@ impl<'a> Directory<'a> {
                 parent,
                 #[cfg(unix)]
                 name,
-                #[cfg(unix)]
                 file,
-                #[cfg(windows)]
-                file: DirectoryHandle(Some(file)),
                 retain: false,
                 path,
             };
@@ -117,29 +100,21 @@ impl Drop for Directory<'_> {
         {
             use std::os::windows::io::AsRawHandle;
             use windows_sys::Win32::Storage::FileSystem::{
-                FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-                FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+                DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE, ReOpenFile,
             };
-            // Keep the object alive after releasing its delete-sharing pin. A native
-            // link cannot operate while the directory itself has a DELETE handle.
-            // SAFETY: the pinned handle is live; the returned reference is checked/owned.
-            let reference = crate::windows::owned(unsafe {
+            // Reopen the owned directory object, never its potentially substituted name.
+            // SAFETY: the live directory handle identifies the object; the new handle is checked/owned.
+            let authority = crate::windows::owned(unsafe {
                 ReOpenFile(
                     self.file.as_raw_handle(),
-                    FILE_READ_ATTRIBUTES,
+                    DELETE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     FILE_FLAG_BACKUP_SEMANTICS,
                 )
             });
-            let Ok(reference) = reference.map(File::from) else {
-                return;
-            };
-            drop(self.file.0.take());
-            if let Some(name) = self.path.file_name()
-                && let Ok(current) = relative(self.parent, name, true, false)
-                && super::edit::same_object(&reference, &current).unwrap_or(false)
-            {
-                delete(&current);
+            if let Ok(authority) = authority.map(File::from) {
+                delete(&authority);
             }
         }
     }
@@ -258,7 +233,15 @@ impl<'a> Staged<'a> {
             )?))
         }
         #[cfg(windows)]
-        relative(&self.directory.file, OsStr::new(ORIGINAL), false, false)
+        relative_shared(
+            &self.directory.file,
+            OsStr::new(ORIGINAL),
+            false,
+            false,
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+        )
     }
 
     pub fn restore_original(&mut self, source: &File, name: &OsStr) -> io::Result<()> {
@@ -313,7 +296,15 @@ impl<'a> Staged<'a> {
     fn remove_link(&self, name: &str) -> io::Result<()> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::{Foundation::GENERIC_READ, Storage::FileSystem::DELETE};
-        let file = relative(&self.directory.file, OsStr::new(name), false, false)?;
+        let file = relative_shared(
+            &self.directory.file,
+            OsStr::new(name),
+            false,
+            false,
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+        )?;
         let authority = super::edit::reopen(file.as_raw_handle(), GENERIC_READ | DELETE)?;
         remove(&authority)?;
         drop(authority);
@@ -343,7 +334,12 @@ impl<'a> Staged<'a> {
 
     pub fn retain_original(&mut self) -> std::path::PathBuf {
         self.directory.retain = true;
-        self.directory.path.join(ORIGINAL)
+        #[cfg(unix)]
+        let path = self.directory.path.clone();
+        #[cfg(windows)]
+        let path =
+            super::final_path(&self.directory.file).unwrap_or_else(|_| self.directory.path.clone());
+        path.join(ORIGINAL)
     }
 
     pub fn publish(&mut self, name: &OsStr) -> io::Result<()> {
@@ -421,6 +417,22 @@ pub(super) fn relative(
     directory: bool,
     create: bool,
 ) -> io::Result<File> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let sharing =
+        FILE_SHARE_READ | FILE_SHARE_DELETE | if directory { FILE_SHARE_WRITE } else { 0 };
+    relative_shared(parent, name, directory, create, sharing)
+}
+
+#[cfg(windows)]
+fn relative_shared(
+    parent: &File,
+    name: &OsStr,
+    directory: bool,
+    create: bool,
+    sharing: u32,
+) -> io::Result<File> {
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
     use windows_sys::Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
@@ -432,8 +444,7 @@ pub(super) fn relative(
     use windows_sys::Win32::{
         Foundation::{GENERIC_READ, GENERIC_WRITE, RtlNtStatusToDosError, UNICODE_STRING},
         Storage::FileSystem::{
-            DELETE, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+            DELETE, FILE_ATTRIBUTE_NORMAL, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
         },
         System::IO::IO_STATUS_BLOCK,
     };
@@ -482,9 +493,7 @@ pub(super) fn relative(
             &raw mut status,
             std::ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
-            FILE_SHARE_READ
-                | if create { FILE_SHARE_WRITE } else { 0 }
-                | if directory { 0 } else { FILE_SHARE_DELETE },
+            sharing,
             if create { FILE_CREATE } else { FILE_OPEN },
             FILE_SYNCHRONOUS_IO_NONALERT
                 | FILE_OPEN_REPARSE_POINT

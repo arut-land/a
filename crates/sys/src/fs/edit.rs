@@ -634,11 +634,15 @@ fn open_parent(path: &Path) -> io::Result<File> {
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
-        // Pin the directory spelling and obtain publication rights before detaching a file.
+        // CopyFileEx gets scoped path pins; publication uses shared directory handles.
         fs::OpenOptions::new()
             .access_mode(GENERIC_READ | FILE_ADD_FILE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .share_mode(
+                FILE_SHARE_READ
+                    | FILE_SHARE_WRITE
+                    | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+            )
             .open(path)
     }
 }
@@ -1439,6 +1443,13 @@ fn stage_windows(
         WRITE_OWNER,
     };
     let access = GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
+    let _source_pin = pin_copy_directory(&transaction.parent)?;
+    let _staging_pin = pin_copy_directory(&directory.file)?;
+    if !same_object(&transaction.parent, &open_parent(&transaction.directory)?)?
+        || !same_object(&directory.file, &open_parent(&directory.path)?)?
+    {
+        return Err(io::ErrorKind::ResourceBusy.into());
+    }
     let Some((source, _)) = &transaction.source else {
         return super::staging::relative(
             &directory.file,
@@ -1488,7 +1499,12 @@ fn stage_windows(
         .destination
         .ok_or_else(|| io::Error::other("native copy omitted its stream callback"))?;
     // Upgrade the same object after the copier releases its data-sharing lease.
-    match reopen(keeper.as_raw_handle(), access) {
+    match reopen_shared(
+        keeper.as_raw_handle(),
+        access,
+        windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+            | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+    ) {
         Ok(file) => Ok(file),
         Err(error) => {
             if let Ok(file) = reopen(keeper.as_raw_handle(), DELETE) {
@@ -1548,6 +1564,26 @@ pub(super) fn accessible_links(file: &File) -> io::Result<u32> {
         });
     }
     Ok(information.NumberOfAccessibleLinks)
+}
+
+#[cfg(windows)]
+fn pin_copy_directory(directory: &File) -> io::Result<File> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+        },
+    };
+    // SAFETY: the existing handle pins the object while the sharing guard is acquired.
+    Ok(File::from(crate::windows::owned(unsafe {
+        ReOpenFile(
+            directory.as_raw_handle(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    })?))
 }
 
 #[cfg(windows)]
