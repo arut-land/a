@@ -374,6 +374,11 @@ pub trait Tool: Send + Sync + 'static {
 
     const NAME: &'static str;
     const DESCRIPTION: &'static str;
+
+    /// Startup-resolved facts may refine the type's fixed description.
+    fn description(&self) -> &str {
+        Self::DESCRIPTION
+    }
     /// Who calls it: the model, or the user, as a command `/name args`
     /// given [`Args`].
     const AUDIENCE: Audience = Audience::Model;
@@ -479,7 +484,7 @@ where
     }
 
     fn description(&self) -> &str {
-        T::DESCRIPTION
+        self.0.description()
     }
 
     fn audience(&self) -> Audience {
@@ -498,7 +503,7 @@ where
         let schema = crate::schema::of::<T::In>();
         llm::Tool {
             name: llm::SmolStr::new_static(T::NAME),
-            description: T::DESCRIPTION.to_owned(),
+            description: self.0.description().to_owned(),
             schema: serde_json::from_str(&schema).expect("a derived schema is JSON"),
             strict: None,
         }

@@ -20,29 +20,9 @@ pub(crate) enum SpawnEnvironment {
     InheritSnapshot,
 }
 
-/// Finds bash using the system location first, then the session's PATH.
+/// Finds native Bash from a captured PATH and installed locations.
 pub fn find_bash(search: Option<&str>) -> Option<String> {
-    let system = std::path::Path::new("/bin/bash");
-    if system.is_file() {
-        return Some(system.display().to_string());
-    }
-    #[cfg(windows)]
-    for (variable, suffix) in [
-        ("ProgramFiles", "Git/bin/bash.exe"),
-        ("LOCALAPPDATA", "Programs/Git/bin/bash.exe"),
-    ] {
-        if let Some(root) = std::env::var_os(variable) {
-            let path = std::path::PathBuf::from(root).join(suffix);
-            if path.is_file() {
-                return Some(path.display().to_string());
-            }
-        }
-    }
-    let name = format!("bash{}", std::env::consts::EXE_SUFFIX);
-    std::env::split_paths(search?)
-        .map(|dir| dir.join(&name))
-        .find(|path| path.is_file())
-        .map(|path| path.display().to_string())
+    crate::shell::find_bash(search).map(|path| path.to_string_lossy().into_owned())
 }
 
 /// Persisted identity for diagnostics; it never owns native resources.

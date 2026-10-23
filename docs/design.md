@@ -90,7 +90,7 @@ is committed, and only then is the request sent.
 
 One async engine actor per loaded session carries out those effects and
 feeds results back. Each running call has its own in-flight state. Tools
-declare shared or exclusive concurrency; `bash` remains exclusive. Blocking
+declare shared or exclusive concurrency; shell commands remain exclusive. Blocking
 store and provider operations run through `rt`'s blocking pool. Followers
 share encoded entries and a bounded tail ring rather than separately
 encoding every entry for every client.
@@ -191,7 +191,7 @@ The linked extensions own:
 
 | Crate | Responsibility |
 | --- | --- |
-| `ext-shell`, `ext-edit` | Streaming `bash`, spill files and `edit` |
+| `ext-shell`, `ext-edit` | One streaming native shell tool, spill files and `edit` |
 | `ext-mcp` | Lazy external tools over stdio and Streamable HTTP |
 | `ext-prompt` | System prompt |
 | `ext-policy` | Permission modes, judge and guarded operator floor |
@@ -202,6 +202,23 @@ The linked extensions own:
 | `ext-title` | Titles from a side model call |
 | `ext-lua` | Optional runtime mods through the erased SDK |
 | `ext-fixtures` | Test-only echo agent and sleep tool |
+
+The shell extension registers one concrete SDK tool type at startup: `bash`
+on Unix; native Bash discovered through PATH, Git for Windows registry/install
+paths or MSYS2 on Windows; otherwise `powershell` using pwsh, else Windows
+PowerShell 5.1. The Windows system WSL launcher is excluded. The daemon pins
+that executable until restart, with no shell setting. Tool descriptions and
+prompt environment context share cached `ExecutionFacts`: dialect, path style,
+utilities, temporary directory and platform cleanup limits. Commands receive
+the published temporary directory even after a different client attaches.
+
+PowerShell uses one bounded Unicode `-Command` payload without profiles,
+interactive input or execution-policy changes. Explicit exit codes survive;
+otherwise the final command's success becomes 0 or 1, with normal error semantics.
+A best-effort UTF-8 FileSystem cwd receipt cannot replace the command's status.
+The 5.1 SDK type binds its native Utility and Management modules before running
+commands, retaining client module paths. The same process service supervises either dialect. See
+[shell execution evidence](perf/shell.md).
 
 The default loop lives in the SDK and registers through the same machinery.
 `apps/cli/src/exts.rs` assembles the linked extensions. `Models` supports
