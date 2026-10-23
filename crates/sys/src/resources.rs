@@ -292,16 +292,10 @@ mod tests {
         fn class() -> u32 {
             let mut class = 0;
             // SAFETY: current thread is live; class is writable, relative output is optional.
-            assert_eq!(
-                unsafe {
-                    pthread_get_qos_class_np(
-                        libc::pthread_self(),
-                        &raw mut class,
-                        std::ptr::null_mut(),
-                    )
-                },
-                0
-            );
+            let result = unsafe {
+                pthread_get_qos_class_np(libc::pthread_self(), &raw mut class, std::ptr::null_mut())
+            };
+            assert_eq!(result, 0);
             class
         }
         let _utility = Priority::utility();
