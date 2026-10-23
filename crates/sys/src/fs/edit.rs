@@ -433,6 +433,8 @@ impl EditTransaction {
                 Err(error) => Err(error.into()),
             };
         };
+        #[cfg(unix)]
+        staged.prepare_vacancy()?;
         #[cfg(windows)]
         let moving_source = {
             use std::os::windows::io::AsRawHandle;

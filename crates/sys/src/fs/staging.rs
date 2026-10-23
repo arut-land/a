@@ -208,20 +208,31 @@ impl<'a> Staged<'a> {
     pub fn restore_original(&mut self, source: &File, name: &OsStr) -> io::Result<()> {
         #[cfg(unix)]
         {
-            use rustix::fs::{AtFlags, linkat, unlinkat};
             let _ = source;
-            linkat(
+            no_replace(
                 &self.directory.file,
-                ORIGINAL,
+                OsStr::new(ORIGINAL),
                 self.directory.parent,
                 name,
-                AtFlags::empty(),
             )?;
-            unlinkat(&self.directory.file, ORIGINAL, AtFlags::empty())?;
         }
         #[cfg(windows)]
         rename(source, self.directory.parent, name)?;
         self.directory.retain = false;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub fn prepare_vacancy(&mut self) -> io::Result<()> {
+        // Prove that the filesystem has a no-replace path before detaching a target.
+        // Both names are exclusively owned; this cannot expose staged content.
+        no_replace(
+            &self.directory.file,
+            OsStr::new(CONTENT),
+            &self.directory.file,
+            OsStr::new("probe"),
+        )?;
+        rustix::fs::renameat(&self.directory.file, "probe", &self.directory.file, CONTENT)?;
         Ok(())
     }
 
@@ -245,21 +256,12 @@ impl<'a> Staged<'a> {
     pub fn publish(&mut self, name: &OsStr) -> io::Result<()> {
         #[cfg(unix)]
         {
-            use rustix::fs::{RenameFlags, renameat_with};
-            let flags = RenameFlags::NOREPLACE;
-            match renameat_with(
+            no_replace(
                 &self.directory.file,
-                CONTENT,
+                OsStr::new(CONTENT),
                 self.directory.parent,
                 name,
-                flags,
-            ) {
-                Ok(()) => Ok(()),
-                Err(
-                    rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::NOTSUP,
-                ) => self.fallback(name),
-                Err(error) => Err(error.into()),
-            }
+            )
         }
         #[cfg(windows)]
         {
@@ -269,12 +271,26 @@ impl<'a> Staged<'a> {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, test))]
     pub fn fallback(&mut self, name: &OsStr) -> io::Result<()> {
         let source = &self.directory.file;
         let target = self.directory.parent;
         rustix::fs::linkat(source, CONTENT, target, name, rustix::fs::AtFlags::empty())?;
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn no_replace(source: &File, from: &OsStr, target: &File, to: &OsStr) -> io::Result<()> {
+    use rustix::fs::{AtFlags, RenameFlags, linkat, renameat_with, unlinkat};
+    match renameat_with(source, from, target, to, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::NOTSUP) => {
+            linkat(source, from, target, to, AtFlags::empty())?;
+            unlinkat(source, from, AtFlags::empty())?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
