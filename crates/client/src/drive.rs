@@ -861,8 +861,11 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!("a-client-{:?}", ClientId::new()));
-            std::fs::create_dir_all(&root).unwrap();
+            let root = tempfile::Builder::new()
+                .prefix("a-client-")
+                .tempdir()
+                .unwrap()
+                .keep();
             let home = sys::Home::from(root.join("home"));
             let exe = root.join("a");
             std::fs::write(&exe, "never run").unwrap();

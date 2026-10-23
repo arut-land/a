@@ -19,3 +19,6 @@ windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_Fil
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = { version = "3", default-features = false }

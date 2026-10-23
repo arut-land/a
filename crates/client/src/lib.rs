@@ -1019,8 +1019,11 @@ mod tests {
     }
 
     fn scratch(name: &str) -> (PathBuf, Home) {
-        let root = std::env::temp_dir().join(format!("a-client-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = tempfile::Builder::new()
+            .prefix(&format!("a-client-{name}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         fs::create_dir_all(root.join("run")).unwrap();
         (root.clone(), Home::from(root))
     }
