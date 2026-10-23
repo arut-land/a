@@ -78,3 +78,49 @@ The perf workflow reports release size on six native targets and compares
 five alternating candidate/reference rounds against main. These observations
 cover daemon startup, first reply, attach, RSS and idle CPU; they do not
 measure PowerShell child startup or child working set.
+
+## Hosted observations
+
+The [paired run](https://github.com/arut-land/a/actions/runs/40001426239)
+compares production revision `17a7b27d` with main `781586d5`, with five
+alternating rounds per build on each native runner. The subsequent `c730c03e`
+changes only the PowerShell test deadline from 20 to 90 seconds; production
+code is identical. The [functional run](https://github.com/arut-land/a/actions/runs/40006363910)
+uses that test deadline with no diagnostic instrumentation.
+
+Release sizes, in KiB:
+
+| Native target | Main | Candidate | Difference |
+| --- | ---: | ---: | ---: |
+| Linux x86_64 | 4160.656 | 4192.070 | +31.414 |
+| Linux ARM64 | 3582.914 | 3604.539 | +21.625 |
+| Windows x86_64 | 5340.000 | 5405.000 | +65.000 |
+| Windows ARM64 | 4698.500 | 4754.500 | +56.000 |
+| macOS x86_64 | 3864.828 | 3896.930 | +32.102 |
+| macOS ARM64 | 3219.625 | 3236.031 | +16.406 |
+
+Paired median differences (candidate minus main):
+
+| Native target | First reply, ms | Attach p50, ms | Attach p99, ms | Startup, ms | Idle RSS, KiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Linux x86_64 | -0.111 | -0.014 | -0.005 | +0.017 | +16 |
+| Linux ARM64 | -0.395 | +0.003 | -0.001 | -0.022 | +28 |
+| Windows x86_64 | -0.422 | -0.007 | +0.014 | -0.109 | +56 |
+| Windows ARM64 | -1.478 | +0.004 | +0.029 | +0.510 | +96 |
+| macOS x86_64 | +10.035 | +0.104 | +0.056 | +0.417 | +40 |
+| macOS ARM64 | +4.912 | -0.063 | -0.027 | -0.885 | +48 |
+
+These small samples are observations, not significance tests. First-reply
+and startup median differences on these targets are smaller than the larger
+of the two p10–p90 spreads. Linux x86_64 attach p50 improved by 0.014 ms and Windows
+ARM64 attach p99 increased by 0.029 ms, exceeding both builds' observed spreads.
+Idle RSS increases on Linux ARM64, Windows ARM64 and Intel macOS exceed those
+spreads; the other RSS changes do not.
+
+Daemon and line-client idle CPU medians are zero for both builds on these
+targets. All Linux and macOS samples and all line-client samples are
+zero. Windows x86_64 has one candidate daemon sample at 15.625 ms; Windows
+ARM64 has nonzero daemon samples in both builds at that resolution. RSS is
+sampled three seconds after first reply; CPU uses a ten-second window after
+fifteen seconds of settling. A zero counter increment describes the OS
+measurement resolution, not proof that no instructions executed.
