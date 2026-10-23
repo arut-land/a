@@ -38,6 +38,11 @@ impl Loader {
             .collect();
         roots.push(self.home.join("skills"));
         roots.push(workspace.join(".a/skills"));
+        for index in (0..roots.len()).rev() {
+            if roots[index + 1..].contains(&roots[index]) {
+                roots.remove(index);
+            }
+        }
         roots
     }
 }
@@ -255,6 +260,41 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn repeated_roots_keep_their_last_precedence_without_duplicate_skills() {
+        let rig = Rig::new("skills-repeated-root", Registry::default());
+        let directory = rig.workspace().join(".a/skills/review");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\nbody",
+        )
+        .unwrap();
+        let loader = Loader::new(
+            &rig.dir,
+            Skills {
+                dirs: vec![".a/skills".into(), "custom".into()],
+                ..Skills::default()
+            },
+        );
+        let prepared = loader
+            .prepare(&rig.workspace(), &Registry::default(), None, false)
+            .unwrap();
+        assert_eq!(
+            prepared
+                .inputs
+                .downcast_ref::<Inputs>()
+                .unwrap()
+                .catalog
+                .len(),
+            1
+        );
+        assert_eq!(
+            loader.roots(&rig.workspace()).last(),
+            Some(&rig.workspace().join(".a/skills"))
+        );
     }
 
     #[test]
