@@ -596,51 +596,23 @@ mod tests {
         const NAME: &str =
             "terminal::tests::terminal_output_never_changes_the_parents_file_status_flags";
         if std::env::var_os("A_TEST_OUTPUT_FLAGS").is_some() {
-            // SAFETY: only this isolated child owns the supplied controlling tty.
-            unsafe {
-                assert_ne!(libc::setsid(), -1);
-                assert_ne!(libc::ioctl(0, libc::TIOCSCTTY as _, 0), -1);
-                assert_eq!(libc::raise(libc::SIGSTOP), 0);
-            }
-            for phase in ["acquired", "resumed"] {
-                let raw = RawMode::enter().unwrap();
-                assert!(
-                    !fcntl_getfl(rustix::stdio::stdout())
-                        .unwrap()
-                        .contains(OFlags::NONBLOCK)
-                );
-                let mut out = Stdout::default();
-                out.write_all(b"output through the private description\r\n")
-                    .unwrap();
-                eprintln!("{phase}");
-                let mut byte = [0];
-                assert_eq!(
-                    rustix::io::read(rustix::stdio::stdin(), &mut byte).unwrap(),
-                    1
-                );
-                drop(raw);
-                if phase == "acquired" {
-                    suspend().unwrap();
-                }
-            }
+            output_flags_child();
             return;
         }
         for killed in [false, true] {
             let mut master = -1;
             let mut slave = -1;
             // SAFETY: openpty initializes both descriptors; optional buffers omitted.
-            assert_eq!(
-                unsafe {
-                    libc::openpty(
-                        &raw mut master,
-                        &raw mut slave,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    )
-                },
-                0
-            );
+            let opened = unsafe {
+                libc::openpty(
+                    &raw mut master,
+                    &raw mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(opened, 0);
             // SAFETY: these newly opened descriptors are transferred exactly once.
             let (mut master, slave) =
                 unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
@@ -699,6 +671,38 @@ mod tests {
                 assert_modes(&cooked, &rustix::termios::tcgetattr(&master).unwrap());
             }
             assert_eq!(fcntl_getfl(&slave).unwrap(), flags);
+        }
+    }
+
+    #[allow(clippy::cast_lossless)] // ioctl request types differ between Unix targets.
+    fn output_flags_child() {
+        use rustix::fs::{OFlags, fcntl_getfl};
+        // SAFETY: only this isolated child owns the supplied controlling tty.
+        unsafe {
+            assert_ne!(libc::setsid(), -1);
+            assert_ne!(libc::ioctl(0, libc::TIOCSCTTY as _, 0), -1);
+            assert_eq!(libc::raise(libc::SIGSTOP), 0);
+        }
+        for phase in ["acquired", "resumed"] {
+            let raw = RawMode::enter().unwrap();
+            assert!(
+                !fcntl_getfl(rustix::stdio::stdout())
+                    .unwrap()
+                    .contains(OFlags::NONBLOCK)
+            );
+            let mut out = Stdout::default();
+            out.write_all(b"output through the private description\r\n")
+                .unwrap();
+            eprintln!("{phase}");
+            let mut byte = [0];
+            assert_eq!(
+                rustix::io::read(rustix::stdio::stdin(), &mut byte).unwrap(),
+                1
+            );
+            drop(raw);
+            if phase == "acquired" {
+                suspend().unwrap();
+            }
         }
     }
 

@@ -23,4 +23,5 @@ jobs:
         with:
           install_args: rust mr-boxington ${{ runner.os == 'Linux' && 'mold' || '' }}
       - shell: bash
-        run: cargo test -p sys terminal:: -- --nocapture
+        run: |
+          cargo test -p sys terminal:: -- --nocapture
