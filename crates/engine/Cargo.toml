@@ -27,6 +27,7 @@ sys.workspace = true
 workspace = true
 
 [dev-dependencies]
+tempfile = { version = "3", default-features = false }
 ext-metrics.workspace = true
 client.workspace = true
 ext-logging = { workspace = true, features = ["testing"] }

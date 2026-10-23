@@ -19,3 +19,6 @@ uuid.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = { version = "3", default-features = false }
