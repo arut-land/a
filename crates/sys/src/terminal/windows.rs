@@ -351,8 +351,9 @@ mod tests {
     use windows_sys::Win32::System::Console::{
         AllocConsole, CTRL_BREAK_EVENT, CTRL_C_EVENT, FlushConsoleInputBuffer, FreeConsole,
         GenerateConsoleCtrlEvent, INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
-        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle, WriteConsoleInputW,
+        STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle, WriteConsoleInputW,
     };
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     #[test]
     fn console_state_is_restored_after_a_panic_and_events_preserve_unicode_and_resize() {
@@ -371,6 +372,7 @@ mod tests {
             );
             return;
         }
+        let stderr = io::stderr().as_handle().try_clone_to_owned().unwrap();
         // This subprocess owns a fresh console; no developer's terminal or
         // other libtest worker can be affected by mode/control-event changes.
         // SAFETY: process-local console attachment; no pointer arguments.
@@ -394,10 +396,14 @@ mod tests {
         // SAFETY: these live handles are transferred to this subprocess's
         // standard-handle table and are never closed before process exit.
         unsafe {
+            assert_ne!(SetStdHandle(STD_ERROR_HANDLE, stderr.as_raw_handle()), 0);
+            assert_ne!(SetConsoleCtrlHandler(None, 0), 0);
             assert_ne!(SetStdHandle(STD_INPUT_HANDLE, input.into_raw_handle()), 0);
             assert_ne!(SetStdHandle(STD_OUTPUT_HANDLE, output.into_raw_handle()), 0);
         }
+        eprintln!("private console allocated");
         assert_panic_restores_state();
+        eprintln!("panic restoration passed");
         let signals = Signals::catch(&[Signal::Interrupt, Signal::Terminate]).unwrap();
         assert_input_events(signals);
     }
@@ -502,6 +508,7 @@ mod tests {
                 _ => panic!("unexpected console input"),
             }
         }
+        eprintln!("Unicode and resize passed");
         assert_eq!(got, "A🙂".as_bytes());
         for (event, signal) in [
             (CTRL_C_EVENT, Signal::Interrupt),
@@ -509,7 +516,12 @@ mod tests {
         ] {
             // SAFETY: the fresh console contains only this test subprocess.
             assert_ne!(unsafe { GenerateConsoleCtrlEvent(event, 0) }, 0);
-            assert_eq!(reader.signals.wait(), [signal]);
+            // SAFETY: the signal source owns this event throughout the wait.
+            let ready =
+                unsafe { WaitForSingleObject(reader.signals.as_handle().as_raw_handle(), 5000) };
+            assert_eq!(ready, 0, "control event {event} did not reach its handler");
+            assert_eq!(reader.signals.take(), [signal]);
+            eprintln!("control event {event} passed");
         }
     }
 }
