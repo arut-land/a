@@ -237,7 +237,9 @@ pub fn write_stdout(
                     .unwrap_or_else(PoisonError::into_inner)
                     .take()
                     .unwrap();
-                return if cancelled {
+                // Completion wins when both events are ready. Still yield to
+                // the queued control instead of surfacing ERROR_OPERATION_ABORTED.
+                return if cancelled || (interruptible && output_interrupted()) {
                     Err(io::ErrorKind::WouldBlock.into())
                 } else {
                     result
