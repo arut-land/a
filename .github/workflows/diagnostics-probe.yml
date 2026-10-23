@@ -1,5 +1,8 @@
 name: diagnostics musl probe
-on: workflow_dispatch
+on:
+  push:
+    branches: [codex-w7diag]
+  workflow_dispatch:
 permissions:
   contents: read
 env:
