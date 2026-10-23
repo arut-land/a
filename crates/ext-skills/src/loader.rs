@@ -24,7 +24,7 @@ impl Files {
 
 #[derive(PartialEq)]
 struct Inputs {
-    files: Files,
+    files: BTreeMap<String, (PathBuf, sys::source::Source)>,
     catalog: BTreeMap<String, Skill>,
 }
 
@@ -115,7 +115,7 @@ impl GenerationLayer for Loader {
                 }) {
                     return Ok(PreparedLayer {
                         inputs: Arc::new(Inputs {
-                            files: files.clone(),
+                            files: files.sources.clone(),
                             catalog,
                         }),
                         registrations: previous.registrations.clone(),
@@ -127,7 +127,7 @@ impl GenerationLayer for Loader {
                 )];
                 Ok(PreparedLayer {
                     inputs: Arc::new(Inputs {
-                        files: files.clone(),
+                        files: files.sources.clone(),
                         catalog,
                     }),
                     registrations,
@@ -142,10 +142,9 @@ impl GenerationLayer for Loader {
 
     fn validate(&self, workspace: &Path, prepared: &PreparedLayer) -> Result<bool, PrepareError> {
         let files = self.capture(workspace)?;
-        Ok(prepared
-            .inputs
-            .downcast_ref::<Inputs>()
-            .is_some_and(|p| files == p.files))
+        Ok(prepared.inputs.downcast_ref::<Inputs>().is_some_and(|p| {
+            files.invalid.is_empty() && files.duplicates.is_empty() && files.sources == p.files
+        }))
     }
 
     fn restore(&self, own_image: &[protocol::Installed]) -> Result<Registrations, Refused> {
