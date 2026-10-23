@@ -16,8 +16,19 @@ pub fn open_browser(link: &str) -> io::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    crate::proc::prepare_spawn(&mut command);
-    let mut child = crate::proc::spawn(&mut command)?;
+    #[cfg(unix)]
+    let mut child = {
+        let null = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/null")?;
+        crate::proc::unix::SpawnPlan::new(&command, [&null, &null, &null])
+            .inherit_snapshot()
+            .uncontained()
+            .spawn()?
+    };
+    #[cfg(windows)]
+    let mut child = command.spawn()?;
     // Some openers stay until the browser they started exits.
     thread::spawn(move || child.wait());
     Ok(())

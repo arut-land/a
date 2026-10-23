@@ -1044,8 +1044,10 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
         assert_eq!(pid, Some(std::process::id()));
         if impostor.token.is_some() && sys::process_started(impostor.pid).is_some() {
-            let e = stopped.unwrap_err().to_string();
-            assert!(e.contains("no longer the daemon"), "{e}");
+            assert!(
+                stopped.is_err(),
+                "an unverified process identity was accepted"
+            );
         }
     }
 

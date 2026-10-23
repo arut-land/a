@@ -1,8 +1,7 @@
-//! Processes: groups a command's whole tree lives in, handles a child is
-//! given, and watches on a process's exit.
+//! Owned process scopes, explicit resource inheritance, and exit observation.
 //!
-//! [`OwnedGroup`] holds live containment; [`GroupId`] is only its recovery
-//! identity. Windows jobs die with their daemon, leaving no recovery handles.
+//! [`ProcessLease`] holds live authority; [`RecordedIdentity`] is diagnostic
+//! data. Windows jobs die with their daemon, leaving no recovery handles.
 
 use std::fs::File;
 use std::io;
@@ -15,29 +14,10 @@ pub(crate) use imp::passed;
 pub(crate) use imp::raw;
 pub use imp::{Child, ExitWatch};
 
-/// macOS creates std's exec-error pipe before setting CLOEXEC. A fork
-/// meanwhile can keep its writer alive until that unrelated child exits.
-pub(crate) fn spawn(cmd: &mut Command) -> io::Result<std::process::Child> {
-    #[cfg(target_vendor = "apple")]
-    let _spawning = {
-        static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        SPAWNING
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    };
-    cmd.spawn()
-}
-
-pub(crate) fn prepare_spawn(cmd: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: the hook only resets signal state with async-signal-safe
-        // libc calls; it does not allocate or acquire locks after fork.
-        unsafe { cmd.pre_exec(crate::signals::reset_before_exec) };
-    }
-    #[cfg(windows)]
-    let _ = cmd;
+#[derive(Clone, Copy)]
+pub(crate) enum SpawnEnvironment {
+    Exact,
+    InheritSnapshot,
 }
 
 /// Finds bash using the system location first, then the session's PATH.
@@ -65,22 +45,17 @@ pub fn find_bash(search: Option<&str>) -> Option<String> {
         .map(|path| path.display().to_string())
 }
 
-/// Persisted identity for explicit recovery; it never owns native resources.
+/// Persisted identity for diagnostics; it never owns native resources.
+///
+/// ```compile_fail
+/// sys::RecordedIdentity(42).signal(sys::Signal::Kill);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct GroupId(pub u32);
+pub struct RecordedIdentity(pub u32);
 
-impl GroupId {
-    /// Sends `signal` to every process in the group. A group that is gone
-    /// has nothing left to signal.
-    pub fn signal(self, signal: Signal) -> io::Result<()> {
-        imp::signal_group(self.0, signal)
-    }
+const MAX_MEMBERS: usize = 4096;
 
-    /// SIGKILL to the whole group.
-    pub fn kill(self) -> io::Result<()> {
-        self.signal(Signal::Kill)
-    }
-
+impl RecordedIdentity {
     /// Whether any process of the group is still alive. A group we may not
     /// signal (a member changed user, as sudo does) is alive too.
     pub fn alive(self) -> bool {
@@ -94,35 +69,31 @@ impl GroupId {
 }
 
 /// Live containment; dropping it terminates everything it still owns.
-pub struct OwnedGroup {
-    id: GroupId,
+pub struct ProcessLease {
+    id: RecordedIdentity,
+    #[cfg(unix)]
+    child: Child,
     #[cfg(windows)]
     handle: std::os::windows::io::OwnedHandle,
 }
 
-impl OwnedGroup {
-    /// Makes the process `cmd` starts lead a group of its own, with no
-    /// controlling terminal (a prompt for a password fails instead of
-    /// waiting), whose id is its pid.
-    pub fn lead(cmd: &mut Command) {
-        imp::lead(cmd);
-    }
-
+impl ProcessLease {
     #[cfg(unix)]
     pub(crate) fn new(child: &Child) -> Self {
         Self {
-            id: GroupId(child.id()),
+            id: RecordedIdentity(child.id()),
+            child: child.clone(),
         }
     }
 
-    pub const fn id(&self) -> GroupId {
+    pub const fn id(&self) -> RecordedIdentity {
         self.id
     }
 
     pub fn signal(&self, signal: Signal) -> io::Result<()> {
         #[cfg(unix)]
         {
-            self.id.signal(signal)
+            self.child.signal_group(signal)
         }
         #[cfg(windows)]
         {
@@ -131,10 +102,26 @@ impl OwnedGroup {
         }
     }
 
-    pub fn members(&self) -> Vec<u32> {
+    pub fn members(&self) -> io::Result<Vec<u32>> {
         #[cfg(unix)]
         {
-            self.id.members()
+            if !self.child.grouped() {
+                return Ok(if self.child.exited() {
+                    Vec::new()
+                } else {
+                    vec![self.child.id()]
+                });
+            }
+            let members = self.id.members();
+            if members.len() > MAX_MEMBERS {
+                return Err(io::Error::other(
+                    "process group exceeds supervision capacity",
+                ));
+            }
+            Ok(members
+                .into_iter()
+                .filter(|pid| *pid != self.child.id() || !self.child.exited())
+                .collect())
         }
         #[cfg(windows)]
         {
@@ -142,19 +129,27 @@ impl OwnedGroup {
         }
     }
 
+    /// Opens exit notifications only for members verified under this live lease.
+    pub fn exit_watches(&self) -> io::Result<Vec<ExitWatch>> {
+        let mut watches = Vec::new();
+        for pid in self.members()? {
+            #[cfg(unix)]
+            let watch = imp::member_watch(self.id.0, pid);
+            #[cfg(windows)]
+            let watch = imp::member_watch(&self.handle, pid);
+            if let Some(watch) = watch? {
+                watches.push(watch);
+            }
+        }
+        Ok(watches)
+    }
+
     pub fn alive(&self) -> bool {
-        #[cfg(unix)]
-        {
-            self.id.alive()
-        }
-        #[cfg(windows)]
-        {
-            !self.members().is_empty()
-        }
+        self.members().map_or(true, |members| !members.is_empty())
     }
 }
 
-impl Drop for OwnedGroup {
+impl Drop for ProcessLease {
     fn drop(&mut self) {
         let _ = self.signal(Signal::Kill);
     }
@@ -163,7 +158,7 @@ impl Drop for OwnedGroup {
 /// Containment cannot be lost between launch and asynchronous adoption.
 pub struct ContainedChild {
     pub child: Child,
-    pub group: OwnedGroup,
+    pub group: ProcessLease,
     pub capture: Option<OutputCapture>,
 }
 
@@ -238,12 +233,13 @@ pub fn daemon_ready() -> io::Result<()> {
     imp::daemon_ready()
 }
 
-/// Creates a command's process tree as a group before any user code runs.
+/// Creates a command in an owned native scope before any user code runs.
 pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<ContainedChild> {
     #[cfg(unix)]
     {
-        let child = imp::spawn_group(cmd, output)?;
-        let group = OwnedGroup::new(&child);
+        let child = imp::spawn_group(cmd, &output)?;
+        drop(output);
+        let group = ProcessLease::new(&child);
         Ok(ContainedChild {
             child,
             group,
@@ -258,7 +254,21 @@ pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<ContainedChild
 /// The caller must drain `capture` before reporting process completion.
 pub fn spawn_group_captured(cmd: &mut Command, output: File) -> io::Result<ContainedChild> {
     #[cfg(unix)]
-    return spawn_group(cmd, output);
+    {
+        let (reader, writer) = io::pipe()?;
+        let input = File::open("/dev/null")?;
+        let writer = File::from(std::os::fd::OwnedFd::from(writer));
+        let child = unix::SpawnPlan::new(cmd, [&input, &writer, &writer]).spawn()?;
+        let group = ProcessLease::new(&child);
+        Ok(ContainedChild {
+            child,
+            group,
+            capture: Some(OutputCapture {
+                reader: File::from(std::os::fd::OwnedFd::from(reader)),
+                file: output,
+            }),
+        })
+    }
     #[cfg(windows)]
     imp::spawn_group_captured(cmd, output)
 }
@@ -331,13 +341,6 @@ pub fn detach_session() -> io::Result<()> {
     imp::detach_session()
 }
 
-/// A handle that turns readable once process `pid` has exited (reaped or
-/// not): a pidfd on Linux, a kqueue of its own elsewhere. `NotFound` when
-/// it is already gone.
-pub fn exit_watch(pid: u32) -> io::Result<ExitWatch> {
-    imp::exit_watch(pid)
-}
-
 /// When the OS says process `pid` started, in its own units: equal for one
 /// process, different for a later one reusing the pid. `None` when there is
 /// no such process, or no way to tell.
@@ -345,13 +348,13 @@ pub fn process_started(pid: u32) -> Option<u64> {
     imp::process_started(pid)
 }
 
-/// A daemon identity bound to its stop target. On Windows the same owned
-/// query+terminate handle checks creation time and performs termination.
+/// A verified native process handle retained across daemon stop attempts.
+/// Platforms unable to retain nonchild identity refuse forced termination.
 pub struct RecordedProcess {
     #[cfg(windows)]
     process: imp::RecordedProcess,
-    #[cfg(unix)]
-    record: crate::crash::Record,
+    #[cfg(target_os = "linux")]
+    process: std::os::fd::OwnedFd,
 }
 
 impl RecordedProcess {
@@ -359,37 +362,48 @@ impl RecordedProcess {
         #[cfg(windows)]
         return imp::RecordedProcess::open(record.pid, record.token)
             .map(|process| Self { process });
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
-            if !record.is_live() {
+            let process = imp::exit_watch(record.pid).map_err(|error| {
+                if error.raw_os_error() == Some(libc::ENOSYS) {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "forced stop requires pidfd support; use daemon RPC or its supervisor",
+                    )
+                } else {
+                    error
+                }
+            })?;
+            if record.token.is_none() || record.token != process_started(record.pid) {
                 return Err(io::Error::other(
-                    "process is no longer the daemon that recorded it",
+                    "process no longer matches the daemon record",
                 ));
             }
-            Ok(Self {
-                record: record.clone(),
-            })
+            Ok(Self { process })
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            let _ = record;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "forced stop requires a retained process identity; use daemon RPC or its supervisor",
+            ))
         }
     }
-
     pub fn signal(&self, signal: Signal) -> io::Result<()> {
         #[cfg(windows)]
         return self.process.signal(signal);
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        return match rustix::process::pidfd_send_signal(&self.process, raw(signal)) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
-            if !self.record.is_live() {
-                return Err(io::Error::other(
-                    "process is no longer the daemon that recorded it",
-                ));
-            }
-            signal_process(self.record.pid, signal)
+            let _ = signal;
+            Err(io::ErrorKind::Unsupported.into())
         }
     }
-}
-
-/// Sends `signal` to a process.
-pub fn signal_process(pid: u32, signal: Signal) -> io::Result<()> {
-    imp::signal_process(pid, signal)
 }
 
 /// The name of the signal that ended a process (`SIGKILL`), if one did.
@@ -397,9 +411,8 @@ pub fn exit_signal(status: ExitStatus) -> Option<String> {
     imp::exit_signal(status)
 }
 
-/// Identifies the current boot, so recorded groups are never acted on
-/// after a reboot. Kept once found; a failure is asked again next time,
-/// never remembered.
+/// Identifies the current boot for recorded process diagnostics. A failed
+/// lookup is retried; a successful identity is stable for the process lifetime.
 pub fn boot_id() -> Option<&'static str> {
     static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     if let Some(id) = BOOT.get() {
@@ -413,36 +426,35 @@ pub fn boot_id() -> Option<&'static str> {
 mod imp {
     use std::fs;
     use std::io;
-    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::process::{Command, ExitStatus};
 
-    use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
     use rustix::process;
 
     use super::Passed;
     use crate::Signal;
 
     pub type ExitWatch = OwnedFd;
-    pub type Child = std::process::Child;
+    pub use super::unix::Child;
 
     pub fn spawn_daemon(
         cmd: &mut Command,
         home: &crate::Home,
         lock: fs::File,
-    ) -> io::Result<std::process::Child> {
+    ) -> io::Result<Child> {
         use super::Pass;
         let listener = home.bind()?;
         let handles = [listener.passed(), lock.passed(), listener.claim_passed()];
-        cmd.env("A_ENDPOINT_CLAIM_FD", handles[2].to_string());
-        cmd.args([
-            "--listen-fd",
-            &handles[0].to_string(),
-            "--lock-fd",
-            &handles[1].to_string(),
-        ]);
-        super::prepare_spawn(cmd);
-        pass(cmd, handles)?;
-        let child = super::spawn(cmd);
+        cmd.env("A_ENDPOINT_CLAIM_FD", "5");
+        cmd.args(["--listen-fd", "3", "--lock-fd", "4"]);
+        let null = fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/null")?;
+        let child = super::unix::SpawnPlan::new(cmd, [&null, &null, &null])
+            .inherited(&handles)
+            .uncontained()
+            .spawn();
         drop((listener, lock));
         child
     }
@@ -455,34 +467,13 @@ mod imp {
         Ok(())
     }
 
-    pub fn spawn_group(cmd: &mut Command, output: fs::File) -> io::Result<Child> {
-        lead(cmd);
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(output.try_clone()?)
-            .stderr(output);
-        super::spawn(cmd)
+    pub fn spawn_group(cmd: &mut Command, output: &fs::File) -> io::Result<Child> {
+        let input = fs::File::open("/dev/null")?;
+        super::unix::SpawnPlan::new(cmd, [&input, output, output]).spawn()
     }
 
     pub fn passed(fd: &impl AsRawFd) -> Passed {
         Passed(fd.as_raw_fd())
-    }
-
-    #[allow(clippy::unnecessary_wraps, reason = "Windows can fail")]
-    pub fn pass<const N: usize>(cmd: &mut Command, fds: [Passed; N]) -> io::Result<()> {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: between fork and exec the hook only calls fcntl, which is
-        // async-signal-safe, and allocates nothing. The fds are open in the
-        // parent, so in the child too.
-        unsafe {
-            cmd.pre_exec(move || {
-                for Passed(fd) in fds {
-                    let fd = BorrowedFd::borrow_raw(fd);
-                    fcntl_setfd(fd, fcntl_getfd(fd)? - FdFlags::CLOEXEC)?;
-                }
-                Ok(())
-            });
-        }
-        Ok(())
     }
 
     pub fn duplicate(fd: i32) -> io::Result<fs::File> {
@@ -549,19 +540,6 @@ mod imp {
     pub fn detach_session() -> io::Result<()> {
         process::setsid()?;
         Ok(())
-    }
-
-    pub fn lead(cmd: &mut Command) {
-        use std::os::unix::process::CommandExt;
-        super::prepare_spawn(cmd);
-        // SAFETY: the closure runs in the forked child before exec and only
-        // calls setsid(2), which is async-signal-safe and allocates nothing.
-        unsafe {
-            cmd.pre_exec(|| {
-                process::setsid()?;
-                Ok(())
-            });
-        }
     }
 
     #[cfg(target_os = "linux")]
@@ -674,6 +652,19 @@ mod imp {
         Ok(queue)
     }
 
+    pub fn member_watch(group: u32, member: u32) -> io::Result<Option<ExitWatch>> {
+        let watch = match exit_watch(member) {
+            Ok(watch) => watch,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match process::getpgid(Some(pid(member)?)) {
+            Ok(actual) if actual.as_raw_nonzero().get().cast_unsigned() == group => Ok(Some(watch)),
+            Ok(_) | Err(rustix::io::Errno::SRCH) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn gone(errno: rustix::io::Errno) -> io::Error {
         if errno == rustix::io::Errno::SRCH {
             io::ErrorKind::NotFound.into()
@@ -698,6 +689,7 @@ mod imp {
         };
         dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
             .filter(|pid| member(pid) == Some(true))
+            .take(super::MAX_MEMBERS + 1)
             .collect()
     }
 
@@ -722,6 +714,13 @@ mod imp {
             if count < pids.len() {
                 pids.truncate(count);
                 return pids.into_iter().filter_map(|p| p.try_into().ok()).collect();
+            }
+            if pids.len() > super::MAX_MEMBERS {
+                return pids
+                    .into_iter()
+                    .take(super::MAX_MEMBERS + 1)
+                    .filter_map(|p| p.try_into().ok())
+                    .collect();
             }
             pids.resize(pids.len() * 2, 0);
         }
@@ -916,16 +915,18 @@ mod tests {
     }
 
     #[test]
-    fn kills_a_whole_process_group() {
-        use std::os::unix::process::CommandExt;
-        let mut child = Command::new("sh")
-            .args(["-c", "sleep 30 & sleep 30"])
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        GroupId(child.id()).kill().unwrap();
+    #[cfg_attr(miri, ignore)]
+    fn only_a_live_lease_can_kill_its_group() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & sleep 30"]);
+        let mut child = spawn_group(
+            &mut command,
+            File::options().write(true).open("/dev/null").unwrap(),
+        )
+        .unwrap();
+        child.group.signal(Signal::Kill).unwrap();
         assert!(!child.wait().unwrap().success());
-        GroupId(child.id()).kill().unwrap();
+        child.group.signal(Signal::Kill).unwrap();
     }
 
     /// Found without a subprocess, the same each time, and the one the
@@ -956,12 +957,11 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 30 & read _"])
             .stdin(std::process::Stdio::piped());
-        OwnedGroup::lead(&mut cmd);
-        let mut child = cmd.spawn().unwrap();
-        let watch = exit_watch(child.id()).unwrap();
+        let (mut child, input, _output) = spawn_stdio(&mut cmd).unwrap();
+        let watch = child.child.exit_watch().unwrap();
         assert!(!readable(&watch, 50));
         // The shell and its background sleep.
-        let group = GroupId(child.id());
+        let group = RecordedIdentity(child.id());
         let mut members = Vec::new();
         for _ in 0..100 {
             members = group.members();
@@ -972,17 +972,14 @@ mod tests {
         }
         assert_eq!(members.len(), 2, "{members:?}");
         assert!(members.contains(&group.0));
-        drop(child.stdin.take());
+        drop(input);
         assert!(readable(&watch, 5000));
         child.wait().unwrap();
-        assert_eq!(
-            exit_watch(group.0).unwrap_err().kind(),
-            io::ErrorKind::NotFound
-        );
+        assert!(child.child.exited());
         assert!(group.alive());
-        group.kill().unwrap();
+        child.group.signal(Signal::Kill).unwrap();
         for _ in 0..100 {
-            if group.members().is_empty() {
+            if child.group.members().unwrap().is_empty() {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -995,15 +992,20 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
-        OwnedGroup::lead(&mut cmd);
-        let mut child = cmd.spawn().unwrap();
-        let group = GroupId(child.id());
+        let mut child = spawn_group(
+            &mut cmd,
+            File::options().write(true).open("/dev/null").unwrap(),
+        )
+        .unwrap();
+        let group = RecordedIdentity(child.id());
         assert!(group.alive());
         let pgid = rustix::process::Pid::from_raw(child.id().cast_signed()).unwrap();
         assert!(imp::has_members(pgid));
-        group.signal(Signal::Terminate).unwrap();
+        child.group.signal(Signal::Terminate).unwrap();
         let status = child.wait().unwrap();
         assert_eq!(exit_signal(status).as_deref(), Some("SIGTERM"));
+        assert!(!child.group.alive());
+        drop(child);
         assert!(!group.alive());
         assert!(!imp::has_members(pgid));
         assert_eq!(
@@ -1023,18 +1025,40 @@ pub type ProcessPipe = crate::Stream;
 
 /// Starts a contained child with only its explicit stdio inherited.
 pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(ContainedChild, ProcessPipe, ProcessPipe)> {
+    spawn_stdio_role(cmd, false)
+}
+
+/// SSH uses the caller's terminal for authentication and visible diagnostics.
+pub fn spawn_ssh(cmd: &mut Command) -> io::Result<(ContainedChild, ProcessPipe, ProcessPipe)> {
+    spawn_stdio_role(cmd, true)
+}
+
+fn spawn_stdio_role(
+    cmd: &mut Command,
+    terminal: bool,
+) -> io::Result<(ContainedChild, ProcessPipe, ProcessPipe)> {
     #[cfg(unix)]
     {
         use std::os::fd::OwnedFd;
-        use std::process::Stdio;
-        imp::lead(cmd);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = spawn(cmd)?;
-        let input = File::from(OwnedFd::from(child.stdin.take().unwrap()));
-        let output = File::from(OwnedFd::from(child.stdout.take().unwrap()));
-        let group = OwnedGroup::new(&child);
+        let (child_input, input) = io::pipe()?;
+        let (output, child_output) = io::pipe()?;
+        let child_input = File::from(OwnedFd::from(child_input));
+        let child_output = File::from(OwnedFd::from(child_output));
+        let error = if terminal {
+            File::from(std::os::fd::AsFd::as_fd(&io::stderr()).try_clone_to_owned()?)
+        } else {
+            File::options().write(true).open("/dev/null")?
+        };
+        let plan = unix::SpawnPlan::new(cmd, [&child_input, &child_output, &error]);
+        let plan = if terminal {
+            plan.terminal().inherit_snapshot()
+        } else {
+            plan
+        };
+        let child = plan.spawn()?;
+        let input = File::from(OwnedFd::from(input));
+        let output = File::from(OwnedFd::from(output));
+        let group = ProcessLease::new(&child);
         Ok((
             ContainedChild {
                 child,
@@ -1046,5 +1070,9 @@ pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(ContainedChild, ProcessPipe
         ))
     }
     #[cfg(windows)]
-    imp::spawn_stdio(cmd)
+    imp::spawn_stdio_role(cmd, terminal)
 }
+
+#[cfg(unix)]
+#[path = "proc_unix.rs"]
+pub(crate) mod unix;

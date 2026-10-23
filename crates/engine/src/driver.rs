@@ -2137,9 +2137,8 @@ impl Actor {
                     );
                 }
             }
-            Effect::Kill { pgid } => {
-                let _ = sys::GroupId(pgid).kill();
-            }
+            // A replayed process number carries no live OS ownership.
+            Effect::Kill { .. } => {}
             Effect::MarkBusy(busy) => {
                 self.live.busy.store(busy, Ordering::SeqCst);
                 let how = if busy { "busy" } else { "settled" };

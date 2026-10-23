@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Threading::{
 
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
-use super::{ContainedChild, GroupId, OwnedGroup, Passed};
+use super::{ContainedChild, Passed, ProcessLease, RecordedIdentity};
 use crate::Signal;
 use crate::windows::{Security, ok, owned};
 
@@ -66,12 +66,14 @@ pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::R
     let (mut output, writer) = io::pipe()?;
     let input = File::open("NUL")?;
     let error = File::options().write(true).open("NUL")?;
-    let mut child = spawn::spawn(
-        cmd,
-        [&input, &writer, &error],
-        None,
-        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-    )?;
+    let mut child = spawn::SpawnPlan {
+        command: cmd,
+        io: [&input, &writer, &error],
+        job: None,
+        flags: DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        environment: super::SpawnEnvironment::Exact,
+    }
+    .spawn()?;
     drop(writer);
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let reader = std::thread::spawn(move || {
@@ -107,10 +109,6 @@ pub fn detach_session() -> io::Result<()> {
     Ok(())
 }
 
-pub fn lead(cmd: &mut Command) {
-    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-}
-
 /// Job assignment is a process creation attribute, so no shell can fork
 /// before containment. The daemon alone owns each kill-on-close handle.
 pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<ContainedChild> {
@@ -131,19 +129,32 @@ pub fn spawn_group_captured(cmd: &mut Command, output: File) -> io::Result<Conta
     Ok(child)
 }
 
-pub fn spawn_stdio(
+pub fn spawn_stdio_role(
     cmd: &mut Command,
+    terminal: bool,
 ) -> io::Result<(ContainedChild, crate::Stream, crate::Stream)> {
     let (input, child_input) = crate::endpoint::imp::process_pipe()?;
     let (output, child_output) = crate::endpoint::imp::process_pipe()?;
-    let error = File::options().write(true).open("NUL")?;
-    let child = spawn_job(cmd, [&child_input, &child_output, &error])?;
+    let error = if terminal {
+        File::from(std::os::windows::io::AsHandle::as_handle(&io::stderr()).try_clone_to_owned()?)
+    } else {
+        File::options().write(true).open("NUL")?
+    };
+    let child = spawn_job_role(cmd, [&child_input, &child_output, &error], terminal)?;
     Ok((child, input, output))
 }
 
 fn spawn_job(
     cmd: &Command,
     io: [&dyn std::os::windows::io::AsHandle; 3],
+) -> io::Result<ContainedChild> {
+    spawn_job_role(cmd, io, false)
+}
+
+fn spawn_job_role(
+    cmd: &Command,
+    io: [&dyn std::os::windows::io::AsHandle; 3],
+    terminal: bool,
 ) -> io::Result<ContainedChild> {
     let security = Security::user_only()?;
     let attributes = security.attributes();
@@ -161,14 +172,20 @@ fn spawn_job(
             u32::try_from(size_of_val(&limits)).unwrap(),
         )
     })?;
-    let child = spawn::spawn(
-        cmd,
+    let child = spawn::SpawnPlan {
+        command: cmd,
         io,
-        Some(&job),
-        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-    )?;
-    let group = OwnedGroup {
-        id: GroupId(child.id()),
+        job: Some(&job),
+        flags: CREATE_NEW_PROCESS_GROUP | if terminal { 0 } else { CREATE_NO_WINDOW },
+        environment: if terminal {
+            super::SpawnEnvironment::InheritSnapshot
+        } else {
+            super::SpawnEnvironment::Exact
+        },
+    }
+    .spawn()?;
+    let group = ProcessLease {
+        id: RecordedIdentity(child.id()),
         handle: job,
     };
     Ok(ContainedChild {
@@ -178,9 +195,12 @@ fn spawn_job(
     })
 }
 
-pub(super) fn members(job: &OwnedHandle) -> Vec<u32> {
+pub(super) fn members(job: &OwnedHandle) -> io::Result<Vec<u32>> {
     let mut count = 64;
     loop {
+        if count > super::MAX_MEMBERS {
+            return Err(io::Error::other("job exceeds supervision capacity"));
+        }
         // Pointer-sized storage aligns JOBOBJECT_BASIC_PROCESS_ID_LIST.
         let mut buffer = vec![0usize; count + 2];
         // SAFETY: the aligned allocation has the advertised writable byte count.
@@ -198,14 +218,17 @@ pub(super) fn members(job: &OwnedHandle) -> Vec<u32> {
             let header = buffer.as_ptr().cast::<u32>();
             // SAFETY: successful query initialized both DWORDs and the listed IDs.
             let len = unsafe { *header.add(1) } as usize;
+            if len > super::MAX_MEMBERS {
+                return Err(io::Error::other("job exceeds supervision capacity"));
+            }
             let offset = 8 / size_of::<usize>();
-            return buffer[offset..offset + len]
+            return Ok(buffer[offset..offset + len]
                 .iter()
                 .filter_map(|&pid| pid.try_into().ok())
-                .collect();
+                .collect());
         }
         if io::Error::last_os_error().raw_os_error() != Some(234) {
-            return Vec::new();
+            return Err(io::Error::last_os_error());
         }
         count *= 2;
     }
@@ -217,9 +240,6 @@ pub fn group_members(_id: u32) -> Vec<u32> {
 }
 pub fn group_alive(_id: u32) -> bool {
     false
-}
-pub fn signal_group(_id: u32, _signal: Signal) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
 }
 
 pub(super) fn terminate_group(job: &OwnedHandle) -> io::Result<()> {
@@ -255,6 +275,7 @@ fn created_at(process: &OwnedHandle) -> io::Result<u64> {
     Ok(u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime))
 }
 
+#[cfg(test)]
 pub fn exit_watch(pid: u32) -> io::Result<OwnedHandle> {
     // SAFETY: scalar inputs; checked handle transferred to the caller.
     owned(unsafe { OpenProcess(0x0010_0000, 0, pid) }).map_err(|error| {
@@ -264,6 +285,30 @@ pub fn exit_watch(pid: u32) -> io::Result<OwnedHandle> {
             error
         }
     })
+}
+
+pub fn member_watch(job: &OwnedHandle, pid: u32) -> io::Result<Option<ExitWatch>> {
+    // The query and membership check use the same retained process object.
+    // SAFETY: scalar access flags and ID; the returned handle is checked and owned.
+    let process = match owned(unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid)
+    }) {
+        Ok(process) => process,
+        Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER.cast_signed()) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut member = 0;
+    // SAFETY: both native objects remain owned; member is a writable BOOL.
+    ok(unsafe {
+        windows_sys::Win32::System::JobObjects::IsProcessInJob(
+            process.as_raw_handle(),
+            job.as_raw_handle(),
+            &raw mut member,
+        )
+    })?;
+    Ok((member != 0).then_some(process))
 }
 
 /// The verified kernel object stays owned across both stop attempts.
@@ -294,13 +339,6 @@ impl RecordedProcess {
         // SAFETY: identity was checked through this same owned handle.
         ok(unsafe { TerminateProcess(self.0.as_raw_handle(), 1) })
     }
-}
-
-pub fn signal_process(pid: u32, _signal: Signal) -> io::Result<()> {
-    // SAFETY: scalar inputs; checked handle is owned until termination returns.
-    let process = owned(unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) })?;
-    // SAFETY: callers own this child PID; daemon stop uses RecordedProcess.
-    ok(unsafe { TerminateProcess(process.as_raw_handle(), 1) })
 }
 
 pub fn exit_signal(_status: ExitStatus) -> Option<String> {
@@ -342,7 +380,7 @@ mod tests {
         let mut child = spawn_group(&mut command, output).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let members = loop {
-            let members = child.group.members();
+            let members = child.group.members().unwrap();
             if members.len() >= 2 {
                 break members;
             }
@@ -398,6 +436,72 @@ mod tests {
             let status = unsafe { WaitForSingleObject(watch.as_raw_handle(), 5000) };
             assert_eq!(status, 0);
         }
+    }
+
+    #[test]
+    fn a_job_cannot_watch_a_process_in_another_job() {
+        let launch = || {
+            let mut command = Command::new("cmd.exe");
+            command
+                .args(["/D", "/C", "ping -n 60 127.0.0.1 >NUL"])
+                .envs(std::env::vars_os());
+            spawn_group(
+                &mut command,
+                File::options().write(true).open("NUL").unwrap(),
+            )
+            .unwrap()
+        };
+        let mut first = launch();
+        let mut second = launch();
+        assert!(
+            member_watch(&first.group.handle, second.id())
+                .unwrap()
+                .is_none()
+        );
+        first.group.signal(Signal::Kill).unwrap();
+        second.group.signal(Signal::Kill).unwrap();
+        first.wait().unwrap();
+        second.wait().unwrap();
+    }
+
+    #[test]
+    fn unicode_environment_and_working_directory_survive_native_creation() {
+        use std::os::windows::ffi::OsStrExt;
+        let root = std::env::temp_dir().join(format!("a-process-世界-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("output");
+        let value = "Grüße 世界 🚀";
+        let mut command = Command::new(
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32/cmd.exe"),
+        );
+        command
+            .args(["/D", "/U", "/C", "echo %ÉCHO% & cd"])
+            .env_clear()
+            .env("écho", value)
+            .current_dir(&root);
+        let mut child = spawn_group(&mut command, File::create(&path).unwrap()).unwrap();
+        assert!(child.wait().unwrap().success());
+        let bytes = std::fs::read(&path).unwrap();
+        let (units, trailing) = bytes.as_chunks::<2>();
+        assert_eq!(trailing, [] as [u8; 0]);
+        let text = String::from_utf16(
+            &units
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(text.starts_with(value), "{text:?}");
+        let directory: Vec<_> = root.file_name().unwrap().encode_wide().collect();
+        assert!(
+            text.encode_utf16()
+                .collect::<Vec<_>>()
+                .windows(directory.len())
+                .any(|s| s == directory)
+        );
+        drop(child);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

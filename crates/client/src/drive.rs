@@ -591,7 +591,7 @@ async fn open_remote(
             let Some(line) = io.line(&mut buffered).await? else {
                 let child = io.bridge.child.as_mut().expect("bridge child");
                 if child.try_wait()?.is_none()
-                    && let Ok(watch) = sys::exit_watch(child.id())
+                    && let Ok(watch) = child.exit_watch()
                 {
                     rt::Async::for_reading(&rt.reactor(), watch)?
                         .readable()

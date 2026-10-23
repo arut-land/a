@@ -67,7 +67,7 @@ fn every_entry_shown_survives_kill_9_at_random_points() {
         let delay = Duration::from_millis(rng.below(200));
         let killer = thread::spawn(move || {
             thread::sleep(delay);
-            sys::signal_process(pid, Signal::Kill).unwrap();
+            crate::support::signal_process(pid, Signal::Kill).unwrap();
         });
         // Live entries until the daemon dies under us.
         while let Some(msg) = conn.try_recv() {

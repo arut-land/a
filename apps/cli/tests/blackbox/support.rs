@@ -10,6 +10,37 @@ use std::time::{Duration, Instant};
 
 use sys::Home;
 
+/// Tests only target daemons they started in isolated homes.
+pub fn signal_process(pid: u32, signal: sys::Signal) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let pid = rustix::process::Pid::from_raw(
+            i32::try_from(pid).map_err(|_| io::ErrorKind::InvalidInput)?,
+        )
+        .ok_or(io::ErrorKind::InvalidInput)?;
+        let signal = match signal {
+            sys::Signal::Terminate => rustix::process::Signal::TERM,
+            sys::Signal::Kill => rustix::process::Signal::KILL,
+            _ => return Err(io::ErrorKind::InvalidInput.into()),
+        };
+        rustix::process::kill_process(pid, signal).map_err(Into::into)
+    }
+    #[cfg(windows)]
+    {
+        let _ = signal;
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other("test daemon termination failed"))
+        }
+    }
+}
+
 pub fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(30)
 }
@@ -103,7 +134,7 @@ impl TestProcess {
         process
     }
 
-    pub fn group(&self) -> &sys::OwnedGroup {
+    pub fn group(&self) -> &sys::ProcessLease {
         match &self.child {
             Process::Contained(child) => &child.group,
             Process::Piped(_) => panic!("uncontained test process"),
