@@ -116,6 +116,40 @@ the system allocator; a separate instrumented execution counts allocations and
 bytes so instrumentation does not determine the timing comparison. Primitive
 microbenchmarks do not establish contended application throughput.
 
+## Hosted primitive measurements
+
+[Native probe](https://github.com/arut-land/a/actions/runs/39980259136), source `1e19ec9e`, normal release profile, 2026-10-23. Each ready-value handoff runs 100,000 times. Queue measurements reuse a channel for 4096 batches; the table uses 1024 messages per batch. Timings come from the execution without allocator instrumentation.
+
+| Target | Old oneshot, ns | futures oneshot, ns | oneshot 0.2, ns | Ring queue, ns/message | futures queue, ns/message | async queue, ns/message |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Linux aarch64 GNU | 133 | 131 | 65 | 30 | 45 | 101 |
+| Windows aarch64 | 194 | 224 | 97 | 36 | 62 | 111 |
+| Windows x86_64 | 174 | 131 | 121 | 14 | 52 | 45 |
+
+Allocator traffic is identical across the observed 64-bit targets. Ready handoffs include one common executor-waker allocation. These are Rust allocator requests, not process RSS.
+
+| Operation | Ring / old handoff | futures-channel | async-channel / oneshot 0.2 |
+| --- | ---: | ---: | ---: |
+| Bytes per ready handoff | 96 | 120 | 56 (oneshot) |
+| Allocations per ready handoff | 3 | 2 | 2 (oneshot) |
+| Bytes per two-slot queue creation + send + receive | 136 | 208 | 1088 (async-channel) |
+| Allocator bytes across 4,194,304 reused-queue messages | 8192 | 100663296 | 68191920 (async-channel) |
+| Allocations across those reused-queue messages | 1 + 8 reallocations | 4194304 | 135304 (async-channel) |
+
+The retained ring earns its custom implementation through lower allocation traffic and faster sustained messages in these observations. Single-use channel construction can favor futures-channel; these measurements do not claim superiority for every workload. The maintained oneshot reduces both handoff time and allocated bytes.
+
+CPU jobs compare ceilings of 4, 8 and 31 using a simulated 32-core configuration, 64 one-MiB jobs and five alternating-order rounds. Every observed host here exposes four effective CPUs. Medians, ms:
+
+| Target | Page bytes | 4 CPU workers | 8 CPU workers | 31 CPU workers |
+| --- | ---: | ---: | ---: | ---: |
+| Linux aarch64 GNU | 4096 | 143.843 | 143.921 | 145.636 |
+| Windows aarch64 | 4096 | 145.599 | 144.150 | 145.117 |
+| Windows x86_64 | 4096 | 110.908 | 111.601 | 112.702 |
+
+Eight bounds oversubscription without changing the established seven-worker ceiling on eight-core machines. The 31-worker configuration shows no throughput justification on these small hosted VMs; this does not establish the optimal ceiling on a physical many-core host. The separate [runtime-demand measurements](runtime-demand.md) show why restricting an eight-core projection workload to four workers can lose throughput.
+
+Raw [primitive samples](resource-primitives.csv) and [CPU samples](resource-cpu.csv) retain the observations. The temporary workflow and comparison example are preserved in the measured revision; they are not production dependencies.
+
 ## Sources and limits
 
 - [Rust available parallelism](https://doc.rust-lang.org/std/thread/fn.available_parallelism.html)
