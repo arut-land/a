@@ -42,7 +42,7 @@ use protocol::{
     PROTO, SessionId, SessionSummary, SettingsChange, Versions, read_frame, write_frame,
 };
 use sys::crash::{Crashes, Record};
-use sys::{Home, Signal, Staged, Stream};
+use sys::{Home, OwnedConnection as Stream, Signal, Staged};
 
 /// Why a daemon could not be reached, or stopped serving this client.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -864,7 +864,17 @@ fn copy(mut from: impl Read, mut to: impl Write) -> io::Result<()> {
 /// from its own client's attach, and the daemon's settings from
 /// `config.toml`.
 const DAEMON_ENV: &[&str] = &[
-    "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "XDG_RUNTIME_DIR",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "PATH",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
 ];
 
 /// Zero-lag start: when no daemon is listening, take the daemon lock, bind
@@ -884,8 +894,10 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
     use std::process::{Command, Stdio};
 
     let endpoint = home.endpoint();
-    if let Ok(stream) = endpoint.connect() {
-        return Ok((stream, false));
+    match endpoint.connect() {
+        Ok(stream) => return Ok((stream, false)),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(error),
+        Err(_) => {}
     }
 
     sys::fs::private_dir(&home.run_dir())?;
@@ -908,8 +920,10 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
         Some(HELLO_TIMEOUT),
     )
     .ok_or_else(|| wedged("another client"))?;
-    if let Ok(stream) = endpoint.connect() {
-        return Ok((stream, false));
+    match endpoint.connect() {
+        Ok(stream) => return Ok((stream, false)),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(error),
+        Err(_) => {}
     }
     let lock = locked(open(home.daemon_pid_file())?, Some(HELLO_TIMEOUT))
         .ok_or_else(|| wedged("the daemon"))?;

@@ -1123,19 +1123,23 @@ struct Exit {
     home: Home,
     /// The locked pid file; see [`claim`].
     pid: File,
+    endpoint: sys::EndpointRetirement,
 }
 
 impl Exit {
-    /// Unlinks the socket first so new clients spawn a fresh daemon (one
-    /// that raced into our backlog sees EOF and retries), then stops
-    /// `daemon`'s sessions, so the next daemon, which waits for the pid
-    /// lock, never loads a log one of ours still writes. Then it empties the
-    /// record and clears the crash breaker (a clean exit is no crash, and
-    /// ends any run of them) and releases the pid lock before the process
-    /// closes its connections: a client reconnecting on EOF finds the lock
-    /// free for the daemon it spawns.
+    /// Retains the endpoint claim through discovery withdrawal and session
+    /// shutdown. Then it releases the claim before
+    /// the pid lock, so a successor never races the old claim or loads a
+    /// log we still write. Clearing the crash breaker ends any run of
+    /// crashes. A client reconnecting on EOF finds both claims free.
     async fn now(self, daemon: &Daemon, why: Stop) -> ! {
-        self.home.endpoint().remove();
+        if let Err(e) = self.endpoint.withdraw() {
+            fact(Fact::Fault {
+                session: None,
+                operation: Operation::Shutdown,
+                kind: Fault(e.kind()),
+            });
+        }
         daemon.shutdown().await;
         if let Err(e) = sys::crash::exited(&self.home, &self.pid) {
             fact(Fact::Fault {
@@ -1151,6 +1155,13 @@ impl Exit {
         });
         fact(Fact::Stopped { reason: why });
         ext_logging::flush(&*daemon.shared.rt).await;
+        if let Err(e) = self.endpoint.retire() {
+            fact(Fact::Fault {
+                session: None,
+                operation: Operation::Shutdown,
+                kind: Fault(e.kind()),
+            });
+        }
         drop(self.pid);
         std::process::exit(0)
     }
@@ -1286,6 +1297,7 @@ fn run(
     let exit = Exit {
         home: home.clone(),
         pid,
+        endpoint: listener.retirement()?,
     };
     daemon.shared.rt.spawn(Box::pin(async move {
         monitor.supervise(&watch, &config, exit).await;

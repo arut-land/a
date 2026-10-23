@@ -51,7 +51,7 @@ fn a_daemon_that_never_accepts_is_waited_on_without_spinning() {
         listener.accept().err().map(|e| e.kind()),
         Some(std::io::ErrorKind::WouldBlock)
     );
-    home.endpoint().remove();
+    listener.retirement().unwrap().retire().unwrap();
     fs::remove_dir_all(&root).unwrap();
 }
 

@@ -66,7 +66,12 @@ impl Fixture {
         let finished = ext::Flag::default();
         let done = finished.clone();
         rt.spawn(Box::pin(async move {
-            let _ = handle(&daemon, &life, theirs.into()).await;
+            let _ = handle(
+                &daemon,
+                &life,
+                sys::OwnedConnection::try_from(theirs).unwrap(),
+            )
+            .await;
             done.set();
         }));
         ours.set_read_timeout(Some(Duration::from_secs(10)))

@@ -18,8 +18,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    GetNamedPipeServerProcessId, PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES,
+    WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, ResetEvent, SetEvent, WaitForSingleObject};
 
@@ -69,13 +70,15 @@ fn generation(record: &crate::crash::Record, root: &Path) -> io::Result<PathBuf>
     )))
 }
 
-pub fn remove(_path: &Path) {}
+pub fn remove(_path: &Path, _discovery: &Path) {}
 
 pub struct Listener {
     path: PathBuf,
     state: Mutex<Accept>,
     event: OwnedHandle,
     nonblocking: AtomicBool,
+    claim: Arc<Mutex<Option<File>>>,
+    retirement_taken: AtomicBool,
 }
 
 struct Accept {
@@ -119,13 +122,25 @@ fn instance(path: &Path, first: bool) -> io::Result<Arc<File>> {
     Ok(Arc::new(File::from(handle)))
 }
 
-pub fn bind(path: &Path, _link: &Path) -> io::Result<Listener> {
+pub fn bind(path: &Path, _link: &Path, _discovery: &Path) -> io::Result<Listener> {
     let root = path
         .parent()
         .and_then(Path::parent)
         .ok_or(io::ErrorKind::InvalidInput)?;
+    crate::fs::private_dir(&root.join("run"))?;
+    // Denying sharing claims this home before creating any generation pipe.
+    // The persistent file is never deleted, and a crash closes its handle.
+    let claim = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(path.with_extension("endpoint-lock"))?;
     let name = generation(&crate::crash::Record::current(""), root)?;
-    listener(instance(&name, true)?, &name)
+    let listener = listener(instance(&name, true)?, &name)?;
+    *lock(&listener.claim) = Some(claim);
+    Ok(listener)
 }
 
 fn listener(file: Arc<File>, path: &Path) -> io::Result<Listener> {
@@ -137,6 +152,8 @@ fn listener(file: Arc<File>, path: &Path) -> io::Result<Listener> {
         }),
         event: event()?,
         nonblocking: AtomicBool::new(false),
+        claim: Arc::new(Mutex::new(None)),
+        retirement_taken: AtomicBool::new(false),
     })
 }
 
@@ -156,7 +173,33 @@ pub(crate) fn process_pipe() -> io::Result<(super::Stream, File)> {
     Ok((super::Stream(accept(&listener)?), child))
 }
 
-pub fn adopt(_file: File, _path: &Path) -> io::Result<Listener> {
+pub struct Retirement(Arc<Mutex<Option<File>>>);
+
+pub fn retirement(listener: &Listener) -> io::Result<Retirement> {
+    if listener.retirement_taken.swap(true, Ordering::AcqRel) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "endpoint retirement already taken",
+        ));
+    }
+    Ok(Retirement(Arc::clone(&listener.claim)))
+}
+
+#[allow(clippy::unnecessary_wraps, reason = "Unix unlinks its socket")]
+pub fn withdraw(_retirement: &Retirement) -> io::Result<()> {
+    // Windows discovery is the locked daemon record, cleared before retirement.
+    Ok(())
+}
+
+#[allow(clippy::unnecessary_wraps, reason = "Unix unlinks its socket")]
+pub fn retire(retirement: Retirement) -> io::Result<()> {
+    let Retirement(claim) = retirement;
+    lock(&claim).take();
+    drop(claim);
+    Ok(())
+}
+
+pub fn adopt(_file: File, _path: &Path, _discovery: &Path) -> io::Result<Listener> {
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "Windows daemon startup re-listens; inherited listeners are not accepted",
@@ -170,6 +213,10 @@ pub fn listener_nonblocking(listener: &Listener, value: bool) -> io::Result<()> 
 }
 
 pub fn accept(listener: &Listener) -> io::Result<Stream> {
+    accept_for(listener, &user_sid(None)?)
+}
+
+fn accept_for(listener: &Listener, owner: &str) -> io::Result<Stream> {
     let mut state = lock(&listener.state);
     loop {
         if state.operation.is_none() {
@@ -210,8 +257,17 @@ pub fn accept(listener: &Listener) -> io::Result<Stream> {
         let next = instance(&listener.path, false)?;
         state.operation = None;
         let connected = std::mem::replace(&mut state.file, next);
+        verify_client(&connected, owner)
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
         return Stream::new(connected);
     }
+}
+
+fn verify_client(file: &File, owner: &str) -> io::Result<()> {
+    let mut pid = 0;
+    // SAFETY: file owns the server pipe and pid is writable.
+    ok(unsafe { GetNamedPipeClientProcessId(file.as_raw_handle(), &raw mut pid) })?;
+    verify_sid(&user_sid(Some(pid))?, owner)
 }
 
 fn recycle(state: &mut Accept) -> io::Result<()> {
@@ -281,7 +337,7 @@ impl CompletionSource for Stream {
     }
 }
 
-pub fn connect(path: &Path) -> io::Result<Stream> {
+pub fn connect(path: &Path, _discovery: &Path) -> io::Result<Stream> {
     // The locked daemon record is also discovery: only its owner writes it.
     // A generation never reuses an old pipe namespace, even if a client
     // keeps an old instance alive after its server has exited.
@@ -328,13 +384,24 @@ fn connect_pipe(path: &Path, expected: Option<u32>) -> io::Result<Stream> {
     let mut pid = 0;
     // SAFETY: file is an open pipe, pid is a writable output.
     ok(unsafe { GetNamedPipeServerProcessId(file.as_raw_handle(), &raw mut pid) })?;
-    if expected.is_some_and(|expected| expected != pid) || user_sid(Some(pid))? != user_sid(None)? {
+    if expected.is_some_and(|expected| expected != pid) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "pipe server belongs to another user",
+            "wrong pipe server process",
         ));
     }
+    verify_sid(&user_sid(Some(pid))?, &user_sid(None)?)?;
     Stream::new(Arc::new(file))
+}
+
+fn verify_sid(peer: &str, owner: &str) -> io::Result<()> {
+    if peer != owner {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "pipe peer belongs to another user",
+        ));
+    }
+    Ok(())
 }
 
 struct Operation {
@@ -624,6 +691,37 @@ mod tests {
     }
 
     #[test]
+    fn foreign_user_identity_is_refused_before_protocol_io() {
+        let home = home("foreign");
+        let listener = home.bind().unwrap();
+        let mut client = connect_pipe(&listener.0.path, None).unwrap();
+        assert_eq!(
+            accept_for(&listener.0, "S-1-5-7").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        let _client = connect_pipe(&listener.0.path, None).unwrap();
+        drop(accept(&listener.0).unwrap());
+        // A client also refuses the wrong server before sending its hello.
+        assert_eq!(
+            connect_pipe(&listener.0.path, Some(0)).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn a_second_listener_cannot_take_the_home_claim() {
+        let home = home("claim");
+        let first = home.bind().unwrap();
+        assert!(home.bind().is_err());
+        home.endpoint().remove();
+        assert!(home.bind().is_err());
+        drop(first);
+        drop(home.bind().unwrap());
+        std::fs::remove_dir_all(home.root()).unwrap();
+    }
+
+    #[test]
     fn alternate_spellings_of_one_home_find_the_same_pipe() {
         let home = home("identity");
         std::fs::create_dir_all(home.root()).unwrap();
@@ -688,7 +786,10 @@ mod tests {
             drop(connect_pipe(&listener.0.path, None).unwrap());
             match accept(&listener.0) {
                 Ok(stream) => drop(stream),
-                Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+                Err(error) => assert!(matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
+                )),
             }
             assert_eq!(
                 accept(&listener.0).unwrap_err().kind(),

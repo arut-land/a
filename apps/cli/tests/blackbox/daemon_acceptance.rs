@@ -25,6 +25,20 @@ fn concurrent_starters_share_one_daemon_and_stop_releases_its_lock() {
 }
 
 #[test]
+fn a_second_daemon_cannot_replace_or_unlink_the_live_endpoint() {
+    let env = Isolated::new("endpoint-owner");
+    env.run(&["ls"]);
+    let pid = env.pid();
+    let second = TestProcess::spawn(&mut env.command(&["__daemon"]))
+        .collect(deadline())
+        .unwrap();
+    assert!(!second.status.success());
+    env.home.endpoint().remove();
+    env.run(&["ls"]);
+    assert_eq!(env.pid(), pid);
+}
+
+#[test]
 fn committed_turns_survive_a_daemon_restart() {
     let env = Isolated::new("durable");
     let output = env.run(&["-p", "durable hello"]);
@@ -210,7 +224,7 @@ fn every_case_uses_an_isolated_home() {
         first.run(&["new"]);
         assert_eq!(second.run(&["ls"]).stdout, b"");
         assert_ne!(first.pid(), second.pid());
-        let stream: sys::Stream = second.home.endpoint().connect().unwrap();
+        let stream: sys::OwnedConnection = second.home.endpoint().connect().unwrap();
         drop(stream);
     }
     assert!(!root.exists());

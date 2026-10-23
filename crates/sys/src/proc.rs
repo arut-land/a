@@ -444,7 +444,8 @@ mod imp {
     ) -> io::Result<Child> {
         use super::Pass;
         let listener = home.bind()?;
-        let handles = [listener.passed(), lock.passed()];
+        let handles = [listener.passed(), lock.passed(), listener.claim_passed()];
+        cmd.env("A_ENDPOINT_CLAIM_FD", "5");
         cmd.args(["--listen-fd", "3", "--lock-fd", "4"]);
         let null = fs::File::options()
             .read(true)
