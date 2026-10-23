@@ -1,5 +1,9 @@
 name: watch rss probe
-on: workflow_dispatch
+on:
+  push:
+    branches: [codex-w1watch]
+    paths: [.github/workflows/watch-rss-probe.yml]
+  workflow_dispatch:
 permissions:
   contents: read
   actions: read
