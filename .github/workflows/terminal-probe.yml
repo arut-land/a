@@ -28,4 +28,5 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           install_args: rust mr-boxington ${{ runner.os == 'Linux' && 'mold' || '' }}
-      - run: mise exec -- cargo test -p sys terminal:: -- --nocapture --test-threads=1
+      - run: |
+          mise exec -- cargo test -p sys terminal:: -- --nocapture --test-threads=1

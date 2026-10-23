@@ -347,7 +347,7 @@ pub fn is_foreground() -> io::Result<bool> {
 mod tests {
     use super::*;
     use std::os::windows::io::IntoRawHandle;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use windows_sys::Win32::System::Console::{
         AllocConsole, CTRL_BREAK_EVENT, CTRL_C_EVENT, FlushConsoleInputBuffer, FreeConsole,
         GenerateConsoleCtrlEvent, INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
@@ -359,17 +359,7 @@ mod tests {
     fn console_state_is_restored_after_a_panic_and_events_preserve_unicode_and_resize() {
         const NAME: &str = "terminal::imp::tests::console_state_is_restored_after_a_panic_and_events_preserve_unicode_and_resize";
         if std::env::var_os("A_TEST_CONSOLE").is_none() {
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", NAME, "--nocapture"])
-                .env("A_TEST_CONSOLE", "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            run_console_test(NAME);
             return;
         }
         let stderr = io::stderr().as_handle().try_clone_to_owned().unwrap();
@@ -406,6 +396,29 @@ mod tests {
         eprintln!("panic restoration passed");
         let signals = Signals::catch(&[Signal::Interrupt, Signal::Terminate]).unwrap();
         assert_input_events(signals);
+    }
+
+    fn run_console_test(name: &str) {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("A_TEST_CONSOLE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        // SAFETY: the child owns this process handle throughout the bounded wait.
+        let ready = unsafe { WaitForSingleObject(child.as_handle().as_raw_handle(), 20_000) };
+        if ready != 0 {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(ready, 0, "private console subprocess timed out");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     fn assert_panic_restores_state() {
