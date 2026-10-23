@@ -54,7 +54,7 @@ env:
 
 jobs:
   matrix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     outputs:
       runners: ${{ steps.select.outputs.runners }}
     steps:
