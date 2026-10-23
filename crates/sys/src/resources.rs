@@ -206,7 +206,8 @@ impl MemoryPressure {
             }
             extern "C" fn destroy(context: *mut std::ffi::c_void) {
                 // SAFETY: finalizer runs exactly once after callbacks have ended.
-                drop(unsafe { Box::from_raw(context.cast::<Callback>()) });
+                let callback = unsafe { Box::from_raw(context.cast::<Callback>()) };
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(callback)));
             }
             let callback: Box<Callback> = Box::new(Box::new(callback));
             // SAFETY: memory pressure uses no handle; WARN|CRITICAL is valid.
@@ -307,6 +308,26 @@ mod tests {
             assert_eq!(class(), 0x19);
         }
         assert_eq!(class(), 0x11);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pressure_source_cancellation_releases_its_callback() {
+        struct Released(std::sync::mpsc::Sender<()>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let (sent, received) = std::sync::mpsc::channel();
+        let released = Released(sent);
+        let source = MemoryPressure::new(move || {
+            std::hint::black_box(&released);
+        });
+        drop(source);
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
     }
 
     #[cfg(windows)]
