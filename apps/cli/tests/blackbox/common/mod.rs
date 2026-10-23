@@ -388,8 +388,8 @@ impl Drop for Env {
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Conn {
-    reader: BufReader<sys::Stream>,
-    writer: sys::Stream,
+    reader: BufReader<sys::OwnedConnection>,
+    writer: sys::OwnedConnection,
     /// Everything received, folded as a client's view.
     pub view: SessionView,
     /// The seq of the last entry received, and of its session.
@@ -426,7 +426,7 @@ impl Conn {
         Self::from(stream.unwrap())
     }
 
-    fn from(stream: sys::Stream) -> Self {
+    fn from(stream: sys::OwnedConnection) -> Self {
         stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         Self {
             reader: BufReader::new(stream.try_clone().unwrap()),

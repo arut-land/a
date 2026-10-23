@@ -930,6 +930,7 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     let exit = Exit {
         home: home.clone(),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
+        endpoint: home.bind().unwrap().retirement().unwrap(),
     };
     let life = Lifecycle::new("test".into(), home.runtime());
     {
@@ -1006,11 +1007,15 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     let exit = Exit {
         home: home.clone(),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
+        endpoint: home.bind().unwrap().retirement().unwrap(),
     };
     let life = Lifecycle::new("test".into(), home.runtime());
     let supervisor = std::sync::Arc::clone(&daemon);
+    let (stop, done) = (ext::Flag::default(), ext::Flag::default());
+    let (stopping, finished) = (stop.clone(), done.clone());
     daemon.shared.rt.spawn(Box::pin(async move {
-        supervisor.supervise(&life, &config, exit).await;
+        rt::or(supervisor.supervise(&life, &config, exit), stopping.wait()).await;
+        finished.set();
     }));
 
     let watcher = Outbox::new();
@@ -1058,6 +1063,9 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     assert!(seen.windows(2).all(|lists| lists[0] != lists[1]));
     daemon.publish_list();
     assert!(watcher.try_next().is_none(), "only changes are sent");
+    stop.set();
+    rt::block_on(done.wait());
+    home.endpoint().remove();
     std::fs::remove_dir_all(&root).unwrap();
 }
 
