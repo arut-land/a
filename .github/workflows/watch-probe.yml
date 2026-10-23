@@ -1,0 +1,33 @@
+name: watcher probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+      MISE_AUTO_INSTALL: false
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - run: echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ${{ runner.temp }}/mbx/actions
+          key: watch-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}
+          restore-keys: cargo-Windows-windows-
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington cargo:cargo-nextest
+      - run: mise exec -- cargo nextest run -p sys -p rt --features rt/watch -E 'test(watch::) | test(directory_watch::)' --no-fail-fast

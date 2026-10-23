@@ -173,7 +173,10 @@ impl Parent {
             crate::or(
                 async {
                     loop {
-                        io.readable().await;
+                        if let Err(error) = io.readable_result().await {
+                            changed(WatchEvent::Unavailable(error));
+                            break;
+                        }
                         io.get_ref().clear();
                         changed(WatchEvent::Changed(vec![path.clone()]));
                     }
@@ -202,10 +205,15 @@ mod tests {
 
     fn changed(watcher: &mut Watcher, recv: &mpsc::Receiver<WatchEvent>, path: &Path, exact: bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = std::collections::VecDeque::new();
         loop {
             let event = recv
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .expect("filesystem event");
+                .unwrap_or_else(|error| panic!("{error}: expected {path:?}, exact={exact}, exists={}, watches={:?}, observed={seen:?}", path.exists(), watcher.watched));
+            if seen.len() == 16 {
+                seen.pop_front();
+            }
+            seen.push_back(format!("{event:?}"));
             // A stale descendant event cannot acknowledge root replacement;
             // rearming for unrelated events can discard the one we await.
             if let WatchEvent::Changed(paths) = event
@@ -217,6 +225,33 @@ mod tests {
                 return;
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_roots_report_changes_in_the_configured_spelling() {
+        let base = std::env::temp_dir().join(format!("a-linked-watch-{}", std::process::id()));
+        fs::create_dir_all(base.join("real")).unwrap();
+        let base = base.canonicalize().unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(base.join("real"), &alias).unwrap();
+        let runtime: crate::Rt = Arc::new(crate::Threads::new(1));
+        let (send, recv) = mpsc::channel();
+        let roots = [alias.clone()];
+        let mut watcher = Watcher::new(
+            Arc::new(move |task| runtime.spawn(task)),
+            roots.clone(),
+            move |event| {
+                if event.affects(&roots) {
+                    let _ = send.send(event);
+                }
+            },
+        )
+        .unwrap();
+        fs::write(base.join("real/source"), "visible through the alias").unwrap();
+        changed(&mut watcher, &recv, &alias.join("source"), true);
+        drop(watcher);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

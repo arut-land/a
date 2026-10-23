@@ -13,11 +13,34 @@ impl Backend {
     pub fn new(_: &Spawn, wanted: &BTreeMap<PathBuf, bool>, changed: &Changed) -> io::Result<Self> {
         use notify::Watcher as _;
         let changed = changed.clone();
+        let mut aliases: Vec<_> = wanted
+            .keys()
+            .filter_map(|path| {
+                path.canonicalize()
+                    .ok()
+                    .map(|resolved| (resolved, path.clone()))
+            })
+            .collect();
+        aliases.sort_by_key(|(resolved, _)| std::cmp::Reverse(resolved.components().count()));
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
                 Ok(event) if event.need_rescan() => changed(WatchEvent::Rescan),
                 Ok(event) if !matches!(event.kind, notify::EventKind::Access(_)) => {
-                    changed(WatchEvent::Changed(event.paths));
+                    let paths = event
+                        .paths
+                        .into_iter()
+                        .map(|path| {
+                            aliases
+                                .iter()
+                                .find_map(|(resolved, original)| {
+                                    path.strip_prefix(resolved)
+                                        .ok()
+                                        .map(|relative| original.join(relative))
+                                })
+                                .unwrap_or(path)
+                        })
+                        .collect();
+                    changed(WatchEvent::Changed(paths));
                 }
                 Err(error) => changed(WatchEvent::Unavailable(io::Error::other(error))),
                 _ => {}

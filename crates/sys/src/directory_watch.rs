@@ -5,6 +5,7 @@ use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use windows_sys::Win32::Foundation::{ERROR_IO_INCOMPLETE, ERROR_NOTIFY_ENUM_DIR};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
     FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
@@ -102,10 +103,10 @@ impl DirectoryWatch {
             )
         });
         match completion {
-            Err(error) if error.raw_os_error() == Some(996) => {
+            Err(error) if error.raw_os_error() == Some(ERROR_IO_INCOMPLETE.cast_signed()) => {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
-            Err(error) if error.raw_os_error() == Some(1022) => {
+            Err(error) if error.raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR.cast_signed()) => {
                 self.arm(&mut request)?;
                 return Ok(None);
             }
@@ -179,5 +180,43 @@ impl Drop for DirectoryWatch {
                 1,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    #[test]
+    fn completions_rearm_unicode_paths_and_pending_reads_cancel_on_drop() {
+        let root = std::env::temp_dir().join(format!("a-directory-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let watch = DirectoryWatch::new(&root, false).unwrap();
+        assert_eq!(watch.take().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        for name in ["café", "second"] {
+            let path = root.join(name);
+            std::fs::write(&path, "visible").unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let remaining = until.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "missing notification for {name}");
+                let timeout = u32::try_from(remaining.as_millis()).unwrap();
+                // SAFETY: watch owns the event throughout the bounded wait.
+                let signalled =
+                    unsafe { WaitForSingleObject(watch.event.as_raw_handle(), timeout) };
+                assert_eq!(signalled, WAIT_OBJECT_0);
+                if watch.take().unwrap().unwrap().contains(&path) {
+                    break;
+                }
+            }
+        }
+        assert!(watch.paths(&[0; 4096], 0).is_none());
+        assert!(watch.paths(&[0; 4096], 4).is_none());
+        assert!(watch.paths(&[0; 4096], 16 * 1024 + 1).is_none());
+        drop(watch);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

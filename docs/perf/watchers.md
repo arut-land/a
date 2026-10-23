@@ -24,11 +24,15 @@ window, compares captures, compiles and revalidates, including failed
 compilations. The host validates all layers again before publication. A
 failed preparation retains the current registry and folded state. Empty
 source sets skip the window. Settled sources leave no recurring timer.
-File-follow opens and bounded reads use admitted Storage work.
+File-follow opens, bounded reads and initial source-backed prompt context
+use admitted Storage work before the kernel is stepped.
 
 The window is a debounce, not a writer-completion signal. A writer paused
 with valid partial content can outlast it. Native notifications are advisory;
 no finite sequence of reads proves that an in-place writer has finished or
-that a future change will generate a notification. Atomic replacement is
-required when that stronger publication guarantee matters. Permanent watch
+that a future change will generate a notification. An agreed inventory also cannot distinguish an intentional source removal
+from a temporary rename gap. A generation requires its effective input set
+to settle during capture; continuously changing effective inputs can delay
+that generation. Atomic replacement or an explicit writer completion
+protocol is required when the stronger publication guarantee matters. Permanent watch
 or filesystem failure is reported; it cannot guarantee eventual reload.

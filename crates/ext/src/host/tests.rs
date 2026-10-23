@@ -870,3 +870,27 @@ fn queued_preparation_does_not_retain_a_closed_workspace() {
     queue.lock().unwrap().pop().unwrap()();
     assert!(registry.upgrade().is_none());
 }
+
+#[test]
+fn prepared_context_is_consumed_without_rereading_sources() {
+    #[derive(Clone)]
+    struct Source(Arc<Mutex<String>>);
+    impl Extension for Source {
+        const NAME: &'static str = "source";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut Registrar) {
+            let source = self.0.clone();
+            r.text(Text::context("source", 0, move |_| {
+                Some(source.lock().unwrap().clone())
+            }));
+        }
+    }
+    let source = Source(Arc::new(Mutex::new("captured".into())));
+    let registry = Registry::default().with(&source).unwrap();
+    let binding = Bound::new(Arc::new(registry), Arc::new(Bare), None);
+    binding.prepare_context();
+    *source.0.lock().unwrap() = "changed".into();
+    assert_eq!(binding.context().as_deref(), Some("captured"));
+    binding.prepare_context();
+    assert_eq!(binding.context().as_deref(), Some("changed"));
+}

@@ -501,6 +501,12 @@ impl Registry {
         self.specs.get_or_init(|| self.tools.specs().into())
     }
 
+    pub fn has_context(&self) -> bool {
+        self.texts
+            .iter()
+            .any(|text| self.offered(text) && matches!(text.place, Place::Context(_)))
+    }
+
     /// The context the texts give for `facts`, if any.
     pub fn context(&self, facts: &Facts<'_>) -> Option<String> {
         let parts: Vec<String> = self
@@ -1053,6 +1059,13 @@ impl std::fmt::Debug for dyn Binding {
     }
 }
 
+#[derive(Default)]
+enum ContextCapture {
+    #[default]
+    Pending,
+    Ready(Option<String>),
+}
+
 /// A registry generation bound to a session: the [`Binding`] the kernel
 /// drives, over the session as its points read it (`V`). Pure glue: the
 /// engine supplies the view and the agent's name, and tests bind real
@@ -1066,6 +1079,7 @@ pub struct Bound<V> {
     /// the text it was read from: its run is given it rather than reading
     /// it again, unless the gate rewrote it.
     parsed: Arc<Mutex<Vec<(CallId, Json, Parsed)>>>,
+    context: Arc<Mutex<ContextCapture>>,
 }
 
 impl<V> Clone for Bound<V> {
@@ -1075,6 +1089,7 @@ impl<V> Clone for Bound<V> {
             view: Arc::clone(&self.view),
             agent: self.agent.clone(),
             parsed: Arc::clone(&self.parsed),
+            context: Arc::clone(&self.context),
         }
     }
 }
@@ -1086,7 +1101,29 @@ impl<V: View + Send + Sync + 'static> Bound<V> {
             view,
             agent,
             parsed: Arc::default(),
+            context: Arc::default(),
         }
+    }
+
+    /// Capture source-backed context on admitted workers before a kernel step.
+    pub fn prepare_context(&self) {
+        let context = self.read_context();
+        *lock(&self.context) = ContextCapture::Ready(context);
+    }
+
+    fn read_context(&self) -> Option<String> {
+        let workspace = self.view.workspace();
+        let env = self.view.env();
+        let mut dir = None;
+        self.view.states(&mut |states| {
+            dir = Some(self.registry.dir(workspace, env.as_deref(), states));
+        });
+        let dir = dir.unwrap_or_else(|| workspace.to_path_buf());
+        let facts = Facts {
+            workspace,
+            dir: &dir,
+        };
+        self.registry.context(&facts)
     }
 
     pub fn registry(&self) -> &Arc<Registry> {
@@ -1230,18 +1267,11 @@ impl<V: View + Send + Sync + 'static> Binding for Bound<V> {
     }
 
     fn context(&self) -> Option<String> {
-        let workspace = self.view.workspace();
-        let env = self.view.env();
-        let mut dir = None;
-        self.view.states(&mut |states| {
-            dir = Some(self.registry.dir(workspace, env.as_deref(), states));
-        });
-        let dir = dir.unwrap_or_else(|| workspace.to_path_buf());
-        let facts = Facts {
-            workspace,
-            dir: &dir,
-        };
-        self.registry.context(&facts)
+        let prepared = std::mem::take(&mut *lock(&self.context));
+        match prepared {
+            ContextCapture::Ready(context) => context,
+            ContextCapture::Pending => self.read_context(),
+        }
     }
 
     fn read(&self, call: CallId, tool: &str, input: &Json) -> Option<Card> {
