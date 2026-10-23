@@ -872,6 +872,18 @@ impl Daemon {
         }
     }
 
+    fn reclaim_idle(&self) {
+        for slot in self.slots() {
+            let disposable = slot.live().is_some_and(|session| {
+                session.summary().activity == protocol::Activity::Idle
+                    && session.idle_for() > Duration::ZERO
+            });
+            if disposable {
+                slot.unload();
+            }
+        }
+    }
+
     /// Starts sending `outbox` the session list, now and on each change.
     fn watch_list(&self, outbox: &Outbox) {
         let sessions = self.list();
@@ -1010,13 +1022,11 @@ impl Daemon {
                 session: None,
                 detail: String::new(),
             });
-            let after = if pressure.count() != pressured {
+            if pressure.count() != pressured {
                 pressured = pressure.count();
-                Duration::from_nanos(1)
-            } else {
-                config.hibernate
-            };
-            self.hibernate(after);
+                self.reclaim_idle();
+            }
+            self.hibernate(config.hibernate);
             self.publish_list();
             let stopping = *lock(&self.stopping);
             if let Some(reason) = stopping {
@@ -1073,7 +1083,7 @@ impl Daemon {
             };
             let reclaim = async {
                 pressure.changed(&mut pressured).await;
-                self.hibernate(Duration::from_nanos(1));
+                self.reclaim_idle();
                 false
             };
             let woken = rt::or(pulse, rt::or(reclaim, rt::or(ended, sleep)));

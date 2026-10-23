@@ -186,13 +186,13 @@ struct Pool {
 impl Threads {
     pub fn new(workers: usize) -> Self {
         Self::configured(Config {
-            workers: workers.max(1),
+            workers: workers.clamp(1, 4),
             ..Config::default()
         })
     }
 
     pub fn configured(config: Config) -> Self {
-        assert!(config.workers > 0);
+        assert!((1..=4).contains(&config.workers));
         let lifecycle = Arc::new(Lifecycle::default());
         Self {
             config,

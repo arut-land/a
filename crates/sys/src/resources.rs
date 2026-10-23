@@ -184,55 +184,7 @@ unsafe extern "C" {
 }
 
 #[cfg(windows)]
-mod windows {
-    use windows_sys::Win32::System::{
-        JobObjects::{
-            JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_MIN_MAX_RATE,
-            JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
-            JobObjectCpuRateControlInformation, QueryInformationJobObject,
-        },
-        Threading::{GetCurrentProcess, GetProcessAffinityMask, GetProcessDefaultCpuSets},
-    };
-
-    pub(super) fn parallelism(mut count: usize) -> usize {
-        // SAFETY: process pseudo-handle is valid and all outputs are writable.
-        unsafe {
-            let process = GetCurrentProcess();
-            let (mut affinity, mut system) = (0, 0);
-            if GetProcessAffinityMask(process, &raw mut affinity, &raw mut system) != 0
-                && affinity != 0
-            {
-                count = count.min(affinity.count_ones() as usize);
-            }
-            let mut required = 0;
-            GetProcessDefaultCpuSets(process, std::ptr::null_mut(), 0, &raw mut required);
-            if required > 0 {
-                count = count.min(required as usize);
-            }
-            let mut rate = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
-            if QueryInformationJobObject(
-                std::ptr::null_mut(),
-                JobObjectCpuRateControlInformation,
-                (&raw mut rate).cast(),
-                u32::try_from(size_of_val(&rate)).expect("fixed-size job rate"),
-                std::ptr::null_mut(),
-            ) != 0
-                && rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE != 0
-                && rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED == 0
-            {
-                let maximum = if rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_MIN_MAX_RATE != 0 {
-                    rate.Anonymous.Anonymous.MaxRate as usize
-                } else {
-                    rate.Anonymous.CpuRate as usize
-                };
-                // CPU rate is a fraction of host capacity, not the affinity subset.
-                let host = std::thread::available_parallelism().map_or(1, usize::from);
-                count = count.min((host * maximum / 10_000).max(1));
-            }
-        }
-        count.max(1)
-    }
-}
+mod windows;
 
 /// Event-driven pressure notification. The callback must only release disposable
 /// state; cancellation can overlap a callback already in progress.
@@ -300,6 +252,35 @@ mod tests {
         let facts = Resources::for_path(&std::env::temp_dir()).unwrap();
         assert!(facts.parallelism > 0);
         assert!(facts.page_size.is_power_of_two());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn affinity_restrictions_bound_effective_parallelism() {
+        // A new thread inherits this test's affinity and exits with the restriction.
+        std::thread::spawn(|| {
+            // SAFETY: CPU sets are initialized and passed with their actual sizes.
+            unsafe {
+                let mut allowed: libc::cpu_set_t = std::mem::zeroed();
+                assert_eq!(
+                    libc::sched_getaffinity(0, size_of_val(&allowed), &raw mut allowed),
+                    0
+                );
+                let first = (0..usize::try_from(libc::CPU_SETSIZE).expect("positive CPU set size"))
+                    .find(|cpu| libc::CPU_ISSET(*cpu, &allowed))
+                    .unwrap();
+                libc::CPU_ZERO(&mut allowed);
+                libc::CPU_SET(first, &mut allowed);
+                assert_eq!(
+                    libc::sched_setaffinity(0, size_of_val(&allowed), &raw const allowed),
+                    0
+                );
+                assert_eq!(effective_parallelism(), 1);
+            }
+        })
+        .join()
+        .unwrap();
     }
 
     #[cfg(target_os = "macos")]

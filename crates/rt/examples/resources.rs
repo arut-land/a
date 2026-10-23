@@ -29,6 +29,7 @@ fn pipeline(name: &str, batch: usize, mut f: impl FnMut()) {
         region.change()
     );
 }
+#[allow(clippy::too_many_lines)]
 fn main() {
     println!(
         "facts {:?}",

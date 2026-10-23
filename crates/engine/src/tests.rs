@@ -157,16 +157,27 @@ fn idle_sessions_hibernate_and_reload_on_attach() {
 }
 
 #[test]
-fn pressure_reclamation_retains_attached_sessions() {
+fn pressure_reclamation_retains_attached_sessions_and_pending_approvals() {
     let (root, home) = home("pressure");
-    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let config = Config {
+        ext: exts("[ext.policy]\nask = [\"bash\"]"),
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
     let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    let pending = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    pending.session().submit("$ echo hi").unwrap();
     settle(&daemon);
-    daemon.hibernate(Duration::from_nanos(1));
-    assert!(daemon.slots()[0].live().is_some());
+    assert_eq!(pending.session().summary().activity, Activity::Approval);
+    drop(pending);
+    daemon.reclaim_idle();
+    assert!(daemon.slots().iter().all(|slot| slot.live().is_some()));
     drop(attachment);
-    daemon.hibernate(Duration::from_nanos(1));
-    assert!(daemon.slots()[0].live().is_none());
+    daemon.reclaim_idle();
+    let loaded = daemon.loaded();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].summary().activity, Activity::Approval);
+    drop(loaded);
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
 }
