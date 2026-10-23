@@ -151,14 +151,21 @@ fn resolve(
             "Windows drive and UNC paths; use -LiteralPath; single quotes escape apostrophes by doubling them",
         )
     };
+    let mut runtime_bin = None;
     let cwd_command = if dialect == Dialect::Bash {
         let parent = executable.parent().unwrap_or(Path::new("."));
         if parent.join("cygwin1.dll").is_file() {
+            runtime_bin = Some(parent.to_path_buf());
             syntax = "Cygwin Bash (no profile or rc files)";
             "cygpath -w -- \"$PWD\""
         } else if parent.join("msys-2.0.dll").is_file()
             || parent.join("../usr/bin/msys-2.0.dll").is_file()
         {
+            runtime_bin = Some(if parent.join("msys-2.0.dll").is_file() {
+                parent.to_path_buf()
+            } else {
+                parent.join("../usr/bin")
+            });
             syntax = "MSYS/Git Bash (no profile or rc files)";
             "pwd -W"
         } else {
@@ -177,6 +184,7 @@ fn resolve(
         cleanup: "timeout/cancellation terminate the owned Windows job and its descendants; no Unix TERM grace; background work is session-owned; jobs die with the daemon; retained output stays in the session spill directory",
         temp: std::env::temp_dir(),
         cwd_command,
+        runtime_bin,
     }
 }
 
@@ -184,6 +192,20 @@ pub(super) fn apply_environment(
     facts: &ExecutionFacts,
     env: &mut std::collections::BTreeMap<String, String>,
 ) {
+    if let Some(bin) = &facts.runtime_bin {
+        let old = env
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+            .map_or_else(String::new, |(_, value)| value.clone());
+        let mut paths: Vec<_> = std::env::split_paths(&old).collect();
+        if !paths.iter().any(|path| path == bin) {
+            paths.push(bin.clone());
+        }
+        if let Ok(path) = std::env::join_paths(paths) {
+            env.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
+            env.insert("PATH".into(), path.to_string_lossy().into_owned());
+        }
+    }
     // Windows environment names compare without case; remove older spellings
     // before inserting the frozen temporary-directory values.
     env.retain(|key, _| {
@@ -257,5 +279,36 @@ mod tests {
             windows.join("System32/WindowsPowerShell/v1.0/powershell.exe")
         );
         assert!(syntax.contains("5.1"));
+    }
+
+    #[test]
+    fn native_quoting_expansion_counts_toward_the_command_line_limit() {
+        assert!(validate_argv(&["pwsh.exe".into(), "\"".repeat(20_000)]).is_err());
+        assert!(validate_argv(&["pwsh.exe".into(), "\"".repeat(10_000)]).is_ok());
+    }
+
+    #[test]
+    fn shell_environment_preserves_client_path_priority_and_pins_temp() {
+        let mut facts = resolve(None, Some(""), None, Path::new(r"C:\Windows"));
+        facts.runtime_bin = Some(r"C:\Git\usr\bin".into());
+        facts.temp = r"C:\startup-temp".into();
+        let mut env = std::collections::BTreeMap::from([
+            ("Path".into(), r"C:\client".into()),
+            ("tmp".into(), r"C:\later-temp".into()),
+            ("bash_env".into(), "unwanted".into()),
+        ]);
+        apply_environment(&facts, &mut env);
+        assert_eq!(
+            std::env::split_paths(&env["PATH"]).collect::<Vec<_>>(),
+            [
+                PathBuf::from(r"C:\client"),
+                PathBuf::from(r"C:\Git\usr\bin")
+            ]
+        );
+        assert_eq!(env["TEMP"], r"C:\startup-temp");
+        assert_eq!(env["TMP"], r"C:\startup-temp");
+        assert!(!env.contains_key("Path"));
+        assert!(!env.contains_key("tmp"));
+        assert!(!env.contains_key("bash_env"));
     }
 }

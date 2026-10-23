@@ -31,6 +31,7 @@ pub(super) fn discover() -> ExecutionFacts {
         cleanup: "timeout/cancellation signal the owned process group, TERM then KILL; descendants that leave the group can escape; background work is session-owned; retained output stays in the session spill directory",
         temp: std::env::temp_dir(),
         cwd_command: "pwd -P",
+        runtime_bin: None,
     }
 }
 

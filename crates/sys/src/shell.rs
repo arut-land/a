@@ -30,6 +30,7 @@ pub struct ExecutionFacts {
     pub cleanup: &'static str,
     pub temp: PathBuf,
     pub cwd_command: &'static str,
+    pub runtime_bin: Option<PathBuf>,
 }
 
 impl ExecutionFacts {
