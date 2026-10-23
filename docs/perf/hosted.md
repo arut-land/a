@@ -72,7 +72,7 @@ never addresses the user's default home.
 | Attach | Five independent daemons; ten recorded echo turns; 500 connect/hello/attach/replays each, through `Synced` |
 | Idle | Five homes; daemon RSS at three seconds; CPU after fifteen seconds settling, then ten seconds with no profiling |
 | CLI workloads | Three warmups, twenty runs: version, fresh-home/new, cold/warm new, echo, 1 MiB shell output, long transcript |
-| Engine/JSON/TUI benches | One warmup, five runs per saved release benchmark executable |
+| Engine/JSON/LLM/TUI benches | One warmup, five runs per saved release benchmark executable; LLM decodes recorded provider cassettes |
 
 The CLI workload generates its transcript through the engine's encoder.
 The engine driver executes 100 recorded turns across the step/effects barrier
@@ -114,7 +114,7 @@ runtime budget pass. Full measurements remain the default.
 For tuning, `paired_ref` additionally builds a reference revision on the same
 runner. Reference builds omit the protocol and TUI bench executables, which
 these paired windows do not use. Five alternating AB/BA rounds measure startup, cold reply, attach,
-idle RSS/CPU, driver turns and large JSON. Paired driver batches use 500 turns (250 per barrier); JSON batches use 200 results
+idle RSS/CPU, driver turns, large JSON and recorded-provider decode. Paired driver batches use 500 turns (250 per barrier); JSON batches use 200 results
 to reduce native CPU counter quantization; the full suite retains its original
 20-result JSON and 100-turn driver workloads. Each role uses fresh isolated
 homes. All builds finish before these paired windows. Both raw observations
@@ -154,3 +154,16 @@ dependency and run `mise exec -- python scripts/perf/hosted.py --runner LABEL`.
 process floor. `perf:idle-rss` measures the line client on every OS; macOS PTY
 and profiler evidence remains the separate historical measurement in
 [idle-rss.md](idle-rss.md).
+
+Optional `profile=true` attributes baseline instructions with
+[Callgrind](https://valgrind.org/docs/manual/cl-manual.html) on Linux x86_64,
+after all timing windows. It builds symbol-bearing engine and LLM benchmark
+executables and profiles recorded turns, large JSON and provider cassettes.
+Exclusive and inclusive instruction summaries and raw traces are artifacts.
+These instrumented observations select packages to investigate; they do not
+establish native speedups. `build_only=true` can skip timing for attribution.
+
+CI owns functional checks, acceptance, platform lints and the Apple build.
+Perf owns release measurements and the existing Unix terminal first-paint,
+PTY idle and quiet-shell invariants, reusing its release fixture binary.
+Release measurements are not duplicated in CI.

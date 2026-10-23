@@ -59,7 +59,6 @@ jobs:
       runners: ${{ steps.select.outputs.runners }}
     steps:
       - uses: actions/checkout@v7
-      - run: python3 -m unittest discover -s scripts/perf -p 'test_*.py'
       - id: select
         env:
           SELECTED: ${{ inputs.runner || 'all' }}
