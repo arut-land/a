@@ -14,6 +14,7 @@ from stats import distribution
 
 
 class Comparison(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("psutil"), "native accounting runs in each perf job")
     def test_captured_output_does_not_wait_for_an_inheriting_descendant(self):
         import tempfile
         import psutil
