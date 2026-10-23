@@ -24,6 +24,7 @@ struct Request {
 
 struct Completion {
     event: OwnedHandle,
+    interruptible: bool,
     cancelled: AtomicBool,
     result: Mutex<Option<io::Result<usize>>>,
 }
@@ -45,6 +46,12 @@ pub(in crate::terminal) fn interrupt_output() {
     if let Some(output) = OUTPUT.get() {
         // SAFETY: process-lifetime manual-reset event; no borrowed buffers.
         unsafe { SetEvent(output.interrupt.as_raw_handle()) };
+        let active = output.active.lock().unwrap_or_else(PoisonError::into_inner);
+        if active.as_ref().is_some_and(|state| state.interruptible) {
+            // SAFETY: controls cancel only this terminal worker's normal
+            // frame. The gate prevents it from advancing to cleanup here.
+            unsafe { CancelSynchronousIo(output.worker.as_raw_handle()) };
+        }
     }
 }
 
@@ -152,6 +159,7 @@ pub fn write_stdout(
     }
     let state = Arc::new(Completion {
         event: event()?,
+        interruptible,
         cancelled: AtomicBool::new(false),
         result: Mutex::new(None),
     });

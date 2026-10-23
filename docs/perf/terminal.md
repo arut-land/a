@@ -54,7 +54,12 @@ There is no tcsetpgrp that could take the foreground from the shell.
 Native tests use isolated pseudo-terminals or a private Windows console
 subprocess. They cover suspension, redraw and continued input, panic mode
 restoration, UTF-16 surrogate pairs, resize records, and native Ctrl-C and
-Ctrl-Break callbacks. Hosted CI is the authority for cross-platform
+Ctrl-Break callbacks. ConPTY tests pause native console writes while keeping
+the frontend drained; they verify cancellation, the panic cleanup deadline,
+mode/code-page restoration and zero idle worker CPU. Unix tests retain the
+parent's inherited tty description through acquisition, suspension, resume,
+normal exit and a killed child, checking that its flags never change.
+Hosted CI is the authority for cross-platform
 results. A PTY or console subprocess does not establish every emulator's
 keyboard/mouse behavior; interactive Windows Terminal, tmux and SSH checks
 remain separate from these automated invariants.

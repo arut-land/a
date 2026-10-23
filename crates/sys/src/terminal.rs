@@ -30,6 +30,7 @@ fn panic_hook() {
 
 /// Restore all terminal modes before an exit that bypasses Rust destructors.
 pub fn restore() {
+    let _interrupt = OutputInterrupt::acquire();
     if let Some(raw) = RAW
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

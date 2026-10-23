@@ -6,9 +6,11 @@ use std::process::{Command, Stdio};
 
 use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::System::Console::{
-    COORD, CTRL_C_EVENT, ClosePseudoConsole, CreatePseudoConsole, GenerateConsoleCtrlEvent,
-    GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, HPCON, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    SetConsoleCtrlHandler, SetStdHandle,
+    COORD, CTRL_C_EVENT, ClosePseudoConsole, CreatePseudoConsole, ENABLE_LINE_INPUT,
+    GenerateConsoleCtrlEvent, GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, HPCON,
+    INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode, SetConsoleOutputCP, SetStdHandle,
+    WriteConsoleInputW,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
@@ -21,7 +23,7 @@ fn the_console_output_worker_does_not_wake_while_idle() {
     const NAME: &str =
         "terminal::imp::output::tests::the_console_output_worker_does_not_wake_while_idle";
     if std::env::var_os("A_TEST_STALLED_OUTPUT").is_none() {
-        run_in_stalled_conpty(NAME);
+        run_in_console(NAME);
         return;
     }
     attach_standard_handles();
@@ -58,13 +60,21 @@ fn writer_cpu() -> u64 {
 fn stalled_console_output_is_cancelled_and_panic_cleanup_has_a_deadline() {
     const NAME: &str = "terminal::imp::output::tests::stalled_console_output_is_cancelled_and_panic_cleanup_has_a_deadline";
     if std::env::var_os("A_TEST_STALLED_OUTPUT").is_none() {
-        run_in_stalled_conpty(NAME);
+        run_in_console(NAME);
         return;
     }
     attach_standard_handles();
+    // SAFETY: this private pseudoconsole must actually change code pages on
+    // acquisition, so a missing restoration cannot pass with UTF-8 defaults.
+    unsafe {
+        assert_ne!(SetConsoleCP(437), 0);
+        assert_ne!(SetConsoleOutputCP(437), 0);
+    }
     let before = console_state();
     let _raw = crate::terminal::RawMode::enter().unwrap();
+    eprintln!("console lease acquired");
     let signals = crate::Signals::catch(&[crate::Signal::Interrupt]).unwrap();
+    pause_console_output();
     let (done, result) = mpsc::channel();
     let renderer = thread::spawn(move || {
         let mut out = crate::terminal::Stdout::default();
@@ -77,19 +87,7 @@ fn stalled_console_output_is_cancelled_and_panic_cleanup_has_a_deadline() {
         }
     });
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let mut pending = 0;
-        // SAFETY: the dedicated writer owns this live, queryable thread handle.
-        ok(unsafe {
-            GetThreadIOPendingFlag(
-                OUTPUT.get().unwrap().worker.as_raw_handle(),
-                &raw mut pending,
-            )
-        })
-        .unwrap();
-        if pending != 0 {
-            break;
-        }
+    while !writer_pending() {
         assert!(
             Instant::now() < deadline,
             "console write never became pending"
@@ -103,13 +101,14 @@ fn stalled_console_output_is_cancelled_and_panic_cleanup_has_a_deadline() {
         ),
         "writer failed before cancellation"
     );
-    eprintln!("native console write is pending with its output pipe unread");
+    eprintln!("native console write is pending under output flow control");
     // SAFETY: this pseudoconsole contains only the dedicated test subprocess.
     assert_ne!(unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) }, 0);
     // SAFETY: the caught signal owns its completion event during the wait.
     let ready = unsafe { WaitForSingleObject(signals.as_handle().as_raw_handle(), 5000) };
     assert_eq!(ready, 0);
     assert_eq!(signals.take(), [crate::Signal::Interrupt]);
+    eprintln!("native Ctrl-C delivered");
     let interrupt = crate::terminal::OutputInterrupt::acquire();
     assert_eq!(
         result.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -122,27 +121,95 @@ fn stalled_console_output_is_cancelled_and_panic_cleanup_has_a_deadline() {
     );
     drop(interrupt);
     eprintln!("Ctrl-C unblocked the renderer");
+    pause_console_output();
 
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        eprintln!("panic cleanup started");
         let started = Instant::now();
         let mut cleanup = crate::terminal::Stdout::restoring();
-        let error = cleanup.write_all(&vec![b' '; 1024 * 1024]).unwrap_err();
+        let error = cleanup
+            .write_all(b"\x1b[0m\x1b[?1049l\x1b[?25h")
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(cleanup);
+        eprintln!("screen cleanup completed within its deadline");
         previous(info);
         assert_eq!(
             console_state(),
             before,
             "panic did not restore native console state"
         );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while writer_pending() {
+            assert!(
+                Instant::now() < deadline,
+                "cleanup left its native write pending"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
         eprintln!("panic cleanup reached its deadline and restored modes and code pages");
     }));
     assert!(std::panic::catch_unwind(|| panic!("restore a stalled terminal")).is_err());
-    // libtest's own final status uses ordinary stdout, outside the bounded
-    // terminal writer; it must not print into the deliberately stalled pipe.
+    // libtest's final status uses ordinary stdout, outside the bounded writer;
+    // it must not print into the deliberately paused console.
     std::process::exit(0);
+}
+
+fn writer_pending() -> bool {
+    let mut pending = 0;
+    // SAFETY: the dedicated writer owns this live, queryable thread handle.
+    ok(unsafe {
+        GetThreadIOPendingFlag(
+            OUTPUT.get().unwrap().worker.as_raw_handle(),
+            &raw mut pending,
+        )
+    })
+    .unwrap();
+    pending != 0
+}
+
+fn pause_console_output() {
+    let input = io::stdin();
+    let mut mode = 0;
+    let key = |code| INPUT_RECORD {
+        EventType: u16::try_from(KEY_EVENT).unwrap(),
+        Event: INPUT_RECORD_0 {
+            KeyEvent: KEY_EVENT_RECORD {
+                bKeyDown: 1,
+                wRepeatCount: 1,
+                wVirtualKeyCode: code,
+                ..Default::default()
+            },
+        },
+    };
+    // An ordinary key releases any prior pause before VK_PAUSE sets it again.
+    let records = [key(u16::from(b'A')), key(0x13)];
+    let mut count = 0;
+    // Pause is intercepted in line mode. Restoring raw input afterward leaves
+    // output suspended while keeping the host's API/control service available.
+    // SAFETY: this child owns its console, record and writable mode/count.
+    unsafe {
+        assert_ne!(
+            GetConsoleMode(input.as_handle().as_raw_handle(), &raw mut mode),
+            0
+        );
+        assert_ne!(
+            SetConsoleMode(input.as_handle().as_raw_handle(), mode | ENABLE_LINE_INPUT),
+            0
+        );
+        assert_ne!(
+            WriteConsoleInputW(
+                input.as_handle().as_raw_handle(),
+                records.as_ptr(),
+                2,
+                &raw mut count
+            ),
+            0
+        );
+        assert_ne!(SetConsoleMode(input.as_handle().as_raw_handle(), mode), 0);
+    }
 }
 
 fn attach_standard_handles() {
@@ -195,7 +262,7 @@ fn pipe() -> (OwnedHandle, OwnedHandle) {
     )
 }
 
-fn run_in_stalled_conpty(name: &str) {
+fn run_in_console(name: &str) {
     let (input_read, _input_write) = pipe();
     let (output_read, output_write) = pipe();
     let mut console: HPCON = 0;
@@ -211,6 +278,12 @@ fn run_in_stalled_conpty(name: &str) {
     };
     assert_eq!(created, 0);
     drop((input_read, output_write));
+    // A ConPTY frontend must keep draining even while its client's writes
+    // are paused; otherwise the host's API/control service can deadlock too.
+    let drain = thread::spawn(move || {
+        let mut output = std::fs::File::from(output_read);
+        let _ = io::copy(&mut output, &mut io::sink());
+    });
     // SAFETY: this attribute takes the HPCON value, rather than a pointer to it,
     // and the fixture keeps it alive until the child exits.
     let attributes = unsafe {
@@ -236,12 +309,6 @@ fn run_in_stalled_conpty(name: &str) {
     if ready != 0 {
         let _ = child.kill();
     }
-    // Closing ConPTY must have an output reader. Start it only after the child
-    // has completed or timed out, preserving actual backpressure during tests.
-    let drain = thread::spawn(move || {
-        let mut output = std::fs::File::from(output_read);
-        let _ = io::copy(&mut output, &mut io::sink());
-    });
     // SAFETY: releases only the pseudoconsole created by this fixture.
     unsafe { ClosePseudoConsole(console) };
     drain.join().unwrap();
