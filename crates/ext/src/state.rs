@@ -188,19 +188,10 @@ impl States {
     }
 
     /// Missing registrations retain only their serialized value, never an old
-    /// reducer or VM. Retention ends with the session, or when reattached.
+    /// reducer or VM. Registered values must already be rebuilt from the log
+    /// and a matching checkpoint; retained images never override replay.
     pub fn adopt(&mut self, live: &Self) -> Result<(), String> {
         self.validate(live)?;
-        for held in &mut self.held {
-            if let Some(image) = live
-                .retained
-                .iter()
-                .find(|image| image.ext == *held.ext && image.state == *held.decl.name)
-            {
-                held.value = (held.decl.restore)(&image.image)?;
-                held.rejected = image.rejected.clone();
-            }
-        }
         self.retained = live
             .retained
             .iter()
@@ -576,8 +567,17 @@ mod tests {
     #[test]
     fn an_omitted_fold_reattaches_its_value_after_an_empty_generation_and_checkpoint() {
         let make = || States::new([(Name::from("counter"), Decl::of::<Count>())]);
+        let log = [Entry::new(
+            Seq::new(1).unwrap(),
+            protocol::Epoch::default(),
+            Body::Ext {
+                ext: "counter".into(),
+                state: "count".into(),
+                data: Json::encode(&42).unwrap(),
+            },
+        )];
         let mut live = make();
-        live.fold("counter", "count", &Json::encode(&42).unwrap());
+        live.replay(&log);
         let mut absent = States::default();
         absent.adopt(&live).unwrap();
         assert!(!absent.registered("counter", "count"));
@@ -585,6 +585,7 @@ mod tests {
         restored_absent.restore(&absent.image().unwrap()).unwrap();
         restored_absent.adopt(&absent).unwrap();
         let mut returned = make();
+        returned.replay(&log);
         returned.adopt(&restored_absent).unwrap();
         assert_eq!(returned.get::<Count>().unwrap().0, 42);
         returned.fold("counter", "count", &Json::encode(&1).unwrap());

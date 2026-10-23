@@ -401,6 +401,36 @@ mod tests {
     }
 
     #[test]
+    fn continuous_identical_saves_cannot_starve_another_skill_source() {
+        let rig = Rig::new("skills-identical-saves", Registry::default());
+        let root = rig.workspace().join(".a/skills");
+        for name in ["a", "b"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let a = root.join("a/SKILL.md");
+        let b = root.join("b/SKILL.md");
+        let unchanged = "---\nname: b\ndescription: B\n---\nunchanged";
+        fs::write(&a, "---\nname: a\ndescription: A\n---\nold").unwrap();
+        fs::write(&b, unchanged).unwrap();
+        let loader = Loader::new(&rig.dir, Skills::default());
+        let _previous = loader
+            .prepare(&rig.workspace(), &Registry::default(), None, false)
+            .unwrap();
+        fs::write(&a, "---\nname: a\ndescription: A\n---\nsettled").unwrap();
+        let prepared = ext::source::prepare(
+            || {
+                fs::write(root.join("b/save.tmp"), unchanged).unwrap();
+                fs::rename(root.join("b/save.tmp"), &b).unwrap();
+                loader.capture(&rig.workspace())
+            },
+            |_| {},
+            catalog,
+        )
+        .unwrap();
+        assert_eq!(prepared["a"].body, "settled");
+    }
+
+    #[test]
     fn a_changed_file_is_seen_only_at_rest_and_replay_never_reads_it() {
         let rig = Rig::new("skills-generation", Registry::default());
         let directory = rig.workspace().join(".a/skills/review");

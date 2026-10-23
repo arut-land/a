@@ -26,7 +26,8 @@ impl std::error::Error for Error {}
 
 /// The window coalesces editor writes; it is not proof that a writer closed.
 /// Compare effective inputs, never notification counts: unrelated activity
-/// must not prevent a settled source from making progress.
+/// must not prevent a settled source from making progress. Each capture must
+/// validate its reads; equality describes content, not native version churn.
 pub fn prepare<S: PartialEq, T>(
     mut capture: impl FnMut() -> Result<S, Error>,
     mut wait: impl FnMut(&S),

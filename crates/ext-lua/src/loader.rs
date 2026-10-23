@@ -191,16 +191,6 @@ impl Loader {
         {
             return Ok(previous.clone());
         }
-        if let Some(previous) = previous.filter(|p| {
-            p.inputs
-                .downcast_ref::<Files>()
-                .is_some_and(|inputs| same_content(inputs, found))
-        }) {
-            return Ok(PreparedLayer {
-                inputs: Arc::new(found.clone()),
-                registrations: previous.registrations.clone(),
-            });
-        }
         let started = Instant::now();
         let mut registry = base.clone();
         let mut installed = Vec::new();
@@ -257,12 +247,6 @@ impl Loader {
                 .collect(),
         })
     }
-}
-
-fn same_content(left: &Files, right: &Files) -> bool {
-    left.len() == right.len() && left.iter().zip(right).all(|((name, source), (other_name, other))| {
-        name == other_name && matches!((source.text(), other.text()), (Ok(left), Ok(right)) if left == right)
-    })
 }
 
 fn inventory(
@@ -351,6 +335,40 @@ mod tests {
     }
 
     #[test]
+    fn continuous_identical_saves_cannot_starve_another_lua_source() {
+        let rig = ext::testing::Rig::new("lua-identical-saves", Registry::default());
+        let directory = rig.dir.join("ext");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("a.lua"), "a.text{name='a',text='old'}").unwrap();
+        let unchanged = "a.text{name='b',text='unchanged'}";
+        fs::write(directory.join("b.lua"), unchanged).unwrap();
+        let loader = Loader::new(&rig.dir, sys::config::Exts::default()).unwrap();
+        let previous = loader
+            .prepare(&rig.workspace(), &Registry::default(), None, false)
+            .unwrap();
+        fs::write(directory.join("a.lua"), "a.text{name='a',text='settled'}").unwrap();
+        let prepared = ext::source::prepare(
+            || {
+                // Every capture observes a new native identity, without a timing race.
+                fs::write(directory.join("save.lua.tmp"), unchanged).unwrap();
+                fs::rename(directory.join("save.lua.tmp"), directory.join("b.lua")).unwrap();
+                loader.capture(&rig.workspace())
+            },
+            |_| {},
+            |files| loader.compile(files, &Registry::default(), Some(&previous), false),
+        )
+        .unwrap();
+        assert!(loader.validate(&rig.workspace(), &prepared).unwrap());
+        let registry = prepared
+            .registrations
+            .into_iter()
+            .fold(Registry::default(), |registry, (tier, module)| {
+                registry.with_dyn(tier, &*module).unwrap()
+            });
+        assert!(registry.system_prompt().contains("settled"));
+    }
+
+    #[test]
     fn missing_optional_source_directories_prepare_an_empty_layer() {
         let rig = ext::testing::Rig::new("lua-missing-home", Registry::default());
         let home = rig.dir.join("home");
@@ -430,8 +448,17 @@ mod tests {
             )
             .states()
         };
+        let log = [protocol::Entry::new(
+            protocol::Seq::new(1).unwrap(),
+            protocol::Epoch::default(),
+            protocol::Body::Ext {
+                ext: "test".into(),
+                state: "count".into(),
+                data: protocol::Json::encode(&42).unwrap(),
+            },
+        )];
         let mut states = prepare();
-        states.fold("test", "count", &protocol::Json::encode(&42).unwrap());
+        states.replay(&log);
         let mut writer = fs::OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -451,6 +478,7 @@ mod tests {
         assert!(!absent.registered("test", "count"));
         fs::write(&file, full).unwrap();
         let mut restored = prepare();
+        restored.replay(&log);
         restored.adopt(&absent).unwrap();
         assert_eq!(restored.erased("test", "count").unwrap().raw(), "42");
         restored.fold("test", "count", &protocol::Json::encode(&1).unwrap());

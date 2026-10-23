@@ -45,9 +45,9 @@ impl Version {
     }
 }
 
+/// Equality compares effective bytes after each read validates native stability.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source {
-    version: Version,
     bytes: Vec<u8>,
 }
 
@@ -61,7 +61,7 @@ impl Source {
         };
         let before = Version::of(&file.metadata()?)?;
         let mut bytes = Vec::new();
-        // Retain failed bytes and version observations before decoding UTF-8.
+        // Decode after capture so torn UTF-8 still passes through the debounce.
         (&file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
         let after = Version::of(&file.metadata()?)?;
         if before != after {
@@ -76,10 +76,7 @@ impl Source {
                 format!("source exceeds {limit} bytes"),
             ));
         }
-        Ok(Some(Self {
-            version: after,
-            bytes,
-        }))
+        Ok(Some(Self { bytes }))
     }
 
     pub fn len(&self) -> usize {
@@ -158,7 +155,7 @@ mod tests {
         assert!(Source::read(&root, &path, 64).unwrap().is_none());
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, "settled").unwrap();
-        assert_ne!(Source::read(&root, &path, 64).unwrap().unwrap(), before);
+        assert_eq!(Source::read(&root, &path, 64).unwrap().unwrap(), before);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

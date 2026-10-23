@@ -25,9 +25,10 @@ Skills inventories frontmatter identities before capturing winning files;
 shadowed bodies and native versions do not participate in comparisons.
 Links may resolve only within configured roots, and descendant target edits
 invalidate the inventory. Source reads and pathname revalidation use sys's
-bounded, nonblocking regular-file opens. Snapshot identity includes native
-file identity, size, modification time and, on Unix, change time. Bytes are
-captured before UTF-8 decoding.
+bounded, nonblocking regular-file opens. Each read validates native file identity, size, modification time and, on
+Unix, change time before and after capture. Validated snapshots compare
+effective bytes rather than native versions, so identical saves cannot
+starve another source. Bytes are captured before UTF-8 decoding.
 
 The I/O-free ext source driver injects capture, wait and compile operations.
 It coalesces writes over a 100 ms window and revalidates after compilation.
@@ -44,9 +45,12 @@ A quiet window is a debounce, not a writer-completion signal. Valid partial
 sources and temporary absence may publish generations with fewer commands.
 Folded values are keyed by mod and fold name: adopting a generation that
 omits a fold retains its serialized image and rejection decisions for the
-session lifetime. The value is included in checkpoints and reattached when
-a later generation registers that identity. Retention holds no old reducer
-or Lua VM. An incompatible restored value rejects adoption. A returned fold
+session lifetime. Retained values are included in checkpoints. Returning
+registrations rebuild from a matching checkpoint and the log, including
+events recorded during absence; retained images never override replay.
+Changed reducers replay the prefix using their own semantics. Retention
+holds no old reducer or Lua VM. A candidate rejecting previously accepted
+changes rejects adoption. A returned fold
 can then accept new changes normally; removing a registration never clears
 its value. Session disposal ends retention.
 
