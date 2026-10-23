@@ -427,20 +427,11 @@ impl EditTransaction {
                 Err(error) => Err(error.into()),
             };
         };
-        #[cfg(unix)]
         staged.prepare_vacancy()?;
-        #[cfg(windows)]
-        let moving_source = {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::{Foundation::GENERIC_READ, Storage::FileSystem::DELETE};
-            // Acquire rename authority on the captured object after CopyFileEx releases
-            // its source handle. The original read handle continues to deny writers.
-            reopen(source.as_raw_handle(), GENERIC_READ | DELETE)
-                .map_err(|error| self.revalidate().err().unwrap_or(EditError::Io(error)))?
-        };
-        #[cfg(windows)]
-        let source = &moving_source;
         staged.take_original(source, &self.name).map_err(|error| {
+            if staged.has_original() {
+                return EditError::Conflict(EditConflict::Recovery(staged.retain_original()));
+            }
             if matches!(
                 error.kind(),
                 io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists
@@ -504,6 +495,10 @@ impl EditTransaction {
         snapshot: &File,
         before: &Signature,
     ) -> Result<(), EditError> {
+        #[cfg(windows)]
+        if accessible_links(displaced)? != 1 {
+            return Err(EditError::Conflict(EditConflict::Changed));
+        }
         let observed = signature(displaced)?;
         if moved_signature(*before) != moved_signature(observed) {
             return Err(EditError::Conflict(EditConflict::Changed));
@@ -531,7 +526,7 @@ impl EditTransaction {
         #[cfg(unix)]
         return Staged::create(directory);
         #[cfg(windows)]
-        Staged::copied(directory, |directory| {
+        Staged::copied(directory, self.source.is_some(), |directory| {
             stage_windows(self, directory, should_cancel)
         })
     }
@@ -1520,7 +1515,42 @@ fn stream_bytes(file: &File, limit: usize) -> io::Result<u64> {
 }
 
 #[cfg(windows)]
-fn reopen(handle: windows_sys::Win32::Foundation::HANDLE, access: u32) -> io::Result<File> {
+pub(super) fn accessible_links(file: &File) -> io::Result<u32> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_STANDARD_LINK_INFORMATION, FileStandardLinkInformation, NtQueryInformationFile,
+    };
+    let mut information = FILE_STANDARD_LINK_INFORMATION::default();
+    let mut status = windows_sys::Win32::System::IO::IO_STATUS_BLOCK::default();
+    // SAFETY: file owns its handle; both outputs have the advertised writable size.
+    let result = unsafe {
+        NtQueryInformationFile(
+            file.as_raw_handle(),
+            &raw mut status,
+            (&raw mut information).cast(),
+            u32::try_from(size_of::<FILE_STANDARD_LINK_INFORMATION>())
+                .expect("fixed structure size"),
+            FileStandardLinkInformation,
+        )
+    };
+    if result < 0 {
+        // SAFETY: converts a scalar status without dereferencing any pointer.
+        let code =
+            unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(result) }.cast_signed();
+        return Err(if matches!(code, 1 | 50 | 87) {
+            io::ErrorKind::Unsupported.into()
+        } else {
+            io::Error::from_raw_os_error(code)
+        });
+    }
+    Ok(information.NumberOfAccessibleLinks)
+}
+
+#[cfg(windows)]
+pub(super) fn reopen(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    access: u32,
+) -> io::Result<File> {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
     };

@@ -107,6 +107,8 @@ pub(super) struct Staged<'a> {
     pub directory: Directory<'a>,
     #[cfg(windows)]
     published: bool,
+    #[cfg(windows)]
+    link_publication: bool,
 }
 
 impl<'a> Staged<'a> {
@@ -129,6 +131,7 @@ impl<'a> Staged<'a> {
     #[cfg(windows)]
     pub fn copied(
         directory: Directory<'a>,
+        link_publication: bool,
         copy: impl FnOnce(&Directory<'_>) -> io::Result<File>,
     ) -> io::Result<Self> {
         let file = copy(&directory)?;
@@ -136,6 +139,7 @@ impl<'a> Staged<'a> {
             file,
             directory,
             published: false,
+            link_publication,
         })
     }
 
@@ -179,15 +183,27 @@ impl<'a> Staged<'a> {
         {
             let _ = source;
             rustix::fs::renameat(self.directory.parent, name, &self.directory.file, ORIGINAL)?;
+            self.directory.retain = true;
         }
         #[cfg(windows)]
         {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::{Foundation::GENERIC_READ, Storage::FileSystem::DELETE};
             let _ = name;
-            rename(source, &self.directory.file, OsStr::new(ORIGINAL))?;
+            // Hard links preserve the ACL verbatim; cross-directory rename can
+            // rewrite inherited ACEs. Both link creation and deletion use our handle.
+            let authority = super::edit::reopen(source.as_raw_handle(), GENERIC_READ | DELETE)?;
+            link(&authority, &self.directory.file, OsStr::new(ORIGINAL))?;
+            self.directory.retain = true;
+            remove(&authority)?;
+            // POSIX deletion vacates this handle's link when the delete handle closes.
+            drop(authority);
         }
-        // From here every error must preserve the displaced version.
-        self.directory.retain = true;
         Ok(())
+    }
+
+    pub fn has_original(&self) -> bool {
+        self.directory.retain
     }
 
     pub fn original(&self) -> io::Result<File> {
@@ -218,7 +234,12 @@ impl<'a> Staged<'a> {
             remove_if_present(&self.directory.file, ORIGINAL)?;
         }
         #[cfg(windows)]
-        rename(source, self.directory.parent, name)?;
+        {
+            let _ = source;
+            let original = self.original()?;
+            link(&original, self.directory.parent, name)?;
+            self.remove_original_link()?;
+        }
         self.directory.retain = false;
         Ok(())
     }
@@ -237,6 +258,34 @@ impl<'a> Staged<'a> {
         remove_if_present(&self.directory.file, "probe")
     }
 
+    #[cfg(windows)]
+    pub fn prepare_vacancy(&mut self) -> io::Result<()> {
+        // Refuse unsupported filesystems while the target is still untouched.
+        link(&self.file, &self.directory.file, OsStr::new("probe"))?;
+        self.remove_link("probe")?;
+        if super::edit::accessible_links(&self.file)? != 1 {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn remove_link(&self, name: &str) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{Foundation::GENERIC_READ, Storage::FileSystem::DELETE};
+        let file = relative(&self.directory.file, OsStr::new(name), false, false)?;
+        let authority = super::edit::reopen(file.as_raw_handle(), GENERIC_READ | DELETE)?;
+        remove(&authority)?;
+        drop(authority);
+        drop(file);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn remove_original_link(&self) -> io::Result<()> {
+        self.remove_link(ORIGINAL)
+    }
+
     pub fn reclaim_original(&mut self, source: &File) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -244,7 +293,10 @@ impl<'a> Staged<'a> {
             rustix::fs::unlinkat(&self.directory.file, ORIGINAL, rustix::fs::AtFlags::empty())?;
         }
         #[cfg(windows)]
-        remove(source)?;
+        {
+            let _ = source;
+            self.remove_original_link()?;
+        }
         self.directory.retain = false;
         Ok(())
     }
@@ -266,8 +318,12 @@ impl<'a> Staged<'a> {
         }
         #[cfg(windows)]
         {
-            rename(&self.file, self.directory.parent, name)?;
-            self.published = true;
+            if self.link_publication {
+                link(&self.file, self.directory.parent, name)?;
+            } else {
+                rename(&self.file, self.directory.parent, name)?;
+                self.published = true;
+            }
             Ok(())
         }
     }
@@ -433,13 +489,40 @@ fn remove(file: &File) -> io::Result<()> {
 
 #[cfg(windows)]
 fn rename(file: &File, parent: &File, to: &OsStr) -> io::Result<()> {
+    name_operation(
+        file,
+        parent,
+        to,
+        windows_sys::Wdk::Storage::FileSystem::FileRenameInformationEx,
+    )
+}
+
+#[cfg(windows)]
+fn link(file: &File, parent: &File, to: &OsStr) -> io::Result<()> {
+    name_operation(
+        file,
+        parent,
+        to,
+        windows_sys::Wdk::Storage::FileSystem::FileLinkInformationEx,
+    )
+}
+
+#[cfg(windows)]
+fn name_operation(
+    file: &File,
+    parent: &File,
+    to: &OsStr,
+    class: windows_sys::Wdk::Storage::FileSystem::FILE_INFORMATION_CLASS,
+) -> io::Result<()> {
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
     let name: Vec<u16> = to.encode_wide().collect();
     let bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2;
-    let length = u32::try_from(bytes).map_err(|_| io::ErrorKind::InvalidInput)?;
+    let length = u32::try_from(bytes.max(size_of::<FILE_RENAME_INFO>()))
+        .map_err(|_| io::ErrorKind::InvalidInput)?;
     let mut buffer = vec![0u64; bytes.max(size_of::<FILE_RENAME_INFO>()).div_ceil(8)];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // Extended native link/rename information has the same documented header.
     // SAFETY: aligned storage contains the complete header and UTF-16 tail;
     // both owned handles and the buffer live through the synchronous call.
     unsafe {
@@ -453,12 +536,14 @@ fn rename(file: &File, parent: &File, to: &OsStr) -> io::Result<()> {
             &raw mut status,
             info.cast(),
             length,
-            windows_sys::Wdk::Storage::FileSystem::FileRenameInformationEx,
+            class,
         );
         if result < 0 {
-            Err(io::Error::from_raw_os_error(
-                windows_sys::Win32::Foundation::RtlNtStatusToDosError(result).cast_signed(),
-            ))
+            let code = windows_sys::Win32::Foundation::RtlNtStatusToDosError(result).cast_signed();
+            if matches!(code, 1 | 50 | 87) {
+                return Err(io::ErrorKind::Unsupported.into());
+            }
+            Err(io::Error::from_raw_os_error(code))
         } else {
             Ok(())
         }
