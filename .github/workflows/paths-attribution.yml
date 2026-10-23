@@ -1,0 +1,36 @@
+name: paths attribution
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_JOBS: 4
+      MISE_AUTO_INSTALL: false
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington
+      - run: python -m pip install psutil==7.2.2
+      - run: mise exec -- python scripts/perf/paths-attribution.py
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: paths-attribution-${{ matrix.os }}
+          path: target/paths-attribution/*.json
