@@ -23,11 +23,12 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
     use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    use std::fs::File;
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
-    struct Capture(std::process::Child, crate::OwnedGroup);
+    struct Capture(crate::Child, crate::ProcessLease);
     impl Drop for Capture {
         fn drop(&mut self) {
             // Every error path (including unwinding) revokes the entire
@@ -47,11 +48,16 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    crate::OwnedGroup::lead(&mut command);
-    let child = crate::proc::spawn(&mut command)?;
-    let group = crate::OwnedGroup::new(&child);
-    let mut child = Capture(child, group);
-    let mut stdout = child.0.stdout.take().expect("stdout is piped");
+    let (reader, writer) = io::pipe()?;
+    let writer = File::from(std::os::fd::OwnedFd::from(writer));
+    let null = File::options().read(true).write(true).open("/dev/null")?;
+    let child = crate::proc::unix::SpawnPlan::new(&command, [&null, &writer, &null])
+        .environment()
+        .spawn()?;
+    drop(writer);
+    let group = crate::ProcessLease::new(&child);
+    let child = Capture(child, group);
+    let mut stdout = reader;
     fcntl_setfl(&stdout, fcntl_getfl(&stdout)? | OFlags::NONBLOCK)?;
     let mut out = Vec::new();
     let mut eof = false;

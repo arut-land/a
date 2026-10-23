@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Threading::{
 
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
-use super::{ContainedChild, GroupId, OwnedGroup, Passed};
+use super::{ContainedChild, Passed, ProcessLease, RecordedIdentity};
 use crate::Signal;
 use crate::windows::{Security, ok, owned};
 
@@ -71,6 +71,7 @@ pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::R
         [&input, &writer, &error],
         None,
         DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        false,
     )?;
     drop(writer);
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -107,10 +108,6 @@ pub fn detach_session() -> io::Result<()> {
     Ok(())
 }
 
-pub fn lead(cmd: &mut Command) {
-    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-}
-
 /// Job assignment is a process creation attribute, so no shell can fork
 /// before containment. The daemon alone owns each kill-on-close handle.
 pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<ContainedChild> {
@@ -131,19 +128,32 @@ pub fn spawn_group_captured(cmd: &mut Command, output: File) -> io::Result<Conta
     Ok(child)
 }
 
-pub fn spawn_stdio(
+pub fn spawn_stdio_role(
     cmd: &mut Command,
+    terminal: bool,
 ) -> io::Result<(ContainedChild, crate::Stream, crate::Stream)> {
     let (input, child_input) = crate::endpoint::imp::process_pipe()?;
     let (output, child_output) = crate::endpoint::imp::process_pipe()?;
-    let error = File::options().write(true).open("NUL")?;
-    let child = spawn_job(cmd, [&child_input, &child_output, &error])?;
+    let error = if terminal {
+        File::from(std::os::windows::io::AsHandle::as_handle(&io::stderr()).try_clone_to_owned()?)
+    } else {
+        File::options().write(true).open("NUL")?
+    };
+    let child = spawn_job_role(cmd, [&child_input, &child_output, &error], terminal)?;
     Ok((child, input, output))
 }
 
 fn spawn_job(
     cmd: &Command,
     io: [&dyn std::os::windows::io::AsHandle; 3],
+) -> io::Result<ContainedChild> {
+    spawn_job_role(cmd, io, false)
+}
+
+fn spawn_job_role(
+    cmd: &Command,
+    io: [&dyn std::os::windows::io::AsHandle; 3],
+    terminal: bool,
 ) -> io::Result<ContainedChild> {
     let security = Security::user_only()?;
     let attributes = security.attributes();
@@ -165,10 +175,11 @@ fn spawn_job(
         cmd,
         io,
         Some(&job),
-        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+        CREATE_NEW_PROCESS_GROUP | if terminal { 0 } else { CREATE_NO_WINDOW },
+        terminal,
     )?;
-    let group = OwnedGroup {
-        id: GroupId(child.id()),
+    let group = ProcessLease {
+        id: RecordedIdentity(child.id()),
         handle: job,
     };
     Ok(ContainedChild {
@@ -178,9 +189,12 @@ fn spawn_job(
     })
 }
 
-pub(super) fn members(job: &OwnedHandle) -> Vec<u32> {
+pub(super) fn members(job: &OwnedHandle) -> io::Result<Vec<u32>> {
     let mut count = 64;
     loop {
+        if count > super::MAX_MEMBERS {
+            return Err(io::Error::other("job exceeds supervision capacity"));
+        }
         // Pointer-sized storage aligns JOBOBJECT_BASIC_PROCESS_ID_LIST.
         let mut buffer = vec![0usize; count + 2];
         // SAFETY: the aligned allocation has the advertised writable byte count.
@@ -199,13 +213,13 @@ pub(super) fn members(job: &OwnedHandle) -> Vec<u32> {
             // SAFETY: successful query initialized both DWORDs and the listed IDs.
             let len = unsafe { *header.add(1) } as usize;
             let offset = 8 / size_of::<usize>();
-            return buffer[offset..offset + len]
+            return Ok(buffer[offset..offset + len]
                 .iter()
                 .filter_map(|&pid| pid.try_into().ok())
-                .collect();
+                .collect());
         }
         if io::Error::last_os_error().raw_os_error() != Some(234) {
-            return Vec::new();
+            return Err(io::Error::last_os_error());
         }
         count *= 2;
     }
@@ -217,9 +231,6 @@ pub fn group_members(_id: u32) -> Vec<u32> {
 }
 pub fn group_alive(_id: u32) -> bool {
     false
-}
-pub fn signal_group(_id: u32, _signal: Signal) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
 }
 
 pub(super) fn terminate_group(job: &OwnedHandle) -> io::Result<()> {
@@ -296,13 +307,6 @@ impl RecordedProcess {
     }
 }
 
-pub fn signal_process(pid: u32, _signal: Signal) -> io::Result<()> {
-    // SAFETY: scalar inputs; checked handle is owned until termination returns.
-    let process = owned(unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) })?;
-    // SAFETY: callers own this child PID; daemon stop uses RecordedProcess.
-    ok(unsafe { TerminateProcess(process.as_raw_handle(), 1) })
-}
-
 pub fn exit_signal(_status: ExitStatus) -> Option<String> {
     None
 }
@@ -342,7 +346,7 @@ mod tests {
         let mut child = spawn_group(&mut command, output).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let members = loop {
-            let members = child.group.members();
+            let members = child.group.members().unwrap();
             if members.len() >= 2 {
                 break members;
             }

@@ -9,8 +9,8 @@
 //! calls and restarts. Its calls are exclusive ([`ext::Concurrency`]): a
 //! session runs one at a time, so commands never race for that directory.
 //!
-//! Its output goes to a file in the session's spill directory as it runs,
-//! never through the daemon's memory: the supervisor follows the file,
+//! Output crosses a bounded capture pipe into the session's spill file.
+//! Storage admission applies back-pressure; the supervisor follows the file,
 //! woken by its writes, keeping only what the model is shown, and the file
 //! is kept as the whole output when that was cut. A command whose output
 //! passes [`OUTPUT_CAP`] is stopped. Cancellation before or during process
@@ -567,8 +567,10 @@ async fn supervise(
     cx: &Cx,
     progress: &Partials<String>,
 ) -> io::Result<Finished> {
-    let mut file = File::open(log)?;
     let rt = runtime(cx)?;
+    let path = log.to_owned();
+    let mut file =
+        rt::unblock_with(rt, rt::BlockingClass::Storage, 0, move || File::open(path)).await?;
     let mut buf = vec![0; 64 * 1024];
     let (mut output, mut live) = (Output::default(), Live::default());
     let start = rt.now();
@@ -599,10 +601,17 @@ async fn supervise(
             rt::or(writes, rt::or(exits, rt::or(cancelled, sleep))).await?;
         }
         written.get_ref().clear();
-        let read = follow(&mut file, &mut buf, READ, |chunk| {
-            output.push(chunk);
-            live.push(chunk);
-        })?;
+        let (state, read) =
+            rt::unblock_with(rt, rt::BlockingClass::Storage, 256 << 10, move || {
+                let read = follow(&mut file, &mut buf, READ, |chunk| {
+                    output.push(chunk);
+                    live.push(chunk);
+                });
+                ((file, buf, output, live), read)
+            })
+            .await;
+        (file, buf, output, live) = state;
+        let read = read?;
         behind = read == READ;
         if read > 0 {
             rt::yield_now().await;
@@ -622,7 +631,7 @@ async fn supervise(
         let seen = Seen {
             exited: if exited { None } else { child.try_wait()? },
             cancelled: cx.cancel.is_set(),
-            flooded: output.bytes() > OUTPUT_CAP,
+            flooded: output.bytes() >= OUTPUT_CAP,
         };
         let signal;
         (run, signal) = run.step(now, seen);
@@ -643,7 +652,11 @@ async fn supervise(
                     child.output_drained().await?;
                 }
                 let rest = OUTPUT_CAP.saturating_sub(output.bytes()).min(READ);
-                follow(&mut file, &mut buf, rest, |chunk| output.push(chunk))?;
+                output = rt::unblock_with(rt, rt::BlockingClass::Storage, 256 << 10, move || {
+                    follow(&mut file, &mut buf, rest, |chunk| output.push(chunk))?;
+                    Ok::<_, io::Error>(output)
+                })
+                .await?;
                 return Ok(Finished {
                     status,
                     stopped: why,

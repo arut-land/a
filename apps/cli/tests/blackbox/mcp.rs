@@ -63,7 +63,7 @@ fn replay_never_repeats_a_server_effect_and_stop_owns_its_tree() {
     let effects = fs::read(env.root.join("effects")).unwrap();
     env.run(&["daemon", "stop"]);
     wait_for("MCP child to end with its daemon", || {
-        !sys::GroupId(child).alive()
+        !sys::RecordedIdentity(child).alive()
     });
     env.start();
     let mut replay = env.connect();
@@ -103,7 +103,7 @@ fn an_unfinished_external_call_is_never_reissued_after_daemon_crash() {
         }
     )));
     wait_for("recovery to kill the old server", || {
-        !sys::GroupId(child).alive()
+        !sys::RecordedIdentity(child).alive()
     });
     assert_eq!(fs::read(env.root.join("effects")).unwrap(), effects);
 }
@@ -197,7 +197,7 @@ fn interrupting_an_active_call_kills_its_server() {
         other => panic!("expected a cancelled call, got {other:?}"),
     }
     wait_for("interrupted MCP server to exit", || {
-        !sys::GroupId(child).alive()
+        !sys::RecordedIdentity(child).alive()
     });
 }
 
@@ -229,7 +229,7 @@ fn daemon_stop_and_cancellation_kill_server_descendants() {
             .parse()
             .unwrap();
         assert_ne!(server, child);
-        assert!(sys::GroupId(server).members().contains(&child));
+        assert!(sys::RecordedIdentity(server).members().contains(&child));
         if cancel {
             conn.send(&ClientMsg::INTERRUPT);
             conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
@@ -238,8 +238,8 @@ fn daemon_stop_and_cancellation_kill_server_descendants() {
         }
         wait_for(
             "the server and its descendant to leave their process group",
-            || !sys::GroupId(server).alive(),
+            || !sys::RecordedIdentity(server).alive(),
         );
-        assert!(!sys::GroupId(server).members().contains(&child));
+        assert!(!sys::RecordedIdentity(server).members().contains(&child));
     }
 }

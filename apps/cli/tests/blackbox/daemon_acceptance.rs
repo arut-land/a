@@ -63,7 +63,7 @@ fn an_unclean_exit_releases_the_endpoint_and_recovers_committed_sessions() {
     env.run(&["ls"]);
     let before = env.logs();
     let pid = env.pid();
-    sys::signal_process(pid, sys::Signal::Kill).unwrap();
+    crate::support::signal_process(pid, sys::Signal::Kill).unwrap();
     assert!(client::wait_exited(&env.home, Some(Duration::from_secs(5))));
     env.run(&["ls"]);
     assert_eq!(before, env.logs());
@@ -166,13 +166,13 @@ fn timeout_reaps_only_the_test_process_tree() {
 
     let ready_deadline = deadline();
     while !fs::read(&output).unwrap().starts_with(b"ready")
-        || process.group().members().len() < 2
+        || process.group().members().unwrap().len() < 2
         || !fs::read(&unrelated_output).unwrap().starts_with(b"ready")
     {
         assert!(Instant::now() < ready_deadline);
         std::thread::sleep(Duration::from_millis(10));
     }
-    let members = process.group().members();
+    let members = process.group().members().unwrap();
     let error = process
         .collect(Instant::now() + Duration::from_millis(20))
         .unwrap_err();

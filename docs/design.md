@@ -131,8 +131,11 @@ rather than reading and decoding it. `derived/` is disposable. See
 `Core::resume` handles recovery after load, failed commit, registry reload
 or contained panic. A fresh agent per turn makes its state reconstructible
 from the log. Safe tools can rerun; unsafe tools settle as interrupted rather
-than repeating an uncertain effect. Logged process groups are interpreted
-against the boot identity to avoid killing reused process ids. Durable waits
+than repeating an uncertain effect. Logged process numbers are diagnostic data;
+recovery cannot turn them into signaling authority. Unix live leases keep their
+leader unreaped through group cleanup; Windows leases own kill-on-close jobs
+assigned and verified before the primary thread runs. Unix group control covers
+cooperative descendants; descendants can leave the group. Durable waits
 and child ownership let interaction continue independently of a connection.
 
 ## Extensions and SDK

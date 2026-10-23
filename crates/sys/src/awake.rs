@@ -90,9 +90,10 @@ mod imp {
 #[cfg(target_os = "linux")]
 mod imp {
     //! A `systemd-inhibit` lock, held for as long as the process it runs.
-    use std::process::{Child, Command, Stdio};
+    use crate::Child;
+    use std::process::{Command, Stdio};
 
-    pub struct Hold(Child, crate::OwnedGroup);
+    pub struct Hold(Child, crate::ProcessLease);
 
     impl Hold {
         pub fn new(why: &str) -> Option<Self> {
@@ -103,11 +104,19 @@ mod imp {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            crate::OwnedGroup::lead(&mut cmd);
-            crate::proc::spawn(&mut cmd).ok().map(|child| {
-                let group = crate::OwnedGroup::new(&child);
-                Self(child, group)
-            })
+            let null = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .ok()?;
+            crate::proc::unix::SpawnPlan::new(&cmd, [&null, &null, &null])
+                .environment()
+                .spawn()
+                .ok()
+                .map(|child| {
+                    let group = crate::ProcessLease::new(&child);
+                    Self(child, group)
+                })
         }
     }
 

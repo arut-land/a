@@ -14,10 +14,10 @@ use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    GetExitCodeProcess, INFINITE, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    TerminateProcess, WaitForSingleObject,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, GetExitCodeProcess, INFINITE, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, WaitForSingleObject,
 };
 
 pub struct Child {
@@ -28,6 +28,9 @@ pub struct Child {
 impl Child {
     pub fn id(&self) -> u32 {
         self.id
+    }
+    pub fn exit_watch(&self) -> io::Result<OwnedHandle> {
+        self.process.try_clone()
     }
     pub fn kill(&mut self) -> io::Result<()> {
         // SAFETY: this owned handle identifies the process created here.
@@ -80,11 +83,19 @@ pub(super) fn spawn(
     io: [&dyn AsHandle; 3],
     job: Option<&OwnedHandle>,
     flags: u32,
+    inherit_environment: bool,
 ) -> io::Result<Child> {
-    let environment: Vec<_> = cmd
-        .get_envs()
-        .filter_map(|(name, value)| value.map(|value| (name.to_owned(), value.to_owned())))
-        .collect();
+    let mut environment: Vec<_> = if inherit_environment {
+        std::env::vars_os().collect()
+    } else {
+        Vec::new()
+    };
+    for (name, value) in cmd.get_envs() {
+        environment.retain(|(key, _)| !key.eq_ignore_ascii_case(name));
+        if let Some(value) = value {
+            environment.push((name.to_owned(), value.to_owned()));
+        }
+    }
     let program = resolve(cmd.get_program(), &environment)?;
     let mut line = command_line(program.as_os_str(), cmd.get_args())?;
     let mut environment = environment_block(environment)?;
@@ -129,7 +140,7 @@ pub(super) fn spawn(
             null(),
             null(),
             1,
-            flags | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+            flags | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
             environment.as_mut_ptr().cast(),
             directory.as_ref().map_or(null(), Vec::as_ptr),
             &raw const startup.StartupInfo,
@@ -137,11 +148,38 @@ pub(super) fn spawn(
         )
     })?;
     let handle = owned(process.hProcess)?;
-    drop(owned(process.hThread)?);
-    Ok(Child {
+    let thread = owned(process.hThread)?;
+    let mut child = Child {
         process: handle,
         id: process.dwProcessId,
-    })
+    };
+    let admitted = (|| {
+        if let Some(job) = job {
+            let mut member = 0;
+            // SAFETY: both handles are owned; the BOOL output is writable.
+            ok(unsafe {
+                windows_sys::Win32::System::JobObjects::IsProcessInJob(
+                    child.process.as_raw_handle(),
+                    job.as_raw_handle(),
+                    &raw mut member,
+                )
+            })?;
+            if member == 0 {
+                return Err(io::Error::other("child was not assigned to its job"));
+            }
+        }
+        // SAFETY: the owned primary thread is suspended from creation.
+        if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    if let Err(error) = admitted {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(child)
 }
 
 fn resolve(program: &OsStr, environment: &[(OsString, OsString)]) -> io::Result<PathBuf> {

@@ -306,7 +306,7 @@ impl Env {
     /// `kill -9` the daemon and waits for its lock to be released.
     pub fn kill_daemon(&self) {
         let pid = self.pid().expect("no daemon to kill");
-        sys::signal_process(pid, Signal::Kill).unwrap();
+        crate::support::signal_process(pid, Signal::Kill).unwrap();
         self.wait_exited("the killed daemon to go");
     }
 
@@ -372,7 +372,7 @@ impl Drop for Env {
         self.group.end();
         // One that would not stop (wedged, or its home already gone).
         for pid in self.daemons() {
-            let _ = sys::signal_process(pid, Signal::Kill);
+            let _ = crate::support::signal_process(pid, Signal::Kill);
         }
         let _ = fs::remove_file(self.home.endpoint().path());
         // A failed test's home, with the daemon's log, is kept to look at.

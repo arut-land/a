@@ -15,14 +15,35 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+const MAX_PROCESSES: usize = 32;
+static PROCESSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct Permit;
+impl Permit {
+    fn acquire() -> io::Result<Self> {
+        use std::sync::atomic::Ordering::AcqRel;
+        PROCESSES
+            .try_update(AcqRel, std::sync::atomic::Ordering::Acquire, |n| {
+                (n < MAX_PROCESSES).then_some(n + 1)
+            })
+            .map(|_| Self)
+            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "process capacity exhausted"))
+    }
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        PROCESSES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 struct Live {
     id: u32,
-    group: Mutex<Option<sys::OwnedGroup>>,
+    group: Mutex<Option<sys::ProcessLease>>,
     status: Mutex<Option<io::Result<ExitStatus>>>,
     exited: Flag,
     copied: Flag,
     captured: Mutex<Option<io::Result<()>>>,
     ended: Flag,
+    permit: Mutex<Option<Permit>>,
 }
 
 impl RunningProcess for Live {
@@ -39,9 +60,7 @@ impl RunningProcess for Live {
         Ok(())
     }
     fn alive(&self) -> bool {
-        lock(&self.group)
-            .as_ref()
-            .is_some_and(sys::OwnedGroup::alive)
+        lock(&self.group).is_some()
     }
     fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
         lock(&self.status).as_ref().map_or(Ok(None), |status| {
@@ -93,6 +112,7 @@ impl Drop for Reap {
         self.complete();
         lock(&self.1.captured).get_or_insert_with(|| Err(io::ErrorKind::Interrupted.into()));
         self.1.copied.set();
+        lock(&self.1.permit).take();
         self.1.ended.set();
     }
 }
@@ -103,22 +123,26 @@ impl Processes for Provider {
         cx: &'a Cx,
         spec: LaunchSpec,
     ) -> BoxFuture<'a, Result<OwnedProcess, SpawnError>> {
-        Box::pin(launch(cx, spec, sys::exit_watch, |reactor, input, _| {
-            rt::Async::new(reactor, input)
-        }))
+        Box::pin(launch(
+            cx,
+            spec,
+            |child| child.exit_watch(),
+            |reactor, input, _| rt::Async::new(reactor, input),
+        ))
     }
 }
 
 async fn launch(
     cx: &Cx,
     mut launch: LaunchSpec,
-    watch: impl FnOnce(u32) -> io::Result<sys::ExitWatch>,
+    watch: impl FnOnce(&mut sys::Child) -> io::Result<sys::ExitWatch>,
     register: impl FnOnce(
         &rt::Reactor,
         sys::ProcessPipe,
         u32,
     ) -> io::Result<rt::Async<sys::ProcessPipe>>,
 ) -> io::Result<OwnedProcess> {
+    let permit = Permit::acquire()?;
     let rt = cx
         .service::<dyn rt::Runtime>()
         .ok_or_else(|| io::Error::other("no runtime"))?;
@@ -133,7 +157,7 @@ async fn launch(
     let cancel = cx.cancel.clone();
     let (sent, received) = rt::oneshot::channel();
     rt.spawn_blocking(
-        rt::BlockingClass::Network,
+        rt::BlockingClass::Storage,
         0,
         Box::new(move || {
             sent.send((|| {
@@ -165,6 +189,7 @@ async fn launch(
                     copied: Flag::default(),
                     captured: Mutex::default(),
                     ended: Flag::default(),
+                    permit: Mutex::new(Some(permit)),
                 });
                 Ok::<_, io::Error>((Reap(Some(child), live), pipes, capture))
             })());
@@ -179,7 +204,7 @@ async fn launch(
         return Err(io::ErrorKind::Interrupted.into());
     }
     let reactor = rt.reactor();
-    let watch = match watch(live.id) {
+    let watch = match watch(owned.0.as_mut().expect("owned child")) {
         Ok(watch) => Some(rt::Async::for_reading(&reactor, watch)?),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             // Exit observation can precede waitable status; reaping must not block the reactor.
@@ -220,11 +245,12 @@ async fn reap_output(
 ) {
     let capturing = Arc::clone(&owned.1);
     let copy_reactor = reactor.clone();
+    let copy_runtime = Arc::clone(&runtime);
     let copying = async move {
         let result = if let Some(capture) = capture {
             let result = async {
                 let input = rt::Async::read_pipe(&copy_reactor, capture.reader)?;
-                rt::capture_output(&*runtime, input, capture.file, sys::fs::output_written).await
+                capture_output(&*copy_runtime, input, capture.file, &capturing).await
             }
             .await;
             if result.is_err() {
@@ -243,7 +269,7 @@ async fn reap_output(
                 watch.readable_result().await?;
             }
             owned.complete();
-            descendants(&reactor, &owned.1).await
+            descendants(&reactor, &owned.1, &*runtime).await
         }
         .await;
         if result.is_err() {
@@ -256,12 +282,59 @@ async fn reap_output(
     let _ = rt::zip(copying, reaping).await;
 }
 
-// A leader can exit first. Failed descendant watches must revoke containment.
-async fn descendants(reactor: &rt::Reactor, live: &Live) -> io::Result<()> {
+// One bounded chunk is admitted to disk at a time; a slow disk stops pipe reads.
+async fn capture_output(
+    runtime: &dyn rt::Runtime,
+    input: rt::Async<sys::ProcessPipe>,
+    mut file: std::fs::File,
+    live: &Live,
+) -> io::Result<()> {
+    let mut buffer = vec![0; 64 << 10];
+    let mut retained = 0u64;
     loop {
-        let members = lock(&live.group)
-            .as_ref()
-            .map_or_else(Vec::new, sys::OwnedGroup::members);
+        let read = input.read_with(|mut input| input.read(&mut buffer)).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        let keep = read.min(
+            usize::try_from(crate::output::OUTPUT_CAP - retained).expect("capture cap fits usize"),
+        );
+        let (state, result) = rt::unblock_with(
+            runtime,
+            rt::BlockingClass::Storage,
+            buffer.len(),
+            move || {
+                let result = file
+                    .write_all(&buffer[..keep])
+                    .and_then(|()| sys::fs::output_written(&file));
+                ((file, buffer), result)
+            },
+        )
+        .await;
+        (file, buffer) = state;
+        result?;
+        retained += keep as u64;
+        if retained == crate::output::OUTPUT_CAP {
+            live.signal(ProcessSignal::Kill)?;
+            return Ok(());
+        }
+    }
+}
+
+// A leader can exit first. Failed descendant watches must revoke containment.
+async fn descendants(
+    reactor: &rt::Reactor,
+    live: &Arc<Live>,
+    runtime: &dyn rt::Runtime,
+) -> io::Result<()> {
+    loop {
+        let owner = Arc::clone(live);
+        let members = rt::unblock_with(runtime, rt::BlockingClass::Storage, 0, move || {
+            lock(&owner.group)
+                .as_ref()
+                .map_or_else(|| Ok(Vec::new()), sys::ProcessLease::members)
+        })
+        .await?;
         let mut watches = Vec::new();
         for pid in members {
             match sys::exit_watch(pid).and_then(|w| rt::Async::for_reading(reactor, w)) {
@@ -339,7 +412,7 @@ mod tests {
         let result = rt::block_on(launch(
             &cx,
             spec(&cx, "read -r line"),
-            sys::exit_watch,
+            |child| child.exit_watch(),
             |_, _, id| {
                 pid = Some(id);
                 Err(io::Error::other("registration refused"))
@@ -439,8 +512,9 @@ mod tests {
         let mut launching = std::pin::pin!(launch(
             &cx,
             spec(&cx, "read -r line"),
-            |id| {
-                *lock(&pid) = Some(id);
+            |child| {
+                *lock(&pid) = Some(child.id());
+                child.kill().unwrap();
                 runtime.defer.store(true, Ordering::Release);
                 Err(io::ErrorKind::NotFound.into())
             },
@@ -453,11 +527,11 @@ mod tests {
         let reaping = lock(&runtime.blocking)
             .pop()
             .expect("status acquisition was admitted");
-        sys::signal_process(id, sys::Signal::Terminate).unwrap();
         reaping();
         let Poll::Ready(Ok(process)) = launching.as_mut().poll(&mut context) else {
             panic!("the reaped child must still be a successful launch");
         };
+        runtime.defer.store(false, Ordering::Release);
         rt::block_on(lock(&runtime.tasks).pop().unwrap());
         let status = rt::block_on(process.process.wait()).unwrap();
         assert!(!status.success());
@@ -495,8 +569,8 @@ mod tests {
         let failed = rt::block_on(launch(
             &cx,
             spec(&cx, "read -r line"),
-            |id| {
-                pid = Some(id);
+            |child| {
+                pid = Some(child.id());
                 Err(io::ErrorKind::Unsupported.into())
             },
             |reactor, input, _| rt::Async::new(reactor, input),

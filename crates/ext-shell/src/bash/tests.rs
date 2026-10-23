@@ -73,7 +73,7 @@ fn model(ran: &Ran) -> String {
 
 fn wait_dead(pgid: u32) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while sys::GroupId(pgid).alive() {
+    while sys::RecordedIdentity(pgid).alive() {
         assert!(Instant::now() < deadline, "group {pgid} survived");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -153,7 +153,7 @@ fn a_background_child_holding_the_pipe_does_not_hold_the_call() {
     let (pgid, _) = rig.spawned.lock().unwrap()[0];
     assert_eq!((ran.output.as_str(), ran.exit), ("started\n", Some(0)));
     assert_eq!(ran.lingering, Some(pgid));
-    assert!(sys::GroupId(pgid).alive());
+    assert!(sys::RecordedIdentity(pgid).alive());
     assert_eq!(
         rig.spawned.lock().unwrap()[1],
         (pgid, true),
@@ -435,7 +435,7 @@ fn a_background_command_returns_at_once_with_its_log() {
         assert!(Instant::now() < deadline, "the log never filled");
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(sys::GroupId(job.pgid).alive());
+    assert!(sys::RecordedIdentity(job.pgid).alive());
     assert!(model(&ran).starts_with(&format!("[running in the background: pgid {}", job.pgid)));
 }
 
@@ -452,7 +452,7 @@ fn a_job_end_is_seen_at_once() {
         let started = Instant::now();
         rt::block_on(rig.ends.changed(&mut seen));
         let took = started.elapsed();
-        assert!(!sys::GroupId(pgid).alive(), "{command}");
+        assert!(!sys::RecordedIdentity(pgid).alive(), "{command}");
         // Re-checking on a backoff would first look again at 1.55 s.
         assert!(took >= Duration::from_millis(900), "{command}: {took:?}");
         assert!(took < Duration::from_millis(1300), "{command}: {took:?}");
@@ -691,4 +691,13 @@ fn continuous_output_yields_to_other_sessions() {
         )
         .await;
     });
+}
+
+#[test]
+fn background_output_cannot_exceed_the_spill_limit() {
+    let rig = rig("bounded-background");
+    let ran = bash(&rig, &json!({ "command": "yes x", "background": true }));
+    let job = ran.background.unwrap();
+    wait_dead(job.pgid);
+    assert_eq!(std::fs::metadata(job.log).unwrap().len(), OUTPUT_CAP);
 }
