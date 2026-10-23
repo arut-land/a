@@ -165,16 +165,31 @@ impl OwnedChild {
         let (kind, id) = target.unwrap_or((libc::P_PID, self.pid));
         #[cfg(not(target_os = "linux"))]
         let (kind, id) = (libc::P_PID, self.pid);
-        let result = observe(kind, id, nonblocking);
+        #[cfg(not(target_os = "linux"))]
+        return observe(kind, id, nonblocking);
         #[cfg(target_os = "linux")]
-        if kind == libc::P_PIDFD
-            && result
-                .as_ref()
-                .is_err_and(|e| e.raw_os_error() == Some(libc::EINVAL))
-        {
-            return observe(libc::P_PID, self.pid, nonblocking);
+        loop {
+            let result = observe(kind, id, nonblocking);
+            if kind == libc::P_PIDFD {
+                if result
+                    .as_ref()
+                    .is_err_and(|e| e.raw_os_error() == Some(libc::EINVAL))
+                {
+                    return observe(libc::P_PID, self.pid, nonblocking);
+                }
+                if result
+                    .as_ref()
+                    .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock)
+                {
+                    if nonblocking {
+                        return Ok(None);
+                    }
+                    wait_pidfd(self.watch.as_ref().expect("selected pidfd"))?;
+                    continue;
+                }
+            }
+            return result;
         }
-        result
     }
 }
 
@@ -221,16 +236,26 @@ fn reap_pidfd(watch: &OwnedFd) -> bool {
             Err(Errno::INVAL) => return false,
             Err(Errno::INTR) => {}
             Err(Errno::AGAIN) => {
-                let mut fds = [rustix::event::PollFd::new(
-                    watch,
-                    rustix::event::PollFlags::IN,
-                )];
-                match rustix::event::poll(&mut fds, None) {
-                    Ok(_) | Err(Errno::INTR) => {}
-                    Err(_) => return true,
+                if wait_pidfd(watch).is_err() {
+                    return true;
                 }
             }
             _ => return true,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_pidfd(watch: &OwnedFd) -> io::Result<()> {
+    let mut fds = [rustix::event::PollFd::new(
+        watch,
+        rustix::event::PollFlags::IN,
+    )];
+    loop {
+        match rustix::event::poll(&mut fds, None) {
+            Ok(_) => return Ok(()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -630,6 +655,40 @@ mod tests {
         assert_eq!(text.trim().parse::<i32>().unwrap(), unsafe {
             libc::getpgrp()
         });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_nonblocking_exit_watch_cannot_change_the_owned_wait_contract() {
+        use std::io::Write as _;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "read -r line; exit 17"]);
+        let null = null();
+        let (input, mut writer) = io::pipe().unwrap();
+        let input = File::from(OwnedFd::from(input));
+        let mut child = SpawnPlan::new(&command, [&input, &null, &null])
+            .spawn()
+            .unwrap();
+        let pid = rustix::process::Pid::from_raw(child.id().cast_signed()).unwrap();
+        let watch = match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::NONBLOCK) {
+            Ok(watch) => watch,
+            Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL) => return,
+            Err(error) => panic!("{error}"),
+        };
+        Arc::get_mut(&mut child.0).unwrap().watch = Some(watch);
+        let mut waiting = child.clone();
+        let (done, result) = std::sync::mpsc::sync_channel(1);
+        let task = std::thread::spawn(move || {
+            done.send(waiting.wait()).unwrap();
+        });
+        let premature = result.recv_timeout(std::time::Duration::from_millis(50));
+        writer.write_all(b"finish\n").unwrap();
+        task.join().unwrap();
+        assert!(matches!(
+            premature,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(result.recv().unwrap().unwrap().code(), Some(17));
     }
 
     #[test]
