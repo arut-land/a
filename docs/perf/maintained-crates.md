@@ -61,11 +61,14 @@ removing homes. CI's RUNNER_TEMP preference remains explicit.
 | Reliability | Predictable reuse across runs; some helpers remove an existing directory before use | Exclusive create with randomized names and collision retries; RAII where ownership permits |
 | Memory | Path allocation; some global counters | Path owner and random-name generation; no resident task or queue |
 | CPU | Create/remove syscalls; bespoke name formatting | Same filesystem work plus random suffix/collision retry; no idle work |
-| Dependencies | std | cfg-if, fastrand, once_cell, rustix on Unix / windows-sys on Windows; existing graph dependencies |
+| Dependencies | std | fastrand, once_cell, rustix on Unix / windows-sys on Windows; existing graph dependencies |
 | Shipped size | No test helper linked | Test-only or optional `ext/testing`; absent from the shipped dependency graph |
 
 Default getrandom reseeding is unnecessary for these short-lived test roots;
-exclusive creation is the invariant. This is not an API for publishing user
+exclusive creation is the invariant. Workspace test feature unification also
+enables getrandom through existing dependencies; the standalone probe isolates
+the declared minimal feature selection. No new tempfile packages enter the
+workspace lockfile. This is not an API for publishing user
 files. Edit transactions and executable staging retain their separate ownership
 and metadata/durability contracts; those files belong to other sessions.
 The hosted infrastructure probe runs five rounds of 10,000 create/drop pairs

@@ -72,5 +72,7 @@ metadata, and serde_yaml_ng's smaller CPU time does not supply the same
 application rejection boundary.
 
 The enabled production graph adds four packages: yaml-rust2, arraydeque,
-hashlink and foldhash. hashbrown was already resolved. The complete standalone
+hashlink and foldhash. hashbrown was already resolved. foldhash uses the
+[Zlib license](https://spdx.org/licenses/Zlib.html), included in the repository
+license allowlist alongside its other permissive licenses. The complete standalone
 normal dependency trees are in the workflow JSON artifact.
