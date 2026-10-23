@@ -148,9 +148,14 @@ Native synchronization has different allocation costs. Ready handoffs include on
 | Windows aarch64 | 96 | 120 | 56 | 8192 | 100663296 | 68191920 |
 | Windows x86_64 | 96 | 120 | 56 | 8192 | 100663296 | 68191920 |
 
-Queue allocator traffic covers 4,194,304 message roundtrips after construction. The ring makes one growth allocation plus eight reallocations on Linux/Windows; native mutex initialization adds an allocation on macOS. futures-channel allocates for each message. Empty retained capacity and allocator residency differ from cumulative allocation traffic.
+Queue counters cover 4,194,304 message roundtrips after construction. Byte totals
+use `stats_alloc::Stats::bytes_allocated`: allocation sizes plus positive
+reallocation growth, excluding bytes copied during reallocation. The ring makes
+one allocation plus eight reallocations on Linux/Windows; native mutex
+initialization adds an allocation on macOS. futures-channel allocates for each
+message. These cumulative counters do not measure peak live memory or RSS.
 
-The retained ring earns its custom implementation through lower allocation traffic and faster sustained messages in these observations. Single-use channel construction can favor futures-channel; these measurements do not claim superiority for every workload. The maintained oneshot reduces both handoff time and allocated bytes.
+The retained ring earns its custom implementation through fewer allocation operations and faster sustained messages in these observations. Single-use channel construction can favor futures-channel; these measurements do not claim superiority for every workload. The maintained oneshot reduces both handoff time and allocated bytes.
 
 CPU jobs compare ceilings of 4, 8 and 31 using a simulated 32-core configuration, 64 one-MiB jobs and five alternating-order rounds. The table reports actual effective CPUs alongside the simulated configuration. Medians, ms:
 
@@ -171,7 +176,7 @@ Raw [primitive samples](resource-primitives.csv) and [CPU samples](resource-cpu.
 
 [Hosted run](https://github.com/arut-land/a/actions/runs/40000401930) compares candidate `e9dacda1a45400951be780d37d98cf98f76d39b5` with main `781586d5a9fec1dd8b5e2b316a28b00a48470f8e` on the same native runner. Each lane completes five alternating reference/candidate rounds. Tables report medians; positive deltas mean more memory or time.
 
-Idle RSS is sampled after three seconds. Idle CPU is a ten-second native counter delta after fifteen seconds settling. Peak RSS and CPU below belong to the named benchmark process, including its retained test log. Primitive allocation traffic and process RSS measure different things.
+Idle RSS is sampled after three seconds. Idle CPU is a ten-second native counter delta after fifteen seconds settling. Peak RSS and CPU below belong to the named benchmark process, including its retained test log. Primitive allocator counters and process RSS measure different things.
 
 | Target | Shipped bytes, main → candidate | Idle RSS, KiB main → candidate | Idle CPU, ms main → candidate | Cold reply, ms | Attach p99, ms |
 | --- | ---: | ---: | ---: | ---: | ---: |
