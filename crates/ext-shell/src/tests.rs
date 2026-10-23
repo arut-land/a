@@ -148,3 +148,127 @@ fn revoking_a_pending_cwd_record_preserves_the_shell_result() {
     assert_eq!(ran.cwd, rig.workspace().join("sub"));
     assert!(rig.log.lock().unwrap().is_empty());
 }
+
+#[test]
+fn published_description_matches_the_selected_executable() {
+    let facts = sys::shell::ExecutionFacts::current();
+    let registry = Registry::default().with(&Shell).unwrap();
+    let specs = registry.tools().specs();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].name, facts.tool());
+    assert!(specs[0].description.contains(&facts.context()));
+    assert_eq!(
+        registry.tools().get(facts.tool()).unwrap().description(),
+        specs[0].description
+    );
+}
+
+struct Selected(&'static sys::shell::ExecutionFacts);
+
+impl ext::Extension for Selected {
+    const NAME: &'static str = "shell";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut ext::Registrar) {
+        super::contribute(r, self.0);
+    }
+}
+
+fn powershell_facts(executable: std::path::PathBuf) -> &'static sys::shell::ExecutionFacts {
+    let dialect = if executable
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("powershell.exe"))
+    {
+        sys::shell::Dialect::WindowsPowerShell
+    } else {
+        sys::shell::Dialect::PowerShell
+    };
+    Box::leak(Box::new(sys::shell::ExecutionFacts {
+        dialect,
+        executable,
+        syntax: "PowerShell test runner",
+        paths: "Windows literal paths",
+        utilities: "PowerShell cmdlets",
+        cleanup: "owned job",
+        temp: std::env::temp_dir(),
+        cwd_command: "",
+        runtime_bin: None,
+    }))
+}
+
+#[test]
+fn fallback_registers_exactly_one_powershell_tool() {
+    let selected = Selected(powershell_facts("powershell.exe".into()));
+    let registry = Registry::default().with(&selected).unwrap();
+    let tools = registry.tools().specs();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "powershell");
+    assert!(tools[0].description.contains("PowerShell"));
+    assert!(!registry.system_prompt().contains("grep"));
+    assert!(registry.tools().get("bash").is_none());
+}
+
+#[test]
+fn powershell_preserves_status_errors_unicode_cwd_and_no_input() {
+    // The hosted native lanes provide both installed editions; other hosts
+    // still exercise catalog selection and pure quoting/length invariants.
+    let Some(executables) = std::env::var_os("A_TEST_POWERSHELL") else {
+        return;
+    };
+    for (index, executable) in std::env::split_paths(&executables).enumerate() {
+        eprintln!("PowerShell runner: {}", executable.display());
+        let rig = Rig::new(
+            &format!("powershell-{index}"),
+            Registry::default()
+                .with(&Selected(powershell_facts(executable)))
+                .unwrap(),
+        );
+        // A failed cwd receipt must not replace the user's explicit exit code.
+        std::fs::create_dir_all(rig.spill().join("1.cwd")).unwrap();
+        let run = |command: &str| -> crate::bash::Ran {
+            eprintln!("PowerShell command: {command}");
+            let ran: crate::bash::Ran = serde_json::from_value(rig.done(
+                "powershell",
+                &serde_json::json!({"command": command, "timeout": 90}),
+            ))
+            .unwrap();
+            eprintln!(
+                "PowerShell result: exit {:?}; timeout {:?}",
+                ran.exit, ran.timed_out
+            );
+            assert!(ran.timed_out.is_none(), "{command}: {}", ran.output);
+            ran
+        };
+        for (command, code) in [
+            ("exit 37", 37),
+            ("cmd.exe /c exit 7", 1),
+            ("cmd.exe /c exit 7; exit $LASTEXITCODE", 7),
+            ("cmd.exe /c exit 7; Write-Output 'ok'", 0),
+            ("Write-Error 'problem'; Write-Output 'ok'", 0),
+            ("Write-Error 'problem'", 1),
+            ("throw 'problem'", 1),
+            (
+                "try { throw 'handled' } catch { Write-Output 'handled' }",
+                0,
+            ),
+            ("return", 0),
+            ("", 0),
+            ("Read-Host 'input'", 1),
+        ] {
+            let ran = run(command);
+            assert_eq!(ran.exit, Some(code), "{command}: {}", ran.output);
+            assert!(!ran.output.contains("CLIXML"), "{command}: {}", ran.output);
+            if command.contains("problem") {
+                assert!(ran.output.contains("problem"));
+            }
+        }
+        let sub = rig.workspace().join("space ' [café]");
+        std::fs::create_dir(&sub).unwrap();
+        let ran = run("Set-Location -LiteralPath 'space '' [café]'; Write-Output 'café'; exit 23");
+        assert_eq!(ran.exit, Some(23), "{}", ran.output);
+        assert_eq!(ran.cwd, sub);
+        assert!(ran.output.contains("café"), "{}", ran.output);
+        let ran = run("Write-Output (");
+        assert_ne!(ran.exit, Some(0));
+        assert_eq!(ran.cwd, sub);
+    }
+}
