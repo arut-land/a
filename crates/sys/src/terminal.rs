@@ -479,6 +479,7 @@ mod tests {
                 let output = Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", NAME, "--nocapture"])
                     .env("A_TEST_JOB", "shell")
+                    .stderr(Stdio::inherit())
                     .stdin(Stdio::from(slave))
                     .output()
                     .unwrap();
@@ -493,7 +494,7 @@ mod tests {
     }
 
     fn shell_job_control(name: &str) {
-        use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
+        use rustix::process::{Pid, Signal, kill_process};
         use std::io::{BufRead, BufReader};
         use std::os::fd::AsFd;
         struct Job(std::process::Child);
@@ -506,42 +507,71 @@ mod tests {
         let stdin = io::stdin();
         let before = rustix::termios::tcgetattr(&stdin).unwrap();
         let mut child = Job(Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--nocapture"])
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
             .env("A_TEST_JOB", "worker")
             .stdin(Stdio::from(stdin.as_fd().try_clone_to_owned().unwrap()))
             .stdout(Stdio::piped())
             .spawn()
             .unwrap());
         let pid = Pid::from_child(&child.0);
-        let stopped = || {
-            let (_, state) = waitpid(Some(pid), WaitOptions::UNTRACED).unwrap().unwrap();
-            assert!(state.stopped());
-        };
         // Background startup must stop before modifying termios.
-        stopped();
+        wait_stopped(pid);
         assert_modes(&before, &rustix::termios::tcgetattr(&stdin).unwrap());
         rustix::termios::tcsetpgrp(&stdin, pid).unwrap();
         kill_process(pid, Signal::CONT).unwrap();
-        let mut lines = BufReader::new(child.0.stdout.take().unwrap()).lines();
-        assert!(
-            lines
-                .by_ref()
-                .any(|line| line.unwrap() == "raw input acquired")
-        );
+        let stdout = child.0.stdout.take().unwrap();
+        let (send, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if send.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        wait_marker(&lines, "raw input acquired");
         kill_process(pid, Signal::TSTP).unwrap();
-        stopped();
+        wait_stopped(pid);
         assert_modes(&before, &rustix::termios::tcgetattr(&stdin).unwrap());
         let _output = OutputGuard::enter().unwrap();
         let shell = rustix::process::getpgrp();
         rustix::termios::tcsetpgrp(&stdin, shell).unwrap();
         kill_process(pid, Signal::CONT).unwrap();
-        stopped();
+        wait_stopped(pid);
         assert_eq!(rustix::termios::tcgetpgrp(&stdin).unwrap(), shell);
         assert_modes(&before, &rustix::termios::tcgetattr(&stdin).unwrap());
         rustix::termios::tcsetpgrp(&stdin, pid).unwrap();
         kill_process(pid, Signal::CONT).unwrap();
-        assert!(lines.any(|line| line.unwrap() == "raw input reacquired"));
+        wait_marker(&lines, "raw input reacquired");
         assert!(child.0.wait().unwrap().success());
         assert_modes(&before, &rustix::termios::tcgetattr(&stdin).unwrap());
+    }
+
+    fn wait_stopped(pid: rustix::process::Pid) {
+        use rustix::process::{WaitOptions, waitpid};
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some((_, state)) =
+                waitpid(Some(pid), WaitOptions::UNTRACED | WaitOptions::NOHANG).unwrap()
+            {
+                assert!(
+                    state.stopped(),
+                    "the job exited instead of stopping: {state:?}"
+                );
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "the job did not stop");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn wait_marker(lines: &std::sync::mpsc::Receiver<String>, marker: &str) {
+        loop {
+            let line = lines
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|error| panic!("waiting for {marker}: {error}"));
+            if line.contains(marker) {
+                return;
+            }
+        }
     }
 }

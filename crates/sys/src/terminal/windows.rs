@@ -6,12 +6,12 @@ use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle};
 
 use windows_sys::Win32::System::Console::{
     CONSOLE_SCREEN_BUFFER_INFO, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
-    CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
-    ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
-    GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo, INPUT_RECORD,
-    KEY_EVENT, ReadConsoleInputW, SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode,
-    SetConsoleOutputCP, WINDOW_BUFFER_SIZE_EVENT,
+    CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT,
+    ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
+    ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    ENABLE_WINDOW_INPUT, GetConsoleCP, GetConsoleMode, GetConsoleOutputCP,
+    GetConsoleScreenBufferInfo, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, SetConsoleCP,
+    SetConsoleCtrlHandler, SetConsoleMode, SetConsoleOutputCP, WINDOW_BUFFER_SIZE_EVENT,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 
@@ -55,7 +55,10 @@ impl RawMode {
         unsafe {
             ok(SetConsoleMode(
                 saved.output.as_raw_handle(),
-                output_mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                output_mode
+                    | ENABLE_PROCESSED_OUTPUT
+                    | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                    | DISABLE_NEWLINE_AUTO_RETURN,
             ))?;
             ok(SetConsoleMode(
                 saved.input.as_raw_handle(),
