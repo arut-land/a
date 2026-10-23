@@ -384,7 +384,6 @@ encoder) is what rustix and vte, linked already, leave to write.
   sequence shows as its parts (`👨‍👩‍👧` as three faces), as wide as it was
   counted.
 - SIGKILL leaves the terminal in raw mode (`reset` fixes it).
-- Ctrl-Z is not handled (raw mode receives it as a key).
 - Inline, a terminal that reflows its lines when narrowed may leave a
   copy of a reflowed viewport row above the redrawn viewport (as before,
   when the client asked the terminal where the cursor was).
