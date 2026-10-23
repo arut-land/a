@@ -157,7 +157,7 @@ pub(super) fn frame(ip: *mut std::ffi::c_void) -> super::Frame {
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
             ip.cast(),
-            &mut module,
+            &raw mut module,
         )
     } == 0
     {

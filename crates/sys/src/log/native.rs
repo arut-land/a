@@ -123,6 +123,8 @@ mod backend {
             *users += 1;
             Some(Self)
         }
+        // This borrow keeps the provider registered while the static macro writes.
+        #[allow(clippy::unused_self)]
         pub(super) fn write(&self, text: &str) {
             tracelogging::write_event!(PROVIDER, "Fact", level(Informational), str8("Json", text));
         }

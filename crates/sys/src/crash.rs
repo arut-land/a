@@ -370,9 +370,14 @@ fn stack() -> Frames {
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
     let mut ips = [std::ptr::null_mut(); DEEP];
     // SAFETY: ips has room for exactly DEEP addresses; no symbolization or DbgHelp state.
-    let len =
-        unsafe { RtlCaptureStackBackTrace(0, DEEP as u32, ips.as_mut_ptr(), std::ptr::null_mut()) }
-            as usize;
+    let len = unsafe {
+        RtlCaptureStackBackTrace(
+            0,
+            u32::try_from(DEEP).expect("frame cap fits u32"),
+            ips.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    } as usize;
     let mut frames = Frames::default();
     for ip in &ips[..len] {
         frames.frames[frames.len] = image::frame(*ip);
