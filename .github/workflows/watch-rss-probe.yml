@@ -1,0 +1,77 @@
+name: watch rss probe
+on: workflow_dispatch
+permissions:
+  contents: read
+  actions: read
+jobs:
+  probe:
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04-arm, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v5
+        with:
+          github-token: ${{ github.token }}
+          run-id: 39914451945
+          name: perf-${{ matrix.runner }}
+          path: reference
+      - uses: actions/download-artifact@v5
+        with:
+          github-token: ${{ github.token }}
+          run-id: 39929184845
+          name: perf-${{ matrix.runner }}
+          path: candidate
+      - run: pip install psutil
+      - name: Attribute resident memory
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, queue, subprocess, tempfile, threading, time
+          import psutil
+          out = pathlib.Path('rss-probe'); out.mkdir()
+          samples = []
+          for trial in range(5):
+            for role in (['reference', 'candidate'] if trial % 2 == 0 else ['candidate', 'reference']):
+              binary = pathlib.Path(role, 'a').resolve(); binary.chmod(0o755)
+              with tempfile.TemporaryDirectory(prefix='a-rss-', dir=os.environ['RUNNER_TEMP']) as tmp:
+                home = pathlib.Path(tmp)
+                (home / 'config.toml').write_text('[daemon]\nidle_secs = 120\n')
+                env = dict(os.environ, A_HOME=tmp, A_TUI='plain'); env.pop('A_HOST', None)
+                child = subprocess.Popen([str(binary)], env=env, cwd=tmp, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                  first = queue.Queue()
+                  threading.Thread(target=lambda: first.put(child.stdout.readline()), daemon=True).start()
+                  line = first.get(timeout=60)
+                  assert line.startswith(b'[session'), (line, child.poll())
+                  pid = int((home / 'run/daemon.pid').read_text().splitlines()[0])
+                  time.sleep(3)
+                  process = psutil.Process(pid)
+                  record = dict(role=role, trial=trial, rss_kib=process.memory_info().rss/1024, full=process.memory_full_info()._asdict())
+                  if os.uname().sysname == 'Linux':
+                    maps = process.memory_maps(grouped=False)
+                    record['groups'] = {}
+                    for region in maps:
+                      group = 'binary' if region.path == str(binary) else ('anonymous' if region.path.startswith('[') else 'libraries')
+                      values = record['groups'].setdefault(group, dict(rss=0, private_dirty=0, private_clean=0))
+                      for k in values: values[k] += getattr(region, k)
+                    (out/f'{role}-{trial}-smaps.txt').write_text(pathlib.Path(f'/proc/{pid}/smaps').read_text())
+                  else:
+                    vm = subprocess.run(['vmmap', '-summary', str(pid)], capture_output=True, text=True)
+                    (out/f'{role}-{trial}-vmmap.txt').write_text(vm.stdout+vm.stderr)
+                  samples.append(record)
+                finally:
+                  child.stdin.close()
+                  try: child.wait(timeout=15)
+                  except subprocess.TimeoutExpired: child.kill(); child.wait()
+                  subprocess.run([str(binary), 'daemon', 'stop'], env=env, cwd=tmp, capture_output=True, timeout=30)
+          (out/'samples.json').write_text(json.dumps(samples, indent=2))
+          PY
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: rss-probe-${{ matrix.runner }}
+          path: rss-probe/
