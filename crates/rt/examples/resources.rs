@@ -32,7 +32,7 @@ fn main() {
         black_box(rt::block_on(rx).unwrap());
     });
     measure("oneshot", || {
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = oneshot::async_channel();
         tx.send(black_box(42u64)).unwrap();
         black_box(rt::block_on(rx).unwrap());
     });

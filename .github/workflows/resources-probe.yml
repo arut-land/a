@@ -3,6 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches: [codex-w5rt]
+    paths: [crates/rt/examples/resources.rs, .github/workflows/resources-probe.yml]
 permissions:
   contents: read
 jobs:
@@ -21,9 +22,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: ${{ runner.os == 'Linux' && 'mold' || '' }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mold clang
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - run: cargo test -p sys resources::tests && cargo test -p rt --lib -- --test-threads=1
       - run: cargo run --release -p rt --example resources | tee resources.txt

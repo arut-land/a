@@ -33,7 +33,7 @@ rustix.workspace = true
 stats_alloc = "0.1"
 futures-channel = "0.3"
 async-channel = "2"
-oneshot = "0.2"
+oneshot = { version = "0.2", features = ["async", "std"] }
 
 [lints]
 workspace = true

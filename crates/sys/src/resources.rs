@@ -229,6 +229,64 @@ mod tests {
         assert!(facts.parallelism > 0);
         assert!(facts.page_size.is_power_of_two());
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_limits_are_observed_in_an_isolated_process() {
+        use windows_sys::Win32::System::{JobObjects::*, Threading::*};
+        if std::env::var_os("A_RESOURCE_LIMIT_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "resources::tests::windows_limits_are_observed_in_an_isolated_process",
+                    "--nocapture",
+                ])
+                .env("A_RESOURCE_LIMIT_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        // The child alone changes process scheduling state, never the test runner.
+        // SAFETY: outputs have their declared sizes, and the pseudo-handle is live.
+        unsafe {
+            let process = GetCurrentProcess();
+            let (mut affinity, mut system) = (0usize, 0usize);
+            assert_ne!(
+                GetProcessAffinityMask(process, &mut affinity, &mut system),
+                0
+            );
+            let one = 1usize << affinity.trailing_zeros();
+            assert_ne!(SetProcessAffinityMask(process, one), 0);
+            assert_eq!(effective_parallelism(), 1);
+            assert_ne!(SetProcessAffinityMask(process, affinity), 0);
+
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            assert!(!job.is_null());
+            let rate = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+                ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
+                    | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+                Anonymous: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0 { CpuRate: 1000 },
+            };
+            assert_ne!(
+                SetInformationJobObject(
+                    job,
+                    JobObjectCpuRateControlInformation,
+                    (&rate as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+                    std::mem::size_of_val(&rate) as u32
+                ),
+                0
+            );
+            assert_ne!(AssignProcessToJobObject(job, process), 0);
+            let host = std::thread::available_parallelism().map_or(1, usize::from);
+            assert!(effective_parallelism() <= (host / 10).max(1));
+            windows_sys::Win32::Foundation::CloseHandle(job);
+        }
+    }
 }
 
 /// Event-driven pressure notification. The callback must only release disposable
