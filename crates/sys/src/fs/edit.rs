@@ -246,7 +246,7 @@ impl EditTransaction {
 
     /// Consuming the transaction ensures an abandoned staging file is reclaimed.
     /// A post-rename flush failure is a visible receipt, never an ambiguous error.
-    /// Windows handle rename promises visibility only; durable mode is rejected
+    /// Windows publication promises visibility only; durable mode is rejected
     /// before writing because there is no documented directory flush barrier.
     /// The cancellation probe receives aggregate bytes copied/written so far;
     /// it is checked by native stream callbacks and immediately before commit.
@@ -1301,80 +1301,136 @@ fn stream_inventory(file: &File, limit: usize) -> io::Result<Vec<(OsString, u64)
 }
 
 #[cfg(windows)]
-fn windows_policy_matches(source: &File, snapshot: &File) -> io::Result<bool> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, EqualSid, GROUP_SECURITY_INFORMATION,
-        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-    };
-    struct Policy {
-        descriptor: *mut std::ffi::c_void,
-        owner: *mut std::ffi::c_void,
-        group: *mut std::ffi::c_void,
-        acl: *mut ACL,
-        protected: bool,
-    }
-    impl Drop for Policy {
-        fn drop(&mut self) {
-            // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
-            unsafe {
-                windows_sys::Win32::Foundation::LocalFree(self.descriptor);
-            }
-        }
-    }
-    let read = |file: &File| -> io::Result<Policy> {
-        let mut policy = Policy {
-            descriptor: std::ptr::null_mut(),
-            owner: std::ptr::null_mut(),
-            group: std::ptr::null_mut(),
-            acl: std::ptr::null_mut(),
-            protected: false,
-        };
-        // SAFETY: the owned file and writable output pointers live through the call.
+struct WindowsPolicy(Vec<u64>);
+
+#[cfg(windows)]
+impl WindowsPolicy {
+    const INFORMATION: u32 = windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION
+        | windows_sys::Win32::Security::GROUP_SECURITY_INFORMATION
+        | windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+
+    fn read(file: &File) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Wdk::Storage::FileSystem::NtQuerySecurityObject;
+        use windows_sys::Win32::Security::{SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE};
+        let mut needed = 0;
+        // SAFETY: a null buffer queries the size of the owned object's descriptor.
         let status = unsafe {
-            GetSecurityInfo(
+            NtQuerySecurityObject(
                 file.as_raw_handle(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &raw mut policy.owner,
-                &raw mut policy.group,
-                &raw mut policy.acl,
+                Self::INFORMATION,
                 std::ptr::null_mut(),
-                &raw mut policy.descriptor,
+                0,
+                &raw mut needed,
             )
         };
-        if status != 0 {
-            return Err(io::Error::from_raw_os_error(status.cast_signed()));
+        let maximum = usize::from(u16::MAX)
+            + 2 * SECURITY_MAX_SID_SIZE as usize
+            + size_of::<SECURITY_DESCRIPTOR>();
+        if needed == 0 {
+            // SAFETY: this converts the returned scalar status without dereferencing pointers.
+            return Err(io::Error::from_raw_os_error(
+                unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) }
+                    .cast_signed(),
+            ));
         }
-        let mut control = 0;
-        let mut revision = 0;
-        // SAFETY: policy retains the descriptor and both outputs are writable.
-        crate::windows::ok(unsafe {
-            GetSecurityDescriptorControl(policy.descriptor, &raw mut control, &raw mut revision)
-        })?;
-        policy.protected = control & SE_DACL_PROTECTED != 0;
+        if needed as usize > maximum {
+            return Err(io::ErrorKind::FileTooLarge.into());
+        }
+        let policy = Self(vec![0; (needed as usize).div_ceil(8)]);
+        // SAFETY: aligned initialized storage covers needed writable bytes.
+        let status = unsafe {
+            NtQuerySecurityObject(
+                file.as_raw_handle(),
+                Self::INFORMATION,
+                policy.descriptor(),
+                needed,
+                &raw mut needed,
+            )
+        };
+        if status < 0 {
+            // SAFETY: converts the scalar native status.
+            return Err(io::Error::from_raw_os_error(
+                unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) }
+                    .cast_signed(),
+            ));
+        }
         Ok(policy)
-    };
-    let (a, b) = (read(source)?, read(snapshot)?);
-    #[cfg(test)]
-    // SAFETY: both descriptors retain the kernel-validated ACLs.
-    unsafe {
-        if !same_acl(a.acl, b.acl)? && !a.acl.is_null() && !b.acl.is_null() {
-            eprintln!(
-                "source ACL {:02x?}; snapshot ACL {:02x?}",
-                std::slice::from_raw_parts(a.acl.cast::<u8>(), usize::from((*a.acl).AclSize)),
-                std::slice::from_raw_parts(b.acl.cast::<u8>(), usize::from((*b.acl).AclSize))
+    }
+
+    fn descriptor(&self) -> windows_sys::Win32::Security::PSECURITY_DESCRIPTOR {
+        self.0.as_ptr().cast_mut().cast()
+    }
+
+    fn matches(&self, other: &Self) -> io::Result<bool> {
+        use windows_sys::Win32::Security::{
+            EqualSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+            GetSecurityDescriptorGroup, GetSecurityDescriptorOwner, SE_DACL_AUTO_INHERIT_REQ,
+            SE_DACL_AUTO_INHERITED, SE_DACL_DEFAULTED, SE_DACL_PRESENT, SE_DACL_PROTECTED,
+            SE_GROUP_DEFAULTED, SE_OWNER_DEFAULTED,
+        };
+        let parts = |policy: &Self| -> io::Result<_> {
+            let (mut owner, mut group, mut acl) = (
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             );
+            let (mut defaulted, mut present, mut control, mut revision) = (0, 0, 0, 0);
+            // SAFETY: policy retains the kernel-validated self-relative descriptor;
+            // all output pointers are writable for their documented types.
+            unsafe {
+                crate::windows::ok(GetSecurityDescriptorOwner(
+                    policy.descriptor(),
+                    &raw mut owner,
+                    &raw mut defaulted,
+                ))?;
+                crate::windows::ok(GetSecurityDescriptorGroup(
+                    policy.descriptor(),
+                    &raw mut group,
+                    &raw mut defaulted,
+                ))?;
+                crate::windows::ok(GetSecurityDescriptorDacl(
+                    policy.descriptor(),
+                    &raw mut present,
+                    &raw mut acl,
+                    &raw mut defaulted,
+                ))?;
+                crate::windows::ok(GetSecurityDescriptorControl(
+                    policy.descriptor(),
+                    &raw mut control,
+                    &raw mut revision,
+                ))?;
+            }
+            Ok((owner, group, acl, control))
+        };
+        let (a, b) = (parts(self)?, parts(other)?);
+        let controls = SE_OWNER_DEFAULTED
+            | SE_GROUP_DEFAULTED
+            | SE_DACL_PRESENT
+            | SE_DACL_DEFAULTED
+            | SE_DACL_AUTO_INHERIT_REQ
+            | SE_DACL_AUTO_INHERITED
+            | SE_DACL_PROTECTED;
+        // SAFETY: descriptors retain all SID/ACL pointers; null SIDs compare only as null.
+        unsafe {
+            let sid = |a: *mut std::ffi::c_void, b: *mut std::ffi::c_void| {
+                if a.is_null() || b.is_null() {
+                    a == b
+                } else {
+                    EqualSid(a, b) != 0
+                }
+            };
+            Ok(a.3 & controls == b.3 & controls
+                && sid(a.0, b.0)
+                && sid(a.1, b.1)
+                && same_acl(a.2, b.2)?)
         }
     }
-    // SAFETY: both policy values retain the descriptors containing all SID/ACL pointers.
-    Ok(unsafe {
-        a.protected == b.protected
-            && EqualSid(a.owner, b.owner) != 0
-            && EqualSid(a.group, b.group) != 0
-            && same_acl(a.acl, b.acl)?
-    })
+}
+
+#[cfg(windows)]
+fn windows_policy_matches(source: &File, snapshot: &File) -> io::Result<bool> {
+    WindowsPolicy::read(source)?.matches(&WindowsPolicy::read(snapshot)?)
 }
 
 #[cfg(windows)]
@@ -1700,123 +1756,30 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
 #[cfg(windows)]
 fn copy_access_policy(source: &File, destination: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetSecurityDescriptorControl,
-        OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-    };
-    let (mut owner, mut group, mut dacl, mut descriptor) = (
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-    );
-    let information =
-        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
-    // SAFETY: source owns its handle; output pointers receive memory owned by the returned descriptor.
+    // Read the stored descriptor, without synthesizing inherited ACE flags from
+    // the current parent spelling. That spelling changes during evacuation.
+    let policy = WindowsPolicy::read(source)?;
+    // SAFETY: both the destination handle and aligned descriptor remain live.
     let status = unsafe {
-        GetSecurityInfo(
-            source.as_raw_handle(),
-            SE_FILE_OBJECT,
-            information,
-            &raw mut owner,
-            &raw mut group,
-            &raw mut dacl,
-            std::ptr::null_mut(),
-            &raw mut descriptor,
-        )
-    };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status.cast_signed()));
-    }
-    let mut control = 0;
-    let mut revision = 0;
-    // SAFETY: descriptor remains valid until LocalFree below, including all interior pointers.
-    let result = unsafe {
-        crate::windows::ok(GetSecurityDescriptorControl(
-            descriptor,
-            &raw mut control,
-            &raw mut revision,
-        ))
-        .and_then(|()| {
-            let protected = control & SE_DACL_PROTECTED != 0;
-            // Apply the complete descriptor without recomputing inheritance
-            // from the private staging directory.
-            let status = windows_sys::Wdk::Storage::FileSystem::NtSetSecurityObject(
-                destination.as_raw_handle(),
-                information,
-                descriptor,
-            );
-            if status >= 0 {
-                verify_acl(destination, dacl, protected)
-            } else {
-                Err(io::Error::from_raw_os_error(
-                    windows_sys::Win32::Foundation::RtlNtStatusToDosError(status).cast_signed(),
-                ))
-            }
-        })
-    };
-    // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
-    unsafe {
-        LocalFree(descriptor);
-    }
-    result
-}
-
-#[cfg(windows)]
-unsafe fn verify_acl(
-    destination: &File,
-    expected: *const windows_sys::Win32::Security::ACL,
-    protected: bool,
-) -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
-    };
-    let (mut actual, mut descriptor) = (std::ptr::null_mut(), std::ptr::null_mut());
-    // SAFETY: destination owns its handle; output pointers receive an owned descriptor.
-    let status = unsafe {
-        GetSecurityInfo(
+        windows_sys::Wdk::Storage::FileSystem::NtSetSecurityObject(
             destination.as_raw_handle(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut actual,
-            std::ptr::null_mut(),
-            &raw mut descriptor,
+            WindowsPolicy::INFORMATION,
+            policy.descriptor(),
         )
     };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status.cast_signed()));
+    if status < 0 {
+        // SAFETY: converts the returned scalar status.
+        return Err(io::Error::from_raw_os_error(
+            unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) }.cast_signed(),
+        ));
     }
-    let mut control = 0;
-    let mut revision = 0;
-    let result = (|| {
-        // SAFETY: descriptor is live and the caller retains expected's descriptor.
-        unsafe {
-            crate::windows::ok(GetSecurityDescriptorControl(
-                descriptor,
-                &raw mut control,
-                &raw mut revision,
-            ))?;
-            if (control & SE_DACL_PROTECTED != 0) != protected || !same_acl(expected, actual)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "cannot preserve the source access ACL without changing inheritance",
-                ));
-            }
-        }
-        Ok(())
-    })();
-    // SAFETY: GetSecurityInfo allocated descriptor with LocalAlloc.
-    unsafe {
-        LocalFree(descriptor);
+    if !policy.matches(&WindowsPolicy::read(destination)?)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cannot preserve the source access policy",
+        ));
     }
-    result
+    Ok(())
 }
 
 #[cfg(windows)]
