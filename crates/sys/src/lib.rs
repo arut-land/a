@@ -7,7 +7,7 @@
 
 //!
 //! Everything a platform does its own way sits behind a type here (a
-//! process [`GroupId`], the daemon's [`Endpoint`], [`Signals`], the [`fs`]
+//! process [`RecordedIdentity`], the daemon's [`Endpoint`], [`Signals`], the [`fs`]
 //! operations), so no crate above names a platform. Local daemon transports are Unix
 //! sockets and Windows named pipes with per-user security.
 
@@ -49,10 +49,10 @@ pub use login::login_env;
 pub use memory::small_footprint;
 pub use platform::{Arch, Os, Platform};
 pub use proc::{
-    AdoptLockError, Child, ContainedChild, DaemonLock, ExitWatch, GroupId, InheritedNumber,
-    OutputCapture, OwnedGroup, Pass, Passed, ProcessPipe, RecordedProcess, adopt_lock, boot_id,
-    daemon_ready, detach_session, exit_signal, exit_watch, find_bash, process_started,
-    signal_process, spawn_daemon, spawn_group, spawn_group_captured, spawn_stdio,
+    AdoptLockError, Child, ContainedChild, DaemonLock, ExitWatch, InheritedNumber, OutputCapture,
+    Pass, Passed, ProcessLease, ProcessPipe, RecordedIdentity, RecordedProcess, adopt_lock,
+    boot_id, daemon_ready, detach_session, exit_signal, find_bash, process_started, spawn_daemon,
+    spawn_group, spawn_group_captured, spawn_ssh, spawn_stdio,
 };
 pub use runtime::{Runtime, Staged, VERSION};
 pub use signals::{Signals, reraise};
@@ -153,7 +153,7 @@ impl Home {
     }
 }
 
-/// What [`signal_process`] and [`GroupId::signal`] send, and [`Signals`]
+/// What [`ProcessLease::signal`] send, and [`Signals`]
 /// catches. On Windows, console control events stand for the ones a
 /// console has (Ctrl-C, Ctrl-Break, close).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1465,6 +1465,49 @@ fn the_shell_directory_survives_a_restart_and_an_interrupt_stops_a_call() {
 }
 
 #[test]
+fn replayed_process_numbers_cannot_signal_a_live_unrelated_lease() {
+    let registry = echoing(&Policy::default()).with(&Extras).unwrap();
+    let fixture = Fixture::new(ext_fixtures::ECHO, registry, openai(&Script::new(&[])));
+    let mut command =
+        std::process::Command::new(sys::find_bash(std::env::var("PATH").ok().as_deref()).unwrap());
+    command.args(["-c", "read -r line"]);
+    command.envs(std::env::vars_os());
+    let (mut child, _input, _output) = sys::spawn_stdio(&mut command).unwrap();
+    let pgid = child.id();
+    let log = [
+        entry(1, user("$ sleep 100")),
+        entry(
+            2,
+            Body::ToolCall {
+                invoke: None,
+                tool: "bash".into(),
+                input: Json::encode(&json!({"command":"sleep 100"})).unwrap(),
+                id: None,
+                card: None,
+                by: Audience::User,
+            },
+        ),
+        entry(
+            3,
+            Body::ToolProcess {
+                call: CallId::new(2).unwrap(),
+                pgid,
+                boot: sys::boot_id().unwrap().into(),
+                background: true,
+            },
+        ),
+    ];
+    let session = fixture.start(&log);
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "recovery signaled a recorded number"
+    );
+    session.halt();
+    child.group.signal(sys::Signal::Kill).unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
 fn background_processes_keep_the_session_and_end_with_it() {
     let registry = echoing(&Policy::default()).with(&Extras).unwrap();
     let fixture = Fixture::new(ext_fixtures::ECHO, registry, openai(&Script::new(&[])));
@@ -1500,7 +1543,7 @@ fn background_processes_keep_the_session_and_end_with_it() {
         Duration::from_secs(5),
         || !session.has_jobs(),
     );
-    assert!(!sys::GroupId(pgid).alive());
+    assert!(!sys::RecordedIdentity(pgid).alive());
 }
 
 /// `lookup_harbor_label`, held until released or the turn is interrupted.

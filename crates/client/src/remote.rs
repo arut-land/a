@@ -76,8 +76,7 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
 }
 
 pub(crate) fn launch(host: &str, script: &str) -> io::Result<Connection> {
-    let (child, stdin, stdout) =
-        sys::spawn_stdio(command("A_SSH", "ssh").arg(host).arg(sh(script)))?;
+    let (child, stdin, stdout) = sys::spawn_ssh(command("A_SSH", "ssh").arg(host).arg(sh(script)))?;
     Ok(Connection {
         reader: Reader(BufReader::new(Transport::Pipe(stdout))),
         writer: Writer {

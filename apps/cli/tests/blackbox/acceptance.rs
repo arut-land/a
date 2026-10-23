@@ -216,12 +216,28 @@ fn a_safe_tool_reruns_after_the_daemon_is_killed() {
 }
 
 #[test]
-fn an_unsafe_tool_is_interrupted_with_its_output_and_its_processes_killed() {
+fn a_restart_interrupts_unsafe_work_without_signaling_recorded_processes() {
+    use std::io::Write as _;
     let env = Env::new("kill-unsafe");
+    let path = env.ws.join("release");
+    assert!(
+        Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Closing this writer releases the command even if an assertion unwinds.
+    let mut release = fs::File::options()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
     env.start();
     let mut conn = env.connect();
     let (id, _) = conn.attach(Target::New, &env.ws);
-    conn.input("$ echo ran >> ran.txt; echo started; sleep 30");
+    conn.input("$ echo ran >> ran.txt; echo started; read -r _ < release");
     let entries = conn.until(|e| matches!(e.body, Body::ToolProcess { .. }));
     let Body::ToolProcess { call, pgid, .. } = entries.last().unwrap().body else {
         unreachable!()
@@ -239,7 +255,13 @@ fn an_unsafe_tool_is_interrupted_with_its_output_and_its_processes_killed() {
     if !entries.iter().any(|e| result_of(e, call.0).is_some()) {
         entries.extend(conn.until(|e| result_of(e, call.0).is_some()));
     }
-    wait_for("the leftover process group to die", || !group_alive(pgid));
+    assert!(
+        group_alive(pgid),
+        "recovery signaled a recorded process number"
+    );
+    release.write_all(b"finish\n").unwrap();
+    drop(release);
+    wait_for("the released command to exit", || !group_alive(pgid));
 
     assert!(orphaned, "the tool's processes died with the daemon");
     assert_contiguous(&entries);

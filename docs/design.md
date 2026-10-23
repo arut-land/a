@@ -131,9 +131,40 @@ rather than reading and decoding it. `derived/` is disposable. See
 `Core::resume` handles recovery after load, failed commit, registry reload
 or contained panic. A fresh agent per turn makes its state reconstructible
 from the log. Safe tools can rerun; unsafe tools settle as interrupted rather
-than repeating an uncertain effect. Logged process groups are interpreted
-against the boot identity to avoid killing reused process ids. Durable waits
+than repeating an uncertain effect. Logged process numbers are diagnostic data;
+recovery cannot turn them into signaling authority. Unix live leases keep their
+leader unreaped through group cleanup; Windows leases own kill-on-close jobs
+assigned and verified before the primary thread runs. Unix group control covers
+cooperative descendants; descendants can leave the group. Durable waits
 and child ownership let interaction continue independently of a connection.
+
+Process creation uses a declarative plan: native spawn file actions and default
+close-on-exec on macOS, a dense descriptor allowlist closed with glibc's
+closefrom/close_range actions on Linux, and Unicode environment plus explicit
+handle and job lists on Windows. The musl backend applies the same fixed plan
+through async-signal-safe child syscalls, using close_range or an old-kernel
+bounded close loop when a descriptor inventory is available. The close_range
+path does not require procfs; without either facility, musl launch fails closed.
+Executable and working-directory paths are made absolute before spawning.
+There are no user callbacks between fork and exec. SSH
+transports preserve terminal access and stderr; shell commands have no terminal
+and null stdin, while protocol subprocesses use explicit pipes. Old Linux
+kernels observe owned children with a blocking, event-driven wait rather than
+polling; if descendant watches are unavailable, group cleanup
+ends the remaining cooperative descendants when the leader exits. Forced daemon
+stop requires a retained verified native handle; macOS and kernels without
+pidfds refuse numeric-PID force-stop and retain RPC shutdown.
+
+The shell process service admits at most 32 outstanding launches and running
+processes. Captured output crosses one 64 KiB buffer per process into a spill
+file, with storage back-pressure and a hard 64 MiB retention limit for foreground
+and background jobs. Group observation is capped at 4096 members; exceeding it
+revokes the live lease. Following spill files and enumerating groups use admitted
+storage workers, leaving reactor workers available for other sessions. Once
+owned-scope cleanup ends, capture finishes accepted writes and drains at most
+1 MiB for up to 100 ms; escaped pipe holders cannot retain admission or delay
+session shutdown indefinitely.
+See [process measurements](perf/processes.md) for native validation and RSS.
 
 ## Extensions and SDK
 

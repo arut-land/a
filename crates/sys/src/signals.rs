@@ -2,8 +2,6 @@
 //! An exclusive lease prevents competing consumers from stealing shutdown.
 //! Windows console control events wake a permanently owned manual-reset event.
 
-#[cfg(unix)]
-pub(crate) use imp::reset_before_exec;
 pub use imp::{Signals, reraise};
 
 #[cfg(windows)]
@@ -286,24 +284,6 @@ mod imp {
                 let _ = install(signal, libc::SIG_DFL);
             }
             self.source.active.store(false, Ordering::Release);
-        }
-    }
-
-    pub(crate) fn reset_before_exec() -> io::Result<()> {
-        for signal in ALL {
-            install(signal, libc::SIG_DFL)?;
-        }
-        // SAFETY: sigemptyset initializes a writable set. sigprocmask is
-        // async-signal-safe; after fork there is only this thread in the child.
-        let ok = unsafe {
-            let mut empty: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&raw mut empty);
-            libc::sigprocmask(libc::SIG_SETMASK, &raw const empty, std::ptr::null_mut())
-        };
-        if ok == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
         }
     }
 

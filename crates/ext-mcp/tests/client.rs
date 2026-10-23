@@ -43,27 +43,14 @@ fn failed(rig: &Rig, tool: &str) -> Failure {
     .unwrap()
 }
 
-fn finish(rig: &Rig) {
-    // Rig records process ownership; the real engine supplies its cleanup.
-    for (pid, _) in rig.spawned.lock().unwrap().iter() {
-        let _ = sys::GroupId(*pid).kill();
-    }
-    rt::block_on(async {
-        let reactor = rt::Reactor::AsyncIo;
-        for _ in 0..200 {
-            if rig
-                .spawned
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|(p, _)| !sys::GroupId(*p).alive())
-            {
-                return;
-            }
-            reactor.sleep(Duration::from_millis(10)).await;
-        }
-        panic!("fixture process leaked");
-    });
+fn finish(rig: Rig) {
+    let recorded = rig.spawned.lock().unwrap().clone();
+    drop(rig);
+    assert!(
+        recorded
+            .iter()
+            .all(|(pid, _)| !sys::RecordedIdentity(*pid).alive())
+    );
 }
 
 #[test]
@@ -120,7 +107,7 @@ fn discovery_is_lazy_and_only_selected_schemas_reach_the_model() {
             .count(),
         1
     );
-    finish(&rig);
+    finish(rig);
 }
 
 #[test]
@@ -137,7 +124,7 @@ fn crashes_and_protocol_failures_are_logged_as_distinct_facts() {
         }
     );
     assert_eq!(failed(&rig, "input"), Failure::InputRequired);
-    finish(&rig);
+    finish(rig);
 }
 
 #[test]
@@ -149,7 +136,7 @@ fn timeout_kills_the_request_and_a_later_call_gets_a_new_process() {
         &json!({"server":"fixture","tool":"echo","arguments":{}}),
     );
     assert!(result.get("ok").is_some());
-    finish(&rig);
+    finish(rig);
 }
 
 #[test]
@@ -181,7 +168,7 @@ fn cancellation_kills_the_process_even_when_the_server_ignores_it() {
         assert_eq!(value["failed"], "cancelled");
     });
     assert_eq!(*rig.progress.lock().unwrap(), "waiting");
-    finish(&rig);
+    finish(rig);
 }
 
 #[test]
@@ -216,7 +203,7 @@ fn notification_flood_is_bounded_per_request() {
         &json!({"server":"fixture","tool":"flood","arguments":{}}),
     );
     let progress_bytes = rig.progress.lock().unwrap().len();
-    finish(&rig);
+    finish(rig);
     assert!(progress_bytes <= 8 * 1024);
     assert_eq!(
         result["failed"], "limit",
@@ -236,14 +223,14 @@ fn progress_bursts_publish_a_bounded_latest_value() {
     assert!(text.starts_with("update 0\n"));
     assert!(text.ends_with("update 99\n"));
     assert!(text.lines().count() <= 8);
-    finish(&rig);
+    finish(rig);
 }
 
 #[test]
 fn paginated_discovery_cannot_exceed_the_client_frame_budget() {
     let rig = rig("review-large-list", Duration::from_secs(10));
     let result = rig.done("mcp_list", &json!({"server":"fixture"}));
-    finish(&rig);
+    finish(rig);
     assert_eq!(result["failed"], "limit");
     let bytes = serde_json::to_vec(&result).unwrap().len();
     assert!(
@@ -278,7 +265,7 @@ fn selected_schemas_and_compact_indexes_fit_with_their_escaped_cards() {
     let frame = protocol::Frame::entry(&entry).unwrap();
     assert!(frame.as_bytes().len() < 4 * 1024 * 1024);
     assert!(protocol::frame_in(frame.as_bytes()).unwrap().is_some());
-    finish(&rig);
+    finish(rig);
 }
 
 #[test]
@@ -286,7 +273,7 @@ fn invalid_discovered_identities_are_refused_before_publication() {
     let rig = rig("invalid-name", Duration::from_secs(10));
     let result = rig.done("mcp_list", &json!({"server":"fixture"}));
     assert!(result["failed"].get("protocol").is_some());
-    finish(&rig);
+    finish(rig);
 }
 
 #[test]
@@ -316,7 +303,7 @@ fn coalesced_progress_is_published_even_when_the_peer_goes_quiet() {
     let fact: Value = output.parse().unwrap();
     assert_eq!(fact["failed"], "cancelled");
     assert!(rig.progress.lock().unwrap().lines().count() <= 8);
-    finish(&rig);
+    finish(rig);
 }
 
 #[test]
@@ -344,5 +331,5 @@ fn schema_publications_follow_effective_context_across_restart_and_edits() {
     );
     let count = rig.log.lock().unwrap().iter().filter(|e| matches!(&e.body, protocol::Body::Context { publication: Some(p), .. } if p.namespace == "mcp-schemas")).count();
     assert_eq!(count, 2);
-    finish(&rig);
+    finish(rig);
 }

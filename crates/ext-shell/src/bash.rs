@@ -9,8 +9,8 @@
 //! calls and restarts. Its calls are exclusive ([`ext::Concurrency`]): a
 //! session runs one at a time, so commands never race for that directory.
 //!
-//! Its output goes to a file in the session's spill directory as it runs,
-//! never through the daemon's memory: the supervisor follows the file,
+//! Output crosses a bounded capture pipe into the session's spill file.
+//! Storage admission applies back-pressure; the supervisor follows the file,
 //! woken by its writes, keeping only what the model is shown, and the file
 //! is kept as the whole output when that was cut. A command whose output
 //! passes [`OUTPUT_CAP`] is stopped. Cancellation before or during process
@@ -573,12 +573,10 @@ async fn supervise(
 ) -> io::Result<Finished> {
     let rt = runtime(cx)?;
     let path = log.to_owned();
-    let mut following = Following {
-        file: rt::unblock(rt, move || File::open(path)).await?,
-        buffer: vec![0; 64 * 1024],
-        output: Output::default(),
-        live: Live::default(),
-    };
+    let mut file =
+        rt::unblock_with(rt, rt::BlockingClass::Storage, 0, move || File::open(path)).await?;
+    let mut buf = vec![0; 64 * 1024];
+    let (mut output, mut live) = (Output::default(), Live::default());
     let start = rt.now();
     let mut run = Run::Running {
         deadline: start + limit,
@@ -608,7 +606,7 @@ async fn supervise(
         }
         written.get_ref().clear();
         let read;
-        (following, read) = following.read(READ, rt).await?;
+        (file, buf, output, live, read) = follow_chunk(rt, file, buf, output, live).await?;
         behind = read == READ;
         if read > 0 {
             rt::yield_now().await;
@@ -620,7 +618,7 @@ async fn supervise(
         }
         if unreported && now >= reported + REPORT {
             unreported = false;
-            if let Some(text) = following.live.take() {
+            if let Some(text) = live.take() {
                 progress.send(text);
                 reported = now;
             }
@@ -628,7 +626,7 @@ async fn supervise(
         let seen = Seen {
             exited: if exited { None } else { child.try_wait()? },
             cancelled: cx.cancel.is_set(),
-            flooded: following.output.bytes() > OUTPUT_CAP,
+            flooded: output.bytes() >= OUTPUT_CAP,
         };
         let signal;
         (run, signal) = run.step(now, seen);
@@ -648,15 +646,18 @@ async fn supervise(
                     // Exit can precede the final captured bytes reaching the file.
                     child.output_drained().await?;
                 }
-                let rest = OUTPUT_CAP
-                    .saturating_sub(following.output.bytes())
-                    .min(READ);
-                (following, _) = following.read(rest, rt).await?;
+                let rest = OUTPUT_CAP.saturating_sub(output.bytes()).min(READ);
+                output = rt::unblock_with(rt, rt::BlockingClass::Storage, 256 << 10, move || {
+                    follow(&mut file, &mut buf, rest, |chunk| output.push(chunk))?;
+                    Ok::<_, io::Error>(output)
+                })
+                .await?;
                 return Ok(Finished {
                     status,
-                    stopped: why,
+                    stopped: why
+                        .or_else(|| (output.bytes() >= OUTPUT_CAP).then_some(Stop::Flooded)),
                     lingering,
-                    output: following.output.finish(log),
+                    output: output.finish(log),
                     process: child,
                 });
             }
@@ -664,37 +665,45 @@ async fn supervise(
     }
 }
 
-/// Reads and rendering share one buffer so a whole batch needs no separate
-/// allocation across the worker boundary.
-struct Following {
-    file: File,
-    buffer: Vec<u8>,
-    output: Output,
-    live: Live,
+async fn follow_chunk(
+    rt: &dyn rt::Runtime,
+    mut file: File,
+    mut buf: Vec<u8>,
+    mut output: Output,
+    mut live: Live,
+) -> io::Result<(File, Vec<u8>, Output, Live, u64)> {
+    rt::unblock_with(rt, rt::BlockingClass::Storage, 256 << 10, move || {
+        let read = follow(&mut file, &mut buf, READ, |chunk| {
+            output.push(chunk);
+            live.push(chunk);
+        })?;
+        Ok((file, buf, output, live, read))
+    })
+    .await
 }
 
-impl Following {
-    async fn read(mut self, most: u64, rt: &dyn rt::Runtime) -> io::Result<(Self, u64)> {
-        rt::unblock_with(rt, rt::BlockingClass::Storage, 1024 * 1024, move || {
-            let mut read = 0;
-            while read < most {
-                let room = usize::try_from(most - read)
-                    .map_or(self.buffer.len(), |left| left.min(self.buffer.len()));
-                match self.file.read(&mut self.buffer[..room]) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        self.output.push(&self.buffer[..n]);
-                        self.live.push(&self.buffer[..n]);
-                        read += n as u64;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(error) => return Err(error),
-                }
+/// Reads what `file` has past where it was last read, up to `most` bytes,
+/// handing each chunk to `chunk`; how many bytes it read.
+fn follow(
+    file: &mut File,
+    buf: &mut [u8],
+    most: u64,
+    mut chunk: impl FnMut(&[u8]),
+) -> io::Result<u64> {
+    let mut read = 0;
+    while read < most {
+        let room = usize::try_from(most - read).map_or(buf.len(), |left| left.min(buf.len()));
+        match file.read(&mut buf[..room]) {
+            Ok(0) => break,
+            Ok(n) => {
+                chunk(&buf[..n]);
+                read += n as u64;
             }
-            Ok((self, read))
-        })
-        .await
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
     }
+    Ok(read)
 }
 
 /// `future`, or one that never resolves when `cond` does not hold.

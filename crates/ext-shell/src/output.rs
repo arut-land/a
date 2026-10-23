@@ -14,7 +14,7 @@ pub const HEAD: usize = 8 * 1024;
 pub const TAIL: usize = 24 * 1024;
 /// The most lines the model sees, split between start and end.
 pub const LINES: usize = 2000;
-/// The most output a command may write: one that writes more is stopped.
+/// The most output retained per command; reaching it stops the process.
 pub const OUTPUT_CAP: u64 = 64 << 20;
 
 /// A line longer than this is passed on in pieces, so one without a newline

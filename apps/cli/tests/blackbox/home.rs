@@ -130,7 +130,7 @@ fn a_signal_exit_leaves_its_reason_without_session_content() {
     let input = "private prompt, key, and echoed tool output: secret-93d7";
     conn.input(input);
     conn.until(|e| matches!(&e.body, Body::Assistant { text } if text == input));
-    sys::signal_process(pid, sys::Signal::Terminate).unwrap();
+    crate::support::signal_process(pid, sys::Signal::Terminate).unwrap();
     env.wait_exited("the signalled daemon to stop");
     let text = env.run(&["daemon", "log"]);
     let records: Vec<serde_json::Value> = text
