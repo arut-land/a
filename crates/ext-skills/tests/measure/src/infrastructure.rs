@@ -1,4 +1,6 @@
 fn main() {
+    #[cfg(all(unix, feature = "signal-maintained"))]
+    let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let start = std::time::Instant::now();
     for n in 0..10000 {
         #[cfg(feature = "temp-custom")]
@@ -20,10 +22,11 @@ fn main() {
         }
         #[cfg(all(unix, feature = "signal-maintained"))]
         {
-            // SAFETY: the action is empty and cannot allocate, lock or panic.
-            let id =
-                unsafe { signal_hook::low_level::register(signal_hook::consts::SIGWINCH, || {}) }
-                    .unwrap();
+            let id = signal_hook::flag::register(
+                signal_hook::consts::SIGWINCH,
+                std::sync::Arc::clone(&pending),
+            )
+            .unwrap();
             signal_hook::low_level::unregister(id);
         }
         std::hint::black_box(n);
