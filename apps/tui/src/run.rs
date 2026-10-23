@@ -66,6 +66,8 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
     // raw; the input thread reads them.
     let signals = Signals::catch(&term::SIGNALS)?;
     let terminal = Terminal::enter(viewport)?;
+    term::spawn_input(tx, signals);
+    terminal.show()?;
     let mut screen = Screen::new(viewport, Stdout::default());
     // no-color.org: set and not empty.
     if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
@@ -82,7 +84,6 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
     client
         .app
         .in_workspace(sys::workspace_of(&std::env::current_dir()?));
-    term::spawn_input(tx, signals);
     client.driver.pump(&mut client.app, first);
     let exit = client.run(&rx);
     let _ = client.screen.close();

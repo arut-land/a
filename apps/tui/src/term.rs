@@ -40,7 +40,9 @@ pub const LEAVE_FULL: &[u8] = b"\x1b[?1006l\x1b[?1000l\x1b[?1049l";
 /// and the input thread restore it too.
 static HELD: Mutex<Option<(Viewport, RawMode)>> = Mutex::new(None);
 
-pub struct Terminal(());
+pub struct Terminal {
+    viewport: Viewport,
+}
 
 impl Terminal {
     /// Raw mode and bracketed paste; on the full screen also the alternate
@@ -57,14 +59,17 @@ impl Terminal {
             }));
         });
         *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some((viewport, cooked));
-        let guard = Self(());
+        Ok(Self { viewport })
+    }
+
+    pub fn show(&self) -> io::Result<()> {
         let mut out = io::stdout().lock();
-        if viewport == Viewport::Full {
+        if self.viewport == Viewport::Full {
             out.write_all(ENTER_FULL)?;
         }
         out.write_all(ENTER)?;
         out.flush()?;
-        Ok(guard)
+        Ok(())
     }
 }
 
@@ -82,7 +87,9 @@ pub fn suspend() -> io::Result<()> {
         restore();
         sys::terminal::suspend()?;
         // Ownership remains with the original Terminal guard.
-        std::mem::forget(Terminal::enter(viewport)?);
+        let resumed = Terminal::enter(viewport)?;
+        resumed.show()?;
+        std::mem::forget(resumed);
     }
     Ok(())
 }
