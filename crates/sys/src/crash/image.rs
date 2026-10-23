@@ -70,30 +70,44 @@ pub(super) fn of(base: usize) -> Option<Identity> {
         // SAFETY: the loader supplies dlpi_phnum readable program headers.
         let headers =
             unsafe { std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum)) };
-        let bias = info.dlpi_addr as usize;
-        let matches = headers
-            .iter()
-            .any(|h| h.p_type == libc::PT_LOAD && bias + h.p_vaddr as usize == search.base);
+        let Ok(bias) = usize::try_from(info.dlpi_addr) else {
+            return 0;
+        };
+        let matches = headers.iter().any(|h| {
+            h.p_type == libc::PT_LOAD
+                && usize::try_from(h.p_vaddr)
+                    .ok()
+                    .and_then(|start| bias.checked_add(start))
+                    == Some(search.base)
+        });
         if !matches {
             return 0;
         }
         for h in headers.iter().filter(|h| h.p_type == libc::PT_NOTE) {
-            let start = h.p_vaddr as usize;
-            let len = h.p_memsz as usize;
+            let (Ok(start), Ok(len)) = (usize::try_from(h.p_vaddr), usize::try_from(h.p_memsz))
+            else {
+                continue;
+            };
+            let (Some(address), Some(end)) =
+                (bias.checked_add(start), h.p_vaddr.checked_add(h.p_memsz))
+            else {
+                continue;
+            };
             // A program note need not be loaded. Read only a note wholly inside
             // a readable PT_LOAD; the loader lock keeps the mapping alive.
             if !headers.iter().any(|load| {
                 load.p_type == libc::PT_LOAD
                     && load.p_flags & libc::PF_R != 0
-                    && start >= load.p_vaddr as usize
-                    && start
-                        .checked_add(len)
-                        .is_some_and(|end| end <= (load.p_vaddr + load.p_memsz) as usize)
+                    && h.p_vaddr >= load.p_vaddr
+                    && load
+                        .p_vaddr
+                        .checked_add(load.p_memsz)
+                        .is_some_and(|limit| end <= limit)
             }) {
                 continue;
             }
             // SAFETY: the range was checked against a readable loaded segment.
-            let notes = unsafe { std::slice::from_raw_parts((bias + start) as *const u8, len) };
+            let notes = unsafe { std::slice::from_raw_parts(address as *const u8, len) };
             if let Some(id) = build_id(notes, h.p_align) {
                 search.identity = Some(Identity::ElfBuildId(id));
                 break;
