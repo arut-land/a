@@ -105,4 +105,6 @@ and each crate's `//!` comment supplying the details.
 Before finishing a change: `mise run check`, `acceptance`, `budgets` (report
 `mise run size` before and after), and whichever of `test:web`,
 `apple:test`, `deny`, `machete`, `check:no-tokio`, `check:windows` the
-change touches. CI (`.github/workflows/ci.yml`) runs all of them.
+change touches. CI (`.github/workflows/ci.yml`) runs functional checks;
+`.github/workflows/perf.yml` runs the release budgets and measurements on
+native hosted OS/architecture runners.
