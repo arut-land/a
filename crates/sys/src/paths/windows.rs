@@ -9,7 +9,7 @@ fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
     let mut raw = std::ptr::null_mut();
     // SAFETY: id is a valid GUID and raw is a writable output pointer. A null
     // token selects the current user and requires no COM initialization.
-    let result = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw) };
+    let result = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &raw mut raw) };
     if result < 0 {
         // SAFETY: the API owns this allocation; CoTaskMemFree accepts null.
         unsafe { CoTaskMemFree(raw.cast()) };
