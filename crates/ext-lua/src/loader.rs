@@ -183,6 +183,16 @@ impl Loader {
         {
             return Ok(previous.clone());
         }
+        if let Some(previous) = previous.filter(|p| {
+            p.inputs
+                .downcast_ref::<Files>()
+                .is_some_and(|inputs| same_content(inputs, found))
+        }) {
+            return Ok(PreparedLayer {
+                inputs: Arc::new(found.clone()),
+                registrations: previous.registrations.clone(),
+            });
+        }
         let started = Instant::now();
         let mut registry = base.clone();
         let mut installed = Vec::new();
@@ -239,6 +249,12 @@ impl Loader {
                 .collect(),
         })
     }
+}
+
+fn same_content(left: &Files, right: &Files) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|((name, source), (other_name, other))| {
+        name == other_name && matches!((source.text(), other.text()), (Ok(left), Ok(right)) if left == right)
+    })
 }
 
 fn inventory(dir: &Path, found: &mut BTreeMap<String, (PathBuf, PathBuf)>) -> Result<(), Refused> {
@@ -343,6 +359,11 @@ mod tests {
             .prepare(&rig.workspace(), &Registry::default(), None, true)
             .unwrap();
         assert_eq!(first.registrations.len(), 1);
+        fs::write(
+            rig.dir.join("ext/good.lua"),
+            "a.text{name='good',text='cached'}",
+        )
+        .unwrap();
         let next = loader
             .prepare(&rig.workspace(), &Registry::default(), Some(&first), false)
             .unwrap();
@@ -350,6 +371,7 @@ mod tests {
             &first.registrations[0].1,
             &next.registrations[0].1
         ));
+        assert!(loader.validate(&rig.workspace(), &next).unwrap());
         fs::write(&bad, "error('different invalid source')").unwrap();
         assert!(
             loader
