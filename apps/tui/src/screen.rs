@@ -71,9 +71,10 @@ impl<W: Write> Screen<W> {
         self.stale = true;
     }
 
-    /// The shell may have moved the cursor while it owned the terminal.
+    /// The shell or a partially written frame may have moved the cursor.
     pub fn resume(&mut self) {
         self.bytes.clear();
+        self.bytes.extend_from_slice(b"\x1b[0m\x1b[?25h");
         (self.row, self.col) = (Some(0), None);
         self.pen = PLAIN;
         self.cursor_shown = true;
@@ -163,6 +164,11 @@ impl<W: Write> Screen<W> {
             .write_all(&self.bytes)
             .and_then(|()| self.out.flush());
         self.bytes.clear();
+        if written.is_err() {
+            // Planned cursor moves may never have reached the terminal. A
+            // fresh anchor cannot move up into output the shell left above it.
+            self.resume();
+        }
         written
     }
 
@@ -373,6 +379,40 @@ mod tests {
         screen.bytes.clear();
         screen.repen(Style::new().fg(Color::Green).bold());
         assert!(screen.bytes.is_empty(), "a colour alone changes nothing");
+    }
+
+    #[test]
+    fn a_cancelled_frame_never_moves_above_its_new_viewport_anchor() {
+        struct CancelOnce(Option<Vec<u8>>);
+        impl Write for CancelOnce {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(out) = &mut self.0 {
+                    out.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                } else {
+                    self.0 = Some(Vec::new());
+                    Err(io::ErrorKind::WouldBlock.into())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut app = App::new(Viewport::Inline, &protocol::Target::New);
+        let mut screen = Screen::new(Viewport::Inline, CancelOnce(None));
+        assert_eq!(
+            screen.draw(&mut app, (80, 24)).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        screen.invalidate();
+        screen.draw(&mut app, (80, 24)).unwrap();
+        let bytes = screen.out.0.unwrap();
+        let reserved = bytes.iter().position(|&byte| byte == b'\n').unwrap();
+        assert!(
+            !bytes[..reserved].contains(&b'A'),
+            "retry moved above shell output before reserving its viewport: {bytes:?}"
+        );
     }
 
     #[test]
