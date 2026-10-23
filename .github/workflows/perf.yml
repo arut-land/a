@@ -161,27 +161,6 @@ jobs:
           for path in ['apps/cli/examples/perf-attach.rs', 'crates/engine/src/driver/tests/bench.rs']:
               shutil.copy2(path, '../measured/' + path)
           PY
-      - name: Isolate context preparation for CPU attribution
-        run: |
-          python - <<'PY'
-          import json, os, pathlib, subprocess
-          if json.loads(os.environ['PERF_VARIANT']).get('ablate_context'):
-              source = pathlib.Path('../measured')
-              revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source, text=True).strip()
-              assert revision == 'cfc05a89f9b2372f34d4d3ce5af86c703812627b'
-              path = source / 'crates/engine/src/driver.rs'
-              text = path.read_text()
-              start = text.index('    async fn prepare_context(')
-              end = text.index('    async fn step_mutations(', start)
-              text = text[:start] + text[end:]
-              start = text.index('            let prepared = self.prepare_context(context.clone()).await;')
-              end = text.index('                Ok(more) => {', start)
-              text = text[:start] + '            match catch_unwind(AssertUnwindSafe(|| context.scope(|| self.core.step(event)))) {\n' + text[end:]
-              path.write_text(text)
-              output = pathlib.Path('target')
-              output.mkdir(parents=True, exist_ok=True)
-              (output / 'ablation.patch').write_bytes(subprocess.check_output(['git', 'diff', '--', 'crates/engine/src/driver.rs'], cwd=source))
-          PY
       - name: Build release binaries and saved benchmarks
         id: build
         run: |
@@ -193,7 +172,6 @@ jobs:
           else
             mise exec -- python scripts/perf/hosted.py --phase build --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' "${extra[@]}"
           fi
-          if [[ -f target/ablation.patch ]]; then cp target/ablation.patch target/hosted-perf/; fi
       - name: Measure startup workloads and benches
         timeout-minutes: 20
         if: env.PERF_BUILD_ONLY != 'true'
