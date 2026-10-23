@@ -3,7 +3,10 @@ on:
   workflow_dispatch:
   push:
     branches: [codex-w5rt]
-    paths: [crates/rt/examples/resources.rs, .github/workflows/resources-probe.yml]
+    paths: [crates/rt/**, crates/sys/**, .github/workflows/resources-probe.yml]
+concurrency:
+  group: resources-probe-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:

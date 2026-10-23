@@ -135,10 +135,12 @@ impl Priority {
         #[cfg(target_os = "macos")]
         {
             let mut relative = 0;
-            // SAFETY: pthread_self is live; relative is writable.
-            let previous =
-                unsafe { pthread_get_qos_class_np(libc::pthread_self(), &raw mut relative) };
-            // SAFETY: USER_INITIATED is a valid qos_class_t; priority zero is valid.
+            let mut previous = 0;
+            // SAFETY: current thread is live; both output pointers are writable.
+            unsafe {
+                pthread_get_qos_class_np(libc::pthread_self(), &raw mut previous, &raw mut relative)
+            };
+            // SAFETY: class is USER_INITIATED or UTILITY; priority zero is valid.
             unsafe { pthread_set_qos_class_self_np(class, 0) };
             Self {
                 previous: (previous, relative),
@@ -173,13 +175,24 @@ impl Drop for Priority {
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
-    fn pthread_get_qos_class_np(thread: libc::pthread_t, relative: *mut i32) -> u32;
+    fn pthread_get_qos_class_np(
+        thread: libc::pthread_t,
+        class: *mut u32,
+        relative: *mut i32,
+    ) -> i32;
     fn pthread_set_qos_class_self_np(class: u32, relative: i32) -> i32;
 }
 
 #[cfg(windows)]
 mod windows {
-    use windows_sys::Win32::System::{JobObjects::*, Threading::*};
+    use windows_sys::Win32::System::{
+        JobObjects::{
+            JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_MIN_MAX_RATE,
+            JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+            JobObjectCpuRateControlInformation, QueryInformationJobObject,
+        },
+        Threading::{GetCurrentProcess, GetProcessAffinityMask, GetProcessDefaultCpuSets},
+    };
 
     pub(super) fn parallelism(mut count: usize) -> usize {
         // SAFETY: process pseudo-handle is valid and all outputs are writable.
@@ -201,7 +214,7 @@ mod windows {
                 std::ptr::null_mut(),
                 JobObjectCpuRateControlInformation,
                 (&raw mut rate).cast(),
-                u32::try_from(std::mem::size_of_val(&rate)).expect("fixed-size job rate"),
+                u32::try_from(size_of_val(&rate)).expect("fixed-size job rate"),
                 std::ptr::null_mut(),
             ) != 0
                 && rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE != 0
@@ -218,96 +231,6 @@ mod windows {
             }
         }
         count.max(1)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn native_facts_are_nonzero_without_assuming_page_granularity() {
-        let facts = Resources::for_path(&std::env::temp_dir()).unwrap();
-        assert!(facts.parallelism > 0);
-        assert!(facts.page_size.is_power_of_two());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn nested_priority_scopes_restore_the_enclosing_work_class() {
-        let _utility = Priority::utility();
-        {
-            let _foreground = Priority::user_initiated();
-            // SAFETY: querying the current thread, without relative-priority output.
-            assert_eq!(
-                unsafe { pthread_get_qos_class_np(libc::pthread_self(), std::ptr::null_mut()) },
-                0x19
-            );
-        }
-        // SAFETY: querying the current thread, without relative-priority output.
-        assert_eq!(
-            unsafe { pthread_get_qos_class_np(libc::pthread_self(), std::ptr::null_mut()) },
-            0x11
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_limits_are_observed_in_an_isolated_process() {
-        use windows_sys::Win32::System::{JobObjects::*, Threading::*};
-        if std::env::var_os("A_RESOURCE_LIMIT_CHILD").is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "resources::tests::windows_limits_are_observed_in_an_isolated_process",
-                    "--nocapture",
-                ])
-                .env("A_RESOURCE_LIMIT_CHILD", "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stdout)
-            );
-            return;
-        }
-        // The child alone changes process scheduling state, never the test runner.
-        // SAFETY: outputs have their declared sizes, and the pseudo-handle is live.
-        unsafe {
-            let process = GetCurrentProcess();
-            let (mut affinity, mut system) = (0usize, 0usize);
-            assert_ne!(
-                GetProcessAffinityMask(process, &raw mut affinity, &raw mut system),
-                0
-            );
-            let one = 1usize << affinity.trailing_zeros();
-            assert_ne!(SetProcessAffinityMask(process, one), 0);
-            assert_eq!(effective_parallelism(), 1);
-            assert_ne!(SetProcessAffinityMask(process, affinity), 0);
-
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            assert!(!job.is_null());
-            let rate = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
-                ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
-                    | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
-                Anonymous: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0 { CpuRate: 1000 },
-            };
-            assert_ne!(
-                SetInformationJobObject(
-                    job,
-                    JobObjectCpuRateControlInformation,
-                    (&raw const rate).cast(),
-                    u32::try_from(std::mem::size_of_val(&rate)).expect("fixed-size job rate")
-                ),
-                0
-            );
-            assert_ne!(AssignProcessToJobObject(job, process), 0);
-            let host = std::thread::available_parallelism().map_or(1, usize::from);
-            assert!(effective_parallelism() <= (host / 10).max(1));
-            windows_sys::Win32::Foundation::CloseHandle(job);
-        }
     }
 }
 
@@ -364,5 +287,110 @@ impl Drop for MemoryPressure {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
         self.source.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn native_facts_are_nonzero_without_assuming_page_granularity() {
+        let facts = Resources::for_path(&std::env::temp_dir()).unwrap();
+        assert!(facts.parallelism > 0);
+        assert!(facts.page_size.is_power_of_two());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nested_priority_scopes_restore_the_enclosing_work_class() {
+        fn class() -> u32 {
+            let mut class = 0;
+            // SAFETY: current thread is live; class is writable, relative output is optional.
+            assert_eq!(
+                unsafe {
+                    pthread_get_qos_class_np(
+                        libc::pthread_self(),
+                        &raw mut class,
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            class
+        }
+        let _utility = Priority::utility();
+        {
+            let _foreground = Priority::user_initiated();
+            assert_eq!(class(), 0x19);
+        }
+        assert_eq!(class(), 0x11);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_limits_are_observed_in_an_isolated_process() {
+        use windows_sys::Win32::System::{
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+                JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+                JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0, JobObjectCpuRateControlInformation,
+                SetInformationJobObject,
+            },
+            Threading::{GetCurrentProcess, GetProcessAffinityMask, SetProcessAffinityMask},
+        };
+        if std::env::var_os("A_RESOURCE_LIMIT_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "resources::tests::windows_limits_are_observed_in_an_isolated_process",
+                    "--nocapture",
+                ])
+                .env("A_RESOURCE_LIMIT_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        // The child alone changes process scheduling state, never the test runner.
+        // SAFETY: outputs have their declared sizes, and the pseudo-handle is live.
+        unsafe {
+            let process = GetCurrentProcess();
+            let (mut affinity, mut system) = (0usize, 0usize);
+            assert_ne!(
+                GetProcessAffinityMask(process, &raw mut affinity, &raw mut system),
+                0
+            );
+            let one = 1usize << affinity.trailing_zeros();
+            assert_ne!(SetProcessAffinityMask(process, one), 0);
+            assert_eq!(effective_parallelism(), 1);
+            assert_ne!(SetProcessAffinityMask(process, affinity), 0);
+
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            assert!(!job.is_null());
+            let rate = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+                ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
+                    | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+                Anonymous: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0 { CpuRate: 1000 },
+            };
+            assert_ne!(
+                SetInformationJobObject(
+                    job,
+                    JobObjectCpuRateControlInformation,
+                    (&raw const rate).cast(),
+                    u32::try_from(size_of_val(&rate)).expect("fixed-size job rate")
+                ),
+                0
+            );
+            assert_ne!(AssignProcessToJobObject(job, process), 0);
+            let host = std::thread::available_parallelism().map_or(1, usize::from);
+            assert!(effective_parallelism() <= (host / 10).max(1));
+            windows_sys::Win32::Foundation::CloseHandle(job);
+        }
     }
 }

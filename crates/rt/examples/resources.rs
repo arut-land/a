@@ -1,5 +1,6 @@
 //! Hosted-only resource-policy and primitive comparison.
 use std::{hint::black_box, time::Instant};
+mod legacy_oneshot;
 
 #[global_allocator]
 static ALLOCATOR: &stats_alloc::StatsAlloc<std::alloc::System> = &stats_alloc::INSTRUMENTED_SYSTEM;
@@ -34,7 +35,7 @@ fn main() {
         sys::resources::Resources::for_path(std::path::Path::new(".")).unwrap()
     );
     measure("custom-oneshot", || {
-        let (tx, rx) = rt::oneshot::channel();
+        let (tx, rx) = legacy_oneshot::channel();
         tx.send(black_box(42u64));
         black_box(rt::block_on(rx));
     });
