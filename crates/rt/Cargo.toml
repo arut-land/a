@@ -30,6 +30,7 @@ rustix.workspace = true
 
 
 [dev-dependencies]
+stats_alloc = "0.1"
 futures-channel = "0.3"
 async-channel = "2"
 oneshot = "0.2"

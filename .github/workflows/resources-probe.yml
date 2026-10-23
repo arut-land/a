@@ -25,7 +25,7 @@ jobs:
         with:
           install_args: ${{ runner.os == 'Linux' && 'mold' || '' }}
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
-      - run: cargo test -p sys resources::tests && cargo test -p rt --lib
+      - run: cargo test -p sys resources::tests && cargo test -p rt --lib -- --test-threads=1
       - run: cargo run --release -p rt --example resources | tee resources.txt
       - uses: actions/upload-artifact@v5
         if: always()

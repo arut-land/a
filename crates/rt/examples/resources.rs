@@ -1,12 +1,20 @@
 //! Hosted-only resource-policy and primitive comparison.
 use std::{hint::black_box, time::Instant};
 
+#[global_allocator]
+static ALLOCATOR: &stats_alloc::StatsAlloc<std::alloc::System> = &stats_alloc::INSTRUMENTED_SYSTEM;
+
 fn measure(name: &str, mut f: impl FnMut()) {
+    let region = stats_alloc::Region::new(ALLOCATOR);
     let start = Instant::now();
     for _ in 0..100_000 {
         f();
     }
-    println!("{name} ns={}", start.elapsed().as_nanos() / 100_000);
+    println!(
+        "{name} ns={} stats={:?}",
+        start.elapsed().as_nanos() / 100_000,
+        region.change()
+    );
 }
 fn main() {
     println!(

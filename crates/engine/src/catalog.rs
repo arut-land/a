@@ -100,6 +100,19 @@ impl Catalog {
         Self::with(None, Image::default())
     }
 
+    pub fn open_on(
+        path: PathBuf,
+        store: Arc<dyn LogStore>,
+        runtime: &dyn rt::Runtime,
+    ) -> io::Result<Self> {
+        rt::block_on(rt::unblock_with(
+            runtime,
+            rt::BlockingClass::Storage,
+            rt::STORAGE_BYTES,
+            move || Self::open(path, &*store),
+        ))
+    }
+
     /// The catalog at `path` of the logs `store` keeps: read, or
     /// rebuilt from the logs unless the last daemon left it clean.
     pub fn open(path: PathBuf, store: &dyn LogStore) -> io::Result<Self> {
@@ -319,48 +332,33 @@ fn read(path: &Path) -> io::Result<Image> {
 /// anything open or waiting.
 fn rebuild(store: &dyn LogStore) -> io::Result<Image> {
     let headers = store.headers()?;
-    let workers = headers.len().min(4);
-    let headers = Mutex::new(headers.into_iter());
-    let records = Mutex::new(BTreeMap::new());
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                loop {
-                    let Some(header) = lock(&headers).next() else {
-                        break;
-                    };
-                    let mut ledger = Ledger::default();
-                    let loaded =
-                        match store.load(header.id, &mut |_| false, &mut |e| ledger.apply(&e)) {
-                            Ok(loaded) => loaded,
-                            Err(e) => {
-                                ext_logging::emit(ext_logging::Fact::Fault {
-                                    session: Some(header.id),
-                                    operation: ext_logging::Operation::Reload,
-                                    kind: ext_logging::Fault(e.kind()),
-                                });
-                                continue;
-                            }
-                        };
-                    let activity = ledger.activity();
-                    let read_only = loaded.writer.read_only();
-                    lock(&records).insert(
-                        header.id.0.as_u128(),
-                        Record {
-                            busy: activity != Activity::Idle && read_only.is_none(),
-                            entries: loaded.seq,
-                            activity,
-                            read_only,
-                            header,
-                        },
-                    );
-                }
-            });
-        }
-    });
-    let records = records
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut records = BTreeMap::new();
+    for header in headers {
+        let mut ledger = Ledger::default();
+        let loaded = match store.load(header.id, &mut |_| false, &mut |e| ledger.apply(&e)) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                ext_logging::emit(ext_logging::Fact::Fault {
+                    session: Some(header.id),
+                    operation: ext_logging::Operation::Reload,
+                    kind: ext_logging::Fault(e.kind()),
+                });
+                continue;
+            }
+        };
+        let activity = ledger.activity();
+        let read_only = loaded.writer.read_only();
+        records.insert(
+            header.id.0.as_u128(),
+            Record {
+                busy: activity != Activity::Idle && read_only.is_none(),
+                entries: loaded.seq,
+                activity,
+                read_only,
+                header,
+            },
+        );
+    }
     Ok(Image {
         lines: records.len(),
         records,
@@ -495,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_rebuild_matches_serial_replay() {
+    fn rebuilt_catalog_matches_log_replay() {
         let store = Memory::default();
         for n in 0..17 {
             let header = Header {

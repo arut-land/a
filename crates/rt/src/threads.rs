@@ -31,6 +31,15 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn for_path(path: &std::path::Path) -> io::Result<Self> {
+        let facts = sys::resources::Resources::for_path(path)?;
+        let mut config = Self::for_cores(facts.parallelism);
+        if facts.storage == sys::resources::Storage::Rotational {
+            config.storage.workers = 1;
+        }
+        Ok(config)
+    }
+
     pub fn for_cores(cores: usize) -> Self {
         Self {
             workers: cores.clamp(1, 4),
@@ -45,7 +54,7 @@ impl Config {
                 bytes: 32 << 20,
             },
             cpu: PoolLimits {
-                workers: cores.saturating_sub(1).max(1),
+                workers: cores.saturating_sub(1).clamp(1, 8),
                 queue: 8,
                 bytes: 64 << 20,
             },
@@ -55,7 +64,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self::for_cores(thread::available_parallelism().map_or(1, usize::from))
+        Self::for_cores(sys::resources::effective_parallelism())
     }
 }
 
@@ -429,7 +438,9 @@ impl Blocking {
             if let Some((bytes, work)) = state.queue.pop_front() {
                 wake(&mut state);
                 drop(state);
+                let _priority = sys::resources::Priority::user_initiated();
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+                drop(_priority);
                 state = lock(&self.state);
                 state.bytes -= bytes;
                 wake(&mut state);
@@ -768,7 +779,11 @@ mod tests {
                     config.network.workers,
                     config.cpu.workers
                 ),
-                ((cores / 2).clamp(1, 4), 8, cores.saturating_sub(1).max(1))
+                (
+                    (cores / 2).clamp(1, 4),
+                    8,
+                    cores.saturating_sub(1).clamp(1, 8)
+                )
             );
             assert_eq!(
                 config.storage.bytes + config.network.bytes + config.cpu.bytes,

@@ -349,7 +349,7 @@ impl Daemon {
 
     fn load_on(home: &Home, config: &Config, runtime: &Arc<impl rt::Runtime>) -> io::Result<Owner> {
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
-        let catalog = Catalog::open(home.catalog_file(), &*store)?;
+        let catalog = Catalog::open_on(home.catalog_file(), store.clone(), &**runtime)?;
         catalog.start(Arc::clone(runtime) as Arc<dyn rt::Runtime>);
         let records = catalog.records();
         let busy: Vec<bool> = records.iter().map(|r| r.busy).collect();
@@ -997,6 +997,10 @@ impl Daemon {
         // When a drain out of grace stopped the calls still running.
         let mut stopped: Option<Instant> = None;
         let mut awake: Option<Option<sys::Awake>> = None;
+        let pressure = Arc::new(rt::Notify::new());
+        let notified = Arc::clone(&pressure);
+        let _pressure_source = sys::resources::MemoryPressure::new(move || notified.notify());
+        let mut pressured = pressure.count();
         let mut pulsed = self.pulse.count();
         let mut jobs = self.jobs.count();
         loop {
@@ -1006,7 +1010,13 @@ impl Daemon {
                 session: None,
                 detail: String::new(),
             });
-            self.hibernate(config.hibernate);
+            let after = if pressure.count() != pressured {
+                pressured = pressure.count();
+                Duration::from_nanos(1)
+            } else {
+                config.hibernate
+            };
+            self.hibernate(after);
             self.publish_list();
             let stopping = *lock(&self.stopping);
             if let Some(reason) = stopping {
@@ -1061,7 +1071,12 @@ impl Daemon {
                 self.jobs.changed(&mut jobs).await;
                 false
             };
-            let woken = rt::or(pulse, rt::or(ended, sleep));
+            let reclaim = async {
+                pressure.changed(&mut pressured).await;
+                self.hibernate(Duration::from_nanos(1));
+                false
+            };
+            let woken = rt::or(pulse, rt::or(reclaim, rt::or(ended, sleep)));
             if woken.await {
                 since = None;
             }
@@ -1191,7 +1206,9 @@ pub fn serve(
     build: &str,
     start: Start,
 ) -> io::Result<()> {
-    let runtime = Arc::new(rt::Threads::default());
+    let runtime = Arc::new(rt::Threads::configured(rt::Config::for_path(
+        &home.sessions_dir(),
+    )?));
     let result = run(listener, home, config, build, start, &runtime);
     if let Err(error) = &result {
         fact(Fact::Fault {
