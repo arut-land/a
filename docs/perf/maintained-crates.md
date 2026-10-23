@@ -204,4 +204,5 @@ also creates its signal pipe atomically with both flags. macOS and Windows keep
 their native signal sources. Shared manifests and the lockfile change only for
 the adopted dependencies, with Zlib added for foldhash. Path backends, channels,
 source watching/reload, edit transactions and executable staging remain with
-their owning sessions. No wire, log, config or recorded fixture changes occur.
+their owning sessions. Wire, log and user-configuration formats stay unchanged; recorded fixtures
+are untouched.
