@@ -32,7 +32,7 @@ for count in (1, 8):
             for i in range(count):
                 stream = (root / f'client-{i}.log').open('wb')
                 files.append(stream)
-                children.append(subprocess.Popen([binary, '-p', '$ yes x | head -c 8388608'],
+                children.append(subprocess.Popen([binary, '--mode', 'auto', '-p', '$ yes x | head -c 8388608'],
                     env=env, cwd=root, stdin=subprocess.DEVNULL, stdout=stream, stderr=stream))
             while any(child.poll() is None for child in children):
                 assert time.monotonic() - started < 120, 'shell workload timed out'

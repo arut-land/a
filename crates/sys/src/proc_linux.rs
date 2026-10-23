@@ -63,76 +63,22 @@ pub(super) fn spawn(
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
-        // SAFETY: every pointer borrows parent-prepared buffers, valid in the
-        // child; failure terminates with _exit instead of unwinding into Rust.
+        // SAFETY: these immutable plan buffers and FDs were prepared before fork;
+        // run terminates by execve or _exit, never returning to Rust cleanup.
         unsafe {
-            let error = writer.as_raw_fd();
-            for &(source, destination) in &descriptors {
-                if libc::dup2(source, destination) < 0 {
-                    failed(error);
-                }
+            Exec {
+                executable,
+                arguments,
+                environment,
+                directory: directory.as_deref(),
+                descriptors: &descriptors,
+                boundary,
+                ceiling,
+                error: writer.as_raw_fd(),
+                session,
+                group,
             }
-            if let Some(directory) = &directory {
-                if libc::chdir(directory.as_ptr()) < 0 {
-                    failed(error);
-                }
-            }
-            if session {
-                if libc::setsid() < 0 {
-                    failed(error);
-                }
-            } else if group && libc::setpgid(0, 0) < 0 {
-                failed(error);
-            }
-            // Close all undesired FDs, retaining only the CLOEXEC error writer.
-            let first = if error > boundary {
-                libc::syscall(
-                    libc::SYS_close_range,
-                    boundary.cast_unsigned(),
-                    (error - 1).cast_unsigned(),
-                    0,
-                )
-            } else {
-                0
-            };
-            let second = libc::syscall(
-                libc::SYS_close_range,
-                (error + 1).cast_unsigned(),
-                u32::MAX,
-                0,
-            );
-            if first < 0 || second < 0 {
-                for descriptor in boundary..ceiling {
-                    if descriptor != error {
-                        libc::close(descriptor);
-                    }
-                }
-            }
-            let mut mask: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&raw mut mask);
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = libc::SIG_DFL;
-            libc::sigemptyset(&raw mut action.sa_mask);
-            for signal in 1..=64 {
-                if signal != libc::SIGKILL
-                    && signal != libc::SIGSTOP
-                    && libc::sigaction(signal, &raw const action, std::ptr::null_mut()) < 0
-                {
-                    // libc reserves a few real-time signals; EINVAL is benign.
-                    if *libc::__errno_location() != libc::EINVAL {
-                        failed(error);
-                    }
-                }
-            }
-            if libc::sigprocmask(libc::SIG_SETMASK, &raw const mask, std::ptr::null_mut()) < 0 {
-                failed(error);
-            }
-            libc::execve(
-                executable.as_ptr(),
-                arguments.as_ptr().cast(),
-                environment.as_ptr().cast(),
-            );
-            failed(error);
+            .run()
         }
     }
     drop(mask);
@@ -158,6 +104,93 @@ pub(super) fn spawn(
     } else {
         io::Error::other("incomplete child exec error")
     })
+}
+
+struct Exec<'a> {
+    executable: &'a CStr,
+    arguments: &'a [*mut libc::c_char],
+    environment: &'a [*mut libc::c_char],
+    directory: Option<&'a CStr>,
+    descriptors: &'a [(i32, i32)],
+    boundary: i32,
+    ceiling: i32,
+    error: i32,
+    session: bool,
+    group: bool,
+}
+impl Exec<'_> {
+    unsafe fn run(&self) -> ! {
+        // SAFETY: spawn prepared every buffer and descriptor before fork.
+        // Only async-signal-safe calls run here; all failures use _exit.
+        unsafe {
+            for &(source, destination) in self.descriptors {
+                if libc::dup2(source, destination) < 0 {
+                    failed(self.error);
+                }
+            }
+            if let Some(directory) = self.directory {
+                if libc::chdir(directory.as_ptr()) < 0 {
+                    failed(self.error);
+                }
+            }
+            if self.session {
+                if libc::setsid() < 0 {
+                    failed(self.error);
+                }
+            } else if self.group && libc::setpgid(0, 0) < 0 {
+                failed(self.error);
+            }
+            // Close all undesired FDs, retaining only the CLOEXEC error writer.
+            let first = if self.error > self.boundary {
+                libc::syscall(
+                    libc::SYS_close_range,
+                    self.boundary.cast_unsigned(),
+                    (self.error - 1).cast_unsigned(),
+                    0,
+                )
+            } else {
+                0
+            };
+            let second = libc::syscall(
+                libc::SYS_close_range,
+                (self.error + 1).cast_unsigned(),
+                u32::MAX,
+                0,
+            );
+            if first < 0 || second < 0 {
+                for descriptor in self.boundary..self.ceiling {
+                    if descriptor != self.error {
+                        libc::close(descriptor);
+                    }
+                }
+            }
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut mask);
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&raw mut action.sa_mask);
+            for signal in 1..=64 {
+                if signal != libc::SIGKILL
+                    && signal != libc::SIGSTOP
+                    && libc::sigaction(signal, &raw const action, std::ptr::null_mut()) < 0
+                {
+                    // libc reserves a few real-time signals; EINVAL is benign.
+                    if *libc::__errno_location() != libc::EINVAL {
+                        failed(self.error);
+                    }
+                }
+            }
+            if libc::sigprocmask(libc::SIG_SETMASK, &raw const mask, std::ptr::null_mut()) < 0 {
+                failed(self.error);
+            }
+            libc::execve(
+                self.executable.as_ptr(),
+                self.arguments.as_ptr().cast(),
+                self.environment.as_ptr().cast(),
+            );
+            failed(self.error);
+        }
+    }
 }
 
 unsafe fn failed(writer: i32) -> ! {
