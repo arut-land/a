@@ -5,6 +5,11 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 [features]
+infrastructure = []
+signal-custom = ["infrastructure", "dep:sys"]
+signal-maintained = ["infrastructure", "dep:signal-hook"]
+temp-custom = ["infrastructure"]
+temp-maintained = ["infrastructure", "dep:tempfile"]
 custom = []
 event = ["dep:yaml-rust2"]
 saphyr = ["dep:saphyr"]
@@ -16,6 +21,13 @@ serde = { version = "1", default-features = false, features = ["std", "derive"] 
 serde_yaml_ng = { version = "=0.10.0", default-features = false, optional = true }
 yaml-rust2 = { version = "=0.13.0", default-features = false, optional = true }
 saphyr = { version = "0.2.2", default-features = false, optional = true }
+sys = { path = "../../../sys", optional = true }
+signal-hook = { version = "0.4.5", default-features = false, optional = true }
+tempfile = { version = "3.27", default-features = false, optional = true }
+[[bin]]
+name = "infrastructure"
+path = "src/infrastructure.rs"
+required-features = ["infrastructure"]
 [profile.release]
 opt-level = "s"
 lto = "fat"

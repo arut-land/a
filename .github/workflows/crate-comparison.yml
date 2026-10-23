@@ -1,5 +1,7 @@
 name: crate comparison
 on:
+  push:
+    branches: [codex-w6crates]
   workflow_dispatch:
 permissions:
   contents: read

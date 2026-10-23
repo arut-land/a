@@ -146,3 +146,24 @@ fn scalar_boundaries_do_not_change_comments_or_delimiters() {
         );
     }
 }
+
+#[test]
+fn maintained_yaml_accepts_portable_text_and_rejects_expansion() {
+    let parsed =
+        header("'name': review\ndescription: \"YAML\\Ntext\"\nmetadata: {x: [a, {y: z}]}\n")
+            .unwrap();
+    assert_eq!(parsed.name, "review");
+    assert_eq!(parsed.description, "YAML\u{85}text");
+    for extra in [
+        "metadata: {x: ok, x: duplicate}",
+        "metadata: &anchor [a]",
+        "metadata: !tag value",
+        "metadata: { ? [a, b]: value }",
+        "...\n---\nname: other\ndescription: other",
+    ] {
+        assert!(
+            header(&format!("name: review\ndescription: ok\n{extra}\n")).is_err(),
+            "{extra}"
+        );
+    }
+}
