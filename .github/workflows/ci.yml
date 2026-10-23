@@ -5,18 +5,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
-    inputs:
-      macos_runner:
-        description: 'Hosted macOS runner'
-        type: choice
-        options: [macos-latest, macos-15-intel]
-        default: macos-latest
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.macos_runner || 'macos-latest' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -27,28 +21,15 @@ env:
 
 jobs:
   check:
-    name: check (${{ matrix.os == 'macos-latest' && inputs.macos_runner || matrix.os }})
+    name: check (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         # Apple silicon and x86_64 Linux.
         os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os == 'macos-latest' && inputs.macos_runner || matrix.os }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      # mbx has no Intel macOS executable; Cargo can own its build cache there.
-      - &native-cargo
-        if: runner.os == 'macOS' && runner.arch == 'X64'
-        name: Use native Cargo
-        run: |
-          python3 - <<'PYTHON'
-          from pathlib import Path
-          path = Path('mise.toml')
-          text = path.read_text().replace('mr-boxington = "1.24.1"\n', '')
-          start = text.index('[wrappers.cargo]\n')
-          end = text.index('[tasks]\n', start)
-          path.write_text(text[:start] + text[end:])
-          PYTHON
       # mbx (the cargo wrapper in mise.toml) keeps compiled crates in its own
       # store; caching that store and the toolchain is what makes reruns fast.
       - &mbx-dir
@@ -67,7 +48,7 @@ jobs:
       - &mise
         uses: jdx/mise-action@v5
         with:
-          install_args: rust ${{ (runner.os != 'macOS' || runner.arch != 'X64') && 'mr-boxington' || '' }} cargo:cargo-nextest ${{ runner.os == 'Linux' && 'mold' || '' }}
+          install_args: rust mr-boxington cargo:cargo-nextest ${{ runner.os == 'Linux' && 'mold' || '' }}
       # The no-polling acceptance test traces the client's syscalls.
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev strace
@@ -80,7 +61,7 @@ jobs:
         run: mise run check:windows
 
   budgets:
-    name: budgets (${{ matrix.os == 'macos-latest' && inputs.macos_runner || matrix.os }})
+    name: budgets (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -90,12 +71,11 @@ jobs:
           # Latency is held to the design's budgets on one lane.
           - os: ubuntu-latest
             strict: 1
-    runs-on: ${{ matrix.os == 'macos-latest' && inputs.macos_runner || matrix.os }}
+    runs-on: ${{ matrix.os }}
     env:
       A_STRICT_BUDGETS: ${{ matrix.strict }}
     steps:
       - uses: actions/checkout@v7
-      - *native-cargo
       - *mbx-dir
       - *cache
       - *mise
@@ -105,9 +85,8 @@ jobs:
       # latency too where strict, else with slack.
       - run: mise run budgets
       # The shipped binary's size as a number to compare: this run's against
-      # the last one on main, warned about past 16 KiB. Apple silicon is
-      # the reference lane; the other skips the
-      # second release link.
+      # the last one on main, warned about past 16 KiB. Apple silicon is the
+      # reference lane; the other skips the second release link.
       - if: runner.os == 'macOS'
         run: mise run size | grep -o 'a:.*KiB' | tee size.txt
       - if: runner.os == 'macOS'
@@ -212,7 +191,7 @@ jobs:
       - *cache
       - uses: jdx/mise-action@v5
         with:
-          install_args: rust ${{ (runner.os != 'macOS' || runner.arch != 'X64') && 'mr-boxington' || '' }} cargo:cargo-nextest
+          install_args: rust mr-boxington cargo:cargo-nextest
       - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
       - run: mise exec -- cargo build -p a
       - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
@@ -222,25 +201,13 @@ jobs:
   # reducer vectors and a live session through it in Swift, then the app
   # built headless with xcodebuild.
   apple:
-    runs-on: ${{ inputs.macos_runner || 'macos-latest' }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - *native-cargo
-      - if: runner.arch == 'X64'
-        name: Use native Apple architecture
-        run: |
-          sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
-          python3 - <<'PYTHON'
-          from pathlib import Path
-          path = Path('crates/ffi/boltffi.toml')
-          path.write_text(path.read_text().replace('macos_architectures = ["arm64"]', 'macos_architectures = ["x86_64"]'))
-          path = Path('mise.toml')
-          path.write_text(path.read_text().replace('platform=macOS,arch=arm64', 'platform=macOS,arch=x86_64'))
-          PYTHON
       - *mbx-dir
       - *cache
       - uses: jdx/mise-action@v5
         with:
-          install_args: rust ${{ (runner.os != 'macOS' || runner.arch != 'X64') && 'mr-boxington' || '' }} github:boltffi/boltffi aqua:yonaskolb/XcodeGen
+          install_args: rust mr-boxington github:boltffi/boltffi aqua:yonaskolb/XcodeGen
       - run: mise run apple:test
       - run: mise run apple:build
