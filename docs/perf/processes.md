@@ -36,7 +36,7 @@ shutdown remains available. These are ownership limits, not shell confinement.
 
 ## Validation
 
-[CI](https://github.com/arut-land/a/actions/runs/39933755732), [native musl probe](https://github.com/arut-land/a/actions/runs/39927056319), [six-target performance run](https://github.com/arut-land/a/actions/runs/39927063613).
+[CI](https://github.com/arut-land/a/actions/runs/39936468315), [native musl probe](https://github.com/arut-land/a/actions/runs/39927056319), [merged six-target performance run](https://github.com/arut-land/a/actions/runs/39936472393).
 
 Regressions cover lease retention through cleanup, foreign-reaper revocation,
 nonblocking pidfd readiness without changing blocking wait semantics, descriptor
@@ -62,17 +62,24 @@ means no counter increment at OS resolution.
 
 | Target | Shipped KiB, before → after | Δ KiB | Cold reply ms, before → after | Idle RSS KiB, before → after | Idle daemon CPU ms, before → after |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Linux x86_64 | 4072.531 → 4100.156 | +27.625 | 6.97 → 5.36 | 7300 → 7260 | 0.00 → 0.00 |
-| Linux aarch64 | 3510.039 → 3533.664 | +23.625 | 6.68 → 6.13 | 6208 → 6296 | 0.00 → 0.00 |
-| macOS arm64 | 3170.281 → 3186.938 | +16.656 | 26.58 → 19.82 | 8608 → 8672 | 0.00 → 0.00 |
-| macOS x86_64 | 3788.109 → 3812.570 | +24.461 | 44.77 → 50.79 | 4004 → 4060 | 0.00 → 0.00 |
-| Windows x86_64 | 5267.000 → 5272.500 | +5.500 | 22.75 → 20.55 | 8356 → 8324 | 0.00 → 0.00 |
-| Windows ARM64 | 4625.000 → 4641.000 | +16.000 | 69.00 → 70.71 | 9660 → 9632 | 0.00 → 0.00 |
+| Linux x86_64 | 4072.531 → 4105.406 | +32.875 | 6.97 → 14.96 | 7300 → 7316 | 0.00 → 0.00 |
+| Linux aarch64 | 3510.039 → 3539.039 | +29.000 | 6.68 → 8.95 | 6208 → 6296 | 0.00 → 0.00 |
+| macOS arm64 | 3170.281 → 3187.078 | +16.797 | 26.58 → 28.13 | 8608 → 8608 | 0.00 → 0.00 |
+| macOS x86_64 | 3788.109 → 3812.688 | +24.578 | 44.77 → 40.34 | 4004 → 4056 | 0.00 → 0.00 |
+| Windows x86_64 | 5267.000 → 5280.500 | +13.500 | 22.75 → 17.84 | 8356 → 8340 | 0.00 → 0.00 |
+| Windows ARM64 | 4625.000 → 4647.500 | +22.500 | 69.00 → 77.18 | 9660 → 9640 | 0.00 → 0.00 |
 
-Measured runtime source: `82f6658325ed6dffaebd81fbcbe612b4bee36af1`. Raw observations and host/toolchain details
+Measured runtime source: `4a6005db23fbfcc4626b20c55318bd5d7e8fb41d`. This includes the endpoint ownership
+changes merged from `origin/main`, so these deltas are not attributable solely
+to process handling. Raw observations and host/toolchain details
 are retained in the performance run artifacts.
 
 ## Capture RSS
+
+[Capture stress run](https://github.com/arut-land/a/actions/runs/39927063613)
+measures process source `82f6658325ed6dffaebd81fbcbe612b4bee36af1`, before
+the endpoint ownership merge. Capture bounds and implementation are unchanged
+by that merge; the table above measures the integrated build.
 
 Each text job writes 8 MiB; eight simultaneous jobs retain 64 MiB in spill files.
 The metadata case writes 8 MiB inside an OSC sequence. Daemon and process-tree
