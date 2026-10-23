@@ -75,3 +75,18 @@ fn context(facts: &Facts<'_>) -> String {
     }
     text
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_publishes_the_same_execution_contract_as_shell_tools() {
+        let workspace = std::env::temp_dir().join("a-prompt-execution-facts");
+        let text = context(&Facts {
+            workspace: &workspace,
+            dir: &workspace,
+        });
+        assert!(text.contains(&sys::shell::ExecutionFacts::current().context()));
+    }
+}

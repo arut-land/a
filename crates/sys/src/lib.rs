@@ -29,7 +29,7 @@ mod signals;
 pub mod terminal;
 #[cfg(windows)]
 mod windows;
-#[cfg(all(test, not(windows)))]
+#[cfg(any(test, windows))]
 mod windows_quote;
 mod workspace;
 

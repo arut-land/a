@@ -440,6 +440,7 @@ fn spawn_with<D: crate::dialect::Dialect>(
     env.remove("ENV");
     let mut argv = vec![facts.executable.to_string_lossy().into_owned()];
     argv.extend(D::arguments(command, dir, report)?);
+    sys::shell::validate_argv(&argv)?;
     Ok(Spawn {
         argv,
         env,

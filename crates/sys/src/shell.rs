@@ -10,7 +10,7 @@ mod imp;
 #[path = "shell/windows.rs"]
 mod imp;
 
-pub use imp::find_bash;
+pub use imp::{find_bash, validate_argv};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {

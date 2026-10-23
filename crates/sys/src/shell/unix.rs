@@ -40,3 +40,8 @@ pub(super) fn apply_environment(
 ) {
     env.insert("TMPDIR".into(), facts.temp.to_string_lossy().into_owned());
 }
+
+/// Unix arguments are not transported in a Windows command line.
+pub fn validate_argv(_: &[String]) -> std::io::Result<()> {
+    Ok(())
+}

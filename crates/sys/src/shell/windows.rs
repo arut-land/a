@@ -187,6 +187,29 @@ pub(super) fn apply_environment(
     }
 }
 
+/// Check the complete native command line with the same quoting as `SpawnPlan`.
+pub fn validate_argv(argv: &[String]) -> std::io::Result<()> {
+    let mut units = 0usize;
+    for arg in argv {
+        let arg: Vec<_> = arg.encode_utf16().collect();
+        if arg.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "shell argument contains NUL",
+            ));
+        }
+        // One separator per argument also accounts for the final NUL.
+        units = units.saturating_add(crate::windows_quote::quote(&arg).len() + 1);
+    }
+    if units > 32767 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "shell command exceeds Windows' 32,767 UTF-16 command-line limit after native quoting",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
