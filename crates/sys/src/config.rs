@@ -39,7 +39,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -249,7 +249,7 @@ impl Config {
             Err(e) => return Err(e),
         };
         let text = self.render(&old).map_err(|e| invalid(path, &e))?;
-        write_private(path, text.as_bytes())
+        crate::fs::write_private(path, text.as_bytes())
     }
 
     /// `old` with the schema's keys replaced by this config's: in place
@@ -438,25 +438,6 @@ pub fn is_var_name(name: &str) -> bool {
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Replaces `path` with `bytes`, readable only by this user, so a reader
-/// sees the old file or the new one, never a torn or world-readable one.
-pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = dir.join(format!(".{name}.{}", std::process::id()));
-    let _ = fs::remove_file(&tmp);
-    let mut file = crate::fs::private_file().open(&tmp)?;
-    let written = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| crate::fs::replace(&tmp, path));
-    if written.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    written
 }
 
 #[cfg(test)]

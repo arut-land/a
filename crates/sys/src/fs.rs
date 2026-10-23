@@ -3,7 +3,7 @@
 //! remain readable by clients inspecting the daemon identity.
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write as _};
 use std::path::Path;
 
 /// Why discovery skipped a candidate instead of opening arbitrary filesystem objects.
@@ -353,6 +353,25 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
             "publish names with write-through rename",
         ))
     }
+}
+
+/// Replaces `path` with `bytes`, readable only by this user, so a reader
+/// sees the old file or the new one, never a torn or world-readable one.
+pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let mut file = private_file().open(&tmp)?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| replace(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Atomically replaces a name. Windows also waits for the move on disk.

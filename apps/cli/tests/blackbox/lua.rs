@@ -6,8 +6,7 @@ use protocol::{Body, Outcome, Target};
 use serde_json::{Value, json};
 
 fn write(dir: &Path, name: &str, source: &str) {
-    fs::create_dir_all(dir).unwrap();
-    fs::write(dir.join(format!("{name}.lua")), source).unwrap();
+    sys::fs::write_private(&dir.join(format!("{name}.lua")), source.as_bytes()).unwrap();
 }
 
 fn command(conn: &mut crate::common::Conn, text: &str) -> Outcome {
