@@ -1,6 +1,10 @@
 name: CI
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        type: string
+        default: windows-latest
 permissions:
   contents: read
 env:
@@ -8,7 +12,7 @@ env:
   MISE_AUTO_INSTALL: false
 jobs:
   windows-publication:
-    runs-on: windows-latest
+    runs-on: ${{ inputs.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v5
