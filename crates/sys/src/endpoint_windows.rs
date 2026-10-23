@@ -205,6 +205,10 @@ pub fn listener_nonblocking(listener: &Listener, value: bool) -> io::Result<()> 
 }
 
 pub fn accept(listener: &Listener) -> io::Result<Stream> {
+    accept_for(listener, &user_sid(None)?)
+}
+
+fn accept_for(listener: &Listener, owner: &str) -> io::Result<Stream> {
     let mut state = lock(&listener.state);
     loop {
         if state.operation.is_none() {
@@ -245,12 +249,17 @@ pub fn accept(listener: &Listener) -> io::Result<Stream> {
         let next = instance(&listener.path, false)?;
         state.operation = None;
         let connected = std::mem::replace(&mut state.file, next);
-        let mut pid = 0;
-        // SAFETY: connected owns the server pipe and pid is writable.
-        ok(unsafe { GetNamedPipeClientProcessId(connected.as_raw_handle(), &raw mut pid) })?;
-        verify_sid(&user_sid(Some(pid))?, &user_sid(None)?)?;
+        verify_client(&connected, owner)
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
         return Stream::new(connected);
     }
+}
+
+fn verify_client(file: &File, owner: &str) -> io::Result<()> {
+    let mut pid = 0;
+    // SAFETY: file owns the server pipe and pid is writable.
+    ok(unsafe { GetNamedPipeClientProcessId(file.as_raw_handle(), &raw mut pid) })?;
+    verify_sid(&user_sid(Some(pid))?, owner)
 }
 
 fn recycle(state: &mut Accept) -> io::Result<()> {
@@ -675,12 +684,21 @@ mod tests {
 
     #[test]
     fn foreign_user_identity_is_refused_before_protocol_io() {
-        let owner = user_sid(None).unwrap();
+        let home = home("foreign");
+        let listener = home.bind().unwrap();
+        let mut client = connect_pipe(&listener.0.path, None).unwrap();
         assert_eq!(
-            verify_sid("S-1-5-7", &owner).unwrap_err().kind(),
+            accept_for(&listener.0, "S-1-5-7").unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
-        verify_sid(&owner, &owner).unwrap();
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        let _client = connect_pipe(&listener.0.path, None).unwrap();
+        drop(accept(&listener.0).unwrap());
+        // A client also refuses the wrong server before sending its hello.
+        assert_eq!(
+            connect_pipe(&listener.0.path, Some(0)).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
@@ -760,7 +778,10 @@ mod tests {
             drop(connect_pipe(&listener.0.path, None).unwrap());
             match accept(&listener.0) {
                 Ok(stream) => drop(stream),
-                Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+                Err(error) => assert!(matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
+                )),
             }
             assert_eq!(
                 accept(&listener.0).unwrap_err().kind(),

@@ -325,9 +325,13 @@ mod imp {
     }
 
     pub fn connect(path: &Path) -> io::Result<UnixStream> {
+        connect_for(path, geteuid().as_raw())
+    }
+
+    pub(super) fn connect_for(path: &Path, owner: u32) -> io::Result<UnixStream> {
         validate_directory(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
         let stream = UnixStream::connect(path)?;
-        verify_peer(&stream)?;
+        verify_uid(peer_uid(&stream)?, owner)?;
         Ok(stream)
     }
 
@@ -391,8 +395,12 @@ mod imp {
     /// holds a whole write batch, so the writer waits on the socket once a
     /// batch rather than once each default 8 KiB macOS buffers.
     pub fn accept(listener: &Listener) -> io::Result<UnixStream> {
+        accept_for(listener, geteuid().as_raw())
+    }
+
+    pub(super) fn accept_for(listener: &Listener, owner: u32) -> io::Result<UnixStream> {
         let (stream, _) = listener.socket.accept()?;
-        verify_peer(&stream)?;
+        verify_uid(peer_uid(&stream)?, owner)?;
         // Only a speed-up: a socket that keeps its default still works.
         let _ = rustix::net::sockopt::set_socket_send_buffer_size(&stream, SEND_BUFFER);
         Ok(stream)
@@ -648,16 +656,35 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn foreign_user_identity_is_refused_before_protocol_io() {
-        let owner = rustix::process::geteuid().as_raw();
+        use std::io::Read;
+        let home = home("foreign");
+        std::fs::create_dir_all(home.root()).unwrap();
+        let listener = home.bind().unwrap();
+        let endpoint = home.endpoint();
+        // Expecting a different UID simulates a foreign peer while still
+        // exercising native credentials and the complete accept/connect paths.
+        let foreign = rustix::process::geteuid().as_raw().wrapping_add(1);
+        let mut client = endpoint.connect().unwrap();
         assert_eq!(
-            super::imp::verify_uid(owner.wrapping_add(1), owner)
+            super::imp::accept_for(&listener.0, foreign)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::PermissionDenied
         );
-        super::imp::verify_uid(owner, owner).unwrap();
-        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        super::OwnedConnection::try_from(ours).unwrap();
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        assert_eq!(
+            super::imp::connect_for(endpoint.path(), foreign)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let mut server = listener.accept().unwrap();
+        assert_eq!(server.read(&mut [0]).unwrap(), 0);
+        let _client = endpoint.connect().unwrap();
+        drop(listener.accept().unwrap());
+        drop(listener);
+        endpoint.remove();
+        std::fs::remove_dir_all(home.root()).unwrap();
     }
 
     #[cfg(unix)]
