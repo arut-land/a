@@ -1,5 +1,8 @@
 name: resource macos validation
 on:
+  push:
+    branches: [codex-w5rt]
+    paths: [.github/workflows/resource-macos-validation.yml]
   workflow_dispatch:
 permissions:
   contents: read
