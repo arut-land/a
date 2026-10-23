@@ -214,13 +214,15 @@ mod tests {
                 seen.pop_front();
             }
             seen.push_back(format!("{event:?}"));
-            // A stale descendant event cannot acknowledge root replacement;
-            // rearming for unrelated events can discard the one we await.
-            if let WatchEvent::Changed(paths) = event
-                && paths
+            // Descendants cannot acknowledge root replacement. Uncertainty
+            // instead requires a full scan, including the subscription inventory.
+            let scan = match event {
+                WatchEvent::Changed(paths) => paths
                     .iter()
-                    .any(|p| p == path || (!exact && path.starts_with(p)))
-            {
+                    .any(|p| p == path || (!exact && path.starts_with(p))),
+                _ => true,
+            };
+            if scan {
                 watcher.refresh().unwrap();
                 return;
             }
