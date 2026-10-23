@@ -97,26 +97,7 @@ impl Drop for Directory<'_> {
             }
         }
         #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Storage::FileSystem::{
-                DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
-                FILE_SHARE_WRITE, ReOpenFile,
-            };
-            // Reopen the owned directory object, never its potentially substituted name.
-            // SAFETY: the live directory handle identifies the object; the new handle is checked/owned.
-            let authority = crate::windows::owned(unsafe {
-                ReOpenFile(
-                    self.file.as_raw_handle(),
-                    DELETE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    FILE_FLAG_BACKUP_SEMANTICS,
-                )
-            });
-            if let Ok(authority) = authority.map(File::from) {
-                delete(&authority);
-            }
-        }
+        delete(&self.file);
     }
 }
 
@@ -420,8 +401,12 @@ pub(super) fn relative(
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
-    let sharing =
-        FILE_SHARE_READ | FILE_SHARE_DELETE | if directory { FILE_SHARE_WRITE } else { 0 };
+    let sharing = FILE_SHARE_READ
+        | if directory {
+            FILE_SHARE_WRITE
+        } else {
+            FILE_SHARE_DELETE
+        };
     relative_shared(parent, name, directory, create, sharing)
 }
 
@@ -473,11 +458,7 @@ fn relative_shared(
     let access = GENERIC_READ
         | SYNCHRONIZE
         | if create {
-            GENERIC_WRITE
-                | READ_CONTROL
-                | WRITE_DAC
-                | WRITE_OWNER
-                | if directory { 0 } else { DELETE }
+            GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER
         } else if directory {
             DELETE
         } else {

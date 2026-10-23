@@ -634,15 +634,11 @@ fn open_parent(path: &Path) -> io::Result<File> {
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
-        // CopyFileEx gets scoped path pins; publication uses shared directory handles.
+        // Pin the spelling used by CopyFileEx; publication uses the owned handle.
         fs::OpenOptions::new()
             .access_mode(GENERIC_READ | FILE_ADD_FILE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .share_mode(
-                FILE_SHARE_READ
-                    | FILE_SHARE_WRITE
-                    | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
-            )
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(path)
     }
 }
@@ -1361,6 +1357,17 @@ fn windows_policy_matches(source: &File, snapshot: &File) -> io::Result<bool> {
         Ok(policy)
     };
     let (a, b) = (read(source)?, read(snapshot)?);
+    #[cfg(test)]
+    // SAFETY: both descriptors retain the kernel-validated ACLs.
+    unsafe {
+        if !same_acl(a.acl, b.acl)? && !a.acl.is_null() && !b.acl.is_null() {
+            eprintln!(
+                "source ACL {:02x?}; snapshot ACL {:02x?}",
+                std::slice::from_raw_parts(a.acl.cast::<u8>(), usize::from((*a.acl).AclSize)),
+                std::slice::from_raw_parts(b.acl.cast::<u8>(), usize::from((*b.acl).AclSize))
+            );
+        }
+    }
     // SAFETY: both policy values retain the descriptors containing all SID/ACL pointers.
     Ok(unsafe {
         a.protected == b.protected
@@ -1443,15 +1450,6 @@ fn stage_windows(
         WRITE_OWNER,
     };
     let access = GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
-    let _source_pin = pin_copy_directory(&transaction.parent)
-        .map_err(|e| io::Error::new(e.kind(), format!("pin source directory: {e}")))?;
-    let _staging_pin = pin_copy_directory(&directory.file)
-        .map_err(|e| io::Error::new(e.kind(), format!("pin staging directory: {e}")))?;
-    if !same_object(&transaction.parent, &open_parent(&transaction.directory)?)?
-        || !same_object(&directory.file, &open_parent(&directory.path)?)?
-    {
-        return Err(io::ErrorKind::ResourceBusy.into());
-    }
     let Some((source, _)) = &transaction.source else {
         return super::staging::relative(
             &directory.file,
@@ -1566,26 +1564,6 @@ pub(super) fn accessible_links(file: &File) -> io::Result<u32> {
         });
     }
     Ok(information.NumberOfAccessibleLinks)
-}
-
-#[cfg(windows)]
-fn pin_copy_directory(directory: &File) -> io::Result<File> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::{
-        Foundation::GENERIC_READ,
-        Storage::FileSystem::{
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
-        },
-    };
-    // SAFETY: the existing handle pins the object while the sharing guard is acquired.
-    Ok(File::from(crate::windows::owned(unsafe {
-        ReOpenFile(
-            directory.as_raw_handle(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            FILE_FLAG_BACKUP_SEMANTICS,
-        )
-    })?))
 }
 
 #[cfg(windows)]
@@ -2920,6 +2898,10 @@ mod tests {
         transaction.revalidate().unwrap();
         assert!(preserved_metadata_matches(source, &staged.file, transaction.limit).unwrap());
         staged.prepare_vacancy().unwrap();
+        assert!(
+            windows_policy_matches(source, &staged.file).unwrap(),
+            "probe changed policy"
+        );
         let authority = source_authority(source).unwrap();
         transaction.revalidate().unwrap();
         staged.take_original(&authority, &transaction.name).unwrap();
