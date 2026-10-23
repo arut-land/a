@@ -369,9 +369,7 @@ fn command_line<'a>(
     Ok(out)
 }
 
-#[path = "windows_quote.rs"]
-mod quoting;
-use quoting::quote;
+use crate::windows_quote::quote;
 
 #[cfg(test)]
 mod tests {
