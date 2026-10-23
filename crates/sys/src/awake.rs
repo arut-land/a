@@ -55,7 +55,7 @@ mod imp {
             // SAFETY: `text` is a valid NUL-terminated string for the call;
             // a null allocator means the default one.
             let s = unsafe { CFStringCreateWithCString(std::ptr::null(), text.as_ptr(), UTF8) };
-            (!s.is_null()).then_some(Self(s))
+            (!s.is_null()).then(|| Self(s))
         }
     }
 
@@ -75,7 +75,7 @@ mod imp {
             // SAFETY: both strings live across the call, which copies what
             // it keeps; `id` is a valid place for the result.
             let status = unsafe { IOPMAssertionCreateWithName(kind.0, ON, name.0, &raw mut id) };
-            (status == 0).then_some(Self(id))
+            (status == 0).then(|| Self(id))
         }
     }
 

@@ -10,7 +10,9 @@ user sleep remains under OS policy.
 
 macOS uses `IOPMAssertionCreateWithName` with
 `PreventUserIdleSystemSleep`. `Drop` releases the assertion; the power
-manager also removes assertions when their owning process dies.
+manager also removes assertions when their owning process dies. Failed
+string allocation or assertion acquisition never constructs an owner to
+release an invalid resource.
 
 Windows uses `PowerCreateRequest` with a UTF-16 reason and one
 `PowerSetRequest(PowerRequestSystemRequired)`. The non-inherited
@@ -35,3 +37,7 @@ Native tests cover macOS assertion visibility and release, Windows
 independent non-inherited handles and Unicode reasons, invalid reasons,
 and the absence of a hold on unsupported platforms. CI supplies native
 OS checks and paired hosted performance measurements.
+
+Platform contracts: [Windows request lifetime](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-powercreaterequest),
+[Windows system-required policy](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-powersetrequest),
+[macOS assertion release](https://developer.apple.com/documentation/iokit/1557090-iopmassertionrelease).
