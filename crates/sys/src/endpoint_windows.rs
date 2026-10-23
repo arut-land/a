@@ -70,7 +70,7 @@ fn generation(record: &crate::crash::Record, root: &Path) -> io::Result<PathBuf>
     )))
 }
 
-pub fn remove(_path: &Path) {}
+pub fn remove(_path: &Path, _discovery: &Path) {}
 
 pub struct Listener {
     path: PathBuf,
@@ -122,7 +122,7 @@ fn instance(path: &Path, first: bool) -> io::Result<Arc<File>> {
     Ok(Arc::new(File::from(handle)))
 }
 
-pub fn bind(path: &Path, _link: &Path) -> io::Result<Listener> {
+pub fn bind(path: &Path, _link: &Path, _discovery: &Path) -> io::Result<Listener> {
     let root = path
         .parent()
         .and_then(Path::parent)
@@ -199,7 +199,7 @@ pub fn retire(retirement: Retirement) -> io::Result<()> {
     Ok(())
 }
 
-pub fn adopt(_file: File, _path: &Path) -> io::Result<Listener> {
+pub fn adopt(_file: File, _path: &Path, _discovery: &Path) -> io::Result<Listener> {
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "Windows daemon startup re-listens; inherited listeners are not accepted",
@@ -337,7 +337,7 @@ impl CompletionSource for Stream {
     }
 }
 
-pub fn connect(path: &Path) -> io::Result<Stream> {
+pub fn connect(path: &Path, _discovery: &Path) -> io::Result<Stream> {
     // The locked daemon record is also discovery: only its owner writes it.
     // A generation never reuses an old pipe namespace, even if a client
     // keeps an old instance alive after its server has exited.

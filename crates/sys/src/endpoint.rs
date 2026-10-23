@@ -3,7 +3,8 @@
 //! and one for a verified connection, so nothing above `sys` names a platform's.
 //!
 //! A listener claims its address before binding or removing a stale socket.
-//! Unix keeps a locked, persistent sibling file through inherited startup;
+//! Unix keeps a locked, persistent home claim through inherited startup and
+//! atomically publishes the socket pathname for clients with other environments;
 //! Linux uses a validated XDG runtime directory, an existing private
 //! `/run/user/UID`, or a private `/tmp/a-UID` fallback. Pathname sockets retain
 //! filesystem access control. macOS uses the private `/tmp/a-UID` directory.
@@ -22,7 +23,7 @@ use crate::proc::{Pass, Passed};
 
 /// Where a home's daemon listens.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Endpoint(PathBuf);
+pub struct Endpoint(PathBuf, PathBuf);
 
 impl Endpoint {
     pub fn path(&self) -> &Path {
@@ -31,12 +32,12 @@ impl Endpoint {
 
     /// A connection to whoever listens here.
     pub fn connect(&self) -> io::Result<OwnedConnection> {
-        imp::connect(&self.0).map(|stream| OwnedConnection(Stream(stream)))
+        imp::connect(&self.0, &self.1).map(|stream| OwnedConnection(Stream(stream)))
     }
 
     /// Removes a stale endpoint only when no listener holds its claim.
     pub fn remove(&self) {
-        imp::remove(&self.0);
+        imp::remove(&self.0, &self.1);
     }
 }
 
@@ -46,13 +47,15 @@ impl Home {
     /// through the daemon record.
     pub fn endpoint(&self) -> Endpoint {
         let hash = imp::home_hash(self.root());
-        Endpoint(imp::address(self.root(), hash))
+        let discovery = self.run_dir().join("daemon.endpoint");
+        Endpoint(imp::address(self.root(), hash), discovery)
     }
 
     /// Listens at [`Home::endpoint`], replacing a stale socket, and points
     /// [`Home::socket_link`] at it.
     pub fn bind(&self) -> io::Result<Listener> {
-        imp::bind(&self.endpoint().0, &self.socket_link()).map(Listener)
+        let endpoint = self.endpoint();
+        imp::bind(&endpoint.0, &self.socket_link(), &endpoint.1).map(Listener)
     }
 }
 
@@ -83,7 +86,7 @@ impl Listener {
 
     /// Adopts the listener and claim our parent bound and passed down.
     pub fn adopt(file: std::fs::File, endpoint: &Endpoint) -> io::Result<Self> {
-        imp::adopt(file, &endpoint.0).map(Self)
+        imp::adopt(file, &endpoint.0, &endpoint.1).map(Self)
     }
 }
 
@@ -293,8 +296,9 @@ impl Write for &Stream {
 #[cfg(unix)]
 mod imp {
     use std::fs;
-    use std::io;
+    use std::io::{self, Read};
     use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -326,12 +330,42 @@ mod imp {
         crate::fnv1a(root.as_os_str().as_encoded_bytes())
     }
 
-    pub fn address(_root: &Path, hash: u64) -> PathBuf {
-        socket_dir().join(format!("{hash:016x}.sock"))
+    pub fn address(root: &Path, hash: u64) -> PathBuf {
+        discover(&root.join("run/daemon.endpoint"))
+            .unwrap_or_else(|_| socket_dir().join(format!("{hash:016x}.sock")))
     }
 
-    pub fn connect(path: &Path) -> io::Result<UnixStream> {
-        connect_for(path, geteuid().as_raw())
+    fn discover(record: &Path) -> io::Result<PathBuf> {
+        validate_directory(record.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(record)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.uid() != geteuid().as_raw() || meta.mode() & 0o777 != 0o600 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid endpoint discovery",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(256).read_to_end(&mut bytes)?;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        if !path.is_absolute() || rustix::net::SocketAddrUnix::new(&path).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid endpoint pathname",
+            ));
+        }
+        Ok(path)
+    }
+
+    pub fn connect(_path: &Path, discovery: &Path) -> io::Result<UnixStream> {
+        connect_discovered_for(discovery, geteuid().as_raw())
+    }
+
+    pub(super) fn connect_discovered_for(discovery: &Path, owner: u32) -> io::Result<UnixStream> {
+        connect_for(&discover(discovery)?, owner)
     }
 
     pub(super) fn connect_for(path: &Path, owner: u32) -> io::Result<UnixStream> {
@@ -341,8 +375,10 @@ mod imp {
         Ok(stream)
     }
 
-    pub fn remove(path: &Path) {
-        if let Ok(_claim) = claim(path) {
+    pub fn remove(_path: &Path, discovery: &Path) {
+        if let Ok(_claim) = claim(discovery)
+            && let Ok(path) = discover(discovery)
+        {
             let _ = fs::remove_file(path);
         }
     }
@@ -373,22 +409,33 @@ mod imp {
         Ok(claim)
     }
 
-    pub fn bind(socket: &Path, link: &Path) -> io::Result<Listener> {
-        prepare_socket_dir(socket.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+    pub fn bind(socket: &Path, link: &Path, discovery: &Path) -> io::Result<Listener> {
+        crate::fs::private_dir(discovery.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
         // The claim inode is never unlinked: a waiter must not lock an old
         // inode while another daemon creates and locks a replacement.
-        let claim = claim(socket)?;
-        match fs::remove_file(socket) {
+        let claim = claim(discovery)?;
+        // A stale runtime directory may have disappeared since the last owner.
+        let socket = if socket
+            .parent()
+            .is_some_and(|dir| validate_directory(dir).is_ok())
+        {
+            socket.to_owned()
+        } else {
+            socket_dir().join(socket.file_name().ok_or(io::ErrorKind::InvalidInput)?)
+        };
+        prepare_socket_dir(socket.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+        match fs::remove_file(&socket) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let listener = UnixListener::bind(socket)?;
-        if fs::read_link(link).ok().as_deref() != Some(socket) {
+        let listener = UnixListener::bind(&socket)?;
+        crate::fs::write_private(discovery, socket.as_os_str().as_encoded_bytes())?;
+        if fs::read_link(link).ok().as_deref() != Some(socket.as_path()) {
             let _ = fs::remove_file(link);
             // Only a convenience: a home on a filesystem without symlinks
             // still works.
-            let _ = std::os::unix::fs::symlink(socket, link);
+            let _ = std::os::unix::fs::symlink(&socket, link);
         }
         Ok(Listener {
             socket: listener,
@@ -418,18 +465,24 @@ mod imp {
         listener.socket.set_nonblocking(nonblocking)
     }
 
-    pub fn adopt(file: fs::File, endpoint: &Path) -> io::Result<Listener> {
+    pub fn adopt(file: fs::File, endpoint: &Path, discovery: &Path) -> io::Result<Listener> {
         let number = std::env::var("A_ENDPOINT_CLAIM_FD")
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "missing endpoint claim"))?
             .parse::<i32>()
             .map_err(|_| io::ErrorKind::InvalidInput)?;
         let claim = crate::InheritedNumber::from(number).duplicate()?;
-        adopt_claim(file, claim, endpoint)
+        adopt_claim(file, claim, endpoint, discovery)
     }
 
-    pub fn adopt_claim(file: fs::File, claim: fs::File, endpoint: &Path) -> io::Result<Listener> {
+    pub fn adopt_claim(
+        file: fs::File,
+        claim: fs::File,
+        endpoint: &Path,
+        discovery: &Path,
+    ) -> io::Result<Listener> {
         validate_directory(endpoint.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
-        let probe = claim_file(endpoint)?;
+        validate_directory(discovery.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+        let probe = claim_file(discovery)?;
         let actual = claim.metadata()?;
         let expected = probe.metadata()?;
         if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino())
@@ -586,14 +639,26 @@ mod imp {
     }
 
     #[cfg(target_os = "linux")]
+    fn fits_socket(dir: &Path) -> bool {
+        // std's UnixListener requires room for the terminating NUL in Linux's
+        // 108-byte sun_path, even though the kernel also accepts unterminated paths.
+        dir.join("0000000000000000.sock")
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            < 108
+    }
+
+    #[cfg(target_os = "linux")]
     pub(super) fn runtime_dir(xdg: Option<PathBuf>, login: &Path, fallback: PathBuf) -> PathBuf {
         if let Some(dir) = xdg
             && dir.is_absolute()
             && validate_directory(&dir).is_ok()
+            && fits_socket(&dir)
         {
             return dir;
         }
-        if validate_directory(login).is_ok() {
+        if validate_directory(login).is_ok() && fits_socket(login) {
             return login.to_owned();
         }
         fallback
@@ -649,12 +714,15 @@ mod tests {
         let listener = home.bind().unwrap();
         let duplicate = || std::fs::File::from(listener.as_fd().try_clone_to_owned().unwrap());
         let endpoint = home.endpoint();
-        let unowned = super::imp::claim_file(endpoint.path()).unwrap();
-        assert!(super::imp::adopt_claim(duplicate(), unowned, endpoint.path()).is_err());
+        let unowned = super::imp::claim_file(&endpoint.1).unwrap();
+        assert!(
+            super::imp::adopt_claim(duplicate(), unowned, endpoint.path(), &endpoint.1).is_err()
+        );
         let adopted = super::imp::adopt_claim(
             duplicate(),
             listener.0.claim.try_clone().unwrap(),
             endpoint.path(),
+            &endpoint.1,
         )
         .unwrap();
         drop(listener);
@@ -686,7 +754,7 @@ mod tests {
         );
         assert_eq!(client.read(&mut [0]).unwrap(), 0);
         assert_eq!(
-            super::imp::connect_for(endpoint.path(), foreign)
+            super::imp::connect_discovered_for(&endpoint.1, foreign)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::PermissionDenied
@@ -746,6 +814,147 @@ mod tests {
             fallback
         );
         std::fs::remove_dir_all(home.root()).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_overlength_runtime_directory_uses_a_bindable_private_fallback() {
+        use std::os::unix::fs::DirBuilderExt;
+        let home = home("long-runtime");
+        std::fs::create_dir_all(home.root()).unwrap();
+        // Including the filename, 108 bytes is already too long for std's
+        // NUL-terminated Linux socket addresses.
+        let boundary = home
+            .root()
+            .join("b".repeat(86 - home.root().as_os_str().as_encoded_bytes().len() - 1));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&boundary)
+            .unwrap();
+        let fallback = home.root().join("fallback");
+        assert_eq!(
+            super::imp::runtime_dir(
+                Some(boundary),
+                &home.root().join("missing"),
+                fallback.clone()
+            ),
+            fallback
+        );
+        let long = home.root().join("x".repeat(100));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&long)
+            .unwrap();
+        let fallback = home.root().join("fallback");
+        assert_eq!(
+            super::imp::runtime_dir(
+                Some(long.clone()),
+                &home.root().join("missing"),
+                fallback.clone()
+            ),
+            fallback
+        );
+        differing_runtime_processes(&home, &long);
+        std::fs::remove_dir_all(home.root()).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clients_discover_the_live_owner_across_runtime_environments() {
+        use std::os::unix::fs::DirBuilderExt;
+        let home = home("discovery");
+        std::fs::create_dir_all(home.root()).unwrap();
+        let runtime = home.root().join("runtime");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&runtime)
+            .unwrap();
+        differing_runtime_processes(&home, &runtime);
+        std::fs::remove_dir_all(home.root()).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovery_client_child() {
+        let Some(root) = std::env::var_os("A_ENDPOINT_TEST_CLIENT") else {
+            return;
+        };
+        let home = Home::from(std::path::PathBuf::from(root));
+        assert!(
+            home.bind().is_err(),
+            "another environment cannot take the home claim"
+        );
+        home.endpoint().connect().unwrap();
+        home.endpoint().remove();
+        home.endpoint().connect().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn differing_runtime_processes(home: &Home, runtime: &std::path::Path) {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::fs::DirBuilderExt;
+        use std::process::{Command, Stdio};
+        // Constructed before the owner publishes discovery, just like a client
+        // waiting for its spawned daemon to become available.
+        let endpoint = home.endpoint();
+        let mut server = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "endpoint::tests::claim_holder_child",
+                "--nocapture",
+            ])
+            .env("A_ENDPOINT_TEST_CHILD", home.root())
+            .env("XDG_RUNTIME_DIR", runtime)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(server.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "owner exited before claiming"
+            );
+            if line.contains("claimed") {
+                break;
+            }
+            line.clear();
+        }
+        let different = home.root().join("other");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&different)
+            .unwrap();
+        let result = (|| {
+            endpoint.connect()?;
+            for runtime in [None, Some(&different)] {
+                let mut client = Command::new(std::env::current_exe().unwrap());
+                client
+                    .args([
+                        "--exact",
+                        "endpoint::tests::discovery_client_child",
+                        "--nocapture",
+                    ])
+                    .env("A_ENDPOINT_TEST_CLIENT", home.root())
+                    .env_remove("A_ENDPOINT_TEST_CHILD")
+                    .env_remove("XDG_RUNTIME_DIR");
+                if let Some(runtime) = runtime {
+                    client.env("XDG_RUNTIME_DIR", runtime);
+                }
+                if !client.status()?.success() {
+                    return Err(io::Error::other("discovery client failed"));
+                }
+            }
+            Ok::<_, io::Error>(())
+        })();
+        server.kill().unwrap();
+        server.wait().unwrap();
+        result.unwrap();
+        let successor = home.bind().unwrap();
+        endpoint.connect().unwrap();
+        drop(successor.accept().unwrap());
+        successor.retirement().unwrap().retire().unwrap();
     }
 
     #[cfg(unix)]
