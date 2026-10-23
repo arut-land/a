@@ -633,22 +633,6 @@ fn torn(tail: &[u8]) -> (Fixture, PathBuf, Header, Vec<Entry>) {
     (store, path, h, written)
 }
 
-#[test]
-fn jsonl_drops_a_torn_tail_and_appends_after_it() {
-    for tail in [
-        &br#"{"seq":3,"epo"#[..],
-        br#"{"seq":3,"epoch":0,"kind":"user","text":"m3"}"#,
-    ] {
-        let (store, _, h, mut written) = torn(tail);
-        assert_eq!(store.count(h.id).unwrap(), 2);
-        let (mut loaded, entries) = load(&*store, h.id);
-        assert_eq!(entries, written);
-        written.extend(append(&mut loaded, 3..=4));
-        assert_eq!(entries_of(&*store, h.id), written);
-        assert_eq!(store.count(h.id).unwrap(), 4);
-    }
-}
-
 /// What a crash cut short is cut off before anything indexes it: no read
 /// lands in it, and what is appended after it reads back whole.
 #[test]
@@ -656,7 +640,12 @@ fn a_torn_tail_is_never_indexed() {
     let unterminated = br#"{"seq":3,"epoch":0,"kind":"user","text":"m3"}"#;
     for tail in [&br#"{"seq":3,"epo"#[..], unterminated, b"not json\n"] {
         let (store, path, h, mut written) = torn(tail);
-        let (mut loaded, _) = load(&*store, h.id);
+        let before = fs::read(&path).unwrap();
+        assert_eq!(store.prefix(h.id, 2).unwrap(), written);
+        assert!(store.prefix(h.id, 3).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let (mut loaded, entries) = load(&*store, h.id);
+        assert_eq!(entries, written);
         assert_eq!(
             line(&*loaded.lines, 3).unwrap_err().kind(),
             ErrorKind::NotFound

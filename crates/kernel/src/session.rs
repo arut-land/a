@@ -708,30 +708,27 @@ impl Core {
                 let side = self.side(of, purpose, model, request, background, fx);
                 fx.immediate.push(Work::Side { ticket, side });
             }
-            crate::SideEvent::Retry {
-                side,
-                by,
-                attempt,
-                failure,
-                after_ms,
-                ticket,
-            } => self.side_retry(
-                side,
-                &by,
-                Verdict::SideRetry {
+            crate::SideEvent::Fact { side, fact, ticket } => match fact {
+                crate::SideFact::Retry {
+                    by,
                     attempt,
                     failure,
                     after_ms,
-                },
-                ticket,
-                fx,
-            ),
-            crate::SideEvent::Done {
-                side,
-                outcome,
-                failure,
-                ticket,
-            } => self.side_done(side, outcome, failure, ticket, fx),
+                } => self.side_retry(
+                    side,
+                    &by,
+                    Verdict::SideRetry {
+                        attempt,
+                        failure,
+                        after_ms,
+                    },
+                    ticket,
+                    fx,
+                ),
+                crate::SideFact::Done { outcome, failure } => {
+                    self.side_done(side, outcome, failure, ticket, fx);
+                }
+            },
         }
     }
 

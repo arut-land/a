@@ -120,10 +120,9 @@ impl Projection {
     pub fn fold(&mut self, prefix: &ext::LogPrefix) {
         let log = self.logs.entry(prefix.session).or_default();
         if prefix.reset {
-            log.facts.clear();
-            log.uncertain.clear();
+            *log = Conversation::default();
         }
-        let after = if prefix.reset { 0 } else { log.covered.seq };
+        let after = log.covered.seq;
         for entry in &prefix.entries {
             if entry.seq.get() <= after.max(prefix.inherited_through) {
                 continue;
@@ -159,17 +158,15 @@ impl Projection {
                 }
                 _ => {}
             }
-            if let Some(fact) = &fact {
+            if let Some(fact) = fact {
                 log.uncertain
                     .retain(|id| *id != (fact.id.call, fact.id.attempt));
-            }
-            if let Some(fact) = fact
-                && let Err(i) = log.facts.binary_search_by_key(&fact.id, |f| f.id)
-            {
-                log.facts.insert(i, fact);
+                if let Err(i) = log.facts.binary_search_by_key(&fact.id, |f| f.id) {
+                    log.facts.insert(i, fact);
+                }
             }
         }
-        if prefix.reset || prefix.cursor.seq >= log.covered.seq {
+        if prefix.cursor.seq >= log.covered.seq {
             log.covered = prefix.cursor;
         }
     }

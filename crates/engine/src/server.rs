@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
@@ -93,7 +93,7 @@ pub(crate) async fn refuse(reactor: &Reactor, listener: &Async<&Listener>, why: 
     while let Some(stream) = next.take() {
         if let Ok(io) = Async::new(reactor, stream) {
             let io = Arc::new(io);
-            if write_all(&io, frame.as_bytes()).await.is_ok() {
+            if io.write_all(frame.as_bytes()).await.is_ok() {
                 // What it sent is read and dropped until it hangs up.
                 within(reactor, REFUSED_GRACE, Frames::new(io).drain()).await;
             }
@@ -164,17 +164,6 @@ impl Frames {
     }
 }
 
-/// Writes all of `bytes`, waiting whenever the socket is full.
-async fn write_all(io: &Async<Stream>, mut bytes: &[u8]) -> io::Result<()> {
-    while !bytes.is_empty() {
-        match io.write_with(|mut s| s.write(bytes)).await? {
-            0 => return Err(io::ErrorKind::WriteZero.into()),
-            n => bytes = &bytes[n..],
-        }
-    }
-    io.flush().await
-}
-
 /// Writes what `outbox` hands out until it closes, as many frames as are
 /// ready at a time, up to [`WRITE_BATCH`] bytes: the client's cursor into
 /// what it is sent, moved on as the socket takes it.
@@ -187,7 +176,7 @@ async fn write_out(io: Arc<Async<Stream>>, outbox: Outbox, rt: rt::Rt) {
         {
             batch.extend_from_slice(frame.as_bytes());
         }
-        if write_all(&io, &batch).await.is_err() {
+        if io.write_all(&batch).await.is_err() {
             outbox.abandon();
             let _ = io.get_ref().shutdown(std::net::Shutdown::Both);
             return;
@@ -566,6 +555,7 @@ impl Conn<'_> {
 mod tests {
     use super::*;
     use rt::Runtime as _;
+    use std::io::Write;
 
     #[test]
     fn ready_incoming_frames_yield_before_reading_another_batch() {

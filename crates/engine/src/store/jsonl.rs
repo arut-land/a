@@ -254,7 +254,8 @@ impl LogStore for Jsonl {
         cursor: &mut ext::LogCursor,
         through: u64,
     ) -> io::Result<(bool, Vec<Entry>)> {
-        let mut reader = BufReader::new(File::open(self.path(id)?)?);
+        let file = File::open(self.path(id)?)?;
+        let mut reader = BufReader::new(&file);
         let mut line = Vec::new();
         let mut reset = false;
         if cursor.seq != 0 {
@@ -284,22 +285,23 @@ impl LogStore for Jsonl {
         };
         let mut entries = Vec::new();
         let mut offset = reader.stream_position()?;
-        while history.seq < through {
-            line.clear();
-            let bytes = reader.read_until(b'\n', &mut line)? as u64;
-            if !unseal(&mut line) {
-                return Err(io::Error::other("incomplete or damaged session suffix"));
-            }
-            let entry = history
-                .decode(&line)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            *cursor = ext::LogCursor {
-                seq: entry.seq.get(),
-                epoch: entry.epoch,
-                offset,
-            };
-            offset += bytes;
-            entries.push(entry);
+        let damage = scan(
+            &mut reader,
+            &mut line,
+            &mut history,
+            through,
+            |entry, end| {
+                *cursor = ext::LogCursor {
+                    seq: entry.seq.get(),
+                    epoch: entry.epoch,
+                    offset,
+                };
+                offset = end;
+                entries.push(entry);
+            },
+        )?;
+        if damage.is_some() || history.seq != through {
+            return Err(io::Error::other("incomplete or damaged session suffix"));
         }
         Ok((reset, entries))
     }
@@ -608,34 +610,48 @@ impl Index {
         through: u64,
         mut each: impl FnMut(Entry),
     ) -> io::Result<Option<ReadOnly>> {
-        let mut end = self.end();
-        (&self.file).seek(SeekFrom::Start(end))?;
         let mut reader = BufReader::with_capacity(64 * 1024, &self.file);
+        reader.seek(SeekFrom::Start(self.end()))?;
         let ends = self.ends.get_mut().unwrap_or_else(PoisonError::into_inner);
-        let mut line = Vec::new();
-        loop {
-            if history.seq == through {
-                return Ok(other);
-            }
-            line.clear();
-            let n = reader.read_until(b'\n', &mut line)?;
-            if n == 0 {
-                return Ok(other);
-            }
-            let sealed = unseal(&mut line);
-            if let Some(entry) = sealed.then(|| history.decode(&line).ok()).flatten() {
-                end += n as u64;
+        scan(
+            &mut reader,
+            &mut Vec::new(),
+            history,
+            through,
+            |entry, end| {
                 ends.ends.push(end);
                 each(entry);
-                continue;
-            }
+            },
+        )
+        .map(|damage| other.or(damage))
+    }
+}
+
+/// Reading a prefix never repairs it; only load decides whether to trim a torn tail.
+fn scan(
+    reader: &mut BufReader<&File>,
+    line: &mut Vec<u8>,
+    history: &mut History,
+    through: u64,
+    mut each: impl FnMut(Entry, u64),
+) -> io::Result<Option<ReadOnly>> {
+    let mut end = reader.stream_position()?;
+    while history.seq < through {
+        line.clear();
+        let n = reader.read_until(b'\n', line)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let sealed = unseal(line);
+        if let Some(entry) = sealed.then(|| history.decode(line).ok()).flatten() {
+            end += n as u64;
+            each(entry, end);
+        } else {
             let torn = !sealed && reader.fill_buf()?.is_empty();
-            let damaged = ReadOnly::Damaged {
-                seq: ends.ends.len() as u64 + 1,
-            };
-            return Ok(other.or((!torn).then_some(damaged)));
+            return Ok((!torn).then(|| history.damage()));
         }
     }
+    Ok(None)
 }
 
 fn little_endian(ends: &[u64]) -> Vec<u8> {
