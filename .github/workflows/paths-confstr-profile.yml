@@ -25,6 +25,12 @@ jobs:
           #include <stdlib.h>
           #include <time.h>
           #include <unistd.h>
+          static volatile unsigned long sink;
+          static void consume(const char *path) {
+              unsigned long hash = 5381;
+              for (; *path; ++path) hash = hash * 33 + (unsigned char)*path;
+              sink = hash;
+          }
           int main(int argc, char **argv) {
               if (argc != 2) return 1;
               struct timespec start, end;
@@ -36,10 +42,12 @@ jobs:
                   if (!path) return 3;
                   size_t written = confstr(_CS_DARWIN_USER_TEMP_DIR, path, length);
                   if (!written || written > length || path[0] != '/') return 4;
+                  consume(path);
                   free(path);
               } else {
                   char path[64];
                   if (snprintf(path, sizeof(path), "/tmp/a-%u", geteuid()) < 0) return 5;
+                  consume(path);
               }
               clock_gettime(CLOCK_MONOTONIC, &end);
               double ms = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
