@@ -116,7 +116,9 @@ runner. Reference builds omit the protocol and TUI bench executables, which
 these paired windows do not use. Five alternating AB/BA rounds measure startup, cold reply, attach,
 idle RSS/CPU, driver turns, large JSON and recorded-provider decode. Paired driver batches use 500 turns (250 per barrier); JSON batches use 200 results
 to reduce native CPU counter quantization; the full suite retains its original
-20-result JSON and 100-turn driver workloads. Each role uses fresh isolated
+20-result JSON and 100-turn driver workloads. Paired rounds also run those
+regular-size cases so long batches cannot hide a resident-code cost in peak RSS.
+Each role uses fresh isolated
 homes. All builds finish before these paired windows. Both raw observations
 and `paired.json` remain in the artifact, with a second summary table. Use
 this comparison when different hosted CPUs or storage obscure a small change.

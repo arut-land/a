@@ -283,6 +283,7 @@ def paired(output, source, reference):
 
     def checkpoint():
         result = dict(driver_turns=500, large_json_results=200,
+                      regular_driver_turns=100, regular_large_json_results=20,
                       reference_revision=reference, candidate_revision=candidate_revision,
                       completed_rounds=completed, order=orders,
                       roles={role: {name: distribution(samples) for name, samples in observed.items()}
@@ -308,17 +309,21 @@ def paired(output, source, reference):
                 ("startup", [str(directory / ("a" + SUFFIX)), "--version"], 20),
                 ("driver", [str(directory / ("engine-bench" + SUFFIX)), "bench_turns_under_each_barrier_setting",
                             "--ignored", "--nocapture", "--test-threads=1"], 1),
+                ("driver_regular", [str(directory / ("engine-bench" + SUFFIX)), "bench_turns_under_each_barrier_setting",
+                                    "--ignored", "--nocapture", "--test-threads=1"], 1),
                 ("large_json", [str(directory / ("engine-bench" + SUFFIX)), "bench_large_tool_result",
                                 "--ignored", "--nocapture", "--test-threads=1"], 1),
+                ("large_json_regular", [str(directory / ("engine-bench" + SUFFIX)), "bench_large_tool_result",
+                                        "--ignored", "--nocapture", "--test-threads=1"], 1),
                 ("llm_decode", [str(directory / ("llm-bench" + SUFFIX)), "decode_recorded",
                                 "--exact", "--ignored", "--nocapture", "--test-threads=1"], 1),
             ]:
                 path = saved / (name + ".json")
                 env = dict(os.environ)
-                if name == "large_json":
-                    env["A_BENCH_JSON_RESULTS"] = "200"
-                elif name == "driver":
-                    env["A_BENCH_DRIVER_TURNS"] = "250"
+                if name.startswith("large_json"):
+                    env["A_BENCH_JSON_RESULTS"] = "20" if name.endswith("regular") else "200"
+                elif name.startswith("driver"):
+                    env["A_BENCH_DRIVER_TURNS"] = "50" if name.endswith("regular") else "250"
                 run(["hyperfine", "-N", "--warmup", "1", "--runs", str(runs), "--metrics", "all",
                      "--export-json", path, workloads.command(argv)], env=env)
                 result = json.loads(path.read_text())["results"][0]
