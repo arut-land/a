@@ -16,9 +16,8 @@ impl Backend {
         let mut aliases: Vec<_> = wanted
             .keys()
             .filter_map(|path| {
-                path.canonicalize()
-                    .ok()
-                    .map(|resolved| (resolved, path.clone()))
+                let resolved = path.canonicalize().ok()?;
+                (resolved != *path).then(|| (resolved, path.clone()))
             })
             .collect();
         aliases.sort_by_key(|(resolved, _)| std::cmp::Reverse(resolved.components().count()));
