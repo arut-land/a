@@ -390,12 +390,12 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     written
 }
 
-/// Atomically replaces a name. Windows also waits for the move on disk.
+/// Atomically replaces a name, without a directory durability promise.
 pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(unix)]
     return fs::rename(from, to);
     #[cfg(windows)]
-    move_file(from, to, true)
+    edit::replace(from, to)
 }
 
 #[cfg(windows)]
@@ -436,10 +436,17 @@ fn move_file(from: &Path, to: &Path, replacing: bool) -> io::Result<()> {
 
 /// Publishes an already flushed file, including its directory entry.
 pub fn publish(from: &Path, to: &Path) -> io::Result<()> {
-    replace(from, to)?;
     #[cfg(unix)]
-    sync_dir(to.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
-    Ok(())
+    {
+        replace(from, to)?;
+        sync_dir(
+            to.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )
+    }
+    #[cfg(windows)]
+    move_file(from, to, true)
 }
 
 /// Removes the durable name before best-effort reclamation of its contents.

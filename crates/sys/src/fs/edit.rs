@@ -232,9 +232,13 @@ impl EditTransaction {
             .into());
         }
         self.revalidate()?;
-        let (name, file) = self
-            .stage()
-            .map_err(|error| self.revalidate().err().unwrap_or(EditError::Io(error)))?;
+        let (name, file) = self.stage().map_err(|error| {
+            if error.kind() == io::ErrorKind::ResourceBusy {
+                EditError::Conflict(EditConflict::Changed)
+            } else {
+                self.revalidate().err().unwrap_or(EditError::Io(error))
+            }
+        })?;
         let pending = Pending {
             transaction: &self,
             name,
@@ -693,7 +697,9 @@ fn stage_windows(transaction: &EditTransaction, name: &std::ffi::OsStr) -> io::R
             remove_pending(&destination);
         }
         // Only exclusive-create collisions may retry with a fresh name.
-        return if error.kind() == io::ErrorKind::AlreadyExists && !owned {
+        return if (error.kind() == io::ErrorKind::AlreadyExists && !owned)
+            || error.kind() == io::ErrorKind::ResourceBusy
+        {
             Err(error)
         } else {
             Err(io::Error::other(error))
@@ -768,7 +774,10 @@ unsafe extern "system" fn copy_progress(
         let result = (|| {
             let copied_source = reopen(source, FILE_READ_ATTRIBUTES)?;
             if !same_object(context.source, &copied_source)? {
-                return Err(io::Error::other("edit source changed during native copy"));
+                return Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    "edit source changed during native copy",
+                ));
             }
             let keeper = reopen(
                 destination,
@@ -905,16 +914,39 @@ fn rename(
     file: &File,
     replacing: bool,
 ) -> io::Result<()> {
+    rename_windows(
+        file,
+        &transaction.directory.join(&transaction.name),
+        replacing,
+    )
+}
+
+#[cfg(windows)]
+pub(super) fn replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_OPEN_REPARSE_POINT};
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .access_mode(DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(from)?;
+    let parent = to
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let to = parent
+        .canonicalize()?
+        .join(to.file_name().ok_or(io::ErrorKind::InvalidInput)?);
+    rename_windows(&file, &to, true)
+}
+
+#[cfg(windows)]
+fn rename_windows(file: &File, to: &Path, replacing: bool) -> io::Result<()> {
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle,
     };
-    let name: Vec<u16> = transaction
-        .directory
-        .join(&transaction.name)
-        .as_os_str()
-        .encode_wide()
-        .collect();
+    let name: Vec<u16> = to.as_os_str().encode_wide().collect();
     let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
     let bytes = offset + name.len() * 2;
     let length = u32::try_from(bytes).map_err(|_| io::ErrorKind::InvalidInput)?;
@@ -1366,13 +1398,22 @@ mod tests {
                 let path = work.target();
                 std::thread::spawn(move || {
                     gate.wait();
-                    super::super::write_private(&path, &[byte; 8192]).unwrap();
+                    super::super::write_private(&path, &[byte; 8192])
                 })
             })
             .collect();
+        let mut completed = 0;
         for writer in writers {
-            writer.join().unwrap();
+            match writer.join().unwrap() {
+                Ok(()) => completed += 1,
+                // Write-through MoveFileEx may reject racing replacements;
+                // each failed save must abort cleanly, never share staging.
+                #[cfg(windows)]
+                Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) => {}
+                Err(error) => panic!("{error}"),
+            }
         }
+        assert!(completed > 0);
         let bytes = fs::read(work.target()).unwrap();
         assert_eq!(bytes.len(), 8192);
         assert!(bytes.iter().all(|byte| *byte == bytes[0]));
