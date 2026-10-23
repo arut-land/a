@@ -52,7 +52,7 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
     let writer = File::from(std::os::fd::OwnedFd::from(writer));
     let null = File::options().read(true).write(true).open("/dev/null")?;
     let child = crate::proc::unix::SpawnPlan::new(&command, [&null, &writer, &null])
-        .environment()
+        .inherit_snapshot()
         .spawn()?;
     drop(writer);
     let group = crate::ProcessLease::new(&child);

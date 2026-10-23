@@ -132,9 +132,29 @@ impl Processes for Provider {
     }
 }
 
-async fn launch(
+fn launch(
     cx: &Cx,
-    mut launch: LaunchSpec,
+    launch: LaunchSpec,
+    watch: impl FnOnce(&mut sys::Child) -> io::Result<sys::ExitWatch>,
+    register: impl FnOnce(
+        &rt::Reactor,
+        sys::ProcessPipe,
+        u32,
+    ) -> io::Result<rt::Async<sys::ProcessPipe>>,
+) -> impl Future<Output = io::Result<OwnedProcess>> {
+    let admitted = match Permit::acquire() {
+        Ok(permit) => Ok((permit, launch)),
+        Err(error) => {
+            drop(launch);
+            Err(error)
+        }
+    };
+    launch_admitted(cx, admitted, watch, register)
+}
+
+async fn launch_admitted(
+    cx: &Cx,
+    admitted: io::Result<(Permit, LaunchSpec)>,
     watch: impl FnOnce(&mut sys::Child) -> io::Result<sys::ExitWatch>,
     register: impl FnOnce(
         &rt::Reactor,
@@ -142,7 +162,7 @@ async fn launch(
         u32,
     ) -> io::Result<rt::Async<sys::ProcessPipe>>,
 ) -> io::Result<OwnedProcess> {
-    let permit = Permit::acquire()?;
+    let (permit, mut launch) = admitted?;
     let rt = cx
         .service::<dyn rt::Runtime>()
         .ok_or_else(|| io::Error::other("no runtime"))?;
@@ -405,14 +425,23 @@ mod tests {
         let rig = Rig::new("process-capacity", Registry::default());
         let cx = rig.cx();
         rt::block_on(async {
+            let mut queued: Vec<_> = (0..MAX_PROCESSES)
+                .map(|_| Provider.spawn(&cx, spec(&cx, "read -r line")))
+                .collect();
+            assert_eq!(
+                Provider
+                    .spawn(&cx, spec(&cx, "read -r line"))
+                    .await
+                    .err()
+                    .expect("queued work exceeded capacity")
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(queued.pop());
+            queued.push(Provider.spawn(&cx, spec(&cx, "read -r line")));
             let mut children = Vec::new();
-            for _ in 0..MAX_PROCESSES {
-                children.push(
-                    Provider
-                        .spawn(&cx, spec(&cx, "read -r line"))
-                        .await
-                        .unwrap(),
-                );
+            for launching in queued {
+                children.push(launching.await.unwrap());
             }
             let refused = Provider
                 .spawn(&cx, spec(&cx, "read -r line"))

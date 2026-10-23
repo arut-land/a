@@ -1,8 +1,7 @@
-//! Processes: groups a command's whole tree lives in, handles a child is
-//! given, and watches on a process's exit.
+//! Owned process scopes, explicit resource inheritance, and exit observation.
 //!
-//! [`ProcessLease`] holds live containment; [`RecordedIdentity`] is only its recovery
-//! identity. Windows jobs die with their daemon, leaving no recovery handles.
+//! [`ProcessLease`] holds live authority; [`RecordedIdentity`] is diagnostic
+//! data. Windows jobs die with their daemon, leaving no recovery handles.
 
 use std::fs::File;
 use std::io;
@@ -14,6 +13,12 @@ pub(crate) use imp::passed;
 #[cfg(unix)]
 pub(crate) use imp::raw;
 pub use imp::{Child, ExitWatch};
+
+#[derive(Clone, Copy)]
+pub(crate) enum SpawnEnvironment {
+    Exact,
+    InheritSnapshot,
+}
 
 /// Finds bash using the system location first, then the session's PATH.
 pub fn find_bash(search: Option<&str>) -> Option<String> {
@@ -228,7 +233,7 @@ pub fn daemon_ready() -> io::Result<()> {
     imp::daemon_ready()
 }
 
-/// Creates a command's process tree as a group before any user code runs.
+/// Creates a command in an owned native scope before any user code runs.
 pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<ContainedChild> {
     #[cfg(unix)]
     {
@@ -389,7 +394,10 @@ impl RecordedProcess {
         #[cfg(windows)]
         return self.process.signal(signal);
         #[cfg(target_os = "linux")]
-        return rustix::process::pidfd_send_signal(&self.process, raw(signal)).map_err(Into::into);
+        return match rustix::process::pidfd_send_signal(&self.process, raw(signal)) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(error) => Err(error.into()),
+        };
         #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = signal;
@@ -403,9 +411,8 @@ pub fn exit_signal(status: ExitStatus) -> Option<String> {
     imp::exit_signal(status)
 }
 
-/// Identifies the current boot, so recorded groups are never acted on
-/// after a reboot. Kept once found; a failure is asked again next time,
-/// never remembered.
+/// Identifies the current boot for recorded process diagnostics. A failed
+/// lookup is retried; a successful identity is stable for the process lifetime.
 pub fn boot_id() -> Option<&'static str> {
     static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     if let Some(id) = BOOT.get() {
@@ -1043,7 +1050,7 @@ fn spawn_stdio_role(
         };
         let plan = unix::SpawnPlan::new(cmd, [&child_input, &child_output, &error]);
         let plan = if terminal {
-            plan.terminal().environment()
+            plan.terminal().inherit_snapshot()
         } else {
             plan
         };

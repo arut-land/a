@@ -701,3 +701,19 @@ fn background_output_cannot_exceed_the_spill_limit() {
     wait_dead(job.pgid);
     assert_eq!(std::fs::metadata(job.log).unwrap().len(), OUTPUT_CAP);
 }
+
+#[test]
+fn unterminated_terminal_metadata_cannot_grow_retained_output() {
+    let (mut output, mut live) = (Output::default(), Live::default());
+    let baseline = ALLOC.reset();
+    output.push(b"\x1b]0;");
+    live.push(b"\x1b]0;");
+    let chunk = [b'x'; 4096];
+    for _ in 0..2048 {
+        output.push(&chunk);
+        live.push(&chunk);
+    }
+    assert!(ALLOC.peak().saturating_sub(baseline) < 256 << 10);
+    assert_eq!(output.finish(Path::new("unused")).text, "");
+    assert_eq!(live.take(), None);
+}

@@ -13,7 +13,7 @@ from process import stop_daemon
 output = Path('target/hosted-perf')
 binary = str((output / ('a-fixtures.exe' if os.name == 'nt' else 'a-fixtures')).resolve())
 records = []
-for count in (1, 8):
+for count, kind in ((1, "text"), (8, "text"), (1, "terminal_metadata")):
     with tempfile.TemporaryDirectory(prefix='a-process-wave-', dir=os.environ.get('RUNNER_TEMP')) as root:
         root = Path(root)
         home = root / 'home'
@@ -29,10 +29,11 @@ for count in (1, 8):
             idle = daemon.memory_info().rss
             peak, tree_peak, samples = idle, idle, 0
             started = time.monotonic()
+            command = '$ yes x | head -c 8388608' if kind == 'text' else "$ printf '\\033]0;'; yes x | head -c 8388608; printf '\\007'"
             for i in range(count):
                 stream = (root / f'client-{i}.log').open('wb')
                 files.append(stream)
-                children.append(subprocess.Popen([binary, '--mode', 'auto', '-p', '$ yes x | head -c 8388608'],
+                children.append(subprocess.Popen([binary, '--mode', 'auto', '-p', command],
                     env=env, cwd=root, stdin=subprocess.DEVNULL, stdout=stream, stderr=stream))
             while any(child.poll() is None for child in children):
                 assert time.monotonic() - started < 120, 'shell workload timed out'
@@ -49,9 +50,10 @@ for count in (1, 8):
             assert all(child.wait() == 0 for child in children)
             wall = time.monotonic() - started
             spill = [path.stat().st_size for path in (home / 'spill').rglob('*.log')]
-            assert spill and max(spill) <= 64 << 20, spill
+            assert kind != 'text' or spill, spill
+            assert not spill or max(spill) <= 64 << 20, spill
             time.sleep(15)
-            records.append(dict(concurrent=count, sample_interval_ms=5, samples=samples,
+            records.append(dict(concurrent=count, kind=kind, sample_interval_ms=5, samples=samples,
                 idle_before_kib=idle/1024, sampled_daemon_peak_kib=peak/1024,
                 sampled_tree_peak_kib=tree_peak/1024, return_idle_kib=daemon.memory_info().rss/1024,
                 wall_seconds=wall, retained_bytes=sum(spill)))

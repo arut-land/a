@@ -7,9 +7,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use super::Passed;
+use super::{Passed, SpawnEnvironment};
 use crate::Signal;
 
 #[derive(Clone)]
@@ -19,6 +19,12 @@ struct OwnedChild {
     pid: u32,
     watch: Option<OwnedFd>,
     group: bool,
+    waiter: Mutex<Option<Waiter>>,
+}
+
+struct Waiter {
+    reader: OwnedFd,
+    thread: std::thread::JoinHandle<()>,
 }
 
 impl Child {
@@ -103,18 +109,29 @@ impl Child {
         if let Some(watch) = &self.0.watch {
             return watch.try_clone();
         }
-        // Old Linux kernels have no pidfds. A wait owns precisely this child,
-        // never wait(-1); WNOWAIT leaves all reaping to OwnedChild's drop.
-        let (reader, mut writer) = io::pipe()?;
-        let child = self.clone();
-        std::thread::Builder::new()
-            .name("a-child-wait".into())
-            .spawn(move || {
-                use std::io::Write;
-                let _ = child.observe(false);
-                let _ = writer.write_all(&[1]);
-            })?;
-        Ok(reader.into())
+        // One event-driven waiter per owned child on kernels without pidfds.
+        // Its status remains unreaped until OwnedChild joins it and reaps.
+        let mut waiter = self.0.waiter.lock().unwrap_or_else(PoisonError::into_inner);
+        if waiter.is_none() {
+            let (reader, mut writer) = io::pipe()?;
+            let pid = self.id();
+            let thread = std::thread::Builder::new()
+                .name("a-child-wait".into())
+                .spawn(move || {
+                    use std::io::Write;
+                    let _ = observe(libc::P_PID, pid, false);
+                    let _ = writer.write_all(&[1]);
+                })?;
+            *waiter = Some(Waiter {
+                reader: reader.into(),
+                thread,
+            });
+        }
+        waiter
+            .as_ref()
+            .expect("registered child waiter")
+            .reader
+            .try_clone()
     }
 }
 
@@ -161,6 +178,14 @@ impl Drop for OwnedChild {
         if self.group && observe(libc::P_PID, self.pid, true).is_ok() {
             let _ = super::imp::signal_group(self.pid, Signal::Kill);
         }
+        if let Some(waiter) = self
+            .waiter
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = waiter.thread.join();
+        }
         // SAFETY: no other owner can reap our child; retry interruption only.
         while unsafe { libc::waitpid(self.pid.cast_signed(), std::ptr::null_mut(), 0) } < 0 {
             if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
@@ -178,7 +203,7 @@ pub(crate) struct SpawnPlan<'a> {
     inherited: &'a [Passed],
     group: bool,
     session: bool,
-    inherit_environment: bool,
+    environment: SpawnEnvironment,
 }
 
 impl<'a> SpawnPlan<'a> {
@@ -189,7 +214,7 @@ impl<'a> SpawnPlan<'a> {
             inherited: &[],
             group: true,
             session: true,
-            inherit_environment: false,
+            environment: SpawnEnvironment::Exact,
         }
     }
     pub(crate) fn inherited(mut self, inherited: &'a [Passed]) -> Self {
@@ -201,8 +226,8 @@ impl<'a> SpawnPlan<'a> {
         self.session = false;
         self
     }
-    pub(crate) fn environment(mut self) -> Self {
-        self.inherit_environment = true;
+    pub(crate) fn inherit_snapshot(mut self) -> Self {
+        self.environment = SpawnEnvironment::InheritSnapshot;
         self
     }
     pub(crate) fn uncontained(mut self) -> Self {
@@ -299,6 +324,7 @@ impl<'a> SpawnPlan<'a> {
             pid: pid.cast_unsigned(),
             watch: None,
             group: self.group,
+            waiter: Mutex::new(None),
         }));
         match super::imp::exit_watch(child.id()) {
             Ok(watch) => Arc::get_mut(&mut child.0).unwrap().watch = Some(watch),
@@ -315,7 +341,7 @@ impl<'a> SpawnPlan<'a> {
         Ok(child)
     }
     fn environment_values(&self) -> std::collections::BTreeMap<OsString, OsString> {
-        let mut environment = if self.inherit_environment {
+        let mut environment = if matches!(self.environment, SpawnEnvironment::InheritSnapshot) {
             std::env::vars_os().collect()
         } else {
             std::collections::BTreeMap::<OsString, OsString>::new()

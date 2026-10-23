@@ -66,13 +66,14 @@ pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::R
     let (mut output, writer) = io::pipe()?;
     let input = File::open("NUL")?;
     let error = File::options().write(true).open("NUL")?;
-    let mut child = spawn::spawn(
-        cmd,
-        [&input, &writer, &error],
-        None,
-        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-        false,
-    )?;
+    let mut child = spawn::SpawnPlan {
+        command: cmd,
+        io: [&input, &writer, &error],
+        job: None,
+        flags: DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        environment: super::SpawnEnvironment::Exact,
+    }
+    .spawn()?;
     drop(writer);
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let reader = std::thread::spawn(move || {
@@ -171,13 +172,18 @@ fn spawn_job_role(
             u32::try_from(size_of_val(&limits)).unwrap(),
         )
     })?;
-    let child = spawn::spawn(
-        cmd,
+    let child = spawn::SpawnPlan {
+        command: cmd,
         io,
-        Some(&job),
-        CREATE_NEW_PROCESS_GROUP | if terminal { 0 } else { CREATE_NO_WINDOW },
-        terminal,
-    )?;
+        job: Some(&job),
+        flags: CREATE_NEW_PROCESS_GROUP | if terminal { 0 } else { CREATE_NO_WINDOW },
+        environment: if terminal {
+            super::SpawnEnvironment::InheritSnapshot
+        } else {
+            super::SpawnEnvironment::Exact
+        },
+    }
+    .spawn()?;
     let group = ProcessLease {
         id: RecordedIdentity(child.id()),
         handle: job,
@@ -467,9 +473,9 @@ mod tests {
                 .join("System32/cmd.exe"),
         );
         command
-            .args(["/D", "/U", "/C", "echo %A_UNICODE% & cd"])
+            .args(["/D", "/U", "/C", "echo %ÉCHO% & cd"])
             .env_clear()
-            .env("A_UNICODE", value)
+            .env("écho", value)
             .current_dir(&root);
         let mut child = spawn_group(&mut command, File::create(&path).unwrap()).unwrap();
         assert!(child.wait().unwrap().success());

@@ -110,7 +110,7 @@ mod imp {
                 .open("/dev/null")
                 .ok()?;
             crate::proc::unix::SpawnPlan::new(&cmd, [&null, &null, &null])
-                .environment()
+                .inherit_snapshot()
                 .spawn()
                 .ok()
                 .map(|child| {

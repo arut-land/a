@@ -23,7 +23,7 @@ pub fn open_browser(link: &str) -> io::Result<()> {
             .write(true)
             .open("/dev/null")?;
         crate::proc::unix::SpawnPlan::new(&command, [&null, &null, &null])
-            .environment()
+            .inherit_snapshot()
             .uncontained()
             .spawn()?
     };
