@@ -2863,7 +2863,7 @@ mod tests {
                     b"second metadata",
                     XattrFlags::empty(),
                 )
-                .unwrap()
+                .unwrap();
             },
             || {},
         );
