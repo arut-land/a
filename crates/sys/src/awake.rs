@@ -115,7 +115,8 @@ mod imp {
             };
             // SAFETY: the context and its NUL-terminated reason live across
             // the call, which copies the reason. The handle is not inherited.
-            let handle = crate::windows::owned(unsafe { PowerCreateRequest(&context) }).ok()?;
+            let handle =
+                crate::windows::owned(unsafe { PowerCreateRequest(&raw const context) }).ok()?;
             // SAFETY: we own a live power request. Failure drops the handle
             // without publishing a hold; success is paired with one clear.
             if unsafe { PowerSetRequest(handle.as_raw_handle(), PowerRequestSystemRequired) } == 0 {
