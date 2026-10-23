@@ -27,6 +27,16 @@ resize events. Both console and signal handles participate in one infinite
 WaitForMultipleObjects call. Console-free and redirected operation does not
 require console mode changes.
 
+Console output uses a dedicated synchronous writer, with one bounded pending
+request. The renderer waits on completion and control events; on interruption it
+calls CancelSynchronousIo for that writer only, retrying until the operation
+acknowledges cancellation. A cleanup deadline bounds the caller's wait even
+when a driver fails to acknowledge cancellation. The writer owns each buffer
+until native completion, and an unresponsive writer closes the output path
+instead of letting later frames spin on a full queue. The worker and renderer
+have no periodic wake while idle. See Microsoft's
+[synchronous I/O cancellation contract](https://learn.microsoft.com/en-us/windows/win32/fileio/canceling-pending-i-o-operations).
+
 Unix output checks foreground ownership and blocks SIGTTOU only around
 cleanup and mode restoration. Rendering lets the kernel report background
 writes and rechecks ownership after interrupted calls. The renderer serializes
@@ -35,7 +45,9 @@ bounded typing backlog; Ctrl-C invalidates already queued keystrokes.
 An owned pause guard disables stdin while leaving signal delivery active
 until ownership has been reacquired. Nonblocking output waits on readiness
 and a dedicated control wake pipe; screen cleanup has a single deadline.
-The saved file status flags are restored with termios. The stop is directed
+Rendering opens the terminal through its own nonblocking file description;
+inherited stdout and the shell's shared file status flags are never changed.
+The stop is directed
 to the calling thread, which cannot re-enter raw mode before being continued.
 There is no tcsetpgrp that could take the foreground from the shell.
 

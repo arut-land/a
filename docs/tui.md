@@ -13,7 +13,8 @@ colours.
 Terminal modes belong to an owned `sys::terminal` lease. Unix uses termios
 and an indefinite poll over stdin and the signal pipe. Ctrl-Z and SIGTSTP
 give back cooked input, paste/mouse modes and the alternate screen before
-stopping the client. Nonblocking output waits on readiness and a suspend
+stopping the client. Rendering opens its own nonblocking tty description,
+leaving the shell's file status flags untouched. Output waits on readiness and a suspend
 wake source; an unread terminal cannot prevent suspension or termination.
 Continuing in the foreground re-enters raw mode and
 redraws the whole viewport; a background continue stops again without
@@ -26,7 +27,9 @@ Windows uses the actual console handles, saved input/output modes and
 UTF-8 code pages. VT output and input are enabled, QuickEdit and line/echo
 input are disabled, and processed input routes Ctrl-C and Ctrl-Break through
 the console control handler. Input waits indefinitely on the console and
-the signal event; native resize records invalidate the viewport. The line
+the signal event; native resize records invalidate the viewport. The
+output writer has its own thread, with cancellation on lifecycle controls and
+a deadline for screen cleanup even when the console stops consuming output. The line
 REPL changes only console output/encoding, preserving cooked input. A
 redirected side stays byte-oriented. Guards and panic hooks restore modes
 and code pages; termination restores them even if screen cleanup times out.

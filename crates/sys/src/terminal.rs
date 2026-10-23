@@ -183,6 +183,7 @@ impl Drop for ResumeInput {
 #[derive(Default)]
 pub struct Stdout {
     restore_until: Option<Instant>,
+    _interrupt: Option<OutputInterrupt>,
 }
 
 impl Stdout {
@@ -191,6 +192,7 @@ impl Stdout {
     pub fn restoring() -> Self {
         Self {
             restore_until: Some(Instant::now() + Duration::from_millis(500)),
+            _interrupt: Some(OutputInterrupt::acquire()),
         }
     }
 }
@@ -208,12 +210,12 @@ impl Write for Stdout {
 mod imp {
     use std::io;
     use std::os::fd::OwnedFd;
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
     use std::time::Instant;
 
     use rustix::event::{PollFd, PollFlags, poll};
-    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use rustix::fs::{Mode, OFlags, fcntl_getfl, fcntl_setfl, open};
     use rustix::io::Errno;
     use rustix::io::{FdFlags, fcntl_setfd};
     use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
@@ -236,7 +238,22 @@ mod imp {
 
     pub struct RawMode {
         cooked: Termios,
-        output_flags: OFlags,
+        output: Arc<OwnedFd>,
+    }
+
+    fn open_output() -> io::Result<Arc<OwnedFd>> {
+        // A dup still shares file status flags with the shell. Open the
+        // terminal itself so nonblocking rendering belongs only to us.
+        let path = match rustix::termios::ttyname(rustix::stdio::stdout(), Vec::new()) {
+            Ok(path) => path,
+            Err(Errno::NOTTY) => c"/dev/tty".into(),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Arc::new(open(
+            path,
+            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?))
     }
 
     struct OutputWake {
@@ -304,16 +321,12 @@ mod imp {
             foreground()?;
             output_wake()?;
             let stdin = rustix::stdio::stdin();
-            let output_flags = fcntl_getfl(rustix::stdio::stdout())?;
+            let output = open_output()?;
             let cooked = tcgetattr(stdin)?;
             let mut raw = cooked.clone();
             raw.make_raw();
-            let saved = Self {
-                cooked,
-                output_flags,
-            };
+            let saved = Self { cooked, output };
             tcsetattr(stdin, OptionalActions::Now, &raw)?;
-            fcntl_setfl(rustix::stdio::stdout(), output_flags | OFlags::NONBLOCK)?;
             Ok(saved)
         }
 
@@ -327,10 +340,7 @@ mod imp {
         }
 
         pub fn restore(&self) -> io::Result<()> {
-            let mode = self.restore_input();
-            let flags = fcntl_setfl(rustix::stdio::stdout(), self.output_flags);
-            mode?;
-            Ok(flags?)
+            self.restore_input()
         }
     }
 
@@ -420,7 +430,14 @@ mod imp {
         interruptible: bool,
         deadline: Option<Instant>,
     ) -> io::Result<usize> {
-        let stdout = rustix::stdio::stdout();
+        let output = super::RAW
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|raw| raw.output.clone());
+        // A termination callback may already have removed the mode snapshot.
+        // Cleanup still needs an independent, nonblocking description.
+        let stdout = output.map_or_else(open_output, Ok)?;
         loop {
             if interruptible && (output_interrupted() || !is_foreground()?) {
                 return Err(io::ErrorKind::WouldBlock.into());
@@ -430,7 +447,7 @@ mod imp {
             } else {
                 Some(OutputGuard::enter()?)
             };
-            match rustix::io::write(stdout, buf) {
+            match rustix::io::write(&stdout, buf) {
                 Ok(n) => return Ok(n),
                 Err(Errno::INTR) => continue,
                 Err(Errno::AGAIN) => {}
@@ -569,6 +586,120 @@ mod tests {
         }
         assert_eq!(after.input_speed(), before.input_speed());
         assert_eq!(after.output_speed(), before.output_speed());
+    }
+
+    #[test]
+    #[allow(clippy::cast_lossless)] // ioctl request types differ between Unix targets.
+    fn terminal_output_never_changes_the_parents_file_status_flags() {
+        use rustix::fs::{OFlags, fcntl_getfl};
+        use std::io::{BufRead, BufReader, Write};
+        const NAME: &str =
+            "terminal::tests::terminal_output_never_changes_the_parents_file_status_flags";
+        if std::env::var_os("A_TEST_OUTPUT_FLAGS").is_some() {
+            // SAFETY: only this isolated child owns the supplied controlling tty.
+            unsafe {
+                assert_ne!(libc::setsid(), -1);
+                assert_ne!(libc::ioctl(0, libc::TIOCSCTTY as _, 0), -1);
+                assert_eq!(libc::raise(libc::SIGSTOP), 0);
+            }
+            for phase in ["acquired", "resumed"] {
+                let raw = RawMode::enter().unwrap();
+                assert!(
+                    !fcntl_getfl(rustix::stdio::stdout())
+                        .unwrap()
+                        .contains(OFlags::NONBLOCK)
+                );
+                let mut out = Stdout::default();
+                out.write_all(b"output through the private description\r\n")
+                    .unwrap();
+                eprintln!("{phase}");
+                let mut byte = [0];
+                assert_eq!(
+                    rustix::io::read(rustix::stdio::stdin(), &mut byte).unwrap(),
+                    1
+                );
+                drop(raw);
+                if phase == "acquired" {
+                    suspend().unwrap();
+                }
+            }
+            return;
+        }
+        for killed in [false, true] {
+            let mut master = -1;
+            let mut slave = -1;
+            // SAFETY: openpty initializes both descriptors; optional buffers omitted.
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &raw mut master,
+                        &raw mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            // SAFETY: these newly opened descriptors are transferred exactly once.
+            let (mut master, slave) =
+                unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+            for file in [&master, &slave] {
+                rustix::io::fcntl_setfd(file, rustix::io::FdFlags::CLOEXEC).unwrap();
+            }
+            let mut drain = master.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let _ = io::copy(&mut drain, &mut io::sink());
+            });
+            let cooked = rustix::termios::tcgetattr(&slave).unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("A_TEST_OUTPUT_FLAGS", "1")
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            wait_stopped(rustix::process::Pid::from_child(&child));
+            let flags = fcntl_getfl(&slave).unwrap();
+            assert!(!flags.contains(OFlags::NONBLOCK));
+            rustix::process::kill_process(
+                rustix::process::Pid::from_child(&child),
+                rustix::process::Signal::CONT,
+            )
+            .unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let (send, markers) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    if send.send(line.unwrap()).is_err() {
+                        break;
+                    }
+                }
+            });
+            wait_marker(&markers, "acquired");
+            assert_eq!(fcntl_getfl(&slave).unwrap(), flags);
+            if killed {
+                child.kill().unwrap();
+                assert!(!child.wait().unwrap().success());
+            } else {
+                master.write_all(b"s").unwrap();
+                wait_stopped(rustix::process::Pid::from_child(&child));
+                assert_eq!(fcntl_getfl(&slave).unwrap(), flags);
+                assert_modes(&cooked, &rustix::termios::tcgetattr(&slave).unwrap());
+                rustix::process::kill_process(
+                    rustix::process::Pid::from_child(&child),
+                    rustix::process::Signal::CONT,
+                )
+                .unwrap();
+                wait_marker(&markers, "resumed");
+                assert_eq!(fcntl_getfl(&slave).unwrap(), flags);
+                master.write_all(b"e").unwrap();
+                assert!(child.wait().unwrap().success());
+                assert_modes(&cooked, &rustix::termios::tcgetattr(&master).unwrap());
+            }
+            assert_eq!(fcntl_getfl(&slave).unwrap(), flags);
+        }
     }
 
     #[test]

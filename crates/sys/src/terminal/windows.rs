@@ -18,6 +18,11 @@ use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 use super::{Input, InputControl};
 use crate::{Signal, Signals, windows::ok};
 
+#[path = "windows/output.rs"]
+mod output;
+pub(super) use output::{interrupt_output, release_output};
+pub use output::{output_interrupted, write_stdout};
+
 pub struct RawMode {
     input: OwnedHandle,
     output: OwnedHandle,
@@ -38,6 +43,7 @@ impl RawMode {
             ok(GetConsoleMode(input.as_raw_handle(), &raw mut input_mode))?;
             ok(GetConsoleMode(output.as_raw_handle(), &raw mut output_mode))?;
         }
+        output::initialize()?;
         let saved = Self {
             input,
             output,
@@ -120,32 +126,6 @@ pub fn size() -> io::Result<(u16, u16)> {
         (info.srWindow.Right - info.srWindow.Left + 1).cast_unsigned(),
         (info.srWindow.Bottom - info.srWindow.Top + 1).cast_unsigned(),
     ))
-}
-
-pub(super) fn interrupt_output() {}
-pub fn output_interrupted() -> bool {
-    false
-}
-pub(super) fn release_output() {}
-
-pub fn write_stdout(
-    buf: &[u8],
-    _interruptible: bool,
-    _deadline: Option<std::time::Instant>,
-) -> io::Result<usize> {
-    let mut written = 0;
-    // SAFETY: stdout is borrowed through the call; the input slice and count
-    // remain valid. WriteFile keeps redirected output byte-oriented too.
-    ok(unsafe {
-        windows_sys::Win32::Storage::FileSystem::WriteFile(
-            io::stdout().as_handle().as_raw_handle(),
-            buf.as_ptr(),
-            u32::try_from(buf.len()).unwrap_or(u32::MAX),
-            &raw mut written,
-            std::ptr::null_mut(),
-        )
-    })?;
-    Ok(written as usize)
 }
 
 pub struct InputReader {
