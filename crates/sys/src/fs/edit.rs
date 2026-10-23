@@ -68,7 +68,9 @@ pub struct EditReceipt {
 /// Retains the original handle and a pinned parent until publication or abort.
 pub struct EditTransaction {
     parent: File,
+    #[cfg(windows)]
     directory: PathBuf,
+    observed_parent: PathBuf,
     name: OsString,
     source: Option<(File, Signature)>,
     original: Option<Vec<u8>>,
@@ -92,11 +94,14 @@ impl EditTransaction {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         fs::create_dir_all(directory)?;
+        let observed_parent = std::path::absolute(directory)?;
         let directory = directory.canonicalize()?;
         let parent = open_parent(&directory)?;
         let mut transaction = Self {
             parent,
+            #[cfg(windows)]
             directory,
+            observed_parent,
             name,
             source: None,
             original: None,
@@ -175,8 +180,8 @@ impl EditTransaction {
     }
 
     fn revalidate(&self) -> Result<(), EditError> {
-        let parent =
-            open_parent(&self.directory).map_err(|_| EditError::Conflict(EditConflict::Changed))?;
+        let parent = open_parent(&self.observed_parent)
+            .map_err(|_| EditError::Conflict(EditConflict::Changed))?;
         if !same_object(&self.parent, &parent)? {
             return Err(EditError::Conflict(EditConflict::Changed));
         }
@@ -1204,6 +1209,31 @@ mod tests {
         ));
         assert_eq!(fs::read(parent.join("file")).unwrap(), b"unrelated");
         assert_eq!(fs::read(moved.join("file")).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redirecting_a_parent_alias_is_a_conflict() {
+        use std::os::unix::fs::symlink;
+        let work = Workspace::new();
+        let first = work.0.join("first");
+        let second = work.0.join("second");
+        let alias = work.0.join("alias");
+        for parent in [&first, &second] {
+            fs::create_dir(parent).unwrap();
+            fs::write(parent.join("file"), b"original").unwrap();
+        }
+        symlink(&first, &alias).unwrap();
+        let transaction = EditTransaction::capture(&alias.join("file"), 32).unwrap();
+        fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+        assert!(matches!(
+            transaction.publish(b"edited", false),
+            Err(EditError::Conflict(EditConflict::Changed))
+        ));
+        for parent in [&first, &second] {
+            assert_eq!(fs::read(parent.join("file")).unwrap(), b"original");
+        }
     }
 
     #[cfg(unix)]
