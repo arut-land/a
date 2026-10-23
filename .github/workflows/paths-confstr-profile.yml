@@ -1,0 +1,72 @@
+name: paths confstr profile
+on:
+  push:
+    branches: [codex-w2paths]
+    paths: ['.github/workflows/paths-confstr-profile.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  lookup:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Time first lookup inside fresh native processes
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/lookup.c" <<'C'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <time.h>
+          #include <unistd.h>
+          int main(int argc, char **argv) {
+              if (argc != 2) return 1;
+              struct timespec start, end;
+              clock_gettime(CLOCK_MONOTONIC, &start);
+              if (atoi(argv[1])) {
+                  size_t length = confstr(_CS_DARWIN_USER_TEMP_DIR, NULL, 0);
+                  if (!length) return 2;
+                  char *path = calloc(length, 1);
+                  if (!path) return 3;
+                  size_t written = confstr(_CS_DARWIN_USER_TEMP_DIR, path, length);
+                  if (!written || written > length || path[0] != '/') return 4;
+                  free(path);
+              } else {
+                  char path[64];
+                  if (snprintf(path, sizeof(path), "/tmp/a-%u", geteuid()) < 0) return 5;
+              }
+              clock_gettime(CLOCK_MONOTONIC, &end);
+              double ms = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
+              printf("%.9f\n", ms);
+              return 0;
+          }
+          C
+          clang -O2 "$RUNNER_TEMP/lookup.c" -o "$RUNNER_TEMP/lookup"
+          python - <<'PY'
+          import json, os, platform, statistics, subprocess
+          from pathlib import Path
+          binary = Path(os.environ['RUNNER_TEMP']) / 'lookup'
+          samples = {'private-runtime': [], 'darwin-user-temp': []}
+          for trial in range(100):
+              order = [0, 1] if trial % 2 == 0 else [1, 0]
+              for mode in order:
+                  value = subprocess.check_output([str(binary), str(mode)], text=True, timeout=10)
+                  samples['darwin-user-temp' if mode else 'private-runtime'].append(float(value))
+          result = {'machine': platform.machine(), 'image': os.environ.get('ImageVersion'),
+                    'method': '100 fresh processes per mode, alternating order; CLOCK_MONOTONIC times only the lookup inside main, not process launch; all samples retained.',
+                    'roles': {name: {'samples_ms': values, 'median_ms': statistics.median(values),
+                                     'min_ms': min(values), 'max_ms': max(values)}
+                              for name, values in samples.items()}}
+          Path('lookup.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps({name: data['median_ms'] for name, data in result['roles'].items()}))
+          PY
+      - uses: actions/upload-artifact@v5
+        with:
+          name: paths-confstr-${{ matrix.os }}
+          path: lookup.json
