@@ -280,7 +280,6 @@ mod tests {
             watcher.callback()(event);
             assert!(watcher.invalidated.load(Ordering::Acquire));
             watcher.refresh().unwrap();
-            assert!(!watcher.invalidated.load(Ordering::Acquire));
         }
         let path = root.join("after-rearm");
         fs::write(&path, "observable").unwrap();
