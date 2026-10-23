@@ -16,6 +16,7 @@ pub use imp::{find_bash, validate_argv};
 pub enum Dialect {
     Bash,
     PowerShell,
+    WindowsPowerShell,
 }
 
 /// One immutable choice for the daemon's lifetime. Client environments do
@@ -48,7 +49,7 @@ impl ExecutionFacts {
     pub const fn tool(&self) -> &'static str {
         match self.dialect {
             Dialect::Bash => "bash",
-            Dialect::PowerShell => "powershell",
+            Dialect::PowerShell | Dialect::WindowsPowerShell => "powershell",
         }
     }
 

@@ -174,8 +174,16 @@ impl ext::Extension for Selected {
 }
 
 fn powershell_facts(executable: std::path::PathBuf) -> &'static sys::shell::ExecutionFacts {
+    let dialect = if executable
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("powershell.exe"))
+    {
+        sys::shell::Dialect::WindowsPowerShell
+    } else {
+        sys::shell::Dialect::PowerShell
+    };
     Box::leak(Box::new(sys::shell::ExecutionFacts {
-        dialect: sys::shell::Dialect::PowerShell,
+        dialect,
         executable,
         syntax: "PowerShell test runner",
         paths: "Windows literal paths",

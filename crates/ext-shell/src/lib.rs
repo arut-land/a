@@ -35,7 +35,7 @@ mod output;
 mod process;
 pub mod state;
 
-pub use bash::{Bash, PowerShell};
+pub use bash::{Bash, PowerShell, WindowsPowerShell};
 
 /// The `shell` extension.
 pub struct Shell;
@@ -66,6 +66,9 @@ fn contribute(r: &mut Registrar, facts: &'static sys::shell::ExecutionFacts) {
         sys::shell::Dialect::PowerShell => {
             r.tool(PowerShell::new(facts));
         }
+        sys::shell::Dialect::WindowsPowerShell => {
+            r.tool(WindowsPowerShell::new(facts));
+        }
     }
     r.fold::<state::Cwd>()
             .provide::<dyn CwdOf>(Arc::new(Shell))
@@ -74,7 +77,7 @@ fn contribute(r: &mut Registrar, facts: &'static sys::shell::ExecutionFacts) {
                 "`{}` runs one command per call in a fresh shell. Filesystem working-directory changes persist; variables do not. No stdin or terminal: avoid prompts. Long output is cut to its start and end; the whole output is saved at the returned path. {} Set timeout (seconds, 120 by default, at most 600) for slow commands; background: true starts session-owned work and returns its log.",
                 facts.tool(), match facts.dialect {
                     sys::shell::Dialect::Bash => "Search saved output with grep or sed -n.",
-                    sys::shell::Dialect::PowerShell => "Read saved output with Get-Content -Tail or Select-String -LiteralPath; use $env:NAME for environment variables.",
+                    sys::shell::Dialect::PowerShell | sys::shell::Dialect::WindowsPowerShell => "Read saved output with Get-Content -Tail or Select-String -LiteralPath; use $env:NAME for environment variables.",
                 }
             )).for_tool(facts.tool()));
 }

@@ -11,6 +11,7 @@ pub trait Dialect: Send + Sync + 'static {
 
 pub struct Bash;
 pub struct PowerShell;
+pub struct WindowsPowerShell;
 
 impl Dialect for Bash {
     const NAME: &'static str = "bash";
@@ -55,45 +56,78 @@ impl Dialect for PowerShell {
     const PROMPT: &'static str = "PS> ";
 
     fn arguments(command: &str, dir: &Path, report: Option<&Path>) -> io::Result<Vec<String>> {
-        let mut script = format!(
-            "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n\
+        powershell_arguments(
+            command,
+            dir,
+            report,
+            "if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText' }\n",
+        )
+    }
+}
+
+impl Dialect for WindowsPowerShell {
+    const NAME: &'static str = PowerShell::NAME;
+    const DESCRIPTION: &'static str = PowerShell::DESCRIPTION;
+    const PROMPT: &'static str = PowerShell::PROMPT;
+
+    fn arguments(command: &str, dir: &Path, report: Option<&Path>) -> io::Result<Vec<String>> {
+        // Desktop startup inserts AllUsers ahead of its own modules. Bind the
+        // standard library explicitly without discarding the client's paths.
+        powershell_arguments(
+            command,
+            dir,
+            report,
+            concat!(
+                "Import-Module ($PSHOME + '\\Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop\n",
+                "Import-Module ($PSHOME + '\\Modules\\Microsoft.PowerShell.Management\\Microsoft.PowerShell.Management.psd1') -ErrorAction Stop\n",
+            ),
+        )
+    }
+}
+
+fn powershell_arguments(
+    command: &str,
+    dir: &Path,
+    report: Option<&Path>,
+    initialize: &str,
+) -> io::Result<Vec<String>> {
+    let mut script = format!(
+        "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n\
              $ProgressPreference = 'SilentlyContinue'\n\
-             if ($PSVersionTable.PSVersion.Major -ge 7 -and $null -ne $PSStyle) {{ $PSStyle.OutputRendering = 'PlainText' }}\n\
-             Set-Location -LiteralPath {} -ErrorAction Stop\n\
+             {initialize}Set-Location -LiteralPath {} -ErrorAction Stop\n\
              $__a_ok = $true\ntry {{\n{command}\n$__a_ok = $?\n}} catch {{\n\
              $__a_ok = $false\n[Console]::Error.WriteLine($_.ToString())\n}} finally {{\n",
-            ps_quote(dir),
+        ps_quote(dir),
+    );
+    if let Some(report) = report {
+        // FileSystem paths only: Registry/provider locations cannot become
+        // the next process's working directory. Explicit exit still runs finally.
+        let _ = writeln!(
+            script,
+            "try {{ if ($PWD.Provider.Name -eq 'FileSystem') {{ [System.IO.File]::WriteAllText({}, $PWD.ProviderPath, [System.Text.UTF8Encoding]::new($false)) }} }} catch {{ }}",
+            ps_quote(report)
         );
-        if let Some(report) = report {
-            // FileSystem paths only: Registry/provider locations cannot become
-            // the next process's working directory. Explicit exit still runs finally.
-            let _ = writeln!(
-                script,
-                "try {{ if ($PWD.Provider.Name -eq 'FileSystem') {{ [System.IO.File]::WriteAllText({}, $PWD.ProviderPath, [System.Text.UTF8Encoding]::new($false)) }} }} catch {{ }}",
-                ps_quote(report)
-            );
-        }
-        script.push_str("}\nif (-not $__a_ok) { exit 1 }\n");
-        // Native argv is Unicode and SpawnPlan quotes it. -Command keeps 5.1
-        // stderr textual; -EncodedCommand implicitly selects CLIXML stderr.
-        if script.encode_utf16().count() > 30_000 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "PowerShell command plus wrapper exceeds 30,000 UTF-16 code units",
-            ));
-        }
-        Ok([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-OutputFormat",
-            "Text",
-            "-Command",
-            &script,
-        ]
-        .map(str::to_owned)
-        .into())
     }
+    script.push_str("}\nif (-not $__a_ok) { exit 1 }\n");
+    // Native argv is Unicode and SpawnPlan quotes it. -Command keeps 5.1
+    // stderr textual; -EncodedCommand implicitly selects CLIXML stderr.
+    if script.encode_utf16().count() > 30_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PowerShell command plus wrapper exceeds 30,000 UTF-16 code units",
+        ));
+    }
+    Ok([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-OutputFormat",
+        "Text",
+        "-Command",
+        &script,
+    ]
+    .map(str::to_owned)
+    .into())
 }
 
 #[cfg(test)]

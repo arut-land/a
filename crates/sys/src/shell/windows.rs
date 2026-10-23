@@ -149,7 +149,14 @@ fn resolve(
     } else {
         let (path, syntax) = powershell(search, program_files, windows);
         (
-            Dialect::PowerShell,
+            if path
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("powershell.exe"))
+            {
+                Dialect::WindowsPowerShell
+            } else {
+                Dialect::PowerShell
+            },
             path,
             syntax,
             "Windows drive and UNC paths; use -LiteralPath; single quotes escape apostrophes by doubling them",
@@ -250,68 +257,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shell_startup_probe() {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::Threading::WaitForSingleObject;
-        if std::env::var_os("A_TEST_POWERSHELL").is_none() {
-            return;
-        }
-        let executable = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-        for (mode, prefix) in [
-            (
-                "path-after-startup",
-                "$env:PSModulePath = $PSHOME + '\\Modules'; ",
-            ),
-            ("cache-disabled", ""),
-            (
-                "explicit-core",
-                "Import-Module ($PSHOME + '\\Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop; ",
-            ),
-            ("version-expression", ""),
-        ] {
-            let body = if mode == "version-expression" {
-                "Write-Output $PSVersionTable.PSVersion.ToString(); exit 37"
-            } else {
-                "Write-Output 'ok'; exit 37"
-            };
-            let script = format!("[Console]::WriteLine($PSHOME); {prefix}{body}");
-            let mut command = std::process::Command::new(&executable);
-            command
-                .args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    &script,
-                ])
-                .envs(std::env::vars_os())
-                .current_dir(std::env::temp_dir());
-            if mode == "cache-disabled" {
-                command.env("PSModuleAnalysisCachePath", "NUL");
-            }
-            let path = std::env::temp_dir()
-                .join(format!("a-shell-module-{}-{mode}.log", std::process::id()));
-            let mut child =
-                crate::spawn_group(&mut command, std::fs::File::create(&path).unwrap()).unwrap();
-            let watch = child.child.exit_watch().unwrap();
-            // SAFETY: the owned watch remains live for the bounded wait.
-            let timeout = unsafe { WaitForSingleObject(watch.as_raw_handle(), 10000) } == 258;
-            if timeout {
-                child.group.signal(crate::Signal::Kill).unwrap();
-            }
-            let status = child.child.wait().unwrap();
-            drop(child);
-            eprintln!(
-                "module probe {mode}: timeout {timeout} exit {:?} out {:?}",
-                status.code(),
-                std::fs::read_to_string(&path)
-            );
-            std::fs::remove_file(path).unwrap();
-        }
-    }
-
-    #[test]
     fn system_bash_is_never_a_native_shell_candidate() {
         let root = std::env::temp_dir().join(format!("a-shell-discovery-{}", std::process::id()));
         let system = root.join("System32");
@@ -331,7 +276,7 @@ mod tests {
     #[test]
     fn no_bash_selects_only_the_powershell_identity() {
         let facts = resolve(None, Some(""), None, Path::new(r"C:\Windows"));
-        assert_eq!(facts.dialect, Dialect::PowerShell);
+        assert_eq!(facts.dialect, Dialect::WindowsPowerShell);
         assert_eq!(facts.tool(), "powershell");
         assert!(facts.syntax.contains("5.1"));
     }

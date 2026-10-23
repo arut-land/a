@@ -42,6 +42,7 @@ pub struct ShellTool<D> {
 
 pub type Bash = ShellTool<crate::dialect::Bash>;
 pub type PowerShell = ShellTool<crate::dialect::PowerShell>;
+pub type WindowsPowerShell = ShellTool<crate::dialect::WindowsPowerShell>;
 
 impl<D: crate::dialect::Dialect> ShellTool<D> {
     pub(crate) fn new(facts: &'static sys::shell::ExecutionFacts) -> Self {
