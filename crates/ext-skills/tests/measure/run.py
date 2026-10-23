@@ -15,6 +15,7 @@ root = Path(__file__).resolve().parent
 corpus = sorted(root.parent.joinpath("corpus").glob("*.md"))
 expected = json.loads(root.parent.joinpath("corpus/expected.json").read_text())
 results = []
+cargo = os.environ.get("PROBE_CARGO", "cargo")
 with tempfile.TemporaryDirectory(prefix="skill-parser-") as tmp:
     candidates = ["custom", "event", "serde", "yaml", "saphyr", "temp-custom", "temp-maintained"]
     if os.name != "nt":
@@ -23,9 +24,9 @@ with tempfile.TemporaryDirectory(prefix="skill-parser-") as tmp:
         infrastructure = parser.startswith(("temp-", "signal-"))
         bin_name = "infrastructure" if infrastructure else "skill-parser-probe"
         target = Path(tmp) / parser
-        env = dict(os.environ, CARGO_TARGET_DIR=str(target))
+        env = dict(os.environ, CARGO_TARGET_DIR=str(target), RUSTC_WRAPPER="", RUSTC_WORKSPACE_WRAPPER="")
         manifest = str(root / "Cargo.toml")
-        command = ["cargo", "build", "--release", "--manifest-path", manifest, "--features", parser, "--bin", bin_name,
+        command = [cargo, "build", "--release", "--manifest-path", manifest, "--features", parser, "--bin", bin_name,
                    "-Zbuild-std=std,panic_unwind", "-Zbuild-std-features=panic-unwind,optimize_for_size"]
         subprocess.run(command, env=env, check=True)
         binary = target / "release" / (bin_name + (".exe" if os.name == "nt" else ""))
@@ -47,7 +48,7 @@ with tempfile.TemporaryDirectory(prefix="skill-parser-") as tmp:
             timing = json.loads(process.communicate()[0])
             assert process.returncode == 0
             rounds.append(dict(**timing, peak_rss_bytes=peak))
-        tree = subprocess.check_output(["cargo", "tree", "--manifest-path", manifest, "--features", parser, "--bin", bin_name, "--edges", "normal", "--prefix", "none"], env=env, text=True)
+        tree = subprocess.check_output([cargo, "tree", "--manifest-path", manifest, "--features", parser, "--bin", bin_name, "--edges", "normal", "--prefix", "none"], env=env, text=True)
         results.append(dict(parser=parser, bytes=binary.stat().st_size, corpus=len(corpus), rounds=rounds,
                             median_ns=statistics.median(r["ns_per_operation" if infrastructure else "ns_per_header"] for r in rounds), dependency_tree=tree))
         print(json.dumps(results[-1]), flush=True)
