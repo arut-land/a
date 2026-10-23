@@ -526,8 +526,11 @@ mod tests {
     }
 
     fn fixture() -> (Session, Home, PathBuf, sys::Listener, std::fs::File) {
-        let root = std::env::temp_dir().join(format!("a-ffi-order-{}", SessionId::new()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("a-ffi-order-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let home = Home::from(root.join("home"));
         let exe = root.join("a");
         std::fs::write(&exe, "never run").unwrap();
