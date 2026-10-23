@@ -20,14 +20,19 @@ Spawn environments select `Exact` or `InheritSnapshot`. Windows preserves
 UTF-16 names and values and uses native ordinal name comparison. Tools have
 explicit stdio policy; SSH keeps terminal access and visible stderr. Linux
 uses glibc closefrom/close_range actions, or a fixed async-signal-safe musl
-sequence with a bounded close loop when close_range is unavailable.
+sequence with a bounded close loop when close_range is unavailable. The range
+path never inspects procfs; an old-kernel launch without a trustworthy descriptor
+inventory fails closed. Child directories and executable paths resolve to
+absolute paths before spawning.
 
 Admission covers queued futures as well as running processes, with 32 slots.
 Each captured process has one 64 KiB chunk in flight and a hard 64 MiB spill
 limit, including background jobs. Spill writes apply storage back-pressure;
 following files and enumerating groups run on admitted storage workers.
 Observation stops at 4096 members. Rendered head/tail, partial lines and terminal
-metadata have independent memory bounds.
+metadata have independent memory bounds. After owned-scope cleanup, capture
+finishes accepted disk writes and drains at most 1 MiB with a 100 ms pipe-drain
+deadline. Escaped pipe holders cannot retain completion or admission.
 
 Unix groups cover cooperative members; descendants can leave them. A daemon
 crash loses Unix leases, so survivors are not killed from their recorded IDs.
@@ -36,16 +41,21 @@ shutdown remains available. These are ownership limits, not shell confinement.
 
 ## Validation
 
-[CI](https://github.com/arut-land/a/actions/runs/39936468315), [native musl probe](https://github.com/arut-land/a/actions/runs/39927056319), [merged six-target performance run](https://github.com/arut-land/a/actions/runs/39936472393).
+[CI](https://github.com/arut-land/a/actions/runs/39943730570), [native musl probe](https://github.com/arut-land/a/actions/runs/39943739759), [six-target performance run](https://github.com/arut-land/a/actions/runs/39943735276).
 
 Regressions cover lease retention through cleanup, foreign-reaper revocation,
 nonblocking pidfd readiness without changing blocking wait semantics, descriptor
 inheritance, verified job membership, Unicode environments and directories,
 embedded-NUL rejection, SSH terminal groups, replay isolation, queued admission,
-completion releasing capacity, background spill caps and bounded unterminated
-terminal metadata. Native process tests run outside Miri; ownership checks that
+completion releasing capacity, escaped pipe holders during timeout and
+cancellation, relative cwd/PATH combinations, procfs-free spawning, background
+spill caps and bounded unterminated terminal metadata. Native process tests run outside Miri; ownership checks that
 Miri can model remain enabled. Old-kernel behavior is exercised through forced
 fallbacks; the hosted kernels themselves are modern.
+
+The escaped-holder and relative-path regressions failed before their fixes.
+The [procfs-free musl chroot before the fix](https://github.com/arut-land/a/actions/runs/39943446868)
+failed to launch; the native musl run linked above passes the same chroot case.
 
 No crate was added. The Windows bindings enable `Win32_Globalization` for native
 name comparison. Thin adapters use the existing rustix/libc/windows-sys APIs;
@@ -62,24 +72,18 @@ means no counter increment at OS resolution.
 
 | Target | Shipped KiB, before → after | Δ KiB | Cold reply ms, before → after | Idle RSS KiB, before → after | Idle daemon CPU ms, before → after |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Linux x86_64 | 4072.531 → 4105.406 | +32.875 | 6.97 → 14.96 | 7300 → 7316 | 0.00 → 0.00 |
-| Linux aarch64 | 3510.039 → 3539.039 | +29.000 | 6.68 → 8.95 | 6208 → 6296 | 0.00 → 0.00 |
-| macOS arm64 | 3170.281 → 3187.078 | +16.797 | 26.58 → 28.13 | 8608 → 8608 | 0.00 → 0.00 |
-| macOS x86_64 | 3788.109 → 3812.688 | +24.578 | 44.77 → 40.34 | 4004 → 4056 | 0.00 → 0.00 |
-| Windows x86_64 | 5267.000 → 5280.500 | +13.500 | 22.75 → 17.84 | 8356 → 8340 | 0.00 → 0.00 |
-| Windows ARM64 | 4625.000 → 4647.500 | +22.500 | 69.00 → 77.18 | 9660 → 9640 | 0.00 → 0.00 |
+| Linux x86_64 | 4072.531 → 4108.906 | +36.375 | 6.97 → 55.46 | 7300 → 7356 | 0.00 → 0.00 |
+| Linux aarch64 | 3510.039 → 3541.789 | +31.750 | 6.68 → 6.64 | 6208 → 6308 | 0.00 → 0.00 |
+| macOS arm64 | 3170.281 → 3187.078 | +16.797 | 26.58 → 25.64 | 8608 → 8624 | 0.00 → 0.00 |
+| macOS x86_64 | 3788.109 → 3816.695 | +28.586 | 44.77 → 50.53 | 4004 → 4032 | 0.00 → 0.00 |
+| Windows x86_64 | 5267.000 → 5285.000 | +18.000 | 22.75 → 20.26 | 8356 → 8328 | 0.00 → 0.00 |
+| Windows ARM64 | 4625.000 → 4651.500 | +26.500 | 69.00 → 84.45 | 9660 → 9644 | 0.00 → 0.00 |
 
-Measured runtime source: `4a6005db23fbfcc4626b20c55318bd5d7e8fb41d`. This includes the endpoint ownership
-changes merged from `origin/main`, so these deltas are not attributable solely
-to process handling. Raw observations and host/toolchain details
-are retained in the performance run artifacts.
+Measured runtime source: `394a546aa4e0f9db9342d4065377e3b7d406a4cc`. Raw observations and host/toolchain details
+are retained in the performance run artifacts. The baseline-to-current table
+includes the endpoint ownership merge from `origin/main`.
 
 ## Capture RSS
-
-[Capture stress run](https://github.com/arut-land/a/actions/runs/39927063613)
-measures process source `82f6658325ed6dffaebd81fbcbe612b4bee36af1`, before
-the endpoint ownership merge. Capture bounds and implementation are unchanged
-by that merge; the table above measures the integrated build.
 
 Each text job writes 8 MiB; eight simultaneous jobs retain 64 MiB in spill files.
 The metadata case writes 8 MiB inside an OSC sequence. Daemon and process-tree
@@ -90,14 +94,32 @@ allocator trimming. Each case uses a fresh isolated `A_HOME` and stops its daemo
 
 | Target | Daemon peak KiB, 1 text job | Daemon peak KiB, 8 text jobs | Tree peak KiB, 8 text jobs | Daemon peak KiB, metadata | Daemon post-burst KiB, 8 text jobs |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Linux x86_64 | 7984 | 12016 | 72828 | 7852 | 12004 |
-| Linux aarch64 | 6988 | 10604 | 63216 | 6692 | 10532 |
-| macOS arm64 | 10000 | 14160 | 50016 | 9440 | 14224 |
-| macOS x86_64 | 5160 | 8748 | 26544 | 4784 | 8088 |
-| Windows x86_64 | 9944 | 14496 | 317736 | 9844 | 12616 |
-| Windows ARM64 | 11160 | 15388 | 466476 | 10852 | 12172 |
+| Linux x86_64 | 8108 | 11880 | 72616 | 7812 | 11868 |
+| Linux aarch64 | 6968 | 10660 | 63256 | 6680 | 10640 |
+| macOS arm64 | 10112 | 14160 | 49984 | 9392 | 14352 |
+| macOS x86_64 | 5048 | 8760 | 26204 | 4784 | 8144 |
+| Windows x86_64 | 9972 | 14396 | 295852 | 9628 | 12304 |
+| Windows ARM64 | 11180 | 15576 | 517216 | 10872 | 12112 |
 
 The code and invariants establish admission and retention limits; sampled RSS
 characterizes this workload rather than proving a maximum for arbitrary child
-programs. No older-kernel machine or signed installed-product lane is implied by
-these hosted observations.
+programs. Old-kernel paths were forced-fallback tested on modern hosted kernels.
+
+## Review-fix release comparison
+
+Before: `4a6005db23fbfcc4626b20c55318bd5d7e8fb41d`
+([run](https://github.com/arut-land/a/actions/runs/39936472393)).
+After: the measured runtime source above. These are separate hosted runs.
+
+| Target | Δ shipped KiB | Δ cold reply ms | Δ idle RSS KiB |
+| --- | ---: | ---: | ---: |
+| Linux x86_64 | +3.500 | +40.50 | +40 |
+| Linux aarch64 | +2.750 | -2.30 | +12 |
+| macOS arm64 | +0.000 | -2.49 | +16 |
+| macOS x86_64 | +4.008 | +10.18 | -24 |
+| Windows x86_64 | +4.500 | +2.42 | -12 |
+| Windows ARM64 | +4.000 | +7.26 | +4 |
+
+Linux x86_64 cold replies ranged from 6.60 to 82.41 ms, versus
+6.27 to 44.18 ms before the fixes. The increased median above
+is an observation; these unpaired, variable runs do not establish its cause.
