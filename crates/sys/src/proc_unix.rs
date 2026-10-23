@@ -73,7 +73,7 @@ impl Child {
     pub(super) fn signal_group(&self, signal: Signal) -> io::Result<()> {
         if self.0.group {
             // The unreaped leader pins this PGID until all leases are dropped.
-            if self.exited()
+            if self.observe(true)?.is_some()
                 && super::imp::group_members(self.id())
                     .iter()
                     .all(|pid| *pid == self.id())
@@ -94,7 +94,8 @@ impl Child {
                 Err(error) => Err(error.into()),
             };
         }
-        // This PID is still our unreaped child, including on old kernels.
+        // A process-global reaper outside this service revokes numeric authority.
+        self.observe(true)?;
         super::imp::signal_process(self.id(), signal)
     }
 
@@ -157,7 +158,7 @@ fn observe(
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        if self.group {
+        if self.group && observe(libc::P_PID, self.pid, true).is_ok() {
             let _ = super::imp::signal_group(self.pid, Signal::Kill);
         }
         // SAFETY: no other owner can reap our child; retry interruption only.
@@ -501,6 +502,26 @@ mod tests {
         drop(lease);
         assert_eq!(
             observe(libc::P_PID, pid, true).unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn an_external_reaper_revokes_numeric_group_authority() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let null = null();
+        let child = SpawnPlan::new(&command, [&null, &null, &null])
+            .spawn()
+            .unwrap();
+        let lease = super::super::ProcessLease::new(&child);
+        // SAFETY: deliberate foreign-reaper fault injection for this test's child.
+        assert_eq!(
+            unsafe { libc::waitpid(child.id().cast_signed(), std::ptr::null_mut(), 0) },
+            child.id().cast_signed()
+        );
+        assert_eq!(
+            lease.signal(Signal::Kill).unwrap_err().raw_os_error(),
             Some(libc::ECHILD)
         );
     }

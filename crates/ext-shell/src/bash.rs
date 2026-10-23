@@ -659,7 +659,8 @@ async fn supervise(
                 .await?;
                 return Ok(Finished {
                     status,
-                    stopped: why,
+                    stopped: why
+                        .or_else(|| (output.bytes() >= OUTPUT_CAP).then_some(Stop::Flooded)),
                     lingering,
                     output: output.finish(log),
                     process: child,
