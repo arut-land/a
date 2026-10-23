@@ -27,6 +27,8 @@ allow = [
     "MIT",
     "Unicode-3.0",
     "Unlicense",
+    # foldhash, through yaml-rust2's hashlink dependency.
+    "Zlib",
 ]
 confidence-threshold = 0.9
 
