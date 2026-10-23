@@ -5,13 +5,11 @@
 /// keeps diagnostics entirely local, including when a native collector is running.
 pub struct Native(Option<backend::Sink>);
 
-impl Default for Native {
-    fn default() -> Self {
-        Self::new(std::env::var_os("A_HOME").is_some())
-    }
-}
-
 impl Native {
+    pub fn for_home(home: &crate::Home) -> Self {
+        Self::new(home.is_isolated())
+    }
+
     fn new(isolated: bool) -> Self {
         Self((!isolated).then(backend::Sink::new).flatten())
     }
@@ -148,7 +146,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn daemon_spawn_preserves_default_and_explicit_home_modes() {
+        let root = std::env::temp_dir().join("a-native-home-mode");
+        let native = crate::Home {
+            root: root.clone(),
+            isolated: false,
+        };
+        let isolated = crate::Home::from(root.clone());
+        for (home, expected) in [(native, None), (isolated, Some(root.as_os_str()))] {
+            let mut command = std::process::Command::new("unused");
+            command.env("A_HOME", "another-instance");
+            home.daemon_env(&mut command);
+            let value = command
+                .get_envs()
+                .find(|(key, _)| *key == "A_HOME")
+                .unwrap()
+                .1;
+            assert_eq!(value, expected);
+        }
+    }
+
+    #[test]
     fn isolated_diagnostics_never_open_a_native_sink() {
-        assert!(Native::new(true).0.is_none());
+        let home = crate::Home::from(std::env::temp_dir().join("a-native-isolation"));
+        assert!(Native::for_home(&home).0.is_none());
     }
 }

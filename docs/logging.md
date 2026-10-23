@@ -38,8 +38,10 @@ Detached stderr goes to the null device so arbitrary library diagnostics
 cannot bypass the typed API. A manually launched daemon can still show
 console errors.
 
-Native delivery supplements the same readable local file. With `A_HOME` set,
-no native sink is opened. Otherwise Linux connects a nonblocking datagram socket
+Native delivery supplements the same readable local file. An explicit home
+(`A_HOME` or `Home::from`) keeps diagnostics local and never opens a native
+sink. The resolved home carries that distinction. Daemon spawn preserves an
+explicit override and leaves `A_HOME` unset for a default per-user home. Otherwise Linux connects a nonblocking datagram socket
 to `/run/systemd/journal/socket` and sends native journal entries with
 `SYSLOG_IDENTIFIER=a`, priority notice and the sealed JSON record as `MESSAGE`.
 A missing journal or a full socket never delays local delivery. macOS uses

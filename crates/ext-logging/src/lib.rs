@@ -398,16 +398,16 @@ fn write_record(write: &mut impl FnMut(&[u8]) -> io::Result<()>, record: Record)
 
 /// Installed once by a daemon after it owns its home lock. Ordinary clients
 /// never install a writer, so they cannot race rotation with that daemon.
-pub fn install(rt: &rt::Rt, path: PathBuf) {
+pub fn install(rt: &rt::Rt, home: &sys::Home) {
     let logger = CURRENT.get_or_init(Logger::new);
     if !logger.0.started.swap(true, Ordering::AcqRel) {
         let mut file = Rotating {
-            path,
+            path: home.daemon_log(),
             max: MAX,
             keep: KEEP,
             repair: None,
         };
-        let native = sys::log::Native::default();
+        let native = sys::log::Native::for_home(home);
         logger.run(rt, move |line| {
             native.write(line);
             file.write(line)
