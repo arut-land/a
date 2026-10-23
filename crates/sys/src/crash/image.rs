@@ -371,8 +371,8 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not provide loaded ELF images")]
     fn a_program_counter_identifies_its_image_without_symbol_lookup() {
-        let pc = super::frame as *const () as usize;
-        let frame = super::frame(pc);
+        let pc = frame as *const () as usize;
+        let frame = frame(pc);
         assert!(matches!(frame.identity, Some(Identity::ElfBuildId(_))));
         assert_ne!(frame.image, 0);
         assert!(frame.offset > 0 && frame.offset < pc as u64);
