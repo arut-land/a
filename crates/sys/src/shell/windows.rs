@@ -116,22 +116,10 @@ fn powershell(
 }
 
 fn windows_powershell(windows: &Path) -> (PathBuf, &'static str) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // System32's Desktop host stalls autoloading core cmdlets from a native
-        // ARM64 parent; the Windows-provided x86 host retains the 5.1 contract.
-        (
-            windows.join("SysWOW64/WindowsPowerShell/v1.0/powershell.exe"),
-            "Windows PowerShell 5.1 (x86 on ARM64; WoW64 redirects System32; Sysnative accesses native system executables; no profile; noninteractive)",
-        )
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        (
-            windows.join("System32/WindowsPowerShell/v1.0/powershell.exe"),
-            "Windows PowerShell 5.1 (no profile; noninteractive)",
-        )
-    }
+    (
+        windows.join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+        "Windows PowerShell 5.1 (no profile; noninteractive)",
+    )
 }
 
 pub(super) fn discover() -> ExecutionFacts {
@@ -262,6 +250,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shell_startup_probe() {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use windows_sys::Win32::System::Threading::{
+            CREATE_NO_WINDOW, IsWow64Process2, WaitForSingleObject,
+        };
+        if std::env::var_os("A_TEST_POWERSHELL").is_none() {
+            return;
+        }
+        let windows = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        for directory in ["System32", "SysWOW64"] {
+            let executable = windows
+                .join(directory)
+                .join("WindowsPowerShell/v1.0/powershell.exe");
+            for flags in [0, CREATE_NO_WINDOW] {
+                for arch in ["inherit", "AMD64", "x86"] {
+                    let mut command = Command::new(&executable);
+                    command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::WriteLine('bits=' + [IntPtr]::Size); [Console]::WriteLine('arch=' + $env:PROCESSOR_ARCHITECTURE); Write-Output 'ok'; exit 37"])
+                        .creation_flags(flags).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).current_dir(std::env::temp_dir());
+                    if arch != "inherit" {
+                        command.env("PROCESSOR_ARCHITECTURE", arch);
+                    }
+                    let mut child = command.spawn().unwrap();
+                    let (mut process_machine, mut native_machine) = (0u16, 0u16);
+                    // SAFETY: the live child owns this queryable handle and both outputs are writable.
+                    let queried = unsafe {
+                        IsWow64Process2(
+                            child.as_raw_handle(),
+                            &raw mut process_machine,
+                            &raw mut native_machine,
+                        )
+                    };
+                    // SAFETY: the child owns the handle for the bounded wait.
+                    let timeout =
+                        unsafe { WaitForSingleObject(child.as_raw_handle(), 5000) } == 258;
+                    if timeout {
+                        child.kill().unwrap();
+                    }
+                    let output = child.wait_with_output().unwrap();
+                    eprintln!(
+                        "native {} {directory} flags {flags:x} env {arch} machine {process_machine:x}/{native_machine:x} queried {queried}: timeout {timeout} exit {:?} out {:?} err {:?}",
+                        std::env::consts::ARCH,
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn system_bash_is_never_a_native_shell_candidate() {
         let root = std::env::temp_dir().join(format!("a-shell-discovery-{}", std::process::id()));
         let system = root.join("System32");
@@ -290,12 +331,6 @@ mod tests {
     fn absent_pwsh_selects_windows_powershell() {
         let windows = Path::new(r"C:\Windows");
         let (path, syntax) = powershell(Some(""), None, windows);
-        #[cfg(target_arch = "aarch64")]
-        assert_eq!(
-            path,
-            windows.join("SysWOW64/WindowsPowerShell/v1.0/powershell.exe")
-        );
-        #[cfg(not(target_arch = "aarch64"))]
         assert_eq!(
             path,
             windows.join("System32/WindowsPowerShell/v1.0/powershell.exe")
