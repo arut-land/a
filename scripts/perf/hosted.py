@@ -29,7 +29,8 @@ def run(argv, **kwargs):
     if argv[0] == "cargo" and "PERF_CARGO" in os.environ:
         argv[0] = os.environ["PERF_CARGO"]
     try:
-        return (run_timed if argv[0] == "hyperfine" else subprocess.run)(argv, check=True, **kwargs)
+        # Compiler builds have the job deadline; measured commands need a shorter one.
+        return (subprocess.run if Path(argv[0]).name in ["cargo", "cargo.exe"] else run_timed)(argv, check=True, **kwargs)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         if error.stdout:
             print(error.stdout, flush=True)

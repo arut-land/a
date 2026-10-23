@@ -21,6 +21,9 @@ def run_timed(argv, timeout=300, check=True, **kwargs):
     """Bound a measured command and stop only its owned process tree on timeout."""
     import subprocess
 
+    if kwargs.pop("capture_output", False):
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
     child = subprocess.Popen(argv, **kwargs)
     try:
         owner = psutil.Process(child.pid)
@@ -60,8 +63,8 @@ def stop_daemon(binary, env, cwd=None):
         except psutil.NoSuchProcess:
             pass
     try:
-        subprocess.run([str(binary), "daemon", "stop"], env=env, cwd=cwd,
-                       capture_output=True, check=True, timeout=60)
+        run_timed([str(binary), "daemon", "stop"], env=env, cwd=cwd,
+                  capture_output=True, timeout=60)
         if daemon is not None:
             daemon.wait(timeout=60)
     except (subprocess.SubprocessError, psutil.TimeoutExpired):
