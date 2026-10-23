@@ -51,7 +51,7 @@ pub fn page_size() -> io::Result<usize> {
     {
         let mut info = windows_sys::Win32::System::SystemInformation::SYSTEM_INFO::default();
         // SAFETY: info is a valid writable SYSTEM_INFO.
-        unsafe { windows_sys::Win32::System::SystemInformation::GetSystemInfo(&mut info) };
+        unsafe { windows_sys::Win32::System::SystemInformation::GetSystemInfo(&raw mut info) };
         Ok(info.dwPageSize as usize)
     }
 }
@@ -136,7 +136,8 @@ impl Priority {
         {
             let mut relative = 0;
             // SAFETY: pthread_self is live; relative is writable.
-            let previous = unsafe { pthread_get_qos_class_np(libc::pthread_self(), &mut relative) };
+            let previous =
+                unsafe { pthread_get_qos_class_np(libc::pthread_self(), &raw mut relative) };
             // SAFETY: USER_INITIATED is a valid qos_class_t; priority zero is valid.
             unsafe { pthread_set_qos_class_self_np(class, 0) };
             Self {
@@ -185,11 +186,13 @@ mod windows {
         unsafe {
             let process = GetCurrentProcess();
             let (mut affinity, mut system) = (0, 0);
-            if GetProcessAffinityMask(process, &mut affinity, &mut system) != 0 && affinity != 0 {
+            if GetProcessAffinityMask(process, &raw mut affinity, &raw mut system) != 0
+                && affinity != 0
+            {
                 count = count.min(affinity.count_ones() as usize);
             }
             let mut required = 0;
-            GetProcessDefaultCpuSets(process, std::ptr::null_mut(), 0, &mut required);
+            GetProcessDefaultCpuSets(process, std::ptr::null_mut(), 0, &raw mut required);
             if required > 0 {
                 count = count.min(required as usize);
             }
@@ -197,8 +200,8 @@ mod windows {
             if QueryInformationJobObject(
                 std::ptr::null_mut(),
                 JobObjectCpuRateControlInformation,
-                (&mut rate as *mut JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
-                std::mem::size_of_val(&rate) as u32,
+                (&raw mut rate).cast(),
+                u32::try_from(std::mem::size_of_val(&rate)).expect("fixed-size job rate"),
                 std::ptr::null_mut(),
             ) != 0
                 && rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE != 0
@@ -230,6 +233,25 @@ mod tests {
         assert!(facts.page_size.is_power_of_two());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nested_priority_scopes_restore_the_enclosing_work_class() {
+        let _utility = Priority::utility();
+        {
+            let _foreground = Priority::user_initiated();
+            // SAFETY: querying the current thread, without relative-priority output.
+            assert_eq!(
+                unsafe { pthread_get_qos_class_np(libc::pthread_self(), std::ptr::null_mut()) },
+                0x19
+            );
+        }
+        // SAFETY: querying the current thread, without relative-priority output.
+        assert_eq!(
+            unsafe { pthread_get_qos_class_np(libc::pthread_self(), std::ptr::null_mut()) },
+            0x11
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_limits_are_observed_in_an_isolated_process() {
@@ -257,7 +279,7 @@ mod tests {
             let process = GetCurrentProcess();
             let (mut affinity, mut system) = (0usize, 0usize);
             assert_ne!(
-                GetProcessAffinityMask(process, &mut affinity, &mut system),
+                GetProcessAffinityMask(process, &raw mut affinity, &raw mut system),
                 0
             );
             let one = 1usize << affinity.trailing_zeros();
@@ -276,8 +298,8 @@ mod tests {
                 SetInformationJobObject(
                     job,
                     JobObjectCpuRateControlInformation,
-                    (&rate as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
-                    std::mem::size_of_val(&rate) as u32
+                    (&raw const rate).cast(),
+                    u32::try_from(std::mem::size_of_val(&rate)).expect("fixed-size job rate")
                 ),
                 0
             );

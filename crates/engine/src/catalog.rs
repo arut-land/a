@@ -496,8 +496,8 @@ mod tests {
     }
 
     #[test]
-    fn rebuilt_catalog_matches_log_replay() {
-        let store = Memory::default();
+    fn catalog_recovery_completes_under_single_worker_admission() {
+        let store = Arc::new(Memory::default());
         for n in 0..17 {
             let header = Header {
                 id: SessionId::new(),
@@ -536,7 +536,14 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(rebuild(&store).unwrap().records, serial);
+        let dir = std::env::temp_dir().join(format!("a-catalog-admitted-{}", SessionId::new()));
+        fs::create_dir(&dir).unwrap();
+        let runtime = rt::Threads::configured(rt::Config::for_cores(1));
+        let catalog = Catalog::open_on(dir.join("catalog"), store, &runtime).unwrap();
+        assert_eq!(catalog.records(), serial.into_values().collect::<Vec<_>>());
+        catalog.clean().unwrap();
+        runtime.shutdown();
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -156,6 +156,21 @@ fn idle_sessions_hibernate_and_reload_on_attach() {
     assert!(missing.is_err());
 }
 
+#[test]
+fn pressure_reclamation_retains_attached_sessions() {
+    let (root, home) = home("pressure");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    settle(&daemon);
+    daemon.hibernate(Duration::from_nanos(1));
+    assert!(daemon.slots()[0].live().is_some());
+    drop(attachment);
+    daemon.hibernate(Duration::from_nanos(1));
+    assert!(daemon.slots()[0].live().is_none());
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// A hibernated session's log is counted once, and counted again after it
 /// was loaded and grew.
 #[test]

@@ -16,6 +16,18 @@ fn measure(name: &str, mut f: impl FnMut()) {
         region.change()
     );
 }
+fn pipeline(name: &str, batch: usize, mut f: impl FnMut()) {
+    let region = stats_alloc::Region::new(ALLOCATOR);
+    let start = Instant::now();
+    for _ in 0..4096 {
+        f();
+    }
+    println!(
+        "{name} ns_per_message={} stats={:?}",
+        start.elapsed().as_nanos() / (4096 * batch as u128),
+        region.change()
+    );
+}
 fn main() {
     println!(
         "facts {:?}",
@@ -51,6 +63,35 @@ fn main() {
         tx.unbounded_send(black_box(42u64)).unwrap();
         black_box(rx.try_recv().unwrap());
     });
+    for batch in [1, 64, 1024] {
+        let (tx, rx) = rt::channel::unbounded();
+        pipeline(&format!("custom-unbounded-{batch}"), batch, || {
+            for i in 0..batch {
+                tx.send(black_box(i)).unwrap();
+            }
+            for _ in 0..batch {
+                black_box(rx.try_recv().unwrap());
+            }
+        });
+        let (tx, mut rx) = futures_channel::mpsc::unbounded();
+        pipeline(&format!("futures-unbounded-{batch}"), batch, || {
+            for i in 0..batch {
+                tx.unbounded_send(black_box(i)).unwrap();
+            }
+            for _ in 0..batch {
+                black_box(rx.try_recv().unwrap());
+            }
+        });
+        let (tx, rx) = async_channel::unbounded();
+        pipeline(&format!("async-unbounded-{batch}"), batch, || {
+            for i in 0..batch {
+                tx.try_send(black_box(i)).unwrap();
+            }
+            for _ in 0..batch {
+                black_box(rx.try_recv().unwrap());
+            }
+        });
+    }
     for round in 0..5 {
         for ceiling in if round % 2 == 0 {
             [4, 8, usize::MAX]
@@ -61,17 +102,19 @@ fn main() {
             config.cpu.workers = 31.min(ceiling);
             let runtime = rt::Threads::configured(config);
             let start = Instant::now();
-            let jobs = (0..64)
+            let jobs = (0u64..64)
                 .map(|seed| {
                     rt::spawn(
                         &runtime,
                         rt::unblock_with(&runtime, rt::BlockingClass::Cpu, 1 << 20, move || {
-                            let mut value = seed as u64;
+                            let mut value = seed;
                             let mut data = vec![0u64; 131_072];
                             for _ in 0..32 {
                                 for slot in &mut data {
                                     value = black_box(
-                                        value.wrapping_mul(6364136223846793005).wrapping_add(1),
+                                        value
+                                            .wrapping_mul(6_364_136_223_846_793_005)
+                                            .wrapping_add(1),
                                     );
                                     *slot = value;
                                 }

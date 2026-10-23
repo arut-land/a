@@ -442,9 +442,9 @@ impl Blocking {
             if let Some((bytes, work)) = state.queue.pop_front() {
                 wake(&mut state);
                 drop(state);
-                let _priority = sys::resources::Priority::user_initiated();
+                let priority = sys::resources::Priority::user_initiated();
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-                drop(_priority);
+                drop(priority);
                 state = lock(&self.state);
                 state.bytes -= bytes;
                 wake(&mut state);
