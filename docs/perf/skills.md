@@ -50,29 +50,45 @@ Sources: [yaml-rust2 event API](https://docs.rs/yaml-rust2/0.13.0/yaml_rust2/par
 
 ## Hosted parser observations
 
-Linux x86_64, nightly-2026-10-17, five rounds per candidate, all 17 recorded
-headers matched. The table reports median ns/header and median sampled peak
-process RSS; executable bytes are exact standalone probe sizes. These do not
-replace the full shipped-binary measurements.
+[Hosted comparison](https://github.com/arut-land/a/actions/runs/39986111462),
+nightly-2026-10-17, five rounds per candidate, 170,000 header decodes per round.
+Every candidate matches all 17 recorded headers. These are separate native
+hosts; compare candidates within a host, not OS speeds against one another.
+RSS is the median of five sampled peak process observations, including code and
+allocator pages. Bytes describe standalone probes, not the shipped executable.
 
-| Parser | Probe bytes | ns/header | Sampled RSS KiB |
-| --- | ---: | ---: | ---: |
-| custom | 145688 | 4825 | 1888 |
-| event | 182872 | 14354 | 1940 |
-| serde | 226128 | 11111 | 2012 |
-| yaml | 223120 | 14615 | 1984 |
-| saphyr | 228696 | 16277 | 2004 |
+| Host | Parser | Probe bytes | ns/header | Sampled RSS KiB |
+| --- | --- | ---: | ---: | ---: |
+| Linux x86_64 | custom | 145688 | 3675 | 2012 |
+| Linux x86_64 | event | 182872 | 12593 | 2068 |
+| Linux x86_64 | serde | 226128 | 10659 | 2140 |
+| Linux x86_64 | yaml | 223120 | 13238 | 2112 |
+| Linux x86_64 | saphyr | 228696 | 14526 | 2132 |
+| macOS arm64 | custom | 170416 | 7825 | 1968 |
+| macOS arm64 | event | 187296 | 21090 | 1920 |
+| macOS arm64 | serde | 220480 | 18506 | 2416 |
+| macOS arm64 | yaml | 220496 | 19777 | 2208 |
+| macOS arm64 | saphyr | 220416 | 17875 | 2000 |
+| Windows x86_64 | custom | 243712 | 5813 | 3452 |
+| Windows x86_64 | event | 280576 | 16388 | 3668 |
+| Windows x86_64 | serde | 323072 | 14938 | 3620 |
+| Windows x86_64 | yaml | 323584 | 17690 | 3788 |
+| Windows x86_64 | saphyr | 332288 | 19026 | 3572 |
 
-The event adapter adds 9.53 µs/header and 52 KiB sampled RSS versus the custom
-subset on this runner. Its standalone executable grows 37,184 bytes. The
-maintained parser costs more CPU than the subset, but removes bespoke YAML
-syntax handling while keeping explicit resource admission. For occasional
-bounded header decoding, this is proportionate. The tree loader retains more
-metadata, and serde_yaml_ng's smaller CPU time does not supply the same
-application rejection boundary.
+The event adapter costs an additional 8.92/13.27/10.58 µs per header on
+Linux/macOS/Windows respectively. Its standalone executable grows
+37,184/16,880/36,864 bytes. Sampled RSS changes are +56/−48/+216 KiB; this is not
+an allocator-level memory-saving claim. The maintained parser costs more CPU
+than the subset, but removes bespoke YAML syntax handling while retaining
+explicit input/depth/expansion admission. That cost is proportionate for
+occasional bounded metadata decoding. Tree-loader probes do not implement the
+same immediate policy rejection boundary; matching the benign corpus alone is
+not a substitute for those production invariants.
 
 The enabled production graph adds four packages: yaml-rust2, arraydeque,
 hashlink and foldhash. hashbrown was already resolved. foldhash uses the
 [Zlib license](https://spdx.org/licenses/Zlib.html), included in the repository
-license allowlist alongside its other permissive licenses. The complete standalone
-normal dependency trees are in the workflow JSON artifact.
+license allowlist alongside its other permissive licenses. The artifact records
+complete normal dependency trees for every candidate. saphyr's tree interface
+also brings ordered-float/num-traits and thiserror; it supplies no demonstrated
+resource or reliability advantage for this bounded event adapter.

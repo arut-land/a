@@ -91,19 +91,41 @@ that contract alone. The MCP subset implements byte/page limits and cancellation
 on the existing transport (see [mcp.md](mcp.md)). None is retained because a
 maintained crate adds executable bytes. This change does not modify those seams.
 
-## Hosted temporary-directory observation
+## Hosted test infrastructure observations
 
-Linux x86_64, five rounds of 10,000 create/drop pairs:
+[Hosted comparison](https://github.com/arut-land/a/actions/runs/39986111462),
+five rounds per candidate. Temporary directories run 10,000 exclusive creates
+and recursive removals per round on both sides. Signal probes run 1,000,000
+leases/hooks per round so RSS sampling observes steady execution. Probe bytes
+are exact; RSS is the median sampled peak process RSS, not live heap accounting.
+Different hosts are not an OS performance ranking.
 
-| Helper | Probe bytes | ns/pair | Sampled RSS KiB |
-| --- | ---: | ---: | ---: |
-| temp-custom | 93776 | 46401 | 1868 |
-| temp-maintained | 108976 | 55499 | 1824 |
+| Host | Helper | Probe bytes | ns/operation | Sampled RSS KiB |
+| --- | --- | ---: | ---: | ---: |
+| Linux x86_64 | temp-custom | 99736 | 22718 | 2004 |
+| Linux x86_64 | temp-maintained | 108992 | 19992 | 1948 |
+| Linux x86_64 | signal-custom | 93304 | 624 | 1932 |
+| Linux x86_64 | signal-maintained | 98184 | 228 | 1940 |
+| macOS arm64 | temp-custom | 137488 | 108281 | 1488 |
+| macOS arm64 | temp-maintained | 137472 | 135999 | 1472 |
+| macOS arm64 | signal-custom | 137008 | 1185 | 5664 |
+| macOS arm64 | signal-maintained | 136928 | 413 | 1488 |
+| Windows x86_64 | temp-custom | 203264 | 490352 | 3304 |
+| Windows x86_64 | temp-maintained | 214528 | 486270 | 3320 |
 
-The observed tempfile cost is 9.10 µs/pair; the small RSS difference is not a
-memory-saving claim. Exclusive creation and workspace ownership remove real
-collision/deletion failure modes. Both implementations have zero idle work,
-and neither helper is linked into the shipped executable.
+Tempfile is within −2.73/+27.72/−4.08 µs per recursive create/drop pair on
+Linux/macOS/Windows. Its filesystem cost is proportionate to exclusive creation,
+collision retries and removal of same-label workspace deletion. The small
+process-RSS differences do not establish a memory improvement. No tempfile
+helper is linked into the shipped executable; both alternatives have zero idle
+work.
+
+Signal-hook's flag-only registration is faster, but omits the native lease's
+restoration syscalls and a wake source, so it is a lower bound rather than an
+equivalent replacement. macOS native lease churn also has higher sampled RSS
+in this million-lease workload; it does not describe the production daemon's
+single process-lifetime subscription. The lifecycle mismatch above decides
+against adoption independently of size or these timings.
 
 ## Shipped size and paired runtime resources
 
