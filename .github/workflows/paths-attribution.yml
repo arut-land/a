@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, windows-11-arm]
+        os: [windows-11-arm]
     runs-on: ${{ matrix.os }}
     env:
       CARGO_BUILD_JOBS: 4
@@ -27,9 +27,16 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - name: Install native LLVM toolchain
+        shell: pwsh
+        run: |
+          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches.Groups[1].Value
+          $toolchain = "$channel-aarch64-pc-windows-msvc"
+          "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+          rustup toolchain install $toolchain --profile minimal --component rust-src
       - uses: jdx/mise-action@v5
         with:
-          install_args: rust mr-boxington
+          install_args: mr-boxington
       - run: python -m pip install psutil==7.2.2
       - run: mise exec -- python scripts/perf/paths-attribution.py
       - uses: actions/upload-artifact@v5
@@ -37,33 +44,3 @@ jobs:
         with:
           name: paths-attribution-${{ matrix.os }}
           path: target/paths-attribution/*.json
-  reaping:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    env:
-      CARGO_BUILD_JOBS: 4
-      MISE_AUTO_INSTALL: false
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington ${{ runner.os == 'Linux' && 'mold' || '' }}
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
-      - run: mise exec -- python scripts/perf/paths-stress.py
-      - uses: actions/upload-artifact@v5
-        if: always()
-        with:
-          name: paths-stress-${{ matrix.os }}
-          path: target/paths-stress/reaping.json

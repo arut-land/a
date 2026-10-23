@@ -93,7 +93,7 @@ def main():
                        cwd=source, env=env, check=True)
         binary = OUTPUT / "build/release/a.exe"
         (OUTPUT / (role + ".json")).write_text(json.dumps(dict(
-            revision=revision, **daemon_probe(binary)), indent=2))
+            revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(), **daemon_probe(binary)), indent=2))
 
 
 if __name__ == "__main__":

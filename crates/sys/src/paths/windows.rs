@@ -42,7 +42,7 @@ fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
     let free = free.map_err(io::Error::other)?;
     let mut raw = std::ptr::null_mut();
     // SAFETY: id is a valid GUID and raw is a writable output pointer. A null
-    // token selects the current user and requires no COM initialization.
+    // token selects the current user.
     let result = unsafe { resolve(id, 0, std::ptr::null_mut(), &raw mut raw) };
     if result < 0 {
         // SAFETY: the API owns this allocation; CoTaskMemFree accepts null.

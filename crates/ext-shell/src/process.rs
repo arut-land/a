@@ -782,7 +782,7 @@ int main(int argc, char **argv) {
                 .unwrap(),
         );
         let cx = rig.cx();
-        // Stdin holds the child until the test releases status acquisition.
+        // Stdin holds the child until the injected early exit observation.
         let mut launching = std::pin::pin!(launch(
             &cx,
             spec(&cx, "read -r line"),
