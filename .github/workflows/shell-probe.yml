@@ -1,5 +1,8 @@
 name: shell startup probe
-on: workflow_dispatch
+on:
+  push:
+    branches: [codex-w3shell]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
