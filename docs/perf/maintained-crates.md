@@ -179,3 +179,29 @@ increases 0.702 ms within a 1.96 ms candidate spread. These hosted observations
 do not establish a stable regression or improvement; the parser CPU comparison
 uses repeated corpus decoding rather than attributing empty-catalog startup to
 YAML work that did not execute.
+
+## Validation
+
+[CI](https://github.com/arut-land/a/actions/runs/39987099187) passes all eleven
+jobs: Linux/macOS fmt, clippy and workspace tests; Windows cross-platform lint;
+native Windows build, workspace tests and acceptance; both release budget
+lanes; dependency/license/source checks; machete; no-Tokio; Miri; coverage
+fuzzing; and Apple FFI/Swift tests plus the headless application build.
+The [crate comparison](https://github.com/arut-land/a/actions/runs/39986111462)
+is green on Linux, macOS and Windows. The six-target paired run linked above
+also passes every lane, with all five reference and candidate rounds complete.
+
+The invariants include `real_headers_preserve_the_reference_index`,
+`errors_are_bounded_and_locate_the_offending_line`,
+`maintained_yaml_accepts_portable_text_and_rejects_expansion`,
+`same_named_rigs_never_remove_each_others_workspaces`,
+`signal_registration_is_exclusive` (including default restoration and CLOEXEC),
+and `termination_survives_a_full_signal_pipe`. MCP fixture scenarios retain
+their labels while locating effects inside the actual workspace.
+
+The YAML adapter and test utilities are shared across operating systems. Linux
+also creates its signal pipe atomically with both flags. macOS and Windows keep
+their native signal sources. Shared manifests and the lockfile change only for
+the adopted dependencies, with Zlib added for foldhash. Path backends, channels,
+source watching/reload, edit transactions and executable staging remain with
+their owning sessions. No wire, log, config or recorded fixture changes occur.
