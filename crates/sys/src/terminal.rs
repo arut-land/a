@@ -329,7 +329,7 @@ mod imp;
 mod tests {
     use super::*;
     use std::fs::File;
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::FromRawFd;
     use std::process::{Command, Stdio};
 
     fn assert_modes(before: &rustix::termios::Termios, after: &rustix::termios::Termios) {
@@ -373,6 +373,7 @@ mod tests {
                 !raw.local_modes
                     .contains(rustix::termios::LocalModes::ICANON)
             );
+            println!("raw input acquired before panic");
             panic!("unwind the owned terminal");
         }
 
@@ -399,7 +400,7 @@ mod tests {
         let before = rustix::termios::tcgetattr(&slave).unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture"])
-            .env("A_TEST_TTY", slave.as_raw_fd().to_string())
+            .env("A_TEST_TTY", "1")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .output()
             .unwrap();
@@ -409,6 +410,124 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("raw input acquired before panic")
+        );
         assert_modes(&before, &rustix::termios::tcgetattr(&master).unwrap());
+    }
+
+    #[test]
+    #[allow(clippy::cast_lossless)] // ioctl request types differ between Unix targets.
+    fn a_background_continue_never_takes_the_terminal_from_the_shell() {
+        const NAME: &str =
+            "terminal::tests::a_background_continue_never_takes_the_terminal_from_the_shell";
+        match std::env::var("A_TEST_JOB").as_deref() {
+            Ok("worker") => {
+                // SAFETY: this child creates its own job in the test session.
+                assert_eq!(unsafe { libc::setpgid(0, 0) }, 0);
+                let signals = crate::Signals::catch(&[Signal::Suspend]).unwrap();
+                let raw = RawMode::enter().unwrap();
+                println!("raw input acquired");
+                assert_eq!(signals.wait(), [Signal::Suspend]);
+                drop(raw);
+                suspend().unwrap();
+                let _raw = RawMode::enter().unwrap();
+                println!("raw input reacquired");
+            }
+            Ok("shell") => {
+                // SAFETY: this subprocess owns the supplied controlling tty.
+                unsafe {
+                    assert_ne!(libc::setsid(), -1);
+                    assert_ne!(libc::ioctl(0, libc::TIOCSCTTY as _, 0), -1);
+                }
+                shell_job_control(NAME);
+            }
+            _ => {
+                let mut master = -1;
+                let mut slave = -1;
+                // SAFETY: writable descriptor buffers; optional buffers omitted.
+                let result = unsafe {
+                    libc::openpty(
+                        &raw mut master,
+                        &raw mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                assert_eq!(result, 0);
+                // SAFETY: openpty descriptors transferred exactly once.
+                let (master, slave) =
+                    unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+                for file in [&master, &slave] {
+                    rustix::io::fcntl_setfd(file, rustix::io::FdFlags::CLOEXEC).unwrap();
+                }
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture"])
+                    .env("A_TEST_JOB", "shell")
+                    .stdin(Stdio::from(slave))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    fn shell_job_control(name: &str) {
+        use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
+        use std::io::{BufRead, BufReader};
+        use std::os::fd::AsFd;
+        struct Job(std::process::Child);
+        impl Drop for Job {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let stdin = io::stdin();
+        let before = rustix::termios::tcgetattr(&stdin).unwrap();
+        let mut child = Job(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("A_TEST_JOB", "worker")
+            .stdin(Stdio::from(stdin.as_fd().try_clone_to_owned().unwrap()))
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap());
+        let pid = Pid::from_child(&child.0);
+        let stopped = || {
+            let (_, state) = waitpid(Some(pid), WaitOptions::UNTRACED).unwrap().unwrap();
+            assert!(state.stopped());
+        };
+        // Background startup must stop before modifying termios.
+        stopped();
+        assert_modes(&before, &rustix::termios::tcgetattr(&stdin).unwrap());
+        rustix::termios::tcsetpgrp(&stdin, pid).unwrap();
+        kill_process(pid, Signal::CONT).unwrap();
+        let mut lines = BufReader::new(child.0.stdout.take().unwrap()).lines();
+        assert!(
+            lines
+                .by_ref()
+                .any(|line| line.unwrap() == "raw input acquired")
+        );
+        kill_process(pid, Signal::TSTP).unwrap();
+        stopped();
+        assert_modes(&before, &rustix::termios::tcgetattr(&stdin).unwrap());
+        let _output = OutputGuard::enter().unwrap();
+        let shell = rustix::process::getpgrp();
+        rustix::termios::tcsetpgrp(&stdin, shell).unwrap();
+        kill_process(pid, Signal::CONT).unwrap();
+        stopped();
+        assert_eq!(rustix::termios::tcgetpgrp(&stdin).unwrap(), shell);
+        assert_modes(&before, &rustix::termios::tcgetattr(&stdin).unwrap());
+        rustix::termios::tcsetpgrp(&stdin, pid).unwrap();
+        kill_process(pid, Signal::CONT).unwrap();
+        assert!(lines.any(|line| line.unwrap() == "raw input reacquired"));
+        assert!(child.0.wait().unwrap().success());
+        assert_modes(&before, &rustix::termios::tcgetattr(&stdin).unwrap());
     }
 }

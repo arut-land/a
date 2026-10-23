@@ -63,6 +63,11 @@ mod imp {
         source.pending.fetch_or(bit, Ordering::Release);
         // SAFETY: SOURCE owns the event for the process lifetime.
         unsafe { SetEvent(source.event.as_raw_handle()) };
+        if signal == Signal::Hangup {
+            // Windows terminates the process when a close/logoff handler
+            // returns; waking the renderer alone cannot guarantee cleanup.
+            crate::terminal::restore();
+        }
         1
     }
 
