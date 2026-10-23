@@ -166,6 +166,21 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn native_guards_can_overlap_and_reopen_without_emitting_a_record() {
+        let home = crate::Home {
+            root: std::env::temp_dir().join("a-native-guard"),
+            isolated: false,
+        };
+        let first = Native::for_home(&home);
+        let second = Native::for_home(&home);
+        assert!(first.0.is_some() && second.0.is_some());
+        drop(first);
+        drop(second);
+        assert!(Native::for_home(&home).0.is_some());
+    }
+
     #[test]
     fn isolated_diagnostics_never_open_a_native_sink() {
         let home = crate::Home::from(std::env::temp_dir().join("a-native-isolation"));
