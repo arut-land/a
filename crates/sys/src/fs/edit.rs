@@ -1,9 +1,9 @@
 //! Safe-save publication. Final-component links and multiply linked files are
 //! rejected: replacing either would silently change which object is edited.
-//! Exchange-capable Unix filesystems verify the displaced version and roll back
-//! conflicts, retaining unexpected rollback data for recovery. Plain-rename
-//! fallbacks and write-denying source handles report their weaker protection.
-//! These facilities do not provide a pathname/content compare-and-swap.
+//! Unix exchange verifies displaced content and preserved metadata. Other paths
+//! move and verify the original, then publish without replacement. Contended
+//! restore operations retain displaced data and report a typed recovery conflict.
+//! Receipts distinguish atomic exchange visibility from a possible absence window.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -30,6 +30,7 @@ pub enum EditError {
     MultipleLinks,
     TooLarge,
     Cancelled,
+    UnsupportedPublication,
     Io(io::Error),
 }
 
@@ -45,6 +46,9 @@ impl std::fmt::Display for EditError {
             Self::MultipleLinks => f.write_str("edit refuses to break multiple hard links"),
             Self::TooLarge => f.write_str("file exceeds byte limit"),
             Self::Cancelled => f.write_str("edit cancelled"),
+            Self::UnsupportedPublication => {
+                f.write_str("filesystem does not support safe edit publication")
+            }
             Self::Io(error) => error.fmt(f),
         }
     }
@@ -57,6 +61,7 @@ impl From<io::Error> for EditError {
         match error.kind() {
             io::ErrorKind::Interrupted => Self::Cancelled,
             io::ErrorKind::FileTooLarge => Self::TooLarge,
+            io::ErrorKind::Unsupported => Self::UnsupportedPublication,
             _ => Self::Io(error),
         }
     }
@@ -77,8 +82,8 @@ pub enum Durability {
 pub enum PublicationProtection {
     ExclusiveCreate,
     ExchangeVerified,
-    WriteDenied,
-    RevalidatedRename,
+    /// The target may be absent between verified removal and no-replace publication.
+    VacantNoReplace,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +91,7 @@ pub struct EditReceipt {
     pub visible: bool,
     pub durability: Durability,
     pub protection: PublicationProtection,
+    pub absence_window: bool,
 }
 
 /// Owns the captured source and parent until publication or abort.
@@ -145,6 +151,8 @@ impl EditTransaction {
         let signature = signature(&file)?;
         #[cfg(target_vendor = "apple")]
         mac_xattrs(&file, file.metadata()?.len(), limit)?;
+        #[cfg(target_os = "linux")]
+        linux_xattrs(&file, file.metadata()?.len(), limit)?;
         #[cfg(windows)]
         {
             transaction.stream_bytes = stream_bytes(&file, limit)?;
@@ -264,7 +272,7 @@ impl EditTransaction {
         if durable {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "edit publication supports atomic visibility only on Windows",
+                "edit publication does not support durability on Windows",
             )
             .into());
         }
@@ -286,7 +294,7 @@ impl EditTransaction {
         }
         check_cancel(should_cancel, 0)?;
         self.revalidate()?;
-        #[cfg(target_vendor = "apple")]
+        #[cfg(unix)]
         let metadata_content = self
             .original
             .as_ref()
@@ -320,6 +328,15 @@ impl EditTransaction {
                 &mut copied,
                 should_cancel,
             )?;
+            #[cfg(target_os = "linux")]
+            copy_xattrs(
+                source,
+                &staged.file,
+                metadata_content,
+                self.limit,
+                &mut copied,
+                should_cancel,
+            )?;
             preserve_metadata(source, &staged.file)?;
         }
         if durable {
@@ -340,6 +357,7 @@ impl EditTransaction {
         Ok(EditReceipt {
             visible: true,
             durability,
+            absence_window: protection == PublicationProtection::VacantNoReplace,
             protection,
         })
     }
@@ -353,7 +371,7 @@ impl EditTransaction {
         before_rollback: impl FnOnce(),
     ) -> Result<PublicationProtection, EditError> {
         #[cfg(windows)]
-        let _ = (bytes, exchange, after_exchange, before_rollback);
+        let _ = (bytes, exchange);
         #[cfg(unix)]
         let published = signature(&staged.file)?;
         #[cfg(unix)]
@@ -368,17 +386,12 @@ impl EditTransaction {
             })?
         {
             after_exchange();
-            let checked = (|| {
-                let mut displaced = staged.displaced()?;
-                if moved_signature(*before) != moved_signature(signature(&displaced)?) {
-                    return Err(EditError::Conflict(EditConflict::Changed));
-                }
-                check_bytes(
-                    &mut displaced,
-                    self.original.as_deref().expect("captured source"),
-                )?;
-                Ok(())
-            })();
+            let checked = staged
+                .displaced()
+                .map_err(EditError::from)
+                .and_then(|mut displaced| {
+                    self.verify_displaced(&mut displaced, &staged.file, before)
+                });
             if checked.is_err() {
                 // A rollback must never discard a second writer's version.
                 // Verify both sides; retain unexpected displaced data for recovery.
@@ -402,19 +415,114 @@ impl EditTransaction {
             }
             return Ok(PublicationProtection::ExchangeVerified);
         }
-        match staged.publish(&self.name, self.source.is_some()) {
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(EditError::Conflict(EditConflict::Appeared));
-            }
-            result => result?,
-        }
-        if self.source.is_none() {
-            return Ok(PublicationProtection::ExclusiveCreate);
-        }
-        #[cfg(unix)]
-        return Ok(PublicationProtection::RevalidatedRename);
+        self.commit_vacant(staged, after_exchange, before_rollback)
+    }
+
+    fn commit_vacant(
+        &self,
+        staged: &mut Staged<'_>,
+        after_move: impl FnOnce(),
+        before_restore: impl FnOnce(),
+    ) -> Result<PublicationProtection, EditError> {
+        let Some((source, before)) = &self.source else {
+            return match staged.publish(&self.name) {
+                Ok(()) => Ok(PublicationProtection::ExclusiveCreate),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    Err(EditError::Conflict(EditConflict::Appeared))
+                }
+                Err(error) => Err(error.into()),
+            };
+        };
         #[cfg(windows)]
-        Ok(PublicationProtection::WriteDenied)
+        let moving_source = {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::{Foundation::GENERIC_READ, Storage::FileSystem::DELETE};
+            // Acquire rename authority on the captured object after CopyFileEx releases
+            // its source handle. The original read handle continues to deny writers.
+            reopen(source.as_raw_handle(), GENERIC_READ | DELETE)
+                .map_err(|error| self.revalidate().err().unwrap_or(EditError::Io(error)))?
+        };
+        #[cfg(windows)]
+        let source = &moving_source;
+        staged.take_original(source, &self.name).map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists
+            ) {
+                EditError::Conflict(EditConflict::Changed)
+            } else {
+                self.revalidate().err().unwrap_or(EditError::Io(error))
+            }
+        })?;
+        after_move();
+        let checked = staged
+            .original()
+            .map_err(EditError::from)
+            .and_then(|mut original| self.verify_displaced(&mut original, &staged.file, before));
+        let conflict = if checked.is_err() {
+            EditConflict::Changed
+        } else {
+            match staged.publish(&self.name) {
+                Ok(()) => {
+                    // The detached file can still have a writer holding an old descriptor.
+                    // Preserve it for recovery if that version changed during publication.
+                    let unchanged = staged.original().is_ok_and(|mut original| {
+                        self.verify_displaced(&mut original, &staged.file, before)
+                            .is_ok()
+                    });
+                    if unchanged && staged.reclaim_original(source).is_ok() {
+                        return Ok(PublicationProtection::VacantNoReplace);
+                    }
+                    return Err(EditError::Conflict(EditConflict::Recovery(
+                        staged.retain_original(),
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    EditConflict::Appeared
+                }
+                Err(error) => {
+                    // A failed no-replace operation cannot justify discarding the original.
+                    before_restore();
+                    if staged.restore_original(source, &self.name).is_ok() {
+                        return Err(error.into());
+                    }
+                    return Err(EditError::Conflict(EditConflict::Recovery(
+                        staged.retain_original(),
+                    )));
+                }
+            }
+        };
+        before_restore();
+        if staged.restore_original(source, &self.name).is_ok() {
+            Err(EditError::Conflict(conflict))
+        } else {
+            Err(EditError::Conflict(EditConflict::Recovery(
+                staged.retain_original(),
+            )))
+        }
+    }
+
+    fn verify_displaced(
+        &self,
+        displaced: &mut File,
+        snapshot: &File,
+        before: &Signature,
+    ) -> Result<(), EditError> {
+        let observed = signature(displaced)?;
+        if moved_signature(*before) != moved_signature(observed) {
+            return Err(EditError::Conflict(EditConflict::Changed));
+        }
+        displaced.rewind()?;
+        check_bytes(
+            displaced,
+            self.original.as_deref().expect("captured source"),
+        )?;
+        if !preserved_metadata_matches(displaced, snapshot, self.limit)?
+            || signature(displaced)? != observed
+        {
+            return Err(EditError::Conflict(EditConflict::Changed));
+        }
+        Ok(())
     }
 
     fn stage(&self, should_cancel: &(dyn Fn(u64) -> bool + Sync)) -> io::Result<Staged<'_>> {
@@ -457,6 +565,12 @@ fn moved_signature(mut signature: Signature) -> Signature {
     // Rename changes ctime itself; identity, mtime, mode and bytes must still match.
     signature.5 = 0;
     signature.6 = 0;
+    signature
+}
+
+#[cfg(windows)]
+fn moved_signature(mut signature: Signature) -> Signature {
+    signature.changed = 0;
     signature
 }
 
@@ -646,8 +760,6 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    #[cfg(target_os = "linux")]
-    copy_xattrs(source, destination)?;
     destination.set_permissions(metadata.permissions())?;
     #[cfg(target_vendor = "apple")]
     access_acl(Some(source), destination)?;
@@ -838,42 +950,404 @@ pub(super) fn access_acl(source: Option<&File>, destination: &File) -> io::Resul
 }
 
 #[cfg(target_os = "linux")]
-fn copy_xattrs(source: &File, destination: &File) -> io::Result<()> {
-    use rustix::fs::{XattrFlags, fgetxattr, flistxattr, fremovexattr, fsetxattr};
+fn linux_xattrs(source: &File, content: u64, limit: usize) -> io::Result<Vec<u8>> {
+    use rustix::fs::{fgetxattr, flistxattr};
+    let mut remaining = (limit as u64)
+        .checked_sub(content)
+        .ok_or(io::ErrorKind::FileTooLarge)?;
     let size = match flistxattr(source, &mut [0u8; 0][..]) {
         Ok(size) => size,
-        Err(rustix::io::Errno::NOTSUP) => return Ok(()),
+        Err(rustix::io::Errno::NOTSUP) => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
+    remaining = remaining
+        .checked_sub(size as u64)
+        .ok_or(io::ErrorKind::FileTooLarge)?;
     let mut names = vec![0; size];
     let length = flistxattr(source, names.as_mut_slice())?;
-    let names = &names[..length];
-    // A directory's current default ACL may differ from the one under which
-    // the source was created. Never retain extra inherited permissions.
-    let size = flistxattr(destination, &mut [0u8; 0][..])?;
-    let mut inherited = vec![0; size];
-    let length = flistxattr(destination, inherited.as_mut_slice())?;
-    for name in inherited[..length]
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-    {
-        if !names.split(|b| *b == 0).any(|source| source == name) {
-            let name = std::ffi::CString::new(name).map_err(|_| io::ErrorKind::InvalidData)?;
-            fremovexattr(destination, &name)?;
+    if length > names.len() {
+        return Err(io::ErrorKind::ResourceBusy.into());
+    }
+    names.truncate(length);
+    for name in names.split_inclusive(|b| *b == 0) {
+        let name =
+            std::ffi::CStr::from_bytes_with_nul(name).map_err(|_| io::ErrorKind::InvalidData)?;
+        let size = fgetxattr(source, name, &mut [0u8; 0][..])?;
+        remaining = remaining
+            .checked_sub(size as u64)
+            .ok_or(io::ErrorKind::FileTooLarge)?;
+    }
+    Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_xattrs(
+    source: &File,
+    destination: &File,
+    content: usize,
+    limit: usize,
+    copied: &mut u64,
+    should_cancel: &(dyn Fn(u64) -> bool + Sync),
+) -> io::Result<()> {
+    use rustix::fs::{XattrFlags, fgetxattr, fremovexattr, fsetxattr};
+    let names = linux_xattrs(source, content as u64, limit)?;
+    let mut remaining = limit - content - names.len();
+    // Strip ACLs inherited from a directory whose defaults changed since capture.
+    for name in linux_xattrs(destination, 0, limit)?.split_inclusive(|b| *b == 0) {
+        check_cancel(should_cancel, *copied)?;
+        if !names
+            .split_inclusive(|b| *b == 0)
+            .any(|source| source == name)
+        {
+            let name = std::ffi::CStr::from_bytes_with_nul(name)
+                .map_err(|_| io::ErrorKind::InvalidData)?;
+            fremovexattr(destination, name)?;
         }
     }
-    for name in names.split(|b| *b == 0).filter(|s| !s.is_empty()) {
-        let name = std::ffi::CString::new(name).map_err(|_| io::ErrorKind::InvalidData)?;
-        let size = fgetxattr(source, &name, &mut [0u8; 0][..])?;
+    for name in names.split_inclusive(|b| *b == 0) {
+        check_cancel(should_cancel, *copied)?;
+        let name =
+            std::ffi::CStr::from_bytes_with_nul(name).map_err(|_| io::ErrorKind::InvalidData)?;
+        let size = fgetxattr(source, name, &mut [0u8; 0][..])?;
+        remaining = remaining
+            .checked_sub(size)
+            .ok_or(io::ErrorKind::FileTooLarge)?;
         let mut value = vec![0; size];
-        let length = fgetxattr(source, &name, value.as_mut_slice())?;
-        fsetxattr(destination, &name, &value[..length], XattrFlags::empty())?;
+        let length = fgetxattr(source, name, value.as_mut_slice())?;
+        if length != size {
+            return Err(io::ErrorKind::ResourceBusy.into());
+        }
+        fsetxattr(destination, name, &value, XattrFlags::empty())?;
+        *copied += size as u64 + name.to_bytes_with_nul().len() as u64;
+        check_cancel(should_cancel, *copied)?;
     }
     Ok(())
 }
 
+#[cfg(unix)]
+fn preserved_metadata_matches(source: &File, snapshot: &File, limit: usize) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let (before, copied) = (source.metadata()?, snapshot.metadata()?);
+    if (before.mode(), before.uid(), before.gid()) != (copied.mode(), copied.uid(), copied.gid()) {
+        return Ok(false);
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        if (
+            before.st_flags(),
+            before.st_birthtime(),
+            before.st_birthtime_nsec(),
+        ) != (
+            copied.st_flags(),
+            copied.st_birthtime(),
+            copied.st_birthtime_nsec(),
+        ) || mac_acl(source)? != mac_acl(snapshot)?
+        {
+            return Ok(false);
+        }
+    }
+    #[cfg(target_vendor = "apple")]
+    let names = |file: &File| mac_xattrs(file, 0, limit);
+    #[cfg(target_os = "linux")]
+    let names = |file: &File| linux_xattrs(file, 0, limit);
+    let (before, copied) = (names(source)?, names(snapshot)?);
+    let sorted = |names: &[u8]| -> Vec<Vec<u8>> {
+        let mut names: Vec<_> = names
+            .split_inclusive(|b| *b == 0)
+            .map(<[u8]>::to_vec)
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    if sorted(&before) != sorted(&copied) {
+        return Ok(false);
+    }
+    let mut remaining = limit - before.len();
+    for name in before.split_inclusive(|b| *b == 0) {
+        let name =
+            std::ffi::CStr::from_bytes_with_nul(name).map_err(|_| io::ErrorKind::InvalidData)?;
+        let size = rustix::fs::fgetxattr(source, name, &mut [0u8; 0][..])?;
+        remaining = remaining
+            .checked_sub(size)
+            .ok_or(io::ErrorKind::FileTooLarge)?;
+        if rustix::fs::fgetxattr(snapshot, name, &mut [0u8; 0][..])? != size {
+            return Ok(false);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut a = vec![0; size];
+            let mut b = vec![0; size];
+            if rustix::fs::fgetxattr(source, name, a.as_mut_slice())? != size
+                || rustix::fs::fgetxattr(snapshot, name, b.as_mut_slice())? != size
+                || a != b
+            {
+                return Ok(false);
+            }
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::fd::AsRawFd;
+            let fork = name == c"com.apple.ResourceFork";
+            let mut a = vec![0u8; if fork { size.min(65536) } else { size }];
+            let mut b = vec![0u8; a.len()];
+            let mut at = 0;
+            loop {
+                let count = (size - at).min(a.len());
+                let position = u32::try_from(at).map_err(|_| io::ErrorKind::FileTooLarge)?;
+                for (file, buffer) in [(source, &mut a), (snapshot, &mut b)] {
+                    // SAFETY: the terminated name and owned file are live, and count fits buffer.
+                    let read = mac_count(unsafe {
+                        libc::fgetxattr(
+                            file.as_raw_fd(),
+                            name.as_ptr(),
+                            buffer.as_mut_ptr().cast(),
+                            count,
+                            position,
+                            0,
+                        )
+                    })?;
+                    if read != count {
+                        return Ok(false);
+                    }
+                }
+                if a[..count] != b[..count] {
+                    return Ok(false);
+                }
+                at += count;
+                if at == size {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(target_vendor = "apple")]
+fn mac_acl(file: &File) -> io::Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn acl_get_fd(fd: libc::c_int) -> *mut std::ffi::c_void;
+        fn acl_size(acl: *mut std::ffi::c_void) -> libc::ssize_t;
+        fn acl_copy_ext(
+            buffer: *mut std::ffi::c_void,
+            acl: *mut std::ffi::c_void,
+            size: libc::ssize_t,
+        ) -> libc::ssize_t;
+        fn acl_free(acl: *mut std::ffi::c_void) -> libc::c_int;
+    }
+    // SAFETY: file owns its descriptor; acl is freed after serialization.
+    let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(Vec::new())
+        } else {
+            Err(error)
+        };
+    }
+    let result = (|| {
+        // SAFETY: acl remains live until acl_free below.
+        let size = mac_count(unsafe { acl_size(acl) })?;
+        // Darwin limits ACLs to 128 entries; cap native serialization defensively.
+        if size > 65536 {
+            return Err(io::ErrorKind::FileTooLarge.into());
+        }
+        let mut bytes = vec![0u8; size];
+        // SAFETY: bytes owns size writable bytes and acl is a valid live object.
+        let copied =
+            mac_count(unsafe { acl_copy_ext(bytes.as_mut_ptr().cast(), acl, size.cast_signed()) })?;
+        bytes.truncate(copied);
+        Ok(bytes)
+    })();
+    // SAFETY: acl_get_fd allocated this object and no call transferred its ownership.
+    unsafe {
+        acl_free(acl);
+    }
+    result
+}
+
 #[cfg(windows)]
-#[derive(PartialEq, Eq)]
+fn preserved_metadata_matches(source: &File, snapshot: &File, limit: usize) -> io::Result<bool> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_ARCHIVE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    };
+    let (a, b) = (source.metadata()?, snapshot.metadata()?);
+    if a.creation_time() != b.creation_time()
+        || a.file_attributes() & !FILE_ATTRIBUTE_ARCHIVE
+            != b.file_attributes() & !FILE_ATTRIBUTE_ARCHIVE
+        || !windows_policy_matches(source, snapshot)?
+    {
+        return Ok(false);
+    }
+    let mut before = stream_inventory(source, limit)?;
+    before.retain(|(name, _)| name != "::$DATA");
+    let mut copied = stream_inventory(snapshot, limit)?;
+    copied.retain(|(name, _)| name != "::$DATA");
+    before.sort_unstable();
+    copied.sort_unstable();
+    if before != copied {
+        return Ok(false);
+    }
+    let open = |base: &File, name: &std::ffi::OsStr| -> io::Result<File> {
+        let mut path = super::final_path(base)?.into_os_string();
+        path.push(name);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(path)?;
+        if !same_object(base, &file)? {
+            return Err(io::ErrorKind::ResourceBusy.into());
+        }
+        Ok(file)
+    };
+    let mut a = [0; 8192];
+    let mut b = [0; 8192];
+    for (name, size) in before {
+        let (mut left, mut right) = (open(source, &name)?, open(snapshot, &name)?);
+        let mut remaining = size;
+        while remaining > 0 {
+            let count =
+                usize::try_from(remaining.min(a.len() as u64)).expect("bounded stream chunk");
+            left.read_exact(&mut a[..count])?;
+            right.read_exact(&mut b[..count])?;
+            if a[..count] != b[..count] {
+                return Ok(false);
+            }
+            remaining -= count as u64;
+        }
+        if left.read(&mut a[..1])? != 0 || right.read(&mut b[..1])? != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn stream_inventory(file: &File, limit: usize) -> io::Result<Vec<(OsString, u64)>> {
+    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_STREAM_INFO, FileStreamInfo, GetFileInformationByHandleEx,
+    };
+    let mut buffer = vec![0u64; 65536 / 8];
+    // SAFETY: buffer is initialized, aligned storage with the advertised byte capacity.
+    crate::windows::ok(unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStreamInfo,
+            buffer.as_mut_ptr().cast(),
+            65536,
+        )
+    })?;
+    let mut at = 0usize;
+    let mut total = 0u64;
+    let mut streams = Vec::new();
+    loop {
+        if at + size_of::<FILE_STREAM_INFO>() > 65536 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        // SAFETY: at is aligned and bounds cover the kernel-populated header.
+        let entry = unsafe { &*buffer.as_ptr().add(at / 8).cast::<FILE_STREAM_INFO>() };
+        let length = entry.StreamNameLength as usize;
+        if length % 2 != 0
+            || at + std::mem::offset_of!(FILE_STREAM_INFO, StreamName) + length > 65536
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        // SAFETY: the checked length covers exactly this UTF-16 name in the live buffer.
+        let name = OsString::from_wide(unsafe {
+            std::slice::from_raw_parts(entry.StreamName.as_ptr(), length / 2)
+        });
+        let size = u64::try_from(entry.StreamSize).map_err(|_| io::ErrorKind::InvalidData)?;
+        {
+            total = total
+                .checked_add(size)
+                .filter(|sum| *sum <= limit as u64)
+                .ok_or(io::ErrorKind::FileTooLarge)?;
+            streams.push((name, size));
+        }
+        if entry.NextEntryOffset == 0 {
+            break;
+        }
+        let next = entry.NextEntryOffset as usize;
+        if next < size_of::<FILE_STREAM_INFO>() || next % 8 != 0 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        at = at.checked_add(next).ok_or(io::ErrorKind::InvalidData)?;
+    }
+    Ok(streams)
+}
+
+#[cfg(windows)]
+fn windows_policy_matches(source: &File, snapshot: &File) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, EqualSid, GROUP_SECURITY_INFORMATION,
+        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+    };
+    struct Policy {
+        descriptor: *mut std::ffi::c_void,
+        owner: *mut std::ffi::c_void,
+        group: *mut std::ffi::c_void,
+        acl: *mut ACL,
+        protected: bool,
+    }
+    impl Drop for Policy {
+        fn drop(&mut self) {
+            // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
+            unsafe {
+                windows_sys::Win32::Foundation::LocalFree(self.descriptor);
+            }
+        }
+    }
+    let read = |file: &File| -> io::Result<Policy> {
+        let mut policy = Policy {
+            descriptor: std::ptr::null_mut(),
+            owner: std::ptr::null_mut(),
+            group: std::ptr::null_mut(),
+            acl: std::ptr::null_mut(),
+            protected: false,
+        };
+        // SAFETY: the owned file and writable output pointers live through the call.
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &raw mut policy.owner,
+                &raw mut policy.group,
+                &raw mut policy.acl,
+                std::ptr::null_mut(),
+                &raw mut policy.descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status.cast_signed()));
+        }
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: policy retains the descriptor and both outputs are writable.
+        crate::windows::ok(unsafe {
+            GetSecurityDescriptorControl(policy.descriptor, &raw mut control, &raw mut revision)
+        })?;
+        policy.protected = control & SE_DACL_PROTECTED != 0;
+        Ok(policy)
+    };
+    let (a, b) = (read(source)?, read(snapshot)?);
+    // SAFETY: both policy values retain the descriptors containing all SID/ACL pointers.
+    Ok(unsafe {
+        a.protected == b.protected
+            && EqualSid(a.owner, b.owner) != 0
+            && EqualSid(a.group, b.group) != 0
+            && same_acl(a.acl, b.acl)?
+    })
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Signature {
     volume: u64,
     identity: [u8; 16],
@@ -1018,51 +1492,10 @@ struct CopyContext<'a> {
 
 #[cfg(windows)]
 fn stream_bytes(file: &File, limit: usize) -> io::Result<u64> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_STREAM_INFO, FileStreamInfo, GetFileInformationByHandleEx,
-    };
-    // Bound metadata too: arbitrarily many empty streams still cost copy work.
-    let mut buffer = vec![0u64; 65536 / 8];
-    // SAFETY: the initialized buffer is 8-byte aligned and has the advertised size.
-    if unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            FileStreamInfo,
-            buffer.as_mut_ptr().cast(),
-            65536,
-        )
-    } == 0
-    {
-        let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(234) {
-            Err(io::ErrorKind::FileTooLarge.into())
-        } else {
-            Err(error)
-        };
-    }
-    let mut at = 0;
-    let mut total = 0u64;
-    loop {
-        if at + size_of::<FILE_STREAM_INFO>() > 65536 {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        // SAFETY: kernel entries are 8-byte aligned; the bounds cover the header.
-        let entry = unsafe { &*buffer.as_ptr().add(at / 8).cast::<FILE_STREAM_INFO>() };
-        let bytes = u64::try_from(entry.StreamSize).map_err(|_| io::ErrorKind::InvalidData)?;
-        total = total
-            .checked_add(bytes)
-            .filter(|sum| *sum <= limit as u64)
-            .ok_or(io::ErrorKind::FileTooLarge)?;
-        if entry.NextEntryOffset == 0 {
-            return Ok(total);
-        }
-        let next = entry.NextEntryOffset as usize;
-        if next < size_of::<FILE_STREAM_INFO>() || next % 8 != 0 {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        at = at.checked_add(next).ok_or(io::ErrorKind::InvalidData)?;
-    }
+    Ok(stream_inventory(file, limit)?
+        .iter()
+        .map(|(_, size)| size)
+        .sum())
 }
 
 #[cfg(windows)]
@@ -1394,9 +1827,7 @@ mod tests {
         assert_eq!(receipt.durability, Durability::NotRequested);
         assert!(matches!(
             receipt.protection,
-            PublicationProtection::ExchangeVerified
-                | PublicationProtection::WriteDenied
-                | PublicationProtection::RevalidatedRename
+            PublicationProtection::ExchangeVerified | PublicationProtection::VacantNoReplace
         ));
         let mut old = String::new();
         reader.read_to_string(&mut old).unwrap();
@@ -1612,10 +2043,15 @@ mod tests {
             symlink(&victim, &public).unwrap();
             staged.file.write_all(b"replacement").unwrap();
             transaction.revalidate().unwrap();
-            if fallback {
-                staged.fallback(&transaction.name, replacing).unwrap();
+            if replacing {
+                preserve_metadata(&transaction.source.as_ref().unwrap().0, &staged.file).unwrap();
+                transaction
+                    .commit(&mut staged, b"replacement", !fallback, || {}, || {})
+                    .unwrap();
+            } else if fallback {
+                staged.fallback(&transaction.name).unwrap();
             } else {
-                staged.publish(&transaction.name, replacing).unwrap();
+                staged.publish(&transaction.name).unwrap();
             }
             drop(staged);
             assert!(
@@ -1802,10 +2238,7 @@ mod tests {
         transaction.revalidate().unwrap();
         fs::write(work.target(), b"theirs").unwrap();
         assert_eq!(
-            staged
-                .fallback(&transaction.name, false)
-                .unwrap_err()
-                .kind(),
+            staged.fallback(&transaction.name).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
@@ -2243,18 +2676,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn plain_rename_is_reported_as_weaker_conflict_protection() {
+    fn fallback_publication_uses_a_verified_vacancy_and_no_replace() {
         let work = Workspace::new();
         fs::write(work.target(), b"original").unwrap();
         let transaction = work.capture();
         let mut staged = transaction.stage(&|_| false).unwrap();
         staged.file.write_all(b"ours").unwrap();
+        preserve_metadata(&transaction.source.as_ref().unwrap().0, &staged.file).unwrap();
         transaction.revalidate().unwrap();
         assert_eq!(
             transaction
-                .commit(&mut staged, b"ours", false, || {}, || {})
+                .commit(
+                    &mut staged,
+                    b"ours",
+                    false,
+                    || assert!(!work.target().exists()),
+                    || {}
+                )
                 .unwrap(),
-            PublicationProtection::RevalidatedRename
+            PublicationProtection::VacantNoReplace
         );
         drop(staged);
         assert_eq!(fs::read(work.target()).unwrap(), b"ours");
@@ -2329,7 +2769,8 @@ mod tests {
                 );
             })
             .unwrap();
-        assert_eq!(receipt.protection, PublicationProtection::WriteDenied);
+        assert_eq!(receipt.protection, PublicationProtection::VacantNoReplace);
+        assert!(receipt.absence_window);
         assert_eq!(fs::read(work.target()).unwrap(), b"ours");
         work.only_target_remains();
     }
@@ -2386,7 +2827,7 @@ mod tests {
             assert_eq!(fs::read(work.target()).unwrap(), b"original");
             let mut value = [0; 32];
             let count = fgetxattr(
-                &File::open(work.target()).unwrap(),
+                File::open(work.target()).unwrap(),
                 c"user.a-edit",
                 &mut value[..],
             )
@@ -2424,7 +2865,7 @@ mod tests {
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
         let mut bytes = [0; 32];
         let count = rustix::fs::fgetxattr(
-            &File::open(work.target()).unwrap(),
+            File::open(work.target()).unwrap(),
             c"com.apple.ResourceFork",
             &mut bytes[..],
         )
@@ -2479,6 +2920,75 @@ mod tests {
         assert!(observed.load(Ordering::Relaxed));
         assert!(matches!(result, Err(EditError::Cancelled)), "{result:?}");
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        work.only_target_remains();
+    }
+
+    #[test]
+    fn an_arrival_during_the_vacancy_is_preserved_with_the_displaced_original() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let transaction = work.capture();
+        let mut staged = transaction.stage(&|_| false).unwrap();
+        staged.file.rewind().unwrap();
+        staged.file.write_all(b"ours").unwrap();
+        staged.file.set_len(4).unwrap();
+        preserve_metadata(&transaction.source.as_ref().unwrap().0, &staged.file).unwrap();
+        transaction.revalidate().unwrap();
+        let result = transaction.commit(
+            &mut staged,
+            b"ours",
+            false,
+            || fs::write(work.target(), b"theirs").unwrap(),
+            || {},
+        );
+        let Err(EditError::Conflict(EditConflict::Recovery(path))) = result else {
+            panic!("{result:?}");
+        };
+        drop(staged);
+        drop(transaction);
+        assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        work.only_target_remains();
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn acl_changes_in_the_final_window_are_restored() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let result = work.capture().publish_with_sync(
+            b"ours",
+            false,
+            File::sync_all,
+            &|_| false,
+            true,
+            || {
+                assert!(
+                    std::process::Command::new("/bin/chmod")
+                        .args(["+a", "everyone allow read"])
+                        .arg(work.target())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            },
+        );
+        assert!(
+            matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        let output = std::process::Command::new("/bin/ls")
+            .arg("-le")
+            .arg(work.target())
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("everyone allow read")
+        );
         work.only_target_remains();
     }
 
@@ -2550,7 +3060,7 @@ mod tests {
                 Err(rustix::io::Errno::NOENT | rustix::io::Errno::PERM)
             ));
             staged.file.write_all(b"published").unwrap();
-            staged.publish(&transaction.name, false).unwrap();
+            staged.publish(&transaction.name).unwrap();
             drop(staged);
             assert_eq!(fs::read("/target").unwrap(), b"published");
             fs::remove_file("/target").unwrap();

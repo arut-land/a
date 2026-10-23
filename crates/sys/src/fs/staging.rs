@@ -8,13 +8,13 @@ use std::io;
 use std::path::Path;
 
 pub(super) const CONTENT: &str = "content";
+pub(super) const ORIGINAL: &str = "original";
 
 pub(super) struct Directory<'a> {
     parent: &'a File,
     #[cfg(unix)]
     pub name: OsString,
     pub file: File,
-    #[cfg(unix)]
     retain: bool,
     pub path: std::path::PathBuf,
 }
@@ -62,7 +62,6 @@ impl<'a> Directory<'a> {
                 #[cfg(unix)]
                 name,
                 file,
-                #[cfg(unix)]
                 retain: false,
                 path,
             };
@@ -82,12 +81,12 @@ impl<'a> Directory<'a> {
 
 impl Drop for Directory<'_> {
     fn drop(&mut self) {
+        if self.retain {
+            return;
+        }
         #[cfg(unix)]
         {
             use rustix::fs::{AtFlags, fstat, statat, unlinkat};
-            if self.retain {
-                return;
-            }
             if let (Ok(ours), Ok(named)) = (
                 fstat(&self.file),
                 statat(self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW),
@@ -175,15 +174,79 @@ impl<'a> Staged<'a> {
         self.directory.path.join(CONTENT)
     }
 
-    pub fn publish(&mut self, name: &OsStr, replacing: bool) -> io::Result<()> {
+    pub fn take_original(&mut self, source: &File, name: &OsStr) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let _ = source;
+            rustix::fs::renameat(self.directory.parent, name, &self.directory.file, ORIGINAL)?;
+        }
+        #[cfg(windows)]
+        {
+            let _ = name;
+            rename(source, &self.directory.file, OsStr::new(ORIGINAL))?;
+        }
+        // From here every error must preserve the displaced version.
+        self.directory.retain = true;
+        Ok(())
+    }
+
+    pub fn original(&self) -> io::Result<File> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags, openat};
+            Ok(File::from(openat(
+                &self.directory.file,
+                ORIGINAL,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?))
+        }
+        #[cfg(windows)]
+        relative(&self.directory.file, OsStr::new(ORIGINAL), false, false)
+    }
+
+    pub fn restore_original(&mut self, source: &File, name: &OsStr) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, linkat, unlinkat};
+            let _ = source;
+            linkat(
+                &self.directory.file,
+                ORIGINAL,
+                self.directory.parent,
+                name,
+                AtFlags::empty(),
+            )?;
+            unlinkat(&self.directory.file, ORIGINAL, AtFlags::empty())?;
+        }
+        #[cfg(windows)]
+        rename(source, self.directory.parent, name)?;
+        self.directory.retain = false;
+        Ok(())
+    }
+
+    pub fn reclaim_original(&mut self, source: &File) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let _ = source;
+            rustix::fs::unlinkat(&self.directory.file, ORIGINAL, rustix::fs::AtFlags::empty())?;
+        }
+        #[cfg(windows)]
+        remove(source)?;
+        self.directory.retain = false;
+        Ok(())
+    }
+
+    pub fn retain_original(&mut self) -> std::path::PathBuf {
+        self.directory.retain = true;
+        self.directory.path.join(ORIGINAL)
+    }
+
+    pub fn publish(&mut self, name: &OsStr) -> io::Result<()> {
         #[cfg(unix)]
         {
             use rustix::fs::{RenameFlags, renameat_with};
-            let flags = if replacing {
-                RenameFlags::empty()
-            } else {
-                RenameFlags::NOREPLACE
-            };
+            let flags = RenameFlags::NOREPLACE;
             match renameat_with(
                 &self.directory.file,
                 CONTENT,
@@ -194,27 +257,23 @@ impl<'a> Staged<'a> {
                 Ok(()) => Ok(()),
                 Err(
                     rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::NOTSUP,
-                ) => self.fallback(name, replacing),
+                ) => self.fallback(name),
                 Err(error) => Err(error.into()),
             }
         }
         #[cfg(windows)]
         {
-            rename(&self.file, self.directory.parent, name, replacing)?;
+            rename(&self.file, self.directory.parent, name)?;
             self.published = true;
             Ok(())
         }
     }
 
     #[cfg(unix)]
-    pub fn fallback(&mut self, name: &OsStr, replacing: bool) -> io::Result<()> {
+    pub fn fallback(&mut self, name: &OsStr) -> io::Result<()> {
         let source = &self.directory.file;
         let target = self.directory.parent;
-        if replacing {
-            rustix::fs::renameat(source, CONTENT, target, name)?;
-        } else {
-            rustix::fs::linkat(source, CONTENT, target, name, rustix::fs::AtFlags::empty())?;
-        }
+        rustix::fs::linkat(source, CONTENT, target, name, rustix::fs::AtFlags::empty())?;
         Ok(())
     }
 }
@@ -323,6 +382,11 @@ pub(super) fn relative(
 
 #[cfg(windows)]
 pub(super) fn delete(file: &File) {
+    let _ = remove(file);
+}
+
+#[cfg(windows)]
+fn remove(file: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx, SetFileInformationByHandle,
@@ -331,18 +395,18 @@ pub(super) fn delete(file: &File) {
         Flags: 0x1 | 0x2 | 0x10,
     }; // DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE
     // SAFETY: deletion is bound to the owned object, never a mutable pathname.
-    unsafe {
+    crate::windows::ok(unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle(),
             FileDispositionInfoEx,
             (&raw const info).cast(),
             u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>()).expect("fixed structure size"),
-        );
-    }
+        )
+    })
 }
 
 #[cfg(windows)]
-fn rename(file: &File, parent: &File, to: &OsStr, replacing: bool) -> io::Result<()> {
+fn rename(file: &File, parent: &File, to: &OsStr) -> io::Result<()> {
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
     let name: Vec<u16> = to.encode_wide().collect();
@@ -353,7 +417,7 @@ fn rename(file: &File, parent: &File, to: &OsStr, replacing: bool) -> io::Result
     // SAFETY: aligned storage contains the complete header and UTF-16 tail;
     // both owned handles and the buffer live through the synchronous call.
     unsafe {
-        (*info).Anonymous.Flags = if replacing { 0x1 | 0x2 } else { 0x2 };
+        (*info).Anonymous.Flags = 0x2; // POSIX_SEMANTICS, without REPLACE_IF_EXISTS
         (*info).RootDirectory = parent.as_raw_handle();
         (*info).FileNameLength = u32::try_from(name.len() * 2).expect("checked buffer length");
         std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
