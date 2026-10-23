@@ -17,6 +17,7 @@ jobs:
     timeout-minutes: 20
     env:
       CARGO_BUILD_JOBS: 2
+      MISE_AUTO_INSTALL: false
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v5

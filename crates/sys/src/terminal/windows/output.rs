@@ -33,6 +33,7 @@ struct Output {
     send: mpsc::SyncSender<Request>,
     interrupt: OwnedHandle,
     failed: AtomicBool,
+    active: Arc<Mutex<Option<Arc<Completion>>>>,
 }
 
 static OUTPUT: OnceLock<Output> = OnceLock::new();
@@ -72,12 +73,20 @@ fn output() -> io::Result<&'static Output> {
         let handle = io::stdout().as_handle().try_clone_to_owned()?;
         let interrupt = event()?;
         let (send, receive) = mpsc::sync_channel::<Request>(1);
+        let active = Arc::new(Mutex::new(None));
+        let worker_active = active.clone();
         let worker = thread::Builder::new()
             .name("terminal-output".into())
             .stack_size(128 * 1024)
             .spawn(move || {
                 for request in receive {
-                    let result = if request.state.cancelled.load(Ordering::Acquire) {
+                    let mut active = worker_active.lock().unwrap_or_else(PoisonError::into_inner);
+                    let cancelled = request.state.cancelled.load(Ordering::Acquire);
+                    if !cancelled {
+                        *active = Some(request.state.clone());
+                    }
+                    drop(active);
+                    let result = if cancelled {
                         Err(io::ErrorKind::Interrupted.into())
                     } else {
                         let mut written = 0;
@@ -95,6 +104,10 @@ fn output() -> io::Result<&'static Output> {
                         })
                         .map(|()| written as usize)
                     };
+                    // Cancellation holds this same gate, so a late retry for
+                    // this frame can never cancel the next cleanup request.
+                    let mut active = worker_active.lock().unwrap_or_else(PoisonError::into_inner);
+                    *active = None;
                     *request
                         .state
                         .result
@@ -109,6 +122,7 @@ fn output() -> io::Result<&'static Output> {
             send,
             interrupt,
             failed: AtomicBool::new(false),
+            active,
         };
         let count = INTERRUPTS.lock().unwrap_or_else(PoisonError::into_inner);
         if *count != 0 {
@@ -166,8 +180,15 @@ pub fn write_stdout(
             // Cancel only our dedicated writer, never another component's
             // synchronous I/O. Retry until completion to close the race where
             // cancellation arrives between the worker's check and WriteFile.
-            // SAFETY: the process-lifetime owner keeps its worker handle open.
-            unsafe { CancelSynchronousIo(output.worker.as_raw_handle()) };
+            let active = output.active.lock().unwrap_or_else(PoisonError::into_inner);
+            if active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &state))
+            {
+                // SAFETY: the owner keeps its worker handle open. The active
+                // request cannot change until this cancellation call returns.
+                unsafe { CancelSynchronousIo(output.worker.as_raw_handle()) };
+            }
         }
         if expired {
             // A driver that fails to acknowledge cancellation must not trap

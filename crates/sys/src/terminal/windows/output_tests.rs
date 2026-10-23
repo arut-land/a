@@ -4,6 +4,7 @@ use std::os::windows::io::IntoRawHandle;
 use std::os::windows::process::{CommandExt, ProcThreadAttributeList};
 use std::process::{Command, Stdio};
 
+use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::System::Console::{
     COORD, CTRL_C_EVENT, ClosePseudoConsole, CreatePseudoConsole, GenerateConsoleCtrlEvent,
     GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, HPCON, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -11,8 +12,47 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    GetThreadIOPendingFlag, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, WaitForSingleObject,
+    GetThreadIOPendingFlag, GetThreadTimes, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+    WaitForSingleObject,
 };
+
+#[test]
+fn the_console_output_worker_does_not_wake_while_idle() {
+    const NAME: &str =
+        "terminal::imp::output::tests::the_console_output_worker_does_not_wake_while_idle";
+    if std::env::var_os("A_TEST_STALLED_OUTPUT").is_none() {
+        run_in_stalled_conpty(NAME);
+        return;
+    }
+    attach_standard_handles();
+    let _raw = crate::terminal::RawMode::enter().unwrap();
+    // Completing one operation certifies that thread initialization is over.
+    assert_eq!(crate::terminal::Stdout::default().write(b"").unwrap(), 0);
+    let before = writer_cpu();
+    thread::sleep(Duration::from_millis(250));
+    assert_eq!(writer_cpu(), before, "the idle output worker consumed CPU");
+}
+
+fn writer_cpu() -> u64 {
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: the owner keeps its thread handle open; each FILETIME is writable.
+    ok(unsafe {
+        GetThreadTimes(
+            OUTPUT.get().unwrap().worker.as_raw_handle(),
+            &raw mut created,
+            &raw mut exited,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    })
+    .unwrap();
+    let ticks =
+        |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    ticks(kernel) + ticks(user)
+}
 
 #[test]
 fn stalled_console_output_is_cancelled_and_panic_cleanup_has_a_deadline() {
@@ -21,25 +61,7 @@ fn stalled_console_output_is_cancelled_and_panic_cleanup_has_a_deadline() {
         run_in_stalled_conpty(NAME);
         return;
     }
-    // ConPTY attaches the console, while libtest's standard handles may still
-    // be redirected. Keep diagnostics on the inherited stderr pipe.
-    let input = std::fs::File::options()
-        .read(true)
-        .write(true)
-        .open("CONIN$")
-        .unwrap();
-    let output = std::fs::File::options()
-        .read(true)
-        .write(true)
-        .open("CONOUT$")
-        .unwrap();
-    // SAFETY: this isolated subprocess transfers both handles to its standard
-    // table until process exit, and clears only its inherited Ctrl-C ignore.
-    unsafe {
-        assert_ne!(SetStdHandle(STD_INPUT_HANDLE, input.into_raw_handle()), 0);
-        assert_ne!(SetStdHandle(STD_OUTPUT_HANDLE, output.into_raw_handle()), 0);
-        assert_ne!(SetConsoleCtrlHandler(None, 0), 0);
-    }
+    attach_standard_handles();
     let before = console_state();
     let _raw = crate::terminal::RawMode::enter().unwrap();
     let signals = crate::Signals::catch(&[crate::Signal::Interrupt]).unwrap();
@@ -118,6 +140,31 @@ fn stalled_console_output_is_cancelled_and_panic_cleanup_has_a_deadline() {
         eprintln!("panic cleanup reached its deadline and restored modes and code pages");
     }));
     assert!(std::panic::catch_unwind(|| panic!("restore a stalled terminal")).is_err());
+    // libtest's own final status uses ordinary stdout, outside the bounded
+    // terminal writer; it must not print into the deliberately stalled pipe.
+    std::process::exit(0);
+}
+
+fn attach_standard_handles() {
+    // ConPTY attaches the console, while libtest's standard handles may still
+    // be redirected. Keep diagnostics on the inherited stderr pipe.
+    let input = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open("CONIN$")
+        .unwrap();
+    let output = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open("CONOUT$")
+        .unwrap();
+    // SAFETY: this isolated subprocess transfers both handles to its standard
+    // table until process exit, and clears only its inherited Ctrl-C ignore.
+    unsafe {
+        assert_ne!(SetStdHandle(STD_INPUT_HANDLE, input.into_raw_handle()), 0);
+        assert_ne!(SetStdHandle(STD_OUTPUT_HANDLE, output.into_raw_handle()), 0);
+        assert_ne!(SetConsoleCtrlHandler(None, 0), 0);
+    }
 }
 
 fn console_state() -> (u32, u32, u32, u32) {
