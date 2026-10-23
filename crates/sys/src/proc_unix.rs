@@ -54,26 +54,7 @@ impl Child {
     }
 
     fn observe(&self, nonblocking: bool) -> io::Result<Option<ExitStatus>> {
-        #[cfg(target_os = "linux")]
-        let target = self
-            .0
-            .watch
-            .as_ref()
-            .map(|fd| (libc::P_PIDFD, fd.as_raw_fd().cast_unsigned()));
-        #[cfg(target_os = "linux")]
-        let (kind, id) = target.unwrap_or((libc::P_PID, self.id()));
-        #[cfg(not(target_os = "linux"))]
-        let (kind, id) = (libc::P_PID, self.id());
-        let result = observe(kind, id, nonblocking);
-        #[cfg(target_os = "linux")]
-        if kind == libc::P_PIDFD
-            && result
-                .as_ref()
-                .is_err_and(|e| e.raw_os_error() == Some(libc::EINVAL))
-        {
-            return observe(libc::P_PID, self.id(), nonblocking);
-        }
-        result
+        self.0.observe(nonblocking)
     }
 
     pub(super) fn signal_group(&self, signal: Signal) -> io::Result<()> {
@@ -173,9 +154,34 @@ fn observe(
     }
 }
 
+impl OwnedChild {
+    fn observe(&self, nonblocking: bool) -> io::Result<Option<ExitStatus>> {
+        #[cfg(target_os = "linux")]
+        let target = self
+            .watch
+            .as_ref()
+            .map(|fd| (libc::P_PIDFD, fd.as_raw_fd().cast_unsigned()));
+        #[cfg(target_os = "linux")]
+        let (kind, id) = target.unwrap_or((libc::P_PID, self.pid));
+        #[cfg(not(target_os = "linux"))]
+        let (kind, id) = (libc::P_PID, self.pid);
+        let result = observe(kind, id, nonblocking);
+        #[cfg(target_os = "linux")]
+        if kind == libc::P_PIDFD
+            && result
+                .as_ref()
+                .is_err_and(|e| e.raw_os_error() == Some(libc::EINVAL))
+        {
+            return observe(libc::P_PID, self.pid, nonblocking);
+        }
+        result
+    }
+}
+
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        if self.group && observe(libc::P_PID, self.pid, true).is_ok() {
+        let owned = self.observe(true).is_ok();
+        if self.group && owned {
             let _ = super::imp::signal_group(self.pid, Signal::Kill);
         }
         if let Some(waiter) = self
@@ -186,11 +192,45 @@ impl Drop for OwnedChild {
         {
             let _ = waiter.thread.join();
         }
-        // SAFETY: no other owner can reap our child; retry interruption only.
+        #[cfg(target_os = "linux")]
+        if let Some(watch) = &self.watch
+            && reap_pidfd(watch)
+        {
+            return;
+        }
+        if !owned {
+            return;
+        }
+        // SAFETY: the child is still waitable and this is its sole reaper.
         while unsafe { libc::waitpid(self.pid.cast_signed(), std::ptr::null_mut(), 0) } < 0 {
             if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 break;
             }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reap_pidfd(watch: &OwnedFd) -> bool {
+    use rustix::io::Errno;
+    use rustix::process::{WaitId, WaitIdOptions, waitid};
+    use std::os::fd::AsFd;
+    loop {
+        match waitid(WaitId::PidFd(watch.as_fd()), WaitIdOptions::EXITED) {
+            // Linux 5.3 has pidfds but cannot yet wait through one.
+            Err(Errno::INVAL) => return false,
+            Err(Errno::INTR) => {}
+            Err(Errno::AGAIN) => {
+                let mut fds = [rustix::event::PollFd::new(
+                    watch,
+                    rustix::event::PollFlags::IN,
+                )];
+                match rustix::event::poll(&mut fds, None) {
+                    Ok(_) | Err(Errno::INTR) => {}
+                    Err(_) => return true,
+                }
+            }
+            _ => return true,
         }
     }
 }
