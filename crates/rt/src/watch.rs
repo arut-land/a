@@ -402,11 +402,18 @@ mod tests {
             },
         )
         .unwrap();
+        watcher.callback()(WatchEvent::Changed(vec![root.join("nested")]));
         watcher.callback()(WatchEvent::Unavailable(io::Error::other("lost watch")));
-        assert!(matches!(
-            recv.recv_timeout(Duration::from_secs(3)).unwrap(),
-            WatchEvent::Unavailable(_)
-        ));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if matches!(
+                recv.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap(),
+                WatchEvent::Unavailable(_)
+            ) {
+                break;
+            }
+        }
         assert!(
             watcher
                 .refresh_using(|_, _, _| Err(io::Error::new(io::ErrorKind::WouldBlock, "busy")))
