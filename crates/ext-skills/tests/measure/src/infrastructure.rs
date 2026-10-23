@@ -1,8 +1,16 @@
 fn main() {
     #[cfg(all(unix, feature = "signal-maintained"))]
     let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let operations = if cfg!(any(
+        feature = "signal-custom",
+        feature = "signal-maintained"
+    )) {
+        1_000_000
+    } else {
+        10_000
+    };
     let start = std::time::Instant::now();
-    for n in 0..10000 {
+    for n in 0..operations {
         #[cfg(feature = "temp-custom")]
         {
             let path = std::env::temp_dir().join(format!("a-probe-{}-{n}", std::process::id()));
@@ -33,6 +41,6 @@ fn main() {
     }
     println!(
         "{}",
-        serde_json::json!({"ns_per_operation": start.elapsed().as_nanos() / 10000})
+        serde_json::json!({"operations": operations, "ns_per_operation": start.elapsed().as_nanos() / operations})
     );
 }

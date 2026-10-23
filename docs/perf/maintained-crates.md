@@ -40,7 +40,7 @@ registration is not a replacement for console close/logoff/shutdown callbacks.
 No signal handlers are installed by embedded library initialization.
 
 The hosted comparison also reports registration/release wall time, sampled RSS,
-normal dependency graph and probe bytes for 10,000 SIGWINCH leases/hooks per
+normal dependency graph and probe bytes for 1,000,000 SIGWINCH leases/hooks per
 round (five rounds, Unix only). The hook action sets a shared atomic flag: that result is a lower
 bound, excluding the wake source and exclusive ownership still needed for
 integration. These are lease churn measurements, not signal-delivery throughput.
