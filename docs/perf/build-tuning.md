@@ -1,6 +1,7 @@
 # Native build tuning
 
 Hosted measurements and reproduction commands are in [hosted.md](hosted.md).
+Per-target decisions and paired CPU/RSS observations are in [hosted-tuning.md](hosted-tuning.md).
 Binary size is reported on every target, without a cap. Decisions prioritize
 CPU, latency, idle and peak RSS, reliability and native platform behaviour.
 
@@ -8,6 +9,7 @@ CPU, latency, idle and peak RSS, reliability and native platform behaviour.
 
 | Setting | Design constraint |
 | --- | --- |
+| serde_json opt-level 1 | Share optimized generic instantiations with release consumers; measured driver CPU benefit without a peak-RSS increase |
 | Fat LTO and one codegen unit | Cross-crate optimization; candidates must improve measured CPU and latency without an unacceptable memory cost |
 | Panic unwinding | A panicking session actor cannot terminate the daemon |
 | Packed split debuginfo and stripped executable symbols | Preserve offline crash symbolication without mapping debug data into the process |
