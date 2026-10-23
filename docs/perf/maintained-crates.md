@@ -122,8 +122,10 @@ work.
 
 Signal-hook's flag-only registration is faster, but omits the native lease's
 restoration syscalls and a wake source, so it is a lower bound rather than an
-equivalent replacement. macOS native lease churn also has higher sampled RSS
-in this million-lease workload; it does not describe the production daemon's
+equivalent replacement. The macOS RSS difference is a whole-process observation with different link
+graphs: the native probe links the sys facade, whereas the flag-only probe does
+not. It is neither per-lease memory accounting nor incremental adoption cost in
+an application that already links sys. Churn also differs from the daemon's
 single process-lifetime subscription. The lifecycle mismatch above decides
 against adoption independently of size or these timings.
 
