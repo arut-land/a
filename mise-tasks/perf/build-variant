@@ -36,10 +36,12 @@ def main():
     parser.add_argument("variant", choices=VARIANTS)
     parser.add_argument("--label", help="save a code experiment separately under the same profile")
     parser.add_argument("--output", type=Path, default=Path("target/perf-variants"))
-    parser.add_argument("--tests", nargs="?", const="engine,tui,protocol",
-                        help="also save test binaries (comma-separated packages; all three by default)")
+    parser.add_argument("--tests", nargs="?", const="engine,protocol,llm,tui",
+                        help="also save test binaries (comma-separated packages; all four by default)")
     parser.add_argument("--profile-data", type=Path, default=Path("target/perf-pgo"))
     args = parser.parse_args()
+    if args.tests and set(args.tests.split(",")) - {"engine", "protocol", "llm", "tui"}:
+        parser.error("unknown benchmark package")
     output = (args.output / (args.label or args.variant)).resolve()
     output.mkdir(parents=True, exist_ok=True)
     (output / "source.diff").write_bytes(subprocess.check_output(["git", "diff", "--binary"]))
@@ -71,7 +73,7 @@ def main():
     if args.tests:
         metadata["tests"] = []
         for package, target in [("engine", ["--lib"]), ("tui", ["--lib"]),
-                                ("protocol", ["--test", "bench"])]:
+                                ("protocol", ["--test", "bench"]), ("llm", ["--test", "bench"])]:
             if package not in args.tests.split(","):
                 continue
             result = subprocess.run(

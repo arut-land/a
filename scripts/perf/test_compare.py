@@ -9,11 +9,77 @@ import sys
 import subprocess
 from unittest import mock
 
-from compare import ArtifactRedirect, compare
+from compare import ArtifactRedirect, baseline, compare
 from stats import distribution
 
 
 class Comparison(unittest.TestCase):
+    def test_a_failed_sibling_lane_never_blocks_a_successful_main_baseline(self):
+        import io
+        import json
+        import zipfile
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as stream:
+            stream.writestr("result.json", json.dumps(dict(variant={}, revision="main-sha", metrics={})))
+        def api(path, binary=False):
+            if "/workflows/" in path:
+                self.assertIn("status=completed", path)
+                return {"workflow_runs": [{"id": 3, "head_sha": "main-sha", "conclusion": "failure"},
+                                          {"id": 2, "head_sha": "main-sha", "conclusion": "failure"}]}
+            if "/jobs?" in path:
+                return {"jobs": [{"name": "perf (ubuntu-latest)",
+                                  "conclusion": "failure" if "/3/" in path else "success"},
+                                 {"name": "perf (windows-11-arm)", "conclusion": "failure"}]}
+            if "/artifacts/" in path:
+                return archive.getvalue()
+            self.assertIn("/2/artifacts", path)
+            return {"artifacts": [{"name": "perf-ubuntu-latest", "expired": False, "id": 7}]}
+        with mock.patch("compare.api", side_effect=api):
+            result, run = baseline("ubuntu-latest", "")
+        self.assertEqual(run, 2)
+        self.assertEqual(result["revision"], "main-sha")
+
+    @unittest.skipUnless(importlib.util.find_spec("psutil"), "native accounting runs in each perf job")
+    def test_bloat_preserves_the_measured_variants_flags_and_package_overrides(self):
+        import tempfile
+        from hosted import bloat, variant_arguments
+        variant = dict(config=["profile.release.package.llm.opt-level=3"],
+                       rustflags=["-Ctarget-cpu=x86-64-v2"])
+        with tempfile.TemporaryDirectory() as directory, mock.patch("hosted.run") as run:
+            run.return_value.stdout = "{}"
+            bloat(Path(directory), Path(directory), variant)
+            for call in run.call_args_list:
+                arguments = call.args[0]
+                begin = arguments.index("--config")
+                expected = variant_arguments(variant)
+                self.assertEqual(arguments[begin:begin + len(expected)], expected)
+                self.assertIn('profile.release.strip="none"', arguments)
+                self.assertNotIn("--features", arguments)
+
+    def test_default_and_selected_variant_builds_produce_every_selected_benchmark(self):
+        import json
+        import tempfile
+        loader = importlib.machinery.SourceFileLoader("build_variant", str(Path(__file__).resolve().parents[2] / "mise-tasks/perf/build-variant"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        task = importlib.util.module_from_spec(spec)
+        loader.exec_module(task)
+        for selection in [[], ["llm"]]:
+            with tempfile.TemporaryDirectory() as directory:
+                binary = Path(directory) / "build/release" / ("a.exe" if os.name == "nt" else "a")
+                binary.parent.mkdir(parents=True)
+                binary.touch()
+                def run(arguments, **kwargs):
+                    return mock.Mock(stdout=json.dumps(dict(executable=str(binary), profile=dict(test=True))))
+                with mock.patch.object(sys, "argv", ["build-variant", "z", "--output", directory, "--tests", *selection]), \
+                     mock.patch.object(task.subprocess, "run", side_effect=run) as cargo, \
+                     mock.patch.object(task.subprocess, "check_output", side_effect=[b"", "revision"]):
+                    task.main()
+                commands = [call.args[0] for call in cargo.call_args_list if call.args[0][1] == "test"]
+                packages = {command[command.index("-p") + 1] for command in commands}
+                self.assertEqual(packages, set(selection or ["engine", "protocol", "llm", "tui"]))
+                for package in packages:
+                    self.assertTrue((Path(directory) / "z" / (package + "-bench" + (".exe" if os.name == "nt" else ""))).is_file())
+
     @unittest.skipUnless(importlib.util.find_spec("psutil"), "native accounting runs in each perf job")
     def test_process_accounting_never_requests_a_macos_debug_task_port(self):
         from process import snapshot

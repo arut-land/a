@@ -34,7 +34,7 @@ on:
         default: ''
         type: string
       baseline_run:
-        description: 'Optional bootstrap baseline run ID; otherwise latest successful main'
+        description: 'Optional bootstrap baseline run ID; otherwise latest successful main lane'
         default: ''
         type: string
 
@@ -172,7 +172,7 @@ jobs:
           else
             mise exec -- python scripts/perf/hosted.py --phase build --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' "${extra[@]}"
           fi
-      - name: Measure startup budgets workloads and benches
+      - name: Measure startup workloads and benches
         timeout-minutes: 20
         if: env.PERF_BUILD_ONLY != 'true'
         run: |

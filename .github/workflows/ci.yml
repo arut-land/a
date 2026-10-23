@@ -53,12 +53,38 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev strace
       # fmt, clippy -D warnings, then every test: unit, llm parity, and the
-      # black-box M1 acceptance tests in apps/cli/tests/blackbox. Release
-      # budgets and measurement harness checks run in perf.yml. Live-model tests stay #[ignore]d; there are no secrets.
+      # black-box M1 acceptance tests in apps/cli/tests/blackbox. The
+      # release budgets run in their own jobs. Live-model tests stay
+      # #[ignore]d; there are no secrets.
       - run: mise run check
       # The Windows build, cross-linted: no platform cfg above `sys`/`rt`.
       - if: runner.os == 'Linux'
         run: mise run check:windows
+
+  budgets:
+    name: budgets (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            strict: 0
+          # Latency is held to the design's budgets on one lane.
+          - os: ubuntu-latest
+            strict: 1
+    runs-on: ${{ matrix.os }}
+    env:
+      A_STRICT_BUDGETS: ${{ matrix.strict }}
+    steps:
+      - uses: actions/checkout@v7
+      - *mbx-dir
+      - *cache
+      - *mise
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
+      # Idle daemon RSS (10 MiB) is held exactly; cold start and attach
+      # latency too where strict, else with slack.
+      - run: mise run budgets
 
   deny:
     runs-on: ubuntu-latest

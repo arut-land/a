@@ -35,8 +35,11 @@ def baseline(runner, explicit):
     if explicit:
         runs = [{"id": explicit}]
     else:
-        runs = api("/actions/workflows/perf.yml/runs?branch=main&status=success&per_page=20")["workflow_runs"]
+        runs = api("/actions/workflows/perf.yml/runs?branch=main&status=completed&per_page=20")["workflow_runs"]
     for run in runs:
+        jobs = api(f'/actions/runs/{run["id"]}/jobs?per_page=100')["jobs"]
+        if not any(job["name"] == f"perf ({runner})" and job["conclusion"] == "success" for job in jobs):
+            continue
         artifacts = api(f'/actions/runs/{run["id"]}/artifacts')["artifacts"]
         for artifact in artifacts:
             if artifact["name"] == "perf-" + runner and not artifact["expired"]:
@@ -65,7 +68,9 @@ def main():
     parser.add_argument("result", type=Path)
     parser.add_argument("--baseline-run", default="")
     args = parser.parse_args()
-    now = observations(json.loads(args.result.read_text()))
+    raw = json.loads(args.result.read_text())
+    windows = {name: value["windows"] for name, value in raw["metrics"].items() if "windows" in value}
+    now = observations(raw)
     was, run_id = baseline(now["runner"], args.baseline_run)
     if was and (was["schema"], was["runner"], was["machine"]) != (now["schema"], now["runner"], now["machine"]):
         raise ValueError("baseline schema or architecture differs")
@@ -79,7 +84,11 @@ def main():
         delta = compare(value, previous)
         comparisons[name] = delta
         lines.append(f'| {name} | {value["median"]:.3f} | {value["p10"]:.3f}–{value["p90"]:.3f} | {value["min"]:.3f}–{value["max"]:.3f} | {delta} |')
-    lines += ["", "Idle CPU is accumulated OS user+kernel time over 10 seconds after 15 seconds settling in each of five fresh homes. RSS is sampled at three seconds. Zero means no counter increment at OS resolution. Client is the line REPL; Unix terminal first-paint/PTY gates run separately in this workflow.", ""]
+    lines += ["", "Idle CPU is accumulated OS user+kernel time over 10 seconds after 15 seconds settling in each of five fresh homes. RSS is sampled at three seconds. Zero means no counter increment at OS resolution. Client is the line REPL; Unix latency, RSS, terminal first-paint/PTY and quiet-shell gates run in CI. Perf values are report-only.", ""]
+    lines += ["| Idle CPU (ms per window) | Windows | Nonzero windows | Max |", "| --- | --- | ---: | ---: |"]
+    for name, values in windows.items():
+        lines.append(f'| {name} | {", ".join(f"{value:.3f}" for value in values)} | {sum(value > 0 for value in values)}/{len(values)} | {max(values):.3f} |')
+    lines += [""]
     paired_path = args.result.with_name("paired.json")
     if paired_path.exists():
         paired = json.loads(paired_path.read_text())

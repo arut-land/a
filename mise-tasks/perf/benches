@@ -36,6 +36,11 @@ def main():
     env = dict(os.environ, A_SESSION_LOG=str(transcript),
                A_PERF_PYTHON=sys.executable,
                A_PERF_PROCESS=str(Path(__file__).resolve().parents[2] / "scripts/perf/process.py"))
+    packages = args.packages.split(",")
+    if set(packages) - {"engine", "protocol", "llm", "tui"}:
+        parser.error("unknown benchmark package")
+    binaries = {package: (build / (package + "-bench" + (".exe" if os.name == "nt" else ""))).resolve(strict=True)
+                for package in packages}
     budget_result = None
     if args.blackbox:
         env.update(A_BIN=str(build / ("a.exe" if os.name == "nt" else "a")), A_STRICT_BUDGETS="1")
@@ -52,10 +57,10 @@ def main():
         ("llm", ["decode_recorded"]),
         ("tui", ["render_cost"]),
     ]:
-        if package not in args.packages.split(","):
+        if package not in packages:
             continue
         for name in filters:
-            binary = (build / (package + "-bench" + (".exe" if os.name == "nt" else ""))).resolve(strict=True)
+            binary = binaries[package]
             command = workloads.command([str(binary), name, "--ignored", "--nocapture", "--test-threads=1"])
             workloads.load(output, name + ":before")
             result = run_timed(["hyperfine", "-N", "--warmup", "1", "-r", str(args.runs),

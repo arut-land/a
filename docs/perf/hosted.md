@@ -89,11 +89,12 @@ resolution, not a claim about instructions below that resolution.
 `result.json` preserves raw samples, median, min/max and p10/p90 for every
 axis. Spreads use nearest-rank percentiles, so a five-observation cohort's
 p10/p90 includes its min/max. Each lane uploads its shipped binary, JSON, workload/load records and `summary.md` for
-30 days, including measurements from budget failures. Its job summary shows
+30 days, including partial measurements from harness failures. Its job summary shows
 the same table. Missing measurements stay absent.
 
-The comparison downloads the matching lane from the latest successful
-`main` perf run through the GitHub API. Build-only runs and dispatches with
+The comparison downloads the latest successful matching measurement job from
+completed `main` perf runs through the GitHub API. A failing sibling lane does
+not prevent healthy lanes from advancing their baselines. Build-only runs and dispatches with
 source or compiler overrides cannot become the automatic baseline. Statistics
 are recomputed from raw observations before comparison. A missing main artifact is reported
 explicitly. `baseline_run` selects a bootstrap run while the workflow is
@@ -103,9 +104,12 @@ heuristic is not a statistical significance test. Separate hosted VMs can
 still differ in CPU, storage or load, so repeat a candidate before retaining
 small gains. Size is exact; timing and memory remain observations.
 
-Idle RSS must remain below 10,240 KiB and idle CPU must have no counter
-increment. The perf workflow also runs strict Linux latency, terminal first-paint,
-PTY-client idle and quiet-shell wake gates; CI owns functional validation.
+Perf fails only on harness errors, including invalid or incomplete replay; numeric
+measurements never fail a lane. Idle CPU reports the maximum, every window
+count and the number of nonzero windows, including Windows watcher ticks.
+CI gates idle RSS below 10,240 KiB, cold reply and attach latency (strict on
+Linux, with CI slack on macOS), attach replay length, terminal first-paint,
+PTY-client idle and quiet-shell wakes.
 
 `build_only` stops after the two release builds and records size, sections and
 imports for linker diagnostics. It does not claim a
@@ -165,7 +169,10 @@ Exclusive and inclusive instruction summaries and raw traces are artifacts.
 These instrumented observations select packages to investigate; they do not
 establish native speedups. `build_only=true` can skip timing for attribution.
 
-CI owns functional checks, acceptance, platform lints and the Apple build.
-Perf owns release measurements and the existing Unix terminal first-paint,
-PTY idle and quiet-shell invariants, reusing its release fixture binary.
-Release measurements are not duplicated in CI.
+CI owns functional checks, acceptance, platform lints, the Apple build and
+release budget gates on pushes to main and pull requests. Perf owns native
+release measurements; gates are not duplicated there.
+
+Attach samples compare every replay entry and the Synced sequence against the
+persisted log before accepting a timing. Bloat uses the measured variant’s
+compiler flags and package overrides, retaining symbols for attribution.

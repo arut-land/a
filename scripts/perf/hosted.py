@@ -76,12 +76,17 @@ def windows_image(binary):
     return dict(headers=headers, dependencies=dependencies)
 
 
-def build(source, output, variant, benchmarks=True, packages=("engine", "protocol", "llm", "tui")):
+def variant_arguments(variant):
     config = list(variant.get("config", []))
     flags = variant.get("rustflags", [])
     if flags:
         config.append("profile.release.rustflags=" + json.dumps(["-Cllvm-args=-addrsig", *flags]))
     overrides = [arg for value in config for arg in ("--config", value)]
+    return overrides
+
+
+def build(source, output, variant, benchmarks=True, packages=("engine", "protocol", "llm", "tui")):
+    overrides = variant_arguments(variant)
     env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
                CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
     release = Path(env["CARGO_TARGET_DIR"]) / "release"
@@ -100,6 +105,8 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
     if not benchmarks:
         return
     run(["cargo", "build-release", "-p", "a", "--example", "perf-attach", *overrides], cwd=source, env=env)
+    run(["cargo", "test", "--release", *STD, "-p", "a", "--example", "perf-attach", *overrides],
+        cwd=source, env=env)
     shutil.copy2(release / "examples" / ("perf-attach" + SUFFIX), output / ("perf-attach" + SUFFIX))
     for package, target in [("engine", ["--lib"]), ("protocol", ["--test", "bench"]),
                             ("llm", ["--test", "bench"]), ("tui", ["--lib"])]:
@@ -113,16 +120,6 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
         assert len(executables) == 1, executables
         shutil.copy2(executables[0], output / (package + "-bench" + SUFFIX))
     run(["rustc", ROOT / "scripts/perf/floor.rs", "-O", "-o", output / ("floor" + SUFFIX)], cwd=source)
-    if os.name != "nt" and "protocol" in packages:
-        for package, target, name in [("a", "blackbox", "terminal-budgets"),
-                                      ("ext-shell", "quiet", "quiet-shell")]:
-            result = run(["cargo", "test", "--release", *STD, "-p", package, "--test", target,
-                          "--no-run", "--message-format=json", *overrides], cwd=source, env=env,
-                         stdout=subprocess.PIPE, text=True)
-            executables = [record["executable"] for line in result.stdout.splitlines()
-                           if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
-            assert len(executables) == 1, executables
-            shutil.copy2(executables[0], output / name)
 
 
 def budgets(output, binary=None, probe=None, samples=5):
@@ -183,9 +180,12 @@ def budgets(output, binary=None, probe=None, samples=5):
                         client.kill()
                         client.wait()
                 stop_daemon(binary, env, home)
-    return {name: distribution(values) for name, values in [
+    metrics = {name: distribution(values) for name, values in [
         ("cold_reply_ms", cold), ("attach_p50_ms", attach_p50), ("attach_p99_ms", attach_p99),
         ("idle_rss_kib", rss), ("idle_daemon_cpu_ms", cpu), ("idle_line_client_cpu_ms", client_cpu)]}
+    metrics["idle_daemon_cpu_ms"]["windows"] = cpu
+    metrics["idle_line_client_cpu_ms"]["windows"] = client_cpu
+    return metrics
 
 
 def cli_probe(output, session, env, home, probe=None):
@@ -235,27 +235,14 @@ def summarize(output, source, variant, runner):
                   windows_image=windows_image(output / ("a" + SUFFIX)) if os.name == "nt" else None,
                   metrics=metrics)
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
-    # Keep measurements even when a hard budget fails.
-    failures = []
-    if metrics["idle_rss_kib"]["max"] >= 10240:
-        failures.append("idle daemon RSS reaches 10240 KiB")
-    if metrics["idle_daemon_cpu_ms"]["max"] > 0 or metrics["idle_line_client_cpu_ms"]["max"] > 0:
-        failures.append("idle CPU is nonzero (OS counter resolution)")
-    if sys.platform == "linux":
-        if metrics["cold_reply_ms"]["median"] - floor >= 50:
-            failures.append("cold daemon reply exceeds 50 ms over the process floor")
-        if metrics["attach_p99_ms"]["median"] >= 2:
-            failures.append("attach p99 reaches 2 ms")
-    if failures:
-        raise RuntimeError("; ".join(failures))
 
 
-def bloat(source, output):
-    env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"))
+def bloat(source, output, variant):
+    env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
+               CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
     for label, extra in [("crates", ["--crates"]), ("functions", ["-n", "100"] )]:
-        result = run(["cargo", "bloat", "--release", "-p", "a", *STD,
-                      "--config", 'profile.release.debug="line-tables-only"',
-                      "--config", 'profile.release.strip="symbols"',
+        result = run(["cargo", "bloat", "--release", "-p", "a", *STD, *variant_arguments(variant),
+                      "--config", 'profile.release.strip="none"',
                       "--message-format=json", *extra], cwd=source, env=env,
                      stdout=subprocess.PIPE, text=True)
         (output / ("bloat-" + label + ".json")).write_text(result.stdout)
@@ -361,7 +348,7 @@ def main():
     if args.phase in ["all", "build"]:
         build(source, output, variant, benchmarks=not args.build_only)
         if args.bloat:
-            bloat(source, output)
+            bloat(source, output, variant)
     if args.build_only or args.phase == "build":
         return
     # Native exec and accounting can stall before a subprocess timeout is armed.
@@ -383,17 +370,6 @@ def main():
     run([sys.executable, ROOT / "mise-tasks/perf/workloads", output / ("a-fixtures" + SUFFIX), "cli",
          "--runs", "20", "--output", output])
     run([sys.executable, ROOT / "mise-tasks/perf/benches", output, output / "cli/transcript.jsonl", "--runs", "5"])
-    if os.name != "nt":
-        env = dict(os.environ, A_BIN=str(output / "a-fixtures"),
-                   A_STRICT_BUDGETS="1" if sys.platform == "linux" else "0")
-        for binary, filters in [
-            ("terminal-budgets", ["budgets::the_terminal_client_paints_its_first_frame_within_16ms",
-                                  "budgets::an_idle_daemon_and_terminal_client_cost_nothing"]),
-            ("quiet-shell", ["a_quiet_command_wakes_nothing_while_it_runs"]),
-        ]:
-            result = run([output / binary, *filters, "--ignored", "--nocapture", "--test-threads=1"],
-                         env=env, timeout=120, capture_output=True, text=True)
-            (output / (binary + ".json")).write_text(json.dumps(dict(stdout=result.stdout, stderr=result.stderr)))
     try:
         summarize(output, source, variant, args.runner)
     finally:
