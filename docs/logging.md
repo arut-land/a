@@ -61,6 +61,9 @@ native byte order; the RSDS GUID's first three fields use Windows little-endian
 GUID layout. Identities come from the loader's mapped image, so a moved,
 replaced or deleted executable path cannot change the report's identity.
 Missing native identity is explicit rather than substituted with a path.
+The `object` crate parses bounded mapped ELF notes and Mach-O load commands;
+compression and unused formats are disabled. Windows uses the existing
+`windows-sys` PE definitions. No executable file is opened during a panic.
 Windows captures frames with `RtlCaptureStackBackTrace` and pins each module
 while reading its PE metadata; it does not initialize DbgHelp or symbolize.
 Unix unwinds without symbolization. No panic payload, thread name, symbol,

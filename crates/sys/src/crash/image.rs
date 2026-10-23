@@ -94,7 +94,7 @@ pub(super) fn of(base: usize) -> Option<Identity> {
             }
             // SAFETY: the range was checked against a readable loaded segment.
             let notes = unsafe { std::slice::from_raw_parts((bias + start) as *const u8, len) };
-            if let Some(id) = build_id(notes) {
+            if let Some(id) = build_id(notes, h.p_align) {
                 search.identity = Some(Identity::ElfBuildId(id));
                 break;
             }
@@ -111,56 +111,31 @@ pub(super) fn of(base: usize) -> Option<Identity> {
 }
 
 #[cfg(target_os = "linux")]
-fn build_id(mut notes: &[u8]) -> Option<Hex> {
-    while notes.len() >= 12 {
-        let word =
-            |offset| u32::from_ne_bytes(notes[offset..offset + 4].try_into().unwrap()) as usize;
-        let (name, size, kind) = (word(0), word(4), word(8));
-        let aligned = |len: usize| len.checked_add(3).map(|n| n & !3);
-        let desc = 12usize.checked_add(aligned(name)?)?;
-        let end = desc.checked_add(size)?;
-        let next = desc.checked_add(aligned(size)?)?;
-        if kind == 3 && notes.get(12..12usize.checked_add(name)?)? == b"GNU\0" {
-            return Hex::new(notes.get(desc..end)?);
+fn build_id(notes: &[u8], align: u64) -> Option<Hex> {
+    use object::{NativeEndian, elf, read::elf::NoteIterator};
+    let mut notes =
+        NoteIterator::<elf::FileHeader64<NativeEndian>>::new(NativeEndian, align, notes).ok()?;
+    while let Some(note) = notes.next().ok()? {
+        if note.name() == elf::ELF_NOTE_GNU && note.n_type(NativeEndian) == elf::NT_GNU_BUILD_ID {
+            return Hex::new(note.desc());
         }
-        notes = notes.get(next..)?;
     }
     None
 }
 
-// libc retains these ABI definitions; no Mach calls or task-port bindings are needed.
-#[allow(deprecated)]
 #[cfg(target_os = "macos")]
 pub(super) fn of(base: usize) -> Option<Identity> {
-    // SAFETY: base came from dladdr for a frame in a loaded image. All supported
-    // Apple targets use the native 64-bit Mach header and load-command layout.
-    let header = unsafe { &*(base as *const libc::mach_header_64) };
-    if header.magic != 0xfeed_facf {
+    use object::{LittleEndian, macho::MachHeader64, read::macho::MachHeader};
+    // SAFETY: base came from dladdr for a frame in a loaded image. Both supported
+    // Apple architectures use native little-endian 64-bit Mach headers.
+    let header = unsafe { &*(base as *const MachHeader64<LittleEndian>) };
+    if !header.is_supported() {
         return None;
     }
+    let len = size_of::<MachHeader64<LittleEndian>>() + header.sizeofcmds(LittleEndian) as usize;
     // SAFETY: the loader validated sizeofcmds and keeps its header mapped.
-    let commands = unsafe {
-        std::slice::from_raw_parts(
-            (base + size_of::<libc::mach_header_64>()) as *const u8,
-            header.sizeofcmds as usize,
-        )
-    };
-    let mut offset = 0usize;
-    for _ in 0..header.ncmds {
-        let command = commands.get(offset..offset.checked_add(8)?)?;
-        let kind = u32::from_ne_bytes(command[..4].try_into().ok()?);
-        let size = u32::from_ne_bytes(command[4..].try_into().ok()?) as usize;
-        if size < 8 {
-            return None;
-        }
-        let end = offset.checked_add(size)?;
-        let command = commands.get(offset..end)?;
-        if kind == 0x1b {
-            return Hex::new(command.get(8..24)?).map(Identity::MachUuid);
-        }
-        offset = end;
-    }
-    None
+    let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, len) };
+    Hex::new(&header.uuid(LittleEndian, bytes, 0).ok()??).map(Identity::MachUuid)
 }
 
 #[cfg(windows)]
@@ -273,11 +248,11 @@ mod tests {
             }
         }
         assert_eq!(
-            serde_json::to_string(&build_id(&notes).unwrap()).unwrap(),
+            serde_json::to_string(&build_id(&notes, 4).unwrap()).unwrap(),
             "\"0102ff\""
         );
         for len in 0..notes.len() - 1 {
-            assert!(build_id(&notes[..len]).is_none());
+            assert!(build_id(&notes[..len], 4).is_none());
         }
     }
 
@@ -285,7 +260,7 @@ mod tests {
     #[test]
     fn malformed_notes_cannot_escape_the_mapped_range() {
         for notes in [&[][..], &[255; 12], &[0; 12], &[1; 31]] {
-            assert!(build_id(notes).is_none());
+            assert!(build_id(notes, 4).is_none());
         }
     }
 }

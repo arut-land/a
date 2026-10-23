@@ -14,7 +14,11 @@ toml_edit = { version = "0.25", default-features = false, features = ["parse", "
 rustix = { workspace = true, features = ["stdio", "pipe", "event", "net", "termios"] }
 libc.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
+object = { version = "0.40", default-features = false, features = ["read_core", "macho"] }
 oslog = { version = "0.2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
