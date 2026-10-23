@@ -237,8 +237,8 @@ crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
   repository root is walked up to for the picker's default; connecting
   (and spawning the daemon) happens on the reader thread. An ssh endpoint
   connects first, since ssh may prompt on the terminal.
-- Unix only, like the daemon: on Windows `tui` builds to a stub and `a`
-  runs the line REPL.
+- Unix and Windows consoles use native terminal backends. Redirected streams
+  select the line REPL.
 
 ## The terminal layer: measurements
 
@@ -346,9 +346,9 @@ opt-level s) on a 120×40 pty, against the same program printing lines:
   layout engines, async runtimes or no inline mode; ratatui-textarea does
   not soft-wrap, which the input needs.
 
-None of them is needed once the client is Unix only and draws its own
-diff: the backends' work (raw mode, a key decoder, a cursor-move and SGR
-encoder) is what rustix and vte, linked already, leave to write.
+The client draws its own diff over the existing rustix, windows-sys and vte
+dependencies. The native mode, control-event and restoration contracts are
+described in [the terminal backend rationale](perf/terminal.md).
 
 ## Tests
 
