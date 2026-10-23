@@ -38,14 +38,15 @@ impl Extension for Prompt {
             Some(system) => Text::system("identity", 0, system.clone()),
             None => Text::system("identity", 0, IDENTITY),
         };
+        let execution = sys::shell::ExecutionFacts::current();
         r.text(identity)
-            .text(Text::context("environment", 0, |facts| {
-                Some(context(facts))
+            .text(Text::context("environment", 0, move |facts| {
+                Some(context(facts, execution))
             }));
     }
 }
 
-fn context(facts: &Facts<'_>) -> String {
+fn context(facts: &Facts<'_>, execution: &sys::shell::ExecutionFacts) -> String {
     let mut text = format!(
         "<environment>\nworking directory: {}\n",
         facts.dir.display()
@@ -57,7 +58,7 @@ fn context(facts: &Facts<'_>) -> String {
         text,
         "platform: {}\n{}\n</environment>",
         sys::Platform::CURRENT,
-        sys::shell::ExecutionFacts::current().context()
+        execution.context()
     );
     let path = facts.workspace.join("AGENTS.md");
     let mut notes = String::new();
@@ -83,10 +84,13 @@ mod tests {
     #[test]
     fn environment_publishes_the_same_execution_contract_as_shell_tools() {
         let workspace = std::env::temp_dir().join("a-prompt-execution-facts");
-        let text = context(&Facts {
-            workspace: &workspace,
-            dir: &workspace,
-        });
+        let text = context(
+            &Facts {
+                workspace: &workspace,
+                dir: &workspace,
+            },
+            sys::shell::ExecutionFacts::current(),
+        );
         assert!(text.contains(&sys::shell::ExecutionFacts::current().context()));
     }
 }

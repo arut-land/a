@@ -181,7 +181,7 @@ fn resolve(
         syntax,
         paths,
         utilities: "installed Windows executables and the selected shell's builtins",
-        cleanup: "timeout/cancellation terminate the owned Windows job and its descendants; no Unix TERM grace; background work is session-owned; jobs die with the daemon; retained output stays in the session spill directory",
+        cleanup: "timeout/cancellation terminate the owned Windows job and its descendants; no Unix TERM grace; background work is session-owned; jobs die with the daemon; retained output stays in the session spill directory; command-created temporary files are not automatically removed",
         temp: std::env::temp_dir(),
         cwd_command,
         runtime_bin,

@@ -168,14 +168,14 @@ impl<D: crate::dialect::Dialect> Tool for ShellTool<D> {
 
     fn present(input: &Command) -> Option<Card> {
         Some(Card {
-            title: title(input).replacen("$ ", D::PROMPT, 1),
+            title: title(input, D::PROMPT),
             ..Card::default()
         })
     }
 
     fn present_result(input: &Command, ran: &Ran) -> Option<Card> {
         Some(Card {
-            title: title(input).replacen("$ ", D::PROMPT, 1),
+            title: title(input, D::PROMPT),
             body: ran.output.clone(),
             note: note(ran),
             mark: mark(ran),
@@ -183,9 +183,9 @@ impl<D: crate::dialect::Dialect> Tool for ShellTool<D> {
     }
 }
 
-fn title(input: &Command) -> String {
+fn title(input: &Command, prompt: &str) -> String {
     let mut lines = input.command.trim().lines();
-    let mut title = format!("$ {}", lines.next().unwrap_or_default());
+    let mut title = format!("{prompt}{}", lines.next().unwrap_or_default());
     if lines.next().is_some() {
         title.push_str(" …");
     }
