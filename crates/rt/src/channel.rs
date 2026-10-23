@@ -170,10 +170,13 @@ impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let mut state = self.0.state();
         state.receiver_gone = true;
+        let waiting = state.waiting > 0;
         let items = std::mem::take(&mut state.items);
         let waker = state.waker.take();
         drop(state);
-        self.0.space.notify_all();
+        if waiting {
+            self.0.space.notify_all();
+        }
         drop((items, waker));
     }
 }
