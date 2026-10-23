@@ -1,5 +1,8 @@
 name: resources probe
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex-w5rt]
 permissions:
   contents: read
 jobs:
