@@ -301,7 +301,11 @@ mod imp {
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = handler;
         // Other threads' interrupted calls restart rather than fail.
-        action.sa_flags = libc::SA_RESTART;
+        action.sa_flags = if matches!(signal, Signal::BackgroundRead | Signal::BackgroundWrite) {
+            0
+        } else {
+            libc::SA_RESTART
+        };
         // SAFETY: `sa_mask` is a valid, writable signal set; `action` is fully
         // initialized and the handler is async-signal-safe (`on_signal`) or
         // `SIG_DFL`.

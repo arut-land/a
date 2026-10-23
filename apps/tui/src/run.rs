@@ -199,6 +199,18 @@ impl Client {
     }
 
     fn draw(&mut self) -> io::Result<()> {
-        self.screen.draw(&mut self.app, term::size()?)
+        loop {
+            if !sys::terminal::is_foreground()? {
+                term::suspend()?;
+                self.screen.invalidate();
+            }
+            match self.screen.draw(&mut self.app, term::size()?) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    term::suspend()?;
+                    self.screen.invalidate();
+                }
+                result => return result,
+            }
+        }
     }
 }

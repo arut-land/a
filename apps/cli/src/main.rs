@@ -217,6 +217,7 @@ enum Input {
 /// as lines and its intents typed. When the daemon drains for an upgrade,
 /// it reconnects (starting the new build) and replays what it missed.
 fn repl(daemon: &client::Daemon, target: Target) -> io::Result<()> {
+    let _terminal = sys::terminal::LineMode::enter()?;
     let (tx, rx) = client::inbox(client::QueueBudget::default(), |input| {
         size_of::<Input>()
             + match input {

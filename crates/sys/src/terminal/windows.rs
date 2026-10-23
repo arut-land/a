@@ -1,10 +1,17 @@
 //! Console handles, rather than environment variables, establish capabilities.
 
 use std::collections::VecDeque;
-use std::io::{self, Write};
+use std::io;
 use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle};
 
-use windows_sys::Win32::System::Console::*;
+use windows_sys::Win32::System::Console::{
+    CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
+    ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
+    GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo, INPUT_RECORD,
+    KEY_EVENT, ReadConsoleInputW, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP,
+    WINDOW_BUFFER_SIZE_EVENT,
+};
 use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 
 use super::Input;
@@ -37,11 +44,13 @@ impl RawMode {
             output_mode,
             // SAFETY: these queries take no pointers.
             input_cp: unsafe { GetConsoleCP() },
+            // SAFETY: scalar query for the attached console.
             output_cp: unsafe { GetConsoleOutputCP() },
         };
         // The guard rolls back even a partially successful setup. Keep
         // processed input so Ctrl-C and Ctrl-Break use the control handler.
         // QuickEdit would freeze output while the user selects text.
+        // SAFETY: both owned console handles remain live; all arguments are scalar.
         unsafe {
             ok(SetConsoleMode(
                 saved.output.as_raw_handle(),
@@ -103,13 +112,25 @@ pub fn size() -> io::Result<(u16, u16)> {
         GetConsoleScreenBufferInfo(io::stdout().as_handle().as_raw_handle(), &raw mut info)
     })?;
     Ok((
-        (info.srWindow.Right - info.srWindow.Left + 1) as u16,
-        (info.srWindow.Bottom - info.srWindow.Top + 1) as u16,
+        (info.srWindow.Right - info.srWindow.Left + 1).cast_unsigned(),
+        (info.srWindow.Bottom - info.srWindow.Top + 1).cast_unsigned(),
     ))
 }
 
 pub fn write_stdout(buf: &[u8]) -> io::Result<usize> {
-    io::stdout().write(buf)
+    let mut written = 0;
+    // SAFETY: stdout is borrowed through the call; the input slice and count
+    // remain valid. WriteFile keeps redirected output byte-oriented too.
+    ok(unsafe {
+        windows_sys::Win32::Storage::FileSystem::WriteFile(
+            io::stdout().as_handle().as_raw_handle(),
+            buf.as_ptr(),
+            u32::try_from(buf.len()).unwrap_or(u32::MAX),
+            &raw mut written,
+            std::ptr::null_mut(),
+        )
+    })?;
+    Ok(written as usize)
 }
 
 pub struct InputReader {
@@ -222,6 +243,11 @@ impl InputReader {
 mod tests {
     use super::*;
     use std::process::Command;
+    use windows_sys::Win32::System::Console::{
+        AllocConsole, CTRL_BREAK_EVENT, CTRL_C_EVENT, FlushConsoleInputBuffer, FreeConsole,
+        GenerateConsoleCtrlEvent, INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
+        WriteConsoleInputW,
+    };
 
     #[test]
     fn console_state_is_restored_after_a_panic_and_events_preserve_unicode_and_resize() {
@@ -267,7 +293,7 @@ mod tests {
         let cp = unsafe { (GetConsoleCP(), GetConsoleOutputCP()) };
         let signals = Signals::catch(&[Signal::Interrupt, Signal::Terminate]).unwrap();
         let panic = std::panic::catch_unwind(|| {
-            let _raw = RawMode::enter().unwrap();
+            let _raw = super::super::RawMode::enter().unwrap();
             // SAFETY: scalar queries for the owned console.
             assert_eq!(
                 unsafe { (GetConsoleCP(), GetConsoleOutputCP()) },
@@ -297,7 +323,7 @@ mod tests {
             assert_eq!((GetConsoleCP(), GetConsoleOutputCP()), cp);
         }
         assert_eq!((restored_input, restored_output), (input_mode, output_mode));
-        let _raw = RawMode::enter().unwrap();
+        let _raw = super::super::RawMode::enter().unwrap();
         let mut reader = InputReader::new(signals);
         let mut records = vec![];
         for unit in "A🙂".encode_utf16() {
@@ -353,4 +379,71 @@ mod tests {
             assert_eq!(reader.signals.wait(), [signal]);
         }
     }
+}
+
+/// Each redirected side remains byte-oriented; only real console handles
+/// participate in mode and code-page ownership.
+pub struct LineMode {
+    input_cp: Option<u32>,
+    output: Option<(OwnedHandle, u32, u32)>,
+}
+
+impl LineMode {
+    pub fn enter() -> io::Result<Self> {
+        let mut saved = Self {
+            input_cp: None,
+            output: None,
+        };
+        let mut mode = 0;
+        // SAFETY: standard handles are borrowed for the call and mode is writable.
+        unsafe {
+            if GetConsoleMode(io::stdin().as_handle().as_raw_handle(), &raw mut mode) != 0 {
+                saved.input_cp = Some(GetConsoleCP());
+                ok(SetConsoleCP(65001))?;
+            }
+            if GetConsoleMode(io::stdout().as_handle().as_raw_handle(), &raw mut mode) != 0 {
+                let output = io::stdout().as_handle().try_clone_to_owned()?;
+                saved.output = Some((output, mode, GetConsoleOutputCP()));
+                ok(SetConsoleMode(
+                    saved.output.as_ref().unwrap().0.as_raw_handle(),
+                    mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                ))?;
+                ok(SetConsoleOutputCP(65001))?;
+            }
+        }
+        Ok(saved)
+    }
+}
+
+impl LineMode {
+    pub fn restore(&self) -> io::Result<()> {
+        // SAFETY: saved console handle remains owned through these calls.
+        unsafe {
+            if let Some(cp) = self.input_cp {
+                SetConsoleCP(cp);
+            }
+            if let Some((handle, mode, cp)) = &self.output {
+                SetConsoleMode(handle.as_raw_handle(), *mode);
+                SetConsoleOutputCP(*cp);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LineMode {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+pub struct OutputGuard;
+impl OutputGuard {
+    pub fn enter() -> io::Result<Self> {
+        Ok(Self)
+    }
+}
+
+pub fn is_foreground() -> io::Result<bool> {
+    Ok(true)
 }

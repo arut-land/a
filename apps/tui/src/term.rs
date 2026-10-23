@@ -70,6 +70,9 @@ impl Terminal {
 
 /// Called by the screen owner, so no frame races the cooked terminal.
 pub fn suspend() -> io::Result<()> {
+    if !sys::terminal::JOB_CONTROL {
+        return Ok(());
+    }
     let viewport = HELD
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -95,6 +98,7 @@ impl Drop for Terminal {
 fn restore() {
     let held = HELD.lock().unwrap_or_else(PoisonError::into_inner).take();
     if let Some((viewport, cooked)) = held {
+        let _output = sys::terminal::OutputGuard::enter();
         let _ = cooked.restore_input();
         let mut out = io::stdout().lock();
         let _ = out.write_all(LEAVE);
@@ -142,9 +146,7 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
                 Input::Signals(signals) => {
                     let mut resized = false;
                     for signal in signals {
-                        if signal == Signal::Resize {
-                            resized = true;
-                        } else if signal == Signal::Continue {
+                        if matches!(signal, Signal::Resize | Signal::Continue) {
                             resized = true;
                         } else if matches!(
                             signal,

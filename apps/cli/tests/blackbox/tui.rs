@@ -193,3 +193,41 @@ fn esc_interrupts_a_running_turn_without_leaving_either_viewport() {
         assert!(term.cooked(), "detaching restores terminal input");
     }
 }
+
+#[test]
+fn the_terminal_is_cooked_while_suspended_and_redrawn_after_continue() {
+    use rustix::process::{WaitOptions, waitpid};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    for external in [false, true] {
+        let env = Env::new("tui-job-control");
+        let mut term = env.tty(&[], 80, 24);
+        term.wait_for("● live");
+        let pid = Pid::from_child(&term.child);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(waitpid(Some(pid), WaitOptions::UNTRACED));
+        });
+        if external {
+            kill_process(pid, Signal::TSTP).unwrap();
+        } else {
+            term.send(b"\x1a");
+        }
+        let (_, stopped) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the client did not suspend")
+            .unwrap()
+            .unwrap();
+        assert!(stopped.stopped());
+        assert!(term.cooked(), "raw input outlived terminal ownership");
+        kill_process(pid, Signal::CONT).unwrap();
+        term.wait_until("raw input after continue", |_| !term.cooked());
+        assert!(!term.cooked(), "continuing did not reacquire raw input");
+        term.send(b"after continue\r");
+        term.wait_for("⏺ after continue");
+        term.send(b"\x03");
+        assert!(term.wait().success());
+        assert!(term.cooked());
+    }
+}
