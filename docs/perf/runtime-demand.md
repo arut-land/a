@@ -20,18 +20,23 @@ processor count.
 | 2 | 2 | 1 | 8 | 1 | 1 | 160 MiB |
 | 4 | 4 | 2 | 8 | 3 | 1 | 160 MiB |
 | 8 | 4 | 4 | 8 | 7 | 1 | 160 MiB |
-| 32 | 4 | 4 | 8 | 31 | 1 | 160 MiB |
+| 32 | 4 | 4 | 8 | 8 | 1 | 160 MiB |
 
-CPU workers are created on demand up to `max(1, cores - 1)`; storage is
+CPU workers are created on demand up to `clamp(cores - 1, 1, 8)`; storage is
 `clamp(cores / 2, 1, 4)`. `Threads::new` sets async worker count while
 blocking defaults use the machine's cores. `Threads::configured` can
 set every lane's worker, queue, and byte limits explicitly.
+
+The daemon selects these limits through `Config::for_path` using effective CPU
+and storage facts. Rotational storage uses one worker. Catalog recovery shares
+storage admission. Per-OS policy, page granularity, QoS, memory pressure and
+channel comparisons are recorded in [native runtime resources](resources.md).
 
 Storage admits up to 16 queued jobs and 64 MiB; Network admits 16 and
 32 MiB; CPU admits 8 and 64 MiB. Budgets cover queued and running jobs
 and do not grow with core count. Seven 8 MiB projections can run together
 on the eight-core host. At 32 cores, the same budget permits eight such
-projections at once; smaller jobs can use all 31 CPU workers. The invariant
+projections at once; smaller jobs remain bounded by the eight-worker CPU ceiling. The invariant
 `cpu_capacity_follows_demand_within_the_fixed_byte_budget` exercises both
 cases, plus simulated 2/4/8-core configurations.
 
