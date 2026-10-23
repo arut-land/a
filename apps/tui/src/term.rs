@@ -366,9 +366,7 @@ mod tests {
         assert_ne!(control.epoch(), epoch, "queued typing survived Ctrl-C");
         assert!(control.take().is_empty());
         assert!(matches!(inbox.try_recv(), Some(Event::Input(_, old)) if old == epoch));
-        if sys::terminal::JOB_CONTROL {
-            assert!(sys::terminal::output_interrupted());
-        }
+        assert!(sys::terminal::output_interrupted());
         drop(pending);
         assert!(!sys::terminal::output_interrupted());
     }

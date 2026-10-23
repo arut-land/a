@@ -18,6 +18,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 2
       MISE_AUTO_INSTALL: false
+      CARGO_PROFILE_DEV_CODEGEN_BACKEND: ${{ matrix.os == 'windows-latest' && 'llvm' || 'cranelift' }}
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v5
