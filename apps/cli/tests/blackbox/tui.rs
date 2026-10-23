@@ -200,8 +200,14 @@ fn the_terminal_is_cooked_while_suspended_and_redrawn_after_continue() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    for external in [false, true] {
-        let env = Env::new("tui-job-control");
+    for (viewport, external) in [
+        ("full", false),
+        ("full", true),
+        ("inline", false),
+        ("inline", true),
+    ] {
+        let mut env = Env::new("tui-job-control");
+        env.vars.push(("A_TUI", viewport));
         let mut term = env.tty(&[], 80, 24);
         term.wait_for("● live");
         let pid = Pid::from_child(&term.child);
@@ -221,11 +227,23 @@ fn the_terminal_is_cooked_while_suspended_and_redrawn_after_continue() {
             .unwrap();
         assert!(stopped.stopped());
         assert!(term.cooked(), "raw input outlived terminal ownership");
+        term.shell_output(b"\r\nshell output while stopped\r\n");
         kill_process(pid, Signal::CONT).unwrap();
         term.wait_until("raw input after continue", |_| !term.cooked());
         assert!(!term.cooked(), "continuing did not reacquire raw input");
         term.send(b"after continue\r");
-        term.wait_for("⏺ after continue");
+        let screen = term.wait_for("⏺ after continue");
+        if viewport == "inline" {
+            assert!(
+                screen.find("shell output while stopped").is_some()
+                    || screen
+                        .scrollback
+                        .iter()
+                        .any(|line| line.contains("shell output while stopped")),
+                "resuming overwrote shell output: {}",
+                screen.text()
+            );
+        }
         term.send(b"\x03");
         assert!(term.wait().success());
         assert!(term.cooked());

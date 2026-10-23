@@ -201,6 +201,18 @@ impl Pty {
         self.master.write_all(bytes).unwrap();
     }
 
+    /// Output from the shell while the client is stopped, through the tty's
+    /// output side rather than the master that sends keyboard input.
+    pub fn shell_output(&self, bytes: &[u8]) {
+        let name = ptsname(&self.master, Vec::new()).unwrap();
+        File::options()
+            .write(true)
+            .open(name.to_str().unwrap())
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
     /// A left click at a screen cell, as an SGR mouse report.
     pub fn click(&mut self, (x, y): (u16, u16)) {
         let report = format!("\x1b[<0;{};{}M\x1b[<0;{};{}m", x + 1, y + 1, x + 1, y + 1);

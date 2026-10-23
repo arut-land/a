@@ -15,8 +15,7 @@ use super::Event;
 use super::Viewport;
 use super::keys::Decoder;
 
-/// The signals the input thread handles: a resize, and the two that end
-/// the client after the terminal is restored.
+/// Terminal lifecycle requests are delivered before the daemon's backlog.
 pub const SIGNALS: [Signal; 8] = [
     Signal::Resize,
     Signal::Terminate,
@@ -113,6 +112,9 @@ fn restore() {
             let _ = out.write_all(LEAVE_FULL);
         }
         let _ = out.write_all(b"\x1b[?25h");
+        if viewport == Viewport::Inline {
+            let _ = out.write_all(b"\r\n");
+        }
         let _ = out.flush();
         let _ = cooked.restore();
     }

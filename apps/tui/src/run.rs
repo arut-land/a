@@ -147,6 +147,7 @@ impl Client {
                 match event {
                     Event::Suspend(done) => {
                         term::suspend()?;
+                        self.screen.resume();
                         let _ = done.send(());
                         whole = true;
                     }
@@ -203,12 +204,12 @@ impl Client {
         loop {
             if !sys::terminal::is_foreground()? {
                 term::suspend()?;
-                self.screen.invalidate();
+                self.screen.resume();
             }
             match self.screen.draw(&mut self.app, term::size()?) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     term::suspend()?;
-                    self.screen.invalidate();
+                    self.screen.resume();
                 }
                 result => return result,
             }

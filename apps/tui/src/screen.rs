@@ -71,6 +71,15 @@ impl<W: Write> Screen<W> {
         self.stale = true;
     }
 
+    /// The shell may have moved the cursor while it owned the terminal.
+    pub fn resume(&mut self) {
+        self.bytes.clear();
+        (self.row, self.col) = (Some(0), None);
+        self.pen = PLAIN;
+        self.cursor_shown = true;
+        self.stale = true;
+    }
+
     /// Draws `app` on a `cols` × `rows` terminal: inline, its settled items
     /// go into the scrollback first. A frame that changed nothing (an ack,
     /// a list nothing shows) writes nothing, not even the envelope.
