@@ -218,6 +218,9 @@ pub(super) fn members(job: &OwnedHandle) -> io::Result<Vec<u32>> {
             let header = buffer.as_ptr().cast::<u32>();
             // SAFETY: successful query initialized both DWORDs and the listed IDs.
             let len = unsafe { *header.add(1) } as usize;
+            if len > super::MAX_MEMBERS {
+                return Err(io::Error::other("job exceeds supervision capacity"));
+            }
             let offset = 8 / size_of::<usize>();
             return Ok(buffer[offset..offset + len]
                 .iter()
