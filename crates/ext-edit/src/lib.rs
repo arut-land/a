@@ -1,6 +1,14 @@
 //! `edit`, and the hashes it keeps to catch stale reads. It edits where
 //! commands run, so it needs [`CwdOf`]: a build without the shell does
 //! not compile.
+//!
+//! Storage workers capture a [`sys::fs::EditTransaction`], CPU workers match
+//! replacements and build the diff, then storage workers publish the result.
+//! Publication replaces a regular file's name, preserving its metadata; links
+//! are rejected. The receipt promises atomic visibility, not power-loss
+//! durability. Identity and byte revalidation detect observed changes, without
+//! claiming compare-and-swap against an uncooperative writer in the final
+//! check/rename interval. New names are published exclusively.
 
 use ext::{Configured, CwdOf, Extension, Need, Refused, Registrar, Table, Text, Tool as _};
 

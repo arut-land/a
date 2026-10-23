@@ -317,7 +317,7 @@ impl Drop for Pending<'_> {
             rustix::fs::AtFlags::empty(),
         );
         #[cfg(windows)]
-        let _ = fs::remove_file(self.transaction.directory.join(&self.name));
+        remove_pending(&self.transaction.directory.join(&self.name));
     }
 }
 
@@ -441,6 +441,33 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         destination.set_modified(modified)?;
+        let mut attributes = libc::attrlist {
+            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: libc::ATTR_CMN_CRTIME,
+            volattr: 0,
+            dirattr: 0,
+            fileattr: 0,
+            forkattr: 0,
+        };
+        let mut birth = libc::timespec {
+            tv_sec: metadata.st_birthtime(),
+            tv_nsec: metadata.st_birthtime_nsec(),
+        };
+        // fcopyfile's STAT does not preserve birth time on every filesystem.
+        // SAFETY: the attribute bitmap describes exactly one native timespec.
+        if unsafe {
+            libc::fsetattrlist(
+                destination.as_raw_fd(),
+                (&raw mut attributes).cast(),
+                (&raw mut birth).cast(),
+                size_of::<libc::timespec>(),
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         // Flags such as hidden/immutable must not disappear on safe-save.
         // SAFETY: destination owns the descriptor and flags came from stat.
         if unsafe { libc::fchflags(destination.as_raw_fd(), metadata.st_flags()) } != 0 {
@@ -604,7 +631,7 @@ fn stage_windows(transaction: &EditTransaction, name: &std::ffi::OsStr) -> io::R
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-        SECURITY_ATTRIBUTES,
+        SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SetSecurityDescriptorControl,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         COPY_FILE_COPY_SYMLINK, CREATE_NEW, CopyFileExW, CreateFileW, DELETE,
@@ -629,6 +656,19 @@ fn stage_windows(transaction: &EditTransaction, name: &std::ffi::OsStr) -> io::R
         };
         if status != 0 {
             return Err(io::Error::from_raw_os_error(status.cast_signed()));
+        }
+        // The temporary file must not gain new ACEs from a directory whose
+        // inheritance policy changed since the original file was created.
+        // SAFETY: descriptor is the owned, mutable result of GetSecurityInfo.
+        let protected = crate::windows::ok(unsafe {
+            SetSecurityDescriptorControl(descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+        });
+        if let Err(error) = protected {
+            // SAFETY: GetSecurityInfo allocated the descriptor with LocalAlloc.
+            unsafe {
+                LocalFree(descriptor);
+            }
+            return Err(error);
         }
     }
     let attributes = SECURITY_ATTRIBUTES {
@@ -675,11 +715,28 @@ fn stage_windows(transaction: &EditTransaction, name: &std::ffi::OsStr) -> io::R
         });
         if let Err(error) = result {
             drop(file);
-            let _ = fs::remove_file(destination);
+            remove_pending(&destination);
             return Err(error);
         }
     }
     Ok(file)
+}
+
+#[cfg(windows)]
+fn remove_pending(path: &Path) {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_READONLY, SetFileAttributesW};
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        let attributes = metadata.file_attributes();
+        if attributes & FILE_ATTRIBUTE_READONLY != 0 {
+            let path = crate::windows::wide(path.as_os_str());
+            // SAFETY: this is an unpublished, owned staging file and the path is terminated.
+            unsafe {
+                SetFileAttributesW(path.as_ptr(), attributes & !FILE_ATTRIBUTE_READONLY);
+            }
+        }
+        let _ = fs::remove_file(path);
+    }
 }
 
 #[cfg(windows)]
@@ -987,6 +1044,8 @@ mod tests {
             (before.mode(), before.uid(), before.gid()),
             (after.mode(), after.uid(), after.gid())
         );
+        #[cfg(target_vendor = "apple")]
+        assert_eq!(before.created().unwrap(), after.created().unwrap());
         let mut value = [0; 32];
         let count = fgetxattr(&destination, attribute, &mut value[..]).unwrap();
         assert_eq!(&value[..count], b"metadata");
@@ -1186,6 +1245,33 @@ mod tests {
         ));
         work.capture().publish(b"new", false).unwrap();
         assert_eq!(fs::read(stream).unwrap(), b"[ZoneTransfer]\r\nZoneId=3\r\n");
+        work.only_target_remains();
+    }
+
+    #[test]
+    fn simultaneous_private_saves_never_share_or_unlink_staging_files() {
+        let work = Workspace::new();
+        let sentinel = work.0.join(format!(".target.{}", std::process::id()));
+        fs::write(&sentinel, b"unrelated").unwrap();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let writers: Vec<_> = (0u8..8)
+            .map(|byte| {
+                let gate = gate.clone();
+                let path = work.target();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    super::super::write_private(&path, &[byte; 8192]).unwrap();
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let bytes = fs::read(work.target()).unwrap();
+        assert_eq!(bytes.len(), 8192);
+        assert!(bytes.iter().all(|byte| *byte == bytes[0]));
+        assert_eq!(fs::read(&sentinel).unwrap(), b"unrelated");
+        fs::remove_file(sentinel).unwrap();
         work.only_target_remains();
     }
 }

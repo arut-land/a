@@ -712,6 +712,13 @@ mod tests {
             matches!(&created, Outcome::Done { output } if output.parse::<Value>().unwrap()["created"] == true)
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n");
+        let Outcome::Done { output } = &created else {
+            unreachable!()
+        };
+        assert_eq!(
+            output.parse::<Value>().unwrap()["publication"],
+            json!({"visible": true, "durability": "not_requested"})
+        );
         let Outcome::Done { output } = change(&rig, "notes.txt", &[("two", "2")]) else {
             panic!()
         };
