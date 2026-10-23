@@ -111,11 +111,14 @@ fn powershell_arguments(
     script.push_str("}\nif (-not $__a_ok) { exit 1 }\n");
     #[cfg(test)]
     if std::env::var_os("A_SHELL_PROBE").is_some() {
-        script = script
+        let (init, body) = script.split_once("$__a_ok = $true").unwrap();
+        script = init
             .lines()
             .enumerate()
             .map(|(i, line)| format!("[Console]::Error.WriteLine('stage {i}'); {line}\n"))
-            .collect();
+            .collect::<String>()
+            + "[Console]::Error.WriteLine('ready'); $__a_ok = $true"
+            + body;
     }
     // Native argv is Unicode and SpawnPlan quotes it. -Command keeps 5.1
     // stderr textual; -EncodedCommand implicitly selects CLIXML stderr.
