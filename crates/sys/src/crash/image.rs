@@ -68,6 +68,9 @@ pub(super) fn frame(ip: usize) -> super::Frame {
     ) -> libc::c_int {
         // SAFETY: dl_iterate_phdr lends these objects for this callback.
         let (info, search) = unsafe { (&*info, &mut *data.cast::<Search>()) };
+        if info.dlpi_phnum == 0 || info.dlpi_phdr.is_null() {
+            return 0;
+        }
         // SAFETY: the loader supplies dlpi_phnum readable program headers.
         let headers =
             unsafe { std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum)) };
@@ -92,7 +95,7 @@ pub(super) fn frame(ip: usize) -> super::Frame {
         }
         let Some(base) = headers
             .iter()
-            .filter(|h| h.p_type == libc::PT_LOAD)
+            .filter(|h| h.p_type == libc::PT_LOAD && h.p_memsz != 0)
             .map(|h| h.p_vaddr)
             .min()
             .and_then(|start| usize::try_from(start).ok())
@@ -111,6 +114,9 @@ pub(super) fn frame(ip: usize) -> super::Frame {
             else {
                 continue;
             };
+            if len == 0 || address == 0 {
+                continue;
+            }
             // A program note need not be loaded. Read only a note wholly inside
             // a readable PT_LOAD; the loader lock keeps the mapping alive.
             if !headers.iter().any(|load| {
@@ -180,7 +186,9 @@ pub(super) fn frame(ip: usize) -> super::Frame {
     super::Frame {
         image,
         offset: ip.saturating_sub(info.dli_fbase as usize) as u64,
-        identity: found.then(|| of(info.dli_fbase as usize)).flatten(),
+        identity: (found && !info.dli_fbase.is_null())
+            .then(|| of(info.dli_fbase as usize))
+            .flatten(),
     }
 }
 
