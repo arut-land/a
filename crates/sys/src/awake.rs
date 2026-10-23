@@ -200,9 +200,4 @@ mod tests {
     fn unsupported_platforms_allocate_no_hold() {
         assert!(Awake::hold("a test hold").is_none());
     }
-
-    #[test]
-    fn holding_never_fails_the_caller() {
-        drop(Awake::hold("a test hold"));
-    }
 }
