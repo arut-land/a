@@ -80,8 +80,8 @@ def main():
         return
     for mode in ("kernelbase", "apiset", "shell"):
         result = subprocess.run([sys.executable, __file__, mode], capture_output=True,
-                                text=True, check=True, timeout=60)
-        (OUTPUT / (mode + ".json")).write_text(result.stdout)
+                                text=True, timeout=60)
+        (OUTPUT / (mode + ".json")).write_text(result.stdout if result.returncode == 0 else json.dumps(dict(error=result.stderr)))
     for role, revision in [("main", "781586d5a9fec1dd8b5e2b316a28b00a48470f8e"),
                            ("regressed", "9bec7823b1a97a5a23c917de2b9c89aae56d1e2c")]:
         source = OUTPUT / role

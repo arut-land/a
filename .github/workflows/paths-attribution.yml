@@ -1,5 +1,8 @@
 name: paths attribution
 on:
+  push:
+    branches: [codex-w2paths]
+    paths: ['.github/workflows/paths-attribution.yml', 'scripts/perf/paths-attribution.py']
   workflow_dispatch:
 permissions:
   contents: read
