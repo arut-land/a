@@ -45,8 +45,7 @@ fn adoption_never_double_closes() {
     }
     let listener = home.bind().unwrap();
     let number = InheritedNumber::from(listener.passed().to_string().parse::<i32>().unwrap());
-    let adopted = sys::Listener::adopt(number.duplicate().unwrap(), &home.endpoint()).unwrap();
-    drop(adopted);
+    assert!(sys::Listener::adopt(number.duplicate().unwrap(), &home.endpoint()).is_err());
     drop(home.endpoint().connect().unwrap());
     drop(listener.accept().unwrap());
     assert!(sys::Listener::adopt(original.try_clone().unwrap(), &home.endpoint()).is_err());

@@ -617,7 +617,7 @@ async fn open_remote(
 }
 
 enum AsyncTransport {
-    Local(rt::Async<sys::Stream>),
+    Local(rt::Async<sys::OwnedConnection>),
     Pipe(rt::Async<sys::ProcessPipe>),
 }
 
@@ -886,7 +886,7 @@ mod tests {
             }
         }
 
-        fn connect(&self, rt: Rt) -> (ClientHandle, sys::Stream) {
+        fn connect(&self, rt: Rt) -> (ClientHandle, sys::OwnedConnection) {
             let (events, received) = mpsc::channel();
             let handle = Driver::new(move |_, event| {
                 let _ = events.send(event);

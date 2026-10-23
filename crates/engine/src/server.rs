@@ -19,7 +19,7 @@ use protocol::{
     Frame, HomeSettings, PROTO, Rejection, Role, SettingsChange, Versions,
 };
 use rt::{Async, BoxFuture, Reactor};
-use sys::{Listener, Stream};
+use sys::{Listener, OwnedConnection as Stream};
 
 use crate::driver::{self, Attachment, Request};
 use crate::outbox::{BUDGET, Outbox};
@@ -40,7 +40,11 @@ pub(crate) async fn accept(
     life: &Arc<Lifecycle>,
 ) -> io::Result<()> {
     loop {
-        let stream = listener.read_with(|l| l.accept()).await?;
+        let stream = match listener.read_with(|l| l.accept()).await {
+            Ok(stream) => stream,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error),
+        };
         if daemon.clients.load(Ordering::SeqCst) >= BUDGET.requests {
             let _ = stream.shutdown(std::net::Shutdown::Both);
             continue;

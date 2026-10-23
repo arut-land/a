@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 pub use awake::Awake;
 pub use config::Config;
 pub use desktop::open_browser;
-pub use endpoint::{Endpoint, Listener, Stream};
+pub use endpoint::{Endpoint, EndpointRetirement, Listener, OwnedConnection, Stream};
 pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
 pub use memory::small_footprint;

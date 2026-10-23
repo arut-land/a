@@ -18,8 +18,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    GetNamedPipeServerProcessId, PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES,
+    WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, ResetEvent, SetEvent, WaitForSingleObject};
 
@@ -76,6 +77,8 @@ pub struct Listener {
     state: Mutex<Accept>,
     event: OwnedHandle,
     nonblocking: AtomicBool,
+    _claim: Arc<Mutex<Option<File>>>,
+    retirement_taken: AtomicBool,
 }
 
 struct Accept {
@@ -124,8 +127,20 @@ pub fn bind(path: &Path, _link: &Path) -> io::Result<Listener> {
         .parent()
         .and_then(Path::parent)
         .ok_or(io::ErrorKind::InvalidInput)?;
+    crate::fs::private_dir(&root.join("run"))?;
+    // Denying sharing claims this home before creating any generation pipe.
+    // The persistent file is never deleted, and a crash closes its handle.
+    let claim = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(path.with_extension("endpoint-lock"))?;
     let name = generation(&crate::crash::Record::current(""), root)?;
-    listener(instance(&name, true)?, &name)
+    let listener = listener(instance(&name, true)?, &name)?;
+    *lock(&listener._claim) = Some(claim);
+    Ok(listener)
 }
 
 fn listener(file: Arc<File>, path: &Path) -> io::Result<Listener> {
@@ -137,6 +152,8 @@ fn listener(file: Arc<File>, path: &Path) -> io::Result<Listener> {
         }),
         event: event()?,
         nonblocking: AtomicBool::new(false),
+        _claim: Arc::new(Mutex::new(None)),
+        retirement_taken: AtomicBool::new(false),
     })
 }
 
@@ -154,6 +171,24 @@ pub(crate) fn process_pipe() -> io::Result<(super::Stream, File)> {
     // synchronous stdio, as arbitrary child programs expect.
     let child = OpenOptions::new().read(true).write(true).open(&name)?;
     Ok((super::Stream(accept(&listener)?), child))
+}
+
+pub struct Retirement(Arc<Mutex<Option<File>>>);
+
+pub fn retirement(listener: &Listener) -> io::Result<Retirement> {
+    if listener.retirement_taken.swap(true, Ordering::AcqRel) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "endpoint retirement already taken",
+        ));
+    }
+    Ok(Retirement(Arc::clone(&listener._claim)))
+}
+
+#[allow(clippy::unnecessary_wraps, reason = "Unix unlinks its socket")]
+pub fn retire(retirement: Retirement) -> io::Result<()> {
+    lock(&retirement.0).take();
+    Ok(())
 }
 
 pub fn adopt(_file: File, _path: &Path) -> io::Result<Listener> {
@@ -210,6 +245,10 @@ pub fn accept(listener: &Listener) -> io::Result<Stream> {
         let next = instance(&listener.path, false)?;
         state.operation = None;
         let connected = std::mem::replace(&mut state.file, next);
+        let mut pid = 0;
+        // SAFETY: connected owns the server pipe and pid is writable.
+        ok(unsafe { GetNamedPipeClientProcessId(connected.as_raw_handle(), &raw mut pid) })?;
+        verify_sid(&user_sid(Some(pid))?, &user_sid(None)?)?;
         return Stream::new(connected);
     }
 }
@@ -328,13 +367,24 @@ fn connect_pipe(path: &Path, expected: Option<u32>) -> io::Result<Stream> {
     let mut pid = 0;
     // SAFETY: file is an open pipe, pid is a writable output.
     ok(unsafe { GetNamedPipeServerProcessId(file.as_raw_handle(), &raw mut pid) })?;
-    if expected.is_some_and(|expected| expected != pid) || user_sid(Some(pid))? != user_sid(None)? {
+    if expected.is_some_and(|expected| expected != pid) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "pipe server belongs to another user",
+            "wrong pipe server process",
         ));
     }
+    verify_sid(&user_sid(Some(pid))?, &user_sid(None)?)?;
     Stream::new(Arc::new(file))
+}
+
+fn verify_sid(peer: &str, owner: &str) -> io::Result<()> {
+    if peer != owner {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "pipe peer belongs to another user",
+        ));
+    }
+    Ok(())
 }
 
 struct Operation {
@@ -621,6 +671,28 @@ mod tests {
         crate::Home::from(
             std::env::temp_dir().join(format!("a-pipe-{name}-{}", std::process::id())),
         )
+    }
+
+    #[test]
+    fn foreign_user_identity_is_refused_before_protocol_io() {
+        let owner = user_sid(None).unwrap();
+        assert_eq!(
+            verify_sid("S-1-5-7", &owner).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        verify_sid(&owner, &owner).unwrap();
+    }
+
+    #[test]
+    fn a_second_listener_cannot_take_the_home_claim() {
+        let home = home("claim");
+        let first = home.bind().unwrap();
+        assert!(home.bind().is_err());
+        home.endpoint().remove();
+        assert!(home.bind().is_err());
+        drop(first);
+        drop(home.bind().unwrap());
+        std::fs::remove_dir_all(home.root()).unwrap();
     }
 
     #[test]
