@@ -58,7 +58,7 @@ impl Dialect for PowerShell {
         let mut script = format!(
             "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n\
              $ProgressPreference = 'SilentlyContinue'\n\
-             if (Get-Variable PSStyle -ErrorAction Ignore) {{ $PSStyle.OutputRendering = 'PlainText' }}\n\
+             if ($PSVersionTable.PSVersion.Major -ge 7 -and $null -ne $PSStyle) {{ $PSStyle.OutputRendering = 'PlainText' }}\n\
              Set-Location -LiteralPath {} -ErrorAction Stop\n\
              $__a_ok = $true\ntry {{\n{command}\n$__a_ok = $?\n}} catch {{\n\
              $__a_ok = $false\n[Console]::Error.WriteLine($_.ToString())\n}} finally {{\n",

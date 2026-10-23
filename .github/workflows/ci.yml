@@ -187,8 +187,6 @@ jobs:
         run: |
           $runners = @((Get-Command pwsh.exe).Source, "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
           "A_TEST_POWERSHELL=$($runners -join ';')" >> $env:GITHUB_ENV
-      - name: Native PowerShell startup diagnostic
-        run: mise exec -- cargo test -p sys shell_startup_probe -- --nocapture
       - name: PowerShell contract diagnostic
         run: mise exec -- cargo nextest run -p ext-shell -E 'test(powershell_preserves_status_errors_unicode_cwd_and_no_input)' --no-fail-fast
       - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
