@@ -806,7 +806,6 @@ mod tests {
         assert!(value["callsite"]["file"].is_u64());
         assert!(value["callsite"]["line"].is_u64());
         let frames = value["frames"].as_array().unwrap();
-        assert!(!frames.is_empty());
         assert!(
             frames.iter().any(|frame| !frame["identity"].is_null()),
             "no native image identity: {report}"

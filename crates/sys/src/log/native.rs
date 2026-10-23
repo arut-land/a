@@ -88,6 +88,8 @@ mod backend {
 mod backend {
     pub(super) struct Sink(oslog::OsLog);
     impl Sink {
+        // The backend constructor is fallible on the other platforms.
+        #[allow(clippy::unnecessary_wraps)]
         pub(super) fn new() -> Option<Self> {
             Some(Self(oslog::OsLog::new("land.arut.a", "daemon")))
         }

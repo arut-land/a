@@ -254,6 +254,35 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn only_the_gnu_build_id_descriptor_becomes_identity() {
+        let mut notes = Vec::new();
+        for (name, kind, value) in [
+            (b"x\0".as_slice(), 42u32, &[9][..]),
+            (b"GNU\0".as_slice(), 3, &[1, 2, 255][..]),
+        ] {
+            notes.extend_from_slice(&u32::try_from(name.len()).unwrap().to_ne_bytes());
+            notes.extend_from_slice(&u32::try_from(value.len()).unwrap().to_ne_bytes());
+            notes.extend_from_slice(&kind.to_ne_bytes());
+            notes.extend_from_slice(name);
+            while notes.len() % 4 != 0 {
+                notes.push(0);
+            }
+            notes.extend_from_slice(value);
+            while notes.len() % 4 != 0 {
+                notes.push(0);
+            }
+        }
+        assert_eq!(
+            serde_json::to_string(&build_id(&notes).unwrap()).unwrap(),
+            "\"0102ff\""
+        );
+        for len in 0..notes.len() - 1 {
+            assert!(build_id(&notes[..len]).is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn malformed_notes_cannot_escape_the_mapped_range() {
         for notes in [&[][..], &[255; 12], &[0; 12], &[1; 31]] {
             assert!(build_id(notes).is_none());
