@@ -444,6 +444,7 @@ mod tests {
                 println!("raw input acquired");
                 assert_eq!(signals.wait(), [Signal::Suspend]);
                 drop(raw);
+                eprintln!("worker restored raw lease before stopping");
                 suspend().unwrap();
                 let _raw = RawMode::enter().unwrap();
                 println!("raw input reacquired");
@@ -516,6 +517,7 @@ mod tests {
         let pid = Pid::from_child(&child.0);
         // Background startup must stop before modifying termios.
         wait_stopped(pid);
+        eprintln!("startup stopped before acquiring terminal");
         assert_modes(&before, &rustix::termios::tcgetattr(&stdin).unwrap());
         rustix::termios::tcsetpgrp(&stdin, pid).unwrap();
         kill_process(pid, Signal::CONT).unwrap();
@@ -531,18 +533,21 @@ mod tests {
         wait_marker(&lines, "raw input acquired");
         kill_process(pid, Signal::TSTP).unwrap();
         wait_stopped(pid);
+        eprintln!("worker suspended after restoring terminal");
         assert_modes(&before, &rustix::termios::tcgetattr(&stdin).unwrap());
         let _output = OutputGuard::enter().unwrap();
         let shell = rustix::process::getpgrp();
         rustix::termios::tcsetpgrp(&stdin, shell).unwrap();
         kill_process(pid, Signal::CONT).unwrap();
         wait_stopped(pid);
+        eprintln!("background continue stopped without acquiring terminal");
         assert_eq!(rustix::termios::tcgetpgrp(&stdin).unwrap(), shell);
         assert_modes(&before, &rustix::termios::tcgetattr(&stdin).unwrap());
         rustix::termios::tcsetpgrp(&stdin, pid).unwrap();
         kill_process(pid, Signal::CONT).unwrap();
         wait_marker(&lines, "raw input reacquired");
         assert!(child.0.wait().unwrap().success());
+        eprintln!("foreground worker exited");
         assert_modes(&before, &rustix::termios::tcgetattr(&stdin).unwrap());
     }
 
