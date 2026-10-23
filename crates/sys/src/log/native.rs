@@ -62,6 +62,7 @@ mod backend {
         use super::*;
 
         #[test]
+        #[cfg_attr(miri, ignore = "Miri does not support AF_UNIX sockets")]
         fn journal_delivery_is_atomic_and_never_waits_for_a_collector() {
             let path = std::env::temp_dir().join(format!("a-journal-{}", std::process::id()));
             let receiver = UnixDatagram::bind(&path).unwrap();
