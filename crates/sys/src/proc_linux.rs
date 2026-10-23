@@ -41,20 +41,7 @@ pub(super) fn spawn(
     drop(writer);
     // SAFETY: fcntl returned an exclusively owned descriptor.
     let writer = unsafe { OwnedFd::from_raw_fd(raw_writer) };
-    // The old-kernel close loop must include pre-existing descriptors even if
-    // a caller lowered its hard limit after opening them.
-    let max_open = std::fs::read_dir("/proc/self/fd")?
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u64>().ok())
-        .max()
-        .unwrap_or(2);
-    // SAFETY: getrlimit initializes this writable output.
-    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
-    // SAFETY: valid resource constant and output pointer.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let ceiling =
-        i32::try_from(limit.rlim_max.max(max_open + 1)).map_err(|_| io::ErrorKind::Unsupported)?;
+    let close_fds = CloseFds::prepare(close_range_available(), open_descriptors)?;
     let mask = Mask::block()?;
     // SAFETY: the child executes only the fixed, async-signal-safe syscall
     // sequence below. It never allocates, locks, unwinds or drops Rust values.
@@ -73,7 +60,7 @@ pub(super) fn spawn(
                 directory: directory.as_deref(),
                 descriptors: &descriptors,
                 boundary,
-                ceiling,
+                close_fds,
                 error: writer.as_raw_fd(),
                 session,
                 group,
@@ -106,6 +93,45 @@ pub(super) fn spawn(
     })
 }
 
+#[derive(Clone, Copy)]
+enum CloseFds {
+    Range,
+    Loop(i32),
+}
+impl CloseFds {
+    fn prepare(range: bool, inventory: impl FnOnce() -> io::Result<u64>) -> io::Result<Self> {
+        let max_open = inventory()?;
+        // SAFETY: getrlimit initializes this writable output.
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: valid resource constant and output pointer.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let ceiling = i32::try_from(limit.rlim_max.max(max_open + 1))
+            .map_err(|_| io::ErrorKind::Unsupported)?;
+        Ok(if range {
+            Self::Range
+        } else {
+            Self::Loop(ceiling)
+        })
+    }
+}
+fn close_range_available() -> bool {
+    // SAFETY: no signed descriptor can occupy this empty range.
+    unsafe { libc::syscall(libc::SYS_close_range, u32::MAX, u32::MAX, 0) == 0 }
+}
+fn open_descriptors() -> io::Result<u64> {
+    std::fs::read_dir("/proc/self/fd")?
+        .map(|entry| {
+            entry?
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| io::Error::other("invalid descriptor inventory"))
+        })
+        .try_fold(2_u64, |max, fd| fd.map(|fd| max.max(fd)))
+}
+
 struct Exec<'a> {
     executable: &'a CStr,
     arguments: &'a [*mut libc::c_char],
@@ -113,7 +139,7 @@ struct Exec<'a> {
     directory: Option<&'a CStr>,
     descriptors: &'a [(i32, i32)],
     boundary: i32,
-    ceiling: i32,
+    close_fds: CloseFds,
     error: i32,
     session: bool,
     group: bool,
@@ -141,26 +167,33 @@ impl Exec<'_> {
                 failed(self.error);
             }
             // Close all undesired FDs, retaining only the CLOEXEC error writer.
-            let first = if self.error > self.boundary {
-                libc::syscall(
-                    libc::SYS_close_range,
-                    self.boundary.cast_unsigned(),
-                    (self.error - 1).cast_unsigned(),
-                    0,
-                )
-            } else {
-                0
-            };
-            let second = libc::syscall(
-                libc::SYS_close_range,
-                (self.error + 1).cast_unsigned(),
-                u32::MAX,
-                0,
-            );
-            if first < 0 || second < 0 {
-                for descriptor in self.boundary..self.ceiling {
-                    if descriptor != self.error {
-                        libc::close(descriptor);
+            match self.close_fds {
+                CloseFds::Range => {
+                    let first = if self.error > self.boundary {
+                        libc::syscall(
+                            libc::SYS_close_range,
+                            self.boundary.cast_unsigned(),
+                            (self.error - 1).cast_unsigned(),
+                            0,
+                        )
+                    } else {
+                        0
+                    };
+                    let second = libc::syscall(
+                        libc::SYS_close_range,
+                        (self.error + 1).cast_unsigned(),
+                        u32::MAX,
+                        0,
+                    );
+                    if first < 0 || second < 0 {
+                        failed(self.error);
+                    }
+                }
+                CloseFds::Loop(ceiling) => {
+                    for descriptor in self.boundary..ceiling {
+                        if descriptor != self.error {
+                            libc::close(descriptor);
+                        }
                     }
                 }
             }
@@ -261,6 +294,22 @@ mod tests {
     use std::ffi::CString;
     use std::fs::File;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn close_range_never_requires_a_descriptor_inventory() {
+        assert!(matches!(
+            CloseFds::prepare(true, || Err(io::ErrorKind::NotFound.into())).unwrap(),
+            CloseFds::Range
+        ));
+    }
+
+    #[test]
+    fn old_kernels_without_an_inventory_fail_closed() {
+        let error = CloseFds::prepare(false, || Err(io::ErrorKind::NotFound.into()))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
 
     #[test]
     fn musl_plans_close_unlisted_fds_and_return_native_exec_failures() {
