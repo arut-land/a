@@ -10,12 +10,16 @@ pub(super) enum Identity {
     #[cfg(target_os = "macos")]
     MachUuid(Hex),
     #[cfg(windows)]
-    Pe {
-        timestamp: u32,
-        size: u32,
-        pdb: Option<Hex>,
-        age: Option<u32>,
-    },
+    Pe(Pe),
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Serialize)]
+pub(super) struct Pe {
+    timestamp: u32,
+    size: u32,
+    pdb: Option<Hex>,
+    age: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -210,18 +214,18 @@ fn of(base: usize) -> Option<Identity> {
 #[cfg(windows)]
 pub(super) fn frame(ip: *mut std::ffi::c_void) -> super::Frame {
     use windows_sys::Win32::{
-        Foundation::FreeLibrary,
-        System::{
-            Diagnostics::Debug::{
-                IMAGE_DEBUG_DIRECTORY, IMAGE_DEBUG_TYPE_CODEVIEW, IMAGE_NT_HEADERS64,
-            },
-            LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleHandleExW},
-            SystemServices::IMAGE_DOS_HEADER,
-        },
+        Foundation::{FreeLibrary, HMODULE},
+        System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleHandleExW},
     };
+    struct Module(HMODULE);
+    impl Drop for Module {
+        fn drop(&mut self) {
+            // SAFETY: releases exactly the reference acquired by GetModuleHandleExW.
+            unsafe { FreeLibrary(self.0) };
+        }
+    }
     let mut module = std::ptr::null_mut();
-    // SAFETY: FROM_ADDRESS interprets the argument as an address, not a string;
-    // the resulting module reference keeps its headers alive until FreeLibrary.
+    // SAFETY: FROM_ADDRESS interprets the argument as an address, not a string.
     if unsafe {
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
@@ -232,65 +236,125 @@ pub(super) fn frame(ip: *mut std::ffi::c_void) -> super::Frame {
     {
         return super::Frame::default();
     }
-    let base = module as usize;
-    // SAFETY: the module loader validated these native PE headers.
-    let dos = unsafe { &*module.cast::<IMAGE_DOS_HEADER>() };
-    let Ok(offset) = usize::try_from(dos.e_lfanew) else {
-        // SAFETY: releases exactly the reference acquired above.
-        unsafe { FreeLibrary(module) };
-        return super::Frame::default();
+    let module = Module(module);
+    let base = module.0 as usize;
+    let pe = pe_identity(base);
+    super::Frame {
+        image: pe.map_or(0, |id| (u64::from(id.timestamp) << 32) | u64::from(id.size)),
+        offset: (ip as usize).saturating_sub(base) as u64,
+        identity: pe.map(Identity::Pe),
+    }
+}
+
+#[cfg(windows)]
+fn pe_identity(base: usize) -> Option<Pe> {
+    use windows_sys::Win32::System::{
+        Diagnostics::Debug::{
+            IMAGE_DEBUG_DIRECTORY, IMAGE_DEBUG_TYPE_CODEVIEW, IMAGE_NT_HEADERS64,
+            IMAGE_NT_OPTIONAL_HDR64_MAGIC,
+        },
+        SystemServices::{IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE},
     };
-    // SAFETY: the loader validated the NT header at this offset in the pinned image.
-    let nt = unsafe { &*((base + offset) as *const IMAGE_NT_HEADERS64) };
-    let timestamp = nt.FileHeader.TimeDateStamp;
-    let size = nt.OptionalHeader.SizeOfImage;
-    let mut pdb = None;
-    let mut age = None;
+    let bytes = read_image::<{ size_of::<IMAGE_DOS_HEADER>() }>(base)?;
+    // SAFETY: this SDK header has only integer fields; every bit pattern is valid.
+    let dos = unsafe { bytes.as_ptr().cast::<IMAGE_DOS_HEADER>().read_unaligned() };
+    if dos.e_magic != IMAGE_DOS_SIGNATURE {
+        return None;
+    }
+    let nt_base = base.checked_add(usize::try_from(dos.e_lfanew).ok()?)?;
+    let bytes = read_image::<{ size_of::<IMAGE_NT_HEADERS64>() }>(nt_base)?;
+    // SAFETY: this SDK header and its nested headers contain only integers/arrays.
+    let nt = unsafe { bytes.as_ptr().cast::<IMAGE_NT_HEADERS64>().read_unaligned() };
+    if nt.Signature != IMAGE_NT_SIGNATURE
+        || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
+    {
+        return None;
+    }
+    let mut pe = Pe {
+        timestamp: nt.FileHeader.TimeDateStamp,
+        size: nt.OptionalHeader.SizeOfImage,
+        pdb: None,
+        age: None,
+    };
+    if nt.OptionalHeader.NumberOfRvaAndSizes <= 6 {
+        return Some(pe);
+    }
     let directory = nt.OptionalHeader.DataDirectory[6];
     let start = directory.VirtualAddress as usize;
-    let end = start.checked_add(directory.Size as usize);
-    if start != 0 && end.is_some_and(|end| end <= size as usize) {
-        let count = directory.Size as usize / size_of::<IMAGE_DEBUG_DIRECTORY>();
-        for index in 0..count {
-            // SAFETY: the debug directory range is contained in the pinned image.
-            let debug = unsafe {
-                ((base + start) as *const IMAGE_DEBUG_DIRECTORY)
-                    .add(index)
-                    .read_unaligned()
-            };
-            let at = debug.AddressOfRawData as usize;
-            if debug.Type == IMAGE_DEBUG_TYPE_CODEVIEW
-                && debug.SizeOfData >= 24
-                && at.checked_add(24).is_some_and(|end| end <= size as usize)
-            {
-                // SAFETY: only the fixed RSDS prefix is read; never the PDB pathname.
-                let data = unsafe { std::slice::from_raw_parts((base + at) as *const u8, 24) };
-                if &data[..4] == b"RSDS" {
-                    pdb = Hex::new(&data[4..20]);
-                    age = Some(u32::from_le_bytes(data[20..24].try_into().unwrap()));
-                    break;
-                }
-            }
+    if start == 0
+        || start
+            .checked_add(directory.Size as usize)
+            .is_none_or(|end| end > pe.size as usize)
+    {
+        return Some(pe);
+    }
+    // A missing/hostile debug directory cannot turn reporting into an unbounded scan.
+    let count = (directory.Size as usize / size_of::<IMAGE_DEBUG_DIRECTORY>()).min(64);
+    for index in 0..count {
+        let address = base
+            .checked_add(start)?
+            .checked_add(index * size_of::<IMAGE_DEBUG_DIRECTORY>())?;
+        let Some(bytes) = read_image::<{ size_of::<IMAGE_DEBUG_DIRECTORY>() }>(address) else {
+            break;
+        };
+        // SAFETY: this SDK directory contains only integer fields.
+        let debug = unsafe {
+            bytes
+                .as_ptr()
+                .cast::<IMAGE_DEBUG_DIRECTORY>()
+                .read_unaligned()
+        };
+        let at = debug.AddressOfRawData as usize;
+        if debug.Type != IMAGE_DEBUG_TYPE_CODEVIEW
+            || debug.SizeOfData < 24
+            || at.checked_add(24).is_none_or(|end| end > pe.size as usize)
+        {
+            continue;
+        }
+        // Only the fixed RSDS prefix is copied, never the PDB pathname.
+        if let Some(data) = read_image::<24>(base.checked_add(at)?)
+            && &data[..4] == b"RSDS"
+        {
+            pe.pdb = Hex::new(&data[4..20]);
+            pe.age = Some(u32::from_le_bytes(data[20..24].try_into().unwrap()));
+            break;
         }
     }
-    let frame = super::Frame {
-        image: (u64::from(timestamp) << 32) | u64::from(size),
-        offset: (ip as usize).saturating_sub(base) as u64,
-        identity: Some(Identity::Pe {
-            timestamp,
-            size,
-            pdb,
-            age,
-        }),
+    Some(pe)
+}
+
+#[cfg(windows)]
+fn read_image<const N: usize>(address: usize) -> Option<[u8; N]> {
+    use windows_sys::Win32::System::{
+        Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess,
     };
-    // SAFETY: releases exactly the reference acquired above.
-    unsafe { FreeLibrary(module) };
-    frame
+    let mut bytes = [0; N];
+    let mut copied = 0;
+    // A module pin does not keep discardable debug pages mapped. The kernel
+    // returns an error for unreadable pages instead of faulting the panic hook.
+    // SAFETY: the output buffer/count are valid; the API checks the source range.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const _,
+            bytes.as_mut_ptr().cast(),
+            N,
+            &raw mut copied,
+        )
+    };
+    (ok != 0 && copied == N).then_some(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_pe_metadata_cannot_fault_a_report() {
+        assert!(pe_identity(0).is_none());
+        assert!(read_image::<24>(usize::MAX).is_none());
+    }
 
     #[test]
     fn image_identity_contains_only_bounded_hex() {

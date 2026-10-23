@@ -69,7 +69,9 @@ The `object` crate parses bounded mapped ELF notes and Mach-O load commands;
 compression and unused formats are disabled. Windows uses the existing
 `windows-sys` PE definitions. No executable file is opened during a panic.
 Windows captures frames with `RtlCaptureStackBackTrace` and pins each module
-while reading its PE metadata; it does not initialize DbgHelp or symbolize.
+while copying its PE metadata through `ReadProcessMemory`. Discarded or
+unreadable debug pages yield missing metadata; the debug scan is capped at
+64 entries per frame. It does not initialize DbgHelp or symbolize.
 Unix unwinds without symbolization. No panic payload, thread name, symbol,
 image name, PDB filename or source path crosses the report boundary, including
 debug builds and reaper reports. The panic hook replaces the default formatter;
