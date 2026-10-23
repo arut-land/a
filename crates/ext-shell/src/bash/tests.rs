@@ -159,9 +159,7 @@ fn a_background_child_holding_the_pipe_does_not_hold_the_call() {
         (pgid, true),
         "owned by the session"
     );
-    assert!(model(&ran).contains(&format!(
-        "[background processes still running: pgid {pgid}]"
-    )));
+    assert!(model(&ran).contains(&format!("[background processes still running: job {pgid}]")));
 }
 
 #[test]
@@ -436,7 +434,7 @@ fn a_background_command_returns_at_once_with_its_log() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(sys::RecordedIdentity(job.pgid).alive());
-    assert!(model(&ran).starts_with(&format!("[running in the background: pgid {}", job.pgid)));
+    assert!(model(&ran).starts_with(&format!("[running in the background: job {}", job.pgid)));
 }
 
 /// Its end is an event, not something a poll finds: noticed within
@@ -648,7 +646,8 @@ fn continuous_output_yields_to_other_sessions() {
             .spawn(
                 &cx,
                 LaunchSpec {
-                    process: spawn(
+                    process: spawn_with::<crate::dialect::Bash>(
+                        sys::shell::ExecutionFacts::current(),
                         &cx,
                         "exit 0",
                         &cx.dir(),
