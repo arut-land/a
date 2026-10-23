@@ -207,6 +207,7 @@ fn powershell_preserves_status_errors_unicode_cwd_and_no_input() {
         return;
     };
     for (index, executable) in std::env::split_paths(&executables).enumerate() {
+        eprintln!("PowerShell runner: {}", executable.display());
         let rig = Rig::new(
             &format!("powershell-{index}"),
             Registry::default()
