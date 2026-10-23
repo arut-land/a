@@ -122,6 +122,7 @@ microbenchmarks do not establish contended application throughput.
 
 | Target | Old oneshot, ns | futures oneshot, ns | oneshot 0.2, ns | Ring queue, ns/message | futures queue, ns/message | async queue, ns/message |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| macOS x86_64 | 637 | 299 | 214 | 80 | 114 | 193 |
 | Linux aarch64 GNU | 133 | 131 | 65 | 30 | 45 | 101 |
 | Windows aarch64 | 194 | 224 | 97 | 36 | 62 | 111 |
 | Windows x86_64 | 174 | 131 | 121 | 14 | 52 | 45 |
@@ -142,6 +143,7 @@ CPU jobs compare ceilings of 4, 8 and 31 using a simulated 32-core configuration
 
 | Target | Page bytes | 4 CPU workers | 8 CPU workers | 31 CPU workers |
 | --- | ---: | ---: | ---: | ---: |
+| macOS x86_64 | 4096 | 184.156 | 161.664 | 217.503 |
 | Linux aarch64 GNU | 4096 | 143.843 | 143.921 | 145.636 |
 | Windows aarch64 | 4096 | 145.599 | 144.150 | 145.117 |
 | Windows x86_64 | 4096 | 110.908 | 111.601 | 112.702 |
