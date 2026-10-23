@@ -17,7 +17,16 @@ use super::keys::Decoder;
 
 /// The signals the input thread handles: a resize, and the two that end
 /// the client after the terminal is restored.
-pub const SIGNALS: [Signal; 3] = [Signal::Resize, Signal::Terminate, Signal::Hangup];
+pub const SIGNALS: [Signal; 8] = [
+    Signal::Resize,
+    Signal::Terminate,
+    Signal::Hangup,
+    Signal::Interrupt,
+    Signal::Suspend,
+    Signal::Continue,
+    Signal::BackgroundRead,
+    Signal::BackgroundWrite,
+];
 
 /// Bracketed paste on; on the full screen also the alternate buffer and
 /// click and wheel reports (SGR) only, not every motion, which would wake
@@ -48,14 +57,31 @@ impl Terminal {
         });
         let cooked = RawMode::enter()?;
         *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some((viewport, cooked));
+        let guard = Self(());
         let mut out = io::stdout().lock();
         if viewport == Viewport::Full {
             out.write_all(ENTER_FULL)?;
         }
         out.write_all(ENTER)?;
         out.flush()?;
-        Ok(Self(()))
+        Ok(guard)
     }
+}
+
+/// Called by the screen owner, so no frame races the cooked terminal.
+pub fn suspend() -> io::Result<()> {
+    let viewport = HELD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|(viewport, _)| *viewport);
+    if let Some(viewport) = viewport {
+        restore();
+        sys::terminal::suspend()?;
+        // Ownership remains with the original Terminal guard.
+        std::mem::forget(Terminal::enter(viewport)?);
+    }
+    Ok(())
 }
 
 impl Drop for Terminal {
@@ -69,7 +95,7 @@ impl Drop for Terminal {
 fn restore() {
     let held = HELD.lock().unwrap_or_else(PoisonError::into_inner).take();
     if let Some((viewport, cooked)) = held {
-        let _ = cooked.restore();
+        let _ = cooked.restore_input();
         let mut out = io::stdout().lock();
         let _ = out.write_all(LEAVE);
         if viewport == Viewport::Full {
@@ -77,6 +103,7 @@ fn restore() {
         }
         let _ = out.write_all(b"\x1b[?25h");
         let _ = out.flush();
+        let _ = cooked.restore();
     }
 }
 
@@ -117,6 +144,17 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
                     for signal in signals {
                         if signal == Signal::Resize {
                             resized = true;
+                        } else if signal == Signal::Continue {
+                            resized = true;
+                        } else if matches!(
+                            signal,
+                            Signal::Suspend | Signal::BackgroundRead | Signal::BackgroundWrite
+                        ) {
+                            request_suspend(&tx);
+                        } else if signal == Signal::Interrupt {
+                            let _ = tx.send_first(Event::Input(super::keys::Input::Key(
+                                super::keys::Key::Ctrl('c'),
+                            )));
                         } else {
                             end(signal);
                         }
@@ -133,6 +171,10 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
                 Input::Bytes(n) => {
                     // A full buffer may end in the start of an escape sequence.
                     for input in decoder.feed(&buf[..n], n == buf.len()) {
+                        if input == super::keys::Input::Key(super::keys::Key::Ctrl('z')) {
+                            request_suspend(&tx);
+                            continue;
+                        }
                         if tx.send_first(Event::Input(input)).is_err() {
                             open = false;
                             reader.close_input();
@@ -143,4 +185,12 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
             }
         }
     });
+}
+
+// Keep the reader away from cooked input while the shell owns the terminal.
+fn request_suspend(tx: &client::Post<Event>) {
+    let (done, wait) = mpsc::sync_channel(0);
+    if tx.send_first(Event::Suspend(done)).is_ok() {
+        let _ = wait.recv();
+    }
 }

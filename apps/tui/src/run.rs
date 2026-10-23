@@ -144,6 +144,11 @@ impl Client {
                 .take(client::PUMP_BATCH)
             {
                 match event {
+                    Event::Suspend(done) => {
+                        term::suspend()?;
+                        let _ = done.send(());
+                        whole = true;
+                    }
                     Event::Input(input) => effects.extend(self.app.input(input)),
                     Event::Resized => whole = true,
                     Event::Tick => self.app.tick(),

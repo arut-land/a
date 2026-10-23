@@ -62,6 +62,8 @@ enum Event {
     Input(keys::Input),
     /// The terminal changed size.
     Resized,
+    /// Give the terminal back before job-control stop.
+    Suspend(std::sync::mpsc::SyncSender<()>),
     /// stdin closed: the terminal is gone.
     InputClosed,
     /// From the session client's driver.

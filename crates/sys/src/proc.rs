@@ -783,6 +783,10 @@ mod imp {
             Signal::Interrupt => process::Signal::INT,
             Signal::Hangup => process::Signal::HUP,
             Signal::Resize => process::Signal::WINCH,
+            Signal::Suspend => process::Signal::TSTP,
+            Signal::Continue => process::Signal::CONT,
+            Signal::BackgroundRead => process::Signal::TTIN,
+            Signal::BackgroundWrite => process::Signal::TTOU,
         }
     }
 

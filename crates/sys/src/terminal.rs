@@ -4,9 +4,9 @@ use std::io::{self, Write};
 
 use crate::Signal;
 
-pub use imp::{InputReader, RawMode, size};
+pub use imp::{InputReader, RawMode, size, suspend};
 
-pub const SUPPORTED: bool = cfg!(unix);
+pub const SUPPORTED: bool = cfg!(any(unix, windows));
 
 pub enum Input {
     Signals(Vec<Signal>),
@@ -41,8 +41,15 @@ mod imp {
 
     pub struct RawMode(Termios);
 
+    impl Drop for RawMode {
+        fn drop(&mut self) {
+            let _ = self.restore();
+        }
+    }
+
     impl RawMode {
         pub fn enter() -> io::Result<Self> {
+            foreground()?;
             let stdin = rustix::stdio::stdin();
             let cooked = tcgetattr(stdin)?;
             let mut raw = cooked.clone();
@@ -51,13 +58,53 @@ mod imp {
             Ok(Self(cooked))
         }
 
-        pub fn restore(&self) -> io::Result<()> {
-            Ok(tcsetattr(
-                rustix::stdio::stdin(),
-                OptionalActions::Now,
-                &self.0,
-            )?)
+        pub fn restore_input(&self) -> io::Result<()> {
+            self.restore()
         }
+
+        pub fn restore(&self) -> io::Result<()> {
+            // SAFETY: initialized signal sets; the previous thread mask is
+            // restored before returning, including when tcsetattr fails.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                let mut old: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&raw mut set);
+                libc::sigaddset(&raw mut set, libc::SIGTTOU);
+                let error = libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, &raw mut old);
+                if error != 0 {
+                    return Err(io::Error::from_raw_os_error(error));
+                }
+                let result = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &self.0);
+                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut());
+                Ok(result?)
+            }
+        }
+    }
+
+    /// Never seize the foreground from the shell. A background resume stops
+    /// again until the shell has assigned this job the controlling terminal.
+    fn foreground() -> io::Result<()> {
+        loop {
+            let group = match rustix::termios::tcgetpgrp(rustix::stdio::stdin()) {
+                Ok(group) => group,
+                // A tty supplied without a controlling session has no job owner.
+                Err(Errno::NOTTY) => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
+            if group == rustix::process::getpgrp() {
+                return Ok(());
+            }
+            // SIGSTOP cannot be caught by our input thread's job-control handler.
+            rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::STOP,
+            )?;
+        }
+    }
+
+    pub fn suspend() -> io::Result<()> {
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::STOP)?;
+        foreground()
     }
 
     pub fn size() -> io::Result<(u16, u16)> {
@@ -122,44 +169,6 @@ mod imp {
     }
 }
 
-#[cfg(not(unix))]
-mod imp {
-    use std::io;
-
-    use super::Input;
-    use crate::Signals;
-
-    pub struct RawMode(());
-
-    impl RawMode {
-        pub fn enter() -> io::Result<Self> {
-            Err(io::ErrorKind::Unsupported.into())
-        }
-
-        pub fn restore(&self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    pub fn size() -> io::Result<(u16, u16)> {
-        Err(io::ErrorKind::Unsupported.into())
-    }
-
-    pub fn write_stdout(_: &[u8]) -> io::Result<usize> {
-        Err(io::ErrorKind::Unsupported.into())
-    }
-
-    pub struct InputReader;
-
-    impl InputReader {
-        pub fn new(_: Signals) -> Self {
-            Self
-        }
-
-        pub fn close_input(&mut self) {}
-
-        pub fn read(&mut self, _: &mut [u8]) -> io::Result<Input> {
-            Err(io::ErrorKind::Unsupported.into())
-        }
-    }
-}
+#[cfg(windows)]
+#[path = "terminal/windows.rs"]
+mod imp;

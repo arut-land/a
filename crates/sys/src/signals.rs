@@ -157,11 +157,15 @@ mod imp {
     use crate::Signal;
     use crate::proc::raw;
 
-    const ALL: [Signal; 4] = [
+    const ALL: [Signal; 8] = [
         Signal::Terminate,
         Signal::Interrupt,
         Signal::Hangup,
         Signal::Resize,
+        Signal::Suspend,
+        Signal::Continue,
+        Signal::BackgroundRead,
+        Signal::BackgroundWrite,
     ];
 
     struct Source {
@@ -189,6 +193,10 @@ mod imp {
             Signal::Interrupt => 2,
             Signal::Hangup => 4,
             Signal::Resize => 8,
+            Signal::Suspend => 16,
+            Signal::Continue => 32,
+            Signal::BackgroundRead => 64,
+            Signal::BackgroundWrite => 128,
             Signal::Kill => 0,
         }
     }

@@ -163,6 +163,14 @@ pub enum Signal {
     Hangup,
     /// SIGWINCH: the terminal changed size.
     Resize,
+    /// Terminal job-control stop request.
+    Suspend,
+    /// The process was continued.
+    Continue,
+    /// A background process attempted terminal input.
+    BackgroundRead,
+    /// A background process attempted terminal output or mode changes.
+    BackgroundWrite,
 }
 
 /// Stable across builds, unlike `std`'s hashers, so every version of `a`
