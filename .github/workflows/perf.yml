@@ -178,7 +178,7 @@ jobs:
               end = text.index('                Ok(more) => {', start)
               text = text[:start] + '            match catch_unwind(AssertUnwindSafe(|| context.scope(|| self.core.step(event)))) {\n' + text[end:]
               path.write_text(text)
-              output = pathlib.Path('target/hosted-perf')
+              output = pathlib.Path('target')
               output.mkdir(parents=True, exist_ok=True)
               (output / 'ablation.patch').write_bytes(subprocess.check_output(['git', 'diff', '--', 'crates/engine/src/driver.rs'], cwd=source))
           PY
@@ -193,6 +193,7 @@ jobs:
           else
             mise exec -- python scripts/perf/hosted.py --phase build --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' "${extra[@]}"
           fi
+          if [[ -f target/ablation.patch ]]; then cp target/ablation.patch target/hosted-perf/; fi
       - name: Measure startup workloads and benches
         timeout-minutes: 20
         if: env.PERF_BUILD_ONLY != 'true'
