@@ -230,7 +230,10 @@ impl EditTransaction {
             )
             .into());
         }
-        let (name, file) = self.stage()?;
+        self.revalidate()?;
+        let (name, file) = self
+            .stage()
+            .map_err(|error| self.revalidate().err().unwrap_or(EditError::Io(error)))?;
         let pending = Pending {
             transaction: &self,
             name,
@@ -716,7 +719,9 @@ fn stage_windows(transaction: &EditTransaction, name: &std::ffi::OsStr) -> io::R
         if let Err(error) = result {
             drop(file);
             remove_pending(&destination);
-            return Err(error);
+            // Only CREATE_NEW collisions may retry with another staging name.
+            // A changed source link can make the copy itself report EEXIST.
+            return Err(io::Error::other(error));
         }
     }
     Ok(file)
@@ -992,6 +997,24 @@ mod tests {
             EditTransaction::capture(&work.0, 16),
             Err(EditError::NotRegular)
         ));
+    }
+
+    #[test]
+    fn abandoning_a_partial_staging_write_reclaims_only_the_temporary_file() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let transaction = work.capture();
+        let (name, file) = transaction.stage().unwrap();
+        let pending = Pending {
+            transaction: &transaction,
+            name,
+        };
+        let mut file = file;
+        file.write_all(b"partial").unwrap();
+        drop(file);
+        drop(pending);
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        work.only_target_remains();
     }
 
     #[test]
