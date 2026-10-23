@@ -346,11 +346,12 @@ pub fn is_foreground() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::IntoRawHandle;
     use std::process::Command;
     use windows_sys::Win32::System::Console::{
         AllocConsole, CTRL_BREAK_EVENT, CTRL_C_EVENT, FlushConsoleInputBuffer, FreeConsole,
         GenerateConsoleCtrlEvent, INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
-        WriteConsoleInputW,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle, WriteConsoleInputW,
     };
 
     #[test]
@@ -376,6 +377,25 @@ mod tests {
         unsafe {
             FreeConsole();
             assert_ne!(AllocConsole(), 0);
+        }
+        // STARTF_USESTDHANDLES preserves libtest's redirected handles during
+        // AllocConsole. Give the process table explicit console handles;
+        // Windows owns them until this isolated subprocess exits.
+        let input = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+            .unwrap();
+        let output = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("CONOUT$")
+            .unwrap();
+        // SAFETY: these live handles are transferred to this subprocess's
+        // standard-handle table and are never closed before process exit.
+        unsafe {
+            assert_ne!(SetStdHandle(STD_INPUT_HANDLE, input.into_raw_handle()), 0);
+            assert_ne!(SetStdHandle(STD_OUTPUT_HANDLE, output.into_raw_handle()), 0);
         }
         assert_panic_restores_state();
         let signals = Signals::catch(&[Signal::Interrupt, Signal::Terminate]).unwrap();
