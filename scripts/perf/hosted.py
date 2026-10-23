@@ -112,6 +112,16 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
         assert len(executables) == 1, executables
         shutil.copy2(executables[0], output / (package + "-bench" + SUFFIX))
     run(["rustc", ROOT / "scripts/perf/floor.rs", "-O", "-o", output / ("floor" + SUFFIX)], cwd=source)
+    if os.name != "nt" and "protocol" in packages:
+        for package, target, name in [("a", "blackbox", "terminal-budgets"),
+                                      ("ext-shell", "quiet", "quiet-shell")]:
+            result = run(["cargo", "test", "--release", *STD, "-p", package, "--test", target,
+                          "--no-run", "--message-format=json", *overrides], cwd=source, env=env,
+                         stdout=subprocess.PIPE, text=True)
+            executables = [record["executable"] for line in result.stdout.splitlines()
+                           if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
+            assert len(executables) == 1, executables
+            shutil.copy2(executables[0], output / name)
 
 
 def budgets(output, binary=None, probe=None, samples=5):
@@ -230,6 +240,11 @@ def summarize(output, source, variant, runner):
         failures.append("idle daemon RSS reaches 10240 KiB")
     if metrics["idle_daemon_cpu_ms"]["max"] > 0 or metrics["idle_line_client_cpu_ms"]["max"] > 0:
         failures.append("idle CPU is nonzero (OS counter resolution)")
+    if sys.platform == "linux":
+        if metrics["cold_reply_ms"]["median"] - floor >= 50:
+            failures.append("cold daemon reply exceeds 50 ms over the process floor")
+        if metrics["attach_p99_ms"]["median"] >= 2:
+            failures.append("attach p99 reaches 2 ms")
     if failures:
         raise RuntimeError("; ".join(failures))
 
@@ -360,6 +375,17 @@ def main():
     run([sys.executable, ROOT / "mise-tasks/perf/workloads", output / ("a-fixtures" + SUFFIX), "cli",
          "--runs", "20", "--output", output])
     run([sys.executable, ROOT / "mise-tasks/perf/benches", output, output / "cli/transcript.jsonl", "--runs", "5"])
+    if os.name != "nt":
+        env = dict(os.environ, A_BIN=str(output / "a-fixtures"),
+                   A_STRICT_BUDGETS="1" if sys.platform == "linux" else "0")
+        for binary, filters in [
+            ("terminal-budgets", ["budgets::the_terminal_client_paints_its_first_frame_within_16ms",
+                                  "budgets::an_idle_daemon_and_terminal_client_cost_nothing"]),
+            ("quiet-shell", ["a_quiet_command_wakes_nothing_while_it_runs"]),
+        ]:
+            result = run([output / binary, *filters, "--ignored", "--nocapture", "--test-threads=1"],
+                         env=env, timeout=120, capture_output=True, text=True)
+            (output / (binary + ".json")).write_text(json.dumps(dict(stdout=result.stdout, stderr=result.stderr)))
     try:
         summarize(output, source, variant, args.runner)
     finally:

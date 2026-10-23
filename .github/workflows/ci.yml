@@ -53,68 +53,12 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev strace
       # fmt, clippy -D warnings, then every test: unit, llm parity, and the
-      # black-box M1 acceptance tests in apps/cli/tests/blackbox (budgets run
-      # with CI slack). Live-model tests stay #[ignore]d; there are no secrets.
+      # black-box M1 acceptance tests in apps/cli/tests/blackbox. Release
+      # budgets and measurement harness checks run in perf.yml. Live-model tests stay #[ignore]d; there are no secrets.
       - run: mise run check
-      - run: python3 -m unittest discover -s scripts/perf -p 'test_*.py'
       # The Windows build, cross-linted: no platform cfg above `sys`/`rt`.
       - if: runner.os == 'Linux'
         run: mise run check:windows
-
-  budgets:
-    name: budgets (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            strict: 0
-          # Latency is held to the design's budgets on one lane.
-          - os: ubuntu-latest
-            strict: 1
-    runs-on: ${{ matrix.os }}
-    env:
-      A_STRICT_BUDGETS: ${{ matrix.strict }}
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - *mise
-      - if: runner.os == 'Linux'
-        run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
-      # Idle daemon RSS (10 MiB) is held exactly;
-      # cold start and attach latency too where strict, else with slack.
-      - run: mise run budgets
-      # The shipped binary's size as a number to compare: this run's against
-      # the last one on main. Apple silicon is
-      # the reference lane; the other skips the
-      # second release link.
-      - if: runner.os == 'macOS'
-        run: mise run size | grep -o 'a:.*KiB' | tee size.txt
-      - if: runner.os == 'macOS'
-        uses: actions/cache/restore@v6
-        with:
-          path: main-size.txt
-          key: size-main-${{ github.sha }}
-          restore-keys: size-main-
-      - if: runner.os == 'macOS'
-        run: |
-          now=$(grep -o '[0-9]* KiB' size.txt | head -1 | cut -d' ' -f1)
-          if [[ -f main-size.txt ]]; then
-            was=$(grep -o '[0-9]* KiB' main-size.txt | head -1 | cut -d' ' -f1)
-            echo "a: $now KiB; main: $was KiB; delta: $((now - was)) KiB" | tee -a "$GITHUB_STEP_SUMMARY"
-          fi
-          cp size.txt main-size.txt
-      - if: runner.os == 'macOS' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v6
-        with:
-          path: main-size.txt
-          key: size-main-${{ github.sha }}
-      - if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v5
-        with:
-          name: size
-          path: size.txt
 
   deny:
     runs-on: ubuntu-latest

@@ -21,6 +21,10 @@ on:
         description: 'Collect native crate/function size attribution'
         default: false
         type: boolean
+      profile:
+        description: 'Attribute baseline instructions with Callgrind on Linux x86_64 after timing'
+        default: false
+        type: boolean
       build_only:
         description: 'Build and inspect a size/linker candidate without runtime measurements'
         default: false
@@ -204,6 +208,12 @@ jobs:
               stream.write(f"Build observation: {result['shipped_bytes'] / 1024:.3f} KiB. Runtime metrics were not completed.\n")
           PYTHON
           fi
+      - name: Attribute hot paths
+        if: ${{ !cancelled() && inputs.profile && matrix.runner == 'ubuntu-latest' && steps.build.outcome == 'success' }}
+        timeout-minutes: 25
+        run: |
+          sudo apt-get install -y --no-install-recommends valgrind
+          mise exec -- python scripts/perf/profile.py ../measured
       - uses: actions/upload-artifact@v5
         if: always()
         with:
@@ -214,6 +224,7 @@ jobs:
             harness/target/hosted-perf/**/*.json
             harness/target/hosted-perf/**/*.jsonl
             harness/target/hosted-perf/**/*.md
+            harness/target/hosted-perf/**/*.callgrind
           if-no-files-found: warn
           retention-days: 30
       - uses: actions/cache/save@v6

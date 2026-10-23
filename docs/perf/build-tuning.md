@@ -9,7 +9,7 @@ CPU, latency, idle and peak RSS, reliability and native platform behaviour.
 
 | Setting | Design constraint |
 | --- | --- |
-| Release level 3, serde_json level 1 | Measured CPU and attach-latency gains; accept the reported resident-code cost within native memory budgets |
+| Release level z | Main profile; package overrides require CPU wins beyond spread on most targets with idle and peak RSS within noise |
 | Fat LTO and one codegen unit | Cross-crate optimization; candidates must improve measured CPU and latency without an unacceptable memory cost |
 | Panic unwinding | A panicking session actor cannot terminate the daemon |
 | Packed split debuginfo and stripped executable symbols | Preserve offline crash symbolication without mapping debug data into the process |
@@ -44,8 +44,7 @@ must demonstrate a joint CPU/RSS benefit before becoming dependencies.
 
 Builds finish before measurement. Small gains require alternating same-runner
 reference/candidate rounds; separate VMs can differ in CPU and storage. Raw
-samples and hardware metadata accompany medians and spreads. Size changes
-never determine whether a runtime optimization is retained.
+samples and hardware metadata accompany medians and spreads. Size and dependency growth must be proportionate to the measured benefit.
 
 Development builds use Cranelift for workspace code and LLVM for dependencies.
 Dependencies default to opt-level zero for fast builds; serde_json, vte,

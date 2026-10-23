@@ -1081,12 +1081,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "io-buffers"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea876d0acdb5e4846b69a92433dc39eec0eb6fd1f041189effc51c98facd5fd8"
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1663,7 +1657,6 @@ dependencies = [
  "notify",
  "rustix",
  "sys",
- "windows-file-watcher",
 ]
 
 [[package]]
@@ -2439,57 +2432,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "win-error-codes"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c07f1170435fb85c67f974ef6cb2df831a025a366ffb407c70a044e3d366439"
-
-[[package]]
-name = "win-handles-sys"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6cc5af90e594f9bcafad8fbe66c5c254885b6e70aeff3d84d58479274cb2b4b"
-dependencies = [
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "win-shared-os-owned-handle"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e2b59af67831285aa278b195c524e8a9d1532c90be9cc9c91e7bebf43561218"
-
-[[package]]
-name = "win-sync-sys"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d715a19899c94ee0a3a830a10f6e632848908a24d23a7ebee8b7dfe8a3b76272"
-dependencies = [
- "win-handles-sys",
- "win-shared-os-owned-handle",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "win-text-sys"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25545fa5f01f05661d4ceaf1dea5b5dac93cc80f28980108facdaaa533cb247a"
-dependencies = [
- "win-error-codes",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "win-time-sys"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccbdeedb7cdb28990babc08deda7976e18830d05e83caa5f41a4319804b94133"
-dependencies = [
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2499,90 +2441,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement",
- "windows-interface",
- "windows-link",
- "windows-result",
- "windows-strings",
-]
-
-[[package]]
-name = "windows-file-watcher"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b64dc27019c68ea92424b929ea3f56affc81cdcbab7f68d24c1e1141139e003"
-dependencies = [
- "log",
- "win-handles-sys",
- "win-shared-os-owned-handle",
- "win-text-sys",
- "windows-overlapped-io-sys",
- "windows-sys 0.61.2",
- "windows-threadpool-sys",
- "wtf-string",
-]
-
-[[package]]
-name = "windows-implement"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "windows-interface"
-version = "0.59.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
-
-[[package]]
-name = "windows-overlapped-io-sys"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0d21d60e265dd389c2c374db5a7bbfa399d257c6a7caf93ad849c9ddabc5954"
-dependencies = [
- "io-buffers",
- "win-shared-os-owned-handle",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "windows-result"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
-dependencies = [
- "windows-link",
-]
-
-[[package]]
-name = "windows-strings"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
-dependencies = [
- "windows-link",
-]
 
 [[package]]
 name = "windows-sys"
@@ -2642,19 +2504,6 @@ dependencies = [
  "windows_x86_64_gnu 0.53.1",
  "windows_x86_64_gnullvm 0.53.1",
  "windows_x86_64_msvc 0.53.1",
-]
-
-[[package]]
-name = "windows-threadpool-sys"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df0708ff7288755a3f65d8319b1a142bf1971aae8f29ff6febcf571c879fdfe7"
-dependencies = [
- "win-shared-os-owned-handle",
- "win-sync-sys",
- "win-time-sys",
- "windows-overlapped-io-sys",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2782,15 +2631,6 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
-
-[[package]]
-name = "wtf-string"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "395437ce07c297d776d3ca78e4d2a5cba9f41d74791947746b01737eca5e03d2"
-dependencies = [
- "windows-core",
-]
 
 [[package]]
 name = "yoke"

@@ -4,17 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use notify::RecursiveMode;
-#[cfg(not(windows))]
-use notify::Watcher as _;
-
-#[cfg(windows)]
-mod windows;
-
-#[cfg(windows)]
-type Recursive = windows::Watch;
-#[cfg(not(windows))]
-type Recursive = notify::RecommendedWatcher;
+use notify::{RecursiveMode, Watcher as _};
 
 use crate::BoxFuture;
 
@@ -28,9 +18,9 @@ pub struct Watcher {
     roots: Arc<[PathBuf]>,
     changed: Changed,
     invalidated: Arc<AtomicBool>,
-    recursive: Option<Recursive>,
+    recursive: Option<notify::RecommendedWatcher>,
     watched: BTreeMap<PathBuf, RecursiveMode>,
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     spawn: Spawn,
     #[cfg(target_os = "macos")]
     parents: Vec<Parent>,
@@ -48,12 +38,12 @@ impl Watcher {
             invalidated: Arc::new(AtomicBool::new(true)),
             recursive: None,
             watched: BTreeMap::new(),
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(target_os = "macos")]
             spawn,
             #[cfg(target_os = "macos")]
             parents: Vec::new(),
         };
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(target_os = "macos"))]
         drop(spawn);
         watcher.refresh()?;
         Ok(watcher)
@@ -72,13 +62,10 @@ impl Watcher {
                 let watcher = if wanted.is_empty() {
                     None
                 } else {
-                    #[cfg(windows)]
-                    let watcher = windows::Watch::new(&self.spawn, &wanted, Arc::clone(&changed))?;
-                    #[cfg(not(windows))]
-                    let watcher = {
-                        let changed = Arc::clone(&changed);
-                        let mut watcher = notify::recommended_watcher(
-                            move |event: notify::Result<notify::Event>| match event {
+                    let changed = Arc::clone(&changed);
+                    let mut watcher =
+                        notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                            match event {
                                 Ok(event)
                                     if !matches!(event.kind, notify::EventKind::Access(_)) =>
                                 {
@@ -86,16 +73,14 @@ impl Watcher {
                                 }
                                 Err(error) => eprintln!("file watcher: {error}"),
                                 _ => {}
-                            },
-                        )
+                            }
+                        })
                         .map_err(io::Error::other)?;
-                        let mut paths = watcher.paths_mut();
-                        for (path, mode) in &wanted {
-                            paths.add(path, *mode).map_err(io::Error::other)?;
-                        }
-                        paths.commit().map_err(io::Error::other)?;
-                        watcher
-                    };
+                    let mut paths = watcher.paths_mut();
+                    for (path, mode) in &wanted {
+                        paths.add(path, *mode).map_err(io::Error::other)?;
+                    }
+                    paths.commit().map_err(io::Error::other)?;
                     Some(watcher)
                 };
                 #[cfg(target_os = "macos")]

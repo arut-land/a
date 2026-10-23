@@ -32,19 +32,17 @@ opt-level = 1
 
 # panic stays unwind so a panicking session actor cannot take the daemon down.
 #
-# Native hosted measurements guide hot-path overrides; size is report-only.
+# The same size profile on every target. Linux measurements and the native
+# TLS comparison are in docs/perf.
 [profile.release]
 # LLVM-only metadata for safe ELF folding; dev uses Cranelift.
 rustflags = ["-Cllvm-args=-addrsig"]
-opt-level = 3
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
 split-debuginfo = "packed"
 strip = "symbols"
-
-[profile.release.package.serde_json]
-opt-level = 1
 
 # cargo-bolero (`mise run fuzz`): optimized, and LLVM throughout for
 # libFuzzer's coverage instrumentation.

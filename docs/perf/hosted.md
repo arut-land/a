@@ -23,7 +23,7 @@ portable RSS adapter. Provider cassettes and encoded fixtures are unchanged.
 
 Build, measurement and optional reference rounds are separate job steps.
 Builds finish before timing starts. Both binaries use `cargo build-release`:
-rebuilt std with its compact algorithms, release level three with JSON helpers at level one, unwinding, fat LTO, one codegen unit, stripped
+rebuilt std with its compact algorithms, the source release profile (main uses level z), unwinding, fat LTO, one codegen unit, stripped
 symbols and the source checkout's native linker flags. The default binary
 must exclude the sleep fixture and include the edit tool; the second binary
 enables fixtures for deterministic echo workloads. Size is measured and reported on every target, without a size gate.
@@ -104,8 +104,8 @@ still differ in CPU, storage or load, so repeat a candidate before retaining
 small gains. Size is exact; timing and memory remain observations.
 
 Idle RSS must remain below 10,240 KiB and idle CPU must have no counter
-increment. The existing CI's strict Linux latency, terminal first-paint,
-PTY-client idle and quiet-shell wake gates remain separate validation.
+increment. The perf workflow also runs strict Linux latency, terminal first-paint,
+PTY-client idle and quiet-shell wake gates; CI owns functional validation.
 
 `build_only` stops after the two release builds and records size, sections and
 imports for linker diagnostics. It does not claim a
