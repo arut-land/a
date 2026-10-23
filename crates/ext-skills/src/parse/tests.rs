@@ -43,6 +43,7 @@ fn real_headers_preserve_the_reference_index() {
             ),
             _ => {
                 parse(&source, Path::new("skills")).unwrap();
+                assert_eq!(identity(source.as_bytes()).unwrap(), actual.name);
             }
         }
     }

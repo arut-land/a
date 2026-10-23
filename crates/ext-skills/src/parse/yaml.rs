@@ -234,7 +234,7 @@ impl Parser<'_> {
     }
 }
 
-fn comment(s: &str) -> &str {
+pub(super) fn comment(s: &str) -> &str {
     if !s.starts_with(['\'', '"', '[', '{']) {
         return s
             .char_indices()
@@ -267,7 +267,7 @@ fn comment(s: &str) -> &str {
     }
     s
 }
-fn scalar(text: &str, line: usize) -> Result<String, Error> {
+pub(super) fn scalar(text: &str, line: usize) -> Result<String, Error> {
     let err = || Error::new(line, Kind::Syntax);
     if text.starts_with(['&', '*', '!', '%', '@', '`']) {
         return Err(Error::new(line, Kind::Unsupported));

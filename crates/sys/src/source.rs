@@ -92,16 +92,42 @@ impl Source {
     }
 }
 
-/// Inventory may inspect a bounded prefix to resolve names before capturing
-/// winning files. Its bytes carry no version or writer-completion assertion.
-pub fn prefix(root: &Path, path: &Path, limit: usize) -> io::Result<Option<Vec<u8>>> {
+/// Tentative identity bytes, with native stability checked before accepting
+/// malformed discovery as an input. Winning content is captured separately.
+pub struct Prefix {
+    bytes: Vec<u8>,
+    stable: bool,
+}
+
+impl Prefix {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn checked(self) -> io::Result<Vec<u8>> {
+        if !self.stable {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "source changed during discovery",
+            ));
+        }
+        Ok(self.bytes)
+    }
+}
+
+pub fn prefix(root: &Path, path: &Path, limit: usize) -> io::Result<Option<Prefix>> {
     let file = match crate::fs::open_regular_within(root, path)? {
         crate::fs::RegularFile::Open(file) => file,
         crate::fs::RegularFile::Skipped(_) => return Ok(None),
     };
+    let before = Version::of(&file.metadata()?)?;
     let mut bytes = Vec::new();
-    file.take(limit as u64).read_to_end(&mut bytes)?;
-    Ok(Some(bytes))
+    (&file).take(limit as u64).read_to_end(&mut bytes)?;
+    let after = Version::of(&file.metadata()?)?;
+    Ok(Some(Prefix {
+        bytes,
+        stable: before == after,
+    }))
 }
 
 /// Native sharing/locking conflicts may disappear without a filesystem event.

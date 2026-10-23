@@ -65,7 +65,13 @@ replaying the recorded conversation.
 
 ## Generations
 
-Preparation snapshots UTF-8 skill files off the async worker. Bodies are held
+Preparation captures raw skill bytes off the async worker. Discovery reads
+only tentative names in priority order; invalid descriptions, other metadata
+and bodies in losing files cannot reject or delay a winner. Winning files
+and unidentifiable prefixes undergo native stability checks. Malformed
+observations remain snapshot inputs until the shared debounce and
+re-observation establish a stable rejection. Changed observations retry
+without requiring another filesystem callback. Bodies are held
 in the immutable generation to prevent a tool midway through a turn from
 reading a newer edit; they enter model context only on demand. Filesystem events
 prepare new candidates. There is no scan on a session burst or generation read.

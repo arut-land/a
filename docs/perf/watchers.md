@@ -21,12 +21,17 @@ watcher cancels pending recovery and native requests. Healthy watches have
 no timer.
 
 Lua resolves home/workspace precedence before opening winning sources.
-Skills inventories frontmatter identities before capturing winning files;
-shadowed bodies and native versions do not participate in comparisons.
+Skills discover tentative names in priority order before capturing winning
+files. Only winners receive full frontmatter validation; losing descriptions,
+metadata, bodies and native versions do not participate in comparisons.
+Unidentifiable prefixes receive native stability checks and remain raw
+snapshot inputs until debounce and re-observation, so malformed UTF-8 or
+frontmatter cannot terminate recovery from a changing capture.
 Links may resolve only within configured roots, and descendant target edits
 invalidate the inventory. Source reads and pathname revalidation use sys's
-bounded, nonblocking regular-file opens. Each read validates native file identity, size, modification time and, on
-Unix, change time before and after capture. Validated snapshots compare
+bounded, nonblocking regular-file opens. Winning and unidentifiable reads
+validate native identity, size, modification time and, on Unix, change time
+before and after capture. Validated snapshots compare
 effective bytes rather than native versions, so identical saves cannot
 starve another source. Bytes are captured before UTF-8 decoding.
 

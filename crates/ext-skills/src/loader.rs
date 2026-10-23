@@ -9,7 +9,18 @@ use ext::{Extension, Refused, Tier};
 
 use crate::{Catalog, Skill, Skills, parse};
 
-type Files = BTreeMap<String, (PathBuf, sys::source::Source)>;
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Files {
+    sources: BTreeMap<String, (PathBuf, sys::source::Source)>,
+    invalid: Vec<(PathBuf, Vec<u8>)>,
+    duplicates: Vec<String>,
+}
+
+impl Files {
+    fn is_empty(&self) -> bool {
+        self.sources.is_empty() && self.invalid.is_empty() && self.duplicates.is_empty()
+    }
+}
 
 #[derive(PartialEq)]
 struct Inputs {
@@ -160,6 +171,7 @@ impl GenerationLayer for Loader {
 fn inventory(
     root: &Path,
     found: &mut BTreeMap<String, (PathBuf, PathBuf)>,
+    files: &mut Files,
 ) -> Result<(), PrepareError> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
@@ -174,7 +186,6 @@ fn inventory(
         return Err(Refused("skill root exceeds 4096 entries".into()).into());
     }
     paths.sort();
-    let mut names = std::collections::BTreeSet::new();
     for directory in paths {
         let path = directory.join("SKILL.md");
         let prefix = match sys::source::prefix(root, &path, 8256) {
@@ -190,24 +201,22 @@ fn inventory(
             }
             Err(e) => return Err(source_error(&path, &e)),
         };
-        // Identity lives in frontmatter, not the package directory. Ignore the
-        // shadowed body and its native version while resolving precedence.
-        let mut end = 0;
-        let mut delimiters = 0;
-        for line in prefix.split_inclusive(|b| *b == b'\n') {
-            end += line.len();
-            if line.trim_ascii() == b"---" {
-                delimiters += 1;
-                if delimiters == 2 {
-                    break;
-                }
+        // Discovery never rejects content. Winners are natively validated
+        // below; malformed identity bytes go through the shared debounce.
+        let Ok(name) = parse::identity(prefix.bytes()) else {
+            let bytes = prefix.checked().map_err(|e| source_error(&path, &e))?;
+            if files.invalid.iter().map(|(_, b)| b.len()).sum::<usize>() + bytes.len() > 1024 * 1024
+            {
+                return Err(Refused("skill identity inventory exceeds 1 MiB".into()).into());
             }
-        }
-        let header = std::str::from_utf8(&prefix[..end]).map_err(|e| Refused(e.to_string()))?;
-        let (name, _) = parse::parse(header, &directory)
-            .map_err(|e| Refused(format!("{}: {e}", path.display())))?;
-        if !names.insert(name.clone()) {
-            return Err(Refused(format!("duplicate skill {name}")).into());
+            files.invalid.push((directory, bytes));
+            continue;
+        };
+        if let Some((prior_root, _)) = found.get(&name) {
+            if prior_root == root {
+                files.duplicates.push(name);
+            }
+            continue;
         }
         found.insert(name, (root.to_owned(), directory));
     }
@@ -217,10 +226,10 @@ fn inventory(
 impl Loader {
     fn capture(&self, workspace: &Path) -> Result<Files, PrepareError> {
         let mut winners = BTreeMap::new();
-        for root in self.roots(workspace) {
-            inventory(&root, &mut winners)?;
+        let mut files = Files::default();
+        for root in self.roots(workspace).into_iter().rev() {
+            inventory(&root, &mut winners, &mut files)?;
         }
-        let mut files = Files::new();
         let mut bytes = 0;
         for (name, (root, directory)) in winners {
             let path = directory.join("SKILL.md");
@@ -236,15 +245,25 @@ impl Loader {
             if bytes > 1024 * 1024 {
                 return Err(Refused("skill source exceeds 1 MiB".into()).into());
             }
-            files.insert(name, (directory, source));
+            files.sources.insert(name, (directory, source));
         }
         Ok(files)
     }
 }
 
 fn catalog(files: &Files) -> Result<BTreeMap<String, Skill>, Refused> {
+    if let Some((directory, bytes)) = files.invalid.first() {
+        let error = parse::identity(bytes).expect_err("unidentifiable discovery");
+        return Err(Refused(format!(
+            "{}: {error}",
+            directory.join("SKILL.md").display()
+        )));
+    }
+    if let Some(name) = files.duplicates.first() {
+        return Err(Refused(format!("duplicate skill {name}")));
+    }
     let mut found = BTreeMap::new();
-    for (expected, (directory, source)) in files {
+    for (expected, (directory, source)) in &files.sources {
         let (name, skill) = parse::parse(
             source.text().map_err(|e| Refused(e.to_string()))?,
             directory,
@@ -313,6 +332,107 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn malformed_inventory_is_reobserved_and_recovers_without_another_callback() {
+        for malformed in [
+            &b"---\nname: rev\xffiew\ndescription: torn\n---\n"[..],
+            &b"---\nname: review\ndescription: [torn\n---\n"[..],
+            &b"---\nname:"[..],
+        ] {
+            let rig = Rig::new("skills-inventory-race", Registry::default());
+            let directory = rig.workspace().join(".a/skills/review");
+            fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("SKILL.md");
+            fs::write(&path, malformed).unwrap();
+            let loader = Loader::new(&rig.dir, Skills::default());
+            let mut captures = 0;
+            let invalid = ext::source::prepare(
+                || {
+                    captures += 1;
+                    loader.capture(&rig.workspace())
+                },
+                |_| {},
+                catalog,
+            );
+            assert!(matches!(invalid, Err(PrepareError::Rejected(_))));
+            assert_eq!(
+                captures, 3,
+                "stable content is rejected only after re-observation"
+            );
+            let mut reobserved = false;
+            let attempt = ext::source::prepare(
+                || loader.capture(&rig.workspace()),
+                |_| {
+                    reobserved = true;
+                    fs::write(
+                        &path,
+                        "---\nname: review\ndescription: Review\n---\nsettled",
+                    )
+                    .unwrap();
+                },
+                catalog,
+            );
+            assert!(
+                reobserved,
+                "discovery must reach the debounce before rejection"
+            );
+            assert!(matches!(attempt, Err(PrepareError::Retry(_))));
+            // The retry is driven by the result, with no filesystem callback.
+            let prepared = loader
+                .prepare(&rig.workspace(), &Registry::default(), None, false)
+                .unwrap();
+            assert_eq!(
+                prepared.inputs.downcast_ref::<Inputs>().unwrap().catalog["review"].body,
+                "settled"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_and_rewritten_shadowed_headers_cannot_block_a_winning_edit() {
+        let rig = Rig::new("skills-shadowed-headers", Registry::default());
+        let home = rig.dir.join("skills/home-package");
+        let local = rig.workspace().join(".a/skills/workspace-package");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        let lower = home.join("SKILL.md");
+        fs::write(&lower, "---\nname: review\ndescription: [invalid\n---\n").unwrap();
+        fs::write(
+            local.join("SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\nold",
+        )
+        .unwrap();
+        let loader = Loader::new(&rig.dir, Skills::default());
+        let previous = loader
+            .prepare(&rig.workspace(), &Registry::default(), None, false)
+            .unwrap();
+        fs::write(
+            local.join("SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\nsettled",
+        )
+        .unwrap();
+        let mut saves = 0;
+        let prepared = ext::source::prepare(
+            || {
+                saves += 1;
+                fs::write(
+                    &lower,
+                    format!(
+                        "---\nname: 'review' # identity only\ndescription: [invalid-{saves}\n---\n"
+                    ),
+                )
+                .unwrap();
+                loader.capture(&rig.workspace())
+            },
+            |_| {},
+            catalog,
+        )
+        .unwrap();
+        assert!(saves >= 3);
+        assert_eq!(prepared["review"].body, "settled");
+        assert!(!loader.validate(&rig.workspace(), &previous).unwrap());
     }
 
     #[test]
