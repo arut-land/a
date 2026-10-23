@@ -224,7 +224,9 @@ fn resolve(
             .then(|| candidate.with_extension("exe"));
         for path in std::iter::once(candidate).chain(executable) {
             if path.is_file() {
-                return std::fs::canonicalize(path);
+                // Verbatim executable names break .NET Framework initialization.
+                // Keep them only when no equivalent ordinary Win32 path exists.
+                return dunce::canonicalize(path);
             }
         }
     }
@@ -369,9 +371,7 @@ fn command_line<'a>(
     Ok(out)
 }
 
-#[path = "windows_quote.rs"]
-mod quoting;
-use quoting::quote;
+use crate::windows_quote::quote;
 
 #[cfg(test)]
 mod tests {
