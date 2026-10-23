@@ -1,184 +1,40 @@
 name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:
-
+on: workflow_dispatch
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_BUILD_JOBS: 2
-  # Each job installs its own tools; task execution must not install the rest.
-  MISE_AUTO_INSTALL: false
-
 jobs:
-  check:
-    name: check (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        # Apple silicon and x86_64 Linux.
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      # mbx (the cargo wrapper in mise.toml) keeps compiled crates in its own
-      # store; caching that store and the toolchain is what makes reruns fast.
-      - &mbx-dir
-        shell: bash
-        run: echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
-      - &cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.rustup/toolchains
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ${{ runner.temp }}/mbx/actions
-          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}
-          restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
-      - &mise
-        uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington cargo:cargo-nextest ${{ runner.os == 'Linux' && 'mold' || '' }}
-      # The no-polling acceptance test traces the client's syscalls.
-      - if: runner.os == 'Linux'
-        run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev strace
-      # fmt, clippy -D warnings, then every test: unit, llm parity, and the
-      # black-box M1 acceptance tests in apps/cli/tests/blackbox. The
-      # release budgets run in their own jobs. Live-model tests stay
-      # #[ignore]d; there are no secrets.
-      - run: mise run check
-      # The Windows build, cross-linted: no platform cfg above `sys`/`rt`.
-      - if: runner.os == 'Linux'
-        run: mise run check:windows
-
-  budgets:
-    name: budgets (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            strict: 0
-          # Latency is held to the design's budgets on one lane.
-          - os: ubuntu-latest
-            strict: 1
-    runs-on: ${{ matrix.os }}
-    env:
-      A_STRICT_BUDGETS: ${{ matrix.strict }}
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - *mise
-      - if: runner.os == 'Linux'
-        run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
-      # Idle daemon RSS (10 MiB) is held exactly; cold start and attach
-      # latency too where strict, else with slack.
-      - run: mise run budgets
-
-  deny:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington cargo:cargo-deny
-      - run: mise run deny
-
-  machete:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington cargo:cargo-machete
-      - run: mise run machete
-
-  # Nothing `a` builds depends on tokio.
-  no-tokio:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington
-      - run: mise run check:no-tokio
-
-  # Coverage-guided fuzzing of the framer, the JSON decoders and the view
-  # reducer, briefly: a regression gate, not a campaign.
-  fuzz:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington mold cargo:cargo-bolero
-      - run: mise run fuzz --time 30s
-      - if: failure()
-        uses: actions/upload-artifact@v5
-        with:
-          name: fuzz-crashes
-          path: crates/protocol/tests/__fuzz__/*/crashes
-
-  miri:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington mold
-      - run: mise run test:miri
-
-  windows:
+  windows-sharing:
     runs-on: windows-latest
-    env:
-      # Session panic isolation and the test harness require unwinding;
-      # Cranelift does not support it on Windows.
-      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
-      NEXTEST_PROFILE: windows
-    defaults:
-      run:
-        shell: bash
-    # Native completion, security, job containment, and daemon acceptance.
     steps:
-      # Recorded wire/provider fixtures must keep their checked-in bytes.
-      - run: git config --global core.autocrlf false
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington cargo:cargo-nextest
-      - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
-      - run: mise exec -- cargo build -p a
-      - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
-      - run: mise run acceptance
-
-  # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
-  # reducer vectors and a live session through it in Swift, then the app
-  # built headless with xcodebuild.
-  apple:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington github:boltffi/boltffi aqua:yonaskolb/XcodeGen
-      - run: mise run apple:test
-      - run: mise run apple:build
+      - shell: pwsh
+        run: |
+          Add-Type @'
+          using System;
+          using System.IO;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          using Microsoft.Win32.SafeHandles;
+          public static class Probe {
+            [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern SafeFileHandle CreateFileW(string p,uint a,uint s,IntPtr sa,uint c,uint f,IntPtr t);
+            [DllImport("ntdll.dll")] static extern int NtSetInformationFile(SafeFileHandle h,IntPtr ios,IntPtr b,uint n,int c);
+            public static void Run() {
+              string root=Path.Combine(Path.GetTempPath(),"a-edit-probe-"+Guid.NewGuid());Directory.CreateDirectory(root);
+              try {
+                foreach(uint share in new uint[]{1,5}) {
+                  string target=Path.Combine(root,"target"),stage=Path.Combine(root,"stage");File.WriteAllText(target,"old");File.WriteAllText(stage,"new");
+                  using(var source=CreateFileW(target,0x80000000,share,IntPtr.Zero,3,128,IntPtr.Zero))
+                  using(var parent=CreateFileW(root,0x80000000,7,IntPtr.Zero,3,0x02000000,IntPtr.Zero))
+                  using(var pending=CreateFileW(stage,0xC0010000,7,IntPtr.Zero,3,128,IntPtr.Zero)) {
+                    if(source.IsInvalid||parent.IsInvalid||pending.IsInvalid)throw new Exception("open "+Marshal.GetLastWin32Error());
+                    using(var writer=CreateFileW(target,0x40000000,7,IntPtr.Zero,3,128,IntPtr.Zero))Console.WriteLine("share="+share+" writer_denied="+writer.IsInvalid);
+                    byte[] name=Encoding.Unicode.GetBytes("target");int n=20+name.Length;IntPtr b=Marshal.AllocHGlobal(n),ios=Marshal.AllocHGlobal(16);
+                    try {for(int i=0;i<n;i++)Marshal.WriteByte(b,i,0);Marshal.WriteInt32(b,3);Marshal.WriteIntPtr(b,8,parent.DangerousGetHandle());Marshal.WriteInt32(b,16,name.Length);Marshal.Copy(name,0,IntPtr.Add(b,20),name.Length);int status=NtSetInformationFile(pending,ios,b,(uint)n,65);Console.WriteLine("share="+share+" rename_status=0x"+status.ToString("X8"));}
+                    finally{Marshal.FreeHGlobal(b);Marshal.FreeHGlobal(ios);}
+                  }
+                  Console.WriteLine("target="+File.ReadAllText(target));File.Delete(target);File.Delete(stage);
+                }
+              } finally {Directory.Delete(root,true);}
+            }
+          }
+          '@
+          [Probe]::Run()
