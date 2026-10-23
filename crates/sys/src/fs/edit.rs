@@ -2799,7 +2799,52 @@ mod tests {
             || {
                 let other = work.0.join("other");
                 fs::write(&other, b"theirs").unwrap();
+                #[cfg(unix)]
                 super::super::replace(&other, &work.target()).unwrap();
+                #[cfg(windows)]
+                {
+                    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
+                    use windows_sys::Win32::Storage::FileSystem::{
+                        DELETE, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                        FILE_SHARE_WRITE,
+                    };
+                    let file = fs::OpenOptions::new()
+                        .access_mode(DELETE)
+                        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                        .open(other)
+                        .unwrap();
+                    let parent = open_parent(&work.0).unwrap();
+                    let name: Vec<u16> = std::ffi::OsStr::new("target").encode_wide().collect();
+                    let length = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2;
+                    let mut buffer =
+                        vec![0u64; length.max(size_of::<FILE_RENAME_INFO>()).div_ceil(8)];
+                    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+                    // SAFETY: aligned storage covers the header and UTF-16 tail; both
+                    // owned handles and the buffer remain live through the native call.
+                    let status = unsafe {
+                        (*info).Anonymous.Flags = 0x3; // REPLACE_IF_EXISTS | POSIX_SEMANTICS
+                        (*info).RootDirectory = parent.as_raw_handle();
+                        (*info).FileNameLength = u32::try_from(name.len() * 2).unwrap();
+                        std::ptr::copy_nonoverlapping(
+                            name.as_ptr(),
+                            (*info).FileName.as_mut_ptr(),
+                            name.len(),
+                        );
+                        let mut status = windows_sys::Win32::System::IO::IO_STATUS_BLOCK::default();
+                        windows_sys::Wdk::Storage::FileSystem::NtSetInformationFile(
+                            file.as_raw_handle(),
+                            &raw mut status,
+                            info.cast(),
+                            u32::try_from(length).unwrap(),
+                            windows_sys::Wdk::Storage::FileSystem::FileRenameInformationEx,
+                        )
+                    };
+                    assert!(
+                        status >= 0,
+                        "external POSIX replacement failed: {:#x}",
+                        status.cast_unsigned()
+                    );
+                }
             },
         );
         assert!(matches!(result, Err(EditError::Conflict(_))), "{result:?}");

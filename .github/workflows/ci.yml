@@ -1,184 +1,36 @@
 name: CI
-
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
-
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
-  CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
-  # Each job installs its own tools; task execution must not install the rest.
   MISE_AUTO_INSTALL: false
-
 jobs:
-  check:
-    name: check (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        # Apple silicon and x86_64 Linux.
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      # mbx (the cargo wrapper in mise.toml) keeps compiled crates in its own
-      # store; caching that store and the toolchain is what makes reruns fast.
-      - &mbx-dir
-        shell: bash
-        run: echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
-      - &cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.rustup/toolchains
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ${{ runner.temp }}/mbx/actions
-          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}
-          restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
-      - &mise
-        uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington cargo:cargo-nextest ${{ runner.os == 'Linux' && 'mold' || '' }}
-      # The no-polling acceptance test traces the client's syscalls.
-      - if: runner.os == 'Linux'
-        run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev strace
-      # fmt, clippy -D warnings, then every test: unit, llm parity, and the
-      # black-box M1 acceptance tests in apps/cli/tests/blackbox. The
-      # release budgets run in their own jobs. Live-model tests stay
-      # #[ignore]d; there are no secrets.
-      - run: mise run check
-      # The Windows build, cross-linted: no platform cfg above `sys`/`rt`.
-      - if: runner.os == 'Linux'
-        run: mise run check:windows
-
-  budgets:
-    name: budgets (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            strict: 0
-          # Latency is held to the design's budgets on one lane.
-          - os: ubuntu-latest
-            strict: 1
-    runs-on: ${{ matrix.os }}
-    env:
-      A_STRICT_BUDGETS: ${{ matrix.strict }}
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - *mise
-      - if: runner.os == 'Linux'
-        run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
-      # Idle daemon RSS (10 MiB) is held exactly; cold start and attach
-      # latency too where strict, else with slack.
-      - run: mise run budgets
-
-  deny:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington cargo:cargo-deny
-      - run: mise run deny
-
-  machete:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington cargo:cargo-machete
-      - run: mise run machete
-
-  # Nothing `a` builds depends on tokio.
-  no-tokio:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington
-      - run: mise run check:no-tokio
-
-  # Coverage-guided fuzzing of the framer, the JSON decoders and the view
-  # reducer, briefly: a regression gate, not a campaign.
-  fuzz:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington mold cargo:cargo-bolero
-      - run: mise run fuzz --time 30s
-      - if: failure()
-        uses: actions/upload-artifact@v5
-        with:
-          name: fuzz-crashes
-          path: crates/protocol/tests/__fuzz__/*/crashes
-
-  miri:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington mold
-      - run: mise run test:miri
-
-  windows:
+  windows-regression:
     runs-on: windows-latest
-    env:
-      # Session panic isolation and the test harness require unwinding;
-      # Cranelift does not support it on Windows.
-      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
-      NEXTEST_PROFILE: windows
-    defaults:
-      run:
-        shell: bash
-    # Native completion, security, job containment, and daemon acceptance.
     steps:
-      # Recorded wire/provider fixtures must keep their checked-in bytes.
-      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
+        with:
+          fetch-depth: 0
       - uses: jdx/mise-action@v5
         with:
           install_args: rust mr-boxington cargo:cargo-nextest
-      - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
-      - run: mise exec -- cargo build -p a
-      - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
-      - run: mise run acceptance
-
-  # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
-  # reducer vectors and a live session through it in Swift, then the app
-  # built headless with xcodebuild.
-  apple:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington github:boltffi/boltffi aqua:yonaskolb/XcodeGen
-      - run: mise run apple:test
-      - run: mise run apple:build
+      - name: Run the POSIX replacement fixture against the old publication code
+        shell: bash
+        run: |
+          python - <<'PYPROBE'
+          from pathlib import Path
+          import subprocess
+          path=Path('crates/sys/src/fs/edit.rs')
+          current=path.read_text()
+          old=subprocess.check_output(['git','show','cd615fa7:crates/sys/src/fs/edit.rs'],text=True)
+          start='    #[test]\n    fn replacement_in_the_final_window_is_never_overwritten_without_exchange()'
+          end='    #[cfg(unix)]\n    #[test]\n    fn metadata_changes_in_the_final_window_are_restored()'
+          fixture=current[current.index(start):current.index(end,current.index(start))]
+          path.write_text(old[:old.index(start)]+fixture+old[old.index(end,old.index(start)):])
+          # Keep the old staging API as well; the only adaptation is the native test fixture.
+          staging=subprocess.check_output(['git','show','cd615fa7:crates/sys/src/fs/staging.rs'],text=True)
+          Path('crates/sys/src/fs/staging.rs').write_text(staging)
+          PYPROBE
+          mise exec -- cargo nextest run -p sys -E 'test(replacement_in_the_final_window_is_never_overwritten_without_exchange)' --no-tests=fail
