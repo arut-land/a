@@ -432,7 +432,8 @@ mod imp {
     ) -> io::Result<std::process::Child> {
         use super::Pass;
         let listener = home.bind()?;
-        let handles = [listener.passed(), lock.passed()];
+        let handles = [listener.passed(), lock.passed(), listener.claim_passed()];
+        cmd.env("A_ENDPOINT_CLAIM_FD", handles[2].to_string());
         cmd.args([
             "--listen-fd",
             &handles[0].to_string(),
