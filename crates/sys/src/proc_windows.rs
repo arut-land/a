@@ -405,6 +405,44 @@ mod tests {
     }
 
     #[test]
+    fn unicode_environment_and_working_directory_survive_native_creation() {
+        use std::os::windows::ffi::OsStrExt;
+        let root = std::env::temp_dir().join(format!("a-process-世界-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("output");
+        let value = "Grüße 世界 🚀";
+        let mut command = Command::new(
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32/cmd.exe"),
+        );
+        command
+            .args(["/D", "/U", "/C", "echo %A_UNICODE% & cd"])
+            .env_clear()
+            .env("A_UNICODE", value)
+            .current_dir(&root);
+        let mut child = spawn_group(&mut command, File::create(&path).unwrap()).unwrap();
+        assert!(child.wait().unwrap().success());
+        let bytes = std::fs::read(&path).unwrap();
+        let text = String::from_utf16(
+            &bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(text.starts_with(value), "{text:?}");
+        let directory: Vec<_> = root.file_name().unwrap().encode_wide().collect();
+        assert!(
+            text.encode_utf16()
+                .collect::<Vec<_>>()
+                .windows(directory.len())
+                .any(|s| s == directory)
+        );
+        drop(child);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_shell_never_inherits_an_unrelated_inheritable_pipe() {
         use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
         let (mut input, output) = io::pipe().unwrap();

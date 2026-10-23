@@ -530,6 +530,22 @@ mod tests {
     }
 
     #[test]
+    fn ssh_keeps_the_callers_terminal_process_group() {
+        use std::io::Read;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "ps -o pgid= -p $$"]);
+        let (mut child, input, mut output) = super::super::spawn_ssh(&mut command).unwrap();
+        drop(input);
+        let mut text = String::new();
+        output.read_to_string(&mut text).unwrap();
+        assert!(child.wait().unwrap().success());
+        // SAFETY: getpgrp has no inputs or ownership effects.
+        assert_eq!(text.trim().parse::<i32>().unwrap(), unsafe {
+            libc::getpgrp()
+        });
+    }
+
+    #[test]
     fn owned_wait_fallback_is_event_driven_and_keeps_the_child_waitable() {
         let null = null();
         let mut command = Command::new("/bin/sh");
