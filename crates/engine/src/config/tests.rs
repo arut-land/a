@@ -5,8 +5,11 @@ use super::*;
 /// A fresh directory holding a home config with `home` and a workspace
 /// config with `workspace` (either left out when `None`).
 fn dirs(name: &str, home: Option<&str>, workspace: Option<&str>) -> (PathBuf, PathBuf) {
-    let root = std::env::temp_dir().join(format!("a-config-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = tempfile::Builder::new()
+        .prefix(&format!("a-config-{name}-"))
+        .tempdir()
+        .unwrap()
+        .keep();
     let ws = root.join("ws");
     std::fs::create_dir_all(ws.join(".a")).unwrap();
     if let Some(text) = home {

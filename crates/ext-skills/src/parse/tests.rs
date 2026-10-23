@@ -54,6 +54,7 @@ fn metadata_is_validated_even_when_not_interpreted() {
         "allowed-tools: [Read, 'Bash(git:*)', \"Write\"] # tools",
         "allowed-tools:\n  - Read\n  - Bash(git:*)\nmetadata:\n  owner: team\n  nested:\n    version: 1",
         "metadata: {owner: team, nested: {version: 1}}",
+        "metadata: {x}",
         "allowed-tools: [Anthropic's, Read] # comment",
     ] {
         header(&format!(
@@ -63,7 +64,6 @@ fn metadata_is_validated_even_when_not_interpreted() {
     }
     for metadata in [
         "metadata: [Read",
-        "metadata: {x}",
         "metadata:\n x: [a,,b]",
         "metadata: *alias",
         "metadata:\n x: ok\n x: duplicate",
@@ -143,6 +143,27 @@ fn scalar_boundaries_do_not_change_comments_or_delimiters() {
         assert!(
             header(&format!("name: review\ndescription: {invalid}\n")).is_err(),
             "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn maintained_yaml_accepts_portable_text_and_rejects_expansion() {
+    let parsed =
+        header("'name': review\ndescription: \"YAML\\Ntext\"\nmetadata: {x: [a, {y: z}]}\n")
+            .unwrap();
+    assert_eq!(parsed.name, "review");
+    assert_eq!(parsed.description, "YAML\u{85}text");
+    for extra in [
+        "metadata: {x: ok, x: duplicate}",
+        "metadata: &anchor [a]",
+        "metadata: !tag value",
+        "metadata: { ? [a, b]: value }",
+        "...\n---\nname: other\ndescription: other",
+    ] {
+        assert!(
+            header(&format!("name: review\ndescription: ok\n{extra}\n")).is_err(),
+            "{extra}"
         );
     }
 }

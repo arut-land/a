@@ -33,9 +33,11 @@ impl Fixture {
 
     /// A daemon on a home that `seed` writes sessions into first.
     fn with(name: &str, seed: impl FnOnce(&Home)) -> Self {
-        let root = std::env::temp_dir().join(format!("a-conn-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir(&root).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix(&format!("a-conn-{name}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         let home = Home::from(root.clone());
         seed(&home);
         let config = Config {
