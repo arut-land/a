@@ -30,6 +30,7 @@ jobs:
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - run: cargo test -p sys resources::tests && cargo test -p rt --lib -- --test-threads=1
       - run: cargo run --release -p rt --example resources | tee resources.txt
+      - run: cargo run --release -p rt --example resources --features resource-allocations | tee -a resources.txt
       - uses: actions/upload-artifact@v5
         if: always()
         with:

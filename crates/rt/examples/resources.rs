@@ -2,7 +2,7 @@
 use std::{hint::black_box, time::Instant};
 mod legacy_oneshot;
 
-#[global_allocator]
+#[cfg_attr(feature = "resource-allocations", global_allocator)]
 static ALLOCATOR: &stats_alloc::StatsAlloc<std::alloc::System> = &stats_alloc::INSTRUMENTED_SYSTEM;
 
 fn measure(name: &str, mut f: impl FnMut()) {
@@ -31,6 +31,10 @@ fn pipeline(name: &str, batch: usize, mut f: impl FnMut()) {
 }
 #[allow(clippy::too_many_lines)]
 fn main() {
+    println!(
+        "allocation_instrumentation={}",
+        cfg!(feature = "resource-allocations")
+    );
     println!(
         "facts {:?}",
         sys::resources::Resources::for_path(std::path::Path::new(".")).unwrap()

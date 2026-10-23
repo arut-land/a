@@ -10,6 +10,7 @@ default = ["threads"]
 # our own (the `blocking` crate's polls every 500 ms while idle).
 threads = ["dep:async-executor"]
 watch = ["dep:notify"]
+resource-allocations = []
 
 [dependencies]
 # Already linked by async-io; producer wake never waits on registration.
