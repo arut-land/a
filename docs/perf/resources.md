@@ -159,6 +159,26 @@ Eight bounds oversubscription without changing the established seven-worker ceil
 
 Raw [primitive samples](resource-primitives.csv) and [CPU samples](resource-cpu.csv) retain the observations. The temporary workflow and comparison example are preserved in the measured revision; they are not production dependencies.
 
+## Paired application measurements
+
+[Hosted run](https://github.com/arut-land/a/actions/runs/39989529804) compares candidate `fb134499ff5ccd4a5a0b0dd6aef02d33bc987eba` with main `065b9331ade244b56e27cb7e457cb8d9a75fcbf0` on the same native runner. Each lane completes five alternating reference/candidate rounds. Tables report medians; positive deltas mean more memory or time.
+
+Idle RSS is sampled after three seconds. Idle CPU is a ten-second native counter delta after fifteen seconds settling. Peak RSS and CPU below belong to the named benchmark process, including its retained test log. Primitive allocation traffic and process RSS measure different things.
+
+| Target | Shipped bytes, main → candidate | Idle RSS, KiB main → candidate | Idle CPU, ms main → candidate | Cold reply delta | Attach p99 delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Linux aarch64 GNU | 3,626,792 → 3,663,272 | 6300 → 6332 | 0.000 → 0.000 | +0.05% | -0.46% |
+| Linux x86_64 GNU | 4,207,520 → 4,248,480 | 7312 → 7392 | 0.000 → 0.000 | +2.36% | -0.20% |
+
+| Target | Driver CPU delta | Driver peak RSS delta | Large-JSON CPU delta | Large-JSON peak RSS delta | Decode control CPU delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Linux aarch64 GNU | +0.87% | -0.01% | +1.67% | -0.80% | +2.27% |
+| Linux x86_64 GNU | +3.73% | -0.03% | +1.45% | +0.06% | +1.43% |
+
+The decode control uses unchanged provider-decoder code. The tables retain small shifts rather than classifying every median difference as a performance win or loss. The many-core ceiling is a concurrency bound; these three/four-CPU VMs do not establish physical many-core throughput.
+
+Exact medians and checkpoint samples are in [paired observations](resource-paired.csv); [runner metadata](resource-hosts.csv) records the native image and hardware description. The harness, native accounting and workload definitions are in [hosted measurements](hosted.md).
+
 ## Sources and limits
 
 - [Rust available parallelism](https://doc.rust-lang.org/std/thread/fn.available_parallelism.html)
