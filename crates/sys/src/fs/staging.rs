@@ -127,8 +127,8 @@ impl<'a> Staged<'a> {
         match anonymous {
             Ok(file) => {
                 return Ok(Self {
-                    directory,
                     file: File::from(file),
+                    directory,
                     anonymous: true,
                 });
             }
@@ -157,8 +157,8 @@ impl<'a> Staged<'a> {
         #[cfg(target_vendor = "apple")]
         super::edit::access_acl(None, &file)?;
         Ok(Self {
-            directory,
             file,
+            directory,
             #[cfg(target_os = "linux")]
             anonymous: false,
         })
@@ -171,8 +171,8 @@ impl<'a> Staged<'a> {
     ) -> io::Result<Self> {
         let file = copy(&directory)?;
         Ok(Self {
-            directory,
             file,
+            directory,
             published: false,
         })
     }
