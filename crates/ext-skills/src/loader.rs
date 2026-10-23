@@ -214,6 +214,7 @@ fn inventory(
         };
         if let Some((prior_root, _)) = found.get(&name) {
             if prior_root == root {
+                prefix.checked().map_err(|e| source_error(&path, &e))?;
                 files.duplicates.push(name);
             }
             continue;
@@ -225,11 +226,20 @@ fn inventory(
 
 impl Loader {
     fn capture(&self, workspace: &Path) -> Result<Files, PrepareError> {
+        self.capture_using(workspace, || {})
+    }
+
+    fn capture_using(
+        &self,
+        workspace: &Path,
+        discovered: impl FnOnce(),
+    ) -> Result<Files, PrepareError> {
         let mut winners = BTreeMap::new();
         let mut files = Files::default();
         for root in self.roots(workspace).into_iter().rev() {
             inventory(&root, &mut winners, &mut files)?;
         }
+        discovered();
         let mut bytes = 0;
         for (name, (root, directory)) in winners {
             let path = directory.join("SKILL.md");
@@ -241,6 +251,11 @@ impl Loader {
                         path.display()
                     )))
                 })?;
+            if parse::identity(source.bytes()).is_ok_and(|observed| observed != name) {
+                return Err(PrepareError::Retry(Refused(
+                    "skill identity changed during capture".into(),
+                )));
+            }
             bytes += source.len();
             if bytes > 1024 * 1024 {
                 return Err(Refused("skill source exceeds 1 MiB".into()).into());
@@ -388,6 +403,31 @@ mod tests {
                 "settled"
             );
         }
+    }
+
+    #[test]
+    fn a_name_changed_between_discovery_and_capture_requires_retry() {
+        let rig = Rig::new("skills-name-race", Registry::default());
+        let directory = rig.workspace().join(".a/skills/package");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("SKILL.md");
+        fs::write(&path, "---\nname: before\ndescription: Review\n---\nbody").unwrap();
+        let loader = Loader::new(&rig.dir, Skills::default());
+        let captured = loader.capture_using(&rig.workspace(), || {
+            fs::write(&path, "---\nname: after\ndescription: Review\n---\nbody").unwrap();
+        });
+        assert!(matches!(captured, Err(PrepareError::Retry(_))));
+        let prepared = loader
+            .prepare(&rig.workspace(), &Registry::default(), None, false)
+            .unwrap();
+        assert!(
+            prepared
+                .inputs
+                .downcast_ref::<Inputs>()
+                .unwrap()
+                .catalog
+                .contains_key("after")
+        );
     }
 
     #[test]

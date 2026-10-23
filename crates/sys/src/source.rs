@@ -79,6 +79,10 @@ impl Source {
         Ok(Some(Self { bytes }))
     }
 
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
