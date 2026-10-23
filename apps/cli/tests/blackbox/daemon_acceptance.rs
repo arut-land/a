@@ -210,7 +210,7 @@ fn every_case_uses_an_isolated_home() {
         first.run(&["new"]);
         assert_eq!(second.run(&["ls"]).stdout, b"");
         assert_ne!(first.pid(), second.pid());
-        let stream: sys::Stream = second.home.endpoint().connect().unwrap();
+        let stream: sys::OwnedConnection = second.home.endpoint().connect().unwrap();
         drop(stream);
     }
     assert!(!root.exists());
