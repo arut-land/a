@@ -648,6 +648,9 @@ pub trait GenerationLayer: Send + Sync {
         previous: Option<&PreparedLayer>,
         initial: bool,
     ) -> Result<PreparedLayer, Refused>;
+    fn validate(&self, _workspace: &Path, _prepared: &PreparedLayer) -> Result<bool, Refused> {
+        Ok(true)
+    }
     fn restore(&self, own_image: &[Installed]) -> Result<Registrations, Refused>;
     fn controls(&self, _rebuild: Weak<Rebuild>) -> Registrations {
         Vec::new()
@@ -793,17 +796,31 @@ impl Workspace {
         for watch in lock(&self.watches).iter_mut() {
             watch()?;
         }
-        let mut registry = (*self.base).clone();
-        let mut prepared = Vec::new();
-        for (index, layer) in self.layers.iter().enumerate() {
-            let next = layer.prepare(&self.path, &registry, previous.get(index), initial)?;
-            registry = self.compose_layer(registry, &**layer, next.registrations.clone())?;
-            prepared.push(next);
-        }
-        *previous = prepared;
-        if registry.installed() != self.current.snapshot().registry.installed() {
-            self.current.replace(registry);
-            self.updates.notify();
+        loop {
+            let mut registry = (*self.base).clone();
+            let mut prepared = Vec::new();
+            for (index, layer) in self.layers.iter().enumerate() {
+                let next = layer.prepare(&self.path, &registry, previous.get(index), initial)?;
+                registry = self.compose_layer(registry, &**layer, next.registrations.clone())?;
+                prepared.push(next);
+            }
+            if self
+                .layers
+                .iter()
+                .zip(&prepared)
+                .map(|(layer, prepared)| layer.validate(&self.path, prepared))
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|valid| !valid)
+            {
+                continue;
+            }
+            *previous = prepared;
+            if registry.installed() != self.current.snapshot().registry.installed() {
+                self.current.replace(registry);
+                self.updates.notify();
+            }
+            break;
         }
         Ok(())
     }

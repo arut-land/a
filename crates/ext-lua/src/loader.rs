@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -10,7 +9,7 @@ use ext::{Extension, Refused, Registrar, Tier};
 
 use crate::{Limits, Mod};
 
-type Files = BTreeMap<String, String>;
+type Files = BTreeMap<String, sys::source::Source>;
 
 pub struct Loader {
     home: PathBuf,
@@ -72,13 +71,9 @@ impl GenerationLayer for Loader {
     ) -> Result<Box<ext::host::Refresh>, Refused> {
         let home = self.home.join("ext");
         let local = workspace.join(".a/ext");
-        let mut watcher = rt::Watcher::new(spawn, [home.clone(), local.clone()], move |paths| {
-            if paths.iter().any(|path| {
-                path.starts_with(&home)
-                    || path.starts_with(&local)
-                    || home.starts_with(path)
-                    || local.starts_with(path)
-            }) {
+        let roots = [home, local];
+        let mut watcher = rt::Watcher::new(spawn, roots.clone(), move |event| {
+            if event.affects(&roots) {
                 changed();
             }
         })
@@ -94,66 +89,21 @@ impl GenerationLayer for Loader {
         previous: Option<&PreparedLayer>,
         initial: bool,
     ) -> Result<PreparedLayer, Refused> {
-        let mut found = Files::new();
-        files(&self.home.join("ext"), &mut found)?;
-        files(&workspace.join(".a/ext"), &mut found)?;
-        found.retain(|name, _| !self.config.disable.contains(name));
-        if let Some(previous) =
-            previous.filter(|p| p.inputs.downcast_ref::<Files>() == Some(&found))
-        {
-            return Ok(previous.clone());
-        }
-        let started = Instant::now();
-        let mut registry = base.clone();
-        let mut installed = Vec::new();
-        for (name, source) in &found {
-            // A workspace preparation has an aggregate bound as well as per-VM fuel.
-            if started.elapsed() > Duration::from_secs(1) {
-                return Err(Refused("lua workspace preparation budget exhausted".into()));
-            }
-            let grants = self
-                .config
-                .table(name)
-                .list("tools")
-                .map_err(|e| Refused(e.to_string()))?
-                .unwrap_or_default()
-                .to_vec();
-            let module = match Mod::load(name, source, &grants, self.limits) {
-                Ok(module) => module,
-                Err(error) if initial => {
-                    ext_logging::emit(ext_logging::Fact::ExtensionRejected {
-                        module: ext_logging::workspace(Path::new(name)),
-                    });
-                    eprintln!("warning: {error}");
-                    continue;
+        ext::source::prepare(
+            || self.capture(workspace),
+            |files: Option<&Files>| {
+                if files.is_none_or(|files| !files.is_empty()) {
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-                Err(error) => return Err(error),
-            };
-            match registry.clone().with_dyn(Tier::User, &module) {
-                Ok(next) => {
-                    installed.push(module);
-                    registry = next;
-                }
-                Err(error) if initial => {
-                    ext_logging::emit(ext_logging::Fact::ExtensionRejected {
-                        module: ext_logging::workspace(Path::new(name)),
-                    });
-                    eprintln!("warning: {error}");
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        if started.elapsed() > Duration::from_secs(1) {
-            return Err(Refused("lua workspace preparation budget exhausted".into()));
-        }
-        Ok(PreparedLayer {
-            inputs: Arc::new(found),
-            registrations: installed
-                .into_iter()
-                .map(|module| (Tier::User, Arc::new(module) as Arc<dyn ext::DynExtension>))
-                .collect(),
-        })
+            },
+            |found| self.compile(found, base, previous, initial),
+        )
     }
+
+    fn validate(&self, workspace: &Path, prepared: &PreparedLayer) -> Result<bool, Refused> {
+        Ok(prepared.inputs.downcast_ref::<Files>() == Some(&self.capture(workspace)?))
+    }
+
     fn restore(&self, own_image: &[protocol::Installed]) -> Result<Registrations, Refused> {
         own_image
             .iter()
@@ -203,7 +153,95 @@ impl Extension for Reload {
     }
 }
 
-fn files(dir: &Path, found: &mut Files) -> Result<(), Refused> {
+impl Loader {
+    fn capture(&self, workspace: &Path) -> Result<Files, Refused> {
+        let mut paths = BTreeMap::new();
+        inventory(&self.home.join("ext"), &mut paths)?;
+        inventory(&workspace.join(".a/ext"), &mut paths)?;
+        paths.retain(|name, _| !self.config.disable.contains(name));
+        let mut found = Files::new();
+        for (name, (root, path)) in paths {
+            let source = sys::source::Source::read(&root, &path, 256 * 1024)
+                .map_err(|e| Refused(format!("{}: {e}", path.display())))?
+                .ok_or_else(|| Refused(format!("{} is not a regular source", path.display())))?;
+            found.insert(name, source);
+            if found.values().map(sys::source::Source::len).sum::<usize>() > 1024 * 1024 {
+                return Err(Refused("lua workspace source exceeds 1 MiB".into()));
+            }
+        }
+        Ok(found)
+    }
+
+    fn compile(
+        &self,
+        found: &Files,
+        base: &Registry,
+        previous: Option<&PreparedLayer>,
+        initial: bool,
+    ) -> Result<PreparedLayer, Refused> {
+        if let Some(previous) = previous.filter(|p| p.inputs.downcast_ref::<Files>() == Some(found))
+        {
+            return Ok(previous.clone());
+        }
+        let started = Instant::now();
+        let mut registry = base.clone();
+        let mut installed = Vec::new();
+        for (name, source) in found {
+            // A workspace preparation has an aggregate bound as well as per-VM fuel.
+            if started.elapsed() > Duration::from_secs(1) {
+                return Err(Refused("lua workspace preparation budget exhausted".into()));
+            }
+            let grants = self
+                .config
+                .table(name)
+                .list("tools")
+                .map_err(|e| Refused(e.to_string()))?
+                .unwrap_or_default()
+                .to_vec();
+            let module = match Mod::load(
+                name,
+                source.text().map_err(|e| Refused(e.to_string()))?,
+                &grants,
+                self.limits,
+            ) {
+                Ok(module) => module,
+                Err(error) if initial => {
+                    ext_logging::emit(ext_logging::Fact::ExtensionRejected {
+                        module: ext_logging::workspace(Path::new(name)),
+                    });
+                    eprintln!("warning: {error}");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match registry.clone().with_dyn(Tier::User, &module) {
+                Ok(next) => {
+                    installed.push(module);
+                    registry = next;
+                }
+                Err(error) if initial => {
+                    ext_logging::emit(ext_logging::Fact::ExtensionRejected {
+                        module: ext_logging::workspace(Path::new(name)),
+                    });
+                    eprintln!("warning: {error}");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if started.elapsed() > Duration::from_secs(1) {
+            return Err(Refused("lua workspace preparation budget exhausted".into()));
+        }
+        Ok(PreparedLayer {
+            inputs: Arc::new(found.clone()),
+            registrations: installed
+                .into_iter()
+                .map(|module| (Tier::User, Arc::new(module) as Arc<dyn ext::DynExtension>))
+                .collect(),
+        })
+    }
+}
+
+fn inventory(dir: &Path, found: &mut BTreeMap<String, (PathBuf, PathBuf)>) -> Result<(), Refused> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -232,17 +270,7 @@ fn files(dir: &Path, found: &mut Files) -> Result<(), Refused> {
                 "at most 128 lua mods may be loaded per workspace".into(),
             ));
         }
-        let mut source = String::new();
-        fs::File::open(&path)
-            .and_then(|file| file.take(256 * 1024 + 1).read_to_string(&mut source))
-            .map_err(|e| Refused(format!("{}: {e}", path.display())))?;
-        if source.len() > 256 * 1024 {
-            return Err(Refused(format!("{} exceeds 256 KiB", path.display())));
-        }
-        found.insert(name.to_owned(), source);
-        if found.values().map(String::len).sum::<usize>() > 1024 * 1024 {
-            return Err(Refused("lua workspace source exceeds 1 MiB".into()));
-        }
+        found.insert(name.to_owned(), (dir.to_owned(), path));
     }
     Ok(())
 }
@@ -255,6 +283,36 @@ mod tests {
     fn spawn() -> Spawn {
         let rt: rt::Rt = Arc::new(rt::Threads::default());
         Arc::new(move |task| rt.spawn(task))
+    }
+
+    #[test]
+    fn shadowed_and_nested_sources_cannot_invalidate_workspace_inputs() {
+        let rig = ext::testing::Rig::new("lua-precedence", Registry::default());
+        let home = rig.dir.join("ext");
+        let local = rig.workspace().join(".a/ext");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(local.join("cache")).unwrap();
+        fs::write(home.join("test.lua"), "home").unwrap();
+        fs::write(
+            local.join("test.lua"),
+            "a.text{name='test',text='workspace'}",
+        )
+        .unwrap();
+        let loader = Loader::new(&rig.dir, sys::config::Exts::default()).unwrap();
+        let captured = loader.capture(&rig.workspace()).unwrap();
+        for n in 0..10 {
+            fs::write(home.join("test.lua"), format!("home {n}")).unwrap();
+            fs::write(local.join("cache/active.lua"), format!("cache {n}")).unwrap();
+            assert_eq!(loader.capture(&rig.workspace()).unwrap(), captured);
+        }
+        let layer = loader
+            .prepare(&rig.workspace(), &Registry::default(), None, false)
+            .unwrap();
+        let mut registry = Registry::default();
+        for (tier, extension) in layer.registrations {
+            registry = registry.with_dyn(tier, &*extension).unwrap();
+        }
+        assert_eq!(registry.system_prompt(), "workspace");
     }
 
     #[test]

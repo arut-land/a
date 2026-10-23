@@ -4,13 +4,35 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use notify::{RecursiveMode, Watcher as _};
+mod backend;
 
 use crate::BoxFuture;
 
 type Spawn = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>;
 
-type Changed = Arc<dyn Fn(Vec<PathBuf>) + Send + Sync>;
+/// Uncertainty invalidates the entire source inventory, even without paths.
+#[derive(Debug)]
+pub enum WatchEvent {
+    Changed(Vec<PathBuf>),
+    Overflow,
+    Rescan,
+    Unavailable(io::Error),
+}
+
+impl WatchEvent {
+    pub fn affects(&self, roots: &[PathBuf]) -> bool {
+        match self {
+            Self::Changed(paths) => paths.iter().any(|path| {
+                roots
+                    .iter()
+                    .any(|root| path.starts_with(root) || root.starts_with(path))
+            }),
+            _ => true,
+        }
+    }
+}
+
+type Changed = Arc<dyn Fn(WatchEvent) + Send + Sync>;
 
 /// Owned directory trees, including roots created later. Refresh before
 /// rescanning after a change to follow newly created or replaced roots.
@@ -18,9 +40,8 @@ pub struct Watcher {
     roots: Arc<[PathBuf]>,
     changed: Changed,
     invalidated: Arc<AtomicBool>,
-    recursive: Option<notify::RecommendedWatcher>,
-    watched: BTreeMap<PathBuf, RecursiveMode>,
-    #[cfg(target_os = "macos")]
+    recursive: Option<backend::Backend>,
+    watched: BTreeMap<PathBuf, bool>,
     spawn: Spawn,
     #[cfg(target_os = "macos")]
     parents: Vec<Parent>,
@@ -30,7 +51,7 @@ impl Watcher {
     pub fn new(
         spawn: Spawn,
         roots: impl IntoIterator<Item = impl AsRef<Path>>,
-        changed: impl Fn(Vec<PathBuf>) + Send + Sync + 'static,
+        changed: impl Fn(WatchEvent) + Send + Sync + 'static,
     ) -> io::Result<Self> {
         let mut watcher = Self {
             roots: roots.into_iter().map(|p| p.as_ref().to_owned()).collect(),
@@ -38,13 +59,10 @@ impl Watcher {
             invalidated: Arc::new(AtomicBool::new(true)),
             recursive: None,
             watched: BTreeMap::new(),
-            #[cfg(target_os = "macos")]
             spawn,
             #[cfg(target_os = "macos")]
             parents: Vec::new(),
         };
-        #[cfg(not(target_os = "macos"))]
-        drop(spawn);
         watcher.refresh()?;
         Ok(watcher)
     }
@@ -62,25 +80,7 @@ impl Watcher {
                 let watcher = if wanted.is_empty() {
                     None
                 } else {
-                    let changed = Arc::clone(&changed);
-                    let mut watcher =
-                        notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                            match event {
-                                Ok(event)
-                                    if !matches!(event.kind, notify::EventKind::Access(_)) =>
-                                {
-                                    changed(event.paths);
-                                }
-                                Err(error) => eprintln!("file watcher: {error}"),
-                                _ => {}
-                            }
-                        })
-                        .map_err(io::Error::other)?;
-                    let mut paths = watcher.paths_mut();
-                    for (path, mode) in &wanted {
-                        paths.add(path, *mode).map_err(io::Error::other)?;
-                    }
-                    paths.commit().map_err(io::Error::other)?;
+                    let watcher = backend::Backend::new(&self.spawn, &wanted, &changed)?;
                     Some(watcher)
                 };
                 #[cfg(target_os = "macos")]
@@ -114,12 +114,12 @@ impl Watcher {
         ))
     }
 
-    fn paths(&self) -> (BTreeMap<PathBuf, RecursiveMode>, Vec<PathBuf>) {
+    fn paths(&self) -> (BTreeMap<PathBuf, bool>, Vec<PathBuf>) {
         let mut wanted = BTreeMap::new();
         let mut parents = Vec::new();
         for root in &*self.roots {
             if root.is_dir() {
-                wanted.insert(root.clone(), RecursiveMode::Recursive);
+                wanted.insert(root.clone(), true);
             }
             // The parent observes removal/replacement of the root itself.
             // Until it exists, watch only its nearest existing ancestor.
@@ -136,9 +136,7 @@ impl Watcher {
         parents.dedup();
         #[cfg(not(target_os = "macos"))]
         for parent in &parents {
-            wanted
-                .entry(parent.clone())
-                .or_insert(RecursiveMode::NonRecursive);
+            wanted.entry(parent.clone()).or_insert(false);
         }
         (wanted, parents)
     }
@@ -147,14 +145,17 @@ impl Watcher {
         let roots = Arc::clone(&self.roots);
         let invalidated = Arc::clone(&self.invalidated);
         let changed = Arc::clone(&self.changed);
-        Arc::new(move |paths| {
-            if paths
-                .iter()
-                .any(|path| roots.iter().any(|root| root.starts_with(path)))
-            {
+        Arc::new(move |event| {
+            let rearm = match &event {
+                WatchEvent::Changed(paths) => paths
+                    .iter()
+                    .any(|path| roots.iter().any(|root| root.starts_with(path))),
+                _ => true,
+            };
+            if rearm {
                 invalidated.store(true, Ordering::Release);
             }
-            changed(paths);
+            changed(event);
         })
     }
 }
@@ -174,7 +175,7 @@ impl Parent {
                     loop {
                         io.readable().await;
                         io.get_ref().clear();
-                        changed(vec![path.clone()]);
+                        changed(WatchEvent::Changed(vec![path.clone()]));
                     }
                 },
                 stopped.wait(),
@@ -199,27 +200,56 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    fn changed(
-        watcher: &mut Watcher,
-        recv: &mpsc::Receiver<Vec<PathBuf>>,
-        path: &Path,
-        exact: bool,
-    ) {
+    fn changed(watcher: &mut Watcher, recv: &mpsc::Receiver<WatchEvent>, path: &Path, exact: bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let paths = recv
+            let event = recv
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .expect("filesystem event");
             // A stale descendant event cannot acknowledge root replacement;
             // rearming for unrelated events can discard the one we await.
-            if paths
-                .iter()
-                .any(|p| p == path || (!exact && path.starts_with(p)))
+            if let WatchEvent::Changed(paths) = event
+                && paths
+                    .iter()
+                    .any(|p| p == path || (!exact && path.starts_with(p)))
             {
                 watcher.refresh().unwrap();
                 return;
             }
         }
+    }
+
+    #[test]
+    fn uncertainty_without_paths_rescans_and_rearms_all_roots() {
+        let root = std::env::temp_dir().join(format!("a-uncertain-watch-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let runtime: crate::Rt = Arc::new(crate::Threads::new(1));
+        let (send, recv) = mpsc::channel();
+        let mut watcher = Watcher::new(
+            Arc::new(move |task| runtime.spawn(task)),
+            [&root],
+            move |event| {
+                let _ = send.send(event);
+            },
+        )
+        .unwrap();
+        for event in [
+            WatchEvent::Overflow,
+            WatchEvent::Rescan,
+            WatchEvent::Unavailable(io::Error::other("lost subscription")),
+        ] {
+            assert!(event.affects(std::slice::from_ref(&root)));
+            watcher.callback()(event);
+            assert!(watcher.invalidated.load(Ordering::Acquire));
+            watcher.refresh().unwrap();
+            assert!(!watcher.invalidated.load(Ordering::Acquire));
+        }
+        let path = root.join("after-rearm");
+        fs::write(&path, "observable").unwrap();
+        changed(&mut watcher, &recv, &path, true);
+        drop(watcher);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

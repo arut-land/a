@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,6 +7,14 @@ use ext::host::{Changed, GenerationLayer, PreparedLayer, Registrations, Registry
 use ext::{Extension, Refused, Tier};
 
 use crate::{Catalog, Skill, Skills, parse};
+
+type Files = Vec<(PathBuf, sys::source::Source)>;
+
+#[derive(PartialEq)]
+struct Inputs {
+    files: Files,
+    catalog: BTreeMap<String, Skill>,
+}
 
 pub struct Loader {
     home: PathBuf,
@@ -47,12 +54,8 @@ impl GenerationLayer for Loader {
         changed: Arc<Changed>,
     ) -> Result<Box<ext::host::Refresh>, Refused> {
         let roots = self.roots(workspace);
-        let mut watcher = rt::Watcher::new(spawn, roots.clone(), move |paths| {
-            if paths.iter().any(|path| {
-                roots
-                    .iter()
-                    .any(|root| path.starts_with(root) || root.starts_with(path))
-            }) {
+        let mut watcher = rt::Watcher::new(spawn, roots.clone(), move |event| {
+            if event.affects(&roots) {
                 changed();
             }
         })
@@ -69,27 +72,55 @@ impl GenerationLayer for Loader {
         previous: Option<&PreparedLayer>,
         _: bool,
     ) -> Result<PreparedLayer, Refused> {
-        let mut catalog = BTreeMap::new();
-        for root in self.roots(workspace) {
-            scan(&root, &mut catalog)?;
-        }
-        for name in catalog.keys() {
-            if base.tools().get(name).is_some() || self.skills.reserved.contains(name) {
-                return Err(Refused(format!(
-                    "skill {name} conflicts with an installed callable"
-                )));
-            }
-        }
-        if let Some(previous) = previous
-            .filter(|p| p.inputs.downcast_ref::<BTreeMap<String, Skill>>() == Some(&catalog))
-        {
-            return Ok(previous.clone());
-        }
-        let catalog = Arc::new(catalog);
-        Ok(PreparedLayer {
-            inputs: catalog.clone(),
-            registrations: vec![(Tier::Pre, Arc::new(Catalog::new(catalog)))],
-        })
+        ext::source::prepare(
+            || self.capture(workspace),
+            |files: Option<&Files>| {
+                if files.is_none_or(|files| !files.is_empty()) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            },
+            |files| {
+                let catalog = catalog(files)?;
+                for name in catalog.keys() {
+                    if base.tools().get(name).is_some() || self.skills.reserved.contains(name) {
+                        return Err(Refused(format!(
+                            "skill {name} conflicts with an installed callable"
+                        )));
+                    }
+                }
+                if let Some(previous) = previous.filter(|p| {
+                    p.inputs
+                        .downcast_ref::<Inputs>()
+                        .is_some_and(|p| p.catalog == catalog)
+                }) {
+                    return Ok(PreparedLayer {
+                        inputs: Arc::new(Inputs {
+                            files: files.clone(),
+                            catalog,
+                        }),
+                        registrations: previous.registrations.clone(),
+                    });
+                }
+                let registrations = vec![(
+                    Tier::Pre,
+                    Arc::new(Catalog::new(Arc::new(catalog.clone()))) as Arc<dyn ext::DynExtension>,
+                )];
+                Ok(PreparedLayer {
+                    inputs: Arc::new(Inputs {
+                        files: files.clone(),
+                        catalog,
+                    }),
+                    registrations,
+                })
+            },
+        )
+    }
+
+    fn validate(&self, workspace: &Path, prepared: &PreparedLayer) -> Result<bool, Refused> {
+        Ok(prepared
+            .inputs
+            .downcast_ref::<Inputs>()
+            .is_some_and(|p| self.capture(workspace).is_ok_and(|files| files == p.files)))
     }
 
     fn restore(&self, own_image: &[protocol::Installed]) -> Result<Registrations, Refused> {
@@ -112,7 +143,7 @@ impl GenerationLayer for Loader {
     }
 }
 
-fn scan(root: &Path, found: &mut BTreeMap<String, Skill>) -> Result<(), Refused> {
+fn scan(root: &Path, found: &mut Files) -> Result<(), Refused> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -126,39 +157,53 @@ fn scan(root: &Path, found: &mut BTreeMap<String, Skill>) -> Result<(), Refused>
         return Err(Refused("skill root exceeds 4096 entries".into()));
     }
     paths.sort();
-    let mut names = std::collections::BTreeSet::new();
     for directory in paths {
         let path = directory.join("SKILL.md");
-        let file = match sys::fs::open_regular_within(root, &path) {
-            Ok(sys::fs::RegularFile::Open(file)) => file,
-            Ok(sys::fs::RegularFile::Skipped(reason)) => {
-                eprintln!("warning: {}: {reason:?}", path.display());
-                continue;
+        match sys::source::Source::read(root, &path, 64 * 1024) {
+            Ok(Some(source)) => {
+                found.push((directory, source));
+                if found.iter().map(|(_, source)| source.len()).sum::<usize>() > 1024 * 1024 {
+                    return Err(Refused("skill source exceeds 1 MiB".into()));
+                }
             }
+            Ok(None) => {}
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                continue;
-            }
+                ) => {}
             Err(e) => return Err(Refused(format!("{}: {e}", path.display()))),
-        };
-        let mut source = String::new();
-        file.take(64 * 1024 + 1)
-            .read_to_string(&mut source)
-            .map_err(|e| Refused(format!("{}: {e}", path.display())))?;
-        if source.len() > 64 * 1024 {
-            return Err(Refused(format!("{} exceeds 64 KiB", path.display())));
         }
-        let (name, skill) = parse::parse(&source, &directory)
-            .map_err(|e| Refused(format!("{}: {e}", path.display())))?;
+    }
+    Ok(())
+}
+
+impl Loader {
+    fn capture(&self, workspace: &Path) -> Result<Files, Refused> {
+        let mut files = Vec::new();
+        for root in self.roots(workspace) {
+            scan(&root, &mut files)?;
+        }
+        Ok(files)
+    }
+}
+
+fn catalog(files: &Files) -> Result<BTreeMap<String, Skill>, Refused> {
+    let mut found = BTreeMap::new();
+    let mut names = std::collections::BTreeSet::new();
+    let mut root = None;
+    for (directory, source) in files {
+        if root != directory.parent() {
+            names.clear();
+            root = directory.parent();
+        }
+        let (name, skill) = parse::parse(
+            source.text().map_err(|e| Refused(e.to_string()))?,
+            directory,
+        )
+        .map_err(|e| Refused(format!("{}: {e}", directory.display())))?;
         if !names.insert(name.clone()) {
-            return Err(Refused(format!(
-                "duplicate skill {name} in {}",
-                root.display()
-            )));
+            return Err(Refused(format!("duplicate skill {name}")));
         }
         found.insert(name, skill);
         if found
@@ -179,7 +224,7 @@ fn scan(root: &Path, found: &mut BTreeMap<String, Skill>) -> Result<(), Refused>
             return Err(Refused("skills exceed 128 entries or 1 MiB".into()));
         }
     }
-    Ok(())
+    Ok(found)
 }
 
 #[cfg(test)]

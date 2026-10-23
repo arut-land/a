@@ -15,6 +15,10 @@ mod awake;
 pub mod config;
 pub mod crash;
 mod desktop;
+#[cfg(windows)]
+mod directory_watch;
+#[cfg(windows)]
+pub use directory_watch::DirectoryWatch;
 mod endpoint;
 pub mod fs;
 pub mod install;
@@ -25,6 +29,7 @@ mod platform;
 mod proc;
 mod runtime;
 mod signals;
+pub mod source;
 pub mod terminal;
 #[cfg(windows)]
 mod windows;

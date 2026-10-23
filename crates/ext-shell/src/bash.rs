@@ -296,15 +296,19 @@ async fn execute(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Re
         let _ = std::fs::remove_file(&log);
     }
 
-    let ended = std::fs::read_to_string(&report).ok();
-    let _ = std::fs::remove_file(&report);
-    let cwd = ended
-        .map(|dir| sys::shell_directory(&dir))
-        .filter(|dir| dir.is_absolute() && dir.is_dir())
-        .unwrap_or_else(|| dir.clone());
-    // `pwd -P` resolves symlinks the starting directory may have.
-    let moved = (std::fs::canonicalize(&dir).ok().as_ref() != Some(&cwd))
-        .then(|| Cwd::change(&cwd, cx.env.as_ref().map(|env| env.cwd.as_path())));
+    let old_dir = dir.clone();
+    let (cwd, moved) = rt::unblock(runtime(cx)?, move || {
+        let ended = std::fs::read_to_string(&report).ok();
+        let _ = std::fs::remove_file(&report);
+        let cwd = ended
+            .map(|dir| sys::shell_directory(&dir))
+            .filter(|dir| dir.is_absolute() && dir.is_dir())
+            .unwrap_or_else(|| old_dir.clone());
+        let moved = std::fs::canonicalize(&old_dir).ok().as_ref() != Some(&cwd);
+        (cwd, moved)
+    })
+    .await;
+    let moved = moved.then(|| Cwd::change(&cwd, cx.env.as_ref().map(|env| env.cwd.as_path())));
     if done.lingering {
         done.process.detach(cx);
     }
@@ -567,9 +571,10 @@ async fn supervise(
     cx: &Cx,
     progress: &Partials<String>,
 ) -> io::Result<Finished> {
-    let mut file = File::open(log)?;
     let rt = runtime(cx)?;
-    let mut buf = vec![0; 64 * 1024];
+    let path = log.to_owned();
+    let mut file = rt::unblock(rt, move || File::open(path)).await?;
+    let mut buf = Vec::new();
     let (mut output, mut live) = (Output::default(), Live::default());
     let start = rt.now();
     let mut run = Run::Running {
@@ -599,10 +604,10 @@ async fn supervise(
             rt::or(writes, rt::or(exits, rt::or(cancelled, sleep))).await?;
         }
         written.get_ref().clear();
-        let read = follow(&mut file, &mut buf, READ, |chunk| {
-            output.push(chunk);
-            live.push(chunk);
-        })?;
+        (file, buf) = follow(file, buf, READ, rt).await?;
+        let read = buf.len() as u64;
+        output.push(&buf);
+        live.push(&buf);
         behind = read == READ;
         if read > 0 {
             rt::yield_now().await;
@@ -643,7 +648,8 @@ async fn supervise(
                     child.output_drained().await?;
                 }
                 let rest = OUTPUT_CAP.saturating_sub(output.bytes()).min(READ);
-                follow(&mut file, &mut buf, rest, |chunk| output.push(chunk))?;
+                let (_, buf) = follow(file, buf, rest, rt).await?;
+                output.push(&buf);
                 return Ok(Finished {
                     status,
                     stopped: why,
@@ -656,28 +662,28 @@ async fn supervise(
     }
 }
 
-/// Reads what `file` has past where it was last read, up to `most` bytes,
-/// handing each chunk to `chunk`; how many bytes it read.
-fn follow(
-    file: &mut File,
-    buf: &mut [u8],
+/// The cursor and bounded buffer move together through admitted storage work.
+async fn follow(
+    file: File,
+    mut buf: Vec<u8>,
     most: u64,
-    mut chunk: impl FnMut(&[u8]),
-) -> io::Result<u64> {
-    let mut read = 0;
-    while read < most {
-        let room = usize::try_from(most - read).map_or(buf.len(), |left| left.min(buf.len()));
-        match file.read(&mut buf[..room]) {
-            Ok(0) => break,
-            Ok(n) => {
-                chunk(&buf[..n]);
-                read += n as u64;
+    rt: &dyn rt::Runtime,
+) -> io::Result<(File, Vec<u8>)> {
+    rt::unblock_with(rt, rt::BlockingClass::Storage, 1024 * 1024, move || {
+        buf.resize(usize::try_from(most).map_err(io::Error::other)?, 0);
+        let mut read = 0;
+        while read < buf.len() {
+            match (&file).read(&mut buf[read..]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
         }
-    }
-    Ok(read)
+        buf.truncate(read);
+        Ok((file, buf))
+    })
+    .await
 }
 
 /// `future`, or one that never resolves when `cond` does not hold.

@@ -845,3 +845,28 @@ fn opening_a_workspace_never_holds_the_global_reservation_map() {
         assert_eq!(layer.scans.load(std::sync::atomic::Ordering::SeqCst), 2);
     });
 }
+
+#[test]
+fn queued_preparation_does_not_retain_a_closed_workspace() {
+    let layer = Arc::new(TestLayer {
+        name: "queued",
+        ..TestLayer::default()
+    });
+    let coordinator = Coordinator::new(Registry::default(), vec![layer.clone()]);
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let queued = queue.clone();
+    let workspace = coordinator
+        .open(
+            Path::new("/queued"),
+            Arc::new(|_| {}),
+            Arc::new(move |work| queued.lock().unwrap().push(work)),
+        )
+        .unwrap();
+    let registry = Arc::downgrade(&workspace.snapshot().registry);
+    layer.changed.lock().unwrap().as_ref().unwrap()();
+    assert_eq!(queue.lock().unwrap().len(), 1);
+    drop(workspace);
+    assert!(registry.upgrade().is_none());
+    queue.lock().unwrap().pop().unwrap()();
+    assert!(registry.upgrade().is_none());
+}
