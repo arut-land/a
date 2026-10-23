@@ -233,8 +233,20 @@ impl<'a> SpawnPlan<'a> {
                 .get(OsStr::new("PATH"))
                 .map_or(OsStr::new("/usr/bin:/bin"), OsString::as_os_str);
             std::env::split_paths(path)
-                .map(|dir| dir.join(program))
-                .find(|path| rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok())
+                .map(|dir| {
+                    let path = dir.join(program);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        self.command
+                            .get_current_dir()
+                            .unwrap_or(std::path::Path::new("."))
+                            .join(path)
+                    }
+                })
+                .find(|path| {
+                    path.is_file() && rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()
+                })
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "executable absent from child PATH")
                 })?
@@ -257,21 +269,39 @@ impl<'a> SpawnPlan<'a> {
             .collect::<io::Result<_>>()?;
         let mut envp: Vec<_> = env.iter().map(|v| v.as_ptr().cast_mut()).collect();
         envp.push(std::ptr::null_mut());
-        let (actions, _duplicates) = self.actions()?;
+        let (actions, duplicates) = self.actions()?;
         let attributes = self.attributes()?;
-        let mut pid = 0;
-        // SAFETY: every action, attribute, string and pointer array lives
-        // through the call; no Rust code runs in the child before exec.
-        checked(unsafe {
-            libc::posix_spawn(
-                &raw mut pid,
-                executable.as_ptr(),
-                &raw const actions.0,
-                &raw const attributes.0,
-                argv.as_ptr(),
-                envp.as_ptr(),
-            )
-        })?;
+        #[cfg(all(target_os = "linux", not(target_env = "gnu")))]
+        let pid = {
+            let _ = (actions, attributes);
+            linux::spawn(
+                &executable,
+                &argv,
+                &envp,
+                self.command.get_current_dir(),
+                &duplicates,
+                self.session,
+                self.group,
+            )?
+        };
+        #[cfg(not(all(target_os = "linux", not(target_env = "gnu"))))]
+        let pid = {
+            let _duplicates = duplicates;
+            let mut pid = 0;
+            // SAFETY: every action, attribute, string and pointer array lives
+            // through the call; no Rust code runs in the child before exec.
+            checked(unsafe {
+                libc::posix_spawn(
+                    &raw mut pid,
+                    executable.as_ptr(),
+                    &raw const actions.0,
+                    &raw const attributes.0,
+                    argv.as_ptr(),
+                    envp.as_ptr(),
+                )
+            })?;
+            pid
+        };
         let mut child = Child(Arc::new(OwnedChild {
             pid: pid.cast_unsigned(),
             watch: None,
@@ -335,11 +365,6 @@ impl<'a> SpawnPlan<'a> {
         checked(unsafe {
             libc::posix_spawn_file_actions_addclosefrom_np(&raw mut actions.0, minimum)
         })?;
-        #[cfg(all(target_os = "linux", not(target_env = "gnu")))]
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "spawn descriptor allowlist requires closefrom",
-        ));
         Ok((actions, duplicates))
     }
 
@@ -371,7 +396,7 @@ impl<'a> SpawnPlan<'a> {
                 } // Darwin POSIX_SPAWN_SETSID, absent from libc bindings.
                 #[cfg(target_os = "linux")]
                 {
-                    flags |= libc::POSIX_SPAWN_SETSID;
+                    flags |= i32::from(libc::POSIX_SPAWN_SETSID);
                 }
             } else if self.group {
                 flags |= libc::POSIX_SPAWN_SETPGROUP;
@@ -521,3 +546,7 @@ mod tests {
         assert!(!child.wait().unwrap().success());
     }
 }
+
+#[cfg(all(target_os = "linux", any(not(target_env = "gnu"), test)))]
+#[path = "proc_linux.rs"]
+mod linux;
