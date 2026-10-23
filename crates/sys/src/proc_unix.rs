@@ -211,18 +211,7 @@ impl<'a> SpawnPlan<'a> {
     }
 
     pub(crate) fn spawn(self) -> io::Result<Child> {
-        let mut environment = if self.inherit_environment {
-            std::env::vars_os().collect()
-        } else {
-            std::collections::BTreeMap::<OsString, OsString>::new()
-        };
-        for (key, value) in self.command.get_envs() {
-            if let Some(value) = value {
-                environment.insert(key.into(), value.into());
-            } else {
-                environment.remove(key);
-            }
-        }
+        let environment = self.environment_values();
         let program = self.command.get_program();
         // posix_spawnp searches the parent's PATH. Resolve using the child's
         // environment so one session cannot select another's executable.
@@ -262,6 +251,9 @@ impl<'a> SpawnPlan<'a> {
         let env: Vec<_> = environment
             .into_iter()
             .map(|(mut key, value)| {
+                if key.is_empty() || key.as_bytes().contains(&b'=') {
+                    return Err(io::ErrorKind::InvalidInput.into());
+                }
                 key.push("=");
                 key.push(value);
                 string(&key)
@@ -321,6 +313,22 @@ impl<'a> SpawnPlan<'a> {
         }
         Ok(child)
     }
+    fn environment_values(&self) -> std::collections::BTreeMap<OsString, OsString> {
+        let mut environment = if self.inherit_environment {
+            std::env::vars_os().collect()
+        } else {
+            std::collections::BTreeMap::<OsString, OsString>::new()
+        };
+        for (key, value) in self.command.get_envs() {
+            if let Some(value) = value {
+                environment.insert(key.into(), value.into());
+            } else {
+                environment.remove(key);
+            }
+        }
+        environment
+    }
+
     fn actions(&self) -> io::Result<(Actions, Vec<OwnedFd>)> {
         let mut actions = Actions::new()?;
         // Keep sources out of destination slots even when stdin/out are closed

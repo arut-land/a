@@ -208,7 +208,7 @@ async fn launch(
         Ok(watch) => Some(rt::Async::for_reading(&reactor, watch)?),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             // Exit observation can precede waitable status; reaping must not block the reactor.
-            owned = rt::unblock_with(rt, rt::BlockingClass::Network, 0, move || {
+            owned = rt::unblock_with(rt, rt::BlockingClass::Storage, 0, move || {
                 owned.complete();
                 owned
             })

@@ -351,7 +351,16 @@ impl RecordedProcess {
             .map(|process| Self { process });
         #[cfg(target_os = "linux")]
         {
-            let process = imp::exit_watch(record.pid)?;
+            let process = imp::exit_watch(record.pid).map_err(|error| {
+                if error.raw_os_error() == Some(libc::ENOSYS) {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "forced stop requires pidfd support; use daemon RPC or its supervisor",
+                    )
+                } else {
+                    error
+                }
+            })?;
             if record.token.is_none() || record.token != process_started(record.pid) {
                 return Err(io::Error::other(
                     "process no longer matches the daemon record",

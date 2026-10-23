@@ -138,6 +138,26 @@ assigned and verified before the primary thread runs. Unix group control covers
 cooperative descendants; descendants can leave the group. Durable waits
 and child ownership let interaction continue independently of a connection.
 
+Process creation uses a declarative plan: native spawn file actions and default
+close-on-exec on macOS, a dense descriptor allowlist closed with glibc's
+closefrom/close_range actions on Linux, and Unicode environment plus explicit
+handle and job lists on Windows. The musl backend applies the same fixed plan
+through async-signal-safe child syscalls, using close_range or an old-kernel
+bounded close loop. There are no user callbacks between fork and exec. SSH
+transports preserve terminal access and stderr; shell commands have no terminal
+and null stdin, while protocol subprocesses use explicit pipes. Old Linux kernels observe owned children with a blocking, event-driven
+wait rather than polling; if descendant watches are unavailable, group cleanup
+ends the remaining cooperative descendants when the leader exits. Forced daemon
+stop requires a retained verified native handle; macOS and kernels without
+pidfds refuse numeric-PID force-stop and retain RPC shutdown.
+
+The shell process service admits at most 32 outstanding launches and running
+processes. Captured output crosses one 64 KiB buffer per process into a spill
+file, with storage back-pressure and a hard 64 MiB retention limit for foreground
+and background jobs. Group observation is capped at 4096 members; exceeding it
+revokes the live lease. Following spill files and enumerating groups use admitted
+storage workers, leaving reactor workers available for other sessions.
+
 ## Extensions and SDK
 
 `ext::Registrar` registers tools, decision-point handlers, services and
