@@ -9,7 +9,7 @@ CPU, latency, idle and peak RSS, reliability and native platform behaviour.
 
 | Setting | Design constraint |
 | --- | --- |
-| serde_json opt-level 1 | Share optimized generic instantiations with release consumers; measured driver CPU benefit without a peak-RSS increase |
+| Release level 3, serde_json level 1 | Measured CPU and attach-latency gains; accept the reported resident-code cost within native memory budgets |
 | Fat LTO and one codegen unit | Cross-crate optimization; candidates must improve measured CPU and latency without an unacceptable memory cost |
 | Panic unwinding | A panicking session actor cannot terminate the daemon |
 | Packed split debuginfo and stripped executable symbols | Preserve offline crash symbolication without mapping debug data into the process |

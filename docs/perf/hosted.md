@@ -23,7 +23,7 @@ portable RSS adapter. Provider cassettes and encoded fixtures are unchanged.
 
 Build, measurement and optional reference rounds are separate job steps.
 Builds finish before timing starts. Both binaries use `cargo build-release`:
-size-optimized rebuilt std, unwinding, fat LTO, one codegen unit, stripped
+rebuilt std with its compact algorithms, release level three with JSON helpers at level one, unwinding, fat LTO, one codegen unit, stripped
 symbols and the source checkout's native linker flags. The default binary
 must exclude the sleep fixture and include the edit tool; the second binary
 enables fixtures for deterministic echo workloads. Size is measured and reported on every target, without a size gate.
@@ -45,7 +45,9 @@ through exit and query `GetProcessMemoryInfo` for lifetime peak working set
 and `GetProcessTimes` for CPU. Hyperfine does not support Windows peak RSS;
 these native observations are stored separately and supply that report axis. psutil 7.2.2
 provides native RSS/working-set and accumulated user+kernel CPU counters,
-including Windows, for the idle daemon and line client. CPU reports separate
+including Windows, for the idle daemon and line client. Optional per-thread
+diagnostics are Windows-only; macOS process accounting uses libproc without
+requesting a debug task port. CPU reports separate
 user and kernel time as well as their total; a reduction in one workload must
 not conceal a regression in another. It is a measurement
 dependency, not a shipped Rust dependency. `/proc` and macOS resident sets
@@ -56,7 +58,9 @@ All daemons use isolated homes and stop through their own binary and `A_HOME`.
 Collection waits for the captured daemon PID to exit before deleting its home;
 Windows retains executable image mappings through process exit. A failed graceful stop is recorded and only that captured daemon PID can be
 terminated. Measured commands have a five-minute deadline; cleanup stops only
-the owned command and its descendants. The tool
+the owned command and its descendants. Measurement and paired job steps have
+twenty- and forty-five-minute deadlines; long Python phases emit a stack
+snapshot every five minutes. The tool
 never addresses the user's default home.
 
 ## Samples and comparisons

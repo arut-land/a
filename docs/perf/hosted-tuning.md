@@ -1,78 +1,95 @@
 # Native release tuning
 
-Decisions prioritize CPU, idle and peak RSS, latency and reliability. Size is
-reported without a cap. The [hosted workflow](hosted.md) records raw native
-observations and p10–p90 spreads; a median delta within either cohort's spread
-is noise, not a retained speedup.
+Release code uses level three, with serde_json helpers at level one, fat LTO,
+one codegen unit, unwinding and offline crash symbolication. CPU baselines
+remain the conservative native toolchain defaults. Size is reported without
+a cap; decisions account for idle and peak RSS, CPU, latency and reliability.
+The [workflow](hosted.md) preserves raw observations and p10–p90 spreads.
 
-| Native target | JSON profile | Allocator | Native facilities retained |
+| Native target | Allocator | Native facilities | Release decision |
 | --- | --- | --- | --- |
-| Linux x86_64 GNU | serde_json level 1; other crates z | glibc, two arenas | mold, safe ICF, RELR, epoll/inotify |
-| Linux aarch64 GNU | serde_json level 1; other crates z | glibc, two arenas | mold, safe ICF, RELR, epoll/inotify |
-| Windows x86_64 MSVC | serde_json level 1; other crates z | system | MSVC, static CRT, thread-pool directory I/O |
-| Windows aarch64 MSVC | serde_json level 1; other crates z | system | native ARM tools, MSVC, static CRT, thread-pool directory I/O |
-| macOS arm64 | serde_json level 1; other crates z | system | Apple linker, compact unwind, kqueue/native directory notifications |
-| macOS x86_64 | serde_json level 1; other crates z | system | Apple linker, compact unwind, kqueue/native directory notifications |
+| Linux x86_64 GNU | glibc, two arenas | mold, safe ICF, RELR, epoll/inotify | Level 3 / JSON 1; lower CPU and attach p99 for 1184 KiB more idle RSS |
+| Linux aarch64 GNU | glibc, two arenas | mold, safe ICF, RELR, epoll/inotify | Level 3 / JSON 1; lower CPU, cold reply and attach p99 for 1260 KiB more idle RSS |
+| Windows x86_64 MSVC | system | MSVC, static CRT, native directory thread-pool I/O | Level 3 / JSON 1; lower JSON CPU for 208 KiB more idle RSS |
+| Windows aarch64 MSVC | system | native ARM tools, MSVC, static CRT, native directory thread-pool I/O | Level 3 / JSON 1; lower attach p99 for 136 KiB more idle RSS |
+| macOS arm64 | system | Apple linker, compact unwind, kqueue/native directory notifications | Level 3 / JSON 1; lower JSON and driver user CPU for 912 KiB more idle RSS |
+| macOS x86_64 | system | Apple linker, compact unwind, kqueue/native directory notifications | Level 3 / JSON 1; lower JSON CPU for 188 KiB more idle RSS |
 
-All targets retain fat LTO, one codegen unit, unwinding and offline crash
-symbolication. CPU baselines remain the conservative native toolchain defaults;
-no new instruction-set requirement is introduced. Linux GNU requires glibc
-2.36 for RELR and native OpenSSL 3. A musl/static build is a different runtime
-and deployment contract; it is not substituted for this GNU measurement.
+Linux GNU requires glibc 2.36 for RELR and native OpenSSL 3. Windows retains
+an 8 MiB stack for nested decode paths. The system allocator remains native
+on Apple and Microsoft platforms. No new instruction-set requirement or
+custom compiler wrapper is introduced.
 
-## JSON CPU and memory
+## CPU and memory tradeoffs
 
-[The same-runner level-one comparison](https://github.com/arut-land/a/actions/runs/39873446213)
-alternates five reference/candidate rounds against main `2a33ad3`. Driver
-processes execute 500 turns; JSON processes emit 200 large results. Each
-process includes fixture setup, encoding and replay, so these are process CPU
-and peak RSS, not isolated parser throughput or daemon peak memory. The large
-500-turn fixture captures request history and uses substantially more memory
-than the regular 100-turn driver benchmark.
+[The paired speed-profile run](https://github.com/arut-land/a/actions/runs/39887943724)
+compares release level three against level z with the same JSON level-one
+override and native backends. Five alternating reference/candidate rounds
+finish all builds before timing. Driver processes execute 500 turns; JSON
+processes emit 200 large results. Values below are medians; `~` means the
+delta is within either cohort's p10–p90 spread, not a significance test.
 
-| Target | Driver CPU ms | Driver peak KiB | JSON CPU ms | JSON peak KiB |
-| --- | ---: | ---: | ---: | ---: |
-| Linux x86_64 | 2449.7 → 2252.4 | 513380 → 513432 | 2323.3 → 2294.4 (noise) | 257316 → 257352 |
-| Linux aarch64 | 2220.4 → 2025.5 | 512276 → 512248 | 2233.9 → 1953.6 | 253916 → 253900 |
-| Windows x86_64 | 2640.6 → 2812.5 (noise) | 490248 → 489884 | 3156.3 → 2906.3 (noise) | 247076 → 247028 |
-| Windows aarch64 | 2406.3 → 2375.0 (noise) | 475600 → 475832 | 2500.0 → 2421.9 (noise) | 248108 → 248152 |
+| Target | Shipped KiB | Driver CPU ms | JSON CPU ms | Idle RSS KiB | JSON peak KiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Linux x86_64 | 6246.531 | 2223.0 → 1952.3 | 2258.5 → 1230.9 | 7124 → 8308 | 257236 → 261320 |
+| Linux aarch64 | 5300.789 | 2041.0 → 1531.7 | 1957.0 → 1166.7 | 6228 → 7488 | 253956 → 258004 |
+| Windows x86_64 | 8509.000 | 2843.8 → 2593.8 ~ | 3640.6 → 2578.1 | 8324 → 8532 | 246944 → 247108 ~ |
+| Windows aarch64 | 7192.000 | 2062.5 → 1937.5 ~ | 2359.4 → 1968.8 ~ | 9648 → 9784 | 248052 → 248552 ~ |
+| macOS arm64 | 5578.141 | 1608.9 → 1119.0 ~ | 1504.4 → 1144.7 | 8656 → 9568 | 255136 → 256512 |
+| macOS x86_64 | 6326.906 | 4147.9 → 3790.8 ~ | 3277.5 → 2516.5 | 4068 → 4256 | 260396 → 257652 ~ |
 
-Linux driver CPU improves 8.1%/8.8%, beyond observed spreads; user CPU
-improves 8.4%/10.9%. Peak and idle RSS changes remain within noise. Windows
-shows no established driver CPU gain. ARM attach p99 in this cohort is
-0.973 → 1.057 ms, outside its observed spread; cold reply and RSS differences
-remain within noise. Per-axis observations remain visible even when another
-axis improves.
+The largest idle cost is 1.23 MiB; every native target remains below
+10,240 KiB in every full-suite sample, with no daemon or line-client CPU
+counter increment during idle. Linux JSON peak rises about 4 MiB, or 1.6%.
+The profile buys 40–45% lower JSON CPU on Linux, 23–24% on macOS and 29% on
+Windows x86_64. Windows ARM JSON CPU remains noisy; its attach p99 improves
+0.958 → 0.871 ms beyond spread. Linux attach p99 improves
+0.477 → 0.378 / 0.412 → 0.309 ms. macOS ARM driver user CPU improves
+1169.3 → 757.6 ms beyond spread, while total driver CPU remains noisy.
+Cold-reply changes are within noise except Linux ARM's 7.486 → 6.378 ms.
+No attach or cold-reply regression is established beyond observed spread.
 
-[Cargo's generic sharing rule](https://doc.rust-lang.org/nightly/cargo/reference/profiles.html#overrides-and-generics)
-explains the profile: level one allows generic instantiations to be shared
-with z consumers; levels two and three do not. Package profiles are common to
-targets in Cargo; target-specific package environment overrides are unsupported.
-The release profile does not add a custom compiler wrapper or duplicate crates
-to simulate them.
+These are process CPU and peak RSS, including fixture setup, encoding and
+replay. The 500-turn fixture captures request history and consumes much more
+memory than the regular 100-turn driver benchmark; its approximately
+500 MiB peak is not daemon idle memory. Full suites retain the original
+100-turn driver and 20-result JSON cases. Native memory definitions differ
+between OSes; comparisons apply within a target.
 
-## Native idle and rejected alternatives
+[The complete main comparison](https://github.com/arut-land/a/actions/runs/39885640037)
+records the independently retained JSON level-one and Windows-backend
+changes against `2a33ad3`. The selected speed-profile evidence applies to the
+measured release-3/JSON-1 combination. As
+[Cargo documents](https://doc.rust-lang.org/nightly/cargo/reference/profiles.html#overrides-and-generics),
+level-three consumers instantiate their own generic code; large decoders
+remain in their owning crates. Target-specific package profile environment
+overrides are unsupported, so the build uses ordinary Cargo profiles.
 
-[Windows subscriptions](windows-watch.md) await the maintained native
-thread-pool backend's queue doorbell rather than notify's 100 ms timed wait.
-[Native Windows validation](https://github.com/arut-land/a/actions/runs/39869570230)
-passes the focused watch invariants and all five candidate idle CPU windows
-on both architectures. Candidate daemon RSS medians are 8456/9716 KiB, with
-maxima 8484/9728 KiB. The x86_64 paired comparison is complete; the ARM
-historical reference failed a later RPC, so that run cannot supply a complete
-paired ARM aggregate.
+## Native idle and alternatives
+
+[Windows subscriptions](windows-watch.md) await a maintained native
+thread-pool backend's queue doorbell. Healthy subscriptions have no periodic
+timeout. The dependency provides overlapped I/O, cancellation, path fidelity
+and overflow/fault recovery behind `rt`. Its 16 target-only dependencies
+include generated Windows bindings; the isolated backend comparison adds
+36 KiB to the x86_64 image. A [combined main comparison](https://github.com/arut-land/a/actions/runs/39877497068)
+measures an ARM idle cost of 72 KiB in one cohort. Native watch invariants pass on both
+Windows architectures; resource costs are reported rather than hidden by
+binary-size limits.
 
 | Candidate | Decision and measured reason |
 | --- | --- |
-| serde_json level 3 | Not retained: the [long Windows ARM comparison](https://github.com/arut-land/a/actions/runs/39867372897) lowers JSON CPU but raises driver user CPU 109.375 → 171.875 ms beyond spread; a JSON-only win is insufficient |
-| mimalloc | System retained: [paired measurements](https://github.com/arut-land/a/actions/runs/39864532590) raise Linux idle RSS about 6–7 → 24–25 MiB and JSON peak about 43–44 → 69–70 MiB; Windows JSON peak rises about 29–36%. macOS budget collection did not complete, so no macOS allocator benefit is established |
+| JSON-only level 3 with level-z callers | Not selected: the [long Windows ARM comparison](https://github.com/arut-land/a/actions/runs/39867372897) lowers JSON CPU but raises driver user CPU 109.375 → 171.875 ms beyond spread |
+| mimalloc | System retained: [paired measurements](https://github.com/arut-land/a/actions/runs/39864532590) raise Linux idle RSS about 6–7 → 24–25 MiB and JSON peak about 43–44 → 69–70 MiB; Windows JSON peak rises about 29–36%. No joint macOS CPU/RSS advantage is established |
 | Linux x86-64-v2 | Baseline retained: [paired run](https://github.com/arut-land/a/actions/runs/39849948034) shows no clear CPU/latency gain and raises JSON peak RSS 46536 → 49128 KiB beyond spread |
-| Windows alternate linker, ICF, CRT, unwind/debug profiles | Native defaults retained: build diagnostics alone do not establish a CPU, RSS or startup benefit |
-| Thin LTO, PGO, musl/static | Not adopted without a joint runtime benefit across the relevant native targets; no claim of a completed all-target PGO comparison |
+| Windows alternate linker, ICF, CRT, unwind/debug profiles | Native settings retained: build diagnostics alone do not establish a CPU, RSS or startup benefit |
+| Thin LTO, PGO, musl/static | Not selected without a joint runtime benefit across the relevant native targets; no completed all-target PGO comparison is claimed |
 | Panic abort | Unwinding retained so one panicking session cannot terminate the daemon |
 
-Size never determines these decisions. To reproduce a single variable, use a
-`perf/<name>` branch with only that change and dispatch `perf.yml` with
-`paired_ref=2a33ad371a766644c7f11e4090ab80b7f45a2a7e`. Download each `perf-<runner>`
+To reproduce, change one variable on a `perf/<name>` branch and dispatch
+`perf.yml` with `paired_ref` set to its full baseline commit. The speed-profile
+baseline is
+`712b6e4052aa8e7cea9a2f52bad67611359905f7`; the main comparison uses
+`2a33ad371a766644c7f11e4090ab80b7f45a2a7e`. Download each `perf-<runner>`
 artifact and inspect `paired.json`, `result.json`, native counters and summary.
-The [workflow guide](hosted.md#reproduce) gives exact commands and variant syntax.
+The [workflow guide](hosted.md#reproduce) gives commands and variant syntax.

@@ -43,7 +43,6 @@ debug = "line-tables-only"
 split-debuginfo = "packed"
 strip = "symbols"
 
-# Level one shares generic JSON instantiations with z consumers; higher levels do not.
 [profile.release.package.serde_json]
 opt-level = 1
 
