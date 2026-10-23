@@ -18,7 +18,6 @@
 
 use ext::{LaunchSpec, OwnedProcess, ProcessOutput, ProcessSignal, Processes};
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Read};
@@ -35,7 +34,24 @@ use crate::state::Cwd;
 use ext::shape::{self, Streams};
 use ext::{Cx, Json, Partials, Schema, SpawnSpec as Spawn, Tool};
 
-pub struct Bash;
+pub struct ShellTool<D> {
+    facts: &'static sys::shell::ExecutionFacts,
+    description: String,
+    dialect: std::marker::PhantomData<D>,
+}
+
+pub type Bash = ShellTool<crate::dialect::Bash>;
+pub type PowerShell = ShellTool<crate::dialect::PowerShell>;
+
+impl<D: crate::dialect::Dialect> ShellTool<D> {
+    pub fn new(facts: &'static sys::shell::ExecutionFacts) -> Self {
+        Self {
+            facts,
+            description: format!("{}\n{}", D::DESCRIPTION, facts.context()),
+            dialect: std::marker::PhantomData,
+        }
+    }
+}
 
 /// How long a stopped command's group has between SIGTERM and SIGKILL.
 pub const GRACE: Duration = Duration::from_secs(3);
@@ -123,16 +139,24 @@ pub struct Job {
     pub log: PathBuf,
 }
 
-impl Tool for Bash {
+impl<D: crate::dialect::Dialect> Tool for ShellTool<D> {
     type In = Command;
     type Out = Ran;
 
-    const NAME: &'static str = "bash";
-    const DESCRIPTION: &'static str = "Runs a bash command in the session's working directory, which persists across calls, and returns its combined stdout and stderr with its exit status. There is no stdin or terminal.";
+    const NAME: &'static str = D::NAME;
+    const DESCRIPTION: &'static str = D::DESCRIPTION;
+
+    fn description(&self) -> &str {
+        &self.description
+    }
 
     /// Streams: its output as it comes is its progress.
     fn call(&self, input: &Command, cx: &Cx) -> impl shape::Output<Ran, Streams<String>> {
-        ext::stream(|output| async move { run(input, cx, output).await.map_err(|e| e.to_string()) })
+        ext::stream(|output| async move {
+            run::<D>(self.facts, input, cx, output)
+                .await
+                .map_err(|e| e.to_string())
+        })
     }
 
     fn to_model(output: &Json) -> llm::Output {
@@ -144,14 +168,14 @@ impl Tool for Bash {
 
     fn present(input: &Command) -> Option<Card> {
         Some(Card {
-            title: title(input),
+            title: title(input).replacen("$ ", D::PROMPT, 1),
             ..Card::default()
         })
     }
 
     fn present_result(input: &Command, ran: &Ran) -> Option<Card> {
         Some(Card {
-            title: title(input),
+            title: title(input).replacen("$ ", D::PROMPT, 1),
             body: ran.output.clone(),
             note: note(ran),
             mark: mark(ran),
@@ -249,8 +273,13 @@ fn model_text(ran: &Ran) -> String {
     text
 }
 
-async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result<Ran> {
-    match execute(input, cx, progress).await {
+async fn run<D: crate::dialect::Dialect>(
+    facts: &sys::shell::ExecutionFacts,
+    input: &Command,
+    cx: &Cx,
+    progress: Partials<String>,
+) -> io::Result<Ran> {
+    match execute::<D>(facts, input, cx, progress).await {
         // Launch can observe cancellation after the initial check, before
         // bash has a process to supervise and mark aborted.
         Err(error) if error.kind() == io::ErrorKind::Interrupted && cx.cancel.is_set() => Ok(Ran {
@@ -262,7 +291,12 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
     }
 }
 
-async fn execute(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result<Ran> {
+async fn execute<D: crate::dialect::Dialect>(
+    facts: &sys::shell::ExecutionFacts,
+    input: &Command,
+    cx: &Cx,
+    progress: Partials<String>,
+) -> io::Result<Ran> {
     let started = runtime(cx)?.now();
     let dir = cx.dir();
     // An interrupted turn's call starts nothing.
@@ -276,10 +310,15 @@ async fn execute(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Re
     let env = environment(cx, std::env::vars());
     let log = cx.spill.join(format!("{}.log", cx.call));
     if input.background {
-        return background(cx, spawn(cx, &input.command, &dir, env, None)?, &log).await;
+        return background(
+            cx,
+            spawn_with::<D>(facts, cx, &input.command, &dir, env, None)?,
+            &log,
+        )
+        .await;
     }
     let report = cx.spill.join(format!("{}.cwd", cx.call));
-    let spawn = spawn(cx, &input.command, &dir, env, Some(&report))?;
+    let spawn = spawn_with::<D>(facts, cx, &input.command, &dir, env, Some(&report))?;
     // Both streams share the one file, and its offset: in the order written.
     let (file, log) = create_private(&log)?;
     // Watched before anything can write to it: a write before the watch
@@ -366,9 +405,7 @@ async fn launch(cx: &Cx, process: Spawn, file: File) -> io::Result<OwnedProcess>
         .await
 }
 
-/// The process for `command`, as the `spawn` hooks leave it: bash without
-/// startup files, so the user's prompt and aliases stay out of it, given a
-/// script that reports where it ended to `report`.
+#[cfg(test)]
 fn spawn(
     cx: &Cx,
     command: &str,
@@ -376,35 +413,37 @@ fn spawn(
     env: BTreeMap<String, String>,
     report: Option<&Path>,
 ) -> io::Result<Spawn> {
-    let bash = sys::find_bash(env.get("PATH").map(String::as_str)).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "bash not found: neither /bin/bash nor bash on PATH",
-        )
-    })?;
+    spawn_with::<crate::dialect::Bash>(
+        sys::shell::ExecutionFacts::current(),
+        cx,
+        command,
+        dir,
+        env,
+        report,
+    )
+}
+
+fn spawn_with<D: crate::dialect::Dialect>(
+    facts: &sys::shell::ExecutionFacts,
+    cx: &Cx,
+    command: &str,
+    dir: &Path,
+    mut env: BTreeMap<String, String>,
+    report: Option<&Path>,
+) -> io::Result<Spawn> {
     if report.is_some() {
         private_dir(&cx.spill)?;
     }
-    let mut script = String::new();
-    if let Some(report) = report {
-        let pwd = format!("{} >{}", sys::shell_pwd(), quote(&sys::shell_path(report)));
-        let _ = writeln!(script, "trap {} EXIT", quote(&pwd));
-    }
-    // On its own line, so a command ending in a comment or a heredoc
-    // still ends where it should.
-    let _ = writeln!(
-        script,
-        "cd -- {} || exit\n{command}",
-        quote(&sys::shell_path(dir))
-    );
-    let spawn = Spawn {
-        argv: [bash.as_str(), "--noprofile", "--norc", "-c", &script]
-            .map(str::to_owned)
-            .into(),
+    // Noninteractive startup files must not rewrite the wrapper's contract.
+    env.remove("BASH_ENV");
+    env.remove("ENV");
+    let mut argv = vec![facts.executable.to_string_lossy().into_owned()];
+    argv.extend(D::arguments(command, dir, report)?);
+    Ok(Spawn {
+        argv,
         env,
         cwd: dir.to_path_buf(),
-    };
-    Ok(spawn)
+    })
 }
 
 /// The session's environment (the client's, or else the daemon's without
@@ -426,11 +465,6 @@ fn environment(
     env.insert("A_SESSION_ID".to_owned(), cx.session.to_string());
     env.insert("A_MODEL".to_owned(), cx.model.to_string());
     env
-}
-
-/// `text` as one shell word.
-fn quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 fn duration_ms(started: Instant) -> u64 {

@@ -53,7 +53,12 @@ fn context(facts: &Facts<'_>) -> String {
     if facts.workspace != facts.dir {
         let _ = writeln!(text, "workspace: {}", facts.workspace.display());
     }
-    let _ = write!(text, "platform: {}\n</environment>", sys::Platform::CURRENT);
+    let _ = write!(
+        text,
+        "platform: {}\n{}\n</environment>",
+        sys::Platform::CURRENT,
+        sys::shell::ExecutionFacts::current().context()
+    );
     let path = facts.workspace.join("AGENTS.md");
     let mut notes = String::new();
     if std::fs::File::open(&path)

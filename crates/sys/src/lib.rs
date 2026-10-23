@@ -24,6 +24,7 @@ mod memory;
 mod platform;
 mod proc;
 mod runtime;
+pub mod shell;
 mod signals;
 pub mod terminal;
 #[cfg(windows)]

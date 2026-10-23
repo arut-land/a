@@ -144,7 +144,11 @@ jobs:
       - run: mise run test:miri
 
   windows:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
     env:
       # Session panic isolation and the test harness require unwinding;
       # Cranelift does not support it on Windows.
@@ -160,9 +164,22 @@ jobs:
       - uses: actions/checkout@v7
       - *mbx-dir
       - *cache
+      - name: Install native LLVM toolchain
+        shell: pwsh
+        run: |
+          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches.Groups[1].Value
+          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+          $toolchain = "$channel-$arch-pc-windows-msvc"
+          "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+          rustup toolchain install $toolchain --profile minimal --component clippy,rust-src,rustfmt
       - uses: jdx/mise-action@v5
         with:
-          install_args: rust mr-boxington cargo:cargo-nextest
+          install_args: mr-boxington cargo:cargo-nextest
+      - name: Select native PowerShell contract runners
+        shell: pwsh
+        run: |
+          $runners = @((Get-Command pwsh.exe).Source, "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
+          "A_TEST_POWERSHELL=$($runners -join ';')" >> $env:GITHUB_ENV
       - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
       - run: mise exec -- cargo build -p a
       - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
