@@ -54,11 +54,12 @@ impl Serialize for Hex {
     }
 }
 
+// Static musl has no dladdr lookup; program headers cover static and dynamic images.
 #[cfg(target_os = "linux")]
-pub(super) fn of(base: usize) -> Option<Identity> {
+pub(super) fn frame(ip: usize) -> super::Frame {
     struct Search {
-        base: usize,
-        identity: Option<Identity>,
+        ip: usize,
+        frame: super::Frame,
     }
     unsafe extern "C" fn visit(
         info: *mut libc::dl_phdr_info,
@@ -73,16 +74,33 @@ pub(super) fn of(base: usize) -> Option<Identity> {
         let Ok(bias) = usize::try_from(info.dlpi_addr) else {
             return 0;
         };
-        let matches = headers.iter().any(|h| {
+        let Some(relative) = search
+            .ip
+            .checked_sub(bias)
+            .and_then(|value| u64::try_from(value).ok())
+        else {
+            return 0;
+        };
+        if !headers.iter().any(|h| {
             h.p_type == libc::PT_LOAD
-                && usize::try_from(h.p_vaddr)
-                    .ok()
-                    .and_then(|start| bias.checked_add(start))
-                    == Some(search.base)
-        });
-        if !matches {
+                && relative >= h.p_vaddr
+                && h.p_vaddr
+                    .checked_add(h.p_memsz)
+                    .is_some_and(|end| relative < end)
+        }) {
             return 0;
         }
+        let Some(base) = headers
+            .iter()
+            .filter(|h| h.p_type == libc::PT_LOAD)
+            .map(|h| h.p_vaddr)
+            .min()
+            .and_then(|start| usize::try_from(start).ok())
+            .and_then(|start| bias.checked_add(start))
+        else {
+            return 0;
+        };
+        let mut build = None;
         for h in headers.iter().filter(|h| h.p_type == libc::PT_NOTE) {
             let (Ok(start), Ok(len)) = (usize::try_from(h.p_vaddr), usize::try_from(h.p_memsz))
             else {
@@ -109,19 +127,27 @@ pub(super) fn of(base: usize) -> Option<Identity> {
             // SAFETY: the range was checked against a readable loaded segment.
             let notes = unsafe { std::slice::from_raw_parts(address as *const u8, len) };
             if let Some(id) = build_id(notes, h.p_align) {
-                search.identity = Some(Identity::ElfBuildId(id));
+                build = Some(id);
                 break;
             }
         }
+        search.frame = super::Frame {
+            image: build.map_or(0, |id| crate::fnv1a(&id.bytes[..id.len])),
+            offset: search.ip.saturating_sub(base) as u64,
+            identity: build.map(Identity::ElfBuildId),
+        };
         1
     }
     let mut search = Search {
-        base,
-        identity: None,
+        ip,
+        frame: super::Frame {
+            offset: ip as u64,
+            ..super::Frame::default()
+        },
     };
     // SAFETY: callback and context remain valid for this synchronous loader walk.
     unsafe { libc::dl_iterate_phdr(Some(visit), (&raw mut search).cast()) };
-    search.identity
+    search.frame
 }
 
 #[cfg(target_os = "linux")]
@@ -138,7 +164,28 @@ fn build_id(notes: &[u8], align: u64) -> Option<Hex> {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn of(base: usize) -> Option<Identity> {
+pub(super) fn frame(ip: usize) -> super::Frame {
+    use std::ffi::{CStr, c_void};
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
+    // SAFETY: dladdr reads the address and fills the output buffer.
+    let found = unsafe { libc::dladdr(ip as *const c_void, info.as_mut_ptr()) } != 0;
+    // SAFETY: zeroed first, then filled by dladdr.
+    let info = unsafe { info.assume_init() };
+    let image = if found && !info.dli_fname.is_null() {
+        // SAFETY: the loader owns this NUL-terminated name for this call.
+        crate::fnv1a(unsafe { CStr::from_ptr(info.dli_fname) }.to_bytes())
+    } else {
+        0
+    };
+    super::Frame {
+        image,
+        offset: ip.saturating_sub(info.dli_fbase as usize) as u64,
+        identity: found.then(|| of(info.dli_fbase as usize)).flatten(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn of(base: usize) -> Option<Identity> {
     use object::{LittleEndian, macho::MachHeader64, read::macho::MachHeader};
     // SAFETY: base came from dladdr for a frame in a loaded image. Both supported
     // Apple architectures use native little-endian 64-bit Mach headers.
@@ -245,6 +292,17 @@ mod tests {
             serde_json::to_string(&Hex::new(&[0, 15, 255]).unwrap()).unwrap(),
             "\"000fff\""
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not provide loaded ELF images")]
+    fn a_program_counter_identifies_its_image_without_symbol_lookup() {
+        let pc = super::frame as *const () as usize;
+        let frame = super::frame(pc);
+        assert!(matches!(frame.identity, Some(Identity::ElfBuildId(_))));
+        assert_ne!(frame.image, 0);
+        assert!(frame.offset > 0 && frame.offset < pc as u64);
     }
 
     #[cfg(target_os = "linux")]

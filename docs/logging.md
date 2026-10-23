@@ -62,7 +62,9 @@ image size and optional CodeView RSDS GUID bytes/age. Hex fields preserve
 native byte order; the RSDS GUID's first three fields use Windows little-endian
 GUID layout. Identities come from the loader's mapped image, so a moved,
 replaced or deleted executable path cannot change the report's identity.
-Missing native identity is explicit rather than substituted with a path.
+Linux resolves program counters directly through loaded ELF segments, including
+static executables, and hashes the build-id for image correlation. Missing native
+identity is explicit rather than substituted with a path.
 The `object` crate parses bounded mapped ELF notes and Mach-O load commands;
 compression and unused formats are disabled. Windows uses the existing
 `windows-sys` PE definitions. No executable file is opened during a panic.

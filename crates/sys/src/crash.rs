@@ -390,7 +390,7 @@ fn stack() -> Frames {
 // report boundary, even in debug builds. Build debug info resolves them offline.
 #[cfg(unix)]
 fn stack() -> Frames {
-    use std::ffi::{CStr, c_int, c_void};
+    use std::ffi::{c_int, c_void};
     unsafe extern "C" {
         fn _Unwind_Backtrace(
             frame: extern "C" fn(*mut c_void, *mut c_void) -> c_int,
@@ -403,22 +403,7 @@ fn stack() -> Frames {
         let frames = unsafe { &mut *frames.cast::<Frames>() };
         // SAFETY: cx is the unwinder's current frame context.
         let ip = unsafe { _Unwind_GetIP(cx) };
-        let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
-        // SAFETY: dladdr reads the address and fills the output buffer.
-        let found = unsafe { libc::dladdr(ip as *const c_void, info.as_mut_ptr()) } != 0;
-        // SAFETY: zeroed first, then filled by dladdr.
-        let info = unsafe { info.assume_init() };
-        let image = if found && !info.dli_fname.is_null() {
-            // SAFETY: the loader owns this NUL-terminated name for this call.
-            crate::fnv1a(unsafe { CStr::from_ptr(info.dli_fname) }.to_bytes())
-        } else {
-            0
-        };
-        frames.frames[frames.len] = Frame {
-            image,
-            offset: ip.saturating_sub(info.dli_fbase as usize) as u64,
-            identity: found.then(|| image::of(info.dli_fbase as usize)).flatten(),
-        };
+        frames.frames[frames.len] = image::frame(ip);
         frames.len += 1;
         if frames.len < DEEP { 0 } else { 5 }
     }
