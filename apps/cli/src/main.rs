@@ -218,17 +218,6 @@ enum Input {
 /// as lines and its intents typed. When the daemon drains for an upgrade,
 /// it reconnects (starting the new build) and replays what it missed.
 fn repl(daemon: &client::Daemon, target: Target) -> io::Result<()> {
-    let signals = sys::Signals::catch(&[
-        sys::Signal::Interrupt,
-        sys::Signal::Terminate,
-        sys::Signal::Hangup,
-    ])?;
-    std::thread::spawn(move || {
-        if let Some(signal) = signals.wait().into_iter().next() {
-            sys::terminal::restore();
-            sys::reraise(signal);
-        }
-    });
     let _terminal = sys::terminal::LineMode::enter()?;
     let (tx, rx) = client::inbox(client::QueueBudget::default(), |input| {
         size_of::<Input>()

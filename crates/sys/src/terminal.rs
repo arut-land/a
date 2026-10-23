@@ -150,6 +150,7 @@ mod imp {
     /// Cooked Unix input already belongs to the terminal driver's job control.
     pub struct LineMode;
 
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)] // Shared backend contract.
     impl LineMode {
         pub fn enter() -> io::Result<Self> {
             Ok(Self)
@@ -194,7 +195,7 @@ mod imp {
 
     /// Cleanup output must be possible after the shell takes the foreground.
     /// Normal writes check ownership first, then block TTOU across the syscall
-    /// so a racing foreground change cannot trap write_all in signal retries.
+    /// so a racing foreground change cannot trap `write_all` in signal retries.
     pub struct OutputGuard(libc::sigset_t);
 
     impl OutputGuard {
@@ -332,13 +333,13 @@ mod tests {
     use std::process::{Command, Stdio};
 
     fn assert_modes(before: &rustix::termios::Termios, after: &rustix::termios::Termios) {
+        use rustix::termios::SpecialCodeIndex as C;
         assert_eq!(after.input_modes, before.input_modes);
         assert_eq!(after.output_modes, before.output_modes);
         assert_eq!(after.control_modes, before.control_modes);
         // BSD sets PENDIN when cooked processing must reconsider queued input.
         let pending = rustix::termios::LocalModes::PENDIN;
         assert_eq!(after.local_modes & !pending, before.local_modes & !pending);
-        use rustix::termios::SpecialCodeIndex as C;
         for code in [
             C::VMIN,
             C::VTIME,
@@ -356,6 +357,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_lossless)] // ioctl request types differ between Unix targets.
     fn the_terminal_is_restored_after_a_panic() {
         const NAME: &str = "terminal::tests::the_terminal_is_restored_after_a_panic";
         if std::env::var_os("A_TEST_TTY").is_some() {
@@ -378,18 +380,16 @@ mod tests {
         let mut slave = -1;
         // SAFETY: openpty initializes these two descriptors; optional name,
         // termios and window size buffers are omitted.
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &raw mut master,
-                    &raw mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            },
-            0
-        );
+        let opened = unsafe {
+            libc::openpty(
+                &raw mut master,
+                &raw mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0);
         // SAFETY: each successful openpty descriptor is transferred once.
         let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
         // Neither descriptor may leak into the test child outside its stdio.

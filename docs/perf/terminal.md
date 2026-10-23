@@ -2,9 +2,10 @@
 
 The terminal backend uses the existing rustix/libc and windows-sys
 bindings, with the existing vte decoder shared by every terminal. No new
-dependency, periodic wake or input worker is added to the TUI. The line
-REPL has a signal waiter so console state is restored on native control
-events as well as normal return, a broken output pipe and panic.
+dependency, periodic wake or input worker is added to the TUI. The Windows line
+REPL restores console state directly in its control callback as well as on
+normal return, a broken output pipe and panic; Unix cooked input needs no
+additional waiter.
 
 Crossterm was considered as the maintained terminal implementation. Its
 [documented raw-mode contract](https://docs.rs/crossterm/latest/crossterm/terminal/)

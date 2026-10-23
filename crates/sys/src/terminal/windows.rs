@@ -5,12 +5,13 @@ use std::io;
 use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle};
 
 use windows_sys::Win32::System::Console::{
-    CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
-    ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
+    CONSOLE_SCREEN_BUFFER_INFO, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
+    CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
+    ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
     ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
     GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo, INPUT_RECORD,
-    KEY_EVENT, ReadConsoleInputW, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP,
-    WINDOW_BUFFER_SIZE_EVENT,
+    KEY_EVENT, ReadConsoleInputW, SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode,
+    SetConsoleOutputCP, WINDOW_BUFFER_SIZE_EVENT,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 
@@ -101,6 +102,7 @@ impl Drop for RawMode {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // Shared job-control contract.
 pub fn suspend() -> io::Result<()> {
     Ok(())
 }
@@ -239,6 +241,108 @@ impl InputReader {
     }
 }
 
+/// Each redirected side remains byte-oriented; only real console handles
+/// participate in mode and code-page ownership.
+pub struct LineMode {
+    input_cp: Option<u32>,
+    control: bool,
+    output: Option<(OwnedHandle, u32, u32)>,
+}
+
+impl LineMode {
+    pub fn enter() -> io::Result<Self> {
+        let mut saved = Self {
+            input_cp: None,
+            control: false,
+            output: None,
+        };
+        let mut mode = 0;
+        // SAFETY: standard handles are borrowed for the call and mode is writable.
+        unsafe {
+            if GetConsoleMode(io::stdin().as_handle().as_raw_handle(), &raw mut mode) != 0 {
+                saved.input_cp = Some(GetConsoleCP());
+                ok(SetConsoleCP(65001))?;
+            }
+            if GetConsoleMode(io::stdout().as_handle().as_raw_handle(), &raw mut mode) != 0 {
+                let output = io::stdout().as_handle().try_clone_to_owned()?;
+                saved.output = Some((output, mode, GetConsoleOutputCP()));
+                ok(SetConsoleMode(
+                    saved.output.as_ref().unwrap().0.as_raw_handle(),
+                    mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                ))?;
+                ok(SetConsoleOutputCP(65001))?;
+            }
+        }
+        // LINE's lock is held until this snapshot is published. A control
+        // callback during setup waits for it before restoring the console.
+        // SAFETY: process-lifetime function; removal is owned by the guard.
+        ok(unsafe { SetConsoleCtrlHandler(Some(line_control), 1) })?;
+        saved.control = true;
+        Ok(saved)
+    }
+}
+
+unsafe extern "system" fn line_control(event: u32) -> i32 {
+    if matches!(
+        event,
+        CTRL_C_EVENT
+            | CTRL_BREAK_EVENT
+            | CTRL_CLOSE_EVENT
+            | CTRL_LOGOFF_EVENT
+            | CTRL_SHUTDOWN_EVENT
+    ) {
+        super::restore();
+    }
+    // Let the next handler preserve the console's native termination status.
+    0
+}
+
+impl LineMode {
+    pub fn restore(&self) -> io::Result<()> {
+        let mut failed = false;
+        // SAFETY: saved console handle remains owned through these calls.
+        unsafe {
+            if let Some(cp) = self.input_cp {
+                failed |= SetConsoleCP(cp) == 0;
+            }
+            if let Some((handle, mode, cp)) = &self.output {
+                failed |= SetConsoleMode(handle.as_raw_handle(), *mode) == 0;
+                failed |= SetConsoleOutputCP(*cp) == 0;
+            }
+        }
+        if failed {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for LineMode {
+    fn drop(&mut self) {
+        let _ = self.restore();
+        if self.control {
+            // SAFETY: removes only this guard's registered process callback.
+            unsafe {
+                SetConsoleCtrlHandler(Some(line_control), 0);
+            }
+        }
+    }
+}
+
+pub struct OutputGuard;
+#[allow(clippy::unnecessary_wraps)] // Shared output-ownership contract.
+impl OutputGuard {
+    pub fn enter() -> io::Result<Self> {
+        Ok(Self)
+    }
+}
+
+#[allow(clippy::unnecessary_wraps)] // A console has no Unix foreground jobs.
+pub fn is_foreground() -> io::Result<bool> {
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +377,12 @@ mod tests {
             FreeConsole();
             assert_ne!(AllocConsole(), 0);
         }
+        assert_panic_restores_state();
+        let signals = Signals::catch(&[Signal::Interrupt, Signal::Terminate]).unwrap();
+        assert_input_events(signals);
+    }
+
+    fn assert_panic_restores_state() {
         let mut input_mode = 0;
         let mut output_mode = 0;
         // SAFETY: live standard handles from AllocConsole and writable modes.
@@ -291,44 +401,47 @@ mod tests {
         }
         // SAFETY: scalar queries for this test's console.
         let cp = unsafe { (GetConsoleCP(), GetConsoleOutputCP()) };
-        let signals = Signals::catch(&[Signal::Interrupt, Signal::Terminate]).unwrap();
-        let panic = std::panic::catch_unwind(|| {
-            let _raw = super::super::RawMode::enter().unwrap();
-            // SAFETY: scalar queries for the owned console.
-            assert_eq!(
-                unsafe { (GetConsoleCP(), GetConsoleOutputCP()) },
-                (65001, 65001)
-            );
-            panic!("restore the console on unwind");
-        });
-        assert!(panic.is_err());
-        let mut restored_input = 0;
-        let mut restored_output = 0;
-        // SAFETY: same handles and writable modes as above.
-        unsafe {
-            assert_ne!(
-                GetConsoleMode(
-                    io::stdin().as_handle().as_raw_handle(),
-                    &raw mut restored_input
-                ),
-                0
-            );
-            assert_ne!(
-                GetConsoleMode(
-                    io::stdout().as_handle().as_raw_handle(),
-                    &raw mut restored_output
-                ),
-                0
-            );
-            assert_eq!((GetConsoleCP(), GetConsoleOutputCP()), cp);
+        for raw in [true, false] {
+            let panic = std::panic::catch_unwind(|| {
+                let _raw = raw.then(|| super::super::RawMode::enter().unwrap());
+                let _line = (!raw).then(|| super::super::LineMode::enter().unwrap());
+                // SAFETY: scalar queries for the owned console.
+                let cp = unsafe { (GetConsoleCP(), GetConsoleOutputCP()) };
+                assert_eq!(cp, (65001, 65001));
+                panic!("restore the console on unwind");
+            });
+            assert!(panic.is_err());
+            let mut restored_input = 0;
+            let mut restored_output = 0;
+            // SAFETY: same handles and writable modes as above.
+            unsafe {
+                assert_ne!(
+                    GetConsoleMode(
+                        io::stdin().as_handle().as_raw_handle(),
+                        &raw mut restored_input
+                    ),
+                    0
+                );
+                assert_ne!(
+                    GetConsoleMode(
+                        io::stdout().as_handle().as_raw_handle(),
+                        &raw mut restored_output
+                    ),
+                    0
+                );
+                assert_eq!((GetConsoleCP(), GetConsoleOutputCP()), cp);
+            }
+            assert_eq!((restored_input, restored_output), (input_mode, output_mode));
         }
-        assert_eq!((restored_input, restored_output), (input_mode, output_mode));
+    }
+
+    fn assert_input_events(signals: Signals) {
         let _raw = super::super::RawMode::enter().unwrap();
         let mut reader = InputReader::new(signals);
         let mut records = vec![];
         for unit in "A🙂".encode_utf16() {
             records.push(INPUT_RECORD {
-                EventType: KEY_EVENT as u16,
+                EventType: u16::try_from(KEY_EVENT).unwrap(),
                 Event: INPUT_RECORD_0 {
                     KeyEvent: KEY_EVENT_RECORD {
                         bKeyDown: 1,
@@ -340,7 +453,7 @@ mod tests {
             });
         }
         records.push(INPUT_RECORD {
-            EventType: WINDOW_BUFFER_SIZE_EVENT as u16,
+            EventType: u16::try_from(WINDOW_BUFFER_SIZE_EVENT).unwrap(),
             ..Default::default()
         });
         let mut count = 0;
@@ -354,7 +467,7 @@ mod tests {
                 WriteConsoleInputW(
                     io::stdin().as_handle().as_raw_handle(),
                     records.as_ptr(),
-                    records.len() as u32,
+                    u32::try_from(records.len()).unwrap(),
                     &raw mut count
                 ),
                 0
@@ -379,71 +492,4 @@ mod tests {
             assert_eq!(reader.signals.wait(), [signal]);
         }
     }
-}
-
-/// Each redirected side remains byte-oriented; only real console handles
-/// participate in mode and code-page ownership.
-pub struct LineMode {
-    input_cp: Option<u32>,
-    output: Option<(OwnedHandle, u32, u32)>,
-}
-
-impl LineMode {
-    pub fn enter() -> io::Result<Self> {
-        let mut saved = Self {
-            input_cp: None,
-            output: None,
-        };
-        let mut mode = 0;
-        // SAFETY: standard handles are borrowed for the call and mode is writable.
-        unsafe {
-            if GetConsoleMode(io::stdin().as_handle().as_raw_handle(), &raw mut mode) != 0 {
-                saved.input_cp = Some(GetConsoleCP());
-                ok(SetConsoleCP(65001))?;
-            }
-            if GetConsoleMode(io::stdout().as_handle().as_raw_handle(), &raw mut mode) != 0 {
-                let output = io::stdout().as_handle().try_clone_to_owned()?;
-                saved.output = Some((output, mode, GetConsoleOutputCP()));
-                ok(SetConsoleMode(
-                    saved.output.as_ref().unwrap().0.as_raw_handle(),
-                    mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-                ))?;
-                ok(SetConsoleOutputCP(65001))?;
-            }
-        }
-        Ok(saved)
-    }
-}
-
-impl LineMode {
-    pub fn restore(&self) -> io::Result<()> {
-        // SAFETY: saved console handle remains owned through these calls.
-        unsafe {
-            if let Some(cp) = self.input_cp {
-                SetConsoleCP(cp);
-            }
-            if let Some((handle, mode, cp)) = &self.output {
-                SetConsoleMode(handle.as_raw_handle(), *mode);
-                SetConsoleOutputCP(*cp);
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for LineMode {
-    fn drop(&mut self) {
-        let _ = self.restore();
-    }
-}
-
-pub struct OutputGuard;
-impl OutputGuard {
-    pub fn enter() -> io::Result<Self> {
-        Ok(Self)
-    }
-}
-
-pub fn is_foreground() -> io::Result<bool> {
-    Ok(true)
 }

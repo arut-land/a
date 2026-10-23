@@ -47,8 +47,8 @@ impl Terminal {
     /// buffer and the mouse (inline keeps the terminal's own scrolling and
     /// selection).
     pub fn enter(viewport: Viewport) -> io::Result<Self> {
-        let cooked = RawMode::enter()?;
         static HOOK: Once = Once::new();
+        let cooked = RawMode::enter()?;
         HOOK.call_once(|| {
             let previous = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
@@ -146,6 +146,7 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
             match input {
                 Input::Signals(signals) => {
                     let mut resized = false;
+                    let mut suspended = false;
                     for signal in signals {
                         if matches!(signal, Signal::Resize | Signal::Continue) {
                             resized = true;
@@ -153,7 +154,7 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
                             signal,
                             Signal::Suspend | Signal::BackgroundRead | Signal::BackgroundWrite
                         ) {
-                            request_suspend(&tx);
+                            suspended = true;
                         } else if signal == Signal::Interrupt {
                             let _ = tx.send_first(Event::Input(super::keys::Input::Key(
                                 super::keys::Key::Ctrl('c'),
@@ -161,6 +162,9 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
                         } else {
                             end(signal);
                         }
+                    }
+                    if suspended {
+                        request_suspend(&tx);
                     }
                     if resized && open && tx.send_first(Event::Resized).is_err() {
                         open = false;
