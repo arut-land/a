@@ -303,27 +303,22 @@ impl<'a> SpawnPlan<'a> {
 
     pub(crate) fn spawn(self) -> io::Result<Child> {
         let environment = self.environment_values();
+        let directory = std::path::absolute(
+            self.command
+                .get_current_dir()
+                .unwrap_or(std::path::Path::new(".")),
+        )?;
         let program = self.command.get_program();
         // posix_spawnp searches the parent's PATH. Resolve using the child's
         // environment so one session cannot select another's executable.
         let executable = if program.as_bytes().contains(&b'/') {
-            program.to_owned()
+            directory.join(program).into_os_string()
         } else {
             let path = environment
                 .get(OsStr::new("PATH"))
                 .map_or(OsStr::new("/usr/bin:/bin"), OsString::as_os_str);
             std::env::split_paths(path)
-                .map(|dir| {
-                    let path = dir.join(program);
-                    if path.is_absolute() {
-                        path
-                    } else {
-                        self.command
-                            .get_current_dir()
-                            .unwrap_or(std::path::Path::new("."))
-                            .join(path)
-                    }
-                })
+                .map(|dir| directory.join(dir).join(program))
                 .find(|path| {
                     path.is_file() && rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()
                 })
@@ -352,7 +347,7 @@ impl<'a> SpawnPlan<'a> {
             .collect::<io::Result<_>>()?;
         let mut envp: Vec<_> = env.iter().map(|v| v.as_ptr().cast_mut()).collect();
         envp.push(std::ptr::null_mut());
-        let (actions, duplicates) = self.actions()?;
+        let (actions, duplicates) = self.actions(&directory)?;
         let attributes = self.attributes()?;
         #[cfg(all(target_os = "linux", not(target_env = "gnu")))]
         let pid = {
@@ -361,7 +356,7 @@ impl<'a> SpawnPlan<'a> {
                 &executable,
                 &argv,
                 &envp,
-                self.command.get_current_dir(),
+                Some(&directory),
                 &duplicates,
                 self.session,
                 self.group,
@@ -421,7 +416,7 @@ impl<'a> SpawnPlan<'a> {
         environment
     }
 
-    fn actions(&self) -> io::Result<(Actions, Vec<OwnedFd>)> {
+    fn actions(&self, directory: &std::path::Path) -> io::Result<(Actions, Vec<OwnedFd>)> {
         let mut actions = Actions::new()?;
         // Keep sources out of destination slots even when stdin/out are closed
         // in the parent; dup actions must not clobber another action's source.
@@ -451,7 +446,7 @@ impl<'a> SpawnPlan<'a> {
             })?;
             duplicates.push(fd);
         }
-        if let Some(directory) = self.command.get_current_dir() {
+        {
             let directory = string(directory.as_os_str())?;
             // SAFETY: initialized actions; the action copies the directory string.
             checked(unsafe {
@@ -574,6 +569,45 @@ mod tests {
             .write(true)
             .open("/dev/null")
             .unwrap()
+    }
+
+    #[test]
+    fn relative_working_directories_and_path_entries_resolve_once() {
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let name = format!("target/spawn-paths-{}", std::process::id());
+        let root = Directory(std::env::current_dir().unwrap().join(&name));
+        std::fs::create_dir_all(root.0.join("child/bin")).unwrap();
+        for directory in ["child", "child/bin"] {
+            std::os::unix::fs::symlink("/bin/sh", root.0.join(directory).join("runner")).unwrap();
+        }
+        let null = null();
+        for (program, path) in [
+            ("runner", "."),
+            ("runner", "bin"),
+            ("runner", ""),
+            ("./runner", ""),
+            ("bin/runner", ""),
+        ] {
+            let mut command = Command::new(program);
+            command
+                .args(["-c", "exit 17"])
+                .current_dir(std::path::Path::new(&name).join("child"))
+                .env("PATH", path);
+            assert_eq!(
+                command.status().unwrap().code(),
+                Some(17),
+                "standard Command fixture: {program}, PATH={path:?}"
+            );
+            let mut child = SpawnPlan::new(&command, [&null, &null, &null])
+                .spawn()
+                .unwrap_or_else(|error| panic!("{program}, PATH={path:?}: {error}"));
+            assert_eq!(child.wait().unwrap().code(), Some(17));
+        }
     }
 
     #[test]

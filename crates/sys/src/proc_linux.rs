@@ -100,20 +100,31 @@ enum CloseFds {
 }
 impl CloseFds {
     fn prepare(range: bool, inventory: impl FnOnce() -> io::Result<u64>) -> io::Result<Self> {
-        let max_open = inventory()?;
+        if range {
+            return Ok(Self::Range);
+        }
+        // A lowered hard limit cannot account for older, higher descriptors.
+        // Without either close_range or a complete inventory, fail closed.
+        let max_open = inventory()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "close_range unavailable; cannot inspect inherited descriptors: {error}"
+                    ),
+                )
+            })?
+            .checked_add(1)
+            .ok_or(io::ErrorKind::Unsupported)?;
         // SAFETY: getrlimit initializes this writable output.
         let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
         // SAFETY: valid resource constant and output pointer.
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        let ceiling = i32::try_from(limit.rlim_max.max(max_open + 1))
-            .map_err(|_| io::ErrorKind::Unsupported)?;
-        Ok(if range {
-            Self::Range
-        } else {
-            Self::Loop(ceiling)
-        })
+        let ceiling =
+            i32::try_from(limit.rlim_max.max(max_open)).map_err(|_| io::ErrorKind::Unsupported)?;
+        Ok(Self::Loop(ceiling))
     }
 }
 fn close_range_available() -> bool {

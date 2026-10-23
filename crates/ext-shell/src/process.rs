@@ -263,6 +263,8 @@ async fn reap_output(
     capture: Option<sys::OutputCapture>,
     runtime: rt::Rt,
 ) {
+    let scope_done = Flag::default();
+    let capture_done = scope_done.clone();
     let capturing = Arc::clone(&owned.1);
     let copy_reactor = reactor.clone();
     let copy_runtime = Arc::clone(&runtime);
@@ -270,7 +272,14 @@ async fn reap_output(
         let result = if let Some(capture) = capture {
             let result = async {
                 let input = rt::Async::read_pipe(&copy_reactor, capture.reader)?;
-                capture_output(&*copy_runtime, input, capture.file, &capturing).await
+                capture_output(
+                    &*copy_runtime,
+                    input,
+                    capture.file,
+                    &capturing,
+                    &capture_done,
+                )
+                .await
             }
             .await;
             if result.is_err() {
@@ -292,13 +301,12 @@ async fn reap_output(
             descendants(&reactor, &owned.1, &*runtime).await
         }
         .await;
-        if result.is_err() {
-            lock(&owned.1.group).take();
-        }
+        lock(&owned.1.group).take();
+        scope_done.set();
         result
     };
-    // Process completion includes every byte already accepted from stdout.
-    // Retain containment until both capture and descendant observation end.
+    // Escaped writers cannot extend ownership. Finish accepted writes, then
+    // give buffered pipe completions a bounded byte budget and grace period.
     let _ = rt::zip(copying, reaping).await;
 }
 
@@ -308,11 +316,63 @@ async fn capture_output(
     input: rt::Async<sys::ProcessPipe>,
     mut file: std::fs::File,
     live: &Live,
+    scope_done: &Flag,
 ) -> io::Result<()> {
     let mut buffer = vec![0; 64 << 10];
     let mut retained = 0u64;
+    let mut drain_left = 1 << 20;
+    let mut drain_until = None;
     loop {
-        let read = input.read_with(|mut input| input.read(&mut buffer)).await?;
+        let read = if scope_done.is_set() {
+            if drain_left == 0 {
+                return Ok(());
+            }
+            let deadline = *drain_until
+                .get_or_insert_with(|| runtime.now() + std::time::Duration::from_millis(100));
+            let remaining = deadline.saturating_duration_since(runtime.now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            let size = buffer.len().min(drain_left);
+            match rt::or(
+                async {
+                    input
+                        .read_with(|mut input| input.read(&mut buffer[..size]))
+                        .await
+                        .map(Some)
+                },
+                async {
+                    runtime.sleep(remaining).await;
+                    Ok(None)
+                },
+            )
+            .await?
+            {
+                Some(read) => {
+                    drain_left -= read;
+                    read
+                }
+                None => return Ok(()),
+            }
+        } else {
+            match rt::or(
+                async {
+                    scope_done.wait().await;
+                    Ok(None)
+                },
+                async {
+                    input
+                        .read_with(|mut input| input.read(&mut buffer))
+                        .await
+                        .map(Some)
+                },
+            )
+            .await?
+            {
+                Some(read) => read,
+                None => continue,
+            }
+        };
         if read == 0 {
             return Ok(());
         }
@@ -417,6 +477,159 @@ mod tests {
                 env: std::env::vars().collect(),
             },
             output: ProcessOutput::Stdio,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn escaped_stdout_cannot_hold_a_timeout_or_its_capacity() {
+        escaped_stdout_releases_capacity(false);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn escaped_stdout_cannot_hold_cancellation_or_its_capacity() {
+        escaped_stdout_releases_capacity(true);
+    }
+
+    #[cfg(unix)]
+    fn escaped_holder(directory: &std::path::Path) -> std::path::PathBuf {
+        let source = directory.join("holder.c");
+        let executable = directory.join("holder");
+        std::fs::write(
+            &source,
+            r#"
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    (void)argc;
+    if (setsid() < 0) return 1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    if (strlen(argv[1]) >= sizeof(address.sun_path)) return 2;
+    strcpy(address.sun_path, argv[1]);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address))) return 3;
+    if (write(1, "escaped\n", 8) != 8) return 4;
+    if (write(fd, "r", 1) != 1) return 5;
+    char release;
+    read(fd, &release, 1);
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("cc")
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .unwrap()
+                .success()
+        );
+        executable
+    }
+
+    #[cfg(unix)]
+    fn escaped_stdout_releases_capacity(cancel: bool) {
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+        let rig = Rig::new(
+            if cancel {
+                "escaped-capture-cancel"
+            } else {
+                "escaped-capture-timeout"
+            },
+            Registry::default().with(&crate::Shell).unwrap(),
+        );
+        let executable = escaped_holder(&rig.dir);
+        {
+            let rig = Rig::new(
+                if cancel {
+                    "escaped-cancel"
+                } else {
+                    "escaped-timeout"
+                },
+                Registry::default().with(&crate::Shell).unwrap(),
+            );
+            let socket = rig.dir.join("release.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let cx = rig.cx();
+            // Leave only one slot for the command whose cleanup is under test.
+            let queued: Vec<_> = (0..MAX_PROCESSES - 1)
+                .map(|_| Provider.spawn(&cx, spec(&cx, "true")))
+                .collect();
+            let command = format!("'{}' '{}' & wait", executable.display(), socket.display());
+            std::thread::scope(|scope| {
+                let (sent, received) = std::sync::mpsc::sync_channel(1);
+                let rig = &rig;
+                scope.spawn(move || {
+                    sent.send(rig.done(
+                        "bash",
+                        &serde_json::json!({"command": command, "timeout": 1}),
+                    ))
+                    .unwrap();
+                });
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut holder = loop {
+                    match listener.accept() {
+                        Ok((holder, _)) => break holder,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "holder did not escape");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                holder.set_nonblocking(false).unwrap();
+                holder
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                holder.read_exact(&mut [0]).unwrap();
+                if cancel {
+                    rig.cancel.set();
+                }
+                let result = received.recv_timeout(Duration::from_secs(4));
+                // Release our escaped process even if the regression fails.
+                if let Ok(result) = &result {
+                    assert_eq!(result["aborted"].as_bool().unwrap_or(false), cancel);
+                    if !cancel {
+                        assert_eq!(result["timed_out"], 1);
+                    }
+                    assert!(result["output"].as_str().unwrap().contains("escaped"));
+                    let replacement = Rig::new("escaped-replacement", Registry::default());
+                    let replacement_cx = replacement.cx();
+                    let released_by = Instant::now() + Duration::from_secs(2);
+                    let next = loop {
+                        match rt::block_on(
+                            Provider.spawn(&replacement_cx, spec(&replacement_cx, "true")),
+                        ) {
+                            Ok(next) => break next,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    Instant::now() < released_by,
+                                    "completion retained its permit"
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("{error}"),
+                        }
+                    };
+                    rt::block_on(next.ended());
+                }
+                holder.shutdown(std::net::Shutdown::Write).unwrap();
+                assert_eq!(holder.read(&mut [0]).unwrap(), 0);
+                drop(holder);
+                assert!(
+                    result.is_ok(),
+                    "escaped stdout retained completion: {result:?}"
+                );
+            });
+            drop(queued);
         }
     }
 

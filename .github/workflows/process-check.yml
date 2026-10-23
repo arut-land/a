@@ -20,6 +20,7 @@ jobs:
           install_args: rust mr-boxington cargo:cargo-nextest mold
       - run: sudo apt-get update && sudo apt-get install -y musl-tools busybox-static
       - run: mise exec -- rustup target add x86_64-unknown-linux-musl
+      - run: mise exec -- cargo clippy -p sys --all-targets --target x86_64-unknown-linux-musl -- -D warnings
       - run: mise exec -- cargo nextest run -p sys --target x86_64-unknown-linux-musl --no-fail-fast
       - name: Spawn with no procfs mounted
         if: always()

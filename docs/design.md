@@ -143,7 +143,10 @@ close-on-exec on macOS, a dense descriptor allowlist closed with glibc's
 closefrom/close_range actions on Linux, and Unicode environment plus explicit
 handle and job lists on Windows. The musl backend applies the same fixed plan
 through async-signal-safe child syscalls, using close_range or an old-kernel
-bounded close loop. There are no user callbacks between fork and exec. SSH
+bounded close loop when a descriptor inventory is available. The close_range
+path does not require procfs; without either facility, musl launch fails closed.
+Executable and working-directory paths are made absolute before spawning.
+There are no user callbacks between fork and exec. SSH
 transports preserve terminal access and stderr; shell commands have no terminal
 and null stdin, while protocol subprocesses use explicit pipes. Old Linux
 kernels observe owned children with a blocking, event-driven wait rather than
@@ -157,7 +160,10 @@ processes. Captured output crosses one 64 KiB buffer per process into a spill
 file, with storage back-pressure and a hard 64 MiB retention limit for foreground
 and background jobs. Group observation is capped at 4096 members; exceeding it
 revokes the live lease. Following spill files and enumerating groups use admitted
-storage workers, leaving reactor workers available for other sessions.
+storage workers, leaving reactor workers available for other sessions. Once
+owned-scope cleanup ends, capture finishes accepted writes and drains at most
+1 MiB for up to 100 ms; escaped pipe holders cannot retain admission or delay
+session shutdown indefinitely.
 See [process measurements](perf/processes.md) for native validation and RSS.
 
 ## Extensions and SDK
