@@ -346,9 +346,16 @@ fn create_directory(dir: &Path, existing: bool) -> io::Result<()> {
 /// Makes directory entries durable on platforms with a directory barrier.
 /// Windows callers must publish names with `publish` instead.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
+    // Miri has no directory-fsync model; native publication tests exercise the
+    // persistence barrier while Miri checks the callers' memory safety.
+    #[cfg(miri)]
+    {
+        let _ = dir;
+        Ok(())
+    }
+    #[cfg(all(unix, not(miri)))]
     return File::open(dir)?.sync_all();
-    #[cfg(windows)]
+    #[cfg(all(windows, not(miri)))]
     {
         let _ = dir;
         Err(io::Error::new(
