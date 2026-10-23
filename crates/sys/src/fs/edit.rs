@@ -953,7 +953,19 @@ pub(super) fn access_acl(source: Option<&File>, destination: &File) -> io::Resul
 
 #[cfg(target_os = "linux")]
 fn linux_xattrs(source: &File, content: u64, limit: usize) -> io::Result<Vec<u8>> {
+    linux_xattrs_checked(source, content, limit, 0, &|_| false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_xattrs_checked(
+    source: &File,
+    content: u64,
+    limit: usize,
+    copied: u64,
+    should_cancel: &(dyn Fn(u64) -> bool + Sync),
+) -> io::Result<Vec<u8>> {
     use rustix::fs::{fgetxattr, flistxattr};
+    check_cancel(should_cancel, copied)?;
     let mut remaining = (limit as u64)
         .checked_sub(content)
         .ok_or(io::ErrorKind::FileTooLarge)?;
@@ -972,6 +984,7 @@ fn linux_xattrs(source: &File, content: u64, limit: usize) -> io::Result<Vec<u8>
     }
     names.truncate(length);
     for name in names.split_inclusive(|b| *b == 0) {
+        check_cancel(should_cancel, copied)?;
         let name =
             std::ffi::CStr::from_bytes_with_nul(name).map_err(|_| io::ErrorKind::InvalidData)?;
         let size = fgetxattr(source, name, &mut [0u8; 0][..])?;
@@ -992,10 +1005,12 @@ fn copy_xattrs(
     should_cancel: &(dyn Fn(u64) -> bool + Sync),
 ) -> io::Result<()> {
     use rustix::fs::{XattrFlags, fgetxattr, fremovexattr, fsetxattr};
-    let names = linux_xattrs(source, content as u64, limit)?;
+    let names = linux_xattrs_checked(source, content as u64, limit, *copied, should_cancel)?;
     let mut remaining = limit - content - names.len();
     // Strip ACLs inherited from a directory whose defaults changed since capture.
-    for name in linux_xattrs(destination, 0, limit)?.split_inclusive(|b| *b == 0) {
+    for name in linux_xattrs_checked(destination, 0, limit, *copied, should_cancel)?
+        .split_inclusive(|b| *b == 0)
+    {
         check_cancel(should_cancel, *copied)?;
         if !names
             .split_inclusive(|b| *b == 0)

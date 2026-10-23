@@ -215,6 +215,7 @@ impl<'a> Staged<'a> {
                 self.directory.parent,
                 name,
             )?;
+            remove_if_present(&self.directory.file, ORIGINAL)?;
         }
         #[cfg(windows)]
         rename(source, self.directory.parent, name)?;
@@ -233,7 +234,7 @@ impl<'a> Staged<'a> {
             OsStr::new("probe"),
         )?;
         rustix::fs::renameat(&self.directory.file, "probe", &self.directory.file, CONTENT)?;
-        Ok(())
+        remove_if_present(&self.directory.file, "probe")
     }
 
     pub fn reclaim_original(&mut self, source: &File) -> io::Result<()> {
@@ -282,14 +283,23 @@ impl<'a> Staged<'a> {
 
 #[cfg(unix)]
 fn no_replace(source: &File, from: &OsStr, target: &File, to: &OsStr) -> io::Result<()> {
-    use rustix::fs::{AtFlags, RenameFlags, linkat, renameat_with, unlinkat};
+    use rustix::fs::{AtFlags, RenameFlags, linkat, renameat_with};
     match renameat_with(source, from, target, to, RenameFlags::NOREPLACE) {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::NOTSUP) => {
+            // Publication is complete once linkat succeeds. Cleanup is separate:
+            // a cleanup error must not turn visible publication into an IO error.
             linkat(source, from, target, to, AtFlags::empty())?;
-            unlinkat(source, from, AtFlags::empty())?;
             Ok(())
         }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn remove_if_present(directory: &File, name: &str) -> io::Result<()> {
+    match rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
