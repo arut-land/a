@@ -16,7 +16,7 @@ fn main() {
             let path = std::env::temp_dir().join(format!("a-probe-{}-{n}", std::process::id()));
             std::fs::create_dir(&path).unwrap();
             std::hint::black_box(&path);
-            std::fs::remove_dir(path).unwrap();
+            std::fs::remove_dir_all(path).unwrap();
         }
         #[cfg(feature = "temp-maintained")]
         {

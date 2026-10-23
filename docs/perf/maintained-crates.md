@@ -115,6 +115,8 @@ header-decoding CPU is assessed separately by the corpus probe above.
 | --- | ---: | ---: | ---: |
 | aarch64-unknown-linux-gnu | 3626792 | 3668904 | +42112 |
 | x86_64-unknown-linux-gnu | 4207520 | 4260512 | +52992 |
+| aarch64-pc-windows-msvc | 4763136 | 4811264 | +48128 |
+| x86_64-pc-windows-msvc | 5411840 | 5468160 | +56320 |
 
 Median candidate-minus-reference deltas (observations, not speedup claims):
 
@@ -122,8 +124,17 @@ Median candidate-minus-reference deltas (observations, not speedup claims):
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | aarch64-unknown-linux-gnu | +0.018 | +0.010 | +0.340 | -0.008 | +36.000 | +17.897 | +200.000 |
 | x86_64-unknown-linux-gnu | -0.011 | -0.008 | -0.036 | +0.014 | -32.000 | +18.542 | +32.000 |
+| aarch64-pc-windows-msvc | -0.069 | +0.000 | -3.939 | +0.022 | +0.000 | -109.375 | +36.000 |
+| x86_64-pc-windows-msvc | +0.248 | +0.000 | -0.622 | +0.016 | +32.000 | -62.500 | -256.000 |
 
-Both Linux targets measure zero daemon and idle line-client CPU in both roles.
-Idle RSS changes are +36 KiB on ARM64 and −32 KiB on x86_64, with no consistent
-memory regression across these samples. Raw distributions, including p10–p90,
-all loaded workloads and all five rounds, remain in each target's artifact.
+| Native target | Large JSON CPU ms delta | Large JSON peak RSS KiB delta | Idle daemon CPU ms (main → candidate) | Idle line-client CPU ms (main → candidate) |
+| --- | ---: | ---: | ---: | ---: |
+| aarch64-unknown-linux-gnu | +29.625 | -24.000 | 0.000 → 0.000 | 0.000 → 0.000 |
+| x86_64-unknown-linux-gnu | +46.727 | -120.000 | 0.000 → 0.000 | 0.000 → 0.000 |
+| aarch64-pc-windows-msvc | -46.875 | +56.000 | 0.000 → 0.000 | 0.000 → 0.000 |
+| x86_64-pc-windows-msvc | -187.500 | -56.000 | 0.000 → 0.000 | 0.000 → 0.000 |
+
+Short Windows startup CPU samples round to zero at the accounting clock's
+resolution; they are not proof of free startup. All other deltas should also
+be read with their distributions, not as performance wins. Raw p10–p90,
+all loaded workloads and all five rounds remain in each target's artifact.
