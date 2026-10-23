@@ -15,6 +15,13 @@ jobs:
     runs-on: ${{ inputs.runner }}
     steps:
       - uses: actions/checkout@v7
+      - if: runner.arch == 'ARM64'
+        shell: pwsh
+        run: |
+          $toolchain = (Get-Content rust-toolchain.toml -Raw) -replace 'components = \[.*\]', 'components = ["rust-src"]'
+          Set-Content rust-toolchain.toml $toolchain
+          $profiles = (Get-Content .cargo/profiles.toml -Raw).Replace('codegen-backend = "cranelift"', 'codegen-backend = "llvm"')
+          Set-Content .cargo/profiles.toml $profiles
       - uses: jdx/mise-action@v5
         with:
           install_args: rust mr-boxington cargo:cargo-nextest
