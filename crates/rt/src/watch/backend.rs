@@ -10,7 +10,7 @@ pub struct Backend {
 
 #[cfg(not(windows))]
 impl Backend {
-    pub fn new(_: &Spawn, wanted: &BTreeMap<PathBuf, bool>, changed: Changed) -> io::Result<Self> {
+    pub fn new(_: &Spawn, wanted: &BTreeMap<PathBuf, bool>, changed: &Changed) -> io::Result<Self> {
         use notify::Watcher as _;
         let changed = changed.clone();
         let mut watcher =
