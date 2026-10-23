@@ -573,9 +573,12 @@ async fn supervise(
 ) -> io::Result<Finished> {
     let rt = runtime(cx)?;
     let path = log.to_owned();
-    let mut file = rt::unblock(rt, move || File::open(path)).await?;
-    let mut buf = Vec::new();
-    let (mut output, mut live) = (Output::default(), Live::default());
+    let mut following = Following {
+        file: rt::unblock(rt, move || File::open(path)).await?,
+        buffer: vec![0; 64 * 1024],
+        output: Output::default(),
+        live: Live::default(),
+    };
     let start = rt.now();
     let mut run = Run::Running {
         deadline: start + limit,
@@ -604,10 +607,8 @@ async fn supervise(
             rt::or(writes, rt::or(exits, rt::or(cancelled, sleep))).await?;
         }
         written.get_ref().clear();
-        (file, buf) = follow(file, buf, READ, rt).await?;
-        let read = buf.len() as u64;
-        output.push(&buf);
-        live.push(&buf);
+        let read;
+        (following, read) = following.read(READ, rt).await?;
         behind = read == READ;
         if read > 0 {
             rt::yield_now().await;
@@ -619,7 +620,7 @@ async fn supervise(
         }
         if unreported && now >= reported + REPORT {
             unreported = false;
-            if let Some(text) = live.take() {
+            if let Some(text) = following.live.take() {
                 progress.send(text);
                 reported = now;
             }
@@ -627,7 +628,7 @@ async fn supervise(
         let seen = Seen {
             exited: if exited { None } else { child.try_wait()? },
             cancelled: cx.cancel.is_set(),
-            flooded: output.bytes() > OUTPUT_CAP,
+            flooded: following.output.bytes() > OUTPUT_CAP,
         };
         let signal;
         (run, signal) = run.step(now, seen);
@@ -647,14 +648,15 @@ async fn supervise(
                     // Exit can precede the final captured bytes reaching the file.
                     child.output_drained().await?;
                 }
-                let rest = OUTPUT_CAP.saturating_sub(output.bytes()).min(READ);
-                let (_, buf) = follow(file, buf, rest, rt).await?;
-                output.push(&buf);
+                let rest = OUTPUT_CAP
+                    .saturating_sub(following.output.bytes())
+                    .min(READ);
+                (following, _) = following.read(rest, rt).await?;
                 return Ok(Finished {
                     status,
                     stopped: why,
                     lingering,
-                    output: output.finish(log),
+                    output: following.output.finish(log),
                     process: child,
                 });
             }
@@ -662,28 +664,37 @@ async fn supervise(
     }
 }
 
-/// The cursor and bounded buffer move together through admitted storage work.
-async fn follow(
+/// Reads and rendering share one buffer so a whole batch needs no separate
+/// allocation across the worker boundary.
+struct Following {
     file: File,
-    mut buf: Vec<u8>,
-    most: u64,
-    rt: &dyn rt::Runtime,
-) -> io::Result<(File, Vec<u8>)> {
-    rt::unblock_with(rt, rt::BlockingClass::Storage, 1024 * 1024, move || {
-        buf.resize(usize::try_from(most).map_err(io::Error::other)?, 0);
-        let mut read = 0;
-        while read < buf.len() {
-            match (&file).read(&mut buf[read..]) {
-                Ok(0) => break,
-                Ok(n) => read += n,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+    buffer: Vec<u8>,
+    output: Output,
+    live: Live,
+}
+
+impl Following {
+    async fn read(mut self, most: u64, rt: &dyn rt::Runtime) -> io::Result<(Self, u64)> {
+        rt::unblock_with(rt, rt::BlockingClass::Storage, 1024 * 1024, move || {
+            let mut read = 0;
+            while read < most {
+                let room = usize::try_from(most - read)
+                    .map_or(self.buffer.len(), |left| left.min(self.buffer.len()));
+                match self.file.read(&mut self.buffer[..room]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        self.output.push(&self.buffer[..n]);
+                        self.live.push(&self.buffer[..n]);
+                        read += n as u64;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
             }
-        }
-        buf.truncate(read);
-        Ok((file, buf))
-    })
-    .await
+            Ok((self, read))
+        })
+        .await
+    }
 }
 
 /// `future`, or one that never resolves when `cond` does not hold.
