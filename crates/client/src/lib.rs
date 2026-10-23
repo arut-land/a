@@ -940,10 +940,10 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
         .args(reset.then_some("--reset-breaker"))
         .env_clear()
         .envs(inherited)
-        .env("A_HOME", home.root())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    home.daemon_env(&mut cmd);
     let mut daemon = sys::spawn_daemon(&mut cmd, home, lock)?;
     thread::spawn(move || daemon.wait());
     Ok((endpoint.connect()?, true))

@@ -73,7 +73,7 @@ fn fake_remote(env: &mut Env, uname: &str) -> (Command, Home) {
             r#"shift
 echo "$*" >> '{log}'
 [ "$*" = "uname -sm" ] && [ -n '{uname}' ] && {{ echo '{uname}'; exit; }}
-cd '{remote}' && exec env -u A_HOME HOME='{remote}' PATH=/usr/bin:/bin sh -c "$*"
+cd '{remote}' && exec env A_HOME='{remote}/.a' HOME='{remote}' PATH=/usr/bin:/bin sh -c "$*"
 "#,
             log = env.root.join("ssh.log").display(),
             remote = remote.display(),

@@ -294,7 +294,7 @@ impl Write for &Stream {
 }
 
 #[cfg(unix)]
-mod imp {
+pub(crate) mod imp {
     use std::fs;
     use std::io::{self, Read};
     use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -623,7 +623,7 @@ mod imp {
         validate_directory(dir)
     }
 
-    fn socket_dir() -> PathBuf {
+    pub(crate) fn socket_dir() -> PathBuf {
         let fallback = PathBuf::from(format!("/tmp/a-{}", geteuid().as_raw()));
         // Pathname sockets retain filesystem access control. A missing XDG
         // directory also works without logind, in SSH sessions and containers;
@@ -634,8 +634,20 @@ mod imp {
             &PathBuf::from(format!("/run/user/{}", geteuid().as_raw())),
             fallback,
         );
-        #[cfg(not(target_os = "linux"))]
-        fallback
+        #[cfg(target_os = "macos")]
+        {
+            crate::paths::darwin_temporary_dir()
+                .ok()
+                .map(|dir| dir.join("a"))
+                .filter(|dir| {
+                    dir.join("0000000000000000.sock")
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .len()
+                        < 104
+                })
+                .unwrap_or(fallback)
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -1,0 +1,51 @@
+use super::*;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+
+pub(crate) fn temporary_dir() -> io::Result<PathBuf> {
+    // confstr is independent of an app's inherited TMPDIR/login environment.
+    let size = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
+    if size == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut bytes = vec![0u8; size];
+    let written = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            bytes.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written == 0 || written > size {
+        return Err(io::Error::other(
+            "cannot resolve Darwin user temporary directory",
+        ));
+    }
+    bytes.truncate(written - 1);
+    let path = PathBuf::from(OsString::from_vec(bytes));
+    if !path.is_absolute() {
+        return Err(io::Error::other(
+            "Darwin temporary directory is not absolute",
+        ));
+    }
+    Ok(path)
+}
+
+pub(super) fn resolve() -> io::Result<Paths> {
+    let library = std::env::home_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?
+        .join("Library");
+    let support = library.join("Application Support/dev.a");
+    Ok(Paths {
+        layout: InstallLayout::Native,
+        config: support.clone(),
+        data: support.clone(),
+        state: support,
+        cache: library.join("Caches/dev.a"),
+        logs: library.join("Logs/dev.a"),
+        temporary: temporary_dir()?.join("dev.a"),
+        runtime: crate::endpoint::imp::socket_dir(),
+    })
+}
+
+pub(super) fn daemon_env(_: &Paths, _: &mut Command) {}

@@ -32,7 +32,9 @@ with an explicit stdio handle allowlist and waits for discovery publication
 under the start lock. Its locked daemon record selects a process-generation
 pipe, so retained clients cannot reserve a successor's endpoint. Neither path polls for readiness. The daemon
 holds its pid-file lock for its lifetime, excluding other writers to that
-home. `A_HOME` overrides the default `~/.a`.
+home. `sys::Paths` resolves native configuration, state, data, cache, logs
+and runtime locations; `A_HOME` selects an isolated root. See [paths and
+install layout](paths.md).
 
 The daemon serves connections and session actors on `rt`. Idle sessions
 hibernate; the daemon exits when no clients or work pin it. Upgrades drain

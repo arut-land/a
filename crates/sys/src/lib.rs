@@ -21,6 +21,7 @@ pub mod install;
 pub mod log;
 mod login;
 mod memory;
+mod paths;
 mod platform;
 mod proc;
 mod runtime;
@@ -32,7 +33,6 @@ mod windows;
 mod windows_quote;
 mod workspace;
 
-use std::io;
 use std::path::{Path, PathBuf};
 
 pub use awake::Awake;
@@ -42,6 +42,9 @@ pub use endpoint::{Endpoint, EndpointRetirement, Listener, OwnedConnection, Stre
 pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
 pub use memory::small_footprint;
+/// The resolved locations belonging to one daemon.
+pub use paths::Paths as Home;
+pub use paths::{InstallLayout, Paths};
 pub use platform::{Arch, Os, Platform};
 pub use proc::{
     AdoptLockError, Child, ContainedChild, DaemonLock, ExitWatch, InheritedNumber, OutputCapture,
@@ -54,99 +57,6 @@ pub use signals::{Signals, reraise};
 #[cfg(windows)]
 pub use windows::CompletionSource;
 pub use workspace::{GitEnv, workspace_in, workspace_of};
-
-/// Locations under the per-user home (`$A_HOME`, default `~/.a`).
-#[derive(Clone, Debug)]
-pub struct Home {
-    root: PathBuf,
-}
-
-impl From<PathBuf> for Home {
-    fn from(root: PathBuf) -> Self {
-        Self { root }
-    }
-}
-
-impl Home {
-    pub fn from_env() -> io::Result<Self> {
-        let root = match std::env::var_os("A_HOME") {
-            Some(dir) => PathBuf::from(dir),
-            None => std::env::home_dir()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?
-                .join(".a"),
-        };
-        Ok(root.into())
-    }
-
-    /// `$A_HOME`, else `~/.a`.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub fn run_dir(&self) -> PathBuf {
-        self.root.join("run")
-    }
-
-    /// Locked by the running daemon for its whole life, and holds its pid.
-    pub fn daemon_pid_file(&self) -> PathBuf {
-        self.run_dir().join("daemon.pid")
-    }
-
-    pub fn sessions_dir(&self) -> PathBuf {
-        self.root.join("sessions")
-    }
-
-    /// How every session lists, derived from their logs by the daemon.
-    pub fn catalog_file(&self) -> PathBuf {
-        self.root.join("sessions.idx")
-    }
-
-    /// Where tools keep output too large for a session's log, a private
-    /// directory per session.
-    pub fn spill_dir(&self) -> PathBuf {
-        self.root.join("spill")
-    }
-
-    pub fn logs_dir(&self) -> PathBuf {
-        self.root.join("logs")
-    }
-
-    pub fn daemon_log(&self) -> PathBuf {
-        self.logs_dir().join("daemon.jsonl")
-    }
-
-    /// The daemon's crash reports; see [`crash`].
-    pub fn crash_dir(&self) -> PathBuf {
-        self.root.join("crash")
-    }
-
-    /// Content-addressed attachments too large for a log.
-    pub fn blobs_dir(&self) -> PathBuf {
-        self.root.join("blobs")
-    }
-
-    /// A link to the daemon socket, where a person looking under the home
-    /// finds it. Clients connect to [`Home::endpoint`] itself, whose path
-    /// is short enough for `sun_path` wherever the home is.
-    pub fn socket_link(&self) -> PathBuf {
-        self.run_dir().join("daemon.sock")
-    }
-
-    /// The user's settings; see [`Config`].
-    pub fn config_file(&self) -> PathBuf {
-        self.root.join("config.toml")
-    }
-
-    /// The operator's permission rules, which only tighten; see
-    /// [`config::rules`].
-    pub fn policy_file(&self) -> PathBuf {
-        self.root.join("policy.toml")
-    }
-
-    pub fn runtime(&self) -> Runtime {
-        Runtime::new(self.root.join("runtime"))
-    }
-}
 
 /// What [`ProcessLease::signal`] send, and [`Signals`]
 /// catches. On Windows, console control events stand for the ones a
