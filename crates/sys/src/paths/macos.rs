@@ -1,4 +1,4 @@
-use super::{Command, InstallLayout, PathBuf, Paths, io};
+use super::{Command, InstallLayout, Locations, PathBuf, Paths, io};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 
@@ -38,7 +38,7 @@ pub(super) fn resolve() -> io::Result<Paths> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?
         .join("Library");
     let support = library.join("Application Support/dev.a");
-    Ok(Paths {
+    Ok(Paths::new(Locations {
         layout: InstallLayout::Native,
         config: support.clone(),
         data: support.clone(),
@@ -47,7 +47,7 @@ pub(super) fn resolve() -> io::Result<Paths> {
         logs: library.join("Logs/dev.a"),
         temporary: temporary_dir()?.join("dev.a"),
         runtime: crate::endpoint::runtime_directory(),
-    })
+    }))
 }
 
 pub(super) fn daemon_env(_: &Paths, _: &mut Command) {}

@@ -1,4 +1,4 @@
-use super::{Command, InstallLayout, PathBuf, Paths, io};
+use super::{Command, InstallLayout, Locations, PathBuf, Paths, io};
 use std::os::windows::ffi::OsStringExt;
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::Shell::{
@@ -34,7 +34,7 @@ fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
 
 pub(super) fn resolve() -> io::Result<Paths> {
     let local = known_folder(&FOLDERID_LocalAppData)?;
-    Ok(Paths {
+    Ok(Paths::new(Locations {
         layout: InstallLayout::Native,
         config: known_folder(&FOLDERID_RoamingAppData)?,
         data: local.join("data"),
@@ -43,7 +43,7 @@ pub(super) fn resolve() -> io::Result<Paths> {
         logs: local.join("logs"),
         temporary: local.join("temp"),
         runtime: local.join("state/run"),
-    })
+    }))
 }
 
 pub(super) fn daemon_env(_: &Paths, _: &mut Command) {}

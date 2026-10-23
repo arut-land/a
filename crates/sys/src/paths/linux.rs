@@ -1,4 +1,4 @@
-use super::{Command, InstallLayout, Path, PathBuf, Paths, io};
+use super::{Command, InstallLayout, Locations, Path, PathBuf, Paths, io};
 
 fn base(value: Option<PathBuf>, home: &Path, fallback: &str) -> PathBuf {
     value
@@ -18,7 +18,7 @@ pub(super) fn resolve() -> io::Result<Paths> {
 fn resolve_at(home: &Path, env: impl Fn(&str) -> Option<PathBuf>) -> Paths {
     let state = base(env("XDG_STATE_HOME"), home, ".local/state");
     let runtime = crate::endpoint::runtime_directory();
-    Paths {
+    Paths::new(Locations {
         layout: InstallLayout::Native,
         config: base(env("XDG_CONFIG_HOME"), home, ".config"),
         data: base(env("XDG_DATA_HOME"), home, ".local/share"),
@@ -27,19 +27,19 @@ fn resolve_at(home: &Path, env: impl Fn(&str) -> Option<PathBuf>) -> Paths {
         state,
         temporary: runtime.join("a-tmp"),
         runtime,
-    }
+    })
 }
 
 pub(super) fn daemon_env(paths: &Paths, command: &mut Command) {
     for (key, dir) in [
-        ("XDG_CONFIG_HOME", &paths.config),
-        ("XDG_DATA_HOME", &paths.data),
-        ("XDG_STATE_HOME", &paths.state),
-        ("XDG_CACHE_HOME", &paths.cache),
+        ("XDG_CONFIG_HOME", &paths.inner.config),
+        ("XDG_DATA_HOME", &paths.inner.data),
+        ("XDG_STATE_HOME", &paths.inner.state),
+        ("XDG_CACHE_HOME", &paths.inner.cache),
     ] {
         command.env(key, dir.parent().expect("application subdirectory"));
     }
-    command.env("XDG_RUNTIME_DIR", &paths.runtime);
+    command.env("XDG_RUNTIME_DIR", &paths.inner.runtime);
 }
 
 pub(super) fn remote_runtime_script() -> &'static str {

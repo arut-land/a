@@ -6,6 +6,7 @@ pub(crate) use native::temporary_dir as darwin_temporary_dir;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use crate::Runtime;
 
@@ -27,9 +28,15 @@ pub enum InstallLayout {
 }
 
 /// All locations for one daemon. Resolution does not create directories or
-/// require a writable configuration/home directory.
+/// require a writable configuration/home directory. Clones share the resolved
+/// locations across clients and session handles.
 #[derive(Clone, Debug)]
 pub struct Paths {
+    inner: Arc<Locations>,
+}
+
+#[derive(Debug)]
+struct Locations {
     layout: InstallLayout,
     config: PathBuf,
     data: PathBuf,
@@ -42,7 +49,7 @@ pub struct Paths {
 
 impl From<PathBuf> for Paths {
     fn from(root: PathBuf) -> Self {
-        Self {
+        Self::new(Locations {
             layout: InstallLayout::Isolated(root.clone()),
             config: root.clone(),
             data: root.clone(),
@@ -51,11 +58,17 @@ impl From<PathBuf> for Paths {
             logs: root.join("logs"),
             temporary: root.join("tmp"),
             runtime: root.join("run"),
-        }
+        })
     }
 }
 
 impl Paths {
+    fn new(locations: Locations) -> Self {
+        Self {
+            inner: Arc::new(locations),
+        }
+    }
+
     pub fn from_env() -> io::Result<Self> {
         match std::env::var_os("A_HOME") {
             Some(root) => {
@@ -88,42 +101,42 @@ fi"#,
     }
 
     pub fn layout(&self) -> &InstallLayout {
-        &self.layout
+        &self.inner.layout
     }
 
     /// The durable instance identity, also used for endpoint ownership.
     pub fn root(&self) -> &Path {
-        &self.state
+        &self.inner.state
     }
 
     pub fn config_dir(&self) -> &Path {
-        &self.config
+        &self.inner.config
     }
 
     pub fn data_dir(&self) -> &Path {
-        &self.data
+        &self.inner.data
     }
 
     pub fn state_dir(&self) -> &Path {
-        &self.state
+        &self.inner.state
     }
 
     pub fn cache_dir(&self) -> &Path {
-        &self.cache
+        &self.inner.cache
     }
 
     pub fn temporary_dir(&self) -> &Path {
-        &self.temporary
+        &self.inner.temporary
     }
 
     /// IPC, never executable staging or retained output.
     pub fn runtime_dir(&self) -> &Path {
-        &self.runtime
+        &self.inner.runtime
     }
 
     /// Preserve directory purposes across the daemon's cleared environment.
     pub fn daemon_env(&self, command: &mut Command) {
-        match &self.layout {
+        match &self.inner.layout {
             InstallLayout::Isolated(root) => {
                 command.env("A_HOME", root);
             }
@@ -134,7 +147,7 @@ fi"#,
         }
     }
     pub fn run_dir(&self) -> PathBuf {
-        self.state.join("run")
+        self.inner.state.join("run")
     }
 
     /// Locked by the running daemon for its whole life, and holds its pid.
@@ -143,22 +156,22 @@ fi"#,
     }
 
     pub fn sessions_dir(&self) -> PathBuf {
-        self.state.join("sessions")
+        self.inner.state.join("sessions")
     }
 
     /// How every session lists, derived from their logs by the daemon.
     pub fn catalog_file(&self) -> PathBuf {
-        self.state.join("sessions.idx")
+        self.inner.state.join("sessions.idx")
     }
 
     /// Where tools keep output too large for a session's log, a private
     /// directory per session.
     pub fn spill_dir(&self) -> PathBuf {
-        self.state.join("spill")
+        self.inner.state.join("spill")
     }
 
     pub fn logs_dir(&self) -> PathBuf {
-        self.logs.clone()
+        self.inner.logs.clone()
     }
 
     pub fn daemon_log(&self) -> PathBuf {
@@ -167,12 +180,12 @@ fi"#,
 
     /// The daemon's crash reports; see [`crate::crash`].
     pub fn crash_dir(&self) -> PathBuf {
-        self.state.join("crash")
+        self.inner.state.join("crash")
     }
 
     /// Content-addressed attachments too large for a log.
     pub fn blobs_dir(&self) -> PathBuf {
-        self.state.join("blobs")
+        self.inner.state.join("blobs")
     }
 
     /// A link to the daemon socket, where a person looking under the home
@@ -184,17 +197,17 @@ fi"#,
 
     /// The user's settings; see [`crate::Config`].
     pub fn config_file(&self) -> PathBuf {
-        self.config.join("config.toml")
+        self.inner.config.join("config.toml")
     }
 
     /// The operator's permission rules, which only tighten; see
     /// [`crate::config::rules`].
     pub fn policy_file(&self) -> PathBuf {
-        self.config.join("policy.toml")
+        self.inner.config.join("policy.toml")
     }
 
     pub fn runtime(&self) -> Runtime {
-        Runtime::new(self.data.join("runtime"))
+        Runtime::new(self.inner.data.join("runtime"))
     }
 }
 
