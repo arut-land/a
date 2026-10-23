@@ -345,7 +345,14 @@ impl EditTransaction {
         self.revalidate()?;
         check_cancel(should_cancel, copied)?;
         before_commit();
-        let protection = self.commit(&mut staged, bytes, exchange, || {}, || {})?;
+        let protection = self.commit(
+            &mut staged,
+            bytes,
+            exchange,
+            || check_cancel(should_cancel, copied),
+            || {},
+            || {},
+        )?;
         let durability = if durable {
             match sync_parent(&self.parent) {
                 Ok(()) => Durability::Confirmed,
@@ -367,9 +374,11 @@ impl EditTransaction {
         staged: &mut Staged<'_>,
         bytes: &[u8],
         exchange: bool,
+        cancel: impl Fn() -> io::Result<()>,
         after_exchange: impl FnOnce(),
         before_rollback: impl FnOnce(),
     ) -> Result<PublicationProtection, EditError> {
+        cancel()?;
         #[cfg(windows)]
         let _ = (bytes, exchange);
         #[cfg(unix)]
@@ -409,12 +418,13 @@ impl EditTransaction {
             }
             return Ok(PublicationProtection::ExchangeVerified);
         }
-        self.commit_vacant(staged, after_exchange, before_rollback)
+        self.commit_vacant(staged, cancel, after_exchange, before_rollback)
     }
 
     fn commit_vacant(
         &self,
         staged: &mut Staged<'_>,
+        cancel: impl Fn() -> io::Result<()>,
         after_move: impl FnOnce(),
         before_restore: impl FnOnce(),
     ) -> Result<PublicationProtection, EditError> {
@@ -441,6 +451,7 @@ impl EditTransaction {
         // Denying delete opens pins the captured name during handle-bound unlink.
         #[cfg(windows)]
         self.revalidate()?;
+        cancel()?;
         #[cfg(unix)]
         let taken = staged.take_original(source, &self.name);
         #[cfg(windows)]
@@ -468,6 +479,16 @@ impl EditTransaction {
         let conflict = if checked.is_err() {
             EditConflict::Changed
         } else {
+            if let Err(cancelled) = cancel() {
+                before_restore();
+                return if staged.restore_original(source, &self.name).is_ok() {
+                    Err(cancelled.into())
+                } else {
+                    Err(EditError::Conflict(EditConflict::Recovery(
+                        staged.retain_original(),
+                    )))
+                };
+            }
             match staged.publish(&self.name) {
                 Ok(()) => {
                     // The detached file can still have a writer holding an old descriptor.
@@ -1337,13 +1358,13 @@ impl WindowsPolicy {
         if needed as usize > maximum {
             return Err(io::ErrorKind::FileTooLarge.into());
         }
-        let policy = Self(vec![0; (needed as usize).div_ceil(8)]);
+        let mut policy = Self(vec![0; (needed as usize).div_ceil(8)]);
         // SAFETY: aligned initialized storage covers needed writable bytes.
         let status = unsafe {
             NtQuerySecurityObject(
                 file.as_raw_handle(),
                 Self::INFORMATION,
-                policy.descriptor(),
+                policy.0.as_mut_ptr().cast(),
                 needed,
                 &raw mut needed,
             )
@@ -2111,7 +2132,14 @@ mod tests {
             if replacing {
                 preserve_metadata(&transaction.source.as_ref().unwrap().0, &staged.file).unwrap();
                 transaction
-                    .commit(&mut staged, b"replacement", !fallback, || {}, || {})
+                    .commit(
+                        &mut staged,
+                        b"replacement",
+                        !fallback,
+                        || Ok(()),
+                        || {},
+                        || {},
+                    )
                     .unwrap();
             } else if fallback {
                 staged.fallback(&transaction.name).unwrap();
@@ -2752,6 +2780,7 @@ mod tests {
                     &mut staged,
                     b"ours",
                     false,
+                    || Ok(()),
                     || assert!(!work.target().exists()),
                     || {}
                 )
@@ -2779,6 +2808,7 @@ mod tests {
                 &mut staged,
                 b"ours",
                 true,
+                || Ok(()),
                 || {
                     if !during_rollback {
                         inject();
@@ -2822,6 +2852,7 @@ mod tests {
             &mut staged,
             b"ours",
             true,
+            || Ok(()),
             || {
                 fsetxattr(
                     File::open(work.target()).unwrap(),
@@ -2884,6 +2915,41 @@ mod tests {
             .unwrap()
         );
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn acl_changes_in_the_final_window_are_never_discarded() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
+            WRITE_OWNER,
+        };
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let parent = open_parent(&work.0).unwrap();
+        let policy = Directory::create(&parent, &work.0).unwrap();
+        let authority = fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC | WRITE_OWNER)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(work.target())
+            .unwrap();
+        let transaction = work.capture();
+        assert!(!windows_policy_matches(&authority, &policy.file).unwrap());
+        let result = transaction.publish_with_sync(
+            b"ours",
+            false,
+            File::sync_all,
+            &|_| false,
+            false,
+            || copy_access_policy(&policy.file, &authority).unwrap(),
+        );
+        assert!(matches!(result, Err(EditError::Conflict(_))), "{result:?}");
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        assert!(windows_policy_matches(&authority, &policy.file).unwrap());
+        drop(authority);
+        drop(policy);
+        work.only_target_remains();
     }
 
     #[cfg(windows)]
@@ -3135,6 +3201,49 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_during_verification_never_publishes_or_discards_an_arrival() {
+        use std::sync::atomic::AtomicBool;
+        for arrival in [false, true] {
+            let work = Workspace::new();
+            fs::write(work.target(), b"original").unwrap();
+            let transaction = work.capture();
+            let mut staged = transaction.stage(&|_| false).unwrap();
+            staged.file.rewind().unwrap();
+            staged.file.write_all(b"ours").unwrap();
+            staged.file.set_len(4).unwrap();
+            preserve_metadata(&transaction.source.as_ref().unwrap().0, &staged.file).unwrap();
+            transaction.revalidate().unwrap();
+            let cancelled = AtomicBool::new(false);
+            let result = transaction.commit(
+                &mut staged,
+                b"ours",
+                false,
+                || check_cancel(&|_| cancelled.load(Ordering::Relaxed), 0),
+                || {
+                    if arrival {
+                        fs::write(work.target(), b"theirs").unwrap();
+                    }
+                    cancelled.store(true, Ordering::Relaxed);
+                },
+                || {},
+            );
+            drop(staged);
+            if arrival {
+                let Err(EditError::Conflict(EditConflict::Recovery(path))) = result else {
+                    panic!("{result:?}");
+                };
+                assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
+                assert_eq!(fs::read(&path).unwrap(), b"original");
+                fs::remove_dir_all(path.parent().unwrap()).unwrap();
+            } else {
+                assert!(matches!(result, Err(EditError::Cancelled)), "{result:?}");
+                assert_eq!(fs::read(work.target()).unwrap(), b"original");
+            }
+            work.only_target_remains();
+        }
+    }
+
+    #[test]
     fn an_arrival_during_the_vacancy_is_preserved_with_the_displaced_original() {
         let work = Workspace::new();
         fs::write(work.target(), b"original").unwrap();
@@ -3149,6 +3258,7 @@ mod tests {
             &mut staged,
             b"ours",
             false,
+            || Ok(()),
             || fs::write(work.target(), b"theirs").unwrap(),
             || {},
         );
