@@ -151,7 +151,7 @@ impl Paths {
         self.logs_dir().join("daemon.jsonl")
     }
 
-    /// The daemon's crash reports; see [`crash`].
+    /// The daemon's crash reports; see [`crate::crash`].
     pub fn crash_dir(&self) -> PathBuf {
         self.state.join("crash")
     }

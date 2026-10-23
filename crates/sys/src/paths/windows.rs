@@ -9,6 +9,7 @@ fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
     let mut raw = std::ptr::null_mut();
     let result = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw) };
     if result < 0 {
+        unsafe { CoTaskMemFree(raw.cast()) };
         return Err(io::Error::other(format!(
             "SHGetKnownFolderPath failed: {result:#x}"
         )));
@@ -41,3 +42,30 @@ pub(super) fn resolve() -> io::Result<Paths> {
 }
 
 pub(super) fn daemon_env(_: &Paths, _: &mut Command) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_user_configuration_roams() {
+        let paths = resolve().unwrap();
+        let local = known_folder(&FOLDERID_LocalAppData).unwrap();
+        assert_eq!(
+            paths.config_dir(),
+            known_folder(&FOLDERID_RoamingAppData).unwrap()
+        );
+        for path in [
+            paths.state_dir(),
+            paths.data_dir(),
+            paths.cache_dir(),
+            paths.temporary_dir(),
+            paths.runtime_dir(),
+            &paths.logs_dir(),
+        ] {
+            assert!(path.starts_with(&local));
+            assert_ne!(path, paths.config_dir());
+        }
+        assert!(paths.spill_dir().starts_with(paths.state_dir()));
+    }
+}

@@ -17,7 +17,7 @@ pub(super) fn resolve() -> io::Result<Paths> {
 
 fn resolve_at(home: &Path, env: impl Fn(&str) -> Option<PathBuf>) -> Paths {
     let state = base(env("XDG_STATE_HOME"), home, ".local/state");
-    let runtime = crate::endpoint::imp::socket_dir();
+    let runtime = crate::endpoint::runtime_directory();
     Paths {
         layout: InstallLayout::Native,
         config: base(env("XDG_CONFIG_HOME"), home, ".config"),

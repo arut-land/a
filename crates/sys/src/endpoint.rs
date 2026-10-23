@@ -7,7 +7,8 @@
 //! atomically publishes the socket pathname for clients with other environments;
 //! Linux uses a validated XDG runtime directory, an existing private
 //! `/run/user/UID`, or a private `/tmp/a-UID` fallback. Pathname sockets retain
-//! filesystem access control. macOS uses the private `/tmp/a-UID` directory.
+//! filesystem access control. macOS prefers Darwin user temp, with a short private
+//! `/tmp/a-UID` fallback.
 //! Windows claims the home with an exclusive file handle before creating a
 //! first-instance, local-only pipe with a user-SID-only DACL. Accepted and
 //! connected peers are checked before constructing `OwnedConnection`.
@@ -39,6 +40,12 @@ impl Endpoint {
     pub fn remove(&self) {
         imp::remove(&self.0, &self.1);
     }
+}
+
+/// The endpoint backend owns validation and its non-desktop fallback policy.
+#[cfg(unix)]
+pub(crate) fn runtime_directory() -> PathBuf {
+    imp::socket_dir()
 }
 
 impl Home {
@@ -294,7 +301,7 @@ impl Write for &Stream {
 }
 
 #[cfg(unix)]
-pub(crate) mod imp {
+mod imp {
     use std::fs;
     use std::io::{self, Read};
     use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -667,10 +674,14 @@ pub(crate) mod imp {
             && dir.is_absolute()
             && validate_directory(&dir).is_ok()
             && fits_socket(&dir)
+            && rustix::fs::access(&dir, rustix::fs::Access::WRITE_OK).is_ok()
         {
             return dir;
         }
-        if validate_directory(login).is_ok() && fits_socket(login) {
+        if validate_directory(login).is_ok()
+            && fits_socket(login)
+            && rustix::fs::access(login, rustix::fs::Access::WRITE_OK).is_ok()
+        {
             return login.to_owned();
         }
         fallback

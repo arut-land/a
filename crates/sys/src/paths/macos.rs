@@ -44,8 +44,31 @@ pub(super) fn resolve() -> io::Result<Paths> {
         cache: library.join("Caches/dev.a"),
         logs: library.join("Logs/dev.a"),
         temporary: temporary_dir()?.join("dev.a"),
-        runtime: crate::endpoint::imp::socket_dir(),
+        runtime: crate::endpoint::runtime_directory(),
     })
 }
 
 pub(super) fn daemon_env(_: &Paths, _: &mut Command) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_output_and_disposable_cache_have_different_native_locations() {
+        let paths = resolve().unwrap();
+        assert!(paths.spill_dir().starts_with(paths.state_dir()));
+        assert!(
+            paths
+                .state_dir()
+                .ends_with("Library/Application Support/dev.a")
+        );
+        assert!(paths.cache_dir().ends_with("Library/Caches/dev.a"));
+        assert!(paths.logs_dir().ends_with("Library/Logs/dev.a"));
+        assert_eq!(
+            paths.temporary_dir(),
+            temporary_dir().unwrap().join("dev.a")
+        );
+        assert!(!paths.spill_dir().starts_with(paths.cache_dir()));
+    }
+}
