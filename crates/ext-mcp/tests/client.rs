@@ -14,7 +14,7 @@ fn rig(name: &str, timeout: Duration) -> Rig {
             description: "test server".into(),
             transport: Transport::Stdio(vec![
                 env!("CARGO_BIN_EXE_mcp-fixture").into(),
-                "effects".into(),
+                format!("effects-{name}"),
             ]),
             env: std::collections::BTreeMap::default(),
         }],
@@ -55,7 +55,7 @@ fn finish(rig: Rig) {
 #[test]
 fn discovery_is_lazy_and_only_selected_schemas_reach_the_model() {
     let rig = rig("lazy", Duration::from_secs(10));
-    assert!(!rig.workspace().join("effects").exists());
+    assert!(!rig.workspace().join("effects-lazy").exists());
     assert!(
         rig.registry
             .generation_context()
@@ -99,7 +99,7 @@ fn discovery_is_lazy_and_only_selected_schemas_reach_the_model() {
             .contains("hello")
     );
     assert_eq!(
-        std::fs::read_to_string(rig.workspace().join("effects"))
+        std::fs::read_to_string(rig.workspace().join("effects-lazy"))
             .unwrap()
             .lines()
             .filter(|l| l.starts_with("start"))
@@ -190,7 +190,7 @@ fn every_mcp_effect_is_unsafe_to_replay_and_policy_gates_before_start() {
         .now()
         .unwrap();
     assert_eq!(gated.gate, ext::Gate::Ask);
-    assert!(!rig.workspace().join("effects").exists());
+    assert!(!rig.workspace().join("effects-policy").exists());
     assert_eq!(<Mcp as Extension>::NAME, "mcp");
 }
 
