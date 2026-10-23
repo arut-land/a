@@ -5,17 +5,28 @@ import json
 import os
 from pathlib import Path
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
 from stats import distribution, observations
 
 
+class ArtifactRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, url):
+        redirected = super().redirect_request(request, response, code, message, headers, url)
+        before, after = map(urllib.parse.urlsplit, (request.full_url, url))
+        if (before.scheme, before.netloc) != (after.scheme, after.netloc):
+            # Artifact storage authenticates its signed URL, not the GitHub token.
+            redirected.remove_header("Authorization")
+        return redirected
+
+
 def api(path, binary=False):
     request = urllib.request.Request("https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"] + path,
                                      headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                               "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.build_opener(ArtifactRedirect()).open(request, timeout=60) as response:
         body = response.read()
         return body if binary else json.loads(body)
 

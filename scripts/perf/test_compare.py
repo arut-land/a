@@ -9,11 +9,20 @@ import sys
 import subprocess
 from unittest import mock
 
-from compare import compare
+from compare import ArtifactRedirect, compare
 from stats import distribution
 
 
 class Comparison(unittest.TestCase):
+    def test_artifact_redirects_never_forward_github_tokens_to_storage(self):
+        import urllib.request
+        request = urllib.request.Request("https://api.github.com/artifact", headers={"Authorization": "Bearer test"})
+        handler = ArtifactRedirect()
+        storage = handler.redirect_request(request, None, 302, "found", {}, "https://storage.example/artifact?signature=test")
+        github = handler.redirect_request(request, None, 302, "found", {}, "https://api.github.com/new-artifact")
+        self.assertFalse(storage.has_header("Authorization"))
+        self.assertEqual(github.get_header("Authorization"), "Bearer test")
+
     @unittest.skipUnless(importlib.util.find_spec("psutil"), "native accounting runs in each perf job")
     def test_captured_output_does_not_wait_for_an_inheriting_descendant(self):
         import tempfile
