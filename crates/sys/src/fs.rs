@@ -333,7 +333,7 @@ fn create_directory(dir: &Path, existing: bool) -> io::Result<()> {
         };
         // A unique sibling avoids sharing staging state with another creator.
         // WRITE_THROUGH publishes the directory before files beneath it commit.
-        let result = move_file(&pending, dir, false);
+        let result = move_file(&pending, dir, false, true);
         if result.is_err() {
             let _ = fs::remove_dir(&pending);
         }
@@ -406,7 +406,10 @@ fn save_private(path: &Path, bytes: &[u8], durable: bool) -> io::Result<()> {
         if durable {
             publish(&tmp, path)
         } else {
-            replace(&tmp, path)
+            #[cfg(unix)]
+            return replace(&tmp, path);
+            #[cfg(windows)]
+            move_file(&tmp, path, true, false)
         }
     });
     if written.is_err() {
@@ -420,11 +423,11 @@ pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(unix)]
     return fs::rename(from, to);
     #[cfg(windows)]
-    move_file(from, to, false)
+    move_file(from, to, true, true)
 }
 
 #[cfg(windows)]
-fn move_file(from: &Path, to: &Path, durable: bool) -> io::Result<()> {
+fn move_file(from: &Path, to: &Path, replacing: bool, durable: bool) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
@@ -450,7 +453,11 @@ fn move_file(from: &Path, to: &Path, durable: bool) -> io::Result<()> {
         MoveFileExW(
             from.as_ptr(),
             to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | if durable { MOVEFILE_WRITE_THROUGH } else { 0 },
+            (if replacing {
+                MOVEFILE_REPLACE_EXISTING
+            } else {
+                0
+            }) | if durable { MOVEFILE_WRITE_THROUGH } else { 0 },
         )
     })
 }
@@ -467,7 +474,7 @@ pub fn publish(from: &Path, to: &Path) -> io::Result<()> {
         )
     }
     #[cfg(windows)]
-    move_file(from, to, true)
+    move_file(from, to, true, true)
 }
 
 /// Removes the durable name before best-effort reclamation of its contents.
@@ -505,7 +512,7 @@ pub fn open_log(path: &Path, header: Option<&[u8]>) -> io::Result<(File, Publica
         file.write_all(header)?;
         file.sync_all()?;
         drop(file);
-        move_file(&pending, path, false)?;
+        move_file(&pending, path, false, true)?;
     }
     let mut open = OpenOptions::new();
     open.read(true).append(true);

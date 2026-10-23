@@ -374,9 +374,7 @@ pub(super) fn delete(file: &File) {
 #[cfg(windows)]
 fn rename(file: &File, parent: &File, to: &OsStr, replacing: bool) -> io::Result<()> {
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle,
-    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
     let name: Vec<u16> = to.encode_wide().collect();
     let bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2;
     let length = u32::try_from(bytes).map_err(|_| io::ErrorKind::InvalidInput)?;
@@ -389,11 +387,20 @@ fn rename(file: &File, parent: &File, to: &OsStr, replacing: bool) -> io::Result
         (*info).RootDirectory = parent.as_raw_handle();
         (*info).FileNameLength = u32::try_from(name.len() * 2).expect("checked buffer length");
         std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-        crate::windows::ok(SetFileInformationByHandle(
+        let mut status = windows_sys::Win32::System::IO::IO_STATUS_BLOCK::default();
+        let result = windows_sys::Wdk::Storage::FileSystem::NtSetInformationFile(
             file.as_raw_handle(),
-            FileRenameInfoEx,
+            &raw mut status,
             info.cast(),
             length,
-        ))
+            windows_sys::Wdk::Storage::FileSystem::FileRenameInformationEx,
+        );
+        if result < 0 {
+            Err(io::Error::from_raw_os_error(
+                windows_sys::Win32::Foundation::RtlNtStatusToDosError(result).cast_signed(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 }

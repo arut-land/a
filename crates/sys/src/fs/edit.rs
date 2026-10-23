@@ -181,7 +181,15 @@ impl EditTransaction {
             )
         };
         #[cfg(windows)]
-        let file = super::staging::relative(&self.parent, &self.name, false, false)?;
+        let file =
+            super::staging::relative(&self.parent, &self.name, false, false).map_err(|error| {
+                if error.raw_os_error() == Some(267) || error.kind() == io::ErrorKind::IsADirectory
+                {
+                    EditError::NotRegular
+                } else {
+                    EditError::Io(error)
+                }
+            })?;
         validate(&file)?;
         Ok(file)
     }
@@ -912,12 +920,10 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
 fn copy_access_policy(source: &File, destination: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
-    };
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetSecurityDescriptorControl,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
     };
     let (mut owner, mut group, mut dacl, mut descriptor) = (
         std::ptr::null_mut(),
@@ -954,26 +960,19 @@ fn copy_access_policy(source: &File, destination: &File) -> io::Result<()> {
         ))
         .and_then(|()| {
             let protected = control & SE_DACL_PROTECTED != 0;
-            let protection = if protected {
-                PROTECTED_DACL_SECURITY_INFORMATION
-            } else {
-                // New files already inherit. Explicitly unprotecting a DACL
-                // would merge this directory's permissions into the source's.
-                0
-            };
-            let status = SetSecurityInfo(
+            // Apply the complete descriptor without recomputing inheritance
+            // from the private staging directory.
+            let status = windows_sys::Wdk::Storage::FileSystem::NtSetSecurityObject(
                 destination.as_raw_handle(),
-                SE_FILE_OBJECT,
-                information | protection,
-                owner,
-                group,
-                dacl,
-                std::ptr::null(),
+                information,
+                descriptor,
             );
-            if status == 0 {
+            if status >= 0 {
                 verify_acl(destination, dacl, protected)
             } else {
-                Err(io::Error::from_raw_os_error(status.cast_signed()))
+                Err(io::Error::from_raw_os_error(
+                    windows_sys::Win32::Foundation::RtlNtStatusToDosError(status).cast_signed(),
+                ))
             }
         })
     };
