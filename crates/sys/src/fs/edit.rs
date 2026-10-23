@@ -248,7 +248,7 @@ impl EditTransaction {
         durable: bool,
         should_cancel: &(dyn Fn(u64) -> bool + Sync),
     ) -> Result<EditReceipt, EditError> {
-        self.publish_with_sync(bytes, durable, File::sync_all, should_cancel, || {})
+        self.publish_with_sync(bytes, durable, File::sync_all, should_cancel, true, || {})
     }
 
     fn publish_with_sync(
@@ -257,6 +257,7 @@ impl EditTransaction {
         durable: bool,
         sync_parent: impl FnOnce(&File) -> io::Result<()>,
         should_cancel: &(dyn Fn(u64) -> bool + Sync),
+        exchange: bool,
         before_commit: impl FnOnce(),
     ) -> Result<EditReceipt, EditError> {
         #[cfg(windows)]
@@ -327,7 +328,7 @@ impl EditTransaction {
         self.revalidate()?;
         check_cancel(should_cancel, copied)?;
         before_commit();
-        let protection = self.commit(&mut staged, bytes, true, || {}, || {})?;
+        let protection = self.commit(&mut staged, bytes, exchange, || {}, || {})?;
         let durability = if durable {
             match sync_parent(&self.parent) {
                 Ok(()) => Durability::Confirmed,
@@ -1731,6 +1732,7 @@ mod tests {
                 true,
                 |_| Err(io::Error::other("injected directory flush failure")),
                 &|_| false,
+                true,
                 || {},
             )
             .unwrap();
@@ -2217,13 +2219,19 @@ mod tests {
             let work = Workspace::new();
             fs::write(work.target(), b"original").unwrap();
             let transaction = work.capture();
-            let result =
-                transaction.publish_with_sync(b"ours", false, File::sync_all, &|_| false, || {
+            let result = transaction.publish_with_sync(
+                b"ours",
+                false,
+                File::sync_all,
+                &|_| false,
+                true,
+                || {
                     if replacing {
                         fs::remove_file(work.target()).unwrap();
                     }
                     fs::write(work.target(), b"theirs").unwrap();
-                });
+                },
+            );
             assert!(
                 matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
                 "{result:?}"
@@ -2312,7 +2320,7 @@ mod tests {
         drop(writer);
         let transaction = work.capture();
         let receipt = transaction
-            .publish_with_sync(b"ours", false, File::sync_all, &|_| false, || {
+            .publish_with_sync(b"ours", false, File::sync_all, &|_| false, true, || {
                 assert!(
                     fs::OpenOptions::new()
                         .write(true)
@@ -2325,6 +2333,155 @@ mod tests {
         assert_eq!(fs::read(work.target()).unwrap(), b"ours");
         work.only_target_remains();
     }
+    #[test]
+    fn replacement_in_the_final_window_is_never_overwritten_without_exchange() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let transaction = work.capture();
+        let result = transaction.publish_with_sync(
+            b"ours",
+            false,
+            File::sync_all,
+            &|_| false,
+            false,
+            || {
+                let other = work.0.join("other");
+                fs::write(&other, b"theirs").unwrap();
+                super::super::replace(&other, &work.target()).unwrap();
+            },
+        );
+        assert!(matches!(result, Err(EditError::Conflict(_))), "{result:?}");
+        assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
+        if let Err(EditError::Conflict(EditConflict::Recovery(path))) = result {
+            assert_eq!(fs::read(&path).unwrap(), b"original");
+            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+        work.only_target_remains();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_changes_in_the_final_window_are_restored() {
+        use rustix::fs::{XattrFlags, fgetxattr, fsetxattr};
+        for exchange in [true, false] {
+            let work = Workspace::new();
+            fs::write(work.target(), b"original").unwrap();
+            let source = File::open(work.target()).unwrap();
+            fsetxattr(&source, c"user.a-edit", b"before", XattrFlags::empty()).unwrap();
+            let transaction = work.capture();
+            let result = transaction.publish_with_sync(
+                b"ours",
+                false,
+                File::sync_all,
+                &|_| false,
+                exchange,
+                || {
+                    fsetxattr(&source, c"user.a-edit", b"after!", XattrFlags::empty()).unwrap();
+                },
+            );
+            assert!(
+                matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
+                "{result:?}"
+            );
+            assert_eq!(fs::read(work.target()).unwrap(), b"original");
+            let mut value = [0; 32];
+            let count = fgetxattr(
+                &File::open(work.target()).unwrap(),
+                c"user.a-edit",
+                &mut value[..],
+            )
+            .unwrap();
+            assert_eq!(&value[..count], b"after!");
+            work.only_target_remains();
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn resource_fork_changes_in_the_final_window_are_restored() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        resource_fork(&work.target(), b"before");
+        let modified = fs::metadata(work.target()).unwrap().modified().unwrap();
+        let result = work.capture().publish_with_sync(
+            b"ours",
+            false,
+            File::sync_all,
+            &|_| false,
+            true,
+            || {
+                resource_fork(&work.target(), b"after!");
+                File::open(work.target())
+                    .unwrap()
+                    .set_modified(modified)
+                    .unwrap();
+            },
+        );
+        assert!(
+            matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        let mut bytes = [0; 32];
+        let count = rustix::fs::fgetxattr(
+            &File::open(work.target()).unwrap(),
+            c"com.apple.ResourceFork",
+            &mut bytes[..],
+        )
+        .unwrap();
+        assert_eq!(&bytes[..count], b"after!");
+        work.only_target_remains();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xattr_names_and_values_share_the_transaction_byte_limit() {
+        use rustix::fs::{XattrFlags, fsetxattr};
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let source = File::open(work.target()).unwrap();
+        for name in [c"user.first", c"user.second"] {
+            fsetxattr(&source, name, &[b'x'; 512], XattrFlags::empty()).unwrap();
+        }
+        assert!(matches!(
+            EditTransaction::capture(&work.target(), 900),
+            Err(EditError::TooLarge)
+        ));
+        let transaction = EditTransaction::capture(&work.target(), 4096).unwrap();
+        assert!(matches!(
+            transaction.publish(&[b'x'; 3100], false, &|_| false),
+            Err(EditError::TooLarge)
+        ));
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        work.only_target_remains();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_between_xattrs_reclaims_staging_without_publication() {
+        use rustix::fs::{XattrFlags, fsetxattr};
+        use std::sync::atomic::AtomicBool;
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let source = File::open(work.target()).unwrap();
+        for name in [c"user.first", c"user.second"] {
+            fsetxattr(&source, name, &[b'x'; 512], XattrFlags::empty()).unwrap();
+        }
+        let observed = AtomicBool::new(false);
+        let result = work.capture().publish(b"ours", false, &|copied| {
+            if copied >= 512 {
+                observed.store(true, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        });
+        assert!(observed.load(Ordering::Relaxed));
+        assert!(matches!(result, Err(EditError::Cancelled)), "{result:?}");
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        work.only_target_remains();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn staging_works_with_tmpfile_but_without_procfs_or_link_capability() {
