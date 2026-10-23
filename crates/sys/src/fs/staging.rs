@@ -265,13 +265,9 @@ impl<'a> Staged<'a> {
     #[cfg(windows)]
     pub fn prepare_vacancy(&mut self) -> io::Result<()> {
         // Refuse unsupported filesystems while the target is still untouched.
-        link(&self.file, &self.directory.file, OsStr::new("probe"))
-            .map_err(|e| io::Error::new(e.kind(), format!("probe link: {e}")))?;
-        self.remove_link("probe")
-            .map_err(|e| io::Error::new(e.kind(), format!("probe removal: {e}")))?;
-        let links = super::edit::accessible_links(&self.file)
-            .map_err(|e| io::Error::new(e.kind(), format!("probe link count: {e}")))?;
-        if links != 1 {
+        link(&self.file, &self.directory.file, OsStr::new("probe"))?;
+        self.remove_link("probe")?;
+        if super::edit::accessible_links(&self.file)? != 1 {
             return Err(io::ErrorKind::Unsupported.into());
         }
         Ok(())

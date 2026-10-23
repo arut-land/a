@@ -1617,6 +1617,7 @@ pub(super) fn accessible_links(file: &File) -> io::Result<u32> {
     use windows_sys::Wdk::Storage::FileSystem::{
         FILE_STANDARD_LINK_INFORMATION, FileStandardLinkInformation, NtQueryInformationFile,
     };
+    // The ULONG-only SDK record needs a quadword boundary for the native query.
     #[repr(C, align(8))]
     struct Aligned(FILE_STANDARD_LINK_INFORMATION);
     let mut information = Aligned(FILE_STANDARD_LINK_INFORMATION::default());
