@@ -1342,6 +1342,21 @@ fn windows_policy_matches(source: &File, snapshot: &File) -> io::Result<bool> {
         Ok(policy)
     };
     let (a, b) = (read(source)?, read(snapshot)?);
+    #[cfg(test)]
+    {
+        // SAFETY: both policy values retain the SID and ACL allocations.
+        eprintln!(
+            "policy protected={:?}, owner/group/acl={:?}",
+            (a.protected, b.protected),
+            unsafe {
+                (
+                    EqualSid(a.owner, b.owner),
+                    EqualSid(a.group, b.group),
+                    same_acl(a.acl, b.acl),
+                )
+            }
+        );
+    }
     // SAFETY: both policy values retain the descriptors containing all SID/ACL pointers.
     Ok(unsafe {
         a.protected == b.protected
@@ -1352,6 +1367,7 @@ fn windows_policy_matches(source: &File, snapshot: &File) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
+#[cfg_attr(test, derive(Debug))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Signature {
     volume: u64,
@@ -2793,6 +2809,43 @@ mod tests {
         assert_eq!(&value[..size], b"second metadata");
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
         work.only_target_remains();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_native_move_keeps_the_captured_metadata_snapshot() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{Foundation::GENERIC_READ, Storage::FileSystem::DELETE};
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let transaction = work.capture();
+        let (source, before) = transaction.source.as_ref().unwrap();
+        let mut staged = transaction.stage(&|_| false).unwrap();
+        staged.file.rewind().unwrap();
+        staged.file.write_all(b"ours").unwrap();
+        staged.file.set_len(4).unwrap();
+        preserve_metadata(source, &staged.file).unwrap();
+        transaction.revalidate().unwrap();
+        eprintln!(
+            "before={before:?}, source={:?}, snapshot={:?}",
+            source.metadata(),
+            staged.file.metadata()
+        );
+        let before_matches = preserved_metadata_matches(source, &staged.file, transaction.limit);
+        eprintln!("metadata before move={before_matches:?}");
+        let moving = reopen(source.as_raw_handle(), GENERIC_READ | DELETE).unwrap();
+        staged.take_original(&moving, &transaction.name).unwrap();
+        let mut original = staged.original().unwrap();
+        let after_matches = preserved_metadata_matches(&original, &staged.file, transaction.limit);
+        let checked = transaction.verify_displaced(&mut original, &staged.file, before);
+        eprintln!(
+            "after={:?}, metadata after move={after_matches:?}, verification={checked:?}",
+            signature(&original)
+        );
+        staged.restore_original(&moving, &transaction.name).unwrap();
+        assert!(matches!(before_matches, Ok(true)));
+        assert!(matches!(after_matches, Ok(true)));
+        checked.unwrap();
     }
 
     #[cfg(windows)]
