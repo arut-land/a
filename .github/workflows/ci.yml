@@ -174,7 +174,14 @@ jobs:
           rustup toolchain install $toolchain --profile minimal --component clippy,rust-src,rustfmt
       - uses: jdx/mise-action@v5
         with:
-          install_args: mr-boxington cargo:cargo-nextest
+          install_args: mr-boxington
+      - name: Install native nextest
+        shell: pwsh
+        run: |
+          $platform = if ($env:RUNNER_ARCH -eq 'ARM64') { 'windows-arm' } else { 'windows' }
+          $archive = "$env:RUNNER_TEMP/nextest.zip"
+          Invoke-WebRequest "https://get.nexte.st/0.9.148/$platform" -OutFile $archive
+          Expand-Archive $archive -DestinationPath "$env:USERPROFILE/.cargo/bin" -Force
       - name: Select native PowerShell contract runners
         shell: pwsh
         run: |

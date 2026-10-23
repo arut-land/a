@@ -2,7 +2,7 @@
 //! starts where the last command left off.
 //!
 //! A command runs in an owned native process scope with no stdin or
-//! terminal. Timeout/cancellation stops that scope; ExecutionFacts describes
+//! terminal. Timeout/cancellation stops that scope; `ExecutionFacts` describes
 //! the platform's containment limits. Its stdout and stderr share one pipe, in the order
 //! written. The directory it ends in is reported through an exit trap and
 //! kept as the `shell` extension's `cwd` state, so `cd` persists across

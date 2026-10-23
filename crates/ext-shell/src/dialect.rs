@@ -18,13 +18,16 @@ impl Dialect for Bash {
     const PROMPT: &'static str = "$ ";
 
     fn arguments(command: &str, dir: &Path, report: Option<&Path>) -> io::Result<Vec<String>> {
+        let pwd_command = sys::shell_pwd();
+        if pwd_command.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native Bash runtime is unsupported: expected MSYS/Git Bash or Cygwin; PowerShell is selected only when Bash is absent",
+            ));
+        }
         let mut script = String::new();
         if let Some(report) = report {
-            let pwd = format!(
-                "{} >{}",
-                sys::shell_pwd(),
-                bash_quote(&sys::shell_path(report))
-            );
+            let pwd = format!("{} >{}", pwd_command, bash_quote(&sys::shell_path(report)));
             let _ = writeln!(script, "trap {} EXIT", bash_quote(&pwd));
         }
         let _ = writeln!(

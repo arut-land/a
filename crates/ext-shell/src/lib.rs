@@ -7,19 +7,19 @@
 //! tool type is registered; neither a client PATH change nor a launch failure
 //! changes that catalog. Restart the daemon to rediscover installed shells.
 //!
-//! Tool descriptions and prompt context share startup `ExecutionFacts`.
+//! Tool descriptions and prompt context share startup ``ExecutionFacts``.
 //! Commands retain the client's environment and cwd, with noninteractive
 //! output preferences and the published temporary directory. Bash startup
-//! hooks BASH_ENV/ENV are suppressed. Foreground cwd reports are removed after
+//! hooks `BASH_ENV`/`ENV` are suppressed. Foreground cwd reports are removed after
 //! use; truncated and background output remains in the session spill directory.
 //!
 //! PowerShell takes one bounded Unicode `-Command` payload, preserving normal
 //! error semantics and explicit exits without changing execution policy. Its
-//! plain-text host streams avoid Windows PowerShell's EncodedCommand CLIXML.
+//! plain-text host streams avoid Windows PowerShell's `EncodedCommand` CLIXML.
 //! Native program output remains bytes, displayed with UTF-8 replacement.
 //!
 //! The extension provides [`CwdOf`] and [`Processes`]; process creation uses
-//! the SDK process service and the platform's existing SpawnPlan backend.
+//! the SDK process service and the platform's existing `SpawnPlan` backend.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

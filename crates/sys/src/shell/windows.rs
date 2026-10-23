@@ -15,8 +15,8 @@ fn installed_git() -> Vec<PathBuf> {
     let value: Vec<u16> = "InstallPath\0".encode_utf16().collect();
     for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
         for view in [RRF_SUBKEY_WOW6464KEY, RRF_SUBKEY_WOW6432KEY] {
-            let mut buffer = [0u16; 32768];
-            let mut bytes = std::mem::size_of_val(&buffer) as u32;
+            let mut buffer = vec![0u16; 32768];
+            let mut bytes = 65536u32;
             // SAFETY: terminated key/value strings and a writable, size-described buffer.
             let status = unsafe {
                 RegGetValueW(
@@ -26,7 +26,7 @@ fn installed_git() -> Vec<PathBuf> {
                     RRF_RT_REG_SZ | view,
                     std::ptr::null_mut(),
                     buffer.as_mut_ptr().cast(),
-                    &mut bytes,
+                    &raw mut bytes,
                 )
             };
             if status == 0 {
@@ -94,9 +94,8 @@ pub fn find_bash(search: Option<&str>) -> Option<PathBuf> {
     for root in roots {
         candidates.extend([root.join("bin/bash.exe"), root.join("usr/bin/bash.exe")]);
     }
-    let windows = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let windows =
+        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
     first_bash(candidates, &windows)
 }
 
@@ -122,35 +121,40 @@ fn powershell(
 pub(super) fn discover() -> ExecutionFacts {
     let search = std::env::var("PATH").ok();
     let bash = find_bash(search.as_deref());
-    let windows = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let windows =
+        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
     let program_files = std::env::var_os("ProgramW6432")
         .or_else(|| std::env::var_os("ProgramFiles"))
         .map(PathBuf::from);
-    let (dialect, executable, syntax, paths) = match bash {
-        Some(path) => (
+    let (dialect, executable, mut syntax, paths) = if let Some(path) = bash {
+        (
             Dialect::Bash,
             path,
             "Bash (native Windows runtime; no profile or rc files)",
             "native Bash paths: C:/dir and runtime POSIX paths; native tools use Windows drive/UNC paths",
-        ),
-        None => {
-            let (path, syntax) = powershell(search.as_deref(), program_files.as_deref(), &windows);
-            (
-                Dialect::PowerShell,
-                path,
-                syntax,
-                "Windows drive and UNC paths; use -LiteralPath; single quotes escape apostrophes by doubling them",
-            )
-        }
+        )
+    } else {
+        let (path, syntax) = powershell(search.as_deref(), program_files.as_deref(), &windows);
+        (
+            Dialect::PowerShell,
+            path,
+            syntax,
+            "Windows drive and UNC paths; use -LiteralPath; single quotes escape apostrophes by doubling them",
+        )
     };
     let cwd_command = if dialect == Dialect::Bash {
         let parent = executable.parent().unwrap_or(Path::new("."));
         if parent.join("cygwin1.dll").is_file() {
+            syntax = "Cygwin Bash (no profile or rc files)";
             "cygpath -w -- \"$PWD\""
-        } else {
+        } else if parent.join("msys-2.0.dll").is_file()
+            || parent.join("../usr/bin/msys-2.0.dll").is_file()
+        {
+            syntax = "MSYS/Git Bash (no profile or rc files)";
             "pwd -W"
+        } else {
+            syntax = "unsupported native Bash runtime (expected MSYS/Git or Cygwin)";
+            ""
         }
     } else {
         ""
@@ -164,6 +168,22 @@ pub(super) fn discover() -> ExecutionFacts {
         cleanup: "timeout/cancellation terminate the owned Windows job and its descendants; no Unix TERM grace; background work is session-owned; jobs die with the daemon; retained output stays in the session spill directory",
         temp: std::env::temp_dir(),
         cwd_command,
+    }
+}
+
+pub(super) fn apply_environment(
+    facts: &ExecutionFacts,
+    env: &mut std::collections::BTreeMap<String, String>,
+) {
+    // Windows environment names compare without case; remove older spellings
+    // before inserting the frozen temporary-directory values.
+    env.retain(|key, _| {
+        !["TEMP", "TMP", "TMPDIR", "BASH_ENV", "ENV"]
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+    });
+    for key in ["TEMP", "TMP", "TMPDIR"] {
+        env.insert(key.into(), facts.temp.to_string_lossy().into_owned());
     }
 }
 
@@ -197,21 +217,5 @@ mod tests {
             windows.join("System32/WindowsPowerShell/v1.0/powershell.exe")
         );
         assert!(syntax.contains("5.1"));
-    }
-}
-
-pub(super) fn apply_environment(
-    facts: &ExecutionFacts,
-    env: &mut std::collections::BTreeMap<String, String>,
-) {
-    // Windows environment names compare without case; remove older spellings
-    // before inserting the frozen temporary-directory values.
-    env.retain(|key, _| {
-        !["TEMP", "TMP", "BASH_ENV", "ENV"]
-            .iter()
-            .any(|name| key.eq_ignore_ascii_case(name))
-    });
-    for key in ["TEMP", "TMP"] {
-        env.insert(key.into(), facts.temp.to_string_lossy().into_owned());
     }
 }
