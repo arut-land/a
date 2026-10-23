@@ -4,6 +4,8 @@
 //!
 //! Storage workers capture a [`sys::fs::EditTransaction`], CPU workers match
 //! replacements and build the diff, then storage workers publish the result.
+//! A private staging namespace shields content until publication. Windows
+//! bounds the aggregate stream bytes and observes cancellation during copying.
 //! Publication replaces a regular file's name, preserving its metadata; links
 //! are rejected. The receipt promises atomic visibility, not power-loss
 //! durability. Identity and byte revalidation detect observed changes, without

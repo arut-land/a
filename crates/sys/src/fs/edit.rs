@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use super::staging::{Directory, Staged};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditConflict {
     Busy,
@@ -49,7 +51,11 @@ impl std::error::Error for EditError {}
 
 impl From<io::Error> for EditError {
     fn from(error: io::Error) -> Self {
-        Self::Io(error)
+        match error.kind() {
+            io::ErrorKind::Interrupted => Self::Cancelled,
+            io::ErrorKind::FileTooLarge => Self::TooLarge,
+            _ => Self::Io(error),
+        }
     }
 }
 
@@ -77,6 +83,9 @@ pub struct EditTransaction {
     name: OsString,
     source: Option<(File, Signature)>,
     original: Option<Vec<u8>>,
+    limit: usize,
+    #[cfg(windows)]
+    stream_bytes: u64,
 }
 
 impl EditTransaction {
@@ -108,6 +117,9 @@ impl EditTransaction {
             name,
             source: None,
             original: None,
+            limit,
+            #[cfg(windows)]
+            stream_bytes: 0,
         };
         let mut file = match transaction.open_source() {
             Ok(file) => file,
@@ -117,6 +129,10 @@ impl EditTransaction {
             Err(error) => return Err(error),
         };
         edit_lease(&file)?;
+        #[cfg(windows)]
+        {
+            transaction.stream_bytes = stream_bytes(&file, limit)?;
+        }
         let signature = signature(&file)?;
         let mut bytes = Vec::new();
         (&mut file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
@@ -145,13 +161,6 @@ impl EditTransaction {
                 return Err(EditError::NotRegular);
             }
         }
-        #[cfg(windows)]
-        {
-            let metadata = fs::symlink_metadata(self.directory.join(&self.name))?;
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
-                return Err(EditError::NotRegular);
-            }
-        }
         #[cfg(unix)]
         let file = {
             use rustix::fs::{Mode, OFlags, openat};
@@ -172,13 +181,7 @@ impl EditTransaction {
             )
         };
         #[cfg(windows)]
-        let file = {
-            use std::os::windows::fs::OpenOptionsExt;
-            fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(0x0020_0000)
-                .open(self.directory.join(&self.name))?
-        };
+        let file = super::staging::relative(&self.parent, &self.name, false, false)?;
         validate(&file)?;
         Ok(file)
     }
@@ -222,13 +225,15 @@ impl EditTransaction {
     /// A post-rename flush failure is a visible receipt, never an ambiguous error.
     /// Windows handle rename promises visibility only; durable mode is rejected
     /// before writing because there is no documented directory flush barrier.
+    /// The cancellation probe receives aggregate bytes copied/written so far;
+    /// it is checked by native stream callbacks and immediately before commit.
     pub fn publish(
         self,
         bytes: &[u8],
         durable: bool,
-        _should_cancel: &(dyn Fn(u64) -> bool + Sync),
+        should_cancel: &(dyn Fn(u64) -> bool + Sync),
     ) -> Result<EditReceipt, EditError> {
-        self.publish_with_sync(bytes, durable, File::sync_all)
+        self.publish_with_sync(bytes, durable, File::sync_all, should_cancel)
     }
 
     fn publish_with_sync(
@@ -236,6 +241,7 @@ impl EditTransaction {
         bytes: &[u8],
         durable: bool,
         sync_parent: impl FnOnce(&File) -> io::Result<()>,
+        should_cancel: &(dyn Fn(u64) -> bool + Sync),
     ) -> Result<EditReceipt, EditError> {
         #[cfg(windows)]
         if durable {
@@ -245,31 +251,48 @@ impl EditTransaction {
             )
             .into());
         }
-        self.revalidate()?;
-        let (name, file) = self.stage().map_err(|error| {
-            if error.kind() == io::ErrorKind::ResourceBusy {
-                EditError::Conflict(EditConflict::Changed)
-            } else {
-                self.revalidate().err().unwrap_or(EditError::Io(error))
+        if bytes.len() > self.limit {
+            return Err(EditError::TooLarge);
+        }
+        #[cfg(unix)]
+        let mut copied = 0;
+        #[cfg(windows)]
+        let mut copied = self.stream_bytes;
+        #[cfg(windows)]
+        {
+            let streams = self
+                .stream_bytes
+                .saturating_sub(self.original.as_ref().map_or(0, |b| b.len() as u64));
+            if streams.saturating_add(bytes.len() as u64) > self.limit as u64 {
+                return Err(EditError::TooLarge);
             }
-        })?;
-        let pending = Pending {
-            transaction: &self,
-            name,
-        };
-        let mut file = file;
-        validate(&file)?;
-        file.rewind()?;
-        file.write_all(bytes)?;
-        file.set_len(bytes.len() as u64)?;
+        }
+        check_cancel(should_cancel, 0)?;
+        self.revalidate()?;
+        let mut staged = self
+            .stage(should_cancel)
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::Interrupted | io::ErrorKind::FileTooLarge => EditError::from(error),
+                io::ErrorKind::ResourceBusy => EditError::Conflict(EditConflict::Changed),
+                _ => self.revalidate().err().unwrap_or(EditError::Io(error)),
+            })?;
+        staged.file.rewind()?;
+        for chunk in bytes.chunks(65536) {
+            check_cancel(should_cancel, copied)?;
+            staged.file.write_all(chunk)?;
+            copied += chunk.len() as u64;
+        }
+        staged.file.set_len(bytes.len() as u64)?;
+        check_cancel(should_cancel, copied)?;
         if let Some((source, _)) = &self.source {
-            preserve_metadata(source, &file)?;
+            preserve_metadata(source, &staged.file)?;
         }
         if durable {
-            file.sync_all()?;
+            staged.file.sync_all()?;
         }
         self.revalidate()?;
-        match rename(&self, &pending.name, &file, self.source.is_some()) {
+        check_cancel(should_cancel, copied)?;
+        match staged.publish(&self.name, self.source.is_some()) {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(EditError::Conflict(EditConflict::Appeared));
             }
@@ -289,29 +312,27 @@ impl EditTransaction {
         })
     }
 
-    fn stage(&self) -> io::Result<(OsString, File)> {
-        loop {
-            let name = temporary_name();
-            #[cfg(unix)]
-            let result = {
-                use rustix::fs::{Mode, OFlags, openat};
-                openat(
-                    &self.parent,
-                    &name,
-                    OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-                    Mode::RUSR | Mode::WUSR,
-                )
-                .map(File::from)
-                .map_err(io::Error::from)
-            };
-            #[cfg(windows)]
-            let result = stage_windows(self, &name);
-            match result {
-                Ok(file) => return Ok((name, file)),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-        }
+    fn stage(&self, should_cancel: &(dyn Fn(u64) -> bool + Sync)) -> io::Result<Staged<'_>> {
+        check_cancel(should_cancel, 0)?;
+        #[cfg(unix)]
+        let path = &self.observed_parent;
+        #[cfg(windows)]
+        let path = &self.directory;
+        let directory = Directory::create(&self.parent, path)?;
+        #[cfg(unix)]
+        return Staged::create(directory);
+        #[cfg(windows)]
+        Staged::copied(directory, |directory| {
+            stage_windows(self, directory, should_cancel)
+        })
+    }
+}
+
+fn check_cancel(should_cancel: &(dyn Fn(u64) -> bool + Sync), copied: u64) -> io::Result<()> {
+    if should_cancel(copied) {
+        Err(io::Error::new(io::ErrorKind::Interrupted, "edit cancelled"))
+    } else {
+        Ok(())
     }
 }
 
@@ -351,24 +372,6 @@ pub(super) fn temporary_name() -> OsString {
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
     .into()
-}
-
-struct Pending<'a> {
-    transaction: &'a EditTransaction,
-    name: OsString,
-}
-
-impl Drop for Pending<'_> {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        let _ = rustix::fs::unlinkat(
-            &self.transaction.parent,
-            &self.name,
-            rustix::fs::AtFlags::empty(),
-        );
-        #[cfg(windows)]
-        remove_pending(&self.transaction.directory.join(&self.name));
-    }
 }
 
 fn open_parent(path: &Path) -> io::Result<File> {
@@ -528,12 +531,12 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
     copy_xattrs(source, destination)?;
     destination.set_permissions(metadata.permissions())?;
     #[cfg(target_vendor = "apple")]
-    copy_acl(source, destination)?;
+    access_acl(Some(source), destination)?;
     Ok(())
 }
 
 #[cfg(target_vendor = "apple")]
-fn copy_acl(source: &File, destination: &File) -> io::Result<()> {
+pub(super) fn access_acl(source: Option<&File>, destination: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     unsafe extern "C" {
         fn acl_get_fd(fd: libc::c_int) -> *mut std::ffi::c_void;
@@ -544,10 +547,12 @@ fn copy_acl(source: &File, destination: &File) -> io::Result<()> {
     // copyfile may return success after an ACL failure. Apply the access policy
     // with checked calls, replacing any ACL inherited by the staging file.
     // SAFETY: source owns its descriptor; the returned ACL is freed below.
-    let mut acl = unsafe { acl_get_fd(source.as_raw_fd()) };
+    let mut acl = source.map_or(std::ptr::null_mut(), |source| unsafe {
+        acl_get_fd(source.as_raw_fd())
+    });
     if acl.is_null() {
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ENOENT) {
+        if source.is_some() && error.raw_os_error() != Some(libc::ENOENT) {
             return Err(error);
         }
         // SAFETY: an empty ACL removes inherited access; zero entries is valid.
@@ -602,56 +607,6 @@ fn copy_xattrs(source: &File, destination: &File) -> io::Result<()> {
         fsetxattr(destination, &name, &value[..length], XattrFlags::empty())?;
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn rename(
-    transaction: &EditTransaction,
-    pending: &std::ffi::OsStr,
-    _: &File,
-    replacing: bool,
-) -> io::Result<()> {
-    use rustix::fs::{RenameFlags, renameat_with};
-    let parent = &transaction.parent;
-    let flags = if replacing {
-        RenameFlags::empty()
-    } else {
-        RenameFlags::NOREPLACE
-    };
-    match renameat_with(parent, pending, parent, &transaction.name, flags) {
-        Ok(()) => Ok(()),
-        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::NOTSUP) => {
-            rename_fallback(transaction, pending, replacing)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-#[cfg(unix)]
-fn rename_fallback(
-    transaction: &EditTransaction,
-    pending: &std::ffi::OsStr,
-    replacing: bool,
-) -> io::Result<()> {
-    let parent = &transaction.parent;
-    if replacing {
-        Ok(rustix::fs::renameat(
-            parent,
-            pending,
-            parent,
-            &transaction.name,
-        )?)
-    } else {
-        // linkat publishes exclusively even without extended rename.
-        // Pending's destructor removes the second link afterward.
-        Ok(rustix::fs::linkat(
-            parent,
-            pending,
-            parent,
-            &transaction.name,
-            rustix::fs::AtFlags::empty(),
-        )?)
-    }
 }
 
 #[cfg(windows)]
@@ -715,35 +670,42 @@ fn signature(file: &File) -> io::Result<Signature> {
 }
 
 #[cfg(windows)]
-fn stage_windows(transaction: &EditTransaction, name: &std::ffi::OsStr) -> io::Result<File> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+fn stage_windows(
+    transaction: &EditTransaction,
+    directory: &Directory<'_>,
+    should_cancel: &(dyn Fn(u64) -> bool + Sync),
+) -> io::Result<File> {
+    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::{
         COPY_FILE_COPY_SYMLINK, COPY_FILE_FAIL_IF_EXISTS, CopyFileExW, DELETE, WRITE_DAC,
         WRITE_OWNER,
     };
-    let destination = transaction.directory.join(name);
     let access = GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
     let Some((source, _)) = &transaction.source else {
-        return fs::OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .access_mode(access)
-            .open(destination);
+        return super::staging::relative(
+            &directory.file,
+            std::ffi::OsStr::new(super::staging::CONTENT),
+            false,
+            true,
+        );
     };
+    stream_bytes(source, transaction.limit)?;
     let context = std::sync::Mutex::new(CopyContext {
         source,
         destination: None,
         error: None,
+        should_cancel,
+        limit: transaction.limit as u64,
+        announced: 0,
+        last_stream: 0,
     });
     let from = crate::windows::wide(transaction.directory.join(&transaction.name).as_os_str());
-    let to = crate::windows::wide(destination.as_os_str());
-    // The first stream-switch callback applies the source access policy before
-    // content is copied. Keeping only attribute/security access during copying
-    // avoids conflicting with CopyFileEx's data-sharing contract.
-    // SAFETY: paths and context live through this synchronous call; the callback
-    // retains owned reopened handles rather than the copier's borrowed handles.
+    let to = crate::windows::wide(directory.path.join(super::staging::CONTENT).as_os_str());
+    // The pinned directories deny delete sharing. CopyFileEx's path is therefore
+    // inside our private namespace for the entire synchronous native operation.
+    // The callback restricts access before copying and checks every work chunk.
+    // SAFETY: paths and synchronized callback context live until the copy returns.
     let copied = crate::windows::ok(unsafe {
         CopyFileExW(
             from.as_ptr(),
@@ -758,32 +720,23 @@ fn stage_windows(transaction: &EditTransaction, name: &std::ffi::OsStr) -> io::R
         .into_inner()
         .map_err(|_| io::Error::other("native copy callback panicked"))?;
     if let Err(error) = copied {
-        let error = context.error.take().unwrap_or(error);
-        let owned = context.destination.is_some();
-        drop(context);
-        if owned {
-            remove_pending(&destination);
-        }
-        // Only exclusive-create collisions may retry with a fresh name.
-        return if (error.kind() == io::ErrorKind::AlreadyExists && !owned)
-            || error.kind() == io::ErrorKind::ResourceBusy
+        if let Some(keeper) = &context.destination
+            && let Ok(file) = reopen(keeper.as_raw_handle(), DELETE)
         {
-            Err(error)
-        } else {
-            Err(io::Error::other(error))
-        };
+            super::staging::delete(&file);
+        }
+        return Err(context.error.take().unwrap_or(error));
     }
-    let Some(keeper) = context.destination else {
-        remove_pending(&destination);
-        return Err(io::Error::other("native copy omitted its stream callback"));
-    };
-    // Reopen the pinned object after the copier closes its data handle. This
-    // grants DELETE for handle-based publication without reopening a pathname.
+    let keeper = context
+        .destination
+        .ok_or_else(|| io::Error::other("native copy omitted its stream callback"))?;
+    // Upgrade the same object after the copier releases its data-sharing lease.
     match reopen(keeper.as_raw_handle(), access) {
         Ok(file) => Ok(file),
         Err(error) => {
-            drop(keeper);
-            remove_pending(&destination);
+            if let Ok(file) = reopen(keeper.as_raw_handle(), DELETE) {
+                super::staging::delete(&file);
+            }
             Err(error)
         }
     }
@@ -794,6 +747,59 @@ struct CopyContext<'a> {
     source: &'a File,
     destination: Option<File>,
     error: Option<io::Error>,
+    should_cancel: &'a (dyn Fn(u64) -> bool + Sync),
+    limit: u64,
+    announced: u64,
+    last_stream: u32,
+}
+
+#[cfg(windows)]
+fn stream_bytes(file: &File, limit: usize) -> io::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_STREAM_INFO, FileStreamInfo, GetFileInformationByHandleEx,
+    };
+    // Bound metadata too: arbitrarily many empty streams still cost copy work.
+    let mut buffer = vec![0u64; 65536 / 8];
+    // SAFETY: the initialized buffer is 8-byte aligned and has the advertised size.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStreamInfo,
+            buffer.as_mut_ptr().cast(),
+            65536,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(234) {
+            Err(io::ErrorKind::FileTooLarge.into())
+        } else {
+            Err(error)
+        };
+    }
+    let mut at = 0;
+    let mut total = 0u64;
+    loop {
+        if at + size_of::<FILE_STREAM_INFO>() > 65536 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        // SAFETY: kernel entries are 8-byte aligned; the bounds cover the header.
+        let entry = unsafe { &*buffer.as_ptr().add(at / 8).cast::<FILE_STREAM_INFO>() };
+        let bytes = u64::try_from(entry.StreamSize).map_err(|_| io::ErrorKind::InvalidData)?;
+        total = total
+            .checked_add(bytes)
+            .filter(|sum| *sum <= limit as u64)
+            .ok_or(io::ErrorKind::FileTooLarge)?;
+        if entry.NextEntryOffset == 0 {
+            return Ok(total);
+        }
+        let next = entry.NextEntryOffset as usize;
+        if next < size_of::<FILE_STREAM_INFO>() || next % 8 != 0 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        at = at.checked_add(next).ok_or(io::ErrorKind::InvalidData)?;
+    }
 }
 
 #[cfg(windows)]
@@ -815,11 +821,11 @@ fn reopen(handle: windows_sys::Win32::Foundation::HANDLE, access: u32) -> io::Re
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 unsafe extern "system" fn copy_progress(
+    total_size: i64,
+    copied: i64,
+    stream_size: i64,
     _: i64,
-    _: i64,
-    _: i64,
-    _: i64,
-    _: u32,
+    stream: u32,
     reason: u32,
     source: windows_sys::Win32::Foundation::HANDLE,
     destination: windows_sys::Win32::Foundation::HANDLE,
@@ -829,9 +835,6 @@ unsafe extern "system" fn copy_progress(
         CALLBACK_STREAM_SWITCH, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES, PROGRESS_CANCEL,
         PROGRESS_CONTINUE, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
-    if reason != CALLBACK_STREAM_SWITCH {
-        return PROGRESS_CONTINUE;
-    }
     // SAFETY: context lives until CopyFileEx returns. A mutex also permits
     // callback delivery from native workers without aliasing mutable state.
     let context = unsafe { &*data.cast::<std::sync::Mutex<CopyContext<'_>>>() };
@@ -864,24 +867,28 @@ unsafe extern "system" fn copy_progress(
             return PROGRESS_CANCEL;
         }
     }
-    PROGRESS_CONTINUE
-}
-
-#[cfg(windows)]
-fn remove_pending(path: &Path) {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_READONLY, SetFileAttributesW};
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        let attributes = metadata.file_attributes();
-        if attributes & FILE_ATTRIBUTE_READONLY != 0 {
-            let path = crate::windows::wide(path.as_os_str());
-            // SAFETY: this is an unpublished, owned staging file and the path is terminated.
-            unsafe {
-                SetFileAttributesW(path.as_ptr(), attributes & !FILE_ATTRIBUTE_READONLY);
-            }
+    let checked = (|| {
+        let size = u64::try_from(total_size).map_err(|_| io::ErrorKind::InvalidData)?;
+        let copied = u64::try_from(copied).map_err(|_| io::ErrorKind::InvalidData)?;
+        if size > context.limit || copied > context.limit {
+            return Err(io::ErrorKind::FileTooLarge.into());
         }
-        let _ = fs::remove_file(path);
+        if reason == CALLBACK_STREAM_SWITCH && stream != context.last_stream {
+            let bytes = u64::try_from(stream_size).map_err(|_| io::ErrorKind::InvalidData)?;
+            context.announced = context
+                .announced
+                .checked_add(bytes)
+                .filter(|sum| *sum <= context.limit)
+                .ok_or(io::ErrorKind::FileTooLarge)?;
+            context.last_stream = stream;
+        }
+        check_cancel(context.should_cancel, copied)
+    })();
+    if let Err(error) = checked {
+        context.error = Some(error);
+        return PROGRESS_CANCEL;
     }
+    PROGRESS_CONTINUE
 }
 
 #[cfg(windows)]
@@ -1083,47 +1090,6 @@ unsafe fn same_acl(
     }
 }
 
-#[cfg(windows)]
-fn rename(
-    transaction: &EditTransaction,
-    _: &std::ffi::OsStr,
-    file: &File,
-    replacing: bool,
-) -> io::Result<()> {
-    rename_windows(
-        file,
-        &transaction.directory.join(&transaction.name),
-        replacing,
-    )
-}
-
-#[cfg(windows)]
-fn rename_windows(file: &File, to: &Path, replacing: bool) -> io::Result<()> {
-    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle,
-    };
-    let name: Vec<u16> = to.as_os_str().encode_wide().collect();
-    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let bytes = offset + name.len() * 2;
-    let length = u32::try_from(bytes).map_err(|_| io::ErrorKind::InvalidInput)?;
-    let mut buffer = vec![0u64; bytes.max(size_of::<FILE_RENAME_INFO>()).div_ceil(8)];
-    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // SAFETY: u64 storage aligns the structure, has room for its flexible UTF-16
-    // tail and stays alive until the synchronous call completes.
-    unsafe {
-        (*info).Anonymous.Flags = if replacing { 0x1 | 0x2 } else { 0x2 }; // REPLACE_IF_EXISTS | POSIX_SEMANTICS
-        (*info).FileNameLength = u32::try_from(name.len() * 2).expect("checked buffer length");
-        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-        crate::windows::ok(SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FileRenameInfoEx,
-            info.cast(),
-            length,
-        ))
-    }
-}
-
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
@@ -1294,15 +1260,9 @@ mod tests {
         let work = Workspace::new();
         fs::write(work.target(), b"original").unwrap();
         let transaction = work.capture();
-        let (name, file) = transaction.stage().unwrap();
-        let pending = Pending {
-            transaction: &transaction,
-            name,
-        };
-        let mut file = file;
-        file.write_all(b"partial").unwrap();
-        drop(file);
-        drop(pending);
+        let mut staged = transaction.stage(&|_| false).unwrap();
+        staged.file.write_all(b"partial").unwrap();
+        drop(staged);
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
         work.only_target_remains();
     }
@@ -1310,8 +1270,29 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[test]
     fn staged_content_never_inherits_public_read_access() {
-        let work = Workspace::new();
+        use std::os::unix::fs::PermissionsExt;
+        let work = Workspace(Path::new("/private/tmp").join(temporary_name()));
+        fs::create_dir(&work.0).unwrap();
+        fs::set_permissions(&work.0, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(work.target(), b"original").unwrap();
+        let reader = |path: &Path| {
+            std::process::Command::new("/usr/bin/sudo")
+                .args(["-n", "-u", "nobody", "/bin/cat"])
+                .arg(path)
+                .output()
+                .unwrap()
+        };
+        let native_reader = std::env::var_os("GITHUB_ACTIONS").is_some();
+        if native_reader {
+            let control = work.0.join("public");
+            fs::write(&control, b"control").unwrap();
+            fs::set_permissions(&control, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                reader(&control).stdout,
+                b"control",
+                "the unprivileged reader must reach the fixture"
+            );
+        }
         assert!(
             std::process::Command::new("/bin/chmod")
                 .args(["+a", "everyone allow read,file_inherit,directory_inherit"])
@@ -1320,24 +1301,39 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let transaction = work.capture();
-        let (name, mut file) = transaction.stage().unwrap();
-        let pending = Pending {
-            transaction: &transaction,
-            name,
-        };
-        file.write_all(&vec![b'x'; 8 << 20]).unwrap();
-        let output = std::process::Command::new("/bin/ls")
-            .arg("-le")
-            .arg(work.0.join(&pending.name))
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let acl = String::from_utf8(output.stdout).unwrap();
-        assert!(
-            !acl.contains("allow read"),
-            "staged data grants public read: {acl}"
-        );
+        let transaction = EditTransaction::capture(&work.target(), 8 << 20).unwrap();
+        let mut staged = transaction.stage(&|_| false).unwrap();
+        staged.file.write_all(&vec![b'x'; 8 << 20]).unwrap();
+        for path in [
+            work.0.join(&staged.directory.name),
+            work.0
+                .join(&staged.directory.name)
+                .join(super::super::staging::CONTENT),
+        ] {
+            let output = std::process::Command::new("/bin/ls")
+                .arg("-led")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let acl = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                !acl.contains("allow read"),
+                "staged data grants public read: {acl}"
+            );
+        }
+        if native_reader {
+            let path = work
+                .0
+                .join(&staged.directory.name)
+                .join(super::super::staging::CONTENT);
+            let denied = reader(&path);
+            assert!(!denied.status.success());
+            assert!(
+                denied.stdout.is_empty(),
+                "no staged byte may reach the reader"
+            );
+        }
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
     }
 
@@ -1345,26 +1341,42 @@ mod tests {
     #[test]
     fn staging_substitution_never_publishes_an_unrelated_object() {
         use std::os::unix::fs::symlink;
-        for fallback in [false, true] {
+        for (fallback, replacing, named) in [false, true].into_iter().flat_map(|fallback| {
+            [false, true].into_iter().flat_map(move |replacing| {
+                [false, true].map(move |named| (fallback, replacing, named))
+            })
+        }) {
             let work = Workspace::new();
-            fs::write(work.target(), b"original").unwrap();
+            if replacing {
+                fs::write(work.target(), b"original").unwrap();
+            }
             let victim = work.0.join("victim");
             fs::write(&victim, b"unrelated").unwrap();
             let transaction = work.capture();
-            let (name, mut file) = transaction.stage().unwrap();
-            let pending = Pending {
-                transaction: &transaction,
-                name,
+            let mut staged = if named {
+                Staged::named(Directory::create(&transaction.parent, &work.0).unwrap()).unwrap()
+            } else {
+                transaction.stage(&|_| false).unwrap()
             };
-            fs::rename(work.0.join(&pending.name), work.0.join("displaced")).unwrap();
-            symlink(&victim, work.0.join(&pending.name)).unwrap();
-            file.write_all(b"replacement").unwrap();
+            let public = work.0.join(&staged.directory.name);
+            fs::rename(&public, work.0.join("displaced")).unwrap();
+            symlink(&victim, &public).unwrap();
+            staged.file.write_all(b"replacement").unwrap();
             transaction.revalidate().unwrap();
             if fallback {
-                rename_fallback(&transaction, &pending.name, true).unwrap();
+                staged.fallback(&transaction.name, replacing).unwrap();
             } else {
-                rename(&transaction, &pending.name, &file, true).unwrap();
+                staged.publish(&transaction.name, replacing).unwrap();
             }
+            drop(staged);
+            assert!(
+                fs::symlink_metadata(&public)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "cleanup must preserve the substitute"
+            );
+            assert_eq!(fs::read_dir(work.0.join("displaced")).unwrap().count(), 0);
             assert!(
                 !fs::symlink_metadata(work.target())
                     .unwrap()
@@ -1374,6 +1386,18 @@ mod tests {
             assert_eq!(fs::read(work.target()).unwrap(), b"replacement");
             assert_eq!(fs::read(&victim).unwrap(), b"unrelated");
         }
+    }
+
+    #[test]
+    fn cancellation_after_staging_never_changes_the_target() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"").unwrap();
+        let result = work
+            .capture()
+            .publish(b"replacement", false, &|copied| copied >= 11);
+        assert!(matches!(result, Err(EditError::Cancelled)));
+        assert_eq!(fs::read(work.target()).unwrap(), b"");
+        work.only_target_remains();
     }
 
     #[cfg(unix)]
@@ -1454,9 +1478,12 @@ mod tests {
         fs::write(work.target(), b"original").unwrap();
         let receipt = work
             .capture()
-            .publish_with_sync(b"new", true, |_| {
-                Err(io::Error::other("injected directory flush failure"))
-            })
+            .publish_with_sync(
+                b"new",
+                true,
+                |_| Err(io::Error::other("injected directory flush failure")),
+                &|_| false,
+            )
             .unwrap();
         assert!(receipt.visible);
         assert!(matches!(receipt.durability, Durability::Failed(_)));
@@ -1519,22 +1546,19 @@ mod tests {
     fn fallback_publication_is_exclusive_even_after_the_last_check() {
         let work = Workspace::new();
         let transaction = work.capture();
-        let (name, mut file) = transaction.stage().unwrap();
-        let pending = Pending {
-            transaction: &transaction,
-            name,
-        };
-        file.write_all(b"ours").unwrap();
+        let mut staged = transaction.stage(&|_| false).unwrap();
+        staged.file.write_all(b"ours").unwrap();
         transaction.revalidate().unwrap();
         fs::write(work.target(), b"theirs").unwrap();
         assert_eq!(
-            rename_fallback(&transaction, &pending.name, false)
+            staged
+                .fallback(&transaction.name, false)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
-        drop(pending);
+        drop(staged);
         work.only_target_remains();
     }
 

@@ -7,6 +7,7 @@ use std::io::{self, Write as _};
 use std::path::Path;
 
 mod edit;
+mod staging;
 pub use edit::{Durability, EditConflict, EditError, EditReceipt, EditTransaction};
 
 /// Why discovery skipped a candidate instead of opening arbitrary filesystem objects.
@@ -367,7 +368,17 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
 
 /// Replaces `path` with `bytes`, readable only by this user, so a reader
 /// sees the old file or the new one, never a torn or world-readable one.
+/// No persistence barrier is requested; configuration uses `write_private_durable`.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    save_private(path, bytes, false)
+}
+
+/// Saves configuration with file and namespace persistence barriers.
+pub fn write_private_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    save_private(path, bytes, true)
+}
+
+fn save_private(path: &Path, bytes: &[u8], durable: bool) -> io::Result<()> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -381,9 +392,23 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     };
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    let written = (|| {
+        #[cfg(target_vendor = "apple")]
+        edit::access_acl(None, &file)?;
+        file.write_all(bytes)?;
+        if durable {
+            file.sync_all()?;
+        }
+        Ok(())
+    })();
     drop(file);
-    let written = written.and_then(|()| publish(&tmp, path));
+    let written = written.and_then(|()| {
+        if durable {
+            publish(&tmp, path)
+        } else {
+            replace(&tmp, path)
+        }
+    });
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }
@@ -395,11 +420,11 @@ pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(unix)]
     return fs::rename(from, to);
     #[cfg(windows)]
-    move_file(from, to, true)
+    move_file(from, to, false)
 }
 
 #[cfg(windows)]
-fn move_file(from: &Path, to: &Path, replacing: bool) -> io::Result<()> {
+fn move_file(from: &Path, to: &Path, durable: bool) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
@@ -425,11 +450,7 @@ fn move_file(from: &Path, to: &Path, replacing: bool) -> io::Result<()> {
         MoveFileExW(
             from.as_ptr(),
             to.as_ptr(),
-            if replacing {
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
-            } else {
-                MOVEFILE_WRITE_THROUGH
-            },
+            MOVEFILE_REPLACE_EXISTING | if durable { MOVEFILE_WRITE_THROUGH } else { 0 },
         )
     })
 }
