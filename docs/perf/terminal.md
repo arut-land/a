@@ -31,7 +31,8 @@ Unix output checks foreground ownership and blocks SIGTTOU only around
 cleanup or an owned write, preventing restarted writes from trapping the
 renderer after the shell changes foreground jobs. The renderer serializes
 restoration and suspension; an acknowledged suspend event parks the input
-reader until ownership has been reacquired. There is no tcsetpgrp that
+reader until ownership has been reacquired. The stop is directed to the
+calling thread, which cannot re-enter raw mode before being continued. There is no tcsetpgrp that
 could take the foreground from the shell.
 
 Native tests use isolated pseudo-terminals or a private Windows console
