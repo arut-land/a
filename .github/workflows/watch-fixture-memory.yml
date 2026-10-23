@@ -61,8 +61,9 @@ jobs:
           if [[ "$RUNNER_OS" == macOS ]]; then cargo_bin="$(rustup which cargo)"; fi
           for role in reference candidate; do
             if [[ "$role" == reference ]]; then revision=0d531a42a8c87275edf13f984a5928ff104d45fe; else revision=416af1e2868c64938b97445ab088919989ffdf87; fi
+            git -C measured fetch --depth=1 origin "$revision"
             git -C measured checkout "$revision"
-            (cd measured && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/measured/target/perf-build" mise exec -- "$cargo_bin" build-release -p a --features fixtures)
+            (cd measured && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/measured/target/perf-build" mise exec -- "$cargo_bin" build-release -p a --features fixtures --locked)
             cp measured/target/perf-build/release/a "built/$role-a"
           done
           python - <<'PY'
