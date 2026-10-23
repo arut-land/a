@@ -170,6 +170,7 @@ jobs:
             mise exec -- python scripts/perf/hosted.py --phase build --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' "${extra[@]}"
           fi
       - name: Measure startup budgets workloads and benches
+        timeout-minutes: 20
         if: env.PERF_BUILD_ONLY != 'true'
         run: |
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
@@ -178,6 +179,7 @@ jobs:
             mise exec -- python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
           fi
       - name: Measure alternating reference and candidate rounds
+        timeout-minutes: 45
         if: ${{ !cancelled() && steps.build.outcome == 'success' && env.PERF_REFERENCE != '' && env.PERF_BUILD_ONLY != 'true' }}
         run: |
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then

@@ -2,6 +2,7 @@
 #MISE description="Measure release CLI workloads and machine load in isolated homes"
 """Run after building: no compilation or profiling overlaps a timing window."""
 import argparse
+import faulthandler
 import json
 import os
 from pathlib import Path
@@ -77,6 +78,7 @@ def command(argv):
 
 
 def main():
+    faulthandler.dump_traceback_later(300, repeat=True)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("label")

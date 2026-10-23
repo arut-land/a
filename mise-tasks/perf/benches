@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #MISE description="Run saved release engine, JSON and TUI workloads with load and process metrics"
 import argparse
+import faulthandler
 import importlib.machinery
 import importlib.util
 import json
@@ -14,6 +15,7 @@ sys.dont_write_bytecode = True
 
 
 def main():
+    faulthandler.dump_traceback_later(300, repeat=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("build", type=Path)
     parser.add_argument("transcript", type=Path)

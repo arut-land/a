@@ -1,5 +1,6 @@
 """Build before timing; retain every observation for same-runner comparisons."""
 import argparse
+import faulthandler
 import importlib.machinery
 import importlib.util
 import json
@@ -340,6 +341,8 @@ def main():
             bloat(source, output)
     if args.build_only or args.phase == "build":
         return
+    # Native exec and accounting can stall before a subprocess timeout is armed.
+    faulthandler.dump_traceback_later(300, repeat=True)
     os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
     if args.phase == "paired":
         if not args.paired_ref:
