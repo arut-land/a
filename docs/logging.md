@@ -118,4 +118,5 @@ panic payload and check the largest numeric report against its cap. The
 engine's Faulty-store test keeps the diagnostic disk stalled through store recovery and a subsequent commit.
 Black-box acceptance checks the crash recovery session and rule; a signal
 exit test checks the recorded reason and absence of session content.
-Dependency and size measurements are in [the logging probe](perf/logging.md).
+Dependency and size measurements are in [the logging probe](perf/logging.md)
+and [the native diagnostics measurements](perf/native-diagnostics.md).
