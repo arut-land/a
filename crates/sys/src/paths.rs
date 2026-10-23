@@ -180,7 +180,10 @@ fi"#,
 
     /// The daemon's crash reports; see [`crate::crash`].
     pub fn crash_dir(&self) -> PathBuf {
-        self.inner.state.join("crash")
+        match self.layout() {
+            InstallLayout::Native => self.inner.logs.join("crash"),
+            InstallLayout::Isolated(root) => root.join("crash"),
+        }
     }
 
     /// Content-addressed attachments too large for a log.

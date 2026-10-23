@@ -8,16 +8,18 @@ reading configuration does not require a writable home.
 
 | Purpose | Linux | macOS | Windows |
 | --- | --- | --- | --- |
-| Configuration, policy, extensions, skills | `$XDG_CONFIG_HOME/a` | `~/Library/Application Support/dev.a` | RoamingAppData `a` |
+| Configuration, policy, extensions, skills | `$XDG_CONFIG_HOME/a` | `~/Library/Application Support/dev.a/config` | LocalAppData `a/config` |
 | Sessions, catalog, retained output, blobs, crash breaker | `$XDG_STATE_HOME/a` | `~/Library/Application Support/dev.a` | LocalAppData `a/state` |
 | Installed assets and current executable staging | `$XDG_DATA_HOME/a` | `~/Library/Application Support/dev.a` | LocalAppData `a/data` |
 | Disposable cache | `$XDG_CACHE_HOME/a` | `~/Library/Caches/dev.a` | LocalAppData `a/cache` |
-| Diagnostic logs | `$XDG_STATE_HOME/a/logs` | `~/Library/Logs/dev.a` | LocalAppData `a/logs` |
+| Diagnostic logs and crash reports | `$XDG_STATE_HOME/a/logs` | `~/Library/Logs/dev.a` | LocalAppData `a/logs` |
 | Temporary files | Runtime directory `a-tmp` | Darwin user temporary directory `dev.a` | LocalAppData `a/temp` |
 
-Windows resolves LocalAppData and RoamingAppData with `SHGetKnownFolderPath`,
-including redirected folders. Only user configuration roams; machine-specific
-session state, builds, caches and diagnostics stay local. macOS obtains its
+Windows resolves LocalAppData with `SHGetKnownFolderPath`, including redirected
+folders. Configuration contains provider keys and machine-specific tool paths,
+so it stays local alongside state, builds, caches and diagnostics. RoamingAppData
+is reserved for explicitly portable, secret-free preferences; there are no such
+preferences in this layout. macOS obtains its
 per-user temporary directory with `confstr(_CS_DARWIN_USER_TEMP_DIR)`, independently
 of an inherited `TMPDIR`.
 

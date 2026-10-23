@@ -1,9 +1,7 @@
 use super::{Command, InstallLayout, Locations, PathBuf, Paths, io};
 use std::os::windows::ffi::OsStringExt;
 use windows_sys::Win32::System::Com::CoTaskMemFree;
-use windows_sys::Win32::UI::Shell::{
-    FOLDERID_LocalAppData, FOLDERID_RoamingAppData, SHGetKnownFolderPath,
-};
+use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
 
 fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
     let mut raw = std::ptr::null_mut();
@@ -36,7 +34,8 @@ pub(super) fn resolve() -> io::Result<Paths> {
     let local = known_folder(&FOLDERID_LocalAppData)?;
     Ok(Paths::new(Locations {
         layout: InstallLayout::Native,
-        config: known_folder(&FOLDERID_RoamingAppData)?,
+        // Provider keys and machine-specific tool paths are not roaming preferences.
+        config: local.join("config"),
         data: local.join("data"),
         state: local.join("state"),
         cache: local.join("cache"),
@@ -59,14 +58,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_user_configuration_roams() {
+    fn credentials_and_machine_state_never_use_roaming_storage() {
         let paths = resolve().unwrap();
         let local = known_folder(&FOLDERID_LocalAppData).unwrap();
-        assert_eq!(
-            paths.config_dir(),
-            known_folder(&FOLDERID_RoamingAppData).unwrap()
-        );
+        assert_eq!(paths.config_dir(), local.join("config"));
         for path in [
+            paths.config_dir(),
             paths.state_dir(),
             paths.data_dir(),
             paths.cache_dir(),
@@ -75,7 +72,6 @@ mod tests {
             &paths.logs_dir(),
         ] {
             assert!(path.starts_with(&local));
-            assert_ne!(path, paths.config_dir());
         }
         assert!(paths.spill_dir().starts_with(paths.state_dir()));
     }

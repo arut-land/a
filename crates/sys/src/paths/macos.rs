@@ -40,7 +40,7 @@ pub(super) fn resolve() -> io::Result<Paths> {
     let support = library.join("Application Support/dev.a");
     Ok(Paths::new(Locations {
         layout: InstallLayout::Native,
-        config: support.clone(),
+        config: support.join("config"),
         data: support.clone(),
         state: support,
         cache: library.join("Caches/dev.a"),
@@ -64,6 +64,12 @@ mod tests {
     fn durable_output_and_disposable_cache_have_different_native_locations() {
         let paths = resolve().unwrap();
         assert!(paths.spill_dir().starts_with(paths.state_dir()));
+        assert!(
+            paths
+                .config_dir()
+                .ends_with("Library/Application Support/dev.a/config")
+        );
+        assert!(paths.crash_dir().starts_with(paths.logs_dir()));
         assert!(
             paths
                 .state_dir()
