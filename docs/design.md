@@ -216,7 +216,8 @@ PowerShell uses one bounded Unicode `-Command` payload without profiles,
 interactive input or execution-policy changes. Explicit exit codes survive;
 otherwise the final command's success becomes 0 or 1, with normal error semantics.
 A best-effort UTF-8 FileSystem cwd receipt cannot replace the command's status.
-The same process service supervises either dialect. See
+The 5.1 SDK type binds its native Utility and Management modules before running
+commands, retaining client module paths. The same process service supervises either dialect. See
 [shell execution evidence](perf/shell.md).
 
 The default loop lives in the SDK and registers through the same machinery.

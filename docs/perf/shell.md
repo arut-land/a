@@ -38,6 +38,25 @@ transitive dependencies. Standard canonicalization fails the measured startup
 case; unconditional prefix removal would discard Windows path semantics.
 Internal filesystem paths retain their native representation.
 
+## Native Desktop standard library
+
+On the Windows 11 Arm runner, implicit 5.1 discovery stalled even for
+`Write-Output`, `Get-Variable` and `Set-Location`. Clearing the inherited module
+path before process startup did not resolve it: Desktop startup reconstructs
+that path and can insert AllUsers ahead of its own modules. A
+[bounded native probe](https://github.com/arut-land/a/actions/runs/39998112920/job/120567421864)
+completed with exit 37 after either replacing the module path inside the
+running shell or importing the native Utility manifest by full path. Disabling
+the analysis cache did not fix discovery. Separate probes ruled out process
+machine choice and console flags.
+
+The Desktop SDK tool therefore imports Utility and Management explicitly from
+its own `$PSHOME` before executing commands. It preserves the client's module
+path and normal error preferences. The pwsh tool uses its own initialization.
+The discovered edition selects these concrete SDK types at startup; both
+publish the single name `powershell`. The process service and SpawnPlan retain
+their existing launch and supervision contracts.
+
 ## Shell contract validation
 
 Hosted Windows x64 and ARM64 CI runs the same SDK tool against both installed
