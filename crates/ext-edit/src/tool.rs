@@ -280,12 +280,14 @@ impl Transaction<'_> {
                 Ok((transaction, content, edited, hash))
             })
             .await?;
+        let cancel = self.cancel.clone();
         self.run(
             Storage,
             limits.file + content.len() + limits.diff_bytes * 2,
             move || {
                 let mut edited = edited;
-                edited.publication = transaction.publish(content.as_bytes(), false)?;
+                edited.publication =
+                    transaction.publish(content.as_bytes(), false, &|_| cancel.is_set())?;
                 Ok((edited, hash))
             },
         )

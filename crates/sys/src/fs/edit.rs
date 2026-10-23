@@ -24,6 +24,7 @@ pub enum EditError {
     NotRegular,
     MultipleLinks,
     TooLarge,
+    Cancelled,
     Io(io::Error),
 }
 
@@ -38,6 +39,7 @@ impl std::fmt::Display for EditError {
             }
             Self::MultipleLinks => f.write_str("edit refuses to break multiple hard links"),
             Self::TooLarge => f.write_str("file exceeds byte limit"),
+            Self::Cancelled => f.write_str("edit cancelled"),
             Self::Io(error) => error.fmt(f),
         }
     }
@@ -220,7 +222,12 @@ impl EditTransaction {
     /// A post-rename flush failure is a visible receipt, never an ambiguous error.
     /// Windows handle rename promises visibility only; durable mode is rejected
     /// before writing because there is no documented directory flush barrier.
-    pub fn publish(self, bytes: &[u8], durable: bool) -> Result<EditReceipt, EditError> {
+    pub fn publish(
+        self,
+        bytes: &[u8],
+        durable: bool,
+        _should_cancel: &(dyn Fn(u64) -> bool + Sync),
+    ) -> Result<EditReceipt, EditError> {
         self.publish_with_sync(bytes, durable, File::sync_all)
     }
 
@@ -1159,7 +1166,10 @@ mod tests {
         let work = Workspace::new();
         fs::write(work.target(), b"original").unwrap();
         let mut reader = File::open(work.target()).unwrap();
-        let receipt = work.capture().publish(b"replacement", false).unwrap();
+        let receipt = work
+            .capture()
+            .publish(b"replacement", false, &|_| false)
+            .unwrap();
         assert_eq!(
             receipt,
             EditReceipt {
@@ -1179,7 +1189,7 @@ mod tests {
         let work = Workspace::new();
         fs::write(work.target(), b"").unwrap();
         for content in [b"longer content".as_slice(), b"x", b""] {
-            work.capture().publish(content, false).unwrap();
+            work.capture().publish(content, false, &|_| false).unwrap();
             assert_eq!(fs::read(work.target()).unwrap(), content);
         }
         work.only_target_remains();
@@ -1195,7 +1205,7 @@ mod tests {
             .join()
             .unwrap();
         assert!(matches!(
-            transaction.publish(b"ours", false),
+            transaction.publish(b"ours", false, &|_| false),
             Err(EditError::Conflict(EditConflict::Changed))
         ));
         assert_eq!(fs::read(work.target()).unwrap(), b"external");
@@ -1210,7 +1220,7 @@ mod tests {
         fs::remove_file(work.target()).unwrap();
         fs::write(work.target(), b"original").unwrap();
         assert!(matches!(
-            transaction.publish(b"ours", false),
+            transaction.publish(b"ours", false, &|_| false),
             Err(EditError::Conflict(EditConflict::Changed))
         ));
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
@@ -1226,8 +1236,10 @@ mod tests {
             EditTransaction::capture(&work.target(), 32),
             Err(EditError::Conflict(EditConflict::Busy))
         ));
-        first.publish(b"first", false).unwrap();
-        work.capture().publish(b"second", false).unwrap();
+        first.publish(b"first", false, &|_| false).unwrap();
+        work.capture()
+            .publish(b"second", false, &|_| false)
+            .unwrap();
         assert_eq!(fs::read(work.target()).unwrap(), b"second");
         work.only_target_remains();
     }
@@ -1238,9 +1250,9 @@ mod tests {
         let first = work.capture();
         let second = work.capture();
         assert!(first.original().is_none());
-        first.publish(b"first", false).unwrap();
+        first.publish(b"first", false, &|_| false).unwrap();
         assert!(matches!(
-            second.publish(b"second", false),
+            second.publish(b"second", false, &|_| false),
             Err(EditError::Conflict(EditConflict::Appeared))
         ));
         assert_eq!(fs::read(work.target()).unwrap(), b"first");
@@ -1254,7 +1266,7 @@ mod tests {
         let transaction = work.capture();
         fs::remove_file(work.target()).unwrap();
         assert!(matches!(
-            transaction.publish(b"ours", false),
+            transaction.publish(b"ours", false, &|_| false),
             Err(EditError::Conflict(EditConflict::Changed))
         ));
         assert_eq!(fs::read_dir(&work.0).unwrap().count(), 0);
@@ -1293,6 +1305,89 @@ mod tests {
         drop(pending);
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
         work.only_target_remains();
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn staged_content_never_inherits_public_read_access() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .args(["+a", "everyone allow read,file_inherit,directory_inherit"])
+                .arg(&work.0)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let transaction = work.capture();
+        let (name, mut file) = transaction.stage().unwrap();
+        let pending = Pending {
+            transaction: &transaction,
+            name,
+        };
+        file.write_all(&vec![b'x'; 8 << 20]).unwrap();
+        let output = std::process::Command::new("/bin/ls")
+            .arg("-le")
+            .arg(work.0.join(&pending.name))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let acl = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            !acl.contains("allow read"),
+            "staged data grants public read: {acl}"
+        );
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_substitution_never_publishes_an_unrelated_object() {
+        use std::os::unix::fs::symlink;
+        for fallback in [false, true] {
+            let work = Workspace::new();
+            fs::write(work.target(), b"original").unwrap();
+            let victim = work.0.join("victim");
+            fs::write(&victim, b"unrelated").unwrap();
+            let transaction = work.capture();
+            let (name, mut file) = transaction.stage().unwrap();
+            let pending = Pending {
+                transaction: &transaction,
+                name,
+            };
+            fs::rename(work.0.join(&pending.name), work.0.join("displaced")).unwrap();
+            symlink(&victim, work.0.join(&pending.name)).unwrap();
+            file.write_all(b"replacement").unwrap();
+            transaction.revalidate().unwrap();
+            if fallback {
+                rename_fallback(&transaction, &pending.name, true).unwrap();
+            } else {
+                rename(&transaction, &pending.name, &file, true).unwrap();
+            }
+            assert!(
+                !fs::symlink_metadata(work.target())
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read(work.target()).unwrap(), b"replacement");
+            assert_eq!(fs::read(&victim).unwrap(), b"unrelated");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconstructible_saves_do_not_require_a_directory_barrier() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = Workspace::new();
+        fs::set_permissions(&work.0, fs::Permissions::from_mode(0o300)).unwrap();
+        let denied = File::open(&work.0).is_err();
+        let saved = super::super::write_private(&work.target(), b"discovery");
+        fs::set_permissions(&work.0, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(denied, "the fixture must deny a directory flush handle");
+        saved.unwrap();
+        assert_eq!(fs::read(work.target()).unwrap(), b"discovery");
     }
 
     #[test]
@@ -1338,7 +1433,7 @@ mod tests {
         let before = source.metadata().unwrap();
         let attribute = c"user.a-edit";
         fsetxattr(&source, attribute, b"metadata", XattrFlags::empty()).unwrap();
-        work.capture().publish(b"new", false).unwrap();
+        work.capture().publish(b"new", false, &|_| false).unwrap();
         let destination = File::open(work.target()).unwrap();
         let after = destination.metadata().unwrap();
         assert_eq!(
@@ -1366,7 +1461,10 @@ mod tests {
         assert!(receipt.visible);
         assert!(matches!(receipt.durability, Durability::Failed(_)));
         assert_eq!(fs::read(work.target()).unwrap(), b"new");
-        let receipt = work.capture().publish(b"durable", true).unwrap();
+        let receipt = work
+            .capture()
+            .publish(b"durable", true, &|_| false)
+            .unwrap();
         assert_eq!(receipt.durability, Durability::Confirmed);
         work.only_target_remains();
     }
@@ -1384,7 +1482,7 @@ mod tests {
         fs::create_dir(&parent).unwrap();
         fs::write(parent.join("file"), b"unrelated").unwrap();
         assert!(matches!(
-            transaction.publish(b"edited", false),
+            transaction.publish(b"edited", false, &|_| false),
             Err(EditError::Conflict(EditConflict::Changed))
         ));
         assert_eq!(fs::read(parent.join("file")).unwrap(), b"unrelated");
@@ -1408,7 +1506,7 @@ mod tests {
         fs::remove_file(&alias).unwrap();
         symlink(&second, &alias).unwrap();
         assert!(matches!(
-            transaction.publish(b"edited", false),
+            transaction.publish(b"edited", false, &|_| false),
             Err(EditError::Conflict(EditConflict::Changed))
         ));
         for parent in [&first, &second] {
@@ -1467,7 +1565,7 @@ mod tests {
             XattrFlags::empty(),
         )
         .unwrap();
-        work.capture().publish(b"new", false).unwrap();
+        work.capture().publish(b"new", false, &|_| false).unwrap();
         let mut copied = [0; 128];
         let count = fgetxattr(
             File::open(work.target()).unwrap(),
@@ -1486,7 +1584,7 @@ mod tests {
             XattrFlags::empty(),
         )
         .unwrap();
-        work.capture().publish(b"new", false).unwrap();
+        work.capture().publish(b"new", false, &|_| false).unwrap();
         assert_eq!(
             fgetxattr(
                 File::open(work.target()).unwrap(),
@@ -1525,7 +1623,7 @@ mod tests {
         };
         let before = entries();
         assert!(before.contains("deny execute"));
-        work.capture().publish(b"new", false).unwrap();
+        work.capture().publish(b"new", false, &|_| false).unwrap();
         assert_eq!(entries(), before);
     }
 
@@ -1540,7 +1638,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        work.capture().publish(b"new", false).unwrap();
+        work.capture().publish(b"new", false, &|_| false).unwrap();
         let output = std::process::Command::new("/bin/ls")
             .arg("-le")
             .arg(work.target())
@@ -1580,7 +1678,7 @@ mod tests {
             output.stdout
         };
         let before = entries();
-        work.capture().publish(b"new", false).unwrap();
+        work.capture().publish(b"new", false, &|_| false).unwrap();
         assert_eq!(entries(), before);
     }
 
@@ -1643,7 +1741,7 @@ mod tests {
         };
         let before = entries();
         assert!(!before.contains("Everyone"), "{before}");
-        work.capture().publish(b"new", false).unwrap();
+        work.capture().publish(b"new", false, &|_| false).unwrap();
         assert_eq!(entries(), before);
         assert_eq!(fs::read(work.target()).unwrap(), b"new");
     }
@@ -1659,8 +1757,48 @@ mod tests {
             EditTransaction::capture(&stream, 128),
             Err(EditError::NotRegular)
         ));
-        work.capture().publish(b"new", false).unwrap();
+        work.capture().publish(b"new", false, &|_| false).unwrap();
         assert_eq!(fs::read(stream).unwrap(), b"[ZoneTransfer]\r\nZoneId=3\r\n");
+        work.only_target_remains();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn alternate_stream_bytes_are_part_of_the_edit_limit() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        fs::write(work.0.join("target:payload"), vec![b'x'; 65536]).unwrap();
+        assert!(matches!(
+            EditTransaction::capture(&work.target(), 128),
+            Err(EditError::TooLarge)
+        ));
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        work.only_target_remains();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_during_an_alternate_stream_copy_never_publishes() {
+        use std::sync::atomic::AtomicBool;
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let stream = work.0.join("target:payload");
+        fs::write(&stream, vec![b'x'; 12 << 20]).unwrap();
+        let copying_stream = AtomicBool::new(false);
+        let transaction = EditTransaction::capture(&work.target(), 16 << 20).unwrap();
+        let result = transaction.publish(b"replacement", false, &|copied| {
+            if copied > 65536 {
+                copying_stream.store(true, Ordering::SeqCst);
+            }
+            copying_stream.load(Ordering::SeqCst)
+        });
+        assert!(
+            copying_stream.load(Ordering::SeqCst),
+            "the native copy must reach an ADS chunk"
+        );
+        assert!(matches!(result, Err(EditError::Cancelled)), "{result:?}");
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        assert_eq!(fs::metadata(stream).unwrap().len(), 12 << 20);
         work.only_target_remains();
     }
 
