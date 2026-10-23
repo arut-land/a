@@ -303,3 +303,21 @@ impl Host for Recorder {
         &self.registry
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_named_rigs_never_remove_each_others_workspaces() {
+        let first = Rig::new("same-name", Registry::default());
+        let file = first.workspace().join("retained");
+        std::fs::write(&file, "first").unwrap();
+        let second = Rig::new("same-name", Registry::default());
+        let second_dir = second.dir.clone();
+        assert_ne!(first.dir, second.dir);
+        drop(second);
+        assert!(!second_dir.exists());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "first");
+    }
+}
