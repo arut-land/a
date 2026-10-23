@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditConflict {
+    Busy,
     Changed,
     Appeared,
 }
@@ -65,7 +66,7 @@ pub struct EditReceipt {
     pub durability: Durability,
 }
 
-/// Retains the original handle and a pinned parent until publication or abort.
+/// Owns a nonblocking edit lease, the source and its parent until publication or abort.
 pub struct EditTransaction {
     parent: File,
     #[cfg(windows)]
@@ -113,6 +114,7 @@ impl EditTransaction {
             }
             Err(error) => return Err(error),
         };
+        edit_lease(&file)?;
         let signature = signature(&file)?;
         let mut bytes = Vec::new();
         (&mut file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
@@ -303,6 +305,20 @@ impl EditTransaction {
                 Err(error) => return Err(error),
             }
         }
+    }
+}
+
+fn edit_lease(file: &File) -> Result<(), EditError> {
+    match super::try_lock(file) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(EditError::Conflict(EditConflict::Busy))
+        }
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(33) => {
+            Err(EditError::Conflict(EditConflict::Busy))
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -832,7 +848,7 @@ unsafe extern "system" fn copy_progress(
                     | WRITE_DAC
                     | WRITE_OWNER,
             )?;
-            copy_access_policy(context.source, &keeper, true)?;
+            copy_access_policy(context.source, &keeper)?;
             context.destination = Some(keeper);
             Ok(())
         })();
@@ -875,11 +891,11 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
             std::ptr::null(),
         )
     })?;
-    copy_access_policy(source, destination, false)
+    copy_access_policy(source, destination)
 }
 
 #[cfg(windows)]
-fn copy_access_policy(source: &File, destination: &File, protect: bool) -> io::Result<()> {
+fn copy_access_policy(source: &File, destination: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
@@ -888,7 +904,6 @@ fn copy_access_policy(source: &File, destination: &File, protect: bool) -> io::R
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetSecurityDescriptorControl,
         OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-        UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     let (mut owner, mut group, mut dacl, mut descriptor) = (
         std::ptr::null_mut(),
@@ -924,10 +939,13 @@ fn copy_access_policy(source: &File, destination: &File, protect: bool) -> io::R
             &raw mut revision,
         ))
         .and_then(|()| {
-            let protection = if protect || control & SE_DACL_PROTECTED != 0 {
+            let protected = control & SE_DACL_PROTECTED != 0;
+            let protection = if protected {
                 PROTECTED_DACL_SECURITY_INFORMATION
             } else {
-                UNPROTECTED_DACL_SECURITY_INFORMATION
+                // New files already inherit. Explicitly unprotecting a DACL
+                // would merge this directory's permissions into the source's.
+                0
             };
             let status = SetSecurityInfo(
                 destination.as_raw_handle(),
@@ -939,7 +957,7 @@ fn copy_access_policy(source: &File, destination: &File, protect: bool) -> io::R
                 std::ptr::null(),
             );
             if status == 0 {
-                Ok(())
+                verify_acl(destination, dacl, protected)
             } else {
                 Err(io::Error::from_raw_os_error(status.cast_signed()))
             }
@@ -950,6 +968,112 @@ fn copy_access_policy(source: &File, destination: &File, protect: bool) -> io::R
         LocalFree(descriptor);
     }
     result
+}
+
+#[cfg(windows)]
+unsafe fn verify_acl(
+    destination: &File,
+    expected: *const windows_sys::Win32::Security::ACL,
+    protected: bool,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+    };
+    let (mut actual, mut descriptor) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: destination owns its handle; output pointers receive an owned descriptor.
+    let status = unsafe {
+        GetSecurityInfo(
+            destination.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut actual,
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status.cast_signed()));
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    let result = (|| {
+        // SAFETY: descriptor is live and the caller retains expected's descriptor.
+        unsafe {
+            crate::windows::ok(GetSecurityDescriptorControl(
+                descriptor,
+                &raw mut control,
+                &raw mut revision,
+            ))?;
+            if (control & SE_DACL_PROTECTED != 0) != protected || !same_acl(expected, actual)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cannot preserve the source access ACL without changing inheritance",
+                ));
+            }
+        }
+        Ok(())
+    })();
+    // SAFETY: GetSecurityInfo allocated descriptor with LocalAlloc.
+    unsafe {
+        LocalFree(descriptor);
+    }
+    result
+}
+
+#[cfg(windows)]
+unsafe fn same_acl(
+    expected: *const windows_sys::Win32::Security::ACL,
+    actual: *const windows_sys::Win32::Security::ACL,
+) -> io::Result<bool> {
+    use windows_sys::Win32::Security::{
+        ACL, ACL_SIZE_INFORMATION, AclSizeInformation, GetAclInformation,
+    };
+    if expected.is_null() || actual.is_null() {
+        return Ok(expected == actual);
+    }
+    let mut before = ACL_SIZE_INFORMATION::default();
+    let mut after = ACL_SIZE_INFORMATION::default();
+    let size = u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).expect("fixed structure size");
+    // SAFETY: callers retain the descriptors containing both kernel-validated ACLs.
+    unsafe {
+        crate::windows::ok(GetAclInformation(
+            expected,
+            (&raw mut before).cast(),
+            size,
+            AclSizeInformation,
+        ))?;
+        crate::windows::ok(GetAclInformation(
+            actual,
+            (&raw mut after).cast(),
+            size,
+            AclSizeInformation,
+        ))?;
+        if before.AceCount != after.AceCount
+            || before.AclBytesInUse != after.AclBytesInUse
+            || (*expected).AclRevision != (*actual).AclRevision
+        {
+            return Ok(false);
+        }
+        let length =
+            usize::try_from(before.AclBytesInUse).map_err(|_| io::ErrorKind::InvalidData)?;
+        let header = size_of::<ACL>();
+        if length < header
+            || length > usize::from((*expected).AclSize)
+            || length > usize::from((*actual).AclSize)
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        // Allocation slack is not access policy. Compare the ACE region only.
+        Ok(
+            std::slice::from_raw_parts(expected.cast::<u8>().add(header), length - header)
+                == std::slice::from_raw_parts(actual.cast::<u8>().add(header), length - header),
+        )
+    }
 }
 
 #[cfg(windows)]
@@ -1083,12 +1207,28 @@ mod tests {
         let work = Workspace::new();
         fs::write(work.target(), b"original").unwrap();
         let transaction = work.capture();
-        work.capture().publish(b"original", false).unwrap();
+        fs::remove_file(work.target()).unwrap();
+        fs::write(work.target(), b"original").unwrap();
         assert!(matches!(
             transaction.publish(b"ours", false),
             Err(EditError::Conflict(EditConflict::Changed))
         ));
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        work.only_target_remains();
+    }
+
+    #[test]
+    fn cooperating_edits_never_capture_the_same_version_concurrently() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let first = work.capture();
+        assert!(matches!(
+            EditTransaction::capture(&work.target(), 32),
+            Err(EditError::Conflict(EditConflict::Busy))
+        ));
+        first.publish(b"first", false).unwrap();
+        work.capture().publish(b"second", false).unwrap();
+        assert_eq!(fs::read(work.target()).unwrap(), b"second");
         work.only_target_remains();
     }
 
@@ -1442,6 +1582,70 @@ mod tests {
         let before = entries();
         work.capture().publish(b"new", false).unwrap();
         assert_eq!(entries(), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn moved_windows_files_do_not_gain_the_new_directorys_access() {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+        };
+        let directory_policy = |path: &Path, sddl: &str| {
+            fs::create_dir_all(path).unwrap();
+            let text = crate::windows::wide(std::ffi::OsStr::new(sddl));
+            let mut descriptor = std::ptr::null_mut();
+            // SAFETY: text is terminated and descriptor receives an owned allocation.
+            crate::windows::ok(unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    SDDL_REVISION_1,
+                    &raw mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            })
+            .unwrap();
+            let path = crate::windows::wide(path.as_os_str());
+            // SAFETY: path and descriptor remain live through the call.
+            let result = crate::windows::ok(unsafe {
+                SetFileSecurityW(
+                    path.as_ptr(),
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    descriptor,
+                )
+            });
+            // SAFETY: the SDDL conversion allocated descriptor with LocalAlloc.
+            unsafe {
+                LocalFree(descriptor);
+            }
+            result.unwrap();
+        };
+        let work = Workspace::new();
+        let sid = crate::windows::user_sid(None).unwrap();
+        directory_policy(
+            &work.0,
+            &format!("D:P(A;OICI;FA;;;{sid})(A;OICI;GRGX;;;WD)"),
+        );
+        let private = work.0.join("private");
+        directory_policy(&private, &format!("D:P(A;OICI;FA;;;{sid})"));
+        fs::write(private.join("file"), b"original").unwrap();
+        fs::rename(private.join("file"), work.target()).unwrap();
+        let entries = || {
+            let output = std::process::Command::new("icacls.exe")
+                .arg(work.target())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let before = entries();
+        assert!(!before.contains("Everyone"), "{before}");
+        work.capture().publish(b"new", false).unwrap();
+        assert_eq!(entries(), before);
+        assert_eq!(fs::read(work.target()).unwrap(), b"new");
     }
 
     #[cfg(windows)]
