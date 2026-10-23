@@ -922,25 +922,6 @@ fn rename(
 }
 
 #[cfg(windows)]
-pub(super) fn replace(from: &Path, to: &Path) -> io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_OPEN_REPARSE_POINT};
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .access_mode(DELETE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(from)?;
-    let parent = to
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let to = parent
-        .canonicalize()?
-        .join(to.file_name().ok_or(io::ErrorKind::InvalidInput)?);
-    rename_windows(&file, &to, true)
-}
-
-#[cfg(windows)]
 fn rename_windows(file: &File, to: &Path, replacing: bool) -> io::Result<()> {
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{

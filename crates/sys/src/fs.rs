@@ -395,7 +395,7 @@ pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(unix)]
     return fs::rename(from, to);
     #[cfg(windows)]
-    edit::replace(from, to)
+    move_file(from, to, true)
 }
 
 #[cfg(windows)]
