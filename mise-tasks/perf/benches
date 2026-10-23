@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 #MISE description="Run saved release engine, JSON and TUI workloads with load and process metrics"
 import argparse
+import faulthandler
 import importlib.machinery
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shlex
@@ -13,13 +15,16 @@ sys.dont_write_bytecode = True
 
 
 def main():
+    faulthandler.dump_traceback_later(300, repeat=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("build", type=Path)
     parser.add_argument("transcript", type=Path)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--blackbox", type=Path)
-    parser.add_argument("--packages", default="engine,protocol,tui")
+    parser.add_argument("--packages", default="engine,protocol,llm,tui")
     args = parser.parse_args()
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/perf"))
+    from process import run_timed
     transcript = args.transcript.resolve(strict=True)
     build = args.build.resolve(strict=True)
     loader = importlib.machinery.SourceFileLoader("workloads", str(Path(__file__).with_name("workloads")))
@@ -28,10 +33,17 @@ def main():
     loader.exec_module(workloads)
     output = build / "measurements"
     output.mkdir(exist_ok=True)
-    env = dict(os.environ, A_SESSION_LOG=str(transcript))
+    env = dict(os.environ, A_SESSION_LOG=str(transcript),
+               A_PERF_PYTHON=sys.executable,
+               A_PERF_PROCESS=str(Path(__file__).resolve().parents[2] / "scripts/perf/process.py"))
+    packages = args.packages.split(",")
+    if set(packages) - {"engine", "protocol", "llm", "tui"}:
+        parser.error("unknown benchmark package")
+    binaries = {package: (build / (package + "-bench" + (".exe" if os.name == "nt" else ""))).resolve(strict=True)
+                for package in packages}
     budget_result = None
     if args.blackbox:
-        env.update(A_BIN=str(build / "a"), A_STRICT_BUDGETS="1")
+        env.update(A_BIN=str(build / ("a.exe" if os.name == "nt" else "a")), A_STRICT_BUDGETS="1")
         workloads.load(output, "budgets:before")
         budget_result = subprocess.run(
             [str(args.blackbox.resolve(strict=True)), "budgets::", "--ignored",
@@ -39,19 +51,30 @@ def main():
         workloads.load(output, "budgets:after")
     for package, filters in [
         ("engine", ["bench_loading_a_long_log", "bench_turns_under_each_barrier_setting",
-                    "bench_concurrent_session_commits", "bench_large_tool_result"]),
+                    "bench_concurrent_session_commits", "bench_large_tool_result",
+                    "concurrent_session_sizing"]),
         ("protocol", ["attach_to_a_logged_session"]),
+        ("llm", ["decode_recorded"]),
         ("tui", ["render_cost"]),
     ]:
-        if package not in args.packages.split(","):
+        if package not in packages:
             continue
         for name in filters:
-            binary = (build / (package + "-bench")).resolve(strict=True)
-            command = shlex.join([str(binary), name, "--ignored", "--nocapture", "--test-threads=1"])
+            binary = binaries[package]
+            command = workloads.command([str(binary), name, "--ignored", "--nocapture", "--test-threads=1"])
             workloads.load(output, name + ":before")
-            subprocess.run(["mise", "exec", "hyperfine@2.0.0", "--", "hyperfine", "-N", "--warmup", "1", "-r", str(args.runs),
-                            "--metrics", "all", "--show-output", "--export-json",
-                            str(output / (name + ".json")), command], check=True, env=env)
+            result = run_timed(["hyperfine", "-N", "--warmup", "1", "-r", str(args.runs),
+                                     "--metrics", "all", "--show-output", "--export-json",
+                                     str(output / (name + ".json")), command], env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+            (output / (name + "-output.json")).write_text(json.dumps({"output": result.stdout}))
+            print(result.stdout, flush=True)
+            result.check_returncode()
+            if os.name == "nt":
+                sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/perf"))
+                from process import measure_windows
+                samples = [measure_windows(shlex.split(command), env=env) for _ in range(5)]
+                (output / (name + "-native.json")).write_text(json.dumps({"native_samples": samples}))
             workloads.load(output, name + ":after")
     if budget_result is not None:
         budget_result.check_returncode()

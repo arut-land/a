@@ -162,7 +162,7 @@ tail, while remaining far slower than barrier-only. Grouping amortizes
 cache flushes under concurrency; it cannot amortize an isolated promise.
 The host contention and small number of independent runs warrant a quiet
 repeat before treating these ratios as stable. Shipped binary size from
-`mise run size`: 2,910 KiB before, 2,894 KiB after, both below 4,096 KiB.
+`mise run size`: 2,910 KiB before, 2,894 KiB after.
 
 After these measurements, `main` advanced to `6744d05` and was merged as
 `b498833`. The tables identify the pre-merge variants; the incoming client
@@ -242,8 +242,7 @@ The earlier 19.79 versus 13.95 ms comparison had unequal contention and
 does not isolate scheduling overhead. No quiet-machine latency claim is
 made for this revision; the coordinator's quiet-machine run comes later.
 `mise run size` on an isolated checkout of the starting merge `00e4d80`
-measured 2,942 KiB; the revised binary measured 2,958 KiB, both below
-4,096 KiB.
+measured 2,942 KiB; the revised binary measured 2,958 KiB.
 
 Validation of this revision: `mise run check` passed 863 tests, acceptance
 passed 12, seeded crash checks passed eight (`A_CRASH_SEED=20261021`), and
@@ -288,7 +287,7 @@ The branch also merged main's platform and canonical-design changes through
 acceptance passed 12, web passed five, and Apple passed 10. Windows clippy,
 machete and the no-Tokio check passed. `CARGO_BUILD_JOBS=3` was set for every
 build. `mise run size` measured 3,007 KiB before the merges and 2,991 KiB
-after, including the fixture-exclusion check, below the 4,096 KiB limit.
+after, including the fixture-exclusion check.
 Budgets and startup timing were deliberately left to the coordinator on a
 quiet machine; no timing claim is made under the shared host's load.
 
@@ -356,4 +355,4 @@ No dependencies were added.
 After merging `main`'s approval explanations and regenerating protocol 11's
 corpus and view vectors, the same size task measured 3559 KiB. The review
 baseline and final merged build therefore have equal total size; the isolated
-pre-merge reduction above is 32 KiB. The merged build remains below 4096 KiB.
+pre-merge reduction above is 32 KiB.

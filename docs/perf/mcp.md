@@ -35,8 +35,7 @@ implementation or TLS configuration. Base64 uses maintained `base64`
 
 `CARGO_BUILD_JOBS=3 mise run size` before changes: **2975 KiB**
 (3,046,432 bytes). After implementation and merging main: **3072 KiB**
-(3,145,856 bytes), an increase of 99,424 bytes (97.09 KiB), below the
-4096 KiB cap. The difference includes main's intervening durability and
+(3,145,856 bytes), an increase of 99,424 bytes (97.09 KiB). The difference includes main's intervening durability and
 protocol work, so it is not an isolated measurement of MCP's contribution.
 The fixture is behind a test feature and is not linked into the shipped
 `a`; the size task's fixture scan passed. MCP changed no wire encoding.
@@ -110,7 +109,7 @@ After merging main (`c7d9de5`), formatting, clippy and all **965 tests**
 passed (28 intentionally skipped). Acceptance passed 13 tests, web passed
 6 tests, and Windows lint, machete, no-tokio and deny all passed.
 `CARGO_BUILD_JOBS=3 mise run size` passed at **3120 KiB** (3,195,584
-bytes), below 4096 KiB. The previous validated release was 3072 KiB
+bytes). The previous validated release was 3072 KiB
 (3,145,856 bytes); the increase of 49,728 bytes (48.56 KiB) includes
 main's fork work as well as review hardening. This is not an isolated
 measurement of either contribution. Release artifacts and retained test
@@ -133,7 +132,7 @@ web passed all 6. Windows lint, machete, no-tokio, deny and size passed.
 An earlier full run lost a CLI `--version` warmup to SIGKILL; the unchanged
 test passed on the complete rerun.
 
-The final release is **3300 KiB** (3,380,192 bytes), below 4096 KiB. The
+The final release is **3300 KiB** (3,380,192 bytes). The
 previous validated pre-review release was 3072 KiB (3,145,856 bytes), a
 difference of 234,336 bytes (228.84 KiB). This includes main's skills and
 fork integration as well as MCP changes. Release artifacts and the one
@@ -175,8 +174,7 @@ are not linked. Exact lengths come from `wc -c target/release/a`.
 | sha2 0.11.1 (RustCrypto) | no defaults | 3,860,784 | 3770 |
 
 Choose **sha2**, saving **16,528 bytes (16.14 KiB)** while retaining full
-SHA-256 collision resistance. Both builds pass the 4096 KiB cap and the
-fixture scan. Sha2 uses Rust implementations and CPU intrinsics, without
+SHA-256 collision resistance. Both builds pass the fixture scan. Sha2 uses Rust implementations and CPU intrinsics, without
 a C build script or Windows SDK headers. The ring baseline reproduces
 `assert.h` missing in `check:windows`; the replacement passes the same
 plain cross-target clippy task.

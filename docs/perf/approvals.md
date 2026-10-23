@@ -14,5 +14,5 @@ alongside literal multiline values, so decoding for display cannot lose
 unknown arguments or change their original representation.
 
 `mise run size` measured 3,398 KiB before and 3,414 KiB after the complete
-change: 16 KiB added, below the 4,096 KiB limit. Timings and resource budgets
+change: 16 KiB added. Timings and resource budgets
 are deferred to a quiet machine, per the shared-machine task instructions.

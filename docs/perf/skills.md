@@ -65,7 +65,7 @@ not quiet-machine performance budgets. No startup or budget timings were run.
 | serde_yaml_ng 0.10.0 | 219520 | +66304 | 237.85 | 17/17 |
 | yaml-rust2 0.13.0 | 236048 | +82832 | 196.47 | 17/17 |
 
-`mise run size`, before: **3844240 bytes (3754 KiB)**; final: **3794544 bytes (3705 KiB)**. The integrated binary saves **49696 bytes** and remains below 4096 KiB. Main was already merged (`git merge main`: already up to date). A final parser-only rebuild after diagnostic corrections still measured **153216 bytes**, with all 17 headers matching (93.81 s incremental rebuild, separate from the fresh-build table). The earlier intermediate integrated build measured 3689 KiB; the final source and full link above are the reported result.
+`mise run size`, before: **3844240 bytes (3754 KiB)**; final: **3794544 bytes (3705 KiB)**. The integrated binary saves **49696 bytes**. Main was already merged (`git merge main`: already up to date). A final parser-only rebuild after diagnostic corrections still measured **153216 bytes**, with all 17 headers matching (93.81 s incremental rebuild, separate from the fresh-build table). The earlier intermediate integrated build measured 3689 KiB; the final source and full link above are the reported result.
 
 Choose the custom subset parser: it passes the complete sourced corpus and
 retains diagnostics, validation and bounds at the lowest measured shipped-profile
@@ -117,7 +117,7 @@ repository's build-std profile; compare deltas, not absolute binary sizes.
 
 The earlier choice was [serde_yaml_ng](https://crates.io/crates/serde_yaml_ng): the maintained
 Serde parser is smaller than the measured tree adapter, supports ordinary
-portable YAML skill headers, and fits the 4 MiB product budget. The saved 97 KiB
+portable YAML skill headers. The saved 97 KiB
 of a tiny parser does not justify maintaining a second quoting and block-scalar
 language. `serde_yaml` 0.9 is deprecated and was excluded rather than added as a
 production dependency. `yaml-rust2` is the measured alternate maintained parser.
@@ -153,7 +153,7 @@ println!("{}: {}", header.name, header.description);
 `mise run size`: **2975 KiB before, 3123 KiB before the main merge**
 (+148 KiB for the extension, parser, watcher and SDK plumbing together).
 After merging main and sharing workspace subscriptions, the integrated build
-measures **3139 KiB**, below the 4096 KiB budget. The integrated delta includes
+measures **3139 KiB**. The integrated delta includes
 main's intervening changes. Budgets and startup are left to the coordinator
 on a quiet machine, as requested.
 

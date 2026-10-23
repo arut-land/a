@@ -48,16 +48,11 @@ test = "cargo nextest run --workspace --features a/lua --no-tests=pass"
 "check:clippy" = "cargo clippy --workspace --all-targets --features a/lua -- -D warnings"
 # Sequential: the tests and clippy would rebuild the same target at once.
 check = { depends = ["check:fmt", "check:clippy"], run = "mise run test" }
-# Report shipped bytes and verify the binary excludes the test fixtures
-# (`sleep`) while retaining a tool it ships.
-size = { depends = ["release"], run = '''
-f=target/release/a; [[ -e $f.exe ]] && f+=.exe
-! grep -q "Waits for a number of seconds." "$f" || { echo "the sleep fixture is in the shipped binary"; exit 1; }
-grep -q "Edits a text file by exact replacement." "$f"
-b=$(wc -c < "$f"); echo "a: $b bytes ($((b / 1024)) KiB)"
-''' }
-# Cold start against the floor: what launching any process costs here.
-startup = { depends = ["release"], run = 'hyperfine -N --warmup 50 -r 500 "target/release/a --version" /usr/bin/true' }
+# Size is reported; the fixture scan still verifies the shipped feature set.
+size = { depends = ["release"], run = "python3 scripts/perf/size.py target/release/a" }
+# The floor is native on Windows too; interpreter startup is not a process floor.
+startup = { depends = ["release"], run = "python3 scripts/perf/startup.py target/release/a" }
+
 bloat = "cargo bloat --release --crates -n 20"
 "bloat:lines" = "cargo llvm-lines --release -p a | head -30"
 # Shell completions (bash, zsh, fish, nu, PowerShell, elvish: usage's
@@ -152,8 +147,14 @@ if cargo tree -e normal,features -p a -f '{p} {f}' | grep 'ext-fixtures v' | gre
   echo "a as built by default turns the fixtures on"; exit 1
 fi
 CARGO_TARGET_DIR=target/fixtures cargo build-release -p a --features fixtures
-b=$(wc -c < target/fixtures/release/a); echo "a (fixtures): $b bytes ($((b / 1024)) KiB)"
-A_BIN=$PWD/target/fixtures/release/a A_STRICT_BUDGETS=${A_STRICT_BUDGETS:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)} cargo nextest run -p a --test blackbox -E 'test(/^budgets::/)' --run-ignored ignored-only --test-threads 1 --no-capture --no-tests=fail
+f=target/fixtures/release/a; [[ -e $f.exe ]] && f+=.exe
+b=$(wc -c < "$f"); echo "a (fixtures): $((b / 1024)) KiB ($b bytes)"
+if [[ ${OS:-} == Windows_NT ]]; then
+  cargo build-release -p a --example perf-attach
+  python3 scripts/perf/budget-task.py "$PWD/$f" "$PWD/target/release/examples/perf-attach.exe"
+else
+  A_BIN="$PWD/$f" A_STRICT_BUDGETS=${A_STRICT_BUDGETS:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)} cargo nextest run -p a --test blackbox -E 'test(/^budgets::/)' --run-ignored ignored-only --test-threads 1 --no-capture --no-tests=fail
+fi
 # The process-wide wake counter needs its own executable, run alone.
 CARGO_TARGET_DIR=target/fixtures cargo nextest run --release -p ext-shell --test quiet --run-ignored ignored-only --test-threads 1 --no-capture --no-tests=fail
 '''

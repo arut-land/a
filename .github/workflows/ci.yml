@@ -53,8 +53,9 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev strace
       # fmt, clippy -D warnings, then every test: unit, llm parity, and the
-      # black-box M1 acceptance tests in apps/cli/tests/blackbox (budgets run
-      # with CI slack). Live-model tests stay #[ignore]d; there are no secrets.
+      # black-box M1 acceptance tests in apps/cli/tests/blackbox. The
+      # release budgets run in their own jobs. Live-model tests stay
+      # #[ignore]d; there are no secrets.
       - run: mise run check
       # The Windows build, cross-linted: no platform cfg above `sys`/`rt`.
       - if: runner.os == 'Linux'
@@ -84,36 +85,6 @@ jobs:
       # Idle daemon RSS (10 MiB) is held exactly; cold start and attach
       # latency too where strict, else with slack.
       - run: mise run budgets
-      # The shipped binary's size as a number to compare: this run's against
-      # the last one on main, warned about past 16 KiB. Apple silicon is the
-      # reference lane; the other skips the second release link.
-      - if: runner.os == 'macOS'
-        run: mise run size | grep -o 'a:.*KiB' | tee size.txt
-      - if: runner.os == 'macOS'
-        uses: actions/cache/restore@v6
-        with:
-          path: main-size.txt
-          key: size-main-${{ github.sha }}
-          restore-keys: size-main-
-      - if: runner.os == 'macOS'
-        run: |
-          now=$(grep -o '[0-9]* KiB' size.txt | head -1 | cut -d' ' -f1)
-          if [[ -f main-size.txt ]]; then
-            was=$(grep -o '[0-9]* KiB' main-size.txt | head -1 | cut -d' ' -f1)
-            echo "a: $now KiB; main: $was KiB; delta: $((now - was)) KiB" | tee -a "$GITHUB_STEP_SUMMARY"
-            ((now - was <= 16)) || echo "::warning::a grew $((now - was)) KiB over main ($was -> $now KiB)"
-          fi
-          cp size.txt main-size.txt
-      - if: runner.os == 'macOS' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v6
-        with:
-          path: main-size.txt
-          key: size-main-${{ github.sha }}
-      - if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v5
-        with:
-          name: size
-          path: size.txt
 
   deny:
     runs-on: ubuntu-latest

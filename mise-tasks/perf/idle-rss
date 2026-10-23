@@ -1,109 +1,53 @@
 #!/usr/bin/env python3
-#MISE description="Sample idle daemon RSS and profiler output on macOS"
-"""Sample a fixture binary at the idle budget boundary, in fresh homes."""
+#MISE description="Sample idle daemon RSS and CPU using native process counters"
+"""Fresh fixture homes; measure an idle line REPL and its daemon on every OS."""
 import argparse
-import fcntl
 import json
 import os
 from pathlib import Path
-import pty
-import select
-import struct
+import queue
 import subprocess
+import sys
 import tempfile
-import termios
+import threading
 import time
 
-
-def cpu_time(pid):
-    text = subprocess.check_output(["ps", "-o", "time=", "-p", str(pid)], text=True)
-    minutes, seconds = text.strip().split(":")
-    return float(minutes) * 60 + float(seconds)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/perf"))
+from process import snapshot, stop_daemon
 
 
-def sample(binary, output, label, run, idle_seconds):
-    with tempfile.TemporaryDirectory(prefix="a-rss-") as directory:
-        root = Path(directory)
-        home, workspace = root / "home", root / "ws"
-        home.mkdir()
-        workspace.mkdir()
-        (home / "config.toml").write_text(
-            '[daemon]\nagent = "echo"\nidle_secs = 15\n'
-        )
-        env = dict(os.environ, A_HOME=str(home), TERM="xterm-256color")
+def sample(binary, idle_seconds):
+    with tempfile.TemporaryDirectory(prefix="a-rss-", dir=os.environ.get("RUNNER_TEMP")) as directory:
+        home = Path(directory)
+        (home / "config.toml").write_text('[daemon]\nagent = "echo"\nidle_secs = 120\n')
+        env = dict(os.environ, A_HOME=str(home), A_TUI="plain")
         env.pop("A_HOST", None)
-        master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
-        client = None
+        client = subprocess.Popen([binary], env=env, cwd=home, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
-            subprocess.run(
-                [binary, "--version"], env=env, check=True,
-                stdout=subprocess.DEVNULL,
-            )
-            client = subprocess.Popen(
-                [binary], stdin=slave, stdout=slave, stderr=slave,
-                env=env, cwd=workspace,
-            )
-            os.close(slave)
-            slave = None
-            data = b""
-            deadline = time.monotonic() + 30
-            while b"live" not in data:
-                if time.monotonic() >= deadline or client.poll() is not None:
-                    raise RuntimeError(f"terminal never became live: {data!r}")
-                if select.select([master], [], [], 0.1)[0]:
-                    data += os.read(master, 65536)
+            first = queue.Queue()
+            threading.Thread(target=lambda: first.put(client.stdout.readline()), daemon=True).start()
+            assert first.get(timeout=30).startswith(b"[session")
+            pid = int((home / "run/daemon.pid").read_text().splitlines()[0])
             time.sleep(3)
-            processes = subprocess.check_output(
-                ["ps", "-axo", "pid=,args="], text=True,
-            )
-            daemons = [
-                int(line.split()[0]) for line in processes.splitlines()
-                if str(home / "runtime") in line and " __daemon " in line
-            ]
-            if len(daemons) != 1:
-                raise RuntimeError(f"expected one staged daemon: {daemons}")
-            pid = daemons[0]
-            rss = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)]))
-            print(f"{label} sample {run}: {rss} KiB; load={os.getloadavg()}", flush=True)
-            if idle_seconds:
-                before = [cpu_time(p) for p in (pid, client.pid)]
-                load_before = os.getloadavg()
-                started = time.monotonic()
-                # No sampling/profiling during the idle interval.
-                time.sleep(idle_seconds)
-                elapsed = time.monotonic() - started
-                used = [cpu_time(p) - t for p, t in zip((pid, client.pid), before)]
-                record = dict(label=label, run=run, seconds=elapsed,
-                              daemon_cpu_seconds=used[0], client_cpu_seconds=used[1],
-                              load_before=load_before, load_after=os.getloadavg())
-                print(json.dumps(record), flush=True)
-                with (output / "idle.jsonl").open("a") as log:
-                    log.write(json.dumps(record) + "\n")
-            # Profilers run after the RSS observation, never during its window.
-            if run == 0:
-                for command in (
-                    ["vmmap", "--summary", str(pid)],
-                    ["footprint", str(pid)],
-                    ["sample", str(pid), "1", "1"],
-                ):
-                    with (output / f"{label}-{command[0]}.txt").open("w") as log:
-                        subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
-            return rss
+            rss = snapshot(pid)["rss_kib"]
+            time.sleep(12)
+            before = [snapshot(p)["cpu_seconds"] for p in (pid, client.pid)]
+            started = time.monotonic()
+            time.sleep(idle_seconds)
+            elapsed = time.monotonic() - started
+            after = [snapshot(p) for p in (pid, client.pid)]
+            return dict(rss=rss, seconds=elapsed,
+                        daemon_cpu_seconds=after[0]["cpu_seconds"] - before[0],
+                        client_cpu_seconds=after[1]["cpu_seconds"] - before[1])
         finally:
+            client.stdin.close()
             try:
-                subprocess.run(
-                    [binary, "daemon", "stop"], env=env, timeout=15,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
-                )
-            finally:
-                if client is not None:
-                    if client.poll() is None:
-                        client.kill()
-                    client.wait()
-                os.close(master)
-                if slave is not None:
-                    os.close(slave)
+                client.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                client.kill()
+                client.wait()
+            stop_daemon(binary, env, home)
 
 
 def main():
@@ -111,20 +55,18 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("label")
     parser.add_argument("--samples", type=int, default=5)
-    parser.add_argument("--idle-seconds", type=float, default=0,
-                        help="measure CPU on the first sample over this window (ps: 10 ms resolution)")
+    parser.add_argument("--idle-seconds", type=float, default=10)
     parser.add_argument("--output", type=Path, default=Path("target/rss"))
     args = parser.parse_args()
-    if args.samples < 1:
-        parser.error("--samples must be positive")
-    if args.idle_seconds < 0:
-        parser.error("--idle-seconds must not be negative")
+    if args.samples < 1 or args.idle_seconds < 0:
+        parser.error("samples must be positive and idle-seconds nonnegative")
     args.output.mkdir(parents=True, exist_ok=True)
-    binary = str(args.binary.resolve())
-    rss = [sample(binary, args.output, args.label, run, args.idle_seconds if run == 0 else 0)
-           for run in range(args.samples)]
-    with (args.output / "samples.jsonl").open("a") as log:
-        log.write(json.dumps({"commit": args.label, "rss": rss, "bytes": os.stat(binary).st_size}) + "\n")
+    samples = [sample(str(args.binary.resolve(strict=True)), args.idle_seconds) for _ in range(args.samples)]
+    record = dict(commit=args.label, rss=[value["rss"] for value in samples],
+                  bytes=args.binary.stat().st_size, samples=samples)
+    print(json.dumps(record))
+    with (args.output / "samples.jsonl").open("a") as stream:
+        stream.write(json.dumps(record) + "\n")
 
 
 if __name__ == "__main__":

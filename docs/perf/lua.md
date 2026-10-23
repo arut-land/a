@@ -44,8 +44,7 @@ runtime candidate. References: [mlua](https://github.com/mlua-rs/mlua),
 [rlua](https://github.com/mlua-rs/rlua).
 
 Vendored Lua 5.4 through mlua is the smallest measured adapter, has allocation
-and instruction limits, and fits the existing async runtime. Luau's minimum
-adapter exceeded 4096 KiB. Piccolo's ownership bridge bought no size advantage.
+and instruction limits, and fits the existing async runtime.
 This choice makes no claim about comparative timings.
 
 ## Generation preparation
@@ -79,15 +78,14 @@ notify 8.2 (CC0-1.0) supplies directory creation, replacement and removal events
 supported platforms. The existing sys watcher only follows writes to one file
 and has no Windows backend. The generation/watcher changes added 68,608 bytes
 before tuning, including notify and the SDK/engine changes; this does not isolate
-notify's individual contribution. The maintained implementation fits the binary
-budget and avoids implementing three additional watcher backends by hand. Its Windows backend pins
+notify's individual contribution. The maintained implementation avoids implementing three additional watcher backends by hand. Its Windows backend pins
 windows-sys 0.60 while sys/the reactor use 0.61; the deny exception is scoped
 to 0.60.2. No Windows types cross between these backends.
 
 ## Release size experiments
 
 All numbers use the same merged main and release flags on macOS arm64 with
-nightly-2026-10-17. The limit is 4,194,304 bytes (4096 KiB).
+nightly-2026-10-17. Size is reported without a cap.
 
 | Build or experiment | Bytes | Decision |
 | --- | ---: | --- |
@@ -98,7 +96,7 @@ nightly-2026-10-17. The limit is 4,194,304 bytes (4096 KiB).
 | Integer handles instead of userdata carriers | 3,605,840 | Keep: saves another 16,528 |
 | Direct bounded JSON-to-Lua conversion | 3,605,840 | Discard: no measured reduction |
 | Final default, including preparation bounds and lint fixes | 3,029,888 | +16 versus baseline |
-| Final Lua | 3,605,792 | +35,536 versus baseline; 588,512 bytes below limit |
+| Final Lua | 3,605,792 | +35,536 versus baseline |
 
 Invocation handles live in a per-VM map and are removed by a drop guard on
 completion or cancellation. Saved callbacks retain no call context. The direct

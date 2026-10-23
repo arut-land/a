@@ -1,4 +1,8 @@
-# Native release performance (2026-10-22)
+# Native release performance
+
+Current hosted per-platform tuning is specified in [hosted.md](hosted.md).
+Size is report-only. The dedicated-host observations below do not establish
+a cross-platform tuning decision.
 
 Keep `z`, fat LTO, one codegen unit, unwinding, packed debuginfo and
 stripping. Retain `memchr2` for JSON CR/LF scans and reuse directory existence
@@ -45,7 +49,7 @@ bench retains its result. The transcript contains 64 real echo turns.
 | Existence queries, two publication attempts | 4 | 2 |
 
 Idle CPU resolution is 10 ms. Daemon RSS ranges overlap, at least 1,056 KiB
-below the 10,240 KiB cap; shipped size is below 4,096 KiB. Standalone probe
+below the 10,240 KiB RSS cap. Shipped size is reported above. Standalone probe
 loads/consumers are in raw records. Allocation counts remain unchanged.
 
 Main → final in every cell:
@@ -86,21 +90,17 @@ samples per process.
 
 ## Build decisions
 
-- Global `s` improves CPU-heavy work but adds 714 KiB. Global `3`, thin LTO
-  and unstripped symbols exceed the Mac size cap. Sixteen codegen units add
-  276 KiB without a broad runtime benefit.
-- Hot-package overrides add size: serde_json `3` 49,632 bytes; protocol
-  `s`/`3` 98,208/280,400; llm 179,952/394,768; engine 278,688/675,344.
-  TUI `s`/`3` improves rendering CPU for 65,792/115,328 bytes. Native Linux
-  size/runtime validation remains; no platform split or CI flag divergence ships.
-- Explicit `apple-m1` repeats this toolchain's default. Removing debuginfo
-  saves 64 bytes and loses offline crash symbolication. Abort saves 912,624
-  bytes but breaks session panic isolation, so is rejected.
-- Historical PGO adds 146,736 bytes with some CPU gains, but omitted daemon
-  profiles. The corrected task verifies collection; retraining and native
-  platform/CI validation remain before adoption.
-- Disabling the macOS Nano zone showed no robust joint speed/RSS gain.
-  Retain the system allocator; replacement allocators were not tested.
+Fat LTO, one codegen unit and unwinding preserve cross-crate optimization and
+session panic isolation. Debug metadata supports offline crash symbolication.
+The system allocator remains the default; disabling the macOS Nano zone did
+not show a robust joint speed/RSS gain in these dedicated-host observations.
+
+Global and per-package optimization levels, CPU baselines, replacement
+allocators and PGO require native hosted CPU, latency and memory comparisons.
+Executable growth does not disqualify a candidate. PGO training must include
+the daemon, not just clients and benchmarks; its profile is specific to the
+Rust toolchain and architecture. The [hosted harness](hosted.md) supplies
+native comparisons with retained raw samples.
 
 ## Reproduce
 

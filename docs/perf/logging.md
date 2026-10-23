@@ -46,7 +46,7 @@ Faulty-store test proves commit and store recovery finish while the log
 writer is stalled, rather than asserting a noisy timing threshold.
 
 `mise run size` before logging: **2,975 KiB** at `9e13330`; after:
-**3,039 KiB**, under the 4,096 KiB limit. Main was merged at `9fcf4cd`
+**3,039 KiB**. Main was merged at `9fcf4cd`
 (including platform seams and shared flush epochs), so the 64 KiB delta
 also includes those changes.
 
@@ -75,7 +75,7 @@ debug symbolizer and raw panic formatting; report storage is at most
 
 Review validation (2026-10-21): `mise run size` before fixes at `40aaade`
 was **3,039 KiB**; after at `d6e82a3` it is **3,252 KiB** (3,330,528 bytes),
-under 4,096 KiB and with the fixture scan passing. This comparison includes
+with the fixture scan passing. This comparison includes
 merges of main through `e133ee4` (forks, skills and protocol 8); the 213 KiB
 difference cannot be attributed to diagnostics alone.
 
