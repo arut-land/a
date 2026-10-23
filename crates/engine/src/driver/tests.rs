@@ -592,6 +592,35 @@ impl LogStore for Probe {
 /// turn it starts; input that cannot be logged is refused and gone, seq
 /// and all, and the session goes on from its log.
 #[test]
+fn pressure_discards_a_cached_snapshot_without_changing_its_rebuild() {
+    let script = Script::new(&[]);
+    let fixture = Fixture::new(ext::LOOP, Registry::default(), openai(&script));
+    let entries: Vec<_> = (1..=SNAPSHOT_GAP + 1)
+        .map(|seq| entry(seq, echo("cached message")))
+        .collect();
+    let session = fixture.start(&entries);
+    let attach = || {
+        let outbox = Outbox::new();
+        session.follow(&outbox, 0);
+        std::iter::from_fn(|| outbox.try_next())
+            .map(|frame| frame.as_bytes().to_vec())
+            .collect::<Vec<_>>()
+    };
+    let first = attach();
+    let built = fixture.hops();
+    assert_eq!(attach(), first);
+    assert_eq!(fixture.hops(), built, "an unchanged snapshot is reused");
+    session.reclaim();
+    session.barrier();
+    assert_eq!(attach(), first);
+    assert!(
+        fixture.hops() > built,
+        "pressure released the cached projection"
+    );
+    session.halt();
+}
+
+#[test]
 fn input_commits_on_arrival_and_a_failed_commit_leaves_no_trace() {
     let probe = Probe::default();
     let fixture = Fixture::on(

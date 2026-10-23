@@ -873,14 +873,8 @@ impl Daemon {
     }
 
     fn reclaim_idle(&self) {
-        for slot in self.slots() {
-            let disposable = slot.live().is_some_and(|session| {
-                session.summary().activity == protocol::Activity::Idle
-                    && session.idle_for() > Duration::ZERO
-            });
-            if disposable {
-                slot.unload();
-            }
+        for session in self.loaded() {
+            session.reclaim();
         }
     }
 

@@ -116,6 +116,7 @@ pub fn storage(path: &Path) -> Storage {
 
 /// Scoped priority for a blocking operation. Async workers keep their normal
 /// priority because they multiplex both foreground and maintenance futures.
+#[must_use]
 pub struct Priority {
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     #[cfg(target_os = "macos")]
@@ -188,6 +189,7 @@ mod windows;
 
 /// Event-driven pressure notification. The callback must only release disposable
 /// state; cancellation can overlap a callback already in progress.
+#[must_use]
 pub struct MemoryPressure {
     #[cfg(target_os = "macos")]
     source: dispatch2::DispatchRetained<dispatch2::DispatchSource>,
@@ -331,6 +333,56 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn check_cpu_sets(affinity: usize) {
+        use windows_sys::Win32::System::{
+            SystemInformation::{
+                CpuSetInformation, GROUP_AFFINITY, GetSystemCpuSetInformation,
+                SYSTEM_CPU_SET_INFORMATION,
+            },
+            Threading::{
+                GetCurrentProcess, GetCurrentThread, GetThreadGroupAffinity,
+                SetProcessDefaultCpuSets,
+            },
+        };
+        // SAFETY: all native outputs are initialized and sized; this runs in the child.
+        unsafe {
+            let process = GetCurrentProcess();
+            let mut bytes = 0;
+            GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &raw mut bytes, process, 0);
+            assert!(bytes > 0);
+            let mut buffer = vec![
+                SYSTEM_CPU_SET_INFORMATION::default();
+                (bytes as usize).div_ceil(size_of::<SYSTEM_CPU_SET_INFORMATION>())
+            ];
+            assert_ne!(
+                GetSystemCpuSetInformation(buffer.as_mut_ptr(), bytes, &raw mut bytes, process, 0),
+                0
+            );
+            let mut group = GROUP_AFFINITY::default();
+            assert_ne!(
+                GetThreadGroupAffinity(GetCurrentThread(), &raw mut group),
+                0
+            );
+            let id = buffer
+                .iter()
+                .find_map(|info| {
+                    if info.Type != CpuSetInformation || info.Size == 0 {
+                        return None;
+                    }
+                    let cpu = info.Anonymous.CpuSet;
+                    let bit = 1usize
+                        .checked_shl(u32::from(cpu.LogicalProcessorIndex))
+                        .unwrap_or(0);
+                    (cpu.Group == group.Group && affinity & bit != 0).then_some(cpu.Id)
+                })
+                .unwrap();
+            assert_ne!(SetProcessDefaultCpuSets(process, &raw const id, 1), 0);
+            assert_eq!(effective_parallelism(), 1);
+            assert_ne!(SetProcessDefaultCpuSets(process, std::ptr::null(), 0), 0);
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     fn windows_limits_are_observed_in_an_isolated_process() {
         use windows_sys::Win32::System::{
@@ -372,6 +424,7 @@ mod tests {
             assert_ne!(SetProcessAffinityMask(process, one), 0);
             assert_eq!(effective_parallelism(), 1);
             assert_ne!(SetProcessAffinityMask(process, affinity), 0);
+            check_cpu_sets(affinity);
 
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             assert!(!job.is_null());

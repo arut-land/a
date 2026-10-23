@@ -171,12 +171,18 @@ fn pressure_reclamation_retains_attached_sessions_and_pending_approvals() {
     assert_eq!(pending.session().summary().activity, Activity::Approval);
     drop(pending);
     daemon.reclaim_idle();
+    settle(&daemon);
     assert!(daemon.slots().iter().all(|slot| slot.live().is_some()));
     drop(attachment);
     daemon.reclaim_idle();
+    settle(&daemon);
     let loaded = daemon.loaded();
-    assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].summary().activity, Activity::Approval);
+    assert_eq!(loaded.len(), 2);
+    assert!(
+        loaded
+            .iter()
+            .any(|session| session.summary().activity == Activity::Approval)
+    );
     drop(loaded);
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();

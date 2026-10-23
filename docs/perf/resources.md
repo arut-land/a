@@ -63,8 +63,9 @@ uses utility QoS. The thread-bound guard restores the enclosing class even when
 a job unwinds. Async workers keep their normal class because one worker polls
 both foreground and maintenance tasks. A single `dispatch2` memory-pressure
 source subscribes to warning and critical events. Its callback only wakes the
-supervisor; the supervisor releases detached, fully idle sessions through
-normal actor shutdown. Attached sessions, pending approvals, active work and
+supervisor; actors then discard optional transcript, snapshot and view caches
+when detached and fully idle. Session and process ownership stay with their
+actors, including when a new attachment arrives during reclamation. Attached sessions, pending approvals, active work and
 process owners remain live. Cancellation releases the source's callback only
 after event delivery ends. There is no pressure timer or allocator trim call.
 

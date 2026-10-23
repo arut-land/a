@@ -429,6 +429,7 @@ enum Msg {
         request: ContextRequest,
     },
 
+    Reclaim,
     Stop,
     /// Make what was only written durable, and show it: sent to itself
     /// [`SYNC_LAG`] after a write that was not synced.
@@ -745,6 +746,10 @@ impl Live {
             ticket: None,
         };
         self.send(Msg::Step(interrupt));
+    }
+
+    pub(crate) fn reclaim(&self) {
+        self.send(Msg::Reclaim);
     }
 
     pub(crate) fn stop(&self) {
@@ -1389,6 +1394,15 @@ impl Actor {
                 return None;
             }
             Msg::Sync => return None,
+            Msg::Reclaim => {
+                if !self.live.idle_for().is_zero() && self.live.summary().activity == Activity::Idle
+                {
+                    self.projection.transcript = None;
+                    self.projection.snapshot = None;
+                    self.projection.view = None;
+                }
+                return None;
+            }
             Msg::Stop => {
                 self.phase = Phase::Draining;
                 self.live.session.cancel_all();
@@ -1529,7 +1543,7 @@ impl Actor {
             Msg::Request { reply, .. } => reply.send(Err(why.to_string())),
             #[cfg(test)]
             Msg::Barrier(_) => drop(self.take(msg).await),
-            Msg::Attach(..) | Msg::Stop => drop(self.take(msg).await),
+            Msg::Attach(..) | Msg::Stop | Msg::Reclaim => drop(self.take(msg).await),
             _ => {}
         }
     }
