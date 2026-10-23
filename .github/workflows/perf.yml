@@ -75,7 +75,7 @@ jobs:
   measure:
     needs: matrix
     name: perf (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner == 'macos-latest' && 'macos-15' || matrix.runner }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
