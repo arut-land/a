@@ -57,9 +57,10 @@ Windows disk classification uses maintained `sysinfo` with only its `disk`
 feature and kind refresh enabled. The longest canonical mount prefix selects
 the store's disk; process, capacity and I/O-rate refresh are disabled. macOS
 uses `statfs` for that mount and maintained `objc2-io-kit`/Core Foundation
-bindings to find its backing medium through the IOKit parent tree. An initial
-all-mount `sysinfo` implementation increased Apple silicon idle RSS from 8656
-to 10608 KiB and cold reply latency by 42% in the paired hosted trial below;
+bindings to find its backing medium through the IOKit parent tree. A candidate
+using all-mount `sysinfo` measured Apple silicon idle RSS of 8656 → 10608 KiB
+and cold reply latency +42% relative to main in a
+[paired hosted trial](https://github.com/arut-land/a/actions/runs/39989529804);
 the selected-device query avoids CFURL's process caches. Unknown media remains
 explicit rather than guessing that a virtual or network mount is an SSD.
 
@@ -70,8 +71,8 @@ both foreground and maintenance tasks. A single `dispatch2` memory-pressure
 source subscribes to warning and critical events. Its callback only wakes the
 supervisor; actors then discard optional transcript, snapshot and view caches
 when detached and fully idle. Session and process ownership stay with their
-actors, including when a new attachment arrives during reclamation. Attached sessions, pending approvals, active work and
-process owners remain live. Cancellation releases the source's callback only
+actors, including when a new attachment arrives during reclamation. Attached
+sessions, pending approvals, active work and process owners remain live. Cancellation releases the source's callback only
 after event delivery ends. There is no pressure timer or allocator trim call.
 
 Page size comes from `sysconf(_SC_PAGESIZE)` or `GetSystemInfo`, rather than an
@@ -82,7 +83,9 @@ actual page granularity.
 
 Linux GNU sets glibc `M_ARENA_MAX=2` before starting workers. Other targets use
 their system allocator without that call. In particular, musl has no glibc
-arena policy; no glibc symbol is referenced in a musl build.
+arena policy; no glibc symbol is referenced in a musl build. The cap bounds
+allocator arena growth as workers come and go; it does not guarantee lower RSS
+for every allocation topology.
 
 The [hosted libc probe](https://github.com/arut-land/a/actions/runs/39863001600)
 used native x86_64 and aarch64 Ubuntu runners and Alpine 3.22 / musl 1.2.5
@@ -166,25 +169,27 @@ Raw [primitive samples](resource-primitives.csv) and [CPU samples](resource-cpu.
 
 ## Paired application measurements
 
-[Hosted run](https://github.com/arut-land/a/actions/runs/39989529804) compares candidate `fb134499ff5ccd4a5a0b0dd6aef02d33bc987eba` with main `065b9331ade244b56e27cb7e457cb8d9a75fcbf0` on the same native runner. Each lane completes five alternating reference/candidate rounds. Tables report medians; positive deltas mean more memory or time.
+[Hosted run](https://github.com/arut-land/a/actions/runs/40000401930) compares candidate `e9dacda1a45400951be780d37d98cf98f76d39b5` with main `781586d5a9fec1dd8b5e2b316a28b00a48470f8e` on the same native runner. Each lane completes five alternating reference/candidate rounds. Tables report medians; positive deltas mean more memory or time.
 
 Idle RSS is sampled after three seconds. Idle CPU is a ten-second native counter delta after fifteen seconds settling. Peak RSS and CPU below belong to the named benchmark process, including its retained test log. Primitive allocation traffic and process RSS measure different things.
 
-| Target | Shipped bytes, main → candidate | Idle RSS, KiB main → candidate | Idle CPU, ms main → candidate | Cold reply delta | Attach p99 delta |
+| Target | Shipped bytes, main → candidate | Idle RSS, KiB main → candidate | Idle CPU, ms main → candidate | Cold reply, ms | Attach p99, ms |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| macOS aarch64 | 3,263,568 → 3,316,016 | 8656 → 10608 | 0.000 → 0.000 | +41.61% | +47.79% |
-| Linux aarch64 GNU | 3,626,792 → 3,663,272 | 6300 → 6332 | 0.000 → 0.000 | +0.05% | -0.46% |
-| Linux x86_64 GNU | 4,207,520 → 4,248,480 | 7312 → 7392 | 0.000 → 0.000 | +2.36% | -0.20% |
-| Windows aarch64 | 4,763,136 → 4,816,896 | 9648 → 9728 | 0.000 → 0.000 | +2.24% | -5.16% |
-| Windows x86_64 | 5,411,840 → 5,470,208 | 8304 → 8392 | 0.000 → 0.000 | +9.78% | +1.11% |
+| macOS x86_64 | 3,957,584 → 4,000,264 | 4028 → 4192 | 0.000 → 0.000 | 56.019 → 45.165 (-19.38%) | 1.446 → 1.332 (-7.89%) |
+| macOS aarch64 | 3,296,896 → 3,348,256 | 8576 → 8720 | 0.000 → 0.000 | 19.968 → 21.882 (+9.59%) | 0.456 → 0.570 (+24.82%) |
+| Linux aarch64 GNU | 3,668,904 → 3,705,896 | 6336 → 6308 | 0.000 → 0.000 | 7.705 → 7.396 (-4.00%) | 0.478 → 0.472 (-1.13%) |
+| Linux x86_64 GNU | 4,260,512 → 4,300,704 | 7196 → 7296 | 0.000 → 0.000 | 8.132 → 8.974 (+10.35%) | 0.526 → 0.616 (+17.15%) |
+| Windows aarch64 | 4,811,264 → 4,865,024 | 9652 → 9736 | 0.000 → 0.000 | 65.651 → 67.771 (+3.23%) | 1.002 → 1.024 (+2.13%) |
+| Windows x86_64 | 5,468,160 → 5,522,944 | 8336 → 8376 | 0.000 → 0.000 | 21.424 → 21.482 (+0.27%) | 0.865 → 0.887 (+2.56%) |
 
 | Target | Driver CPU delta | Driver peak RSS delta | Large-JSON CPU delta | Large-JSON peak RSS delta | Decode control CPU delta |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| macOS aarch64 | +2.62% | +0.08% | +12.58% | -0.01% | -17.25% |
-| Linux aarch64 GNU | +0.87% | -0.01% | +1.67% | -0.80% | +2.27% |
-| Linux x86_64 GNU | +3.73% | -0.03% | +1.45% | +0.06% | +1.43% |
-| Windows aarch64 | +1.95% | +0.01% | +0.60% | +0.02% | -0.72% |
-| Windows x86_64 | +0.49% | -0.17% | +1.69% | +0.06% | -0.49% |
+| macOS x86_64 | -11.02% | +1.25% | -6.42% | +2.38% | -2.06% |
+| macOS aarch64 | +0.17% | +0.07% | +0.32% | +0.08% | -3.63% |
+| Linux aarch64 GNU | +2.10% | -0.02% | -31.67% | -0.00% | +2.47% |
+| Linux x86_64 GNU | -1.38% | +0.00% | -3.09% | -0.91% | +1.96% |
+| Windows aarch64 | -3.92% | -0.10% | +4.49% | -0.08% | +0.00% |
+| Windows x86_64 | -6.08% | +0.10% | -2.86% | -0.01% | +0.00% |
 
 The decode control uses unchanged provider-decoder code. The tables retain small shifts rather than classifying every median difference as a performance win or loss. The many-core ceiling is a concurrency bound; these three/four-CPU VMs do not establish physical many-core throughput.
 
