@@ -75,7 +75,7 @@ jobs:
   measure:
     needs: matrix
     name: perf (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner == 'macos-latest' && 'macos-15' || matrix.runner }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -181,9 +181,6 @@ jobs:
           else
             mise exec -- python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
           fi
-      - name: Temporary process capture RSS probe
-        if: env.PERF_BUILD_ONLY != 'true'
-        run: python scripts/perf/process_wave.py
       - name: Measure alternating reference and candidate rounds
         timeout-minutes: 45
         if: ${{ !cancelled() && steps.build.outcome == 'success' && env.PERF_REFERENCE != '' && env.PERF_BUILD_ONLY != 'true' }}
