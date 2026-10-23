@@ -186,6 +186,12 @@ pub fn retirement(listener: &Listener) -> io::Result<Retirement> {
 }
 
 #[allow(clippy::unnecessary_wraps, reason = "Unix unlinks its socket")]
+pub fn withdraw(_retirement: &Retirement) -> io::Result<()> {
+    // Windows discovery is the locked daemon record, cleared before retirement.
+    Ok(())
+}
+
+#[allow(clippy::unnecessary_wraps, reason = "Unix unlinks its socket")]
 pub fn retire(retirement: Retirement) -> io::Result<()> {
     let Retirement(claim) = retirement;
     lock(&claim).take();

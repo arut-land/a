@@ -98,6 +98,12 @@ impl Pass for Listener {
 pub struct EndpointRetirement(imp::Retirement);
 
 impl EndpointRetirement {
+    /// Withdraws a socket name while retaining its claim through shutdown.
+    /// Pipe discovery remains governed by the daemon record.
+    pub fn withdraw(&self) -> io::Result<()> {
+        imp::withdraw(&self.0)
+    }
+
     pub fn retire(self) -> io::Result<()> {
         imp::retire(self.0)
     }
@@ -481,13 +487,20 @@ mod imp {
         Ok(Retirement { claim, path })
     }
 
-    pub fn retire(retirement: Retirement) -> io::Result<()> {
-        match fs::remove_file(retirement.path) {
+    pub fn withdraw(retirement: &Retirement) -> io::Result<()> {
+        match fs::remove_file(&retirement.path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        retirement.claim.unlock()
+        Ok(())
+    }
+
+    pub fn retire(retirement: Retirement) -> io::Result<()> {
+        withdraw(&retirement)?;
+        let result = retirement.claim.unlock();
+        drop(retirement);
+        result
     }
 
     pub fn shutdown(stream: &UnixStream, how: std::net::Shutdown) -> io::Result<()> {
@@ -744,8 +757,13 @@ mod tests {
         let retirement = listener.retirement().unwrap();
         assert!(listener.retirement().is_err());
         assert!(home.bind().is_err());
-        retirement.retire().unwrap();
+        retirement.withdraw().unwrap();
         assert!(!home.endpoint().path().exists());
+        assert!(
+            home.bind().is_err(),
+            "withdrawal retains the claim during shutdown"
+        );
+        retirement.retire().unwrap();
         let successor = home.bind().unwrap();
         drop(listener);
         let _client = home.endpoint().connect().unwrap();

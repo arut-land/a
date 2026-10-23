@@ -1127,12 +1127,19 @@ struct Exit {
 }
 
 impl Exit {
-    /// Stops sessions and clears the record while retaining the endpoint
-    /// claim. Then it withdraws the endpoint and releases its claim before
+    /// Retains the endpoint claim through discovery withdrawal and session
+    /// shutdown. Then it releases the claim before
     /// the pid lock, so a successor never races the old claim or loads a
     /// log we still write. Clearing the crash breaker ends any run of
     /// crashes. A client reconnecting on EOF finds both claims free.
     async fn now(self, daemon: &Daemon, why: Stop) -> ! {
+        if let Err(e) = self.endpoint.withdraw() {
+            fact(Fact::Fault {
+                session: None,
+                operation: Operation::Shutdown,
+                kind: Fault(e.kind()),
+            });
+        }
         daemon.shutdown().await;
         if let Err(e) = sys::crash::exited(&self.home, &self.pid) {
             fact(Fact::Fault {
