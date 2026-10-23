@@ -171,21 +171,30 @@ fn pressure_reclamation_retains_attached_sessions_and_pending_approvals() {
     pending.session().submit("$ echo hi").unwrap();
     settle(&daemon);
     assert_eq!(pending.session().summary().activity, Activity::Approval);
+    let pending_live = std::sync::Arc::clone(pending.session());
+    for live in [attachment.session(), &pending_live] {
+        assert_eq!(live.projection_cache(true), [true; 3]);
+    }
     drop(pending);
     daemon.reclaim_idle();
     settle(&daemon);
-    assert!(daemon.slots().iter().all(|slot| slot.live().is_some()));
+    for live in [attachment.session(), &pending_live] {
+        assert_eq!(
+            live.projection_cache(false),
+            [true; 3],
+            "protected projections are retained without rebuilding"
+        );
+    }
+    assert_eq!(pending_live.summary().activity, Activity::Approval);
+    let idle_live = std::sync::Arc::clone(attachment.session());
     drop(attachment);
     daemon.reclaim_idle();
     settle(&daemon);
-    let loaded = daemon.loaded();
-    assert_eq!(loaded.len(), 2);
-    assert!(
-        loaded
-            .iter()
-            .any(|session| session.summary().activity == Activity::Approval)
-    );
-    drop(loaded);
+    assert_eq!(idle_live.projection_cache(false), [false; 3]);
+    assert_eq!(pending_live.projection_cache(false), [true; 3]);
+    assert_eq!(daemon.loaded().len(), 2);
+    drop(pending_live);
+    drop(idle_live);
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -58,7 +58,7 @@ impl Config {
                 bytes: 32 << 20,
             },
             cpu: PoolLimits {
-                workers: cores.saturating_sub(1).clamp(1, 8),
+                workers: cores.saturating_sub(1).max(1),
                 queue: 8,
                 bytes: 64 << 20,
             },
@@ -782,7 +782,7 @@ mod tests {
         assert_eq!(config.storage.workers, 1);
         assert_eq!(
             (config.workers, config.cpu.workers, config.network.workers),
-            (4, 8, 8)
+            (4, 63, 8)
         );
         assert_eq!(config.storage.bytes, 64 << 20);
     }
@@ -798,11 +798,7 @@ mod tests {
                     config.network.workers,
                     config.cpu.workers
                 ),
-                (
-                    (cores / 2).clamp(1, 4),
-                    8,
-                    cores.saturating_sub(1).clamp(1, 8)
-                )
+                ((cores / 2).clamp(1, 4), 8, cores.saturating_sub(1).max(1))
             );
             assert_eq!(
                 config.storage.bytes + config.network.bytes + config.cpu.bytes,

@@ -429,6 +429,8 @@ enum Msg {
         request: ContextRequest,
     },
 
+    #[cfg(test)]
+    ProjectionCache(bool, oneshot::Sender<[bool; 3]>),
     Reclaim,
     Stop,
     /// Make what was only written durable, and show it: sent to itself
@@ -504,7 +506,7 @@ impl Msg {
         }
 
         #[cfg(test)]
-        if matches!(self, Self::Position(_)) {
+        if matches!(self, Self::Position(_) | Self::ProjectionCache(..)) {
             return true;
         }
         matches!(
@@ -1391,6 +1393,23 @@ impl Actor {
             #[cfg(test)]
             Msg::Position(done) => {
                 done.send((self.journal.ordered_seq, self.journal.durable_seq));
+                return None;
+            }
+            #[cfg(test)]
+            Msg::ProjectionCache(populate, reply) => {
+                if populate {
+                    self.conversation(CallId(
+                        protocol::Seq::new(self.journal.ordered_seq.max(1)).unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                    self.snapshot(self.journal.ordered_seq).await;
+                }
+                reply.send([
+                    self.projection.transcript.is_some(),
+                    self.projection.snapshot.is_some(),
+                    self.projection.view.is_some(),
+                ]);
                 return None;
             }
             Msg::Sync => return None,
@@ -2517,6 +2536,12 @@ impl Live {
 
     pub fn ended(&self) -> Flag {
         self.ended.clone()
+    }
+
+    pub(crate) fn projection_cache(&self, populate: bool) -> [bool; 3] {
+        let (reply, result) = oneshot::channel();
+        self.send(Msg::ProjectionCache(populate, reply));
+        rt::block_on(result).unwrap()
     }
 
     /// Returns once the actor has taken every message sent before.

@@ -10,7 +10,7 @@ remain available for hosts and measurement harnesses.
 | Lane | Worker ceiling | Queued jobs | Queued + running reservations |
 | --- | ---: | ---: | ---: |
 | Async | min(effective CPUs, 4), at least 1 | Executor tasks are caller-owned | Caller-owned |
-| CPU | clamp(effective CPUs − 1, 1, 8) | 8 | 64 MiB |
+| CPU | max(effective CPUs − 1, 1) | 8 | 64 MiB |
 | Storage | clamp(effective CPUs / 2, 1, 4); 1 for rotational media | 16 | 64 MiB |
 | Network | 8 | 16 | 32 MiB |
 | Flush | 1 | 1 | Metadata only |
@@ -29,6 +29,7 @@ outside storage admission, so reconstruction also completes with one worker.
 Catalog records themselves remain retained state, not a promise of an
 eight-MiB catalog size bound.
 
+Storage classification is an unqualified heuristic pending slow-disk measurements.
 Unknown media retain the core-based storage ceiling; a media label does not
 establish filesystem latency or durability. Device-mapper, remote mounts and
 virtual disks may report unknown media or an inaccurate rotation flag. Explicit
@@ -168,7 +169,7 @@ CPU jobs compare ceilings of 4, 8 and 31 using a simulated 32-core configuration
 | Windows aarch64 | 4 | 4096 | 145.599 | 144.150 | 145.117 |
 | Windows x86_64 | 4 | 4096 | 110.908 | 111.601 | 112.702 |
 
-Eight bounds oversubscription without changing the established seven-worker ceiling on eight-core machines. The 31-worker configuration shows no throughput justification on these small hosted VMs; this does not establish the optimal ceiling on a physical many-core host. The separate [runtime-demand measurements](runtime-demand.md) show why restricting an eight-core projection workload to four workers can lose throughput.
+These runs measure oversubscription on three/four-CPU VMs and do not justify a CPU cap. The default therefore follows effective parallelism alone: max(effective CPUs − 1, 1). A future cap requires paired measurements on real hosts with more than nine effective CPUs, comparing 4, 8 and cores − 1 workers on representative projection and CPU workloads across supported OS/architecture/libc targets. Evidence must include throughput, CPU, peak/idle RSS and tail latency, with any throughput tradeoff stated. The separate [runtime-demand measurements](runtime-demand.md) show why restricting an eight-core projection workload to four workers can lose throughput.
 
 Raw [primitive samples](resource-primitives.csv) and [CPU samples](resource-cpu.csv) retain the observations. The temporary workflow and comparison example are preserved in the measured revision; they are not production dependencies.
 
@@ -196,7 +197,7 @@ Idle RSS is sampled after three seconds. Idle CPU is a ten-second native counter
 | Windows aarch64 | +0.66% | -0.00% | +4.32% | -0.04% | -0.72% |
 | Windows x86_64 | +2.15% | +0.04% | -2.76% | +0.03% | -0.50% |
 
-The decode control uses unchanged provider-decoder code. The tables retain small shifts rather than classifying every median difference as a performance win or loss. The many-core ceiling is a concurrency bound; these three/four-CPU VMs do not establish physical many-core throughput.
+The decode control uses unchanged provider-decoder code. The tables retain small shifts rather than classifying every median difference as a performance win or loss. These three/four-CPU VMs do not establish physical many-core throughput.
 
 Exact medians and checkpoint samples are in [paired observations](resource-paired.csv); [runner metadata](resource-hosts.csv) records the native image and hardware description. The harness, native accounting and workload definitions are in [hosted measurements](hosted.md).
 
@@ -212,7 +213,11 @@ check. The paired run above uses the same source and main baseline.
 Invariant tests cover affinity and CPU-set restrictions, QoS restoration,
 pressure callback lifetime, single-worker catalog reconstruction, blocked
 producer cancellation and cache rebuild equivalence. Reclamation preserves
-attached sessions, pending approvals and process ownership. A shared shell
+attached sessions, pending approvals and process ownership. The preservation tests
+populate transcript, snapshot and view caches before reclamation, then inspect
+retention without invoking a rebuild. Removing the reclamation guards makes
+both preservation tests fail with all three caches absent; restoring them
+passes. An unprotected idle session still releases all three caches. A shared shell
 test checks deferred wait completion directly: PID metadata can disappear at
 exit before the child is reaped.
 

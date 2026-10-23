@@ -255,7 +255,8 @@ HTTP authentication, sampling and elicitation remain unsupported.
 default `Threads` implementation uses async-executor and async-io with owned
 workers and separately admitted blocking classes. Native CPU and storage facts
 bound the default pools: async workers never exceed four, the default CPU
-ceiling is eight, and rotational storage uses one worker. Catalog reconstruction
+ceiling is effective parallelism minus one (at least one), and rotational
+storage uses one worker. Catalog reconstruction
 shares storage admission. macOS pressure events ask actors to release disposable
 projection caches while retaining session ownership. Platform calls and unsafe
 code belong in `sys`; `rt` owns admission and readiness integration.
