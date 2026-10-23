@@ -782,13 +782,11 @@ int main(int argc, char **argv) {
                 .unwrap(),
         );
         let cx = rig.cx();
-        let pid = Mutex::new(None);
         // Stdin holds the child until the test releases status acquisition.
         let mut launching = std::pin::pin!(launch(
             &cx,
             spec(&cx, "read -r line"),
             |child| {
-                *lock(&pid) = Some(child.id());
                 child.kill().unwrap();
                 runtime.defer.store(true, Ordering::Release);
                 Err(io::ErrorKind::NotFound.into())
@@ -797,8 +795,9 @@ int main(int argc, char **argv) {
         ));
         let mut context = Context::from_waker(Waker::noop());
         assert!(launching.as_mut().poll(&mut context).is_pending());
-        let id = lock(&pid).unwrap();
-        assert!(sys::process_started(id).is_some());
+        // Zombie visibility in the process table is not portable. The pending
+        // future and deferred status task establish that acquisition has not run.
+        assert_eq!(lock(&runtime.blocking).len(), 1);
         let reaping = lock(&runtime.blocking)
             .pop()
             .expect("status acquisition was admitted");
@@ -812,7 +811,7 @@ int main(int argc, char **argv) {
         assert!(!status.success());
         assert_eq!(process.process.try_wait().unwrap(), Some(status));
         assert_eq!(rt::block_on(process.process.wait()).unwrap(), status);
-        assert!(sys::process_started(id).is_none());
+        assert!(!process.process.alive());
         assert!(lock(&runtime.blocking).is_empty());
     }
 

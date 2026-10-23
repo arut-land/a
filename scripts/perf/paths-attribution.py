@@ -83,7 +83,9 @@ def main():
                                 text=True, timeout=60)
         (OUTPUT / (mode + ".json")).write_text(result.stdout if result.returncode == 0 else json.dumps(dict(error=result.stderr)))
     for role, revision in [("main", "781586d5a9fec1dd8b5e2b316a28b00a48470f8e"),
-                           ("regressed", "9bec7823b1a97a5a23c917de2b9c89aae56d1e2c")]:
+                           ("regressed", "9bec7823b1a97a5a23c917de2b9c89aae56d1e2c"),
+                           ("current-main", "4d978b0b94290ecbf5b851f08b6d987940c2da0c"),
+                           ("candidate", "HEAD")]:
         source = OUTPUT / role
         subprocess.run(["git", "worktree", "add", "--detach", str(source), revision], check=True)
         env = dict(os.environ, CARGO_TARGET_DIR=str(OUTPUT / "build"))
