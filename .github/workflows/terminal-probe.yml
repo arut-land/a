@@ -1,6 +1,11 @@
 name: terminal probe
 on:
+  push:
+    branches: [codex-w3term]
   workflow_dispatch:
+concurrency:
+  group: terminal-probe-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
