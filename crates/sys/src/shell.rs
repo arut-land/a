@@ -29,12 +29,19 @@ pub struct ExecutionFacts {
     pub utilities: &'static str,
     pub cleanup: &'static str,
     pub temp: PathBuf,
+    pub cwd_command: &'static str,
 }
 
 impl ExecutionFacts {
     pub fn current() -> &'static Self {
         static FACTS: OnceLock<ExecutionFacts> = OnceLock::new();
         FACTS.get_or_init(imp::discover)
+    }
+
+    /// Keep the published temporary-directory contract independent of a
+    /// later attaching client's environment.
+    pub fn apply_environment(&self, env: &mut std::collections::BTreeMap<String, String>) {
+        imp::apply_environment(self, env);
     }
 
     pub const fn tool(&self) -> &'static str {

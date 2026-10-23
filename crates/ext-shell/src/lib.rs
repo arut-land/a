@@ -1,6 +1,25 @@
-//! `bash`, and the session's working directory it keeps. The extension
-//! provides the [`CwdOf`] and [`Processes`] services: where commands run, and
-//! how the processes tools start are started.
+//! One native shell tool and the session working directory it keeps.
+//!
+//! Startup selects Bash on Unix. Windows searches the daemon's captured
+//! PATH, Git for Windows' user/machine registry install paths and conventional
+//! Git/MSYS2 locations, excluding the Windows system WSL launcher. Without
+//! native Bash it selects pwsh, else Windows PowerShell 5.1. Exactly one SDK
+//! tool type is registered; neither a client PATH change nor a launch failure
+//! changes that catalog. Restart the daemon to rediscover installed shells.
+//!
+//! Tool descriptions and prompt context share startup `ExecutionFacts`.
+//! Commands retain the client's environment and cwd, with noninteractive
+//! output preferences and the published temporary directory. Bash startup
+//! hooks BASH_ENV/ENV are suppressed. Foreground cwd reports are removed after
+//! use; truncated and background output remains in the session spill directory.
+//!
+//! PowerShell takes one bounded Unicode `-Command` payload, preserving normal
+//! error semantics and explicit exits without changing execution policy. Its
+//! plain-text host streams avoid Windows PowerShell's EncodedCommand CLIXML.
+//! Native program output remains bytes, displayed with UTF-8 replacement.
+//!
+//! The extension provides [`CwdOf`] and [`Processes`]; process creation uses
+//! the SDK process service and the platform's existing SpawnPlan backend.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

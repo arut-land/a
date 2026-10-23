@@ -109,7 +109,7 @@ fn powershell(
     if let Some(root) = program_files {
         candidates.push(root.join("PowerShell/7/pwsh.exe"));
     }
-    if let Some(path) = candidates.into_iter().find(|path| native_executable(path)) {
+    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
         (path, "PowerShell (pwsh; no profile; noninteractive)")
     } else {
         (
@@ -133,7 +133,7 @@ pub(super) fn discover() -> ExecutionFacts {
             Dialect::Bash,
             path,
             "Bash (native Windows runtime; no profile or rc files)",
-            "MSYS/Git Bash paths: C:/dir or /c/dir; native tools use Windows paths",
+            "native Bash paths: C:/dir and runtime POSIX paths; native tools use Windows drive/UNC paths",
         ),
         None => {
             let (path, syntax) = powershell(search.as_deref(), program_files.as_deref(), &windows);
@@ -145,6 +145,16 @@ pub(super) fn discover() -> ExecutionFacts {
             )
         }
     };
+    let cwd_command = if dialect == Dialect::Bash {
+        let parent = executable.parent().unwrap_or(Path::new("."));
+        if parent.join("cygwin1.dll").is_file() {
+            "cygpath -w -- \"$PWD\""
+        } else {
+            "pwd -W"
+        }
+    } else {
+        ""
+    };
     ExecutionFacts {
         dialect,
         executable,
@@ -153,6 +163,7 @@ pub(super) fn discover() -> ExecutionFacts {
         utilities: "installed Windows executables and the selected shell's builtins",
         cleanup: "timeout/cancellation terminate the owned Windows job and its descendants; no Unix TERM grace; background work is session-owned; jobs die with the daemon; retained output stays in the session spill directory",
         temp: std::env::temp_dir(),
+        cwd_command,
     }
 }
 
@@ -186,5 +197,21 @@ mod tests {
             windows.join("System32/WindowsPowerShell/v1.0/powershell.exe")
         );
         assert!(syntax.contains("5.1"));
+    }
+}
+
+pub(super) fn apply_environment(
+    facts: &ExecutionFacts,
+    env: &mut std::collections::BTreeMap<String, String>,
+) {
+    // Windows environment names compare without case; remove older spellings
+    // before inserting the frozen temporary-directory values.
+    env.retain(|key, _| {
+        !["TEMP", "TMP", "BASH_ENV", "ENV"]
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+    });
+    for key in ["TEMP", "TMP"] {
+        env.insert(key.into(), facts.temp.to_string_lossy().into_owned());
     }
 }

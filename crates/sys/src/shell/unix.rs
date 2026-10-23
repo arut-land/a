@@ -30,5 +30,13 @@ pub(super) fn discover() -> ExecutionFacts {
         },
         cleanup: "timeout/cancellation signal the owned process group, TERM then KILL; descendants that leave the group can escape; background work is session-owned; retained output stays in the session spill directory",
         temp: std::env::temp_dir(),
+        cwd_command: "pwd -P",
     }
+}
+
+pub(super) fn apply_environment(
+    facts: &ExecutionFacts,
+    env: &mut std::collections::BTreeMap<String, String>,
+) {
+    env.insert("TMPDIR".into(), facts.temp.to_string_lossy().into_owned());
 }

@@ -43,7 +43,7 @@ fn bash_quote(text: &str) -> String {
 }
 
 fn ps_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+    format!("'{}'", sys::shell_path(path).replace('\'', "''"))
 }
 
 impl Dialect for PowerShell {

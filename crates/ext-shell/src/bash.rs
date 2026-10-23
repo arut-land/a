@@ -1,9 +1,9 @@
 //! `bash`: one command per call, in a fresh non-interactive bash that
 //! starts where the last command left off.
 //!
-//! A command runs in a session and process group of its own, with no stdin
-//! and no terminal, so nothing it starts can wait for input or outlive a
-//! timeout unnoticed. Its stdout and stderr share one pipe, in the order
+//! A command runs in an owned native process scope with no stdin or
+//! terminal. Timeout/cancellation stops that scope; ExecutionFacts describes
+//! the platform's containment limits. Its stdout and stderr share one pipe, in the order
 //! written. The directory it ends in is reported through an exit trap and
 //! kept as the `shell` extension's `cwd` state, so `cd` persists across
 //! calls and restarts. Its calls are exclusive ([`ext::Concurrency`]): a
@@ -435,6 +435,7 @@ fn spawn_with<D: crate::dialect::Dialect>(
         private_dir(&cx.spill)?;
     }
     // Noninteractive startup files must not rewrite the wrapper's contract.
+    facts.apply_environment(&mut env);
     env.remove("BASH_ENV");
     env.remove("ENV");
     let mut argv = vec![facts.executable.to_string_lossy().into_owned()];

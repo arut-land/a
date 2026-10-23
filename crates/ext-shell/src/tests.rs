@@ -182,6 +182,7 @@ fn powershell_facts(executable: std::path::PathBuf) -> &'static sys::shell::Exec
         utilities: "PowerShell cmdlets",
         cleanup: "owned job",
         temp: std::env::temp_dir(),
+        cwd_command: "",
     }))
 }
 

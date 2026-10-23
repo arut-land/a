@@ -214,14 +214,14 @@ pub fn shell_directory(text: &str) -> PathBuf {
 }
 
 /// The shell builtin that reports a directory in the host's path syntax.
-pub const fn shell_pwd() -> &'static str {
+pub fn shell_pwd() -> &'static str {
     #[cfg(unix)]
     {
         "pwd -P"
     }
     #[cfg(windows)]
     {
-        "pwd -W"
+        shell::ExecutionFacts::current().cwd_command
     }
 }
 
