@@ -39,6 +39,14 @@ Windows retains its native console handler and manual-reset event. POSIX signal
 registration is not a replacement for console close/logoff/shutdown callbacks.
 No signal handlers are installed by embedded library initialization.
 
+The hosted comparison also reports registration/release wall time, sampled RSS,
+normal dependency graph and probe bytes for 10,000 SIGWINCH leases/hooks per
+round (five rounds, Unix only). The hook action is empty: that result is a lower
+bound, excluding the wake source and exclusive ownership still needed for
+integration. These are lease churn measurements, not signal-delivery throughput.
+The existing full-pipe and exclusivity tests cover coalescing and ownership;
+exclusivity also verifies default disposition restoration and CLOEXEC.
+
 ## Test temporary directories
 
 Use `tempfile` 3.27 with default features disabled in test infrastructure.
@@ -60,6 +68,11 @@ Default getrandom reseeding is unnecessary for these short-lived test roots;
 exclusive creation is the invariant. This is not an API for publishing user
 files. Edit transactions and executable staging retain their separate ownership
 and metadata/durability contracts; those files belong to other sessions.
+The hosted infrastructure probe runs five rounds of 10,000 create/drop pairs
+for std PID/counter directories and TempDir, reporting ns/pair, sampled process
+RSS and exact probe bytes. Filesystem noise affects both; no daemon runtime
+claim follows from test-helper timings.
+
 The acceptance harness retains its cross-process warm-up lock: its stable name
 coordinates different test processes, unlike a temporary isolated directory.
 Other individual tests still using incidental paths are not a new shared helper.

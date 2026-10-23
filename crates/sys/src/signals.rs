@@ -535,6 +535,21 @@ mod imp {
             on_signal(raw(Signal::Resize).as_raw());
             assert_eq!(signals.wait(), [Signal::Resize]);
             drop(signals);
+            // SAFETY: query writes a valid sigaction buffer without changing it.
+            let action = unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                assert_eq!(
+                    libc::sigaction(libc::SIGWINCH, std::ptr::null(), &raw mut action),
+                    0
+                );
+                action
+            };
+            assert_eq!(action.sa_sigaction, libc::SIG_DFL);
+            assert!(
+                rustix::io::fcntl_getfd(&SOURCE.get().unwrap().read)
+                    .unwrap()
+                    .contains(FdFlags::CLOEXEC)
+            );
             let next = Signals::catch(&[Signal::Terminate]).unwrap();
             // A handler from the previous lease may finish after reacquisition.
             next.0

@@ -59,22 +59,22 @@ pub(super) fn header(source: &str) -> Result<Header, Error> {
         name: None,
         description: None,
     };
-    p.expect(yaml_rust2::parser::Event::StreamStart)?;
-    p.expect(yaml_rust2::parser::Event::DocumentStart)?;
+    p.expect(&yaml_rust2::parser::Event::StreamStart)?;
+    p.expect(&yaml_rust2::parser::Event::DocumentStart)?;
     let (event, line) = p.next()?;
     if !matches!(event, yaml_rust2::parser::Event::MappingStart(0, None)) {
         return Err(Error::new(line, Kind::Collection));
     }
     p.mapping(1)?;
-    p.expect(yaml_rust2::parser::Event::DocumentEnd)?;
-    p.expect(yaml_rust2::parser::Event::StreamEnd)?;
+    p.expect(&yaml_rust2::parser::Event::DocumentEnd)?;
+    p.expect(&yaml_rust2::parser::Event::StreamEnd)?;
     let (name, name_line) = p.name.ok_or_else(|| Error::new(2, Kind::Missing))?;
     let (description, description_line) =
         p.description.ok_or_else(|| Error::new(2, Kind::Missing))?;
     Ok(Header {
         name,
-        name_line,
         description,
+        name_line,
         description_line,
     })
 }
@@ -87,9 +87,9 @@ impl HeaderParser<'_> {
             .map_err(|e| Error::new(e.marker().line() + 1, Kind::Syntax))
     }
 
-    fn expect(&mut self, expected: yaml_rust2::parser::Event) -> Result<(), Error> {
+    fn expect(&mut self, expected: &yaml_rust2::parser::Event) -> Result<(), Error> {
         let (event, line) = self.next()?;
-        if event == expected {
+        if &event == expected {
             Ok(())
         } else {
             Err(Error::new(line, Kind::Syntax))
