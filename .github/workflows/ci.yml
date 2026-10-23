@@ -7,11 +7,11 @@ env:
   CARGO_BUILD_JOBS: 2
   MISE_AUTO_INSTALL: false
 jobs:
-  windows-metadata-diagnostic:
+  windows-publication:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v5
         with:
           install_args: rust mr-boxington cargo:cargo-nextest
-      - run: mise exec -- cargo nextest run -p sys -E 'test(a_native_move_keeps_the_captured_metadata_snapshot)' --no-tests=fail --success-output immediate
+      - run: mise exec -- cargo nextest run -p sys -p ext-edit -E 'test(fs::edit::tests) | package(ext-edit)' --no-tests=fail --no-fail-fast

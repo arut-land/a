@@ -526,7 +526,12 @@ fn name_operation(
     // SAFETY: aligned storage contains the complete header and UTF-16 tail;
     // both owned handles and the buffer live through the synchronous call.
     unsafe {
-        (*info).Anonymous.Flags = 0x2; // POSIX_SEMANTICS, without REPLACE_IF_EXISTS
+        (*info).Anonymous.Flags =
+            if class == windows_sys::Wdk::Storage::FileSystem::FileRenameInformationEx {
+                0x2
+            } else {
+                0
+            }; // Never REPLACE_IF_EXISTS.
         (*info).RootDirectory = parent.as_raw_handle();
         (*info).FileNameLength = u32::try_from(name.len() * 2).expect("checked buffer length");
         std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
