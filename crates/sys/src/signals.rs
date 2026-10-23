@@ -199,6 +199,11 @@ mod imp {
                 return Err(io::ErrorKind::InvalidInput.into());
             }
             if SOURCE.get().is_none() {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let (read, write) = rustix::pipe::pipe_with(
+                    rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+                )?;
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 let (read, write) = rustix::pipe::pipe()?;
                 for fd in [&read, &write] {
                     fcntl_setfd(fd, FdFlags::CLOEXEC)?;

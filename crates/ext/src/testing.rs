@@ -35,6 +35,7 @@ pub struct Rig {
     pub session: SessionId,
     host: Arc<Recorder>,
     calls: AtomicU64,
+    _directory: tempfile::TempDir,
 }
 
 /// What the calls tell the engine.
@@ -62,8 +63,11 @@ impl Deref for Rig {
 impl Rig {
     /// A rig in a fresh directory named for `name`, its workspace.
     pub fn new(name: &str, registry: Registry) -> Self {
-        let dir = std::env::temp_dir().join(format!("a-rig-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let directory = tempfile::Builder::new()
+            .prefix(&format!("a-rig-{name}-"))
+            .tempdir()
+            .unwrap();
+        let dir = directory.path();
         std::fs::create_dir_all(dir.join("ws")).unwrap();
         let dir = std::fs::canonicalize(dir).unwrap();
         Self {
@@ -81,6 +85,7 @@ impl Rig {
                 ends: Arc::default(),
             }),
             calls: AtomicU64::new(0),
+            _directory: directory,
         }
     }
 
@@ -136,7 +141,6 @@ impl Drop for Rig {
             let _ = process.signal(crate::ProcessSignal::Kill);
             rt::block_on(released.wait());
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

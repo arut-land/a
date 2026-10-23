@@ -4,7 +4,6 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -46,15 +45,14 @@ pub fn deadline() -> Instant {
 }
 
 pub fn isolated_root(name: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
     // CI scratch storage avoids slow durable writes in the OS temp directory.
     let base = std::env::var_os("RUNNER_TEMP").map_or_else(std::env::temp_dir, PathBuf::from);
-    let root = base.join(format!(
-        "a-acc-{name}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir(&root).unwrap();
+    // The harness stops daemons and retries Windows handle release before removal.
+    let root = tempfile::Builder::new()
+        .prefix(&format!("a-acc-{name}-"))
+        .tempdir_in(base)
+        .unwrap()
+        .keep();
     fs::canonicalize(root).unwrap()
 }
 

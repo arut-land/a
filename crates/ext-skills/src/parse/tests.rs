@@ -54,6 +54,7 @@ fn metadata_is_validated_even_when_not_interpreted() {
         "allowed-tools: [Read, 'Bash(git:*)', \"Write\"] # tools",
         "allowed-tools:\n  - Read\n  - Bash(git:*)\nmetadata:\n  owner: team\n  nested:\n    version: 1",
         "metadata: {owner: team, nested: {version: 1}}",
+        "metadata: {x}",
         "allowed-tools: [Anthropic's, Read] # comment",
     ] {
         header(&format!(
@@ -63,7 +64,6 @@ fn metadata_is_validated_even_when_not_interpreted() {
     }
     for metadata in [
         "metadata: [Read",
-        "metadata: {x}",
         "metadata:\n x: [a,,b]",
         "metadata: *alias",
         "metadata:\n x: ok\n x: duplicate",

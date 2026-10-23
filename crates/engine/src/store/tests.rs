@@ -5,7 +5,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::ops::{Deref, RangeInclusive};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use protocol::{Body, Decode, Entry, Epoch, Json, ReadOnly, Seq, SessionId};
@@ -36,9 +35,11 @@ impl Drop for Fixture {
 }
 
 fn temp_dir() -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("a-store-{}-{n}", std::process::id()))
+    tempfile::Builder::new()
+        .prefix("a-store-")
+        .tempdir()
+        .unwrap()
+        .keep()
 }
 
 fn jsonl() -> Fixture {

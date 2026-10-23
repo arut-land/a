@@ -6,6 +6,8 @@ edition = "2024"
 publish = false
 [features]
 custom = []
+event = ["dep:yaml-rust2"]
+saphyr = ["dep:saphyr"]
 serde = ["dep:serde_yaml_ng"]
 yaml = ["dep:yaml-rust2"]
 [dependencies]
@@ -13,6 +15,7 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_yaml_ng = { version = "=0.10.0", default-features = false, optional = true }
 yaml-rust2 = { version = "=0.13.0", default-features = false, optional = true }
+saphyr = { version = "0.2.2", default-features = false, optional = true }
 [profile.release]
 opt-level = "s"
 lto = "fat"
