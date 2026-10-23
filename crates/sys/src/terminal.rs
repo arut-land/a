@@ -308,11 +308,11 @@ mod imp {
             let cooked = tcgetattr(stdin)?;
             let mut raw = cooked.clone();
             raw.make_raw();
-            tcsetattr(stdin, OptionalActions::Now, &raw)?;
             let saved = Self {
                 cooked,
                 output_flags,
             };
+            tcsetattr(stdin, OptionalActions::Now, &raw)?;
             fcntl_setfl(rustix::stdio::stdout(), output_flags | OFlags::NONBLOCK)?;
             Ok(saved)
         }
@@ -335,8 +335,8 @@ mod imp {
     }
 
     /// Cleanup output must be possible after the shell takes the foreground.
-    /// Normal writes check ownership first, then block TTOU across the syscall
-    /// so a racing foreground change cannot trap `write_all` in signal retries.
+    /// Normal writes let the kernel report background output and recheck
+    /// ownership after an interrupted call.
     pub struct OutputGuard {
         mask: libc::sigset_t,
         thread: std::marker::PhantomData<std::rc::Rc<()>>,
@@ -425,7 +425,11 @@ mod imp {
             if interruptible && (output_interrupted() || !is_foreground()?) {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
-            let output = OutputGuard::enter()?;
+            let output = if interruptible {
+                None
+            } else {
+                Some(OutputGuard::enter()?)
+            };
             match rustix::io::write(stdout, buf) {
                 Ok(n) => return Ok(n),
                 Err(Errno::INTR) => continue,

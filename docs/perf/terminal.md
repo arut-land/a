@@ -28,8 +28,8 @@ WaitForMultipleObjects call. Console-free and redirected operation does not
 require console mode changes.
 
 Unix output checks foreground ownership and blocks SIGTTOU only around
-cleanup or an owned write, preventing restarted writes from trapping the
-renderer after the shell changes foreground jobs. The renderer serializes
+cleanup and mode restoration. Rendering lets the kernel report background
+writes and rechecks ownership after interrupted calls. The renderer serializes
 restoration and suspension. An owned pause guard disables stdin while
 leaving signal delivery active until ownership has been reacquired.
 Nonblocking output waits on readiness and a dedicated suspend wake pipe;
