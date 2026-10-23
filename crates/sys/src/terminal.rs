@@ -367,12 +367,22 @@ mod tests {
                 assert_ne!(libc::setsid(), -1);
                 assert_ne!(libc::ioctl(0, libc::TIOCSCTTY as _, 0), -1);
             }
+            let before = rustix::termios::tcgetattr(rustix::stdio::stdin()).unwrap();
             let _raw = RawMode::enter().unwrap();
             let raw = rustix::termios::tcgetattr(rustix::stdio::stdin()).unwrap();
             assert!(
                 !raw.local_modes
                     .contains(rustix::termios::LocalModes::ICANON)
             );
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                previous(info);
+                assert_modes(
+                    &before,
+                    &rustix::termios::tcgetattr(rustix::stdio::stdin()).unwrap(),
+                );
+                eprintln!("terminal modes restored before process exit");
+            }));
             println!("raw input acquired before panic");
             panic!("unwind the owned terminal");
         }
@@ -412,6 +422,10 @@ mod tests {
         );
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("raw input acquired before panic")
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("terminal modes restored before process exit")
         );
         assert_modes(&before, &rustix::termios::tcgetattr(&master).unwrap());
     }

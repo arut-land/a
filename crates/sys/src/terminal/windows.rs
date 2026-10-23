@@ -256,6 +256,11 @@ impl LineMode {
             control: false,
             output: None,
         };
+        // LINE's lock is held until this snapshot is published. A control
+        // callback during setup waits for it before restoring the console.
+        // SAFETY: process-lifetime function; removal is owned by the guard.
+        ok(unsafe { SetConsoleCtrlHandler(Some(line_control), 1) })?;
+        saved.control = true;
         let mut mode = 0;
         // SAFETY: standard handles are borrowed for the call and mode is writable.
         unsafe {
@@ -273,11 +278,6 @@ impl LineMode {
                 ok(SetConsoleOutputCP(65001))?;
             }
         }
-        // LINE's lock is held until this snapshot is published. A control
-        // callback during setup waits for it before restoring the console.
-        // SAFETY: process-lifetime function; removal is owned by the guard.
-        ok(unsafe { SetConsoleCtrlHandler(Some(line_control), 1) })?;
-        saved.control = true;
         Ok(saved)
     }
 }
