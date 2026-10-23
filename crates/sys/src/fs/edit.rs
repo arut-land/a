@@ -1860,4 +1860,58 @@ mod tests {
         fs::remove_file(sentinel).unwrap();
         work.only_target_remains();
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_works_with_tmpfile_but_without_procfs_or_link_capability() {
+        const TEST: &str = "fs::edit::tests::staging_works_with_tmpfile_but_without_procfs_or_link_capability";
+        if let Some(root) = std::env::var_os("A_EDIT_CHROOT") {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            use rustix::fs::{openat, linkat, AtFlags, Mode, OFlags, CWD};
+            let root = std::ffi::CString::new(root.as_bytes()).unwrap();
+            // SAFETY: this child runs only this test; root is its isolated fixture.
+            assert_eq!(unsafe { libc::chroot(root.as_ptr()) }, 0);
+            std::env::set_current_dir("/").unwrap();
+            assert!(!Path::new("/proc").exists());
+            let anonymous = openat(CWD, ".", OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC, Mode::RUSR | Mode::WUSR).unwrap();
+            let transaction = EditTransaction::capture(Path::new("/target"), 128).unwrap();
+            let mut staged = transaction.stage(&|_| false).unwrap();
+            // Transfer our objects before dropping credentials. This also makes
+            // AT_EMPTY_PATH require privilege on kernels that accept same-cred fds.
+            for fd in [staged.file.as_raw_fd(), staged.directory.file.as_raw_fd()] {
+                // SAFETY: both descriptors name this child's newly created objects.
+                assert_eq!(unsafe { libc::fchown(fd, 65534, 65534) }, 0);
+            }
+            // SAFETY: drop this isolated child's group/user privileges permanently.
+            assert_eq!(unsafe { libc::setgid(65534) }, 0);
+            assert_eq!(unsafe { libc::setuid(65534) }, 0);
+            #[repr(C)]
+            struct Header { version: u32, pid: i32 }
+            let header = Header { version: 0x2008_0522, pid: 0 };
+            let mut capabilities = [0u32; 6];
+            // SAFETY: these are the Linux v3 capget header and two data records.
+            assert_eq!(unsafe { libc::syscall(libc::SYS_capget, &raw const header, capabilities.as_mut_ptr()) }, 0);
+            assert_eq!(capabilities[0] | capabilities[3], 0);
+            assert!(matches!(linkat(&anonymous, "", &staged.directory.file, "probe", AtFlags::EMPTY_PATH), Err(rustix::io::Errno::NOENT | rustix::io::Errno::PERM)));
+            staged.file.write_all(b"published").unwrap();
+            staged.publish(&transaction.name, false).unwrap();
+            drop(staged);
+            assert_eq!(fs::read("/target").unwrap(), b"published");
+            fs::remove_file("/target").unwrap();
+            assert_eq!(fs::read_dir("/").unwrap().count(), 0);
+            return;
+        }
+        if std::env::var_os("GITHUB_ACTIONS").is_none() { return; }
+        use std::os::unix::fs::PermissionsExt;
+        let work = Workspace::new();
+        fs::set_permissions(&work.0, fs::Permissions::from_mode(0o777)).unwrap();
+        let result = std::process::Command::new("sudo")
+            .args(["-n", "--preserve-env=A_EDIT_CHROOT"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env("A_EDIT_CHROOT", &work.0)
+            .output().unwrap();
+        assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+    }
+
 }
