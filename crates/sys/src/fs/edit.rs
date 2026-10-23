@@ -428,7 +428,26 @@ impl EditTransaction {
             };
         };
         staged.prepare_vacancy()?;
-        staged.take_original(source, &self.name).map_err(|error| {
+        #[cfg(windows)]
+        let authority = source_authority(source).map_err(|error| {
+            self.revalidate().err().unwrap_or_else(|| {
+                if error.raw_os_error() == Some(32) {
+                    EditError::Conflict(EditConflict::Busy)
+                } else {
+                    error.into()
+                }
+            })
+        })?;
+        // Denying delete opens pins the captured name during handle-bound unlink.
+        #[cfg(windows)]
+        self.revalidate()?;
+        #[cfg(unix)]
+        let taken = staged.take_original(source, &self.name);
+        #[cfg(windows)]
+        let taken = staged.take_original(&authority, &self.name);
+        #[cfg(windows)]
+        drop(authority);
+        taken.map_err(|error| {
             if staged.has_original() {
                 return EditError::Conflict(EditConflict::Recovery(staged.retain_original()));
             }
@@ -573,7 +592,7 @@ fn check_cancel(should_cancel: &(dyn Fn(u64) -> bool + Sync), copied: u64) -> io
     }
 }
 
-fn same_object(left: &File, right: &File) -> io::Result<bool> {
+pub(super) fn same_object(left: &File, right: &File) -> io::Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1532,21 +1551,43 @@ pub(super) fn accessible_links(file: &File) -> io::Result<u32> {
 }
 
 #[cfg(windows)]
+fn source_authority(source: &File) -> io::Result<File> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{DELETE, FILE_SHARE_READ},
+    };
+    reopen_shared(
+        source.as_raw_handle(),
+        GENERIC_READ | DELETE,
+        FILE_SHARE_READ,
+    )
+}
+
+#[cfg(windows)]
 pub(super) fn reopen(
     handle: windows_sys::Win32::Foundation::HANDLE,
     access: u32,
 ) -> io::Result<File> {
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
-    // SAFETY: callers keep the borrowed handle alive; the returned handle is checked and owned.
+    reopen_shared(
+        handle,
+        access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+}
+
+#[cfg(windows)]
+fn reopen_shared(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    access: u32,
+    sharing: u32,
+) -> io::Result<File> {
+    // SAFETY: callers retain the borrowed handle; the new handle is checked and owned.
     Ok(File::from(crate::windows::owned(unsafe {
-        ReOpenFile(
-            handle,
-            access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            0,
-        )
+        windows_sys::Win32::Storage::FileSystem::ReOpenFile(handle, access, sharing, 0)
     })?))
 }
 
@@ -2841,7 +2882,10 @@ mod tests {
         transaction.revalidate().unwrap();
         assert!(preserved_metadata_matches(source, &staged.file, transaction.limit).unwrap());
         staged.prepare_vacancy().unwrap();
-        staged.take_original(source, &transaction.name).unwrap();
+        let authority = source_authority(source).unwrap();
+        transaction.revalidate().unwrap();
+        staged.take_original(&authority, &transaction.name).unwrap();
+        drop(authority);
         assert!(!work.target().exists());
         let mut original = staged.original().unwrap();
         transaction
@@ -2958,6 +3002,29 @@ mod tests {
             fs::remove_dir_all(path.parent().unwrap()).unwrap();
         }
         work.only_target_remains();
+    }
+
+    #[test]
+    fn moving_the_target_away_in_the_final_window_never_deletes_its_new_name() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let moved = work.0.join("moved");
+        let result = work.capture().publish_with_sync(
+            b"ours",
+            false,
+            File::sync_all,
+            &|_| false,
+            false,
+            || fs::rename(work.target(), &moved).unwrap(),
+        );
+        assert!(
+            matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
+            "{result:?}"
+        );
+        assert!(!work.target().exists());
+        assert_eq!(fs::read(&moved).unwrap(), b"original");
+        fs::remove_file(moved).unwrap();
+        assert_eq!(fs::read_dir(&work.0).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

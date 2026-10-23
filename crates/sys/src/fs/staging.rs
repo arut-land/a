@@ -10,11 +10,25 @@ use std::path::Path;
 pub(super) const CONTENT: &str = "content";
 pub(super) const ORIGINAL: &str = "original";
 
+#[cfg(windows)]
+pub(super) struct DirectoryHandle(Option<File>);
+
+#[cfg(windows)]
+impl std::ops::Deref for DirectoryHandle {
+    type Target = File;
+    fn deref(&self) -> &File {
+        self.0.as_ref().expect("directory is pinned until cleanup")
+    }
+}
+
 pub(super) struct Directory<'a> {
     parent: &'a File,
     #[cfg(unix)]
     pub name: OsString,
+    #[cfg(unix)]
     pub file: File,
+    #[cfg(windows)]
+    pub file: DirectoryHandle,
     retain: bool,
     pub path: std::path::PathBuf,
 }
@@ -61,7 +75,10 @@ impl<'a> Directory<'a> {
                 parent,
                 #[cfg(unix)]
                 name,
+                #[cfg(unix)]
                 file,
+                #[cfg(windows)]
+                file: DirectoryHandle(Some(file)),
                 retain: false,
                 path,
             };
@@ -97,7 +114,34 @@ impl Drop for Directory<'_> {
             }
         }
         #[cfg(windows)]
-        delete(&self.file);
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+                FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+            };
+            // Keep the object alive after releasing its delete-sharing pin. A native
+            // link cannot operate while the directory itself has a DELETE handle.
+            // SAFETY: the pinned handle is live; the returned reference is checked/owned.
+            let reference = crate::windows::owned(unsafe {
+                ReOpenFile(
+                    self.file.as_raw_handle(),
+                    FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                )
+            });
+            let Ok(reference) = reference.map(File::from) else {
+                return;
+            };
+            drop(self.file.0.take());
+            if let Some(name) = self.path.file_name()
+                && let Ok(current) = relative(self.parent, name, true, false)
+                && super::edit::same_object(&reference, &current).unwrap_or(false)
+            {
+                delete(&current);
+            }
+        }
     }
 }
 
@@ -187,17 +231,13 @@ impl<'a> Staged<'a> {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::{Foundation::GENERIC_READ, Storage::FileSystem::DELETE};
             let _ = name;
             // Hard links preserve the ACL verbatim; cross-directory rename can
-            // rewrite inherited ACEs. Both link creation and deletion use our handle.
-            let authority = super::edit::reopen(source.as_raw_handle(), GENERIC_READ | DELETE)?;
-            link(&authority, &self.directory.file, OsStr::new(ORIGINAL))?;
+            // rewrite inherited ACEs. The caller closes this DELETE handle to
+            // complete POSIX unlink before attempting no-replace publication.
+            link(source, &self.directory.file, OsStr::new(ORIGINAL))?;
             self.directory.retain = true;
-            remove(&authority)?;
-            // POSIX deletion vacates this handle's link when the delete handle closes.
-            drop(authority);
+            remove(source)?;
         }
         Ok(())
     }
@@ -422,7 +462,13 @@ pub(super) fn relative(
     let access = GENERIC_READ
         | SYNCHRONIZE
         | if create {
-            GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER
+            GENERIC_WRITE
+                | READ_CONTROL
+                | WRITE_DAC
+                | WRITE_OWNER
+                | if directory { 0 } else { DELETE }
+        } else if directory {
+            DELETE
         } else {
             0
         };
