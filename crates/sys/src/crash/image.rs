@@ -109,12 +109,13 @@ pub(super) fn frame(ip: usize) -> super::Frame {
         };
         let mut build = None;
         for h in headers.iter().filter(|h| h.p_type == libc::PT_NOTE) {
-            let (Ok(start), Ok(len)) = (usize::try_from(h.p_vaddr), usize::try_from(h.p_memsz))
+            // Notes describe file-backed content; PT_LOAD supplies the mapped bounds.
+            let (Ok(start), Ok(len)) = (usize::try_from(h.p_vaddr), usize::try_from(h.p_filesz))
             else {
                 continue;
             };
             let (Some(address), Some(end)) =
-                (bias.checked_add(start), h.p_vaddr.checked_add(h.p_memsz))
+                (bias.checked_add(start), h.p_vaddr.checked_add(h.p_filesz))
             else {
                 continue;
             };
