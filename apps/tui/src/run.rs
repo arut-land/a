@@ -120,9 +120,15 @@ struct Client {
     app: App,
     screen: Screen,
     terminal: Terminal,
-    input: sys::terminal::InputControl,
+    input: term::Control,
     post: client::Post<Event>,
     shown: bool,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.input.cancel();
+    }
 }
 
 impl Client {
@@ -131,9 +137,13 @@ impl Client {
     /// an ack, or a list no picker is open for, draws nothing.
     fn run(&mut self, rx: &Inbox<Event>) -> io::Result<Exit> {
         loop {
-            // The one timer: the working indicator's, armed only while a
-            // turn runs, so an idle client sleeps until something happens.
-            let first = if self.app.working() {
+            let (mut whole, exit) = self.control_step()?;
+            if let Some(exit) = exit {
+                return Ok(exit);
+            }
+            let first = if whole {
+                Event::Control
+            } else if self.app.working() {
                 match rx.recv_timeout(TICK) {
                     Some(event) => event,
                     None if rx.closed() => break,
@@ -145,23 +155,24 @@ impl Client {
                 break;
             };
             let mut effects = Vec::new();
-            let mut whole = false;
             for event in std::iter::once(first)
                 .chain(std::iter::from_fn(|| rx.try_recv()))
                 .take(client::PUMP_BATCH)
             {
                 match event {
-                    Event::Suspend(resume) => {
-                        term::suspend()?;
-                        self.shown = false;
-                        self.screen.resume();
-                        drop(resume);
-                        whole = true;
+                    Event::Control => {
+                        let (changed, exit) = self.control_step()?;
+                        whole |= changed;
+                        if let Some(exit) = exit {
+                            return Ok(exit);
+                        }
                     }
-                    Event::Input(input, _output) => effects.extend(self.app.input(input)),
-                    Event::Resized(_output) => whole = true,
+                    Event::Input(input, epoch) => {
+                        if epoch == self.input.epoch() {
+                            effects.extend(self.app.input(input));
+                        }
+                    }
                     Event::Tick => self.app.tick(),
-                    Event::InputClosed(_output) => effects.push(Effect::Detach),
                     Event::Client(event) => {
                         let stepped = self.app.client.step(event);
                         self.driver.pump(&mut self.app, stepped);
@@ -175,6 +186,11 @@ impl Client {
                     Err(Redraw) => whole = true,
                 }
             }
+            let (changed, exit) = self.control_step()?;
+            whole |= changed;
+            if let Some(exit) = exit {
+                return Ok(exit);
+            }
             if whole {
                 self.screen.invalidate();
             }
@@ -183,6 +199,34 @@ impl Client {
             }
         }
         Ok(Exit::Quit)
+    }
+
+    fn control_step(&mut self) -> io::Result<(bool, Option<Exit>)> {
+        let pending = self.input.take();
+        let changed = !pending.is_empty();
+        if let Some(interrupt) = pending.interrupt {
+            for _ in 0..(if interrupt.repeat { 2 } else { 1 }) {
+                if let Some(effect) = self
+                    .app
+                    .input(super::keys::Input::Key(super::keys::Key::Ctrl('c')))
+                    && let Ok(Some(exit)) = self.effect(effect)
+                {
+                    return Ok((changed, Some(exit)));
+                }
+            }
+        }
+        if pending.closed.is_some()
+            && let Ok(Some(exit)) = self.effect(Effect::Detach)
+        {
+            return Ok((changed, Some(exit)));
+        }
+        if let Some(resume) = pending.suspend {
+            term::suspend()?;
+            self.shown = false;
+            self.screen.resume();
+            drop(resume);
+        }
+        Ok((changed, None))
     }
 
     /// `Err(Redraw)` asks for the next frame whole.

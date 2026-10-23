@@ -161,7 +161,9 @@ fn the_full_screen_client_rides_out_a_daemon_upgrade() {
     env.run(&["ls"]);
     assert_ne!(env.pid().unwrap(), first);
     term.send(b"after the upgrade\r");
-    let screen = term.wait_for("⏺ after the upgrade");
+    let screen = term.wait_until("certified idle after upgrade", |screen| {
+        screen.find("⏺ after the upgrade").is_some() && screen.find("message the agent").is_some()
+    });
     assert!(!screen.text().contains("disconnected"), "{}", screen.text());
     assert_eq!(screen.text().matches("❯ after the upgrade").count(), 1);
 
@@ -232,7 +234,9 @@ fn the_terminal_is_cooked_while_suspended_and_redrawn_after_continue() {
         term.wait_until("raw input after continue", |_| !term.cooked());
         assert!(!term.cooked(), "continuing did not reacquire raw input");
         term.send(b"after continue\r");
-        let screen = term.wait_for("⏺ after continue");
+        let screen = term.wait_until("certified idle after continue", |screen| {
+            screen.find("⏺ after continue").is_some() && screen.find("message the agent").is_some()
+        });
         if viewport == "inline" {
             assert!(
                 screen.find("shell output while stopped").is_some()
@@ -271,7 +275,11 @@ fn suspension_and_termination_restore_a_terminal_that_does_not_drain() {
     kill_process(pid, Signal::TSTP).unwrap();
     let (_, status) = stopped
         .recv_timeout(Duration::from_secs(10))
-        .expect("suspension waited for a terminal that does not drain")
+        .unwrap_or_else(|error| panic!(
+            "suspension waited for an unread terminal: {error}; cooked={}, parked={}, threads={:?}",
+            term.cooked(), crate::common::threads_parked(term.child.id()),
+            crate::common::thread_names(term.child.id()),
+        ))
         .unwrap()
         .unwrap();
     assert!(status.stopped());

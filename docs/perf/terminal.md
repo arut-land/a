@@ -30,13 +30,14 @@ require console mode changes.
 Unix output checks foreground ownership and blocks SIGTTOU only around
 cleanup and mode restoration. Rendering lets the kernel report background
 writes and rechecks ownership after interrupted calls. The renderer serializes
-restoration and suspension. An owned pause guard disables stdin while
-leaving signal delivery active until ownership has been reacquired.
-Nonblocking output waits on readiness and a dedicated suspend wake pipe;
-screen cleanup has a single deadline. The saved file status flags are
-restored with termios. The stop is directed to the
-calling thread, which cannot re-enter raw mode before being continued. There is no tcsetpgrp that
-could take the foreground from the shell.
+restoration and suspension. Fixed, coalescing control slots bypass the
+bounded typing backlog; Ctrl-C invalidates already queued keystrokes.
+An owned pause guard disables stdin while leaving signal delivery active
+until ownership has been reacquired. Nonblocking output waits on readiness
+and a dedicated control wake pipe; screen cleanup has a single deadline.
+The saved file status flags are restored with termios. The stop is directed
+to the calling thread, which cannot re-enter raw mode before being continued.
+There is no tcsetpgrp that could take the foreground from the shell.
 
 Native tests use isolated pseudo-terminals or a private Windows console
 subprocess. They cover suspension, redraw and continued input, panic mode

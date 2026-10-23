@@ -59,17 +59,12 @@ pub fn viewport() -> Option<Viewport> {
 
 /// What wakes the event loop.
 enum Event {
-    Input(keys::Input, Option<sys::terminal::OutputInterrupt>),
-    /// The terminal changed size.
-    Resized(sys::terminal::OutputInterrupt),
-    /// Give the terminal back before job-control stop.
-    Suspend(sys::terminal::ResumeInput),
-    /// stdin closed: the terminal is gone.
-    InputClosed(sys::terminal::OutputInterrupt),
+    Input(keys::Input, u64),
+    /// Coalesced lifecycle controls live outside the typing backlog.
+    Control,
     /// From the session client's driver.
     Client(client::Event),
-    /// The working indicator's clock; only ever waited for while a turn
-    /// runs.
+    /// The working indicator's clock; only waited for while a turn runs.
     Tick,
 }
 

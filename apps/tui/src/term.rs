@@ -3,7 +3,8 @@
 //! the app's events.
 
 use std::io::{self, Write};
-use std::sync::{Mutex, Once, PoisonError, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -14,6 +15,122 @@ use sys::{Signal, Signals};
 use super::Event;
 use super::Viewport;
 use super::keys::Decoder;
+
+// Lifecycle controls must not wait behind a backlog of typed keys.
+#[derive(Clone)]
+pub struct Control {
+    input: sys::terminal::InputControl,
+    shared: Arc<SharedControl>,
+}
+
+struct SharedControl {
+    epoch: AtomicU64,
+    pending: Mutex<Pending>,
+}
+
+#[derive(Default)]
+pub struct Pending {
+    pub interrupt: Option<Interrupt>,
+    pub resized: Option<sys::terminal::OutputInterrupt>,
+    pub suspend: Option<sys::terminal::ResumeInput>,
+    pub closed: Option<sys::terminal::OutputInterrupt>,
+}
+
+pub struct Interrupt {
+    _output: sys::terminal::OutputInterrupt,
+    pub repeat: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Request {
+    Interrupt,
+    Resize,
+    Suspend,
+    Closed,
+}
+
+impl Pending {
+    pub fn is_empty(&self) -> bool {
+        self.interrupt.is_none()
+            && self.resized.is_none()
+            && self.suspend.is_none()
+            && self.closed.is_none()
+    }
+}
+
+impl Control {
+    fn new(input: sys::terminal::InputControl) -> Self {
+        Self {
+            input,
+            shared: Arc::new(SharedControl {
+                epoch: AtomicU64::new(0),
+                pending: Mutex::new(Pending::default()),
+            }),
+        }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.shared.epoch.load(Ordering::Acquire)
+    }
+
+    pub fn take(&self) -> Pending {
+        std::mem::take(
+            &mut *self
+                .shared
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    pub fn cancel(&self) {
+        drop(self.take());
+    }
+
+    fn request(&self, tx: &client::Post<Event>, request: Request) {
+        let wake = {
+            let mut pending = self
+                .shared
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let first = pending.is_empty();
+            match request {
+                Request::Interrupt => {
+                    // Keys queued before Ctrl-C must not reappear after it clears input.
+                    self.shared.epoch.fetch_add(1, Ordering::AcqRel);
+                    if let Some(interrupt) = &mut pending.interrupt {
+                        interrupt.repeat = true;
+                    } else {
+                        pending.interrupt = Some(Interrupt {
+                            _output: sys::terminal::OutputInterrupt::acquire(),
+                            repeat: false,
+                        });
+                    }
+                }
+                Request::Resize => {
+                    pending
+                        .resized
+                        .get_or_insert_with(sys::terminal::OutputInterrupt::acquire);
+                }
+                Request::Closed => {
+                    pending
+                        .closed
+                        .get_or_insert_with(sys::terminal::OutputInterrupt::acquire);
+                }
+                Request::Suspend => {
+                    if pending.suspend.is_none() {
+                        pending.suspend = self.input.pause();
+                    }
+                }
+            }
+            first && !pending.is_empty()
+        };
+        if wake {
+            let _ = tx.send_first(Event::Control);
+        }
+    }
+}
 
 /// Terminal lifecycle requests are delivered before the daemon's backlog.
 pub const SIGNALS: [Signal; 8] = [
@@ -143,9 +260,9 @@ fn end(signal: Signal) -> ! {
 /// before a replay still queued. Once stdin is gone it goes on reading the
 /// signals, which are caught for as long as the process lives: the client
 /// may yet have a while to go, and a SIGTERM must end it all the same.
-pub fn spawn_input(tx: client::Post<Event>, signals: Signals) -> sys::terminal::InputControl {
+pub fn spawn_input(tx: client::Post<Event>, signals: Signals) -> Control {
     let mut reader = InputReader::new(signals);
-    let control = reader.control();
+    let control = Control::new(reader.control());
     let input_control = control.clone();
     thread::spawn(move || {
         let mut decoder = Decoder::default();
@@ -165,10 +282,7 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) -> sys::terminal::
                         ) {
                             suspended = true;
                         } else if signal == Signal::Interrupt {
-                            let _ = send_input(
-                                &tx,
-                                super::keys::Input::Key(super::keys::Key::Ctrl('c')),
-                            );
+                            input_control.request(&tx, Request::Interrupt);
                         } else {
                             end(signal);
                         }
@@ -176,28 +290,21 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) -> sys::terminal::
                     if suspended {
                         request_suspend(&tx, &input_control);
                     }
-                    if resized
-                        && open
-                        && tx
-                            .send_first(Event::Resized(sys::terminal::OutputInterrupt::acquire()))
-                            .is_err()
-                    {
-                        open = false;
-                        reader.close_input();
+                    if resized && open {
+                        input_control.request(&tx, Request::Resize);
                     }
                 }
                 Input::Closed => {
                     open = false;
-                    let _ = tx.send(Event::InputClosed(sys::terminal::OutputInterrupt::acquire()));
+                    input_control.request(&tx, Request::Closed);
                 }
                 Input::Bytes(n) => {
-                    // A full buffer may end in the start of an escape sequence.
                     for input in decoder.feed(&buf[..n], n == buf.len()) {
                         if input == super::keys::Input::Key(super::keys::Key::Ctrl('z')) {
                             request_suspend(&tx, &input_control);
                             continue;
                         }
-                        if !send_input(&tx, input) {
+                        if !send_input(&tx, &input_control, input) {
                             open = false;
                             reader.close_input();
                             break;
@@ -210,15 +317,59 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) -> sys::terminal::
     control
 }
 
-// Keep the reader away from cooked input while the shell owns the terminal.
-pub fn request_suspend(tx: &client::Post<Event>, control: &sys::terminal::InputControl) {
-    if let Some(resume) = control.pause() {
-        let _ = tx.send_first(Event::Suspend(resume));
+pub fn request_suspend(tx: &client::Post<Event>, control: &Control) {
+    control.request(tx, Request::Suspend);
+}
+
+fn send_input(tx: &client::Post<Event>, control: &Control, input: super::keys::Input) -> bool {
+    if input == super::keys::Input::Key(super::keys::Key::Ctrl('c')) {
+        control.request(tx, Request::Interrupt);
+        true
+    } else {
+        tx.send_first(Event::Input(input, control.epoch())).is_ok()
     }
 }
 
-fn send_input(tx: &client::Post<Event>, input: super::keys::Input) -> bool {
-    let output = (input == super::keys::Input::Key(super::keys::Key::Ctrl('c')))
-        .then(sys::terminal::OutputInterrupt::acquire);
-    tx.send_first(Event::Input(input, output)).is_ok()
+#[cfg(test)]
+mod tests {
+    use super::super::keys::{Input as KeyInput, Key};
+    use super::*;
+
+    #[test]
+    fn lifecycle_controls_bypass_a_full_typing_backlog() {
+        let signals = Signals::catch(&[Signal::Resize]).unwrap();
+        let reader = InputReader::new(signals);
+        let control = Control::new(reader.control());
+        let (post, inbox) = client::inbox(
+            client::QueueBudget {
+                bytes: 1024,
+                requests: 2,
+                control_reserve: 0,
+            },
+            |_| 1,
+        );
+        let epoch = control.epoch();
+        for _ in 0..2 {
+            assert!(
+                post.send_first(Event::Input(KeyInput::Key(Key::Char('x')), epoch))
+                    .is_ok()
+            );
+        }
+        control.request(&post, Request::Interrupt);
+        for _ in 0..1000 {
+            control.request(&post, Request::Resize);
+        }
+        control.request(&post, Request::Interrupt);
+        let pending = control.take();
+        assert!(pending.interrupt.as_ref().unwrap().repeat);
+        assert!(pending.resized.is_some());
+        assert_ne!(control.epoch(), epoch, "queued typing survived Ctrl-C");
+        assert!(control.take().is_empty());
+        assert!(matches!(inbox.try_recv(), Some(Event::Input(_, old)) if old == epoch));
+        if sys::terminal::JOB_CONTROL {
+            assert!(sys::terminal::output_interrupted());
+        }
+        drop(pending);
+        assert!(!sys::terminal::output_interrupted());
+    }
 }
