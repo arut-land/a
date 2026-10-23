@@ -166,7 +166,13 @@ pub(super) fn frame(ip: *mut std::ffi::c_void) -> super::Frame {
     let base = module as usize;
     // SAFETY: the module loader validated these native PE headers.
     let dos = unsafe { &*module.cast::<IMAGE_DOS_HEADER>() };
-    let nt = unsafe { &*((base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64) };
+    let Ok(offset) = usize::try_from(dos.e_lfanew) else {
+        // SAFETY: releases exactly the reference acquired above.
+        unsafe { FreeLibrary(module) };
+        return super::Frame::default();
+    };
+    // SAFETY: the loader validated the NT header at this offset in the pinned image.
+    let nt = unsafe { &*((base + offset) as *const IMAGE_NT_HEADERS64) };
     let timestamp = nt.FileHeader.TimeDateStamp;
     let size = nt.OptionalHeader.SizeOfImage;
     let mut pdb = None;
@@ -239,11 +245,11 @@ mod tests {
             notes.extend_from_slice(&u32::try_from(value.len()).unwrap().to_ne_bytes());
             notes.extend_from_slice(&kind.to_ne_bytes());
             notes.extend_from_slice(name);
-            while notes.len() % 4 != 0 {
+            while !notes.len().is_multiple_of(4) {
                 notes.push(0);
             }
             notes.extend_from_slice(value);
-            while notes.len() % 4 != 0 {
+            while !notes.len().is_multiple_of(4) {
                 notes.push(0);
             }
         }
