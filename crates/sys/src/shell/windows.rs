@@ -252,9 +252,8 @@ mod tests {
     #[test]
     fn shell_startup_probe() {
         use std::os::windows::io::AsRawHandle;
-        use std::os::windows::process::CommandExt;
-        use std::process::{Command, Stdio};
-        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, WaitForSingleObject};
+        use std::process::Command;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
         if std::env::var_os("A_TEST_POWERSHELL").is_none() {
             return;
         }
@@ -264,21 +263,28 @@ mod tests {
             let mut command = Command::new(system.join("cmd.exe"));
             command.args(["/d", "/c", "start", "", "/b", "/wait", "/machine", machine]);
             command.arg(&powershell).args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::WriteLine('bits=' + [IntPtr]::Size); [Console]::WriteLine('arch=' + $env:PROCESSOR_ARCHITECTURE); Write-Output 'ok'; exit 37"])
-                .creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).current_dir(std::env::temp_dir());
-            eprintln!("machine probe {command:?}");
-            let mut child = command.spawn().unwrap();
-            // SAFETY: the child owns this process handle throughout the wait.
-            let timeout = unsafe { WaitForSingleObject(child.as_raw_handle(), 15000) } == 258;
+                .envs(std::env::vars_os()).current_dir(std::env::temp_dir());
+            let path = std::env::temp_dir().join(format!(
+                "a-shell-machine-{}-{machine}.log",
+                std::process::id()
+            ));
+            eprintln!("machine probe {machine}");
+            let mut child =
+                crate::spawn_group(&mut command, std::fs::File::create(&path).unwrap()).unwrap();
+            let watch = child.child.exit_watch().unwrap();
+            // SAFETY: the owned watch remains live for the bounded wait.
+            let timeout = unsafe { WaitForSingleObject(watch.as_raw_handle(), 15000) } == 258;
             if timeout {
-                child.kill().unwrap();
+                child.group.signal(crate::Signal::Kill).unwrap();
             }
-            let output = child.wait_with_output().unwrap();
+            let status = child.child.wait().unwrap();
+            drop(child);
             eprintln!(
-                "machine {machine}: timeout {timeout} exit {:?} out {:?} err {:?}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                "machine {machine}: timeout {timeout} exit {:?} out {:?}",
+                status.code(),
+                std::fs::read_to_string(&path)
             );
+            std::fs::remove_file(path).unwrap();
         }
     }
 
