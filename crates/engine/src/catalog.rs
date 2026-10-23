@@ -109,7 +109,10 @@ impl Catalog {
             runtime,
             rt::BlockingClass::Storage,
             rt::STORAGE_BYTES,
-            move || Self::open(path, &*store),
+            move || {
+                let _priority = sys::resources::Priority::utility();
+                Self::open(path, &*store)
+            },
         ))
     }
 

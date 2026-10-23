@@ -95,7 +95,11 @@ pub fn storage(path: &Path) -> Storage {
         );
         disks
             .iter()
-            .filter(|disk| path.starts_with(disk.mount_point()))
+            .filter(|disk| {
+                disk.mount_point()
+                    .canonicalize()
+                    .is_ok_and(|mount| path.starts_with(mount))
+            })
             .max_by_key(|disk| disk.mount_point().components().count())
             .map_or(Storage::Unknown, |disk| match disk.kind() {
                 sysinfo::DiskKind::HDD => Storage::Rotational,
@@ -113,25 +117,40 @@ pub fn storage(path: &Path) -> Storage {
 /// Scoped priority for a blocking operation. Async workers keep their normal
 /// priority because they multiplex both foreground and maintenance futures.
 pub struct Priority {
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     #[cfg(target_os = "macos")]
     previous: (u32, i32),
 }
 
 impl Priority {
     pub fn user_initiated() -> Self {
+        Self::enter(0x19)
+    }
+
+    pub fn utility() -> Self {
+        Self::enter(0x11)
+    }
+
+    fn enter(class: u32) -> Self {
         #[cfg(target_os = "macos")]
         {
             let mut relative = 0;
             // SAFETY: pthread_self is live; relative is writable.
             let previous = unsafe { pthread_get_qos_class_np(libc::pthread_self(), &mut relative) };
             // SAFETY: USER_INITIATED is a valid qos_class_t; priority zero is valid.
-            unsafe { pthread_set_qos_class_self_np(0x19, 0) };
+            unsafe { pthread_set_qos_class_self_np(class, 0) };
             Self {
                 previous: (previous, relative),
+                _thread: std::marker::PhantomData,
             }
         }
         #[cfg(not(target_os = "macos"))]
-        Self {}
+        {
+            let _ = class;
+            Self {
+                _thread: std::marker::PhantomData,
+            }
+        }
     }
 }
 
@@ -204,6 +223,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn native_facts_are_nonzero_without_assuming_page_granularity() {
         let facts = Resources::for_path(&std::env::temp_dir()).unwrap();
         assert!(facts.parallelism > 0);

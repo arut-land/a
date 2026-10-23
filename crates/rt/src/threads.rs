@@ -33,11 +33,15 @@ pub struct Config {
 impl Config {
     pub fn for_path(path: &std::path::Path) -> io::Result<Self> {
         let facts = sys::resources::Resources::for_path(path)?;
+        Ok(Self::for_resources(facts))
+    }
+
+    pub fn for_resources(facts: sys::resources::Resources) -> Self {
         let mut config = Self::for_cores(facts.parallelism);
         if facts.storage == sys::resources::Storage::Rotational {
             config.storage.workers = 1;
         }
-        Ok(config)
+        config
     }
 
     pub fn for_cores(cores: usize) -> Self {
@@ -766,6 +770,21 @@ mod tests {
             runtime.shutdown();
             assert_eq!(observed, (expected, 0, expected * bytes));
         }
+    }
+
+    #[test]
+    fn rotational_storage_is_serial_without_reducing_flush_or_cpu_capacity() {
+        let config = Config::for_resources(sys::resources::Resources {
+            parallelism: 64,
+            page_size: 16_384,
+            storage: sys::resources::Storage::Rotational,
+        });
+        assert_eq!(config.storage.workers, 1);
+        assert_eq!(
+            (config.workers, config.cpu.workers, config.network.workers),
+            (4, 8, 8)
+        );
+        assert_eq!(config.storage.bytes, 64 << 20);
     }
 
     #[test]
