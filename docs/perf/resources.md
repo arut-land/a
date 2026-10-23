@@ -174,31 +174,47 @@ Raw [primitive samples](resource-primitives.csv) and [CPU samples](resource-cpu.
 
 ## Paired application measurements
 
-[Hosted run](https://github.com/arut-land/a/actions/runs/40000401930) compares candidate `e9dacda1a45400951be780d37d98cf98f76d39b5` with main `781586d5a9fec1dd8b5e2b316a28b00a48470f8e` on the same native runner. Each lane completes five alternating reference/candidate rounds. Tables report medians; positive deltas mean more memory or time.
+[Hosted run](https://github.com/arut-land/a/actions/runs/40027848041) compares candidate `84333bc3a45012219e25990857bdadd3ac401610` with main `4d978b0b94290ecbf5b851f08b6d987940c2da0c` on the same native runner. Each lane completes five alternating reference/candidate rounds. Tables report medians; positive deltas mean more memory or time.
 
 Idle RSS is sampled after three seconds. Idle CPU is a ten-second native counter delta after fifteen seconds settling. Peak RSS and CPU below belong to the named benchmark process, including its retained test log. Primitive allocator counters and process RSS measure different things.
 
 | Target | Shipped bytes, main → candidate | Idle RSS, KiB main → candidate | Idle CPU, ms main → candidate | Cold reply, ms | Attach p99, ms |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| macOS x86_64 | 3,957,584 → 4,000,264 | 4028 → 4192 | 0.000 → 0.000 | 56.019 → 45.165 (-19.38%) | 1.446 → 1.332 (-7.89%) |
-| macOS aarch64 | 3,296,896 → 3,348,256 | 8576 → 8720 | 0.000 → 0.000 | 19.968 → 21.882 (+9.59%) | 0.456 → 0.570 (+24.82%) |
-| Linux aarch64 GNU | 3,668,904 → 3,705,896 | 6336 → 6308 | 0.000 → 0.000 | 7.705 → 7.396 (-4.00%) | 0.478 → 0.472 (-1.13%) |
-| Linux x86_64 GNU | 4,260,512 → 4,300,704 | 7196 → 7296 | 0.000 → 0.000 | 8.132 → 8.974 (+10.35%) | 0.526 → 0.616 (+17.15%) |
-| Windows aarch64 | 4,811,264 → 4,865,024 | 9652 → 9736 | 0.000 → 0.000 | 65.651 → 67.771 (+3.23%) | 1.002 → 1.024 (+2.13%) |
-| Windows x86_64 | 5,468,160 → 5,522,944 | 8336 → 8376 | 0.000 → 0.000 | 21.424 → 21.482 (+0.27%) | 0.865 → 0.887 (+2.56%) |
+| macOS x86_64 | 3,990,456 → 4,029,032 | 4084 → 4244 | 0.000 → 0.000 | 56.698 → 54.740 (-3.45%) | 1.414 → 1.389 (-1.75%) |
+| macOS aarch64 | 3,313,696 → 3,365,056 | 8688 → 8688 | 0.000 → 0.000 | 20.298 → 20.032 (-1.31%) | 0.479 → 0.461 (-3.78%) |
+| Linux aarch64 GNU | 3,691,048 → 3,728,552 | 6372 → 6400 | 0.000 → 0.000 | 10.187 → 10.184 (-0.02%) | 0.663 → 1.008 (+52.02%) |
+| Linux x86_64 GNU | 4,292,680 → 4,333,000 | 7260 → 7268 | 0.000 → 0.000 | 7.299 → 7.513 (+2.93%) | 0.496 → 0.498 (+0.44%) |
+| Windows aarch64 | 4,868,608 → 4,923,392 | 9744 → 9796 | 0.000 → 0.000 | 86.839 → 90.597 (+4.33%) | 0.979 → 0.990 (+1.10%) |
+| Windows x86_64 | 5,534,720 → 5,591,040 | 8448 → 8492 | 0.000 → 0.000 | 26.203 → 27.882 (+6.41%) | 1.145 → 1.172 (+2.35%) |
 
 | Target | Driver CPU delta | Driver peak RSS delta | Large-JSON CPU delta | Large-JSON peak RSS delta | Decode control CPU delta |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| macOS x86_64 | -11.02% | +1.25% | -6.42% | +2.38% | -2.06% |
-| macOS aarch64 | +0.17% | +0.07% | +0.32% | +0.08% | -3.63% |
-| Linux aarch64 GNU | +2.10% | -0.02% | -31.67% | -0.00% | +2.47% |
-| Linux x86_64 GNU | -1.38% | +0.00% | -3.09% | -0.91% | +1.96% |
-| Windows aarch64 | -3.92% | -0.10% | +4.49% | -0.08% | +0.00% |
-| Windows x86_64 | -6.08% | +0.10% | -2.86% | -0.01% | +0.00% |
+| macOS x86_64 | +2.50% | -0.39% | -5.69% | +4.11% | +1.99% |
+| macOS aarch64 | -4.47% | -0.00% | -0.52% | -0.06% | +0.76% |
+| Linux aarch64 GNU | -0.99% | -0.03% | -33.33% | +0.46% | +2.28% |
+| Linux x86_64 GNU | -0.75% | -0.01% | +3.38% | +0.04% | +2.82% |
+| Windows aarch64 | +0.66% | -0.00% | +4.32% | -0.04% | -0.72% |
+| Windows x86_64 | +2.15% | +0.04% | -2.76% | +0.03% | -0.50% |
 
 The decode control uses unchanged provider-decoder code. The tables retain small shifts rather than classifying every median difference as a performance win or loss. The many-core ceiling is a concurrency bound; these three/four-CPU VMs do not establish physical many-core throughput.
 
 Exact medians and checkpoint samples are in [paired observations](resource-paired.csv); [runner metadata](resource-hosts.csv) records the native image and hardware description. The harness, native accounting and workload definitions are in [hosted measurements](hosted.md).
+
+## Validation
+
+[Integration CI](https://github.com/arut-land/a/actions/runs/40027821474) at
+`84333bc3a45012219e25990857bdadd3ac401610` passes on Linux, macOS and native
+Windows x86_64/aarch64. It includes formatting, clippy, the full test suite,
+acceptance, Linux/macOS release budgets, Swift/FFI tests and the app build,
+Miri, fuzzing, dependency checks, the Windows platform lint and the no-Tokio
+check. The paired run above uses the same source and main baseline.
+
+Invariant tests cover affinity and CPU-set restrictions, QoS restoration,
+pressure callback lifetime, single-worker catalog reconstruction, blocked
+producer cancellation and cache rebuild equivalence. Reclamation preserves
+attached sessions, pending approvals and process ownership. A shared shell
+test checks deferred wait completion directly: PID metadata can disappear at
+exit before the child is reaped.
 
 ## Sources and limits
 
