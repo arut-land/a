@@ -237,16 +237,25 @@ mod imp {
     // never take it from the shell with tcsetpgrp.
     fn foreground() -> io::Result<()> {
         while !is_foreground()? {
-            rustix::process::kill_process(
-                rustix::process::getpid(),
-                rustix::process::Signal::STOP,
-            )?;
+            stop()?;
         }
         Ok(())
     }
 
+    fn stop() -> io::Result<()> {
+        // A process-directed stop may land on another thread: the caller
+        // can otherwise re-enter raw mode before the group stop completes.
+        // SAFETY: raise directs the uncatchable stop to this thread, and
+        // returns only after it has been continued.
+        if unsafe { libc::raise(libc::SIGSTOP) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     pub fn suspend() -> io::Result<()> {
-        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::STOP)?;
+        stop()?;
         foreground()
     }
 
