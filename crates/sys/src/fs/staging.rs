@@ -101,8 +101,9 @@ impl Drop for Directory<'_> {
 }
 
 pub(super) struct Staged<'a> {
-    pub directory: Directory<'a>,
+    // Close the child before removing its directory on Windows.
     pub file: File,
+    pub directory: Directory<'a>,
     #[cfg(target_os = "linux")]
     anonymous: bool,
     #[cfg(windows)]
@@ -335,8 +336,10 @@ pub(super) fn relative(
                 | FILE_OPEN_REPARSE_POINT
                 | if directory {
                     FILE_DIRECTORY_FILE
-                } else {
+                } else if create {
                     FILE_NON_DIRECTORY_FILE
+                } else {
+                    0
                 },
             std::ptr::null(),
             0,
