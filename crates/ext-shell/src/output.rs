@@ -422,13 +422,11 @@ mod tests {
     }
 
     fn dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "a-output-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+        tempfile::Builder::new()
+            .prefix("a-output-")
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     const FILE: &str = "/spill/1.log";

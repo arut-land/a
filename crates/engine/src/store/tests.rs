@@ -5,7 +5,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::ops::{Deref, RangeInclusive};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use protocol::{Body, Decode, Entry, Epoch, Json, ReadOnly, Seq, SessionId};
@@ -36,9 +35,11 @@ impl Drop for Fixture {
 }
 
 fn temp_dir() -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("a-store-{}-{n}", std::process::id()))
+    tempfile::Builder::new()
+        .prefix("a-store-")
+        .tempdir()
+        .unwrap()
+        .keep()
 }
 
 fn jsonl() -> Fixture {
@@ -1080,7 +1081,6 @@ fn uncertain_import_never_leaves_a_clean_catalog() {
         ImportStep::Published,
     ] {
         let dir = temp_dir();
-        fs::create_dir(&dir).unwrap();
         let inner = Arc::new(Jsonl::open(dir.join("sessions")).unwrap());
         let store = Faulty::new(inner.clone());
         let catalog_path = dir.join("catalog");
@@ -1111,7 +1111,6 @@ fn uncertain_import_never_leaves_a_clean_catalog() {
 fn a_successful_import_survives_a_clean_catalog_restart() {
     use crate::catalog::Catalog;
     let dir = temp_dir();
-    fs::create_dir(&dir).unwrap();
     let store = Jsonl::open(dir.join("sessions")).unwrap();
     let path = dir.join("catalog");
     let catalog = Catalog::open(path.clone(), &store).unwrap();
