@@ -25,3 +25,51 @@ impl<T> Future for Receiver<T> {
         Pin::new(&mut self.get_mut().0).poll(cx).map(Result::ok)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::task::{Wake, Waker};
+    use std::time::Duration;
+
+    struct Reenter {
+        receiver: Mutex<Receiver<usize>>,
+        finished: mpsc::Sender<bool>,
+    }
+
+    impl Wake for Reenter {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let mut receiver = self.receiver.lock().unwrap();
+            let result = Pin::new(&mut *receiver).poll(&mut Context::from_waker(Waker::noop()));
+            let _ = self.finished.send(matches!(result, Poll::Ready(None)));
+        }
+    }
+
+    #[test]
+    fn cancellation_allows_a_waker_to_poll_its_receiver() {
+        let (sender, receiver) = channel();
+        let (finished, result) = mpsc::channel();
+        let wake = Arc::new(Reenter {
+            receiver: Mutex::new(receiver),
+            finished,
+        });
+        let waker = Waker::from(Arc::clone(&wake));
+        assert!(
+            Pin::new(&mut *wake.receiver.lock().unwrap())
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let cancelled = std::thread::spawn(move || drop(sender));
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(2)),
+            Ok(true),
+            "cancellation must permit receiver polling during wake delivery"
+        );
+        cancelled.join().unwrap();
+    }
+}

@@ -36,7 +36,7 @@ variation is reported alongside the runtime workloads.
 | Mechanism | Targets | Disabled behavior |
 | --- | --- | --- |
 | Scoped QoS | macOS x86_64/aarch64 | Per-job foreground and catalog utility guards |
-| Pressure reclamation | All six | Source, supervisor notification allocation and pressure polling branch |
+| Pressure reclamation | All six | Source, supervisor notification allocation and pressure branch |
 | Storage lookup | All six | IOKit on macOS, disk-kind lookup on Windows, sysfs rotation lookup on Linux; medium becomes unknown |
 | Worker sizing | All six | Rotational override and explicit async-worker clamp; core formula remains the pre-O15 formula |
 | Effective CPU discovery | Windows x86_64/aarch64 | Additional process CPU-set/job restrictions; standard discovery remains |
@@ -46,6 +46,21 @@ variation is reported alongside the runtime workloads.
 The Linux/macOS effective-CPU implementation already delegates to the standard
 library used before O15, so there is no additional discovery mechanism to disable
 on those platforms. Non-macOS QoS guards are empty.
+
+## Cancellation reliability
+
+The original channel calls its receiver waker while holding the slot mutex.
+`cancellation_allows_a_waker_to_poll_its_receiver` registers a waker that polls
+the receiver immediately. Dropping the sender with the original implementation
+fails the bounded test by deadlocking; the maintained implementation and the
+compact wrapper pass. Restoring the original channel unchanged would reintroduce
+that failure.
+
+An additional compact-oneshot variant retains the maintained state machine and
+uses a shared type-erased payload representation. It tests whether sharing the
+wake/cancel code across payload types reduces resident code enough to offset
+the extra payload allocation. It has the same 20-round, six-target protocol.
+Its retention remains pending measurements.
 
 ## Decisions
 

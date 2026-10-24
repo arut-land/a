@@ -322,5 +322,59 @@
     "run_id": 40052168217,
     "reference": "4b662d7ab8151802b8417e71378c8ec800834f34",
     "rounds": 20
+  },
+  {
+    "mechanism": "compact-oneshot",
+    "branch": "codex-w5rt-compact-oneshot",
+    "sha": "e4426ff3b986a5bbde11376527134b2f64975f99",
+    "target": "windows-latest",
+    "run_id": 40053393602,
+    "reference": "93344bb06d9096103ecf6ed18d2d78058a30791d",
+    "rounds": 20
+  },
+  {
+    "mechanism": "compact-oneshot",
+    "branch": "codex-w5rt-compact-oneshot",
+    "sha": "e4426ff3b986a5bbde11376527134b2f64975f99",
+    "target": "macos-15-intel",
+    "run_id": 40053396046,
+    "reference": "93344bb06d9096103ecf6ed18d2d78058a30791d",
+    "rounds": 20
+  },
+  {
+    "mechanism": "compact-oneshot",
+    "branch": "codex-w5rt-compact-oneshot",
+    "sha": "e4426ff3b986a5bbde11376527134b2f64975f99",
+    "target": "ubuntu-latest",
+    "run_id": 40053399086,
+    "reference": "93344bb06d9096103ecf6ed18d2d78058a30791d",
+    "rounds": 20
+  },
+  {
+    "mechanism": "compact-oneshot",
+    "branch": "codex-w5rt-compact-oneshot",
+    "sha": "e4426ff3b986a5bbde11376527134b2f64975f99",
+    "target": "ubuntu-24.04-arm",
+    "run_id": 40053401444,
+    "reference": "93344bb06d9096103ecf6ed18d2d78058a30791d",
+    "rounds": 20
+  },
+  {
+    "mechanism": "compact-oneshot",
+    "branch": "codex-w5rt-compact-oneshot",
+    "sha": "e4426ff3b986a5bbde11376527134b2f64975f99",
+    "target": "windows-11-arm",
+    "run_id": 40053403641,
+    "reference": "93344bb06d9096103ecf6ed18d2d78058a30791d",
+    "rounds": 20
+  },
+  {
+    "mechanism": "compact-oneshot",
+    "branch": "codex-w5rt-compact-oneshot",
+    "sha": "e4426ff3b986a5bbde11376527134b2f64975f99",
+    "target": "macos-latest",
+    "run_id": 40053405708,
+    "reference": "93344bb06d9096103ecf6ed18d2d78058a30791d",
+    "rounds": 20
   }
 ]
