@@ -32,7 +32,9 @@ for run in runs:
    idle_path=path.parent/'paired'/f'{i}-{role}'/'idle-0.json'
    if idle_path.exists():
     t[role]['idle_retired_rss_kib']=[json.loads(idle_path.read_text())['after'][0]['rss_kib']]
- on,off=('candidate','reference') if run['mechanism']=='full-vs-main' else ('reference','candidate')
+ on=run.get('enabled_role', 'candidate' if run['mechanism']=='full-vs-main' else 'reference')
+ assert on in ['candidate','reference'],run
+ off='reference' if on=='candidate' else 'candidate'
  item={**run,'effects':{},'host':data['host']}
  for metric in metrics:
   if metric=='size_kib':

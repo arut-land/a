@@ -1,0 +1,38 @@
+[
+  {
+    "mechanism": "composed-vs-main",
+    "branch": "codex-w5rt",
+    "sha": "2937e0489d3a0ac9cdd9403ee9ad4f5987ff3b42",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "ubuntu-latest",
+    "run_id": 40077749363
+  },
+  {
+    "mechanism": "composed-vs-main",
+    "branch": "codex-w5rt",
+    "sha": "2937e0489d3a0ac9cdd9403ee9ad4f5987ff3b42",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "ubuntu-24.04-arm",
+    "run_id": 40077751505
+  },
+  {
+    "mechanism": "composed-vs-main",
+    "branch": "codex-w5rt",
+    "sha": "2937e0489d3a0ac9cdd9403ee9ad4f5987ff3b42",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "windows-latest",
+    "run_id": 40077753563
+  },
+  {
+    "mechanism": "composed-vs-main",
+    "branch": "codex-w5rt",
+    "sha": "2937e0489d3a0ac9cdd9403ee9ad4f5987ff3b42",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "windows-11-arm",
+    "run_id": 40077755504
+  }
+]

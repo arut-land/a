@@ -136,6 +136,15 @@ allocator fragmentation also affect RSS. The driver fixtures do not run the
 daemon supervisor or open a persistent catalog; those CPU results compare the
 compiled images, rather than demonstrating CPU consumed by an inactive probe.
 
+## Assembled validation
+
+The [assembled comparisons](resource-mechanisms/composed-runs.json) use the
+merged implementation against main `8a0388a7c06e18d59025dfe969c52ba85a0ba43a`.
+Their manifest explicitly identifies the enabled role and reference revision;
+they do not reuse the original checkpoint's main baseline. The temporary facts
+example is absent from this harness, so a reference without O15's facts API
+can still use the paired-only measurement suite.
+
 ## Observations
 
 The [per-target table](resource-mechanisms/observations.md) reports complete
