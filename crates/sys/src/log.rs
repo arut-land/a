@@ -1,5 +1,8 @@
 //! File rotation and stderr redirection at the platform seam.
 
+mod native;
+pub use native::Native;
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
