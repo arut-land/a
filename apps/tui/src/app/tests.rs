@@ -683,6 +683,180 @@ fn inline_prints_settled_items_once_and_keeps_the_rest_live() {
     );
 }
 
+/// An inline app whose last item, a tool result, has just settled.
+fn settled_result() -> App {
+    let (mut app, _) = app(Viewport::Inline, &running_command());
+    app.fold(&entry(
+        6,
+        Body::ToolResult {
+            call: CallId::new(3).unwrap(),
+            outcome: Outcome::Done {
+                output: Json::encode(&json!({"output": "retained result", "exit": 0})).unwrap(),
+            },
+            card: Some(Card {
+                title: "$ ls".into(),
+                body: "retained result".into(),
+                note: "exit 0".into(),
+                ..Card::default()
+            }),
+        },
+    ));
+    app
+}
+
+/// Accepts the first `limit` bytes, then reports the write interrupted.
+struct Partial(Term, Option<usize>);
+impl std::io::Write for Partial {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(limit) = &mut self.1 else {
+            return self.0.write(bytes);
+        };
+        if *limit == 0 {
+            self.1 = None;
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+        let n = bytes.len().min(*limit).min(7);
+        *limit -= n;
+        self.0.write(&bytes[..n])
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The lines `bytes` leave on a terminal that never wraps nor scrolls
+/// away: text, carriage returns and line feeds, vertical and column moves,
+/// and erasing to the end of the screen. Rows above the start count too,
+/// so a move up into the scrollback is seen.
+fn screen(bytes: &[u8]) -> Vec<String> {
+    const ORIGIN: usize = 1000;
+    let text = String::from_utf8_lossy(bytes);
+    let mut grid: Vec<Vec<char>> = vec![Vec::new(); ORIGIN + 1];
+    let (mut row, mut col) = (ORIGIN, 0);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' if chars.peek() == Some(&'[') => {
+                chars.next();
+                let mut param = String::new();
+                let fin = loop {
+                    match chars.next() {
+                        Some(c) if ('\x40'..='\x7e').contains(&c) => break Some(c),
+                        Some(c) => param.push(c),
+                        None => break None,
+                    }
+                };
+                let n = param.parse::<usize>().unwrap_or(1);
+                match fin {
+                    Some('A') => row -= n,
+                    Some('B') => row += n,
+                    Some('G') => col = n - 1,
+                    Some('J') if param.is_empty() => {
+                        grid[row].truncate(col);
+                        grid.truncate(row + 1);
+                    }
+                    _ => {}
+                }
+            }
+            '\r' => col = 0,
+            '\n' => row += 1,
+            c => {
+                if grid[row].len() <= col {
+                    grid[row].resize(col + 1, ' ');
+                }
+                grid[row][col] = c;
+                col += 1;
+            }
+        }
+        if grid.len() <= row {
+            grid.resize(row + 1, Vec::new());
+        }
+    }
+    let mut lines: Vec<String> = grid
+        .into_iter()
+        .map(|line| line.into_iter().collect::<String>().trim_end().to_owned())
+        .skip_while(String::is_empty)
+        .collect();
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    // Each fixture app has a session id of its own.
+    lines.retain(|line| !line.starts_with("● live"));
+    lines
+}
+
+/// What the whole first frame of `settled_result` leaves at 80 columns.
+fn reference_frame() -> (Vec<u8>, Vec<String>) {
+    let whole = Term::default();
+    Screen::new(Viewport::Inline, whole.clone())
+        .draw(&mut settled_result(), (80, 24))
+        .unwrap();
+    let frame = whole.take().1;
+    let lines = screen(&frame);
+    (frame, lines)
+}
+
+/// Draws `settled_result` with the first write cut after `cut` bytes,
+/// then redraws as an interrupted frame is, at `width`.
+fn cut_and_redraw(cut: usize, width: u16) -> Vec<u8> {
+    let mut app = settled_result();
+    let term = Term::default();
+    let mut screen = Screen::new(Viewport::Inline, Partial(term.clone(), Some(cut)));
+    assert_eq!(
+        screen.draw(&mut app, (80, 24)).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    screen.invalidate();
+    screen.draw(&mut app, (width, 24)).unwrap();
+    screen.draw(&mut app, (width, 24)).unwrap();
+    term.take().1
+}
+
+#[test]
+fn a_cut_write_leaves_the_screen_the_whole_frame_would_have() {
+    let (frame, whole) = reference_frame();
+    assert!(whole.iter().any(|line| line.contains("retained result")));
+    // Every cut: inside a line, at a line end, between a vertical move and
+    // the column move after it, inside the viewport.
+    for cut in 0..frame.len() {
+        let bytes = cut_and_redraw(cut, 80);
+        assert_eq!(
+            screen(&bytes),
+            whole,
+            "cut at {cut}: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    let place = frame.windows(4).position(|w| w == b"\x1b[6A").unwrap();
+    assert_eq!(screen(&cut_and_redraw(place + 4, 80)), whole);
+}
+
+#[test]
+fn rows_a_cut_write_left_undelivered_are_printed_once_at_any_width() {
+    let (frame, whole) = reference_frame();
+    // The scrollback rows: those above the viewport's recap.
+    let recap = whole
+        .iter()
+        .position(|line| line.contains("recap"))
+        .unwrap();
+    let rows: Vec<&String> = whole[..recap].iter().filter(|l| !l.is_empty()).collect();
+    assert!(rows.iter().any(|line| line.contains("retained result")));
+    let card = frame
+        .windows(b"retained result".len())
+        .position(|window| window == b"retained result")
+        .unwrap();
+    for width in [40, 120] {
+        let shown = screen(&cut_and_redraw(card, width));
+        for row in &rows {
+            assert_eq!(
+                shown.iter().filter(|line| line == row).count(),
+                1,
+                "redrawn at {width}: {row:?} in {shown:#?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn draws_at_tiny_sizes_without_panicking() {
     let (mut app, _) = app(Viewport::Full, &asked_command());

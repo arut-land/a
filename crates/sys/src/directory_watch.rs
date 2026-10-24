@@ -154,6 +154,8 @@ impl DirectoryWatch {
     }
 
     fn arm(&self, request: &Request) -> io::Result<()> {
+        // Any early return below leaves nothing in flight.
+        request.pending.set(false);
         // SAFETY: the heap allocation and directory live until completion;
         // only one operation is in flight and the previous one has completed.
         let result = unsafe {

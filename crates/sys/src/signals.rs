@@ -2,6 +2,7 @@
 //! An exclusive lease prevents competing consumers from stealing shutdown.
 //! Windows console control events wake a permanently owned manual-reset event.
 
+pub(crate) use imp::Wake;
 pub use imp::{Signals, reraise};
 
 #[cfg(windows)]
@@ -30,6 +31,18 @@ mod imp {
     static SOURCE: OnceLock<Source> = OnceLock::new();
 
     pub struct Signals(&'static Source);
+
+    #[derive(Clone, Copy)]
+    pub(crate) struct Wake(&'static Source);
+
+    impl Wake {
+        pub(crate) fn wake(self) {
+            // SAFETY: the source owns its event for the process lifetime.
+            unsafe {
+                SetEvent(self.0.event.as_raw_handle());
+            }
+        }
+    }
 
     impl AsHandle for Signals {
         fn as_handle(&self) -> BorrowedHandle<'_> {
@@ -63,10 +76,19 @@ mod imp {
         source.pending.fetch_or(bit, Ordering::Release);
         // SAFETY: SOURCE owns the event for the process lifetime.
         unsafe { SetEvent(source.event.as_raw_handle()) };
+        if signal == Signal::Hangup {
+            // Windows terminates the process when a close/logoff handler
+            // returns; waking the renderer alone cannot guarantee cleanup.
+            crate::terminal::restore();
+        }
         1
     }
 
     impl Signals {
+        pub(crate) fn waker(&self) -> Wake {
+            Wake(self.0)
+        }
+
         pub fn catch(signals: &[Signal]) -> io::Result<Self> {
             if SOURCE.get().is_none() {
                 let source = Source {
@@ -157,11 +179,15 @@ mod imp {
     use crate::Signal;
     use crate::proc::raw;
 
-    const ALL: [Signal; 4] = [
+    const ALL: [Signal; 8] = [
         Signal::Terminate,
         Signal::Interrupt,
         Signal::Hangup,
         Signal::Resize,
+        Signal::Suspend,
+        Signal::Continue,
+        Signal::BackgroundRead,
+        Signal::BackgroundWrite,
     ];
 
     struct Source {
@@ -183,17 +209,34 @@ mod imp {
 
     pub struct Signals(SignalLease);
 
+    #[derive(Clone, Copy)]
+    pub(crate) struct Wake(&'static Source);
+
+    impl Wake {
+        pub(crate) fn wake(self) {
+            let _ = rustix::io::write(&self.0.write, &[1]);
+        }
+    }
+
     fn bit(signal: Signal) -> u32 {
         match signal {
             Signal::Terminate => 1,
             Signal::Interrupt => 2,
             Signal::Hangup => 4,
             Signal::Resize => 8,
+            Signal::Suspend => 16,
+            Signal::Continue => 32,
+            Signal::BackgroundRead => 64,
+            Signal::BackgroundWrite => 128,
             Signal::Kill => 0,
         }
     }
 
     impl Signals {
+        pub(crate) fn waker(&self) -> Wake {
+            Wake(self.0.source)
+        }
+
         pub fn catch(signals: &[Signal]) -> io::Result<Self> {
             if signals.contains(&Signal::Kill) {
                 return Err(io::ErrorKind::InvalidInput.into());
@@ -298,7 +341,11 @@ mod imp {
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = handler;
         // Other threads' interrupted calls restart rather than fail.
-        action.sa_flags = libc::SA_RESTART;
+        action.sa_flags = if matches!(signal, Signal::BackgroundRead | Signal::BackgroundWrite) {
+            0
+        } else {
+            libc::SA_RESTART
+        };
         // SAFETY: `sa_mask` is a valid, writable signal set; `action` is fully
         // initialized and the handler is async-signal-safe (`on_signal`) or
         // `SIG_DFL`.

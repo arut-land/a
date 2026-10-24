@@ -25,6 +25,7 @@ pub mod install;
 pub mod log;
 mod login;
 mod memory;
+mod paths;
 mod platform;
 mod proc;
 mod runtime;
@@ -38,7 +39,6 @@ mod windows;
 mod windows_quote;
 mod workspace;
 
-use std::io;
 use std::path::{Path, PathBuf};
 
 pub use awake::Awake;
@@ -48,6 +48,9 @@ pub use endpoint::{Endpoint, EndpointRetirement, Listener, OwnedConnection, Stre
 pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
 pub use memory::small_footprint;
+/// The resolved locations belonging to one daemon.
+pub use paths::Paths as Home;
+pub use paths::{InstallLayout, Paths, RemoteLayout};
 pub use platform::{Arch, Os, Platform};
 pub use proc::{
     AdoptLockError, Child, ContainedChild, DaemonLock, ExitWatch, InheritedNumber, OutputCapture,
@@ -60,126 +63,6 @@ pub use signals::{Signals, reraise};
 #[cfg(windows)]
 pub use windows::CompletionSource;
 pub use workspace::{GitEnv, workspace_in, workspace_of};
-
-/// Locations under the per-user home (`$A_HOME`, default `~/.a`).
-#[derive(Clone, Debug)]
-pub struct Home {
-    root: PathBuf,
-    isolated: bool,
-}
-
-impl From<PathBuf> for Home {
-    fn from(root: PathBuf) -> Self {
-        Self {
-            root,
-            isolated: true,
-        }
-    }
-}
-
-impl Home {
-    pub fn from_env() -> io::Result<Self> {
-        match std::env::var_os("A_HOME") {
-            Some(dir) => Ok(PathBuf::from(dir).into()),
-            None => Ok(Self {
-                root: std::env::home_dir()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?
-                    .join(".a"),
-                isolated: false,
-            }),
-        }
-    }
-
-    /// Explicit homes keep diagnostics local, including homes supplied by an embedder.
-    pub fn is_isolated(&self) -> bool {
-        self.isolated
-    }
-
-    /// Preserve isolation across the daemon's cleared environment without turning
-    /// a default per-user home into an explicit override.
-    pub fn daemon_env(&self, command: &mut std::process::Command) {
-        if self.isolated {
-            command.env("A_HOME", &self.root);
-        } else {
-            command.env_remove("A_HOME");
-            if let Some(user_home) = self.root.parent() {
-                #[cfg(unix)]
-                command.env("HOME", user_home);
-                #[cfg(windows)]
-                command.env("USERPROFILE", user_home);
-            }
-        }
-    }
-
-    /// `$A_HOME`, else `~/.a`.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub fn run_dir(&self) -> PathBuf {
-        self.root.join("run")
-    }
-
-    /// Locked by the running daemon for its whole life, and holds its pid.
-    pub fn daemon_pid_file(&self) -> PathBuf {
-        self.run_dir().join("daemon.pid")
-    }
-
-    pub fn sessions_dir(&self) -> PathBuf {
-        self.root.join("sessions")
-    }
-
-    /// How every session lists, derived from their logs by the daemon.
-    pub fn catalog_file(&self) -> PathBuf {
-        self.root.join("sessions.idx")
-    }
-
-    /// Where tools keep output too large for a session's log, a private
-    /// directory per session.
-    pub fn spill_dir(&self) -> PathBuf {
-        self.root.join("spill")
-    }
-
-    pub fn logs_dir(&self) -> PathBuf {
-        self.root.join("logs")
-    }
-
-    pub fn daemon_log(&self) -> PathBuf {
-        self.logs_dir().join("daemon.jsonl")
-    }
-
-    /// The daemon's crash reports; see [`crash`].
-    pub fn crash_dir(&self) -> PathBuf {
-        self.root.join("crash")
-    }
-
-    /// Content-addressed attachments too large for a log.
-    pub fn blobs_dir(&self) -> PathBuf {
-        self.root.join("blobs")
-    }
-
-    /// A link to the daemon socket, where a person looking under the home
-    /// finds it. Clients connect to [`Home::endpoint`] itself, whose path
-    /// is short enough for `sun_path` wherever the home is.
-    pub fn socket_link(&self) -> PathBuf {
-        self.run_dir().join("daemon.sock")
-    }
-
-    /// The user's settings; see [`Config`].
-    pub fn config_file(&self) -> PathBuf {
-        self.root.join("config.toml")
-    }
-
-    /// The operator's permission rules, which only tighten; see
-    /// [`config::rules`].
-    pub fn policy_file(&self) -> PathBuf {
-        self.root.join("policy.toml")
-    }
-
-    pub fn runtime(&self) -> Runtime {
-        Runtime::new(self.root.join("runtime"))
-    }
-}
 
 /// What [`ProcessLease::signal`] send, and [`Signals`]
 /// catches. On Windows, console control events stand for the ones a
@@ -196,6 +79,14 @@ pub enum Signal {
     Hangup,
     /// SIGWINCH: the terminal changed size.
     Resize,
+    /// Terminal job-control stop request.
+    Suspend,
+    /// The process was continued.
+    Continue,
+    /// A background process attempted terminal input.
+    BackgroundRead,
+    /// A background process attempted terminal output or mode changes.
+    BackgroundWrite,
 }
 
 /// Stable across builds, unlike `std`'s hashers, so every version of `a`
@@ -254,6 +145,35 @@ pub fn shell_pwd() -> &'static str {
     #[cfg(windows)]
     {
         shell::ExecutionFacts::current().cwd_command
+    }
+}
+
+/// A test that reruns itself as a child, filtered with `--exact`, passes
+/// even when the filter matches nothing; the child's marker proves it ran.
+#[cfg(test)]
+pub(crate) mod child {
+    use std::io::Write as _;
+
+    const MARK: &str = "a-test-child-ran:";
+
+    /// Written through a copy of the process's stdout, which the harness's
+    /// output capture never intercepts.
+    pub(crate) fn mark(stage: &str) {
+        #[cfg(unix)]
+        let handle = std::os::fd::AsFd::as_fd(&std::io::stdout()).try_clone_to_owned();
+        #[cfg(windows)]
+        let handle =
+            std::os::windows::io::AsHandle::as_handle(&std::io::stdout()).try_clone_to_owned();
+        let mut out = std::fs::File::from(handle.unwrap());
+        out.write_all(format!("{MARK}{stage}\n").as_bytes())
+            .unwrap();
+    }
+
+    pub(crate) fn ran(output: &std::process::Output, stage: &str) -> bool {
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == format!("{MARK}{stage}"))
     }
 }
 
