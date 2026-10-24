@@ -15,6 +15,10 @@ pub(super) fn install(_: &Home, _: bool, _: impl FnOnce() -> io::Result<()>) -> 
 pub(super) fn uninstall(_: &Home, _: bool) -> io::Result<()> {
     Err(unsupported())
 }
+pub(super) fn wait(_: &Home) -> io::Result<()> {
+    Err(unsupported())
+}
+
 pub(super) fn listener(_: &Home) -> io::Result<Listener> {
     Err(unsupported())
 }

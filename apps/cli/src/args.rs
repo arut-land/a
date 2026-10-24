@@ -94,6 +94,9 @@ pub enum Daemon {
     Log,
     /// Install optional native socket activation for this user
     InstallActivation {
+        /// Wait for an enabled app registration to publish its socket
+        #[usage(long, hide)]
+        wait: bool,
         /// Prepare registration by the installed app
         #[usage(long, hide)]
         app: bool,

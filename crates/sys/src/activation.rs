@@ -79,6 +79,18 @@ impl<'a> Installation<'a> {
     }
 }
 
+/// Completes the initial secure-socket bootstrap after registration is enabled.
+pub fn wait(home: &Home) -> io::Result<()> {
+    native_home(home)?;
+    if !installed(home)? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "native activation is not installed",
+        ));
+    }
+    native::wait(home)
+}
+
 /// Called before any runtime or child threads exist.
 pub fn listener(home: &Home) -> io::Result<Listener> {
     native_home(home)?;
@@ -138,6 +150,7 @@ mod tests {
             Installation::claim(&home).err().unwrap().kind(),
             io::ErrorKind::Unsupported
         );
+        assert_eq!(wait(&home).unwrap_err().kind(), io::ErrorKind::Unsupported);
         assert_eq!(
             listener(&home).err().unwrap().kind(),
             io::ErrorKind::Unsupported

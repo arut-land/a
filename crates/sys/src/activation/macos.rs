@@ -106,6 +106,35 @@ pub(super) fn uninstall(home: &Home, app: bool) -> io::Result<()> {
     forget(home)
 }
 
+pub(super) fn wait(home: &Home) -> io::Result<()> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use std::time::{Duration, Instant};
+
+    // Arm the directory before checking discovery: atomic publication replaces
+    // the record inode, and a write between checking and waiting must wake us.
+    let watch = crate::write_watch(&home.run_dir())?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        watch.clear();
+        if home.endpoint().connect().is_ok() {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the LaunchAgent did not publish its socket; check Login Items approval and the daemon log",
+            ));
+        }
+        let timeout = Timespec::try_from(remaining).map_err(io::Error::other)?;
+        let mut fds = [PollFd::new(&watch, PollFlags::IN)];
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 pub(super) fn listener(home: &Home) -> io::Result<Listener> {
     unsafe extern "C" {
         fn launch_activate_socket(

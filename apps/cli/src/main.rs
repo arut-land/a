@@ -158,9 +158,12 @@ const RESTART: &str = "run `a daemon restart` to replace it";
 fn daemon_cmd(daemon: &client::Daemon, action: Daemon) -> io::Result<()> {
     let home = daemon.home()?;
     match action {
-        Daemon::InstallActivation { app } => {
+        Daemon::InstallActivation { app, wait } => {
             let installation = sys::activation::Installation::claim(home)?;
             installation.install(app, || client::stop(home).map(drop))?;
+            if !app || wait {
+                sys::activation::wait(home)?;
+            }
             sayln!("native activation installed");
         }
         Daemon::UninstallActivation { app } => {

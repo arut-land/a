@@ -53,12 +53,6 @@ try:
         for managed in ([False, True] if sample % 2 == 0 else [True, False]):
             if managed:
                 command("daemon", "install-activation")
-                # RunAtLoad on launchd publishes its secure socket before first attach.
-                deadline = time.monotonic() + 20
-                while not (run_dir / "daemon.endpoint").exists():
-                    if time.monotonic() >= deadline:
-                        raise AssertionError("activation did not publish discovery")
-                    time.sleep(.05)
                 command("ls")
                 command("daemon", "stop")
             samples["activation_ms" if managed else "self_spawn_ms"].append(connect())

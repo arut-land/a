@@ -60,7 +60,9 @@ Both agents request a launchd `SecureSocketWithKey` Unix stream socket and
 consume it through `launch_activate_socket`. The initial `RunAtLoad` launch
 publishes its absolute address into the private discovery record. This
 bootstrap runs at registration/login, then obeys the same idle exit policy;
-`KeepAlive` is absent. The bundled plist does not interpolate `$HOME`,
+`KeepAlive` is absent. Installation waits for the initial verified socket
+using a directory event and a bounded deadline, including app registration
+that is already enabled. Approval-required registration stays pending. The bundled plist does not interpolate `$HOME`,
 `$TMPDIR` or `~`. Socket mode is 0600, the process umask is 0077 and the stop
 timeout is 30 seconds. Subsequent connects use the published manager socket
 and the existing `getpeereid` checks. The managed daemon stays in the

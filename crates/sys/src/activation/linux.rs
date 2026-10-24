@@ -139,6 +139,14 @@ pub(super) fn uninstall(home: &Home, app: bool) -> io::Result<()> {
     forget(home)
 }
 
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "launchd must await initial secure-socket discovery"
+)]
+pub(super) fn wait(_: &Home) -> io::Result<()> {
+    Ok(())
+}
+
 pub(super) fn listener(home: &Home) -> io::Result<Listener> {
     // listenfd also supports development supervisors. Admit only systemd's
     // PID-scoped, fd-3 contract, and bound its descriptor-vector allocation.

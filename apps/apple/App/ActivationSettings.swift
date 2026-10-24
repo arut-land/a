@@ -45,6 +45,9 @@ struct ActivationSettings: View {
                 if enable {
                     try await Self.command(helper, "install-activation")
                     try service.register()
+                    if service.status == .enabled {
+                        try await Self.command(helper, "install-activation", wait: true)
+                    }
                 } else {
                     try await service.unregister()
                     try await Self.command(helper, "uninstall-activation")
@@ -60,11 +63,11 @@ struct ActivationSettings: View {
         }
     }
 
-    nonisolated private static func command(_ helper: URL, _ action: String) async throws {
+    nonisolated private static func command(_ helper: URL, _ action: String, wait: Bool = false) async throws {
         try await Task.detached {
             let process = Process()
             process.executableURL = helper
-            process.arguments = ["daemon", action, "--app"]
+            process.arguments = ["daemon", action, "--app"] + (wait ? ["--wait"] : [])
             let errors = Pipe()
             process.standardError = errors
             process.standardOutput = FileHandle.nullDevice
