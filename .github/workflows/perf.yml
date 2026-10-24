@@ -168,9 +168,8 @@ jobs:
         run: |
           python - <<'PY'
           import shutil
-          paths = ['apps/cli/examples/perf-attach.rs', 'crates/engine/src/driver/tests/bench.rs']
-          for path in paths:
-              from pathlib import Path
+          from pathlib import Path
+          for path in ['apps/cli/examples/perf-attach.rs', 'crates/engine/src/driver/tests/bench.rs']:
               Path('../measured/' + path).parent.mkdir(parents=True, exist_ok=True)
               shutil.copy2(path, '../measured/' + path)
           PY
