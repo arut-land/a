@@ -28,6 +28,7 @@ mod memory;
 mod paths;
 mod platform;
 mod proc;
+pub mod resources;
 mod runtime;
 pub mod shell;
 mod signals;

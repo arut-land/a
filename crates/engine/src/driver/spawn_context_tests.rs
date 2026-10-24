@@ -39,7 +39,7 @@ fn context_survives_removal_of_ancestor_files() {
     let mut parent = ancestor_store.create(&header).unwrap();
     parent
         .append(Body::Input {
-            text: "ancestor".into(),
+            segments: "ancestor".into(),
             mode: Mode::Queue,
             taken: true,
             origin: None,

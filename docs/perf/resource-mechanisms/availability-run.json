@@ -1,0 +1,17 @@
+{
+  "run_id": 40062594284,
+  "superseded_run_id": 40062196278,
+  "revision": "d5a0729f2aa9b3cb1bd644fea6949217dcc70410",
+  "branch": "codex-w5rt-availability",
+  "target": "windows-latest",
+  "max_phases": 200,
+  "messages_per_phase": 50,
+  "idle_seconds": 25,
+  "variants": [
+    "full",
+    "main",
+    "compact",
+    "full-trace"
+  ],
+  "purpose": "diagnosis, not performance measurements"
+}

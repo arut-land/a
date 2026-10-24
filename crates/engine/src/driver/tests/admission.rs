@@ -110,7 +110,7 @@ fn enqueue(session: &Live, text: &str) -> oneshot::Receiver<Result<(), String>> 
     let (reply, received) = oneshot::channel();
     session.send(Msg::Request {
         request: Request::Input {
-            text: text.into(),
+            segments: text.into(),
             mode: Mode::Queue,
         },
         origin: None,
@@ -818,8 +818,10 @@ fn submitted_input_is_cancelled_while_its_publication_flush_is_held() {
         let mut effects = client.run(cmd);
         let request = match effects.remove(0) {
             client::Effect::Io(client::Io::Send(protocol::ClientMsg::Input {
-                text, mode, ..
-            })) => Request::Input { text, mode },
+                segments,
+                mode,
+                ..
+            })) => Request::Input { segments, mode },
             client::Effect::Io(client::Io::Send(protocol::ClientMsg::Interrupt { .. })) => {
                 Request::Interrupt
             }
@@ -1260,7 +1262,7 @@ fn cancelled_before_provider_send_adds_no_executed_attempt() {
     assert_eq!(projection.own(session.id, &prices).attempts.executed, 0);
 }
 
-struct StaleProcess;
+pub(super) struct StaleProcess;
 impl ext::RunningProcess for StaleProcess {
     fn id(&self) -> u32 {
         42

@@ -2,16 +2,16 @@
 //! commands that every client (the terminal, the line REPL, the web page,
 //! the apps through their FFI) parses typed lines with.
 
-use protocol::{CallId, CommandInfo, Target};
+use protocol::{CallId, CommandInfo, Segment, Segments, Target};
 
 /// A person's intent: from a typed line, a key or a button.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cmd {
     /// Input for the session: a message, or a slash command the daemon
     /// runs.
-    Input(String),
+    Input(Segments),
     /// Input for the running turn, before its next step.
-    Steer(String),
+    Steer(Segments),
     Approve {
         call: CallId,
         approved: bool,
@@ -98,7 +98,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "text",
         help: "tell the running turn, before its next step",
-        parse: |rest| (!rest.is_empty()).then(|| Cmd::Steer(rest.to_owned())),
+        parse: |rest| (!rest.is_empty()).then(|| Cmd::Steer(rest.into())),
     },
     Command {
         name: "env",
@@ -154,7 +154,23 @@ pub fn parse(line: &str, asking: Option<CallId>) -> Option<Cmd> {
             .find(|c| c.name == name || c.aliases.contains(&name))?;
         (command.parse)(rest.trim())
     });
-    Some(own.unwrap_or_else(|| Cmd::Input(line.to_owned())))
+    Some(own.unwrap_or_else(|| Cmd::Input(line.into())))
+}
+
+/// What composed input asks for: typed text alone is a line, as [`parse`]
+/// reads it; input holding a paste or an attachment is a message, or a
+/// steer when its typed start says `/steer`.
+pub fn parse_input(mut segments: Segments, asking: Option<CallId>) -> Option<Cmd> {
+    if let Some(line) = segments.as_text() {
+        return parse(line, asking);
+    }
+    if let Some(Segment::Text(first)) = segments.0.first_mut()
+        && let Some(rest) = first.trim_start().strip_prefix("/steer ")
+    {
+        *first = rest.trim_start().to_owned();
+        return Some(Cmd::Steer(segments));
+    }
+    Some(Cmd::Input(segments))
 }
 
 /// Every slash command, as `(usage, help)`: the client's own, then those
@@ -223,6 +239,19 @@ mod tests {
         for (line, asking, want) in cases {
             assert_eq!(&parse(line, *asking), want, "{line:?}");
         }
+    }
+
+    #[test]
+    fn input_holding_a_paste_is_a_message_never_a_command() {
+        let text = |text: &str| Segment::Text(text.into());
+        let paste = || Segment::Paste("/help\n".into());
+        let pasted = Segments(vec![text("/model "), paste()]);
+        assert_eq!(parse_input(pasted.clone(), None), Some(Cmd::Input(pasted)));
+        assert_eq!(
+            parse_input(Segments(vec![text(" /steer  and "), paste()]), None),
+            Some(Cmd::Steer(Segments(vec![text("and "), paste()])))
+        );
+        assert_eq!(parse_input("/help".into(), None), Some(Cmd::Help));
     }
 
     #[test]

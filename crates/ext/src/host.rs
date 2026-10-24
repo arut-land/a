@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
-use protocol::{Audience, CallId, Card, Environment, Installed, Json, Outcome, Seq, SessionId};
+use protocol::{
+    Audience, CallId, Card, Environment, Installed, Json, Outcome, Segments, Seq, SessionId,
+};
 
 use crate::ext::RegisteredAgent;
 use crate::point::{Approving, Asked, Failed, Later, Stepped, View};
@@ -413,6 +415,14 @@ impl Registry {
 
     pub fn hooks(&self) -> &Hooks {
         &self.hooks
+    }
+
+    /// What the model is shown of a call's outcome: its tool's own
+    /// presentation, as the `present_result` handlers leave it.
+    pub fn present_result(&self, tool: &str, outcome: &Outcome) -> crate::point::Presented {
+        let (output, error) = self.tools.to_model(tool, outcome);
+        let ended = crate::point::Ended { tool, outcome };
+        (self.hooks).present_result(ended, crate::point::Presented { output, error })
     }
 
     /// What the extensions did that is worth telling: one replacing an
@@ -1086,8 +1096,8 @@ pub trait Binding: Send + Sync {
 
     /// The `input` point: the text as the chain leaves it, or why it is
     /// refused.
-    fn input(&self, text: String) -> Result<Chained<String>, String> {
-        Ok(Chained::new(text))
+    fn input(&self, segments: Segments) -> Result<Chained<Segments>, String> {
+        Ok(Chained::new(segments))
     }
 
     /// The `pre_tool`, `permission` and `approve` points, merged.
@@ -1359,8 +1369,8 @@ impl<V: View + Send + Sync + 'static> Binding for Bound<V> {
         card
     }
 
-    fn input(&self, text: String) -> Result<Chained<String>, String> {
-        self.registry.hooks().input(&self.point(), text)
+    fn input(&self, segments: Segments) -> Result<Chained<Segments>, String> {
+        self.registry.hooks().input(&self.point(), segments)
     }
 
     fn gate(&self, call: CallId, tool: &str, input: &Json) -> Answer<Gated> {

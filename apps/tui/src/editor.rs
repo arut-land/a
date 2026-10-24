@@ -2,6 +2,8 @@
 
 use std::ops::Range;
 
+use protocol::{Segment, Segments};
+
 use super::keys::Key;
 use super::text::{Line, Span, Style, char_width};
 
@@ -15,8 +17,8 @@ pub struct Editor {
     history: Vec<String>,
     /// While browsing history: the entry shown, and the draft it replaced.
     browsing: Option<(usize, String, Vec<Paste>)>,
-    /// Long pastes, shown in `text` as `[Pasted text #n +m lines]` and put
-    /// back when the input is sent.
+    /// Long pastes, shown in `text` as `[Pasted text #n +m lines]` and sent
+    /// as paste segments, which the model reads tagged as pasted.
     pastes: Vec<Paste>,
 }
 
@@ -29,8 +31,8 @@ struct Paste {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Edit {
     Changed,
-    /// Enter with this text (trimmed, non-empty).
-    Submit(String),
+    /// Enter with this input (trimmed, non-empty).
+    Submit(Segments),
     /// The key is not an editing key.
     Ignored,
 }
@@ -78,12 +80,27 @@ impl Editor {
         self.pastes.sort_by_key(|p| p.range.start);
     }
 
-    fn expanded(&self) -> String {
-        let mut out = self.text.clone();
-        for paste in self.pastes.iter().rev() {
-            out.replace_range(paste.range.clone(), &paste.text);
+    /// The input as typed text and pastes, its ends trimmed.
+    fn segments(&self) -> Segments {
+        let mut out = Vec::new();
+        let mut at = 0;
+        for paste in &self.pastes {
+            out.push(Segment::Text(self.text[at..paste.range.start].to_owned()));
+            out.push(Segment::Paste(paste.text.clone()));
+            at = paste.range.end;
         }
-        out.trim().to_owned()
+        out.push(Segment::Text(self.text[at..].to_owned()));
+        if let Some(Segment::Text(first)) = out.first_mut() {
+            *first = first.trim_start().to_owned();
+        }
+        if let Some(Segment::Text(last)) = out.last_mut() {
+            last.truncate(last.trim_end().len());
+        }
+        out.retain(|segment| !matches!(segment, Segment::Text(text) if text.is_empty()));
+        if out.is_empty() {
+            out.push(Segment::Text(String::new()));
+        }
+        Segments(out)
     }
 
     // Placeholders are atomic: editing one removes it, and literal text
@@ -123,13 +140,14 @@ impl Editor {
             }
             Key::Newline => self.insert("\n"),
             Key::Enter => {
-                let text = self.expanded();
-                if text.is_empty() {
+                let input = self.segments();
+                let text = input.text();
+                if text.trim().is_empty() {
                     return Edit::Ignored;
                 }
                 self.remember(&text);
                 self.clear();
-                return Edit::Submit(text);
+                return Edit::Submit(input);
             }
             Key::Backspace => {
                 if let Some(prev) = self.prev(self.cursor) {
@@ -329,8 +347,20 @@ mod tests {
         }
     }
 
+    fn sent(segments: &[Segment]) -> Edit {
+        Edit::Submit(Segments(segments.to_vec()))
+    }
+
+    fn typed_text(text: &str) -> Segment {
+        Segment::Text(text.into())
+    }
+
+    fn pasted(text: &str) -> Segment {
+        Segment::Paste(text.into())
+    }
+
     #[test]
-    fn a_long_paste_shows_as_a_placeholder_and_is_sent_whole() {
+    fn a_long_paste_shows_as_a_placeholder_and_is_sent_as_a_paste() {
         let mut e = Editor::default();
         e.insert("see ");
         e.paste("a\nb\nc\nd\n");
@@ -338,7 +368,11 @@ mod tests {
         e.paste("short\nbit");
         assert_eq!(
             e.key(Key::Enter),
-            Edit::Submit("see a\nb\nc\nd\nshort\nbit".into())
+            sent(&[
+                typed_text("see "),
+                pasted("a\nb\nc\nd\n"),
+                typed_text("short\nbit")
+            ])
         );
     }
 
@@ -351,7 +385,11 @@ mod tests {
         e.insert("prefix ");
         assert_eq!(
             e.key(Key::Enter),
-            Edit::Submit("prefix a\nb\nc\nd [Pasted text #1 +3 lines]".into())
+            sent(&[
+                typed_text("prefix "),
+                pasted("a\nb\nc\nd"),
+                typed_text(" [Pasted text #1 +3 lines]")
+            ])
         );
     }
 
@@ -373,9 +411,9 @@ mod tests {
         e.key(Key::Up);
         assert_eq!(e.text(), "old");
         e.key(Key::Down);
-        assert_eq!(e.key(Key::Enter), Edit::Submit("a\nb\nc\nd".into()));
+        assert_eq!(e.key(Key::Enter), sent(&[pasted("a\nb\nc\nd")]));
         e.key(Key::Up);
-        assert_eq!(e.expanded(), "a\nb\nc\nd");
+        assert_eq!(e.text(), "a\nb\nc\nd");
     }
 
     #[test]

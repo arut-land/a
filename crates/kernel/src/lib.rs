@@ -118,7 +118,7 @@ pub enum Event {
     /// otherwise queued. A `Steer` goes to the running turn before its next
     /// model call.
     Input {
-        text: String,
+        segments: protocol::Segments,
         mode: Mode,
         origin: Option<Author>,
         ticket: Option<Ticket>,

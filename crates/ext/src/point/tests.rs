@@ -77,7 +77,8 @@ macro_rules! every_point {
             Turn,
             Reply,
             Resume,
-            Step
+            Step,
+            PresentResult
         )
     };
 }
@@ -99,6 +100,7 @@ const TABLE: &[(&str, Merge)] = &[
     ("reply", Merge::Chain),
     ("resume", Merge::FirstSome),
     ("step", Merge::Chain),
+    ("present_result", Merge::Chain),
 ];
 
 /// A chain point merges as a chain: each handler sees what the last left,
@@ -277,6 +279,7 @@ fn every_point_declares_its_failure_policy() {
         ("reply", FailOpen),
         ("resume", FailOpen),
         ("step", FailOpen),
+        ("present_result", FailOpen),
     ];
     assert_eq!(declared, want);
     // The table of points is the table of erased points: a point cannot
@@ -429,7 +432,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
         tool: "t",
         input: &input,
     };
-    let texts = ["0", "a", "b"].map(str::to_owned);
+    let texts = ["0", "a", "b"].map(Segments::from);
     let stop = Some("no".to_owned());
     let view = Counted::default();
     let cx = &point_cx(&view);
@@ -523,8 +526,8 @@ fn a_point_with_no_handler_costs_nothing() {
     })]);
     for hooks in [Hooks::default(), elsewhere] {
         let outcome = Outcome::Interrupted { output: None };
-        let text = hooks.input(&cx, "hi".to_owned());
-        assert_eq!(text, Ok(Chained::new("hi".to_owned())));
+        let text = hooks.input(&cx, "hi".into());
+        assert_eq!(text, Ok(Chained::new("hi".into())));
         let subject = input.clone();
         assert_eq!(
             hooks.gate(&cx, "t", &subject),
@@ -748,9 +751,9 @@ fn input_rejections_name_who_and_post_tool_logs_the_original() {
     let view = Counted::default();
     let cx = point_cx(&view);
     let set = hooks(vec![one("a", |r| {
-        r.on::<Input>(|_, text| match text {
-            "no" => Rewrite::Stop("not that".into()),
-            text => Rewrite::Replace(format!("{text}1")),
+        r.on::<Input>(|_, input| match input.as_text() {
+            Some("no") => Rewrite::Stop("not that".into()),
+            _ => Rewrite::Replace(format!("{input}1").into()),
         })
         .on::<PostTool>(|_, done| {
             assert!(matches!(done.outcome, Outcome::Interrupted { .. }));
@@ -759,10 +762,10 @@ fn input_rejections_name_who_and_post_tool_logs_the_original() {
             })
         });
     })]);
-    let Chained { value, decisions } = set.input(&cx, "hi".to_owned()).unwrap();
+    let Chained { value, decisions } = set.input(&cx, "hi".into()).unwrap();
     assert_eq!(value, "hi1");
     assert!(matches!(&decisions[..], [(_, Verdict::Input { original })] if original == "hi"));
-    assert_eq!(set.input(&cx, "no".to_owned()), Err("a: not that".into()));
+    assert_eq!(set.input(&cx, "no".into()), Err("a: not that".into()));
 
     let outcome = Outcome::Interrupted { output: None };
     let Chained { value, decisions } = set.post_tool(&cx, ("t", &Json::null()), outcome);
@@ -785,6 +788,32 @@ impl ErasedHandler for Erased {
     fn on(&self, _: &PointCx<'_>, args: &Json) -> Result<Json, String> {
         Ok(Json::encode(&(self.0)(&args.parse::<Value>().unwrap())).unwrap())
     }
+}
+
+#[test]
+fn erased_input_handlers_read_typed_text_as_a_string_and_a_paste_as_segments() {
+    let view = Counted::default();
+    let cx = point_cx(&view);
+    let set = hooks(vec![one("lua", |r| {
+        r.on_erased(
+            "input",
+            Arc::new(Erased(|args| match args {
+                Value::String(text) => json!({ "replace": text.to_uppercase() }),
+                segments => json!({ "replace": [segments[1]] }),
+            })),
+        );
+    })]);
+    let typed = set.input(&cx, "hi".into()).unwrap();
+    assert_eq!(typed.value, "HI");
+    let pasted = Segments(vec![
+        protocol::Segment::Text("see ".into()),
+        protocol::Segment::Paste("x".into()),
+    ]);
+    let kept = set.input(&cx, pasted).unwrap();
+    assert_eq!(
+        kept.value,
+        Segments(vec![protocol::Segment::Paste("x".into())])
+    );
 }
 
 #[test]

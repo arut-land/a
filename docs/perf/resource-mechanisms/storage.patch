@@ -1,0 +1,73 @@
+diff --git a/crates/sys/src/resources.rs b/crates/sys/src/resources.rs
+index 1fb74d85..2057ee64 100644
+--- a/crates/sys/src/resources.rs
++++ b/crates/sys/src/resources.rs
+@@ -56,66 +56,8 @@ pub fn page_size() -> io::Result<usize> {
+     }
+ }
+ 
+-pub fn storage(path: &Path) -> Storage {
+-    let Some(path) = path.ancestors().find(|p| p.exists()) else {
+-        return Storage::Unknown;
+-    };
+-    #[cfg(target_os = "linux")]
+-    {
+-        use std::os::unix::fs::MetadataExt;
+-        let Ok(meta) = path.metadata() else {
+-            return Storage::Unknown;
+-        };
+-        let dev = meta.dev();
+-        let device = format!("/sys/dev/block/{}:{}", libc::major(dev), libc::minor(dev));
+-        let Ok(device) = std::fs::canonicalize(device) else {
+-            return Storage::Unknown;
+-        };
+-        // Partitions inherit their parent block device's queue. Device-mapper
+-        // and virtual devices may not reveal media; unknown stays explicit.
+-        for device in device.ancestors().take(2) {
+-            match std::fs::read_to_string(device.join("queue/rotational"))
+-                .as_deref()
+-                .map(str::trim)
+-            {
+-                Ok("1") => return Storage::Rotational,
+-                Ok("0") => return Storage::SolidState,
+-                _ => {}
+-            }
+-        }
+-        Storage::Unknown
+-    }
+-    #[cfg(target_os = "macos")]
+-    {
+-        macos::storage(path)
+-    }
+-    #[cfg(windows)]
+-    {
+-        let Ok(path) = path.canonicalize() else {
+-            return Storage::Unknown;
+-        };
+-        let disks = sysinfo::Disks::new_with_refreshed_list_specifics(
+-            sysinfo::DiskRefreshKind::nothing().with_kind(),
+-        );
+-        disks
+-            .iter()
+-            .filter(|disk| {
+-                disk.mount_point()
+-                    .canonicalize()
+-                    .is_ok_and(|mount| path.starts_with(mount))
+-            })
+-            .max_by_key(|disk| disk.mount_point().components().count())
+-            .map_or(Storage::Unknown, |disk| match disk.kind() {
+-                sysinfo::DiskKind::HDD => Storage::Rotational,
+-                sysinfo::DiskKind::SSD => Storage::SolidState,
+-                sysinfo::DiskKind::Unknown(_) => Storage::Unknown,
+-            })
+-    }
+-    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+-    {
+-        let _ = path;
+-        Storage::Unknown
+-    }
++pub fn storage(_path: &Path) -> Storage {
++    Storage::Unknown
+ }
+ 
+ /// Scoped priority for a blocking operation. Async workers keep their normal

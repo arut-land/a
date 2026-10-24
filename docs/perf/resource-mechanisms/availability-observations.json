@@ -1,0 +1,58 @@
+{
+  "run_id": 40062594284,
+  "observations": [
+    {
+      "variant": "full",
+      "source": "93344bb06d9096103ecf6ed18d2d78058a30791d",
+      "phase": 0,
+      "drain_stdout": true,
+      "resume_attempts": 46,
+      "failure": "! the daemon (pid 8856) is not responding after 2s\n  log: D:\\a\\_temp\\a-availability-htdvurba\\logs\\daemon.jsonl\na: run `a daemon restart` to replace it\n",
+      "late_probe": {
+        "returncode": 0
+      },
+      "daemon_cpu_before": 0.125,
+      "daemon_cpu_after": 0.125
+    },
+    {
+      "variant": "full-trace",
+      "source": "93344bb06d9096103ecf6ed18d2d78058a30791d",
+      "phase": 22,
+      "drain_stdout": true,
+      "resume_attempts": 1142,
+      "failure": "! the daemon (pid 8120) is not responding after 2s\n  log: D:\\a\\_temp\\a-availability-74w_rk17\\logs\\daemon.jsonl\na: run `a daemon restart` to replace it\n",
+      "late_probe": {
+        "returncode": 0
+      },
+      "daemon_cpu_before": 0.078125,
+      "daemon_cpu_after": 0.078125
+    },
+    {
+      "variant": "compact",
+      "source": "e4426ff3b986a5bbde11376527134b2f64975f99",
+      "phase": 69,
+      "drain_stdout": false,
+      "resume_attempts": 3462,
+      "failure": "! the daemon (pid 2904) is not responding after 2s\n  log: D:\\a\\_temp\\a-availability-hb1m88bu\\logs\\daemon.jsonl\na: run `a daemon restart` to replace it\n",
+      "late_probe": {
+        "returncode": 0
+      },
+      "daemon_cpu_before": 0.03125,
+      "daemon_cpu_after": 0.046875
+    },
+    {
+      "variant": "main",
+      "source": "4b662d7ab8151802b8417e71378c8ec800834f34",
+      "phase": 122,
+      "drain_stdout": true,
+      "resume_attempts": 6126,
+      "failure": "! the daemon (pid 2580) is not responding after 2s\n  log: D:\\a\\_temp\\a-availability-6_7wzoud\\logs\\daemon.jsonl\na: run `a daemon restart` to replace it\n",
+      "late_probe": {
+        "returncode": 0
+      },
+      "daemon_cpu_before": 0.140625,
+      "daemon_cpu_after": 0.140625
+    }
+  ],
+  "capture_limit": "Copying the held endpoint claim file raises WinError 32 after collecting failure evidence; phases.jsonl retains the failing phase. Later probe catches copy errors."
+}

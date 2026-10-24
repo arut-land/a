@@ -151,11 +151,11 @@ impl Core {
                 fx.immediate.push(Work::Invocation { ticket, result });
             }
             Event::Input {
-                text,
+                segments,
                 mode,
                 origin,
                 ticket,
-            } => self.input(text, mode, origin, ticket, &mut fx),
+            } => self.input(segments, mode, origin, ticket, &mut fx),
             Event::OwnerCancelled => {
                 self.owned_cancelled = true;
                 self.interrupt(None, &mut fx);
@@ -420,7 +420,7 @@ impl Core {
 
     fn input(
         &mut self,
-        text: String,
+        segments: protocol::Segments,
         mode: Mode,
         origin: Option<Author>,
         ticket: Option<Ticket>,
@@ -442,9 +442,9 @@ impl Core {
             && self.fold.asked.is_empty()
             && self.fold.ledger.untaken().is_empty();
         let Chained {
-            value: text,
+            value: segments,
             decisions,
-        } = match self.registry.input(text) {
+        } = match self.registry.input(segments) {
             Ok(chained) => chained,
             Err(why) => return reply(fx, ticket, Err(why)),
         };
@@ -454,7 +454,7 @@ impl Core {
         self.append(
             fx,
             Body::Input {
-                text,
+                segments,
                 mode,
                 taken,
                 origin,

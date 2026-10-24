@@ -16,14 +16,7 @@ struct State<T> {
     closed: bool,
     receiver_gone: bool,
     waker: Option<Waker>,
-}
-
-impl<T> State<T> {
-    fn wake(&mut self) {
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
-    }
+    waiting: usize,
 }
 
 struct Shared<T> {
@@ -46,20 +39,30 @@ impl<T> Shared<T> {
         while state.items.len() >= self.capacity && !state.receiver_gone {
             #[cfg(test)]
             self.blocked.notify();
+            state.waiting += 1;
             state = wait(&self.space, state);
+            state.waiting -= 1;
         }
         if state.receiver_gone {
             return Err(item);
         }
         state.items.push_back(item);
-        state.wake();
+        let waker = state.waker.take();
+        drop(state);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
         Ok(())
     }
 
     fn close(&self) {
         let mut state = self.state();
         state.closed = true;
-        state.wake();
+        let waker = state.waker.take();
+        drop(state);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 
@@ -80,6 +83,7 @@ fn channel<T>(capacity: usize) -> (Arc<Shared<T>>, Receiver<T>) {
             closed: false,
             receiver_gone: false,
             waker: None,
+            waiting: 0,
         }),
         space: Condvar::new(),
         capacity,
@@ -131,23 +135,30 @@ impl<T> Receiver<T> {
     pub fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         let mut state = self.0.state();
         if let Some(item) = state.items.pop_front() {
-            self.0.space.notify_one();
+            if state.waiting > 0 {
+                self.0.space.notify_one();
+            }
             return Poll::Ready(Some(item));
         }
         if state.closed {
             return Poll::Ready(None);
         }
-        match &mut state.waker {
-            Some(waker) if waker.will_wake(cx.waker()) => {}
-            slot => *slot = Some(cx.waker().clone()),
-        }
+        let previous = match &state.waker {
+            Some(waker) if waker.will_wake(cx.waker()) => None,
+            _ => state.waker.replace(cx.waker().clone()),
+        };
+        drop(state);
+        drop(previous);
         Poll::Pending
     }
 
     /// The next item if one is queued, without waiting.
     pub fn try_recv(&self) -> Option<T> {
-        let item = self.0.state().items.pop_front()?;
-        self.0.space.notify_one();
+        let mut state = self.0.state();
+        let item = state.items.pop_front()?;
+        if state.waiting > 0 {
+            self.0.space.notify_one();
+        }
         Some(item)
     }
 
@@ -161,8 +172,14 @@ impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let mut state = self.0.state();
         state.receiver_gone = true;
-        state.items.clear();
-        self.0.space.notify_all();
+        let waiting = state.waiting > 0;
+        let items = std::mem::take(&mut state.items);
+        let waker = state.waker.take();
+        drop(state);
+        if waiting {
+            self.0.space.notify_all();
+        }
+        drop((items, waker));
     }
 }
 
@@ -177,6 +194,37 @@ impl<T> futures_core::Stream for Receiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumer_wakes_and_discarded_values_never_run_under_the_queue_lock() {
+        struct Observe(Arc<Shared<Observe>>);
+        impl std::task::Wake for Observe {
+            fn wake(self: Arc<Self>) {
+                assert!(self.0.state.try_lock().is_ok());
+            }
+        }
+        impl Drop for Observe {
+            fn drop(&mut self) {
+                assert!(self.0.state.try_lock().is_ok());
+            }
+        }
+        let (tx, rx) = unbounded();
+        let waker = Waker::from(Arc::new(Observe(Arc::clone(&tx.0))));
+        assert!(rx.poll_recv(&mut Context::from_waker(&waker)).is_pending());
+        assert!(tx.send(Observe(Arc::clone(&tx.0))).is_ok());
+        drop(rx.try_recv());
+        drop(waker);
+        let waker = Waker::from(Arc::new(Observe(Arc::clone(&tx.0))));
+        assert!(rx.poll_recv(&mut Context::from_waker(&waker)).is_pending());
+        drop(waker);
+        assert!(
+            rx.poll_recv(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(tx.send(Observe(Arc::clone(&tx.0))).is_ok());
+        drop(rx);
+        drop(tx);
+    }
 
     #[test]
     fn a_dropped_receiver_releases_a_waiting_sender() {

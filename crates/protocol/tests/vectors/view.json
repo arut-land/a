@@ -400,7 +400,7 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"epoch\":0,\"kind\":\"input\",\"seq\":1,\"t\":\"entry\",\"taken\":true,\"text\":\"run\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"run\"}],\"seq\":1,\"t\":\"entry\",\"taken\":true}",
       "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":2,\"t\":\"entry\",\"tool\":\"owner\"}",
       "{\"epoch\":0,\"input\":null,\"invoke\":{\"name\":\"lookup\",\"parent\":2},\"kind\":\"tool_call\",\"seq\":3,\"t\":\"entry\",\"tool\":\"lookup\"}",
       "{\"call\":3,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}",
@@ -416,10 +416,14 @@
       {
         "epoch": 0,
         "kind": "input",
+        "segments": [
+          {
+            "text": "run"
+          }
+        ],
         "seq": 1,
         "t": "entry",
-        "taken": true,
-        "text": "run"
+        "taken": true
       },
       {
         "epoch": 0,
@@ -1615,7 +1619,7 @@
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"activity\":\"idle\",\"seq\":0,\"t\":\"activity\"}",
-      "{\"epoch\":0,\"kind\":\"input\",\"seq\":1,\"t\":\"entry\",\"taken\":true,\"text\":\"hi\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"hi\"}],\"seq\":1,\"t\":\"entry\",\"taken\":true}",
       "{\"activity\":\"running\",\"seq\":1,\"t\":\"activity\"}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":2,\"t\":\"entry\",\"text\":\"hi\"}",
       "{\"activity\":\"idle\",\"seq\":1,\"t\":\"activity\"}",
@@ -1637,10 +1641,14 @@
       {
         "epoch": 0,
         "kind": "input",
+        "segments": [
+          {
+            "text": "hi"
+          }
+        ],
         "seq": 1,
         "t": "entry",
-        "taken": true,
-        "text": "hi"
+        "taken": true
       },
       {
         "activity": "running",
@@ -1942,7 +1950,7 @@
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"seq\":0,\"t\":\"synced\"}",
-      "{\"epoch\":0,\"kind\":\"input\",\"seq\":1,\"t\":\"entry\",\"taken\":true,\"text\":\"hi\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"hi\"}],\"seq\":1,\"t\":\"entry\",\"taken\":true}",
       "{\"epoch\":0,\"kind\":\"model_call\",\"model\":\"m\",\"seq\":2,\"t\":\"entry\"}",
       "{\"call\":2,\"t\":\"delta\",\"text\":\"hel\"}",
       "{\"call\":2,\"t\":\"delta\",\"text\":\"lo\"}",
@@ -1962,10 +1970,14 @@
       {
         "epoch": 0,
         "kind": "input",
+        "segments": [
+          {
+            "text": "hi"
+          }
+        ],
         "seq": 1,
         "t": "entry",
-        "taken": true,
-        "text": "hi"
+        "taken": true
       },
       {
         "epoch": 0,
@@ -2316,8 +2328,8 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"epoch\":0,\"kind\":\"input\",\"seq\":1,\"t\":\"entry\",\"taken\":true,\"text\":\"one\"}",
-      "{\"epoch\":0,\"kind\":\"input\",\"mode\":\"steer\",\"seq\":2,\"t\":\"entry\",\"text\":\"two\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"one\"}],\"seq\":1,\"t\":\"entry\",\"taken\":true}",
+      "{\"epoch\":0,\"kind\":\"input\",\"mode\":\"steer\",\"segments\":[{\"text\":\"two\"}],\"seq\":2,\"t\":\"entry\"}",
       "{\"attempt\":1,\"by\":\"retry\",\"call\":1,\"d\":\"retry\",\"epoch\":0,\"error\":\"rate limited\",\"kind\":\"decision\",\"seq\":3,\"t\":\"entry\"}",
       "{\"epoch\":0,\"input\":2,\"kind\":\"take\",\"seq\":4,\"t\":\"entry\"}",
       "{\"seq\":4,\"t\":\"synced\"}"
@@ -2332,18 +2344,26 @@
       {
         "epoch": 0,
         "kind": "input",
+        "segments": [
+          {
+            "text": "one"
+          }
+        ],
         "seq": 1,
         "t": "entry",
-        "taken": true,
-        "text": "one"
+        "taken": true
       },
       {
         "epoch": 0,
         "kind": "input",
         "mode": "steer",
+        "segments": [
+          {
+            "text": "two"
+          }
+        ],
         "seq": 2,
-        "t": "entry",
-        "text": "two"
+        "t": "entry"
       },
       {
         "attempt": 1,
@@ -2605,13 +2625,13 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"epoch\":0,\"kind\":\"input\",\"seq\":1,\"t\":\"entry\",\"taken\":true,\"text\":\"one\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"one\"}],\"seq\":1,\"t\":\"entry\",\"taken\":true}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":2,\"t\":\"entry\",\"text\":\"one\"}",
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"t\":\"draining\"}",
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":2,\"t\":\"entry\",\"text\":\"one\"}",
-      "{\"epoch\":0,\"kind\":\"input\",\"seq\":3,\"t\":\"entry\",\"taken\":true,\"text\":\"two\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"two\"}],\"seq\":3,\"t\":\"entry\",\"taken\":true}",
       "{\"seq\":3,\"t\":\"synced\"}"
     ],
     "hash": "64ada3363c907849",
@@ -2624,10 +2644,14 @@
       {
         "epoch": 0,
         "kind": "input",
+        "segments": [
+          {
+            "text": "one"
+          }
+        ],
         "seq": 1,
         "t": "entry",
-        "taken": true,
-        "text": "one"
+        "taken": true
       },
       {
         "epoch": 0,
@@ -2658,10 +2682,14 @@
       {
         "epoch": 0,
         "kind": "input",
+        "segments": [
+          {
+            "text": "two"
+          }
+        ],
         "seq": 3,
         "t": "entry",
-        "taken": true,
-        "text": "two"
+        "taken": true
       },
       {
         "seq": 3,
@@ -2878,7 +2906,7 @@
       "{\"card\":{\"title\":\"$ echo hi\"},\"epoch\":0,\"input\":{\"command\":\"echo hi\"},\"kind\":\"tool_call\",\"seq\":1,\"t\":\"entry\",\"tool\":\"bash\"}",
       "{\"call\":1,\"card\":{\"body\":\"hi\\n\",\"note\":\"exit 0\",\"title\":\"$ echo hi\"},\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":2,\"t\":\"entry\"}",
       "{\"data\":{\"cwd\":\"/w/src\"},\"epoch\":0,\"ext\":\"shell\",\"kind\":\"ext\",\"seq\":3,\"state\":\"cwd\",\"t\":\"entry\"}",
-      "{\"epoch\":0,\"kind\":\"input\",\"seq\":4,\"t\":\"entry\",\"taken\":true,\"text\":\"/jobs\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"/jobs\"}],\"seq\":4,\"t\":\"entry\",\"taken\":true}",
       "{\"by\":\"user\",\"epoch\":0,\"input\":{\"args\":\"\"},\"kind\":\"tool_call\",\"seq\":5,\"t\":\"entry\",\"tool\":\"jobs\"}",
       "{\"call\":5,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":\"no jobs\",\"status\":\"done\"},\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
@@ -2936,10 +2964,14 @@
       {
         "epoch": 0,
         "kind": "input",
+        "segments": [
+          {
+            "text": "/jobs"
+          }
+        ],
         "seq": 4,
         "t": "entry",
-        "taken": true,
-        "text": "/jobs"
+        "taken": true
       },
       {
         "by": "user",
@@ -3115,7 +3147,7 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"epoch\":0,\"kind\":\"input\",\"seq\":1,\"t\":\"entry\",\"taken\":true,\"text\":\"one\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"one\"}],\"seq\":1,\"t\":\"entry\",\"taken\":true}",
       "{\"epoch\":0,\"kind\":\"model_call\",\"model\":\"m\",\"seq\":2,\"t\":\"entry\"}",
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":2,\"t\":\"delta\",\"text\":\"thinking\"}",
@@ -3134,10 +3166,14 @@
       {
         "epoch": 0,
         "kind": "input",
+        "segments": [
+          {
+            "text": "one"
+          }
+        ],
         "seq": 1,
         "t": "entry",
-        "taken": true,
-        "text": "one"
+        "taken": true
       },
       {
         "epoch": 0,
@@ -3453,7 +3489,7 @@
       "{\"call\":20,\"t\":\"delta\",\"text\":\"ply \"}",
       "{\"call\":20,\"t\":\"delta\",\"text\":\"467\"}",
       "{\"call\":20,\"epoch\":0,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"reply 467\",\"type\":\"text\"}]},\"usage\":{\"input\":3,\"output\":5}},\"status\":\"done\"},\"seq\":21,\"t\":\"entry\"}",
-      "{\"epoch\":0,\"kind\":\"input\",\"mode\":\"steer\",\"seq\":22,\"t\":\"entry\",\"taken\":true,\"text\":\"u47\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"mode\":\"steer\",\"segments\":[{\"text\":\"u47\"}],\"seq\":22,\"t\":\"entry\",\"taken\":true}",
       "{\"epoch\":0,\"kind\":\"from_a_newer_build\",\"seq\":23,\"t\":\"entry\"}",
       "{\"child\":\"00000000-0000-0000-0ceb-9e68e19650bf\",\"epoch\":0,\"input\":\"go\",\"intent\":null,\"kind\":\"link\",\"seq\":24,\"t\":\"entry\"}",
       "{\"child\":\"00000000-0000-0000-0ceb-9e68e19650bf\",\"epoch\":0,\"kind\":\"watch\",\"seq\":25,\"t\":\"entry\"}",
@@ -3796,10 +3832,14 @@
         "epoch": 0,
         "kind": "input",
         "mode": "steer",
+        "segments": [
+          {
+            "text": "u47"
+          }
+        ],
         "seq": 22,
         "t": "entry",
-        "taken": true,
-        "text": "u47"
+        "taken": true
       },
       {
         "epoch": 0,

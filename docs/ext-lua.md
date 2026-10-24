@@ -61,9 +61,11 @@ it needs. Lua tools are exclusive and unsafe to replay after a crash.
 `a.on(point, function(input, cx) ... end)` supports the SDK's wire points:
 `input`, `pre_tool`, `permission`, `approve`, `on_stop`, and `observe`.
 A rewrite returns `{replace = value}`, a block returns `{stop = "reason"}`,
-and `nil` passes. Permission answers are `"allow"`, `"ask"`, `"defer"` or
-`"deny"`; approval answers are booleans. `on_stop` returns continuation text
-or nil. `observe` is read-only; its return is ignored. Handler errors use the
+and `nil` passes. An `input` handler is given typed input as its text, and
+input holding a paste or an attachment as its segments
+(`{{text = "see "}, {paste = "…"}}`); it may replace either with either.
+Permission answers are `"allow"`, `"ask"`, `"defer"` or `"deny"`;
+approval answers are booleans. `on_stop` returns continuation text or nil. `observe` is read-only; its return is ignored. Handler errors use the
 point's declared `ON_ERROR`: for example, an input error refuses that input,
 while an `on_stop` error passes. Hooks cannot await effects.
 

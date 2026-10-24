@@ -367,9 +367,15 @@ struct SideAdmitted {
 }
 
 pub enum Request {
-    Input { text: String, mode: Mode },
+    Input {
+        segments: protocol::Segments,
+        mode: Mode,
+    },
     Interrupt,
-    Answer { call: CallId, value: Json },
+    Answer {
+        call: CallId,
+        value: Json,
+    },
 }
 
 enum Completion {
@@ -433,6 +439,9 @@ enum Msg {
         request: ContextRequest,
     },
 
+    #[cfg(test)]
+    ProjectionCache(bool, oneshot::Sender<[bool; 3]>),
+    Reclaim,
     Stop,
     /// Make what was only written durable, and show it: sent to itself
     /// [`SYNC_LAG`] after a write that was not synced.
@@ -509,7 +518,7 @@ impl Msg {
         }
 
         #[cfg(test)]
-        if matches!(self, Self::Position(_)) {
+        if matches!(self, Self::Position(_) | Self::ProjectionCache(..)) {
             return true;
         }
         matches!(
@@ -752,6 +761,10 @@ impl Live {
             ticket: None,
         };
         self.send(Msg::Step(interrupt));
+    }
+
+    pub(crate) fn reclaim(&self) {
+        self.send(Msg::Reclaim);
     }
 
     pub(crate) fn stop(&self) {
@@ -1399,7 +1412,33 @@ impl Actor {
                 done.send((self.journal.ordered_seq, self.journal.durable_seq));
                 return None;
             }
+            #[cfg(test)]
+            Msg::ProjectionCache(populate, reply) => {
+                if populate {
+                    self.conversation(CallId(
+                        protocol::Seq::new(self.journal.ordered_seq.max(1)).unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                    self.snapshot(self.journal.ordered_seq).await;
+                }
+                reply.send([
+                    self.projection.transcript.is_some(),
+                    self.projection.snapshot.is_some(),
+                    self.projection.view.is_some(),
+                ]);
+                return None;
+            }
             Msg::Sync => return None,
+            Msg::Reclaim => {
+                if !self.live.idle_for().is_zero() && self.live.summary().activity == Activity::Idle
+                {
+                    self.projection.transcript = None;
+                    self.projection.snapshot = None;
+                    self.projection.view = None;
+                }
+                return None;
+            }
             Msg::Stop => {
                 self.phase = Phase::Draining;
                 self.live.session.cancel_all();
@@ -1540,7 +1579,7 @@ impl Actor {
             Msg::Request { reply, .. } => reply.send(Err(why.to_string())),
             #[cfg(test)]
             Msg::Barrier(_) => drop(self.take(msg).await),
-            Msg::Attach(..) | Msg::Stop => drop(self.take(msg).await),
+            Msg::Attach(..) | Msg::Stop | Msg::Reclaim => drop(self.take(msg).await),
             _ => {}
         }
     }
@@ -1557,8 +1596,8 @@ impl Actor {
         self.replies.clients.insert(ticket, reply);
         let ticket = Some(ticket);
         match request {
-            Request::Input { text, mode } => Event::Input {
-                text,
+            Request::Input { segments, mode } => Event::Input {
+                segments,
                 mode,
                 origin,
                 ticket,
@@ -2564,9 +2603,8 @@ const BURST: usize = 64;
 impl Live {
     /// Takes `text` in as a client's input, once committed.
     pub fn submit(&self, text: &str) -> Result<(), String> {
-        let text = text.to_owned();
         let input = Request::Input {
-            text,
+            segments: text.into(),
             mode: Mode::Queue,
         };
         rt::block_on(self.request(input, None))
@@ -2574,6 +2612,12 @@ impl Live {
 
     pub fn ended(&self) -> Flag {
         self.ended.clone()
+    }
+
+    pub(crate) fn projection_cache(&self, populate: bool) -> [bool; 3] {
+        let (reply, result) = oneshot::channel();
+        self.send(Msg::ProjectionCache(populate, reply));
+        rt::block_on(result).unwrap()
     }
 
     /// Returns once the actor has taken every message sent before.
