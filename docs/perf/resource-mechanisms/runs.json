@@ -618,5 +618,21 @@
     "target": "macos-latest",
     "run_id": 40062825847,
     "harness": "8e80fcad3bc033bd7287135cd3fdabdf25d01680"
+  },
+  {
+    "mechanism": "pressure-signal",
+    "branch": "codex-w5rt-pressure-signal",
+    "sha": "b03cb29c668ceba390b53596377daff58171bd14",
+    "target": "ubuntu-latest",
+    "run_id": 40067119239,
+    "harness": "397a37934760df1b4105aa8078bfe7170515af1d"
+  },
+  {
+    "mechanism": "pressure-signal",
+    "branch": "codex-w5rt-pressure-signal",
+    "sha": "b03cb29c668ceba390b53596377daff58171bd14",
+    "target": "ubuntu-24.04-arm",
+    "run_id": 40067121202,
+    "harness": "397a37934760df1b4105aa8078bfe7170515af1d"
   }
 ]

@@ -141,6 +141,13 @@ Windows daemon stopped responding to a resume request. Its daemon log has no
 panic. A separate isolated availability campaign compares full, main, compact
 oneshot and a foreground traced daemon, preserving failures before cleanup.
 The cause is unresolved; it is not attributed to catalog admission.
+The [availability campaign](resource-mechanisms/availability-observations.json)
+reproduces the same timeout on main after 6,126 resume attempts, and on full,
+traced-full and compact builds. All four answer a later probe. This establishes
+that the failure pre-exists O15, not that its frequency is unchanged. A separate
+campaign exercises the displaced-waker fix. The initial diagnostic's copy of a
+held endpoint claim file fails with WinError 32; collected phase records and
+stacks survive. The later probe records copy errors without losing its summary.
 
 Run 40052186159 failed in the catalog-off Windows ARM benchmark after five
 pairs. Hyperfine did not expose the benchmark's failure output, so its cause is

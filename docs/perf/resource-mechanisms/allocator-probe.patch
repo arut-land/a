@@ -1,0 +1,171 @@
+diff --git a/.github/workflows/o15-cache.yml b/.github/workflows/o15-cache.yml
+new file mode 100644
+index 00000000..bb5c4a51
+--- /dev/null
++++ b/.github/workflows/o15-cache.yml
+@@ -0,0 +1,46 @@
++name: o15 cache benefit
++on:
++  push:
++    branches: [codex-w5rt-cache-probe]
++    paths: [.github/workflows/o15-cache.yml]
++permissions:
++  contents: read
++jobs:
++  cache:
++    strategy:
++      fail-fast: false
++      matrix:
++        os: [macos-latest, macos-15-intel, macos-15]
++    runs-on: ${{ matrix.os }}
++    timeout-minutes: 90
++    env:
++      CARGO_BUILD_JOBS: 4
++      MISE_AUTO_INSTALL: false
++      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
++    steps:
++      - uses: actions/checkout@v7
++      - uses: actions/setup-python@v6
++        with:
++          python-version: '3.13'
++      - run: python -m pip install psutil==7.2.2
++      - uses: jdx/mise-action@v5
++        with:
++          install_args: rust
++      - uses: Swatinem/rust-cache@v2
++        with:
++          cache-all-crates: true
++      - name: Measure allocator live bytes and native pressure relief
++        shell: bash
++        run: |
++          uname -a
++          sw_vers
++          sysctl hw.pagesize
++          rustup component add rust-src
++          export A_PERF_PYTHON="$(command -v python)"
++          export A_PERF_PROCESS="$PWD/scripts/perf/process.py"
++          "$(rustup which cargo)" test --release -Zbuild-std=std,panic_unwind -Zbuild-std-features=panic-unwind,optimize_for_size -p engine --lib pressure_cache_release_measurement -- --ignored --nocapture 2>&1 | tee cache-benefit.log
++      - uses: actions/upload-artifact@v5
++        if: always()
++        with:
++          name: cache-benefit-${{ matrix.os }}
++          path: cache-benefit.log
+diff --git a/crates/engine/src/driver/tests.rs b/crates/engine/src/driver/tests.rs
+index 5efbacad..f919b07c 100644
+--- a/crates/engine/src/driver/tests.rs
++++ b/crates/engine/src/driver/tests.rs
+@@ -2837,3 +2837,52 @@ fn environment_bursts_retain_one_payload_and_one_mailbox_marker() {
+     drop(fixture);
+     std::fs::remove_file(home).unwrap();
+ }
++
++#[test]
++#[ignore = "a hosted memory measurement"]
++fn pressure_cache_release_measurement() {
++    fn rss() -> u64 {
++        let out = std::process::Command::new(std::env::var("A_PERF_PYTHON").unwrap())
++            .args([
++                &std::env::var("A_PERF_PROCESS").unwrap(),
++                &std::process::id().to_string(),
++                "rss",
++            ])
++            .output()
++            .unwrap();
++        assert!(out.status.success());
++        String::from_utf8(out.stdout)
++            .unwrap()
++            .trim()
++            .parse()
++            .unwrap()
++    }
++    let fixture = Fixture::new(ext::LOOP, Registry::default(), openai(&Script::new(&[])));
++    let entries: Vec<_> = (1..=1024)
++        .map(|seq| entry(seq, echo(&"cached projection ".repeat(2048))))
++        .collect();
++    let session = fixture.start(&entries);
++    drop(entries);
++    for round in 0..5 {
++        let baseline = rss();
++        let baseline_heap = sys::pressure_probe_stats();
++        assert_eq!(session.projection_cache(true), [true; 3]);
++        let cached = rss();
++        let cached_heap = sys::pressure_probe_stats();
++        session.reclaim();
++        assert_eq!(session.projection_cache(false), [false; 3]);
++        let reclaimed = rss();
++        let reclaimed_heap = sys::pressure_probe_stats();
++        std::thread::sleep(Duration::from_secs(1));
++        let delayed = rss();
++        let started = Instant::now();
++        let relief_bytes = sys::pressure_probe_relief();
++        let relief_us = started.elapsed().as_micros();
++        let relieved = rss();
++        let relieved_heap = sys::pressure_probe_stats();
++        eprintln!(
++            "RESOURCE_CACHE {{\"round\":{round},\"baseline_kib\":{baseline},\"cached_kib\":{cached},\"reclaimed_kib\":{reclaimed},\"delayed_kib\":{delayed},\"baseline_heap\":{baseline_heap:?},\"cached_heap\":{cached_heap:?},\"reclaimed_heap\":{reclaimed_heap:?},\"relieved_heap\":{relieved_heap:?},\"relieved_kib\":{relieved},\"relief_bytes\":{relief_bytes},\"relief_us\":{relief_us}}}"
++        );
++    }
++    session.halt();
++}
+diff --git a/crates/sys/src/lib.rs b/crates/sys/src/lib.rs
+index 47092db1..023866f6 100644
+--- a/crates/sys/src/lib.rs
++++ b/crates/sys/src/lib.rs
+@@ -43,7 +43,7 @@ pub use desktop::open_browser;
+ pub use endpoint::{Endpoint, EndpointRetirement, Listener, OwnedConnection, Stream};
+ pub use fs::{read_exact_at, sync_data, write_watch};
+ pub use login::login_env;
+-pub use memory::small_footprint;
++pub use memory::{pressure_probe_relief, pressure_probe_stats, small_footprint};
+ pub use platform::{Arch, Os, Platform};
+ pub use proc::{
+     AdoptLockError, Child, ContainedChild, DaemonLock, ExitWatch, InheritedNumber, OutputCapture,
+diff --git a/crates/sys/src/memory.rs b/crates/sys/src/memory.rs
+index 47151073..ef0449e7 100644
+--- a/crates/sys/src/memory.rs
++++ b/crates/sys/src/memory.rs
+@@ -11,3 +11,44 @@ pub fn small_footprint() {
+         unsafe { libc::mallopt(libc::M_ARENA_MAX, 2) };
+     }
+ }
++
++pub fn pressure_probe_stats() -> [usize; 4] {
++    #[cfg(target_os = "macos")]
++    {
++        #[repr(C)]
++        #[derive(Default)]
++        struct Stats {
++            blocks: u32,
++            used: usize,
++            peak: usize,
++            allocated: usize,
++        }
++        unsafe extern "C" {
++            fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut Stats);
++        }
++        let mut stats = Stats::default();
++        // SAFETY: null selects all zones; stats has malloc_statistics_t's layout.
++        unsafe { malloc_zone_statistics(std::ptr::null_mut(), &raw mut stats) };
++        [
++            stats.blocks as usize,
++            stats.used,
++            stats.peak,
++            stats.allocated,
++        ]
++    }
++    #[cfg(not(target_os = "macos"))]
++    [0; 4]
++}
++
++pub fn pressure_probe_relief() -> usize {
++    #[cfg(target_os = "macos")]
++    {
++        unsafe extern "C" {
++            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
++        }
++        // SAFETY: null selects all process-owned zones; zero requests maximal relief.
++        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) }
++    }
++    #[cfg(not(target_os = "macos"))]
++    0
++}
