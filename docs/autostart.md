@@ -12,7 +12,8 @@ register: they always start on first use.
 
 The registration is the only state, and it belongs to the OS: present means
 on. A daemon that has served for two seconds asks for it on a blocking
-worker, off every reply's path. If autostart is on, it rewrites an outdated
+worker, off every reply's path, and idleness does not end it before the
+answer. If autostart is on, it rewrites an outdated
 registration (a new executable path or native layout) and from then on stays
 up instead of exiting when idle, waking for nothing while idle. A daemon
 started without autostart, or before it was turned on, keeps the idle exit;
@@ -23,8 +24,8 @@ restart it.
 
 The login entry is `a __daemon --login`. It takes `start.lock` like a
 self-spawning client, so a client starting at the same moment either waits
-and connects to it or wins and makes it exit quietly. It binds and serves in
-the foreground the service manager tracks, and owns the same exclusive home
+and connects to it or wins and makes it exit quietly. Under a service manager
+(Linux, macOS) it binds and serves in the foreground the manager tracks, and owns the same exclusive home
 claim and peer-verified endpoint as any daemon. On Unix, an entry point older
 than the build the install selects (the app's bundled helper) re-execs that
 build in the same PID before serving, so the first client never has to drain
@@ -71,6 +72,7 @@ off; the daemon is resident only while Explorer's `StartupApproved` record
 allows it. A logon-triggered scheduled task was the alternative: it needs
 COM registration, does not appear in that list, and runs without a window
 only under a stored-credential or batch logon that standard users lack. The
-value runs the daemon under `conhost.exe --headless`, because a console
-program started at logon otherwise opens a console window (a Terminal tab on
-Windows 11).
+value runs `a __daemon --login` under `conhost.exe --headless`, because a
+console program started at logon otherwise opens a console window (a
+Terminal tab on Windows 11). That host ends with its process, so the entry
+starts a detached daemon exactly as a client does and exits.

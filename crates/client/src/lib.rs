@@ -926,6 +926,12 @@ pub fn bind_at_login(home: &Home) -> io::Result<Option<sys::Listener>> {
     }
 }
 
+/// A login entry whose host does not outlive it: start a detached daemon
+/// as any client does, unless one serves.
+pub fn spawn_at_login(home: &Home) -> io::Result<()> {
+    connect_or_spawn(home, false).map(drop)
+}
+
 /// Zero-lag start: when no daemon is listening, take the daemon lock, bind
 /// the socket here, hand both to a detached daemon running
 /// `runtime/current`, and connect straight into its backlog. The lock goes

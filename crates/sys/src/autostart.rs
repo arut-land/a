@@ -18,6 +18,18 @@ mod native;
 #[path = "autostart/windows.rs"]
 mod native;
 
+/// How the login entry brings a daemon up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Login {
+    /// Serves in the foreground the service manager tracks.
+    Serve,
+    /// Starts a detached daemon as a client does, and exits: the entry's
+    /// host does not outlive the process it started.
+    Spawn,
+}
+
+pub const LOGIN: Login = native::LOGIN;
+
 fn native_home(home: &Home) -> io::Result<()> {
     if home.layout() != &InstallLayout::Native {
         return Err(io::Error::new(

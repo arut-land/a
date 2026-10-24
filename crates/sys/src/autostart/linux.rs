@@ -2,6 +2,8 @@ use super::{Command, Home, io, run, update};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+pub(super) const LOGIN: super::Login = super::Login::Serve;
+
 fn name(home: &Home) -> String {
     format!(
         "a-daemon-{:016x}.service",

@@ -623,6 +623,9 @@ fn serve(
     }
     if login {
         sys::autostart::enter(home, &daemon.staged.id)?;
+        if sys::autostart::LOGIN == sys::autostart::Login::Spawn {
+            return client::spawn_at_login(home);
+        }
     }
     sys::crash::install(home.crash_dir(), sys::crash::Build::of(&daemon.staged.id));
     if detached || listen_fd.is_some() {

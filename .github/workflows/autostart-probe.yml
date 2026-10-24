@@ -28,6 +28,9 @@ jobs:
         uses: jdx/mise-action@v5
         with:
           install_args: mold
+      - if: runner.os == 'Linux'
+        name: Use native Cargo without the optional mise wrapper
+        run: echo "$(dirname "$(rustup which cargo)")" >> "$GITHUB_PATH"
       - if: runner.os == 'Windows'
         name: Install native toolchain
         shell: pwsh

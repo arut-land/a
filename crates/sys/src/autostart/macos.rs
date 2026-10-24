@@ -1,6 +1,8 @@
 use super::{Command, Home, io, run, update};
 use std::path::PathBuf;
 
+pub(super) const LOGIN: super::Login = super::Login::Serve;
+
 /// The installed app's bundled agent, registered through `SMAppService`.
 const APP_LABEL: &str = "dev.a.daemon";
 

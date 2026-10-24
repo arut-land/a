@@ -12,6 +12,8 @@ use windows_sys::Win32::System::Registry::{
     RegSetKeyValueW,
 };
 
+pub(super) const LOGIN: super::Login = super::Login::Spawn;
+
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const APPROVED: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 const NOT_FOUND: u32 = windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
@@ -45,7 +47,8 @@ fn system_dir() -> io::Result<PathBuf> {
 }
 
 /// A console program started at logon gets a console window (a Terminal
-/// tab on Windows 11); a headless console host gives it none.
+/// tab on Windows 11); a headless console host gives it none, and the entry
+/// leaves a detached daemon behind it ([`super::Login::Spawn`]).
 fn command(home: &Home) -> io::Result<String> {
     let host = system_dir()?.join("conhost.exe");
     let exe = home.runtime().current_exe();
