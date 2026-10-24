@@ -199,3 +199,13 @@ pub fn takes_mid_conversation_system(model: &str) -> bool {
 pub fn binds_context(model: &str) -> bool {
     claude_spelled(model).is_some_and(|claude| claude.binds_context)
 }
+
+/// Whether `model`, however spelled, streams a summary of its thinking
+/// rather than the thinking itself: every Claude since Claude 4.
+pub fn summarizes_thinking(model: &str) -> bool {
+    let name = super::name(model);
+    let name = name
+        .rsplit_once("anthropic.")
+        .map_or(name, |(_, rest)| rest);
+    name.starts_with("claude") && !name.starts_with("claude-3")
+}

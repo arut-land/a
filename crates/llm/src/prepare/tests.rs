@@ -176,11 +176,39 @@ fn unanswered_calls_get_error_results_and_stray_results_go() {
 }
 
 #[test]
-fn a_foreign_turn_that_was_only_reasoning_disappears() {
+fn foreign_reasoning_stays_as_context_naming_its_source_without_its_state() {
     let out = run(vec![
         Message::user("hi"),
         Message::Assistant(Assistant {
-            content: vec![thinking()],
+            content: vec![thinking(), AssistantPart::Text(Text::new("yo"))],
+            origin: Some(origin("other")),
+        }),
+    ]);
+    let Message::Assistant(assistant) = &out[1] else {
+        panic!()
+    };
+    let [AssistantPart::Text(reasoning), AssistantPart::Text(answer)] = &assistant.content[..]
+    else {
+        panic!("{:?}", assistant.content)
+    };
+    assert_eq!(
+        reasoning.text,
+        "<reasoning source=\"p/other\">\nhmm\n</reasoning>"
+    );
+    assert!(reasoning.meta.is_empty());
+    assert_eq!(answer.text, "yo");
+}
+
+#[test]
+fn a_foreign_turn_that_was_only_redacted_reasoning_disappears() {
+    let mut redacted = thinking();
+    if let AssistantPart::Reasoning(reasoning) = &mut redacted {
+        reasoning.redacted = true;
+    }
+    let out = run(vec![
+        Message::user("hi"),
+        Message::Assistant(Assistant {
+            content: vec![redacted],
             origin: Some(origin("other")),
         }),
     ]);

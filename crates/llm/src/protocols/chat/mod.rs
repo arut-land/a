@@ -17,13 +17,47 @@ use super::schema::{legal_call_id, short_hash};
 use crate::error::Error;
 use crate::models::Maker;
 use crate::protocol::{Decoder, Encoded, Host, Hosted, Protocol, Target};
-use crate::spec::{ProtocolKey, Reason, Request};
+use crate::spec::{ProtocolKey, Reason, Reasoning, Request};
+use crate::tag::Thought;
 
 /// Which protocol this is.
 pub const PROTOCOL: ProtocolKey = ProtocolKey::OpenaiChat;
 
 /// Where this protocol's options and part state go.
 pub const KEY: &str = PROTOCOL.as_str();
+
+/// What another model is shown of this protocol's reasoning: the
+/// reasoning fields hosts stream (`reasoning_content`, `reasoning`) are
+/// raw reasoning, unless the part's `reasoning_details` hold only summaries
+/// (`reasoning.summary`, as `OpenRouter` relays them for models that keep
+/// their reasoning to themselves). Encrypted details are shown to no one.
+pub(crate) fn foreign(reasoning: &Reasoning) -> Option<Thought<'_>> {
+    if reasoning.redacted {
+        return None;
+    }
+    let item = crate::replay::item(&reasoning.meta, KEY);
+    let details = item
+        .as_ref()
+        .and_then(|item| item.get(merge::REASONING_DETAILS))
+        .and_then(Value::as_array)
+        .map(|details| {
+            details
+                .iter()
+                .filter_map(|detail| detail.get("type")?.as_str())
+        });
+    let summarized = details.is_some_and(|mut kinds| {
+        let mut any = false;
+        kinds.all(|kind| {
+            any |= kind == "reasoning.summary";
+            kind != "reasoning.text"
+        }) && any
+    });
+    if summarized {
+        Thought::summary(&reasoning.text)
+    } else {
+        Thought::raw(&reasoning.text)
+    }
+}
 
 /// How a host addresses a model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -15,7 +15,8 @@ everything around them is our own and small.
 | JSON | `json.rs` | Lenient reads of what providers send, the borrowing frame reader every decoder shares (`json/read.rs`), and tool arguments parsed so a cut-off call never fails a reply. |
 | Models | `models/` | What model ids say: reasoning (levels, budgets, whether it turns off), sampling, vision and output limits, as id rules and const tables, one module per vendor. Protocols ask here and keep only how their wire spells an option. |
 | Replay | `replay.rs` | How an encoder sends back a part its own protocol produced: the provider item verbatim while the part is unchanged (fingerprint), its identity when edited, rebuilt otherwise. |
-| Prepare | `prepare.rs` | Runs before every encode: turns from another protocol, provider or model lose reasoning, opaque items and state; foreign tool ids are fitted; unanswered calls get error results. |
+| Prepare | `prepare.rs` | Runs before every encode: turns from another protocol, provider or model lose opaque items and state, and keep their readable reasoning as tagged context naming its source; foreign tool ids are fitted; unanswered calls get error results. |
+| Tags | `tag.rs` | Model-facing markers (`Tag`, one renderer) and their vocabulary: pastes, steers, inbox messages, background results, another model's reasoning. Attribute values are escaped; bodies go in verbatim. |
 | Client | `client.rs` | `stream` joins a provider, a protocol and an `Http` into a stream of events that ends with exactly one `Finish` or one error. `generate` accumulates it. No retries: `Error::is_retryable` says whether to. |
 | HTTP | `http.rs`, `ureq.rs` | `Http` sends one request and returns status, headers and a body stream. `Ureq` (feature `ureq`) runs ureq on the `rt` runtime's blocking pool. |
 | Hosts | `hosts.rs` | `host:model` specs (`openrouter:anthropic/claude-sonnet-5`, `openai@chat:gpt-4.1`) to a configured provider, over every `Hosted` protocol's table. |
@@ -60,8 +61,20 @@ copy. A fact about a model goes in `models/`.
   rejects one (sent as `auto`).
 - Reasoning streams by default: Responses asks for `summary: "auto"` and
   Gemini for `includeThoughts`.
-- Readable reasoning from another model is dropped, not sent as text: a
-  model would take it for its own answer.
+- Readable reasoning from another model is kept, as tagged context where
+  it was in that turn: `<reasoning-summary source="anthropic/claude-…">`
+  for a summary the provider wrote, `<reasoning source="…">` for raw
+  reasoning. The tag names the source so the model does not take it for
+  its own answer. Which kind a part is belongs to its producer: each
+  protocol module has a `foreign` conversion (Claude 4 and later, Gemini
+  thoughts and Responses summaries are summaries; Chat reasoning fields,
+  Responses `reasoning_text` and Claude 3.7 or other models over the
+  Messages wire are raw), and the target's prepare pass calls the
+  source's. Encrypted and redacted reasoning is dropped, with its ids and
+  signatures: they mean nothing to another model. The same protocol,
+  provider and model still get their own items back verbatim, encrypted
+  ones included. `tests/encode.rs` checks this against every recorded
+  reply that reasons.
 - Replayed items drop `null` fields, and replayed Anthropic thinking, text and
   `tool_use` blocks keep only their input fields: strict input validators
   reject what a stream added (a reasoning item's `status: null`, Vertex's
