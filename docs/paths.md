@@ -21,7 +21,8 @@ folders. Resolution opens the shell-folders and COM Windows API contracts throug
 COM allocation, then releases both library references. There are no static
 Shell32 or COM imports for path resolution; isolated `A_HOME` resolution does not
 open either contract. A fresh-process invariant checks that native resolution
-retains neither Shell32, Ole32 nor Combase. Configuration contains provider keys and machine-specific tool paths,
+retains neither Shell32, Ole32 nor Combase. Configuration contains provider keys
+and machine-specific tool paths,
 so it stays local alongside state, builds, caches and diagnostics. RoamingAppData
 is reserved for explicitly portable, secret-free preferences; there are no such
 preferences in this layout. macOS obtains its
@@ -68,3 +69,6 @@ Executable staging remains `data/runtime` and retains its existing publication
 behavior. Installer-owned executable identity and avoiding routine staging are
 a separate change; the data-directory seam supplies its location. A read-only
 or `noexec` data directory can still prevent staging until that change lands.
+
+[Directory resolution measurements](perf/paths.md) include native module lists,
+first-lookup profiles, paired performance measurements and dependency cost.
