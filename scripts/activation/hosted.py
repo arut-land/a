@@ -59,6 +59,7 @@ try:
                     if time.monotonic() >= deadline:
                         raise AssertionError("activation did not publish discovery")
                     time.sleep(.05)
+                command("ls")
                 command("daemon", "stop")
             samples["activation_ms" if managed else "self_spawn_ms"].append(connect())
             pid = int((run_dir / "daemon.pid").read_text().splitlines()[0])
@@ -68,9 +69,13 @@ try:
                 if time.monotonic() >= deadline:
                     raise AssertionError(f"daemon {pid} failed to exit idle")
                 time.sleep(.05)
+            assert "not running" in command("daemon", "status").stdout
+            assert not (run_dir / "daemon.pid").read_text().strip()
             if managed:
-                assert (run_dir / "daemon.endpoint").exists()
+                socket = Path(os.fsdecode((run_dir / "daemon.endpoint").read_bytes()))
+                identity = socket.stat().st_ino
                 connect()  # same manager socket reactivates a fresh daemon
+                assert socket.stat().st_ino == identity
                 command("daemon", "stop")
                 command("daemon", "uninstall-activation")
     result = {"platform": platform.platform(), "binary_bytes": binary.stat().st_size, "samples": samples,

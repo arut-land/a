@@ -67,8 +67,8 @@ impl<'a> Installation<'a> {
     }
 
     /// `app` prepares registration by the installed app's SMAppService UI.
-    pub fn install(&self, app: bool) -> io::Result<()> {
-        native::install(self.home, app)
+    pub fn install(&self, app: bool, stop: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        native::install(self.home, app, stop)
     }
 
     pub fn uninstall(&self, app: bool) -> io::Result<()> {

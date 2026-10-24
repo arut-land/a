@@ -25,7 +25,11 @@ fn xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-pub(super) fn install(home: &Home, app: bool) -> io::Result<()> {
+pub(super) fn install(
+    home: &Home,
+    app: bool,
+    stop: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
     if installed(home)? {
         if app && std::fs::read_to_string(record(home))? == "app" {
             return Ok(());
@@ -36,6 +40,7 @@ pub(super) fn install(home: &Home, app: bool) -> io::Result<()> {
         ));
     }
     if app {
+        stop()?;
         return prepare(home, "app");
     }
     let path = plist()?;
@@ -68,6 +73,7 @@ pub(super) fn install(home: &Home, app: bool) -> io::Result<()> {
             .ok_or(io::ErrorKind::InvalidInput)?)
     );
     std::fs::create_dir_all(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+    stop()?;
     crate::fs::write_private(&path, value.as_bytes())?;
     prepare(home, "launchd")?;
     let result = run(Command::new("launchctl")

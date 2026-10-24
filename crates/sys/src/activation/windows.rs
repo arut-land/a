@@ -9,7 +9,7 @@ fn unsupported() -> io::Error {
     )
 }
 
-pub(super) fn install(_: &Home, _: bool) -> io::Result<()> {
+pub(super) fn install(_: &Home, _: bool, _: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
     Err(unsupported())
 }
 pub(super) fn uninstall(_: &Home, _: bool) -> io::Result<()> {

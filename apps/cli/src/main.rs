@@ -160,10 +160,7 @@ fn daemon_cmd(daemon: &client::Daemon, action: Daemon) -> io::Result<()> {
     match action {
         Daemon::InstallActivation { app } => {
             let installation = sys::activation::Installation::claim(home)?;
-            if home.layout() == &sys::InstallLayout::Native && !sys::activation::installed(home)? {
-                client::stop(home)?;
-            }
-            installation.install(app)?;
+            installation.install(app, || client::stop(home).map(drop))?;
             sayln!("native activation installed");
         }
         Daemon::UninstallActivation { app } => {

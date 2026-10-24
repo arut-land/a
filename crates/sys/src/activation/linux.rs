@@ -69,7 +69,11 @@ fn service(home: &Home) -> io::Result<String> {
     ))
 }
 
-pub(super) fn install(home: &Home, app: bool) -> io::Result<()> {
+pub(super) fn install(
+    home: &Home,
+    app: bool,
+    stop: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
     if app {
         return Err(io::ErrorKind::Unsupported.into());
     }
@@ -103,6 +107,7 @@ pub(super) fn install(home: &Home, app: bool) -> io::Result<()> {
             ));
         }
     }
+    stop()?;
     crate::fs::write_private(&dir.join(SOCKET), socket.as_bytes())?;
     crate::fs::write_private(&dir.join(SERVICE), service.as_bytes())?;
     prepare(home, "systemd")?;
