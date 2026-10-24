@@ -60,23 +60,50 @@ pub use workspace::{GitEnv, workspace_in, workspace_of};
 #[derive(Clone, Debug)]
 pub struct Home {
     root: PathBuf,
+    isolated: bool,
 }
 
 impl From<PathBuf> for Home {
     fn from(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            isolated: true,
+        }
     }
 }
 
 impl Home {
     pub fn from_env() -> io::Result<Self> {
-        let root = match std::env::var_os("A_HOME") {
-            Some(dir) => PathBuf::from(dir),
-            None => std::env::home_dir()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?
-                .join(".a"),
-        };
-        Ok(root.into())
+        match std::env::var_os("A_HOME") {
+            Some(dir) => Ok(PathBuf::from(dir).into()),
+            None => Ok(Self {
+                root: std::env::home_dir()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?
+                    .join(".a"),
+                isolated: false,
+            }),
+        }
+    }
+
+    /// Explicit homes keep diagnostics local, including homes supplied by an embedder.
+    pub fn is_isolated(&self) -> bool {
+        self.isolated
+    }
+
+    /// Preserve isolation across the daemon's cleared environment without turning
+    /// a default per-user home into an explicit override.
+    pub fn daemon_env(&self, command: &mut std::process::Command) {
+        if self.isolated {
+            command.env("A_HOME", &self.root);
+        } else {
+            command.env_remove("A_HOME");
+            if let Some(user_home) = self.root.parent() {
+                #[cfg(unix)]
+                command.env("HOME", user_home);
+                #[cfg(windows)]
+                command.env("USERPROFILE", user_home);
+            }
+        }
     }
 
     /// `$A_HOME`, else `~/.a`.

@@ -9,6 +9,8 @@
 //! daemon that died without exiting: killed, aborted, or crashed by a
 //! signal. A panic hook also writes the reason, when there is one.
 
+mod image;
+
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -294,7 +296,7 @@ pub fn install(dir: PathBuf, build: Build) {
 }
 
 /// Even an adversarial panic cannot enlarge a report or add text fields.
-pub const MAX_REPORT: usize = 16 << 10;
+pub const MAX_REPORT: usize = 32 << 10;
 const DEEP: usize = 128;
 
 #[derive(Serialize)]
@@ -315,6 +317,7 @@ struct Callsite {
 struct Frame {
     image: u64,
     offset: u64,
+    identity: Option<image::Identity>,
 }
 
 struct Frames {
@@ -362,16 +365,32 @@ fn describe(info: &PanicHookInfo<'_>, build: Build) -> Report {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn stack() -> Frames {
-    Frames::default()
+    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+    let mut ips = [std::ptr::null_mut(); DEEP];
+    // SAFETY: ips has room for exactly DEEP addresses; no symbolization or DbgHelp state.
+    let len = unsafe {
+        RtlCaptureStackBackTrace(
+            0,
+            u32::try_from(DEEP).expect("frame cap fits u32"),
+            ips.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    } as usize;
+    let mut frames = Frames::default();
+    for ip in &ips[..len] {
+        frames.frames[frames.len] = image::frame(*ip);
+        frames.len += 1;
+    }
+    frames
 }
 
 // No symbolization: only numeric image fingerprints and offsets cross the
 // report boundary, even in debug builds. Build debug info resolves them offline.
 #[cfg(unix)]
 fn stack() -> Frames {
-    use std::ffi::{CStr, c_int, c_void};
+    use std::ffi::{c_int, c_void};
     unsafe extern "C" {
         fn _Unwind_Backtrace(
             frame: extern "C" fn(*mut c_void, *mut c_void) -> c_int,
@@ -384,21 +403,7 @@ fn stack() -> Frames {
         let frames = unsafe { &mut *frames.cast::<Frames>() };
         // SAFETY: cx is the unwinder's current frame context.
         let ip = unsafe { _Unwind_GetIP(cx) };
-        let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
-        // SAFETY: dladdr reads the address and fills the output buffer.
-        let found = unsafe { libc::dladdr(ip as *const c_void, info.as_mut_ptr()) } != 0;
-        // SAFETY: zeroed first, then filled by dladdr.
-        let info = unsafe { info.assume_init() };
-        let image = if found && !info.dli_fname.is_null() {
-            // SAFETY: the loader owns this NUL-terminated name for this call.
-            crate::fnv1a(unsafe { CStr::from_ptr(info.dli_fname) }.to_bytes())
-        } else {
-            0
-        };
-        frames.frames[frames.len] = Frame {
-            image,
-            offset: ip.saturating_sub(info.dli_fbase as usize) as u64,
-        };
+        frames.frames[frames.len] = image::frame(ip);
         frames.len += 1;
         if frames.len < DEEP { 0 } else { 5 }
     }
@@ -741,6 +746,7 @@ mod tests {
                 frames: [Frame {
                     image: u64::MAX,
                     offset: u64::MAX,
+                    identity: Some(image::Identity::ElfBuildId(image::Hex::maximal())),
                 }; DEEP],
                 len: DEEP,
             },
@@ -792,7 +798,12 @@ mod tests {
         assert!(value["build"]["fingerprint"].is_null());
         assert!(value["callsite"]["file"].is_u64());
         assert!(value["callsite"]["line"].is_u64());
-        for frame in value["frames"].as_array().unwrap() {
+        let frames = value["frames"].as_array().unwrap();
+        assert!(
+            frames.iter().any(|frame| !frame["identity"].is_null()),
+            "no native image identity: {report}"
+        );
+        for frame in frames {
             assert!(frame["image"].is_u64() && frame["offset"].is_u64());
         }
     }

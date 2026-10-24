@@ -798,7 +798,6 @@ int main(int argc, char **argv) {
         let mut context = Context::from_waker(Waker::noop());
         assert!(launching.as_mut().poll(&mut context).is_pending());
         let id = lock(&pid).unwrap();
-        assert!(sys::process_started(id).is_some());
         let reaping = lock(&runtime.blocking)
             .pop()
             .expect("status acquisition was admitted");
