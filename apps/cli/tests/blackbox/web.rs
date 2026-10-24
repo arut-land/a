@@ -587,9 +587,7 @@ fn a_web_fork_switches_to_the_new_conversation_without_rewinding_files() {
     let (_, history) = env
         .connect()
         .attach(protocol::Target::Prefix(source), &env.ws);
-    assert!(
-        !history
-            .iter()
-            .any(|e| matches!(&e.body, protocol::Body::Input { text, .. } if text == "after fork"))
-    );
+    assert!(!history.iter().any(
+        |e| matches!(&e.body, protocol::Body::Input { segments: text, .. } if text == "after fork")
+    ));
 }

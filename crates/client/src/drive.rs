@@ -933,7 +933,7 @@ mod tests {
 
     fn large_input() -> ClientMsg {
         ClientMsg::Input {
-            text: "x".repeat(8 << 20),
+            segments: "x".repeat(8 << 20).into(),
             client_seq: Some(1),
             mode: protocol::Mode::default(),
             force: false,
@@ -1024,7 +1024,7 @@ mod tests {
         for seq in 1..MUTATION_SLOTS {
             queue
                 .send(Request::Io(Box::new(Io::Send(ClientMsg::Input {
-                    text: seq.to_string(),
+                    segments: seq.to_string().into(),
                     mode: protocol::Mode::default(),
                     client_seq: Some(seq as u64),
                     force: false,

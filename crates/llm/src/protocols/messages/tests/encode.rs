@@ -693,7 +693,7 @@ fn violations(body: &Value) -> Vec<String> {
 /// folds them into the prompt.
 #[test]
 fn adversarial_histories_encode_to_requests_anthropic_takes() {
-    let other = Some(crate::Origin {
+    let other = Some(Origin {
         protocol: ProtocolKey::OpenaiChat,
         provider: "openai".into(),
         model: "gpt-4.1".into(),

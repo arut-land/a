@@ -365,7 +365,7 @@ struct SideAdmitted {
 
 pub enum Request {
     Input {
-        text: String,
+        segments: protocol::Segments,
         mode: Mode,
         force: bool,
     },
@@ -1602,8 +1602,12 @@ impl Actor {
         self.replies.clients.insert(ticket, reply);
         let ticket = Some(ticket);
         match request {
-            Request::Input { text, mode, force } => Event::Input {
-                text,
+            Request::Input {
+                segments,
+                mode,
+                force,
+            } => Event::Input {
+                segments,
                 mode,
                 force,
                 origin,
@@ -2639,9 +2643,8 @@ const BURST: usize = 64;
 impl Live {
     /// Takes `text` in as a client's input, once committed.
     pub fn submit(&self, text: &str) -> Result<(), String> {
-        let text = text.to_owned();
         let input = Request::Input {
-            text,
+            segments: text.into(),
             mode: Mode::Queue,
             force: false,
         };

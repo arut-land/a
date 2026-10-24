@@ -157,12 +157,12 @@ impl Core {
                 fx.immediate.push(Work::Invocation { ticket, result });
             }
             Event::Input {
-                text,
+                segments,
                 mode,
                 force,
                 origin,
                 ticket,
-            } => self.input(text, mode, force, origin, ticket, &mut fx),
+            } => self.input(segments, mode, force, origin, ticket, &mut fx),
             Event::Withdraw {
                 input,
                 origin,
@@ -446,7 +446,7 @@ impl Core {
 
     fn input(
         &mut self,
-        text: String,
+        segments: protocol::Segments,
         mode: Mode,
         force: bool,
         origin: Option<Author>,
@@ -469,9 +469,9 @@ impl Core {
             && self.fold.asked.is_empty()
             && self.fold.ledger.untaken().is_empty();
         let Chained {
-            value: text,
+            value: segments,
             decisions,
-        } = match self.registry.input(text) {
+        } = match self.registry.input(segments) {
             Ok(chained) => chained,
             Err(why) => return reply(fx, ticket, Err(why)),
         };
@@ -482,7 +482,7 @@ impl Core {
         self.append(
             fx,
             Body::Input {
-                text,
+                segments,
                 mode,
                 taken,
                 origin,
@@ -1880,7 +1880,7 @@ impl Core {
                 });
                 continue;
             }
-            let stream = Json::encode(&OutputStream { call: d.call }).unwrap_or_default();
+            let stream = OutputStream { call: d.call };
             let output = format!(
                 "[the daemon stopped while this call ran in the background: it may not have \
                  completed; its output so far is in {stream}]"

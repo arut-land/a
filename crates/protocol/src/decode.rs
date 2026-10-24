@@ -255,6 +255,7 @@ macro_rules! same {
 
 same!(
     crate::Invocation,
+    crate::Segments,
     crate::Envelope,
     crate::EnvelopeId,
     crate::InboxRefusal,
@@ -303,6 +304,7 @@ macro_rules! parsed {
 
 parsed!(
     ForkError,
+    crate::Segments,
     Rejection,
     String,
     u32,
@@ -428,6 +430,7 @@ pub(crate) struct EntryFields {
     pub(crate) execution: Option<Json>,
     pub(crate) kind: Option<Tag>,
     pub(crate) text: Option<String>,
+    pub(crate) segments: Option<crate::Segments>,
     pub(crate) mode: Option<Mode>,
     pub(crate) taken: Option<bool>,
     pub(crate) tool: Option<String>,
@@ -489,6 +492,7 @@ pub(crate) struct MsgFields {
     pub(crate) seq: Option<u64>,
     pub(crate) call: Option<u64>,
     pub(crate) text: Option<String>,
+    pub(crate) segments: Option<crate::Segments>,
     pub(crate) attempt: Option<u16>,
     pub(crate) proto: Option<u32>,
     pub(crate) build: Option<String>,

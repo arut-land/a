@@ -24,7 +24,7 @@ fn call(n: u64) -> CallId {
 
 fn input(text: &str, taken: bool) -> Body {
     Body::Input {
-        text: text.into(),
+        segments: text.into(),
         mode: Mode::Steer,
         taken,
         origin: None,
@@ -108,7 +108,7 @@ fn what_is_taken_into_a_result_is_read_with_it_and_never_between_a_call_and_its_
     };
     assert_eq!(
         texts(&answers.results[0].output),
-        [r#""slept""#, "also this"]
+        [r#""slept""#, "<steer from=\"user\">\nalso this\n</steer>"]
     );
 }
 
@@ -151,7 +151,7 @@ fn a_detached_call_answers_with_its_stream_and_its_outcome_is_read_once_taken() 
         panic!("{waiting:#?}");
     };
     let placeholder = texts(&answers.results[0].output).join("");
-    assert!(placeholder.contains(r#"{"call":3}"#), "{placeholder}");
+    assert!(placeholder.contains("stream:3"), "{placeholder}");
     bodies.push(Body::Take {
         input: seq(6),
         into: None,
@@ -161,6 +161,9 @@ fn a_detached_call_answers_with_its_stream_and_its_outcome_is_read_once_taken() 
         panic!("{taken:#?}");
     };
     let text = format!("{user:?}");
-    assert!(text.contains("went on in the background"), "{text}");
+    assert!(
+        text.contains(r#"<background-result call=\"3\" command=\"sleep\" log=\"stream:3\">"#),
+        "{text}"
+    );
     assert!(text.contains("slept"), "{text}");
 }

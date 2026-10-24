@@ -49,6 +49,22 @@ fn envelope() -> protocol::Envelope {
     }
 }
 
+/// Input of every segment kind.
+fn segments() -> protocol::Segments {
+    use protocol::{BlobId, BlobRef, Segment};
+    let blob = |media_type: &str| BlobRef {
+        id: BlobId("0f".repeat(32)),
+        size: 9000,
+        media_type: media_type.into(),
+    };
+    protocol::Segments(vec![
+        Segment::Text("see ".into()),
+        Segment::Paste("a\nb".into()),
+        Segment::PasteRef(blob("text/plain")),
+        Segment::Attachment(blob("image/png")),
+    ])
+}
+
 fn context_image() -> protocol::publication::ContextImage {
     use protocol::publication::{
         ContextInput, ContextLayer, ContextValue, Publication, RunnerKind,
@@ -56,7 +72,8 @@ fn context_image() -> protocol::publication::ContextImage {
     let values = [
         ContextValue::Inherited(1),
         ContextValue::User("summary at an excluded position".into()),
-        ContextValue::Queued("consumed input".into()),
+        ContextValue::Queued("consumed input".into(), Mode::Steer),
+        ContextValue::Inbox(envelope()),
         ContextValue::Taken(Seq::new(3).unwrap()),
         ContextValue::Assistant("answer".into()),
         ContextValue::Context(
@@ -182,12 +199,13 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
         sample(
             "input_numbered",
             ClientMsg::Input {
-                text: "hi".into(),
+                segments: "hi".into(),
                 client_seq: Some(1),
                 mode: Mode::Queue,
                 force: false,
             },
         ),
+        sample("input_segments", ClientMsg::input(segments())),
         sample("list", ClientMsg::List),
         sample("detach", ClientMsg::Detach),
         sample("approve", ClientMsg::approve(CallId::new(3).unwrap(), true)),
@@ -202,7 +220,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
         sample(
             "steer",
             ClientMsg::Input {
-                text: "also this".into(),
+                segments: "also this".into(),
                 mode: Mode::Steer,
                 client_seq: None,
                 force: false,
@@ -211,7 +229,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
         sample(
             "steer_numbered",
             ClientMsg::Input {
-                text: "also this".into(),
+                segments: "also this".into(),
                 mode: Mode::Steer,
                 client_seq: Some(4),
                 force: false,
@@ -220,7 +238,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
         sample(
             "steer_forced",
             ClientMsg::Input {
-                text: "now".into(),
+                segments: "now".into(),
                 mode: Mode::Steer,
                 client_seq: Some(5),
                 force: true,
@@ -298,7 +316,20 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 1,
                 Body::Input {
-                    text: "hi".into(),
+                    segments: "hi".into(),
+                    mode: Mode::Queue,
+                    taken: true,
+                    origin: None,
+                    force: false,
+                },
+            ),
+        ),
+        sample(
+            "entry_input_segments",
+            entry(
+                2,
+                Body::Input {
+                    segments: segments(),
                     mode: Mode::Queue,
                     taken: true,
                     origin: None,
@@ -311,7 +342,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 3,
                 Body::Input {
-                    text: "also this".into(),
+                    segments: "also this".into(),
                     mode: Mode::Steer,
                     taken: false,
                     origin: None,
@@ -324,7 +355,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 3,
                 Body::Input {
-                    text: "also this".into(),
+                    segments: "also this".into(),
                     mode: Mode::Queue,
                     taken: false,
                     origin: Some(author),
@@ -569,7 +600,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             Seq::new(1).unwrap(),
             Epoch(0),
             Body::Input {
-                text: "hi".into(),
+                segments: "hi".into(),
                 mode: Mode::Queue,
                 taken: true,
                 origin: None,
@@ -606,7 +637,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             Seq::new(4).unwrap(),
             Epoch(0),
             Body::Input {
-                text: "and sizes".into(),
+                segments: "and sizes".into(),
                 mode: Mode::Steer,
                 taken: false,
                 origin: None,

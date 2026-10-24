@@ -110,7 +110,7 @@ mod tests {
                     protocol::Seq::new(seq).unwrap(),
                     protocol::Epoch(1),
                     protocol::Body::Input {
-                        text: format!("message {seq}"),
+                        segments: format!("message {seq}").into(),
                         mode: protocol::Mode::Queue,
                         taken: true,
                         origin: None,

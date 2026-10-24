@@ -1,6 +1,6 @@
 //! Named model context is recorded with its identity in the same sealed line.
 
-use crate::{Body, CallId, Entry, Json, Outcome, Seq};
+use crate::{Body, CallId, Entry, Envelope, Json, Mode, Outcome, Segments, Seq};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -41,8 +41,11 @@ pub struct ContextInput(pub Seq, pub ContextValue);
 pub enum ContextValue {
     Inherited(usize),
     User(String),
-    /// Queued text: the model reads it once it is taken.
-    Queued(String),
+    /// Input waiting to be taken up, as it was given: how a model reads
+    /// it depends on who takes it.
+    Queued(Segments, Mode),
+    /// A message another session sent, waiting to be taken up.
+    Inbox(Envelope),
     Taken(Seq),
     /// Taken into the result of a call, read with it.
     Into(Seq, CallId),
@@ -55,6 +58,8 @@ pub enum ContextValue {
     Detached(CallId),
     /// A queued outcome of a call that went on in the background.
     Background(CallId, Outcome),
+    /// A queued end of a process group call `call` left to the session.
+    Job(CallId, String),
     Reply(Json),
     ToolCall(String, String),
     ToolResult(CallId, Outcome),

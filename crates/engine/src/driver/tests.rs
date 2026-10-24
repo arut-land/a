@@ -46,7 +46,7 @@ fn id(seq: u64) -> CallId {
 /// Input that started a turn as it arrived.
 fn user(text: &str) -> Body {
     Body::Input {
-        text: text.into(),
+        segments: text.into(),
         mode: Mode::Queue,
         taken: true,
         origin: None,
@@ -57,7 +57,7 @@ fn user(text: &str) -> Body {
 /// Input that waits to be taken up.
 fn queued(text: &str) -> Body {
     Body::Input {
-        text: text.into(),
+        segments: text.into(),
         mode: Mode::Queue,
         taken: false,
         origin: None,
@@ -406,9 +406,8 @@ impl Fixture {
 
 impl Live {
     fn steer(&self, text: &str) -> Result<(), String> {
-        let text = text.to_owned();
         let steer = Request::Input {
-            text,
+            segments: text.into(),
             mode: Mode::Steer,
             force: false,
         };
@@ -1152,7 +1151,7 @@ fn an_interrupt_in_the_burst_that_approves_a_call_stops_it() {
     let held = lock(&probe.held);
     let queued = session.ask(
         Request::Input {
-            text: "then".into(),
+            segments: "then".into(),
             mode: Mode::Queue,
             force: false,
         },
@@ -1280,9 +1279,11 @@ impl Extension for Extras {
 
     fn contribute(&self, r: &mut Registrar) {
         r.tool(Jobs)
-            .on::<point::Input>(|_, text| match text {
-                "no" => Rewrite::Stop("not that".into()),
-                text if text.starts_with("shout ") => Rewrite::Replace(text.to_uppercase()),
+            .on::<point::Input>(|_, input| match input.as_text() {
+                Some("no") => Rewrite::Stop("not that".into()),
+                Some(text) if text.starts_with("shout ") => {
+                    Rewrite::Replace(text.to_uppercase().into())
+                }
                 _ => Rewrite::Pass,
             })
             .on::<point::PreTool>(|_, call| {
@@ -1664,7 +1665,7 @@ fn a_forced_steer_detaches_a_running_call_whose_outcome_comes_back_on_the_queue(
     session.submit("call held {}").unwrap();
     until(&session, "called the tool", tool_running);
     let force = Request::Input {
-        text: "now".into(),
+        segments: "now".into(),
         mode: Mode::Steer,
         force: true,
     };
@@ -2173,7 +2174,7 @@ fn one_fsync_per_burst() {
     settle(&session);
     let input = |text: &str| {
         let input = Event::Input {
-            text: text.into(),
+            segments: text.into(),
             mode: Mode::Queue,
             origin: None,
             ticket: None,

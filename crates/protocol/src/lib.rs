@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 27;
+pub const PROTO: u32 = 28;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 27;
+pub const PROTO_MIN: u32 = 28;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -289,7 +289,7 @@ kinds! {
         /// a `force`d one cuts the model call short and detaches the
         /// running calls that can go on in the background, so that
         /// boundary comes now.
-        Input "input" { text: String, mode: Mode = default, taken: bool = default, origin: Option<Author> = default, force: bool = default } = Durable;
+        Input "input" { segments: Segments, mode: Mode = default, taken: bool = default, origin: Option<Author> = default, force: bool = default } = Durable;
         /// Queued item `input` was taken up: it starts a turn, is read by
         /// the next model call, or, `into` a call, is read with that
         /// call's result, keeping each call beside its result.
@@ -421,6 +421,110 @@ impl Body {
     pub const INTERRUPT: Self = Self::Interrupt { origin: None };
 }
 
+/// A blob by its content. A placeholder until the store keeps blobs
+/// (seam D), which defines it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BlobId(pub String);
+
+/// Bytes the store keeps apart from the log, by reference.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRef {
+    pub id: BlobId,
+    pub size: u64,
+    pub media_type: String,
+}
+
+/// A piece of input as its client composed it: what the user typed, what
+/// they pasted, and what they attached. A client shows a paste as a
+/// placeholder and the model reads it tagged as one, so the two are never
+/// confused with typed text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Segment {
+    Text(String),
+    Paste(String),
+    /// A paste the daemon keeps as a blob: one too large to inline, as the
+    /// `input` point decides.
+    PasteRef(BlobRef),
+    Attachment(BlobRef),
+}
+
+/// Input, a segment at a time.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Segments(pub Vec<Segment>);
+
+impl Segments {
+    /// What the user typed and pasted, as one text; what is kept by
+    /// reference adds nothing.
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        for segment in &self.0 {
+            if let Segment::Text(text) | Segment::Paste(text) = segment {
+                out.push_str(text);
+            }
+        }
+        out
+    }
+
+    /// The text, when the input is typed text alone: a command, or a
+    /// message a program wrote.
+    pub fn as_text(&self) -> Option<&str> {
+        match &self.0[..] {
+            [] => Some(""),
+            [Segment::Text(text)] => Some(text),
+            _ => None,
+        }
+    }
+
+    /// The bytes its texts hold.
+    pub fn capacity(&self) -> usize {
+        (self.0.iter())
+            .map(|segment| match segment {
+                Segment::Text(text) | Segment::Paste(text) => text.capacity(),
+                Segment::PasteRef(_) | Segment::Attachment(_) => size_of::<BlobRef>(),
+            })
+            .sum()
+    }
+}
+
+impl From<String> for Segments {
+    fn from(text: String) -> Self {
+        Self(vec![Segment::Text(text)])
+    }
+}
+
+impl From<&str> for Segments {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_owned())
+    }
+}
+
+impl From<Vec<Segment>> for Segments {
+    fn from(segments: Vec<Segment>) -> Self {
+        Self(segments)
+    }
+}
+
+impl PartialEq<str> for Segments {
+    fn eq(&self, text: &str) -> bool {
+        self.as_text() == Some(text)
+    }
+}
+
+impl PartialEq<&str> for Segments {
+    fn eq(&self, text: &&str) -> bool {
+        self == *text
+    }
+}
+
+impl fmt::Display for Segments {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text())
+    }
+}
+
 /// How input waits: for the turn running to end, or for its next step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -496,8 +600,8 @@ kinds! {
         /// The agent stopped and was given `text` to continue with.
         OnStop "on_stop" { text: String };
         /// The user's input was rewritten: the input entry that follows holds
-        /// the new text, `original` what it replaced.
-        Input "input" { original: String };
+        /// the new input, `original` what it replaced.
+        Input "input" { original: Segments };
         /// The model call failed with `error` and is sent again, for the
         /// `attempt`th time, with the request as the extension left it.
         Retry "retry" { attempt: u16, error: String };
@@ -1369,7 +1473,7 @@ kinds! {
         /// boundary, and with no turn running is plain input. A `force`d
         /// steer brings that boundary on now: the model call is cut short
         /// and the calls running that can go on in the background do.
-        Input "input" { text: String, mode: Mode = default, force: bool = default, client_seq: Option<u64> = default };
+        Input "input" { segments: Segments, mode: Mode = default, force: bool = default, client_seq: Option<u64> = default };
         /// Takes back the user's queued input `input` before it is taken up;
         /// refused once it was. Editing it is this, then the new input.
         Withdraw "withdraw" { input: Seq, client_seq: Option<u64> = default };
@@ -1422,7 +1526,7 @@ impl ClientMsg {
         count.count.max(
             size_of::<Self>()
                 + match self {
-                    Self::Input { text, .. } => text.capacity(),
+                    Self::Input { segments, .. } => segments.capacity(),
                     _ => 0,
                 },
         )
@@ -1447,9 +1551,9 @@ impl DaemonMsg {
 impl ClientMsg {
     pub const INTERRUPT: Self = Self::Interrupt { client_seq: None };
 
-    pub fn input(text: impl Into<String>) -> Self {
+    pub fn input(segments: impl Into<Segments>) -> Self {
         Self::Input {
-            text: text.into(),
+            segments: segments.into(),
             mode: Mode::Queue,
             force: false,
             client_seq: None,
@@ -1887,6 +1991,13 @@ pub struct OutputStream {
     pub call: CallId,
 }
 
+/// `stream:<call>`, as text names it, as `blob:<id>` names a blob.
+impl fmt::Display for OutputStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "stream:{}", self.call)
+    }
+}
+
 impl OutputStream {
     /// The result a call detached as it ran is answered with at once:
     /// done, naming where its output goes on.
@@ -2012,7 +2123,7 @@ mod tests {
         write_frame(&mut buf, &ClientMsg::Detach).unwrap();
         let mut r = buf.as_slice();
         assert!(
-            matches!(read_frame(&mut r).unwrap(), Some(ClientMsg::Input { text, .. }) if text == "hi")
+            matches!(read_frame(&mut r).unwrap(), Some(ClientMsg::Input { segments: text, .. }) if text == "hi")
         );
         assert!(matches!(
             read_frame(&mut r).unwrap(),
@@ -2042,7 +2153,7 @@ mod tests {
             Seq::new(1).unwrap(),
             Epoch(0),
             Body::Input {
-                text: "hi".into(),
+                segments: "hi".into(),
                 mode: Mode::Queue,
                 taken: true,
                 origin: None,
@@ -2051,7 +2162,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&e).unwrap(),
-            r#"{"seq":1,"epoch":0,"kind":"input","text":"hi","taken":true}"#
+            r#"{"seq":1,"epoch":0,"kind":"input","segments":[{"text":"hi"}],"taken":true}"#
         );
     }
 
@@ -2203,14 +2314,14 @@ mod tests {
         let seq = |n| Seq::new(n).unwrap();
         let bodies = [
             Body::Input {
-                text: "hi".into(),
+                segments: "hi".into(),
                 mode: Mode::Queue,
                 taken: true,
                 origin: Some(author),
                 force: false,
             },
             Body::Input {
-                text: "also".into(),
+                segments: "also".into(),
                 mode: Mode::Steer,
                 taken: false,
                 origin: None,
@@ -2279,8 +2390,8 @@ mod tests {
         assert_eq!(
             json,
             [
-                format!(r#"{head}"input","text":"hi","taken":true,{who}}}"#),
-                format!(r#"{head}"input","text":"also","mode":"steer"}}"#),
+                format!(r#"{head}"input","segments":[{{"text":"hi"}}],"taken":true,{who}}}"#),
+                format!(r#"{head}"input","segments":[{{"text":"also"}}],"mode":"steer"}}"#),
                 format!(r#"{head}"take","input":2}}"#),
                 format!(r#"{head}"model_call","model":"m","attempt":1,"choice":"none"}}"#),
                 format!(

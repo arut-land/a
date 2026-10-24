@@ -62,7 +62,7 @@ mod tests {
 
     fn input(origin: Author, taken: bool) -> Body {
         Body::Input {
-            text: "same".into(),
+            segments: "same".into(),
             mode: Mode::Queue,
             taken,
             origin: Some(origin),
@@ -192,7 +192,7 @@ mod tests {
             entry(
                 1,
                 Body::Input {
-                    text: "/model m".into(),
+                    segments: "/model m".into(),
                     mode: Mode::Queue,
                     taken: true,
                     origin: Some(id),

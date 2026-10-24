@@ -130,6 +130,7 @@ mod tests {
             steer,
             source,
             outcome: false,
+            typed: Default::default(),
         }
     }
 

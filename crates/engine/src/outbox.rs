@@ -548,7 +548,7 @@ mod tests {
             Seq::new(seq).unwrap(),
             Epoch(0),
             Body::Input {
-                text: text.into(),
+                segments: text.into(),
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
@@ -698,7 +698,7 @@ mod tests {
             let e = self
                 .0
                 .append(Body::Input {
-                    text: text.into(),
+                    segments: text.into(),
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,

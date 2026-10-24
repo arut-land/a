@@ -524,8 +524,18 @@ impl Conn<'_> {
                 )));
             }
             ClientMsg::Input {
-                text, mode, force, ..
-            } => (Request::Input { text, mode, force }, Rejection::Refused),
+                segments,
+                mode,
+                force,
+                ..
+            } => (
+                Request::Input {
+                    segments,
+                    mode,
+                    force,
+                },
+                Rejection::Refused,
+            ),
             ClientMsg::Withdraw { input, .. } => {
                 (Request::Withdraw { input }, Rejection::NotWaiting)
             }

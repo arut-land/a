@@ -4,7 +4,7 @@
 //!
 //! | Point | Merge |
 //! | --- | --- |
-//! | [`Input`] | replacement chain over the user's text; the first rejection wins |
+//! | [`Input`] | replacement chain over the user's input; the first rejection wins |
 //! | [`Step`] | replacement chain over a model request; the first answer of its own wins |
 //! | [`RequestError`] | the first recovery wins |
 //! | [`PreTool`] | replacement chain over the input; the first block wins |
@@ -17,10 +17,12 @@
 //! | [`SessionStart`], [`SessionEnd`] | every handler is told, and changes nothing |
 //! | [`Turn`], [`Reply`] | replacement chain over what the loop does next |
 //! | [`Resume`] | the first answer wins; with none, the loop goes on |
+//! | [`PresentResult`] | replacement chain over what the model is shown of an outcome |
 //! | [`Dequeue`] | the first answer wins; with none, the queue drains as it always has |
 //!
 //! The loop points ([`Turn`], [`Reply`], [`Resume`], [`Dequeue`]) run
 //! inside the fold of the session's log, or decide what it logs next, and
+//! [`PresentResult`] inside the transcript's, rebuilt from the log; all
 //! rerun as it loads: their handlers are given their arguments and nothing
 //! of the session (a `()` for its context), so what a replay asks of them
 //! is what the live run did.
@@ -55,7 +57,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
-use protocol::{CallId, Entry, Json, Outcome, SessionId, Verdict};
+use protocol::{CallId, Entry, Json, Outcome, Segments, SessionId, Verdict};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -683,6 +685,38 @@ fn post_tool<'a, 'b: 'a>(call: ToolUse<'b>, outcome: &'a Outcome) -> Finished<'a
     }
 }
 
+/// A call's end, as the model is to be shown it.
+#[derive(Clone, Copy, Debug)]
+pub struct Ended<'a> {
+    pub tool: &'a str,
+    pub outcome: &'a Outcome,
+}
+
+/// What the model is shown of a call's outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Presented {
+    pub output: llm::Output,
+    pub error: bool,
+}
+
+/// A call's end, as `present_result` handlers see it.
+#[derive(Clone, Copy, Debug)]
+pub struct Presenting<'a> {
+    pub tool: &'a str,
+    pub outcome: &'a Outcome,
+    /// What the model is shown, as the handlers before left it: first,
+    /// the tool's own [`to_model`](crate::Tool::to_model).
+    pub presented: &'a Presented,
+}
+
+fn presenting<'a, 'b: 'a>(ended: Ended<'b>, presented: &'a Presented) -> Presenting<'a> {
+    Presenting {
+        tool: ended.tool,
+        outcome: ended.outcome,
+        presented,
+    }
+}
+
 fn turn<'a, 'b: 'a>(
     input: &'b crate::Input,
     actions: &'a Actions,
@@ -800,9 +834,10 @@ macro_rules! points {
 
 points! {
     /// What becomes of the user's input before it is logged: a rejection
-    /// refuses it, and its client is told why.
+    /// refuses it, and its client is told why. Where a paste too large to
+    /// inline becomes a reference, so every client behaves the same.
     Input(input) = "input", wire, FailClosed,
-        PointCx<'c>, (), &'a str, Rewrite<String, String>, text;
+        PointCx<'c>, (), &'a Segments, Rewrite<Segments, String>, same;
     /// The request of a model call, about to be sent: a handler may
     /// rewrite it (a model fallback, a reminder appended at the tail) or
     /// answer it itself (a fixture, a cache), with a reply or an error (a
@@ -871,15 +906,17 @@ points! {
     Dequeue(dequeue) = "dequeue", -, FailOpen,
         (), (crate::Boundary, crate::QueueView<'a>), (crate::Boundary, crate::QueueView<'a>),
         Option<crate::Take>;
+    /// What the model is shown of a call's outcome: the tool's own
+    /// presentation unless a handler says otherwise (a long output cut to
+    /// its ends and where the rest is). Presentation only: the log keeps
+    /// the outcome whole.
+    PresentResult(present_result) = "present_result", -, FailOpen,
+        (), Ended<'a>, Presenting<'a>, Rewrite<Presented>, presenting;
 }
 
 /// The subject of a chain whose handlers read it alone.
 fn same<T>((): (), subject: &T) -> &T {
     subject
-}
-
-fn text((): (), text: &String) -> &str {
-    text
 }
 
 /// A handler over JSON text: what a Lua mod, a WASM component or an
@@ -902,13 +939,30 @@ fn encode(value: &impl Serialize) -> Json {
     Json::encode(value).unwrap_or_default()
 }
 
+/// Input as an erased handler reads and answers it: typed text alone as
+/// its text, so a mod that matches on what was typed stays a string match;
+/// anything else as its segments.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Given {
+    Text(String),
+    Segments(Segments),
+}
+
 impl Wire for Input {
-    fn to_json(text: &&str) -> Json {
-        encode(text)
+    fn to_json(segments: &&Segments) -> Json {
+        segments
+            .as_text()
+            .map_or_else(|| encode(segments), |text| encode(&text))
     }
 
     fn from_json(answer: &Json) -> Self::Out {
-        rewrite(answer)
+        match rewrite(answer) {
+            Rewrite::Pass => Rewrite::Pass,
+            Rewrite::Replace(Given::Text(text)) => Rewrite::Replace(text.into()),
+            Rewrite::Replace(Given::Segments(segments)) => Rewrite::Replace(segments),
+            Rewrite::Stop(why) => Rewrite::Stop(why),
+        }
     }
 }
 
@@ -1162,18 +1216,29 @@ impl Hooks {
         self.run::<P>(cx, facts, &mut (), &mut |_, (), ()| {})
     }
 
-    /// The user's text as the `input` chain leaves it; `Err` is why it was
-    /// refused.
-    pub fn input(&self, cx: &PointCx<'_>, mut text: String) -> Result<Chained<String>, String> {
+    /// The user's input as the `input` chain leaves it; `Err` is why it
+    /// was refused.
+    pub fn input(
+        &self,
+        cx: &PointCx<'_>,
+        mut segments: Segments,
+    ) -> Result<Chained<Segments>, String> {
         let mut decisions = Decided::new();
-        self.run::<Input>(cx, (), &mut text, &mut |name, original, _| {
+        self.run::<Input>(cx, (), &mut segments, &mut |name, original, _| {
             decisions.push((Name::clone(name), Verdict::Input { original }));
         })
         .map_err(|(name, reason)| format!("{name}: {reason}"))?;
         Ok(Chained {
-            value: text,
+            value: segments,
             decisions,
         })
+    }
+
+    /// What the model is shown of `ended`, starting from `presented`, as
+    /// the `present_result` chain leaves it.
+    pub fn present_result(&self, ended: Ended<'_>, mut presented: Presented) -> Presented {
+        let Ok(()) = self.run::<PresentResult>(&(), ended, &mut presented, &mut |_, _, _| {});
+        presented
     }
 
     /// How to recover a model call from `failed`, if any handler says, and

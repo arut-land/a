@@ -110,7 +110,7 @@ fn enqueue(session: &Live, text: &str) -> oneshot::Receiver<Result<(), String>> 
     let (reply, received) = oneshot::channel();
     session.send(Msg::Request {
         request: Request::Input {
-            text: text.into(),
+            segments: text.into(),
             mode: Mode::Queue,
             force: false,
         },
@@ -819,9 +819,11 @@ fn submitted_input_is_cancelled_while_its_publication_flush_is_held() {
         let mut effects = client.run(cmd);
         let request = match effects.remove(0) {
             client::Effect::Io(client::Io::Send(protocol::ClientMsg::Input {
-                text, mode, ..
+                segments,
+                mode,
+                ..
             })) => Request::Input {
-                text,
+                segments,
                 mode,
                 force: false,
             },

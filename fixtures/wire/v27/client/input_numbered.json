@@ -1,1 +1,1 @@
-{"t":"input","text":"hi","client_seq":1}
+{"t":"input","segments":[{"text":"hi"}],"client_seq":1}

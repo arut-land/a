@@ -51,13 +51,15 @@ fn drive(s: &mut Session, fx: impl IntoIterator<Item = Work>) {
 /// and how input waited are left out.
 fn conversation(log: &[Entry]) -> Vec<String> {
     let text_of = |seq: u64| match &log[usize::try_from(seq).unwrap() - 1].body {
-        Body::Input { text, .. } => text.clone(),
+        Body::Input { segments: text, .. } => text.clone(),
         _ => unreachable!(),
     };
     log.iter()
         .filter_map(|e| match &e.body {
             Body::Input {
-                text, taken: true, ..
+                segments: text,
+                taken: true,
+                ..
             } => Some(format!("user {text}")),
             Body::Take { input, .. } => Some(format!("user {}", text_of(input.get()))),
             Body::Assistant { text } => Some(format!("said {text}")),

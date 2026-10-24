@@ -1,1 +1,1 @@
-{"t":"entry","seq":1,"epoch":0,"kind":"outbox","envelope_id":{"sender":"00000000-0000-0000-0000-00000000000a","call":3,"purpose":"subagent:message"},"recipients":["00000000-0000-0000-0000-00000000000c","00000000-0000-0000-0000-00000000000d"],"payload":"hello"}
+{"t":"entry","seq":1,"epoch":0,"kind":"outbox","envelope":{"id":{"sender":"00000000-0000-0000-0000-00000000000a","call":3,"purpose":"subagent:message"},"destination":"00000000-0000-0000-0000-00000000000c","payload":"hello"}}

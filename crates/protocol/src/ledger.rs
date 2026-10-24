@@ -188,6 +188,9 @@ pub struct Queued {
     /// Its text is an [`Outcome`]'s payload: a detached call's.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub outcome: bool,
+    /// Whether `text` was typed, not pasted or attached: only typed text
+    /// may be a slash command.
+    pub typed: bool,
 }
 
 /// A call that went on in the background, and what it runs: what a
@@ -317,11 +320,13 @@ impl Ledger {
                         steer: false,
                         source,
                         outcome,
+                        // What the session sends itself is no command.
+                        typed: matches!(source, Source::Agent(_)),
                     });
                 }
             }
             Body::Input {
-                text,
+                segments,
                 mode,
                 taken,
                 origin,
@@ -333,10 +338,11 @@ impl Ledger {
                 } else {
                     self.untaken.push(Queued {
                         seq,
-                        text: text.clone(),
+                        text: segments.text(),
                         steer: *mode == Mode::Steer,
                         source: Source::User,
                         outcome: false,
+                        typed: segments.as_text().is_some(),
                     });
                 }
             }
@@ -865,7 +871,7 @@ mod durable_tests {
 
     fn queued() -> Body {
         Body::Input {
-            text: "later".into(),
+            segments: "later".into(),
             mode: Mode::Queue,
             taken: false,
             origin: None,

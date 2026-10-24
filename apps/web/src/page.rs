@@ -339,7 +339,7 @@ mod tests {
         entry(
             seq,
             Body::Input {
-                text: text.into(),
+                segments: text.into(),
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,

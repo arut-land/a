@@ -273,7 +273,7 @@ fn a_restart_runs_a_safe_detached_call_again_and_reports_an_unsafe_one_cut_off()
         panic!("{cut:?}");
     };
     assert!(output.contains("may not have completed"), "{output}");
-    assert!(output.contains(r#"{"call":2}"#), "{output}");
+    assert!(output.contains("stream:2"), "{output}");
 }
 
 #[test]

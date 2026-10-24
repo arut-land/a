@@ -533,7 +533,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
         child_log[1..],
         [
             Body::Input {
-                text: "hi".into(),
+                segments: "hi".into(),
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
@@ -604,7 +604,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     let spawned = |child: SessionId| {
         vec![
             Body::Input {
-                text: "spawn sleep 0".into(),
+                segments: "spawn sleep 0".into(),
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
@@ -633,7 +633,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         ]
     };
     let opened = || Body::Input {
-        text: "sleep 0".into(),
+        segments: "sleep 0".into(),
         mode: protocol::Mode::Queue,
         taken: true,
         origin: None,
@@ -807,7 +807,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
             intent: spawn_intent(2, "sleep 0"),
         },
         Body::Input {
-            text: "sleep 0".into(),
+            segments: "sleep 0".into(),
             mode: protocol::Mode::Queue,
             taken: true,
             origin: None,

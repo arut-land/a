@@ -330,7 +330,7 @@ mod tests {
 
     fn input(text: &str) -> Event {
         Event::Input {
-            text: text.into(),
+            segments: text.into(),
             mode: Mode::Queue,
             origin: None,
             ticket: None,

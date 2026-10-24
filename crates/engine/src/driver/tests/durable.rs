@@ -310,7 +310,7 @@ impl ManualSession {
         let (reply, received) = oneshot::channel();
         session.send(Msg::Request {
             request: Request::Input {
-                text: "sleep 0".into(),
+                segments: "sleep 0".into(),
                 mode: Mode::Queue,
                 force: false,
             },
@@ -372,7 +372,7 @@ impl ManualSession {
         let (reply, received) = oneshot::channel();
         self.session.send(Msg::Request {
             request: Request::Input {
-                text: text.into(),
+                segments: text.into(),
                 mode: Mode::Queue,
                 force: false,
             },
@@ -1241,7 +1241,7 @@ fn final_sync_publishes_activity_after_its_entries() {
     let (reply, _) = oneshot::channel();
     session.send(Msg::Request {
         request: Request::Input {
-            text: "$ true".into(),
+            segments: "$ true".into(),
             mode: Mode::Queue,
             force: false,
         },

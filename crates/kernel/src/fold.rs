@@ -99,8 +99,10 @@ impl Fold {
         let body = &e.body;
         match body {
             Body::Input {
-                text, taken: true, ..
-            } => self.user(text, registry),
+                segments,
+                taken: true,
+                ..
+            } => self.user(&segments.text(), segments.as_text().is_some(), registry),
             Body::Take { input, into } => self.taken(*input, into.is_some(), registry),
             Body::Decision {
                 d: Verdict::OnStop { text },
@@ -212,8 +214,8 @@ impl Fold {
             }
             _ => {}
         }
-        let text = queued.text.clone();
-        self.user(&text, registry)
+        let (text, typed) = (queued.text.clone(), queued.typed);
+        self.user(&text, typed, registry)
     }
 
     /// An intent folded: it carries out what was asked for next.
@@ -260,9 +262,10 @@ impl Fold {
         }
     }
 
-    /// Input `text` taken up: a user's command, or the agent's.
-    fn user(&mut self, text: &str, registry: &dyn Binding) -> Option<Input> {
-        match command(text, registry) {
+    /// Input `text` taken up: a user's command, or the agent's. Only
+    /// `typed` text is a command: a pasted `/name` line is what was pasted.
+    fn user(&mut self, text: &str, typed: bool, registry: &dyn Binding) -> Option<Input> {
+        match typed.then(|| command(text, registry)).flatten() {
             Some((name, args)) => {
                 self.asked.push_back(Next::Command {
                     name: name.to_owned(),

@@ -121,7 +121,7 @@ impl ViewState {
         self.publications.apply(e);
         match &e.body {
             Body::Input {
-                text,
+                segments,
                 mode,
                 taken,
                 origin,
@@ -133,7 +133,7 @@ impl ViewState {
                 } else {
                     self.queued.push_back(Queued {
                         seq: e.seq,
-                        text: text.clone(),
+                        text: segments.text(),
                         steer: *mode == crate::Mode::Steer,
                         source: crate::Source::User,
                         origin: *origin,
@@ -749,10 +749,12 @@ impl SessionView {
         self.state.apply(e);
         let item = match &e.body {
             Body::Input {
-                text, taken: true, ..
+                segments,
+                taken: true,
+                ..
             } => Item::User {
                 seq,
-                text: text.clone(),
+                text: segments.text(),
             },
             Body::Input { .. } => return None,
             Body::Take { .. } => Item::User { seq, text: taken? },

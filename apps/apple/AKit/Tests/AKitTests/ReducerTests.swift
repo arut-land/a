@@ -94,7 +94,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     var last: ChangeBatch?
     for seq in 1...1000 {
         last = try reducer.fold(
-            message: #"{"t":"entry","seq":\#(seq),"epoch":0,"kind":"input","text":"m\#(seq)","taken":true}"#)
+            message: #"{"t":"entry","seq":\#(seq),"epoch":0,"kind":"input","segments":[{"text":"m\#(seq)"}],"taken":true}"#)
     }
     store.apply(last!)
     expectInStep(store, reducer, "far behind")

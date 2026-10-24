@@ -123,7 +123,7 @@ fn asked_command() -> Vec<DaemonMsg> {
         entry(
             2,
             Body::Input {
-                text: "$ ls".into(),
+                segments: "$ ls".into(),
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
@@ -202,7 +202,7 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
             entry(
                 2,
                 Body::Input {
-                    text: "hi".into(),
+                    segments: "hi".into(),
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
@@ -375,7 +375,7 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
             entry(
                 seq,
                 Body::Input {
-                    text: format!("message {seq}"),
+                    segments: format!("message {seq}").into(),
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
@@ -395,7 +395,7 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
     app.fold(&entry(
         40,
         Body::Input {
-            text: "message 40".into(),
+            segments: "message 40".into(),
             mode: protocol::Mode::Queue,
             taken: true,
             origin: None,
@@ -497,7 +497,7 @@ fn ctrl_c_interrupts_a_running_model_call_too() {
         entry(
             1,
             Body::Input {
-                text: "hi".into(),
+                segments: "hi".into(),
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
@@ -1070,7 +1070,7 @@ fn render_cost() {
         msgs.push(entry(
             seq,
             Body::Input {
-                text: text.join(" "),
+                segments: text.join(" ").into(),
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
@@ -1434,7 +1434,7 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
             entry(
                 1,
                 Body::Input {
-                    text: "hi".into(),
+                    segments: "hi".into(),
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
@@ -1495,7 +1495,7 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
     app.fold(&entry(
         6,
         Body::Input {
-            text: "next".into(),
+            segments: "next".into(),
             mode: protocol::Mode::Queue,
             taken: true,
             origin: None,

@@ -6,10 +6,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ext::host::Registry;
-use llm::{Assistant, Message, Messages, ToolMessage, ToolResult};
+use llm::{Assistant, Message, Messages, Tag, ToolMessage, ToolResult, tag};
 use protocol::publication::{ContextImage, ContextInput, ContextLayer, ContextValue, RunnerKind};
 use protocol::{
-    Body, CallId, Entry, EnvelopeId, Json, Outcome, OutputStream, Seq, Source, Verdict,
+    Body, CallId, Entry, Envelope, EnvelopeId, Mode, Outcome, OutputStream, Segment, Segments, Seq,
+    Source, Verdict,
 };
 
 /// Provider replies remain intact; live updates and recovery share projection rules.
@@ -26,27 +27,94 @@ pub struct Transcript {
     /// the calls' order, whatever order they ended in, so the request is
     /// the same however a run went.
     answered: Vec<CallId>,
-    /// What is queued and not taken up, by seq, as the model reads it once
-    /// it is.
-    waiting: HashMap<Seq, String>,
-    /// Calls that went on in the background, with their tool: the result
-    /// logged for one is a placeholder, and its outcome comes queued.
-    detached: HashMap<CallId, String>,
+    /// What is queued and not taken up, by seq: the model reads it once
+    /// it is, where it is taken.
+    waiting: HashMap<Seq, Waiting>,
+    /// The tool of each call the model made, by seq: what a result that
+    /// comes back from the background is named for.
+    tools: HashMap<CallId, String>,
+    /// Calls that went on in the background: the result logged for one
+    /// is a placeholder, and its outcome comes queued.
+    detached: HashSet<CallId>,
     /// The seq of the last entry that changed the messages.
     last: u64,
     registry: Arc<Registry>,
 }
 
+/// Input waiting to be taken up.
+enum Waiting {
+    /// The user's, as it was given: rendered once it is known who takes it.
+    Input(Segments, Mode),
+    /// Another session's message, as it sent it: a model-only thread reads
+    /// its payload as the turn it asks for.
+    Inbox(Envelope),
+    /// What the session's own envelope brought back, as the model reads it.
+    Own(String),
+}
+
+/// `segments` as the model reads them: typed text as it is, and what the
+/// user pasted or attached tagged as such; a steer, given to a turn already
+/// running, says who gave it.
+fn model_text(segments: &Segments, mode: Mode) -> String {
+    let mut text = String::new();
+    for segment in &segments.0 {
+        match segment {
+            Segment::Text(typed) => text.push_str(typed),
+            Segment::Paste(pasted) => Tag::from(tag::Pasted(pasted)).render(&mut text),
+            Segment::PasteRef(blob) => {
+                let at = format!("blob:{}", blob.id.0);
+                Tag::from(tag::PastedRef {
+                    at: &at,
+                    bytes: blob.size,
+                })
+                .render(&mut text);
+            }
+            Segment::Attachment(blob) => {
+                let at = format!("blob:{}", blob.id.0);
+                Tag::from(tag::Attached {
+                    at: &at,
+                    media_type: &blob.media_type,
+                    bytes: blob.size,
+                })
+                .render(&mut text);
+            }
+        }
+    }
+    match mode {
+        Mode::Queue => text,
+        // Every steer comes from a client today; agents' and models' come
+        // through the inbox.
+        Mode::Steer => Tag::from(tag::Steer {
+            from: "user",
+            text: &text,
+        })
+        .to_string(),
+    }
+}
+
+/// Another session's message, as the model reads it.
+fn inbox_text(envelope: &Envelope) -> String {
+    let from = envelope.id.sender.to_string();
+    Tag::from(tag::Inbox {
+        from: &from,
+        channel: &envelope.id.purpose,
+        text: &envelope.payload,
+    })
+    .to_string()
+}
+
 fn context_fact(body: &Body) -> Option<ContextValue> {
     Some(match body {
         Body::Input {
-            text, taken: true, ..
-        }
-        | Body::Decision {
+            segments,
+            taken: true,
+            ..
+        } => ContextValue::User(model_text(segments, Mode::Queue)),
+        Body::Decision {
             d: Verdict::OnStop { text },
             ..
         } => ContextValue::User(text.clone()),
-        Body::Input { text, .. } => ContextValue::Queued(text.clone()),
+        Body::Input { segments, mode, .. } => ContextValue::Queued(segments.clone(), *mode),
         Body::Enqueue { envelope } => {
             let outcome = || Outcome::from_payload(&envelope.payload);
             match envelope.source() {
@@ -54,7 +122,8 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
                 Source::Job(call) if envelope.id.purpose == EnvelopeId::DETACHED => {
                     ContextValue::Background(call, outcome()?)
                 }
-                _ => ContextValue::Queued(envelope.payload.clone()),
+                Source::Job(call) => ContextValue::Job(call, envelope.payload.clone()),
+                _ => ContextValue::Inbox(envelope.clone()),
             }
         }
         Body::Take { input, into: None } => ContextValue::Taken(*input),
@@ -79,6 +148,32 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
         Body::ToolResult { call, outcome, .. } => ContextValue::ToolResult(*call, outcome.clone()),
         _ => return None,
     })
+}
+
+impl Waiting {
+    /// As the model reads it, taken by an agent.
+    fn text(self) -> String {
+        match self {
+            Self::Input(segments, mode) => model_text(&segments, mode),
+            Self::Inbox(envelope) => inbox_text(&envelope),
+            Self::Own(text) => text,
+        }
+    }
+}
+
+/// An output as text, for a message of text alone.
+fn text_of(output: llm::Output) -> String {
+    match output {
+        llm::Output::Text(text) => text,
+        llm::Output::Json(json) => json.raw().to_owned(),
+        llm::Output::Content(parts) => (parts.into_iter())
+            .filter_map(|part| match part {
+                llm::UserPart::Text(text) => Some(text.text),
+                llm::UserPart::Media(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
 }
 
 impl Transcript {
@@ -111,7 +206,8 @@ impl Transcript {
             calls: HashMap::new(),
             answered: Vec::new(),
             waiting: HashMap::new(),
-            detached: HashMap::new(),
+            tools: HashMap::new(),
+            detached: HashSet::new(),
             last: 0,
             registry,
         }
@@ -142,12 +238,23 @@ impl Transcript {
     fn apply_input(&mut self, seq: Seq, value: ContextValue, fresh: Option<Assistant>) {
         let message = match value {
             ContextValue::User(text) => Message::user(text),
-            ContextValue::Queued(text) => {
-                self.waiting.insert(seq, text);
+            ContextValue::Queued(segments, mode) => {
+                self.waiting.insert(seq, Waiting::Input(segments, mode));
+                return;
+            }
+            ContextValue::Inbox(envelope) => {
+                self.waiting.insert(seq, Waiting::Inbox(envelope));
                 return;
             }
             ContextValue::Taken(input) => match self.waiting.remove(&input) {
-                Some(text) if self.model_only => {
+                Some(waiting) if self.model_only => {
+                    // As the side-thread runner reads it: what was given,
+                    // untagged.
+                    let text = match waiting {
+                        Waiting::Input(segments, _) => segments.text(),
+                        Waiting::Inbox(envelope) => envelope.payload,
+                        Waiting::Own(text) => text,
+                    };
                     if let Ok((turn, _)) = ext::ModelTurn::from_intent(&text) {
                         for message in turn.messages.iter() {
                             self.messages.push(message.clone());
@@ -157,37 +264,11 @@ impl Transcript {
                     }
                     Message::user(text)
                 }
-                Some(text) => Message::user(text),
+                Some(waiting) => Message::user(waiting.text()),
                 None => return,
             },
-            ContextValue::Assistant(text) => Message::assistant(text),
-            ContextValue::Context(text, _) => {
-                self.messages.insert(self.context, Message::user(text));
-                self.context += 1;
-                self.last = seq.get();
-                return;
-            }
-            ContextValue::Child(outcome) => {
-                self.waiting.insert(seq, ext::child_result(&outcome));
-                return;
-            }
-            ContextValue::Background(call, outcome) => {
-                let text = self.background(call, &outcome);
-                self.waiting.insert(seq, text);
-                return;
-            }
-            ContextValue::Detached(call) => {
-                if let Some((_, tool)) = self.calls.get(&call) {
-                    self.detached.insert(call, tool.clone());
-                }
-                return;
-            }
-            ContextValue::Withdrawn(input) => {
-                self.waiting.remove(&input);
-                return;
-            }
             ContextValue::Into(input, call) => match self.waiting.remove(&input) {
-                Some(text) => match self.join_result(call, text) {
+                Some(waiting) => match self.join_result(call, waiting.text()) {
                     Ok(()) => {
                         self.last = seq.get();
                         return;
@@ -196,6 +277,18 @@ impl Transcript {
                 },
                 None => return,
             },
+            value @ (ContextValue::Withdrawn(_)
+            | ContextValue::Child(_)
+            | ContextValue::Background(..)
+            | ContextValue::Job(..)
+            | ContextValue::Detached(_)) => return self.queue(seq, value),
+            ContextValue::Assistant(text) => Message::assistant(text),
+            ContextValue::Context(text, _) => {
+                self.messages.insert(self.context, Message::user(text));
+                self.context += 1;
+                self.last = seq.get();
+                return;
+            }
             ContextValue::Reply(output) => {
                 let reply = match fresh {
                     Some(message) => Ok(message),
@@ -207,6 +300,7 @@ impl Transcript {
                 }
             }
             ContextValue::ToolCall(id, tool) => {
+                self.tools.insert(CallId(seq), tool.clone());
                 self.calls.insert(CallId(seq), (id, tool));
                 return;
             }
@@ -224,15 +318,18 @@ impl Transcript {
         let Some((id, tool)) = self.calls.remove(&call) else {
             return;
         };
-        let (output, error) = if self.detached.contains_key(&call) {
-            let stream = Json::encode(&OutputStream { call }).unwrap_or_default();
+        let ext::Presented { output, error } = if self.detached.contains(&call) {
+            let stream = OutputStream { call };
             let text = format!(
-                "[it goes on in the background; its output streams to {stream}, and its \
-                 result follows once it ends]"
+                "[it goes on in the background; its output streams to {stream}, and \
+                 its result follows once it ends]"
             );
-            (llm::Output::Text(text), false)
+            ext::Presented {
+                output: llm::Output::Text(text),
+                error: false,
+            }
         } else {
-            self.registry.tools().to_model(&tool, outcome)
+            self.registry.present_result(&tool, outcome)
         };
         let result = ToolResult {
             id: id.into(),
@@ -255,15 +352,49 @@ impl Transcript {
         }
     }
 
+    /// Folds what the queue holds of the session's own: an item withdrawn,
+    /// a result that came back, a call gone to the background.
+    fn queue(&mut self, seq: Seq, value: ContextValue) {
+        let text = match value {
+            ContextValue::Withdrawn(input) => {
+                self.waiting.remove(&input);
+                return;
+            }
+            ContextValue::Detached(call) => {
+                self.detached.insert(call);
+                return;
+            }
+            ContextValue::Child(outcome) => ext::child_result(&outcome),
+            ContextValue::Background(call, outcome) => self.background(call, &outcome),
+            ContextValue::Job(call, text) => self.ended(call, None, &text),
+            _ => return,
+        };
+        self.waiting.insert(seq, Waiting::Own(text));
+    }
+
     /// What the model reads of the outcome of call `call`, which went on
     /// in the background.
     fn background(&mut self, call: CallId, outcome: &Outcome) -> String {
-        let tool = self.detached.remove(&call).unwrap_or_default();
-        let (output, _) = self.registry.tools().to_model(&tool, outcome);
-        format!(
-            "The call {call} to {tool}, which went on in the background, ended:\n{}",
-            text_of(output)
-        )
+        self.detached.remove(&call);
+        let tool = self.tools.get(&call).cloned().unwrap_or_default();
+        let ext::Presented { output, .. } = self.registry.present_result(&tool, outcome);
+        self.ended(call, Some(&text_of(output)), "")
+    }
+
+    /// A call that went on in the background ended, as the model reads it:
+    /// with its output, or with `note` about its end.
+    fn ended(&self, call: CallId, output: Option<&str>, note: &str) -> String {
+        let command = self.tools.get(&call).map_or("", String::as_str);
+        let stream = OutputStream { call }.to_string();
+        let id = call.to_string();
+        Tag::from(tag::BackgroundResult {
+            call: &id,
+            command,
+            exit: None,
+            log: Some(&stream),
+            output: output.or(Some(note)),
+        })
+        .to_string()
     }
 
     /// Appends `text` to the result of call `call`, if that result is in
@@ -413,9 +544,11 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
                 matches!(
                     value,
                     ContextValue::ToolCall(..)
-                        | ContextValue::Queued(_)
+                        | ContextValue::Queued(..)
+                        | ContextValue::Inbox(_)
                         | ContextValue::Child(_)
                         | ContextValue::Background(..)
+                        | ContextValue::Job(..)
                 ) && !done.contains(&e.seq)
             }) {
                 continue;
@@ -451,21 +584,6 @@ fn project(image: ContextImage, registry: Arc<Registry>, system: &str) -> Transc
     Transcript::empty(registry, system)
 }
 
-/// An output as text, for a message of text alone.
-fn text_of(output: llm::Output) -> String {
-    match output {
-        llm::Output::Text(text) => text,
-        llm::Output::Json(json) => json.raw().to_owned(),
-        llm::Output::Content(parts) => (parts.into_iter())
-            .filter_map(|part| match part {
-                llm::UserPart::Text(text) => Some(text.text),
-                llm::UserPart::Media(_) => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
 #[cfg(test)]
 #[path = "transcript/context_image_tests.rs"]
 mod context_image_tests;
@@ -473,3 +591,195 @@ mod context_image_tests;
 #[cfg(test)]
 #[path = "transcript/queue_tests.rs"]
 mod queue_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ext::point::{PresentResult, Presenting};
+    use ext::{Extension, Presented, Registrar, Rewrite};
+    use protocol::{BlobId, BlobRef, EnvelopeId, Epoch, Json, SessionId};
+
+    fn entry(seq: u64, body: Body) -> Entry {
+        Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)
+    }
+
+    fn input(segments: impl Into<Segments>, mode: Mode, taken: bool) -> Body {
+        Body::Input {
+            segments: segments.into(),
+            mode,
+            taken,
+            origin: None,
+            force: false,
+        }
+    }
+
+    fn take(input: u64) -> Body {
+        Body::Take {
+            input: Seq::new(input).unwrap(),
+            into: None,
+        }
+    }
+
+    fn seen(entries: &[Entry], registry: Registry) -> Vec<Message> {
+        Transcript::of(entries, Arc::new(registry), "")
+            .into_messages()
+            .to_vec()
+    }
+
+    fn said(messages: &[Message]) -> Vec<String> {
+        (messages.iter())
+            .filter_map(|message| match message {
+                Message::User(user) => match &user.content[..] {
+                    [llm::UserPart::Text(text)] => Some(text.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_paste_reaches_the_model_tagged_and_typed_text_as_it_is() {
+        let blob = BlobRef {
+            id: BlobId("ab12".into()),
+            size: 9000,
+            media_type: "text/plain".into(),
+        };
+        let segments = vec![
+            Segment::Text("see ".into()),
+            Segment::Paste("a\nb".into()),
+            Segment::PasteRef(blob),
+        ];
+        let entries = [entry(1, input(segments, Mode::Queue, true))];
+        assert_eq!(
+            said(&seen(&entries, Registry::default())),
+            [
+                "see <pasted-content lines=\"2\" bytes=\"3\">\na\nb\n</pasted-content>\
+              <pasted-content path=\"blob:ab12\" bytes=\"9000\"/>"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_steer_reaches_the_model_naming_who_gave_it() {
+        let entries = [
+            entry(1, input("first", Mode::Queue, true)),
+            entry(2, input("not that", Mode::Steer, false)),
+            entry(3, take(2)),
+            entry(4, input("later", Mode::Queue, false)),
+            entry(5, take(4)),
+        ];
+        assert_eq!(
+            said(&seen(&entries, Registry::default())),
+            [
+                "first",
+                "<steer from=\"user\">\nnot that\n</steer>",
+                "later"
+            ]
+        );
+    }
+
+    #[test]
+    fn another_sessions_message_names_its_sender_and_channel() {
+        let sender = SessionId::new();
+        let envelope = Envelope {
+            id: EnvelopeId {
+                sender,
+                call: CallId::new(3).unwrap(),
+                purpose: "subagent:message/0".into(),
+            },
+            destination: SessionId::new(),
+            payload: "hello".into(),
+        };
+        let entries = [entry(1, Body::Enqueue { envelope }), entry(2, take(1))];
+        assert_eq!(
+            said(&seen(&entries, Registry::default())),
+            [format!(
+                "<message from=\"{sender}\" channel=\"subagent:message/0\">\nhello\n</message>"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_model_only_thread_reads_waiting_input_as_given_and_an_agent_reads_it_tagged() {
+        let pasted = Segments(vec![
+            Segment::Text("see ".into()),
+            Segment::Paste("x".into()),
+        ]);
+        let inputs = |runner| {
+            let seq = |n| Seq::new(n).unwrap();
+            vec![ContextLayer(
+                runner,
+                vec![
+                    ContextInput(seq(1), ContextValue::Queued(pasted.clone(), Mode::Steer)),
+                    ContextInput(seq(2), ContextValue::Taken(seq(1))),
+                ],
+            )]
+        };
+        let read = |runner| {
+            let transcript = project(inputs(runner), Arc::new(Registry::default()), "");
+            said(&transcript.into_messages())
+        };
+        assert_eq!(read(RunnerKind::ModelOnly), ["see x"]);
+        assert_eq!(
+            read(RunnerKind::Agent),
+            [
+                "<steer from=\"user\">\nsee <pasted-content lines=\"1\" bytes=\"1\">\nx\n</pasted-content>\n</steer>"
+            ]
+        );
+    }
+
+    struct Shown;
+
+    impl Extension for Shown {
+        const NAME: &'static str = "shown";
+        const VERSION: u32 = 1;
+
+        fn contribute(&self, r: &mut Registrar) {
+            r.on::<PresentResult>(|(), ended: Presenting<'_>| {
+                Rewrite::Replace(Presented {
+                    output: llm::Output::Text(format!(
+                        "{} said {:?}",
+                        ended.tool, ended.presented.output
+                    )),
+                    error: ended.presented.error,
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn present_result_decides_what_the_model_sees_of_an_outcome_and_defaults_to_the_tool() {
+        let entries = [
+            entry(
+                1,
+                Body::ToolCall {
+                    invoke: None,
+                    tool: "t".into(),
+                    input: Json::null(),
+                    id: Some("c1".into()),
+                    card: None,
+                    by: protocol::Audience::Model,
+                },
+            ),
+            entry(
+                2,
+                Body::ToolResult {
+                    call: CallId::new(1).unwrap(),
+                    outcome: Outcome::Done {
+                        output: Json::encode("ok").unwrap(),
+                    },
+                    card: None,
+                },
+            ),
+        ];
+        let output = |registry| match seen(&entries, registry).last() {
+            Some(Message::Tool(tool)) => tool.results[0].output.clone(),
+            other => panic!("{other:?}"),
+        };
+        let plain = output(Registry::default());
+        assert_eq!(plain, llm::Output::Json(Json::encode("ok").unwrap()));
+        let shown = output(Registry::default().with(&Shown).unwrap());
+        assert_eq!(shown, llm::Output::Text(format!("t said {plain:?}")));
+    }
+}

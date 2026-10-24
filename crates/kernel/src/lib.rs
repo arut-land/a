@@ -120,7 +120,7 @@ pub enum Event {
     /// and the running calls that can go on in the background are
     /// detached ([`Work::Detach`]).
     Input {
-        text: String,
+        segments: protocol::Segments,
         mode: Mode,
         force: bool,
         origin: Option<Author>,
