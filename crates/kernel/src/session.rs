@@ -1,14 +1,13 @@
 //! The turn and call state machine: one [`Core`] per session.
 
 use protocol::publication::RunnerKind;
-use std::collections::VecDeque;
 use std::mem;
 use std::sync::Arc;
 
-use protocol::ledger::{Call, Ledger, OutcomeKind, Phase};
+use protocol::ledger::{Call, Ledger, OutcomeKind, Phase, Queued};
 use protocol::{
-    Audience, Author, Body, CallId, Entry, Json, Mode, Outcome, Seq, SessionId, ToolChoice,
-    Verdict, WaitOn,
+    Audience, Author, Body, CallId, Entry, Envelope, EnvelopeId, Json, Mode, Outcome, OutputStream,
+    Seq, SessionId, ToolChoice, Verdict, WaitOn,
 };
 use smallvec::SmallVec;
 
@@ -16,9 +15,9 @@ use protocol::Card;
 
 use crate::fold::{Fold, Next};
 use crate::{
-    Action, Admission, Answer, Barriers, Binding, Chained, Concurrency, Durability, Event, Gate,
-    Gated, Load, ModelPhase, Name, Note, Owner, Recover, Replay, Replied, Requirement, Step,
-    StepPlan, Ticket, Turn, Work,
+    Action, Admission, Answer, Barriers, Binding, Boundary, Chained, Concurrency, Detach,
+    Durability, Event, Gate, Gated, Load, ModelPhase, Name, Note, Owner, QueueView, Recover,
+    Replay, Replied, Requirement, Step, StepPlan, Ticket, Turn, Work,
 };
 
 /// Who refused a call the agent would not run.
@@ -33,6 +32,8 @@ pub const RESTART_CAP: u16 = 10;
 /// generation its steps run on.
 pub struct Core {
     registry: Arc<dyn Binding>,
+    /// The session's id, which its own envelopes are addressed by.
+    session: SessionId,
     generation_context: Option<String>,
     fold: Fold,
     turn: Turn,
@@ -43,9 +44,6 @@ pub struct Core {
     busy: bool,
     /// The last entry when the session last reported.
     reported: u64,
-    /// Results of children no call waits on, held until the turn running
-    /// ends: each starts a turn of its own.
-    deferred: VecDeque<(SessionId, Outcome)>,
     /// Why the model call being recovered failed, while a handler decides.
     failed: Option<String>,
     barriers: Barriers,
@@ -94,12 +92,12 @@ impl Core {
             fold: Fold::restore(registry.agent(), ledger),
             generation_context: registry.generation_context(),
             registry,
+            session: SessionId::NIL,
             turn: Turn::Idle,
             child: false,
             owned_cancelled: false,
             busy: false,
             reported: 0,
-            deferred: VecDeque::new(),
             failed: None,
             barriers: Barriers::default(),
         }
@@ -121,6 +119,9 @@ impl Core {
     pub fn resumed(&mut self, load: &Load<'_>) -> StepPlan {
         // What the log shows the agent stepped through is done.
         self.fold.stepped = false;
+        if let Some(session) = load.session {
+            self.session = session;
+        }
         self.child = matches!(load.owner, Owner::Present | Owner::Cancelled);
         self.owned_cancelled = matches!(load.owner, Owner::Gone | Owner::Cancelled);
         self.busy = load.busy;
@@ -136,6 +137,7 @@ impl Core {
     }
 
     /// What follows `event`.
+    #[allow(clippy::too_many_lines, reason = "one arm per event")]
     pub fn step(&mut self, event: Event) -> StepPlan {
         let mut fx = StepPlan::default();
         match event {
@@ -153,9 +155,18 @@ impl Core {
             Event::Input {
                 text,
                 mode,
+                force,
                 origin,
                 ticket,
-            } => self.input(text, mode, origin, ticket, &mut fx),
+            } => self.input(text, mode, force, origin, ticket, &mut fx),
+            Event::Withdraw {
+                input,
+                origin,
+                ticket,
+            } => {
+                let result = self.withdraw(input, origin, &mut fx);
+                reply(&mut fx, ticket, result);
+            }
             Event::OwnerCancelled => {
                 self.owned_cancelled = true;
                 self.interrupt(None, &mut fx);
@@ -185,6 +196,10 @@ impl Core {
                 outcome,
                 card,
             } => self.tool_done(call, outcome, card, &mut fx),
+            Event::Detached { call } => self.detached(call, &mut fx),
+            Event::JobEnded { call, text } => {
+                self.own(call, EnvelopeId::JOB, text, &mut fx);
+            }
             Event::Note { call, note } => self.note(call, note, &mut fx),
             Event::Waits { call, on } => self.waits(call, on, &mut fx),
             Event::Spawn {
@@ -217,12 +232,17 @@ impl Core {
                 decisions,
                 answered,
             } => self.prepared(call, decisions, answered, &mut fx),
-            Event::SendEnvelope { envelope, ticket } => {
-                self.send_envelope(envelope, ticket, &mut fx);
+            Event::SendEnvelope { outgoing, ticket } => {
+                self.send_envelope(&outgoing, ticket, &mut fx);
             }
             Event::Enqueue { envelope, ticket } => self.enqueue(envelope, ticket, &mut fx),
-            Event::Delivered { id, result, ticket } => self.delivered(id, result, ticket, &mut fx),
-            Event::ChildSettled { child, outcome } => self.child_settled(child, outcome, &mut fx),
+            Event::Delivered {
+                id,
+                recipient,
+                result,
+                ticket,
+            } => self.delivered(&id, recipient, result, ticket, &mut fx),
+            Event::ChildSettled { child, outcome } => self.child_settled(child, &outcome, &mut fx),
             Event::Registry(registry) => {
                 if self.at_rest() {
                     self.resolve(registry, &mut fx);
@@ -242,15 +262,15 @@ impl Core {
         &self.turn
     }
 
-    /// Whether nothing is in flight, asked for, queued or deferred: the
-    /// ledger alone says where the session stands, so a snapshot of it
-    /// restores the session ([`Core::restore`]).
+    /// Whether nothing is in flight, asked for, queued or in the
+    /// background: the ledger alone says where the session stands, so a
+    /// snapshot of it restores the session ([`Core::restore`]).
     pub fn at_rest(&self) -> bool {
         self.turn == Turn::Idle
             && self.failed.is_none()
             && self.fold.at_rest()
-            && self.deferred.is_empty()
             && self.fold.ledger.untaken().is_empty()
+            && self.fold.ledger.detached().is_empty()
             && self.fold.ledger.open_calls().next().is_none()
             && self.fold.ledger.pending_outbox().next().is_none()
     }
@@ -303,7 +323,7 @@ impl Core {
                 | Work::StartChild { .. }
                 | Work::Interrupt { .. }
                 | Work::Report { .. } => Some(Requirement::Durable),
-                Work::Cancel { .. } | Work::MarkBusy(_) => None,
+                Work::Cancel { .. } | Work::Detach { .. } | Work::MarkBusy(_) => None,
             };
             match requirement {
                 Some(requirement) => fx.admitted.push(crate::Guarded {
@@ -334,36 +354,38 @@ impl Core {
         }
     }
 
-    fn send_envelope(&mut self, envelope: protocol::Envelope, ticket: Ticket, fx: &mut StepPlan) {
-        let id = &envelope.id;
+    /// Sends `outgoing` to each recipient its route resolved, once: the
+    /// intent commits before any delivery, and the send is answered once
+    /// every recipient has answered.
+    fn send_envelope(&mut self, outgoing: &protocol::Outgoing, ticket: Ticket, fx: &mut StepPlan) {
+        let id = &outgoing.id;
         if let Some(refusal) = self.fold.ledger.acknowledged(id) {
+            let result = refusal.clone().map_or(Ok(()), Err);
+            fx.immediate.push(Work::Delivery { ticket, result });
+            return;
+        }
+        if outgoing.recipients.is_empty() {
             fx.immediate.push(Work::Delivery {
                 ticket,
-                result: refusal.clone().map_or(Ok(()), Err),
+                result: Ok(()),
             });
-        } else {
-            let envelope = self
-                .fold
-                .ledger
-                .outbox()
-                .iter()
-                .find(|e| e.id == *id)
-                .cloned()
-                .unwrap_or(envelope);
-            if !self
-                .fold
-                .ledger
-                .outbox()
-                .iter()
-                .any(|e| e.id == envelope.id)
-            {
-                self.append(
-                    fx,
-                    Body::Outbox {
-                        envelope: envelope.clone(),
-                    },
-                );
-            }
+            return;
+        }
+        if !self.fold.ledger.outbox().iter().any(|e| e.id == *id) {
+            self.append(
+                fx,
+                Body::Outbox {
+                    envelope_id: outgoing.id.clone(),
+                    recipients: outgoing.recipients.clone(),
+                    payload: outgoing.payload.clone(),
+                },
+            );
+        }
+        let envelopes: Vec<Envelope> = (self.fold.ledger.outbox().iter())
+            .filter(|e| e.id == *id)
+            .flat_map(protocol::ledger::Sending::envelopes)
+            .collect();
+        for envelope in envelopes {
             fx.immediate.push(Work::Deliver {
                 envelope,
                 ticket: Some(ticket),
@@ -371,7 +393,7 @@ impl Core {
         }
     }
 
-    fn enqueue(&mut self, envelope: protocol::Envelope, ticket: Ticket, fx: &mut StepPlan) {
+    fn enqueue(&mut self, envelope: Envelope, ticket: Ticket, fx: &mut StepPlan) {
         if self.registry.runner() == RunnerKind::ModelOnly
             && !self.fold.ledger.received(&envelope.id)
         {
@@ -392,26 +414,26 @@ impl Core {
 
     fn delivered(
         &mut self,
-        id: protocol::EnvelopeId,
+        id: &EnvelopeId,
+        recipient: SessionId,
         result: Result<(), protocol::InboxRefusal>,
         ticket: Option<Ticket>,
         fx: &mut StepPlan,
     ) {
-        let result = self
-            .fold
-            .ledger
-            .acknowledged(&id)
-            .map_or(result, |r| r.clone().map_or(Ok(()), Err));
-        if self.fold.ledger.acknowledged(&id).is_none() {
+        let pending = (self.fold.ledger.outbox().iter())
+            .any(|e| e.id == *id && e.pending.contains(&recipient));
+        if pending {
             self.append(
                 fx,
                 Body::Ack {
-                    envelope_id: id,
-                    refusal: result.clone().err(),
+                    envelope_id: id.clone(),
+                    recipient,
+                    refusal: result.err(),
                 },
             );
         }
-        if let Some(ticket) = ticket {
+        if let (Some(ticket), Some(settled)) = (ticket, self.fold.ledger.acknowledged(id)) {
+            let result = settled.clone().map_or(Ok(()), Err);
             fx.immediate.push(Work::Delivery { ticket, result });
         }
     }
@@ -422,6 +444,7 @@ impl Core {
         &mut self,
         text: String,
         mode: Mode,
+        force: bool,
         origin: Option<Author>,
         ticket: Option<Ticket>,
         fx: &mut StepPlan,
@@ -451,6 +474,7 @@ impl Core {
         for (by, d) in decisions {
             self.decide(None, &by, d, fx);
         }
+        let force = force && mode == Mode::Steer && !taken;
         self.append(
             fx,
             Body::Input {
@@ -458,9 +482,128 @@ impl Core {
                 mode,
                 taken,
                 origin,
+                force,
             },
         );
+        if force {
+            self.force(fx);
+        }
         reply(fx, ticket, Ok(()));
+    }
+
+    /// Brings the running turn's next boundary on now, for a forced steer:
+    /// the model call is cut short, its partial reply dropped, and the
+    /// running calls that can go on in the background are detached. What
+    /// cannot be detached runs on; the steer is read once it is answered.
+    fn force(&mut self, fx: &mut StepPlan) {
+        match self.turn {
+            Turn::Model {
+                call,
+                phase: ModelPhase::Streaming,
+                ..
+            } => fx.immediate.push(Work::Cancel { call }),
+            Turn::Model { call, .. } => {
+                fx.immediate.push(Work::Cancel { call });
+                self.failed = None;
+                self.turn = Turn::Acting {
+                    open: SmallVec::new(),
+                };
+                self.settle(call, Outcome::Interrupted { output: None }, fx);
+            }
+            Turn::Acting { ref open } => {
+                let running: SmallVec<[CallId; 2]> = (open.iter())
+                    .filter(|&&(call, step)| step == Step::Running && self.detachable(call))
+                    .map(|&(call, _)| call)
+                    .collect();
+                fx.immediate
+                    .extend(running.into_iter().map(|call| Work::Detach { call }));
+            }
+            Turn::Idle | Turn::Stopping { .. } => {}
+        }
+    }
+
+    /// Whether running call `call` may go on in the background: its tool
+    /// says so, and it waits on nothing it started (a call of its own).
+    fn detachable(&self, call: CallId) -> bool {
+        let invoking = (self.fold.ledger.open_calls()).any(
+            |(_, open)| matches!(&open.call, Call::Tool { invoke: Some(key), .. } if key.parent == call),
+        );
+        !invoking
+            && self
+                .tool_of(call)
+                .and_then(|(tool, _)| self.registry.callable(&tool))
+                .is_some_and(|c| c.detach == Detach::Background)
+    }
+
+    /// Takes back the user's queued input `input`, unless it was taken
+    /// first: the first of the two logged wins.
+    fn withdraw(
+        &mut self,
+        input: Seq,
+        origin: Option<Author>,
+        fx: &mut StepPlan,
+    ) -> Result<(), String> {
+        if self.resent(origin) {
+            return Ok(());
+        }
+        let queued =
+            (self.fold.ledger.untaken().iter()).any(|q| q.seq == input && q.source.visible());
+        if !queued {
+            return Err(format!("input {input} is no longer queued"));
+        }
+        self.append(fx, Body::Withdraw { input, origin });
+        Ok(())
+    }
+
+    /// Running call `call` goes on in the background: its result now is a
+    /// placeholder naming its output stream, and its outcome comes back as
+    /// the session's own envelope ([`Core::tool_done`]).
+    fn detached(&mut self, call: CallId, fx: &mut StepPlan) {
+        if !matches!(self.turn, Turn::Acting { .. }) || self.step_of(call) != Some(Step::Running) {
+            return;
+        }
+        self.append(fx, Body::Detached { call });
+        self.close(call);
+        let outcome = OutputStream { call }.placeholder();
+        self.result(call, outcome, None, fx);
+    }
+
+    /// Queues an envelope from the session to itself, about its own call
+    /// `call`, unless one with its id was queued already.
+    fn own(
+        &mut self,
+        call: CallId,
+        purpose: &str,
+        payload: String,
+        fx: &mut StepPlan,
+    ) -> Option<Seq> {
+        let envelope = Envelope::own(self.session, call, purpose, payload);
+        if self.fold.ledger.received(&envelope.id) {
+            return None;
+        }
+        Some(self.append(fx, Body::Enqueue { envelope }).0)
+    }
+
+    /// Ends the calls running in the background, as an interrupt does:
+    /// each is cancelled, and its outcome, interrupted, is queued and
+    /// withdrawn at once, so it closes the call and starts nothing.
+    fn drop_detached(&mut self, fx: &mut StepPlan) {
+        let detached: SmallVec<[CallId; 1]> = (self.fold.ledger.detached().iter())
+            .map(|d| d.call)
+            .collect();
+        for call in detached {
+            fx.immediate.push(Work::Cancel { call });
+            let payload = Outcome::Interrupted { output: None }.payload();
+            if let Some(input) = self.own(call, EnvelopeId::DETACHED, payload, fx) {
+                self.append(
+                    fx,
+                    Body::Withdraw {
+                        input,
+                        origin: None,
+                    },
+                );
+            }
+        }
     }
 
     /// Stops the turn running: its model call or the calls it waits on.
@@ -468,6 +611,7 @@ impl Core {
     /// in any state: what waits settles at once, what runs is cancelled and
     /// settles as it reports.
     fn interrupt(&mut self, origin: Option<Author>, fx: &mut StepPlan) {
+        self.drop_detached(fx);
         let detached: Vec<_> = self
             .fold
             .ledger
@@ -898,6 +1042,10 @@ impl Core {
     /// Logs a call's outcome as the `post_tool` chain leaves it, with the
     /// card its tool showed it with, unless a handler replaced it.
     fn tool_done(&mut self, call: CallId, outcome: Outcome, card: Option<Card>, fx: &mut StepPlan) {
+        if self.fold.ledger.detached().iter().any(|d| d.call == call) {
+            self.own(call, EnvelopeId::DETACHED, outcome.payload(), fx);
+            return;
+        }
         if self.step_of(call) != Some(Step::Running) {
             return;
         }
@@ -914,6 +1062,20 @@ impl Core {
         }
         self.cancel_invocations(call, fx);
         self.close(call);
+        self.result(call, outcome, card, fx);
+    }
+
+    /// Logs tool call `call`'s result: a boundary at which queued items
+    /// may go into it, for a call the model made.
+    fn result(&mut self, call: CallId, outcome: Outcome, card: Option<Card>, fx: &mut StepPlan) {
+        let model = matches!(
+            self.fold.ledger.call(call).map(|open| &open.call),
+            Some(Call::Tool {
+                by: Audience::Model,
+                invoke: None,
+                ..
+            })
+        );
         self.append(
             fx,
             Body::ToolResult {
@@ -922,6 +1084,36 @@ impl Core {
                 card,
             },
         );
+        if model {
+            for input in self.dequeue(Boundary::ToolDone(call)) {
+                let into = Some(call);
+                self.append(fx, Body::Take { input, into });
+            }
+        }
+    }
+
+    /// What of the queue to take up at `boundary`, as the `dequeue` point
+    /// answers. A model-only runner answers one input per turn, so what
+    /// the user did not send waits for the turn's end.
+    fn dequeue(&self, boundary: Boundary) -> SmallVec<[Seq; 4]> {
+        let items = self.fold.ledger.untaken();
+        if items.is_empty() {
+            return SmallVec::new();
+        }
+        let visible: Vec<Queued>;
+        let items =
+            if self.registry.runner() == RunnerKind::ModelOnly && boundary != Boundary::TurnEnd {
+                visible = items
+                    .iter()
+                    .filter(|q| q.source.visible())
+                    .cloned()
+                    .collect();
+                &visible[..]
+            } else {
+                items
+            };
+        let queue = QueueView::new(items);
+        (self.registry.loop_points().dequeue(boundary, queue)).of(boundary, queue)
     }
 
     /// Extension-owned facts may arrive while an open call waits. Closing
@@ -1038,17 +1230,15 @@ impl Core {
     }
 
     /// Fires the watches on `child`. A call waiting on it goes on with its
-    /// result; otherwise the result is the agent's, between turns.
-    fn child_settled(&mut self, child: SessionId, outcome: Outcome, fx: &mut StepPlan) {
+    /// result; otherwise the result is queued, as the session's own
+    /// envelope under the watch, for the agent to take up.
+    fn child_settled(&mut self, child: SessionId, outcome: &Outcome, fx: &mut StepPlan) {
         let Some(call) = self.fold.owner(child) else {
-            if self.turn == Turn::Idle {
-                self.fire(child, &outcome, fx);
-            } else if self.fold.ledger.armed().any(|(_, c)| c == child) {
-                self.deferred.push_back((child, outcome));
-            }
+            self.fire(child, outcome, fx);
+            self.queue_children(fx);
             return;
         };
-        if !self.fire(child, &outcome, fx) {
+        if self.fire(child, outcome, fx).is_empty() {
             return;
         }
         match (&self.turn, self.step_of(call)) {
@@ -1056,13 +1246,18 @@ impl Core {
                 self.close(call);
                 self.settle(call, self.interrupted(call), fx);
             }
-            (_, Some(Step::Waiting)) => self.resume_call(call, to_json(&outcome), fx),
+            (_, Some(Step::Waiting)) => self.resume_call(call, to_json(outcome), fx),
             _ => {}
         }
     }
 
-    /// Logs each armed watch on `child` fired; whether any was.
-    fn fire(&mut self, child: SessionId, outcome: &Outcome, fx: &mut StepPlan) -> bool {
+    /// Logs each armed watch on `child` fired: the watches.
+    fn fire(
+        &mut self,
+        child: SessionId,
+        outcome: &Outcome,
+        fx: &mut StepPlan,
+    ) -> SmallVec<[Seq; 1]> {
         let watches: SmallVec<[Seq; 1]> = (self.fold.ledger.armed())
             .filter_map(|(watch, watched)| (watched == child).then_some(watch))
             .collect();
@@ -1070,15 +1265,16 @@ impl Core {
             let outcome = outcome.clone();
             self.append(fx, Body::Fired { watch, outcome });
         }
-        !watches.is_empty()
+        watches
     }
 
     // ── the turn ──────────────────────────────────────────────────────
 
     /// Carries out what is asked for while nothing is open: the agent's
-    /// next action, or a shared call alongside the shared calls open;
-    /// once it stopped, what the `on_stop` point gives it; then queued
-    /// input, and children's results.
+    /// next action, or a shared call alongside the shared calls open, the
+    /// queue's boundary before a model call taken first; once it stopped,
+    /// what the `on_stop` point gives it; then the queue's boundary at the
+    /// turn's end.
     #[allow(clippy::too_many_lines)]
     fn advance(&mut self, fx: &mut StepPlan) {
         loop {
@@ -1105,24 +1301,22 @@ impl Core {
                 Turn::Acting { .. } | Turn::Idle => {}
             }
             if self.owned_cancelled {
-                let pending: Vec<_> = self
-                    .fold
-                    .ledger
-                    .pending_outbox()
-                    .map(|e| e.id.clone())
+                let pending: Vec<_> = (self.fold.ledger.pending_outbox())
+                    .flat_map(|e| e.pending.iter().map(|&to| (e.id.clone(), to)))
                     .collect();
-                for envelope_id in pending {
+                for (envelope_id, recipient) in pending {
                     self.append(
                         fx,
                         Body::Ack {
                             envelope_id,
+                            recipient,
                             refusal: Some(protocol::InboxRefusal::Interrupted),
                         },
                     );
                 }
                 let queued = !self.fold.ledger.untaken().is_empty();
-                while let Some(input) = self.fold.ledger.untaken().front().map(|q| q.seq) {
-                    self.append(fx, Body::Take { input });
+                while let Some(input) = self.fold.ledger.untaken().first().map(|q| q.seq) {
+                    self.append(fx, Body::Take { input, into: None });
                 }
                 if queued {
                     self.append(fx, Body::Interrupt { origin: None });
@@ -1137,21 +1331,10 @@ impl Core {
                     self.fold.asked.front(),
                     Some(Next::Agent(Action::CallModel { .. }))
                 );
-            if next_request && self.registry.runner() == RunnerKind::Agent {
-                if let Some((child, outcome)) = self.deferred.pop_front() {
-                    self.fire(child, &outcome, fx);
-                    continue;
-                }
-                if let Some(input) = self
-                    .fold
-                    .ledger
-                    .untaken()
-                    .front()
-                    .filter(|q| self.fold.ledger.enqueued(q.seq))
-                    .map(|q| q.seq)
-                {
-                    self.append(fx, Body::Take { input });
-                    continue;
+            if next_request {
+                // Read at the request's tail, which keeps its prefix cached.
+                for input in self.dequeue(Boundary::BeforeModel) {
+                    self.append(fx, Body::Take { input, into: None });
                 }
             }
             if let Some(next) = self.fold.asked.front().cloned() {
@@ -1171,18 +1354,16 @@ impl Core {
                 continue;
             }
             self.turn = Turn::Idle;
-            if let Some(input) = self.fold.ledger.untaken().front().map(|q| q.seq) {
-                self.turn = Turn::Acting {
-                    open: SmallVec::new(),
-                };
-                self.append(fx, Body::Take { input });
-                continue;
+            let taken = self.dequeue(Boundary::TurnEnd);
+            if taken.is_empty() {
+                return;
             }
-            if let Some((child, outcome)) = self.deferred.pop_front() {
-                self.fire(child, &outcome, fx);
-                continue;
+            self.turn = Turn::Acting {
+                open: SmallVec::new(),
+            };
+            for input in taken {
+                self.append(fx, Body::Take { input, into: None });
             }
-            return;
         }
     }
 
@@ -1223,15 +1404,6 @@ impl Core {
                 self.append(fx, Body::Assistant { text });
             }
             Next::Agent(Action::CallModel { choice }) => {
-                // Steering input reaches the turn before the model is
-                // next asked.
-                let steers: SmallVec<[Seq; 2]> = (self.fold.ledger.untaken().iter())
-                    .filter(|q| q.steer)
-                    .map(|q| q.seq)
-                    .collect();
-                for input in steers {
-                    self.append(fx, Body::Take { input });
-                }
                 if !self.fold.ledger.has_context()
                     && let Some(text) = self.registry.context()
                 {
@@ -1535,7 +1707,8 @@ impl Core {
             Turn::Model { .. } | Turn::Stopping { .. } => true,
         };
         let outgoing = ledger.pending_outbox().next().is_some();
-        let busy = working || queued || armed || outgoing;
+        let background = !ledger.detached().is_empty();
+        let busy = working || queued || armed || outgoing || background;
         if busy != self.busy {
             self.busy = busy;
             // Marked before the work starts, cleared after it ends.
@@ -1547,7 +1720,7 @@ impl Core {
         }
         // Settled with something new since it last reported (one given no
         // input yet has not run).
-        let settled = self.turn == Turn::Idle && !queued && !armed && !outgoing;
+        let settled = self.turn == Turn::Idle && !queued && !armed && !outgoing && !background;
         let ran = ledger.turn_start() > 0;
         if settled && self.child && ran && ledger.seq() > self.reported {
             self.reported = ledger.seq();
@@ -1590,12 +1763,14 @@ impl Core {
             for cancelled in load.abandoned {
                 let input = cancelled.input;
                 if self.fold.ledger.untaken().iter().any(|q| q.seq == input) {
-                    self.append(fx, Body::Take { input });
+                    self.append(fx, Body::Take { input, into: None });
                 }
             }
             self.append(fx, Body::Interrupt { origin: None });
         }
         self.relink(fx);
+        self.queue_children(fx);
+        self.recover_detached(fx);
         // A command cut off is not run again.
         let commands: SmallVec<[CallId; 1]> = self.fold.ledger.open_commands().collect();
         for call in commands {
@@ -1633,6 +1808,7 @@ impl Core {
     }
 
     fn cancel_recovered(&mut self, fx: &mut StepPlan) {
+        self.drop_detached(fx);
         let children: Vec<_> = self.fold.ledger.armed().map(|(_, child)| child).collect();
         for child in children {
             fx.immediate.push(Work::Interrupt { child });
@@ -1655,21 +1831,51 @@ impl Core {
         self.turn = Turn::Idle;
     }
 
+    /// Queues, as the session's own envelopes, the results of children no
+    /// call waits on that have fired and are not queued yet.
+    fn queue_children(&mut self, fx: &mut StepPlan) {
+        for (watch, outcome) in mem::take(&mut self.fold.unqueued) {
+            self.own(CallId(watch), EnvelopeId::CHILD, outcome.payload(), fx);
+        }
+    }
+
+    /// Calls a restart cut off in the background go on as each tool's
+    /// replay says: one safe to run again runs again, still detached; any
+    /// other's outcome is that it was cut off and may not have completed,
+    /// with where its output so far went.
+    fn recover_detached(&mut self, fx: &mut StepPlan) {
+        for d in self.fold.ledger.detached().to_vec() {
+            let safe = (self.registry.callable(&d.tool)).is_some_and(|c| c.replay == Replay::Safe);
+            if safe {
+                fx.immediate.push(Work::RunTool {
+                    call: d.call,
+                    tool: d.tool,
+                    input: d.input,
+                });
+                continue;
+            }
+            let stream = Json::encode(&OutputStream { call: d.call }).unwrap_or_default();
+            let output = format!(
+                "[the daemon stopped while this call ran in the background: it may not have \
+                 completed; its output so far is in {stream}]"
+            );
+            let outcome = Outcome::Interrupted {
+                output: Some(output),
+            };
+            self.own(d.call, EnvelopeId::DETACHED, outcome.payload(), fx);
+        }
+    }
+
     /// Re-arms links: a link not yet watched is watched, and every child
     /// still watched is started, so it runs to its end and reports back.
     fn relink(&mut self, fx: &mut StepPlan) {
-        for envelope in self
-            .fold
-            .ledger
-            .outbox()
-            .iter()
-            .filter(|e| self.fold.ledger.acknowledged(&e.id).is_none())
-        {
-            fx.immediate.push(Work::Deliver {
-                envelope: envelope.clone(),
+        let unacknowledged =
+            (self.fold.ledger.outbox().iter()).flat_map(protocol::ledger::Sending::envelopes);
+        fx.immediate
+            .extend(unacknowledged.map(|envelope| Work::Deliver {
+                envelope,
                 ticket: None,
-            });
-        }
+            }));
         let ledger = &self.fold.ledger;
         let links: SmallVec<[_; 1]> = (ledger.links().iter())
             .filter_map(|link| {

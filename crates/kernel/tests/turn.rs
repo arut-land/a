@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use common::*;
 use kernel::{Event, Gated, Later, Load, Note, Owner, Recover, Replied, Ticket};
-use protocol::{Audience, Body, CallId, Installed, Json, Mode, Outcome, Permission, Seq, Verdict};
+use protocol::{
+    Audience, Body, CallId, Installed, Json, Mode, Outcome, Permission, Seq, SessionId, Verdict,
+};
 use serde_json::json;
 
 fn echo() -> Session {
@@ -410,6 +412,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
         mode: Mode::Steer,
         taken: false,
         origin: None,
+        force: false,
     };
     modeled().table(vec![
         (
@@ -840,6 +843,7 @@ fn the_input_point_rewrites_or_refuses_input_before_it_is_logged() {
                 mode: Mode::Queue,
                 origin: None,
                 ticket: Some(Ticket(1)),
+                force: false,
             },
             (
                 vec![],
@@ -1086,21 +1090,24 @@ fn a_background_childs_result_starts_a_turn_of_its_own() {
             fx.1.push(started());
             fx
         }),
-        // The turn runs: the result waits for it to end.
+        // The turn runs: the result is queued, and waits for it to end.
         (
             Event::ChildSettled {
                 child: child(),
                 outcome: ok.clone(),
             },
-            (vec![], vec![]),
+            (
+                vec![fired(5, 4, ok.clone()), entry(6, own_child(4, &ok))],
+                vec![],
+            ),
         ),
         (
             tool_done(2, done(json!(null))),
             (
                 vec![
-                    entry(5, tool_result(2, done(json!(null)))),
-                    fired(6, 4, ok),
-                    entry(7, said("child: \"ok\"")),
+                    entry(7, tool_result(2, done(json!(null)))),
+                    entry(8, take(6)),
+                    entry(9, said("child: \"ok\"")),
                 ],
                 vec![IDLE],
             ),
@@ -1178,6 +1185,7 @@ fn a_resend_runs_once() {
         mode: Mode::Queue,
         origin: Some(author(1)),
         ticket: Some(Ticket(ticket)),
+        force: false,
     };
     let ok = |ticket| Work::Reply {
         ticket: Ticket(ticket),
@@ -1188,6 +1196,7 @@ fn a_resend_runs_once() {
         mode: Mode::Queue,
         taken: true,
         origin: Some(author(1)),
+        force: false,
     };
     echo().table(vec![
         // Answered once its input is logged, before the turn it starts.
@@ -1283,6 +1292,15 @@ fn a_call_waits_on_a_dialog_and_resumes_with_its_answer() {
     ]);
 }
 
+fn outgoing(envelope: &protocol::Envelope) -> protocol::Outgoing {
+    protocol::Outgoing {
+        id: envelope.id.clone(),
+        recipients: vec![envelope.destination],
+        payload: envelope.payload.clone(),
+    }
+}
+
+/// An envelope from the child to this session.
 fn envelope(purpose: &str) -> protocol::Envelope {
     protocol::Envelope {
         id: protocol::EnvelopeId {
@@ -1290,7 +1308,7 @@ fn envelope(purpose: &str) -> protocol::Envelope {
             call: id(2),
             purpose: purpose.into(),
         },
-        destination: child(),
+        destination: SessionId::NIL,
         payload: purpose.into(),
     }
 }
@@ -1312,7 +1330,7 @@ fn inbox_order_and_consumption_survive_duplicate_delivery_and_replay() {
         .log
         .iter()
         .filter_map(|e| match e.body {
-            Body::Take { input } => Some(input),
+            Body::Take { input, .. } => Some(input),
             _ => None,
         })
         .collect();
@@ -1373,7 +1391,7 @@ fn an_outbox_replays_the_original_envelope_until_its_durable_ack() {
     s.step(user("$ hold"));
     let original = envelope("first");
     s.step(Event::SendEnvelope {
-        envelope: original.clone(),
+        outgoing: outgoing(&original),
         ticket: Ticket(1),
     });
     let (mut restored, fx) = Session::resume(Reg::echo().arc(), s.log.clone(), &Load::default());
@@ -1383,7 +1401,7 @@ fn an_outbox_replays_the_original_envelope_until_its_durable_ack() {
     let mut changed = original.clone();
     changed.payload = "different".into();
     let fx = restored.step(Event::SendEnvelope {
-        envelope: changed,
+        outgoing: outgoing(&changed),
         ticket: Ticket(2),
     });
     assert!(
@@ -1393,11 +1411,12 @@ fn an_outbox_replays_the_original_envelope_until_its_durable_ack() {
         id: original.id.clone(),
         result: Ok(()),
         ticket: Some(Ticket(2)),
+        recipient: SessionId::NIL,
     });
     let (mut again, fx) = Session::resume(Reg::echo().arc(), restored.log, &Load::default());
     assert!(!work(&fx).any(|e| matches!(e, Work::Deliver { .. })));
     let fx = again.step(Event::SendEnvelope {
-        envelope: original,
+        outgoing: outgoing(&original),
         ticket: Ticket(3),
     });
     assert!(!work(&fx).any(|e| matches!(e, Work::Deliver { .. })));
@@ -1495,11 +1514,8 @@ fn detached_results_and_messages_enter_before_the_next_provider_step() {
         envelope: envelope("update"),
         ticket: Ticket(1),
     });
-    assert!(
-        s.log
-            .iter()
-            .all(|e| !matches!(e.body, Body::Fired { .. } | Body::Take { .. }))
-    );
+    // Both are queued at once, and taken up only at the boundary.
+    assert!(s.log.iter().all(|e| !matches!(e.body, Body::Take { .. })));
     s.step(Event::ToolDone {
         call,
         outcome: done(json!("handle")),
@@ -1536,7 +1552,7 @@ fn an_unacknowledged_outbox_keeps_its_owner_recoverable() {
     s.step(user("$ hold"));
     let message = envelope("pending");
     s.step(Event::SendEnvelope {
-        envelope: message.clone(),
+        outgoing: outgoing(&message),
         ticket: Ticket(1),
     });
     s.step(tool_done(2, done(json!("finished"))));
@@ -1550,6 +1566,7 @@ fn an_unacknowledged_outbox_keeps_its_owner_recoverable() {
         id: message.id,
         result: Ok(()),
         ticket: None,
+        recipient: SessionId::NIL,
     });
     assert_eq!(restored.core.ledger().activity(), protocol::Activity::Idle);
     assert!(restored.core.at_rest());
@@ -1573,7 +1590,7 @@ fn child_and_inbox_recovery_keep_their_original_identity() {
         ticket: Ticket(1),
     });
     session.step(Event::SendEnvelope {
-        envelope: message.clone(),
+        outgoing: outgoing(&message),
         ticket: Ticket(2),
     });
     let link = session

@@ -108,6 +108,7 @@ impl Rig {
             spill: self.spill().into(),
             cancel: self.cancel.clone(),
             services: Arc::clone(&SERVICES),
+            detach: crate::Flag::default(),
         }
         .cx(Arc::clone(&self.host) as _)
     }
@@ -190,6 +191,7 @@ impl Host for Recorder {
                 spill: cx.spill,
                 cancel: cx.cancel,
                 services: Arc::clone(&SERVICES),
+                detach: crate::Flag::default(),
             }
             .cx(self.clone())
             .with_invocation(context);

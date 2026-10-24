@@ -112,6 +112,7 @@ fn enqueue(session: &Live, text: &str) -> oneshot::Receiver<Result<(), String>> 
         request: Request::Input {
             text: text.into(),
             mode: Mode::Queue,
+            force: false,
         },
         origin: None,
         reply,
@@ -842,7 +843,11 @@ fn submitted_input_is_cancelled_while_its_publication_flush_is_held() {
         let request = match effects.remove(0) {
             client::Effect::Io(client::Io::Send(protocol::ClientMsg::Input {
                 text, mode, ..
-            })) => Request::Input { text, mode },
+            })) => Request::Input {
+                text,
+                mode,
+                force: false,
+            },
             client::Effect::Io(client::Io::Send(protocol::ClientMsg::Interrupt { .. })) => {
                 Request::Interrupt
             }

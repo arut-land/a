@@ -59,7 +59,7 @@ fn conversation(log: &[Entry]) -> Vec<String> {
             Body::Input {
                 text, taken: true, ..
             } => Some(format!("user {text}")),
-            Body::Take { input } => Some(format!("user {}", text_of(input.get()))),
+            Body::Take { input, .. } => Some(format!("user {}", text_of(input.get()))),
             Body::Assistant { text } => Some(format!("said {text}")),
             Body::ToolCall { tool, input, .. } => Some(format!("call {tool} {input}")),
             Body::ToolResult { outcome, .. } => Some(format!("result {outcome:?}")),

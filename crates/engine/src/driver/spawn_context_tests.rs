@@ -43,6 +43,7 @@ fn context_survives_removal_of_ancestor_files() {
             mode: Mode::Queue,
             taken: true,
             origin: None,
+            force: false,
         })
         .unwrap();
     let mut intent = SpawnIntent::from_json(&crate::tests::spawn_intent(1, "child")).unwrap();

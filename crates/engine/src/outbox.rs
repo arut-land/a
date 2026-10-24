@@ -552,6 +552,7 @@ mod tests {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                force: false,
             },
         ))
         .unwrap()
@@ -701,6 +702,7 @@ mod tests {
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
+                    force: false,
                 })
                 .unwrap();
             let frame = (text.len() <= TAIL)

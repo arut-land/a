@@ -1,12 +1,13 @@
 //! Execution state recovered from the durable session log.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Activity, Audience, Author, Body, CallId, ClientId, ClientSeq, Entry, Environment, Installed,
-    Json, Mode, Outcome, Permission, Seq, SessionId, ToolChoice, Verdict, WaitOn,
+    Activity, Audience, Author, Body, CallId, ClientId, ClientSeq, Entry, EnvelopeId, Environment,
+    InboxRefusal, Installed, Json, Mode, Outcome, Permission, Seq, SessionId, Source, ToolChoice,
+    Verdict, WaitOn,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -15,12 +16,15 @@ pub struct Ledger {
     seq: u64,
     received: Vec<Seq>,
     identities: BTreeMap<String, BTreeSet<(u128, u64)>>,
-    outbox: Vec<crate::Envelope>,
-    acknowledgements: Vec<(crate::EnvelopeId, Option<crate::InboxRefusal>)>,
+    outbox: Vec<Sending>,
+    acknowledgements: Vec<(EnvelopeId, Option<InboxRefusal>)>,
     /// Model and tool calls with an intent and no outcome.
     open: Keyed<CallId, Open>,
-    /// Input queued and not yet taken up, in order.
-    untaken: VecDeque<Queued>,
+    /// What is queued and not yet taken up, in order.
+    untaken: Vec<Queued>,
+    /// Calls detached as they ran whose outcome has not come back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    detached: Vec<Detached>,
     /// Watches that have not fired.
     armed: Keyed<Seq, SessionId>,
     /// Every child linked, in order, and the children ever watched.
@@ -173,12 +177,50 @@ impl OutcomeKind {
     }
 }
 
-/// Input taken in and not yet taken up.
+/// An item taken into the queue and not yet taken up: input, or an
+/// envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Queued {
     pub seq: Seq,
     pub text: String,
     pub steer: bool,
+    pub source: Source,
+}
+
+/// A call that went on in the background, and what it runs: what a
+/// restart runs again, if it may.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Detached {
+    pub call: CallId,
+    pub tool: String,
+    pub input: Json,
+}
+
+/// An envelope on its way out, and the recipients yet to take it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sending {
+    pub id: EnvelopeId,
+    pub payload: String,
+    pub pending: Vec<SessionId>,
+    /// The first refusal heard, which the send is answered with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<InboxRefusal>,
+}
+
+impl Sending {
+    /// The envelope recipient `to` is delivered.
+    pub fn to(&self, to: SessionId) -> crate::Envelope {
+        crate::Envelope {
+            id: self.id.clone(),
+            destination: to,
+            payload: self.payload.clone(),
+        }
+    }
+
+    /// The envelopes yet to be taken in.
+    pub fn envelopes(&self) -> impl Iterator<Item = crate::Envelope> + '_ {
+        self.pending.iter().map(|&to| self.to(to))
+    }
 }
 
 /// A child session linked, and the input it starts with.
@@ -209,24 +251,47 @@ impl Ledger {
         let (seq, body) = (e.seq, &e.body);
         self.seq = seq.get();
         match body {
-            Body::Outbox { envelope } => {
-                if self.acknowledged(&envelope.id).is_none()
-                    && !self.outbox.iter().any(|e| e.id == envelope.id)
+            Body::Outbox {
+                envelope_id,
+                recipients,
+                payload,
+            } => {
+                if self.acknowledged(envelope_id).is_none()
+                    && !self.outbox.iter().any(|e| e.id == *envelope_id)
                 {
-                    self.outbox.push(envelope.clone());
+                    self.outbox.push(Sending {
+                        id: envelope_id.clone(),
+                        payload: payload.clone(),
+                        pending: recipients.clone(),
+                        refusal: None,
+                    });
                 }
             }
             Body::Ack {
                 envelope_id,
+                recipient,
                 refusal,
             } => {
-                self.outbox.retain(|e| &e.id != envelope_id);
+                // Settled once every recipient has answered, with the first
+                // refusal any gave.
+                let mut settled = refusal.clone();
+                if let Some(at) = self.outbox.iter().position(|e| &e.id == envelope_id) {
+                    let sending = &mut self.outbox[at];
+                    sending.pending.retain(|r| r != recipient);
+                    if sending.refusal.is_none() {
+                        sending.refusal.clone_from(refusal);
+                    }
+                    if !sending.pending.is_empty() {
+                        return;
+                    }
+                    settled = self.outbox.remove(at).refusal;
+                }
                 if let Err(at) = self
                     .acknowledgements
                     .binary_search_by(|(id, _)| identity(id).cmp(&identity(envelope_id)))
                 {
                     self.acknowledgements
-                        .insert(at, (envelope_id.clone(), refusal.clone()));
+                        .insert(at, (envelope_id.clone(), settled));
                 }
             }
             Body::Enqueue { envelope } => {
@@ -236,11 +301,18 @@ impl Ledger {
                     .or_default()
                     .insert((envelope.id.sender.0.as_u128(), envelope.id.call.0.get()))
                 {
+                    let source = envelope.source();
+                    if source == Source::Job(envelope.id.call)
+                        && envelope.id.purpose == EnvelopeId::DETACHED
+                    {
+                        self.detached.retain(|d| d.call != envelope.id.call);
+                    }
                     self.received.push(seq);
-                    self.untaken.push_back(Queued {
+                    self.untaken.push(Queued {
                         seq,
                         text: envelope.payload.clone(),
                         steer: false,
+                        source,
                     });
                 }
             }
@@ -249,24 +321,44 @@ impl Ledger {
                 mode,
                 taken,
                 origin,
+                ..
             } => {
                 self.author(*origin);
                 if *taken {
                     self.turn = seq.get();
                 } else {
-                    self.untaken.push_back(Queued {
+                    self.untaken.push(Queued {
                         seq,
                         text: text.clone(),
                         steer: *mode == Mode::Steer,
+                        source: Source::User,
                     });
                 }
             }
-            Body::Take { input } => {
+            Body::Take { input, into } => {
                 if let Some(at) = self.untaken.iter().position(|q| q.seq == *input)
-                    && let Some(q) = self.untaken.remove(at)
-                    && !q.steer
+                    && !self.untaken.remove(at).steer
+                    && into.is_none()
                 {
                     self.turn = seq.get();
+                }
+            }
+            Body::Withdraw { input, origin } => {
+                self.author(*origin);
+                self.untaken.retain(|q| q.seq != *input);
+            }
+            Body::Detached { call } => {
+                if let Some(Open {
+                    call: Call::Tool { tool, input, .. },
+                    ..
+                }) = self.open.get(*call)
+                    && !self.detached.iter().any(|d| d.call == *call)
+                {
+                    self.detached.push(Detached {
+                        call: *call,
+                        tool: tool.clone(),
+                        input: input.clone(),
+                    });
                 }
             }
             Body::ToolCall { .. }
@@ -435,11 +527,16 @@ impl Ledger {
         };
         // A retried model call's attempts are counted here, so a restart
         // does not start the count again.
-        if let (Verdict::Retry { attempt, .. }, Call::Model { attempt: at, .. }) =
-            (d, &mut open.call)
-        {
-            *at = (*at).max(*attempt);
-            return;
+        match (d, &mut open.call) {
+            (Verdict::Retry { attempt, .. }, Call::Model { attempt: at, .. }) => {
+                *at = (*at).max(*attempt);
+                return;
+            }
+            // What it runs with from here on, as a restart runs it.
+            (Verdict::PreTool { input }, Call::Tool { input: runs, .. }) => {
+                runs.clone_from(input);
+            }
+            _ => {}
         }
         open.phase.decide(d);
     }
@@ -492,8 +589,14 @@ impl Ledger {
             .map(|(call, _)| call)
     }
 
-    pub fn untaken(&self) -> &VecDeque<Queued> {
+    pub fn untaken(&self) -> &[Queued] {
         &self.untaken
+    }
+
+    /// The calls detached as they ran whose outcome has not come back,
+    /// in order.
+    pub fn detached(&self) -> &[Detached] {
+        &self.detached
     }
 
     /// Commands the user ran with an intent and no outcome, in order.
@@ -512,24 +615,28 @@ impl Ledger {
     pub fn enqueued(&self, seq: Seq) -> bool {
         self.received.binary_search(&seq).is_ok()
     }
-    pub fn received(&self, id: &crate::EnvelopeId) -> bool {
+    pub fn received(&self, id: &EnvelopeId) -> bool {
         self.identities
             .get(&id.purpose)
             .is_some_and(|ids| ids.contains(&(id.sender.0.as_u128(), id.call.0.get())))
     }
+    /// What other sessions have queued here: what the inbox's admission
+    /// limit bounds. The session's own envelopes are bounded by its calls.
     pub fn inbox_len(&self) -> usize {
         self.untaken
             .iter()
-            .filter(|q| self.received.binary_search(&q.seq).is_ok())
+            .filter(|q| matches!(q.source, Source::Agent(_)))
             .count()
     }
-    pub fn pending_outbox(&self) -> impl Iterator<Item = &crate::Envelope> {
+    pub fn pending_outbox(&self) -> impl Iterator<Item = &Sending> {
         self.outbox.iter()
     }
-    pub fn outbox(&self) -> &[crate::Envelope] {
+    pub fn outbox(&self) -> &[Sending] {
         &self.outbox
     }
-    pub fn acknowledged(&self, id: &crate::EnvelopeId) -> Option<&Option<crate::InboxRefusal>> {
+    /// What the send of envelope `id` came to, once every recipient
+    /// answered: `Some(None)` taken in by all, else the first refusal.
+    pub fn acknowledged(&self, id: &EnvelopeId) -> Option<&Option<InboxRefusal>> {
         self.acknowledgements
             .binary_search_by(|(seen, _)| identity(seen).cmp(&identity(id)))
             .ok()
@@ -608,6 +715,7 @@ impl Ledger {
             .any(|(_, open)| !matches!(open.call, Call::Side { .. }))
             || !self.untaken.is_empty()
             || !self.armed.is_empty()
+            || !self.detached.is_empty()
             || self.pending_outbox().next().is_some()
         {
             Activity::Running
@@ -685,7 +793,7 @@ impl<K: Ord + Copy, V> Keyed<K, V> {
     }
 }
 
-fn identity(id: &crate::EnvelopeId) -> (u128, u64, &str) {
+fn identity(id: &EnvelopeId) -> (u128, u64, &str) {
     (id.sender.0.as_u128(), id.call.0.get(), &id.purpose)
 }
 
@@ -694,47 +802,129 @@ mod durable_tests {
     use super::*;
     use crate::{Envelope, EnvelopeId, Epoch};
 
-    #[test]
-    fn acknowledged_payloads_leave_the_live_outbox() {
-        let envelope = Envelope {
-            id: EnvelopeId {
-                sender: SessionId::new(),
-                call: CallId::new(1).unwrap(),
-                purpose: "delivery".into(),
-            },
-            destination: SessionId::new(),
-            payload: "large payload".repeat(1024),
-        };
+    fn fold(bodies: impl IntoIterator<Item = Body>) -> Ledger {
         let mut ledger = Ledger::default();
-        for (seq, body) in [
-            Body::Outbox {
-                envelope: envelope.clone(),
-            },
-            Body::Ack {
-                envelope_id: envelope.id.clone(),
-                refusal: Some(crate::InboxRefusal::Full),
-            },
-            Body::Outbox {
-                envelope: envelope.clone(),
-            },
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (seq, body) in bodies.into_iter().enumerate() {
             ledger.apply(&Entry::new(
                 Seq::new(seq as u64 + 1).unwrap(),
                 Epoch(0),
                 body,
             ));
         }
+        ledger
+    }
+
+    fn seq(n: u64) -> Seq {
+        Seq::new(n).unwrap()
+    }
+
+    #[test]
+    fn a_send_settles_once_every_recipient_answers_with_the_first_refusal() {
+        let id = EnvelopeId {
+            sender: SessionId::new(),
+            call: CallId::new(1).unwrap(),
+            purpose: "delivery".into(),
+        };
+        let (a, b) = (SessionId::new(), SessionId::new());
+        let outbox = || Body::Outbox {
+            envelope_id: id.clone(),
+            recipients: vec![a, b],
+            payload: "large payload".repeat(1024),
+        };
+        let ack = |recipient, refusal| Body::Ack {
+            envelope_id: id.clone(),
+            recipient,
+            refusal,
+        };
+        let half = fold([outbox(), ack(a, Some(InboxRefusal::Full))]);
+        assert_eq!(half.acknowledged(&id), None);
+        let pending: Vec<Envelope> = half.pending_outbox().flat_map(Sending::envelopes).collect();
+        assert_eq!(
+            pending.iter().map(|e| e.destination).collect::<Vec<_>>(),
+            [b]
+        );
+        let ledger = fold([
+            outbox(),
+            ack(a, Some(InboxRefusal::Full)),
+            ack(b, None),
+            outbox(),
+        ]);
         assert_eq!(ledger.outbox(), []);
-        assert!(ledger.pending_outbox().next().is_none());
         let image = Json::encode(&ledger).unwrap();
         assert!(!image.raw().contains("large payload"));
         let restored: Ledger = image.parse().unwrap();
+        assert_eq!(restored.acknowledged(&id), Some(&Some(InboxRefusal::Full)));
+    }
+
+    fn queued() -> Body {
+        Body::Input {
+            text: "later".into(),
+            mode: Mode::Queue,
+            taken: false,
+            origin: None,
+            force: false,
+        }
+    }
+
+    #[test]
+    fn whichever_of_withdraw_and_take_is_logged_first_wins() {
+        let take = || Body::Take {
+            input: seq(1),
+            into: None,
+        };
+        let withdraw = || Body::Withdraw {
+            input: seq(1),
+            origin: None,
+        };
+        let withdrawn = fold([queued(), withdraw(), take()]);
+        assert_eq!(withdrawn.untaken(), []);
         assert_eq!(
-            restored.acknowledged(&envelope.id),
-            Some(&Some(crate::InboxRefusal::Full))
+            withdrawn.turn_start(),
+            0,
+            "a withdrawn input starts nothing"
         );
+        let taken = fold([queued(), take(), withdraw()]);
+        assert_eq!(taken.untaken(), []);
+        assert_eq!(taken.turn_start(), 2, "the take came first and stands");
+    }
+
+    #[test]
+    fn a_detached_call_is_outstanding_until_its_own_envelope_comes_back() {
+        let session = SessionId::new();
+        let call = CallId::new(2).unwrap();
+        let tool = Body::ToolCall {
+            invoke: None,
+            tool: "sleep".into(),
+            input: Json::null(),
+            id: None,
+            card: None,
+            by: Audience::Model,
+        };
+        let outcome = Outcome::Done {
+            output: Json::null(),
+        };
+        let detached = [
+            queued(),
+            tool,
+            Body::Detached { call },
+            Body::ToolResult {
+                call,
+                outcome: crate::OutputStream { call }.placeholder(),
+                card: None,
+            },
+        ];
+        let running = fold(detached.clone());
+        let calls: Vec<_> = running.detached().iter().map(|d| d.call).collect();
+        assert_eq!(calls, [call]);
+        assert_eq!(running.activity(), Activity::Running);
+        let payload = outcome.payload();
+        let back = Body::Enqueue {
+            envelope: Envelope::own(session, call, EnvelopeId::DETACHED, payload),
+        };
+        let done = fold(detached.into_iter().chain([back]));
+        assert_eq!(done.detached(), []);
+        let item = done.untaken().last().unwrap();
+        assert_eq!(item.source, Source::Job(call));
+        assert!(!item.source.visible());
     }
 }

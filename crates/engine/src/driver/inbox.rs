@@ -48,7 +48,7 @@ impl Actor {
             },
             |cancel| {
                 Box::pin(async move {
-                    let id = envelope.id.clone();
+                    let (id, recipient) = (envelope.id.clone(), envelope.destination);
                     let result = match daemon {
                         Some(daemon) => super::unless(&cancel, daemon.deliver(envelope))
                             .await
@@ -58,7 +58,12 @@ impl Actor {
                     let message = if result == Err(InboxRefusal::Interrupted) {
                         super::Completion::DeliveryLost { ticket }
                     } else {
-                        super::Completion::Delivered { id, result, ticket }
+                        super::Completion::Delivered {
+                            id,
+                            recipient,
+                            result,
+                            ticket,
+                        }
                     };
                     session.emit(fence, message);
                 })
@@ -106,10 +111,14 @@ impl CallPorts {
             if !self.origin.current(session) {
                 return Err(InboxRefusal::Interrupted);
             }
-            let envelope = message.envelope(session.id, self.origin.id);
             let (reply, result) = oneshot::channel();
-            self.origin
-                .send(session, ContextRequest::Send { envelope, reply });
+            let request = ContextRequest::Send {
+                id: message.id(session.id, self.origin.id),
+                to: message.to,
+                payload: message.payload,
+                reply,
+            };
+            self.origin.send(session, request);
             result.await.unwrap_or(Err(InboxRefusal::Interrupted))
         })
     }

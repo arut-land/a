@@ -441,18 +441,35 @@ impl Default for Budget {
     }
 }
 
-/// Child sessions: a call starts one it owns and waits for what it settles
-/// with. The engine provides it.
-/// An extension chooses which ownership edges may carry messages.
-pub trait InboxAccess: Send + Sync {
-    fn permits(
+/// Where a session's messages go: the one extension that provides it
+/// resolves each [`Address`](crate::Address) a send names to the sessions
+/// that receive it, once, as the send commits, so a broadcast's recipients
+/// are those of when it was sent. The engine only validates the issued
+/// route and carries the envelopes; who may reach whom (parent and child
+/// only, siblings directly, everything through the parent, a channel's
+/// members) is the provider's.
+pub trait Route: Send + Sync {
+    fn resolve(
         &self,
-        destination: protocol::SessionId,
-        parent: Option<protocol::SessionId>,
-        children: &[protocol::SessionId],
-    ) -> bool;
+        from: Topology<'_>,
+        to: &crate::Address,
+    ) -> Result<Recipients, protocol::InboxRefusal>;
 }
 
+/// The sessions a send reaches.
+pub type Recipients = smallvec::SmallVec<[protocol::SessionId; 2]>;
+
+/// Where the sending session stands among the sessions it may know of.
+#[derive(Clone, Copy, Debug)]
+pub struct Topology<'a> {
+    pub session: protocol::SessionId,
+    pub parent: Option<protocol::SessionId>,
+    /// The children it linked, in order.
+    pub children: &'a [protocol::SessionId],
+}
+
+/// Child sessions: a call starts one it owns and waits for what it settles
+/// with. The engine provides it.
 pub trait Sessions: Send + Sync {
     fn runner(&self) -> crate::Runner;
     fn send<'a>(

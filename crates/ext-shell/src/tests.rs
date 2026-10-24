@@ -116,6 +116,7 @@ fn revoking_a_pending_cwd_record_preserves_the_shell_result() {
         services: Arc::new(
             SessionServices::default().with::<dyn rt::Runtime>(Arc::new(rt::Threads::default())),
         ),
+        detach: ext::Flag::default(),
     }
     .cx(Arc::new(PausedRecord {
         rig: Arc::clone(&rig),

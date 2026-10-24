@@ -312,6 +312,7 @@ impl ManualSession {
             request: Request::Input {
                 text: "sleep 0".into(),
                 mode: Mode::Queue,
+                force: false,
             },
             origin: None,
             reply,
@@ -373,6 +374,7 @@ impl ManualSession {
             request: Request::Input {
                 text: text.into(),
                 mode: Mode::Queue,
+                force: false,
             },
             origin: None,
             reply,
@@ -1241,6 +1243,7 @@ fn final_sync_publishes_activity_after_its_entries() {
         request: Request::Input {
             text: "$ true".into(),
             mode: Mode::Queue,
+            force: false,
         },
         origin: None,
         reply,

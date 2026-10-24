@@ -101,6 +101,7 @@ pub struct Parts {
     pub model: Arc<str>,
     pub spill: Arc<Path>,
     pub cancel: Cancel,
+    pub detach: crate::Flag,
     pub services: Arc<SessionServices>,
 }
 
@@ -1335,6 +1336,7 @@ impl<V: View + Send + Sync + 'static> Binding for Bound<V> {
             audience: tool.audience(),
             replay: tool.replay(),
             concurrency: tool.concurrency(),
+            detach: tool.detach(),
         })
     }
 

@@ -18,8 +18,8 @@ use ext::point::{
     View,
 };
 use ext::{
-    Concurrency, DynExtension, DynTool, Extension, Later, Name, Parsed, Refused, Registrar, Replay,
-    Rewrite, States, Tier,
+    Concurrency, Detach, DynExtension, DynTool, Extension, Later, Name, Parsed, Refused, Registrar,
+    Replay, Rewrite, States, Tier,
 };
 pub use kernel::{StepPlan, Work};
 
@@ -307,6 +307,12 @@ impl DynExtension for Fixtures {
                 audience,
                 replay,
                 concurrency,
+                // A sleep can go on in the background.
+                detach: if name == "sleep" {
+                    Detach::Background
+                } else {
+                    Detach::Never
+                },
             }) as Arc<dyn DynTool>
         };
         for name in ["sleep", "task"] {
@@ -343,6 +349,7 @@ struct Shape {
     audience: Audience,
     replay: Replay,
     concurrency: Concurrency,
+    detach: Detach,
 }
 
 impl DynTool for Shape {
@@ -364,6 +371,10 @@ impl DynTool for Shape {
 
     fn concurrency(&self) -> Concurrency {
         self.concurrency
+    }
+
+    fn detach(&self) -> Detach {
+        self.detach
     }
 
     fn spec(&self) -> llm::Tool {
@@ -737,6 +748,7 @@ pub fn user(text: &str) -> Event {
         mode: Mode::Queue,
         origin: None,
         ticket: None,
+        force: false,
     }
 }
 
@@ -746,6 +758,18 @@ pub fn steer(text: &str) -> Event {
         mode: Mode::Steer,
         origin: None,
         ticket: None,
+        force: false,
+    }
+}
+
+/// A steer that brings the turn's next boundary on now.
+pub fn forced(text: &str) -> Event {
+    Event::Input {
+        text: text.to_owned(),
+        mode: Mode::Steer,
+        origin: None,
+        ticket: None,
+        force: true,
     }
 }
 
@@ -872,6 +896,7 @@ pub fn input(text: &str) -> Body {
         mode: Mode::Queue,
         taken: true,
         origin: None,
+        force: false,
     }
 }
 
@@ -881,11 +906,28 @@ pub fn queued(text: &str) -> Body {
         mode: Mode::Queue,
         taken: false,
         origin: None,
+        force: false,
+    }
+}
+
+/// The session's own envelope with the result of the child it watched
+/// at `watch`.
+pub fn own_child(watch: u64, outcome: &Outcome) -> Body {
+    Body::Enqueue {
+        envelope: protocol::Envelope::own(
+            SessionId::NIL,
+            id(watch),
+            protocol::EnvelopeId::CHILD,
+            outcome.payload(),
+        ),
     }
 }
 
 pub fn take(input: u64) -> Body {
-    Body::Take { input: seq(input) }
+    Body::Take {
+        input: seq(input),
+        into: None,
+    }
 }
 
 pub fn said(text: &str) -> Body {

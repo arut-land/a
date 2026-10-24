@@ -39,6 +39,7 @@ fn a_prefix_projects_edits_and_publications_without_executable_ownership() {
                 mode: Mode::Queue,
                 taken: true,
                 origin: None,
+                force: false,
             },
         ),
         entry(
@@ -168,6 +169,7 @@ fn pending_exchanges_never_become_child_work() {
             mode: Mode::Queue,
             taken: false,
             origin: None,
+            force: false,
         },
     ));
     let image = context_image(&entries);
@@ -555,12 +557,14 @@ fn model_only_inputs_keep_their_interpretation_across_agent_scopes() {
                 mode: Mode::Queue,
                 taken: false,
                 origin: None,
+                force: false,
             },
         ),
         entry(
             3,
             Body::Take {
                 input: Seq::new(2).unwrap(),
+                into: None,
             },
         ),
     ];

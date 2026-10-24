@@ -16,6 +16,7 @@ impl Session {
             model: self.model_spec(registry).into(),
             spill: Arc::clone(&self.spill),
             cancel: origin.cancel.clone(),
+            detach: origin.detach.clone(),
             services: Arc::clone(&self.services),
         }
         .cx(Arc::new(CallPorts {

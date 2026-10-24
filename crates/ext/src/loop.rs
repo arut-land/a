@@ -17,7 +17,7 @@ use protocol::{Outcome, ToolChoice};
 use serde_json::value::RawValue;
 
 use crate::point::{self, Hooks};
-use crate::{Action, Actions, Agent, Extension, Input, Registrar};
+use crate::{Action, Actions, Agent, Boundary, Extension, Input, QueueView, Registrar, Take};
 
 /// What the loop asks at its decisions. A registry's [`Hooks`] answer
 /// through the handlers at the loop points; [`Defaults`] with none.
@@ -30,6 +30,10 @@ pub trait LoopPoints {
     fn reply(&self, step: u16, reply: &llm::Response, default: Actions) -> Actions;
     /// What follows once every call of step `step`'s reply is answered.
     fn resume(&self, step: u16) -> Resume;
+    /// What of the session's queue is taken up at `boundary`.
+    fn dequeue(&self, boundary: Boundary, queue: QueueView<'_>) -> Take {
+        Take::default_at(boundary, queue)
+    }
 }
 
 /// What follows a step whose calls are all answered.
@@ -77,6 +81,12 @@ impl LoopPoints for Hooks {
     fn resume(&self, step: u16) -> Resume {
         let answer = self.run::<point::Resume>(&(), step, &mut (), &mut |_, (), ()| {});
         answer.map_or_else(Resume::default, |(_, resume)| resume)
+    }
+
+    fn dequeue(&self, boundary: Boundary, queue: QueueView<'_>) -> Take {
+        let facts = (boundary, queue);
+        let answer = self.run::<point::Dequeue>(&(), facts, &mut (), &mut |_, (), ()| {});
+        answer.map_or_else(|| Take::default_at(boundary, queue), |(_, take)| take)
     }
 }
 

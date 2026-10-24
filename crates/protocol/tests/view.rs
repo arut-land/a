@@ -151,10 +151,12 @@ impl Session {
             mode,
             taken,
             origin: None,
+            force: false,
         });
         if !taken && rng.chance(70) {
             self.commit(Body::Take {
                 input: Seq::new(input).unwrap(),
+                into: None,
             });
         }
     }
@@ -508,6 +510,98 @@ fn activity_never_certifies_a_newer_entry_or_a_replacement_view() {
     assert_eq!(view.activity, None);
 }
 
+/// Input queued, one withdrawn and sent again edited, a background job's
+/// end queued and taken up hidden, then the user's input.
+fn queue_entries() -> Vec<Entry> {
+    let queued = |text: &str| Body::Input {
+        text: text.into(),
+        mode: Mode::Queue,
+        taken: false,
+        origin: None,
+        force: false,
+    };
+    let job = protocol::Envelope::own(
+        SESSION,
+        CallId::new(1).unwrap(),
+        protocol::EnvelopeId::JOB,
+        "[background job 7 ended: exit code 0]".into(),
+    );
+    let seq = |n| Seq::new(n).unwrap();
+    [
+        Body::Input {
+            text: "work".into(),
+            mode: Mode::Queue,
+            taken: true,
+            origin: None,
+            force: false,
+        },
+        queued("later"),
+        queued("edit me"),
+        Body::Withdraw {
+            input: seq(3),
+            origin: None,
+        },
+        queued("edited"),
+        Body::Enqueue { envelope: job },
+        Body::Take {
+            input: seq(6),
+            into: None,
+        },
+        Body::Take {
+            input: seq(2),
+            into: None,
+        },
+    ]
+    .into_iter()
+    .zip(1..)
+    .map(|(body, n)| Entry::new(seq(n), Epoch(0), body))
+    .collect()
+}
+
+fn queue_scenario() -> Vec<Value> {
+    let attached = DaemonMsg::Attached {
+        session: SESSION,
+        workspace: "/w".into(),
+    };
+    std::iter::once(attached)
+        .chain(queue_entries().into_iter().map(DaemonMsg::Entry))
+        .chain([DaemonMsg::Synced { seq: 8 }])
+        .map(|m| serde_json::to_value(m).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_withdrawn_input_leaves_every_clients_queue_and_hidden_items_never_join_the_transcript() {
+    let entries = queue_entries();
+    let queued = |upto: usize| {
+        let view = SessionView::from_log(SESSION, "/w".into(), &entries[..upto]);
+        let queue: Vec<_> = (view.snapshot().state.queued())
+            .map(|q| (q.text.clone(), q.source.visible()))
+            .collect();
+        (view, queue)
+    };
+    let (_, queue) = queued(6);
+    let shown = |text: &str| (text.to_owned(), true);
+    let hidden = |text: &str| (text.to_owned(), false);
+    assert_eq!(
+        queue,
+        [
+            shown("later"),
+            shown("edited"),
+            hidden("[background job 7 ended: exit code 0]")
+        ]
+    );
+    let (view, queue) = queued(8);
+    assert_eq!(queue, [shown("edited")]);
+    let users: Vec<_> = (view.items.iter())
+        .filter_map(|item| match item {
+            protocol::view::Item::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users, ["work", "later"]);
+}
+
 fn vectors_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/view.json")
 }
@@ -533,6 +627,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         mode: Mode::Queue,
         taken: true,
         origin: None,
+        force: false,
     };
     let call = |seq| CallId::new(seq).unwrap();
     let ask = |seq| Body::Decision {
@@ -577,12 +672,13 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     ]
     };
     let mut scenarios = vec![
+        ("the queue folds withdrawals and keeps what it hides out of the transcript", queue_scenario()),
         ("queued submission origins survive snapshots and ownership transfer", {
             let origin = protocol::Author { client: protocol::ClientId(Uuid::from_u128(0xc)), seq: protocol::ClientSeq::new(7).unwrap() };
-            let queued = entry(1, Body::Input { text: "same".into(), mode: Mode::Queue, taken: false, origin: Some(origin) });
+            let queued = entry(1, Body::Input { text: "same".into(), mode: Mode::Queue, taken: false, origin: Some(origin), force: false });
             let mut view = SessionView::default();
             view.fold(&DaemonMsg::from_json(queued.to_string().as_bytes()).unwrap());
-            vec![attached(), msg(DaemonMsg::Snapshot(Box::new(view.snapshot()))), entry(2, Body::Take { input: Seq::new(1).unwrap() }), msg(DaemonMsg::Activity { seq: 2, activity: protocol::Activity::Idle }), msg(DaemonMsg::Synced { seq: 2 })]
+            vec![attached(), msg(DaemonMsg::Snapshot(Box::new(view.snapshot()))), entry(2, Body::Take { input: Seq::new(1).unwrap(), into: None }), msg(DaemonMsg::Activity { seq: 2, activity: protocol::Activity::Idle }), msg(DaemonMsg::Synced { seq: 2 })]
         }),
         ("publication identities survive snapshots and later publications", {
             let entries: Vec<_> = ["skills", "mcp-schemas"].into_iter().zip(1..).map(|(namespace, seq)| Entry::new(
@@ -796,6 +892,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                         mode: Mode::Steer,
                         taken: false,
                         origin: None,
+                        force: false,
                     },
                 ),
                 entry(
@@ -813,6 +910,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     4,
                     Body::Take {
                         input: Seq::new(2).unwrap(),
+                        into: None,
                     },
                 ),
                 msg(DaemonMsg::Synced { seq: 4 }),
@@ -1098,6 +1196,7 @@ fn a_recap_tells_what_the_replay_held() {
                 mode: Mode::Queue,
                 taken: true,
                 origin: None,
+                force: false,
             },
         ),
         entry(

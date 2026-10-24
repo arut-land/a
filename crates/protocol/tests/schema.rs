@@ -320,6 +320,7 @@ fn the_log_knows_each_clients_last_mutation() {
             mode: protocol::Mode::Queue,
             taken: true,
             origin: Some(author(1)),
+            force: false,
         },
         Body::Interrupt {
             origin: Some(author(3)),

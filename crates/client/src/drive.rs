@@ -936,6 +936,7 @@ mod tests {
             text: "x".repeat(8 << 20),
             client_seq: Some(1),
             mode: protocol::Mode::default(),
+            force: false,
         }
     }
 
@@ -1026,6 +1027,7 @@ mod tests {
                     text: seq.to_string(),
                     mode: protocol::Mode::default(),
                     client_seq: Some(seq as u64),
+                    force: false,
                 }))))
                 .unwrap();
         }

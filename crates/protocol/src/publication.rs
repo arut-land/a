@@ -41,11 +41,20 @@ pub struct ContextInput(pub Seq, pub ContextValue);
 pub enum ContextValue {
     Inherited(usize),
     User(String),
+    /// Queued text: the model reads it once it is taken.
     Queued(String),
     Taken(Seq),
+    /// Taken into the result of a call, read with it.
+    Into(Seq, CallId),
+    Withdrawn(Seq),
     Assistant(String),
     Context(String, Option<Publication>),
+    /// A queued child result.
     Child(Outcome),
+    /// The call's result is a placeholder: it went on in the background.
+    Detached(CallId),
+    /// A queued outcome of a call that went on in the background.
+    Background(CallId, Outcome),
     Reply(Json),
     ToolCall(String, String),
     ToolResult(CallId, Outcome),

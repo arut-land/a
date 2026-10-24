@@ -77,7 +77,8 @@ macro_rules! every_point {
             Turn,
             Reply,
             Resume,
-            Step
+            Step,
+            Dequeue
         )
     };
 }
@@ -99,6 +100,7 @@ const TABLE: &[(&str, Merge)] = &[
     ("reply", Merge::Chain),
     ("resume", Merge::FirstSome),
     ("step", Merge::Chain),
+    ("dequeue", Merge::FirstSome),
 ];
 
 /// A chain point merges as a chain: each handler sees what the last left,
@@ -277,6 +279,7 @@ fn every_point_declares_its_failure_policy() {
         ("reply", FailOpen),
         ("resume", FailOpen),
         ("step", FailOpen),
+        ("dequeue", FailOpen),
     ];
     assert_eq!(declared, want);
     // The table of points is the table of erased points: a point cannot

@@ -17,11 +17,13 @@
 //! | [`SessionStart`], [`SessionEnd`] | every handler is told, and changes nothing |
 //! | [`Turn`], [`Reply`] | replacement chain over what the loop does next |
 //! | [`Resume`] | the first answer wins; with none, the loop goes on |
+//! | [`Dequeue`] | the first answer wins; with none, the queue drains as it always has |
 //!
-//! The loop points ([`Turn`], [`Reply`], [`Resume`]) run inside the fold
-//! of the session's log, rerun as it loads: their handlers are given their
-//! arguments and nothing of the session (a `()` for its context), so what
-//! a replay asks of them is what the live run did.
+//! The loop points ([`Turn`], [`Reply`], [`Resume`], [`Dequeue`]) run
+//! inside the fold of the session's log, or decide what it logs next, and
+//! rerun as it loads: their handlers are given their arguments and nothing
+//! of the session (a `()` for its context), so what a replay asks of them
+//! is what the live run did.
 //!
 //! The four rules are [`Merge`]'s, each implemented once, by the
 //! [`Rule`] that carries it, for every point. Handlers run in
@@ -863,6 +865,12 @@ points! {
     /// default loop asks: with no answer, another model call.
     Resume(resume) = "resume", -, FailOpen,
         (), u16, u16, Option<crate::Resume>;
+    /// What the kernel takes of the session's queue at a boundary: with no
+    /// answer, [`Take::default_at`](crate::Take::default_at). A policy
+    /// (all at once, one at a time, into each tool's result) is a handler.
+    Dequeue(dequeue) = "dequeue", -, FailOpen,
+        (), (crate::Boundary, crate::QueueView<'a>), (crate::Boundary, crate::QueueView<'a>),
+        Option<crate::Take>;
 }
 
 /// The subject of a chain whose handlers read it alone.

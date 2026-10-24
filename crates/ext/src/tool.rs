@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use crate::BoxFuture;
 #[cfg(doc)]
 use crate::CwdOf;
-use crate::flag::Cancel;
+use crate::flag::{Cancel, Flag};
 use crate::host::{Host, SessionServices};
 use crate::point::{PointCx, View};
 use crate::schema::Schema;
@@ -71,6 +71,20 @@ pub enum Concurrency {
     Exclusive,
 }
 
+/// Whether a running call may be detached, as a forced steer or a
+/// client asks: answered at once with a placeholder naming its output
+/// stream, while it goes on in the background, its outcome reaching the
+/// agent later on the session's queue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Detach {
+    /// It is waited for; [`Cx::detach`] tells it it may stop being, if it
+    /// can hand its work off itself.
+    #[default]
+    Never,
+    /// It goes on in the background: the engine stops waiting on it.
+    Background,
+}
+
 /// What a user's command is given: the text after its name.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Args {
@@ -85,12 +99,14 @@ impl Schema for Args {
 }
 
 /// What the kernel knows of a callable: who may call it, whether a call a
-/// crash cut off runs again, and whether it runs alongside others.
+/// crash cut off runs again, whether it runs alongside others, and
+/// whether it may go on in the background.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Callable {
     pub audience: Audience,
     pub replay: Replay,
     pub concurrency: Concurrency,
+    pub detach: Detach,
 }
 
 /// A process a tool starts: `argv[0]` is the program.
@@ -122,6 +138,10 @@ pub struct Cx {
     /// on first use.
     pub spill: Arc<Path>,
     pub cancel: Cancel,
+    /// Set when the session stops waiting on the call (a forced steer):
+    /// a call that can hand its work to the background may, and one whose
+    /// tool is [`Detach::Background`] is no longer waited for.
+    pub detach: Flag,
     services: Arc<SessionServices>,
     host: Arc<dyn Host>,
     invocation: crate::point::InvocationContext,
@@ -137,6 +157,7 @@ impl Cx {
             model,
             spill,
             cancel,
+            detach,
             services,
         } = call;
         Self {
@@ -147,6 +168,7 @@ impl Cx {
             model,
             spill,
             cancel,
+            detach,
             services,
             host,
             invocation: crate::point::InvocationContext::default(),
@@ -386,6 +408,8 @@ pub trait Tool: Send + Sync + 'static {
     const REPLAY: Replay = Replay::Unsafe;
     /// Whether its calls run alongside others of the turn.
     const CONCURRENCY: Concurrency = Concurrency::Exclusive;
+    /// Whether a running call may go on in the background.
+    const DETACH: Detach = Detach::Never;
 
     /// Runs a call. What it returns is its shape ([`Output`]): a
     /// `Result<Self::Out, String>` for a call done at once, a future of one
@@ -459,6 +483,9 @@ pub trait DynTool: Send + Sync {
     fn audience(&self) -> Audience;
     fn replay(&self) -> Replay;
     fn concurrency(&self) -> Concurrency;
+    fn detach(&self) -> Detach {
+        Detach::Never
+    }
     /// How the tool is offered to the model, its schema written now.
     fn spec(&self) -> llm::Tool;
     /// Reads a call's input into the tool's own type.
@@ -497,6 +524,10 @@ where
 
     fn concurrency(&self) -> Concurrency {
         T::CONCURRENCY
+    }
+
+    fn detach(&self) -> Detach {
+        T::DETACH
     }
 
     fn spec(&self) -> llm::Tool {

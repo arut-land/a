@@ -206,36 +206,47 @@ pub enum SpawnRefusal {
     Interrupted,
 }
 
+/// Who a message is for, as its sender names it: the session's
+/// [`Route`](crate::Route) resolves it to the sessions that receive it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Address {
+    Conversation(ConversationHandle),
+    /// The session that owns the sender.
+    Parent,
+    /// A name the route gives meaning: a channel, a group.
+    Named(crate::Name),
+}
+
+impl From<ConversationHandle> for Address {
+    fn from(handle: ConversationHandle) -> Self {
+        Self::Conversation(handle)
+    }
+}
+
 /// A sender chooses an extension-local purpose; the engine supplies its call id.
 #[derive(Clone, Debug)]
 pub struct SendMessage {
     pub(crate) owner: &'static str,
     pub purpose: String,
-    pub destination: ConversationHandle,
+    pub to: Address,
     pub payload: String,
 }
 impl SendMessage {
-    pub fn new<E: Extension>(
-        purpose: &str,
-        destination: ConversationHandle,
-        payload: String,
-    ) -> Self {
+    pub fn new<E: Extension>(purpose: &str, to: impl Into<Address>, payload: String) -> Self {
         Self {
             owner: E::NAME,
             purpose: purpose.into(),
-            destination,
+            to: to.into(),
             payload,
         }
     }
-    pub fn envelope(&self, sender: SessionId, call: protocol::CallId) -> protocol::Envelope {
-        protocol::Envelope {
-            id: protocol::EnvelopeId {
-                sender,
-                call,
-                purpose: format!("{}:{}", self.owner, self.purpose),
-            },
-            destination: self.destination.session,
-            payload: self.payload.clone(),
+
+    /// The send's id: a purpose of the extension's own, under the call.
+    pub fn id(&self, sender: SessionId, call: protocol::CallId) -> protocol::EnvelopeId {
+        protocol::EnvelopeId {
+            sender,
+            call,
+            purpose: format!("{}:{}", self.owner, self.purpose),
         }
     }
 }

@@ -59,12 +59,14 @@ pub struct ViewState {
     publications: crate::publication::Publications,
 }
 
+/// An item of the session's queue, as every client shows it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct Queued {
-    seq: Seq,
-    text: String,
-    steer: bool,
-    origin: Option<crate::Author>,
+pub struct Queued {
+    pub seq: Seq,
+    pub text: String,
+    pub steer: bool,
+    pub source: crate::Source,
+    pub origin: Option<crate::Author>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
@@ -104,6 +106,12 @@ impl ViewState {
         self.turn
     }
 
+    /// The queue, in order: its visible part ([`crate::Source::visible`])
+    /// is the user's input, which a client may withdraw.
+    pub fn queued(&self) -> impl Iterator<Item = &Queued> {
+        self.queued.iter()
+    }
+
     pub fn publications(&self) -> &crate::publication::Publications {
         &self.publications
     }
@@ -127,6 +135,7 @@ impl ViewState {
                         seq: e.seq,
                         text: text.clone(),
                         steer: *mode == crate::Mode::Steer,
+                        source: crate::Source::User,
                         origin: *origin,
                     });
                 }
@@ -135,14 +144,16 @@ impl ViewState {
                 seq: e.seq,
                 text: envelope.payload.clone(),
                 steer: false,
+                source: envelope.source(),
                 origin: None,
             }),
-            Body::Take { input } => {
+            Body::Withdraw { input, .. } => self.queued.retain(|q| q.seq != *input),
+            Body::Take { input, into } => {
                 if let Some(at) = self.queued.iter().position(|q| q.seq == *input)
                     && let Some(q) = self.queued.remove(at)
                 {
                     self.taken.extend(q.origin);
-                    if !q.steer {
+                    if !q.steer && into.is_none() {
                         self.turn = e.seq.get();
                     }
                 }
@@ -724,12 +735,13 @@ impl SessionView {
         self.seq = e.seq.get();
         let seq = e.seq;
         // Input taken up is shown as the user's message where it was taken:
-        // its text is in the ledger until this entry leaves it.
-        let taken = if let Body::Take { input } = &e.body {
+        // its text is in the ledger until this entry leaves it. What the
+        // queue hid stays hidden.
+        let taken = if let Body::Take { input, .. } = &e.body {
             self.state
                 .queued
                 .iter()
-                .find(|q| q.seq == *input)
+                .find(|q| q.seq == *input && q.source.visible())
                 .map(|q| q.text.clone())
         } else {
             None

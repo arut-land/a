@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 
 use protocol::ledger::{Call, Ledger};
-use protocol::{Audience, Body, CallId, Entry, Json, Outcome, Seq, Verdict, WaitOn};
+use protocol::{Audience, Body, CallId, Entry, Json, Outcome, Seq, Source, Verdict, WaitOn};
 
 use crate::{Action, Agent, Binding, Input};
 
@@ -37,6 +37,10 @@ pub struct Fold {
     /// The calls the agent refused, with why, until answered: a crash
     /// before the answer commits must not run them.
     refused: Vec<(CallId, String)>,
+    /// Results of children no call waits on, by watch, until the envelope
+    /// that queues each is folded: a crash between the two must not lose
+    /// one.
+    pub unqueued: Vec<(Seq, Outcome)>,
 }
 
 impl Fold {
@@ -53,6 +57,7 @@ impl Fold {
             owners: Vec::new(),
             fired: Vec::new(),
             refused: Vec::new(),
+            unqueued: Vec::new(),
         }
     }
 
@@ -65,6 +70,7 @@ impl Fold {
             && self.owners.is_empty()
             && self.fired.is_empty()
             && self.refused.is_empty()
+            && self.unqueued.is_empty()
     }
 
     /// Folds entry `e`, the one after the last folded: the agent is given
@@ -92,22 +98,7 @@ impl Fold {
             Body::Input {
                 text, taken: true, ..
             } => self.user(text, registry),
-            Body::Take { input } => {
-                let queued = self.ledger.untaken().iter().find(|q| q.seq == *input)?;
-                // A steer taken just before a model call is the model's to
-                // read; one left when the turn ended starts the next.
-                let steers = (queued.steer || self.ledger.enqueued(*input))
-                    && matches!(
-                        self.asked.front(),
-                        Some(Next::Agent(Action::CallModel { .. }))
-                    );
-                let text = queued.text.clone();
-                if steers {
-                    None
-                } else {
-                    self.user(&text, registry)
-                }
-            }
+            Body::Take { input, into } => self.taken(*input, into.is_some(), registry),
             Body::Decision {
                 d: Verdict::OnStop { text },
                 ..
@@ -167,21 +158,22 @@ impl Fold {
                 self.owners.push((*link, *call));
                 None
             }
+            // A child no call waits on reaches the agent through the queue,
+            // by the envelope that follows.
             Body::Fired { watch, outcome } => {
-                let watch = *watch;
-                let child = self.watched(watch)?;
-                if let Some(call) = self.owner(child) {
-                    self.fired.push((call, outcome.clone()));
-                    return None;
+                let child = self.watched(*watch)?;
+                match self.owner(child) {
+                    Some(call) => self.fired.push((call, outcome.clone())),
+                    None => self.unqueued.push((*watch, outcome.clone())),
                 }
-                // A committed continuation will read the delivery in its request.
-                if !self.asked.is_empty() {
-                    return None;
-                }
-                Some(Input::ChildDone {
-                    watch,
-                    outcome: outcome.clone(),
-                })
+                None
+            }
+            Body::Enqueue { envelope }
+                if envelope.source() == Source::Child(envelope.id.call.0) =>
+            {
+                self.unqueued
+                    .retain(|(watch, _)| *watch != envelope.id.call.0);
+                None
             }
             // What the turn asked for and had not started is dropped.
             Body::Interrupt { .. } => {
@@ -190,6 +182,27 @@ impl Fold {
             }
             _ => None,
         }
+    }
+
+    /// Queued item `input` taken up: what is taken just before a model
+    /// call, or `into` a call's result, is the model's to read; what is
+    /// taken as a turn ended starts the next.
+    fn taken(&mut self, input: Seq, into: bool, registry: &dyn Binding) -> Option<Input> {
+        let queued = self.ledger.untaken().iter().find(|q| q.seq == input)?;
+        let read = into
+            || matches!(
+                self.asked.front(),
+                Some(Next::Agent(Action::CallModel { .. }))
+            );
+        if read {
+            return None;
+        }
+        if let Source::Child(watch) = queued.source {
+            let outcome = Outcome::from_payload(&queued.text)?;
+            return Some(Input::ChildDone { watch, outcome });
+        }
+        let text = queued.text.clone();
+        self.user(&text, registry)
     }
 
     /// An intent folded: it carries out what was asked for next.

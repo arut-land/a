@@ -66,6 +66,7 @@ mod tests {
             mode: Mode::Queue,
             taken,
             origin: Some(origin),
+            force: false,
         }
     }
 
@@ -108,6 +109,7 @@ mod tests {
                 3,
                 Body::Take {
                     input: Seq::new(2).unwrap(),
+                    into: None,
                 },
             ),
         );
@@ -194,6 +196,7 @@ mod tests {
                     mode: Mode::Queue,
                     taken: true,
                     origin: Some(id),
+                    force: false,
                 },
             ),
             entry(
