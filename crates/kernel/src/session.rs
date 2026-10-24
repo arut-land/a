@@ -46,6 +46,9 @@ pub struct Core {
     reported: u64,
     /// Why the model call being recovered failed, while a handler decides.
     failed: Option<String>,
+    /// Detached calls an interrupt cancelled before its entry, which ends
+    /// them, is logged: what they report meanwhile is dropped.
+    dropped: SmallVec<[CallId; 1]>,
     barriers: Barriers,
 }
 
@@ -99,6 +102,7 @@ impl Core {
             busy: false,
             reported: 0,
             failed: None,
+            dropped: SmallVec::new(),
             barriers: Barriers::default(),
         }
     }
@@ -584,26 +588,25 @@ impl Core {
         Some(self.append(fx, Body::Enqueue { envelope }).0)
     }
 
-    /// Ends the calls running in the background, as an interrupt does:
-    /// each is cancelled, and its outcome, interrupted, is queued and
-    /// withdrawn at once, so it closes the call and starts nothing.
-    fn drop_detached(&mut self, fx: &mut StepPlan) {
-        let detached: SmallVec<[CallId; 1]> = (self.fold.ledger.detached().iter())
-            .map(|d| d.call)
-            .collect();
-        for call in detached {
-            fx.immediate.push(Work::Cancel { call });
-            let payload = Outcome::Interrupted { output: None }.payload();
-            if let Some(input) = self.own(call, EnvelopeId::DETACHED, payload, fx) {
-                self.append(
-                    fx,
-                    Body::Withdraw {
-                        input,
-                        origin: None,
-                    },
-                );
+    /// Cancels the calls running in the background, as an interrupt does:
+    /// the interrupt's entry ends them, queuing nothing, so they start
+    /// nothing; whether there were any.
+    fn drop_detached(&mut self, fx: &mut StepPlan) -> bool {
+        for d in self.fold.ledger.detached() {
+            if !self.dropped.contains(&d.call) {
+                self.dropped.push(d.call);
             }
         }
+        for &call in &self.dropped {
+            fx.immediate.push(Work::Cancel { call });
+        }
+        !self.dropped.is_empty()
+    }
+
+    /// Logs an interrupt, which ends the calls in the background.
+    fn interrupted_entry(&mut self, origin: Option<Author>, fx: &mut StepPlan) {
+        self.append(fx, Body::Interrupt { origin });
+        self.dropped.clear();
     }
 
     /// Stops the turn running: its model call or the calls it waits on.
@@ -611,7 +614,7 @@ impl Core {
     /// in any state: what waits settles at once, what runs is cancelled and
     /// settles as it reports.
     fn interrupt(&mut self, origin: Option<Author>, fx: &mut StepPlan) {
-        self.drop_detached(fx);
+        let background = self.drop_detached(fx);
         let detached: Vec<_> = self
             .fold
             .ledger
@@ -633,7 +636,13 @@ impl Core {
             self.settle(side, Outcome::Interrupted { output: None }, fx);
         }
         let open = match mem::take(&mut self.turn) {
-            Turn::Idle => return,
+            // With no turn to stop, the calls in the background end now.
+            Turn::Idle => {
+                if background {
+                    self.interrupted_entry(origin, fx);
+                }
+                return;
+            }
             stopping @ Turn::Stopping { .. } => {
                 self.turn = stopping;
                 return;
@@ -1043,7 +1052,9 @@ impl Core {
     /// card its tool showed it with, unless a handler replaced it.
     fn tool_done(&mut self, call: CallId, outcome: Outcome, card: Option<Card>, fx: &mut StepPlan) {
         if self.fold.ledger.detached().iter().any(|d| d.call == call) {
-            self.own(call, EnvelopeId::DETACHED, outcome.payload(), fx);
+            if !self.dropped.contains(&call) {
+                self.own(call, EnvelopeId::DETACHED, outcome.payload(), fx);
+            }
             return;
         }
         if self.step_of(call) != Some(Step::Running) {
@@ -1319,7 +1330,7 @@ impl Core {
                     self.append(fx, Body::Take { input, into: None });
                 }
                 if queued {
-                    self.append(fx, Body::Interrupt { origin: None });
+                    self.interrupted_entry(None, fx);
                 }
                 self.fold.asked.clear();
                 self.fold.stepped = false;
@@ -1677,7 +1688,7 @@ impl Core {
             let call = self.call(&tool, &input, id, by, None, fx);
             self.settle(call, Outcome::Interrupted { output: None }, fx);
         }
-        self.append(fx, Body::Interrupt { origin });
+        self.interrupted_entry(origin, fx);
         self.fold.stepped = false;
     }
 
@@ -1766,10 +1777,11 @@ impl Core {
                     self.append(fx, Body::Take { input, into: None });
                 }
             }
-            self.append(fx, Body::Interrupt { origin: None });
+            self.interrupted_entry(None, fx);
         }
         self.relink(fx);
         self.queue_children(fx);
+        self.placeholders(fx);
         self.recover_detached(fx);
         // A command cut off is not run again.
         let commands: SmallVec<[CallId; 1]> = self.fold.ledger.open_commands().collect();
@@ -1808,7 +1820,7 @@ impl Core {
     }
 
     fn cancel_recovered(&mut self, fx: &mut StepPlan) {
-        self.drop_detached(fx);
+        let background = self.drop_detached(fx);
         let children: Vec<_> = self.fold.ledger.armed().map(|(_, child)| child).collect();
         for child in children {
             fx.immediate.push(Work::Interrupt { child });
@@ -1821,12 +1833,12 @@ impl Core {
             .map(|(call, _)| call)
             .chain(self.fold.ledger.open_commands())
             .collect();
-        let interrupted = !calls.is_empty();
+        let interrupted = !calls.is_empty() || background;
         for call in calls {
             self.settle(call, self.interrupted(call), fx);
         }
         if interrupted || !matches!(self.fold.ledger.result(), Some(Outcome::Interrupted { .. })) {
-            self.append(fx, Body::Interrupt { origin: None });
+            self.interrupted_entry(None, fx);
         }
         self.turn = Turn::Idle;
     }
@@ -1836,6 +1848,20 @@ impl Core {
     fn queue_children(&mut self, fx: &mut StepPlan) {
         for (watch, outcome) in mem::take(&mut self.fold.unqueued) {
             self.own(CallId(watch), EnvelopeId::CHILD, outcome.payload(), fx);
+        }
+    }
+
+    /// Answers each detached call whose placeholder a crash cut off with
+    /// it, as the step that detached it would have, so it is recovered
+    /// once, as a call in the background, and never as an open call too.
+    fn placeholders(&mut self, fx: &mut StepPlan) {
+        let open: SmallVec<[CallId; 1]> = (self.fold.ledger.detached().iter())
+            .map(|d| d.call)
+            .filter(|&call| self.fold.ledger.call(call).is_some())
+            .collect();
+        for call in open {
+            self.cancel_invocations(call, fx);
+            self.result(call, OutputStream { call }.placeholder(), None, fx);
         }
     }
 

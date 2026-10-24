@@ -148,11 +148,10 @@ fn an_interrupt_ends_the_calls_in_the_background_and_starts_nothing() {
     let before = takes(&s);
     let fx = s.step(interrupt());
     assert!(work(&fx).any(|w| *w == Work::Cancel { call: id(4) }));
-    let queued = last(&s, |b| matches!(b, Body::Enqueue { .. }));
-    assert!(matches!(
-        s.log.last().unwrap().body,
-        Body::Withdraw { input, origin: None } if input.get() == queued
-    ));
+    // The interrupt's entry ends it: nothing is queued that a torn write
+    // could leave behind.
+    assert_eq!(s.log.last().unwrap().body, Body::INTERRUPT);
+    assert!(!s.bodies().iter().any(|b| matches!(b, Body::Enqueue { .. })));
     assert_eq!(s.core.ledger().detached(), []);
     assert_eq!(s.core.ledger().untaken(), []);
     // What it reports once cancelled changes nothing.
@@ -161,6 +160,77 @@ fn an_interrupt_ends_the_calls_in_the_background_and_starts_nothing() {
     assert_eq!(s.log.len(), after);
     assert_eq!(takes(&s), before);
     assert!(s.core.at_rest());
+}
+
+#[test]
+fn a_call_in_the_background_reporting_while_an_interrupt_stops_the_turn_queues_nothing() {
+    let mut s = sleeping();
+    s.step(forced("now"));
+    s.step(Event::Detached { call: id(4) });
+    // The turn's model call runs as the interrupt comes.
+    let asked = last(&s, |b| matches!(b, Body::ModelCall { .. }));
+    s.step(interrupt());
+    s.step(tool_done(4, Outcome::Interrupted { output: None }));
+    s.step(Event::ModelDone {
+        call: id(asked),
+        replied: Replied::Interrupted(None),
+    });
+    assert!(!s.bodies().iter().any(|b| matches!(b, Body::Enqueue { .. })));
+    assert_eq!(s.core.ledger().detached(), []);
+    assert!(s.core.at_rest());
+}
+
+#[test]
+fn a_crash_between_detached_and_its_placeholder_recovers_the_call_once() {
+    for (command, call, safe) in [
+        ("sleep 9", sleep_call(9), true),
+        ("$ make", bash("make"), false),
+    ] {
+        let torn = log([input(command), call, Body::Detached { call: id(2) }]);
+        let (s, fx) = Session::resume(Reg::echo().arc(), torn, &Load::default());
+        let placeholder = tool_result(2, OutputStream { call: id(2) }.placeholder());
+        let results = (s.bodies().into_iter())
+            .filter(|b| matches!(b, Body::ToolResult { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(results, [&placeholder], "{command}");
+        let reruns = work(&fx)
+            .filter(|w| matches!(w, Work::RunTool { .. }))
+            .count();
+        let reported = (fx.appends.iter())
+            .filter(|e| matches!(&e.body, Body::Enqueue { envelope } if envelope.id.purpose == EnvelopeId::DETACHED))
+            .count();
+        assert_eq!(
+            (reruns, reported),
+            if safe { (1, 0) } else { (0, 1) },
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn a_childs_result_never_jumps_ahead_of_the_users_queued_input() {
+    let mut s = echo();
+    s.step(user("task go"));
+    s.step(Event::Spawn {
+        call: id(2),
+        child: child(),
+        input: "go".into(),
+        intent: protocol::Json::null(),
+        wait: false,
+    });
+    s.step(Event::ChildSettled {
+        child: child(),
+        outcome: done(json!("ok")),
+    });
+    s.step(user("next"));
+    s.step(tool_done(2, done(json!(null))));
+    let said: Vec<_> = (s.bodies().into_iter())
+        .filter_map(|b| match b {
+            Body::Assistant { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said, ["next", "child: \"ok\""]);
 }
 
 #[test]

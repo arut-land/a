@@ -81,7 +81,10 @@ impl Fold {
         if let Some(input) = input {
             // A turn's agent is made for it: nothing carries over from the
             // last, so a session restored at rest lacks none of it.
-            if matches!(input, Input::User { .. } | Input::ChildDone { .. }) {
+            if matches!(
+                input,
+                Input::User { .. } | Input::ChildDone { .. } | Input::Detached { .. }
+            ) {
                 self.agent = registry.agent();
             }
             self.stepped = true;
@@ -197,9 +200,17 @@ impl Fold {
         if read {
             return None;
         }
-        if let Source::Child(watch) = queued.source {
-            let outcome = Outcome::from_payload(&queued.text)?;
-            return Some(Input::ChildDone { watch, outcome });
+        match queued.source {
+            Source::Child(watch) => {
+                let outcome = Outcome::from_payload(&queued.text)?;
+                return Some(Input::ChildDone { watch, outcome });
+            }
+            // A detached call's outcome; a job's end is text.
+            Source::Job(call) if queued.outcome => {
+                let outcome = Outcome::from_payload(&queued.text)?;
+                return Some(Input::Detached { call, outcome });
+            }
+            _ => {}
         }
         let text = queued.text.clone();
         self.user(&text, registry)

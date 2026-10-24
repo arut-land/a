@@ -2179,9 +2179,12 @@ impl Actor {
             Effect::Sleep { call, after } => {
                 self.later(call, shared.rt.sleep(after), move |()| Event::Woke { call });
             }
+            // The call's handle, made now if it is still held behind
+            // admission: the run it admits takes the flag up.
             Effect::Detach { call } => {
-                if let Some(handle) = lock(&self.live.session.work).get_mut(&WorkId::Call(call)) {
-                    handle.detach.set();
+                let fence = self.live.session.fence.load(Ordering::SeqCst);
+                if let Some(origin) = self.live.session.call_work(call, fence, None) {
+                    origin.detach.set();
                 }
             }
             Effect::Cancel { call } => {

@@ -519,6 +519,10 @@ impl Agent for Echo {
             Input::ChildDone { outcome, .. } => {
                 return Actions::from_iter([Action::Say(format!("child: {}", told(&outcome)))]);
             }
+            Input::Detached { call, outcome } => {
+                let said = format!("detached {call}: {}", told(&outcome));
+                return Actions::from_iter([Action::Say(said)]);
+            }
             Input::ToolDone { .. } | Input::ModelDone { .. } => return Actions::new(),
         };
         let call = |tool: &str, input: Value| Action::Call {
@@ -560,7 +564,7 @@ pub struct Modeled {
 impl Agent for Modeled {
     fn step(&mut self, input: Input, _: &dyn LoopPoints) -> Actions {
         match input {
-            Input::User { .. } | Input::ChildDone { .. } => {
+            Input::User { .. } | Input::ChildDone { .. } | Input::Detached { .. } => {
                 self.pending = 0;
                 Actions::from_iter([Action::CallModel {
                     choice: ToolChoice::Auto,

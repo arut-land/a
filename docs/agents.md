@@ -139,7 +139,9 @@ complete creation, but cannot allocate another child. Admission failure is a
 terminal result for that identity. The child starts its initial input once.
 
 Awaited work ties a call's wait to its watch. Detached work leaves the parent
-call free to finish, and delivers a `Fired` result at a parent step boundary.
+call free to finish: its `fired` fact closes the watch, and its result waits
+on the parent's queue as the parent's own `child` envelope, taken up at a
+step boundary (see "One queue").
 A watch has one terminal result. Duplicate child notifications cannot append
 another result, even after reload. A notification during parent execution
 waits until the next safe boundary; it does not mutate an in-flight request.
@@ -212,10 +214,19 @@ ignores the flag, or hands its own work off.
 
 A detached call is the session's work: the session stays busy, so the
 daemon neither idle-exits nor finishes an upgrade drain while one runs. An
-interrupt cancels detached calls; their outcome is queued interrupted and
-withdrawn at once, so it starts nothing. A restart runs a detached call
+interrupt cancels detached calls, and its `interrupt` entry ends them:
+nothing of theirs is queued, so they start nothing. A restart answers a
+detached call whose placeholder a crash cut off with it, then runs the call
 again if its tool is `Replay::Safe`; otherwise its outcome is an
 interruption saying it may not have completed, with where its output went.
+Either way the call is recovered once. A detached call's outcome taken up
+as a turn ends reaches the agent as `Input::Detached`, as a child's does as
+`Input::ChildDone`.
+
+An upgrade drain waits for running turns and detached calls for as long as
+they run; only an interrupt or `a daemon stop` ends them sooner. Background
+process groups hold it only for `[daemon] drain_secs`, since a drain refuses
+input meanwhile and a server left running would hold it forever.
 
 `Input { force }` on a steer brings the turn's next boundary on now: the
 model call streaming is cut short (its partial reply is dropped, and the
@@ -372,7 +383,7 @@ crates choose modes and policy.
 | Parent sends while child works | Tool composition: `Sessions::send` to a conversation id |
 | Child asks parent | Tool composition: question and correlated reply fold in an `ext-*` crate |
 | Sibling chat | Policy and tool composition over durable inboxes addressed by conversation id |
-| Named channels | Needs SDK contracts for channel identity, admission, membership and recipient snapshots; current destinations are conversation ids |
+| Named channels | A `Route` provider resolving `Address::Named`, with membership as ordered facts of its own; recipients are recorded on each `outbox` |
 | Different agent/model | Tool composition: select a registered agent and model role; select `Runner::Agent` or `Runner::ModelOnly` |
 | Recursive same agent | Tool composition: inherit task registration; depth budget descends |
 | Root-only extension | Rust declaration or Lua `a.inherit(false)` excludes the whole generation |

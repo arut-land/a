@@ -112,9 +112,14 @@ impl Agent for Loop {
             Input::ChildDone {
                 outcome: Outcome::Interrupted { .. },
                 ..
+            }
+            | Input::Detached {
+                outcome: Outcome::Interrupted { .. },
+                ..
             } => Actions::new(),
-            // A child's result arrives between turns, so it starts one.
-            Input::User { .. } | Input::ChildDone { .. } => {
+            // A child's result, or a background call's, arrives between
+            // turns, so it starts one.
+            Input::User { .. } | Input::ChildDone { .. } | Input::Detached { .. } => {
                 *self = Self {
                     step: 1,
                     ..Self::default()

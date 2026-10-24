@@ -63,7 +63,9 @@ impl Take {
     /// steers and children's results are read, and so are messages and
     /// background outcomes, unless the user's input is queued ahead of
     /// them, which starts its own turn first. At a turn's end the first
-    /// item starts the next turn.
+    /// input or message starts the next turn, and only with none queued
+    /// does the first of the session's own results (a child's, a
+    /// background call's), so none jumps ahead of the user.
     pub fn default_at(boundary: Boundary, queue: QueueView<'_>) -> Self {
         let items = queue.items();
         match boundary {
@@ -85,8 +87,13 @@ impl Take {
                     Self::These(these)
                 }
             }
-            Boundary::TurnEnd if items.is_empty() => Self::None,
-            Boundary::TurnEnd => Self::One,
+            Boundary::TurnEnd => {
+                let own = |q: &&Queued| matches!(q.source, Source::Child(_) | Source::Job(_));
+                let first = (items.iter().find(|q| !own(q)))
+                    .or_else(|| items.first())
+                    .map(|q| q.seq);
+                first.map_or(Self::None, |seq| Self::These(SmallVec::from_elem(seq, 1)))
+            }
         }
     }
 
@@ -122,6 +129,7 @@ mod tests {
             text: String::new(),
             steer,
             source,
+            outcome: false,
         }
     }
 
@@ -164,5 +172,27 @@ mod tests {
         assert_eq!(take.of(Boundary::TurnEnd, view), seqs(&[5]));
         let none = Take::default_at(Boundary::TurnEnd, QueueView::new(&[]));
         assert_eq!(none, Take::None);
+    }
+
+    #[test]
+    fn at_a_turns_end_the_default_takes_the_users_input_before_the_sessions_own_results() {
+        let child = Source::Child(Seq::new(3).unwrap());
+        let job = Source::Job(CallId::new(4).unwrap());
+        let at_end = |queue: &[Queued]| {
+            let view = QueueView::new(queue);
+            Take::default_at(Boundary::TurnEnd, view).of(Boundary::TurnEnd, view)
+        };
+        let queue = [
+            item(5, false, child),
+            item(6, false, job),
+            item(7, false, Source::User),
+        ];
+        assert_eq!(at_end(&queue), seqs(&[7]));
+        assert_eq!(at_end(&queue[..2]), seqs(&[5]));
+        let agent = Source::Agent(SessionId::new());
+        assert_eq!(
+            at_end(&[item(5, false, child), item(6, false, agent)]),
+            seqs(&[6])
+        );
     }
 }

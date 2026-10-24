@@ -185,6 +185,9 @@ pub struct Queued {
     pub text: String,
     pub steer: bool,
     pub source: Source,
+    /// Its text is an [`Outcome`]'s payload: a detached call's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outcome: bool,
 }
 
 /// A call that went on in the background, and what it runs: what a
@@ -302,9 +305,9 @@ impl Ledger {
                     .insert((envelope.id.sender.0.as_u128(), envelope.id.call.0.get()))
                 {
                     let source = envelope.source();
-                    if source == Source::Job(envelope.id.call)
-                        && envelope.id.purpose == EnvelopeId::DETACHED
-                    {
+                    let outcome = source == Source::Job(envelope.id.call)
+                        && envelope.id.purpose == EnvelopeId::DETACHED;
+                    if outcome {
                         self.detached.retain(|d| d.call != envelope.id.call);
                     }
                     self.received.push(seq);
@@ -313,6 +316,7 @@ impl Ledger {
                         text: envelope.payload.clone(),
                         steer: false,
                         source,
+                        outcome,
                     });
                 }
             }
@@ -332,6 +336,7 @@ impl Ledger {
                         text: text.clone(),
                         steer: *mode == Mode::Steer,
                         source: Source::User,
+                        outcome: false,
                     });
                 }
             }
@@ -372,8 +377,10 @@ impl Ledger {
             | Body::Watch { .. }
             | Body::Fired { .. }
             | Body::Answer { .. } => self.track(CallId(seq), body),
+            // What runs in the background ends with the interrupt.
             Body::Interrupt { origin } => {
                 self.author(*origin);
+                self.detached.clear();
                 self.result = Some(Outcome::Interrupted { output: None });
             }
             Body::Link {
