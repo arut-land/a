@@ -152,6 +152,15 @@ try:
         wait(lambda: "--login-outdated" not in registration().read_text(), "the registration was not refreshed", SETTLED + 10)
         checks["registration_refreshed_by_a_daemon"] = True
     logout()
+    if system == "Windows":
+        # The entry exactly as Explorer runs it, waited for: its host and the
+        # entry itself must both succeed, leaving a daemon behind.
+        a("daemon", "autostart", "on")
+        ran = subprocess.run(registration()[1], env=env, capture_output=True, text=True, timeout=60)
+        print(f"logon entry: {ran.returncode} {ran.stdout!r} {ran.stderr!r}", flush=True)
+        wait(lambda: pid() is not None, "the logon entry did not leave a daemon running")
+        logout()
+        checks["logon_entry_leaves_a_detached_daemon"] = True
 
     for sample in range(args.samples):
         # Alternate order to reduce runner drift.
