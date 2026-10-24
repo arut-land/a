@@ -1,0 +1,173 @@
+diff --git a/.github/workflows/o15-availability.yml b/.github/workflows/o15-availability.yml
+new file mode 100644
+index 00000000..ed55f635
+--- /dev/null
++++ b/.github/workflows/o15-availability.yml
+@@ -0,0 +1,73 @@
++name: o15 availability diagnosis
++on:
++  push:
++    branches: [codex-w5rt-availability]
++    paths: [.github/workflows/o15-availability.yml]
++permissions:
++  contents: read
++jobs:
++  stress:
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - label: full
++            source: 93344bb06d9096103ecf6ed18d2d78058a30791d
++            trace: false
++          - label: main
++            source: 4b662d7ab8151802b8417e71378c8ec800834f34
++            trace: false
++          - label: compact
++            source: e4426ff3b986a5bbde11376527134b2f64975f99
++            trace: false
++          - label: full-trace
++            source: 93344bb06d9096103ecf6ed18d2d78058a30791d
++            trace: true
++    name: availability (${{ matrix.label }})
++    runs-on: windows-latest
++    timeout-minutes: 180
++    defaults:
++      run:
++        shell: bash
++    env:
++      CARGO_BUILD_JOBS: 4
++      MISE_AUTO_INSTALL: false
++      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
++    steps:
++      - run: git config --global core.autocrlf false
++      - uses: actions/checkout@v7
++        with:
++          path: harness
++      - uses: actions/checkout@v7
++        with:
++          ref: ${{ matrix.source }}
++          path: measured
++      - uses: actions/setup-python@v6
++        with:
++          python-version: '3.13'
++      - run: python -m pip install psutil==7.2.2
++      - uses: jdx/mise-action@v5
++        with:
++          working_directory: measured
++          install_args: rust
++      - uses: Swatinem/rust-cache@v2
++        with:
++          workspaces: measured -> target
++          cache-all-crates: true
++      - name: Build the diagnostic source
++        working-directory: measured
++        run: |
++          rustup component add rust-src
++          extra=()
++          if [[ '${{ matrix.trace }}' == true ]]; then extra+=(--features engine/events); fi
++          "$(rustup which cargo)" build-release -p a --features fixtures "${extra[@]}"
++      - name: Exercise idle retirement and cli churn
++        run: |
++          extra=()
++          if [[ '${{ matrix.trace }}' == true ]]; then extra+=(--trace); fi
++          python harness/scripts/perf/availability_stress.py --binary measured/target/release/a.exe --output diagnosis "${extra[@]}"
++      - uses: actions/upload-artifact@v5
++        if: always()
++        with:
++          name: availability-${{ matrix.label }}
++          path: diagnosis
+diff --git a/scripts/perf/availability_stress.py b/scripts/perf/availability_stress.py
+new file mode 100644
+index 00000000..fb7eb246
+--- /dev/null
++++ b/scripts/perf/availability_stress.py
+@@ -0,0 +1,88 @@
++"""Availability diagnosis only: owned daemons, isolated homes, no timing claims."""
++import argparse,json,os,queue,shutil,subprocess,tempfile,threading,time
++from pathlib import Path
++import psutil
++from process import run_timed,snapshot,stop_daemon
++
++def stack(pid,output):
++    tools=list(Path('C:/Program Files (x86)/Windows Kits/10/Debuggers/x64').glob('cdb.exe'))
++    if not tools:return 'SDK debugger unavailable'
++    try:
++        p=subprocess.run([str(tools[0]),'-pv','-p',str(pid),'-c','~* k 0n30; qd'],capture_output=True,text=True,timeout=30)
++        (output/'stacks.txt').write_text(p.stdout+p.stderr)
++        return p.returncode
++    except subprocess.TimeoutExpired:return 'debugger timeout'
++
++def main():
++    parser=argparse.ArgumentParser();parser.add_argument('--binary',type=Path,required=True);parser.add_argument('--output',type=Path,required=True);parser.add_argument('--trace',action='store_true');args=parser.parse_args()
++    binary=args.binary.resolve();output=args.output.resolve();output.mkdir(parents=True,exist_ok=True)
++    failures=[]
++    for phase in range(200):
++        home=Path(tempfile.mkdtemp(prefix='a-availability-',dir=os.environ['RUNNER_TEMP']))
++        env=dict(os.environ,A_HOME=str(home),A_TUI='plain');env.pop('A_HOST',None)
++        (home/'config.toml').write_text('[daemon]\nagent="echo"\nidle_secs=120\n')
++        record=dict(phase=phase,drain_stdout=phase%2==0,trace=args.trace)
++        first=queue.Queue();client=None;server=None;drain_started=False;first_read=False
++        def drain(stream):
++            while stream.read(65536):pass
++        def first_line(stream, drain_output, result):
++            result.put(stream.readline())
++            if drain_output:drain(stream)
++        def cli(*argv):return run_timed([str(binary),*argv],env=env,cwd=home,capture_output=True,timeout=60,check=True)
++        try:
++            if args.trace:
++                server=subprocess.Popen([str(binary),'__daemon'],env=env,cwd=home,stdout=subprocess.DEVNULL,stderr=(output/f'trace-{phase}.log').open('wb'))
++                deadline=time.monotonic()+30
++                while not (home/'run/daemon.pid').exists():
++                    if server.poll() is not None:raise RuntimeError('foreground daemon exited')
++                    if time.monotonic()>deadline:raise TimeoutError('foreground startup')
++                    time.sleep(.05)
++            client=subprocess.Popen([str(binary)],env=env,cwd=home,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
++            threading.Thread(target=first_line,args=(client.stdout,record['drain_stdout'],first),daemon=True).start()
++            assert first.get(timeout=60).startswith(b'[session')
++            first_read=True
++            drain_started=record['drain_stdout']
++            daemon_pid=int((home/'run/daemon.pid').read_text().splitlines()[0]);record['daemon_pid']=daemon_pid
++            time.sleep(25)
++            process=psutil.Process(daemon_pid)
++            process.memory_full_info();process.memory_maps(grouped=True)
++            session=cli('new').stdout.decode().strip()
++            for message in range(50):
++                record['message']=message
++                cli('-p',f'message {message}','resume',session)
++            record['result']='ok'
++        except Exception as error:
++            record['result']='failed';record['error']=str(error)
++            if isinstance(error,subprocess.CalledProcessError):record['stderr']=error.stderr.decode(errors='replace')
++            diag=output/f'failed-{phase}';diag.mkdir(exist_ok=True)
++            if 'daemon_pid' in record:
++                try:
++                    record['before']=snapshot(daemon_pid,threads=True);record['debugger']=stack(daemon_pid,diag)
++                    time.sleep(3);record['after']=snapshot(daemon_pid,threads=True)
++                    try:record['late_probe']=dict(returncode=cli('ls').returncode)
++                    except Exception as late:record['late_probe']=str(late)
++                except psutil.Error as lost:record['process_error']=str(lost)
++            for directory in ['logs','crash','run']:
++                p=home/directory
++                if p.exists():shutil.copytree(p,diag/directory,dirs_exist_ok=True)
++            failures.append(record)
++        finally:
++            if client:
++                if not drain_started and first_read:
++                    threading.Thread(target=drain,args=(client.stdout,),daemon=True).start()
++                client.stdin.close()
++                try:client.wait(timeout=15)
++                except subprocess.TimeoutExpired:client.kill();client.wait()
++            try:stop_daemon(binary,env,home)
++            except Exception as error:record['cleanup_error']=str(error)
++            if server:
++                try:server.wait(timeout=15)
++                except subprocess.TimeoutExpired:server.kill();server.wait()
++            shutil.rmtree(home,ignore_errors=True)
++            with (output/'phases.jsonl').open('a') as f:f.write(json.dumps(record)+'\n')
++            print(json.dumps(record),flush=True)
++        if failures:break
++    (output/'summary.json').write_text(json.dumps(dict(phases=phase+1,failures=failures),indent=2))
++    if failures:raise SystemExit(1)
++
++if __name__=='__main__':main()

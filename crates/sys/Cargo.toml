@@ -25,6 +25,7 @@ object = { version = "0.40", default-features = false, features = ["read_core", 
 [target.'cfg(target_os = "macos")'.dependencies]
 object = { version = "0.40", default-features = false, features = ["read_core", "macho"] }
 oslog = { version = "0.2", default-features = false }
+dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
 tracelogging = "1.2.4"

@@ -275,7 +275,7 @@ mod tests {
                     Seq::new(1).unwrap(),
                     Epoch(0),
                     Body::Input {
-                        text: "hello".into(),
+                        segments: "hello".into(),
                         mode: Mode::Queue,
                         taken: true,
                         origin: Some(id),

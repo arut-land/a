@@ -234,7 +234,7 @@ fn attach(target: Target, since: u64, decl: ClientDecl) -> ClientMsg {
 
 fn input(text: &str, seq: u64) -> ClientMsg {
     ClientMsg::Input {
-        text: text.into(),
+        segments: text.into(),
         client_seq: Some(seq),
         mode: protocol::Mode::Queue,
     }
@@ -476,7 +476,7 @@ fn far_behind_a_client_gets_a_snapshot() {
             .map(|seq| {
                 let text = format!("m{seq}");
                 let body = Body::Input {
-                    text,
+                    segments: text.into(),
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
@@ -707,7 +707,7 @@ fn fork_refusals_are_typed_and_leave_the_source_attachment_usable() {
             .unwrap()
             .iter()
             .any(
-                |entry| matches!(&entry.body, Body::Input { text, .. } if text == "still attached")
+                |entry| matches!(&entry.body, Body::Input { segments: text, .. } if text == "still attached")
             )
     );
 }

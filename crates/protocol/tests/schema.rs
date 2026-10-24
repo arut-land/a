@@ -132,12 +132,12 @@ fn a_payload_is_never_parsed_on_the_wire_path() {
 fn log() -> Vec<Vec<u8>> {
     [
         r#"{"seq":1,"epoch":0,"kind":"context","text":"cwd: /w"}"#,
-        r#"{"seq":2,"epoch":0,"kind":"input","text":"list files","taken":true}"#,
+        r#"{"seq":2,"epoch":0,"kind":"input","segments":[{"text":"list files"}],"taken":true}"#,
         r#"{"seq":3,"epoch":0,"kind":"model_call","model":"openai:m"}"#,
         r#"{"seq":4,"epoch":0,"kind":"model_result","call":3,"outcome":{"status":"done","output":{"text":"ok"}}}"#,
         r#"{"seq":5,"epoch":0,"kind":"tool_call","tool":"bash","input":{"command":"ls"}}"#,
         r#"{"seq":6,"epoch":0,"kind":"decision","by":"policy","call":5,"d":"permission","permission":{"ask":{"mode":{"mode":"ask"}}}}"#,
-        r#"{"seq":7,"epoch":0,"kind":"input","text":"and sizes","mode":"steer"}"#,
+        r#"{"seq":7,"epoch":0,"kind":"input","segments":[{"text":"and sizes"}],"mode":"steer"}"#,
         r#"{"seq":8,"epoch":0,"kind":"answer","call":5,"value":true}"#,
         r#"{"seq":9,"epoch":0,"kind":"tool_process","call":5,"pgid":42,"boot":"b"}"#,
         r#"{"seq":10,"epoch":0,"kind":"progress","call":5,"text":"src\n"}"#,
@@ -148,7 +148,7 @@ fn log() -> Vec<Vec<u8>> {
         r#"{"seq":15,"epoch":0,"kind":"tool_call","tool":"model","input":{"args":"openai:n"},"by":"user"}"#,
         r#"{"seq":16,"epoch":0,"kind":"ext","ext":"settings","state":"model","data":"openai:n"}"#,
         r#"{"seq":17,"epoch":0,"kind":"tool_result","call":15,"outcome":{"status":"done","output":null}}"#,
-        r#"{"seq":18,"epoch":0,"kind":"input","text":"later"}"#,
+        r#"{"seq":18,"epoch":0,"kind":"input","segments":[{"text":"later"}]}"#,
         r#"{"seq":19,"epoch":0,"kind":"tool_call","tool":"bash","input":{"command":"rm x"}}"#,
         r#"{"seq":20,"epoch":0,"kind":"decision","by":"policy","call":19,"d":"permission","permission":{"ask":{"mode":{"mode":"ask"}}}}"#,
     ]
@@ -316,7 +316,7 @@ fn the_log_knows_each_clients_last_mutation() {
     };
     let entries = [
         Body::Input {
-            text: "hi".into(),
+            segments: "hi".into(),
             mode: protocol::Mode::Queue,
             taken: true,
             origin: Some(author(1)),

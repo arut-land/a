@@ -1,0 +1,33 @@
+diff --git a/crates/rt/src/threads.rs b/crates/rt/src/threads.rs
+index 16db8439..d1793245 100644
+--- a/crates/rt/src/threads.rs
++++ b/crates/rt/src/threads.rs
+@@ -37,11 +37,7 @@ impl Config {
+     }
+ 
+     pub fn for_resources(facts: sys::resources::Resources) -> Self {
+-        let mut config = Self::for_cores(facts.parallelism);
+-        if facts.storage == sys::resources::Storage::Rotational {
+-            config.storage.workers = 1;
+-        }
+-        config
++        Self::for_cores(facts.parallelism)
+     }
+ 
+     pub fn for_cores(cores: usize) -> Self {
+@@ -186,13 +182,13 @@ struct Pool {
+ impl Threads {
+     pub fn new(workers: usize) -> Self {
+         Self::configured(Config {
+-            workers: workers.clamp(1, 4),
++            workers: workers.max(1),
+             ..Config::default()
+         })
+     }
+ 
+     pub fn configured(config: Config) -> Self {
+-        assert!((1..=4).contains(&config.workers));
++        assert!(config.workers > 0);
+         let lifecycle = Arc::new(Lifecycle::default());
+         Self {
+             config,

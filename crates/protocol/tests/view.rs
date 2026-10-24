@@ -147,7 +147,7 @@ impl Session {
             Mode::Queue
         };
         let input = self.commit(Body::Input {
-            text,
+            segments: text.into(),
             mode,
             taken,
             origin: None,
@@ -529,7 +529,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         })
     };
     let input = |text: &str| Body::Input {
-        text: text.into(),
+        segments: text.into(),
         mode: Mode::Queue,
         taken: true,
         origin: None,
@@ -579,7 +579,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     let mut scenarios = vec![
         ("queued submission origins survive snapshots and ownership transfer", {
             let origin = protocol::Author { client: protocol::ClientId(Uuid::from_u128(0xc)), seq: protocol::ClientSeq::new(7).unwrap() };
-            let queued = entry(1, Body::Input { text: "same".into(), mode: Mode::Queue, taken: false, origin: Some(origin) });
+            let queued = entry(1, Body::Input { segments: "same".into(), mode: Mode::Queue, taken: false, origin: Some(origin) });
             let mut view = SessionView::default();
             view.fold(&DaemonMsg::from_json(queued.to_string().as_bytes()).unwrap());
             vec![attached(), msg(DaemonMsg::Snapshot(Box::new(view.snapshot()))), entry(2, Body::Take { input: Seq::new(1).unwrap() }), msg(DaemonMsg::Activity { seq: 2, activity: protocol::Activity::Idle }), msg(DaemonMsg::Synced { seq: 2 })]
@@ -792,7 +792,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     2,
                     Body::Input {
-                        text: "two".into(),
+                        segments: "two".into(),
                         mode: Mode::Steer,
                         taken: false,
                         origin: None,
@@ -1094,7 +1094,7 @@ fn a_recap_tells_what_the_replay_held() {
         entry(
             1,
             Body::Input {
-                text: "list files\nand more".into(),
+                segments: "list files\nand more".into(),
                 mode: Mode::Queue,
                 taken: true,
                 origin: None,

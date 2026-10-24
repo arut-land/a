@@ -60,8 +60,8 @@ pub use flag::{Cancel, Flag};
 pub use llm::Json;
 pub use r#loop::{Defaults, LOOP, Loop, LoopPoints, Resume, StepLimit};
 pub use point::{
-    Answer, Asked, Chained, Gate, Gated, Gating, Later, PointCx, Reaction, Recover, Requirement,
-    Rewrite,
+    Answer, Asked, Chained, Gate, Gated, Gating, Later, PointCx, Presented, Reaction, Recover,
+    Requirement, Rewrite,
 };
 pub use protocol::{Annotation, AnnotationLifetime, ExtensionFact};
 pub use schema::Schema;

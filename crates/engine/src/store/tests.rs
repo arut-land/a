@@ -266,7 +266,7 @@ fn entry(seq: u64, epoch: u32) -> Entry {
         Seq::new(seq).unwrap(),
         Epoch(epoch),
         Body::Input {
-            text: format!("m{seq}"),
+            segments: format!("m{seq}").into(),
             mode: protocol::Mode::Queue,
             taken: true,
             origin: None,
@@ -787,7 +787,7 @@ fn a_valid_line_is_never_cut() {
 
     // A sealed line of a kind this build knows, which it cannot read, in
     // the middle and at the end.
-    let bad = br#"{"seq":3,"epoch":1,"kind":"input","text":5}"#;
+    let bad = br#"{"seq":3,"epoch":1,"kind":"input","segments":5}"#;
     let mut lines = lines_of(&file);
     lines[3] = bad.to_vec();
     seal(&mut lines[3], 0);

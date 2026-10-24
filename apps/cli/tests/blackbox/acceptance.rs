@@ -81,7 +81,7 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
         }
     }
     let taken = |text: &str| Body::Input {
-        text: text.into(),
+        segments: text.into(),
         mode: Mode::Queue,
         taken: true,
         origin: None,

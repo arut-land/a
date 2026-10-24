@@ -9,13 +9,36 @@ use serde_json::Value;
 
 use crate::error::Error;
 use crate::protocol::{Decoder, Encoded, Host, Hosted, Protocol, Target};
-use crate::spec::{ProtocolKey, Request};
+use crate::spec::{ProtocolKey, Reasoning, Request};
+use crate::tag::Thought;
 
 /// Which protocol this is.
 pub const PROTOCOL: ProtocolKey = ProtocolKey::OpenaiResponses;
 
 /// Where this protocol's options and part state go.
 pub const KEY: &str = PROTOCOL.as_str();
+
+/// What another model is shown of this protocol's reasoning: a reasoning
+/// item's text is its summary, unless the item streamed raw reasoning
+/// text (`reasoning_text`, from open-weight models) and no summary. Its
+/// `encrypted_content` and id are shown to no one.
+pub(crate) fn foreign(reasoning: &Reasoning) -> Option<Thought<'_>> {
+    if reasoning.redacted {
+        return None;
+    }
+    let item = crate::replay::item(&reasoning.meta, KEY);
+    let has = |field: &str| {
+        item.as_ref()
+            .and_then(|item| item.get(field))
+            .and_then(Value::as_array)
+            .is_some_and(|parts| !parts.is_empty())
+    };
+    if has("content") && !has("summary") {
+        Thought::raw(&reasoning.text)
+    } else {
+        Thought::summary(&reasoning.text)
+    }
+}
 
 /// Where the request's system instructions go.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

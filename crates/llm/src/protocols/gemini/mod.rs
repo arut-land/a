@@ -11,13 +11,23 @@ mod encode;
 
 use crate::error::Error;
 use crate::protocol::{Decoder, Encoded, Host, Hosted, KeyStyle, Protocol, Target};
-use crate::spec::{ProtocolKey, Request};
+use crate::spec::{ProtocolKey, Reasoning, Request};
+use crate::tag::Thought;
 
 /// Which protocol this is.
 pub const PROTOCOL: ProtocolKey = ProtocolKey::GoogleGemini;
 
 /// Where this protocol's options and part state go.
 pub const KEY: &str = PROTOCOL.as_str();
+
+/// What another model is shown of this protocol's reasoning: a thought
+/// part with `includeThoughts` is a summary Gemini wrote of its thinking;
+/// a thought signature alone is ciphertext and is shown to no one.
+pub(crate) fn foreign(reasoning: &Reasoning) -> Option<Thought<'_>> {
+    (!reasoning.redacted)
+        .then(|| Thought::summary(&reasoning.text))
+        .flatten()
+}
 
 /// Which earlier thought signatures a request sends back.
 ///

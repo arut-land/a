@@ -3,10 +3,13 @@
 //! and the transcript is repaired into a shape every provider accepts.
 //!
 //! - An assistant message from another protocol, provider or model loses
-//!   its reasoning, its opaque items, its hosted-tool steps and all part
-//!   state: those mean something only to their producer. Readable thinking
-//!   is dropped rather than turned into text, which a model would take for
-//!   its own answer.
+//!   its opaque items, its hosted-tool steps and all part state: those mean
+//!   something only to their producer. Its readable reasoning stays, as
+//!   tagged context naming its source (`<reasoning-summary source=…>`,
+//!   `<reasoning source=…>`) where the reasoning was, so the model that
+//!   continues neither loses it nor takes it for its own; which kind a part
+//!   is, its producer's protocol module says ([`foreign`]). Encrypted and
+//!   redacted reasoning is dropped, and its ids with it.
 //! - Tool-call ids the target cannot take are rewritten, with their results.
 //! - A call nothing answered gets an error result before the conversation
 //!   moves on; a result nothing asked for is dropped.
@@ -22,9 +25,12 @@ use std::borrow::Cow;
 use crate::conversation::{Settled, Step};
 use crate::error::Error;
 use crate::protocol::Target;
+use crate::protocols::{chat, gemini, messages, responses};
 use crate::spec::{
-    Assistant, AssistantPart, Message, Meta, Output, SmolStr, ToolMessage, ToolResult,
+    Assistant, AssistantPart, Message, Meta, Origin, Output, ProtocolKey, Reasoning, SmolStr, Text,
+    ToolMessage, ToolResult,
 };
+use crate::tag::Thought;
 
 /// The text an unanswered call is answered with.
 pub const NO_RESULT: &str = "No result provided";
@@ -37,6 +43,17 @@ fn native(assistant: &Assistant, target: &Target<'_>) -> bool {
             && origin.provider == *target.provider.id
             && origin.model == target.model
     })
+}
+
+/// What a model other than `origin`'s is shown of its `reasoning`: the
+/// conversion its producer's protocol owns.
+fn foreign<'a>(reasoning: &'a Reasoning, origin: &Origin) -> Option<Thought<'a>> {
+    match origin.protocol {
+        ProtocolKey::OpenaiChat => chat::foreign(reasoning, origin),
+        ProtocolKey::OpenaiResponses => responses::foreign(reasoning),
+        ProtocolKey::AnthropicMessages => messages::foreign(reasoning, origin),
+        ProtocolKey::GoogleGemini => gemini::foreign(reasoning),
+    }
 }
 
 /// The pass over a conversation, as far as it got.
@@ -193,16 +210,24 @@ impl Prepare {
                     return (!assistant.content.is_empty()).then_some(Cow::Borrowed(message));
                 }
                 let mut assistant = assistant.clone();
-                assistant.content.retain(|part| {
-                    native
-                        || match part {
-                            AssistantPart::Text(_) | AssistantPart::Media(_) => true,
-                            AssistantPart::ToolCall(call) => !call.provider_executed,
-                            AssistantPart::Reasoning(_)
-                            | AssistantPart::ToolResult(_)
-                            | AssistantPart::Opaque(_) => false,
-                        }
-                });
+                if !native {
+                    let origin = assistant.origin.as_ref();
+                    let content = std::mem::take(&mut assistant.content);
+                    assistant.content = (content.into_iter())
+                        .filter_map(|part| match part {
+                            AssistantPart::Text(_) | AssistantPart::Media(_) => Some(part),
+                            AssistantPart::ToolCall(ref call) => {
+                                (!call.provider_executed).then_some(part)
+                            }
+                            AssistantPart::Reasoning(reasoning) => {
+                                let thought = foreign(&reasoning, origin?)?;
+                                let text = thought.tag(origin?).to_string();
+                                Some(AssistantPart::Text(Text::new(text)))
+                            }
+                            AssistantPart::ToolResult(_) | AssistantPart::Opaque(_) => None,
+                        })
+                        .collect();
+                }
                 let mut ids = ids.into_iter();
                 for part in &mut assistant.content {
                     if !native {

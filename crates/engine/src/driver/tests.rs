@@ -46,7 +46,7 @@ fn id(seq: u64) -> CallId {
 /// Input that started a turn as it arrived.
 fn user(text: &str) -> Body {
     Body::Input {
-        text: text.into(),
+        segments: text.into(),
         mode: Mode::Queue,
         taken: true,
         origin: None,
@@ -56,7 +56,7 @@ fn user(text: &str) -> Body {
 /// Input that waits to be taken up.
 fn queued(text: &str) -> Body {
     Body::Input {
-        text: text.into(),
+        segments: text.into(),
         mode: Mode::Queue,
         taken: false,
         origin: None,
@@ -404,9 +404,8 @@ impl Fixture {
 
 impl Live {
     fn steer(&self, text: &str) -> Result<(), String> {
-        let text = text.to_owned();
         let steer = Request::Input {
-            text,
+            segments: text.into(),
             mode: Mode::Steer,
         };
         rt::block_on(self.request(steer, None))
@@ -591,6 +590,54 @@ impl LogStore for Probe {
 /// #9 `a_failed_commit_is_resume`: input commits on arrival, before the
 /// turn it starts; input that cannot be logged is refused and gone, seq
 /// and all, and the session goes on from its log.
+#[test]
+fn pressure_retains_cached_projections_while_a_process_is_owned() {
+    let fixture = Fixture::new(ext::LOOP, Registry::default(), openai(&Script::new(&[])));
+    let session = fixture.start(&[entry(1, echo("cached message"))]);
+    let process: Arc<dyn ext::RunningProcess> = Arc::new(admission::StaleProcess);
+    lock(&session.session.jobs).push(Arc::clone(&process));
+    assert!(session.has_jobs());
+    assert!(!session.has_work());
+    assert_eq!(session.summary().activity, Activity::Idle);
+    assert_eq!(session.projection_cache(true), [true; 3]);
+    session.reclaim();
+    assert_eq!(session.projection_cache(false), [true; 3]);
+    assert!(Arc::ptr_eq(&lock(&session.session.jobs)[0], &process));
+    lock(&session.session.jobs).clear();
+    session.reclaim();
+    assert_eq!(session.projection_cache(false), [false; 3]);
+    session.halt();
+}
+
+#[test]
+fn pressure_discards_a_cached_snapshot_without_changing_its_rebuild() {
+    let script = Script::new(&[]);
+    let fixture = Fixture::new(ext::LOOP, Registry::default(), openai(&script));
+    let entries: Vec<_> = (1..=SNAPSHOT_GAP + 1)
+        .map(|seq| entry(seq, echo("cached message")))
+        .collect();
+    let session = fixture.start(&entries);
+    let attach = || {
+        let outbox = Outbox::new();
+        session.follow(&outbox, 0);
+        std::iter::from_fn(|| outbox.try_next())
+            .map(|frame| frame.as_bytes().to_vec())
+            .collect::<Vec<_>>()
+    };
+    let first = attach();
+    let built = fixture.hops();
+    assert_eq!(attach(), first);
+    assert_eq!(fixture.hops(), built, "an unchanged snapshot is reused");
+    session.reclaim();
+    session.barrier();
+    assert_eq!(attach(), first);
+    assert!(
+        fixture.hops() > built,
+        "pressure released the cached projection"
+    );
+    session.halt();
+}
+
 #[test]
 fn input_commits_on_arrival_and_a_failed_commit_leaves_no_trace() {
     let probe = Probe::default();
@@ -1134,7 +1181,7 @@ fn an_interrupt_in_the_burst_that_approves_a_call_stops_it() {
     let held = lock(&probe.held);
     let queued = session.ask(
         Request::Input {
-            text: "then".into(),
+            segments: "then".into(),
             mode: Mode::Queue,
         },
         None,
@@ -1261,9 +1308,11 @@ impl Extension for Extras {
 
     fn contribute(&self, r: &mut Registrar) {
         r.tool(Jobs)
-            .on::<point::Input>(|_, text| match text {
-                "no" => Rewrite::Stop("not that".into()),
-                text if text.starts_with("shout ") => Rewrite::Replace(text.to_uppercase()),
+            .on::<point::Input>(|_, input| match input.as_text() {
+                Some("no") => Rewrite::Stop("not that".into()),
+                Some(text) if text.starts_with("shout ") => {
+                    Rewrite::Replace(text.to_uppercase().into())
+                }
                 _ => Rewrite::Pass,
             })
             .on::<point::PreTool>(|_, call| {
@@ -2041,7 +2090,7 @@ fn one_fsync_per_burst() {
     settle(&session);
     let input = |text: &str| {
         let input = Event::Input {
-            text: text.into(),
+            segments: text.into(),
             mode: Mode::Queue,
             origin: None,
             ticket: None,

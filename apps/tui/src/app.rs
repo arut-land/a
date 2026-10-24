@@ -448,15 +448,15 @@ impl App {
                         if args {
                             self.editor.insert(" ");
                         } else if key == Key::Enter
-                            && let Edit::Submit(text) = self.editor.key(Key::Enter)
+                            && let Edit::Submit(input) = self.editor.key(Key::Enter)
                         {
-                            return self.submit(&text);
+                            return self.submit(input);
                         }
                     }
                     key => {
                         self.menu_at = Some(0);
-                        if let Edit::Submit(text) = self.editor.key(key) {
-                            return self.submit(&text);
+                        if let Edit::Submit(input) = self.editor.key(key) {
+                            return self.submit(input);
                         }
                     }
                 }
@@ -494,8 +494,8 @@ impl App {
         None
     }
 
-    fn submit(&mut self, text: &str) -> Option<Effect> {
-        let cmd = client::parse(text, self.client.turn().asking)?;
+    fn submit(&mut self, input: protocol::Segments) -> Option<Effect> {
+        let cmd = client::parse_input(input, self.client.turn().asking)?;
         match &cmd {
             Cmd::Detach => return Some(Effect::Detach),
             Cmd::Interrupt => return Some(self.interrupt()),

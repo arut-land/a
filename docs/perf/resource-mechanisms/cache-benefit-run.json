@@ -1,0 +1,11 @@
+{
+  "run_id": 40056828919,
+  "revision": "67091d6e2031eb932a7935d8efb6becb5c6223a7",
+  "branch": "codex-w5rt-cache-probe",
+  "targets": [
+    "macos-latest",
+    "macos-15-intel"
+  ],
+  "rounds": 3,
+  "log_bytes": 37748736
+}

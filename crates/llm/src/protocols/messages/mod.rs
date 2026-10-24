@@ -25,7 +25,8 @@ use serde_json::Value;
 
 use crate::error::{Error, Kind};
 use crate::protocol::{Decoder, Encoded, Host, Hosted, KeyStyle, Protocol, Target};
-use crate::spec::{ProtocolKey, Request};
+use crate::spec::{Origin, ProtocolKey, Reasoning, Request};
+use crate::tag::Thought;
 
 pub use crate::models::anthropic::{default_max_tokens, rejects_forced_tool_choice};
 
@@ -34,6 +35,21 @@ pub const PROTOCOL: ProtocolKey = ProtocolKey::AnthropicMessages;
 
 /// Where this protocol's options and part state go.
 pub const KEY: &str = PROTOCOL.as_str();
+
+/// What another model is shown of this protocol's reasoning: Claude 4 and
+/// later stream a summary of their thinking, while Claude 3.7 and the
+/// other models served over this wire stream it raw. Redacted thinking is
+/// ciphertext and is shown to no one.
+pub(crate) fn foreign<'a>(reasoning: &'a Reasoning, origin: &Origin) -> Option<Thought<'a>> {
+    if reasoning.redacted {
+        return None;
+    }
+    if crate::models::anthropic::summarizes_thinking(&origin.model) {
+        Thought::summary(&reasoning.text)
+    } else {
+        Thought::raw(&reasoning.text)
+    }
+}
 
 /// The `anthropic-version` every request names.
 pub const VERSION: &str = "2023-06-01";

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use protocol::view::{Change, SessionList, SessionView, Update};
 use protocol::{
-    Activity, CallId, ClientMsg, CommandInfo, DaemonMsg, Environment, Mode, Rejection,
+    Activity, CallId, ClientMsg, CommandInfo, DaemonMsg, Environment, Mode, Rejection, Segments,
     SessionSummary, Target,
 };
 
@@ -636,15 +636,15 @@ pub struct Offer<'a>(&'a mut SessionClient);
 
 impl Offer<'_> {
     /// A message, or a slash command the daemon runs.
-    pub fn input(self, text: String) -> Result<Vec<Effect>, Notice> {
-        self.send(ClientMsg::input(text))
+    pub fn input(self, segments: impl Into<Segments>) -> Result<Vec<Effect>, Notice> {
+        self.send(ClientMsg::input(segments))
     }
 
     /// Input for the running turn, before its next step.
-    pub fn steer(self, text: String) -> Result<Vec<Effect>, Notice> {
+    pub fn steer(self, segments: impl Into<Segments>) -> Result<Vec<Effect>, Notice> {
         self.running()?;
         self.send(ClientMsg::Input {
-            text,
+            segments: segments.into(),
             mode: Mode::Steer,
             client_seq: None,
         })
@@ -856,7 +856,7 @@ mod tests {
                 Seq::new(1).unwrap(),
                 Epoch(1),
                 Body::Input {
-                    text: "hi".into(),
+                    segments: "hi".into(),
                     mode: Mode::Queue,
                     taken: true,
                     origin: None,
@@ -1005,8 +1005,8 @@ mod tests {
         // who sent what does it once.
         assert!(
             matches!(&sends(&out)[..], [
-                ClientMsg::Input { text: one, client_seq: Some(1), .. },
-                ClientMsg::Input { text: two, client_seq: Some(2), .. },
+                ClientMsg::Input { segments: one, client_seq: Some(1), .. },
+                ClientMsg::Input { segments: two, client_seq: Some(2), .. },
             ] if one == "one" && two == "two"),
             "{out:?}"
         );
@@ -1056,7 +1056,7 @@ mod tests {
     fn a_full_mutation_window_cannot_drop_cancellation_intent() {
         let (mut client, _) = attached(Env::Keep);
         for n in 0..UNANSWERED {
-            client.run(Cmd::Input(n.to_string()));
+            client.run(Cmd::Input(n.to_string().into()));
         }
         let out = client.offer().unwrap().interrupt().unwrap();
         assert!(matches!(sends(&out)[..], [ClientMsg::Interrupt { .. }]));
@@ -1073,7 +1073,7 @@ mod tests {
                 client.step(closed(1));
             }
             for n in 0..UNANSWERED {
-                let out = client.run(Cmd::Input(n.to_string()));
+                let out = client.run(Cmd::Input(n.to_string().into()));
                 assert_eq!(notices(&out), [] as [&Notice; 0]);
                 assert_eq!(sends(&out).len(), usize::from(!disconnected));
             }
@@ -1089,7 +1089,9 @@ mod tests {
             assert_eq!(replay.len(), UNANSWERED);
             for (n, msg) in replay.iter().enumerate() {
                 assert_eq!(msg.client_seq(), Some(n as u64 + 1));
-                assert!(matches!(msg, ClientMsg::Input { text, .. } if text == &n.to_string()));
+                assert!(
+                    matches!(msg, ClientMsg::Input { segments: text, .. } if *text == *n.to_string())
+                );
             }
             client.step(msg(2, DaemonMsg::Ack { client_seq: 1 }));
             let out = client.run(Cmd::Input("accepted".into()));
@@ -1169,7 +1171,9 @@ mod tests {
         client.open(Target::Id(b));
         assert!(client.run(Cmd::Input("for B".into())).is_empty());
         let out = client.step(live(3, Caps::ALL));
-        assert!(matches!(sends(&out)[..], [ClientMsg::Input { text, .. }] if text == "for B"));
+        assert!(
+            matches!(sends(&out)[..], [ClientMsg::Input { segments: text, .. }] if text == "for B")
+        );
         client.step(msg(
             3,
             DaemonMsg::Attached {
@@ -1255,14 +1259,7 @@ mod tests {
         // Connecting counts as attached: input waits for the connection.
         let mut client = SessionClient::new(Env::Origin);
         client.open(Target::New);
-        assert!(
-            client
-                .offer()
-                .unwrap()
-                .input("hi".into())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(client.offer().unwrap().input("hi").unwrap().is_empty());
         client.step(Event {
             conn: ConnId(1),
             kind: EventKind::Wedged(Diagnosis::default()),
@@ -1279,11 +1276,11 @@ mod tests {
             Some(Notice::NothingRunning)
         );
         assert_eq!(
-            sends(&client.offer().unwrap().input("hi".into()).unwrap()).len(),
+            sends(&client.offer().unwrap().input("hi").unwrap()).len(),
             1
         );
         assert_eq!(
-            client.offer().unwrap().steer("more".into()).err(),
+            client.offer().unwrap().steer("more").err(),
             Some(Notice::NothingRunning)
         );
         let two = CallId::new(2).unwrap();
@@ -1311,14 +1308,7 @@ mod tests {
         // connection is up.
         client.step(msg(1, DaemonMsg::Draining));
         client.step(closed(1));
-        assert!(
-            client
-                .offer()
-                .unwrap()
-                .steer("go".into())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(client.offer().unwrap().steer("go").unwrap().is_empty());
         let out = client.step(live(2, Caps::ALL));
         // After the unanswered ones go again.
         assert!(

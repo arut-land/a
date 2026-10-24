@@ -1,0 +1,23 @@
+[
+  {
+    "run_id": 40065944262,
+    "branch": "codex-w5rt-cache-probe",
+    "source": "edb3cd1dea272aa61e84d6dd12f83f6c5dc61662",
+    "superseded_run_id": 40065068677,
+    "purpose": "allocator diagnostics on macos15 Intel/ARM and macos26 ARM"
+  },
+  {
+    "run_id": 40066474095,
+    "branch": "codex-w5rt-availability",
+    "source": "70f4a315133917f706990f5e85d435fb2c9d7b8c",
+    "measured_source": "4a06977b6667f0656a417986cfacad5b9ae4a0b2",
+    "purpose": "availability diagnosis with displaced-waker fix"
+  },
+  {
+    "run_id": 40076566659,
+    "branch": "codex-w5rt-cache-probe",
+    "source": "312abb69b7f4459f9abd9c108cb46cab890a3cf9",
+    "purpose": "explicit macos26 runner-label probe",
+    "cancelled_reason": "Original macos-latest allocator probe completed before this duplicate started."
+  }
+]

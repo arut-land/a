@@ -219,7 +219,9 @@ sequence numbers define order. Each sender serializes its durable outbox;
 concurrent senders are ordered by receiver admission, not wall clocks.
 
 The receiver records `Take` with the enqueue identity at a step boundary,
-before the input influences an agent or request. Folding the log reconstructs
+before the input influences an agent or request. An agent's model reads a
+taken message as `<message from="<sender>" channel="<purpose>">`; a
+model-only thread reads its payload as the turn it asks for. Folding the log reconstructs
 both queued and consumed input. Messages arriving during a provider request
 wait for its next step. Context edits cannot undo delivery. Forks copy consumed
 context but do not replay outbound effects; queued external messages require

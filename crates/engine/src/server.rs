@@ -522,8 +522,8 @@ impl Conn<'_> {
                     "the daemon is restarting for an upgrade; send that again in a moment".into(),
                 )));
             }
-            ClientMsg::Input { text, mode, .. } => {
-                (Request::Input { text, mode }, Rejection::Refused)
+            ClientMsg::Input { segments, mode, .. } => {
+                (Request::Input { segments, mode }, Rejection::Refused)
             }
             ClientMsg::Approve { call, approved, .. } => {
                 let value = protocol::Json::encode(&approved).unwrap_or_default();

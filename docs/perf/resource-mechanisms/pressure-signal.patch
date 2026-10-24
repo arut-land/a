@@ -1,0 +1,138 @@
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index b5f7a2de..63d6efb2 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -1003,10 +1003,7 @@ impl Daemon {
+         // When a drain out of grace stopped the calls still running.
+         let mut stopped: Option<Instant> = None;
+         let mut awake: Option<Option<sys::Awake>> = None;
+-        let pressure = Arc::new(rt::Notify::new());
+-        let notified = Arc::clone(&pressure);
+-        let _pressure_source = sys::resources::MemoryPressure::new(move || notified.notify());
+-        let mut pressured = pressure.count();
++        let mut pressure = rt::MemoryPressure::default();
+         let mut pulsed = self.pulse.count();
+         let mut jobs = self.jobs.count();
+         loop {
+@@ -1016,8 +1013,7 @@ impl Daemon {
+                 session: None,
+                 detail: String::new(),
+             });
+-            if pressure.count() != pressured {
+-                pressured = pressure.count();
++            if pressure.take_request() {
+                 self.reclaim_idle();
+             }
+             self.hibernate(config.hibernate);
+@@ -1076,8 +1072,7 @@ impl Daemon {
+                 false
+             };
+             let reclaim = async {
+-                pressure.changed(&mut pressured).await;
+-                self.reclaim_idle();
++                pressure.wait().await;
+                 false
+             };
+             let woken = rt::or(pulse, rt::or(reclaim, rt::or(ended, sleep)));
+diff --git a/crates/rt/src/lib.rs b/crates/rt/src/lib.rs
+index 12f17664..e043d006 100644
+--- a/crates/rt/src/lib.rs
++++ b/crates/rt/src/lib.rs
+@@ -16,6 +16,9 @@ pub mod oneshot;
+ mod threads;
+ mod wakeup;
+ 
++mod memory_pressure;
++pub use memory_pressure::MemoryPressure;
++
+ use std::future::Future;
+ use std::pin::{Pin, pin};
+ use std::sync::atomic::{AtomicU64, Ordering};
+diff --git a/crates/rt/src/memory_pressure.rs b/crates/rt/src/memory_pressure.rs
+new file mode 100644
+index 00000000..139faa38
+--- /dev/null
++++ b/crates/rt/src/memory_pressure.rs
+@@ -0,0 +1,82 @@
++//! A native pressure subscription; unsupported targets retain no signal state.
++
++pub struct MemoryPressure {
++    #[cfg(target_os = "macos")]
++    notify: std::sync::Arc<crate::Notify>,
++    #[cfg(target_os = "macos")]
++    seen: u64,
++    #[cfg(target_os = "macos")]
++    _source: sys::resources::MemoryPressure,
++}
++
++impl Default for MemoryPressure {
++    fn default() -> Self {
++        #[cfg(target_os = "macos")]
++        {
++            let notify = std::sync::Arc::new(crate::Notify::new());
++            let seen = notify.count();
++            let callback = std::sync::Arc::clone(&notify);
++            let source = sys::resources::MemoryPressure::new(move || callback.notify());
++            Self {
++                notify,
++                seen,
++                _source: source,
++            }
++        }
++        #[cfg(not(target_os = "macos"))]
++        Self {}
++    }
++}
++
++impl MemoryPressure {
++    pub fn take_request(&mut self) -> bool {
++        #[cfg(target_os = "macos")]
++        {
++            let current = self.notify.count();
++            let requested = current != self.seen;
++            self.seen = current;
++            requested
++        }
++        #[cfg(not(target_os = "macos"))]
++        false
++    }
++
++    pub async fn wait(&self) {
++        #[cfg(target_os = "macos")]
++        {
++            let mut seen = self.seen;
++            self.notify.changed(&mut seen).await;
++        }
++        #[cfg(not(target_os = "macos"))]
++        std::future::pending::<()>().await;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[cfg(not(target_os = "macos"))]
++    #[test]
++    fn unsupported_pressure_waits_retain_no_state_or_delay_other_events() {
++        let mut pressure = MemoryPressure::default();
++        assert_eq!(std::mem::size_of_val(&pressure), 0);
++        assert!(!pressure.take_request());
++        assert!(crate::block_on(crate::or(
++            async {
++                pressure.wait().await;
++                false
++            },
++            async { true },
++        )));
++    }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn a_pressure_wake_stays_pending_until_its_owner_consumes_it() {
++        let mut pressure = MemoryPressure::default();
++        pressure.notify.notify();
++        crate::block_on(pressure.wait());
++        assert!(pressure.take_request());
++    }
++}

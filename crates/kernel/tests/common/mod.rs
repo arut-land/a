@@ -30,7 +30,7 @@ use kernel::{
 use protocol::ledger::Ledger;
 use protocol::{
     Audience, Author, Body, CallId, ClientId, ClientSeq, Entry, Epoch, Installed, Json, Mode,
-    Outcome, Permission, Seq, SessionId, ToolChoice, Verdict, WaitOn,
+    Outcome, Permission, Segments, Seq, SessionId, ToolChoice, Verdict, WaitOn,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -252,8 +252,8 @@ impl Binding for Harness {
         self.bound.read(call, tool, input)
     }
 
-    fn input(&self, text: String) -> Result<kernel::Chained<String>, String> {
-        self.bound.input(text)
+    fn input(&self, segments: Segments) -> Result<kernel::Chained<Segments>, String> {
+        self.bound.input(segments)
     }
 
     fn gate(&self, call: CallId, tool: &str, input: &Json) -> Answer<Gated> {
@@ -406,8 +406,8 @@ impl Extension for Filter {
             if text == "secret" {
                 return Rewrite::Stop("no secrets".to_owned());
             }
-            match text.strip_prefix("shout ") {
-                Some(loud) => Rewrite::Replace(loud.to_uppercase()),
+            match text.as_text().and_then(|text| text.strip_prefix("shout ")) {
+                Some(loud) => Rewrite::Replace(loud.to_uppercase().into()),
                 None => Rewrite::Pass,
             }
         });
@@ -733,7 +733,7 @@ pub fn barriered(plan: &StepPlan, through: u64) {
 
 pub fn user(text: &str) -> Event {
     Event::Input {
-        text: text.to_owned(),
+        segments: text.into(),
         mode: Mode::Queue,
         origin: None,
         ticket: None,
@@ -742,7 +742,7 @@ pub fn user(text: &str) -> Event {
 
 pub fn steer(text: &str) -> Event {
     Event::Input {
-        text: text.to_owned(),
+        segments: text.into(),
         mode: Mode::Steer,
         origin: None,
         ticket: None,
@@ -868,7 +868,7 @@ pub fn log(bodies: impl IntoIterator<Item = Body>) -> Vec<Entry> {
 
 pub fn input(text: &str) -> Body {
     Body::Input {
-        text: text.to_owned(),
+        segments: text.to_owned().into(),
         mode: Mode::Queue,
         taken: true,
         origin: None,
@@ -877,7 +877,7 @@ pub fn input(text: &str) -> Body {
 
 pub fn queued(text: &str) -> Body {
     Body::Input {
-        text: text.to_owned(),
+        segments: text.to_owned().into(),
         mode: Mode::Queue,
         taken: false,
         origin: None,

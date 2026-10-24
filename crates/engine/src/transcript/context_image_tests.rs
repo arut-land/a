@@ -35,7 +35,7 @@ fn a_prefix_projects_edits_and_publications_without_executable_ownership() {
         entry(
             1,
             Body::Input {
-                text: "old".into(),
+                segments: "old".into(),
                 mode: Mode::Queue,
                 taken: true,
                 origin: None,
@@ -164,7 +164,7 @@ fn pending_exchanges_never_become_child_work() {
     entries.push(entry(
         7,
         Body::Input {
-            text: "pending input".into(),
+            segments: "pending input".into(),
             mode: Mode::Queue,
             taken: false,
             origin: None,
@@ -546,7 +546,7 @@ fn model_only_inputs_keep_their_interpretation_across_agent_scopes() {
         entry(
             2,
             Body::Input {
-                text: turn.intent(None).unwrap().raw().into(),
+                segments: turn.intent(None).unwrap().raw().into(),
                 mode: Mode::Queue,
                 taken: false,
                 origin: None,

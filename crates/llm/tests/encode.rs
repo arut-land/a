@@ -442,3 +442,90 @@ fn every_body_is_the_one_pinned() {
         differ.join("\n")
     );
 }
+
+/// The provider state a reasoning part keeps that means something only to
+/// its producer: ids, signatures and ciphertext.
+fn ciphertext(value: &serde_json::Value, out: &mut Vec<String>) {
+    const SECRET: &[&str] = &[
+        "id",
+        "signature",
+        "encrypted_content",
+        "data",
+        "thoughtSignature",
+    ];
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                match value.as_str() {
+                    Some(text) if SECRET.contains(&key.as_str()) && text.len() >= 8 => {
+                        out.push(text.to_owned());
+                    }
+                    _ => ciphertext(value, out),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|item| ciphertext(item, out)),
+        _ => {}
+    }
+}
+
+/// Every recorded reply that reasons, continued by any other model, over
+/// its own protocol or another: its readable reasoning reaches the next
+/// model as context naming its source, and none of its ids, signatures or
+/// ciphertext does.
+#[test]
+fn foreign_reasoning_reaches_other_providers_tagged_and_never_its_ciphertext() {
+    let (mut shown, mut switched, mut guarded) = (0, 0, 0);
+    for (by, reply) in &replies() {
+        let reasoning: Vec<&llm::Reasoning> = (reply.message.content.iter())
+            .filter_map(|part| match part {
+                AssistantPart::Reasoning(reasoning) => Some(reasoning),
+                _ => None,
+            })
+            .collect();
+        let readable = reasoning
+            .iter()
+            .any(|r| !r.redacted && !r.text.trim().is_empty());
+        let mut secrets = Vec::new();
+        for part in &reasoning {
+            ciphertext(&serde_json::to_value(&part.meta).unwrap(), &mut secrets);
+        }
+        let origin = reply
+            .message
+            .origin
+            .as_ref()
+            .expect("a decoded reply names its origin");
+        let source = format!("source=\\\"{}/{}\\\"", origin.provider, origin.model);
+        for (label, provider, models) in targets() {
+            let key = provider.protocol.key();
+            for model in models {
+                if *provider.id == origin.provider && *model == origin.model {
+                    continue;
+                }
+                let messages = vec![
+                    Message::user("hi"),
+                    Message::Assistant(reply.message.clone()),
+                    Message::user("go on"),
+                ];
+                let body = sent(&provider, &request(model, key, 4, messages));
+                let body = String::from_utf8_lossy(&body);
+                for secret in &secrets {
+                    assert!(
+                        !body.contains(secret.as_str()),
+                        "{label} {model} was sent {secret}"
+                    );
+                }
+                assert_eq!(body.contains(&source), readable, "{label} {model}: {body}");
+                shown += usize::from(readable);
+                switched += usize::from(readable && key == *by);
+                guarded += secrets.len();
+            }
+        }
+    }
+    assert!(shown > 0, "the cassettes hold readable reasoning");
+    assert!(
+        switched > 0,
+        "a model switch over the same protocol is covered"
+    );
+    assert!(guarded > 0, "the cassettes hold reasoning state");
+}

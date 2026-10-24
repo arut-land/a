@@ -1,0 +1,17 @@
+diff --git a/crates/sys/src/resources.rs b/crates/sys/src/resources.rs
+index 1fb74d85..be3bf12c 100644
+--- a/crates/sys/src/resources.rs
++++ b/crates/sys/src/resources.rs
+@@ -30,11 +30,7 @@ impl Resources {
+ /// Rust's Linux implementation intersects affinity with cgroup v1/v2 quota,
+ /// including ancestor limits and non-root controller mounts.
+ pub fn effective_parallelism() -> usize {
+-    let available = std::thread::available_parallelism().map_or(1, usize::from);
+-    #[cfg(windows)]
+-    return windows::parallelism(available);
+-    #[cfg(not(windows))]
+-    available
++    std::thread::available_parallelism().map_or(1, usize::from)
+ }
+ 
+ pub fn page_size() -> io::Result<usize> {
