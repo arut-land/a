@@ -121,13 +121,22 @@ The harness records binary hashes for both builds. This control was added after
 the first worker-sizing comparisons showed CPU differences despite matching
 worker counts.
 
+## Observations
+
+The [per-target table](resource-mechanisms/observations.md) reports complete
+matched lanes and their intervals. [Raw paired values](resource-mechanisms/effects.csv)
+include peak RSS, steady idle after retirement, regular-size workloads, CPU
+components, run order and image size. Results are conditional on each runner;
+within-host bootstrap intervals do not establish variation across hardware.
+
 ## Decisions
 
 Windows storage lookup is removed. Its enabled-minus-disabled idle cost is
 55.4 KiB [31.6, 80.2] on x86_64 and 18.2 KiB [10.0, 26.8] on aarch64
 (20 paired rounds, bootstrap 95% intervals). It changes neither target's selected
-pool widths; ARM reports unknown media even with the query. On x86_64 cold reply
-cost is 1.88% [0.91, 2.95]. These costs have no qualified slow-disk benefit.
+pool widths; ARM reports unknown media even with the query. The unadjusted x86_64 cold-reply delta is 1.88% [0.91, 2.95], while the
+same-source control is 2.43% [0.68, 4.46]; no cold-latency benefit is attributed
+to removing the query. The RSS cost has no qualified slow-disk benefit.
 The remaining decisions await the complete comparisons and same-build controls.
 
 ## Incomplete runs
