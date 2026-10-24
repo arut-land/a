@@ -121,6 +121,21 @@ The harness records binary hashes for both builds. This control was added after
 the first worker-sizing comparisons showed CPU differences despite matching
 worker counts.
 
+The [native allocator diagnostic](resource-mechanisms/cache-allocator-observations.json)
+records cache population, clearing, a one-second delay and explicit pressure
+relief. Reported live allocator bytes fall by about 72 MiB on Intel and 129 MiB
+on macOS 15 ARM. ARM RSS remains high. Explicit pressure relief reports zero
+released bytes and does not justify an allocator policy change. Some ARM zone
+counters wrap after relief and the counters are advisory; none is substituted
+for RSS. The uninstrumented cache observations remain separate.
+
+In all 20 Intel QoS pairs, `vmmap` reports identical retained allocation counts
+and live bytes at its reported precision. Its RSS delta therefore is not
+attributed to retained allocation growth. Page residency, image layout and
+allocator fragmentation also affect RSS. The driver fixtures do not run the
+daemon supervisor or open a persistent catalog; those CPU results compare the
+compiled images, rather than demonstrating CPU consumed by an inactive probe.
+
 ## Observations
 
 The [per-target table](resource-mechanisms/observations.md) reports complete
@@ -156,7 +171,11 @@ traced-full and compact builds. All four answer a later probe. This establishes
 that the failure pre-exists O15, not that its frequency is unchanged. A separate
 campaign exercises the displaced-waker fix. The initial diagnostic's copy of a
 held endpoint claim file fails with WinError 32; collected phase records and
-stacks survive. The later probe records copy errors without losing its summary.
+stacks survive. The later probe records copy errors without losing its summary. Its
+[waker-drop campaign](resource-mechanisms/additional-runs.json) completes all
+200 phases and 10,000 resumes with no timeout. The native hosts differ, so this
+is supporting evidence rather than causal proof that the lock-boundary fix
+resolves the transient timeout.
 
 Run 40052186159 failed in the catalog-off Windows ARM benchmark after five
 pairs. Hyperfine did not expose the benchmark's failure output, so its cause is
