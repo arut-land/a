@@ -433,6 +433,84 @@ pub fn remove_durable(path: &Path) -> io::Result<()> {
     fs::remove_file(tombstone)
 }
 
+/// Gives an ordered file its final name, ordered before later writes
+/// without a cache flush of its own: the next flush of the device makes
+/// both durable, as it does a log's barriers. Never replaces `to`.
+pub fn publish_ordered(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        // A hard link fails on an existing name where rename would replace it.
+        fs::hard_link(from, to)?;
+        fs::remove_file(from)?;
+        order_dir(to.parent().ok_or(io::ErrorKind::InvalidInput)?)
+    }
+    #[cfg(windows)]
+    move_file(from, to, false)
+}
+
+/// Makes `to` a copy of `from`, sharing its storage where the file system
+/// can: an APFS clone, a reflink, else a hard link (so the two are one
+/// file), else a copy. `to` must not exist.
+pub fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        /// `CLONE_NOFOLLOW` from `<sys/clonefile.h>`, which libc lacks.
+        const NOFOLLOW: u32 = 1;
+        let (src, dst) = (
+            CString::new(from.as_os_str().as_bytes())?,
+            CString::new(to.as_os_str().as_bytes())?,
+        );
+        // SAFETY: both paths are NUL-terminated and outlive the call.
+        if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), NOFOLLOW) } == 0 {
+            return Ok(());
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if reflink(from, to).is_ok() {
+        return Ok(());
+    }
+    match fs::hard_link(from, to) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let mut source = File::open(from)?;
+            let mut copy = private_file().open(to)?;
+            let copied = io::copy(&mut source, &mut copy).and_then(|_| {
+                let mut read_only = copy.metadata()?.permissions();
+                read_only.set_readonly(true);
+                copy.set_permissions(read_only)
+            });
+            if copied.is_err() {
+                let _ = fs::remove_file(to);
+            }
+            copied
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn reflink(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let source = File::open(from)?;
+    let clone = private_file().open(to)?;
+    // SAFETY: both descriptors stay open for the call; FICLONE takes the
+    // source descriptor as its argument.
+    let shared = unsafe { libc::ioctl(clone.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) };
+    let done = if shared == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        let mut read_only = clone.metadata()?.permissions();
+        read_only.set_readonly(true);
+        clone.set_permissions(read_only)
+    };
+    if done.is_err() {
+        let _ = fs::remove_file(to);
+    }
+    done
+}
+
 /// A name whose publication must precede the log's first durable promise.
 /// Windows receives this only after a flushed temporary file was published;
 /// Unix retains its deferred directory barrier to share the first log flush.
@@ -614,7 +692,7 @@ pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
     Ok(WriteWatch { fd, _file: file })
 }
 
-/// Completion of spill-file writes copied from a contained process's pipe.
+/// Completion of output-stream writes copied from a contained process's pipe.
 /// NTFS directory notifications can wait until the writer closes its file.
 #[cfg(windows)]
 pub struct WriteWatch {
@@ -677,7 +755,7 @@ pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
     Ok(WriteWatch { key, event })
 }
 
-/// Signals only after the copied output is readable from its spill file.
+/// Signals only after the copied output is readable from its output stream.
 pub fn output_written(file: &File) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -732,6 +810,28 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn a_clone_reads_as_its_source_and_neither_is_ever_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (staged, blob, copy) = (
+            dir.path().join("staged"),
+            dir.path().join("blob"),
+            dir.path().join("copy"),
+        );
+        fs::write(&staged, "bytes").unwrap();
+        publish_ordered(&staged, &blob).unwrap();
+        assert!(!staged.exists());
+        fs::write(&staged, "other").unwrap();
+        let taken = publish_ordered(&staged, &blob).unwrap_err();
+        assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&blob).unwrap(), "bytes");
+        clone_file(&blob, &copy).unwrap();
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "bytes");
+        let taken = clone_file(&staged, &copy).unwrap_err();
+        assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "bytes");
+    }
 
     #[test]
     fn discovery_never_opens_a_fifo_or_directory() {

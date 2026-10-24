@@ -26,9 +26,9 @@ inventory fails closed. Child directories and executable paths resolve to
 absolute paths before spawning.
 
 Admission covers queued futures as well as running processes, with 32 slots.
-Each captured process has one 64 KiB chunk in flight and a hard 64 MiB spill
-limit, including background jobs. Spill writes apply storage back-pressure;
-following files and enumerating groups run on admitted storage workers.
+Each captured process has one 64 KiB chunk in flight and a hard 64 MiB output
+limit, including background jobs. Stream writes apply storage back-pressure;
+following streams and enumerating groups run on admitted storage workers.
 Observation stops at 4096 members. Rendered head/tail, partial lines and terminal
 metadata have independent memory bounds. After owned-scope cleanup, capture
 finishes accepted disk writes and drains at most 1 MiB with a 100 ms pipe-drain
@@ -49,7 +49,7 @@ inheritance, verified job membership, Unicode environments and directories,
 embedded-NUL rejection, SSH terminal groups, replay isolation, queued admission,
 completion releasing capacity, escaped pipe holders during timeout and
 cancellation, relative cwd/PATH combinations, procfs-free spawning, background
-spill caps and bounded unterminated terminal metadata. Native process tests run outside Miri; ownership checks that
+output caps and bounded unterminated terminal metadata. Native process tests run outside Miri; ownership checks that
 Miri can model remain enabled. Old-kernel behavior is exercised through forced
 fallbacks; the hosted kernels themselves are modern.
 
@@ -85,7 +85,7 @@ includes the endpoint ownership merge from `origin/main`.
 
 ## Capture RSS
 
-Each text job writes 8 MiB; eight simultaneous jobs retain 64 MiB in spill files.
+Each text job writes 8 MiB; eight simultaneous jobs retain 64 MiB in blob streams.
 The metadata case writes 8 MiB inside an OSC sequence. Daemon and process-tree
 RSS are sampled every 5 ms while the workload runs; short spikes may be missed.
 Tree RSS includes user tools; kernel pipe memory is outside RSS. Post-burst RSS

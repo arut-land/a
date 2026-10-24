@@ -73,7 +73,10 @@ pub struct Shared {
     pub barriers: kernel::Barriers,
     /// This build: what a snapshot must be of to be restored.
     pub build: String,
-    pub spill: PathBuf,
+    /// The blobs every session's entries reference, one namespace.
+    pub blobs: Arc<dyn ext::blob::BlobStore>,
+    /// How those blobs appear as files.
+    pub tree: Arc<dyn ext::blob::Materialize>,
     pub(crate) loaded: Mutex<std::collections::HashSet<SessionId>>,
     pub(crate) daemon: Weak<Daemon>,
 }
@@ -309,7 +312,7 @@ struct Session {
     fence: AtomicU64,
     id: SessionId,
     workspace: Arc<Path>,
-    spill: Arc<Path>,
+    blobs: ext::blob::Blobs,
     mail: Mail,
     states: Mutex<Arc<Mutex<States>>>,
     env: Mutex<Option<Arc<Environment>>>,
@@ -2593,7 +2596,11 @@ impl Session {
             fence: AtomicU64::new(0),
             id: header.id,
             workspace: Arc::from(header.workspace.as_path()),
-            spill: Arc::from(shared.spill.join(header.id.to_string())),
+            blobs: ext::blob::Blobs::new(
+                Arc::clone(&shared.blobs),
+                Arc::clone(&shared.tree),
+                header.id,
+            ),
             mail,
             states: Mutex::new(Arc::new(Mutex::new(registry.states()))),
             env: Mutex::default(),

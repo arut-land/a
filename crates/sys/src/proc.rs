@@ -142,7 +142,7 @@ pub struct ContainedChild {
     pub capture: Option<OutputCapture>,
 }
 
-/// Output that must be copied asynchronously to its spill file before completion.
+/// Output that must be copied asynchronously to its output stream before completion.
 pub struct OutputCapture {
     pub reader: ProcessPipe,
     pub file: File,

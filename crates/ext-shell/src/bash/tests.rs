@@ -163,13 +163,18 @@ fn a_background_child_holding_the_pipe_does_not_hold_the_call() {
 }
 
 #[test]
-fn huge_output_is_cut_and_spilled_whole() {
+fn huge_output_is_cut_and_kept_whole_as_a_blob() {
     let rig = rig("huge");
     let ran = run(&rig, "seq 1 200000");
-    let full = ran.full.clone().unwrap();
+    let blob = ran.full.clone().unwrap();
+    let full = rig.tree().join("by-id").join(blob.id.to_string());
     let saved = std::fs::read_to_string(&full).unwrap();
-    assert!(full.starts_with(rig.spill()), "{}", full.display());
-    assert_eq!(full.file_name().unwrap(), "1.log");
+    assert_eq!(blob.size, saved.len() as u64);
+    assert_eq!(
+        blob.origin,
+        BlobOrigin::ToolOutput(protocol::CallId::new(1).unwrap())
+    );
+    assert!(!rig.stream(1, "log").exists(), "the stream was sealed");
     assert!(ran.truncated);
     assert_eq!(saved.lines().count(), 200_000);
     assert!(ran.output.starts_with("1\n2\n3\n"));
@@ -193,7 +198,9 @@ fn binary_and_terminal_output_are_cleaned() {
         "{}",
         binary.output
     );
-    let saved = std::fs::read(binary.full.unwrap()).unwrap();
+    let blob = binary.full.unwrap();
+    assert_eq!(blob.media_type, "application/octet-stream");
+    let saved = std::fs::read(rig.tree().join("by-id").join(blob.id.to_string())).unwrap();
     assert_eq!(saved.len(), 20004);
     let styled = run(
         &rig,
@@ -499,7 +506,7 @@ fn invalid_input_fails_the_call() {
 #[test]
 fn a_running_commands_output_is_on_disk() {
     let rig = rig("on-disk");
-    let log = rig.spill().join("1.log");
+    let log = rig.stream(1, "log");
     let ran = std::thread::scope(|s| {
         let call = s.spawn(|| run(&rig, "echo started; sleep 100"));
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -533,7 +540,9 @@ fn big_output_never_sits_in_memory() {
     let peak = ALLOC.peak() - before;
     assert!(ran.truncated && ran.exit == Some(0), "{ran:?}");
     let full = ran.full.unwrap();
-    assert_eq!(std::fs::metadata(full).unwrap().len(), 16_000_000);
+    assert_eq!(full.size, 16_000_000);
+    let path = rig.tree().join("by-id").join(full.id.to_string());
+    assert_eq!(std::fs::metadata(path).unwrap().len(), 16_000_000);
     assert!(peak < 4 << 20, "{peak} bytes at most while 16 MB ran");
 }
 
@@ -542,8 +551,11 @@ fn a_command_that_floods_its_output_is_stopped() {
     let rig = rig("flood");
     let ran = run(&rig, "cat /dev/zero");
     assert_eq!(ran.flooded, Some(OUTPUT_CAP), "{ran:?}");
-    let size = std::fs::metadata(ran.full.as_ref().unwrap()).unwrap().len();
-    assert!(size >= OUTPUT_CAP, "{size}");
+    assert_eq!(
+        ran.full.as_ref().unwrap().size,
+        OUTPUT_CAP,
+        "kept up to its cap"
+    );
     assert!(model(&ran).contains("[stopped: its output passed 64 MiB]"));
 }
 
@@ -631,8 +643,8 @@ fn continuous_output_yields_to_other_sessions() {
     let rig = rig("output-quantum");
     let cx = rig.cx();
     rt::block_on(async {
-        let log = cx.spill.join("quantum.log");
-        let (mut file, log) = create_private(&log).unwrap();
+        let Stream { mut file, open } = cx.blobs.stream(cx.call, "quantum", u64::MAX).unwrap();
+        let log = open.path().to_owned();
         file.write_all(&vec![b'x'; usize::try_from(READ * 3).unwrap()])
             .unwrap();
         let written = rt::Async::for_reading(
@@ -648,7 +660,6 @@ fn continuous_output_yields_to_other_sessions() {
                 LaunchSpec {
                     process: spawn_with::<crate::dialect::Bash>(
                         sys::shell::ExecutionFacts::current(),
-                        &cx,
                         "exit 0",
                         &cx.dir(),
                         environment(&cx, std::env::vars()),
@@ -693,7 +704,7 @@ fn continuous_output_yields_to_other_sessions() {
 }
 
 #[test]
-fn background_output_cannot_exceed_the_spill_limit() {
+fn background_output_cannot_exceed_the_output_cap() {
     let rig = rig("bounded-background");
     let ran = bash(&rig, &json!({ "command": "yes x", "background": true }));
     let job = ran.background.unwrap();
@@ -713,6 +724,6 @@ fn unterminated_terminal_metadata_cannot_grow_retained_output() {
         live.push(&chunk);
     }
     assert!(ALLOC.peak().saturating_sub(baseline) < 256 << 10);
-    assert_eq!(output.finish(Path::new("unused")).text, "");
+    assert_eq!(output.finish().render(None).text, "");
     assert_eq!(live.take(), None);
 }

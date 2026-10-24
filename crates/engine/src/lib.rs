@@ -349,6 +349,12 @@ impl Daemon {
 
     fn load_on(home: &Home, config: &Config, runtime: &Arc<impl rt::Runtime>) -> io::Result<Owner> {
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
+        let blobs: Arc<dyn ext::blob::BlobStore> =
+            Arc::new(store::Files::open(home.blobs_dir(), &home.sessions_dir())?);
+        let tree = Arc::new(store::CacheDir::new(
+            home.cache_dir().join("tree"),
+            Arc::clone(&blobs),
+        ));
         let catalog = Catalog::open(home.catalog_file(), &*store)?;
         catalog.start(Arc::clone(runtime) as Arc<dyn rt::Runtime>);
         let records = catalog.records();
@@ -377,7 +383,8 @@ impl Daemon {
                 models,
                 barriers: config.barriers,
                 build: config.build.clone(),
-                spill: home.spill_dir(),
+                blobs,
+                tree,
                 loaded: Mutex::default(),
                 daemon: daemon.clone(),
             }),

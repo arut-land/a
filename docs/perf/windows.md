@@ -62,7 +62,7 @@ reports and daemon environment variables are handled in `sys`. Each shell
 enters its job at creation; there is no terminal or interactive shell stdin.
 
 Captured output enters an overlapped pipe. `rt` copies bounded 64 KiB chunks
-to the spill file on storage workers and signals file-identity-keyed follower
+to the output stream on storage workers and signals file-identity-keyed follower
 events. NTFS directory notifications can wait until close and cannot provide
 live progress. A quiet process holds no copying worker and causes no polling.
 Output draining completes independently of descendant reaping. The copier

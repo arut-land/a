@@ -111,7 +111,7 @@ fn revoking_a_pending_cwd_record_preserves_the_shell_result() {
         session: original.session,
         call: original.call,
         model: original.model,
-        spill: original.spill,
+        blobs: original.blobs,
         cancel: original.cancel,
         services: Arc::new(
             SessionServices::default().with::<dyn rt::Runtime>(Arc::new(rt::Threads::default())),
@@ -223,7 +223,7 @@ fn powershell_preserves_status_errors_unicode_cwd_and_no_input() {
                 .unwrap(),
         );
         // A failed cwd receipt must not replace the user's explicit exit code.
-        std::fs::create_dir_all(rig.spill().join("1.cwd")).unwrap();
+        std::fs::create_dir_all(rig.stream(1, "cwd")).unwrap();
         let run = |command: &str| -> crate::bash::Ran {
             eprintln!("PowerShell command: {command}");
             let ran: crate::bash::Ran = serde_json::from_value(rig.done(

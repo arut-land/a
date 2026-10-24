@@ -15,7 +15,8 @@ utility directory, suppress Bash startup hooks and pin the published temporary
 directory. Unix process-group cleanup permits descendants to escape their group;
 Windows cleanup owns a kill-on-close job. Command-created temporary files remain
 the command's responsibility. Foreground cwd receipts are best effort; truncated
-and background output remains in the session spill directory.
+output is sealed into a blob the result references, and background output stays
+an open blob stream while the job runs.
 
 ## Windows executable names
 

@@ -118,9 +118,9 @@ pub struct Cx {
     pub call: CallId,
     /// The model the session talks to, as `host:model`.
     pub model: Arc<str>,
-    /// The session's directory for output too large for the log, created
-    /// on first use.
-    pub spill: Arc<Path>,
+    /// Where output too large for the log goes: the session store's
+    /// blobs, which a result references by id.
+    pub blobs: crate::blob::Blobs,
     pub cancel: Cancel,
     services: Arc<SessionServices>,
     host: Arc<dyn Host>,
@@ -135,7 +135,7 @@ impl Cx {
             session,
             call,
             model,
-            spill,
+            blobs,
             cancel,
             services,
         } = call;
@@ -145,7 +145,7 @@ impl Cx {
             session,
             call,
             model,
-            spill,
+            blobs,
             cancel,
             services,
             host,

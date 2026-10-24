@@ -1,12 +1,11 @@
 //! A command's output as the model sees it: decoded and cleaned of what
 //! only a terminal would render, and cut to its start and end. The whole
-//! is the file the command writes to, which only a cut output keeps.
+//! is the stream the command writes to, which only a cut output keeps, as
+//! a blob.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::fs::File;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The most of the output's start the model sees.
 pub const HEAD: usize = 8 * 1024;
@@ -46,8 +45,13 @@ enum Kind {
 pub struct Rendered {
     pub text: String,
     pub truncated: bool,
-    /// The whole output, if it was cut.
-    pub full: Option<PathBuf>,
+}
+
+/// The output once it has ended, before it is shown.
+pub struct Ended {
+    view: View,
+    kind: Kind,
+    bytes: u64,
 }
 
 impl Output {
@@ -87,8 +91,8 @@ impl Output {
         clean.feed(bytes, &mut |piece| view.push(piece));
     }
 
-    /// What the model is shown of the output, whose whole is `file`.
-    pub fn finish(mut self, file: &Path) -> Rendered {
+    /// The output, ended: what is incomplete is cleaned up.
+    pub fn finish(mut self) -> Ended {
         if self.kind == Kind::Undecided {
             self.text();
         }
@@ -100,22 +104,46 @@ impl Output {
             ..
         } = self;
         clean.finish(&mut |piece| view.push(piece));
-        let full = Some(file.to_path_buf());
+        Ended { view, kind, bytes }
+    }
+}
+
+impl Ended {
+    /// Whether the model sees less than the whole, which is then kept.
+    pub const fn cut(&self) -> bool {
+        matches!(self.kind, Kind::Binary) || self.view.cut
+    }
+
+    pub const fn media_type(&self) -> &'static str {
+        match self.kind {
+            Kind::Binary => "application/octet-stream",
+            _ => "text/plain; charset=utf-8",
+        }
+    }
+
+    /// What the model is shown, naming where the whole can be read, if
+    /// it was kept.
+    pub fn render(self, whole: Option<&Path>) -> Rendered {
+        let Self { view, kind, bytes } = self;
         if kind == Kind::Binary {
+            let text = match whole {
+                Some(file) => {
+                    format!(
+                        "[binary output: {bytes} bytes, saved to {}]",
+                        file.display()
+                    )
+                }
+                None => format!("[binary output: {bytes} bytes]"),
+            };
             return Rendered {
-                text: format!(
-                    "[binary output: {bytes} bytes, saved to {}]",
-                    file.display()
-                ),
+                text,
                 truncated: true,
-                full,
             };
         }
         let truncated = view.cut;
         Rendered {
-            text: view.render(file),
+            text: view.render(whole),
             truncated,
-            full: full.filter(|_| truncated),
         }
     }
 }
@@ -197,7 +225,7 @@ impl View {
         }
     }
 
-    fn render(self, file: &Path) -> String {
+    fn render(self, whole: Option<&Path>) -> String {
         if !self.cut {
             return self.head;
         }
@@ -207,48 +235,19 @@ impl View {
         if !text.ends_with('\n') {
             text.push('\n');
         }
-        let _ = writeln!(
+        let _ = write!(
             text,
-            "[… {} lines / {} bytes omitted; full output: {}]",
+            "[… {} lines / {} bytes omitted",
             self.lines.saturating_sub(shown_lines),
             self.bytes - shown,
-            file.display(),
         );
+        let _ = match whole {
+            Some(file) => writeln!(text, "; full output: {}]", file.display()),
+            None => writeln!(text, "]"),
+        };
         text.extend(self.tail);
         text
     }
-}
-
-/// Creates a file only its owner can read, in a directory only its owner
-/// can enter, never opening one that exists: at `path`, or at `path` with
-/// a number added when that is taken.
-pub fn create_private(path: &Path) -> io::Result<(File, PathBuf)> {
-    let open = sys::fs::private_file();
-    if let Some(parent) = path.parent() {
-        private_dir(parent)?;
-    }
-    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = path.extension().unwrap_or_default().to_string_lossy();
-    for n in 0..100 {
-        let path = match n {
-            0 => path.to_path_buf(),
-            n => path.with_file_name(format!("{stem}-{n}.{ext}")),
-        };
-        match open.open(&path) {
-            Ok(file) => return Ok((file, path)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!("{} and its alternatives exist", path.display()),
-    ))
-}
-
-/// Creates `dir` and its parents, entered only by their owner.
-pub fn private_dir(dir: &Path) -> io::Result<()> {
-    sys::fs::private_dir(dir)
 }
 
 /// The most output a call reports as it runs: its log holds this much of
@@ -421,23 +420,21 @@ mod tests {
         assert_eq!(clean(&[b"\xe2\x82", b"\xac\n"]), "\u{20ac}\n");
     }
 
-    fn dir() -> PathBuf {
-        tempfile::Builder::new()
-            .prefix("a-output-")
-            .tempdir()
-            .unwrap()
-            .keep()
-    }
+    const FILE: &str = "/tree/by-id/1";
 
-    const FILE: &str = "/spill/1.log";
+    fn shown(out: Output) -> (bool, Rendered) {
+        let ended = out.finish();
+        let cut = ended.cut();
+        (cut, ended.render(cut.then_some(Path::new(FILE))))
+    }
 
     #[test]
     fn short_output_is_shown_whole_and_names_no_file() {
         let mut out = Output::default();
         out.push(b"hello\n");
-        let rendered = out.finish(Path::new(FILE));
+        let (cut, rendered) = shown(out);
         assert_eq!(rendered.text, "hello\n");
-        assert!(!rendered.truncated && rendered.full.is_none());
+        assert!(!rendered.truncated && !cut);
     }
 
     #[test]
@@ -447,9 +444,8 @@ mod tests {
         for chunk in lines.chunks(7) {
             out.push(chunk.concat().as_bytes());
         }
-        let rendered = out.finish(Path::new(FILE));
-        assert!(rendered.truncated);
-        assert_eq!(rendered.full.as_deref(), Some(Path::new(FILE)));
+        let (cut, rendered) = shown(out);
+        assert!(rendered.truncated && cut);
         let text = rendered.text;
         assert!(text.starts_with("line 0\nline 1\n"), "{}", &text[..40]);
         assert!(text.ends_with("line 9999\n"));
@@ -463,7 +459,7 @@ mod tests {
     fn one_huge_line_is_cut_too() {
         let mut out = Output::default();
         out.push("é".repeat(100_000).as_bytes());
-        let rendered = out.finish(Path::new(FILE));
+        let (_, rendered) = shown(out);
         assert!(rendered.truncated);
         assert!(rendered.text.len() <= HEAD + TAIL + 200);
     }
@@ -473,23 +469,21 @@ mod tests {
         let mut out = Output::default();
         out.push(b"\x7fELF\x00\x01");
         out.push(&[0xff; 9000]);
-        let rendered = out.finish(Path::new(FILE));
+        let (cut, rendered) = shown(out);
         assert_eq!(
             rendered.text,
             format!("[binary output: 9006 bytes, saved to {FILE}]")
         );
-        assert_eq!(rendered.full.as_deref(), Some(Path::new(FILE)));
+        assert!(cut);
     }
 
     #[test]
-    fn a_taken_file_name_is_never_reused() {
-        let dir = dir();
-        let path = dir.join("2.log");
-        let (_, first) = create_private(&path).unwrap();
-        let (_, second) = create_private(&path).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(first, path);
-        assert_eq!(second, dir.join("2-1.log"));
+    fn output_whose_whole_was_not_kept_names_no_file() {
+        let mut out = Output::default();
+        out.push("x\n".repeat(LINES * 2).as_bytes());
+        let rendered = out.finish().render(None);
+        let marker = rendered.text.lines().find(|l| l.starts_with("[…")).unwrap();
+        assert!(marker.ends_with("omitted]"), "{marker}");
     }
 
     #[test]

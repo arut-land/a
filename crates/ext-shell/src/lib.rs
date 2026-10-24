@@ -11,7 +11,8 @@
 //! Commands retain the client's environment and cwd, with noninteractive
 //! output preferences and the published temporary directory. Bash startup
 //! hooks `BASH_ENV`/`ENV` are suppressed. Foreground cwd reports are removed after
-//! use; truncated and background output remains in the session spill directory.
+//! use; truncated output is sealed into a blob the result references, and a
+//! background job's output stays an open blob stream while it runs.
 //!
 //! PowerShell takes one bounded Unicode `-Command` payload, preserving normal
 //! error semantics and explicit exits without changing execution policy. Its

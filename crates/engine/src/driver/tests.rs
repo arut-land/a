@@ -330,6 +330,15 @@ impl Fixture {
         // One worker: no effect may hold it.
         let counting = Arc::new(Counting(rt::Threads::new(1), AtomicUsize::new(0)));
         let rt: rt::Rt = Arc::clone(&counting) as _;
+        let scratch = std::env::temp_dir().join(format!("a-blobs-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let blobs: Arc<dyn ext::blob::BlobStore> = Arc::new(
+            crate::store::Files::open(scratch.join("blobs"), &std::env::temp_dir()).unwrap(),
+        );
+        let tree = Arc::new(crate::store::CacheDir::new(
+            scratch.join("tree"),
+            Arc::clone(&blobs),
+        ));
         let daemon = Arc::new_cyclic(|daemon| Daemon {
             shared: Arc::new(Shared {
                 http_clients: std::sync::OnceLock::new(),
@@ -340,7 +349,8 @@ impl Fixture {
                 models,
                 barriers: kernel::Barriers::default(),
                 build: "test".into(),
-                spill: std::env::temp_dir().join(format!("a-spill-{}", std::process::id())),
+                blobs,
+                tree,
                 loaded: Mutex::default(),
                 daemon: daemon.clone(),
             }),

@@ -9,10 +9,11 @@
 //! calls and restarts. Its calls are exclusive ([`ext::Concurrency`]): a
 //! session runs one at a time, so commands never race for that directory.
 //!
-//! Output crosses a bounded capture pipe into the session's spill file.
-//! Storage admission applies back-pressure; the supervisor follows the file,
-//! woken by its writes, keeping only what the model is shown, and the file
-//! is kept as the whole output when that was cut. A command whose output
+//! Output crosses a bounded capture pipe into an open blob stream.
+//! Storage admission applies back-pressure; the supervisor follows the
+//! stream, woken by its writes, keeping only what the model is shown, and
+//! the stream is sealed into a blob as the whole output when that was cut:
+//! the result references the blob, and names where it is materialized. A command whose output
 //! passes [`OUTPUT_CAP`] is stopped. Cancellation before or during process
 //! launch reports an aborted command, as cancellation during supervision does.
 
@@ -29,8 +30,9 @@ use protocol::{Card, Environment, Mark};
 use serde::{Deserialize, Serialize};
 
 pub use crate::output::OUTPUT_CAP;
-use crate::output::{Live, Output, Rendered, create_private, private_dir};
+use crate::output::{Ended, Live, Output, Rendered};
 use crate::state::Cwd;
+use ext::blob::{BlobOrigin, BlobRef, Open, Stream};
 use ext::shape::{self, Streams};
 use ext::{Cx, Json, Partials, Schema, SpawnSpec as Spawn, Tool};
 
@@ -123,7 +125,7 @@ pub struct Ran {
     pub truncated: bool,
     /// The whole output, when it was cut.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub full: Option<PathBuf>,
+    pub full: Option<BlobRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<Job>,
     /// The process group, when processes the command started outlived it.
@@ -136,7 +138,8 @@ pub struct Ran {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     pub pgid: u32,
-    /// Where its output goes.
+    /// Where its output stream can be read as it grows: open for as long
+    /// as the job runs.
     pub log: PathBuf,
 }
 
@@ -309,32 +312,33 @@ async fn execute<D: crate::dialect::Dialect>(
         });
     }
     let env = environment(cx, std::env::vars());
-    let log = cx.spill.join(format!("{}.log", cx.call));
+    // Both streams share the one file, and its offset: in the order written.
+    let Stream { file, open: log } = cx.blobs.stream(cx.call, "log", OUTPUT_CAP)?;
     if input.background {
         return background(
             cx,
-            spawn_with::<D>(facts, cx, &input.command, &dir, env, None)?,
-            &log,
+            spawn_with::<D>(facts, &input.command, &dir, env, None)?,
+            file,
+            log,
         )
         .await;
     }
-    let report = cx.spill.join(format!("{}.cwd", cx.call));
-    let spawn = spawn_with::<D>(facts, cx, &input.command, &dir, env, Some(&report))?;
-    // Both streams share the one file, and its offset: in the order written.
-    let (file, log) = create_private(&log)?;
+    // Beside the stream, so it is as private, and swept with it.
+    let report = log.path().with_extension("cwd");
+    let spawn = spawn_with::<D>(facts, &input.command, &dir, env, Some(&report))?;
     // Watched before anything can write to it: a write before the watch
     // raises no edge, and would be read only once the command exits.
-    let written = rt::Async::for_reading(&runtime(cx)?.reactor(), sys::write_watch(&log)?)?;
+    let written = rt::Async::for_reading(&runtime(cx)?.reactor(), sys::write_watch(log.path())?)?;
     let child = launch(cx, spawn, file).await?;
     let pgid = child.id();
     cx.spawned(pgid, false);
     let limit = input.timeout.unwrap_or(TIMEOUT).clamp(1, MAX_TIMEOUT);
-    let output = Followed { log: &log, written };
+    let output = Followed {
+        log: log.path(),
+        written,
+    };
     let done = supervise(child, output, Duration::from_secs(limit), cx, &progress).await?;
-    // The file is kept as the whole output only when the model saw less.
-    if done.output.full.is_none() {
-        let _ = std::fs::remove_file(&log);
-    }
+    let (Rendered { text, truncated }, full) = keep(cx, log, done.output).await?;
 
     let old_dir = dir.clone();
     let (cwd, moved) = rt::unblock(runtime(cx)?, move || {
@@ -352,11 +356,6 @@ async fn execute<D: crate::dialect::Dialect>(
     if done.lingering {
         done.process.detach(cx);
     }
-    let Rendered {
-        text,
-        truncated,
-        full,
-    } = done.output;
     let ran = Ran {
         exit: done.status.code(),
         signal: sys::exit_signal(done.status),
@@ -380,11 +379,34 @@ async fn execute<D: crate::dialect::Dialect>(
     }
 }
 
-/// Starts the command with its output going straight to its log, and
-/// leaves it running: the session owns it from here.
-async fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
+/// What the model is shown of the ended output: when it saw less than the
+/// whole, the stream is sealed into a blob and materialized, so the text
+/// names a file that exists. A store that fails costs the path, not the
+/// command's result.
+async fn keep(cx: &Cx, log: Open, output: Ended) -> io::Result<(Rendered, Option<BlobRef>)> {
+    let blobs = cx.blobs.clone();
+    let origin = BlobOrigin::ToolOutput(cx.call);
+    rt::unblock_with(runtime(cx)?, rt::BlockingClass::Storage, 0, move || {
+        if !output.cut() {
+            let _ = log.discard();
+            return Ok((output.render(None), None));
+        }
+        let kept = log
+            .seal(output.media_type(), origin)
+            .and_then(|blob| Ok((blobs.materialize(&blob)?, blob)));
+        Ok(match kept {
+            Ok((path, blob)) => (output.render(Some(&path)), Some(blob)),
+            Err(_) => (output.render(None), None),
+        })
+    })
+    .await
+}
+
+/// Starts the command with its output going straight to its stream, and
+/// leaves it running: the session owns it from here, and the stream stays
+/// open.
+async fn background(cx: &Cx, spawn: Spawn, file: File, log: Open) -> io::Result<Ran> {
     let started = runtime(cx)?.now();
-    let (file, log) = create_private(log)?;
     let cwd = spawn.cwd.clone();
     let child = launch(cx, spawn, file).await?;
     let pgid = child.id();
@@ -392,7 +414,10 @@ async fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
     Ok(Ran {
         cwd,
         duration_ms: duration_ms(started),
-        background: Some(Job { pgid, log }),
+        background: Some(Job {
+            pgid,
+            log: log.path().to_owned(),
+        }),
         ..Ran::default()
     })
 }
@@ -412,15 +437,11 @@ async fn launch(cx: &Cx, process: Spawn, file: File) -> io::Result<OwnedProcess>
 
 fn spawn_with<D: crate::dialect::Dialect>(
     facts: &sys::shell::ExecutionFacts,
-    cx: &Cx,
     command: &str,
     dir: &Path,
     mut env: BTreeMap<String, String>,
     report: Option<&Path>,
 ) -> io::Result<Spawn> {
-    if report.is_some() {
-        private_dir(&cx.spill)?;
-    }
     // Noninteractive startup files must not rewrite the wrapper's contract.
     facts.apply_environment(&mut env);
     env.remove("BASH_ENV");
@@ -565,7 +586,7 @@ struct Finished {
     status: ExitStatus,
     stopped: Option<Stop>,
     lingering: bool,
-    output: Rendered,
+    output: Ended,
     process: OwnedProcess,
 }
 
@@ -676,7 +697,7 @@ async fn supervise(
                     stopped: why
                         .or_else(|| (output.bytes() >= OUTPUT_CAP).then_some(Stop::Flooded)),
                     lingering,
-                    output: output.finish(log),
+                    output: output.finish(),
                     process: child,
                 });
             }

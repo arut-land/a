@@ -14,7 +14,7 @@ impl Session {
             session: self.id,
             call: origin.id,
             model: self.model_spec(registry).into(),
-            spill: Arc::clone(&self.spill),
+            blobs: self.blobs.clone(),
             cancel: origin.cancel.clone(),
             services: Arc::clone(&self.services),
         }

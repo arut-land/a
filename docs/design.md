@@ -73,6 +73,37 @@ Child conversations live recursively below their parent in
 `children/<id>/log.jsonl`; the catalog's ownership headers reconstruct id lookup
 without scanning the directory tree on a clean start.
 
+### Blobs
+
+Bytes too large for a log line (cut tool output now; pastes and attachments
+later) are blobs: content-addressed by SHA-256 (`protocol::BlobId`), owned by
+the store beside the logs that reference them, one namespace per daemon. An
+entry holds a `BlobRef { id, size, media_type, origin }`, never a path, so a
+fork or child references its parent's blobs rather than its files.
+`ext::blob` is the seam: `BlobStore` (`writer`, `stream`, `open`,
+`materialize`, `sweep`), `Materialize` (how blobs appear as files) and the
+shape of `Namespace` (what that tree holds, derived from the logs). Calls
+reach them through `Cx.blobs`.
+
+The JSONL backend (`store::Files`) keeps `blobs/<aa>/<id>`, 0400 in a 0700
+directory. A writer hashes into `staging/` as it writes and refuses bytes past
+its cap; a stream grows in `open/<session>/<call>.<ext>`, readable while a
+process writes it, and seals into a blob (cut at its cap) with no copy.
+Sealing orders the bytes and the new name, then returns the ref: an entry
+referencing it is appended after, so the shared flush epoch that makes the
+entry durable covers the blob (a blob on another device is flushed at once).
+Staging, open streams and unreferenced blobs are never trusted after a crash;
+`sweep` removes them at rest given a `RefIndex` derived from the logs. Nothing
+runs it yet: there is no session deletion. Blob bytes are as private as their
+log, and environment redaction does not apply to them.
+
+`Materialize` makes a blob readable at a stable path before the model is told
+it. The only backend is `store::CacheDir`: `cache/tree/by-id/<id>`, cloned
+(APFS `clonefile`, Linux `FICLONE`), else hard-linked, else copied, read-only,
+evicted least recently used first and rebuilt on demand. Virtual backends
+(Windows Cloud Files, macOS File Provider, Linux FUSE) would plug in behind
+the same trait, answering from `Namespace` and hydrating via `BlobStore::open`.
+
 Calls have durable intents and outcomes. Tool output is structured data;
 model transcripts and client presentation are projections. Approval waits,
 queued input, decisions, child links, process ownership and extension state
@@ -156,10 +187,13 @@ stop requires a retained verified native handle; macOS and kernels without
 pidfds refuse numeric-PID force-stop and retain RPC shutdown.
 
 The shell process service admits at most 32 outstanding launches and running
-processes. Captured output crosses one 64 KiB buffer per process into a spill
-file, with storage back-pressure and a hard 64 MiB retention limit for foreground
-and background jobs. Group observation is capped at 4096 members; exceeding it
-revokes the live lease. Following spill files and enumerating groups use admitted
+processes. Captured output crosses one 64 KiB buffer per process into an open
+blob stream, with storage back-pressure and a hard 64 MiB retention limit for
+foreground and background jobs. A foreground command whose output the model saw
+cut is sealed into a blob that its result references (`Ran.full`); otherwise the
+stream is discarded. A background job's stream stays open at the path its
+result names (`Job.log`) while it runs. Group observation is capped at 4096
+members; exceeding it revokes the live lease. Following streams and enumerating groups use admitted
 storage workers, leaving reactor workers available for other sessions. Once
 owned-scope cleanup ends, capture finishes accepted writes and drains at most
 1 MiB for up to 100 ms; escaped pipe holders cannot retain admission or delay
@@ -191,7 +225,7 @@ The linked extensions own:
 
 | Crate | Responsibility |
 | --- | --- |
-| `ext-shell`, `ext-edit` | One streaming native shell tool, spill files and `edit` |
+| `ext-shell`, `ext-edit` | One streaming native shell tool, its output as blobs, and `edit` |
 | `ext-mcp` | Lazy external tools over stdio and Streamable HTTP |
 | `ext-prompt` | System prompt |
 | `ext-policy` | Permission modes, judge and guarded operator floor |
@@ -264,8 +298,10 @@ instantiations. [The provider layer](llm.md) implements Responses, Chat,
 Messages and Gemini with recorded-cassette parity; it runs HTTP via `rt`'s
 blocking pool and leaves retry policy to extensions.
 
-The daemon wire is length-prefixed JSON over the local endpoint or bridge
-stdio; `protocol::PROTO` defines the current version. Typed ids and message classes distinguish durable entries,
+The daemon wire is framed over the local endpoint or bridge stdio: a
+little-endian u32 length, a `FrameKind` byte, then the body. Only JSON frames
+exist; a reader refuses a kind it does not know, so binary frames (blob
+chunks, without base64) can be added. `protocol::PROTO` defines the current version. Typed ids and message classes distinguish durable entries,
 ephemeral traffic and control. Hello negotiates a supported version; attach
 replays from a seq or supplies a view snapshot, ends replay with `Synced`,
 then follows live entries. A wire encoding change requires a new version

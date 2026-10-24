@@ -99,7 +99,7 @@ pub struct Parts {
     pub session: SessionId,
     pub call: CallId,
     pub model: Arc<str>,
-    pub spill: Arc<Path>,
+    pub blobs: crate::blob::Blobs,
     pub cancel: Cancel,
     pub services: Arc<SessionServices>,
 }

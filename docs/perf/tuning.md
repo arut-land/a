@@ -32,7 +32,7 @@ remain open. Windows cross-lint does not establish native performance.
 
 CLI: three warmups/30 samples; fresh creation: 30 independent homes. Benches:
 one warmup/three runs. Values are medians unless stated. CLI CPU/RSS exclude
-the daemon; bench CPU/RSS include setup/replay. Shell stdout spills; the JSON
+the daemon; bench CPU/RSS include setup/replay. Cut shell stdout becomes a blob; the JSON
 bench retains its result. The transcript contains 64 real echo turns.
 
 ## Per-axis comparison

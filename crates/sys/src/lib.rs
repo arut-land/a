@@ -134,12 +134,6 @@ impl Home {
         self.root.join("sessions.idx")
     }
 
-    /// Where tools keep output too large for a session's log, a private
-    /// directory per session.
-    pub fn spill_dir(&self) -> PathBuf {
-        self.root.join("spill")
-    }
-
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }
@@ -153,9 +147,16 @@ impl Home {
         self.root.join("crash")
     }
 
-    /// Content-addressed attachments too large for a log.
+    /// The session store's content-addressed blobs: pastes, attachments
+    /// and output too large for a log, one namespace for every session.
     pub fn blobs_dir(&self) -> PathBuf {
         self.root.join("blobs")
+    }
+
+    /// What can be rebuilt from the store and is deleted at will: blobs
+    /// materialized as ordinary files under `cache/tree`.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.join("cache")
     }
 
     /// A link to the daemon socket, where a person looking under the home

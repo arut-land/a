@@ -28,7 +28,7 @@ pub(super) fn discover() -> ExecutionFacts {
         } else {
             "host PATH utilities; GNU tools are not assumed on minimal systems"
         },
-        cleanup: "timeout/cancellation signal the owned process group, TERM then KILL; descendants that leave the group can escape; background work is session-owned; retained output stays in the session spill directory; command-created temporary files are not automatically removed",
+        cleanup: "timeout/cancellation signal the owned process group, TERM then KILL; descendants that leave the group can escape; background work is session-owned; cut output is kept whole in the daemon's blob store; command-created temporary files are not automatically removed",
         temp: std::env::temp_dir(),
         cwd_command: "pwd -P",
         runtime_bin: None,

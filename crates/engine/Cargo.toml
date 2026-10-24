@@ -22,6 +22,8 @@ serde.workspace = true
 serde_json.workspace = true
 protocol.workspace = true
 sys.workspace = true
+# Blob ids; already built for ext-mcp's content hashes.
+sha2 = { version = "0.11", default-features = false }
 
 [lints]
 workspace = true

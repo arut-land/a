@@ -2,7 +2,12 @@
 //! the daemon picks the backend. Each backend owns its own concurrency and
 //! durability guarantees; the conformance suite in `tests` holds every one
 //! to the same contract.
+//!
+//! Beside each log backend, the blobs its entries reference
+//! ([`ext::blob::BlobStore`]: [`Files`] for JSONL) and how they appear as
+//! ordinary files ([`ext::blob::Materialize`]: [`CacheDir`]).
 
+mod blobs;
 #[cfg(test)]
 mod faulty;
 pub(crate) mod index;
@@ -12,6 +17,7 @@ mod lease;
 mod memory;
 #[cfg(test)]
 mod tests;
+mod tree;
 
 use std::io;
 use std::ops::RangeInclusive;
@@ -23,6 +29,7 @@ use protocol::Seq;
 use protocol::{Decode, Entry, Epoch, Json, ReadOnly, SessionId};
 use serde::{Deserialize, Serialize};
 
+pub use blobs::Files;
 #[cfg(test)]
 pub use faulty::{Faulty, SyncFailure};
 pub use jsonl::Jsonl;
@@ -31,6 +38,7 @@ pub(crate) use jsonl::{FORMAT, seal, unseal};
 pub use lease::{LeaseAuthority, Local};
 #[cfg(test)]
 pub use memory::Memory;
+pub use tree::CacheDir;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Header {

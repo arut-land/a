@@ -147,7 +147,7 @@ fn run(tool: &str, input: u64) -> (Outcome, String) {
         session: SessionId::new(),
         call: protocol::CallId::new(1).unwrap(),
         model: "test:model".into(),
-        spill: Path::new("/s").into(),
+        blobs: crate::blob::none(),
         cancel: Cancel::default(),
         services: Arc::default(),
     }
