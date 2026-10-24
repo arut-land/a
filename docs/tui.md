@@ -10,6 +10,32 @@ own scrolling and selection). `A_TUI=plain`, a pipe on stdout, or
 exits instead: see [cli.md](cli.md). `NO_COLOR` draws attributes without
 colours.
 
+Terminal modes belong to an owned `sys::terminal` lease. Unix uses termios
+and an indefinite poll over stdin and the signal pipe. Ctrl-Z and SIGTSTP
+give back cooked input, paste/mouse modes and the alternate screen before
+stopping the client. Rendering opens its own nonblocking tty description,
+leaving the shell's file status flags untouched. Output waits on readiness and a suspend
+wake source; an unread terminal cannot prevent suspension or termination.
+Continuing in the foreground re-enters raw mode and
+redraws the whole viewport; a background continue stops again without
+taking the terminal from the shell. SIGWINCH and SIGCONT invalidate the
+screen. Background reads request suspension rather than appearing as EOF;
+background writes yield to job control. The line REPL leaves Unix cooked
+mode and its terminal-driver job control intact.
+
+Windows uses the actual console handles, saved input/output modes and
+UTF-8 code pages. VT output and input are enabled, QuickEdit and line/echo
+input are disabled, and processed input routes Ctrl-C and Ctrl-Break through
+the console control handler. Input waits indefinitely on the console and
+the signal event; native resize records invalidate the viewport. Available
+console records are drained in batches, with continuation metadata preserving
+VT keys and pastes across bounded reads and interleaved resizes. The
+output writer has its own thread, with cancellation on lifecycle controls and
+a deadline for screen cleanup even when the console stops consuming output. The line
+REPL changes only console output/encoding, preserving cooked input. A
+redirected side stays byte-oriented. Guards and panic hooks restore modes
+and code pages; termination restores them even if screen cleanup times out.
+
 ## What it shows
 
 Everything comes from the shared reducer, `protocol::view::SessionView`:
@@ -196,7 +222,9 @@ crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
   the screen at the bottom) and moving back up; settled items are printed
   from its top with `\r\n`, so they scroll into the terminal's own
   scrollback, and the viewport is drawn whole under them. A resize or
-  Ctrl-L draws it whole from its top.
+  Ctrl-L draws it whole from its top. A write cut short keeps the scrollback
+  lines the terminal did not accept and prints them first in the next frame,
+  at any width, and resumes the viewport from the row the cursor reached.
 - Rows are wrapped lazily and cached per item and width: a frame wraps only
   what it shows, counted from the bottom or from the scroll anchor (an item
   and a row, which stays put as output arrives below). A 6000-item session
@@ -216,8 +244,8 @@ crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
   repository root is walked up to for the picker's default; connecting
   (and spawning the daemon) happens on the reader thread. An ssh endpoint
   connects first, since ssh may prompt on the terminal.
-- Unix only, like the daemon: on Windows `tui` builds to a stub and `a`
-  runs the line REPL.
+- Unix and Windows consoles use native terminal backends. Redirected streams
+  select the line REPL.
 
 ## The terminal layer: measurements
 
@@ -325,9 +353,9 @@ opt-level s) on a 120×40 pty, against the same program printing lines:
   layout engines, async runtimes or no inline mode; ratatui-textarea does
   not soft-wrap, which the input needs.
 
-None of them is needed once the client is Unix only and draws its own
-diff: the backends' work (raw mode, a key decoder, a cursor-move and SGR
-encoder) is what rustix and vte, linked already, leave to write.
+The client draws its own diff over the existing rustix, windows-sys and vte
+dependencies. The native mode, control-event and restoration contracts are
+described in [the terminal backend rationale](perf/terminal.md).
 
 ## Tests
 
@@ -363,7 +391,6 @@ encoder) is what rustix and vte, linked already, leave to write.
   sequence shows as its parts (`👨‍👩‍👧` as three faces), as wide as it was
   counted.
 - SIGKILL leaves the terminal in raw mode (`reset` fixes it).
-- Ctrl-Z is not handled (raw mode receives it as a key).
 - Inline, a terminal that reflows its lines when narrowed may leave a
   copy of a reflowed viewport row above the redrawn viewport (as before,
   when the client asked the terminal where the cursor was).
