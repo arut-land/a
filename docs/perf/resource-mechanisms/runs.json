@@ -593,7 +593,8 @@
     "sha": "de119945b48c3ae0f35bd8bdba752d8a2247b6d2",
     "target": "macos-15-intel",
     "run_id": 40062780386,
-    "harness": "8e80fcad3bc033bd7287135cd3fdabdf25d01680"
+    "harness": "8e80fcad3bc033bd7287135cd3fdabdf25d01680",
+    "cancelled_reason": "Revision rejected: no resolved RSS saving and Linux CPU regressions; native pressure itself remains under comparison."
   },
   {
     "mechanism": "native-pressure",
@@ -601,7 +602,8 @@
     "sha": "de119945b48c3ae0f35bd8bdba752d8a2247b6d2",
     "target": "macos-latest",
     "run_id": 40062782799,
-    "harness": "8e80fcad3bc033bd7287135cd3fdabdf25d01680"
+    "harness": "8e80fcad3bc033bd7287135cd3fdabdf25d01680",
+    "cancelled_reason": "Revision rejected: no resolved RSS saving and Linux CPU regressions; native pressure itself remains under comparison."
   },
   {
     "mechanism": "catalog",

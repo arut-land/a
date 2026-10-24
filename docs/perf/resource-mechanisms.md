@@ -144,6 +144,19 @@ include peak RSS, steady idle after retirement, regular-size workloads, CPU
 components, run order and image size. Results are conditional on each runner;
 within-host bootstrap intervals do not establish variation across hardware.
 
+## Pressure implementation revisions
+
+Both zero-state pressure revisions are rejected. The generic revision increases
+Linux ARM large-JSON CPU by about 2.5% relative to the full implementation; the
+independent-signal revision increases it by about 4.8% and increases Linux x64
+driver CPU by about 1.8%. Neither establishes an RSS saving. Their completed
+lanes remain in the table; the generic revision's queued Mac lanes are cancelled
+because that implementation is no longer selected.
+
+The supervisor retains its small shared observer. Its event counter is captured
+before native subscription so a warning delivered while subscribing stays
+pending. This does not add another public runtime interface.
+
 ## Decisions
 
 Windows storage lookup is removed. Its enabled-minus-disabled idle cost is
