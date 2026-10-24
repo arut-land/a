@@ -409,6 +409,7 @@ impl Conn<'_> {
                 ClientMsg::Detach => break Ok(()),
                 ClientMsg::Hello { .. }
                 | ClientMsg::Input { .. }
+                | ClientMsg::Withdraw { .. }
                 | ClientMsg::Approve { .. }
                 | ClientMsg::Interrupt { .. } => {}
             }
@@ -522,8 +523,21 @@ impl Conn<'_> {
                     "the daemon is restarting for an upgrade; send that again in a moment".into(),
                 )));
             }
-            ClientMsg::Input { segments, mode, .. } => {
-                (Request::Input { segments, mode }, Rejection::Refused)
+            ClientMsg::Input {
+                segments,
+                mode,
+                force,
+                ..
+            } => (
+                Request::Input {
+                    segments,
+                    mode,
+                    force,
+                },
+                Rejection::Refused,
+            ),
+            ClientMsg::Withdraw { input, .. } => {
+                (Request::Withdraw { input }, Rejection::NotWaiting)
             }
             ClientMsg::Approve { call, approved, .. } => {
                 let value = protocol::Json::encode(&approved).unwrap_or_default();

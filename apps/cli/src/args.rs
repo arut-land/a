@@ -70,6 +70,9 @@ pub enum Cmd {
     },
     #[usage(name = "__daemon", hide)]
     Serve {
+        /// Started by the OS at login: serve unless a daemon already does.
+        #[usage(long)]
+        login: bool,
         #[usage(long)]
         listen_fd: Option<i32>,
         /// Start without a terminal and acknowledge the listener on stdout.
@@ -89,10 +92,24 @@ pub enum Cmd {
 pub enum Daemon {
     /// Read the current daemon diagnostic log (JSON lines); never starts it
     Log,
+    /// Start the daemon when you log in, and keep it running
+    Autostart {
+        #[usage(subcommand)]
+        state: Autostart,
+    },
     /// Show whether the daemon is running and responding
     Status,
     /// Stop the daemon; sessions resume when it next starts
     Stop,
     /// Stop the daemon and start a fresh one
     Restart,
+}
+
+/// What `a daemon autostart` sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommands)]
+pub enum Autostart {
+    /// Register with the OS to start at login; the daemon then stays up
+    On,
+    /// Remove that registration; a running daemon stays until stopped
+    Off,
 }

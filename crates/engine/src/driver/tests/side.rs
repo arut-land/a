@@ -968,6 +968,7 @@ fn shutdown_never_admits_a_background_side_call_waiting_for_its_flush() {
         request: Request::Input {
             segments: "background".into(),
             mode: Mode::Queue,
+            force: false,
         },
         origin: None,
         reply,

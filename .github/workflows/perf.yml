@@ -3,8 +3,14 @@ name: perf
 on:
   push:
     branches: [main, 'perf/**']
+  schedule:
+    - cron: '17 4 * * 1'
   workflow_dispatch:
     inputs:
+      autostart:
+        description: 'Run only the hosted autostart probe'
+        default: false
+        type: boolean
       variant:
         description: 'One variant as JSON: {"rustflags": ["-Ctarget-cpu=x86-64-v2"], "config": ["profile.release.package.serde_json.opt-level=2"]}'
         default: '{}'
@@ -51,7 +57,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: perf-${{ github.ref }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.variant || '{}' }}
+  group: perf-${{ github.ref }}-${{ inputs.autostart && 'autostart' || 'measure' }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.variant || '{}' }}
   cancel-in-progress: false
 
 env:
@@ -62,6 +68,7 @@ env:
 
 jobs:
   matrix:
+    if: github.event_name != 'schedule' && !inputs.autostart
     runs-on: ubuntu-latest
     outputs:
       runners: ${{ steps.select.outputs.runners }}
@@ -247,3 +254,60 @@ jobs:
             ~/.cargo/registry/cache
             ${{ runner.temp }}/mbx/actions
           key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  # Autostart's lifetime handshake against each OS's real service manager
+  # (scripts/autostart/hosted.py). It registers with the runner's own user
+  # manager, so it runs only on disposable hosted runners: weekly and on demand.
+  autostart:
+    if: github.event_name == 'schedule' || inputs.autostart
+    name: autostart (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 4
+      MISE_AUTO_INSTALL: false
+      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+    steps:
+      - uses: actions/checkout@v7
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang pkg-config libssl-dev
+      - if: runner.os == 'Linux'
+        uses: jdx/mise-action@v5
+        with:
+          install_args: mold
+      - if: runner.os == 'Linux'
+        name: Use native Cargo without the optional mise wrapper
+        run: echo "$(dirname "$(rustup which cargo)")" >> "$GITHUB_PATH"
+      - if: runner.os == 'Windows'
+        name: Install native toolchain
+        shell: pwsh
+        run: |
+          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches.Groups[1].Value
+          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+          $toolchain = "$channel-$arch-pc-windows-msvc"
+          "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+          rustup toolchain install $toolchain --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p a
+      - if: runner.os == 'Linux'
+        name: User manager
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - run: ${{ runner.os == 'Windows' && 'python' || 'python3' }} scripts/autostart/hosted.py target/release/a${{ runner.os == 'Windows' && '.exe' || '' }}
+      - if: failure() && runner.os == 'Linux'
+        run: journalctl --user -u 'a-daemon-*.service' --no-pager -n 150
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: autostart-${{ matrix.runner }}
+          path: autostart-result.json

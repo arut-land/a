@@ -150,6 +150,7 @@ fn run(tool: &str, input: u64) -> (Outcome, String) {
         blobs: crate::blob::none(),
         cancel: Cancel::default(),
         services: Arc::default(),
+        detach: crate::Flag::default(),
     }
     .cx(Arc::clone(&host) as _);
     let input = Json::encode(&input).unwrap();

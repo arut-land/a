@@ -13,8 +13,8 @@ registrations, nested storage, durable inbox transport and depth
 enforcement are implemented. `ext-subagent` supplies `task`, `fork_task`
 and `background_task`; title, compact, judge and approval descriptions are
 turns. Named channels and questions remain follow-up compositions. The
-current inbox access policy permits parent and child edges; `InboxAccess` is
-the extension seam for other policies.
+`Route` service decides who a message reaches; `ext-subagent`'s route
+permits parent and child edges.
 
 A conversation owns an ordered log, an inbox and a runner. Main sessions,
 child agents and side threads differ in their runner and ownership, not in
@@ -187,7 +187,9 @@ complete creation, but cannot allocate another child. Admission failure is a
 terminal result for that identity. The child starts its initial input once.
 
 Awaited work ties a call's wait to its watch. Detached work leaves the parent
-call free to finish, and delivers a `Fired` result at a parent step boundary.
+call free to finish: its `fired` fact closes the watch, and its result waits
+on the parent's queue as the parent's own `child` envelope, taken up at a
+step boundary (see "One queue").
 A watch has one terminal result. Duplicate child notifications cannot append
 another result, even after reload. A notification during parent execution
 waits until the next safe boundary; it does not mutate an in-flight request.
@@ -203,20 +205,108 @@ A prefix-context child imports no ownership facts at all.
 
 ## Inboxes, channels and questions
 
-Messaging uses an envelope with a durable id `(sender, call, purpose)`, sender,
-destination and payload. A destination is a conversation inbox or a typed
-channel name within a root's namespace. Membership and subscription changes
-are ordered channel log facts. Broadcast resolves and records its recipient
-set at enqueue time; later subscribers do not receive old broadcasts unless
-an explicit replay request says so. A work queue instead records one claimed
-recipient. These are separate extension policies over the same envelope.
+### One queue
 
-Send commits an outbox intent before delivery. The receiver commits enqueue
-and deduplicates by envelope id before acknowledging. The sender then records
-acknowledgement. Recovery resends unacknowledged envelopes with the same id;
-this is at-least-once transport with exactly-once logged enqueue. Receiver
-sequence numbers define order. Each sender serializes its durable outbox;
-concurrent senders are ordered by receiver admission, not wall clocks.
+A conversation has one queue, the ledger's untaken items in arrival order,
+and everything that arrives for its agent waits on it: the user's input,
+other sessions' envelopes, and the session's own envelopes. Each item has a
+`Source`: `User`, `Agent(session)`, `Job(call)` or `Child(watch)`. The
+user's input is the queue's visible part, which every client's view folds
+and shows; the rest is hidden, shown at most as a status. A hidden item
+taken up adds no user item to the view.
+
+What the session started and stopped waiting on comes back as an envelope
+it sends itself, `EnvelopeId { sender: self, call, purpose }`, deduplicated
+by its id as any envelope is: `child`, under the watch, for the result of a
+child no call waits on (its `fired` fact closes the watch first, and a load
+queues a fired result whose envelope a crash cut off); `detached`, under the
+call, for a detached call's outcome; `job`, under the call, for the end of
+a process group the call left to the session. A payload of the first two is
+the `Outcome`; the model reads the child's result, or the call's output as
+its tool presents it.
+
+`Withdraw { input }` takes the user's queued input back before it is taken
+up; editing it is a withdrawal, then the new input. Whichever of `withdraw`
+and `take` the kernel logs first wins, and the other is refused or finds
+nothing, so every client folds the same queue. Only visible items can be
+withdrawn by a client.
+
+### Where the queue drains
+
+The kernel keeps only the boundaries at which another message can join the
+conversation without coming between a reply's calls and their results:
+`ToolDone(call)`, after a model call's tool result, where what is taken goes
+into that result (`take { into: call }`); `BeforeModel`, where what is taken
+is read at the request's tail, so its prefix stays cached; and `TurnEnd`,
+where what is taken starts the next turn. At each, the pure `dequeue` loop
+point answers a `Take` (`None`, `One`, `All`, `These`, or `IntoResult`, the
+one answer that takes anything at `ToolDone`). With no handler,
+`Take::default_at` answers as the kernel always has: nothing into results;
+before a model call, steers, children's results, and the hidden items not
+behind the user's queued input; at a turn's end, the first item. A policy
+(all at once, one at a time, into each result) is a handler; a model-only
+runner answers one input per turn, so only the user's input may join it
+before its end. Owner cancellation drains the queue; it is not a policy.
+
+### Detached calls and forced steers
+
+`Cx::detach` is a flag beside `cancel`: the session stops waiting on the
+call. A tool declares `DETACH = Detach::Background` when it can go on in
+the background; the engine then stops awaiting it, and the kernel logs
+`detached { call }` and answers the call at once with a placeholder result
+naming its output stream (`OutputStream { call }`; the blob store names the
+stream's growing blob once it exists). The reply's calls stay paired with
+their results, and the turn goes on. The call's real outcome arrives later
+as its `detached` envelope. A tool that cannot go on in the background
+ignores the flag, or hands its own work off.
+
+A detached call is the session's work: the session stays busy, so the
+daemon neither idle-exits nor finishes an upgrade drain while one runs. An
+interrupt cancels detached calls, and its `interrupt` entry ends them:
+nothing of theirs is queued, so they start nothing. A restart answers a
+detached call whose placeholder a crash cut off with it, then runs the call
+again if its tool is `Replay::Safe`; otherwise its outcome is an
+interruption saying it may not have completed, with where its output went.
+Either way the call is recovered once. A detached call's outcome taken up
+as a turn ends reaches the agent as `Input::Detached`, as a child's does as
+`Input::ChildDone`.
+
+An upgrade drain waits for running turns and detached calls for as long as
+they run; only an interrupt or `a daemon stop` ends them sooner. Background
+process groups hold it only for `[daemon] drain_secs`, since a drain refuses
+input meanwhile and a server left running would hold it forever.
+
+`Input { force }` on a steer brings the turn's next boundary on now: the
+model call streaming is cut short (its partial reply is dropped, and the
+steer is taken as the turn goes on), and every running call whose tool can
+go on in the background is detached. Force-steering and detaching are one
+mechanism.
+
+### Routing and transport
+
+Messaging uses an envelope with a durable id `(sender, call, purpose)`, sender,
+destination and payload. A sender names an `Address`: a conversation, its
+parent, or a name its route gives meaning (a channel, a group); `Address::send`
+sends to one, and `ConversationHandle::send` to a conversation. Exactly one
+extension provides `Route`, which resolves the address against the sender's
+`Topology` (its id, parent and children) to the recipients, or a typed
+refusal; with no route, nothing is sent. `ext-subagent`'s route permits
+parent and child edges. Broadcast, channels with membership as ordered facts,
+work queues that record one claimed recipient, and routing everything
+through the parent are routes of other extensions over the same envelope,
+composed at build time.
+
+Send commits `outbox { envelope_id, recipients, payload }`, the recipient
+set resolved once, before any delivery: a later subscriber does not receive
+an old broadcast. Each recipient is delivered an envelope under the one id.
+The receiver commits enqueue and deduplicates by envelope id before
+acknowledging; the sender records `ack { envelope_id, recipient }` per
+recipient, and the send settles once every recipient answered, with the
+first refusal if any. Recovery resends to the recipients not yet
+acknowledged, with the same id; this is at-least-once transport with
+exactly-once logged enqueue. Receiver sequence numbers define order. Each
+sender serializes its durable outbox; concurrent senders are ordered by
+receiver admission, not wall clocks.
 
 The receiver records `Take` with the enqueue identity at a step boundary,
 before the input influences an agent or request. An agent's model reads a
@@ -225,9 +315,10 @@ model-only thread reads its payload as the turn it asks for. Folding the log rec
 both queued and consumed input. Messages arriving during a provider request
 wait for its next step. Context edits cannot undo delivery. Forks copy consumed
 context but do not replay outbound effects; queued external messages require
-an explicit fork policy and default to refusal. Inbox admission is bounded to
-128 queued envelopes and
-returns a typed refusal rather than silently dropping input.
+an explicit fork policy and default to refusal. Inbox admission bounds what
+other sessions queue to 128 envelopes and returns a typed refusal rather
+than silently dropping input; the session's own envelopes are bounded by its
+calls.
 
 A question is a message carrying a correlation id and a reply address. An
 answer references that id. An awaiting question uses a durable wait; an
@@ -432,7 +523,7 @@ crates choose modes and policy.
 | Parent sends while child works | `ConversationHandle::send` |
 | Child asks parent | Tool composition: question and correlated reply fold in an `ext-*` crate |
 | Sibling chat | Policy and tool composition over durable inboxes addressed by conversation id |
-| Named channels | Needs SDK contracts for channel identity, admission, membership and recipient snapshots; current destinations are conversation ids |
+| Named channels | A `Route` provider resolving `Address::Named`, with membership as ordered facts of its own; recipients are recorded on each `outbox` |
 | Different agent/model | `.kind(name)` and `.role(role)`; a turn or a task |
 | Recursive same agent | Tool composition: inherit task registration; depth budget descends |
 | Root-only extension | Rust declaration or Lua `a.inherit(false)` excludes the whole generation |

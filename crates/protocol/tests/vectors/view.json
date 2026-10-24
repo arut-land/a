@@ -2,7 +2,191 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"items\":[],\"seq\":1,\"session\":null,\"state\":{\"calls\":[],\"queued\":[{\"origin\":{\"client\":\"00000000-0000-0000-0000-00000000000c\",\"seq\":7},\"seq\":1,\"steer\":false,\"text\":\"same\"}],\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"work\"}],\"seq\":1,\"t\":\"entry\",\"taken\":true}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"later\"}],\"seq\":2,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"edit me\"}],\"seq\":3,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"input\":3,\"kind\":\"withdraw\",\"seq\":4,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"edited\"}],\"seq\":5,\"t\":\"entry\"}",
+      "{\"envelope\":{\"destination\":\"00000000-0000-0000-0000-00000000000a\",\"id\":{\"call\":1,\"purpose\":\"job\",\"sender\":\"00000000-0000-0000-0000-00000000000a\"},\"payload\":\"[background job 7 ended: exit code 0]\"},\"epoch\":0,\"kind\":\"enqueue\",\"seq\":6,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"input\":6,\"kind\":\"take\",\"seq\":7,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"input\":2,\"kind\":\"take\",\"seq\":8,\"t\":\"entry\"}",
+      "{\"seq\":8,\"t\":\"synced\"}"
+    ],
+    "hash": "4bedb790b0a6cee6",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "kind": "input",
+        "segments": [
+          {
+            "text": "work"
+          }
+        ],
+        "seq": 1,
+        "t": "entry",
+        "taken": true
+      },
+      {
+        "epoch": 0,
+        "kind": "input",
+        "segments": [
+          {
+            "text": "later"
+          }
+        ],
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "input",
+        "segments": [
+          {
+            "text": "edit me"
+          }
+        ],
+        "seq": 3,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "input": 3,
+        "kind": "withdraw",
+        "seq": 4,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "input",
+        "segments": [
+          {
+            "text": "edited"
+          }
+        ],
+        "seq": 5,
+        "t": "entry"
+      },
+      {
+        "envelope": {
+          "destination": "00000000-0000-0000-0000-00000000000a",
+          "id": {
+            "call": 1,
+            "purpose": "job",
+            "sender": "00000000-0000-0000-0000-00000000000a"
+          },
+          "payload": "[background job 7 ended: exit code 0]"
+        },
+        "epoch": 0,
+        "kind": "enqueue",
+        "seq": 6,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "input": 6,
+        "kind": "take",
+        "seq": 7,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "input": 2,
+        "kind": "take",
+        "seq": 8,
+        "t": "entry"
+      },
+      {
+        "seq": 8,
+        "t": "synced"
+      }
+    ],
+    "name": "the queue folds withdrawals and keeps what it hides out of the transcript",
+    "state": {
+      "items": [
+        {
+          "seq": 1,
+          "text": "work",
+          "type": "user"
+        },
+        {
+          "seq": 8,
+          "text": "later",
+          "type": "user"
+        }
+      ],
+      "seq": 8,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [
+          {
+            "origin": null,
+            "seq": 5,
+            "source": "user",
+            "steer": false,
+            "text": "edited"
+          }
+        ],
+        "taken": [],
+        "turn": 8
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "seq": 1,
+            "text": "work",
+            "type": "user"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "seq": 8,
+            "text": "later",
+            "type": "user"
+          }
+        },
+        "rev": 3,
+        "seq": 8
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 4,
+        "seq": 8
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"items\":[],\"seq\":1,\"session\":null,\"state\":{\"calls\":[],\"queued\":[{\"origin\":{\"client\":\"00000000-0000-0000-0000-00000000000c\",\"seq\":7},\"seq\":1,\"source\":\"user\",\"steer\":false,\"text\":\"same\"}],\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"\"}",
       "{\"epoch\":0,\"input\":1,\"kind\":\"take\",\"seq\":2,\"t\":\"entry\"}",
       "{\"activity\":\"idle\",\"seq\":2,\"t\":\"activity\"}",
       "{\"seq\":2,\"t\":\"synced\"}"
@@ -27,6 +211,7 @@
                 "seq": 7
               },
               "seq": 1,
+              "source": "user",
               "steer": false,
               "text": "same"
             }

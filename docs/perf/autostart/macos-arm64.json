@@ -1,0 +1,64 @@
+{
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "binary_bytes": 3711712,
+  "samples": {
+    "self_spawn_ms": [
+      22.612042,
+      22.911875,
+      19.665417,
+      22.374792,
+      18.110167,
+      22.535292,
+      20.510542,
+      36.306791,
+      29.596916,
+      46.205209,
+      32.881875,
+      64.919708
+    ],
+    "login_first_ms": [
+      19.59575,
+      13.954625,
+      12.664083,
+      33.803709,
+      9.294,
+      18.570042,
+      13.766334,
+      11.244375,
+      23.166166,
+      18.917917,
+      11.400583,
+      23.155791
+    ],
+    "login_warm_ms": [
+      11.983875,
+      8.887792,
+      9.034417,
+      19.061083,
+      8.885792,
+      13.245042,
+      8.022584,
+      12.400834,
+      9.871833,
+      12.510041,
+      11.615791,
+      11.604166
+    ]
+  },
+  "medians": {
+    "self_spawn_ms": 22.7619585,
+    "login_first_ms": 16.2623335,
+    "login_warm_ms": 11.6099785
+  },
+  "login_first_minus_warm_ms": 4.652355,
+  "login_first_minus_self_spawn_ms": -6.499624999999998,
+  "checks": {
+    "isolated_homes_refused": true,
+    "idle_exit_without_autostart": true,
+    "resident_with_autostart": true,
+    "login_entry_defers_to_a_running_daemon": true,
+    "registration_refreshed_by_a_daemon": true,
+    "login_started_daemons_stay_resident": true,
+    "off_removes_the_registration": true
+  }
+}

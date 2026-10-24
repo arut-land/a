@@ -112,6 +112,7 @@ fn enqueue(session: &Live, text: &str) -> oneshot::Receiver<Result<(), String>> 
         request: Request::Input {
             segments: text.into(),
             mode: Mode::Queue,
+            force: false,
         },
         origin: None,
         reply,
@@ -821,7 +822,11 @@ fn submitted_input_is_cancelled_while_its_publication_flush_is_held() {
                 segments,
                 mode,
                 ..
-            })) => Request::Input { segments, mode },
+            })) => Request::Input {
+                segments,
+                mode,
+                force: false,
+            },
             client::Effect::Io(client::Io::Send(protocol::ClientMsg::Interrupt { .. })) => {
                 Request::Interrupt
             }

@@ -35,6 +35,10 @@ impl Agent for Echo {
                 let text = ext::child_result(&outcome);
                 return Actions::from_elem(Action::Say(text), 1);
             }
+            Input::Detached { call, outcome } => {
+                let text = format!("call {call} ended in the background: {outcome:?}");
+                return Actions::from_elem(Action::Say(text), 1);
+            }
             Input::ToolDone { .. } | Input::ModelDone { .. } => return Actions::new(),
         };
         // `par <n> <message>`: n of the call the message makes, at once, as

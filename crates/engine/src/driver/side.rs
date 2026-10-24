@@ -638,7 +638,7 @@ impl Actor {
         let seq = protocol::Seq::new(self.core.ledger().turn_start())
             .ok_or("model-only turn has no admitted input")?;
         let mut entry = self.indexed_entry(seq).await.map_err(|e| e.to_string())?;
-        if let Body::Take { input } = entry.body {
+        if let Body::Take { input, .. } = entry.body {
             entry = self.indexed_entry(input).await.map_err(|e| e.to_string())?;
         }
         let (text, keyed) = match &entry.body {

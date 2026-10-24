@@ -135,6 +135,7 @@ impl Rig {
             blobs: self.blob_store(),
             cancel: self.cancel.clone(),
             services: Arc::clone(&SERVICES),
+            detach: crate::Flag::default(),
         }
         .cx(Arc::clone(&self.host) as _)
     }
@@ -217,6 +218,7 @@ impl Host for Recorder {
                 blobs: cx.blobs,
                 cancel: cx.cancel,
                 services: Arc::clone(&SERVICES),
+                detach: crate::Flag::default(),
             }
             .cx(self.clone())
             .with_invocation(context);
@@ -363,19 +365,15 @@ impl Hash {
     }
 }
 
-fn id_of(bytes: &[u8]) -> BlobId {
-    let mut hash = Hash::new();
-    hash.update(bytes);
-    hash.id()
-}
-
 impl Store {
     fn path(&self, id: &BlobId) -> PathBuf {
         self.0.join(id.to_string())
     }
 
     fn put(&self, bytes: &[u8], media_type: &str, origin: BlobOrigin) -> std::io::Result<BlobRef> {
-        let id = id_of(bytes);
+        let mut hash = Hash::new();
+        hash.update(bytes);
+        let id = hash.id();
         std::fs::create_dir_all(&self.0)?;
         std::fs::write(self.path(&id), bytes)?;
         Ok(BlobRef {
@@ -508,6 +506,13 @@ impl Materialize for Tree {
             std::fs::copy(self.store.materialize(&blob.id)?, path)?;
         }
         Ok(())
+    }
+
+    fn expose(&self, at: &TreePath, open: &std::path::Path) -> std::io::Result<()> {
+        let path = self.path(at);
+        std::fs::create_dir_all(path.parent().expect("in the tree"))?;
+        let _ = std::fs::remove_file(&path);
+        std::fs::hard_link(open, path)
     }
 
     fn evict(&self, _: u64) -> std::io::Result<u64> {

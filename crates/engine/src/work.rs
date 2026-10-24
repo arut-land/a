@@ -22,6 +22,8 @@ pub(super) struct WorkHandle<K = WorkId> {
     pub(super) fence: u64,
     pub(super) admission: Admission,
     pub(super) cancel: Cancel,
+    /// Set when the session stops waiting on a call ([`kernel::Work::Detach`]).
+    pub(super) detach: Flag,
     pub(super) ended: Flag,
 }
 
@@ -32,6 +34,7 @@ impl<K: Send + 'static> WorkHandle<K> {
             fence,
             admission,
             cancel,
+            detach: Flag::default(),
             ended: Flag::default(),
         }
     }

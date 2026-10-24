@@ -1,0 +1,65 @@
+{
+  "platform": "Windows-11-10.0.26200-SP0",
+  "binary_bytes": 5078016,
+  "samples": {
+    "self_spawn_ms": [
+      56.2493,
+      52.6646,
+      56.987,
+      58.5737,
+      57.6526,
+      56.437,
+      58.3359,
+      56.8404,
+      55.0447,
+      59.3488,
+      55.3669,
+      54.656
+    ],
+    "login_first_ms": [
+      19.5145,
+      18.7971,
+      19.9943,
+      19.459,
+      19.1404,
+      18.6718,
+      19.6454,
+      19.2265,
+      18.9855,
+      19.6231,
+      19.2001,
+      19.134
+    ],
+    "login_warm_ms": [
+      17.3071,
+      17.2104,
+      18.2422,
+      18.2006,
+      17.8299,
+      17.9295,
+      17.1821,
+      17.5878,
+      16.8359,
+      17.2407,
+      17.6602,
+      17.2763
+    ]
+  },
+  "medians": {
+    "self_spawn_ms": 56.6387,
+    "login_first_ms": 19.2133,
+    "login_warm_ms": 17.44745
+  },
+  "login_first_minus_warm_ms": 1.7658500000000004,
+  "login_first_minus_self_spawn_ms": -37.425399999999996,
+  "checks": {
+    "isolated_homes_refused": true,
+    "idle_exit_without_autostart": true,
+    "resident_with_autostart": true,
+    "login_entry_defers_to_a_running_daemon": true,
+    "manifest_asks_for_no_console": true,
+    "logon_entry_leaves_a_detached_daemon": true,
+    "login_started_daemons_stay_resident": true,
+    "off_removes_the_registration": true
+  }
+}

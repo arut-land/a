@@ -76,3 +76,8 @@ privacy boundary and best-effort delivery.
 `a fork <session>[@<seq>]` creates a new session and prints its id. `/fork [seq]` copies the current conversation at a rest point and switches to it.
 Files stay as they are; this does not rewind or copy the workspace. The fork
 keeps its recorded cwd and environment. See [fork semantics](fork.md).
+
+`a daemon autostart on` registers the daemon to start at login and stay up;
+`a daemon autostart off` removes that registration. See [autostart](autostart.md)
+for the systemd user unit, the macOS LaunchAgent and app login item, and the
+Windows `Run` entry.

@@ -294,10 +294,25 @@ impl Actor {
             if let Some(transcript) = &mut self.projection.transcript {
                 transcript.apply(e, replied.map(|(_, m)| m));
             }
-            if let Body::ToolResult { call, .. } | Body::ModelResult { call, .. } = &e.body {
-                self.inflight.remove(call);
-                session.cancelled(*call);
-                self.bound.settled(*call);
+            // A call ends with its result, unless it was detached: then
+            // with its own envelope, its result a placeholder.
+            let ended = match &e.body {
+                Body::ToolResult { call, .. } | Body::ModelResult { call, .. } => {
+                    self.bound.settled(*call);
+                    let ledger = self.core.ledger();
+                    (!ledger.detached().iter().any(|d| d.call == *call)).then_some(*call)
+                }
+                Body::Enqueue { envelope }
+                    if envelope.id.purpose == protocol::EnvelopeId::DETACHED
+                        && envelope.source() == protocol::Source::Job(envelope.id.call) =>
+                {
+                    Some(envelope.id.call)
+                }
+                _ => None,
+            };
+            if let Some(call) = ended {
+                self.inflight.remove(&call);
+                session.cancelled(call);
             }
         }
     }
@@ -410,6 +425,7 @@ impl Actor {
         let registry = Arc::clone(&self.registry);
         let pending: Vec<_> = self.pending_entries().collect();
         let model_only = self.live.session.model_only();
+        let places = self.live.session.blobs.places();
         let (transcript, messages) = rt::unblock_with(
             &*self.live.session.shared.rt,
             Cpu,
@@ -421,16 +437,21 @@ impl Actor {
                 } else {
                     registry.system_prompt()
                 };
-                let transcript =
-                    Transcript::of(entries.iter().cloned(), Arc::clone(&registry), system);
+                let transcript = Transcript::placed(
+                    entries.iter().cloned(),
+                    Arc::clone(&registry),
+                    system,
+                    &places,
+                );
                 let messages = transcript.before(call.get()).cloned().unwrap_or_else(|| {
-                    Transcript::of(
+                    Transcript::placed(
                         entries.into_iter().filter(|e| {
                             e.seq < call.0
                                 || matches!(e.body, Body::Context { .. } | Body::Edit { .. })
                         }),
                         Arc::clone(&registry),
                         system,
+                        &places,
                     )
                     .into_messages()
                 });

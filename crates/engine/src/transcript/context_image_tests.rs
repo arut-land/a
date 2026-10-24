@@ -39,6 +39,7 @@ fn a_prefix_projects_edits_and_publications_without_executable_ownership() {
                 mode: Mode::Queue,
                 taken: true,
                 origin: None,
+                force: false,
             },
         ),
         entry(
@@ -168,6 +169,7 @@ fn pending_exchanges_never_become_child_work() {
             mode: Mode::Queue,
             taken: false,
             origin: None,
+            force: false,
         },
     ));
     let image = context_image(&entries);
@@ -211,7 +213,7 @@ fn pending_exchanges_never_become_child_work() {
 }
 
 fn recursive_scope(image: &ContextImage, scope: usize, registry: &Arc<Registry>) -> Transcript {
-    let mut transcript = Transcript::empty(registry.clone(), "");
+    let mut transcript = Transcript::empty(registry.clone(), "", &Places::default());
     let Some(ContextLayer(runner, inputs)) = image.get(scope) else {
         return transcript;
     };
@@ -228,7 +230,7 @@ fn recursive_scope(image: &ContextImage, scope: usize, registry: &Arc<Registry>)
 }
 
 fn recursive_projection(entries: &[Entry], registry: &Arc<Registry>) -> Transcript {
-    let mut transcript = Transcript::empty(registry.clone(), "");
+    let mut transcript = Transcript::empty(registry.clone(), "", &Places::default());
     let edits = context_edits(entries);
     for e in entries {
         match edits
@@ -550,12 +552,14 @@ fn model_only_inputs_keep_their_interpretation_across_agent_scopes() {
                 mode: Mode::Queue,
                 taken: false,
                 origin: None,
+                force: false,
             },
         ),
         entry(
             3,
             Body::Take {
                 input: Seq::new(2).unwrap(),
+                into: None,
             },
         ),
     ];
@@ -573,7 +577,7 @@ fn model_only_inputs_keep_their_interpretation_across_agent_scopes() {
                 intent: spawn_image(image),
             },
         );
-        let mut live = Transcript::empty(registry.clone(), "");
+        let mut live = Transcript::empty(registry.clone(), "", &Places::default());
         live.apply(&child, None);
         assert_eq!(live.into_context(), expected);
         assert_eq!(

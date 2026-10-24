@@ -285,6 +285,7 @@ same!(
     HomeSettings,
     SettingsChange,
     Vec<String>,
+    Vec<SessionId>,
     Vec<Installed>,
     Vec<CommandInfo>,
     Vec<SessionSummary>,
@@ -416,6 +417,11 @@ pub(crate) struct EntryFields {
     pub(crate) envelope: Option<crate::Envelope>,
     pub(crate) envelope_id: Option<crate::EnvelopeId>,
     pub(crate) refusal: Option<crate::InboxRefusal>,
+    pub(crate) recipient: Option<SessionId>,
+    pub(crate) recipients: Option<Vec<SessionId>>,
+    pub(crate) payload: Option<String>,
+    pub(crate) into: Option<u64>,
+    pub(crate) force: Option<bool>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) intent: Option<Json>,
     pub(crate) publication: Option<publication::Publication>,
@@ -526,6 +532,10 @@ pub(crate) struct MsgFields {
     pub(crate) client_seq: Option<u64>,
     pub(crate) approved: Option<bool>,
     pub(crate) change: Option<SettingsChange>,
+    pub(crate) force: Option<bool>,
+    // A withdrawal's seq; JSON, as other messages carry a tool's input.
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) input: Option<Json>,
 }
 
 /// An [`Item`] of a snapshot.

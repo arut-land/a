@@ -37,10 +37,17 @@ use protocol::view::{
 };
 use sys::Home;
 
-use crate::args::{Args, Cmd, Daemon};
+use crate::args::{Args, Autostart, Cmd, Daemon};
 
 fn main() -> ExitCode {
     sys::small_footprint();
+    // The daemon never wants one: whoever starts it gives it no terminal.
+    if std::env::args_os()
+        .nth(1)
+        .is_none_or(|first| first != "__daemon")
+    {
+        sys::console::attach_when_launched_without_one();
+    }
     // Help, the version, completion requests and usage errors (status 2)
     // end the process here.
     let args = Args::parse();
@@ -74,11 +81,12 @@ fn main() -> ExitCode {
                     unreachable!("daemon commands are handled before installation")
                 }
                 Some(Cmd::Serve {
+                    login,
                     listen_fd,
                     detached,
                     lock_fd,
                     reset_breaker,
-                }) => serve(&daemon, listen_fd, lock_fd, reset_breaker, detached),
+                }) => serve(&daemon, listen_fd, lock_fd, reset_breaker, detached, login),
             };
             done.map(|()| ExitCode::SUCCESS)
         }),
@@ -163,6 +171,18 @@ fn daemon_cmd(host: Option<String>, action: Daemon) -> io::Result<()> {
     }
     let home = Home::from_env()?;
     match action {
+        Daemon::Autostart {
+            state: Autostart::On,
+        } => {
+            sys::autostart::enable(&home)?;
+            sayln!("autostart on: the daemon starts at login and stays up");
+        }
+        Daemon::Autostart {
+            state: Autostart::Off,
+        } => {
+            sys::autostart::disable(&home)?;
+            sayln!("autostart off: the daemon starts on first use and exits when idle");
+        }
         Daemon::Log => match std::fs::read_to_string(home.daemon_log()) {
             Ok(text) => out(format_args!("{text}")),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -605,35 +625,63 @@ fn web(_daemon: client::Daemon, _open: bool) -> io::Result<()> {
 }
 
 /// The daemon. Started by a client (`listen_fd`), it leaves the client's
-/// session and discards untyped stderr; by hand, it stays at the terminal.
-/// The engine owns the typed diagnostic log in either case.
+/// session and discards untyped stderr; by hand, it stays at the terminal;
+/// by the OS at login (`login`), it stays in the foreground the service
+/// manager tracks. The engine owns the typed diagnostic log in every case.
 fn serve(
     daemon: &client::Daemon,
     listen_fd: Option<i32>,
     lock_fd: Option<i32>,
     reset_breaker: bool,
     detached: bool,
+    login: bool,
 ) -> io::Result<()> {
     let home = daemon.home()?;
+    if login && (listen_fd.is_some() || lock_fd.is_some() || detached) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a login start has no client handoff",
+        ));
+    }
+    if login {
+        sys::autostart::enter(home, &daemon.staged.id)?;
+        if sys::autostart::LOGIN == sys::autostart::Login::Spawn {
+            return client::spawn_at_login(home);
+        }
+    }
     sys::crash::install(home.crash_dir(), sys::crash::Build::of(&daemon.staged.id));
     if detached || listen_fd.is_some() {
         sys::detach_session()?;
         sys::log::discard_stderr()?;
     }
-    let listener = if let Some(fd) = listen_fd {
-        sys::Listener::adopt(
-            sys::InheritedNumber::from(fd).duplicate()?,
-            &home.endpoint(),
-        )?
+    let (lock, listener) = if login {
+        match client::bind_at_login(home)? {
+            Some((lock, listener)) => (Some(lock), listener),
+            // A client started one first; it learns of autostart itself.
+            None => return Ok(()),
+        }
     } else {
-        home.bind()?
+        let lock = lock_fd
+            .map(|fd| sys::adopt_lock(sys::InheritedNumber::from(fd).duplicate()?, home))
+            .transpose()?;
+        let listener = if let Some(fd) = listen_fd {
+            sys::Listener::adopt(
+                sys::InheritedNumber::from(fd).duplicate()?,
+                &home.endpoint(),
+            )?
+        } else {
+            home.bind()?
+        };
+        (lock, listener)
     };
     let start = engine::Start {
-        lock: lock_fd
-            .map(|fd| sys::adopt_lock(sys::InheritedNumber::from(fd).duplicate()?, home))
-            .transpose()?,
+        lock,
         reset_breaker,
-        logs: detached || listen_fd.is_some(),
+        logs: login || detached || listen_fd.is_some(),
+        login,
+        // Only a home that can register asks, so an isolated daemon has no
+        // question pending and nothing to wake for.
+        resident: sys::autostart::applies(home).then_some(sys::autostart::refresh),
     };
     engine::serve(
         &listener,

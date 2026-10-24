@@ -14,7 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -42,7 +42,8 @@ pub struct Config {
     pub idle: Duration,
     /// Unload a session after this long unused.
     pub hibernate: Duration,
-    /// How long an upgrade waits for in-flight work.
+    /// How long an upgrade waits for background process groups; running
+    /// sessions, and calls gone on in the background, it waits out.
     pub drain: Duration,
     /// The agent sessions run, by name: overrides the config files'
     /// `agent`.
@@ -743,6 +744,7 @@ impl Daemon {
             let input = Request::Input {
                 segments: input.into(),
                 mode: Mode::Queue,
+                force: false,
             };
             live.request(input, None).await.map_err(io::Error::other)?;
         }
@@ -998,19 +1000,20 @@ impl Daemon {
     }
 
     /// Hibernates idle sessions, and exits once the whole daemon has been
-    /// idle for `config.idle`, or once a drain has no work left or runs out
-    /// of grace. Every entry is durable when written, so exiting is all a
-    /// drain needs; unfinished calls recover in the next daemon.
+    /// idle for `config.idle`, or once a drain has no work left. Running
+    /// sessions and calls detached into the background hold a drain for as
+    /// long as they run, so an upgrade never cuts them off; background
+    /// process groups only for its grace, since a drain refuses input
+    /// meanwhile and a server left running would hold it forever. Every
+    /// entry is durable when written, so exiting is all a drain needs.
     ///
     /// It sleeps until the next deadline or until [`Daemon::pulse`] says
     /// something changed (a client came or went, a session's work began or
     /// ended), so an idle daemon does not wake at all. While work runs it
     /// holds off system sleep.
-    async fn supervise(&self, life: &Lifecycle, config: &Config, exit: Exit) {
+    async fn supervise(&self, life: &Lifecycle, config: &Config, exit: Exit, idling: &Idling) {
         // When the daemon last became idle.
         let mut since: Option<Instant> = None;
-        // When a drain out of grace stopped the calls still running.
-        let mut stopped: Option<Instant> = None;
         let mut awake: Option<Option<sys::Awake>> = None;
         let pressure = Arc::new(rt::Notify::new());
         // Reclamation runs only at the top of the loop; reading the count
@@ -1020,6 +1023,7 @@ impl Daemon {
         let _pressure_source = sys::resources::MemoryPressure::new(move || notified.notify());
         let mut pulsed = self.pulse.count();
         let mut jobs = self.jobs.count();
+        let mut answers = idling.answered.count();
         loop {
             let now = self.shared.rt.now();
             event(|| rt::Event {
@@ -1044,25 +1048,20 @@ impl Daemon {
             }
             let mut next = self.next_hibernation(config.hibernate, now);
             if let Some(began) = draining {
-                if now >= began + config.drain && stopped.is_none() {
-                    for session in self.loaded() {
-                        session.interrupt();
-                    }
-                    stopped = Some(now);
-                }
-                // A stopped call gets the time its processes have to go
-                // and its outcome to commit.
-                let settled = stopped.map(|at| at + KILL_GRACE * 2);
-                if !self.has_work() || settled.is_some_and(|at| now >= at) {
+                let jobs = self.loaded().iter().any(|s| s.has_jobs());
+                let graced = now >= began + config.drain;
+                if !self.has_work() && (!jobs || graced) {
                     exit.now(self, Stop::Upgrade).await;
                 }
-                next = Some(earliest(next, settled.unwrap_or(began + config.drain)));
-            } else if self.idle() {
-                let at = *since.get_or_insert(now) + config.idle;
-                if now >= at {
-                    exit.now(self, Stop::Idle).await;
+                if !graced {
+                    next = Some(earliest(next, began + config.drain));
                 }
-                next = Some(earliest(next, at));
+            } else if self.idle() {
+                match idling.next(*since.get_or_insert(now), config.idle, now) {
+                    Idle::Exit => exit.now(self, Stop::Idle).await,
+                    Idle::Until(at) => next = Some(earliest(next, at)),
+                    Idle::Stay => {}
+                }
             } else {
                 since = None;
             }
@@ -1086,11 +1085,18 @@ impl Daemon {
                 self.jobs.changed(&mut jobs).await;
                 false
             };
+            let answered = async {
+                idling.answered.changed(&mut answers).await;
+                false
+            };
             let pressed = async {
                 pressure.changed(&mut pressured.clone()).await;
                 false
             };
-            let woken = rt::or(pulse, rt::or(pressed, rt::or(ended, sleep)));
+            let woken = rt::or(
+                pulse,
+                rt::or(pressed, rt::or(ended, rt::or(answered, sleep))),
+            );
             if woken.await {
                 since = None;
             }
@@ -1206,6 +1212,71 @@ pub struct Start {
     pub reset_breaker: bool,
     /// A detached starter waits for discovery to be published.
     pub logs: bool,
+    /// Started by the OS at login rather than by a client or by hand.
+    pub login: bool,
+    /// Asked on a blocking worker once the daemon has served for a moment,
+    /// off every reply's path: whether the OS starts this daemon at login,
+    /// so it stays up instead of exiting when idle.
+    pub resident: Option<fn(&Home) -> bool>,
+}
+
+/// How long a new daemon serves before asking [`Start::resident`].
+const SETTLED: Duration = Duration::from_secs(2);
+
+/// Whether idleness may end this daemon. Until [`Start::resident`] answers,
+/// it may not: a short idle limit must not end a daemon the OS starts at
+/// login before it learns so. The answer wakes the supervisor without
+/// counting as activity, so idleness while asking still counts.
+struct Idling {
+    state: AtomicU8,
+    answered: rt::Notify,
+}
+
+/// What an idle daemon does next.
+#[derive(Debug, PartialEq, Eq)]
+enum Idle {
+    /// Exit now.
+    Exit,
+    /// Exit at this instant unless something happens first.
+    Until(Instant),
+    /// Wait for the answer, or stay up for good.
+    Stay,
+}
+
+impl Idling {
+    const ASKING: u8 = 0;
+    const TRANSIENT: u8 = 1;
+    const RESIDENT: u8 = 2;
+
+    fn new(state: u8) -> Self {
+        Self {
+            state: AtomicU8::new(state),
+            answered: rt::Notify::new(),
+        }
+    }
+
+    fn answer(&self, resident: bool) {
+        let state = if resident {
+            Self::RESIDENT
+        } else {
+            Self::TRANSIENT
+        };
+        self.state.store(state, Ordering::SeqCst);
+        self.answered.notify();
+    }
+
+    /// For a daemon idle since `since`, allowed `limit` of it.
+    fn next(&self, since: Instant, limit: Duration, now: Instant) -> Idle {
+        if self.state.load(Ordering::SeqCst) != Self::TRANSIENT {
+            return Idle::Stay;
+        }
+        let at = since + limit;
+        if now >= at {
+            Idle::Exit
+        } else {
+            Idle::Until(at)
+        }
+    }
 }
 
 /// Runs the daemon, as staged build `build`, until it has been idle for
@@ -1247,7 +1318,9 @@ fn run(
     start: Start,
     runtime: &Arc<rt::Threads>,
 ) -> io::Result<()> {
-    let origin = if start.logs || start.lock.is_some() {
+    let origin = if start.login {
+        ext_logging::Origin::Login
+    } else if start.logs || start.lock.is_some() {
         ext_logging::Origin::Client
     } else {
         ext_logging::Origin::Foreground
@@ -1328,12 +1401,29 @@ fn run(
         pid,
         endpoint: listener.retirement()?,
     };
+    let idling = idling(&daemon, home, start.resident);
+    let answered = Arc::clone(&idling);
     daemon.shared.rt.spawn(Box::pin(async move {
-        monitor.supervise(&watch, &config, exit).await;
+        monitor.supervise(&watch, &config, exit, &answered).await;
     }));
     let listener = rt::Async::new(&daemon.shared.rt.reactor(), listener)?;
     // The signal lease is scoped to serving, including non-signal shutdown.
     rt::block_on(rt::or(server::accept(&listener, &daemon, &life), signalled))
+}
+
+/// Asks `resident`, if given, once the daemon has served for [`SETTLED`].
+fn idling(daemon: &Arc<Daemon>, home: &Home, resident: Option<fn(&Home) -> bool>) -> Arc<Idling> {
+    let Some(ask) = resident else {
+        return Arc::new(Idling::new(Idling::TRANSIENT));
+    };
+    let idling = Arc::new(Idling::new(Idling::ASKING));
+    let (answer, daemon, home) = (Arc::clone(&idling), Arc::clone(daemon), home.clone());
+    let runtime = Arc::clone(&daemon.shared.rt);
+    runtime.spawn(Box::pin(async move {
+        daemon.shared.rt.sleep(SETTLED).await;
+        answer.answer(rt::unblock(&*daemon.shared.rt, move || ask(&home)).await);
+    }));
+    idling
 }
 
 /// Whether a daemon may serve.

@@ -131,13 +131,6 @@ fn blob(id: BlobId, size: u64, media_type: &str, origin: BlobOrigin) -> BlobRef 
     }
 }
 
-fn too_large(cap: u64) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::FileTooLarge,
-        format!("a blob holds at most {cap} bytes"),
-    )
-}
-
 struct Writing {
     store: Arc<Inner>,
     file: File,
@@ -151,7 +144,10 @@ struct Writing {
 impl Write for Writing {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.size + buf.len() as u64 > self.cap {
-            return Err(too_large(self.cap));
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!("a blob holds at most {} bytes", self.cap),
+            ));
         }
         let n = self.file.write(buf)?;
         self.hash.update(&buf[..n]);

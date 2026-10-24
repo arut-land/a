@@ -40,6 +40,8 @@ pub use sys::crash::Build;
 pub enum Origin {
     Client,
     Foreground,
+    /// The OS at login, through `a daemon autostart`.
+    Login,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

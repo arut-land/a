@@ -429,6 +429,7 @@ mod tests {
                         mode: Mode::Queue,
                         taken: true,
                         origin: Some(origin),
+                        force: false,
                     },
                 )),
             );

@@ -1,0 +1,64 @@
+{
+  "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+  "binary_bytes": 4719632,
+  "samples": {
+    "self_spawn_ms": [
+      5.958532,
+      6.49709,
+      5.549831,
+      5.996145,
+      5.335406,
+      5.880286,
+      5.155318,
+      6.067436,
+      5.477581,
+      6.755566,
+      5.557843,
+      6.118293
+    ],
+    "login_first_ms": [
+      3.087945,
+      3.076746,
+      3.033324,
+      3.139762,
+      3.117521,
+      3.162956,
+      3.014528,
+      3.105268,
+      3.023323,
+      3.143685,
+      3.016153,
+      3.122417
+    ],
+    "login_warm_ms": [
+      2.207914,
+      2.189791,
+      2.140111,
+      2.192508,
+      2.174965,
+      2.188339,
+      2.235359,
+      2.148926,
+      2.148865,
+      2.248993,
+      2.148936,
+      2.181578
+    ]
+  },
+  "medians": {
+    "self_spawn_ms": 5.919409,
+    "login_first_ms": 3.0966065,
+    "login_warm_ms": 2.1849585
+  },
+  "login_first_minus_warm_ms": 0.911648,
+  "login_first_minus_self_spawn_ms": -2.8228025,
+  "checks": {
+    "isolated_homes_refused": true,
+    "idle_exit_without_autostart": true,
+    "resident_with_autostart": true,
+    "login_entry_defers_to_a_running_daemon": true,
+    "registration_refreshed_by_a_daemon": true,
+    "login_started_daemons_stay_resident": true,
+    "off_removes_the_registration": true
+  }
+}

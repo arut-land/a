@@ -237,6 +237,7 @@ fn input(text: &str, seq: u64) -> ClientMsg {
         segments: text.into(),
         client_seq: Some(seq),
         mode: protocol::Mode::Queue,
+        force: false,
     }
 }
 
@@ -480,6 +481,7 @@ fn far_behind_a_client_gets_a_snapshot() {
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
+                    force: false,
                 };
                 Entry::new(Seq::new(seq).unwrap(), Epoch(epoch), body)
             })

@@ -431,13 +431,44 @@ impl ConversationHandle {
         purpose: &str,
         payload: String,
     ) -> Result<(), protocol::InboxRefusal> {
+        Address::from(self).send::<E>(cx, purpose, payload).await
+    }
+}
+
+/// Who a message is for, as its sender names it: the session's
+/// [`Route`](crate::Route) resolves it to the sessions that receive it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Address {
+    Conversation(ConversationHandle),
+    /// The session that owns the sender.
+    Parent,
+    /// A name the route gives meaning: a channel, a group.
+    Named(crate::Name),
+}
+
+impl From<ConversationHandle> for Address {
+    fn from(handle: ConversationHandle) -> Self {
+        Self::Conversation(handle)
+    }
+}
+
+impl Address {
+    /// Sends `payload` to whoever the route resolves this to, as `E`'s
+    /// `purpose`, which with the call keeps the message's identity across
+    /// retries.
+    pub async fn send<E: Extension>(
+        self,
+        cx: &Cx,
+        purpose: &str,
+        payload: String,
+    ) -> Result<(), protocol::InboxRefusal> {
         let conversations = cx
             .conversations()
             .ok_or(protocol::InboxRefusal::Unauthorized)?;
         let message = SendMessage {
             owner: E::NAME,
             purpose: purpose.into(),
-            destination: self,
+            to: self,
             payload,
         };
         conversations.send(cx, message).await
@@ -769,21 +800,24 @@ impl ModelTurn {
 pub struct SendMessage {
     owner: &'static str,
     purpose: String,
-    destination: ConversationHandle,
+    to: Address,
     payload: String,
 }
 
 impl SendMessage {
-    pub fn envelope(&self, sender: SessionId, call: CallId) -> protocol::Envelope {
-        protocol::Envelope {
-            id: protocol::EnvelopeId {
-                sender,
-                call,
-                purpose: format!("{}:{}", self.owner, self.purpose),
-            },
-            destination: self.destination.session,
-            payload: self.payload.clone(),
-        }
+    /// The send's id under the call, a purpose of the extension's own;
+    /// who it is for; and what it says.
+    pub fn into_parts(
+        self,
+        sender: SessionId,
+        call: CallId,
+    ) -> (protocol::EnvelopeId, Address, String) {
+        let id = protocol::EnvelopeId {
+            sender,
+            call,
+            purpose: format!("{}:{}", self.owner, self.purpose),
+        };
+        (id, self.to, self.payload)
     }
 }
 

@@ -49,7 +49,9 @@ pipe, so retained clients cannot reserve a successor's endpoint. Neither path po
 holds its pid-file lock for its lifetime, excluding other writers to that
 home. `sys::Paths` resolves native configuration, state, data, cache, logs
 and runtime locations; `A_HOME` selects an isolated root. See [paths and
-install layout](paths.md).
+install layout](paths.md). Optional [autostart](autostart.md) registers
+the daemon with the OS to start at login and stay up; clients still self-spawn
+it when none is running.
 
 The daemon serves connections and session actors on `rt`. Idle sessions
 hibernate; the daemon exits when no clients or work pin it. Upgrades drain
@@ -102,7 +104,13 @@ fork or child references its parent's blobs rather than its files.
 shape of `Namespace` (what that tree holds, derived from the logs). Calls
 reach them through `Cx.blobs`. Pasted and attached segments
 (`Segment::PasteRef`, `Segment::Attachment`) carry a `BlobRef` and are shown to
-the model at their tree place, `by-id/<id>`.
+the model at their tree place, `by-id/<id>`. A call's growing output
+(`protocol::OutputStream`, what a detached call's placeholder names, and a
+background shell job's log) is shown at `sessions/<session>/streams/<call>.log`:
+`Blobs::expose` hard-links the open stream there, so a reader sees it grow and,
+once sealed, the blob it became. The live transcript names both through
+`ext::blob::Places` under the session's tree root; context published to other
+sessions names them by tree place alone.
 
 The JSONL backend (`store::Files`) keeps `blobs/<aa>/<id>`, 0400 in a 0700
 directory. A writer hashes into `staging/` as it writes and refuses bytes past

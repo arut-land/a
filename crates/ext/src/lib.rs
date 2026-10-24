@@ -37,10 +37,11 @@ mod history;
 pub mod host;
 mod r#loop;
 pub mod point;
+mod queue;
 pub mod schema;
 mod service;
 pub use conversation::{
-    Background, Context, ContextPolicy, Conversation, ConversationHandle, Conversations,
+    Address, Background, Context, ContextPolicy, Conversation, ConversationHandle, Conversations,
     DepthBudget, Ephemeral, ModelTurn, OwnerScope, Persisted, Placement, Runner, SendMessage,
     SideIdentity, Spawn, SpawnRefusal, Storage, Task, ThreadKey, Turn, TurnKey,
 };
@@ -65,18 +66,19 @@ pub use point::{
     Requirement, Rewrite,
 };
 pub use protocol::{Annotation, AnnotationLifetime, ExtensionFact};
+pub use queue::{Boundary, QueueView, Take};
 pub use schema::Schema;
 pub use service::{
-    Budget, CwdOf, InboxAccess, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec, OwnedProcess,
-    ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes, RunningProcess,
-    SideProvider, SideRetry, SpawnError,
+    Budget, CwdOf, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec, OwnedProcess,
+    ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes, Recipients, Route,
+    RunningProcess, SideProvider, SideRetry, SpawnError, Topology,
 };
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};
 pub use state::{Checkpoint, DynFold, Fold, Image, PreparedPublication, Publication, States};
 pub use tool::{
-    Args, Callable, Called, Concurrency, Cx, DynTool, MutationError, MutationResult, Parsed,
-    Replay, SpawnSpec, Tool,
+    Args, Callable, Called, Concurrency, Cx, Detach, DynTool, MutationError, MutationResult,
+    Parsed, Replay, SpawnSpec, Tool,
 };
 
 /// A runtime name: of an extension, a tool, an agent. Typed Rust items

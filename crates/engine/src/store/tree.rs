@@ -50,6 +50,18 @@ impl Materialize for CacheDir {
         }
     }
 
+    /// A hard link: the reader sees what the writer adds, and the sealed
+    /// blob after, as one file. Made again if the cache lost it.
+    fn expose(&self, at: &TreePath, open: &Path) -> io::Result<()> {
+        let path = self.path(at);
+        sys::fs::private_dir(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        fs::hard_link(open, &path)
+    }
+
     fn evict(&self, budget: u64) -> io::Result<u64> {
         let mut files: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
         let mut pending = vec![self.root.clone()];
@@ -129,6 +141,27 @@ mod tests {
             SessionId::new(),
         );
         assert_eq!(other.materialize(&blob).unwrap(), path);
+    }
+
+    #[test]
+    fn an_exposed_stream_reads_the_same_while_it_grows_and_once_sealed() {
+        let (_home, files, tree) = cache();
+        let session = SessionId::new();
+        let blobs = Blobs::new(Arc::clone(&files) as _, Arc::new(tree), session);
+        let call = protocol::CallId::new(3).unwrap();
+        let ext::blob::Stream { mut file, mut open } = blobs.stream(call, "log", 1 << 20).unwrap();
+        let shown = blobs.expose(&mut open, call).unwrap();
+        assert_eq!(
+            shown.display().to_string(),
+            blobs.places().stream(protocol::OutputStream { call })
+        );
+        file.write_all(b"so far").unwrap();
+        assert_eq!(fs::read(&shown).unwrap(), b"so far");
+        file.write_all(b", and the rest").unwrap();
+        drop(file);
+        let sealed = open.seal("text/plain", BlobOrigin::JobLog(call)).unwrap();
+        assert_eq!(fs::read(&shown).unwrap(), b"so far, and the rest");
+        assert_eq!(sealed.size, 20);
     }
 
     #[test]

@@ -139,7 +139,7 @@ pub struct Ran {
 pub struct Job {
     pub pgid: u32,
     /// Where its output stream can be read as it grows: open for as long
-    /// as the job runs.
+    /// as the job runs, at the tree place its call's stream has.
     pub log: PathBuf,
 }
 
@@ -313,13 +313,19 @@ async fn execute<D: crate::dialect::Dialect>(
     }
     let env = environment(cx, std::env::vars());
     // Both streams share the one file, and its offset: in the order written.
-    let Stream { file, open: log } = cx.blobs.stream(cx.call, "log", OUTPUT_CAP)?;
+    let Stream {
+        file,
+        open: mut log,
+    } = cx.blobs.stream(cx.call, "log", OUTPUT_CAP)?;
     if input.background {
+        // Shown where the model is told it grows: the tree, as a detached
+        // call's stream is.
+        let shown = cx.blobs.expose(&mut log, cx.call)?;
         return background(
             cx,
             spawn_with::<D>(facts, &input.command, &dir, env, None)?,
             file,
-            log,
+            shown,
         )
         .await;
     }
@@ -405,7 +411,7 @@ async fn keep(cx: &Cx, log: Open, output: Ended) -> io::Result<(Rendered, Option
 /// Starts the command with its output going straight to its stream, and
 /// leaves it running: the session owns it from here, and the stream stays
 /// open.
-async fn background(cx: &Cx, spawn: Spawn, file: File, log: Open) -> io::Result<Ran> {
+async fn background(cx: &Cx, spawn: Spawn, file: File, log: PathBuf) -> io::Result<Ran> {
     let started = runtime(cx)?.now();
     let cwd = spawn.cwd.clone();
     let child = launch(cx, spawn, file).await?;
@@ -414,10 +420,7 @@ async fn background(cx: &Cx, spawn: Spawn, file: File, log: Open) -> io::Result<
     Ok(Ran {
         cwd,
         duration_ms: duration_ms(started),
-        background: Some(Job {
-            pgid,
-            log: log.path().to_owned(),
-        }),
+        background: Some(Job { pgid, log }),
         ..Ran::default()
     })
 }

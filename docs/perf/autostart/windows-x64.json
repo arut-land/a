@@ -1,0 +1,65 @@
+{
+  "platform": "Windows-2025Server-10.0.26100-SP0",
+  "binary_bytes": 5776384,
+  "samples": {
+    "self_spawn_ms": [
+      57.5145,
+      34.2196,
+      36.5163,
+      37.1784,
+      88.0695,
+      40.0352,
+      40.6474,
+      46.4752,
+      38.2484,
+      39.3426,
+      36.2381,
+      203.2223
+    ],
+    "login_first_ms": [
+      15.4759,
+      14.4478,
+      13.8944,
+      16.4845,
+      15.9599,
+      16.2029,
+      14.8348,
+      14.6225,
+      14.8234,
+      16.2274,
+      14.8261,
+      14.4873
+    ],
+    "login_warm_ms": [
+      13.5355,
+      13.0281,
+      11.2542,
+      13.5951,
+      14.2906,
+      14.8162,
+      12.5138,
+      13.0483,
+      13.7885,
+      14.104,
+      13.0657,
+      13.169
+    ]
+  },
+  "medians": {
+    "self_spawn_ms": 39.688900000000004,
+    "login_first_ms": 14.830449999999999,
+    "login_warm_ms": 13.352250000000002
+  },
+  "login_first_minus_warm_ms": 1.4781999999999975,
+  "login_first_minus_self_spawn_ms": -24.858450000000005,
+  "checks": {
+    "isolated_homes_refused": true,
+    "idle_exit_without_autostart": true,
+    "resident_with_autostart": true,
+    "login_entry_defers_to_a_running_daemon": true,
+    "manifest_asks_for_no_console": true,
+    "logon_entry_leaves_a_detached_daemon": true,
+    "login_started_daemons_stay_resident": true,
+    "off_removes_the_registration": true
+  }
+}

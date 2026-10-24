@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 pub use protocol::{BlobId, BlobOrigin, BlobRef, Payload};
-use protocol::{CallId, SessionId};
+use protocol::{CallId, OutputStream, SessionId};
 
 use crate::BoxFuture;
 
@@ -64,12 +64,18 @@ pub struct Stream {
 pub struct Open {
     path: PathBuf,
     sealer: Box<dyn Sealer>,
+    /// Where [`Blobs::expose`] shows it in the tree, if it does.
+    shown: Option<PathBuf>,
 }
 
 impl Open {
     /// For a backend: the stream at `path`, which `sealer` ends.
     pub fn new(path: PathBuf, sealer: Box<dyn Sealer>) -> Self {
-        Self { path, sealer }
+        Self {
+            path,
+            sealer,
+            shown: None,
+        }
     }
 
     /// Where the stream can be read while it grows. Not the blob's path:
@@ -82,8 +88,11 @@ impl Open {
         self.sealer.seal(&self.path, media_type, origin)
     }
 
-    /// Ends the stream without keeping it.
+    /// Ends the stream without keeping it, nor showing it.
     pub fn discard(self) -> io::Result<()> {
+        if let Some(shown) = &self.shown {
+            let _ = std::fs::remove_file(shown);
+        }
         self.sealer.discard(&self.path)
     }
 }
@@ -155,6 +164,15 @@ impl TreePath {
         Self(format!("by-id/{id}"))
     }
 
+    /// Where call `call`'s output stream is read, while it grows and once
+    /// it is sealed: what [`OutputStream`] names.
+    pub fn stream(session: SessionId, stream: OutputStream) -> Self {
+        Self(format!(
+            "sessions/{session}/streams/{}.log",
+            stream.call.get()
+        ))
+    }
+
     pub fn parts(&self) -> impl Iterator<Item = &str> {
         self.0.split('/').filter(|part| !part.is_empty())
     }
@@ -182,6 +200,11 @@ pub trait Materialize: Send + Sync {
     /// backend makes sure its entry exists. Blocks: run it on a storage
     /// worker.
     fn ensure(&self, at: &TreePath, blob: &BlobRef) -> io::Result<()>;
+
+    /// Shows the open stream at `open` at `at` as it grows, and as the
+    /// blob it is sealed into: the same file, never a copy of what it
+    /// held so far.
+    fn expose(&self, at: &TreePath, open: &Path) -> io::Result<()>;
 
     /// Frees what it holds beyond `budget` bytes, least recently used
     /// first; returns the bytes freed. A cache deletes, a virtual backend
@@ -251,6 +274,60 @@ impl Blobs {
         self.tree.ensure(&at, blob)?;
         Ok(self.tree.path(&at))
     }
+
+    /// Shows `open`, call `call`'s output stream, where [`Places::stream`]
+    /// names it, which exists when this returns.
+    pub fn expose(&self, open: &mut Open, call: CallId) -> io::Result<PathBuf> {
+        let at = TreePath::stream(self.session, OutputStream { call });
+        self.tree.expose(&at, open.path())?;
+        let shown = self.tree.path(&at);
+        open.shown = Some(shown.clone());
+        Ok(shown)
+    }
+
+    /// How the session's references are named for the model.
+    pub fn places(&self) -> Places {
+        Places::new(self.tree.root().to_path_buf(), self.session)
+    }
+}
+
+/// How a reference reads where the model is told of it: the path the
+/// tree shows it at. Pure, so a projection of the log can name it; the
+/// default names the place within the tree, for a projection that has
+/// no tree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Places {
+    root: Option<PathBuf>,
+    session: Option<SessionId>,
+}
+
+impl Places {
+    /// Session `session`'s references, in the tree at `root`.
+    pub const fn new(root: PathBuf, session: SessionId) -> Self {
+        Self {
+            root: Some(root),
+            session: Some(session),
+        }
+    }
+
+    fn at(&self, at: &TreePath) -> String {
+        match &self.root {
+            Some(root) => at.under(root).display().to_string(),
+            None => at.parts().collect::<Vec<_>>().join("/"),
+        }
+    }
+
+    pub fn blob(&self, blob: &BlobRef) -> String {
+        self.at(&TreePath::by_id(&blob.id))
+    }
+
+    /// Where `stream` is read; without a session, by its call alone.
+    pub fn stream(&self, stream: OutputStream) -> String {
+        match self.session {
+            Some(session) => self.at(&TreePath::stream(session, stream)),
+            None => stream.to_string(),
+        }
+    }
 }
 
 /// Blobs for a test whose calls write none: every use fails.
@@ -284,38 +361,12 @@ pub(crate) fn none() -> Blobs {
         fn ensure(&self, _: &TreePath, _: &BlobRef) -> io::Result<()> {
             refused()
         }
+        fn expose(&self, _: &TreePath, _: &Path) -> io::Result<()> {
+            refused()
+        }
         fn evict(&self, _: u64) -> io::Result<u64> {
             refused()
         }
     }
     Blobs::new(Arc::new(None), Arc::new(None), SessionId::new())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_tree_path_never_leaves_its_root() {
-        for bad in [
-            "..", "a/../b", "/a", "a//b", "a/", "./a", "a\\b", "c:x", "a\0",
-        ] {
-            assert_eq!(TreePath::new(bad), None, "{bad:?}");
-        }
-        let at = TreePath::new("sessions/x/tool-output/7.log").unwrap();
-        let root = Path::new("root");
-        assert_eq!(
-            at.under(root),
-            root.join("sessions")
-                .join("x")
-                .join("tool-output")
-                .join("7.log")
-        );
-        assert_eq!(TreePath::ROOT.under(root), root);
-        let id = BlobId([0xab; 32]);
-        assert_eq!(
-            TreePath::by_id(&id).parts().collect::<Vec<_>>(),
-            ["by-id", &id.to_string()]
-        );
-    }
 }

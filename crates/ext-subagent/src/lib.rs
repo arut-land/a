@@ -32,7 +32,7 @@ impl Extension for Subagent {
                     protocol::Permission::Allow
                 }
             });
-        r.provide::<dyn ext::InboxAccess>(std::sync::Arc::new(Self));
+        r.provide::<dyn ext::Route>(std::sync::Arc::new(Self));
         r.tool(Task).tool(ForkTask).tool(BackgroundTask).text(Text::system("task", 30, "`task` hands a self-contained piece of work to a fresh session, which sees nothing of this conversation: say all it needs in `prompt`. It answers with what that session ended with.").for_tool(Task::NAME));
     }
 }
@@ -131,14 +131,21 @@ impl Tool for BackgroundTask {
     }
 }
 
-impl ext::InboxAccess for Subagent {
-    fn permits(
+/// Messages go along ownership edges only: to the parent, or a child.
+impl ext::Route for Subagent {
+    fn resolve(
         &self,
-        destination: protocol::SessionId,
-        parent: Option<protocol::SessionId>,
-        children: &[protocol::SessionId],
-    ) -> bool {
-        parent == Some(destination) || children.contains(&destination)
+        from: ext::Topology<'_>,
+        to: &ext::Address,
+    ) -> Result<ext::Recipients, protocol::InboxRefusal> {
+        let to = match to {
+            ext::Address::Parent => from.parent,
+            ext::Address::Conversation(handle) => Some(handle.session)
+                .filter(|s| from.parent == Some(*s) || from.children.contains(s)),
+            ext::Address::Named(_) => None,
+        };
+        to.map(|to| ext::Recipients::from_elem(to, 1))
+            .ok_or(protocol::InboxRefusal::Unauthorized)
     }
 }
 

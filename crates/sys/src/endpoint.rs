@@ -47,6 +47,11 @@ pub(crate) fn runtime_directory() -> PathBuf {
     imp::socket_dir()
 }
 
+/// A home's name in per-user OS registrations, the one its endpoint uses.
+pub(crate) fn home_identity(home: &Home) -> u64 {
+    imp::home_hash(home.root())
+}
+
 impl Home {
     /// The daemon's endpoint. Unix uses a short socket name in a private
     /// runtime directory; Windows discovers a process-generation pipe

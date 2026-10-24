@@ -32,7 +32,7 @@ pub use watch::SessionWatch;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufReader, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -877,6 +877,55 @@ const DAEMON_ENV: &[&str] = &[
     "TZ",
 ];
 
+fn open(path: &Path) -> io::Result<File> {
+    File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+fn wedged(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("{what} holds its lock but the daemon is not listening"),
+    )
+}
+
+/// `start.lock`: one starter at a time, whether a client or the OS at login.
+fn starting(home: &Home) -> io::Result<File> {
+    sys::fs::private_dir(&home.run_dir())?;
+    locked(
+        open(&home.run_dir().join("start.lock"))?,
+        Some(HELLO_TIMEOUT),
+    )
+    .ok_or_else(|| wedged("another client"))
+}
+
+/// The daemon lock and endpoint for a daemon the OS starts at login, taken
+/// in the order a self-spawning client takes them and under the same
+/// `start.lock`, so the two never race. `None` when a daemon already serves:
+/// once this is bound, clients connect into its backlog.
+pub fn bind_at_login(home: &Home) -> io::Result<Option<(sys::DaemonLock, sys::Listener)>> {
+    let _starting = starting(home)?;
+    if home.endpoint().connect().is_ok() {
+        return Ok(None);
+    }
+    // A daemon draining or stopping still holds the record and its endpoint;
+    // binding before it lets go would replace the discovery it withdraws.
+    let lock = locked(open(&home.daemon_pid_file())?, Some(HELLO_TIMEOUT))
+        .ok_or_else(|| wedged("the daemon"))?;
+    let listener = home.bind()?;
+    Ok(Some((sys::adopt_lock(lock, home)?, listener)))
+}
+
+/// A login entry whose host does not outlive it: start a detached daemon
+/// as any client does, unless one serves.
+pub fn spawn_at_login(home: &Home) -> io::Result<()> {
+    connect_or_spawn(home, false).map(drop)
+}
+
 /// Zero-lag start: when no daemon is listening, take the daemon lock, bind
 /// the socket here, hand both to a detached daemon running
 /// `runtime/current`, and connect straight into its backlog. The lock goes
@@ -900,32 +949,13 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
         Err(_) => {}
     }
 
-    sys::fs::private_dir(&home.run_dir())?;
-    let open = |name: PathBuf| {
-        File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(name)
-    };
-    let wedged = |what: &str| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("{what} holds its lock but the daemon is not listening"),
-        )
-    };
-    let _starting = locked(
-        open(home.run_dir().join("start.lock"))?,
-        Some(HELLO_TIMEOUT),
-    )
-    .ok_or_else(|| wedged("another client"))?;
+    let _starting = starting(home)?;
     match endpoint.connect() {
         Ok(stream) => return Ok((stream, false)),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(error),
         Err(_) => {}
     }
-    let lock = locked(open(home.daemon_pid_file())?, Some(HELLO_TIMEOUT))
+    let lock = locked(open(&home.daemon_pid_file())?, Some(HELLO_TIMEOUT))
         .ok_or_else(|| wedged("the daemon"))?;
 
     // The daemon leaves this process's session (`setsid`) as it starts, so
@@ -973,6 +1003,33 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_login_start_takes_the_daemon_lock_before_it_binds() {
+        let root = std::env::temp_dir().join(format!("a-login-order-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let home = Home::from(root.join("home"));
+        sys::fs::private_dir(&home.run_dir()).unwrap();
+        // A daemon draining for an upgrade still holds its record.
+        let draining = open(&home.daemon_pid_file()).unwrap();
+        sys::fs::try_lock(&draining).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let starter = home.clone();
+        let login = thread::spawn(move || {
+            let _ = tx.send(bind_at_login(&starter).map(|bound| bound.is_some()));
+        });
+        thread::sleep(HELLO_TIMEOUT / 4);
+        assert!(
+            !home.run_dir().join("daemon.endpoint").exists(),
+            "bound while another daemon held the record"
+        );
+        assert!(home.endpoint().connect().is_err());
+        drop(draining);
+        assert!(rx.recv().unwrap().unwrap());
+        login.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn an_older_client_is_pointed_at_the_newer_build_not_at_a_restart() {

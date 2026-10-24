@@ -578,6 +578,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                force: false,
             },
             Body::Assistant { text: "hi".into() },
         ]
@@ -648,6 +649,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                force: false,
             },
             Body::ToolCall {
                 invoke: None,
@@ -676,6 +678,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         mode: protocol::Mode::Queue,
         taken: true,
         origin: None,
+        force: false,
     };
     let sleep = || Body::ToolCall {
         invoke: None,
@@ -849,6 +852,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
             mode: protocol::Mode::Queue,
             taken: true,
             origin: None,
+            force: false,
         },
         Body::ToolCall {
             invoke: None,
@@ -974,7 +978,8 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     {
         // Owning the polls distinguishes queued news from unsolicited wakes,
         // regardless of how long a worker would take to consume that news.
-        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit));
+        let idling = super::Idling::new(super::Idling::TRANSIENT);
+        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling));
         let mut cx = Context::from_waker(Waker::noop());
         let before = EVENTS.count("wake");
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
@@ -994,8 +999,45 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
         assert_eq!(EVENTS.count("wake") - before, 4);
         assert_eq!(*super::lock(&runtime.1), [config.idle; 4]);
     }
+    {
+        // Neither a daemon the OS starts at login nor one still asking
+        // whether it is has an idle deadline to wake for.
+        let exit = Exit {
+            home: home.clone(),
+            pid: std::fs::File::create(root.join("resident-pid")).unwrap(),
+            endpoint: home.bind().unwrap().retirement().unwrap(),
+        };
+        super::lock(&runtime.1).clear();
+        let idling = super::Idling::new(super::Idling::ASKING);
+        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(supervisor.as_mut().poll(&mut cx).is_pending());
+        idling.answer(true);
+        assert!(supervisor.as_mut().poll(&mut cx).is_pending());
+        assert!(super::lock(&runtime.1).is_empty());
+    }
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn an_idle_daemon_exits_as_soon_as_it_learns_it_is_transient() {
+    use super::{Idle, Idling};
+
+    let began = Instant::now();
+    let limit = Duration::from_secs(1);
+    let later = began + Duration::from_secs(5);
+    let idling = Idling::new(Idling::ASKING);
+    // Past its idle limit while asking, it stays.
+    assert_eq!(idling.next(began, limit, later), Idle::Stay);
+    let seen = idling.answered.count();
+    idling.answer(false);
+    // The answer wakes the supervisor, and the idleness it waited through counts.
+    assert_ne!(idling.answered.count(), seen);
+    assert_eq!(idling.next(began, limit, later), Idle::Exit);
+    assert_eq!(idling.next(began, limit, began), Idle::Until(began + limit));
+    idling.answer(true);
+    assert_eq!(idling.next(began, limit, later), Idle::Stay);
 }
 
 #[test]
@@ -1052,7 +1094,12 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     let (stop, done) = (ext::Flag::default(), ext::Flag::default());
     let (stopping, finished) = (stop.clone(), done.clone());
     daemon.shared.rt.spawn(Box::pin(async move {
-        rt::or(supervisor.supervise(&life, &config, exit), stopping.wait()).await;
+        let idling = super::Idling::new(super::Idling::TRANSIENT);
+        rt::or(
+            supervisor.supervise(&life, &config, exit, &idling),
+            stopping.wait(),
+        )
+        .await;
         finished.set();
     }));
 

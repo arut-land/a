@@ -708,6 +708,14 @@ fn background_output_cannot_exceed_the_output_cap() {
     let rig = rig("bounded-background");
     let ran = bash(&rig, &json!({ "command": "yes x", "background": true }));
     let job = ran.background.unwrap();
+    let call = protocol::CallId::new(1).unwrap();
+    assert_eq!(
+        job.log.display().to_string(),
+        rig.blob_store()
+            .places()
+            .stream(protocol::OutputStream { call }),
+        "shown where its call's stream is named"
+    );
     wait_dead(job.pgid);
     assert_eq!(std::fs::metadata(job.log).unwrap().len(), OUTPUT_CAP);
 }

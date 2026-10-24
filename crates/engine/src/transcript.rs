@@ -5,10 +5,14 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use ext::blob::Places;
 use ext::host::Registry;
 use llm::{Assistant, Message, Messages, Tag, ToolMessage, ToolResult, tag};
 use protocol::publication::{ContextImage, ContextInput, ContextLayer, ContextValue, RunnerKind};
-use protocol::{Body, CallId, Entry, Envelope, Mode, Outcome, Segment, Segments, Seq, Verdict};
+use protocol::{
+    Body, CallId, Entry, Envelope, EnvelopeId, Mode, Outcome, OutputStream, Segment, Segments, Seq,
+    Source, Verdict,
+};
 
 /// Provider replies remain intact; live updates and recovery share projection rules.
 pub struct Transcript {
@@ -24,11 +28,20 @@ pub struct Transcript {
     /// the calls' order, whatever order they ended in, so the request is
     /// the same however a run went.
     answered: Vec<CallId>,
-    /// Input waiting to be taken up, by seq: the user's once it is.
+    /// What is queued and not taken up, by seq: the model reads it once
+    /// it is, where it is taken.
     waiting: HashMap<Seq, Waiting>,
+    /// The tool of each call the model made, by seq: what a result that
+    /// comes back from the background is named for.
+    tools: HashMap<CallId, String>,
+    /// Calls that went on in the background: the result logged for one
+    /// is a placeholder, and its outcome comes queued.
+    detached: HashSet<CallId>,
     /// The seq of the last entry that changed the messages.
     last: u64,
     registry: Arc<Registry>,
+    /// How references are named for the model.
+    places: Places,
 }
 
 /// Input waiting to be taken up.
@@ -38,19 +51,21 @@ enum Waiting {
     /// Another session's message, as it sent it: a model-only thread reads
     /// its payload as the turn it asks for.
     Inbox(Envelope),
+    /// What the session's own envelope brought back, as the model reads it.
+    Own(String),
 }
 
 /// `segments` as the model reads them: typed text as it is, and what the
 /// user pasted or attached tagged as such; a steer, given to a turn already
 /// running, says who gave it.
-fn model_text(segments: &Segments, mode: Mode) -> String {
+fn model_text(segments: &Segments, mode: Mode, places: &Places) -> String {
     let mut text = String::new();
     for segment in &segments.0 {
         match segment {
             Segment::Text(typed) => text.push_str(typed),
             Segment::Paste(pasted) => Tag::from(tag::Pasted(pasted)).render(&mut text),
             Segment::PasteRef(blob) => {
-                let at = shown_at(blob);
+                let at = places.blob(blob);
                 Tag::from(tag::PastedRef {
                     at: &at,
                     bytes: blob.size,
@@ -58,7 +73,7 @@ fn model_text(segments: &Segments, mode: Mode) -> String {
                 .render(&mut text);
             }
             Segment::Attachment(blob) => {
-                let at = shown_at(blob);
+                let at = places.blob(blob);
                 Tag::from(tag::Attached {
                     at: &at,
                     media_type: &blob.media_type,
@@ -80,13 +95,6 @@ fn model_text(segments: &Segments, mode: Mode) -> String {
     }
 }
 
-/// Where a blob is named for the model: its place in the materialized
-/// tree, which is the same for every session that references it.
-fn shown_at(blob: &protocol::BlobRef) -> String {
-    let at = ext::blob::TreePath::by_id(&blob.id);
-    at.parts().collect::<Vec<_>>().join("/")
-}
-
 /// Another session's message, as the model reads it.
 fn inbox_text(envelope: &Envelope) -> String {
     let from = envelope.id.sender.to_string();
@@ -104,19 +112,36 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
             segments,
             taken: true,
             ..
-        } => ContextValue::User(model_text(segments, Mode::Queue)),
+        // Published to other sessions: named by tree place, not this
+        // session's paths.
+        } => ContextValue::User(model_text(segments, Mode::Queue, &Places::default())),
         Body::Decision {
             d: Verdict::OnStop { text },
             ..
         } => ContextValue::User(text.clone()),
         Body::Input { segments, mode, .. } => ContextValue::Queued(segments.clone(), *mode),
-        Body::Enqueue { envelope } => ContextValue::Inbox(envelope.clone()),
-        Body::Take { input } => ContextValue::Taken(*input),
+        Body::Enqueue { envelope } => {
+            let outcome = || Outcome::from_payload(&envelope.payload);
+            match envelope.source() {
+                Source::Child(_) => ContextValue::Child(outcome()?),
+                Source::Job(call) if envelope.id.purpose == EnvelopeId::DETACHED => {
+                    ContextValue::Background(call, outcome()?)
+                }
+                Source::Job(call) => ContextValue::Job(call, envelope.payload.clone()),
+                _ => ContextValue::Inbox(envelope.clone()),
+            }
+        }
+        Body::Take { input, into: None } => ContextValue::Taken(*input),
+        Body::Take {
+            input,
+            into: Some(call),
+        } => ContextValue::Into(*input, *call),
+        Body::Withdraw { input, .. } => ContextValue::Withdrawn(*input),
+        Body::Detached { call } => ContextValue::Detached(*call),
         Body::Assistant { text } => ContextValue::Assistant(text.clone()),
         Body::Context { text, publication } => {
             ContextValue::Context(text.clone(), publication.clone())
         }
-        Body::Fired { outcome, .. } => ContextValue::Child(outcome.clone()),
         Body::ModelResult {
             r#for: None,
             outcome: Outcome::Done { output },
@@ -130,6 +155,32 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
     })
 }
 
+impl Waiting {
+    /// As the model reads it, taken by an agent.
+    fn text(self, places: &Places) -> String {
+        match self {
+            Self::Input(segments, mode) => model_text(&segments, mode, places),
+            Self::Inbox(envelope) => inbox_text(&envelope),
+            Self::Own(text) => text,
+        }
+    }
+}
+
+/// An output as text, for a message of text alone.
+fn text_of(output: llm::Output) -> String {
+    match output {
+        llm::Output::Text(text) => text,
+        llm::Output::Json(json) => json.raw().to_owned(),
+        llm::Output::Content(parts) => (parts.into_iter())
+            .filter_map(|part| match part {
+                llm::UserPart::Text(text) => Some(text.text),
+                llm::UserPart::Media(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
 impl Transcript {
     /// The transcript of `entries`, on `registry`, that `system` prompts,
     /// as their edits leave it: the entries an `edit` covers stand as its
@@ -140,6 +191,16 @@ impl Transcript {
         registry: Arc<Registry>,
         system: &str,
     ) -> Self {
+        Self::placed(entries, registry, system, &Places::default())
+    }
+
+    /// As [`Transcript::of`], naming references where `places` shows them.
+    pub fn placed(
+        entries: impl IntoIterator<Item = impl Borrow<Entry>>,
+        registry: Arc<Registry>,
+        system: &str,
+        places: &Places,
+    ) -> Self {
         let entries: Vec<_> = entries.into_iter().collect();
         project(
             normalize(
@@ -148,10 +209,11 @@ impl Transcript {
             ),
             registry,
             system,
+            places,
         )
     }
 
-    fn empty(registry: Arc<Registry>, system: &str) -> Self {
+    fn empty(registry: Arc<Registry>, system: &str, places: &Places) -> Self {
         let messages = Messages::from_iter((!system.is_empty()).then(|| Message::system(system)));
         Self {
             context: messages.len(),
@@ -160,8 +222,11 @@ impl Transcript {
             calls: HashMap::new(),
             answered: Vec::new(),
             waiting: HashMap::new(),
+            tools: HashMap::new(),
+            detached: HashSet::new(),
             last: 0,
             registry,
+            places: places.clone(),
         }
     }
 
@@ -171,7 +236,8 @@ impl Transcript {
         if let Body::Spawned { intent } = &e.body {
             if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
                 self.model_only = image.runner == RunnerKind::ModelOnly;
-                let messages = project(image.image, Arc::clone(&self.registry), "").into_context();
+                let messages = project(image.image, Arc::clone(&self.registry), "", &self.places)
+                    .into_context();
                 self.inherit(&messages, e.seq);
             }
         } else if let Some(value) = context_fact(&e.body) {
@@ -205,6 +271,7 @@ impl Transcript {
                     let text = match waiting {
                         Waiting::Input(segments, _) => segments.text(),
                         Waiting::Inbox(envelope) => envelope.payload,
+                        Waiting::Own(text) => text,
                     };
                     if let Ok((turn, _)) = ext::ModelTurn::from_intent(&text) {
                         for message in turn.messages.iter() {
@@ -215,10 +282,24 @@ impl Transcript {
                     }
                     Message::user(text)
                 }
-                Some(Waiting::Input(segments, mode)) => Message::user(model_text(&segments, mode)),
-                Some(Waiting::Inbox(envelope)) => Message::user(inbox_text(&envelope)),
+                Some(waiting) => Message::user(waiting.text(&self.places)),
                 None => return,
             },
+            ContextValue::Into(input, call) => match self.waiting.remove(&input) {
+                Some(waiting) => match self.join_result(call, waiting.text(&self.places)) {
+                    Ok(()) => {
+                        self.last = seq.get();
+                        return;
+                    }
+                    Err(text) => Message::user(text),
+                },
+                None => return,
+            },
+            value @ (ContextValue::Withdrawn(_)
+            | ContextValue::Child(_)
+            | ContextValue::Background(..)
+            | ContextValue::Job(..)
+            | ContextValue::Detached(_)) => return self.queue(seq, value),
             ContextValue::Assistant(text) => Message::assistant(text),
             ContextValue::Context(text, _) => {
                 self.messages.insert(self.context, Message::user(text));
@@ -226,7 +307,6 @@ impl Transcript {
                 self.last = seq.get();
                 return;
             }
-            ContextValue::Child(outcome) => Message::user(ext::child_result(&outcome)),
             ContextValue::Reply(output) => {
                 let reply = match fresh {
                     Some(message) => Ok(message),
@@ -238,40 +318,119 @@ impl Transcript {
                 }
             }
             ContextValue::ToolCall(id, tool) => {
+                self.tools.insert(CallId(seq), tool.clone());
                 self.calls.insert(CallId(seq), (id, tool));
                 return;
             }
-            ContextValue::ToolResult(call, outcome) => {
-                let Some((id, tool)) = self.calls.remove(&call) else {
-                    return;
-                };
-                let ext::Presented { output, error } =
-                    self.registry.present_result(&tool, &outcome);
-                let result = ToolResult {
-                    id: id.into(),
-                    name: tool.into(),
-                    output,
-                    error,
-                    meta: llm::Meta::new(),
-                };
-                self.last = seq.get();
-                // Only a tool message changes to take the result.
-                if let Some(Message::Tool(answers)) = self.messages.last_mut() {
-                    let at = self.answered.partition_point(|&seq| seq < call);
-                    self.answered.insert(at, call);
-                    answers.results.insert(at, result);
-                } else {
-                    self.answered = vec![call];
-                    self.messages.push(Message::Tool(ToolMessage {
-                        results: vec![result],
-                    }));
-                }
-                return;
-            }
+            ContextValue::ToolResult(call, outcome) => return self.answer(seq, call, &outcome),
             ContextValue::Inherited(_) => return,
         };
         self.messages.push(message);
         self.last = seq.get();
+    }
+
+    /// The result of call `call` the model made, in the tool message its
+    /// reply's results share, in the calls' order: a detached call's is a
+    /// placeholder naming its stream.
+    fn answer(&mut self, seq: Seq, call: CallId, outcome: &Outcome) {
+        let Some((id, tool)) = self.calls.remove(&call) else {
+            return;
+        };
+        let ext::Presented { output, error } = if self.detached.contains(&call) {
+            let stream = self.places.stream(OutputStream { call });
+            let text = format!(
+                "[it goes on in the background; its output streams to {stream}, and \
+                 its result follows once it ends]"
+            );
+            ext::Presented {
+                output: llm::Output::Text(text),
+                error: false,
+            }
+        } else {
+            self.registry.present_result(&tool, outcome)
+        };
+        let result = ToolResult {
+            id: id.into(),
+            name: tool.into(),
+            output,
+            error,
+            meta: llm::Meta::new(),
+        };
+        self.last = seq.get();
+        // Only a tool message changes to take the result.
+        if let Some(Message::Tool(answers)) = self.messages.last_mut() {
+            let at = self.answered.partition_point(|&seq| seq < call);
+            self.answered.insert(at, call);
+            answers.results.insert(at, result);
+        } else {
+            self.answered = vec![call];
+            self.messages.push(Message::Tool(ToolMessage {
+                results: vec![result],
+            }));
+        }
+    }
+
+    /// Folds what the queue holds of the session's own: an item withdrawn,
+    /// a result that came back, a call gone to the background.
+    fn queue(&mut self, seq: Seq, value: ContextValue) {
+        let text = match value {
+            ContextValue::Withdrawn(input) => {
+                self.waiting.remove(&input);
+                return;
+            }
+            ContextValue::Detached(call) => {
+                self.detached.insert(call);
+                return;
+            }
+            ContextValue::Child(outcome) => ext::child_result(&outcome),
+            ContextValue::Background(call, outcome) => self.background(call, &outcome),
+            ContextValue::Job(call, text) => self.ended(call, None, &text),
+            _ => return,
+        };
+        self.waiting.insert(seq, Waiting::Own(text));
+    }
+
+    /// What the model reads of the outcome of call `call`, which went on
+    /// in the background.
+    fn background(&mut self, call: CallId, outcome: &Outcome) -> String {
+        self.detached.remove(&call);
+        let tool = self.tools.get(&call).cloned().unwrap_or_default();
+        let ext::Presented { output, .. } = self.registry.present_result(&tool, outcome);
+        self.ended(call, Some(&text_of(output)), "")
+    }
+
+    /// A call that went on in the background ended, as the model reads it:
+    /// with its output, or with `note` about its end.
+    fn ended(&self, call: CallId, output: Option<&str>, note: &str) -> String {
+        let command = self.tools.get(&call).map_or("", String::as_str);
+        let stream = self.places.stream(OutputStream { call });
+        let id = call.to_string();
+        Tag::from(tag::BackgroundResult {
+            call: &id,
+            command,
+            exit: None,
+            log: Some(&stream),
+            output: output.or(Some(note)),
+        })
+        .to_string()
+    }
+
+    /// Appends `text` to the result of call `call`, if that result is in
+    /// the last message still; `Err` gives the text back otherwise, for it
+    /// to join as the user's.
+    fn join_result(&mut self, call: CallId, text: String) -> Result<(), String> {
+        let at = self.answered.iter().position(|&c| c == call);
+        let (Some(Message::Tool(answers)), Some(at)) = (self.messages.last_mut(), at) else {
+            return Err(text);
+        };
+        let result = &mut answers.results[at].output;
+        let mut parts = match std::mem::take(result) {
+            llm::Output::Content(parts) => parts,
+            output => vec![llm::UserPart::Text(llm::Text::new(text_of(output)))],
+        };
+        parts.push(llm::UserPart::Text(llm::Text::new(text)));
+        *result = llm::Output::Content(parts);
+        Ok(())
     }
 
     /// Whether the tools of `registry` presented the results.
@@ -357,7 +516,7 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
             .iter()
             .filter_map(|e| match &e.body {
                 Body::ToolResult { call, .. } => Some(call.0),
-                Body::Take { input } => Some(*input),
+                Body::Take { input, .. } => Some(*input),
                 _ => None,
             })
             .collect::<HashSet<_>>()
@@ -402,7 +561,12 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
             if completed.as_ref().is_some_and(|done| {
                 matches!(
                     value,
-                    ContextValue::ToolCall(..) | ContextValue::Queued(..) | ContextValue::Inbox(_)
+                    ContextValue::ToolCall(..)
+                        | ContextValue::Queued(..)
+                        | ContextValue::Inbox(_)
+                        | ContextValue::Child(_)
+                        | ContextValue::Background(..)
+                        | ContextValue::Job(..)
                 ) && !done.contains(&e.seq)
             }) {
                 continue;
@@ -414,11 +578,19 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
     image
 }
 
-fn project(image: ContextImage, registry: Arc<Registry>, system: &str) -> Transcript {
+fn project(
+    image: ContextImage,
+    registry: Arc<Registry>,
+    system: &str,
+    places: &Places,
+) -> Transcript {
     let mut inherited = HashMap::new();
     for (scope, ContextLayer(runner, inputs)) in image.into_iter().enumerate().rev() {
-        let mut transcript =
-            Transcript::empty(Arc::clone(&registry), if scope == 0 { system } else { "" });
+        let mut transcript = Transcript::empty(
+            Arc::clone(&registry),
+            if scope == 0 { system } else { "" },
+            places,
+        );
         transcript.model_only = runner == RunnerKind::ModelOnly;
         for ContextInput(seq, value) in inputs {
             if let ContextValue::Inherited(child) = value {
@@ -435,12 +607,16 @@ fn project(image: ContextImage, registry: Arc<Registry>, system: &str) -> Transc
         }
         inherited.insert(scope, transcript.into_context());
     }
-    Transcript::empty(registry, system)
+    Transcript::empty(registry, system, places)
 }
 
 #[cfg(test)]
 #[path = "transcript/context_image_tests.rs"]
 mod context_image_tests;
+
+#[cfg(test)]
+#[path = "transcript/queue_tests.rs"]
+mod queue_tests;
 
 #[cfg(test)]
 mod tests {
@@ -459,12 +635,14 @@ mod tests {
             mode,
             taken,
             origin: None,
+            force: false,
         }
     }
 
     fn take(input: u64) -> Body {
         Body::Take {
             input: Seq::new(input).unwrap(),
+            into: None,
         }
     }
 
@@ -567,7 +745,12 @@ mod tests {
             )]
         };
         let read = |runner| {
-            let transcript = project(inputs(runner), Arc::new(Registry::default()), "");
+            let transcript = project(
+                inputs(runner),
+                Arc::new(Registry::default()),
+                "",
+                &Places::default(),
+            );
             said(&transcript.into_messages())
         };
         assert_eq!(read(RunnerKind::ModelOnly), ["see x"]);
