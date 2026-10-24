@@ -189,13 +189,10 @@ mod tests {
 
     fn history() -> (Vec<Entry>, ext::ModelTurn, SessionId, Envelope) {
         let child = SessionId::new();
-        let side = ext::ModelTurn::new::<ext::ModelOnly>(
-            ext::ThreadKey::new::<ext_title::Title>("index", ext::OwnerScope::Session),
-            ext::TurnKey("initial".into()),
-            ext::ModelRole::Fast,
-            ext::SideContext::None,
-            llm::Messages::default(),
-        );
+        let side = ext::Conversation::turn::<ext_title::Title>("index", "")
+            .key("initial")
+            .role(ext::ModelRole::Fast)
+            .request(CallId::new(1).unwrap());
         let owner = CallId::new(1).unwrap();
         let envelope = Envelope {
             id: EnvelopeId {

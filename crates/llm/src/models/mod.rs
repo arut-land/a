@@ -36,6 +36,30 @@ pub fn has_prefix(prefixes: &[&str], id: &str) -> bool {
     prefixes.iter().any(|prefix| id.starts_with(prefix))
 }
 
+/// Input context windows, in tokens, by id prefix: the first row whose
+/// prefix starts the model's own name wins, so a longer prefix goes first.
+/// An id no row knows has no window to measure a request against.
+const WINDOWS: &[(&str, u32)] = &[
+    ("claude-", 200_000),
+    ("gpt-4.1", 1_047_576),
+    ("gpt-4o", 128_000),
+    ("gpt-5-chat", 128_000),
+    ("gpt-5", 400_000),
+    ("o1-mini", 128_000),
+    ("o1", 200_000),
+    ("o3", 200_000),
+    ("o4-mini", 200_000),
+    ("gemini-1.5-pro", 2_097_152),
+    ("gemini-", 1_048_576),
+    ("deepseek-", 128_000),
+    ("grok-4", 256_000),
+];
+
+/// The context window of `model`, past any `vendor/` prefix, if known.
+pub fn context_window(model: &str) -> Option<u32> {
+    by_prefix(WINDOWS, name(model))
+}
+
 /// A thinking budget's range, in tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {

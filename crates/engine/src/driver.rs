@@ -2403,7 +2403,7 @@ impl Actor {
                             &mut observed,
                         )))
                         .await;
-                        execution = live.session.execution(&cx, observed, agent);
+                        execution = live.session.execution(cx.call, observed, agent, None);
                         result
                     }
                     Err(error) => (
@@ -2415,6 +2415,11 @@ impl Actor {
                     let (turn, messages, model) = *prepared;
                     let cx = live.session.cx(origin.clone(), &registry);
                     let mut observed = Observation::default();
+                    let attempt = side::Attempt {
+                        id: origin.id,
+                        cancel: &origin.cancel,
+                        fence: origin.fence,
+                    };
                     let running = unless(
                         &cancel,
                         Box::pin(side::run_side(
@@ -2423,7 +2428,7 @@ impl Actor {
                             &turn,
                             messages,
                             &model,
-                            &origin,
+                            attempt,
                             &mut observed,
                         )),
                     );
@@ -2434,7 +2439,9 @@ impl Actor {
                     if matches!(replied, Replied::Interrupted(_)) {
                         observed.usage = None;
                     }
-                    execution = live.session.execution(&cx, observed, "model_only".into());
+                    execution =
+                        live.session
+                            .execution(cx.call, observed, "model_only".into(), None);
                     (replied, None)
                 }
                 _ => unreachable!(),
