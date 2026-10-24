@@ -1,31 +1,4 @@
-//! Native facts for runtime admission. Query at startup, never on an idle timer.
-
-use std::io;
-use std::path::Path;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Storage {
-    Rotational,
-    SolidState,
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Resources {
-    pub parallelism: usize,
-    pub page_size: usize,
-    pub storage: Storage,
-}
-
-impl Resources {
-    pub fn for_path(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            parallelism: effective_parallelism(),
-            page_size: page_size()?,
-            storage: storage(path),
-        })
-    }
-}
+//! Native CPU limits, scheduling classes and memory pressure for the runtime.
 
 /// Rust's Linux implementation intersects affinity with cgroup v1/v2 quota,
 /// including ancestor limits and non-root controller mounts.
@@ -35,62 +8,6 @@ pub fn effective_parallelism() -> usize {
     return windows::parallelism(available);
     #[cfg(not(windows))]
     available
-}
-
-pub fn page_size() -> io::Result<usize> {
-    #[cfg(unix)]
-    {
-        // SAFETY: sysconf has no pointer arguments or side effects.
-        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        usize::try_from(size)
-            .ok()
-            .filter(|n| *n > 0)
-            .ok_or_else(io::Error::last_os_error)
-    }
-    #[cfg(windows)]
-    {
-        let mut info = windows_sys::Win32::System::SystemInformation::SYSTEM_INFO::default();
-        // SAFETY: info is a valid writable SYSTEM_INFO.
-        unsafe { windows_sys::Win32::System::SystemInformation::GetSystemInfo(&raw mut info) };
-        Ok(info.dwPageSize as usize)
-    }
-}
-
-pub fn storage(path: &Path) -> Storage {
-    #[cfg(target_os = "linux")]
-    let Some(path) = path.ancestors().find(|p| p.exists()) else {
-        return Storage::Unknown;
-    };
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let Ok(meta) = path.metadata() else {
-            return Storage::Unknown;
-        };
-        let dev = meta.dev();
-        let device = format!("/sys/dev/block/{}:{}", libc::major(dev), libc::minor(dev));
-        let Ok(device) = std::fs::canonicalize(device) else {
-            return Storage::Unknown;
-        };
-        // Partitions inherit their parent block device's queue. Device-mapper
-        // and virtual devices may not reveal media; unknown stays explicit.
-        for device in device.ancestors().take(2) {
-            match std::fs::read_to_string(device.join("queue/rotational"))
-                .as_deref()
-                .map(str::trim)
-            {
-                Ok("1") => return Storage::Rotational,
-                Ok("0") => return Storage::SolidState,
-                _ => {}
-            }
-        }
-        Storage::Unknown
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = path;
-        Storage::Unknown
-    }
 }
 
 /// Scoped priority for a blocking operation. Async workers keep their normal
@@ -227,14 +144,6 @@ impl Drop for MemoryPressure {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn native_facts_are_nonzero_without_assuming_page_granularity() {
-        let facts = Resources::for_path(&std::env::temp_dir()).unwrap();
-        assert!(facts.parallelism > 0);
-        assert!(facts.page_size.is_power_of_two());
-    }
 
     #[cfg(target_os = "linux")]
     #[test]

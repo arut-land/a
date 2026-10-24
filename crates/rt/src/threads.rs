@@ -31,19 +31,6 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn for_path(path: &std::path::Path) -> io::Result<Self> {
-        let facts = sys::resources::Resources::for_path(path)?;
-        Ok(Self::for_resources(facts))
-    }
-
-    pub fn for_resources(facts: sys::resources::Resources) -> Self {
-        let mut config = Self::for_cores(facts.parallelism);
-        if facts.storage == sys::resources::Storage::Rotational {
-            config.storage.workers = 1;
-        }
-        config
-    }
-
     pub fn for_cores(cores: usize) -> Self {
         Self {
             workers: cores.clamp(1, 4),
@@ -186,13 +173,13 @@ struct Pool {
 impl Threads {
     pub fn new(workers: usize) -> Self {
         Self::configured(Config {
-            workers: workers.clamp(1, 4),
+            workers: workers.max(1),
             ..Config::default()
         })
     }
 
     pub fn configured(config: Config) -> Self {
-        assert!((1..=4).contains(&config.workers));
+        assert!(config.workers > 0);
         let lifecycle = Arc::new(Lifecycle::default());
         Self {
             config,
@@ -770,21 +757,6 @@ mod tests {
             runtime.shutdown();
             assert_eq!(observed, (expected, 0, expected * bytes));
         }
-    }
-
-    #[test]
-    fn rotational_storage_is_serial_without_reducing_flush_or_cpu_capacity() {
-        let config = Config::for_resources(sys::resources::Resources {
-            parallelism: 64,
-            page_size: 16_384,
-            storage: sys::resources::Storage::Rotational,
-        });
-        assert_eq!(config.storage.workers, 1);
-        assert_eq!(
-            (config.workers, config.cpu.workers, config.network.workers),
-            (4, 63, 8)
-        );
-        assert_eq!(config.storage.bytes, 64 << 20);
     }
 
     #[test]

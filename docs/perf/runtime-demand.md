@@ -27,9 +27,8 @@ CPU workers are created on demand up to `max(cores - 1, 1)`; storage is
 blocking defaults use the machine's cores. `Threads::configured` can
 set every lane's worker, queue, and byte limits explicitly.
 
-The daemon selects these limits through `Config::for_path` using effective CPU
-and storage facts. Rotational storage uses one worker. Catalog recovery shares
-storage admission. Per-OS policy, page granularity, QoS, memory pressure and
+The daemon's default configuration uses effective CPU parallelism. Catalog
+recovery shares storage admission. Per-OS policy, QoS, memory pressure and
 channel comparisons are recorded in [native runtime resources](resources.md).
 
 Storage admits up to 16 queued jobs and 64 MiB; Network admits 16 and

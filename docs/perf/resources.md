@@ -1,9 +1,11 @@
 # Native runtime resources
 
-`rt::Config::for_path` sizes the daemon from the filesystem containing its
-session store and `sys::resources` facts. Facts are read once at startup;
-there is no CPU, storage or pressure polling loop. Explicit configurations
-remain available for hosts and measurement harnesses.
+`rt::Config::default` sizes the daemon from
+`sys::resources::effective_parallelism`, read once at startup; there is no CPU
+or pressure polling loop. Explicit configurations remain available for hosts
+and measurement harnesses. Each mechanism below was kept or dropped by a
+paired comparison with it disabled; the [mechanism comparisons](resource-mechanisms.md)
+hold the table and its evidence.
 
 ## Admission policy
 
@@ -11,15 +13,14 @@ remain available for hosts and measurement harnesses.
 | --- | ---: | ---: | ---: |
 | Async | min(effective CPUs, 4), at least 1 | Executor tasks are caller-owned | Caller-owned |
 | CPU | max(effective CPUs − 1, 1) | 8 | 64 MiB |
-| Storage | clamp(effective CPUs / 2, 1, 4); 1 for rotational media | 16 | 64 MiB |
+| Storage | clamp(effective CPUs / 2, 1, 4) | 16 | 64 MiB |
 | Network | 8 | 16 | 32 MiB |
 | Flush | 1 | 1 | Metadata only |
 
 Blocking workers start on demand and retire after one ten-second idle wait.
 Starting workers count against the ceiling. Queue and byte admission is shared
 by all sessions on the runtime; these reservations do not bound the complete
-process heap. `Threads::new` also caps async workers at four; explicit
-configurations outside 1–4 async workers are rejected.
+process heap. `Threads::new` takes an explicit async worker count of at least one.
 
 Catalog startup, including reconstruction after an unclean exit, uses ordinary
 storage admission for preparation, log reads and publication. Up to four replay
@@ -29,21 +30,11 @@ outside storage admission, so reconstruction also completes with one worker.
 Catalog records themselves remain retained state, not a promise of an
 eight-MiB catalog size bound.
 
-Storage classification is an unqualified heuristic pending slow-disk measurements.
-Unknown media retain the core-based storage ceiling; a media label does not
-establish filesystem latency or durability. Device-mapper, remote mounts and
-virtual disks may report unknown media or an inaccurate rotation flag. Explicit
-`Config` values can represent a qualified slow filesystem without changing
-platform-independent callers.
-
 ## Native facts and scheduling
 
 Linux uses Rust's `available_parallelism`, whose implementation intersects
 `sched_getaffinity` with cgroup v1/v2 quotas, including ancestor limits and
-non-root controller mounts. This avoids another cgroup parser. Storage discovery
-stats the selected path, resolves its block device in sysfs, and reads the
-queue rotation flag on that device or its partition parent. Failure is an
-explicit unknown, not an SSD claim.
+non-root controller mounts. This avoids another cgroup parser.
 
 Windows intersects process affinity and process-default CPU-set IDs within the
 calling processor group, then bounds capacity by the immediate job's CPU rate
@@ -54,10 +45,11 @@ parent handles and cannot be discovered through the public current-job query;
 this is an approximation in nested quota hierarchies. No thread is pinned to a
 guessed performance or efficiency core.
 
-Windows and macOS leave storage media unknown. Disk-kind enumeration and the
-IOKit lookup add resident memory without a qualified slow-disk benefit; their
-measured costs are in the [mechanism comparisons](resource-mechanisms.md).
-Explicit configurations can limit a qualified slow filesystem to one worker.
+No storage-media lookup runs on any OS. A media label does not establish
+filesystem latency, no hosted runner can qualify a slow disk, and the lookups
+cost resident memory (Windows disk kinds 18–55 KiB, the macOS IOKit query
+56 KiB) without changing a selected pool width. Explicit configurations can
+limit a qualified slow filesystem to one storage worker.
 
 macOS blocking jobs use scoped user-initiated QoS; catalog recovery temporarily
 uses utility QoS. The thread-bound guard restores the enclosing class even when
@@ -69,10 +61,6 @@ when detached and fully idle. Session and process ownership stay with their
 actors, including when a new attachment arrives during reclamation. Attached
 sessions, pending approvals, active work and process owners remain live. Cancellation releases the source's callback only
 after event delivery ends. There is no pressure timer or allocator trim call.
-
-Page size comes from `sysconf(_SC_PAGESIZE)` or `GetSystemInfo`, rather than an
-architecture constant. Native Apple silicon and Intel therefore keep their
-actual page granularity.
 
 ## Allocators
 
@@ -101,10 +89,13 @@ the allocator; no replacement allocator is selected from idle RSS alone.
 
 ## Channel policy
 
-The single-value handoff wraps maintained `oneshot` 0.2 with its async and std
-features. The adapter preserves `Option<T>` cancellation and a consuming send,
-without type erasure or a second payload allocation. The crate has no runtime
-dependencies.
+The single-value handoff is one type-erased slot for every payload type: a
+box and a downcast per value instead of a channel's code per type. Its waker
+runs, and a displaced waker drops, after the slot's lock is released, so a
+waker may poll its own receiver (`cancellation_allows_a_waker_to_poll_its_receiver`).
+Maintained `oneshot` 0.2 is faster in the primitive table below, but in the
+daemon it added 31 KiB [26, 36] and 46 KiB [3, 91] idle RSS on Linux
+aarch64/x86_64 and 3.2% large-JSON CPU on Windows x86_64, so it is not taken.
 
 The streaming queue retains a growable ring under one mutex. It counts blocked
 producers so a receive signals space only when someone is actually waiting.
@@ -150,7 +141,7 @@ one allocation plus eight reallocations on Linux/Windows; native mutex
 initialization adds an allocation on macOS. futures-channel allocates for each
 message. These cumulative counters do not measure peak live memory or RSS.
 
-The retained ring earns its custom implementation through fewer allocation operations and faster sustained messages in these observations. Single-use channel construction can favor futures-channel; these measurements do not claim superiority for every workload. The maintained oneshot reduces both handoff time and allocated bytes.
+The retained ring earns its custom implementation through fewer allocation operations and faster sustained messages in these observations. Single-use channel construction can favor futures-channel; these measurements do not claim superiority for every workload. The maintained oneshot reduces both handoff time and allocated bytes; the daemon-level comparison above outweighs it.
 
 CPU jobs compare ceilings of 4, 8 and 31 using a simulated 32-core configuration, 64 one-MiB jobs and five alternating-order rounds. The table reports actual effective CPUs alongside the simulated configuration. Medians, ms:
 
@@ -191,7 +182,7 @@ Idle RSS is sampled after three seconds. Idle CPU is a ten-second native counter
 | Windows aarch64 | -6.33% | +0.03% | -3.77% | +0.08% | +0.00% |
 | Windows x86_64 | +10.40% | +0.11% | -1.38% | +0.03% | +5.13% |
 
-The macOS Intel driver CPU median rises 38.03%, with reference samples spanning 3.93–6.01 s and candidate samples 3.99–6.14 s; the unchanged decode control rises 21.10%. These observations do not isolate a cause. Windows x86_64 driver CPU rises 10.40% and cold reply rises 7.56%; its decode control rises 5.13%. The samples are retained without attributing the regressions solely to the runtime change or solely to runner variation.
+The macOS Intel driver CPU median rises 38.03%, with reference samples spanning 3.93–6.01 s and candidate samples 3.99–6.14 s; the unchanged decode control rises 21.10%. Windows x86_64 driver CPU rises 10.40% and cold reply rises 7.56%; its decode control rises 5.13%. Neither CPU regression survives 20 matched rounds of the same comparison: driver CPU is −2.88% [−8.72, +3.65] on Intel macOS and +0.27% [−4.35, +5.08] on Windows x86_64. The idle RSS increase does survive, and the [mechanism comparisons](resource-mechanisms.md) attribute it.
 
 The decode control uses unchanged provider-decoder code. The tables retain small shifts rather than classifying every median difference as a performance win or loss. These three/four-CPU VMs do not establish physical many-core throughput.
 
@@ -206,7 +197,7 @@ acceptance, Linux/macOS release budgets, Swift/FFI tests and the app build,
 Miri, fuzzing, dependency checks, the Windows platform lint and the no-Tokio
 check. The paired run above uses the same source and main baseline.
 
-Invariant tests cover affinity and CPU-set restrictions, QoS restoration,
+Invariant tests cover affinity and CPU-set restrictions, QoS restoration, reentrant oneshot wakes,
 pressure callback lifetime, single-worker catalog reconstruction, blocked
 producer cancellation and cache rebuild equivalence. Reclamation preserves
 attached sessions, pending approvals and process ownership. The preservation tests
@@ -226,9 +217,8 @@ exit before the child is reaped.
 - [Windows job CPU rates](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_cpu_rate_control_information)
 - [Current-job query and nested jobs](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-queryinformationjobobject)
 - [Apple pressure source](https://developer.apple.com/documentation/dispatch/dispatch_source_type_memorypressure)
-- [sysinfo disk interface](https://docs.rs/sysinfo/0.39.6/sysinfo/struct.Disks.html)
 
-Hosted VM storage flags are not real-HDD latency tests. A simulated 32-core
+A simulated 32-core
 configuration on a small VM measures oversubscription, not a 32-core host.
 Hardware power loss, battery/thermal policy and injected system-wide memory
 pressure require separate hardware qualification. These checks preserve
