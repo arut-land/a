@@ -7,6 +7,15 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[test]
+fn diagnosing_stopping_and_reading_logs_never_install_an_executable() {
+    let env = Isolated::new("administration");
+    for action in ["status", "log", "stop"] {
+        env.run(&["daemon", action]);
+        assert!(!env.home.runtime().dir().exists());
+    }
+}
+
+#[test]
 fn concurrent_starters_share_one_daemon_and_stop_releases_its_lock() {
     let env = Isolated::new("concurrent");
     let clients: Vec<_> = (0..8)

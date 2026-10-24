@@ -68,6 +68,7 @@ never addresses the user's default home.
 | Measurement | Repetitions and boundary |
 | --- | --- |
 | Startup | 10 warmups, 100 launches each of shipped `a --version` and a native empty Rust executable |
+| First run | Five fresh homes; initial `ls`, including immutable build installation and daemon startup |
 | Cold first reply | Five fresh homes; stage once, stop, then line REPL spawn through first session line |
 | Attach | Five independent daemons; ten recorded echo turns; 500 connect/hello/attach/replays each, through `Synced` |
 | Idle | Five homes; daemon RSS at three seconds; CPU after fifteen seconds settling, then ten seconds with no profiling |

@@ -10,6 +10,8 @@ ext-logging.workspace = true
 protocol.workspace = true
 sys.workspace = true
 serde_json.workspace = true
+# The remote verifies uploads with POSIX `cksum`, the one digest every host has.
+crc = "3.2"
 
 [lints]
 workspace = true

@@ -76,7 +76,12 @@ fn fake_remote(env: &mut Env, uname: &str) -> (Command, Home) {
             r#"shift
 printf '%s\n' "$*" >> {log}
 [ "$*" = "uname -sm" ] && [ -n '{uname}' ] && {{ echo '{uname}'; exit; }}
-cd {remote} && exec env A_HOME={home} HOME={remote} PATH=/usr/bin:/bin sh -c "$*"
+cd {remote} || exit
+# A connection cut mid-upload: the remote sees a clean EOF.
+case "${{A_TEST_CUT:-}} $*" in [0-9]*"cat > "*)
+    head -c "$A_TEST_CUT" | env A_HOME={home} HOME={remote} PATH=/usr/bin:/bin sh -c "$*"; exit;;
+esac
+exec env A_HOME={home} HOME={remote} PATH=/usr/bin:/bin sh -c "$*"
 "#,
             log = quote(&env.root.join("ssh.log")),
             remote = quote(&remote),
@@ -119,14 +124,14 @@ fn workspace_and_env(text: &str) -> (String, protocol::Environment) {
 }
 
 #[test]
-fn a_remote_upload_preserves_bytes_under_literal_paths() {
+fn a_host_reuses_its_installed_identity_when_discovery_is_lost() {
     let mut env = Env::new("install");
     let (mut new, host) = fake_remote(&mut env, "");
     let session = ok(&new.arg("new").output().unwrap());
 
     let current = fs::read_link(host.root().join("runtime/current")).unwrap();
     let installed = host.root().join("runtime").join(&current).join("a");
-    assert_eq!(fs::read(installed).unwrap(), fs::read(&env.exe).unwrap());
+    assert_eq!(fs::read(&installed).unwrap(), fs::read(&env.exe).unwrap());
     assert!(host.sessions_dir().is_dir());
     assert!(!env.home.sessions_dir().exists(), "a session at home");
 
@@ -136,6 +141,55 @@ fn a_remote_upload_preserves_bytes_under_literal_paths() {
     assert!(listed.starts_with(session.trim()), "{listed}");
     let log = fs::read_to_string(env.root.join("ssh.log")).unwrap();
     assert_eq!(log.matches("uname -sm").count(), 1, "{log}");
+    // The remote root's command substitution stayed literal.
+    let remote = host.root().parent().unwrap();
+    assert!(!remote.join("injected").exists());
+    assert!(!env.root.join("injected").exists());
+
+    let modified = fs::metadata(&installed).unwrap().modified().unwrap();
+    fs::remove_file(host.runtime().dir().join("current")).unwrap();
+    let (mut ls, _) = fake_remote(&mut env, "");
+    assert!(ok(&ls.arg("ls").output().unwrap()).starts_with(session.trim()));
+    let log = fs::read_to_string(env.root.join("ssh.log")).unwrap();
+    assert_eq!(log.matches("cat > ").count(), 1, "{log}");
+    assert_eq!(
+        fs::metadata(installed).unwrap().modified().unwrap(),
+        modified
+    );
+}
+
+#[test]
+fn a_cut_remote_upload_is_never_published_or_reused() {
+    let mut env = Env::new("install-cut");
+    let (mut cut, host) = fake_remote(&mut env, "");
+    let output = cut.env("A_TEST_CUT", "4096").arg("ls").output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let runtime = host.root().join("runtime");
+    let published = fs::read_dir(&runtime)
+        .unwrap()
+        .filter(|id| id.as_ref().unwrap().path().join("a").exists())
+        .count();
+    assert_eq!(published, 0, "a partial image was published");
+
+    let (mut ls, _) = fake_remote(&mut env, "");
+    ok(&ls.arg("ls").output().unwrap());
+    let current = fs::read_link(runtime.join("current")).unwrap();
+    let installed = runtime.join(&current).join("a");
+    assert_eq!(fs::read(&installed).unwrap(), fs::read(&env.exe).unwrap());
+
+    // A partial image left by an older installer is replaced, not trusted.
+    let partial = runtime.join(&current).join("partial");
+    fs::write(&partial, &fs::read(&env.exe).unwrap()[..4096]).unwrap();
+    fs::set_permissions(
+        &partial,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    fs::rename(&partial, &installed).unwrap();
+    fs::remove_file(runtime.join("current")).unwrap();
+    let (mut ls, _) = fake_remote(&mut env, "");
+    ok(&ls.arg("ls").output().unwrap());
+    assert_eq!(fs::read(&installed).unwrap(), fs::read(&env.exe).unwrap());
 }
 
 #[test]

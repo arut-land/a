@@ -114,11 +114,21 @@ pub(crate) fn install(host: &str, staged: &Staged) -> io::Result<()> {
             "`a` is not installed on {host}, and this build is for {here}, not {uname:?}; install `a` there and retry"
         )));
     }
+    let (crc, size) = cksum(std::fs::File::open(&staged.exe)?)?;
+    // An image that does not match is a crash leftover from an interrupted
+    // upload, never a build to run.
+    let verify = format!(
+        r#"crc={crc} size={size}
+verify() {{ [ -x "$1" ] && set -- $(cksum < "$1") && [ "$1 $2" = "$crc $size" ]; }}"#
+    );
     let prepare = format!(
-        "{}\nmkdir -p \"$a_runtime/{}\" && cd \"$a_runtime/{}\" && pwd -P",
+        r#"{}
+{verify}
+if verify "$a_runtime/{id}/a"; then exit 0; fi
+umask 077
+mkdir -p "$a_runtime/{id}" && mktemp -d "$a_runtime/{id}/.install.XXXXXXXXXX""#,
         sys::RemoteLayout::for_platform(here).runtime_script(),
-        staged.id,
-        staged.id
+        id = staged.id,
     );
     let prepared = command("A_SSH", "ssh")
         .arg(host)
@@ -131,23 +141,30 @@ pub(crate) fn install(host: &str, staged: &Staged) -> io::Result<()> {
             String::from_utf8_lossy(&prepared.stderr).trim_end()
         )));
     }
+    if prepared.stdout.is_empty() {
+        return Ok(());
+    }
     let dir = String::from_utf8(prepared.stdout)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let dir = dir.strip_suffix('\n').ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "ssh: missing runtime directory")
     })?;
+    // A cut connection ends `cat` with a clean EOF, so only the checksum
+    // proves the upload whole. It is flushed before its name exists, and a
+    // concurrent installer may win, but a verified image is never replaced.
     let upload = format!(
         "{} -- '{}'",
-        sh(r#"set -eu
+        sh(&format!(
+            r#"set -u
 umask 077
-target=$1
-tmp=$(mktemp "$target.tmp.XXXXXXXXXX")
-trap 'rm -f "$tmp"' 0
+upload=$1
+{verify}
+trap 'rm -f "$upload/a"; rmdir "$upload"' 0
 trap 'exit 1' HUP INT TERM
-cat > "$tmp"
-chmod 700 "$tmp"
-mv -f "$tmp" "$target""#),
-        format!("{dir}/a").replace('\'', r"'\''")
+cat > "$upload/a" && chmod 700 "$upload/a" && verify "$upload/a" && sync || exit 1
+ln "$upload/a" "$upload/../a" 2>/dev/null || verify "$upload/../a" || mv -f "$upload/a" "$upload/../a""#
+        )),
+        dir.replace('\'', r"'\''")
     );
     let status = command("A_SSH", "ssh")
         .arg(host)
@@ -161,6 +178,28 @@ mv -f "$tmp" "$target""#),
             "ssh {host}: upload failed: {status}"
         )))
     }
+}
+
+/// POSIX `cksum` of a file: its CRC and its length.
+fn cksum(mut file: impl io::Read) -> io::Result<(u32, u64)> {
+    const CKSUM: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
+    let mut digest = CKSUM.digest();
+    let mut buf = vec![0; 64 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buf[..n]);
+        size += n as u64;
+    }
+    let mut len = size;
+    while len > 0 {
+        digest.update(&len.to_le_bytes()[..1]);
+        len >>= 8;
+    }
+    Ok((digest.finalize(), size))
 }
 
 fn command(var: &str, default: &str) -> Command {
@@ -184,6 +223,26 @@ pub(crate) fn token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_checksums_match_the_hosts_cksum() {
+        for len in [0, 1, 255, 256, 65_537, 200_003] {
+            let bytes: Vec<u8> = (0..len).map(|n: u32| (n * 31 % 251) as u8).collect();
+            let mut child = Command::new("cksum")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            io::Write::write_all(&mut child.stdin.take().unwrap(), &bytes).unwrap();
+            let out = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+            let (crc, size) = cksum(&bytes[..]).unwrap();
+            assert_eq!(
+                out.split_whitespace().collect::<Vec<_>>(),
+                [crc.to_string(), size.to_string()]
+            );
+        }
+    }
 
     #[test]
     fn quotes_scripts_for_the_login_shell() {

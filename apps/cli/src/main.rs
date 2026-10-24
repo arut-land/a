@@ -52,38 +52,45 @@ fn main() -> ExitCode {
     // end the process here.
     let args = Args::parse();
     let (prompt, mode) = (args.prompt, args.mode);
-    let result = daemon_of(args.host).and_then(|daemon| {
-        let done = match args.cmd {
-            None => return session(&daemon, Target::New, prompt, mode),
-            Some(Cmd::Resume { id: None, any }) => {
-                return session(&daemon, Target::Latest { any_workspace: any }, prompt, mode);
-            }
-            Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
-                return session(&daemon, Target::Prefix(id), prompt, mode);
-            }
-            Some(_) if prompt.is_some() => {
-                eprintln!("a: -p runs a turn: it takes no command but `resume` or `attach`");
-                return Ok(ExitCode::from(2));
-            }
-            Some(Cmd::Ls) => ls(&daemon),
-            Some(Cmd::New) => new(&daemon),
-            Some(Cmd::Fork { session }) => fork(&daemon, &session),
-            Some(Cmd::Bridge { token }) => client::bridge(
-                daemon.home()?,
-                token.as_deref().unwrap_or(&daemon.staged.id),
-            ),
-            Some(Cmd::Web { no_open }) => web(daemon, !no_open),
-            Some(Cmd::Daemon { action }) => daemon_cmd(&daemon, action),
-            Some(Cmd::Serve {
-                login,
-                listen_fd,
-                detached,
-                lock_fd,
-                reset_breaker,
-            }) => serve(&daemon, listen_fd, lock_fd, reset_breaker, detached, login),
-        };
-        done.map(|()| ExitCode::SUCCESS)
-    });
+    let result = match args.cmd {
+        Some(Cmd::Daemon { action }) if prompt.is_none() => {
+            daemon_cmd(args.host, action).map(|()| ExitCode::SUCCESS)
+        }
+        cmd => daemon_of(args.host).and_then(|daemon| {
+            let done = match cmd {
+                None => return session(&daemon, Target::New, prompt, mode),
+                Some(Cmd::Resume { id: None, any }) => {
+                    return session(&daemon, Target::Latest { any_workspace: any }, prompt, mode);
+                }
+                Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
+                    return session(&daemon, Target::Prefix(id), prompt, mode);
+                }
+                Some(_) if prompt.is_some() => {
+                    eprintln!("a: -p runs a turn: it takes no command but `resume` or `attach`");
+                    return Ok(ExitCode::from(2));
+                }
+                Some(Cmd::Ls) => ls(&daemon),
+                Some(Cmd::New) => new(&daemon),
+                Some(Cmd::Fork { session }) => fork(&daemon, &session),
+                Some(Cmd::Bridge { token }) => client::bridge(
+                    daemon.home()?,
+                    token.as_deref().unwrap_or(&daemon.staged.id),
+                ),
+                Some(Cmd::Web { no_open }) => web(daemon, !no_open),
+                Some(Cmd::Daemon { .. }) => {
+                    unreachable!("daemon commands are handled before installation")
+                }
+                Some(Cmd::Serve {
+                    login,
+                    listen_fd,
+                    detached,
+                    lock_fd,
+                    reset_breaker,
+                }) => serve(&daemon, listen_fd, lock_fd, reset_breaker, detached, login),
+            };
+            done.map(|()| ExitCode::SUCCESS)
+        }),
+    };
     match result {
         Ok(code) => code,
         Err(e) => {
@@ -124,8 +131,8 @@ fn write(mut output: impl Write + IsTerminal, stream: usize, args: fmt::Argument
     }
 }
 
-/// The daemon to talk to, as this build: every entry point stages itself
-/// first, so the daemon it may spawn runs the newest build.
+/// Entry points that attach resolve their installed image first, so a daemon
+/// they may spawn runs the newest installed build.
 fn daemon_of(host: Option<String>) -> io::Result<client::Daemon> {
     let home = Home::from_env()?;
     let staged = home.runtime().stage(&std::env::current_exe()?)?;
@@ -156,19 +163,24 @@ fn wedged(daemon: &client::Daemon, e: client::Error) -> io::Error {
 
 const RESTART: &str = "run `a daemon restart` to replace it";
 
-fn daemon_cmd(daemon: &client::Daemon, action: Daemon) -> io::Result<()> {
-    let home = daemon.home()?;
+fn daemon_cmd(host: Option<String>, action: Daemon) -> io::Result<()> {
+    if let Some(host) = host {
+        return Err(io::Error::other(format!(
+            "this command acts on this machine; run it on {host} instead"
+        )));
+    }
+    let home = Home::from_env()?;
     match action {
         Daemon::Autostart {
             state: Autostart::On,
         } => {
-            sys::autostart::enable(home)?;
+            sys::autostart::enable(&home)?;
             sayln!("autostart on: the daemon starts at login and stays up");
         }
         Daemon::Autostart {
             state: Autostart::Off,
         } => {
-            sys::autostart::disable(home)?;
+            sys::autostart::disable(&home)?;
             sayln!("autostart off: the daemon starts on first use and exits when idle");
         }
         Daemon::Log => match std::fs::read_to_string(home.daemon_log()) {
@@ -177,8 +189,8 @@ fn daemon_cmd(daemon: &client::Daemon, action: Daemon) -> io::Result<()> {
             Err(e) => return Err(e),
         },
         Daemon::Status => {
-            let d = client::diagnose(home);
-            match (d.pid, client::status(home)) {
+            let d = client::diagnose(&home);
+            match (d.pid, client::status(&home)) {
                 (None, _) | (_, Ok(None)) => sayln!("not running"),
                 (_, Ok(Some(s))) => sayln!(
                     "running (pid {}, {}), {} sessions, {} other clients",
@@ -195,11 +207,12 @@ fn daemon_cmd(daemon: &client::Daemon, action: Daemon) -> io::Result<()> {
             }
         }
         Daemon::Stop => {
-            let stopped = client::stop(home)?;
+            let stopped = client::stop(&home)?;
             sayln!("{}", if stopped { "stopped" } else { "not running" });
         }
         Daemon::Restart => {
-            daemon.restart()?;
+            let installed = home.runtime().stage(&std::env::current_exe()?)?;
+            client::Daemon::local(home, installed).restart()?;
             sayln!("restarted");
         }
     }
