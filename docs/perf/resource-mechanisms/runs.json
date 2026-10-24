@@ -1,31 +1,35 @@
 [
   {
-    "mechanism": "qos",
+    "mechanism": "qos-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-no-qos",
     "sha": "3a06b92627ec2dd62c91fdad976dc2e5eeb381e0",
     "target": "macos-15-intel",
-    "run_id": 40052131160
+    "run_id": 40052131160,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
-    "mechanism": "pressure",
+    "mechanism": "pressure-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-no-pressure",
     "sha": "0a1e9eacea8ed7dbd601c4c5ab05d1998aa6e9a1",
     "target": "macos-15-intel",
-    "run_id": 40052133341
+    "run_id": 40052133341,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
-    "mechanism": "storage",
+    "mechanism": "storage-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-no-storage",
     "sha": "2dbed959d412407ec4d7a3f44a08c05b76146e7c",
     "target": "macos-15-intel",
-    "run_id": 40052135284
+    "run_id": 40052135284,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
-    "mechanism": "workers",
+    "mechanism": "workers-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-no-workers",
     "sha": "208fc9fc8bbf5e4df5836b899b7fbe06b68ddcbe",
     "target": "macos-15-intel",
-    "run_id": 40052137580
+    "run_id": 40052137580,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
     "mechanism": "cpus",
@@ -35,11 +39,12 @@
     "run_id": 40052139824
   },
   {
-    "mechanism": "oneshot",
+    "mechanism": "oneshot-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-no-oneshot",
     "sha": "e7345f73d77f9f1f77ac194d2dcf1b221b7ad892",
     "target": "macos-15-intel",
-    "run_id": 40052142398
+    "run_id": 40052142398,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
     "mechanism": "catalog-original-probe",
@@ -50,11 +55,12 @@
     "superseded_reason": "restore original min(headers,4) replay thread bound"
   },
   {
-    "mechanism": "qos",
+    "mechanism": "qos-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-no-qos",
     "sha": "3a06b92627ec2dd62c91fdad976dc2e5eeb381e0",
     "target": "macos-latest",
-    "run_id": 40052147304
+    "run_id": 40052147304,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
     "mechanism": "pressure",
@@ -100,32 +106,36 @@
     "superseded_reason": "restore original min(headers,4) replay thread bound"
   },
   {
-    "mechanism": "pressure",
+    "mechanism": "pressure-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-no-pressure",
     "sha": "0a1e9eacea8ed7dbd601c4c5ab05d1998aa6e9a1",
     "target": "macos-latest",
-    "run_id": 40052164158
+    "run_id": 40052164158,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
-    "mechanism": "storage",
+    "mechanism": "storage-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-no-storage",
     "sha": "2dbed959d412407ec4d7a3f44a08c05b76146e7c",
     "target": "macos-latest",
-    "run_id": 40052166337
+    "run_id": 40052166337,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
-    "mechanism": "workers",
+    "mechanism": "workers-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-no-workers",
     "sha": "208fc9fc8bbf5e4df5836b899b7fbe06b68ddcbe",
     "target": "macos-latest",
-    "run_id": 40052168784
+    "run_id": 40052168784,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
-    "mechanism": "oneshot",
+    "mechanism": "oneshot-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-no-oneshot",
     "sha": "e7345f73d77f9f1f77ac194d2dcf1b221b7ad892",
     "target": "macos-latest",
-    "run_id": 40052171262
+    "run_id": 40052171262,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
     "mechanism": "catalog-original-probe",
@@ -265,11 +275,12 @@
     "run_id": 40053393602
   },
   {
-    "mechanism": "compact-oneshot",
+    "mechanism": "compact-oneshot-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-compact-oneshot",
     "sha": "e4426ff3b986a5bbde11376527134b2f64975f99",
     "target": "macos-15-intel",
-    "run_id": 40053396046
+    "run_id": 40053396046,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
     "mechanism": "compact-oneshot",
@@ -293,25 +304,28 @@
     "run_id": 40053403641
   },
   {
-    "mechanism": "compact-oneshot",
+    "mechanism": "compact-oneshot-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-compact-oneshot",
     "sha": "e4426ff3b986a5bbde11376527134b2f64975f99",
     "target": "macos-latest",
-    "run_id": 40053405708
+    "run_id": 40053405708,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
-    "mechanism": "worker-qos",
+    "mechanism": "worker-qos-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-worker-qos",
     "sha": "423a3ee4a8561e88b0dd3f76e8ae26deccfddb19",
     "target": "macos-15-intel",
-    "run_id": 40054850976
+    "run_id": 40054850976,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
-    "mechanism": "worker-qos",
+    "mechanism": "worker-qos-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-worker-qos",
     "sha": "423a3ee4a8561e88b0dd3f76e8ae26deccfddb19",
     "target": "macos-latest",
-    "run_id": 40054853496
+    "run_id": 40054853496,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
     "mechanism": "sham",
@@ -328,11 +342,12 @@
     "run_id": 40057998235
   },
   {
-    "mechanism": "sham",
+    "mechanism": "sham-unbounded-diagnostic-probe",
     "branch": "codex-w5rt",
     "sha": "e2b56c644a0f5456c639225352cf219db1069230",
     "target": "macos-15-intel",
-    "run_id": 40058000287
+    "run_id": 40058000287,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
     "mechanism": "sham",
@@ -349,11 +364,12 @@
     "run_id": 40058006129
   },
   {
-    "mechanism": "sham",
+    "mechanism": "sham-unbounded-diagnostic-probe",
     "branch": "codex-w5rt",
     "sha": "e2b56c644a0f5456c639225352cf219db1069230",
     "target": "macos-latest",
-    "run_id": 40058008370
+    "run_id": 40058008370,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
     "mechanism": "native-pressure",
@@ -384,25 +400,28 @@
     "run_id": 40058969687
   },
   {
-    "mechanism": "native-pressure",
+    "mechanism": "native-pressure-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-native-pressure",
     "sha": "de119945b48c3ae0f35bd8bdba752d8a2247b6d2",
     "target": "macos-15-intel",
-    "run_id": 40058971891
+    "run_id": 40058971891,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
-    "mechanism": "native-pressure",
+    "mechanism": "native-pressure-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-native-pressure",
     "sha": "de119945b48c3ae0f35bd8bdba752d8a2247b6d2",
     "target": "macos-latest",
-    "run_id": 40058974015
+    "run_id": 40058974015,
+    "superseded_reason": "macOS psutil memory_full_info can block indefinitely; retain timed samples and bound diagnostics"
   },
   {
-    "mechanism": "catalog",
+    "mechanism": "catalog-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-no-catalog",
     "sha": "8bc2a3e5b6f877c29ce6b906dc925a2ac6571454",
     "target": "macos-15-intel",
-    "run_id": 40062672415
+    "run_id": 40062672415,
+    "superseded_reason": "bound macOS memory diagnostics"
   },
   {
     "mechanism": "catalog",
@@ -412,11 +431,12 @@
     "run_id": 40062674383
   },
   {
-    "mechanism": "catalog",
+    "mechanism": "catalog-unbounded-diagnostic-probe",
     "branch": "codex-w5rt-no-catalog",
     "sha": "8bc2a3e5b6f877c29ce6b906dc925a2ac6571454",
     "target": "macos-latest",
-    "run_id": 40062676519
+    "run_id": 40062676519,
+    "superseded_reason": "bound macOS memory diagnostics"
   },
   {
     "mechanism": "catalog",
@@ -438,5 +458,165 @@
     "sha": "8bc2a3e5b6f877c29ce6b906dc925a2ac6571454",
     "target": "ubuntu-24.04-arm",
     "run_id": 40062683521
+  },
+  {
+    "mechanism": "qos",
+    "branch": "codex-w5rt-no-qos",
+    "sha": "3a06b92627ec2dd62c91fdad976dc2e5eeb381e0",
+    "target": "macos-15-intel",
+    "run_id": 40062746307,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "pressure",
+    "branch": "codex-w5rt-no-pressure",
+    "sha": "0a1e9eacea8ed7dbd601c4c5ab05d1998aa6e9a1",
+    "target": "macos-15-intel",
+    "run_id": 40062748277,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "storage",
+    "branch": "codex-w5rt-no-storage",
+    "sha": "2dbed959d412407ec4d7a3f44a08c05b76146e7c",
+    "target": "macos-15-intel",
+    "run_id": 40062750622,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "workers",
+    "branch": "codex-w5rt-no-workers",
+    "sha": "208fc9fc8bbf5e4df5836b899b7fbe06b68ddcbe",
+    "target": "macos-15-intel",
+    "run_id": 40062752765,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "oneshot",
+    "branch": "codex-w5rt-no-oneshot",
+    "sha": "e7345f73d77f9f1f77ac194d2dcf1b221b7ad892",
+    "target": "macos-15-intel",
+    "run_id": 40062754991,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "qos",
+    "branch": "codex-w5rt-no-qos",
+    "sha": "3a06b92627ec2dd62c91fdad976dc2e5eeb381e0",
+    "target": "macos-latest",
+    "run_id": 40062756908,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "pressure",
+    "branch": "codex-w5rt-no-pressure",
+    "sha": "0a1e9eacea8ed7dbd601c4c5ab05d1998aa6e9a1",
+    "target": "macos-latest",
+    "run_id": 40062758766,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "storage",
+    "branch": "codex-w5rt-no-storage",
+    "sha": "2dbed959d412407ec4d7a3f44a08c05b76146e7c",
+    "target": "macos-latest",
+    "run_id": 40062760863,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "workers",
+    "branch": "codex-w5rt-no-workers",
+    "sha": "208fc9fc8bbf5e4df5836b899b7fbe06b68ddcbe",
+    "target": "macos-latest",
+    "run_id": 40062763003,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "oneshot",
+    "branch": "codex-w5rt-no-oneshot",
+    "sha": "e7345f73d77f9f1f77ac194d2dcf1b221b7ad892",
+    "target": "macos-latest",
+    "run_id": 40062765147,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "compact-oneshot",
+    "branch": "codex-w5rt-compact-oneshot",
+    "sha": "e4426ff3b986a5bbde11376527134b2f64975f99",
+    "target": "macos-15-intel",
+    "run_id": 40062767300,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "compact-oneshot",
+    "branch": "codex-w5rt-compact-oneshot",
+    "sha": "e4426ff3b986a5bbde11376527134b2f64975f99",
+    "target": "macos-latest",
+    "run_id": 40062769758,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "worker-qos",
+    "branch": "codex-w5rt-worker-qos",
+    "sha": "423a3ee4a8561e88b0dd3f76e8ae26deccfddb19",
+    "target": "macos-15-intel",
+    "run_id": 40062771946,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "worker-qos",
+    "branch": "codex-w5rt-worker-qos",
+    "sha": "423a3ee4a8561e88b0dd3f76e8ae26deccfddb19",
+    "target": "macos-latest",
+    "run_id": 40062774070,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "sham",
+    "branch": "codex-w5rt",
+    "sha": "e2b56c644a0f5456c639225352cf219db1069230",
+    "target": "macos-15-intel",
+    "run_id": 40062776136,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "sham",
+    "branch": "codex-w5rt",
+    "sha": "e2b56c644a0f5456c639225352cf219db1069230",
+    "target": "macos-latest",
+    "run_id": 40062777985,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "native-pressure",
+    "branch": "codex-w5rt-native-pressure",
+    "sha": "de119945b48c3ae0f35bd8bdba752d8a2247b6d2",
+    "target": "macos-15-intel",
+    "run_id": 40062780386,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "native-pressure",
+    "branch": "codex-w5rt-native-pressure",
+    "sha": "de119945b48c3ae0f35bd8bdba752d8a2247b6d2",
+    "target": "macos-latest",
+    "run_id": 40062782799,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "catalog",
+    "branch": "codex-w5rt-no-catalog",
+    "sha": "8bc2a3e5b6f877c29ce6b906dc925a2ac6571454",
+    "target": "macos-15-intel",
+    "run_id": 40062821905,
+    "harness": "8e80fcad"
+  },
+  {
+    "mechanism": "catalog",
+    "branch": "codex-w5rt-no-catalog",
+    "sha": "8bc2a3e5b6f877c29ce6b906dc925a2ac6571454",
+    "target": "macos-latest",
+    "run_id": 40062825847,
+    "harness": "8e80fcad"
   }
 ]

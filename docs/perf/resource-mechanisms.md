@@ -18,7 +18,9 @@ retains individual matched pairs, user/kernel CPU, wall time, peak RSS, idle RSS
 idle CPU, cold reply and attach latency. Runtime facts record effective and
 standard CPU counts, page bytes, detected medium and selected pool widths.
 Memory-map diagnostics run after the idle accounting window. Compilers and
-profilers do not run during timing. No observations are discarded.
+profilers do not run during timing. Run provenance retains failures, superseded setup variants and partial rounds.
+Primary comparisons use complete matched lanes; incomplete lanes remain diagnostic
+evidence and are not silently retried into successful measurements.
 
 The analysis reports enabled-minus-disabled memory costs and paired time ratios,
 with bootstrap intervals over complete pairs and both run orders inspected.
@@ -92,4 +94,31 @@ worker counts.
 
 ## Decisions
 
-Pending hosted results.
+Windows storage lookup is removed. Its enabled-minus-disabled idle cost is
+55.4 KiB [31.6, 80.2] on x86_64 and 18.2 KiB [10.0, 26.8] on aarch64
+(20 paired rounds, bootstrap 95% intervals). It changes neither target's selected
+pool widths; ARM reports unknown media even with the query. On x86_64 cold reply
+cost is 1.88% [0.91, 2.95]. These costs have no qualified slow-disk benefit.
+The remaining decisions await the complete comparisons and same-build controls.
+
+## Incomplete runs
+
+The initial catalog-off probe incorrectly started four replay threads even for
+an empty store. The corrected probe retains the original `min(headers, 4)`
+bound. The run manifest identifies both revisions and their supersession reason.
+
+Run 40052161443 failed after eight pairs when the unchanged full-reference
+Windows daemon stopped responding to a resume request. Its daemon log has no
+panic. A separate isolated availability campaign compares full, main, compact
+oneshot and a foreground traced daemon, preserving failures before cleanup.
+The cause is unresolved; it is not attributed to catalog admission.
+
+Run 40052186159 failed in the catalog-off Windows ARM benchmark after five
+pairs. Hyperfine did not expose the benchmark's failure output, so its cause is
+unresolved. The corrected catalog probe is measured separately.
+
+Run 40052168784 stalled in macOS `psutil.memory_full_info`, after idle timing,
+until the job timeout. Subsequent Mac diagnostics use a bounded `vmmap` subprocess
+and record diagnostic timeouts without extending the measured idle window.
+Queued and unfinished Mac lanes using the unbounded probe were superseded;
+completed lanes retain their original observations.
