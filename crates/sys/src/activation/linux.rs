@@ -1,4 +1,5 @@
 use super::{Command, Home, Listener, PathBuf, forget, installed, io, prepare, run};
+use std::fmt::Write as _;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 
@@ -70,7 +71,7 @@ fn service(home: &Home, socket: &str) -> io::Result<String> {
             let mut assignment = key.to_os_string();
             assignment.push("=");
             assignment.push(value);
-            settings.push_str(&format!("Environment={}\n", quote(Path::new(&assignment))?));
+            let _ = writeln!(settings, "Environment={}", quote(Path::new(&assignment))?);
         }
     }
     Ok(format!(

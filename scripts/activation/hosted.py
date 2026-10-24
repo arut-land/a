@@ -138,7 +138,7 @@ try:
         selected = (upgrade_runtime / "current").readlink().name
         assert selected != previous, "upgrade probe needs distinct older/newer executables"
         (upgrade_config / "config.toml").write_text('[daemon]\nagent = "echo"\nidle_secs = 60\n')
-        reply = command("activation-upgrade", environment=upgrade_env).stdout
+        reply = command("-p", "activation-upgrade", environment=upgrade_env).stdout
         assert "activation-upgrade" in reply, "selected fixture daemon did not execute its echo agent"
         assert (upgrade_run / "daemon.pid").read_text().splitlines()[3] == selected
     finally:
