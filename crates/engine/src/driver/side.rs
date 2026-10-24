@@ -466,10 +466,11 @@ impl Actor {
             entry = self.indexed_entry(input).await.map_err(|e| e.to_string())?;
         }
         let (text, keyed) = match &entry.body {
-            Body::Enqueue { envelope } => (envelope.payload.as_str(), true),
-            Body::Input { text, .. } => (text.as_str(), false),
+            Body::Enqueue { envelope } => (envelope.payload.clone(), true),
+            Body::Input { segments, .. } => (segments.text(), false),
             _ => return Err("model-only turn has no admitted input".into()),
         };
+        let text = text.as_str();
         let (turn, prefix) = keyed
             .then(|| ext::ModelTurn::from_intent(text).ok())
             .flatten()

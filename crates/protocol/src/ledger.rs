@@ -245,7 +245,7 @@ impl Ledger {
                 }
             }
             Body::Input {
-                text,
+                segments,
                 mode,
                 taken,
                 origin,
@@ -256,7 +256,7 @@ impl Ledger {
                 } else {
                     self.untaken.push_back(Queued {
                         seq,
-                        text: text.clone(),
+                        text: segments.text(),
                         steer: *mode == Mode::Steer,
                     });
                 }

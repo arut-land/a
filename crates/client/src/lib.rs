@@ -20,7 +20,7 @@ pub use submission::{Submission, SubmissionId, SubmissionState};
 mod watch;
 
 pub use approval::{ApprovalPart, approval_parts, approval_text};
-pub use command::{COMMANDS, Cmd, Command, help, parse};
+pub use command::{COMMANDS, Cmd, Command, help, parse, parse_input};
 pub use drive::{ClientHandle, Driver, Renderer, pump};
 pub use inbox::{Inbox, PUMP_BATCH, Post, QueueBudget, inbox};
 pub use session::{

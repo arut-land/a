@@ -90,8 +90,10 @@ impl Fold {
         let body = &e.body;
         match body {
             Body::Input {
-                text, taken: true, ..
-            } => self.user(text, registry),
+                segments,
+                taken: true,
+                ..
+            } => self.user(&segments.text(), registry),
             Body::Take { input } => {
                 let queued = self.ledger.untaken().iter().find(|q| q.seq == *input)?;
                 // A steer taken just before a model call is the model's to

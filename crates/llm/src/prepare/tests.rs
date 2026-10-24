@@ -8,8 +8,8 @@ use crate::spec::{Assistant, Meta, Origin, Reasoning, Request, Text, ToolCall, U
 struct Short;
 
 impl Protocol for Short {
-    fn key(&self) -> crate::ProtocolKey {
-        crate::ProtocolKey::OpenaiChat
+    fn key(&self) -> ProtocolKey {
+        ProtocolKey::OpenaiChat
     }
 
     fn encode(&self, _: &Target<'_>, _: &Request) -> Result<Encoded, Error> {
@@ -31,7 +31,7 @@ fn provider() -> Provider {
 
 fn origin(model: &str) -> Origin {
     Origin {
-        protocol: crate::ProtocolKey::OpenaiChat,
+        protocol: ProtocolKey::OpenaiChat,
         provider: "p".into(),
         model: model.into(),
     }
@@ -219,7 +219,7 @@ fn a_foreign_turn_that_was_only_redacted_reasoning_disappears() {
 fn legal_and_normalised_call_ids_remain_distinct_and_results_follow_them() {
     for ids in [["a.b", "a_b"], ["a_b", "a.b"]] {
         let mut provider = provider();
-        provider.protocol = std::sync::Arc::new(crate::protocols::gemini::Gemini::default());
+        provider.protocol = std::sync::Arc::new(gemini::Gemini::default());
         let request = Request {
             messages: vec![
                 Message::Assistant(Assistant {
@@ -261,7 +261,7 @@ fn separate_turns_keep_distinct_ids_and_all_results_even_with_native_calls() {
     for ids in [["a.b", "a_b"], ["a_b", "a.b"]] {
         for native_at in [None, Some(0), Some(1)] {
             let mut provider = provider();
-            provider.protocol = std::sync::Arc::new(crate::protocols::gemini::Gemini::default());
+            provider.protocol = std::sync::Arc::new(gemini::Gemini::default());
             let mut messages = Vec::new();
             for (at, id) in ids.iter().enumerate() {
                 let mut part = call(id);

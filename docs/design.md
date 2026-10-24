@@ -80,6 +80,16 @@ are facts in the log. Streaming deltas are ephemeral until an outcome or
 progress entry records them. Essential facts that projections cannot rebuild
 still need an explicit logging audit (see milestones).
 
+Input is logged as segments: typed text, pastes, and pastes and attachments
+kept by reference, so a client shows a paste as a placeholder and the model
+reads it tagged. Whatever a model reads that no person typed is an
+`llm::Tag`, made by one renderer: `<pasted-content>`, `<steer from=…>`,
+`<message from=… channel=…>`, `<background-result call=… command=…>`, and
+another model's `<reasoning-summary source=…>` or `<reasoning source=…>`
+([llm.md](llm.md)). What the model is shown of a call's outcome is a pure
+point, `present_result`, which defaults to the tool's own `to_model`; the log
+keeps the outcome whole.
+
 ### Kernel and driver
 
 `kernel::Core::step(Event) -> Effects` is synchronous, does no I/O and reads

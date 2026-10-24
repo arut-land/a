@@ -363,9 +363,15 @@ struct SideAdmitted {
 }
 
 pub enum Request {
-    Input { text: String, mode: Mode },
+    Input {
+        segments: protocol::Segments,
+        mode: Mode,
+    },
     Interrupt,
-    Answer { call: CallId, value: Json },
+    Answer {
+        call: CallId,
+        value: Json,
+    },
 }
 
 enum Completion {
@@ -1544,8 +1550,8 @@ impl Actor {
         self.replies.clients.insert(ticket, reply);
         let ticket = Some(ticket);
         match request {
-            Request::Input { text, mode } => Event::Input {
-                text,
+            Request::Input { segments, mode } => Event::Input {
+                segments,
                 mode,
                 origin,
                 ticket,
@@ -2515,9 +2521,8 @@ const BURST: usize = 64;
 impl Live {
     /// Takes `text` in as a client's input, once committed.
     pub fn submit(&self, text: &str) -> Result<(), String> {
-        let text = text.to_owned();
         let input = Request::Input {
-            text,
+            segments: text.into(),
             mode: Mode::Queue,
         };
         rt::block_on(self.request(input, None))

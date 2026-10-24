@@ -406,7 +406,7 @@ fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
 fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
     let sleep = json!({ "seconds": 1 });
     let steered = Body::Input {
-        text: "twice".into(),
+        segments: "twice".into(),
         mode: Mode::Steer,
         taken: false,
         origin: None,
@@ -836,7 +836,7 @@ fn the_input_point_rewrites_or_refuses_input_before_it_is_logged() {
     echo().table(vec![
         (
             Event::Input {
-                text: "secret".into(),
+                segments: "secret".into(),
                 mode: Mode::Queue,
                 origin: None,
                 ticket: Some(Ticket(1)),
@@ -1174,7 +1174,7 @@ fn a_settled_call_cannot_write_and_stray_reports_change_nothing() {
 #[test]
 fn a_resend_runs_once() {
     let hi = |ticket| Event::Input {
-        text: "hi".into(),
+        segments: "hi".into(),
         mode: Mode::Queue,
         origin: Some(author(1)),
         ticket: Some(Ticket(ticket)),
@@ -1184,7 +1184,7 @@ fn a_resend_runs_once() {
         result: Ok(()),
     };
     let logged = Body::Input {
-        text: "hi".into(),
+        segments: "hi".into(),
         mode: Mode::Queue,
         taken: true,
         origin: Some(author(1)),

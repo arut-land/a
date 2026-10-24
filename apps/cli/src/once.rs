@@ -154,7 +154,9 @@ impl Once {
         }
         let mut effects = Vec::new();
         if let Some(mode) = &self.mode {
-            effects = self.client.run(client::Cmd::Input(format!("/mode {mode}")));
+            effects = self
+                .client
+                .run(client::Cmd::Input(format!("/mode {mode}").into()));
         }
         match self.client.submit(text) {
             Ok((id, sent)) => {
@@ -423,7 +425,7 @@ mod tests {
                     Seq::new(seq).unwrap(),
                     Epoch(0),
                     Body::Input {
-                        text: "same".into(),
+                        segments: "same".into(),
                         mode: Mode::Queue,
                         taken: true,
                         origin: Some(origin),

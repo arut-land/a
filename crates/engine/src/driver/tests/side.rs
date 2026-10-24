@@ -841,7 +841,7 @@ fn shutdown_never_admits_a_background_side_call_waiting_for_its_flush() {
     let (reply, ack) = oneshot::channel();
     session.send(Msg::Request {
         request: Request::Input {
-            text: "background".into(),
+            segments: "background".into(),
             mode: Mode::Queue,
         },
         origin: None,

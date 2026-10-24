@@ -732,7 +732,7 @@ impl Daemon {
                 live.set_env(env)?;
             }
             let input = Request::Input {
-                text: input,
+                segments: input.into(),
                 mode: Mode::Queue,
             };
             live.request(input, None).await.map_err(io::Error::other)?;
