@@ -52,10 +52,6 @@ pub(super) fn resolve() -> io::Result<Paths> {
 
 pub(super) fn daemon_env(_: &Paths, _: &mut Command) {}
 
-pub(super) fn remote_runtime_script() -> &'static str {
-    r#"a_runtime="$HOME/Library/Application Support/dev.a/runtime""#
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

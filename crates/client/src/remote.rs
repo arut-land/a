@@ -29,11 +29,7 @@ pub fn open(host: &str, staged: &Staged) -> io::Result<Connection> {
         return Ok(conn);
     }
     install(host, staged)?;
-    let installed = format!(
-        "{}\nexec \"$a_runtime/{}/a\" bridge {token}",
-        sys::Paths::remote_runtime_script(),
-        staged.id
-    );
+    let installed = installed_script(&staged.id, &token);
     bridge(host, &installed, &token)?
         .ok_or_else(|| io::Error::other(format!("the `a` installed on {host} does not run")))
 }
@@ -43,7 +39,14 @@ pub(crate) fn find_script(token: &str) -> String {
         r#"if command -v a >/dev/null 2>&1; then exec a bridge {token}; fi
 {}
 if [ -x "$a_runtime/current/a" ]; then exec "$a_runtime/current/a" bridge {token}; else exit {NOT_FOUND}; fi"#,
-        sys::Paths::remote_runtime_script()
+        sys::RemoteLayout::discovery_script()
+    )
+}
+
+pub(crate) fn installed_script(id: &str, token: &str) -> String {
+    format!(
+        "{}\nexec \"$a_runtime/{id}/a\" bridge {token}",
+        sys::RemoteLayout::for_platform(Platform::CURRENT).runtime_script()
     )
 }
 
@@ -113,7 +116,7 @@ pub(crate) fn install(host: &str, staged: &Staged) -> io::Result<()> {
     }
     let prepare = format!(
         "{}\nmkdir -p \"$a_runtime/{}\" && cd \"$a_runtime/{}\" && pwd -P",
-        sys::Paths::remote_runtime_script(),
+        sys::RemoteLayout::for_platform(here).runtime_script(),
         staged.id,
         staged.id
     );

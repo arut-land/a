@@ -7,6 +7,9 @@ use std::sync::Arc;
 
 use crate::Runtime;
 
+mod remote;
+pub use remote::RemoteLayout;
+
 #[cfg(target_os = "linux")]
 #[path = "paths/linux.rs"]
 mod native;
@@ -81,20 +84,6 @@ impl Paths {
             }
             None => native::resolve(),
         }
-    }
-
-    /// A POSIX bootstrap on a host matching this build sets `a_runtime` using
-    /// that host's environment, never the connecting client's home.
-    pub fn remote_runtime_script() -> String {
-        format!(
-            r#"if [ "${{A_HOME+x}}" = x ]; then
-[ -n "$A_HOME" ] || exit 1
-a_runtime="$A_HOME/runtime"
-else
-{}
-fi"#,
-            native::remote_runtime_script()
-        )
     }
 
     pub fn layout(&self) -> &InstallLayout {
@@ -257,7 +246,7 @@ mod tests {
             .arg("-c")
             .arg(format!(
                 "{}\nprintf '%s' \"$a_runtime\"",
-                Paths::remote_runtime_script()
+                RemoteLayout::for_platform(crate::Platform::CURRENT).runtime_script()
             ))
             .env_remove("A_HOME")
             .output()
@@ -274,7 +263,7 @@ mod tests {
         let root = std::env::temp_dir().join("a paths café");
         let script = format!(
             "{}\nprintf '%s' \"$a_runtime\"",
-            Paths::remote_runtime_script()
+            RemoteLayout::for_platform(crate::Platform::CURRENT).runtime_script()
         );
         let output = Command::new("sh")
             .args(["-c", &script])

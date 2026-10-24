@@ -138,6 +138,61 @@ fn a_host_without_a_gets_this_build_installed() {
 }
 
 #[test]
+fn native_remote_discovery_works_across_platforms_without_an_isolated_home() {
+    for uname in ["Linux x86_64", "Darwin arm64"] {
+        let env = Env::new("remote-native-layout");
+        let home = env.root.join("remote home");
+        let data = env.root.join("remote data");
+        let platform = sys::Platform::from_uname(uname).unwrap();
+        let runtime = Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "{}\nprintf '%s' \"$a_runtime\"",
+                    sys::RemoteLayout::for_platform(platform).runtime_script()
+                ),
+            ])
+            .env_remove("A_HOME")
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", &data)
+            .output()
+            .unwrap();
+        assert!(runtime.status.success());
+        let runtime = std::path::PathBuf::from(String::from_utf8(runtime.stdout).unwrap());
+        let current = runtime.join("current");
+        fs::create_dir_all(&current).unwrap();
+        let marker = env.root.join("discovered");
+        let found = env.script(
+            "found",
+            &format!("printf '%s' \"$1\" > '{}'\nexit 7", marker.display()),
+        );
+        fs::rename(found, current.join("a")).unwrap();
+        let os = uname.split_whitespace().next().unwrap();
+        env.script("uname", &format!("printf '%s\\n' '{os}'"));
+        let ssh = env.script(
+            "ssh",
+            &format!(
+                "shift\nexec env -u A_HOME HOME='{home}' XDG_DATA_HOME='{data}' PATH='{bin}:/usr/bin:/bin' sh -c \"$*\"",
+                home = home.display(),
+                data = data.display(),
+                bin = env.root.display(),
+            ),
+        );
+        let output = env
+            .cmd(&["--host", "box", "ls"])
+            .env("A_SSH", ssh)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            fs::read_to_string(&marker).ok().as_deref(),
+            Some("bridge"),
+            "{uname}: {output:?}"
+        );
+    }
+}
+
+#[test]
 fn a_remote_session_runs_in_the_hosts_directory_and_environment() {
     let mut env = Env::new("remote-env");
     let (mut new, host) = fake_remote(&mut env, "");

@@ -43,6 +43,10 @@ pub struct Platform {
 }
 
 impl Platform {
+    pub(crate) fn os(self) -> Os {
+        self.os
+    }
+
     pub const CURRENT: Self = Self {
         #[cfg(target_os = "macos")]
         os: Os::Macos,

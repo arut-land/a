@@ -31,7 +31,9 @@ of an inherited `TMPDIR`.
 
 Linux ignores relative or empty XDG values. Defaults are `~/.config`,
 `~/.local/state`, `~/.local/share` and `~/.cache`. These conventions need no
-systemd, desktop session, D-Bus or glibc facility. A read-only configuration
+systemd, desktop session, D-Bus or glibc facility. Complete absolute XDG bases
+work without `HOME` or a passwd entry; home lookup occurs only when a base
+needs its default. A read-only configuration
 or network home can coexist with writable local state/cache using absolute
 `XDG_STATE_HOME` and `XDG_CACHE_HOME`. Retained output is durable state, never
 purgeable cache. The layout does not silently move sessions or claim remote
@@ -61,8 +63,11 @@ isolated instances pass `A_HOME`; native instances pass the resolved XDG bases
 on Linux and use native directory lookup on macOS/Windows. Native launches do
 not turn their state directory into an isolated `A_HOME`. Extension and skill
 loaders use the configuration root, while endpoint ownership uses the durable
-state root. SSH bootstrap uses the same backend to resolve the matching
-host's build directory, including that host's `A_HOME` or XDG overrides.
+state root. SSH discovery selects `sys::RemoteLayout` from the remote host's
+platform inside the SSH call, including that host's `A_HOME` or XDG overrides.
+It can find an installed remote build across client platforms; copying this
+build still requires a matching remote platform. Sync and async launch use
+the same layout scripts.
 There is no migration from older layouts.
 
 Executable staging remains `data/runtime` and retains its existing publication
