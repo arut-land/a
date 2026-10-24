@@ -376,5 +376,23 @@
     "run_id": 40053405708,
     "reference": "93344bb06d9096103ecf6ed18d2d78058a30791d",
     "rounds": 20
+  },
+  {
+    "mechanism": "worker-qos",
+    "branch": "codex-w5rt-worker-qos",
+    "sha": "423a3ee4a8561e88b0dd3f76e8ae26deccfddb19",
+    "target": "macos-15-intel",
+    "run_id": 40054850976,
+    "reference": "93344bb06d9096103ecf6ed18d2d78058a30791d",
+    "rounds": 20
+  },
+  {
+    "mechanism": "worker-qos",
+    "branch": "codex-w5rt-worker-qos",
+    "sha": "423a3ee4a8561e88b0dd3f76e8ae26deccfddb19",
+    "target": "macos-latest",
+    "run_id": 40054853496,
+    "reference": "93344bb06d9096103ecf6ed18d2d78058a30791d",
+    "rounds": 20
   }
 ]

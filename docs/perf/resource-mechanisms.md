@@ -62,6 +62,11 @@ wake/cancel code across payload types reduces resident code enough to offset
 the extra payload allocation. It has the same 20-round, six-target protocol.
 Its retention remains pending measurements.
 
+A worker-QoS variant keeps foreground priority for the lifetime of each owned
+blocking worker and retains catalog utility scopes. It removes per-job
+get/set/restore transitions while leaving the requested class during each job
+unchanged. Both native Mac targets use the same 20-round protocol.
+
 ## Decisions
 
 Pending hosted results.
