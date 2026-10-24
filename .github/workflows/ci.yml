@@ -26,13 +26,10 @@ jobs:
       fail-fast: false
       matrix:
         # Apple silicon and x86_64 Linux.
-        os: [macos-15, ubuntu-latest]
+        os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - &macos-sdk
-        if: runner.os == 'macOS'
-        run: echo "DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer" >> "$GITHUB_ENV"
       # mbx (the cargo wrapper in mise.toml) keeps compiled crates in its own
       # store; caching that store and the toolchain is what makes reruns fast.
       - &mbx-dir
@@ -70,7 +67,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15
+          - os: macos-latest
             strict: 0
           # Latency is held to the design's budgets on one lane.
           - os: ubuntu-latest
@@ -80,7 +77,6 @@ jobs:
       A_STRICT_BUDGETS: ${{ matrix.strict }}
     steps:
       - uses: actions/checkout@v7
-      - *macos-sdk
       - *mbx-dir
       - *cache
       - *mise
@@ -200,10 +196,9 @@ jobs:
   # reducer vectors and a live session through it in Swift, then the app
   # built headless with xcodebuild.
   apple:
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - *macos-sdk
       - *mbx-dir
       - *cache
       - uses: jdx/mise-action@v5
