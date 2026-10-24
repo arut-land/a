@@ -33,6 +33,14 @@ on:
         description: 'Optional reference source revision for interleaved same-runner tuning'
         default: ''
         type: string
+      paired_rounds:
+        description: 'Alternating reference/candidate rounds'
+        default: '5'
+        type: string
+      ablation:
+        description: 'Paired mechanism experiment; skip the separate unpaired suite'
+        default: false
+        type: boolean
       baseline_run:
         description: 'Optional bootstrap baseline run ID; otherwise latest successful main lane'
         default: ''
@@ -76,12 +84,14 @@ jobs:
     needs: matrix
     name: perf (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         runner: ${{ fromJSON(needs.matrix.outputs.runners) }}
     env:
+      PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
+      PERF_ABLATION: ${{ inputs.ablation || false }}
       PERF_VARIANT: ${{ inputs.variant || '{}' }}
       PERF_REFERENCE: ${{ inputs.paired_ref }}
       PERF_BUILD_ONLY: ${{ inputs.build_only }}
@@ -157,8 +167,13 @@ jobs:
       - name: Install the same measurement harness into the source checkout
         run: |
           python - <<'PY'
-          import shutil
-          for path in ['apps/cli/examples/perf-attach.rs', 'crates/engine/src/driver/tests/bench.rs']:
+          import shutil, os
+          paths = ['apps/cli/examples/perf-attach.rs', 'crates/engine/src/driver/tests/bench.rs']
+          if os.environ.get('PERF_ABLATION') == 'true':
+              paths.append('crates/rt/examples/o15-facts.rs')
+          for path in paths:
+              from pathlib import Path
+              Path('../measured/' + path).parent.mkdir(parents=True, exist_ok=True)
               shutil.copy2(path, '../measured/' + path)
           PY
       - name: Build release binaries and saved benchmarks
@@ -174,7 +189,7 @@ jobs:
           fi
       - name: Measure startup workloads and benches
         timeout-minutes: 20
-        if: env.PERF_BUILD_ONLY != 'true'
+        if: env.PERF_BUILD_ONLY != 'true' && env.PERF_ABLATION != 'true'
         run: |
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
             python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
@@ -182,7 +197,7 @@ jobs:
             mise exec -- python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
           fi
       - name: Measure alternating reference and candidate rounds
-        timeout-minutes: 45
+        timeout-minutes: 140
         if: ${{ !cancelled() && steps.build.outcome == 'success' && env.PERF_REFERENCE != '' && env.PERF_BUILD_ONLY != 'true' }}
         run: |
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then

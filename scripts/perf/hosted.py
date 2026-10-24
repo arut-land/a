@@ -87,6 +87,8 @@ def variant_arguments(variant):
 
 def build(source, output, variant, benchmarks=True, packages=("engine", "protocol", "llm", "tui")):
     overrides = variant_arguments(variant)
+    if os.environ.get("PERF_ABLATION") == "true":
+        packages = ("engine", "llm")
     env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
                CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
     release = Path(env["CARGO_TARGET_DIR"]) / "release"
@@ -119,6 +121,10 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
                        if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
         assert len(executables) == 1, executables
         shutil.copy2(executables[0], output / (package + "-bench" + SUFFIX))
+    if os.environ.get("PERF_ABLATION") == "true":
+        run(["cargo", "build-release", "-p", "rt", "--example", "o15-facts", *overrides], cwd=source, env=env)
+        facts = subprocess.check_output([release / "examples" / ("o15-facts" + SUFFIX)], text=True)
+        (output / "facts.json").write_text(facts)
     run(["rustc", ROOT / "scripts/perf/floor.rs", "-O", "-o", output / ("floor" + SUFFIX)], cwd=source)
 
 
@@ -157,6 +163,23 @@ def budgets(output, binary=None, probe=None, samples=5):
                     daemon_pid=pid, client_pid=client.pid, before=before, after=after), indent=2))
                 cpu.append((after[0]["cpu_seconds"] - before[0]["cpu_seconds"]) * 1000)
                 client_cpu.append((after[1]["cpu_seconds"] - before[1]["cpu_seconds"]) * 1000)
+                if os.environ.get("PERF_ABLATION") == "true":
+                    import psutil
+                    diagnostic = {}
+                    process = psutil.Process(pid)
+                    try:
+                        diagnostic["memory"] = process.memory_full_info()._asdict()
+                    except (psutil.Error, NotImplementedError) as error:
+                        diagnostic["memory_error"] = str(error)
+                    if sys.platform == "darwin":
+                        maps = subprocess.run(["vmmap", "-summary", str(pid)], capture_output=True, text=True, timeout=20)
+                        diagnostic["vmmap"] = maps.stdout + maps.stderr
+                    else:
+                        try:
+                            diagnostic["maps"] = [m._asdict() for m in process.memory_maps(grouped=True)]
+                        except (psutil.Error, NotImplementedError, AttributeError) as error:
+                            diagnostic["maps_error"] = str(error)
+                    (output / f"memory-{trial}.json").write_text(json.dumps(diagnostic, indent=2))
                 session = cli("new").stdout.decode().strip()
                 for n in range(10):
                     cli("-p", f"message {n}", "resume", session)
@@ -253,7 +276,11 @@ def paired(output, source, reference):
     run(["git", "fetch", "--no-tags", "--depth=1", "origin", reference], cwd=source)
     reference = subprocess.check_output(["git", "rev-parse", "FETCH_HEAD"], cwd=source, text=True).strip()
     run(["git", "worktree", "add", "--detach", reference_source, reference], cwd=source)
-    for path in ["apps/cli/examples/perf-attach.rs", "crates/engine/src/driver/tests/bench.rs"]:
+    paths = ["apps/cli/examples/perf-attach.rs", "crates/engine/src/driver/tests/bench.rs"]
+    if os.environ.get("PERF_ABLATION") == "true":
+        paths.append("crates/rt/examples/o15-facts.rs")
+    for path in paths:
+        (reference_source / path).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / path, reference_source / path)
     root = output / "paired"
     root.mkdir(exist_ok=True)
@@ -263,6 +290,8 @@ def paired(output, source, reference):
     builds = dict(reference=reference_output, candidate=output)
     values = {role: {} for role in builds}
     orders = []
+    trials = []
+    host = dict(platform=platform.platform(), machine=platform.machine(), hardware=hardware())
     completed = {role: 0 for role in builds}
     candidate_revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
     for role in builds:
@@ -272,7 +301,7 @@ def paired(output, source, reference):
         result = dict(driver_turns=500, large_json_results=200,
                       regular_driver_turns=100, regular_large_json_results=20,
                       reference_revision=reference, candidate_revision=candidate_revision,
-                      completed_rounds=completed, order=orders,
+                      completed_rounds=completed, order=orders, trials=trials, host=host,
                       roles={role: {name: distribution(samples) for name, samples in observed.items()}
                              for role, observed in values.items()})
         temporary = output / "paired.json.tmp"
@@ -281,7 +310,8 @@ def paired(output, source, reference):
 
     checkpoint()
     workloads = load_task("workloads")
-    for trial in range(5):
+    for trial in range(int(os.environ.get("PERF_PAIRED_ROUNDS", "5"))):
+        trials.append({})
         order = ["reference", "candidate"] if trial % 2 == 0 else ["candidate", "reference"]
         orders.append(order)
         for role in order:
@@ -290,6 +320,7 @@ def paired(output, source, reference):
             directory = builds[role]
             observed = budgets(saved, directory / ("a-fixtures" + SUFFIX),
                                directory / ("perf-attach" + SUFFIX), samples=1)
+            trials[-1][role] = {name: value["samples"] for name, value in observed.items()}
             for name, value in observed.items():
                 values[role].setdefault(name, []).extend(value["samples"])
             for name, argv, runs in [
@@ -320,11 +351,13 @@ def paired(output, source, reference):
                     samples = [sample[field]["value"] * scale for sample in result["measurements"] if field in sample]
                     if samples:
                         values[role].setdefault(name + "_" + unit, []).extend(samples)
+                        trials[-1][role][name + "_" + unit] = samples
                 if os.name == "nt":
                     from process import measure_windows
                     record = measure_windows(argv, env=env)
                     (saved / (name + "-native.json")).write_text(json.dumps(record))
                     values[role].setdefault(name + "_rss_kib", []).append(record["peak_rss_kib"])
+                    trials[-1][role][name + "_rss_kib"] = [record["peak_rss_kib"]]
             completed[role] += 1
             checkpoint()
 
