@@ -60,6 +60,9 @@ impl Client {
             },
             |e| e.vars.clone(),
         );
+        // Servers share the tools' temporary storage; their own
+        // configuration still wins.
+        sys::shell::ExecutionFacts::current().apply_environment(&mut env);
         env.extend(server.env.clone());
         let spec = SpawnSpec {
             argv: argv.clone(),
@@ -215,6 +218,73 @@ mod tests {
         let mcp = crate::Mcp::new(vec![server.clone()], Duration::from_secs(5)).unwrap();
         let rig = Rig::new(name, Registry::default().with(&ext_shell::Shell).unwrap());
         (mcp, rig, server)
+    }
+
+    /// The child's environment as `name=value` lines, written to `env.txt`
+    /// in its working directory before it exits.
+    fn environment_of(rig: &Rig, env: BTreeMap<String, String>) -> BTreeMap<String, String> {
+        #[cfg(unix)]
+        let argv = vec!["/bin/sh".into(), "-c".into(), "env > env.txt".into()];
+        // MSYS shells rewrite TMP and TEMP; cmd reports them as stored.
+        #[cfg(windows)]
+        let argv = vec![
+            "cmd.exe".into(),
+            "/d".into(),
+            "/c".into(),
+            "set > env.txt".into(),
+        ];
+        let server = Server {
+            name: "temporary-env".parse().unwrap(),
+            description: String::new(),
+            transport: Transport::Stdio(argv),
+            env,
+        };
+        let mcp = crate::Mcp::new(vec![server.clone()], Duration::from_secs(5)).unwrap();
+        let mut cx = rig.cx();
+        // A client whose own temporary directory lies outside the home.
+        let mut vars: BTreeMap<String, String> = std::env::vars()
+            .filter(|(k, _)| {
+                ["PATH", "SYSTEMROOT"]
+                    .iter()
+                    .any(|n| k.eq_ignore_ascii_case(n))
+            })
+            .collect();
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            vars.insert(name.into(), "/outside".into());
+        }
+        cx.env = Some(Arc::new(protocol::Environment {
+            cwd: cx.workspace.to_path_buf(),
+            vars,
+            ..Default::default()
+        }));
+        let client = rt::block_on(Client::start(&server, &cx, Arc::downgrade(&mcp.0))).unwrap();
+        rt::block_on(client.child.process.ended());
+        std::fs::read_to_string(cx.dir().join("env.txt"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.to_ascii_uppercase(), v.trim_end().to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn stdio_servers_keep_temporary_files_in_the_homes_temporary_dir() {
+        let rig = Rig::new(
+            "temporary-env",
+            Registry::default().with(&ext_shell::Shell).unwrap(),
+        );
+        let env = environment_of(&rig, BTreeMap::new());
+        let temp = sys::shell::ExecutionFacts::current().temp.to_str().unwrap();
+        assert_eq!(env["TMPDIR"], temp);
+        #[cfg(windows)]
+        for name in ["TMP", "TEMP"] {
+            assert_eq!(env[name], temp);
+        }
+        let explicit = environment_of(
+            &rig,
+            BTreeMap::from([("TMPDIR".into(), "/explicit".into())]),
+        );
+        assert_eq!(explicit["TMPDIR"], "/explicit");
     }
 
     #[test]
