@@ -20,8 +20,11 @@ staged metadata snapshot. A mismatch triggers an atomic swap back and a typed
 conflict; failure to swap back is a distinct `RollbackFailed` conflict. Successful
 transactions remove displaced originals. Filesystems without exchange use a
 plain atomic rename after the final check. Windows denies write sharing on the
-source through revalidation and uses `FileRenameInfoEx` with
-`REPLACE_IF_EXISTS | POSIX_SEMANTICS` through owned handles. Unsupported native
+source through revalidation and uses native `FileRenameInformationEx` with
+`REPLACE_IF_EXISTS | POSIX_SEMANTICS` through owned handles. The Win32
+`SetFileInformationByHandle(FileRenameInfoEx)` wrapper expands relative names;
+calling its native operation directly preserves the destination directory anchor,
+as in [Go's directory-relative rename](https://go.dev/src/internal/syscall/windows/at_windows.go). Unsupported native
 publication returns a typed error. Creating a new target never replaces an
 existing entry.
 

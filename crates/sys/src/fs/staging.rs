@@ -370,8 +370,10 @@ fn remove(file: &File) -> io::Result<()> {
 #[cfg(windows)]
 pub(super) fn rename(file: &File, parent: &File, to: &OsStr, replacing: bool) -> io::Result<()> {
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle,
+    use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformationEx, NtSetInformationFile};
+    use windows_sys::Win32::{
+        Foundation::RtlNtStatusToDosError, Storage::FileSystem::FILE_RENAME_INFO,
+        System::IO::IO_STATUS_BLOCK,
     };
     let name: Vec<u16> = to.encode_wide().collect();
     let bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2;
@@ -381,22 +383,31 @@ pub(super) fn rename(file: &File, parent: &File, to: &OsStr, replacing: bool) ->
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     // SAFETY: aligned storage covers the header and UTF-16 tail. Both directory
     // and source handles stay owned throughout this synchronous atomic rename.
+    let mut status = IO_STATUS_BLOCK::default();
+    // The Win32 wrapper expands relative names before honoring RootDirectory.
+    // The native FileRenameInfoEx operation keeps both namespace anchors owned.
     let result = unsafe {
         (*info).Anonymous.Flags = 0x2 | u32::from(replacing); // POSIX_SEMANTICS | REPLACE_IF_EXISTS
         (*info).RootDirectory = parent.as_raw_handle();
         (*info).FileNameLength = u32::try_from(name.len() * 2).expect("checked buffer length");
         std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-        crate::windows::ok(SetFileInformationByHandle(
+        NtSetInformationFile(
             file.as_raw_handle(),
-            FileRenameInfoEx,
+            &raw mut status,
             info.cast(),
             length,
-        ))
+            FileRenameInformationEx,
+        )
     };
-    match result {
-        Err(error) if matches!(error.raw_os_error(), Some(1 | 50 | 87)) => {
-            Err(io::ErrorKind::Unsupported.into())
-        }
-        other => other,
+    if result >= 0 {
+        return Ok(());
+    }
+    // SAFETY: converts the returned scalar status without accessing pointers.
+    let error =
+        io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(result) }.cast_signed());
+    if matches!(error.raw_os_error(), Some(1 | 50 | 87)) {
+        Err(io::ErrorKind::Unsupported.into())
+    } else {
+        Err(error)
     }
 }
