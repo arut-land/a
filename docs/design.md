@@ -238,10 +238,12 @@ commands, retaining client module paths. The same process service supervises eit
 [shell execution evidence](perf/shell.md).
 
 The default loop lives in the SDK and registers through the same machinery.
-`apps/cli/src/exts.rs` assembles the linked extensions. `Models` supports
-[durable side requests](side-calls.md) with role-based routing, explicit
-awaited or background execution, committed results, and bounded retries;
-title, compact and the policy judge use it. Compaction edits the model's
+`apps/cli/src/exts.rs` assembles the linked extensions. One typed
+[conversation primitive](agents.md) covers side requests and sub-agents
+alike: turns or agent tasks, persisted or ephemeral, keyed, bounded,
+awaited or detached, with role-based routing, committed results and bounded
+retries; title, compact, the policy judge and `ext-subagent` are each a few
+builder calls on it. Compaction edits the model's
 transcript without erasing history. Optional [Lua mods](ext-lua.md) already support tools,
 wire points, folds, text and agents in a bounded sandbox. They do not expose
 every Rust service or decision point. [Skills](ext-skills.md) publish a small

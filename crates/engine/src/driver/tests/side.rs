@@ -21,15 +21,12 @@ impl Extension for Aside {
                 return Answer::Now(None);
             };
             Answer::Later(ext::Later::new(async move {
-                let models = cx.models()?;
-                let side = ext::ModelTurn::new::<ext::ModelOnly>(
-                    ext::ThreadKey::new::<Aside>("test", ext::OwnerScope::Call(cx.call)),
-                    ext::TurnKey("initial".into()),
-                    ext::ModelRole::Session,
-                    ext::SideContext::None,
-                    [llm::Message::user("Say hi.")].into_iter().collect(),
-                );
-                models.call(&cx, side).await.ok()?;
+                ext::Conversation::turn::<Aside>("test", "Say hi.")
+                    .per_call()
+                    .key("initial")
+                    .ask(&cx)
+                    .await
+                    .ok()?;
                 Some(Recover::Resend)
             }))
         });
@@ -332,18 +329,32 @@ impl Tool for Probe {
             );
             return Ok("edited".into());
         }
-        let mut side = ext::ModelTurn::new::<ext::ModelOnly>(
-            ext::ThreadKey::new::<Probes>("probe", ext::OwnerScope::Call(cx.call)),
-            ext::TurnKey("initial".into()),
-            ext::ModelRole::Session,
-            ext::SideContext::None,
-            [llm::Message::user("Say hi.")].into_iter().collect(),
-        );
-        if args.args == "session" {
-            side.thread.owner_scope = ext::OwnerScope::Session;
+        let probe = || {
+            let probe = ext::Conversation::turn::<Probes>("probe", "Say hi.").key("initial");
+            if args.args == "session" {
+                probe
+            } else {
+                probe.per_call()
+            }
+        };
+        if let Some(how) = args.args.strip_prefix("ephemeral") {
+            let probe = probe().ephemeral();
+            let probe = match how {
+                "-owner" => probe.owner_context(),
+                "-timeout" => probe.budget(ext::Budget {
+                    timeout: Duration::from_millis(50),
+                    ..ext::Budget::default()
+                }),
+                _ => probe,
+            };
+            return probe
+                .ask(cx)
+                .await
+                .map(|r| r.message.text())
+                .map_err(|e| e.to_string());
         }
         if args.args == "background" {
-            let work = side.background().start(cx.clone()).work.unwrap();
+            let work = probe().detach().start(cx.clone()).work.unwrap();
             let completed = cx.service::<BackgroundCompletion>().map(|s| s.0.clone());
             cx.service::<dyn rt::Runtime>()
                 .unwrap()
@@ -358,25 +369,19 @@ impl Tool for Probe {
         if args.args == "duplicate" {
             let (done, other) = oneshot::channel();
             let owned = cx.clone();
-            let again = side.clone();
+            let again = probe();
             cx.service::<dyn rt::Runtime>()
                 .unwrap()
                 .spawn(Box::pin(async move {
-                    done.send(owned.models().unwrap().call(&owned, again).await);
+                    done.send(again.ask(&owned).await);
                 }));
-            let first = cx
-                .models()
-                .unwrap()
-                .call(cx, side)
-                .await
-                .map_err(|e| e.to_string())?;
+            let first = probe().ask(cx).await.map_err(|e| e.to_string())?;
             let second = other.await.unwrap().map_err(|e| e.to_string())?;
             assert_eq!(first.message.text(), second.message.text());
             return Ok(first.message.text());
         }
-        cx.models()
-            .unwrap()
-            .call(cx, side)
+        probe()
+            .ask(cx)
             .await
             .map(|r| r.message.text())
             .map_err(|e| e.to_string())
@@ -446,6 +451,126 @@ fn repeating_a_turn_key_never_calls_the_provider_again() {
     assert!(log.iter().any(|e| matches!(&e.body,
         Body::ToolResult { outcome: Outcome::Done { output }, .. }
             if output.raw().contains("crimson-harbor"))));
+}
+
+/// An ephemeral turn is admitted, bounded and keyed in its owner's log
+/// like any other, but no child conversation is ever created for it.
+#[test]
+fn an_ephemeral_turn_writes_no_child_log_and_still_reuses_its_key() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("ephemeral").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    let children = session
+        .1
+        .loaded()
+        .into_iter()
+        .filter(|live| live.parent.is_some_and(|p| p.session == session.id))
+        .count();
+    session.halt();
+    assert_eq!(children, 0);
+    assert_eq!(http.sent(), 1);
+    let [(side, ..)] = sides(&log)[..] else {
+        panic!("one side call");
+    };
+    assert!(log.iter().any(|e| matches!(&e.body,
+        Body::ModelResult { call, .. } if *call == side)));
+    let prefix: Vec<_> = log
+        .into_iter()
+        .take_while(|e| !matches!(e.body, Body::ToolResult { .. }))
+        .collect();
+    let replay = Flaky::new([]);
+    let session = probes(&replay, Registry::default()).start(&prefix);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(replay.sent(), 0);
+    assert!(log.iter().any(|e| matches!(&e.body,
+        Body::ToolResult { outcome: Outcome::Done { output }, .. }
+            if output.raw().contains("crimson-harbor"))));
+}
+
+/// The provider attempts behind the only ephemeral side call in `log`.
+fn ephemeral_attempts(log: &[Entry]) -> Vec<protocol::CallFact> {
+    log.iter()
+        .filter_map(|e| e.execution.as_ref())
+        .map(|j| protocol::CallFact::from_json(j).unwrap())
+        .filter(|fact| fact.side)
+        .collect()
+}
+
+/// An ephemeral turn that sees its owner gets the owner's conversation in
+/// its request, though it keeps no thread of its own.
+#[test]
+fn an_ephemeral_turn_with_owner_context_sends_the_owners_conversation() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("ephemeral-owner").unwrap();
+    settle(&session);
+    session.halt();
+    let bodies = http.bodies();
+    assert_eq!(bodies.len(), 1);
+    let sent = bodies[0].to_string();
+    assert!(sent.contains("ephemeral-owner"), "{sent}");
+    assert!(sent.contains("Say hi."), "{sent}");
+}
+
+/// An ephemeral turn cut off by its deadline still settles the attempt it
+/// made, with no usage, and fails as a timeout.
+#[test]
+fn an_ephemeral_timeout_keeps_its_attempts_metrics() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("ephemeral-timeout").unwrap();
+    until(&session, "the side call failed", |log| {
+        log.iter().any(|e| {
+            matches!(
+                &e.body,
+                Body::ModelResult {
+                    r#for: Some(_),
+                    outcome: Outcome::Failed { .. },
+                    ..
+                }
+            )
+        })
+    });
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    let facts = ephemeral_attempts(&log);
+    assert_eq!(facts.len(), 1, "{log:#?}");
+    assert!(facts[0].usage.is_none());
+    assert!(facts[0].elapsed_ns.is_some_and(|ns| ns > 0));
+    assert_eq!(facts[0].id.executing_session, session.id);
+    assert_eq!(facts[0].id.call, sides(&log)[0].0);
+}
+
+/// An interrupt while an ephemeral turn is out cancels it before its call
+/// ends, and its attempt is still settled.
+#[test]
+fn an_ephemeral_turn_dies_with_its_call() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("ephemeral").unwrap();
+    http.wait_sent(1);
+    session.interrupt_now();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    let (side, ..) = sides(&log)[0];
+    let side_end = log.iter().position(|e| {
+        matches!(&e.body, Body::ModelResult { call, outcome: Outcome::Interrupted { .. }, .. }
+            if *call == side)
+    });
+    let call_end = log.iter().position(
+        |e| matches!(&e.body, Body::ToolResult { call, .. } if *call == CallId::new(2).unwrap()),
+    );
+    assert!(side_end.is_some() && call_end.is_some(), "{log:#?}");
+    assert!(side_end < call_end, "{log:#?}");
+    let facts = ephemeral_attempts(&log);
+    assert_eq!(facts.len(), 1, "{log:#?}");
+    assert!(facts[0].usage.is_none());
+    assert_eq!(http.sent(), 1);
 }
 
 #[test]
@@ -1129,7 +1254,7 @@ impl ext::SideProvider for HeldDescription {
         Box::pin(async move {
             assert_eq!(side.thread.purpose, "approval-description");
             assert!(matches!(side.role, ext::ModelRole::Fast));
-            assert!(matches!(side.context, ext::SideContext::None));
+            assert!(matches!(side.context, ext::Context::Fresh));
             assert!(side.is_while_waiting());
             assert!(
                 side.messages.iter().any(|message| match message {

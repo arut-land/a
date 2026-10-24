@@ -296,8 +296,12 @@ impl Actor {
             .map(|m| m.freeze());
         let mut image = protocol::publication::ContextImage::default();
         let installed = registry.installed();
-        if let ext::ContextSource::Prefix { session, seq } = request.context {
-            if session != self.live.id || seq.get() > self.journal.ordered_seq {
+        match request.placement {
+            ext::Placement::Here => {}
+        }
+        if let ext::Context::Owner = request.context {
+            let seq = call.0;
+            if seq.get() > self.journal.ordered_seq {
                 refusal = Some(SpawnRefusal::Unavailable(
                     "prefix is not committed in the owning conversation".into(),
                 ));
@@ -341,7 +345,24 @@ impl Actor {
     }
 }
 
-impl ext::Sessions for CallPorts {
+impl ext::Conversations for CallPorts {
+    fn kind(&self) -> String {
+        let session = &self.session;
+        lock(&session.spawn)
+            .as_ref()
+            .and_then(|i| i.request.runner.agent().map(str::to_owned))
+            .or_else(|| session.shared.models.settings.agent(&session.workspace))
+            .unwrap_or_else(|| ext::LOOP.into())
+    }
+
+    fn turn<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        turn: ext::ModelTurn,
+    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        CallPorts::turn(self, turn)
+    }
+
     fn send<'a>(
         &'a self,
         _cx: &'a Cx,
@@ -353,7 +374,7 @@ impl ext::Sessions for CallPorts {
     fn detach<'a>(
         &'a self,
         _cx: &'a Cx,
-        request: ext::Detached<ext::Spawn>,
+        request: ext::Spawn,
     ) -> BoxFuture<'a, Result<ext::ConversationHandle, SpawnRefusal>> {
         Box::pin(async move {
             let session = &self.session;
@@ -364,30 +385,18 @@ impl ext::Sessions for CallPorts {
             self.origin.send(
                 session,
                 ContextRequest::Child {
-                    request: request.0,
+                    request,
                     reply: SpawnReply::Detached(reply),
                 },
             );
             result.await.unwrap_or(Err(SpawnRefusal::Interrupted))
         })
     }
-    fn runner(&self) -> ext::Runner {
-        let session = &self.session;
-        let agent = lock(&session.spawn)
-            .as_ref()
-            .and_then(|i| i.request.runner.agent().map(str::to_owned))
-            .or_else(|| session.shared.models.settings.agent(&session.workspace))
-            .unwrap_or_else(|| ext::LOOP.into());
-        ext::Runner::Agent {
-            agent,
-            role: ext::ModelRole::Session,
-        }
-    }
 
-    fn spawn<'a>(
+    fn task<'a>(
         &'a self,
         _cx: &'a Cx,
-        request: ext::Awaited<ext::Spawn>,
+        request: ext::Spawn,
     ) -> BoxFuture<'a, Result<Outcome, SpawnRefusal>> {
         Box::pin(async move {
             let session = &self.session;
@@ -398,7 +407,7 @@ impl ext::Sessions for CallPorts {
             self.origin.send(
                 session,
                 ContextRequest::Child {
-                    request: request.0,
+                    request,
                     reply: SpawnReply::Awaited(reply),
                 },
             );
