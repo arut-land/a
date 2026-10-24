@@ -123,10 +123,6 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
                        if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
         assert len(executables) == 1, executables
         shutil.copy2(executables[0], output / (package + "-bench" + SUFFIX))
-    if os.environ.get("PERF_ABLATION") == "true":
-        run(["cargo", "build-release", "-p", "rt", "--example", "o15-facts", *overrides], cwd=source, env=env)
-        facts = subprocess.check_output([release / "examples" / ("o15-facts" + SUFFIX)], text=True)
-        (output / "facts.json").write_text(facts)
     metadata = json.loads((output / "build.json").read_text())
     metadata["executables"] = {
         p.name: dict(bytes=p.stat().st_size, sha256=hashlib.sha256(p.read_bytes()).hexdigest())
@@ -286,8 +282,6 @@ def paired(output, source, reference):
     reference = subprocess.check_output(["git", "rev-parse", "FETCH_HEAD"], cwd=source, text=True).strip()
     run(["git", "worktree", "add", "--detach", reference_source, reference], cwd=source)
     paths = ["apps/cli/examples/perf-attach.rs", "crates/engine/src/driver/tests/bench.rs"]
-    if os.environ.get("PERF_ABLATION") == "true":
-        paths.append("crates/rt/examples/o15-facts.rs")
     for path in paths:
         (reference_source / path).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / path, reference_source / path)

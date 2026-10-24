@@ -38,7 +38,7 @@ on:
         default: '5'
         type: string
       ablation:
-        description: 'Paired mechanism experiment; skip the separate unpaired suite'
+        description: 'Paired comparison only; skip the separate unpaired suite'
         default: false
         type: boolean
       baseline_run:
