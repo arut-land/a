@@ -1,5 +1,7 @@
 name: activation probe
 on:
+  push:
+    branches: [codex-w4activate]
   workflow_dispatch:
 permissions:
   contents: read

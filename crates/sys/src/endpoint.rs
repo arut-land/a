@@ -774,13 +774,18 @@ mod tests {
     #[test]
     fn manager_owned_sockets_survive_daemon_retirement() {
         use std::os::fd::AsFd;
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let home = home("activation-retirement");
         std::fs::create_dir_all(home.root()).unwrap();
         let parent = home.bind().unwrap();
         let duplicate = || std::fs::File::from(parent.as_fd().try_clone_to_owned().unwrap());
         let descriptor = duplicate();
         let manager = duplicate();
+        std::fs::set_permissions(
+            home.endpoint().path(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         assert!(
             super::Listener::activated(duplicate(), &home).is_err(),
             "a live home claim excludes managed writers too"
@@ -801,7 +806,7 @@ mod tests {
         let mut server = listener.accept().unwrap();
         client.write_all(b"verified").unwrap();
         let mut bytes = [0; 8];
-        std::io::Read::read_exact(&mut server, &mut bytes).unwrap();
+        io::Read::read_exact(&mut server, &mut bytes).unwrap();
         assert_eq!(&bytes, b"verified");
         let retirement = listener.retirement().unwrap();
         retirement.withdraw().unwrap();
