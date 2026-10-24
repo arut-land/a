@@ -56,3 +56,22 @@ targets passed rapid stop/reconnect with a one-second launchd throttle, as well
 as the idle-exit timing rounds. The Swift app build and tests passed in
 [CI](https://github.com/arut-land/a/actions/runs/40065827570). Interactive
 SMAppService approval on a signed installation remains a manual validation.
+
+The [paired perf run](https://github.com/arut-land/a/actions/runs/40065757703)
+compares `171fedd7` with main at `8a0388a7` in five alternating rounds per role.
+That main revision predates the paths work inherited by this branch, so these
+deltas include both paths and activation. [The generated comparison](activation/paired.csv)
+retains every paired metric's medians, p10/p90, sample counts and source revisions.
+Shipped sizes below exclude fixtures. Cold reply measures unmanaged startup;
+it is separate from the native activation experiment above.
+
+| Hosted target | Main bytes | Candidate bytes | Cold reply delta (ms) | Attach p99 delta (ms) | Idle RSS delta (KiB) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Linux ARM64 | 3,694,760 | 3,728,424 | +0.917 | +0.0001 | −28 |
+| Linux x64 | 4,296,008 | 4,334,664 | +0.015 | +0.018 | +52 |
+| macOS ARM64 | 3,330,768 | 3,364,144 | +0.677 | +0.035 | −48 |
+| Windows ARM64 | 4,876,288 | 4,893,696 | −1.993 | −0.026 | −120 |
+| Windows x64 | 5,545,472 | 5,559,296 | −0.168 | −0.015 | −96 |
+
+Daemon and line-client CPU medians remained zero in the ten-second idle windows
+on these targets. Small positive or negative deltas can reflect runner noise.
