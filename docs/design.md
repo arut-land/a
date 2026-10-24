@@ -23,7 +23,22 @@ pre-release: formats change outright, without compatibility shims.
 
 ## Process model
 
-The CLI stages its executable into the home runtime directory. A local
+Commands that start or attach resolve an immutable installed image by content
+identity in the executable data directory. Daemon status, log and stop operate
+on the local home without touching executable installation. An unchanged source or installed image needs no
+executable read, copy, flush or reference publication. First installation
+verifies a private snapshot: reflink on Linux where supported, clonefile on
+macOS with a metadata-preserving copy fallback, CopyFile on Windows preserving
+alternate streams. Source files never share writable inodes with installed
+images. Installation is crash consistent rather than durable: each image and receipt
+is ordered before its name (a write barrier on Apple platforms, not a
+drive-cache flush), and a lost image or reference is recovered on the next
+start. Small installation receipts and source fingerprints survive image
+reclamation, preventing old or relocated sources from being installed again.
+macOS quarantine and code signatures are retained. Windows retires a mapped
+old image under a private name; a later installation reclaims it after process
+exit, without blocking replacement or adding cleanup work to ordinary starts.
+A local
 client first connects to the daemon's endpoint. On a cold start, clients
 serialize through `start.lock`, recheck the connection, take the daemon
 lock, then start a detached `a __daemon`. Unix passes the bound listener
@@ -32,7 +47,9 @@ with an explicit stdio handle allowlist and waits for discovery publication
 under the start lock. Its locked daemon record selects a process-generation
 pipe, so retained clients cannot reserve a successor's endpoint. Neither path polls for readiness. The daemon
 holds its pid-file lock for its lifetime, excluding other writers to that
-home. `A_HOME` overrides the default `~/.a`.
+home. `sys::Paths` resolves native configuration, state, data, cache, logs
+and runtime locations; `A_HOME` selects an isolated root. See [paths and
+install layout](paths.md).
 
 The daemon serves connections and session actors on `rt`. Idle sessions
 hibernate; the daemon exits when no clients or work pin it. Upgrades drain
@@ -255,10 +272,12 @@ commands, retaining client module paths. The same process service supervises eit
 [shell execution evidence](perf/shell.md).
 
 The default loop lives in the SDK and registers through the same machinery.
-`apps/cli/src/exts.rs` assembles the linked extensions. `Models` supports
-[durable side requests](side-calls.md) with role-based routing, explicit
-awaited or background execution, committed results, and bounded retries;
-title, compact and the policy judge use it. Compaction edits the model's
+`apps/cli/src/exts.rs` assembles the linked extensions. One typed
+[conversation primitive](agents.md) covers side requests and sub-agents
+alike: turns or agent tasks, persisted or ephemeral, keyed, bounded,
+awaited or detached, with role-based routing, committed results and bounded
+retries; title, compact, the policy judge and `ext-subagent` are each a few
+builder calls on it. Compaction edits the model's
 transcript without erasing history. Optional [Lua mods](ext-lua.md) already support tools,
 wire points, folds, text and agents in a bounded sandbox. They do not expose
 every Rust service or decision point. [Skills](ext-skills.md) publish a small

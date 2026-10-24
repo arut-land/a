@@ -348,6 +348,8 @@ impl Daemon {
     }
 
     fn load_on(home: &Home, config: &Config, runtime: &Arc<impl rt::Runtime>) -> io::Result<Owner> {
+        // Extensions publish these facts as they register.
+        sys::shell::ExecutionFacts::initialize(home)?;
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
         let blobs: Arc<dyn ext::blob::BlobStore> =
             Arc::new(store::Files::open(home.blobs_dir(), &home.sessions_dir())?);

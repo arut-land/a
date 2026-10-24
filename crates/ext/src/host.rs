@@ -27,10 +27,7 @@ pub use crate::point::{Decided, Hooks};
 
 /// The engine, as a running call reaches it.
 pub trait Host: Send + Sync {
-    fn models(&self) -> Option<&dyn crate::Models> {
-        None
-    }
-    fn sessions(&self) -> Option<&dyn crate::Sessions> {
+    fn conversations(&self) -> Option<&dyn crate::Conversations> {
         None
     }
 

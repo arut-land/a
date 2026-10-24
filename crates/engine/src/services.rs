@@ -149,10 +149,7 @@ impl CallPorts {
 }
 
 impl Host for CallPorts {
-    fn models(&self) -> Option<&dyn ext::Models> {
-        Some(self)
-    }
-    fn sessions(&self) -> Option<&dyn ext::Sessions> {
+    fn conversations(&self) -> Option<&dyn ext::Conversations> {
         Some(self)
     }
 
@@ -379,27 +376,29 @@ impl ext::Logs for SessionLogs {
 
 impl Session {
     #[inline(never)]
+    /// `ephemeral` is the role of a turn executed here for its owner,
+    /// rather than by this session's own runner.
     pub(super) fn execution(
         &self,
-        cx: &Cx,
+        call: CallId,
         observed: super::Observation,
         agent: String,
+        ephemeral: Option<&ext::ModelRole>,
     ) -> Option<Json> {
         let started = observed.started?;
         let (epoch, clock) = attempt_clock();
         let spawn = lock(&self.spawn);
         let runner = spawn.as_ref().map(|s| &s.request.runner);
-        let side = runner.is_some_and(|r| r.agent().is_none());
+        let side = ephemeral.is_some() || runner.is_some_and(|r| r.agent().is_none());
+        let role = ephemeral.or(runner.map(ext::Runner::role));
         protocol::CallFact {
             id: protocol::AttemptId {
                 executing_session: self.id,
-                call: cx.call,
+                call,
                 attempt: observed.attempt,
             },
             model: observed.model,
-            role: runner
-                .map_or(&ext::ModelRole::Session, ext::Runner::role)
-                .to_string(),
+            role: role.unwrap_or(&ext::ModelRole::Session).to_string(),
             runner: if side { "model_only" } else { "agent" }.into(),
             agent,
             side,

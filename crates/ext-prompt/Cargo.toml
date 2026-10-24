@@ -8,5 +8,8 @@ publish.workspace = true
 ext.workspace = true
 sys.workspace = true
 
+[dev-dependencies]
+sys = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

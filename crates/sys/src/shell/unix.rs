@@ -15,7 +15,7 @@ pub fn find_bash(search: Option<&str>) -> Option<PathBuf> {
         })
 }
 
-pub(super) fn discover() -> ExecutionFacts {
+pub(super) fn discover(temp: PathBuf) -> ExecutionFacts {
     ExecutionFacts {
         dialect: Dialect::Bash,
         // Keep the missing dependency visible at launch; never substitute sh.
@@ -29,7 +29,7 @@ pub(super) fn discover() -> ExecutionFacts {
             "host PATH utilities; GNU tools are not assumed on minimal systems"
         },
         cleanup: "timeout/cancellation signal the owned process group, TERM then KILL; descendants that leave the group can escape; background work is session-owned; cut output is kept whole in the daemon's blob store; command-created temporary files are not automatically removed",
-        temp: std::env::temp_dir(),
+        temp,
         cwd_command: "pwd -P",
         runtime_bin: None,
     }

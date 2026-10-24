@@ -522,24 +522,19 @@ fn identical_local_sequences_and_provider_ids_remain_in_their_scopes() {
 
 #[test]
 fn model_only_inputs_keep_their_interpretation_across_agent_scopes() {
-    let turn = ext::ModelTurn::new::<ext::ModelOnly>(
-        ext::ThreadKey::new::<ext_title::Title>(
-            "test",
-            ext::OwnerScope::Call(CallId::new(1).unwrap()),
-        ),
-        ext::TurnKey("turn".into()),
-        ext::ModelRole::Session,
-        ext::SideContext::None,
-        Messages::from_iter([
-            Message::system("side instructions"),
-            Message::user("side input"),
-        ]),
-    );
+    let turn = ext::Conversation::turn::<ext_title::Title>("test", "side input")
+        .per_call()
+        .key("turn")
+        .instructions("side instructions")
+        .request(CallId::new(1).unwrap());
     let mut intent =
         crate::driver::spawn::SpawnIntent::from_json(&crate::tests::spawn_intent(1, "")).unwrap();
     intent.request.runner = ext::Runner::ModelOnly {
         role: ext::ModelRole::Session,
-        context: <ext::ModelOnly as ext::ModelOnlyKind>::CONTEXT,
+        context: ext::ContextPolicy {
+            exchanges: 8,
+            bytes: 65536,
+        },
     };
     let entries = vec![
         entry(

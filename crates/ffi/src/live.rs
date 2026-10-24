@@ -76,7 +76,7 @@ fn session_path() -> OsString {
         .unwrap_or_default()
 }
 
-/// The per-user daemon, as the CLI reaches it: `$A_HOME`, else `~/.a`.
+/// The per-user daemon, as the CLI reaches it: the native layout or explicit `$A_HOME`.
 pub struct Client {
     home: Home,
     daemon: Daemon,

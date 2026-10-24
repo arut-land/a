@@ -1,0 +1,646 @@
+{
+  "run": "https://github.com/arut-land/a/actions/runs/40045489577",
+  "method": "50 fresh isolated homes per role, alternating order; identical staged cold-reply workload; in-process from_env timer in fresh resolver processes; fixed-seed 10000-resample percentile bootstrap of the paired median",
+  "summary": {
+    "rounds": 50,
+    "builds": {
+      "main": {
+        "revision": "4b662d7ab8151802b8417e71378c8ec800834f34"
+      },
+      "candidate": {
+        "revision": "8225ad43a8f757952a645f0af22d0b07cf8f041f"
+      }
+    },
+    "cold_median_ms": {
+      "main": 66.01220000001717,
+      "candidate": 66.1162000000104
+    },
+    "paired_delta_median_ms": -1.0264999999378688,
+    "paired_delta_bootstrap_95_ms": [
+      -1.746500000024298,
+      0.6359999999858701
+    ],
+    "resolver_median_ms": {
+      "main": 0.0078,
+      "candidate": 0.0188
+    }
+  },
+  "samples": {
+    "builds": {
+      "main": {
+        "revision": "4b662d7ab8151802b8417e71378c8ec800834f34"
+      },
+      "candidate": {
+        "revision": "8225ad43a8f757952a645f0af22d0b07cf8f041f"
+      }
+    },
+    "records": [
+      {
+        "trial": 0,
+        "role": "main",
+        "cold_ms": 70.99319999997533
+      },
+      {
+        "trial": 0,
+        "role": "candidate",
+        "cold_ms": 69.39149999999472
+      },
+      {
+        "trial": 1,
+        "role": "candidate",
+        "cold_ms": 68.65779999998267
+      },
+      {
+        "trial": 1,
+        "role": "main",
+        "cold_ms": 67.57690000000593
+      },
+      {
+        "trial": 2,
+        "role": "main",
+        "cold_ms": 66.14489999998341
+      },
+      {
+        "trial": 2,
+        "role": "candidate",
+        "cold_ms": 64.31850000001305
+      },
+      {
+        "trial": 3,
+        "role": "candidate",
+        "cold_ms": 64.06950000001643
+      },
+      {
+        "trial": 3,
+        "role": "main",
+        "cold_ms": 64.62139999996452
+      },
+      {
+        "trial": 4,
+        "role": "main",
+        "cold_ms": 65.32630000003792
+      },
+      {
+        "trial": 4,
+        "role": "candidate",
+        "cold_ms": 66.12740000002759
+      },
+      {
+        "trial": 5,
+        "role": "candidate",
+        "cold_ms": 63.71519999999009
+      },
+      {
+        "trial": 5,
+        "role": "main",
+        "cold_ms": 64.89799999997103
+      },
+      {
+        "trial": 6,
+        "role": "main",
+        "cold_ms": 68.03710000002638
+      },
+      {
+        "trial": 6,
+        "role": "candidate",
+        "cold_ms": 63.5763999999881
+      },
+      {
+        "trial": 7,
+        "role": "candidate",
+        "cold_ms": 62.679000000002816
+      },
+      {
+        "trial": 7,
+        "role": "main",
+        "cold_ms": 63.515800000004674
+      },
+      {
+        "trial": 8,
+        "role": "main",
+        "cold_ms": 64.93130000001202
+      },
+      {
+        "trial": 8,
+        "role": "candidate",
+        "cold_ms": 63.32219999995914
+      },
+      {
+        "trial": 9,
+        "role": "candidate",
+        "cold_ms": 61.179299999992054
+      },
+      {
+        "trial": 9,
+        "role": "main",
+        "cold_ms": 63.92080000000533
+      },
+      {
+        "trial": 10,
+        "role": "main",
+        "cold_ms": 62.71229999998695
+      },
+      {
+        "trial": 10,
+        "role": "candidate",
+        "cold_ms": 69.84649999998283
+      },
+      {
+        "trial": 11,
+        "role": "candidate",
+        "cold_ms": 62.075800000002346
+      },
+      {
+        "trial": 11,
+        "role": "main",
+        "cold_ms": 64.41979999999603
+      },
+      {
+        "trial": 12,
+        "role": "main",
+        "cold_ms": 67.70640000002004
+      },
+      {
+        "trial": 12,
+        "role": "candidate",
+        "cold_ms": 61.761300000000574
+      },
+      {
+        "trial": 13,
+        "role": "candidate",
+        "cold_ms": 65.05310000000009
+      },
+      {
+        "trial": 13,
+        "role": "main",
+        "cold_ms": 63.14639999999372
+      },
+      {
+        "trial": 14,
+        "role": "main",
+        "cold_ms": 69.08270000002403
+      },
+      {
+        "trial": 14,
+        "role": "candidate",
+        "cold_ms": 67.33619999999974
+      },
+      {
+        "trial": 15,
+        "role": "candidate",
+        "cold_ms": 67.80919999999924
+      },
+      {
+        "trial": 15,
+        "role": "main",
+        "cold_ms": 64.92100000002665
+      },
+      {
+        "trial": 16,
+        "role": "main",
+        "cold_ms": 66.24490000001515
+      },
+      {
+        "trial": 16,
+        "role": "candidate",
+        "cold_ms": 63.706200000012814
+      },
+      {
+        "trial": 17,
+        "role": "candidate",
+        "cold_ms": 70.06200000000717
+      },
+      {
+        "trial": 17,
+        "role": "main",
+        "cold_ms": 75.24860000000899
+      },
+      {
+        "trial": 18,
+        "role": "main",
+        "cold_ms": 75.28200000001561
+      },
+      {
+        "trial": 18,
+        "role": "candidate",
+        "cold_ms": 66.33429999999407
+      },
+      {
+        "trial": 19,
+        "role": "candidate",
+        "cold_ms": 71.76990000004935
+      },
+      {
+        "trial": 19,
+        "role": "main",
+        "cold_ms": 65.20680000005541
+      },
+      {
+        "trial": 20,
+        "role": "main",
+        "cold_ms": 66.84400000006008
+      },
+      {
+        "trial": 20,
+        "role": "candidate",
+        "cold_ms": 66.38780000002953
+      },
+      {
+        "trial": 21,
+        "role": "candidate",
+        "cold_ms": 64.0617999999904
+      },
+      {
+        "trial": 21,
+        "role": "main",
+        "cold_ms": 67.27649999993446
+      },
+      {
+        "trial": 22,
+        "role": "main",
+        "cold_ms": 67.69889999998213
+      },
+      {
+        "trial": 22,
+        "role": "candidate",
+        "cold_ms": 66.07229999997344
+      },
+      {
+        "trial": 23,
+        "role": "candidate",
+        "cold_ms": 67.85190000005059
+      },
+      {
+        "trial": 23,
+        "role": "main",
+        "cold_ms": 69.44950000001882
+      },
+      {
+        "trial": 24,
+        "role": "main",
+        "cold_ms": 69.8702999999341
+      },
+      {
+        "trial": 24,
+        "role": "candidate",
+        "cold_ms": 66.19060000002719
+      },
+      {
+        "trial": 25,
+        "role": "candidate",
+        "cold_ms": 65.14389999995274
+      },
+      {
+        "trial": 25,
+        "role": "main",
+        "cold_ms": 66.66649999999663
+      },
+      {
+        "trial": 26,
+        "role": "main",
+        "cold_ms": 65.87950000005094
+      },
+      {
+        "trial": 26,
+        "role": "candidate",
+        "cold_ms": 68.20470000002388
+      },
+      {
+        "trial": 27,
+        "role": "candidate",
+        "cold_ms": 65.23569999990286
+      },
+      {
+        "trial": 27,
+        "role": "main",
+        "cold_ms": 67.53730000002633
+      },
+      {
+        "trial": 28,
+        "role": "main",
+        "cold_ms": 66.2644999999884
+      },
+      {
+        "trial": 28,
+        "role": "candidate",
+        "cold_ms": 69.37699999991764
+      },
+      {
+        "trial": 29,
+        "role": "candidate",
+        "cold_ms": 68.52590000005421
+      },
+      {
+        "trial": 29,
+        "role": "main",
+        "cold_ms": 69.396099999949
+      },
+      {
+        "trial": 30,
+        "role": "main",
+        "cold_ms": 65.6863000000385
+      },
+      {
+        "trial": 30,
+        "role": "candidate",
+        "cold_ms": 73.31709999994018
+      },
+      {
+        "trial": 31,
+        "role": "candidate",
+        "cold_ms": 68.98069999999734
+      },
+      {
+        "trial": 31,
+        "role": "main",
+        "cold_ms": 64.60919999994985
+      },
+      {
+        "trial": 32,
+        "role": "main",
+        "cold_ms": 65.80289999999422
+      },
+      {
+        "trial": 32,
+        "role": "candidate",
+        "cold_ms": 66.91220000004705
+      },
+      {
+        "trial": 33,
+        "role": "candidate",
+        "cold_ms": 67.50099999999293
+      },
+      {
+        "trial": 33,
+        "role": "main",
+        "cold_ms": 67.34460000006948
+      },
+      {
+        "trial": 34,
+        "role": "main",
+        "cold_ms": 63.90550000003259
+      },
+      {
+        "trial": 34,
+        "role": "candidate",
+        "cold_ms": 69.00880000000598
+      },
+      {
+        "trial": 35,
+        "role": "candidate",
+        "cold_ms": 69.2288999999846
+      },
+      {
+        "trial": 35,
+        "role": "main",
+        "cold_ms": 71.05990000002294
+      },
+      {
+        "trial": 36,
+        "role": "main",
+        "cold_ms": 68.63420000001952
+      },
+      {
+        "trial": 36,
+        "role": "candidate",
+        "cold_ms": 66.42039999996996
+      },
+      {
+        "trial": 37,
+        "role": "candidate",
+        "cold_ms": 60.828199999946264
+      },
+      {
+        "trial": 37,
+        "role": "main",
+        "cold_ms": 63.35079999996651
+      },
+      {
+        "trial": 38,
+        "role": "main",
+        "cold_ms": 68.74819999995907
+      },
+      {
+        "trial": 38,
+        "role": "candidate",
+        "cold_ms": 63.54879999992136
+      },
+      {
+        "trial": 39,
+        "role": "candidate",
+        "cold_ms": 66.85079999999743
+      },
+      {
+        "trial": 39,
+        "role": "main",
+        "cold_ms": 64.36669999993683
+      },
+      {
+        "trial": 40,
+        "role": "main",
+        "cold_ms": 67.81610000007277
+      },
+      {
+        "trial": 40,
+        "role": "candidate",
+        "cold_ms": 64.44460000000163
+      },
+      {
+        "trial": 41,
+        "role": "candidate",
+        "cold_ms": 64.50380000001132
+      },
+      {
+        "trial": 41,
+        "role": "main",
+        "cold_ms": 63.87879999999768
+      },
+      {
+        "trial": 42,
+        "role": "main",
+        "cold_ms": 67.05539999995835
+      },
+      {
+        "trial": 42,
+        "role": "candidate",
+        "cold_ms": 67.69139999994422
+      },
+      {
+        "trial": 43,
+        "role": "candidate",
+        "cold_ms": 64.606700000013
+      },
+      {
+        "trial": 43,
+        "role": "main",
+        "cold_ms": 62.2321999999258
+      },
+      {
+        "trial": 44,
+        "role": "main",
+        "cold_ms": 62.323200000037104
+      },
+      {
+        "trial": 44,
+        "role": "candidate",
+        "cold_ms": 63.8166999999612
+      },
+      {
+        "trial": 45,
+        "role": "candidate",
+        "cold_ms": 65.53359999998065
+      },
+      {
+        "trial": 45,
+        "role": "main",
+        "cold_ms": 63.09790000000248
+      },
+      {
+        "trial": 46,
+        "role": "main",
+        "cold_ms": 69.81329999996433
+      },
+      {
+        "trial": 46,
+        "role": "candidate",
+        "cold_ms": 66.56650000002173
+      },
+      {
+        "trial": 47,
+        "role": "candidate",
+        "cold_ms": 64.77169999993748
+      },
+      {
+        "trial": 47,
+        "role": "main",
+        "cold_ms": 63.89359999991484
+      },
+      {
+        "trial": 48,
+        "role": "main",
+        "cold_ms": 65.6891999999516
+      },
+      {
+        "trial": 48,
+        "role": "candidate",
+        "cold_ms": 62.45279999996001
+      },
+      {
+        "trial": 49,
+        "role": "candidate",
+        "cold_ms": 66.1049999999932
+      },
+      {
+        "trial": 49,
+        "role": "main",
+        "cold_ms": 65.25360000000546
+      }
+    ],
+    "resolver_ms": {
+      "main": [
+        0.0157,
+        0.0073,
+        0.0092,
+        0.0076,
+        0.0094,
+        0.0077,
+        0.0073,
+        0.0082,
+        0.0101,
+        0.008,
+        0.0075,
+        0.0082,
+        0.0317,
+        0.008,
+        0.0075,
+        0.0077,
+        0.0074,
+        0.008,
+        0.0088,
+        0.0075,
+        0.0081,
+        0.0073,
+        0.008,
+        0.0075,
+        0.0077,
+        0.0078,
+        0.0077,
+        0.0075,
+        0.0076,
+        0.008,
+        0.012,
+        0.0075,
+        0.0096,
+        0.0077,
+        0.0078,
+        0.0077,
+        0.0096,
+        0.0078,
+        0.0091,
+        0.0076,
+        0.0128,
+        0.0082,
+        0.0077,
+        0.0083,
+        0.0077,
+        0.0077,
+        0.0079,
+        0.0074,
+        0.0079,
+        0.0071
+      ],
+      "candidate": [
+        0.0255,
+        0.019,
+        0.0193,
+        0.0186,
+        0.0195,
+        0.0242,
+        0.0187,
+        0.0185,
+        0.0195,
+        0.0177,
+        0.0185,
+        0.0188,
+        0.0182,
+        0.0193,
+        0.0184,
+        0.019,
+        0.0185,
+        0.0185,
+        0.0188,
+        0.0182,
+        0.0197,
+        0.0184,
+        0.0207,
+        0.0194,
+        0.0187,
+        0.0189,
+        0.0193,
+        0.0212,
+        0.0195,
+        0.0194,
+        0.0196,
+        0.0239,
+        0.0193,
+        0.0191,
+        0.0196,
+        0.0185,
+        0.0184,
+        0.0177,
+        0.0184,
+        0.02,
+        0.0263,
+        0.0184,
+        0.0186,
+        0.0183,
+        0.0182,
+        0.0186,
+        0.0185,
+        0.0182,
+        0.0192,
+        0.0187
+      ]
+    }
+  }
+}

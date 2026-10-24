@@ -6,16 +6,19 @@
 //! `request_error` point, and answers nothing else: a request that
 //! overflowed is summarised aside, the edit committed, and the request
 //! sent again from the transcript as the edit leaves it. A call is
-//! compacted once: overflowing again, it fails. With a `threshold`, the
-//! `step` point fails a request estimated past it as an overflow before
-//! it is sent, so it is compacted at no cost. `/compact` compacts now.
+//! compacted once: overflowing again, it fails. With a `threshold`, a
+//! percentage of the request's model's context window, the `step` point
+//! fails a request estimated past it as an overflow before it is sent, so
+//! it is compacted at no cost; a model with no known window compacts only
+//! when its provider says so. `/compact` compacts now, and
+//! `/compact <instructions>` says what the summary should keep.
 //!
 //! What it summarises is the conversation the call's model sees, sent as
 //! it is, so the provider's cache of it serves the summary.
 
 use ext::point::{RequestError, Step};
 use ext::{
-    Answer, Args, Configured, Cx, Extension, Fold, Later, ModelTurn, PointCx, Recover, Refused,
+    Answer, Args, Configured, Conversation, Cx, Extension, Fold, Later, PointCx, Recover, Refused,
     Registrar, Rewrite, Table, Tool,
 };
 use protocol::{Audience, CallId, Seq};
@@ -27,9 +30,27 @@ const SUMMARY: &str = "The conversation above no longer fits the model's context
 /// The `compact` extension.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Compact {
-    /// The estimated tokens past which a request is compacted before it is
-    /// sent; with none, only when the provider says it overflowed.
-    pub threshold: Option<u64>,
+    /// The share of the model's context window past which a request is
+    /// compacted before it is sent; with none, only when the provider says
+    /// it overflowed.
+    pub threshold: Option<Percent>,
+}
+
+/// A whole percentage, from 1 to 100.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Percent(u8);
+
+impl Percent {
+    pub const fn new(percent: u8) -> Option<Self> {
+        match percent {
+            1..=100 => Some(Self(percent)),
+            _ => None,
+        }
+    }
+    /// This share of `tokens`.
+    pub const fn of(self, tokens: u32) -> u64 {
+        tokens as u64 * self.0 as u64 / 100
+    }
 }
 
 /// The calls compacted, which are not compacted again.
@@ -57,8 +78,20 @@ impl Compact {
 
 impl Configured for Compact {
     fn configure(table: &impl Table) -> Result<Self, Refused> {
+        let threshold = table.whole("threshold")?;
+        let threshold = threshold.map(|percent| {
+            u8::try_from(percent)
+                .ok()
+                .and_then(Percent::new)
+                .ok_or_else(|| {
+                    Refused(format!(
+                        "ext.{}.threshold is a percentage of the context window, 1 to 100",
+                        table.name()
+                    ))
+                })
+        });
         Ok(Self {
-            threshold: table.whole("threshold")?,
+            threshold: threshold.transpose()?,
         })
     }
 }
@@ -77,26 +110,49 @@ impl Extension for Compact {
                 };
                 let cx = cx.cx();
                 Answer::Later(Later::new(async move {
-                    compact(&cx?, call).await.ok()?;
+                    compact(&cx?, call, "").await.ok()?;
                     Some(Recover::Resend)
                 }))
             })
-            .on::<Step>(move |cx, request| match threshold {
-                Some(most)
-                    if estimate(request) > most
+            .on::<Step>(move |cx, request| match threshold.zip(window(request)) {
+                None if threshold.is_some() => {
+                    unmeasured(cx.session);
+                    Rewrite::Pass
+                }
+                Some((share, window))
+                    if estimate(request) > share.of(window)
                         && cx.call.is_some_and(|call| {
                             !cx.state(|c: &Compacted| c.0.contains(&call.get()))
                         }) =>
                 {
                     let error = format!(
-                        "the request is about {} tokens, past the {most} to compact at",
-                        estimate(request)
+                        "the request is about {} tokens, past {} of the model's {window}",
+                        estimate(request),
+                        share.of(window)
                     );
                     Rewrite::Stop(Err(llm::Error::new(llm::Kind::ContextOverflow, error)))
                 }
                 _ => Rewrite::Pass,
             });
     }
+}
+
+/// Says once per session, in the daemon log, that its threshold measures
+/// nothing: the model has no known window.
+fn unmeasured(session: protocol::SessionId) {
+    static NOTED: std::sync::Mutex<Vec<protocol::SessionId>> = std::sync::Mutex::new(Vec::new());
+    let mut noted = NOTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !noted.contains(&session) {
+        noted.push(session);
+        ext_logging::emit(ext_logging::Fact::ThresholdUnmeasured { session });
+    }
+}
+
+/// The request's model's context window, if the model registry knows it.
+fn window(request: &llm::Request) -> Option<u32> {
+    llm::models::context_window(&request.model)
 }
 
 /// About how many tokens `request`'s messages are: a quarter of their
@@ -128,19 +184,19 @@ fn estimate(request: &llm::Request) -> u64 {
     u64::try_from(bytes / 4).unwrap_or(u64::MAX)
 }
 
-/// Summarises the conversation before call `call` and has the model see
-/// the summary in its place from now on.
-async fn compact(cx: &Cx, call: CallId) -> Result<String, String> {
-    let models = cx.models().ok_or("this engine asks no model aside")?;
-    let ask = [llm::Message::user(SUMMARY)].into_iter().collect();
-    let side = ModelTurn::new::<ext::ModelOnly>(
-        ext::ThreadKey::new::<Compact>("compact", ext::OwnerScope::Session),
-        ext::TurnKey(cx.call.get().to_string()),
-        ext::ModelRole::Session,
-        ext::SideContext::BeforeOwner,
-        ask,
-    );
-    let reply = models.call(cx, side).await.map_err(|e| e.to_string())?;
+/// Summarises the conversation before call `call`, keeping what the
+/// user's `instructions` ask for, and has the model see the summary in its
+/// place from now on.
+async fn compact(cx: &Cx, call: CallId, instructions: &str) -> Result<String, String> {
+    let ask = match instructions.trim() {
+        "" => SUMMARY.to_owned(),
+        said => format!("{SUMMARY}\nThe user's instructions for this summary: {said}"),
+    };
+    let reply = Conversation::turn::<Compact>("compact", ask)
+        .owner_context()
+        .ask(cx)
+        .await
+        .map_err(|e| e.to_string())?;
     let summary = reply.message.text();
     if summary.trim().is_empty() {
         return Err("the model wrote no summary".into());
@@ -167,11 +223,11 @@ impl Tool for CompactNow {
     type Out = String;
 
     const NAME: &'static str = "compact";
-    const DESCRIPTION: &'static str = "summarise the conversation for the model to go on from";
+    const DESCRIPTION: &'static str = "summarise the conversation for the model to go on from, optionally keeping what the instructions ask for";
     const AUDIENCE: Audience = Audience::User;
 
-    async fn call(&self, _: &Args, cx: &Cx) -> Result<String, String> {
-        compact(cx, cx.call).await
+    async fn call(&self, args: &Args, cx: &Cx) -> Result<String, String> {
+        compact(cx, cx.call, &args.args).await
     }
 }
 

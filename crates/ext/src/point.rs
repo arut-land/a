@@ -588,8 +588,8 @@ impl<'a> PointCx<'a> {
     }
 
     /// What the call this decides about runs with, owned and cheap to
-    /// clone, so an [`Answer::Later`] can take it along: to a side model
-    /// request, say ([`Cx::models`]). `None` for a point about no call.
+    /// clone, so an [`Answer::Later`] can take it along: to a
+    /// [`Conversation`](crate::Conversation), say. `None` for a point about no call.
     pub fn cx(&self) -> Option<Cx> {
         self.call.and_then(|call| self.view.cx(call))
     }
