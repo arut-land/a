@@ -44,6 +44,15 @@ fn main() -> ExitCode {
     // Help, the version, completion requests and usage errors (status 2)
     // end the process here.
     let args = Args::parse();
+    if matches!(
+        args.cmd.as_ref(),
+        Some(Cmd::Serve {
+            activated: true,
+            ..
+        })
+    ) {
+        sys::activation::prepare_process();
+    }
     let (prompt, mode) = (args.prompt, args.mode);
     let result = daemon_of(args.host).and_then(|daemon| {
         let done = match args.cmd {

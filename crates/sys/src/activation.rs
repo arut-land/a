@@ -18,6 +18,12 @@ mod native;
 #[path = "activation/windows.rs"]
 mod native;
 
+/// Runs at entry, before native path lookup or runtime/library workers exist.
+pub fn prepare_process() {
+    #[cfg(target_os = "macos")]
+    native::prepare_process();
+}
+
 pub fn installed(home: &Home) -> io::Result<bool> {
     if !native::SUPPORTED {
         return Ok(false);
