@@ -47,6 +47,11 @@ pub(crate) fn runtime_directory() -> PathBuf {
     imp::socket_dir()
 }
 
+#[cfg(unix)]
+pub(crate) fn register_activation(home: &Home, kind: &str) -> io::Result<()> {
+    imp::register_activation(home, kind)
+}
+
 impl Home {
     /// The daemon's endpoint. Unix uses a short socket name in a private
     /// runtime directory; Windows discovers a process-generation pipe
@@ -60,7 +65,6 @@ impl Home {
     /// Listens at [`Home::endpoint`], replacing a stale socket, and points
     /// [`Home::socket_link`] at it.
     pub fn bind(&self) -> io::Result<Listener> {
-        crate::activation::require_unmanaged(self)?;
         let endpoint = self.endpoint();
         imp::bind(&endpoint.0, &self.socket_link(), &endpoint.1).map(Listener)
     }
@@ -393,18 +397,28 @@ mod imp {
         Ok(stream)
     }
 
-    pub fn remove(_path: &Path, discovery: &Path) {
-        if discovery
-            .parent()
-            .is_some_and(|dir| dir.join("activation").exists())
-        {
-            return;
+    fn registered(discovery: &Path) -> io::Result<bool> {
+        let marker = discovery.with_file_name("activation");
+        match fs::symlink_metadata(marker) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
         }
+    }
+
+    pub fn remove(_path: &Path, discovery: &Path) {
         if let Ok(_claim) = claim(discovery)
+            && matches!(registered(discovery), Ok(false))
             && let Ok(path) = discover(discovery)
         {
             let _ = fs::remove_file(path);
         }
+    }
+
+    pub(super) fn register_activation(home: &crate::Home, kind: &str) -> io::Result<()> {
+        crate::fs::private_dir(&home.run_dir())?;
+        let _claim = claim(&home.run_dir().join("daemon.endpoint"))?;
+        crate::fs::write_private(&crate::activation::record(home), kind.as_bytes())
     }
 
     pub(super) fn claim_file(socket: &Path) -> io::Result<fs::File> {
@@ -438,6 +452,12 @@ mod imp {
         // The claim inode is never unlinked: a waiter must not lock an old
         // inode while another daemon creates and locks a replacement.
         let claim = claim(discovery)?;
+        if registered(discovery)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "the service manager owns this endpoint",
+            ));
+        }
         // A stale runtime directory may have disappeared since the last owner.
         let socket = if socket
             .parent()
@@ -801,9 +821,10 @@ mod tests {
             super::Listener::activated(duplicate(), &home).is_err(),
             "a live home claim excludes managed writers too"
         );
+        assert!(super::register_activation(&home, "test").is_err());
         drop((parent, resource));
         std::fs::remove_file(old_path).unwrap();
-        std::fs::write(crate::activation::record(&home), "test").unwrap();
+        super::register_activation(&home, "test").unwrap();
         let listener = super::Listener::activated(descriptor, &home).unwrap();
         let endpoint = home.endpoint();
         assert_eq!(endpoint.path(), managed_path);

@@ -19,6 +19,9 @@ mod native;
 mod native;
 
 pub fn installed(home: &Home) -> io::Result<bool> {
+    if !native::SUPPORTED {
+        return Ok(false);
+    }
     match std::fs::symlink_metadata(record(home)) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -109,8 +112,7 @@ fn run(command: &mut Command) -> io::Result<()> {
 
 #[cfg(unix)]
 fn prepare(home: &Home, kind: &str) -> io::Result<()> {
-    crate::fs::private_dir(&home.run_dir())?;
-    crate::fs::write_private(&record(home), kind.as_bytes())
+    crate::endpoint::register_activation(home, kind)
 }
 
 #[cfg(unix)]
