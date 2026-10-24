@@ -43,6 +43,8 @@ fn native_home(home: &Home) -> io::Result<()> {
 /// Registers the daemon to start when this user logs in.
 pub fn enable(home: &Home) -> io::Result<()> {
     native_home(home)?;
+    // The registration names the installed build: install the running one.
+    home.runtime().stage(&std::env::current_exe()?)?;
     native::enable(home)
 }
 
@@ -69,22 +71,39 @@ pub fn enter(home: &Home, executing_build: &str) -> io::Result<()> {
         use std::os::unix::process::CommandExt;
 
         let runtime = home.runtime();
-        if runtime
-            .current()
-            .is_some_and(|selected| selected != executing_build)
-        {
-            let executable = runtime.current_exe();
-            if executable.is_file() {
-                // Same PID: the service manager keeps tracking the daemon.
-                return Err(Command::new(executable)
-                    .args(std::env::args_os().skip(1))
-                    .exec());
-            }
+        let running = std::env::current_exe()?;
+        if let Some(executable) = handover(
+            runtime.current().as_deref(),
+            executing_build,
+            &runtime.current_exe(),
+            &running,
+        ) {
+            // Same PID: the service manager keeps tracking the daemon.
+            return Err(Command::new(executable)
+                .args(std::env::args_os().skip(1))
+                .exec());
         }
     }
     #[cfg(windows)]
     let _ = executing_build;
     Ok(())
+}
+
+/// The executable to hand over to, if any. Never the one running: an image
+/// whose id differs from the marker naming it would otherwise exec itself
+/// forever.
+#[cfg(unix)]
+fn handover(
+    selected: Option<&str>,
+    executing_build: &str,
+    current_exe: &std::path::Path,
+    running: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let same = |a: &std::path::Path, b: &std::path::Path| matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b);
+    (selected.is_some_and(|selected| selected != executing_build)
+        && current_exe.is_file()
+        && !same(current_exe, running))
+    .then(|| current_exe.to_owned())
 }
 
 #[cfg(unix)]
@@ -115,6 +134,27 @@ fn update(path: &std::path::Path, contents: &[u8]) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_login_entry_hands_over_at_most_once() {
+        let root =
+            std::env::temp_dir().join(format!("a-autostart-handover-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (bundled, selected) = (root.join("bundled"), root.join("selected"));
+        std::fs::write(&bundled, "old").unwrap();
+        std::fs::write(&selected, "new").unwrap();
+        assert_eq!(
+            handover(Some("new"), "old", &selected, &bundled),
+            Some(selected.clone())
+        );
+        // The selected image reports another id than its marker names: it
+        // is already running, so it serves rather than exec itself again.
+        assert_eq!(handover(Some("new"), "other", &selected, &selected), None);
+        assert_eq!(handover(Some("old"), "old", &selected, &bundled), None);
+        assert_eq!(handover(None, "old", &selected, &bundled), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn isolated_instances_cannot_register_at_login() {
