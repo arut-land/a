@@ -15,7 +15,9 @@ clients, work and jobs no longer pin it. Retirement releases the home claim
 without withdrawing the manager's socket. The next connection starts a new
 daemon; no helper process or readiness poll stays resident.
 
-A registration record in the private state/run directory prevents self-spawn
+A registration record in the private state/run directory retains the installed
+artifact locations, so uninstall works after a client changes its configuration
+base. It prevents self-spawn
 from bypassing disabled or failed native activation. If a registered socket
 cannot be reached, the client reports an actionable error. Remove activation
 explicitly to return to unmanaged startup. `a daemon stop` stops a running
@@ -27,9 +29,10 @@ idle daemon, and its rate limiting remains in effect after failures.
 ## Linux
 
 The CLI probes the running `systemd --user` manager, then writes
-`a-daemon.socket` and `a-daemon.service` under the XDG configuration base's
+`a-daemon-HASH.socket` and `a-daemon-HASH.service` under the XDG configuration base's
 `systemd/user` directory. It links the service and enables the socket with
-`systemctl --user`. The socket uses `Accept=no`, mode 0600 and the endpoint's
+`systemctl --user`. Names use the endpoint home identity, so changing native
+layout bases cannot stop another layout's service. The socket uses `Accept=no`, mode 0600 and the endpoint's
 private runtime directory. The service runs the executable selected by
 `Paths::runtime().current_exe()`, with a stable `/` working directory, umask
 0077, `KillMode=mixed` and a 30-second stop timeout. Resolved XDG directory
@@ -49,7 +52,7 @@ No distro or kernel-version heuristic controls this choice.
 
 ## macOS
 
-A CLI installation writes `~/Library/LaunchAgents/dev.a.daemon.plist` and
+A CLI installation writes `~/Library/LaunchAgents/dev.a.daemon.HASH.plist` and
 uses `launchctl bootstrap gui/UID`; uninstall uses `bootout`. The installed
 app provides **Start on connection** in its Command Line settings and
 registers its bundled LaunchAgent through `SMAppService`. Approval-required

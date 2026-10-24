@@ -1,19 +1,30 @@
-use super::{Command, Home, Listener, PathBuf, forget, installed, io, prepare, record, run};
-
-pub(super) const SUPPORTED: bool = true;
+use super::{Command, Home, Listener, PathBuf, forget, installed, io, prepare, run};
 use std::os::fd::FromRawFd;
 
+pub(super) const SUPPORTED: bool = true;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) enum Registration {
+    Launchd { plist: PathBuf },
+    App,
+}
+
 const LABEL: &str = "dev.a.daemon";
-const PLIST: &str = "dev.a.daemon.plist";
+fn label(home: &Home) -> String {
+    format!(
+        "{LABEL}.{:016x}",
+        crate::endpoint::activation_identity(home)
+    )
+}
 
 fn domain() -> String {
     format!("gui/{}", rustix::process::geteuid().as_raw())
 }
-fn plist() -> io::Result<PathBuf> {
+fn plist(home: &Home) -> io::Result<PathBuf> {
     Ok(std::env::home_dir()
         .ok_or(io::ErrorKind::NotFound)?
         .join("Library/LaunchAgents")
-        .join(PLIST))
+        .join(format!("{}.plist", label(home))))
 }
 
 fn xml(value: &str) -> String {
@@ -31,7 +42,7 @@ pub(super) fn install(
     stop: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     if installed(home)? {
-        if app && std::fs::read_to_string(record(home))? == "app" {
+        if app && matches!(Registration::read(home)?, Registration::App) {
             return Ok(());
         }
         return Err(io::Error::new(
@@ -41,9 +52,10 @@ pub(super) fn install(
     }
     if app {
         stop()?;
-        return prepare(home, "app");
+        return prepare(home, &Registration::App);
     }
-    let path = plist()?;
+    let path = plist(home)?;
+    let label = label(home);
     if path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -56,7 +68,7 @@ pub(super) fn install(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>Label</key><string>{LABEL}</string>
+<key>Label</key><string>{label}</string>
 <key>ProgramArguments</key><array><string>{}</string><string>__daemon</string><string>--activated</string></array>
 <key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string></dict>
 <key>WorkingDirectory</key><string>/</string>
@@ -75,7 +87,13 @@ pub(super) fn install(
     std::fs::create_dir_all(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
     stop()?;
     crate::fs::write_private(&path, value.as_bytes())?;
-    prepare(home, "launchd")?;
+    let path = std::fs::canonicalize(path)?;
+    prepare(
+        home,
+        &Registration::Launchd {
+            plist: path.clone(),
+        },
+    )?;
     let result = run(Command::new("launchctl")
         .arg("bootstrap")
         .arg(domain())
@@ -91,17 +109,21 @@ pub(super) fn uninstall(home: &Home, app: bool) -> io::Result<()> {
     if !installed(home)? {
         return Ok(());
     }
-    let kind = std::fs::read_to_string(record(home))?;
-    if (kind == "app") != app {
-        return Err(io::Error::other(
-            "use the app to remove its background service, or the CLI for its LaunchAgent",
-        ));
-    }
-    if !app {
-        run(Command::new("launchctl")
-            .arg("bootout")
-            .arg(format!("{}/{LABEL}", domain())))?;
-        std::fs::remove_file(plist()?)?;
+    match (Registration::read(home)?, app) {
+        (Registration::Launchd { plist }, false) => {
+            run(Command::new("launchctl").arg("bootout").arg(format!(
+                "{}/{}",
+                domain(),
+                label(home)
+            )))?;
+            std::fs::remove_file(plist)?;
+        }
+        (Registration::App, true) => {}
+        _ => {
+            return Err(io::Error::other(
+                "use the app to remove its background service, or the CLI for its LaunchAgent",
+            ));
+        }
     }
     forget(home)
 }
@@ -181,6 +203,15 @@ pub(super) fn listener(home: &Home) -> io::Result<Listener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_names_cannot_cross_state_homes() {
+        let root = std::env::temp_dir().join(format!("a-activation-names-{}", std::process::id()));
+        let one = Home::from(root.join("one"));
+        let two = Home::from(root.join("two"));
+        assert_ne!(label(&one), label(&two));
+        assert_ne!(plist(&one).unwrap(), plist(&two).unwrap());
+    }
 
     #[test]
     fn plist_values_cannot_become_markup() {

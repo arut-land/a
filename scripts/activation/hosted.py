@@ -31,8 +31,8 @@ config.mkdir(parents=True)
 (config / "config.toml").write_text("[daemon]\nidle_secs = 1\n")
 
 
-def command(*words, check=True):
-    result = subprocess.run([str(binary), *words], env=env, capture_output=True, text=True, timeout=45)
+def command(*words, check=True, environment=None):
+    result = subprocess.run([str(binary), *words], env=env if environment is None else environment, capture_output=True, text=True, timeout=45)
     if check and result.returncode:
         raise RuntimeError(f"{words}: {result.returncode}: {result.stderr}")
     return result
@@ -46,6 +46,9 @@ def connect():
 
 samples = {"self_spawn_ms": [], "activation_ms": []}
 try:
+    unregistered = command("__daemon", "--activated", check=False)
+    assert unregistered.returncode and "not installed for this home" in unregistered.stderr
+    assert not (run_dir / "daemon.endpoint").exists()
     command("ls")
     command("daemon", "stop")
     for sample in range(args.samples):
@@ -72,7 +75,32 @@ try:
                 assert socket.stat().st_ino == identity
                 command("daemon", "stop")
                 command("daemon", "uninstall-activation")
-    result = {"platform": platform.platform(), "binary_bytes": binary.stat().st_size, "samples": samples,
+    # Native layout bases may differ for the same user; uninstall must own
+    # its manager namespace as strictly as it owns its endpoint claim.
+    peer_root = Path(tempfile.mkdtemp(prefix="a-activation-peer-"))
+    peer_env = dict(env, HOME=str(peer_root))
+    for kind in ["CONFIG", "DATA", "STATE", "CACHE"]:
+        peer_env[f"XDG_{kind}_HOME"] = str(peer_root / kind.lower())
+    peer_config = peer_root / ("Library/Application Support/dev.a/config" if platform.system() == "Darwin" else "config/a")
+    peer_config.mkdir(parents=True)
+    for directory in [config, peer_config]:
+        (directory / "config.toml").write_text("[daemon]\nidle_secs = 60\n")
+    try:
+        for environment in [env, peer_env]:
+            command("daemon", "install-activation", environment=environment)
+            command("ls", environment=environment)
+        before = command("daemon", "status", environment=peer_env).stdout.splitlines()[0]
+        assert before.startswith("running (pid "), before
+        uninstall_env = dict(env)
+        if platform.system() == "Linux":
+            uninstall_env["XDG_CONFIG_HOME"] = str(root / "another-config")
+        command("daemon", "uninstall-activation", environment=uninstall_env)
+        after = command("daemon", "status", environment=peer_env).stdout.splitlines()[0]
+        assert after == before, "uninstall affected another native state home"
+    finally:
+        command("daemon", "stop", check=False, environment=peer_env)
+        command("daemon", "uninstall-activation", check=False, environment=peer_env)
+    result = {"platform": platform.platform(), "binary_bytes": binary.stat().st_size, "samples": samples, "cross_home_uninstall": True,
               "medians": {key: statistics.median(values) for key, values in samples.items()}}
     result["activation_minus_self_spawn_ms"] = result["medians"]["activation_ms"] - result["medians"]["self_spawn_ms"]
     print(json.dumps(result, indent=2))

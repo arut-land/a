@@ -33,6 +33,17 @@ pub(crate) fn record(home: &Home) -> PathBuf {
     home.run_dir().join("activation")
 }
 
+#[cfg(unix)]
+use native::Registration;
+
+#[cfg(unix)]
+impl Registration {
+    fn read(home: &Home) -> io::Result<Self> {
+        serde_json::from_slice(&std::fs::read(record(home))?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+}
+
 fn native_home(home: &Home) -> io::Result<()> {
     if home.layout() != &InstallLayout::Native {
         return Err(io::Error::new(
@@ -94,6 +105,12 @@ pub fn wait(home: &Home) -> io::Result<()> {
 /// Called before any runtime or child threads exist.
 pub fn listener(home: &Home) -> io::Result<Listener> {
     native_home(home)?;
+    if !installed(home)? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "native activation is not installed for this home",
+        ));
+    }
     native::listener(home)
 }
 
@@ -123,8 +140,9 @@ fn run(command: &mut Command) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn prepare(home: &Home, kind: &str) -> io::Result<()> {
-    crate::endpoint::register_activation(home, kind)
+fn prepare(home: &Home, registration: &Registration) -> io::Result<()> {
+    let bytes = serde_json::to_vec(registration).map_err(io::Error::other)?;
+    crate::endpoint::register_activation(home, &bytes)
 }
 
 #[cfg(unix)]

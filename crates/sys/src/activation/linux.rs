@@ -1,11 +1,21 @@
 use super::{Command, Home, Listener, PathBuf, forget, installed, io, prepare, run};
-
-pub(super) const SUPPORTED: bool = true;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 
-const SOCKET: &str = "a-daemon.socket";
-const SERVICE: &str = "a-daemon.service";
+pub(super) const SUPPORTED: bool = true;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct Registration {
+    directory: PathBuf,
+}
+
+fn names(home: &Home) -> (String, String) {
+    let identity = crate::endpoint::activation_identity(home);
+    (
+        format!("a-daemon-{identity:016x}.socket"),
+        format!("a-daemon-{identity:016x}.service"),
+    )
+}
 
 fn systemctl() -> Command {
     let mut command = Command::new("systemctl");
@@ -51,7 +61,7 @@ fn socket_path(path: &Path) -> io::Result<String> {
     Ok(value.replace('%', "%%"))
 }
 
-fn service(home: &Home) -> io::Result<String> {
+fn service(home: &Home, socket: &str) -> io::Result<String> {
     let mut env = Command::new("unused");
     home.daemon_env(&mut env);
     let mut settings = String::new();
@@ -64,7 +74,7 @@ fn service(home: &Home) -> io::Result<String> {
         }
     }
     Ok(format!(
-        "[Unit]\nDescription=a per-user agent daemon\nRequires={SOCKET}\nAfter={SOCKET}\n\n[Service]\nType=simple\nExecStart={} __daemon --activated\nWorkingDirectory=/\nUMask=0077\nKillMode=mixed\nTimeoutStopSec=30\n{settings}",
+        "[Unit]\nDescription=a per-user agent daemon\nRequires={socket}\nAfter={socket}\n\n[Service]\nType=simple\nExecStart={} __daemon --activated\nWorkingDirectory=/\nUMask=0077\nKillMode=mixed\nTimeoutStopSec=30\n{settings}",
         quote(&home.runtime().current_exe())?.replace('$', "$$")
     ))
 }
@@ -83,6 +93,7 @@ pub(super) fn install(
             "activation is already installed",
         ));
     }
+    let (socket_name, service_name) = names(home);
     // This probes the actual user manager, including WSL/container deployments.
     run(systemctl().args(["show-environment"]))?;
     let endpoint = home.endpoint();
@@ -96,10 +107,11 @@ pub(super) fn install(
         "[Unit]\nDescription=a per-user agent socket\n\n[Socket]\nListenStream={}\nSocketMode=0600\nDirectoryMode=0700\nAccept=no\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n",
         socket_path(endpoint.path())?
     );
-    let service = service(home)?;
+    let service = service(home, &socket_name)?;
     let dir = units(home);
     std::fs::create_dir_all(&dir)?;
-    for name in [SOCKET, SERVICE] {
+    let dir = std::fs::canonicalize(dir)?;
+    for name in [&socket_name, &service_name] {
         if dir.join(name).exists() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -108,17 +120,24 @@ pub(super) fn install(
         }
     }
     stop()?;
-    crate::fs::write_private(&dir.join(SOCKET), socket.as_bytes())?;
-    crate::fs::write_private(&dir.join(SERVICE), service.as_bytes())?;
-    prepare(home, "systemd")?;
+    crate::fs::write_private(&dir.join(&socket_name), socket.as_bytes())?;
+    crate::fs::write_private(&dir.join(&service_name), service.as_bytes())?;
+    prepare(
+        home,
+        &Registration {
+            directory: dir.clone(),
+        },
+    )?;
     // Publish discovery before enabling: the first connect can enter the manager's backlog.
     crate::fs::write_private(
         &home.run_dir().join("daemon.endpoint"),
         endpoint.path().as_os_str().as_encoded_bytes(),
     )?;
-    run(systemctl().arg("link").arg(dir.join(SERVICE)))?;
+    run(systemctl().arg("link").arg(dir.join(&service_name)))?;
     run(systemctl().arg("daemon-reload"))?;
-    run(systemctl().args(["enable", "--now"]).arg(dir.join(SOCKET)))
+    run(systemctl()
+        .args(["enable", "--now"])
+        .arg(dir.join(&socket_name)))
 }
 
 pub(super) fn uninstall(home: &Home, app: bool) -> io::Result<()> {
@@ -128,12 +147,14 @@ pub(super) fn uninstall(home: &Home, app: bool) -> io::Result<()> {
     if !installed(home)? {
         return Ok(());
     }
+    let Registration { directory } = Registration::read(home)?;
+    let (socket_name, service_name) = names(home);
     // Stop the socket first, otherwise a reconnect could start another writer.
-    run(systemctl().args(["disable", "--now", SOCKET]))?;
-    run(systemctl().args(["stop", SERVICE]))?;
-    run(systemctl().args(["disable", SERVICE]))?;
-    for name in [SOCKET, SERVICE] {
-        std::fs::remove_file(units(home).join(name))?;
+    run(systemctl().args(["disable", "--now", &socket_name]))?;
+    run(systemctl().args(["stop", &service_name]))?;
+    run(systemctl().args(["disable", &service_name]))?;
+    for name in [&socket_name, &service_name] {
+        std::fs::remove_file(directory.join(name))?;
     }
     run(systemctl().arg("daemon-reload"))?;
     forget(home)
@@ -185,6 +206,17 @@ pub(super) fn listener(home: &Home) -> io::Result<Listener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_names_cannot_cross_state_homes() {
+        let root = std::env::temp_dir().join(format!("a-activation-names-{}", std::process::id()));
+        let one = Home::from(root.join("one"));
+        let two = Home::from(root.join("two"));
+        let (one_socket, one_service) = names(&one);
+        let (two_socket, two_service) = names(&two);
+        assert_ne!(one_socket, two_socket);
+        assert_ne!(one_service, two_service);
+    }
 
     #[test]
     fn unit_paths_cannot_expand_specifiers_or_inject_directives() {

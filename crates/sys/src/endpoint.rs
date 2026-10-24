@@ -48,8 +48,13 @@ pub(crate) fn runtime_directory() -> PathBuf {
 }
 
 #[cfg(unix)]
-pub(crate) fn register_activation(home: &Home, kind: &str) -> io::Result<()> {
-    imp::register_activation(home, kind)
+pub(crate) fn activation_identity(home: &Home) -> u64 {
+    imp::home_hash(home.root())
+}
+
+#[cfg(unix)]
+pub(crate) fn register_activation(home: &Home, bytes: &[u8]) -> io::Result<()> {
+    imp::register_activation(home, bytes)
 }
 
 impl Home {
@@ -415,10 +420,10 @@ mod imp {
         }
     }
 
-    pub(super) fn register_activation(home: &crate::Home, kind: &str) -> io::Result<()> {
+    pub(super) fn register_activation(home: &crate::Home, bytes: &[u8]) -> io::Result<()> {
         crate::fs::private_dir(&home.run_dir())?;
         let _claim = claim(&home.run_dir().join("daemon.endpoint"))?;
-        crate::fs::write_private(&crate::activation::record(home), kind.as_bytes())
+        crate::fs::write_private(&crate::activation::record(home), bytes)
     }
 
     pub(super) fn claim_file(socket: &Path) -> io::Result<fs::File> {
@@ -821,10 +826,10 @@ mod tests {
             super::Listener::activated(duplicate(), &home).is_err(),
             "a live home claim excludes managed writers too"
         );
-        assert!(super::register_activation(&home, "test").is_err());
+        assert!(super::register_activation(&home, b"test").is_err());
         drop((parent, resource));
         std::fs::remove_file(old_path).unwrap();
-        super::register_activation(&home, "test").unwrap();
+        super::register_activation(&home, b"test").unwrap();
         let listener = super::Listener::activated(descriptor, &home).unwrap();
         let endpoint = home.endpoint();
         assert_eq!(endpoint.path(), managed_path);

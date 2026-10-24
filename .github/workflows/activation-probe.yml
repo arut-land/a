@@ -40,9 +40,9 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == Linux ]]; then
-            journalctl --user -u a-daemon.service -u a-daemon.socket --no-pager -n 150
+            journalctl --user -u 'a-daemon-*.service' -u 'a-daemon-*.socket' --no-pager -n 150
           else
-            launchctl print "gui/$(id -u)/dev.a.daemon" || true
+            launchctl list | rg 'dev\.a\.daemon' || true
           fi
       - uses: actions/upload-artifact@v5
         if: always()
