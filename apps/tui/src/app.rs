@@ -99,8 +99,13 @@ pub struct App {
     /// Tokens the session's model calls used, summed as replies arrive.
     tokens: Usage,
     clock: WorkingClock,
-    /// Inline: the items already printed into the scrollback.
+    /// Inline: the items already printed into the scrollback, and the
+    /// rows of the next one that are (a write can stop inside an item).
     committed: usize,
+    committed_row: usize,
+    /// Inline: where the printed cursor is after each row this frame put
+    /// into the scrollback.
+    scrolled: Vec<(usize, usize)>,
     /// The attach asked for the latest session: if there is none, the
     /// picker opens instead.
     resuming: bool,
@@ -192,6 +197,8 @@ impl App {
             tokens: Usage::default(),
             clock: WorkingClock::default(),
             committed: 0,
+            committed_row: 0,
+            scrolled: Vec::new(),
             resuming: matches!(target, Target::Latest { .. }),
             redraw: true,
         }
@@ -289,7 +296,7 @@ impl App {
                     self.cache.clear();
                     self.collapsed.clear();
                     self.anchor = None;
-                    self.committed = 0;
+                    (self.committed, self.committed_row) = (0, 0);
                     self.tokens = Usage::default();
                     self.clock = WorkingClock::default();
                     self.recap_hidden = false;
@@ -327,7 +334,9 @@ impl App {
             Change::Snapshot => {
                 self.cache.clear();
                 self.anchor = None;
-                self.committed = self.committed.min(len);
+                if self.committed >= len {
+                    (self.committed, self.committed_row) = (len, 0);
+                }
                 self.tokens = Usage::default();
                 for item in &self.client.view().items {
                     spend(&mut self.tokens, item);

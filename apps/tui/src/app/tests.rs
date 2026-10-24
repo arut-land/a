@@ -732,39 +732,54 @@ fn settled_result() -> App {
     app
 }
 
+/// Accepts the first `limit` bytes, then reports the write interrupted.
+struct Partial(Term, Option<usize>);
+impl std::io::Write for Partial {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(limit) = &mut self.1 else {
+            return self.0.write(bytes);
+        };
+        if *limit == 0 {
+            self.1 = None;
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+        let n = bytes.len().min(*limit).min(7);
+        *limit -= n;
+        self.0.write(&bytes[..n])
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn scrollback_the_terminal_accepted_is_never_printed_again() {
-    /// Accepts the first `limit` bytes, then reports the write interrupted.
-    struct Partial(Term, Option<usize>);
-    impl std::io::Write for Partial {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            let Some(limit) = &mut self.1 else {
-                return self.0.write(bytes);
-            };
-            if *limit == 0 {
-                self.1 = None;
-                return Err(std::io::ErrorKind::WouldBlock.into());
-            }
-            let n = bytes.len().min(*limit).min(7);
-            *limit -= n;
-            self.0.write(&bytes[..n])
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
     let whole = Term::default();
     Screen::new(Viewport::Inline, whole.clone())
         .draw(&mut settled_result(), (80, 24))
         .unwrap();
     let frame = whole.take().1;
-    let history = frame
-        .windows(b"retained result".len())
-        .rposition(|window| window == b"retained result")
-        .unwrap();
-    // Interrupted short of the item (it is printed again whole) and past
-    // the scrollback, short of the frame's end (it is not), in short writes.
-    for limit in [history, frame.len() - 1] {
+    let find = |needle: &str| {
+        frame
+            .windows(needle.len())
+            .position(|window| window == needle.as_bytes())
+            .unwrap()
+    };
+    let count = |bytes: &[u8], needle: &str| {
+        bytes
+            .windows(needle.len())
+            .filter(|window| *window == needle.as_bytes())
+            .count()
+    };
+    // Cut before the card, inside it after its header line, after the
+    // scrollback inside the viewport, and short of the frame's end; each
+    // in short writes, then redrawn as an interrupted frame is.
+    for limit in [
+        find("⏺"),
+        find("retained result"),
+        find("esc stops it"),
+        frame.len() - 1,
+    ] {
         let mut app = settled_result();
         let term = Term::default();
         let mut screen = Screen::new(Viewport::Inline, Partial(term.clone(), Some(limit)));
@@ -772,21 +787,62 @@ fn scrollback_the_terminal_accepted_is_never_printed_again() {
             screen.draw(&mut app, (80, 24)).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
-        screen.resume();
+        screen.invalidate();
         screen.draw(&mut app, (80, 24)).unwrap();
         screen.draw(&mut app, (80, 24)).unwrap();
         let output = term.take().1;
-        let printed = output
-            .windows(b"retained result".len())
-            .filter(|window| *window == b"retained result")
-            .count();
+        let shown = String::from_utf8_lossy(&output);
+        assert_eq!(count(&output, "⏺"), 1, "limit {limit}: {shown:?}");
         assert_eq!(
-            printed,
+            count(&output, "retained result"),
             1,
-            "limit {limit}: {:?}",
-            String::from_utf8_lossy(&output)
+            "limit {limit}: {shown:?}"
         );
     }
+}
+
+#[test]
+fn a_frame_cut_inside_the_viewport_resumes_from_the_row_it_reached() {
+    let whole = Term::default();
+    Screen::new(Viewport::Inline, whole.clone())
+        .draw(&mut settled_result(), (80, 24))
+        .unwrap();
+    let frame = whole.take().1;
+    let top = frame
+        .windows(4)
+        .position(|window| window == b"\x1b[6A")
+        .unwrap();
+    let cut = top
+        + frame[top..]
+            .windows(b"esc stops it".len())
+            .position(|window| window == b"esc stops it")
+            .unwrap();
+    // The rows the viewport moved down before the cut.
+    let reached = frame[top..cut]
+        .windows(4)
+        .filter(|window| *window == b"\x1b[1B")
+        .count();
+    assert!(reached > 0);
+    let mut app = settled_result();
+    let term = Term::default();
+    let mut screen = Screen::new(Viewport::Inline, Partial(term.clone(), Some(cut)));
+    assert_eq!(
+        screen.draw(&mut app, (80, 24)).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    term.take();
+    screen.invalidate();
+    screen.draw(&mut app, (80, 24)).unwrap();
+    let retry = term.take().1;
+    let up = format!("\x1b[{reached}A\r");
+    let first_newline = retry.iter().position(|&byte| byte == b'\n').unwrap();
+    assert!(
+        retry[..first_newline]
+            .windows(up.len())
+            .any(|window| window == up.as_bytes()),
+        "the retry must return to the viewport's top from row {reached}: {:?}",
+        String::from_utf8_lossy(&retry)
+    );
 }
 
 #[test]

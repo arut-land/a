@@ -40,10 +40,16 @@ pub struct Screen<W = Stdout> {
     /// Draw the next frame whole: the first, after a resize, Ctrl-L, or
     /// (inline) when the viewport moved or changed size.
     stale: bool,
-    /// Where this frame's scrollback lines end in `bytes`; after its
-    /// write, kept only if the terminal accepted that many bytes: those
-    /// lines are printed even if the rest of the frame is not.
-    history_end: Option<usize>,
+    /// Where each of this frame's scrollback lines ends in `bytes`. A line
+    /// the terminal accepted whole is printed even if the rest of the frame
+    /// is not; the next frame overwrites a partial one.
+    history_ends: Vec<usize>,
+    /// How many scrollback lines the last write delivered.
+    printed: usize,
+    /// Inline: the viewport row the cursor is on once `bytes` up to each
+    /// offset are written, so a cut-short frame resumes from where the
+    /// cursor actually stopped.
+    marks: Vec<(usize, Option<u16>)>,
 }
 
 impl<W: Write> Screen<W> {
@@ -59,7 +65,9 @@ impl<W: Write> Screen<W> {
             colour: true,
             cursor_shown: true,
             stale: true,
-            history_end: None,
+            history_ends: Vec::new(),
+            printed: 0,
+            marks: Vec::new(),
         }
     }
 
@@ -92,13 +100,13 @@ impl<W: Write> Screen<W> {
     pub fn draw(&mut self, app: &mut App, size: (u16, u16)) -> io::Result<()> {
         let mut frame = app.begin_frame();
         let drawn = self.draw_frame(&mut frame, size);
-        if self.history_end.take().is_some() || drawn.is_ok() {
-            frame.commit();
-        }
+        frame.printed(std::mem::take(&mut self.printed));
         drawn
     }
 
     fn draw_frame(&mut self, app: &mut App, (cols, rows): (u16, u16)) -> io::Result<()> {
+        self.marks.clear();
+        self.marks.push((0, self.row));
         self.bytes.extend_from_slice(OPEN);
         let (w, h) = match self.viewport {
             Viewport::Full => {
@@ -154,6 +162,7 @@ impl<W: Write> Screen<W> {
         }
         if self.bytes.len() == OPEN.len() {
             self.bytes.clear();
+            self.marks.clear();
             return Ok(());
         }
         self.bytes.extend_from_slice(CLOSE);
@@ -171,7 +180,7 @@ impl<W: Write> Screen<W> {
         self.flush()
     }
 
-    /// The frame's bytes, in one write.
+    /// The frame's bytes, written in as many calls as the terminal takes.
     fn flush(&mut self) -> io::Result<()> {
         let mut sent = 0;
         let written = loop {
@@ -185,12 +194,26 @@ impl<W: Write> Screen<W> {
                 Err(e) => break Err(e),
             }
         };
-        self.history_end = self.history_end.filter(|&end| sent >= end);
+        self.printed = self
+            .history_ends
+            .iter()
+            .take_while(|&&end| end <= sent)
+            .count();
+        self.history_ends.clear();
+        let reached = self.marks.iter().rev().find(|&&(at, _)| at <= sent);
+        let row = reached.and_then(|&(_, row)| row);
+        self.marks.clear();
         self.bytes.clear();
         if written.is_err() {
             // Planned cursor moves may never have reached the terminal. A
-            // fresh anchor cannot move up into output the shell left above it.
+            // fresh anchor cannot move up into output the shell left above
+            // it; inline, it is the row the delivered bytes left the cursor
+            // on, so viewport rows already drawn are drawn over, not left
+            // in the scrollback.
             self.resume();
+            if self.viewport == Viewport::Inline && row.is_some() {
+                self.row = row;
+            }
         }
         written
     }
@@ -208,8 +231,10 @@ impl<W: Write> Screen<W> {
             }
             self.repen(PLAIN);
             self.bytes.extend_from_slice(b"\r\n");
+            self.history_ends.push(self.bytes.len());
+            // Each printed line moves the viewport's top down to the next.
+            self.marks.push((self.bytes.len(), Some(0)));
         }
-        self.history_end = Some(self.bytes.len());
         // The viewport starts on the row after them.
         (self.row, self.col) = (Some(0), Some(0));
         self.stale = true;
@@ -223,11 +248,13 @@ impl<W: Write> Screen<W> {
         }
         self.home();
         self.repen(PLAIN);
-        for _ in 1..h {
+        for row in 1..h {
             self.bytes.push(b'\n');
+            self.marks.push((self.bytes.len(), Some(row)));
         }
         if h > 1 {
             csi(&mut self.bytes, h - 1, b'A');
+            self.marks.push((self.bytes.len(), Some(0)));
         }
         self.bytes.extend_from_slice(b"\x1b[J");
         self.stale = true;
@@ -240,6 +267,7 @@ impl<W: Write> Screen<W> {
         }
         self.bytes.push(b'\r');
         (self.row, self.col) = (Some(0), Some(0));
+        self.marks.push((self.bytes.len(), self.row));
     }
 
     /// Writes columns `cols` of row `y` of `grid`, skipping the ones wide
@@ -290,6 +318,7 @@ impl<W: Write> Screen<W> {
             }
         }
         (self.row, self.col) = (Some(y), Some(x));
+        self.marks.push((self.bytes.len(), self.row));
     }
 
     /// Switches SGR state to `pen`, in one sequence.

@@ -237,10 +237,12 @@ pub fn write_stdout(
                     .unwrap_or_else(PoisonError::into_inner)
                     .take()
                     .unwrap();
-                // Bytes the console accepted are reported, so the caller's
-                // count stays exact; the queued control surfaces on its next
-                // call. A cancelled write yields to it instead of surfacing
-                // ERROR_OPERATION_ABORTED.
+                // A write that completed reports its bytes even with an
+                // interruption pending: they are on the screen, and a caller
+                // told WouldBlock would count them unwritten and print them
+                // again (the TUI's scrollback). The interruption surfaces on
+                // the next call, which checks it before writing. A cancelled
+                // write yields to it instead of surfacing ERROR_OPERATION_ABORTED.
                 return match result {
                     Err(_) if cancelled || (interruptible && output_interrupted()) => {
                         Err(io::ErrorKind::WouldBlock.into())
