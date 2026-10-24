@@ -102,7 +102,9 @@ mod tests {
         let file = root.join("SKILL.md");
         std::fs::write(&file, "").unwrap();
         let event = |kind, paths: &[&PathBuf]| {
-            notify::Event::new(kind).set_paths(paths.iter().map(|&p| p.clone()).collect())
+            paths.iter().fold(notify::Event::new(kind), |event, &path| {
+                event.add_path(path.clone())
+            })
         };
         let renamed = notify::EventKind::Modify(ModifyKind::Name(RenameMode::To));
         assert!(structural(&event(
