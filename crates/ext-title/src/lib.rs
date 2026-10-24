@@ -3,8 +3,8 @@
 
 use ext::point::Observe;
 use ext::{
-    Args, Budget, Configured, Cx, Extension, ModelTurn, Reaction, Refused, Registrar, Replay,
-    Table, Tool, TurnKey,
+    Args, Configured, Conversation, Cx, Extension, Reaction, Refused, Registrar, Replay, Table,
+    Tool, Turn,
 };
 use protocol::{Audience, Body};
 
@@ -13,11 +13,13 @@ const TITLE: &str = "Name this conversation in at most six words, for a list of 
 
 pub struct Title;
 
-impl ext::ModelOnlyKind for Title {
-    const CONTEXT: ext::ContextPolicy = ext::ContextPolicy {
-        exchanges: 2,
-        bytes: 8192,
-    };
+/// A title is a few fast words about the recent conversation.
+fn title(prompt: impl Into<String>) -> Conversation<Turn> {
+    Conversation::turn::<Title>(PURPOSE, prompt)
+        .fast()
+        .owner_context()
+        .bounds(2, 8192)
+        .max_tokens(const { std::num::NonZeroU32::new(32).unwrap() })
 }
 
 impl Configured for Title {
@@ -45,26 +47,9 @@ impl Extension for Title {
             let Some(cx) = cx.cx() else {
                 return Reaction::NONE;
             };
-            turn(TurnKey("initial".into()), TITLE.into())
-                .background()
-                .start(cx)
+            title(TITLE).key("initial").detach().start(cx)
         });
     }
-}
-
-fn turn(key: TurnKey, prompt: String) -> ModelTurn {
-    let mut turn = ModelTurn::new::<Title>(
-        ext::ThreadKey::new::<Title>(PURPOSE, ext::OwnerScope::Session),
-        key,
-        ext::ModelRole::Fast,
-        ext::SideContext::BeforeOwner,
-        [llm::Message::user(prompt)].into_iter().collect(),
-    );
-    turn.budget = Budget {
-        max_tokens: std::num::NonZeroU32::new(32).unwrap(),
-        ..Budget::default()
-    };
-    turn
 }
 
 pub struct Rename;
@@ -82,9 +67,8 @@ impl Tool for Rename {
         } else {
             format!("{TITLE}\nNaming instructions: {}", args.args)
         };
-        cx.models()
-            .ok_or("this engine has no model service")?
-            .call(cx, turn(TurnKey(cx.call.get().to_string()), prompt))
+        title(prompt)
+            .ask(cx)
             .await
             .map(|reply| reply.message.text())
             .map_err(|error| error.to_string())

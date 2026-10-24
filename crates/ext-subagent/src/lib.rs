@@ -1,11 +1,11 @@
 //! `subagent`: the `task` tool, which hands a self-contained piece of work
-//! to a child session and answers with what it settled with. The engine's
-//! [`Sessions`] starts the child, owned by the call: it is interrupted with
+//! to a child session and answers with what it settled with. Each tool is
+//! an [`ext::Conversation`] task, owned by the call: it is interrupted with
 //! the turn, survives a restart, and is heard from once.
 
 use ext::{
-    Concurrency, Configured, Cx, Extension, Json, Refused, Registrar, Replay, Schema, Table, Text,
-    Tool,
+    Concurrency, Configured, Conversation, Cx, Extension, Json, Refused, Registrar, Replay, Schema,
+    Table, Task as Child, Text, Tool,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,7 +61,7 @@ impl Tool for Task {
     const CONCURRENCY: Concurrency = Concurrency::Shared;
 
     async fn call(&self, input: &Prompt, cx: &Cx) -> Result<String, String> {
-        awaited_task(input, cx, "task", ext::ContextSource::Fresh).await
+        awaited(child("task", input), cx).await
     }
 
     /// The child's text, as text rather than a JSON string.
@@ -83,46 +83,20 @@ impl Tool for ForkTask {
     const REPLAY: Replay = Replay::Safe;
     const CONCURRENCY: Concurrency = Concurrency::Shared;
     async fn call(&self, input: &Prompt, cx: &Cx) -> Result<String, String> {
-        awaited_task(
-            input,
-            cx,
-            "fork_task",
-            ext::ContextSource::Prefix {
-                session: cx.session,
-                seq: cx.call.0,
-            },
-        )
-        .await
+        awaited(child("fork_task", input).owner_context(), cx).await
     }
     fn to_model(output: &Json) -> llm::Output {
         Task::to_model(output)
     }
 }
 
-async fn awaited_task(
-    input: &Prompt,
-    cx: &Cx,
-    purpose: &str,
-    context: ext::ContextSource,
-) -> Result<String, String> {
-    let sessions = cx.sessions().ok_or("this engine runs no child sessions")?;
-    let mut spawn = ext::Spawn::new::<Subagent>(
-        purpose,
-        input.prompt.clone(),
-        ext::Runner::Agent {
-            agent: input
-                .kind
-                .clone()
-                .unwrap_or_else(|| sessions.runner().agent().unwrap_or(ext::LOOP).into()),
-            role: ext::ModelRole::Session,
-        },
-        ext::DepthBudget::new(8),
-    );
-    spawn.context = context;
-    let outcome = sessions
-        .spawn(cx, spawn.awaited())
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+fn child(purpose: &str, input: &Prompt) -> Conversation<Child> {
+    let child = Conversation::task::<Subagent>(purpose, &input.prompt);
+    input.kind.iter().fold(child, Conversation::kind)
+}
+
+async fn awaited(child: Conversation<Child>, cx: &Cx) -> Result<String, String> {
+    let outcome = child.ask(cx).await.map_err(|e| format!("{e:?}"))?;
     Ok(ext::child_result(&outcome))
 }
 
@@ -143,27 +117,13 @@ impl Tool for BackgroundTask {
     const REPLAY: Replay = Replay::Safe;
     const CONCURRENCY: Concurrency = Concurrency::Shared;
     async fn call(&self, input: &BackgroundPrompt, cx: &Cx) -> Result<Self::Out, String> {
-        let sessions = cx.sessions().ok_or("this engine runs no child sessions")?;
-        let spawn = ext::Spawn::new::<Subagent>(
-            "background_task",
-            input.prompt.clone(),
-            sessions.runner(),
-            ext::DepthBudget::new(8),
-        );
-        let handle = sessions
-            .detach(cx, spawn.detached())
+        let handle = Conversation::task::<Subagent>("background_task", &input.prompt)
+            .detach(cx)
             .await
             .map_err(|e| format!("{e:?}"))?;
         for (index, message) in input.messages.iter().enumerate() {
-            sessions
-                .send(
-                    cx,
-                    ext::SendMessage::new::<Subagent>(
-                        &format!("message/{index}"),
-                        handle,
-                        message.clone(),
-                    ),
-                )
+            handle
+                .send::<Subagent>(cx, &format!("message/{index}"), message.clone())
                 .await
                 .map_err(|e| format!("{e:?}"))?;
         }

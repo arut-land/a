@@ -360,6 +360,7 @@ struct SideAdmitted {
     thread: protocol::publication::ThreadImage,
     limited: bool,
     cancel: Cancel,
+    started: Option<Arc<side::Started>>,
 }
 
 pub enum Request {
@@ -467,6 +468,8 @@ impl ContextOrigin {
 }
 
 struct PendingSide {
+    /// An ephemeral turn's role, which settles its attempt here.
+    ephemeral: Option<ext::ModelRole>,
     while_waiting: bool,
     background: bool,
     cancel: Cancel,
@@ -664,6 +667,7 @@ impl Live {
             delivery_queue: std::collections::VecDeque::new(),
             detached: Vec::new(),
             sides: BTreeMap::default(),
+            ephemeral: Vec::new(),
             waiting_sides: Vec::new(),
             tickets: 0,
             phase: Phase::Serving,
@@ -963,6 +967,9 @@ struct Actor {
         oneshot::Sender<Result<ext::ConversationHandle, ext::SpawnRefusal>>,
     )>,
     sides: BTreeMap<Ticket, PendingSide>,
+    /// Admitted ephemeral turns, by side call: what their attempt started,
+    /// for when an interrupt settles them before they report.
+    ephemeral: Vec<(CallId, ext::ModelRole, Arc<side::Started>)>,
     transport_active: bool,
     delivery_queue: std::collections::VecDeque<(protocol::Envelope, Option<Ticket>)>,
 
@@ -1345,9 +1352,12 @@ impl Actor {
                         execution,
                         done,
                     } => {
-                        self.projection
-                            .executions
-                            .extend(execution.map(|fact| (side, fact)));
+                        // A side already settled, by an interrupt, keeps no late execution.
+                        if self.core.ledger().call(side).is_some() {
+                            self.projection
+                                .executions
+                                .extend(execution.map(|fact| (side, fact)));
+                        }
                         self.side_fact(side, fact, done)
                     }
                     Completion::Replied {
@@ -1770,6 +1780,32 @@ impl Actor {
     /// Appends a burst once, then admits each effect against the prefix
     /// and requirement declared by the kernel. Publication and unsafe
     /// effects share an epoch while ordered work keeps making progress.
+    /// An ephemeral turn's result entry ends its attempt's watch; one an
+    /// interrupt wrote first, before the turn reported, settles the attempt
+    /// it cut off, sent or not.
+    fn settle_ephemeral(&mut self, entry: &mut Entry) {
+        let Body::ModelResult { call, outcome, .. } = &entry.body else {
+            return;
+        };
+        let Some(i) = self.ephemeral.iter().position(|(id, ..)| id == call) else {
+            return;
+        };
+        let (call, role, started) = self.ephemeral.swap_remove(i);
+        if entry.execution.is_none()
+            && matches!(outcome, Outcome::Interrupted { .. })
+            && let Some((at, attempt, model)) = lock(&started.0).take()
+        {
+            let observed = Observation {
+                attempt,
+                model,
+                started: Some(at),
+                usage: None,
+            };
+            entry.execution =
+                (self.live.session).execution(call, observed, "model_only".into(), Some(&role));
+        }
+    }
+
     async fn carry(&mut self, plan: StepPlan) -> Result<(), ()> {
         let StepPlan {
             mut appends,
@@ -1795,6 +1831,7 @@ impl Actor {
             {
                 entry.execution = Some(self.projection.executions.remove(i).1);
             }
+            self.settle_ephemeral(entry);
         }
         let mut after = admitted;
         let busy = immediate.iter().rev().find_map(|work| match work {
@@ -2115,6 +2152,7 @@ impl Actor {
         // Retirement also cancels the deferred sync task; later writes need a new timer.
         self.journal.sync_armed = false;
         self.detached.clear();
+        self.ephemeral.clear();
     }
 
     // Retire the old generation before reopening its log: no waiter or
@@ -2466,7 +2504,7 @@ impl Actor {
                             &mut observed,
                         )))
                         .await;
-                        execution = live.session.execution(&cx, observed, agent);
+                        execution = live.session.execution(cx.call, observed, agent, None);
                         result
                     }
                     Err(error) => (
@@ -2478,6 +2516,12 @@ impl Actor {
                     let (turn, messages, model) = *prepared;
                     let cx = live.session.cx(origin.clone(), &registry);
                     let mut observed = Observation::default();
+                    let attempt = side::Attempt {
+                        id: origin.id,
+                        cancel: &origin.cancel,
+                        fence: origin.fence,
+                        started: None,
+                    };
                     let running = unless(
                         &cancel,
                         Box::pin(side::run_side(
@@ -2486,7 +2530,7 @@ impl Actor {
                             &turn,
                             messages,
                             &model,
-                            &origin,
+                            attempt,
                             &mut observed,
                         )),
                     );
@@ -2497,7 +2541,9 @@ impl Actor {
                     if matches!(replied, Replied::Interrupted(_)) {
                         observed.usage = None;
                     }
-                    execution = live.session.execution(&cx, observed, "model_only".into());
+                    execution =
+                        live.session
+                            .execution(cx.call, observed, "model_only".into(), None);
                     (replied, None)
                 }
                 _ => unreachable!(),

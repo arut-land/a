@@ -112,10 +112,11 @@ impl CallPorts {
                 return Err(InboxRefusal::Interrupted);
             }
             let (reply, result) = oneshot::channel();
+            let (id, to, payload) = message.into_parts(session.id, self.origin.id);
             let request = ContextRequest::Send {
-                id: message.id(session.id, self.origin.id),
-                to: message.to,
-                payload: message.payload,
+                id,
+                to,
+                payload,
                 reply,
             };
             self.origin.send(session, request);

@@ -23,12 +23,14 @@ description refreshes an already-visible question in every client.
 
 Set `[ext.policy] describe = true` to add a plain-language description.
 It is off by default because it spends a model call. Policy observes the
-logged ask and starts a background `Fast` request with no conversation
-context and a 96-token cap. The question never waits for that request.
+logged ask and starts a detached, ephemeral `Fast` turn with no conversation
+context and a 96-token cap: its result is in the session's log, and it
+writes no child conversation. The question never waits for that request.
 Descriptions are labelled `Model summary (unverified)` separately from the typed `Why`;
 a missing or failed description leaves the question usable.
 
-The SDK's `Background::while_waiting` scopes optional work to its owner's
+The judge is likewise an ephemeral turn, keyed by its call. The SDK's
+`Background::while_waiting` scopes optional work to its owner's
 question. The driver checks that scope both when opening and admitting a
 side call. An answer cancels the side token without cancelling the owner's
 execution token. If the answer races admission, the cancelled request

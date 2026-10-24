@@ -62,30 +62,100 @@ fn a_second_overflow_on_the_same_call_fails_the_turn() {
     assert!(matches!(asked, Asked::None));
 }
 
-/// With a threshold, a request estimated past it fails as an overflow
-/// before it is sent; under it, it goes as it is.
+/// With a threshold, a request estimated past that share of its model's
+/// window fails as an overflow before it is sent; under it, or for a model
+/// with no known window, it goes as it is.
 #[test]
-fn a_request_past_the_threshold_overflows_before_it_is_sent() {
+fn a_request_past_its_models_window_share_overflows_before_it_is_sent() {
     let registry = Registry::default()
         .with_in(
             Tier::Pre,
             &Compact {
-                threshold: Some(10),
+                threshold: Percent::new(50),
             },
         )
         .unwrap();
     let rig = Rig::new("compact-threshold", registry);
     let cx = rig.cx();
-    let big = llm::Request {
-        messages: [llm::Message::user("x".repeat(400))].into_iter().collect(),
+    let sized = |model: &str, tokens: usize| llm::Request {
+        model: model.into(),
+        messages: [llm::Message::user("x".repeat(tokens * 4))]
+            .into_iter()
+            .collect(),
         ..llm::Request::default()
     };
-    let (_, answered) = rig.registry.hooks().step(&cx.point(), &mut big.clone());
-    let Some((by, Err(error))) = answered else {
-        panic!("not stopped")
+    let stopped = |request: llm::Request| {
+        let (_, answered) = rig.registry.hooks().step(&cx.point(), &mut request.clone());
+        answered.map(|(by, result)| (by.to_string(), result.map(|_| ()).map_err(|e| e.kind)))
     };
-    assert_eq!((&*by, error.kind), ("compact", llm::Kind::ContextOverflow));
-    let small = llm::Request::default();
-    let (_, answered) = rig.registry.hooks().step(&cx.point(), &mut small.clone());
-    assert!(answered.is_none());
+    assert_eq!(
+        stopped(sized("claude-sonnet-4-5", 100_001)),
+        Some(("compact".into(), Err(llm::Kind::ContextOverflow)))
+    );
+    assert_eq!(stopped(sized("claude-sonnet-4-5", 99_000)), None);
+    assert_eq!(stopped(sized("my-deployment", 10_000_000)), None);
+}
+
+/// A threshold is a share of a window, never a token count.
+#[test]
+fn a_threshold_outside_one_to_a_hundred_percent_is_refused() {
+    assert_eq!(Percent::new(0), None);
+    assert_eq!(Percent::new(101), None);
+    assert_eq!(Percent::new(80).unwrap().of(200_000), 160_000);
+}
+
+/// Answers every turn with a summary, keeping the prompts it was asked.
+struct Summarizer(std::sync::Mutex<Vec<String>>);
+
+impl ext::Conversations for Summarizer {
+    fn turn<'a>(
+        &'a self,
+        _: &'a Cx,
+        turn: ext::ModelTurn,
+    ) -> ext::BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        let asked = llm::Json::encode(&turn.messages).unwrap().raw().to_owned();
+        self.0.lock().unwrap().push(asked);
+        Box::pin(std::future::ready(Ok(llm::Response {
+            message: llm::Assistant {
+                content: vec![llm::AssistantPart::Text(llm::Text::new("the summary"))],
+                origin: None,
+            },
+            finish: llm::Finish::new(llm::Reason::Stop, None),
+            usage: llm::Usage::default(),
+            id: None,
+            model: None,
+            meta: llm::Meta::new(),
+        })))
+    }
+}
+
+struct Summaries(std::sync::Arc<Summarizer>);
+
+impl Extension for Summaries {
+    const NAME: &'static str = "summaries";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn ext::Conversations>(self.0.clone());
+    }
+}
+
+/// `/compact <instructions>` asks the summary to keep what the user says,
+/// and plain `/compact` asks the summary alone.
+#[test]
+fn compact_instructions_reach_the_summary_prompt() {
+    let summarizer = std::sync::Arc::new(Summarizer(std::sync::Mutex::default()));
+    let registry = Registry::default()
+        .with(&Summaries(summarizer.clone()))
+        .and_then(|r| r.with(&Compact::default()))
+        .unwrap();
+    let rig = Rig::new("compact-instructions", registry);
+    let _ = (rig.cx(), rig.cx());
+    for args in ["keep every API name", ""] {
+        let summary = rt::block_on(CompactNow.call(&Args { args: args.into() }, &rig.cx()));
+        assert_eq!(summary.as_deref(), Ok("the summary"));
+    }
+    let asked = summarizer.0.lock().unwrap();
+    assert!(asked[0].contains("The user's instructions for this summary: keep every API name"));
+    assert!(asked[1].contains("Leave out nothing a continuation needs"));
+    assert!(!asked[1].contains("instructions for this summary"));
 }

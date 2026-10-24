@@ -406,15 +406,10 @@ pub(crate) fn spawn_intent(call: u64, prompt: &str) -> Json {
         awaited: true,
         admitted_at: std::time::SystemTime::now(),
         call: CallId::new(call).unwrap(),
-        request: ext::Spawn::new::<ext_subagent::Subagent>(
-            "task",
-            prompt.into(),
-            ext::Runner::Agent {
-                agent: ext_fixtures::ECHO.into(),
-                role: ext::ModelRole::Session,
-            },
-            ext::DepthBudget::new(7),
-        ),
+        request: ext::Conversation::task::<ext_subagent::Subagent>("task", prompt)
+            .kind(ext_fixtures::ECHO)
+            .depth(7)
+            .spawn(String::new),
         model: "none".into(),
         routing: Err("no model".into()),
         installed: extensions(&ext_policy::Policy::default())
@@ -1717,6 +1712,43 @@ impl ext::Tool for HeldChild {
     }
 }
 
+/// Forking a finished child is how it is promoted: a root of its own,
+/// which runs on and never reports to its old parent.
+#[test]
+fn a_forked_child_is_a_root_that_never_reports_to_its_parent() {
+    let (root, home) = home("promote-child");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    let id = parent.session().id;
+    parent
+        .session()
+        .submit("call task {\"prompt\":\"child work\"}")
+        .unwrap();
+    let parent_log = until(&daemon, id, |log| {
+        log.iter().any(|b| matches!(b, Body::ToolResult { .. }))
+    });
+    settle(&daemon);
+    let child = parent_log
+        .iter()
+        .find_map(|b| match b {
+            Body::Link { child, .. } => Some(*child),
+            _ => None,
+        })
+        .unwrap();
+    let promoted = rt::block_on(daemon.fork(&child.to_string(), None)).unwrap();
+    assert!(promoted.session().parent.is_none());
+    let promoted_id = promoted.session().id;
+    promoted.session().submit("promoted").unwrap();
+    until(&daemon, promoted_id, |log| {
+        log.iter()
+            .any(|b| matches!(b, Body::Assistant { text } if text == "promoted"))
+    });
+    settle(&daemon);
+    assert_eq!(fired(&bodies(&*daemon.shared.store, id)).len(), 1);
+    drop((promoted, parent, daemon));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn detached_messages_wait_for_a_boundary_and_the_parent_hears_once() {
     let (root, home) = home("detached-inbox");
@@ -1964,17 +1996,11 @@ impl ext::Tool for PairTasks {
     const REPLAY: ext::Replay = ext::Replay::Safe;
     const CONCURRENCY: ext::Concurrency = ext::Concurrency::Shared;
     async fn call(&self, _: &NoInput, cx: &ext::Cx) -> Result<Self::Out, String> {
-        let sessions = cx.sessions().unwrap();
         let mut results = Vec::new();
         for purpose in ["first", "second"] {
-            let spawn = ext::Spawn::new::<Self>(
-                purpose,
-                purpose.into(),
-                sessions.runner(),
-                ext::DepthBudget::new(2),
-            );
-            let result = sessions
-                .spawn(cx, spawn.awaited())
+            let result = ext::Conversation::task::<Self>(purpose, purpose)
+                .depth(2)
+                .ask(cx)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             results.push(ext::child_result(&result));
@@ -2132,18 +2158,11 @@ mod inheritance {
                 "fast" => ext::ModelRole::Fast,
                 name => ext::ModelRole::Named(name.into()),
             };
-            let request = ext::Spawn::new::<Kinds>(
-                "role",
-                "spawn done".into(),
-                ext::Runner::Agent {
-                    agent: agent.into(),
-                    role,
-                },
-                ext::DepthBudget::new(4),
-            );
-            cx.sessions()
-                .unwrap()
-                .spawn(cx, request.awaited())
+            ext::Conversation::task::<Kinds>("role", "spawn done")
+                .kind(agent)
+                .role(role)
+                .depth(4)
+                .ask(cx)
                 .await
                 .map(|outcome| ext::child_result(&outcome))
                 .map_err(|e| format!("{e:?}"))

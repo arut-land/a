@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::BoxFuture;
-use protocol::{Environment, Outcome};
+use protocol::Environment;
 
 use crate::{Cx, SpawnSpec, States};
 
@@ -162,18 +162,6 @@ pub trait ModelSpec: Send + Sync {
     ) -> Result<(String, String), String>;
 }
 
-/// Model requests owned by a session, outside its main transcript.
-pub trait Models: Send + Sync {
-    /// Reuse the committed fact for this extension's key, or admit it and
-    /// return only after its result commits. A lost attempt is interrupted,
-    /// never repeated by recovery. The engine provides this service.
-    fn call<'a>(
-        &'a self,
-        cx: &'a Cx,
-        side: ModelTurn,
-    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>>;
-}
-
 /// Routing intent, never a provider model id.
 #[derive(Clone, Debug)]
 pub enum ModelRole {
@@ -190,95 +178,6 @@ pub trait ModelRoles: Send + Sync {
         layers: &dyn Layers,
         workspace: &Path,
     ) -> Result<String, String>;
-}
-
-/// The immutable transcript prefix visible to a side request.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-pub enum SideContext {
-    None,
-    /// The effective conversation strictly before the owning call.
-    BeforeOwner,
-}
-
-/// A stable owned conversation, independent of any one provider turn.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct ThreadKey {
-    pub extension: String,
-    pub purpose: String,
-    pub owner_scope: OwnerScope,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum OwnerScope {
-    Session,
-    Call(protocol::CallId),
-}
-
-impl serde::Serialize for OwnerScope {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        serde::Serialize::serialize(
-            &match self {
-                Self::Session => None,
-                Self::Call(call) => Some(*call),
-            },
-            s,
-        )
-    }
-}
-impl<'de> serde::Deserialize<'de> for OwnerScope {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        <Option<protocol::CallId> as serde::Deserialize>::deserialize(d)
-            .map(|call| call.map_or(Self::Session, Self::Call))
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct TurnKey(pub String);
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize)]
-pub struct SideIdentity {
-    pub thread: ThreadKey,
-    pub turn: TurnKey,
-}
-
-impl ThreadKey {
-    pub fn conversation(&self, owner: protocol::SessionId) -> protocol::SessionId {
-        owner.owned(llm::Json::encode(self).expect("thread key encodes").raw())
-    }
-
-    pub fn new<E: crate::Extension>(purpose: &str, owner_scope: OwnerScope) -> Self {
-        Self {
-            extension: E::NAME.into(),
-            purpose: purpose.into(),
-            owner_scope,
-        }
-    }
-}
-
-impl SideIdentity {
-    pub fn to_json(&self) -> serde_json::Result<llm::Json> {
-        llm::Json::encode(&(&self.thread, &self.turn))
-    }
-
-    pub fn from_intent(intent: &llm::Json) -> serde_json::Result<Self> {
-        let image = protocol::publication::ThreadImage::from_json(intent)?;
-        let (identity, _): (Self, serde::de::IgnoredAny) = image.turn.parse()?;
-        Ok(identity)
-    }
-}
-
-/// A keyed response in an owned conversation, outside its parent's transcript.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ModelTurn {
-    pub thread: ThreadKey,
-    pub turn: TurnKey,
-    pub role: ModelRole,
-    pub messages: llm::Messages,
-    pub context: SideContext,
-    pub budget: Budget,
-    background: bool,
-    while_waiting: bool,
-    context_policy: crate::ContextPolicy,
 }
 
 impl std::fmt::Display for ModelRole {
@@ -313,108 +212,6 @@ impl<'de> serde::Deserialize<'de> for ModelRole {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let role = <String as serde::Deserialize>::deserialize(d)?;
         Self::from_word(role).map_err(serde::de::Error::custom)
-    }
-}
-
-impl ModelTurn {
-    pub fn from_intent(text: &str) -> serde_json::Result<(Self, Option<protocol::Seq>)> {
-        serde_json::from_slice(text.as_bytes())
-    }
-
-    pub fn context_policy(&self) -> crate::ContextPolicy {
-        self.context_policy
-    }
-
-    pub fn identity(&self) -> SideIdentity {
-        SideIdentity {
-            thread: self.thread.clone(),
-            turn: self.turn.clone(),
-        }
-    }
-
-    pub fn intent(&self, prefix: Option<protocol::Seq>) -> Result<llm::Json, String> {
-        llm::Json::encode(&(self, prefix)).map_err(|e| e.to_string())
-    }
-
-    pub const fn is_while_waiting(&self) -> bool {
-        self.while_waiting
-    }
-    pub const fn is_background(&self) -> bool {
-        self.background
-    }
-
-    pub fn new<K: crate::ModelOnlyKind>(
-        thread: ThreadKey,
-        turn: TurnKey,
-        role: ModelRole,
-        context: SideContext,
-        messages: llm::Messages,
-    ) -> Self {
-        Self {
-            thread,
-            turn,
-            role,
-            messages,
-            context,
-            budget: Budget::default(),
-            background: false,
-            while_waiting: false,
-            context_policy: K::CONTEXT,
-        }
-    }
-
-    pub fn background(mut self) -> Background {
-        self.background = true;
-        Background(self)
-    }
-}
-
-/// Observation work: completion is a logged fact, never a main-turn reply.
-///
-/// ```compile_fail
-/// # fn awaited(models: &dyn ext::Models, cx: &ext::Cx, background: ext::Background) {
-/// let result = models.call(cx, background);
-/// # }
-/// ```
-pub struct Background(ModelTurn);
-
-impl Background {
-    /// Scope optional work to the owner's current question. Answering the
-    /// question cancels it even when the approved owner keeps running.
-    #[must_use]
-    pub fn while_waiting(mut self) -> Self {
-        self.0.while_waiting = true;
-        self
-    }
-    pub fn annotate(self, cx: Cx, lifetime: protocol::AnnotationLifetime) -> crate::Reaction {
-        self.finish(cx, Some(lifetime))
-    }
-
-    pub fn start(self, cx: Cx) -> crate::Reaction {
-        self.finish(cx, None)
-    }
-
-    fn finish(self, cx: Cx, annotation: Option<protocol::AnnotationLifetime>) -> crate::Reaction {
-        crate::Reaction::later(crate::Requirement::Ordered, async move {
-            if let Some(models) = cx.models()
-                && let Ok(reply) = models.call(&cx, self.0).await
-                && let Some(lifetime) = annotation
-            {
-                let body = reply.message.text().trim().to_owned();
-                if !body.is_empty() {
-                    let _ = cx
-                        .fact(protocol::ExtensionFact::Annotation(protocol::Annotation {
-                            target: cx.call,
-                            lifetime,
-                            card: protocol::Card {
-                                body,
-                                ..protocol::Card::default()
-                            },
-                        }))
-                        .await;
-                }
-            }
-        })
     }
 }
 
@@ -468,93 +265,12 @@ pub struct Topology<'a> {
     pub children: &'a [protocol::SessionId],
 }
 
-/// Child sessions: a call starts one it owns and waits for what it settles
-/// with. The engine provides it.
-pub trait Sessions: Send + Sync {
-    fn runner(&self) -> crate::Runner;
-    fn send<'a>(
-        &'a self,
-        cx: &'a Cx,
-        message: crate::SendMessage,
-    ) -> BoxFuture<'a, Result<(), protocol::InboxRefusal>>;
-    fn detach<'a>(
-        &'a self,
-        cx: &'a Cx,
-        request: crate::Detached<crate::Spawn>,
-    ) -> BoxFuture<'a, Result<crate::ConversationHandle, crate::SpawnRefusal>>;
-    /// What a child session started on `input` settles with. The child is
-    /// the call's own: started once however often the call runs again (as
-    /// recovery runs it), and heard from once. An interrupt of the call's
-    /// turn reaches the child first.
-    fn spawn<'a>(
-        &'a self,
-        cx: &'a Cx,
-        request: crate::Awaited<crate::Spawn>,
-    ) -> BoxFuture<'a, Result<Outcome, crate::SpawnRefusal>>;
-}
-
 /// An extension-supplied model transport for side requests, useful for
 /// deterministic fixtures. It still runs behind the engine's log barriers.
 pub trait SideProvider: Send + Sync {
     fn reply<'a>(
         &'a self,
-        side: &'a ModelTurn,
+        side: &'a crate::ModelTurn,
         messages: &'a llm::Messages,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct Owner;
-    impl crate::Extension for Owner {
-        const NAME: &'static str = "identity";
-        const VERSION: u32 = 1;
-        fn contribute(&self, _: &mut crate::Registrar) {}
-    }
-
-    #[test]
-    fn side_identity_depends_only_on_extension_purpose_and_owner_scope() {
-        let of = protocol::CallId::new(1).unwrap();
-        let other = protocol::CallId::new(2).unwrap();
-        let mut side = ModelTurn::new::<crate::ModelOnly>(
-            ThreadKey::new::<Owner>("summary", OwnerScope::Call(of)),
-            TurnKey("initial".into()),
-            ModelRole::Fast,
-            SideContext::None,
-            llm::Messages::default(),
-        );
-        let identity = side.identity();
-        side.messages
-            .push(llm::Message::user("prompt".repeat(1 << 18)));
-        side.context = SideContext::BeforeOwner;
-        side.role = ModelRole::Session;
-        assert_eq!(side.identity(), identity);
-        side.thread.owner_scope = OwnerScope::Call(other);
-        assert_ne!(side.identity(), identity);
-        side.thread.owner_scope = OwnerScope::Call(of);
-        let mut renamed = side.clone();
-        renamed.thread.extension = "another-extension".into();
-        assert_ne!(renamed.identity(), identity);
-        renamed = side.clone();
-        renamed.thread.purpose = "another-purpose".into();
-        assert_ne!(renamed.identity(), identity);
-        renamed = side.clone();
-        renamed.turn = TurnKey("next".into());
-        assert_ne!(renamed.identity(), identity);
-        let mut session = side;
-        session.thread.owner_scope = OwnerScope::Session;
-        assert_ne!(session.identity(), identity);
-        let intent = protocol::publication::ThreadImage {
-            turn: session.intent(None).unwrap(),
-            authority: llm::Json::null(),
-        }
-        .to_json()
-        .unwrap();
-        assert_eq!(
-            SideIdentity::from_intent(&intent).unwrap(),
-            session.identity()
-        );
-    }
 }
