@@ -86,7 +86,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     output = args.output.resolve()
-    output.mkdir(parents=True)
+    output.mkdir(parents=True, exist_ok=True)
+    if any((output / name).exists() for name in
+           ["metadata.json", "ready", "ack", "samples.json", "result.json"]):
+        raise FileExistsError("choose a fresh measurement output directory")
     build = run(["cargo", "test", "-p", "sys", "--release", "--lib", "--no-run",
                  "--message-format=json"], capture_output=True, text=True)
     (output / "build.log").write_text(build.stdout + build.stderr)
