@@ -15,7 +15,6 @@ rustix = { workspace = true, features = ["stdio", "pipe", "event", "net", "termi
 libc.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-listenfd = "1.0.2"
 object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

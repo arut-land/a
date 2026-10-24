@@ -77,6 +77,7 @@ privacy boundary and best-effort delivery.
 Files stay as they are; this does not rewind or copy the workspace. The fork
 keeps its recorded cwd and environment. See [fork semantics](fork.md).
 
-`a daemon install-activation` opts into native user socket activation;
-`a daemon uninstall-activation` restores self-spawn. See [native activation](activation.md)
-for Linux systemd, macOS LaunchAgent/app registration and Windows behavior.
+`a daemon autostart on` registers the daemon to start at login and stay up;
+`a daemon autostart off` removes that registration. See [autostart](autostart.md)
+for the systemd user unit, the macOS LaunchAgent and app login item, and the
+Windows `Run` entry.

@@ -145,7 +145,7 @@ struct CommandLineSettings: View {
                 CliStatusView(model: model)
             }
             Section("Daemon") {
-                ActivationSettings()
+                AutostartSettings()
                 LabeledContent("Status") {
                     Text(model.daemonProblem ?? model.daemonPid.map { "running, pid \(String($0))" } ?? "not running")
                 }

@@ -70,9 +70,9 @@ pub enum Cmd {
     },
     #[usage(name = "__daemon", hide)]
     Serve {
-        /// Adopt the native service manager socket and remain in the foreground.
+        /// Started by the OS at login: serve unless a daemon already does.
         #[usage(long)]
-        activated: bool,
+        login: bool,
         #[usage(long)]
         listen_fd: Option<i32>,
         /// Start without a terminal and acknowledge the listener on stdout.
@@ -92,19 +92,10 @@ pub enum Cmd {
 pub enum Daemon {
     /// Read the current daemon diagnostic log (JSON lines); never starts it
     Log,
-    /// Install optional native socket activation for this user
-    InstallActivation {
-        /// Wait for an enabled app registration to publish its socket
-        #[usage(long, hide)]
-        wait: bool,
-        /// Prepare registration by the installed app
-        #[usage(long, hide)]
-        app: bool,
-    },
-    /// Remove native activation and return to self-spawn
-    UninstallActivation {
-        #[usage(long, hide)]
-        app: bool,
+    /// Start the daemon when you log in, and keep it running
+    Autostart {
+        #[usage(subcommand)]
+        state: Autostart,
     },
     /// Show whether the daemon is running and responding
     Status,
@@ -112,4 +103,13 @@ pub enum Daemon {
     Stop,
     /// Stop the daemon and start a fresh one
     Restart,
+}
+
+/// What `a daemon autostart` sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommands)]
+pub enum Autostart {
+    /// Register with the OS to start at login; the daemon then stays up
+    On,
+    /// Remove that registration; a running daemon stays until stopped
+    Off,
 }

@@ -34,8 +34,9 @@ pipe, so retained clients cannot reserve a successor's endpoint. Neither path po
 holds its pid-file lock for its lifetime, excluding other writers to that
 home. `sys::Paths` resolves native configuration, state, data, cache, logs
 and runtime locations; `A_HOME` selects an isolated root. See [paths and
-install layout](paths.md). Optional [native activation](activation.md) lets
-a user service manager own the socket and start a foreground daemon on connect.
+install layout](paths.md). Optional [autostart](autostart.md) registers
+the daemon with the OS to start at login and stay up; clients still self-spawn
+it when none is running.
 
 The daemon serves connections and session actors on `rt`. Idle sessions
 hibernate; the daemon exits when no clients or work pin it. Upgrades drain

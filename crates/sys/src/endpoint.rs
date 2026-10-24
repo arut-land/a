@@ -47,14 +47,9 @@ pub(crate) fn runtime_directory() -> PathBuf {
     imp::socket_dir()
 }
 
-#[cfg(unix)]
-pub(crate) fn activation_identity(home: &Home) -> u64 {
+/// A home's name in per-user OS registrations, the one its endpoint uses.
+pub(crate) fn home_identity(home: &Home) -> u64 {
     imp::home_hash(home.root())
-}
-
-#[cfg(unix)]
-pub(crate) fn register_activation(home: &Home, bytes: &[u8]) -> io::Result<()> {
-    imp::register_activation(home, bytes)
 }
 
 impl Home {
@@ -98,16 +93,6 @@ impl Listener {
     /// Retire it after session shutdown and before releasing the daemon record.
     pub fn retirement(&self) -> io::Result<EndpointRetirement> {
         imp::retirement(&self.0).map(EndpointRetirement)
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn activated(file: std::fs::File, home: &Home) -> io::Result<Self> {
-        imp::activated(
-            file,
-            &home.socket_link(),
-            &home.run_dir().join("daemon.endpoint"),
-        )
-        .map(Self)
     }
 
     /// Adopts the listener and claim our parent bound and passed down.
@@ -336,7 +321,6 @@ mod imp {
         socket: UnixListener,
         pub(super) claim: fs::File,
         retirement_taken: std::sync::atomic::AtomicBool,
-        managed: bool,
     }
 
     impl AsFd for Listener {
@@ -402,28 +386,12 @@ mod imp {
         Ok(stream)
     }
 
-    fn registered(discovery: &Path) -> io::Result<bool> {
-        let marker = discovery.with_file_name("activation");
-        match fs::symlink_metadata(marker) {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
     pub fn remove(_path: &Path, discovery: &Path) {
         if let Ok(_claim) = claim(discovery)
-            && matches!(registered(discovery), Ok(false))
             && let Ok(path) = discover(discovery)
         {
             let _ = fs::remove_file(path);
         }
-    }
-
-    pub(super) fn register_activation(home: &crate::Home, bytes: &[u8]) -> io::Result<()> {
-        crate::fs::private_dir(&home.run_dir())?;
-        let _claim = claim(&home.run_dir().join("daemon.endpoint"))?;
-        crate::fs::write_private(&crate::activation::record(home), bytes)
     }
 
     pub(super) fn claim_file(socket: &Path) -> io::Result<fs::File> {
@@ -457,12 +425,6 @@ mod imp {
         // The claim inode is never unlinked: a waiter must not lock an old
         // inode while another daemon creates and locks a replacement.
         let claim = claim(discovery)?;
-        if registered(discovery)? {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                "the service manager owns this endpoint",
-            ));
-        }
         // A stale runtime directory may have disappeared since the last owner.
         let socket = if socket
             .parent()
@@ -479,24 +441,18 @@ mod imp {
             Err(error) => return Err(error),
         }
         let listener = UnixListener::bind(&socket)?;
-        publish(&socket, link, discovery)?;
+        crate::fs::write_private(discovery, socket.as_os_str().as_encoded_bytes())?;
+        if fs::read_link(link).ok().as_deref() != Some(socket.as_path()) {
+            let _ = fs::remove_file(link);
+            // Only a convenience: a home on a filesystem without symlinks
+            // still works.
+            let _ = std::os::unix::fs::symlink(&socket, link);
+        }
         Ok(Listener {
             socket: listener,
             claim,
             retirement_taken: std::sync::atomic::AtomicBool::new(false),
-            managed: false,
         })
-    }
-
-    fn publish(socket: &Path, link: &Path, discovery: &Path) -> io::Result<()> {
-        crate::fs::write_private(discovery, socket.as_os_str().as_encoded_bytes())?;
-        if fs::read_link(link).ok().as_deref() != Some(socket) {
-            let _ = fs::remove_file(link);
-            // Only a convenience: a home on a filesystem without symlinks
-            // still works.
-            let _ = std::os::unix::fs::symlink(socket, link);
-        }
-        Ok(())
     }
 
     /// A connection the daemon writes to without blocking: its send buffer
@@ -567,49 +523,12 @@ mod imp {
             socket: listener,
             claim,
             retirement_taken: std::sync::atomic::AtomicBool::new(false),
-            managed: false,
-        })
-    }
-
-    pub fn activated(file: fs::File, link: &Path, discovery: &Path) -> io::Result<Listener> {
-        crate::fs::private_dir(discovery.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
-        let claim = claim(discovery)?;
-        let fd = OwnedFd::from(file);
-        if rustix::net::sockopt::socket_type(&fd)? != rustix::net::SocketType::STREAM {
-            return Err(io::ErrorKind::InvalidInput.into());
-        }
-        // No inherited descriptor may escape into tools. This also applies to
-        // launchd, whose contract differs from systemd's CLOEXEC handling.
-        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
-        let socket = UnixListener::from(fd);
-        let address = socket.local_addr()?;
-        let path = address.as_pathname().ok_or(io::ErrorKind::InvalidInput)?;
-        validate_directory(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
-        let metadata = fs::symlink_metadata(path)?;
-        if !std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type())
-            || metadata.uid() != geteuid().as_raw()
-            || metadata.mode() & 0o077 != 0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "activation socket is not private",
-            ));
-        }
-        // Darwin caches server credentials at listen: refresh launchd's
-        // credentials to ours before publishing discovery to clients.
-        rustix::net::listen(&socket, 128)?;
-        publish(path, link, discovery)?;
-        Ok(Listener {
-            socket,
-            claim,
-            retirement_taken: std::sync::atomic::AtomicBool::new(false),
-            managed: true,
         })
     }
 
     pub struct Retirement {
         claim: fs::File,
-        path: Option<PathBuf>,
+        path: PathBuf,
     }
 
     pub fn retirement(listener: &Listener) -> io::Result<Retirement> {
@@ -629,17 +548,11 @@ mod imp {
                 "endpoint retirement already taken",
             ));
         }
-        Ok(Retirement {
-            claim,
-            path: (!listener.managed).then_some(path),
-        })
+        Ok(Retirement { claim, path })
     }
 
     pub fn withdraw(retirement: &Retirement) -> io::Result<()> {
-        let Some(path) = &retirement.path else {
-            return Ok(());
-        };
-        match fs::remove_file(path) {
+        match fs::remove_file(&retirement.path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -803,65 +716,6 @@ mod tests {
         );
         drop(listener);
         drop(home.bind().unwrap());
-        endpoint.remove();
-        std::fs::remove_dir_all(home.root()).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn manager_owned_sockets_survive_daemon_retirement() {
-        use std::os::fd::AsFd;
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let home = home("activation-retirement");
-        std::fs::create_dir_all(home.root()).unwrap();
-        let parent = home.bind().unwrap();
-        let old_path = home.endpoint().path().to_owned();
-        let managed_path = old_path.with_extension("managed.sock");
-        let resource = std::os::unix::net::UnixListener::bind(&managed_path).unwrap();
-        let duplicate = || std::fs::File::from(resource.as_fd().try_clone_to_owned().unwrap());
-        let descriptor = duplicate();
-        let manager = duplicate();
-        std::fs::set_permissions(&managed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(
-            super::Listener::activated(duplicate(), &home).is_err(),
-            "a live home claim excludes managed writers too"
-        );
-        assert!(super::register_activation(&home, b"test").is_err());
-        drop((parent, resource));
-        std::fs::remove_file(old_path).unwrap();
-        super::register_activation(&home, b"test").unwrap();
-        let listener = super::Listener::activated(descriptor, &home).unwrap();
-        let endpoint = home.endpoint();
-        assert_eq!(endpoint.path(), managed_path);
-        assert_eq!(
-            std::fs::read_link(home.socket_link()).unwrap(),
-            managed_path
-        );
-        let identity = std::fs::metadata(endpoint.path()).unwrap().ino();
-        assert!(
-            rustix::io::fcntl_getfd(&listener)
-                .unwrap()
-                .contains(rustix::io::FdFlags::CLOEXEC)
-        );
-        assert!(home.bind().is_err());
-        endpoint.remove();
-        let mut client = endpoint.connect().unwrap();
-        let mut server = listener.accept().unwrap();
-        client.write_all(b"verified").unwrap();
-        let mut bytes = [0; 8];
-        io::Read::read_exact(&mut server, &mut bytes).unwrap();
-        assert_eq!(&bytes, b"verified");
-        let retirement = listener.retirement().unwrap();
-        retirement.withdraw().unwrap();
-        retirement.retire().unwrap();
-        drop(listener);
-        assert_eq!(std::fs::metadata(endpoint.path()).unwrap().ino(), identity);
-        let successor = super::Listener::activated(manager, &home).unwrap();
-        let _client = endpoint.connect().unwrap();
-        drop(successor.accept().unwrap());
-        successor.retirement().unwrap().retire().unwrap();
-        drop(successor);
-        std::fs::remove_file(crate::activation::record(&home)).unwrap();
         endpoint.remove();
         std::fs::remove_dir_all(home.root()).unwrap();
     }

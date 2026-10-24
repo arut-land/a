@@ -938,7 +938,8 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     {
         // Owning the polls distinguishes queued news from unsolicited wakes,
         // regardless of how long a worker would take to consume that news.
-        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit));
+        let resident = std::sync::atomic::AtomicBool::new(false);
+        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &resident));
         let mut cx = Context::from_waker(Waker::noop());
         let before = EVENTS.count("wake");
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
@@ -957,6 +958,20 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
         assert_eq!(EVENTS.count("wake") - before, 4);
         assert_eq!(*super::lock(&runtime.1), [config.idle; 4]);
+    }
+    {
+        // A daemon the OS starts at login has no idle deadline to wake for.
+        let exit = Exit {
+            home: home.clone(),
+            pid: std::fs::File::create(root.join("resident-pid")).unwrap(),
+            endpoint: home.bind().unwrap().retirement().unwrap(),
+        };
+        super::lock(&runtime.1).clear();
+        let resident = std::sync::atomic::AtomicBool::new(true);
+        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &resident));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(supervisor.as_mut().poll(&mut cx).is_pending());
+        assert!(super::lock(&runtime.1).is_empty());
     }
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
@@ -1016,7 +1031,12 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     let (stop, done) = (ext::Flag::default(), ext::Flag::default());
     let (stopping, finished) = (stop.clone(), done.clone());
     daemon.shared.rt.spawn(Box::pin(async move {
-        rt::or(supervisor.supervise(&life, &config, exit), stopping.wait()).await;
+        let resident = std::sync::atomic::AtomicBool::new(false);
+        rt::or(
+            supervisor.supervise(&life, &config, exit, &resident),
+            stopping.wait(),
+        )
+        .await;
         finished.set();
     }));
 

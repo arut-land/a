@@ -32,7 +32,7 @@ pub use watch::SessionWatch;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufReader, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -817,9 +817,6 @@ pub fn restart(
     client: Option<ClientId>,
 ) -> Result<Connection, Error> {
     stop(home)?;
-    if sys::activation::installed(home)? {
-        sys::crash::reset(home)?;
-    }
     drop(connect_or_spawn(home, true)?);
     Daemon::local(home.clone(), staged.clone()).connect_as(client, &|| {}, &|_| Ok(Vec::new()))
 }
@@ -880,6 +877,55 @@ const DAEMON_ENV: &[&str] = &[
     "TZ",
 ];
 
+fn open(path: &Path) -> io::Result<File> {
+    File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+fn wedged(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("{what} holds its lock but the daemon is not listening"),
+    )
+}
+
+/// `start.lock`: one starter at a time, whether a client or the OS at login.
+fn starting(home: &Home) -> io::Result<File> {
+    sys::fs::private_dir(&home.run_dir())?;
+    locked(
+        open(&home.run_dir().join("start.lock"))?,
+        Some(HELLO_TIMEOUT),
+    )
+    .ok_or_else(|| wedged("another client"))
+}
+
+/// The endpoint for a daemon the OS starts at login, bound under the same
+/// lock clients start one under, so the two never race. `None` when a daemon
+/// already serves: once this is bound, clients connect into its backlog.
+pub fn bind_at_login(home: &Home) -> io::Result<Option<sys::Listener>> {
+    let _starting = starting(home)?;
+    if home.endpoint().connect().is_ok() {
+        return Ok(None);
+    }
+    match home.bind() {
+        Ok(listener) => Ok(Some(listener)),
+        // Held by a daemon that is exiting or not yet listening.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::ResourceBusy
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Zero-lag start: when no daemon is listening, take the daemon lock, bind
 /// the socket here, hand both to a detached daemon running
 /// `runtime/current`, and connect straight into its backlog. The lock goes
@@ -903,33 +949,13 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
         Err(_) => {}
     }
 
-    sys::activation::require_unmanaged(home)?;
-    sys::fs::private_dir(&home.run_dir())?;
-    let open = |name: PathBuf| {
-        File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(name)
-    };
-    let wedged = |what: &str| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("{what} holds its lock but the daemon is not listening"),
-        )
-    };
-    let _starting = locked(
-        open(home.run_dir().join("start.lock"))?,
-        Some(HELLO_TIMEOUT),
-    )
-    .ok_or_else(|| wedged("another client"))?;
+    let _starting = starting(home)?;
     match endpoint.connect() {
         Ok(stream) => return Ok((stream, false)),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(error),
         Err(_) => {}
     }
-    let lock = locked(open(home.daemon_pid_file())?, Some(HELLO_TIMEOUT))
+    let lock = locked(open(&home.daemon_pid_file())?, Some(HELLO_TIMEOUT))
         .ok_or_else(|| wedged("the daemon"))?;
 
     // The daemon leaves this process's session (`setsid`) as it starts, so

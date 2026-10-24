@@ -14,7 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -991,7 +991,13 @@ impl Daemon {
     /// something changed (a client came or went, a session's work began or
     /// ended), so an idle daemon does not wake at all. While work runs it
     /// holds off system sleep.
-    async fn supervise(&self, life: &Lifecycle, config: &Config, exit: Exit) {
+    async fn supervise(
+        &self,
+        life: &Lifecycle,
+        config: &Config,
+        exit: Exit,
+        resident: &AtomicBool,
+    ) {
         // When the daemon last became idle.
         let mut since: Option<Instant> = None;
         // When a drain out of grace stopped the calls still running.
@@ -1032,7 +1038,7 @@ impl Daemon {
                     exit.now(self, Stop::Upgrade).await;
                 }
                 next = Some(earliest(next, settled.unwrap_or(began + config.drain)));
-            } else if self.idle() {
+            } else if self.idle() && !resident.load(Ordering::SeqCst) {
                 let at = *since.get_or_insert(now) + config.idle;
                 if now >= at {
                     exit.now(self, Stop::Idle).await;
@@ -1177,7 +1183,14 @@ pub struct Start {
     pub reset_breaker: bool,
     /// A detached starter waits for discovery to be published.
     pub logs: bool,
+    /// Asked on a blocking worker once the daemon has served for a moment,
+    /// off every reply's path: whether the OS starts this daemon at login,
+    /// so it stays up instead of exiting when idle.
+    pub resident: Option<fn(&Home) -> bool>,
 }
+
+/// How long a new daemon serves before asking [`Start::resident`].
+const SETTLED: Duration = Duration::from_secs(2);
 
 /// Runs the daemon, as staged build `build`, until it has been idle for
 /// `config.idle` (no attached clients and no unfinished work) or has drained
@@ -1299,9 +1312,22 @@ fn run(
         pid,
         endpoint: listener.retirement()?,
     };
+    let resident = Arc::new(AtomicBool::new(false));
+    let stays = Arc::clone(&resident);
     daemon.shared.rt.spawn(Box::pin(async move {
-        monitor.supervise(&watch, &config, exit).await;
+        monitor.supervise(&watch, &config, exit, &stays).await;
     }));
+    if let Some(ask) = start.resident {
+        let (waker, home) = (Arc::clone(&daemon), home.clone());
+        daemon.shared.rt.spawn(Box::pin(async move {
+            let daemon = waker;
+            daemon.shared.rt.sleep(SETTLED).await;
+            if rt::unblock(&*daemon.shared.rt, move || ask(&home)).await {
+                resident.store(true, Ordering::SeqCst);
+                daemon.pulse.notify();
+            }
+        }));
+    }
     let listener = rt::Async::new(&daemon.shared.rt.reactor(), listener)?;
     // The signal lease is scoped to serving, including non-signal shutdown.
     rt::block_on(rt::or(server::accept(&listener, &daemon, &life), signalled))

@@ -25,7 +25,7 @@ targets:
     platform: macOS
     sources: [App]
     preBuildScripts:
-      - name: Bundle the socket activation agent
+      - name: Bundle the login agent
         basedOnDependencyAnalysis: false
         script: |
           set -eu
