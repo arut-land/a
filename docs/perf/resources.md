@@ -114,7 +114,7 @@ dependencies.
 
 The streaming queue retains a growable ring under one mutex. It counts blocked
 producers so a receive signals space only when someone is actually waiting.
-Consumer wake callbacks and discarded payload destructors run after releasing
+Consumer wake callbacks, replaced wakers and discarded payload destructors run after releasing
 the queue lock. Bounded senders retain the explicit blocking-only API; async
 callers cannot accidentally await a blocking send through the ordinary sender.
 

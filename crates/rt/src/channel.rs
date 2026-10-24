@@ -143,10 +143,12 @@ impl<T> Receiver<T> {
         if state.closed {
             return Poll::Ready(None);
         }
-        match &mut state.waker {
-            Some(waker) if waker.will_wake(cx.waker()) => {}
-            slot => *slot = Some(cx.waker().clone()),
-        }
+        let previous = match &state.waker {
+            Some(waker) if waker.will_wake(cx.waker()) => None,
+            _ => state.waker.replace(cx.waker().clone()),
+        };
+        drop(state);
+        drop(previous);
         Poll::Pending
     }
 
@@ -209,6 +211,16 @@ mod tests {
         let (tx, rx) = unbounded();
         let waker = Waker::from(Arc::new(Observe(Arc::clone(&tx.0))));
         assert!(rx.poll_recv(&mut Context::from_waker(&waker)).is_pending());
+        assert!(tx.send(Observe(Arc::clone(&tx.0))).is_ok());
+        drop(rx.try_recv());
+        drop(waker);
+        let waker = Waker::from(Arc::new(Observe(Arc::clone(&tx.0))));
+        assert!(rx.poll_recv(&mut Context::from_waker(&waker)).is_pending());
+        drop(waker);
+        assert!(
+            rx.poll_recv(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         assert!(tx.send(Observe(Arc::clone(&tx.0))).is_ok());
         drop(rx);
         drop(tx);
