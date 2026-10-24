@@ -167,10 +167,8 @@ jobs:
       - name: Install the same measurement harness into the source checkout
         run: |
           python - <<'PY'
-          import shutil, os
+          import shutil
           paths = ['apps/cli/examples/perf-attach.rs', 'crates/engine/src/driver/tests/bench.rs']
-          if os.environ.get('PERF_ABLATION') == 'true':
-              paths.append('crates/rt/examples/o15-facts.rs')
           for path in paths:
               from pathlib import Path
               Path('../measured/' + path).parent.mkdir(parents=True, exist_ok=True)
