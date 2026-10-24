@@ -31,7 +31,9 @@ of an inherited `TMPDIR`.
 
 Linux ignores relative or empty XDG values. Defaults are `~/.config`,
 `~/.local/state`, `~/.local/share` and `~/.cache`. These conventions need no
-systemd, desktop session, D-Bus or glibc facility. A read-only configuration
+systemd, desktop session, D-Bus or glibc facility. Complete absolute XDG bases
+work without `HOME` or a passwd entry; home lookup occurs only when a base
+needs its default. A read-only configuration
 or network home can coexist with writable local state/cache using absolute
 `XDG_STATE_HOME` and `XDG_CACHE_HOME`. Retained output is durable state, never
 purgeable cache. The layout does not silently move sessions or claim remote
@@ -56,13 +58,26 @@ backend's private runtime directory, so arbitrarily long isolated roots work;
 its discovery record stays under the isolated root. No native directory is
 created for isolated storage. Tests stop only their own isolated daemon.
 
+Daemon startup creates the resolved temporary directory privately before
+registering extensions. Launch passes
+it as `TMPDIR`, and as `TMP` and `TEMP` on Windows. Cached shell facts use that
+same directory, including foreground starts; tool environments override attaching
+clients' temporary-directory values with it.
+
 Daemon launch preserves the selected layout through its cleared environment:
 isolated instances pass `A_HOME`; native instances pass the resolved XDG bases
-on Linux and use native directory lookup on macOS/Windows. Native launches do
+on Linux, preserve the resolved home on macOS, and use Known Folder lookup on
+Windows. Native launches do
 not turn their state directory into an isolated `A_HOME`. Extension and skill
 loaders use the configuration root, while endpoint ownership uses the durable
-state root. SSH bootstrap uses the same backend to resolve the matching
-host's build directory, including that host's `A_HOME` or XDG overrides.
+state root. SSH discovery selects `sys::RemoteLayout` from the remote host's
+platform inside the SSH call, including that host's `A_HOME` or XDG overrides.
+It can find an installed remote build across client platforms; copying this
+build still requires a matching remote platform. Sync and async launch use
+the same layout scripts. Uploads stream binary bytes through SSH stdin to a
+private temporary file beside the destination, then publish it with a rename.
+The destination is a quoted positional argument, preserving spaces, apostrophes
+and shell metacharacters in native or overridden roots.
 There is no migration from older layouts.
 
 Executable staging remains `data/runtime` and retains its existing publication

@@ -42,27 +42,13 @@ pub fn adopt_lock(_file: File, _home: &crate::Home) -> Result<File, super::Adopt
     Err(super::AdoptLockError::Unsupported)
 }
 
-pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::Result<Child> {
+pub fn spawn_daemon(cmd: &mut Command, home: &crate::Home, lock: File) -> io::Result<Child> {
     // Windows byte locks belong to processes. The start lock remains held
     // by the client until binding is acknowledged, serializing re-listen.
     drop(lock);
     cmd.arg("--detached")
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    for name in [
-        "SystemRoot",
-        "WINDIR",
-        "USERPROFILE",
-        "LOCALAPPDATA",
-        "ProgramFiles",
-        "TEMP",
-        "TMP",
-        "COMSPEC",
-        "PATHEXT",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            cmd.env(name, value);
-        }
-    }
+    daemon_environment(cmd, home);
     let (mut output, writer) = io::pipe()?;
     let input = File::open("NUL")?;
     let error = File::options().write(true).open("NUL")?;
@@ -96,6 +82,23 @@ pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::R
     }
     let _ = reader.join();
     Ok(child)
+}
+
+fn daemon_environment(cmd: &mut Command, home: &crate::Home) {
+    for name in [
+        "SystemRoot",
+        "WINDIR",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "ProgramFiles",
+        "COMSPEC",
+        "PATHEXT",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
+    home.daemon_env(cmd);
 }
 
 pub fn daemon_ready() -> io::Result<()> {
@@ -364,6 +367,36 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    #[test]
+    fn daemon_bootstrap_never_replaces_resolved_temporary_environment() {
+        const CHILD: &str = "A_TEST_DAEMON_TEMP_BOOTSTRAP";
+        if std::env::var_os(CHILD).is_some() {
+            let home = crate::Home::from_env().unwrap();
+            for key in ["TMPDIR", "TMP", "TEMP"] {
+                assert_eq!(
+                    std::path::PathBuf::from(std::env::var_os(key).unwrap()),
+                    home.temporary_dir(),
+                );
+            }
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .prefix("a daemon temp 'literal' ")
+            .tempdir()
+            .unwrap();
+        let home = crate::Home::from(root.path().to_owned());
+        home.prepare_temporary_dir().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.env_clear().env(CHILD, "1").args([
+            "--exact",
+            "proc::imp::tests::daemon_bootstrap_never_replaces_resolved_temporary_environment",
+        ]);
+        home.daemon_env(&mut command);
+        daemon_environment(&mut command, &home);
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
 
     #[test]
     fn job_owner() {

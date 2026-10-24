@@ -1277,6 +1277,7 @@ fn run(
         sys::Signal::Interrupt,
         sys::Signal::Hangup,
     ])?;
+    sys::shell::ExecutionFacts::initialize(home)?;
     let daemon = Daemon::load_on(home, &config, runtime)?;
     let signals = rt::Async::for_reading(&daemon.shared.rt.reactor(), signals)?;
     let signalled = async {

@@ -83,12 +83,6 @@ pub(super) fn resolve() -> io::Result<Paths> {
 
 pub(super) fn daemon_env(_: &Paths, _: &mut Command) {}
 
-pub(super) fn remote_runtime_script() -> &'static str {
-    // Native Windows bootstrap is not a POSIX/uname protocol. Connections
-    // still work through an explicitly installed `a` on the remote PATH.
-    "exit 127"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

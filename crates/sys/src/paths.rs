@@ -7,6 +7,9 @@ use std::sync::Arc;
 
 use crate::Runtime;
 
+mod remote;
+pub use remote::RemoteLayout;
+
 #[cfg(target_os = "linux")]
 #[path = "paths/linux.rs"]
 mod native;
@@ -79,22 +82,17 @@ impl Paths {
                 // never select a different instance in the child.
                 Ok(std::path::absolute(root)?.into())
             }
-            None => native::resolve(),
+            None => Self::native(),
         }
     }
 
-    /// A POSIX bootstrap on a host matching this build sets `a_runtime` using
-    /// that host's environment, never the connecting client's home.
-    pub fn remote_runtime_script() -> String {
-        format!(
-            r#"if [ "${{A_HOME+x}}" = x ]; then
-[ -n "$A_HOME" ] || exit 1
-a_runtime="$A_HOME/runtime"
-else
-{}
-fi"#,
-            native::remote_runtime_script()
-        )
+    pub(crate) fn native() -> io::Result<Self> {
+        native::resolve()
+    }
+
+    /// Explicit storage roots keep diagnostics local, including embedder roots.
+    pub fn is_isolated(&self) -> bool {
+        matches!(self.layout(), InstallLayout::Isolated(_))
     }
 
     pub fn layout(&self) -> &InstallLayout {
@@ -126,6 +124,12 @@ fi"#,
         &self.inner.temporary
     }
 
+    /// Prepare the daemon's temporary storage before any child can use it.
+    pub fn prepare_temporary_dir(&self) -> io::Result<PathBuf> {
+        crate::fs::private_dir(self.temporary_dir())?;
+        Ok(self.temporary_dir().to_owned())
+    }
+
     /// IPC, never executable staging or retained output.
     pub fn runtime_dir(&self) -> &Path {
         &self.inner.runtime
@@ -133,6 +137,11 @@ fi"#,
 
     /// Preserve directory purposes across the daemon's cleared environment.
     pub fn daemon_env(&self, command: &mut Command) {
+        command.env("TMPDIR", self.temporary_dir());
+        #[cfg(windows)]
+        command
+            .env("TMP", self.temporary_dir())
+            .env("TEMP", self.temporary_dir());
         match &self.inner.layout {
             InstallLayout::Isolated(root) => {
                 command.env("A_HOME", root);
@@ -253,17 +262,19 @@ mod tests {
     #[test]
     fn remote_bootstrap_and_native_resolution_choose_the_same_build_directory() {
         use std::os::unix::ffi::OsStrExt;
-        let output = Command::new("sh")
+        let native = Paths::native().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.env_clear();
+        native.daemon_env(&mut command);
+        let output = command
             .arg("-c")
             .arg(format!(
                 "{}\nprintf '%s' \"$a_runtime\"",
-                Paths::remote_runtime_script()
+                RemoteLayout::for_platform(crate::Platform::CURRENT).runtime_script()
             ))
-            .env_remove("A_HOME")
             .output()
             .unwrap();
         assert!(output.status.success());
-        let native = native::resolve().unwrap();
         assert_eq!(output.stdout, native.runtime().dir().as_os_str().as_bytes());
     }
 
@@ -274,7 +285,7 @@ mod tests {
         let root = std::env::temp_dir().join("a paths café");
         let script = format!(
             "{}\nprintf '%s' \"$a_runtime\"",
-            Paths::remote_runtime_script()
+            RemoteLayout::for_platform(crate::Platform::CURRENT).runtime_script()
         );
         let output = Command::new("sh")
             .args(["-c", &script])

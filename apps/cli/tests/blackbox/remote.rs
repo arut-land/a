@@ -1,4 +1,4 @@
-//! `a bridge` and `a --host`, with ssh and scp simulated by scripts that run
+//! `a bridge` and `a --host`, with ssh simulated by scripts that run
 //! the "remote" command locally under a home of its own.
 
 use std::fs;
@@ -61,29 +61,30 @@ fn bridge_speaks_the_protocol_over_stdio() {
     assert!(child.wait().unwrap().success());
 }
 
-/// Fake `ssh` and `scp`: the remote is `<root>/remote`, with its own `HOME`
+/// Fake `ssh`: the remote has a literal path containing shell metacharacters,
+/// its own `HOME`
 /// and no `a` on its `PATH`, so the first connection installs this build.
 /// Returns `a --host box` for the test's own (local) home, and the host's.
 fn fake_remote(env: &mut Env, uname: &str) -> (Command, Home) {
-    let remote = env.root.join("remote");
+    let remote = env.root.join("remote space 'quote' $(touch injected)");
     let host = env.other_home(remote.join(".a"));
+    let quote =
+        |path: &std::path::Path| format!("'{}'", path.to_str().unwrap().replace('\'', r"'\''"));
     let ssh = env.script(
         "ssh",
         &format!(
             r#"shift
-echo "$*" >> '{log}'
+printf '%s\n' "$*" >> {log}
 [ "$*" = "uname -sm" ] && [ -n '{uname}' ] && {{ echo '{uname}'; exit; }}
-cd '{remote}' && exec env A_HOME='{remote}/.a' HOME='{remote}' PATH=/usr/bin:/bin sh -c "$*"
+cd {remote} && exec env A_HOME={home} HOME={remote} PATH=/usr/bin:/bin sh -c "$*"
 "#,
-            log = env.root.join("ssh.log").display(),
-            remote = remote.display(),
+            log = quote(&env.root.join("ssh.log")),
+            remote = quote(&remote),
+            home = quote(host.root()),
         ),
     );
-    let scp = env.script("scp", r#"cp "$2" "${3#*:}""#);
     let mut cmd = env.cmd(&["--host", "box"]);
-    cmd.env("A_SSH", ssh)
-        .env("A_SCP", scp)
-        .env("PATH", "/usr/bin:/bin");
+    cmd.env("A_SSH", ssh).env("PATH", "/usr/bin:/bin");
     (cmd, host)
 }
 
@@ -118,7 +119,7 @@ fn workspace_and_env(text: &str) -> (String, protocol::Environment) {
 }
 
 #[test]
-fn a_host_without_a_gets_this_build_installed() {
+fn a_remote_upload_preserves_bytes_under_literal_paths() {
     let mut env = Env::new("install");
     let (mut new, host) = fake_remote(&mut env, "");
     let session = ok(&new.arg("new").output().unwrap());
@@ -135,6 +136,61 @@ fn a_host_without_a_gets_this_build_installed() {
     assert!(listed.starts_with(session.trim()), "{listed}");
     let log = fs::read_to_string(env.root.join("ssh.log")).unwrap();
     assert_eq!(log.matches("uname -sm").count(), 1, "{log}");
+}
+
+#[test]
+fn native_remote_discovery_works_across_platforms_without_an_isolated_home() {
+    for uname in ["Linux x86_64", "Darwin arm64"] {
+        let env = Env::new("remote-native-layout");
+        let home = env.root.join("remote home");
+        let data = env.root.join("remote data");
+        let platform = sys::Platform::from_uname(uname).unwrap();
+        let runtime = Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "{}\nprintf '%s' \"$a_runtime\"",
+                    sys::RemoteLayout::for_platform(platform).runtime_script()
+                ),
+            ])
+            .env_remove("A_HOME")
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", &data)
+            .output()
+            .unwrap();
+        assert!(runtime.status.success());
+        let runtime = std::path::PathBuf::from(String::from_utf8(runtime.stdout).unwrap());
+        let current = runtime.join("current");
+        fs::create_dir_all(&current).unwrap();
+        let marker = env.root.join("discovered");
+        let found = env.script(
+            "found",
+            &format!("printf '%s' \"$1\" > '{}'\nexit 7", marker.display()),
+        );
+        fs::rename(found, current.join("a")).unwrap();
+        let os = uname.split_whitespace().next().unwrap();
+        env.script("uname", &format!("printf '%s\\n' '{os}'"));
+        let ssh = env.script(
+            "ssh",
+            &format!(
+                "shift\nexec env -u A_HOME HOME='{home}' XDG_DATA_HOME='{data}' PATH='{bin}:/usr/bin:/bin' sh -c \"$*\"",
+                home = home.display(),
+                data = data.display(),
+                bin = env.root.display(),
+            ),
+        );
+        let output = env
+            .cmd(&["--host", "box", "ls"])
+            .env("A_SSH", ssh)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            fs::read_to_string(&marker).ok().as_deref(),
+            Some("bridge"),
+            "{uname}: {output:?}"
+        );
+    }
 }
 
 #[test]

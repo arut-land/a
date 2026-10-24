@@ -71,6 +71,40 @@ fn shell_paths_with_spaces_and_non_ascii_reach_the_native_directory() {
 }
 
 #[test]
+fn shell_created_temporary_files_stay_inside_the_isolated_home() {
+    let env = Isolated::new("temporary space 'quote'");
+    let script = if sys::find_bash(std::env::var("PATH").ok().as_deref()).is_some() {
+        r#"p=$(mktemp "$TMPDIR/a-test.XXXXXXXX") && printf child-temp > "$p" && printf '%s' "$p" > temp-location"#
+    } else {
+        "$p=[IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($p,'child-temp'); [IO.File]::WriteAllText((Join-Path $PWD 'temp-location'),$p)"
+    };
+    let prompt = format!("$ {script}");
+    let mut command = env.command(&["--mode", "auto", "-p", &prompt]);
+    let outside = env.home.root().join("outside");
+    fs::create_dir(&outside).unwrap();
+    command
+        .env("TMPDIR", &outside)
+        .env("TMP", &outside)
+        .env("TEMP", &outside);
+    let output = TestProcess::spawn(&mut command)
+        .collect(deadline())
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let location = fs::read_to_string(env.home.root().join("temp-location")).unwrap();
+    let location = sys::shell_directory(&location).canonicalize().unwrap();
+    assert_eq!(
+        location.parent().unwrap(),
+        env.home.temporary_dir().canonicalize().unwrap()
+    );
+    assert_eq!(fs::read(location).unwrap(), b"child-temp");
+    assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+}
+
+#[test]
 fn an_unclean_exit_releases_the_endpoint_and_recovers_committed_sessions() {
     let env = Isolated::new("crash");
     env.run(&["-p", "before crash"]);

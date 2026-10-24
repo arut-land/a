@@ -51,7 +51,7 @@ pub use login::login_env;
 pub use memory::small_footprint;
 /// The resolved locations belonging to one daemon.
 pub use paths::Paths as Home;
-pub use paths::{InstallLayout, Paths};
+pub use paths::{InstallLayout, Paths, RemoteLayout};
 pub use platform::{Arch, Os, Platform};
 pub use proc::{
     AdoptLockError, Child, ContainedChild, DaemonLock, ExitWatch, InheritedNumber, OutputCapture,

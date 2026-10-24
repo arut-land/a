@@ -576,7 +576,7 @@ async fn open_remote(
                 crate::remote::install(&host, &installing)
             })
             .await?;
-            format!(r#"exec "$HOME/.a/runtime/{}/a" bridge {token}"#, staged.id)
+            crate::remote::installed_script(&staged.id, &token)
         } else {
             crate::remote::find_script(&token)
         };

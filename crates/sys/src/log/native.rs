@@ -7,7 +7,7 @@ pub struct Native(Option<backend::Sink>);
 
 impl Native {
     pub fn for_home(home: &crate::Home) -> Self {
-        Self::new(matches!(home.layout(), crate::InstallLayout::Isolated(_)))
+        Self::new(home.is_isolated())
     }
 
     fn new(isolated: bool) -> Self {
@@ -211,15 +211,36 @@ mod measure;
 mod tests {
     use super::*;
 
+    #[test]
+    fn daemon_spawn_preserves_default_and_explicit_home_modes() {
+        let root = std::env::temp_dir().join("a-native-home-mode");
+        let native = crate::Home::native().unwrap();
+        let isolated = crate::Home::from(root.clone());
+        assert!(!native.is_isolated());
+        assert!(isolated.is_isolated());
+        for (home, expected) in [(native, None), (isolated, Some(root.as_os_str()))] {
+            let mut command = std::process::Command::new("unused");
+            command.env("A_HOME", "another-instance");
+            home.daemon_env(&mut command);
+            let value = command
+                .get_envs()
+                .find(|(key, _)| *key == "A_HOME")
+                .unwrap()
+                .1;
+            assert_eq!(value, expected);
+        }
+    }
+
     #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn native_guards_can_overlap_and_reopen_without_emitting_a_record() {
-        let first = Native::new(false);
-        let second = Native::new(false);
+        let home = crate::Home::native().unwrap();
+        let first = Native::for_home(&home);
+        let second = Native::for_home(&home);
         assert!(first.0.is_some() && second.0.is_some());
         drop(first);
         drop(second);
-        assert!(Native::new(false).0.is_some());
+        assert!(Native::for_home(&home).0.is_some());
     }
 
     #[test]
