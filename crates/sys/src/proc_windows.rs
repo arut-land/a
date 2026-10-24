@@ -370,7 +370,12 @@ mod tests {
 
     #[test]
     fn daemon_bootstrap_never_replaces_resolved_temporary_environment() {
-        let home = crate::Home::from(std::env::temp_dir().join("a daemon temp 'literal'"));
+        let root = tempfile::Builder::new()
+            .prefix("a daemon temp 'literal' ")
+            .tempdir()
+            .unwrap();
+        let home = crate::Home::from(root.path().to_owned());
+        home.prepare_temporary_dir().unwrap();
         let mut command = Command::new(
             std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
                 .join("System32/cmd.exe"),
