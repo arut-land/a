@@ -30,7 +30,7 @@ jobs:
           fetch-depth: 0
       - uses: jdx/mise-action@v5
         with:
-          install_args: rust mr-boxington
+          install_args: rust mr-boxington ${{ runner.os == 'Linux' && 'mold' || '' }}
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
@@ -45,8 +45,13 @@ jobs:
           set -e
           git restore --source=HEAD -- crates/sys/src/log/native.rs
           test "$status" -eq 101
-          rg 'journal_delivery_resumes_after_endpoint_replacement.*FAILED' probe/original.log
-          rg 'kind: WouldBlock' probe/original.log
+          python - <<'PYTHON'
+          import re
+          data = re.sub(r'\x1b\[[0-9;]*m', '', open('probe/original.log').read())
+          assert re.search(r'journal_delivery_resumes_after_endpoint_replacement.*FAILED', data), data
+          assert 'kind: WouldBlock' in data, data
+          print('Original implementation loses delivery after endpoint replacement (WouldBlock).')
+          PYTHON
       - name: Verify replacement and full-queue behavior
         if: runner.os == 'Linux'
         run: cargo test -p sys --lib journal_delivery_
