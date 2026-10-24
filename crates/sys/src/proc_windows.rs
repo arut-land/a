@@ -379,6 +379,7 @@ mod tests {
                     home.temporary_dir(),
                 );
             }
+            crate::child::mark("bootstrap");
             return;
         }
         let root = tempfile::Builder::new()
@@ -395,7 +396,7 @@ mod tests {
         home.daemon_env(&mut command);
         daemon_environment(&mut command, &home);
         let output = command.output().unwrap();
-        assert!(output.status.success(), "{output:?}");
+        assert!(crate::child::ran(&output, "bootstrap"), "{output:?}");
     }
 
     #[test]

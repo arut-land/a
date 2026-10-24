@@ -140,6 +140,35 @@ pub fn shell_pwd() -> &'static str {
     }
 }
 
+/// A test that reruns itself as a child, filtered with `--exact`, passes
+/// even when the filter matches nothing; the child's marker proves it ran.
+#[cfg(test)]
+pub(crate) mod child {
+    use std::io::Write as _;
+
+    const MARK: &str = "a-test-child-ran:";
+
+    /// Written through a copy of the process's stdout, which the harness's
+    /// output capture never intercepts.
+    pub(crate) fn mark(stage: &str) {
+        #[cfg(unix)]
+        let handle = std::os::fd::AsFd::as_fd(&std::io::stdout()).try_clone_to_owned();
+        #[cfg(windows)]
+        let handle =
+            std::os::windows::io::AsHandle::as_handle(&std::io::stdout()).try_clone_to_owned();
+        let mut out = std::fs::File::from(handle.unwrap());
+        out.write_all(format!("{MARK}{stage}\n").as_bytes())
+            .unwrap();
+    }
+
+    pub(crate) fn ran(output: &std::process::Output, stage: &str) -> bool {
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == format!("{MARK}{stage}"))
+    }
+}
+
 #[cfg(test)]
 mod path_tests {
     use super::*;

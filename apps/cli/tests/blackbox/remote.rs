@@ -136,6 +136,10 @@ fn a_remote_upload_preserves_bytes_under_literal_paths() {
     assert!(listed.starts_with(session.trim()), "{listed}");
     let log = fs::read_to_string(env.root.join("ssh.log")).unwrap();
     assert_eq!(log.matches("uname -sm").count(), 1, "{log}");
+    // The remote root's command substitution stayed literal.
+    let remote = host.root().parent().unwrap();
+    assert!(!remote.join("injected").exists());
+    assert!(!env.root.join("injected").exists());
 }
 
 #[test]
