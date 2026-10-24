@@ -20,39 +20,39 @@ formats are disabled. Windows reuses `windows-sys` for loaded-module identity
 and stack capture. The maintained parsers and native logging adapters avoid
 custom Mach-O parsing, os_log argument packing and TraceLogging metadata.
 
-The [hosted paired run](https://github.com/arut-land/a/actions/runs/40036096021)
-compares main `4b662d7a` with implementation `fa05741c`, five reference and
-five candidate rounds per target in alternating order. Sizes are stripped
+The [hosted paired run](https://github.com/arut-land/a/actions/runs/40047980069)
+compares main `4b662d7a` with reconnect implementation `3e576051`, five reference
+and five candidate rounds per target in alternating order. Sizes are stripped
 shipped binaries; values and deltas below are medians. KiB means 1024 bytes.
 
 | Target | Main KiB | Candidate KiB | Delta KiB | Cold reply delta ms | Attach p99 delta ms | Idle RSS delta KiB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Linux x86_64 | 4190.820 | 4194.820 | +4.000 | +0.232 | -0.005 | +40 |
-| Linux arm64 | 3603.539 | 3607.789 | +4.250 | -0.732 | +0.026 | +12 |
-| macOS arm64 | 3236.031 | 3252.703 | +16.672 | -0.907 | +0.088 | -112 |
-| macOS x86_64 | 3896.922 | 3901.453 | +4.531 | -7.144 | -0.022 | -60 |
-| Windows x86_64 | 5408.000 | 5415.500 | +7.500 | -0.496 | +0.018 | +28 |
-| Windows arm64 | 4754.500 | 4762.000 | +7.500 | +2.546 | -0.008 | +48 |
+| Linux x86_64 | 4190.820 | 4195.320 | +4.500 | +0.068 | +0.005 | +84 |
+| Linux arm64 | 3603.539 | 3608.164 | +4.625 | +0.306 | +0.001 | +0 |
+| macOS arm64 | 3236.031 | 3252.703 | +16.672 | +0.528 | +0.002 | -96 |
+| macOS x86_64 | 3896.922 | 3901.453 | +4.531 | -8.216 | +0.002 | +4 |
+| Windows x86_64 | 5408.000 | 5415.500 | +7.500 | -0.034 | +0.020 | +8 |
+| Windows arm64 | 4754.500 | 4762.000 | +7.500 | -0.809 | -0.046 | +56 |
 
 Idle daemon and line-client CPU medians are zero before and after on every
 target. Large-JSON CPU median deltas are:
 
 | Target | CPU delta |
 | --- | ---: |
-| Linux x86_64 | -0.87% |
-| Linux arm64 | +1.53% |
-| macOS arm64 | -4.25% |
-| macOS x86_64 | -7.77% |
-| Windows x86_64 | +9.88% |
-| Windows arm64 | +2.58% |
+| Linux x86_64 | -2.53% |
+| Linux arm64 | +1.87% |
+| macOS arm64 | +7.26% |
+| macOS x86_64 | -1.17% |
+| Windows x86_64 | +0.00% |
+| Windows arm64 | +7.36% |
 
 Positive CPU deltas remain visible; these measurements do not establish their
-cause. Windows x86_64 CPU samples span 2.38–2.67 s for main and
-2.47–2.88 s for the candidate. macOS arm64 attach-p99 samples span
-0.39–0.52 ms and 0.45–0.74 ms respectively. The spread limits causal
-conclusions and does not rule out an application regression. No active-workload
-performance improvement is claimed. Producer admission is unchanged; successful
-large-JSON processing does not emit diagnostic facts.
+cause. Linux arm64 CPU samples span 2.214–2.236 s for main and 2.233–2.270 s
+for the candidate. macOS arm64 spans 1.552–2.397 s and 1.686–2.947 s;
+Windows arm64 spans 2.391–2.641 s and 2.391–2.812 s respectively. The spread
+limits causal conclusions and does not rule out an application regression.
+No active-workload performance improvement is claimed. Producer admission is
+unchanged; successful large-JSON processing does not emit diagnostic facts.
 
 The application harness uses isolated `A_HOME`, so native delivery is disabled.
 Enabled-call costs are measured separately below. End-to-end collector latency
@@ -105,11 +105,12 @@ daemon state, and does not change normal isolated-`A_HOME` behavior.
 A separate [hosted static-musl probe](https://github.com/arut-land/a/actions/runs/39997996173)
 verifies ELF identity without symbol lookup in both static and PIC relocation
 modes. The native transport tests cover atomic datagrams, a full collector
-queue, missing native delivery, isolated homes and provider lifetimes. Crash
+queue, endpoint replacement with and without records during the restart gap,
+missing native delivery, isolated homes and provider lifetimes. Crash
 tests cover bounded identity, malformed ELF notes, unreadable PE memory and
 the report's privacy and size limits.
 
-[Hosted CI](https://github.com/arut-land/a/actions/runs/40036092401) validates
+[Hosted CI](https://github.com/arut-land/a/actions/runs/40048333822) validates
 the combined source on Linux, macOS and both Windows architectures, including
 workspace checks, acceptance, release budgets, Apple tests/build, Miri, fuzz
 smoke, dependency checks and the no-tokio and Windows seams.
