@@ -176,6 +176,7 @@ impl Host for CallPorts {
             result.await.unwrap_or(super::Called {
                 outcome: super::Outcome::Interrupted { output: None },
                 card: None,
+                held: Vec::new(),
             })
         })
     }

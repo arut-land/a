@@ -8,7 +8,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{CallId, Json};
+use crate::{CallId, Json, OutputStream};
 
 /// The SHA-256 of a blob's bytes. One namespace per daemon: the same
 /// bytes from any session, child or fork are one blob.
@@ -91,6 +91,15 @@ pub enum BlobOrigin {
     ToolOutput(CallId),
     /// The output of a call's background job.
     JobLog(CallId),
+}
+
+/// What an entry references outside the log: a sealed blob, or a stream
+/// still growing. A sweep keeps what any entry holds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Held {
+    Blob(BlobRef),
+    Stream(OutputStream),
 }
 
 /// A value too large for its log line is held as a blob.

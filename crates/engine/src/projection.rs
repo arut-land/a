@@ -143,18 +143,24 @@ impl Invocations {
 impl super::Waiter {
     fn reply(self, body: &Body) {
         let interrupted = protocol::Outcome::Interrupted { output: None };
-        let (outcome, failure, card) = match body {
-            Body::ToolResult { outcome, card, .. } => (outcome, None, card.as_ref()),
+        let (outcome, failure, card, held) = match body {
+            Body::ToolResult {
+                outcome,
+                card,
+                held,
+                ..
+            } => (outcome, None, card.as_ref(), held.as_slice()),
             Body::ModelResult {
                 outcome, failure, ..
-            } => (outcome, failure.as_ref(), None),
-            Body::Interrupt { .. } => (&interrupted, None, None),
+            } => (outcome, failure.as_ref(), None, &[][..]),
+            Body::Interrupt { .. } => (&interrupted, None, None, &[][..]),
             _ => unreachable!("committed result"),
         };
         match self {
             Self::Tool(reply) => reply.send(super::Called {
                 outcome: outcome.clone(),
                 card: card.cloned(),
+                held: held.to_vec(),
             }),
             Self::Model(reply) => reply.send(super::Opened::Cached {
                 outcome: outcome.clone(),
@@ -509,6 +515,7 @@ mod tests {
                     call,
                     outcome: outcome.clone(),
                     card: None,
+                    held: Vec::new(),
                 },
             ));
             let mut restored: Invocations = Json::encode(&completed).unwrap().parse().unwrap();
@@ -524,6 +531,7 @@ mod tests {
                     call: parent,
                     outcome: Outcome::Interrupted { output: None },
                     card: None,
+                    held: Vec::new(),
                 },
             );
             restored.fold(&end);

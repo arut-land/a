@@ -1569,6 +1569,7 @@ fn detached_results_and_messages_enter_before_the_next_provider_step() {
         call,
         outcome: done(json!("handle")),
         card: None,
+        held: Vec::new(),
     });
     let request = s
         .log

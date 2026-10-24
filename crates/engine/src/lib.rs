@@ -352,9 +352,11 @@ impl Daemon {
         // Extensions publish these facts as they register.
         sys::shell::ExecutionFacts::initialize(home)?;
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
-        let blobs: Arc<dyn ext::blob::BlobStore> =
-            Arc::new(store::Files::open(home.blobs_dir(), &home.sessions_dir())?);
-        let tree = Arc::new(store::CacheDir::new(
+        let blobs: Arc<dyn ext::blob::BlobStore> = Arc::new(blob_files::Files::open(
+            home.blobs_dir(),
+            &home.sessions_dir(),
+        )?);
+        let tree = Arc::new(blob_files::CacheDir::new(
             home.cache_dir().join("tree"),
             Arc::clone(&blobs),
         ));

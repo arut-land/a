@@ -102,6 +102,7 @@ fn context_image() -> protocol::publication::ContextImage {
         ContextValue::ToolResult(
             CallId::new(9).unwrap(),
             Outcome::Interrupted { output: None },
+            Vec::new(),
         ),
     ];
     let inputs: Vec<_> = values
@@ -772,7 +773,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                         body: "src\n".into(),
                         note: "exit 0".into(),
                         ..Card::default()
-                    }),
+                    }), held: Vec::new(),
                 },
             ),
         ),
@@ -847,7 +848,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         sample("entry_withdraw", entry(5, Body::Withdraw { input: Seq::new(3).unwrap(), origin: None })),
         sample("entry_take_into", entry(6, Body::Take { input: Seq::new(3).unwrap(), into: CallId::new(4) })),
         sample("entry_detached", entry(7, Body::Detached { call: CallId::new(4).unwrap() })),
-        sample("entry_placeholder", entry(8, Body::ToolResult { call: CallId::new(4).unwrap(), outcome: protocol::OutputStream { call: CallId::new(4).unwrap() }.placeholder(), card: None })),
+        sample("entry_placeholder", entry(8, Body::ToolResult { call: CallId::new(4).unwrap(), outcome: protocol::OutputStream { session: SESSION, call: CallId::new(4).unwrap() }.placeholder(), card: None, held: vec![protocol::Held::Stream(protocol::OutputStream { session: SESSION, call: CallId::new(4).unwrap() })] })),
         sample("entry_spawned_model_only", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::ModelOnly, authority: protocol::Json::null(), image: protocol::publication::ContextImage::default() }.to_json().unwrap() })),
         sample("entry_model_thread", entry(2, Body::ModelCall { model: "example:model".into(), attempt: 0, choice: protocol::ToolChoice::None, r#for: CallId::new(1), purpose: Some("example".into()), request: Some(protocol::publication::ThreadImage { turn: protocol::Json::null(), authority: protocol::Json::null() }.to_json().unwrap()) })),
         sample("entry_spawned", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::Agent, authority: protocol::Json::null(), image: context_image() }.to_json().unwrap() })),

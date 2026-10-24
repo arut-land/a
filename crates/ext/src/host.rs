@@ -98,7 +98,7 @@ pub struct Parts {
     pub session: SessionId,
     pub call: CallId,
     pub model: Arc<str>,
-    pub blobs: crate::blob::Blobs,
+    pub blobs: blob::Blobs,
     pub cancel: Cancel,
     pub detach: crate::Flag,
     pub services: Arc<SessionServices>,
@@ -148,11 +148,18 @@ impl Toolset {
     }
 
     /// What the model sees of a call's outcome.
-    pub fn to_model(&self, name: &str, outcome: &Outcome) -> (llm::Output, bool) {
+    pub fn to_model(
+        &self,
+        name: &str,
+        outcome: &Outcome,
+        places: &blob::Places,
+    ) -> (llm::Output, bool) {
         match outcome {
             Outcome::Done { output } => (
-                self.get(name)
-                    .map_or_else(|| llm::Output::Json(output.clone()), |t| t.to_model(output)),
+                self.get(name).map_or_else(
+                    || llm::Output::Json(output.clone()),
+                    |t| t.to_model(output, places),
+                ),
                 false,
             ),
             Outcome::Failed { error } => (llm::Output::Text(error.clone()), true),
@@ -420,8 +427,13 @@ impl Registry {
 
     /// What the model is shown of a call's outcome: its tool's own
     /// presentation, as the `present_result` handlers leave it.
-    pub fn present_result(&self, tool: &str, outcome: &Outcome) -> crate::point::Presented {
-        let (output, error) = self.tools.to_model(tool, outcome);
+    pub fn present_result(
+        &self,
+        tool: &str,
+        outcome: &Outcome,
+        places: &blob::Places,
+    ) -> crate::point::Presented {
+        let (output, error) = self.tools.to_model(tool, outcome, places);
         let ended = crate::point::Ended { tool, outcome };
         (self.hooks).present_result(ended, crate::point::Presented { output, error })
     }

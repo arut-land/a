@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use protocol::ledger::{Call, Ledger, OutcomeKind, Phase, Queued};
 use protocol::{
-    Audience, Author, Body, CallId, Entry, Envelope, EnvelopeId, Json, Mode, Outcome, OutputStream,
-    Seq, SessionId, ToolChoice, Verdict, WaitOn,
+    Audience, Author, Body, CallId, Entry, Envelope, EnvelopeId, Held, Json, Mode, Outcome,
+    OutputStream, Seq, SessionId, ToolChoice, Verdict, WaitOn,
 };
 use smallvec::SmallVec;
 
@@ -27,6 +27,13 @@ const AGENT: &str = "agent";
 /// whatever the `request_error` point says: a daemon that keeps dying
 /// mid-call cannot retry it forever.
 pub const RESTART_CAP: u16 = 10;
+
+/// How a tool call ended, as its result is logged.
+struct Ended {
+    outcome: Outcome,
+    card: Option<Card>,
+    held: Vec<Held>,
+}
 
 /// A session's kernel: its log folded, its turn, and the registry
 /// generation its steps run on.
@@ -199,7 +206,16 @@ impl Core {
                 call,
                 outcome,
                 card,
-            } => self.tool_done(call, outcome, card, &mut fx),
+                held,
+            } => self.tool_done(
+                call,
+                Ended {
+                    outcome,
+                    card,
+                    held,
+                },
+                &mut fx,
+            ),
             Event::Detached { call } => self.detached(call, &mut fx),
             Event::JobEnded { call, text } => {
                 self.own(call, EnvelopeId::JOB, text, &mut fx);
@@ -568,8 +584,7 @@ impl Core {
         }
         self.append(fx, Body::Detached { call });
         self.close(call);
-        let outcome = OutputStream { call }.placeholder();
-        self.result(call, outcome, None, fx);
+        self.result(call, self.placeholder(call), fx);
     }
 
     /// Queues an envelope from the session to itself, about its own call
@@ -1049,8 +1064,15 @@ impl Core {
     }
 
     /// Logs a call's outcome as the `post_tool` chain leaves it, with the
-    /// card its tool showed it with, unless a handler replaced it.
-    fn tool_done(&mut self, call: CallId, outcome: Outcome, card: Option<Card>, fx: &mut StepPlan) {
+    /// card its tool showed it with, unless a handler replaced it. What it
+    /// holds stays held either way: a replaced outcome's original is
+    /// logged with the decision.
+    fn tool_done(&mut self, call: CallId, ended: Ended, fx: &mut StepPlan) {
+        let Ended {
+            outcome,
+            card,
+            held,
+        } = ended;
         if self.fold.ledger.detached().iter().any(|d| d.call == call) {
             if !self.dropped.contains(&call) {
                 self.own(call, EnvelopeId::DETACHED, outcome.payload(), fx);
@@ -1073,12 +1095,25 @@ impl Core {
         }
         self.cancel_invocations(call, fx);
         self.close(call);
-        self.result(call, outcome, card, fx);
+        self.result(
+            call,
+            Ended {
+                outcome,
+                card,
+                held,
+            },
+            fx,
+        );
     }
 
     /// Logs tool call `call`'s result: a boundary at which queued items
     /// may go into it, for a call the model made.
-    fn result(&mut self, call: CallId, outcome: Outcome, card: Option<Card>, fx: &mut StepPlan) {
+    fn result(&mut self, call: CallId, ended: Ended, fx: &mut StepPlan) {
+        let Ended {
+            outcome,
+            card,
+            held,
+        } = ended;
         let model = matches!(
             self.fold.ledger.call(call).map(|open| &open.call),
             Some(Call::Tool {
@@ -1093,6 +1128,7 @@ impl Core {
                 call,
                 outcome,
                 card,
+                held,
             },
         );
         if model {
@@ -1861,7 +1897,7 @@ impl Core {
             .collect();
         for call in open {
             self.cancel_invocations(call, fx);
-            self.result(call, OutputStream { call }.placeholder(), None, fx);
+            self.result(call, self.placeholder(call), fx);
         }
     }
 
@@ -1880,7 +1916,10 @@ impl Core {
                 });
                 continue;
             }
-            let stream = OutputStream { call: d.call };
+            let stream = OutputStream {
+                session: self.session,
+                call: d.call,
+            };
             let output = format!(
                 "[the daemon stopped while this call ran in the background: it may not have \
                  completed; its output so far is in {stream}]"
@@ -2038,10 +2077,25 @@ impl Core {
                 call,
                 outcome,
                 card: None,
+                held: Vec::new(),
             },
             None => return,
         };
         self.append(fx, body);
+    }
+
+    /// The result of call `call`, detached: done, naming the stream its
+    /// output goes on in, which it holds.
+    fn placeholder(&self, call: CallId) -> Ended {
+        let stream = OutputStream {
+            session: self.session,
+            call,
+        };
+        Ended {
+            outcome: stream.placeholder(),
+            card: None,
+            held: vec![Held::Stream(stream)],
+        }
     }
 
     /// An interrupted outcome for call `call`, with the output it logged.

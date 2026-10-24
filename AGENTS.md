@@ -18,6 +18,7 @@ and each crate's `//!` comment supplying the details.
 | `crates/sys` | Platform specifics; the only crate allowed `unsafe` |
 | `crates/rt` | The async runtime seam: library code is plain async over `Runtime`, never names tokio |
 | `crates/json`, `crates/transport` | Payloads carried without being parsed (tool arguments and output, replies, extension state); HTTP requests over reusable pools |
+| `crates/blob`, `crates/blob-files` | The blob seam (store, materialize, how references are named; no I/O), and its file-system backends |
 | `crates/protocol` | Wire types shared by daemon and clients, framing, the shared view reducer (`protocol::view`) |
 | `crates/llm` | Language models over their wire protocols (docs/llm.md) |
 | `crates/kernel` | What a session does next, as a pure function of its log and what just happened |
@@ -30,8 +31,9 @@ and each crate's `//!` comment supplying the details.
 | `docs/perf` | Build tuning, budgets and the measurements behind them |
 
 Dependencies point down the layers in docs/design.md's crate map, from
-the bottom: `sys`, `rt`, `json`/`transport`, `protocol`/`llm`, `ext`,
-then `ext-*` and `kernel`, then `engine`. Clients (`client`, `ffi`,
+the bottom: `sys`, `rt`, `json`/`transport`, `protocol`/`llm`, `blob`
+(`blob-files` over it and `sys`), `ext`, then `ext-*` and `kernel`, then
+`engine`. Clients (`client`, `ffi`,
 `tui`, `web`) never depend on `ext`, `kernel` or `engine`; `apps/cli`
 composes the daemon from the extensions.
 

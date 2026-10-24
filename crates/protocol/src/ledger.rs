@@ -922,8 +922,9 @@ mod durable_tests {
             Body::Detached { call },
             Body::ToolResult {
                 call,
-                outcome: crate::OutputStream { call }.placeholder(),
+                outcome: crate::OutputStream { session, call }.placeholder(),
                 card: None,
+                held: Vec::new(),
             },
         ];
         let running = fold(detached.clone());

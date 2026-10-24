@@ -9,12 +9,10 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use protocol::{Body, CallId, Entry, Environment, Epoch, Json, Outcome, Seq, SessionId};
 use serde_json::Value;
 
-use crate::blob::{
-    BlobId, BlobOrigin, BlobRef, BlobStore, BlobWriter, Blobs, Materialize, Open, RefIndex, Sealer,
-    Stream, TreePath,
-};
 use crate::host::{Host, Parts, Registry, SessionServices};
 use crate::{BoxFuture, Called, Cancel, Cx, Gate, Gating, States};
+use blob::{Blobs, OutputStream};
+use blob_files::{CacheDir, Files};
 
 /// The runtime the calls run on, as the engine provides it.
 static RT: LazyLock<rt::Rt> = LazyLock::new(|| Arc::new(rt::Threads::default()));
@@ -37,6 +35,9 @@ pub struct Rig {
     pub env: Option<Environment>,
     pub cancel: Cancel,
     pub session: SessionId,
+    /// The session's blobs, in the store the engine keeps them in, under
+    /// the rig's directory.
+    pub blobs: Blobs,
     host: Arc<Recorder>,
     calls: AtomicU64,
     _directory: tempfile::TempDir,
@@ -74,11 +75,15 @@ impl Rig {
         let dir = directory.path();
         std::fs::create_dir_all(dir.join("ws")).unwrap();
         let dir = std::fs::canonicalize(dir).unwrap();
+        let session = SessionId::new();
+        let store = Arc::new(Files::open(dir.join("blobs"), &dir).expect("the rig's store"));
+        let tree = Arc::new(CacheDir::new(dir.join("tree"), Arc::clone(&store) as _));
         Self {
+            blobs: Blobs::new(store, tree, session),
             dir,
             env: None,
             cancel: Cancel::default(),
-            session: SessionId::new(),
+            session,
             host: Arc::new(Recorder {
                 states: Mutex::new(registry.states()),
                 registry,
@@ -97,31 +102,14 @@ impl Rig {
         self.dir.join("ws")
     }
 
-    /// Where the session's blobs are kept.
-    pub fn blobs(&self) -> PathBuf {
-        self.dir.join("blobs")
-    }
-
-    /// Where blobs are materialized.
-    pub fn tree(&self) -> PathBuf {
-        self.dir.join("tree")
-    }
-
-    /// Where call `call`'s open stream named `.ext` is read while it grows.
-    pub fn stream(&self, call: u64, ext: &str) -> PathBuf {
-        (self.blobs().join("open"))
-            .join(self.session.to_string())
-            .join(format!("{call}.{ext}"))
-    }
-
-    /// The session's blobs as a call writes them.
-    pub fn blob_store(&self) -> Blobs {
-        let store = Arc::new(Store(self.blobs()));
-        let tree = Arc::new(Tree {
-            root: self.tree(),
-            store: Arc::clone(&store),
-        });
-        Blobs::new(store, tree, self.session)
+    /// Where call `call`'s output stream is read while it grows.
+    pub fn stream(&self, call: u64) -> PathBuf {
+        let call = CallId::new(call).expect("from 1");
+        let of = OutputStream {
+            session: self.session,
+            call,
+        };
+        self.blobs.places().stream(of).into()
     }
 
     /// What the next call runs with.
@@ -132,7 +120,7 @@ impl Rig {
             session: self.session,
             call: CallId::new(self.calls.fetch_add(1, Ordering::SeqCst) + 1).expect("from 1"),
             model: "test:model".into(),
-            blobs: self.blob_store(),
+            blobs: self.blobs.clone(),
             cancel: self.cancel.clone(),
             services: Arc::clone(&SERVICES),
             detach: crate::Flag::default(),
@@ -255,6 +243,7 @@ impl Host for Recorder {
                 call,
                 outcome: called.outcome.clone(),
                 card: called.card.clone(),
+                held: Vec::new(),
             })
             .unwrap();
             called
@@ -330,193 +319,6 @@ impl Host for Recorder {
 
     fn registry(&self) -> &Registry {
         &self.registry
-    }
-}
-
-/// Blobs as plain files named by a stand-in for their hash: the same
-/// bytes, the same id, with none of the store's durability.
-struct Store(PathBuf);
-
-/// Four seeded hashers, fed as the bytes come.
-struct Hash([std::collections::hash_map::DefaultHasher; 4]);
-
-impl Hash {
-    fn new() -> Self {
-        use std::hash::Hasher;
-        Self(std::array::from_fn(|seed| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            hasher.write_usize(seed);
-            hasher
-        }))
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        use std::hash::Hasher;
-        self.0.iter_mut().for_each(|hasher| hasher.write(bytes));
-    }
-
-    fn id(&self) -> BlobId {
-        use std::hash::Hasher;
-        let mut id = [0; 32];
-        for (part, hasher) in id.as_chunks_mut::<8>().0.iter_mut().zip(&self.0) {
-            *part = hasher.finish().to_le_bytes();
-        }
-        BlobId(id)
-    }
-}
-
-impl Store {
-    fn path(&self, id: &BlobId) -> PathBuf {
-        self.0.join(id.to_string())
-    }
-
-    fn put(&self, bytes: &[u8], media_type: &str, origin: BlobOrigin) -> std::io::Result<BlobRef> {
-        let mut hash = Hash::new();
-        hash.update(bytes);
-        let id = hash.id();
-        std::fs::create_dir_all(&self.0)?;
-        std::fs::write(self.path(&id), bytes)?;
-        Ok(BlobRef {
-            id,
-            size: bytes.len() as u64,
-            media_type: media_type.to_owned(),
-            origin,
-        })
-    }
-}
-
-struct Writing {
-    store: Store,
-    bytes: Vec<u8>,
-    cap: u64,
-}
-
-impl std::io::Write for Writing {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if (self.bytes.len() + buf.len()) as u64 > self.cap {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
-                "past the blob's cap",
-            ));
-        }
-        self.bytes.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl BlobWriter for Writing {
-    fn finish(self: Box<Self>, media_type: &str, origin: BlobOrigin) -> std::io::Result<BlobRef> {
-        self.store.put(&self.bytes, media_type, origin)
-    }
-}
-
-struct Sealing {
-    store: Store,
-    cap: u64,
-}
-
-impl Sealer for Sealing {
-    fn seal(
-        self: Box<Self>,
-        path: &std::path::Path,
-        media_type: &str,
-        origin: BlobOrigin,
-    ) -> std::io::Result<BlobRef> {
-        use std::io::Read as _;
-        let file = std::fs::OpenOptions::new().write(true).open(path)?;
-        let size = file.metadata()?.len().min(self.cap);
-        file.set_len(size)?;
-        let (mut hash, mut buf) = (Hash::new(), vec![0; 64 << 10]);
-        let mut read = std::fs::File::open(path)?;
-        loop {
-            match read.read(&mut buf)? {
-                0 => break,
-                n => hash.update(&buf[..n]),
-            }
-        }
-        let id = hash.id();
-        std::fs::rename(path, self.store.path(&id))?;
-        Ok(BlobRef {
-            id,
-            size,
-            media_type: media_type.to_owned(),
-            origin,
-        })
-    }
-
-    fn discard(self: Box<Self>, path: &std::path::Path) -> std::io::Result<()> {
-        std::fs::remove_file(path)
-    }
-}
-
-impl BlobStore for Store {
-    fn writer(&self, cap: u64) -> std::io::Result<Box<dyn BlobWriter>> {
-        Ok(Box::new(Writing {
-            store: Self(self.0.clone()),
-            bytes: Vec::new(),
-            cap,
-        }))
-    }
-
-    fn stream(&self, name: &str, cap: u64) -> std::io::Result<Stream> {
-        let path = self.0.join("open").join(name);
-        std::fs::create_dir_all(path.parent().expect("named"))?;
-        let file = std::fs::File::create_new(&path)?;
-        let sealer = Sealing {
-            store: Self(self.0.clone()),
-            cap,
-        };
-        Ok(Stream {
-            file,
-            open: Open::new(path, Box::new(sealer)),
-        })
-    }
-
-    fn open(&self, id: &BlobId) -> std::io::Result<Box<dyn std::io::Read + Send>> {
-        Ok(Box::new(std::fs::File::open(self.path(id))?))
-    }
-
-    fn materialize(&self, id: &BlobId) -> std::io::Result<PathBuf> {
-        Ok(self.path(id))
-    }
-
-    fn sweep(&self, _: &dyn RefIndex) -> std::io::Result<u64> {
-        Ok(0)
-    }
-}
-
-struct Tree {
-    root: PathBuf,
-    store: Arc<Store>,
-}
-
-impl Materialize for Tree {
-    fn root(&self) -> &std::path::Path {
-        &self.root
-    }
-
-    fn ensure(&self, at: &TreePath, blob: &BlobRef) -> std::io::Result<()> {
-        let path = self.path(at);
-        std::fs::create_dir_all(path.parent().expect("in the tree"))?;
-        if !path.exists() {
-            std::fs::copy(self.store.materialize(&blob.id)?, path)?;
-        }
-        Ok(())
-    }
-
-    fn expose(&self, at: &TreePath, open: &std::path::Path) -> std::io::Result<()> {
-        let path = self.path(at);
-        std::fs::create_dir_all(path.parent().expect("in the tree"))?;
-        let _ = std::fs::remove_file(&path);
-        std::fs::hard_link(open, path)
-    }
-
-    fn evict(&self, _: u64) -> std::io::Result<u64> {
-        Ok(0)
     }
 }
 

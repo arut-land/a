@@ -98,38 +98,56 @@ Bytes too large for a log line (cut tool output now; pastes and attachments
 later) are blobs: content-addressed by SHA-256 (`protocol::BlobId`), owned by
 the store beside the logs that reference them, one namespace per daemon. An
 entry holds a `BlobRef { id, size, media_type, origin }`, never a path, so a
-fork or child references its parent's blobs rather than its files.
-`ext::blob` is the seam: `BlobStore` (`writer`, `stream`, `open`,
-`materialize`, `sweep`), `Materialize` (how blobs appear as files) and the
-shape of `Namespace` (what that tree holds, derived from the logs). Calls
-reach them through `Cx.blobs`. Pasted and attached segments
-(`Segment::PasteRef`, `Segment::Attachment`) carry a `BlobRef` and are shown to
-the model at their tree place, `by-id/<id>`. A call's growing output
-(`protocol::OutputStream`, what a detached call's placeholder names, and a
-background shell job's log) is shown at `sessions/<session>/streams/<call>.log`:
-`Blobs::expose` hard-links the open stream there, so a reader sees it grow and,
-once sealed, the blob it became. The live transcript names both through
-`ext::blob::Places` under the session's tree root; context published to other
-sessions names them by tree place alone.
+fork or child references its parent's blobs rather than its files. A tool
+result says what it references outside the log in a typed field,
+`ToolResult.held: Vec<Held>` (`Held::Blob` or `Held::Stream`), filled from the
+tool's `Tool::held(&Out)`: a sweep's reference index folds that field, never
+tool output JSON.
 
-The JSONL backend (`store::Files`) keeps `blobs/<aa>/<id>`, 0400 in a 0700
-directory. A writer hashes into `staging/` as it writes and refuses bytes past
-its cap; a stream grows in `open/<session>/<call>.<ext>`, readable while a
-process writes it, and seals into a blob (cut at its cap) with no copy.
+The seam is the `blob` crate (re-exported as `ext::blob`), which does no I/O:
+`BlobStore` (`writer`, `stream`, `open`, `materialize`, `sweep`),
+`Materialize` (how blobs appear as files) and the shape of `Namespace` (what
+that tree holds, derived from the logs). Calls reach them through `Cx.blobs`.
+The file-system backends are `blob-files`, which the engine and the
+extension test rig both run on.
+
+A call's output stream (`protocol::OutputStream { session, call }`, what a
+detached call's placeholder names, a background shell job's log, and the
+output of a command whose leftover processes still write it) grows at
+`blobs/open/<session>/<call>.log`, named by the session whose log holds the
+call. It is sealed into a blob only once nothing writes it: a command that
+leaves processes behind keeps its whole output as a growing stream. Sealing a
+background job's stream when its group ends is to come with the queue's job
+facts.
+
+References are named for the model when it reads them, not when they are
+logged: `Tool::to_model_with(output, &Places)` and the transcript name a blob
+`<cache>/tree/by-id/<id>` and a stream by its path in the store, from what the
+log records, whoever's session projects it. A projection without a store
+names a blob by its tree place and a stream `stream:<call>`. Making a named
+path exist before a model call shows it is deferred: a call materializes the
+blob it seals, but a paste, an attachment or a detached call's stream is not
+yet ensured by the projection.
+
+The JSONL backend (`blob_files::Files`) keeps `blobs/<aa>/<id>`, 0400 in a
+0700 directory. A writer hashes into `staging/` as it writes and refuses bytes
+past its cap; a stream, readable while a process writes it, seals into a blob
+(cut at its cap) with no copy, and a call run again starts its stream over.
 Sealing orders the bytes and the new name, then returns the ref: an entry
 referencing it is appended after, so the shared flush epoch that makes the
 entry durable covers the blob (a blob on another device is flushed at once).
-Staging, open streams and unreferenced blobs are never trusted after a crash;
-`sweep` removes them at rest given a `RefIndex` derived from the logs. Nothing
-runs it yet: there is no session deletion. Blob bytes are as private as their
-log, and environment redaction does not apply to them.
+Staging and unreferenced blobs are never trusted after a crash; `sweep` removes
+them at rest given liveness derived from the logs, and keeps every stream.
+Nothing runs it yet: there is no session deletion. Blob bytes are as private as
+their log, and environment redaction does not apply to them.
 
-`Materialize` makes a blob readable at a stable path before the model is told
-it. The only backend is `store::CacheDir`: `cache/tree/by-id/<id>`, cloned
-(APFS `clonefile`, Linux `FICLONE`), else hard-linked, else copied, read-only,
-evicted least recently used first and rebuilt on demand. Virtual backends
-(Windows Cloud Files, macOS File Provider, Linux FUSE) would plug in behind
-the same trait, answering from `Namespace` and hydrating via `BlobStore::open`.
+`Materialize`'s only backend is `blob_files::CacheDir`:
+`cache/tree/by-id/<id>`, cloned (APFS `clonefile`, Linux `FICLONE`), else
+hard-linked, else copied, read-only, evicted least recently used first and
+rebuilt on demand. A hard-linked file is the store's own, so a write that
+clears its read-only bit reaches the blob. Virtual backends (Windows Cloud
+Files, macOS File Provider, Linux FUSE) would plug in behind the same trait,
+answering from `Namespace` and hydrating via `BlobStore::open`.
 
 Calls have durable intents and outcomes. Tool output is structured data;
 model transcripts and client presentation are projections. Approval waits,
@@ -227,9 +245,10 @@ The shell process service admits at most 32 outstanding launches and running
 processes. Captured output crosses one 64 KiB buffer per process into an open
 blob stream, with storage back-pressure and a hard 64 MiB retention limit for
 foreground and background jobs. A foreground command whose output the model saw
-cut is sealed into a blob that its result references (`Ran.full`); otherwise the
-stream is discarded. A background job's stream stays open at the path its
-result names (`Job.log`) while it runs. Group observation is capped at 4096
+cut is sealed into a blob that its result references (`Ran.full`), unless
+processes it left running still write it (`Ran.growing`, the stream); otherwise
+the stream is discarded. A background job's stream (`Job.log`) stays open while
+it runs. Group observation is capped at 4096
 members; exceeding it revokes the live lease. Following streams and enumerating groups use admitted
 storage workers, leaving reactor workers available for other sessions. Once
 owned-scope cleanup ends, capture finishes accepted writes and drains at most
@@ -366,7 +385,8 @@ Moving the client driver onto the reactor remains deferred.
 | Layer | Crates and apps |
 | --- | --- |
 | Platform and execution | `sys`, `rt` |
-| Data and wire | `json`, `protocol`, `llm` |
+| Data and wire | `json`, `protocol`, `llm`, `blob` (the blob seam, no I/O) |
+| Blob backends | `blob-files` (over `sys`; the engine and the extension test rig) |
 | Extension contract and implementations | `ext`, `ext-derive`, `ext-*` |
 | Session decisions and execution | `kernel`, `engine` (including log store and catalog) |
 | Client contract and foreign facade | `client`, `ffi` |

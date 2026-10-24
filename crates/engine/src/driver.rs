@@ -1331,6 +1331,7 @@ impl Actor {
                         call,
                         outcome: called.outcome,
                         card: called.card,
+                        held: called.held,
                     },
                     Completion::DeliveryLost { ticket } => {
                         self.transport_active = false;
@@ -1979,6 +1980,7 @@ impl Actor {
                     call,
                     outcome: Outcome::Interrupted { output: None },
                     card: None,
+                    held: Vec::new(),
                 }
             } else {
                 Event::ModelDone {

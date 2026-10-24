@@ -116,6 +116,7 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
                     output: Json::encode(&json!({ "slept": 1 })).unwrap()
                 },
                 card: None,
+                held: Vec::new(),
             },
         ]
     );

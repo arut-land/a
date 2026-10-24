@@ -657,6 +657,7 @@ mod tests {
                 output: Json::encode(&true).unwrap(),
             },
             card: None,
+            held: Vec::new(),
         });
         assert!(core.at_rest());
         core.step(Event::Registry(new_binding));

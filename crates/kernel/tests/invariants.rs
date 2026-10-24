@@ -25,6 +25,7 @@ fn drive(s: &mut Session, fx: impl IntoIterator<Item = Work>) {
                 call,
                 outcome: done(json!(tool)),
                 card: None,
+                held: Vec::new(),
             },
             Work::Prepare { call, .. } => {
                 let before = &s.log[usize::try_from(call.get()).unwrap() - 2].body;

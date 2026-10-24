@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::output::OUTPUT_CAP;
 use crate::output::{Ended, Live, Output, Rendered};
 use crate::state::Cwd;
-use ext::blob::{BlobOrigin, BlobRef, Open, Stream};
+use ext::blob::{BlobOrigin, BlobRef, Held, Open, OutputStream, Places, Stream};
 use ext::shape::{self, Streams};
 use ext::{Cx, Json, Partials, Schema, SpawnSpec as Spawn, Tool};
 
@@ -126,6 +126,11 @@ pub struct Ran {
     /// The whole output, when it was cut.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full: Option<BlobRef>,
+    /// The whole output, when it was cut while processes the command left
+    /// running still write it: its stream, which it goes on growing in,
+    /// never a blob sealed under them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub growing: Option<OutputStream>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<Job>,
     /// The process group, when processes the command started outlived it.
@@ -138,9 +143,8 @@ pub struct Ran {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     pub pgid: u32,
-    /// Where its output stream can be read as it grows: open for as long
-    /// as the job runs, at the tree place its call's stream has.
-    pub log: PathBuf,
+    /// Its output, which grows for as long as the job runs.
+    pub log: OutputStream,
 }
 
 impl<D: crate::dialect::Dialect> Tool for ShellTool<D> {
@@ -164,10 +168,22 @@ impl<D: crate::dialect::Dialect> Tool for ShellTool<D> {
     }
 
     fn to_model(output: &Json) -> llm::Output {
+        Self::to_model_with(output, &Places::default())
+    }
+
+    fn to_model_with(output: &Json, places: &Places) -> llm::Output {
         output.parse().map_or_else(
             |_| llm::Output::Json(output.clone()),
-            |ran| llm::Output::Text(model_text(&ran)),
+            |ran| llm::Output::Text(model_text(&ran, places)),
         )
+    }
+
+    fn held(ran: &Ran) -> Vec<Held> {
+        let full = ran.full.clone().map(Held::Blob);
+        let streams = [ran.growing, ran.background.as_ref().map(|job| job.log)];
+        full.into_iter()
+            .chain(streams.into_iter().flatten().map(Held::Stream))
+            .collect()
     }
 
     fn present(input: &Command) -> Option<Card> {
@@ -238,7 +254,7 @@ fn mark(ran: &Ran) -> Mark {
 
 /// What the model reads: the output, then what became of the command,
 /// its exit status last.
-fn model_text(ran: &Ran) -> String {
+fn model_text(ran: &Ran, places: &Places) -> String {
     let mut text = ran.output.trim_end_matches('\n').to_owned();
     let mut trailer = |line: String| {
         if !text.is_empty() {
@@ -250,12 +266,21 @@ fn model_text(ran: &Ran) -> String {
         trailer(format!(
             "[running in the background: job {}; output: {}]",
             job.pgid,
-            job.log.display()
+            places.stream(job.log)
         ));
         return text;
     }
     if ran.output.is_empty() {
         trailer("(no output)".to_owned());
+    }
+    if let Some(full) = &ran.full {
+        trailer(format!("[full output: {}]", places.blob(full)));
+    }
+    if let Some(growing) = ran.growing {
+        trailer(format!(
+            "[full output, still being written: {}]",
+            places.stream(growing)
+        ));
     }
     if let Some(pgid) = ran.lingering {
         trailer(format!("[background processes still running: job {pgid}]"));
@@ -313,19 +338,12 @@ async fn execute<D: crate::dialect::Dialect>(
     }
     let env = environment(cx, std::env::vars());
     // Both streams share the one file, and its offset: in the order written.
-    let Stream {
-        file,
-        open: mut log,
-    } = cx.blobs.stream(cx.call, "log", OUTPUT_CAP)?;
+    let Stream { file, open: log } = cx.blobs.stream(cx.call, OUTPUT_CAP)?;
     if input.background {
-        // Shown where the model is told it grows: the tree, as a detached
-        // call's stream is.
-        let shown = cx.blobs.expose(&mut log, cx.call)?;
         return background(
             cx,
             spawn_with::<D>(facts, &input.command, &dir, env, None)?,
             file,
-            shown,
         )
         .await;
     }
@@ -344,7 +362,7 @@ async fn execute<D: crate::dialect::Dialect>(
         written,
     };
     let done = supervise(child, output, Duration::from_secs(limit), cx, &progress).await?;
-    let (Rendered { text, truncated }, full) = keep(cx, log, done.output).await?;
+    let (Rendered { text, truncated }, kept) = keep(cx, log, done.output, done.lingering).await?;
 
     let old_dir = dir.clone();
     let (cwd, moved) = rt::unblock(runtime(cx)?, move || {
@@ -372,7 +390,8 @@ async fn execute<D: crate::dialect::Dialect>(
         duration_ms: duration_ms(started),
         output: text,
         truncated,
-        full,
+        full: kept.blob,
+        growing: kept.growing,
         background: None,
         lingering: done.lingering.then_some(pgid),
     };
@@ -385,25 +404,48 @@ async fn execute<D: crate::dialect::Dialect>(
     }
 }
 
-/// What the model is shown of the ended output: when it saw less than the
-/// whole, the stream is sealed into a blob and materialized, so the text
-/// names a file that exists. A store that fails costs the path, not the
-/// command's result.
-async fn keep(cx: &Cx, log: Open, output: Ended) -> io::Result<(Rendered, Option<BlobRef>)> {
+/// Where the whole output is kept, when the model saw less of it.
+#[derive(Default)]
+struct Kept {
+    blob: Option<BlobRef>,
+    growing: Option<OutputStream>,
+}
+
+/// What the model is shown of the ended output, and where the whole is
+/// kept when it saw less: sealed into a blob and materialized, or, while
+/// processes the command left behind still write it, left growing in its
+/// stream. A store that fails costs the whole output, not the command's
+/// result; a cache that fails costs only the path.
+async fn keep(cx: &Cx, log: Open, output: Ended, lingering: bool) -> io::Result<(Rendered, Kept)> {
     let blobs = cx.blobs.clone();
-    let origin = BlobOrigin::ToolOutput(cx.call);
+    let stream = OutputStream {
+        session: cx.session,
+        call: cx.call,
+    };
     rt::unblock_with(runtime(cx)?, rt::BlockingClass::Storage, 0, move || {
-        if !output.cut() {
+        let cut = output.cut();
+        let media_type = output.media_type();
+        let rendered = output.render();
+        if !cut {
             let _ = log.discard();
-            return Ok((output.render(None), None));
+            return Ok((rendered, Kept::default()));
         }
-        let kept = log
-            .seal(output.media_type(), origin)
-            .and_then(|blob| Ok((blobs.materialize(&blob)?, blob)));
-        Ok(match kept {
-            Ok((path, blob)) => (output.render(Some(&path)), Some(blob)),
-            Err(_) => (output.render(None), None),
-        })
+        if lingering {
+            let kept = Kept {
+                growing: Some(stream),
+                ..Kept::default()
+            };
+            return Ok((rendered, kept));
+        }
+        let Ok(blob) = log.seal(media_type, BlobOrigin::ToolOutput(stream.call)) else {
+            return Ok((rendered, Kept::default()));
+        };
+        let _ = blobs.materialize(&blob);
+        let kept = Kept {
+            blob: Some(blob),
+            ..Kept::default()
+        };
+        Ok((rendered, kept))
     })
     .await
 }
@@ -411,7 +453,7 @@ async fn keep(cx: &Cx, log: Open, output: Ended) -> io::Result<(Rendered, Option
 /// Starts the command with its output going straight to its stream, and
 /// leaves it running: the session owns it from here, and the stream stays
 /// open.
-async fn background(cx: &Cx, spawn: Spawn, file: File, log: PathBuf) -> io::Result<Ran> {
+async fn background(cx: &Cx, spawn: Spawn, file: File) -> io::Result<Ran> {
     let started = runtime(cx)?.now();
     let cwd = spawn.cwd.clone();
     let child = launch(cx, spawn, file).await?;
@@ -420,7 +462,13 @@ async fn background(cx: &Cx, spawn: Spawn, file: File, log: PathBuf) -> io::Resu
     Ok(Ran {
         cwd,
         duration_ms: duration_ms(started),
-        background: Some(Job { pgid, log }),
+        background: Some(Job {
+            pgid,
+            log: OutputStream {
+                session: cx.session,
+                call: cx.call,
+            },
+        }),
         ..Ran::default()
     })
 }

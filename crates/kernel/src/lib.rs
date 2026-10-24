@@ -147,12 +147,14 @@ pub enum Event {
     },
     /// Model call `call` ended.
     ModelDone { call: CallId, replied: Replied },
-    /// Tool call `call` ended, its outcome shown as `card`. One detached
-    /// before it ended reaches the agent as the session's own envelope.
+    /// Tool call `call` ended, its outcome shown as `card`, referencing
+    /// `held` outside the log. One detached before it ended reaches the
+    /// agent as the session's own envelope.
     ToolDone {
         call: CallId,
         outcome: Outcome,
         card: Option<Card>,
+        held: Vec<protocol::Held>,
     },
     /// The driver stopped waiting on running tool call `call`, which goes
     /// on in the background ([`Work::Detach`]).

@@ -102,7 +102,7 @@ pub mod ledger;
 pub mod publication;
 pub mod view;
 
-pub use blob::{BlobId, BlobOrigin, BlobRef, Payload};
+pub use blob::{BlobId, BlobOrigin, BlobRef, Held, Payload};
 pub use json::Json;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -383,6 +383,9 @@ kinds! {
             outcome: Outcome,
             /// How clients show the outcome, as the tool presents it.
             card: Option<Card> = default,
+            /// What the outcome references outside the log, which the
+            /// store keeps for as long as the entry is.
+            held: Vec<Held> = default,
         } = Durable;
         /// What extension `by` decided at a decision point, about call
         /// `call` when it is about one; logged after the call's intent. Only
@@ -2015,11 +2018,13 @@ impl Source {
     }
 }
 
-/// The output of call `call` as it streams: what a detached call's
-/// placeholder result names. The content-addressed blob it grows into is
-/// the blob store's to name; within a session the call names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The output of call `call` of session `session` as it streams: what a
+/// detached call's placeholder result names, and a background job's log.
+/// Named by the session whose log holds the call, so a child or fork that
+/// inherits the entry names the same stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OutputStream {
+    pub session: SessionId,
     pub call: CallId,
 }
 

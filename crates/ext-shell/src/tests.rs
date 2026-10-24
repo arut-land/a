@@ -224,7 +224,7 @@ fn powershell_preserves_status_errors_unicode_cwd_and_no_input() {
                 .unwrap(),
         );
         // A failed cwd receipt must not replace the user's explicit exit code.
-        std::fs::create_dir_all(rig.stream(1, "cwd")).unwrap();
+        std::fs::create_dir_all(rig.stream(1).with_extension("cwd")).unwrap();
         let run = |command: &str| -> crate::bash::Ran {
             eprintln!("PowerShell command: {command}");
             let ran: crate::bash::Ran = serde_json::from_value(rig.done(

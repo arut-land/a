@@ -321,6 +321,7 @@ fn a_card_folds_on_click_and_ctrl_o_shows_all_output() {
                 note: "exit 0".into(),
                 ..Card::default()
             }),
+            held: Vec::new(),
         },
     ));
     let (mut app, _) = app(Viewport::Full, &msgs);
@@ -353,6 +354,7 @@ fn tool_success_can_precede_the_idle_frame_that_makes_ctrl_c_detach() {
                 note: "exit 0".into(),
                 ..Card::default()
             }),
+            held: Vec::new(),
         },
     ));
     let (_, rows) = frame(&mut app, 80, 24);
@@ -473,6 +475,7 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
                 note: "aborted · killed by SIGTERM".into(),
                 mark: protocol::Mark::Bad,
             }),
+            held: Vec::new(),
         },
     ));
     let (_, rows) = frame(&mut app, 60, 12);
@@ -674,6 +677,7 @@ fn inline_prints_settled_items_once_and_keeps_the_rest_live() {
                 note: "exit 0".into(),
                 ..Card::default()
             }),
+            held: Vec::new(),
         },
     ));
     let printed: Vec<String> = app.scrollback(60).iter().map(Line::text).collect();
@@ -699,6 +703,7 @@ fn settled_result() -> App {
                 note: "exit 0".into(),
                 ..Card::default()
             }),
+            held: Vec::new(),
         },
     ));
     app
@@ -924,6 +929,7 @@ fn session(viewport: Viewport) -> Vec<(&'static str, usize, Vec<u8>)> {
                 note: "exit 0".into(),
                 ..Card::default()
             }),
+            held: Vec::new(),
         },
     ));
     step("result", &mut app, &mut screen, (80, 24));
@@ -1315,6 +1321,7 @@ fn no_timer_runs_unless_a_turn_is_working() {
                 output: Json::encode(&json!({"output": "", "exit": 0})).unwrap(),
             },
             card: None,
+            held: Vec::new(),
         },
     ));
     assert!(busy.working(), "the result alone cannot end the turn");
@@ -1387,6 +1394,7 @@ fn running_tools_show_each_progress_update_and_then_the_finished_card() {
                     note: "exit 0".into(),
                     ..Card::default()
                 }),
+                held: Vec::new(),
             },
         ));
         let (_, rows) = frame(&mut app, 80, 24);
@@ -1410,6 +1418,7 @@ fn inline_review_expands_finished_cards_without_printing_history_twice() {
                 note: "exit 0".into(),
                 ..Card::default()
             }),
+            held: Vec::new(),
         },
     ));
     assert_ne!(app.scrollback(80).len(), 0);
@@ -1484,6 +1493,7 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
                 output: Json::encode(&0).unwrap(),
             },
             card: None,
+            held: Vec::new(),
         },
     ));
     app.fold(&DaemonMsg::Activity {

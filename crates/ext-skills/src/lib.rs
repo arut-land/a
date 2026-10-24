@@ -243,12 +243,13 @@ impl ext::DynTool for Command {
                 Ok(output) => ext::Called {
                     outcome: protocol::Outcome::Done { output },
                     card: None,
+                    held: Vec::new(),
                 },
                 Err(e) => ext::Called::failed(e.to_string()),
             }
         })
     }
-    fn to_model(&self, output: &ext::Json) -> llm::Output {
+    fn to_model(&self, output: &ext::Json, _places: &ext::blob::Places) -> llm::Output {
         llm::Output::Json(output.clone())
     }
     fn present(&self, _: &ext::Parsed) -> Option<protocol::Card> {

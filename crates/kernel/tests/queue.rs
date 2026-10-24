@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use kernel::{Boundary, Event, Load, Replied, Take, Ticket};
-use protocol::{Body, CallId, EnvelopeId, Outcome, OutputStream, Source};
+use protocol::{Body, CallId, EnvelopeId, Outcome, Source};
 use serde_json::json;
 
 fn modeled() -> Session {
@@ -84,9 +84,8 @@ fn a_forced_steer_detaches_only_the_calls_that_can_go_on_in_the_background() {
     );
     assert!(work(&fx).any(|w| *w == Work::Detach { call: id(4) }));
     s.step(Event::Detached { call: id(4) });
-    let placeholder = OutputStream { call: id(4) }.placeholder();
     assert!(s.bodies().contains(&&Body::Detached { call: id(4) }));
-    assert!(s.bodies().contains(&&tool_result(4, placeholder)));
+    assert!(s.bodies().contains(&&placeholder(4)));
     // The reply's calls are answered, so the steer is read before the
     // model is asked again.
     assert_eq!(takes(&s), [(steer, None)]);
@@ -188,7 +187,7 @@ fn a_crash_between_detached_and_its_placeholder_recovers_the_call_once() {
     ] {
         let torn = log([input(command), call, Body::Detached { call: id(2) }]);
         let (s, fx) = Session::resume(Reg::echo().arc(), torn, &Load::default());
-        let placeholder = tool_result(2, OutputStream { call: id(2) }.placeholder());
+        let placeholder = placeholder(2);
         let results = (s.bodies().into_iter())
             .filter(|b| matches!(b, Body::ToolResult { .. }))
             .collect::<Vec<_>>();
@@ -240,7 +239,7 @@ fn a_restart_runs_a_safe_detached_call_again_and_reports_an_unsafe_one_cut_off()
             input(command),
             call,
             Body::Detached { call: id(2) },
-            tool_result(2, OutputStream { call: id(2) }.placeholder()),
+            placeholder(2),
         ])
     };
     let (s, fx) = Session::resume(

@@ -1115,12 +1115,13 @@ impl DynTool for LuaTool {
                 Ok(output) => Called {
                     outcome: Outcome::Done { output },
                     card: None,
+                    held: Vec::new(),
                 },
                 Err(error) => Called::failed(format!("lua {}: {error}", self.owner)),
             }
         })
     }
-    fn to_model(&self, output: &Json) -> llm::Output {
+    fn to_model(&self, output: &Json, _places: &ext::blob::Places) -> llm::Output {
         llm::Output::Json(output.clone())
     }
     fn present(&self, _: &Parsed) -> Option<Card> {

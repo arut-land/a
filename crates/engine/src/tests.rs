@@ -562,7 +562,8 @@ fn a_parent_hears_from_its_child_exactly_once() {
                 outcome: Outcome::Done {
                     output: Json::encode("The child session finished:\nhi").unwrap()
                 },
-                card: None
+                card: None,
+                held: Vec::new(),
             },
         ]
     );
@@ -717,6 +718,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         call: CallId::new(3).unwrap(),
         outcome: slept.clone(),
         card: None,
+        held: Vec::new(),
     };
     write(
         &child,

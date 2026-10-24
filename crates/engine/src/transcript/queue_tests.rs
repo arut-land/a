@@ -2,6 +2,8 @@
 //! nothing withdrawn, and calls detached into the background.
 
 use super::*;
+use std::path::Path;
+
 use protocol::{Audience, Envelope, Epoch, Json, Mode, SessionId};
 
 const SESSION: SessionId = SessionId::NIL;
@@ -96,6 +98,7 @@ fn what_is_taken_into_a_result_is_read_with_it_and_never_between_a_call_and_its_
                 output: Json::encode("slept").unwrap(),
             },
             card: None,
+            held: Vec::new(),
         },
         Body::Take {
             input: seq(4),
@@ -139,8 +142,13 @@ fn a_detached_call_answers_with_its_stream_and_its_outcome_is_read_once_taken() 
         Body::Detached { call: call(3) },
         Body::ToolResult {
             call: call(3),
-            outcome: OutputStream { call: call(3) }.placeholder(),
+            outcome: OutputStream {
+                session: SESSION,
+                call: call(3),
+            }
+            .placeholder(),
             card: None,
+            held: Vec::new(),
         },
         Body::Enqueue {
             envelope: Envelope::own(SESSION, call(3), EnvelopeId::DETACHED, outcome.payload()),
@@ -169,28 +177,33 @@ fn a_detached_call_answers_with_its_stream_and_its_outcome_is_read_once_taken() 
 }
 
 #[test]
-fn a_detached_calls_stream_is_named_where_the_tree_shows_it() {
+fn a_detached_calls_stream_is_named_for_the_session_whose_log_holds_it() {
+    // As a child inherits it: the viewer is not the owner.
+    let owner = OutputStream {
+        session: SessionId::new(),
+        call: call(3),
+    };
     let mut bodies = called();
     bodies.extend([
         Body::Detached { call: call(3) },
         Body::ToolResult {
             call: call(3),
-            outcome: OutputStream { call: call(3) }.placeholder(),
+            outcome: owner.placeholder(),
             card: None,
+            held: vec![Held::Stream(owner)],
         },
     ]);
     let entries: Vec<_> = (bodies.into_iter().zip(1..))
         .map(|(body, seq)| Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
         .collect();
-    let session = SessionId::new();
-    let places = Places::new("tree".into(), session);
+    let places = Places::new(Path::new("tree"), Path::new("streams"));
     let messages =
         Transcript::placed(&entries, Arc::new(Registry::default()), "", &places).into_messages();
     let Some(Message::Tool(answers)) = messages.iter().last() else {
         panic!("{messages:#?}");
     };
     let placeholder = texts(&answers.results[0].output).join("");
-    let shown = places.stream(OutputStream { call: call(3) });
-    assert!(shown.ends_with("3.log") && shown.contains(&session.to_string()));
+    let shown = places.stream(owner);
+    assert!(shown.contains(&owner.session.to_string()), "{shown}");
     assert!(placeholder.contains(&shown), "{placeholder}");
 }

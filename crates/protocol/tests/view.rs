@@ -211,6 +211,7 @@ impl Session {
                     note: "exit 0".into(),
                     ..Card::default()
                 }),
+                held: Vec::new(),
             });
         }
     }
@@ -707,8 +708,8 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             attached(), entry(1, input("run")),
             entry(2, Body::ToolCall { invoke: None, tool: "owner".into(), input: Json::null(), id: None, card: None, by: Audience::Model }),
             entry(3, Body::ToolCall { invoke: Some(protocol::Invocation { parent: call(2), name: "lookup".into() }), tool: "lookup".into(), input: Json::null(), id: None, card: None, by: Audience::Model }),
-            entry(4, Body::ToolResult { call: call(3), outcome: echoed(), card: None }),
-            entry(5, Body::ToolResult { call: call(2), outcome: echoed(), card: None }),
+            entry(4, Body::ToolResult { call: call(3), outcome: echoed(), card: None, held: Vec::new(), }),
+            entry(5, Body::ToolResult { call: call(2), outcome: echoed(), card: None, held: Vec::new(), }),
         ]),
 
         ("approval reviews the effective multiline call", review("bash", json!({"command":"printf harmless\nrm -rf /tmp/approval-test-sentinel", "timeout":60000, "extra":"every argument"}))),
@@ -795,7 +796,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::ToolResult {
                         call: call(1),
                         outcome: echoed(),
-                        card: Some(card()),
+                        card: Some(card()), held: Vec::new(),
                     },
                 ),
                 msg(DaemonMsg::Synced { seq: 4 }),
@@ -875,7 +876,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::ToolResult {
                         call: CallId::new(1).unwrap(),
                         outcome: echoed(),
-                        card: Some(card()),
+                        card: Some(card()), held: Vec::new(),
                     },
                 ),
             ],
@@ -999,7 +1000,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::ToolResult {
                         call: CallId::new(1).unwrap(),
                         outcome: echoed(),
-                        card: Some(card()),
+                        card: Some(card()), held: Vec::new(),
                     },
                 ),
                 entry(
@@ -1029,7 +1030,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                         outcome: Outcome::Done {
                             output: Json::encode("no jobs").unwrap(),
                         },
-                        card: None,
+                        card: None, held: Vec::new(),
                     },
                 ),
                 msg(DaemonMsg::Synced { seq: 6 }),
@@ -1306,6 +1307,7 @@ fn answered_and_cancelled_questions_stop_presenting_existing_descriptions() {
             call: CallId::new(1).unwrap(),
             outcome: Outcome::Interrupted { output: None },
             card: None,
+            held: Vec::new(),
         },
     ] {
         let (_, messages) = scenarios()

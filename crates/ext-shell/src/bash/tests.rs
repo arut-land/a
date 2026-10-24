@@ -65,7 +65,12 @@ fn run(rig: &Rig, command: &str) -> Ran {
 }
 
 fn model(ran: &Ran) -> String {
-    let llm::Output::Text(text) = Bash::to_model(&Json::encode(ran).unwrap()) else {
+    placed(ran, &Places::default())
+}
+
+/// What the model reads of `ran`, its references named by `places`.
+fn placed(ran: &Ran, places: &Places) -> String {
+    let llm::Output::Text(text) = Bash::to_model_with(&Json::encode(ran).unwrap(), places) else {
         panic!("bash answers in text")
     };
     text
@@ -163,28 +168,57 @@ fn a_background_child_holding_the_pipe_does_not_hold_the_call() {
 }
 
 #[test]
+fn output_a_lingering_process_still_writes_is_never_sealed() {
+    let rig = rig("lingering-cut");
+    let ran = run(&rig, "(sleep 1; seq 1 50000) & seq 1 200000");
+    assert!(ran.truncated && ran.lingering.is_some(), "{ran:?}");
+    assert_eq!(ran.full, None, "a blob is never sealed under a writer");
+    let growing = ran.growing.unwrap();
+    assert_eq!(Bash::held(&ran), [Held::Stream(growing)]);
+    let places = rig.blobs.places();
+    let log = places.stream(growing);
+    assert!(placed(&ran, &places).contains(&format!("[full output, still being written: {log}]")));
+    let before = std::fs::metadata(&log).unwrap().len();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::metadata(&log).unwrap().len() == before {
+        assert!(
+            Instant::now() < deadline,
+            "the lingering writer never wrote"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut stored: Vec<_> = std::fs::read_dir(rig.dir.join("blobs"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    stored.sort();
+    assert_eq!(stored, ["open"], "no blob was sealed");
+}
+
+#[test]
 fn huge_output_is_cut_and_kept_whole_as_a_blob() {
     let rig = rig("huge");
     let ran = run(&rig, "seq 1 200000");
     let blob = ran.full.clone().unwrap();
-    let full = rig.tree().join("by-id").join(blob.id.to_string());
+    let full = rig.blobs.places().blob(&blob);
     let saved = std::fs::read_to_string(&full).unwrap();
     assert_eq!(blob.size, saved.len() as u64);
     assert_eq!(
         blob.origin,
         BlobOrigin::ToolOutput(protocol::CallId::new(1).unwrap())
     );
-    assert!(!rig.stream(1, "log").exists(), "the stream was sealed");
+    assert_eq!(Bash::held(&ran), [Held::Blob(blob)]);
+    assert!(!rig.stream(1).exists(), "the stream was sealed");
     assert!(ran.truncated);
     assert_eq!(saved.lines().count(), 200_000);
     assert!(ran.output.starts_with("1\n2\n3\n"));
     assert!(ran.output.ends_with("199999\n200000\n"));
     assert!(ran.output.lines().count() <= crate::output::LINES + 1);
+    assert!(ran.output.contains(" omitted]\n"));
     assert!(
-        ran.output
-            .contains(&format!("omitted; full output: {}]", full.display()))
+        placed(&ran, &rig.blobs.places())
+            .ends_with(&format!("200000\n[full output: {full}]\n[exit code: 0]"))
     );
-    assert!(model(&ran).ends_with("200000\n[exit code: 0]"));
 }
 
 #[test]
@@ -192,15 +226,13 @@ fn binary_and_terminal_output_are_cleaned() {
     let rig = rig("clean");
     let binary = run(&rig, "printf 'ELF\\0'; head -c 20000 /dev/zero");
     assert!(
-        binary
-            .output
-            .starts_with("[binary output: 20004 bytes, saved to "),
+        binary.output.starts_with("[binary output: 20004 bytes]"),
         "{}",
         binary.output
     );
     let blob = binary.full.unwrap();
     assert_eq!(blob.media_type, "application/octet-stream");
-    let saved = std::fs::read(rig.tree().join("by-id").join(blob.id.to_string())).unwrap();
+    let saved = std::fs::read(rig.blobs.places().blob(&blob)).unwrap();
     assert_eq!(saved.len(), 20004);
     let styled = run(
         &rig,
@@ -436,7 +468,8 @@ fn a_background_command_returns_at_once_with_its_log() {
     let job = ran.background.as_ref().unwrap();
     assert_eq!(rig.spawned.lock().unwrap()[..], [(job.pgid, true)]);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while std::fs::read_to_string(&job.log).unwrap_or_default() != "hi\n" {
+    let log = rig.stream(1);
+    while std::fs::read_to_string(&log).unwrap_or_default() != "hi\n" {
         assert!(Instant::now() < deadline, "the log never filled");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -506,7 +539,7 @@ fn invalid_input_fails_the_call() {
 #[test]
 fn a_running_commands_output_is_on_disk() {
     let rig = rig("on-disk");
-    let log = rig.stream(1, "log");
+    let log = rig.stream(1);
     let ran = std::thread::scope(|s| {
         let call = s.spawn(|| run(&rig, "echo started; sleep 100"));
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -541,7 +574,7 @@ fn big_output_never_sits_in_memory() {
     assert!(ran.truncated && ran.exit == Some(0), "{ran:?}");
     let full = ran.full.unwrap();
     assert_eq!(full.size, 16_000_000);
-    let path = rig.tree().join("by-id").join(full.id.to_string());
+    let path = rig.blobs.places().blob(&full);
     assert_eq!(std::fs::metadata(path).unwrap().len(), 16_000_000);
     assert!(peak < 4 << 20, "{peak} bytes at most while 16 MB ran");
 }
@@ -643,7 +676,7 @@ fn continuous_output_yields_to_other_sessions() {
     let rig = rig("output-quantum");
     let cx = rig.cx();
     rt::block_on(async {
-        let Stream { mut file, open } = cx.blobs.stream(cx.call, "quantum", u64::MAX).unwrap();
+        let Stream { mut file, open } = cx.blobs.stream(cx.call, u64::MAX).unwrap();
         let log = open.path().to_owned();
         file.write_all(&vec![b'x'; usize::try_from(READ * 3).unwrap()])
             .unwrap();
@@ -707,17 +740,12 @@ fn continuous_output_yields_to_other_sessions() {
 fn background_output_cannot_exceed_the_output_cap() {
     let rig = rig("bounded-background");
     let ran = bash(&rig, &json!({ "command": "yes x", "background": true }));
-    let job = ran.background.unwrap();
-    let call = protocol::CallId::new(1).unwrap();
-    assert_eq!(
-        job.log.display().to_string(),
-        rig.blob_store()
-            .places()
-            .stream(protocol::OutputStream { call }),
-        "shown where its call's stream is named"
-    );
+    let job = ran.background.as_ref().unwrap();
+    assert_eq!(Bash::held(&ran), [Held::Stream(job.log)]);
+    let log = rig.blobs.places().stream(job.log);
+    assert!(placed(&ran, &rig.blobs.places()).contains(&format!("output: {log}]")));
     wait_dead(job.pgid);
-    assert_eq!(std::fs::metadata(job.log).unwrap().len(), OUTPUT_CAP);
+    assert_eq!(std::fs::metadata(log).unwrap().len(), OUTPUT_CAP);
 }
 
 #[test]
@@ -732,6 +760,6 @@ fn unterminated_terminal_metadata_cannot_grow_retained_output() {
         live.push(&chunk);
     }
     assert!(ALLOC.peak().saturating_sub(baseline) < 256 << 10);
-    assert_eq!(output.finish().render(None).text, "");
+    assert_eq!(output.finish().render().text, "");
     assert_eq!(live.take(), None);
 }

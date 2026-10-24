@@ -846,6 +846,7 @@ impl SessionView {
                 call,
                 outcome,
                 card,
+                ..
             } => {
                 let at = self.call(*call)?;
                 let Item::Tool {

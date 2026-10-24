@@ -83,7 +83,7 @@ Path/backend-specific fixtures and watcher fixtures remain with their owning ses
 ## Blob hashing
 
 Blob ids are SHA-256 through `sha2` 0.11, which the shipped build already
-links for `ext-mcp`'s content hashes: the engine adds no crate. BLAKE3 would
+links for `ext-mcp`'s content hashes: `blob-files` adds no crate. BLAKE3 would
 add `blake3` and its build-time SIMD selection for no need a blob has; `ring`
 is only linked with the optional rustls transport. Hashing is not on the
 latency path of a call that is not cut: only output the model saw cut is

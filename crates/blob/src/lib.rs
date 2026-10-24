@@ -1,32 +1,45 @@
 //! Blobs: bytes too large for a log line, owned by the session store and
-//! named by their content. A result holds a [`BlobRef`], never a path; a
-//! path is a materialized copy that can always be made again.
+//! named by their content. An entry holds a [`BlobRef`] (and says so in
+//! its `held` field), never a path; a path is named from the reference
+//! when the model is told of it, and is a copy that can be made again.
 //!
 //! Three seams, each behind a trait so a backend plugs in without the
 //! tools or the store changing:
 //!
 //! - [`BlobStore`]: where the bytes live, one namespace per daemon. The
-//!   store that keeps the logs keeps the blobs, its own way.
+//!   store that keeps the logs keeps the blobs, its own way: `blob_files`'s
+//!   `Files` beside JSONL logs.
 //! - [`Materialize`]: how a blob appears to the OS as an ordinary file
-//!   under one root, for `cat`, `rg` and file managers. A cache directory
-//!   now; a virtual file system (Cloud Files, File Provider, FUSE) later.
+//!   under one root, for `cat`, `rg` and file managers: `blob_files`'s
+//!   `CacheDir` now; a virtual file system (Cloud Files, File Provider,
+//!   FUSE) later.
+//!
+//! This crate does no I/O: the SDK and the kernel build on it, and the
+//! backends implement it.
 //! - [`Namespace`]: what that tree holds, derived from the logs. Its shape
 //!   only, for the virtual backends.
 //!
+//! A call's output stream ([`OutputStream`]) grows in the store, where a
+//! reader follows it, and is sealed into a blob once nothing writes it.
+//!
 //! Blob bytes are as private as the log that references them, and are
 //! kept as they were written: environment redaction never applies to them.
+//!
+//! Deferred: making a named path exist before a model call shows it.
+//! Today a call ensures the blob it seals (`Blobs::materialize`); a paste,
+//! an attachment or a detached call's stream is named but not ensured
+//! until the projection calls [`Materialize::ensure`] before each request.
 
-use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-pub use protocol::{BlobId, BlobOrigin, BlobRef, Payload};
-use protocol::{CallId, OutputStream, SessionId};
-
-use crate::BoxFuture;
+pub use protocol::{BlobId, BlobOrigin, BlobRef, Held, OutputStream, Payload};
+use protocol::{CallId, SessionId};
 
 /// A new blob, hashed as it is written and refused past its cap.
 pub trait BlobWriter: Write + Send {
@@ -40,7 +53,7 @@ pub trait BlobWriter: Write + Send {
 /// How a backend seals or drops an open stream.
 pub trait Sealer: Send {
     /// As [`BlobWriter::finish`], for the bytes at `path`, cut at the
-    /// stream's cap.
+    /// stream's cap. Only once nothing writes the stream any more.
     fn seal(
         self: Box<Self>,
         path: &Path,
@@ -52,7 +65,7 @@ pub trait Sealer: Send {
 }
 
 /// A growing blob: what a running call writes, readable at its path while
-/// it grows, and sealed into a content-addressed blob when the call ends.
+/// it grows, and sealed into a content-addressed blob once it is done.
 pub struct Stream {
     /// Where the writer (a process) writes. Readers open the path.
     pub file: File,
@@ -64,54 +77,29 @@ pub struct Stream {
 pub struct Open {
     path: PathBuf,
     sealer: Box<dyn Sealer>,
-    /// Where [`Blobs::expose`] shows it in the tree, if it does.
-    shown: Option<PathBuf>,
 }
 
 impl Open {
     /// For a backend: the stream at `path`, which `sealer` ends.
     pub fn new(path: PathBuf, sealer: Box<dyn Sealer>) -> Self {
-        Self {
-            path,
-            sealer,
-            shown: None,
-        }
+        Self { path, sealer }
     }
 
-    /// Where the stream can be read while it grows. Not the blob's path:
-    /// once sealed, it is [`Blobs::materialize`]'s.
+    /// Where the stream is read while it grows: where [`Places::stream`]
+    /// names it.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Seals the stream into a blob. Its writers must all be gone: one
+    /// still writing would change a blob named by what it held.
     pub fn seal(self, media_type: &str, origin: BlobOrigin) -> io::Result<BlobRef> {
         self.sealer.seal(&self.path, media_type, origin)
     }
 
-    /// Ends the stream without keeping it, nor showing it.
+    /// Ends the stream without keeping it.
     pub fn discard(self) -> io::Result<()> {
-        if let Some(shown) = &self.shown {
-            let _ = std::fs::remove_file(shown);
-        }
         self.sealer.discard(&self.path)
-    }
-}
-
-/// What a blob store's sweep keeps: the blobs some log references, as an
-/// index derived from the logs (rebuilt, never counted in place).
-pub trait RefIndex {
-    fn live(&self, id: &BlobId) -> bool;
-}
-
-impl<S: std::hash::BuildHasher> RefIndex for HashSet<BlobId, S> {
-    fn live(&self, id: &BlobId) -> bool {
-        self.contains(id)
-    }
-}
-
-impl RefIndex for BTreeSet<BlobId> {
-    fn live(&self, id: &BlobId) -> bool {
-        self.contains(id)
     }
 }
 
@@ -122,10 +110,12 @@ pub trait BlobStore: Send + Sync {
     /// A new blob of at most `cap` bytes.
     fn writer(&self, cap: u64) -> io::Result<Box<dyn BlobWriter>>;
 
-    /// A new open stream of at most `cap` bytes, named for where it is
-    /// read while it grows: `name` is relative, and a taken name gets a
-    /// number added.
-    fn stream(&self, name: &str, cap: u64) -> io::Result<Stream>;
+    /// `of`'s stream, new and empty, of at most `cap` bytes: a call run
+    /// again starts its stream over.
+    fn stream(&self, of: OutputStream, cap: u64) -> io::Result<Stream>;
+
+    /// The directory streams grow in, each where [`stream_path`] puts it.
+    fn streams(&self) -> &Path;
 
     fn open(&self, id: &BlobId) -> io::Result<Box<dyn Read + Send>>;
 
@@ -133,9 +123,10 @@ pub trait BlobStore: Send + Sync {
     /// (clone or link) rather than copy.
     fn materialize(&self, id: &BlobId) -> io::Result<PathBuf>;
 
-    /// Removes, at rest, every sealed blob `live` does not hold, and every
-    /// stream left open by a daemon that stopped; returns the bytes freed.
-    fn sweep(&self, live: &dyn RefIndex) -> io::Result<u64>;
+    /// Removes, at rest, every sealed blob `live` does not hold, and what a
+    /// writer left half done; returns the bytes freed. Streams are kept:
+    /// a log may name one still.
+    fn sweep(&self, live: &dyn Fn(&BlobId) -> bool) -> io::Result<u64>;
 }
 
 /// A place in the tree blobs appear in: relative, `/`-separated, the same
@@ -143,8 +134,7 @@ pub trait BlobStore: Send + Sync {
 ///
 /// `by-id/<id>` is a blob whatever references it, so a fork or a child
 /// shows the same path its parent did. Later, by origin:
-/// `sessions/<id>/attachments/<name>`, `sessions/<id>/tool-output/<call>.log`,
-/// `sessions/<id>/pastes/<seq>.txt`.
+/// `sessions/<id>/attachments/<name>`, `sessions/<id>/pastes/<seq>.txt`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TreePath(String);
 
@@ -164,15 +154,6 @@ impl TreePath {
         Self(format!("by-id/{id}"))
     }
 
-    /// Where call `call`'s output stream is read, while it grows and once
-    /// it is sealed: what [`OutputStream`] names.
-    pub fn stream(session: SessionId, stream: OutputStream) -> Self {
-        Self(format!(
-            "sessions/{session}/streams/{}.log",
-            stream.call.get()
-        ))
-    }
-
     pub fn parts(&self) -> impl Iterator<Item = &str> {
         self.0.split('/').filter(|part| !part.is_empty())
     }
@@ -184,8 +165,10 @@ impl TreePath {
     }
 }
 
-/// How the tree appears to the OS. Read-only on every backend: a blob
-/// never changes, and a write never reaches the store.
+/// How the tree appears to the OS. Read-only to the store on every backend
+/// a blob is copied or cloned into; where the cache falls back to a hard
+/// link, the file is the store's own, and a write that clears its
+/// read-only bit reaches the blob.
 pub trait Materialize: Send + Sync {
     fn root(&self) -> &Path;
 
@@ -200,11 +183,6 @@ pub trait Materialize: Send + Sync {
     /// backend makes sure its entry exists. Blocks: run it on a storage
     /// worker.
     fn ensure(&self, at: &TreePath, blob: &BlobRef) -> io::Result<()>;
-
-    /// Shows the open stream at `open` at `at` as it grows, and as the
-    /// blob it is sealed into: the same file, never a copy of what it
-    /// held so far.
-    fn expose(&self, at: &TreePath, open: &Path) -> io::Result<()>;
 
     /// Frees what it holds beyond `budget` bytes, least recently used
     /// first; returns the bytes freed. A cache deletes, a virtual backend
@@ -221,7 +199,7 @@ pub trait Namespace: Send + Sync {
     fn lookup(&self, path: &TreePath) -> io::Result<Option<TreeEntry>>;
 
     /// Resolves with the next path that appears, as sessions append.
-    fn changes(&self) -> BoxFuture<'_, TreePath>;
+    fn changes(&self) -> Pin<Box<dyn Future<Output = TreePath> + Send + '_>>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,115 +236,68 @@ impl Blobs {
         self.store.writer(cap)
     }
 
-    /// An open stream for call `call`'s output, its name ending `.ext`.
-    pub fn stream(&self, call: CallId, ext: &str, cap: u64) -> io::Result<Stream> {
-        self.store
-            .stream(&format!("{}/{}.{ext}", self.session, call.get()), cap)
+    /// Call `call`'s output stream, which it names, new and empty.
+    pub fn stream(&self, call: CallId, cap: u64) -> io::Result<Stream> {
+        let of = OutputStream {
+            session: self.session,
+            call,
+        };
+        self.store.stream(of, cap)
     }
 
     pub fn open(&self, id: &BlobId) -> io::Result<Box<dyn Read + Send>> {
         self.store.open(id)
     }
 
-    /// A path `blob` can be read at, which exists when this returns.
-    pub fn materialize(&self, blob: &BlobRef) -> io::Result<PathBuf> {
-        let at = TreePath::by_id(&blob.id);
-        self.tree.ensure(&at, blob)?;
-        Ok(self.tree.path(&at))
+    /// Makes `blob` readable where [`Places::blob`] names it.
+    pub fn materialize(&self, blob: &BlobRef) -> io::Result<()> {
+        self.tree.ensure(&TreePath::by_id(&blob.id), blob)
     }
 
-    /// Shows `open`, call `call`'s output stream, where [`Places::stream`]
-    /// names it, which exists when this returns.
-    pub fn expose(&self, open: &mut Open, call: CallId) -> io::Result<PathBuf> {
-        let at = TreePath::stream(self.session, OutputStream { call });
-        self.tree.expose(&at, open.path())?;
-        let shown = self.tree.path(&at);
-        open.shown = Some(shown.clone());
-        Ok(shown)
-    }
-
-    /// How the session's references are named for the model.
+    /// How references are named for the model.
     pub fn places(&self) -> Places {
-        Places::new(self.tree.root().to_path_buf(), self.session)
+        Places::new(self.tree.root(), self.store.streams())
     }
 }
 
-/// How a reference reads where the model is told of it: the path the
-/// tree shows it at. Pure, so a projection of the log can name it; the
-/// default names the place within the tree, for a projection that has
-/// no tree.
+/// How a reference reads where the model is told of it: the path it is
+/// at. Pure, named from what the log records, so a projection of the log
+/// names it, whoever's session projects it; the default names a blob by
+/// its place within the tree and a stream by its call, for a projection
+/// that has no store.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Places {
-    root: Option<PathBuf>,
-    session: Option<SessionId>,
+    roots: Option<(PathBuf, PathBuf)>,
 }
 
 impl Places {
-    /// Session `session`'s references, in the tree at `root`.
-    pub const fn new(root: PathBuf, session: SessionId) -> Self {
+    /// The tree at `tree`, and streams under `streams`.
+    pub fn new(tree: &Path, streams: &Path) -> Self {
         Self {
-            root: Some(root),
-            session: Some(session),
-        }
-    }
-
-    fn at(&self, at: &TreePath) -> String {
-        match &self.root {
-            Some(root) => at.under(root).display().to_string(),
-            None => at.parts().collect::<Vec<_>>().join("/"),
+            roots: Some((tree.to_path_buf(), streams.to_path_buf())),
         }
     }
 
     pub fn blob(&self, blob: &BlobRef) -> String {
-        self.at(&TreePath::by_id(&blob.id))
+        let at = TreePath::by_id(&blob.id);
+        match &self.roots {
+            Some((tree, _)) => at.under(tree).display().to_string(),
+            None => at.parts().collect::<Vec<_>>().join("/"),
+        }
     }
 
-    /// Where `stream` is read; without a session, by its call alone.
     pub fn stream(&self, stream: OutputStream) -> String {
-        match self.session {
-            Some(session) => self.at(&TreePath::stream(session, stream)),
+        match &self.roots {
+            Some((_, streams)) => stream_path(streams, stream).display().to_string(),
             None => stream.to_string(),
         }
     }
 }
 
-/// Blobs for a test whose calls write none: every use fails.
-#[cfg(test)]
-pub(crate) fn none() -> Blobs {
-    struct None;
-    fn refused<T>() -> io::Result<T> {
-        Err(io::Error::other("no blob store"))
-    }
-    impl BlobStore for None {
-        fn writer(&self, _: u64) -> io::Result<Box<dyn BlobWriter>> {
-            refused()
-        }
-        fn stream(&self, _: &str, _: u64) -> io::Result<Stream> {
-            refused()
-        }
-        fn open(&self, _: &BlobId) -> io::Result<Box<dyn Read + Send>> {
-            refused()
-        }
-        fn materialize(&self, _: &BlobId) -> io::Result<PathBuf> {
-            refused()
-        }
-        fn sweep(&self, _: &dyn RefIndex) -> io::Result<u64> {
-            refused()
-        }
-    }
-    impl Materialize for None {
-        fn root(&self) -> &Path {
-            Path::new("")
-        }
-        fn ensure(&self, _: &TreePath, _: &BlobRef) -> io::Result<()> {
-            refused()
-        }
-        fn expose(&self, _: &TreePath, _: &Path) -> io::Result<()> {
-            refused()
-        }
-        fn evict(&self, _: u64) -> io::Result<u64> {
-            refused()
-        }
-    }
-    Blobs::new(Arc::new(None), Arc::new(None), SessionId::new())
+/// Where `of` grows under `streams`: the layout every [`BlobStore`] keeps
+/// its streams in, so [`Places`] names them without one.
+pub fn stream_path(streams: &Path, of: OutputStream) -> PathBuf {
+    streams
+        .join(of.session.to_string())
+        .join(format!("{}.log", of.call.get()))
 }

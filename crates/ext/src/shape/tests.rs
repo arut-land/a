@@ -147,7 +147,13 @@ fn run(tool: &str, input: u64) -> (Outcome, String) {
         session: SessionId::new(),
         call: protocol::CallId::new(1).unwrap(),
         model: "test:model".into(),
-        blobs: crate::blob::none(),
+        // The tools here write no blob: the store does no I/O until one does.
+        blobs: {
+            let unused = std::env::temp_dir();
+            let store = Arc::new(blob_files::Files::open(unused.join("unused"), &unused).unwrap());
+            let tree = Arc::new(blob_files::CacheDir::new(unused, Arc::clone(&store) as _));
+            blob::Blobs::new(store, tree, SessionId::new())
+        },
         cancel: Cancel::default(),
         services: Arc::default(),
         detach: crate::Flag::default(),

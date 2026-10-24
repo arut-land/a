@@ -465,6 +465,7 @@ fn failed_epochs_fence_speculative_reports_before_sequences_are_reused() {
                 output: Json::encode(&"stale result").unwrap(),
             },
             card: None,
+            held: Vec::new(),
         }),
     });
     let _ = positions(&session);

@@ -62,7 +62,9 @@ pub enum ContextValue {
     Job(CallId, String),
     Reply(Json),
     ToolCall(String, String),
-    ToolResult(CallId, Outcome),
+    /// A result, and what it holds outside the log: how its references
+    /// are named, by whoever projects it.
+    ToolResult(CallId, Outcome, Vec<crate::Held>),
 }
 
 /// Execution identity belongs to the owner, never to copied audit history.

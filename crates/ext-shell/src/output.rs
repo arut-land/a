@@ -5,7 +5,6 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::path::Path;
 
 /// The most of the output's start the model sees.
 pub const HEAD: usize = 8 * 1024;
@@ -121,28 +120,19 @@ impl Ended {
         }
     }
 
-    /// What the model is shown, naming where the whole can be read, if
-    /// it was kept.
-    pub fn render(self, whole: Option<&Path>) -> Rendered {
+    /// What the model is shown. Where the whole is read is named apart,
+    /// from the reference the result keeps.
+    pub fn render(self) -> Rendered {
         let Self { view, kind, bytes } = self;
         if kind == Kind::Binary {
-            let text = match whole {
-                Some(file) => {
-                    format!(
-                        "[binary output: {bytes} bytes, saved to {}]",
-                        file.display()
-                    )
-                }
-                None => format!("[binary output: {bytes} bytes]"),
-            };
             return Rendered {
-                text,
+                text: format!("[binary output: {bytes} bytes]"),
                 truncated: true,
             };
         }
         let truncated = view.cut;
         Rendered {
-            text: view.render(whole),
+            text: view.render(),
             truncated,
         }
     }
@@ -225,7 +215,7 @@ impl View {
         }
     }
 
-    fn render(self, whole: Option<&Path>) -> String {
+    fn render(self) -> String {
         if !self.cut {
             return self.head;
         }
@@ -235,16 +225,12 @@ impl View {
         if !text.ends_with('\n') {
             text.push('\n');
         }
-        let _ = write!(
+        let _ = writeln!(
             text,
-            "[… {} lines / {} bytes omitted",
+            "[… {} lines / {} bytes omitted]",
             self.lines.saturating_sub(shown_lines),
             self.bytes - shown,
         );
-        let _ = match whole {
-            Some(file) => writeln!(text, "; full output: {}]", file.display()),
-            None => writeln!(text, "]"),
-        };
         text.extend(self.tail);
         text
     }
@@ -420,12 +406,9 @@ mod tests {
         assert_eq!(clean(&[b"\xe2\x82", b"\xac\n"]), "\u{20ac}\n");
     }
 
-    const FILE: &str = "/tree/by-id/1";
-
     fn shown(out: Output) -> (bool, Rendered) {
         let ended = out.finish();
-        let cut = ended.cut();
-        (cut, ended.render(cut.then_some(Path::new(FILE))))
+        (ended.cut(), ended.render())
     }
 
     #[test]
@@ -452,7 +435,10 @@ mod tests {
         assert!(text.lines().count() <= LINES + 1);
         assert!(text.len() <= HEAD + TAIL + 200, "{}", text.len());
         let marker = text.lines().find(|l| l.starts_with("[…")).unwrap();
-        assert!(marker.contains("lines /") && marker.ends_with(&format!("full output: {FILE}]")));
+        assert!(
+            marker.contains("lines /") && marker.ends_with("omitted]"),
+            "{marker}"
+        );
     }
 
     #[test]
@@ -470,20 +456,8 @@ mod tests {
         out.push(b"\x7fELF\x00\x01");
         out.push(&[0xff; 9000]);
         let (cut, rendered) = shown(out);
-        assert_eq!(
-            rendered.text,
-            format!("[binary output: 9006 bytes, saved to {FILE}]")
-        );
+        assert_eq!(rendered.text, "[binary output: 9006 bytes]");
         assert!(cut);
-    }
-
-    #[test]
-    fn output_whose_whole_was_not_kept_names_no_file() {
-        let mut out = Output::default();
-        out.push("x\n".repeat(LINES * 2).as_bytes());
-        let rendered = out.finish().render(None);
-        let marker = rendered.text.lines().find(|l| l.starts_with("[…")).unwrap();
-        assert!(marker.ends_with("omitted]"), "{marker}");
     }
 
     #[test]

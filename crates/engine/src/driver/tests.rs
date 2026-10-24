@@ -231,7 +231,13 @@ fn with_home(script: &Arc<Script>, path: &Path) -> Models {
     }
 }
 
-struct Fixture(Arc<Shared>, Arc<Counting>, Arc<Daemon>);
+/// The fixture's blobs live in its own directory, removed with it.
+struct Fixture(
+    Arc<Shared>,
+    Arc<Counting>,
+    Arc<Daemon>,
+    Arc<tempfile::TempDir>,
+);
 
 struct TestingLive(Arc<Live>, Arc<Daemon>);
 impl std::ops::Deref for TestingLive {
@@ -306,7 +312,7 @@ impl Extension for Agents {
 
 impl Fixture {
     fn configure(self, configure: impl FnOnce(&mut Shared)) -> Self {
-        let Self(shared, runtime, daemon) = self;
+        let Self(shared, runtime, daemon, scratch) = self;
         drop(shared);
         let mut daemon = Arc::try_unwrap(daemon).ok().expect("unstarted fixture");
         configure(Arc::get_mut(&mut daemon.shared).unwrap());
@@ -314,7 +320,7 @@ impl Fixture {
             Arc::get_mut(&mut daemon.shared).unwrap().daemon = weak.clone();
             daemon
         });
-        Self(Arc::clone(&daemon.shared), runtime, daemon)
+        Self(Arc::clone(&daemon.shared), runtime, daemon, scratch)
     }
 
     fn new(agent: &str, registry: Registry, models: Models) -> Self {
@@ -332,13 +338,12 @@ impl Fixture {
         // One worker: no effect may hold it.
         let counting = Arc::new(Counting(rt::Threads::new(1), AtomicUsize::new(0)));
         let rt: rt::Rt = Arc::clone(&counting) as _;
-        let scratch = std::env::temp_dir().join(format!("a-blobs-{}", std::process::id()));
-        std::fs::create_dir_all(&scratch).unwrap();
+        let scratch = Arc::new(tempfile::tempdir().unwrap());
         let blobs: Arc<dyn ext::blob::BlobStore> = Arc::new(
-            crate::store::Files::open(scratch.join("blobs"), &std::env::temp_dir()).unwrap(),
+            blob_files::Files::open(scratch.path().join("blobs"), scratch.path()).unwrap(),
         );
-        let tree = Arc::new(crate::store::CacheDir::new(
-            scratch.join("tree"),
+        let tree = Arc::new(blob_files::CacheDir::new(
+            scratch.path().join("tree"),
             Arc::clone(&blobs),
         ));
         let daemon = Arc::new_cyclic(|daemon| Daemon {
@@ -365,7 +370,7 @@ impl Fixture {
             stopping: Mutex::default(),
             started: 0,
         });
-        Self(Arc::clone(&daemon.shared), counting, daemon)
+        Self(Arc::clone(&daemon.shared), counting, daemon, scratch)
     }
 
     /// The blocking hops taken so far.
@@ -709,7 +714,7 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
                 Body::ModelCall { .. },
                 Body::ModelResult { r#for: None, failure: None, call: a, outcome: Outcome::Done { .. } },
                 Body::ToolCall { tool, id: Some(id), .. },
-                Body::ToolResult { call: b, outcome: Outcome::Done { output }, card: None },
+                Body::ToolResult { call: b, outcome: Outcome::Done { output }, card: None, .. },
                 Body::ModelCall { .. },
                 Body::ModelResult { r#for: None, failure: None, call: c, outcome: Outcome::Done { output: answer } },
             ] if (a.get(), b.get(), c.get()) == (2, 4, 6) && tool == "lookup_harbor_label" && id == call_id && output.parse::<Value>().unwrap() == "crimson-harbor"
@@ -1033,6 +1038,7 @@ fn hook_decisions_are_logged_after_their_call_and_replay_to_the_same_state() {
                     error: "policy denied this call".into()
                 },
                 card: None,
+                held: Vec::new(),
             },
             &decision(
                 "policy",
@@ -1078,6 +1084,7 @@ fn results_are_logged_in_call_order() {
             output: Json::encode(&json!({ "slept": call })).unwrap(),
         },
         card: None,
+        held: Vec::new(),
     };
     let log = [
         entry(1, call("a")),
@@ -1302,7 +1309,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
                 Body::ToolResult {
                     call: done,
                     outcome: Outcome::Done { output },
-                    card: Some(card),
+                    card: Some(card), ..
                 },
             ] if [call, ran, done].iter().all(|c| c.get() == 2) && value.raw() == "true"
                 && output.parse::<Value>().unwrap()["output"] == "approved\n" && card.note == "exit 0"
@@ -1382,6 +1389,7 @@ fn slash_commands_are_callables_and_input_hooks_rewrite_or_refuse() {
             output: Json::encode("all of them in 2").unwrap(),
         },
         card: None,
+        held: Vec::new(),
     };
     // The command is an intent and an outcome under the input that ran
     // it; what came behind it waits, then is taken up in order.
@@ -1740,7 +1748,9 @@ fn a_forced_steer_detaches_a_running_call_whose_outcome_comes_back_on_the_queue(
         "{log:#?}"
     );
     assert!(log.iter().any(|e| matches!(&e.body,
-        Body::ToolResult { call: c, outcome, .. } if *c == call && *outcome == protocol::OutputStream { call }.placeholder())));
+        Body::ToolResult { call: c, outcome, held, .. } if *c == call
+            && *outcome == protocol::OutputStream { session: session.id, call }.placeholder()
+            && *held == [protocol::Held::Stream(protocol::OutputStream { session: session.id, call })])));
     // The call in the background keeps the session working.
     assert!(session.has_work());
     release.set();
@@ -1898,6 +1908,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
                 output: Some("one\ntwo\n".into())
             },
             card: None,
+            held: Vec::new(),
         }]
     );
     let (output, error) = ext::host::Toolset::default().to_model(
@@ -1905,6 +1916,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
         &Outcome::Interrupted {
             output: Some("one\n".into()),
         },
+        &ext::blob::Places::default(),
     );
     assert!(error);
     assert_eq!(

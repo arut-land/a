@@ -8,7 +8,8 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use protocol::{Audience, CallId, Card, Environment, Json, Outcome, Seq, SessionId};
+use blob::Places;
+use protocol::{Audience, CallId, Card, Environment, Held, Json, Outcome, Seq, SessionId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -136,7 +137,7 @@ pub struct Cx {
     pub model: Arc<str>,
     /// Where output too large for the log goes: the session store's
     /// blobs, which a result references by id.
-    pub blobs: crate::blob::Blobs,
+    pub blobs: blob::Blobs,
     pub cancel: Cancel,
     /// Set when the session stops waiting on the call (a forced steer):
     /// a call that can hand its work to the background may, and one whose
@@ -420,6 +421,18 @@ pub trait Tool: Send + Sync + 'static {
         llm::Output::Json(output.clone())
     }
 
+    /// As [`Tool::to_model`], for an output that references blobs or
+    /// streams ([`Tool::held`]): `places` names where the model reads them.
+    fn to_model_with(output: &Json, _places: &Places) -> llm::Output {
+        Self::to_model(output)
+    }
+
+    /// What an output references outside the log, which the store keeps
+    /// for as long as the call's result is logged.
+    fn held(_output: &Self::Out) -> Vec<Held> {
+        Vec::new()
+    }
+
     /// How clients show a call; pure, so a replay shows the same.
     fn present(_input: &Self::In) -> Option<Card> {
         None
@@ -460,6 +473,8 @@ impl fmt::Debug for Parsed {
 pub struct Called {
     pub outcome: Outcome,
     pub card: Option<Card>,
+    /// What the outcome references outside the log.
+    pub held: Vec<Held>,
 }
 
 impl Called {
@@ -467,6 +482,7 @@ impl Called {
         Self {
             outcome: Outcome::Failed { error },
             card: None,
+            held: Vec::new(),
         }
     }
 }
@@ -488,8 +504,9 @@ pub trait DynTool: Send + Sync {
     fn parse(&self, input: &Json) -> Result<Parsed, String>;
     /// Runs a call on an input [`DynTool::parse`] read.
     fn call<'a>(&'a self, input: Parsed, cx: &'a Cx) -> BoxFuture<'a, Called>;
-    /// What the model sees of a stored output.
-    fn to_model(&self, output: &Json) -> llm::Output;
+    /// What the model sees of a stored output, its references named by
+    /// `places`.
+    fn to_model(&self, output: &Json, places: &Places) -> llm::Output;
     fn present(&self, input: &Parsed) -> Option<Card>;
 }
 
@@ -556,6 +573,7 @@ where
             match Json::encode(&output) {
                 Ok(json) => Called {
                     card: T::present_result(&input, &output),
+                    held: T::held(&output),
                     outcome: Outcome::Done { output: json },
                 },
                 Err(e) => Called::failed(e.to_string()),
@@ -563,8 +581,8 @@ where
         })
     }
 
-    fn to_model(&self, output: &Json) -> llm::Output {
-        T::to_model(output)
+    fn to_model(&self, output: &Json, places: &Places) -> llm::Output {
+        T::to_model_with(output, places)
     }
 
     fn present(&self, input: &Parsed) -> Option<Card> {

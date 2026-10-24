@@ -1,0 +1,18 @@
+[package]
+name = "blob-files"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+blob.workspace = true
+protocol.workspace = true
+# Blob ids; already built for ext-mcp's content hashes.
+sha2 = { version = "0.11", default-features = false }
+sys.workspace = true
+
+[dev-dependencies]
+tempfile = { version = "3", default-features = false }
+
+[lints]
+workspace = true

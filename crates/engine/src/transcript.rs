@@ -10,8 +10,8 @@ use ext::host::Registry;
 use llm::{Assistant, Message, Messages, Tag, ToolMessage, ToolResult, tag};
 use protocol::publication::{ContextImage, ContextInput, ContextLayer, ContextValue, RunnerKind};
 use protocol::{
-    Body, CallId, Entry, Envelope, EnvelopeId, Mode, Outcome, OutputStream, Segment, Segments, Seq,
-    Source, Verdict,
+    Body, CallId, Entry, Envelope, EnvelopeId, Held, Mode, Outcome, OutputStream, Segment,
+    Segments, Seq, Source, Verdict,
 };
 
 /// Provider replies remain intact; live updates and recovery share projection rules.
@@ -42,6 +42,8 @@ pub struct Transcript {
     registry: Arc<Registry>,
     /// How references are named for the model.
     places: Places,
+    /// The stream each call's result named, by call.
+    streams: HashMap<CallId, OutputStream>,
 }
 
 /// Input waiting to be taken up.
@@ -150,7 +152,12 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
         Body::ToolCall {
             tool, id: Some(id), ..
         } => ContextValue::ToolCall(id.clone(), tool.clone()),
-        Body::ToolResult { call, outcome, .. } => ContextValue::ToolResult(*call, outcome.clone()),
+        Body::ToolResult {
+            call,
+            outcome,
+            held,
+            ..
+        } => ContextValue::ToolResult(*call, outcome.clone(), held.clone()),
         _ => return None,
     })
 }
@@ -227,6 +234,7 @@ impl Transcript {
             last: 0,
             registry,
             places: places.clone(),
+            streams: HashMap::new(),
         }
     }
 
@@ -322,7 +330,9 @@ impl Transcript {
                 self.calls.insert(CallId(seq), (id, tool));
                 return;
             }
-            ContextValue::ToolResult(call, outcome) => return self.answer(seq, call, &outcome),
+            ContextValue::ToolResult(call, outcome, held) => {
+                return self.answer(seq, call, &outcome, &held);
+            }
             ContextValue::Inherited(_) => return,
         };
         self.messages.push(message);
@@ -332,12 +342,17 @@ impl Transcript {
     /// The result of call `call` the model made, in the tool message its
     /// reply's results share, in the calls' order: a detached call's is a
     /// placeholder naming its stream.
-    fn answer(&mut self, seq: Seq, call: CallId, outcome: &Outcome) {
+    fn answer(&mut self, seq: Seq, call: CallId, outcome: &Outcome, held: &[Held]) {
         let Some((id, tool)) = self.calls.remove(&call) else {
             return;
         };
+        for held in held {
+            if let Held::Stream(stream) = held {
+                self.streams.insert(call, *stream);
+            }
+        }
         let ext::Presented { output, error } = if self.detached.contains(&call) {
-            let stream = self.places.stream(OutputStream { call });
+            let stream = self.stream(call);
             let text = format!(
                 "[it goes on in the background; its output streams to {stream}, and \
                  its result follows once it ends]"
@@ -347,7 +362,7 @@ impl Transcript {
                 error: false,
             }
         } else {
-            self.registry.present_result(&tool, outcome)
+            self.registry.present_result(&tool, outcome, &self.places)
         };
         let result = ToolResult {
             id: id.into(),
@@ -395,15 +410,24 @@ impl Transcript {
     fn background(&mut self, call: CallId, outcome: &Outcome) -> String {
         self.detached.remove(&call);
         let tool = self.tools.get(&call).cloned().unwrap_or_default();
-        let ext::Presented { output, .. } = self.registry.present_result(&tool, outcome);
+        let ext::Presented { output, .. } =
+            self.registry.present_result(&tool, outcome, &self.places);
         self.ended(call, Some(&text_of(output)), "")
+    }
+
+    /// Where call `call`'s output streams, named by what its result held:
+    /// the session whose log holds the call, whoever projects it.
+    fn stream(&self, call: CallId) -> String {
+        self.streams
+            .get(&call)
+            .map_or_else(|| format!("stream:{call}"), |s| self.places.stream(*s))
     }
 
     /// A call that went on in the background ended, as the model reads it:
     /// with its output, or with `note` about its end.
     fn ended(&self, call: CallId, output: Option<&str>, note: &str) -> String {
         let command = self.tools.get(&call).map_or("", String::as_str);
-        let stream = self.places.stream(OutputStream { call });
+        let stream = self.stream(call);
         let id = call.to_string();
         Tag::from(tag::BackgroundResult {
             call: &id,
@@ -803,6 +827,7 @@ mod tests {
                         output: Json::encode("ok").unwrap(),
                     },
                     card: None,
+                    held: Vec::new(),
                 },
             ),
         ];

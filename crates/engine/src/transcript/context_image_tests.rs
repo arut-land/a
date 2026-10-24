@@ -157,6 +157,7 @@ fn pending_exchanges_never_become_child_work() {
                     output: Json::encode("answer").unwrap(),
                 },
                 card: None,
+                held: Vec::new(),
             },
         ),
         tool_entry(5, "pending"),
@@ -491,6 +492,7 @@ fn identical_local_sequences_and_provider_ids_remain_in_their_scopes() {
                         output: Json::encode(text).unwrap(),
                     },
                     card: None,
+                    held: Vec::new(),
                 },
             ),
         ]

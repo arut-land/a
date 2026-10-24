@@ -396,7 +396,7 @@ impl DynTool for Shape {
         )))
     }
 
-    fn to_model(&self, output: &Json) -> llm::Output {
+    fn to_model(&self, output: &Json, _places: &ext::blob::Places) -> llm::Output {
         llm::Output::Json(output.clone())
     }
 
@@ -798,6 +798,7 @@ pub fn tool_done(call: u64, outcome: Outcome) -> Event {
         call: id(call),
         outcome,
         card: None,
+        held: Vec::new(),
     }
 }
 
@@ -964,6 +965,22 @@ pub fn tool_result(call: u64, outcome: Outcome) -> Body {
         call: CallId::new(call).unwrap(),
         outcome,
         card: None,
+        held: Vec::new(),
+    }
+}
+
+/// The result call `call` gets as it detaches, in a session loaded with
+/// no id: naming the stream it holds.
+pub fn placeholder(call: u64) -> Body {
+    let stream = protocol::OutputStream {
+        session: SessionId::NIL,
+        call: id(call),
+    };
+    Body::ToolResult {
+        call: id(call),
+        outcome: stream.placeholder(),
+        card: None,
+        held: vec![protocol::Held::Stream(stream)],
     }
 }
 

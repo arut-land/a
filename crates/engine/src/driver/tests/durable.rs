@@ -569,6 +569,7 @@ fn pending_fold_changes_survive_reload_exactly_once() {
             output: Json::default(),
         },
         card: None,
+        held: Vec::new(),
     }));
     harness.request("adopt");
     let adopted = harness.session.session.state_view();
@@ -640,6 +641,7 @@ impl ManualSession {
                 output: Json::default(),
             },
             card: None,
+            held: Vec::new(),
         }));
     }
     fn value(&self) -> u64 {
@@ -800,6 +802,7 @@ fn reattached_fold_matches_restart(multiplier: u64, absent_event: bool) {
                 output: Json::default(),
             },
             card: None,
+            held: Vec::new(),
         }));
         release.send(());
         h.snapshot();
@@ -1485,6 +1488,7 @@ fn interrupt_revokes_bookkeeping_but_settles_the_completed_effect_once() {
             called: Called {
                 outcome: outcome.clone(),
                 card: None,
+                held: Vec::new(),
             },
         },
     );

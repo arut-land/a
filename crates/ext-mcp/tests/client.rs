@@ -254,6 +254,7 @@ fn selected_schemas_and_compact_indexes_fit_with_their_escaped_cards() {
             call: cx.call,
             outcome: called.outcome,
             card: called.card,
+            held: Vec::new(),
         },
     );
     for publication in rig.log.lock().unwrap().iter() {

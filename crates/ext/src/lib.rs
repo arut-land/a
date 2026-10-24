@@ -29,7 +29,7 @@ use protocol::Outcome;
 
 mod agent;
 mod assemble;
-pub mod blob;
+pub use blob;
 mod conversation;
 mod ext;
 mod flag;
