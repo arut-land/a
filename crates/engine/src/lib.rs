@@ -1001,6 +1001,7 @@ impl Daemon {
         let mut awake: Option<Option<sys::Awake>> = None;
         let mut pulsed = self.pulse.count();
         let mut jobs = self.jobs.count();
+        let mut answers = idling.answered.count();
         loop {
             let now = self.shared.rt.now();
             event(|| rt::Event {
@@ -1034,14 +1035,11 @@ impl Daemon {
                     exit.now(self, Stop::Upgrade).await;
                 }
                 next = Some(earliest(next, settled.unwrap_or(began + config.drain)));
-            } else if self.idle() && !idling.is(Idling::RESIDENT) {
-                let at = *since.get_or_insert(now) + config.idle;
-                // While the answer is pending, its pulse is what wakes us.
-                if idling.is(Idling::TRANSIENT) {
-                    if now >= at {
-                        exit.now(self, Stop::Idle).await;
-                    }
-                    next = Some(earliest(next, at));
+            } else if self.idle() {
+                match idling.next(*since.get_or_insert(now), config.idle, now) {
+                    Idle::Exit => exit.now(self, Stop::Idle).await,
+                    Idle::Until(at) => next = Some(earliest(next, at)),
+                    Idle::Stay => {}
                 }
             } else {
                 since = None;
@@ -1066,7 +1064,11 @@ impl Daemon {
                 self.jobs.changed(&mut jobs).await;
                 false
             };
-            let woken = rt::or(pulse, rt::or(ended, sleep));
+            let answered = async {
+                idling.answered.changed(&mut answers).await;
+                false
+            };
+            let woken = rt::or(pulse, rt::or(ended, rt::or(answered, sleep)));
             if woken.await {
                 since = None;
             }
@@ -1182,6 +1184,8 @@ pub struct Start {
     pub reset_breaker: bool,
     /// A detached starter waits for discovery to be published.
     pub logs: bool,
+    /// Started by the OS at login rather than by a client or by hand.
+    pub login: bool,
     /// Asked on a blocking worker once the daemon has served for a moment,
     /// off every reply's path: whether the OS starts this daemon at login,
     /// so it stays up instead of exiting when idle.
@@ -1193,8 +1197,23 @@ const SETTLED: Duration = Duration::from_secs(2);
 
 /// Whether idleness may end this daemon. Until [`Start::resident`] answers,
 /// it may not: a short idle limit must not end a daemon the OS starts at
-/// login before it learns so.
-struct Idling(AtomicU8);
+/// login before it learns so. The answer wakes the supervisor without
+/// counting as activity, so idleness while asking still counts.
+struct Idling {
+    state: AtomicU8,
+    answered: rt::Notify,
+}
+
+/// What an idle daemon does next.
+#[derive(Debug, PartialEq, Eq)]
+enum Idle {
+    /// Exit now.
+    Exit,
+    /// Exit at this instant unless something happens first.
+    Until(Instant),
+    /// Wait for the answer, or stay up for good.
+    Stay,
+}
 
 impl Idling {
     const ASKING: u8 = 0;
@@ -1202,11 +1221,10 @@ impl Idling {
     const RESIDENT: u8 = 2;
 
     fn new(state: u8) -> Self {
-        Self(AtomicU8::new(state))
-    }
-
-    fn is(&self, state: u8) -> bool {
-        self.0.load(Ordering::SeqCst) == state
+        Self {
+            state: AtomicU8::new(state),
+            answered: rt::Notify::new(),
+        }
     }
 
     fn answer(&self, resident: bool) {
@@ -1215,7 +1233,21 @@ impl Idling {
         } else {
             Self::TRANSIENT
         };
-        self.0.store(state, Ordering::SeqCst);
+        self.state.store(state, Ordering::SeqCst);
+        self.answered.notify();
+    }
+
+    /// For a daemon idle since `since`, allowed `limit` of it.
+    fn next(&self, since: Instant, limit: Duration, now: Instant) -> Idle {
+        if self.state.load(Ordering::SeqCst) != Self::TRANSIENT {
+            return Idle::Stay;
+        }
+        let at = since + limit;
+        if now >= at {
+            Idle::Exit
+        } else {
+            Idle::Until(at)
+        }
     }
 }
 
@@ -1258,7 +1290,9 @@ fn run(
     start: Start,
     runtime: &Arc<rt::Threads>,
 ) -> io::Result<()> {
-    let origin = if start.logs || start.lock.is_some() {
+    let origin = if start.login {
+        ext_logging::Origin::Login
+    } else if start.logs || start.lock.is_some() {
         ext_logging::Origin::Client
     } else {
         ext_logging::Origin::Foreground
@@ -1360,7 +1394,6 @@ fn idling(daemon: &Arc<Daemon>, home: &Home, resident: Option<fn(&Home) -> bool>
     runtime.spawn(Box::pin(async move {
         daemon.shared.rt.sleep(SETTLED).await;
         answer.answer(rt::unblock(&*daemon.shared.rt, move || ask(&home)).await);
-        daemon.pulse.notify();
     }));
     idling
 }

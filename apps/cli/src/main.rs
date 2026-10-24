@@ -654,26 +654,31 @@ fn serve(
         sys::detach_session()?;
         sys::log::discard_stderr()?;
     }
-    let listener = if login {
+    let (lock, listener) = if login {
         match client::bind_at_login(home)? {
-            Some(listener) => listener,
+            Some((lock, listener)) => (Some(lock), listener),
             // A client started one first; it learns of autostart itself.
             None => return Ok(()),
         }
-    } else if let Some(fd) = listen_fd {
-        sys::Listener::adopt(
-            sys::InheritedNumber::from(fd).duplicate()?,
-            &home.endpoint(),
-        )?
     } else {
-        home.bind()?
+        let lock = lock_fd
+            .map(|fd| sys::adopt_lock(sys::InheritedNumber::from(fd).duplicate()?, home))
+            .transpose()?;
+        let listener = if let Some(fd) = listen_fd {
+            sys::Listener::adopt(
+                sys::InheritedNumber::from(fd).duplicate()?,
+                &home.endpoint(),
+            )?
+        } else {
+            home.bind()?
+        };
+        (lock, listener)
     };
     let start = engine::Start {
-        lock: lock_fd
-            .map(|fd| sys::adopt_lock(sys::InheritedNumber::from(fd).duplicate()?, home))
-            .transpose()?,
+        lock,
         reset_breaker,
         logs: login || detached || listen_fd.is_some(),
+        login,
         resident: Some(sys::autostart::refresh),
     };
     engine::serve(
