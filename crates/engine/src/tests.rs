@@ -973,12 +973,31 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
         let mut cx = Context::from_waker(Waker::noop());
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
         idling.answer(true);
-        daemon.pulse.notify();
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
         assert!(super::lock(&runtime.1).is_empty());
     }
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn an_idle_daemon_exits_as_soon_as_it_learns_it_is_transient() {
+    use super::{Idle, Idling};
+
+    let began = Instant::now();
+    let limit = Duration::from_secs(1);
+    let later = began + Duration::from_secs(5);
+    let idling = Idling::new(Idling::ASKING);
+    // Past its idle limit while asking, it stays.
+    assert_eq!(idling.next(began, limit, later), Idle::Stay);
+    let seen = idling.answered.count();
+    idling.answer(false);
+    // The answer wakes the supervisor, and the idleness it waited through counts.
+    assert_ne!(idling.answered.count(), seen);
+    assert_eq!(idling.next(began, limit, later), Idle::Exit);
+    assert_eq!(idling.next(began, limit, began), Idle::Until(began + limit));
+    idling.answer(true);
+    assert_eq!(idling.next(began, limit, later), Idle::Stay);
 }
 
 #[test]
