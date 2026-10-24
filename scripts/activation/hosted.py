@@ -53,6 +53,18 @@ def connect():
     return (time.perf_counter_ns() - begin) / 1e6
 
 
+def idle():
+    pid = int((run_dir / "daemon.pid").read_text().splitlines()[0])
+    # Inspect records rather than connecting to a manager-owned socket.
+    deadline = time.monotonic() + 15
+    while (run_dir / "daemon.pid").read_text().strip():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"daemon {pid} failed to exit idle")
+        time.sleep(.05)
+    assert "not running" in command("daemon", "status").stdout
+    assert not (run_dir / "daemon.pid").read_text().strip()
+
+
 samples = {"self_spawn_ms": [], "activation_ms": []}
 try:
     unregistered = command("__daemon", "--activated", check=False)
@@ -67,16 +79,10 @@ try:
                 command("daemon", "install-activation")
                 command("ls")
                 command("daemon", "stop")
+                command("ls")  # a rapid reconnect must fit the startup deadline
+                idle()  # time reactivation after a real idle exit
             samples["activation_ms" if managed else "self_spawn_ms"].append(connect())
-            pid = int((run_dir / "daemon.pid").read_text().splitlines()[0])
-            # Prove idle exit without opening the socket (which would reactivate it).
-            deadline = time.monotonic() + 15
-            while (run_dir / "daemon.pid").read_text().strip():
-                if time.monotonic() >= deadline:
-                    raise AssertionError(f"daemon {pid} failed to exit idle")
-                time.sleep(.05)
-            assert "not running" in command("daemon", "status").stdout
-            assert not (run_dir / "daemon.pid").read_text().strip()
+            idle()
             if managed:
                 socket = Path(os.fsdecode((run_dir / "daemon.endpoint").read_bytes()))
                 identity = socket.stat().st_ino
