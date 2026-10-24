@@ -375,11 +375,11 @@ mod tests {
             std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
                 .join("System32/cmd.exe"),
         );
-        command.env_clear().args(["/D", "/C", "set TMP& set TEMP"]);
+        command.env_clear().args(["/D", "/C", "set"]);
         home.daemon_env(&mut command);
         daemon_environment(&mut command, &home);
         let output = command.output().unwrap();
-        assert!(output.status.success());
+        assert!(output.status.success(), "{output:?}");
         let output = String::from_utf8(output.stdout).unwrap();
         for key in ["TMPDIR", "TMP", "TEMP"] {
             assert!(
