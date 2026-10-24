@@ -61,6 +61,33 @@ mod backend {
 
         #[test]
         #[cfg_attr(miri, ignore = "Miri does not support AF_UNIX sockets")]
+        fn journal_delivery_resumes_after_endpoint_replacement() {
+            for record_during_gap in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("journal.sock");
+                let receiver = UnixDatagram::bind(&path).unwrap();
+                let sender = Sink::connect(&path).unwrap();
+                drop(receiver);
+                std::fs::remove_file(&path).unwrap();
+                if record_during_gap {
+                    for _ in 0..3 {
+                        sender.write("{}");
+                    }
+                }
+                let replacement = UnixDatagram::bind(&path).unwrap();
+                replacement.set_nonblocking(true).unwrap();
+                sender.write("{}");
+                let mut bytes = [0; 256];
+                let len = replacement.recv(&mut bytes).unwrap();
+                assert_eq!(
+                    &bytes[..len],
+                    b"SYSLOG_IDENTIFIER=a\nPRIORITY=5\nMESSAGE={}\n"
+                );
+            }
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore = "Miri does not support AF_UNIX sockets")]
         fn journal_delivery_is_atomic_and_never_waits_for_a_collector() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("journal.sock");
