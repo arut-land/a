@@ -40,6 +40,12 @@ fn native_home(home: &Home) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether this home can have autostart at all: only the native
+/// installation registers, so an isolated daemon never asks.
+pub fn applies(home: &Home) -> bool {
+    native_home(home).is_ok()
+}
+
 /// Registers the daemon to start when this user logs in.
 pub fn enable(home: &Home) -> io::Result<()> {
     native_home(home)?;

@@ -679,7 +679,9 @@ fn serve(
         reset_breaker,
         logs: login || detached || listen_fd.is_some(),
         login,
-        resident: Some(sys::autostart::refresh),
+        // Only a home that can register asks, so an isolated daemon has no
+        // question pending and nothing to wake for.
+        resident: sys::autostart::applies(home).then_some(sys::autostart::refresh),
     };
     engine::serve(
         &listener,

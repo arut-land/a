@@ -13,8 +13,9 @@ settings. Neither needs root, and explicit `A_HOME` instances cannot
 register: they always start on first use.
 
 The registration is the only state, and it belongs to the OS: present means
-on. A daemon that has served for two seconds asks for it on a blocking
-worker, off every reply's path. Idleness does not end it before the answer,
+on. A daemon of the native installation that has served for two seconds
+asks for it on a blocking worker, off every reply's path; that is its one
+wake not caused by a client or by work, and an isolated daemon has none. Idleness does not end it before the answer,
 and the answer is not activity: a transient daemon past its idle limit exits
 as soon as it learns so. If autostart is on, it rewrites an outdated
 registration (a new executable path or native layout) and from then on stays
