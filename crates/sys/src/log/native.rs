@@ -28,19 +28,28 @@ impl Native {
 
 #[cfg(target_os = "linux")]
 mod backend {
+    use std::io;
     use std::os::unix::net::UnixDatagram;
+    use std::path::{Path, PathBuf};
 
-    pub(super) struct Sink(UnixDatagram);
+    pub(super) struct Sink {
+        socket: UnixDatagram,
+        path: PathBuf,
+    }
     impl Sink {
         pub(super) fn new() -> Option<Self> {
             Self::connect("/run/systemd/journal/socket")
         }
 
-        fn connect(path: impl AsRef<std::path::Path>) -> Option<Self> {
+        fn connect(path: impl AsRef<Path>) -> Option<Self> {
+            let path = path.as_ref();
             let socket = UnixDatagram::unbound().ok()?;
             socket.set_nonblocking(true).ok()?;
             socket.connect(path).ok()?;
-            Some(Self(socket))
+            Some(Self {
+                socket,
+                path: path.to_owned(),
+            })
         }
 
         pub(super) fn write(&self, text: &str) {
@@ -51,7 +60,24 @@ mod backend {
             let end = PREFIX.len() + text.len();
             bytes[PREFIX.len()..end].copy_from_slice(text.as_bytes());
             bytes[end] = b'\n';
-            let _ = self.0.send(&bytes[..=end]);
+            let record = &bytes[..=end];
+            if let Err(error) = self.socket.send(record)
+                && matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::NotFound
+                        | io::ErrorKind::NotConnected
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                )
+                // A connected AF_UNIX socket retains the old endpoint's inode.
+                // One reconnect and resend per record also covers a restart gap;
+                // backpressure never reconnects or waits for the collector.
+                && self.socket.connect(&self.path).is_ok()
+            {
+                let _ = self.socket.send(record);
+            }
         }
     }
 
