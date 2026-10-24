@@ -416,7 +416,9 @@ mod imp {
     }
 
     pub fn bind(socket: &Path, link: &Path, discovery: &Path) -> io::Result<Listener> {
-        crate::fs::private_dir(discovery.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+        let records = crate::fs::PrivateDirectory::create(
+            discovery.parent().ok_or(io::ErrorKind::InvalidInput)?,
+        )?;
         // The claim inode is never unlinked: a waiter must not lock an old
         // inode while another daemon creates and locks a replacement.
         let claim = claim(discovery)?;
@@ -436,7 +438,10 @@ mod imp {
             Err(error) => return Err(error),
         }
         let listener = UnixListener::bind(&socket)?;
-        crate::fs::write_private(discovery, socket.as_os_str().as_encoded_bytes())?;
+        records.write_private(
+            discovery.file_name().ok_or(io::ErrorKind::InvalidInput)?,
+            socket.as_os_str().as_encoded_bytes(),
+        )?;
         if fs::read_link(link).ok().as_deref() != Some(socket.as_path()) {
             let _ = fs::remove_file(link);
             // Only a convenience: a home on a filesystem without symlinks

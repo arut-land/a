@@ -6,6 +6,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::Path;
 
+mod edit;
+mod staging;
+pub use edit::{
+    Durability, EditConflict, EditError, EditReceipt, EditTransaction, PublicationLimitations,
+    PublicationProtection,
+};
+
 /// Why discovery skipped a candidate instead of opening arbitrary filesystem objects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectedFile {
@@ -329,7 +336,7 @@ fn create_directory(dir: &Path, existing: bool) -> io::Result<()> {
         };
         // A unique sibling avoids sharing staging state with another creator.
         // WRITE_THROUGH publishes the directory before files beneath it commit.
-        let result = move_file(&pending, dir, false);
+        let result = move_file(&pending, dir, false, true);
         if result.is_err() {
             let _ = fs::remove_dir(&pending);
         }
@@ -343,9 +350,16 @@ fn create_directory(dir: &Path, existing: bool) -> io::Result<()> {
 /// Makes directory entries durable on platforms with a directory barrier.
 /// Windows callers must publish names with `publish` instead.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
+    // Miri has no directory-fsync model; native publication tests exercise the
+    // persistence barrier while Miri checks the callers' memory safety.
+    #[cfg(miri)]
+    {
+        let _ = dir;
+        Ok(())
+    }
+    #[cfg(all(unix, not(miri)))]
     return File::open(dir)?.sync_all();
-    #[cfg(windows)]
+    #[cfg(all(windows, not(miri)))]
     {
         let _ = dir;
         Err(io::Error::new(
@@ -355,35 +369,137 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// An owned private runtime namespace, checked once before publishing records.
+/// Its access policy must remain private for the lifetime of this capability.
+#[cfg(unix)]
+pub(crate) struct PrivateDirectory(File);
+
+#[cfg(unix)]
+impl PrivateDirectory {
+    pub(crate) fn create(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        private_dir(path)?;
+        let file = edit::open_parent(path)?;
+        let metadata = file.metadata()?;
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o777 != 0o700
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        #[cfg(target_vendor = "apple")]
+        edit::private_directory_acl(&file)?;
+        Ok(Self(file))
+    }
+
+    /// Reconstructible discovery records require visibility, not persistence.
+    pub(crate) fn write_private(&self, name: &std::ffi::OsStr, bytes: &[u8]) -> io::Result<()> {
+        if !matches!(
+            (
+                Path::new(name).components().next(),
+                Path::new(name).components().count()
+            ),
+            (Some(std::path::Component::Normal(_)), 1)
+        ) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let (temporary, mut file) = loop {
+            let temporary = edit::temporary_name();
+            #[cfg(unix)]
+            let created = rustix::fs::openat(
+                &self.0,
+                &temporary,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .map(File::from)
+            .map_err(io::Error::from);
+
+            match created {
+                Ok(file) => break (temporary, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        };
+        let result = (|| {
+            file.write_all(bytes)?;
+            #[cfg(unix)]
+            rustix::fs::renameat(&self.0, &temporary, &self.0, name)?;
+
+            Ok(())
+        })();
+        if result.is_err() {
+            #[cfg(unix)]
+            let _ = rustix::fs::unlinkat(&self.0, &temporary, rustix::fs::AtFlags::empty());
+        }
+        result
+    }
+}
+
 /// Replaces `path` with `bytes`, readable only by this user, so a reader
 /// sees the old file or the new one, never a torn or world-readable one.
+/// No persistence barrier is requested; configuration uses `write_private_durable`.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
+    save_private(path, bytes, false)
+}
+
+/// Saves configuration with file and namespace persistence barriers.
+pub fn write_private_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    save_private(path, bytes, true)
+}
+
+fn save_private(path: &Path, bytes: &[u8], durable: bool) -> io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = dir.join(format!(".{name}.{}", std::process::id()));
-    let _ = fs::remove_file(&tmp);
-    let mut file = private_file().open(&tmp)?;
-    let written = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| replace(&tmp, path));
+    let (tmp, mut file) = loop {
+        let tmp = dir.join(edit::temporary_name());
+        match private_file().open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    };
+    let written = (|| {
+        #[cfg(target_vendor = "apple")]
+        edit::access_acl(None, &file)?;
+        file.write_all(bytes)?;
+        if durable {
+            file.sync_all()?;
+        }
+        Ok(())
+    })();
+    drop(file);
+    let written = written.and_then(|()| {
+        if durable {
+            publish(&tmp, path)
+        } else {
+            #[cfg(unix)]
+            return replace(&tmp, path);
+            #[cfg(windows)]
+            move_file(&tmp, path, true, false)
+        }
+    });
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     written
 }
 
-/// Atomically replaces a name. Windows also waits for the move on disk.
+/// Atomically replaces a name, without a directory durability promise.
 pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(unix)]
     return fs::rename(from, to);
     #[cfg(windows)]
-    move_file(from, to, true)
+    move_file(from, to, true, true)
 }
 
 #[cfg(windows)]
-fn move_file(from: &Path, to: &Path, replacing: bool) -> io::Result<()> {
+fn move_file(from: &Path, to: &Path, replacing: bool, durable: bool) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
@@ -409,21 +525,28 @@ fn move_file(from: &Path, to: &Path, replacing: bool) -> io::Result<()> {
         MoveFileExW(
             from.as_ptr(),
             to.as_ptr(),
-            if replacing {
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+            (if replacing {
+                MOVEFILE_REPLACE_EXISTING
             } else {
-                MOVEFILE_WRITE_THROUGH
-            },
+                0
+            }) | if durable { MOVEFILE_WRITE_THROUGH } else { 0 },
         )
     })
 }
 
 /// Publishes an already flushed file, including its directory entry.
 pub fn publish(from: &Path, to: &Path) -> io::Result<()> {
-    replace(from, to)?;
     #[cfg(unix)]
-    sync_dir(to.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
-    Ok(())
+    {
+        replace(from, to)?;
+        sync_dir(
+            to.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )
+    }
+    #[cfg(windows)]
+    move_file(from, to, true, true)
 }
 
 /// Removes the durable name before best-effort reclamation of its contents.
@@ -461,7 +584,7 @@ pub fn open_log(path: &Path, header: Option<&[u8]>) -> io::Result<(File, Publica
         file.write_all(header)?;
         file.sync_all()?;
         drop(file);
-        move_file(&pending, path, false)?;
+        move_file(&pending, path, false, true)?;
     }
     let mut open = OpenOptions::new();
     open.read(true).append(true);
@@ -767,6 +890,57 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn discovery_publication_stays_in_the_owned_private_directory() {
+        let root = std::env::temp_dir().join(edit::temporary_name());
+        fs::create_dir(&root).unwrap();
+        let runtime = root.join("runtime");
+        let records = PrivateDirectory::create(&runtime).unwrap();
+        let moved = root.join("moved");
+        fs::rename(&runtime, &moved).unwrap();
+        fs::create_dir(&runtime).unwrap();
+        records
+            .write_private(std::ffi::OsStr::new("endpoint"), b"socket")
+            .unwrap();
+        assert_eq!(fs::read(moved.join("endpoint")).unwrap(), b"socket");
+        assert!(!runtime.join("endpoint").exists());
+        assert!(
+            records
+                .write_private(std::ffi::OsStr::new("../escape"), b"socket")
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn discovery_directory_removes_inheritable_access_before_publication() {
+        let root = std::env::temp_dir().join(edit::temporary_name());
+        fs::create_dir(&root).unwrap();
+        assert!(
+            std::process::Command::new("chmod")
+                .args(["+a", "everyone allow read,file_inherit,directory_inherit"])
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let runtime = root.join("runtime");
+        let records = PrivateDirectory::create(&runtime).unwrap();
+        records
+            .write_private(std::ffi::OsStr::new("endpoint"), b"socket")
+            .unwrap();
+        let listing = std::process::Command::new("ls")
+            .args(["-led"])
+            .arg(&runtime)
+            .arg(runtime.join("endpoint"))
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        assert!(!String::from_utf8_lossy(&listing.stdout).contains("everyone"));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn discovery_never_opens_a_fifo_or_directory() {
