@@ -5,15 +5,18 @@ A client starts the daemon itself when none is running (self-spawn,
 is equally fast with autostart on or off. Autostart is the optional OS
 integration on top: `a daemon autostart on` registers the daemon to start
 when the user logs in, so it is already serving when the first client
-connects, and `a daemon autostart off` removes the registration. On macOS
+connects, and `a daemon autostart off` removes the registration. `on`
+installs the running build first, since the registration names the
+installed one. On macOS
 the installed app offers the same as **Start at login** in its Command Line
 settings. Neither needs root, and explicit `A_HOME` instances cannot
 register: they always start on first use.
 
 The registration is the only state, and it belongs to the OS: present means
 on. A daemon that has served for two seconds asks for it on a blocking
-worker, off every reply's path, and idleness does not end it before the
-answer. If autostart is on, it rewrites an outdated
+worker, off every reply's path. Idleness does not end it before the answer,
+and the answer is not activity: a transient daemon past its idle limit exits
+as soon as it learns so. If autostart is on, it rewrites an outdated
 registration (a new executable path or native layout) and from then on stays
 up instead of exiting when idle, waking for nothing while idle. A daemon
 started without autostart, or before it was turned on, keeps the idle exit;
@@ -22,14 +25,18 @@ an upgrade drain still end a resident daemon; the next client self-spawns a
 successor, which becomes resident the same way, and the OS does not
 restart it.
 
-The login entry is `a __daemon --login`. It takes `start.lock` like a
-self-spawning client, so a client starting at the same moment either waits
-and connects to it or wins and makes it exit quietly. Under a service manager
-(Linux, macOS) it binds and serves in the foreground the manager tracks, and owns the same exclusive home
-claim and peer-verified endpoint as any daemon. On Unix, an entry point older
-than the build the install selects (the app's bundled helper) re-execs that
-build in the same PID before serving, so the first client never has to drain
-it.
+The login entry is `a __daemon --login`, and the daemon log records its
+start with the `login` origin. It takes `start.lock` like a self-spawning
+client, so a client starting at the same moment either waits and connects to
+it or wins and makes it exit quietly. Under a service manager (Linux, macOS)
+it then waits for the daemon record as a client does, so a predecessor still
+draining or stopping lets go of its endpoint first, binds, and serves in the
+foreground the manager tracks, with the same exclusive home claim and
+peer-verified endpoint as any daemon. On Unix, an entry point older than the
+build the install selects (the app's bundled helper) re-execs that build in
+the same PID before serving, so the first client never has to drain it. It
+does so at most once: it never execs the image it is already running, even
+when that image reports another id than the marker naming it.
 
 ## Linux
 
@@ -40,8 +47,9 @@ starts it with the user's first session. Names use the home's endpoint
 identity, so layouts with different bases never touch each other's unit.
 The unit runs the executable selected by `Paths::runtime().current_exe()`
 with `/` as working directory, umask 0077, `KillMode=mixed`, a 30-second
-stop timeout and the resolved XDG directory purposes in its environment,
-so the manager's login environment cannot select another home. It has no
+stop timeout and the resolved XDG base directories in its environment, so
+the manager's login environment cannot select another home.
+`XDG_RUNTIME_DIR` is left to the manager, which sets the session's own. It has no
 `Restart=`. Disabling it with `systemctl --user disable` is respected: the
 daemon is resident only while the unit is enabled. The installer does not
 enable lingering.
@@ -61,7 +69,11 @@ its helper inside the bundle) through `SMAppService`, links to Login Items
 settings when approval is required, and refreshes that status when it
 becomes active. Both agents have umask 0077 and a 30-second exit timeout
 and no `KeepAlive`. A daemon counts the app's agent as on while launchd has
-it loaded.
+it loaded. Either is off while the user has switched it off in Login Items:
+Background Task Management records that in launchd's disabled list
+(`launchctl print-disabled`), which the daemon reads. When launchd first
+loads either agent, macOS shows its "Background Items Added" notification;
+for the CLI's agent that is at the next login.
 
 ## Windows
 
@@ -76,7 +88,8 @@ only under a stored-credential or batch logon that standard users lack.
 The value runs `a.exe __daemon --login`, which starts a detached daemon
 exactly as a client does and exits. A console program started at logon
 would otherwise get a console window (a Terminal tab on Windows 11), so
-`a.exe` embeds an application manifest whose `consoleAllocationPolicy` is
+`a.exe` embeds an application manifest (MSVC builds, the shipped Windows
+targets; a GNU-toolchain build has none) whose `consoleAllocationPolicy` is
 `detached`: started by Explorer or the `Run` key it gets no console, while
 started from a console it shares that console as before. When something
 without a console starts `a` with no standard handles (Explorer, the Run

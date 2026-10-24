@@ -1,7 +1,8 @@
 # Autostart measurements
 
 Autostart adds no dependency. `scripts/autostart/hosted.py` runs on a
-disposable hosted runner against its native installation. It checks the
+disposable hosted runner against its native installation; the `autostart`
+workflow runs it on all six hosted targets weekly and on demand. It checks the
 behaviour in [autostart](../autostart.md) and alternates twelve rounds per
 role, timing a complete `a ls` process through its first daemon reply:
 
