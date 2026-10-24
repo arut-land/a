@@ -495,33 +495,68 @@ pub fn private_file() -> OpenOptions {
 }
 
 /// Creates `dir` and its parents, entered only by their owner (mode 0700),
-/// and makes an existing `dir` so.
+/// and makes an existing `dir` so. The final component is opened without
+/// following links, so a planted link or another user's directory is
+/// refused rather than adopted.
 pub fn private_dir(dir: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
         builder.mode(0o700).create(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        let handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(dir)?;
+        let meta = handle.metadata()?;
+        if !meta.is_dir() || meta.uid() != rustix::process::geteuid().as_raw() {
+            return Err(not_private(dir));
+        }
+        if meta.mode() & 0o777 != 0o700 {
+            handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
     }
     #[cfg(windows)]
     {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Security::{
-            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, WRITE_DAC,
         };
         builder.create(dir)?;
+        let handle = OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(dir)?;
+        let attributes = handle.metadata()?.file_attributes();
+        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(not_private(dir));
+        }
         let security = crate::windows::Security::user_only()?;
-        let path = crate::windows::wide(dir.as_os_str());
-        // SAFETY: the path and security descriptor remain valid during the call.
+        // SAFETY: the handle and security descriptor remain valid during the call.
         crate::windows::ok(unsafe {
-            SetFileSecurityW(
-                path.as_ptr(),
+            SetKernelObjectSecurity(
+                handle.as_raw_handle(),
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 security.descriptor(),
             )
         })
     }
+}
+
+fn not_private(dir: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{} is not a directory owned by this user", dir.display()),
+    )
 }
 
 /// Fills `buf` from `file` at `offset`, as one positioned read where the
@@ -804,6 +839,20 @@ mod tests {
             device: domain.device ^ 1,
         };
         assert!(other.check(&file).is_err());
+    }
+
+    #[test]
+    fn private_dir_never_adopts_a_planted_link() {
+        let dir = std::env::temp_dir().join(format!("a-sys-fs-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("link")).unwrap();
+        assert!(private_dir(&dir.join("link")).is_err());
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(mode, 0o755);
     }
 
     #[test]
