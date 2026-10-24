@@ -1,9 +1,10 @@
 //! Overlapped directory notifications, owned through cancellation completion.
+use std::cell::{Cell, UnsafeCell};
 use std::io;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{ERROR_IO_INCOMPLETE, ERROR_NOTIFY_ENUM_DIR};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -20,18 +21,29 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::windows::{event, ok, owned, wide};
 
-struct Request {
+struct NativeRequest {
     overlapped: OVERLAPPED,
     buffer: [u32; 4096],
-    pending: bool,
 }
 
-// SAFETY: requests have stable heap addresses, all access is serialized by
-// State's mutex; its completion wait retains the allocation through cancellation.
-unsafe impl Send for Request {}
+// SAFETY: native storage stays inside a shared Arc allocation through completion.
+// Rust observes it only through raw pointers or after GetOverlappedResult succeeds.
+unsafe impl Send for NativeRequest {}
+
+struct Request {
+    native: UnsafeCell<NativeRequest>,
+    pending: Cell<bool>,
+}
+
+impl Request {
+    fn overlapped(&self) -> *mut OVERLAPPED {
+        // SAFETY: forms an address without borrowing kernel-owned storage.
+        unsafe { &raw mut (*self.native.get()).overlapped }
+    }
+}
 
 pub struct DirectoryWatch {
-    state: Option<Box<State>>,
+    state: Option<Arc<State>>,
     root: PathBuf,
     recursive: bool,
 }
@@ -40,17 +52,17 @@ struct State {
     directory: OwnedHandle,
     event: OwnedHandle,
     request: Mutex<Request>,
-    cleanup: PTP_WAIT,
+    cleanup: OnceLock<PTP_WAIT>,
     #[cfg(test)]
-    reclaimed: Option<std::sync::mpsc::Sender<()>>,
+    reclaimed: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl State {
-    fn retire(self: Box<Self>) {
-        let cleanup = self.cleanup;
+    fn retire(self: Arc<Self>) {
+        let cleanup = *self.cleanup.get().unwrap();
         let event = self.event.as_raw_handle();
-        let _ = Box::into_raw(self);
-        // SAFETY: this one-shot wait is armed only after exclusive ownership
+        let _ = Arc::into_raw(self);
+        // SAFETY: this one-shot wait is armed only after ownership
         // transfers to its callback. The event, OVERLAPPED and buffer remain
         // alive until the kernel signals completion; no timer or worker waits.
         unsafe { SetThreadpoolWait(cleanup, event, std::ptr::null()) };
@@ -59,13 +71,13 @@ impl State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        if self.cleanup != 0 {
+        if let Some(&cleanup) = self.cleanup.get() {
             // SAFETY: either never armed, or inside its sole callback. Closing
             // does not wait; Windows frees the wait after this callback returns.
-            unsafe { CloseThreadpoolWait(self.cleanup) };
+            unsafe { CloseThreadpoolWait(cleanup) };
         }
         #[cfg(test)]
-        if let Some(done) = self.reclaimed.take() {
+        if let Some(done) = self.reclaimed.get_mut().unwrap().take() {
             let _ = done.send(());
         }
     }
@@ -77,9 +89,9 @@ unsafe extern "system" fn reclaim(
     _: PTP_WAIT,
     _: u32,
 ) {
-    // SAFETY: retire transferred this Box to a one-shot completion wait. No
+    // SAFETY: retire transferred this Arc to a one-shot completion wait. No
     // callback is armed while DirectoryWatch can access the request.
-    drop(unsafe { Box::from_raw(context.cast::<State>()) });
+    drop(unsafe { Arc::from_raw(context.cast::<State>()) });
 }
 
 impl DirectoryWatch {
@@ -98,35 +110,42 @@ impl DirectoryWatch {
             )
         })?;
         let event = event()?;
-        let mut request = Request {
+        let mut native = NativeRequest {
             // SAFETY: a zeroed OVERLAPPED with a live completion event is valid.
             overlapped: unsafe { std::mem::zeroed() },
             buffer: [0; 4096],
-            pending: false,
         };
-        request.overlapped.hEvent = event.as_raw_handle();
-        let mut state = Box::new(State {
+        native.overlapped.hEvent = event.as_raw_handle();
+        let state = Arc::new(State {
             directory,
             event,
-            request: Mutex::new(request),
-            cleanup: 0,
+            request: Mutex::new(Request {
+                native: UnsafeCell::new(native),
+                pending: Cell::new(false),
+            }),
+            cleanup: OnceLock::new(),
             #[cfg(test)]
-            reclaimed: None,
+            reclaimed: Mutex::new(None),
         });
         // SAFETY: State's stable allocation supplies the context. This wait is
         // allocated before I/O starts, and remains unarmed until retirement.
-        state.cleanup = unsafe {
-            CreateThreadpoolWait(Some(reclaim), (&raw mut *state).cast(), std::ptr::null())
+        let cleanup = unsafe {
+            CreateThreadpoolWait(
+                Some(reclaim),
+                Arc::as_ptr(&state).cast_mut().cast(),
+                std::ptr::null(),
+            )
         };
-        if state.cleanup == 0 {
+        if cleanup == 0 {
             return Err(io::Error::last_os_error());
         }
+        state.cleanup.set(cleanup).unwrap();
         let watch = Self {
             state: Some(state),
             root: path.to_owned(),
             recursive,
         };
-        watch.arm(&mut watch.state().request.lock().unwrap())?;
+        watch.arm(&watch.state().request.lock().unwrap())?;
         Ok(watch)
     }
 
@@ -134,14 +153,14 @@ impl DirectoryWatch {
         self.state.as_ref().unwrap()
     }
 
-    fn arm(&self, request: &mut Request) -> io::Result<()> {
+    fn arm(&self, request: &Request) -> io::Result<()> {
         // SAFETY: the heap allocation and directory live until completion;
         // only one operation is in flight and the previous one has completed.
         let result = unsafe {
             ok(ResetEvent(self.state().event.as_raw_handle()))?;
             ok(ReadDirectoryChangesW(
                 self.state().directory.as_raw_handle(),
-                request.buffer.as_mut_ptr().cast(),
+                (&raw mut (*request.native.get()).buffer).cast(),
                 16 * 1024,
                 i32::from(self.recursive),
                 FILE_NOTIFY_CHANGE_FILE_NAME
@@ -150,11 +169,11 @@ impl DirectoryWatch {
                     | FILE_NOTIFY_CHANGE_SIZE
                     | FILE_NOTIFY_CHANGE_ATTRIBUTES,
                 std::ptr::null_mut(),
-                &raw mut request.overlapped,
+                request.overlapped(),
                 None,
             ))
         };
-        request.pending = result.is_ok();
+        request.pending.set(result.is_ok());
         result
     }
 
@@ -164,13 +183,13 @@ impl DirectoryWatch {
     }
 
     fn take_before_rearm(&self, before_rearm: impl FnOnce()) -> io::Result<Option<Vec<PathBuf>>> {
-        let mut request = self.state().request.lock().unwrap();
+        let request = self.state().request.lock().unwrap();
         let mut bytes = 0;
         // SAFETY: the request owns all in-flight storage; FALSE never waits.
         let completion = ok(unsafe {
             GetOverlappedResult(
                 self.state().directory.as_raw_handle(),
-                &raw const request.overlapped,
+                request.overlapped(),
                 &raw mut bytes,
                 0,
             )
@@ -180,22 +199,24 @@ impl DirectoryWatch {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
             Err(error) if error.raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR.cast_signed()) => {
-                request.pending = false;
-                self.arm(&mut request)?;
+                request.pending.set(false);
+                self.arm(&request)?;
                 return Ok(None);
             }
             Err(error) => {
-                request.pending = false;
+                request.pending.set(false);
                 return Err(error);
             }
             Ok(()) => {}
         }
-        request.pending = false;
-        let result = self.paths(&request.buffer, bytes as usize);
+        request.pending.set(false);
+        // SAFETY: completion has returned ownership of the buffer; the borrow
+        // ends before rearming. Pending storage is never a Rust reference.
+        let result = unsafe { self.paths(&(*request.native.get()).buffer, bytes as usize) };
         before_rearm();
         // Windows retains changes between requests in the directory handle's
         // kernel buffer. Rearm before delivering this completion to the caller.
-        self.arm(&mut request)?;
+        self.arm(&request)?;
         Ok(result)
     }
 
@@ -242,33 +263,31 @@ impl AsHandle for DirectoryWatch {
 
 impl Drop for DirectoryWatch {
     fn drop(&mut self) {
-        let Some(mut state) = self.state.take() else {
+        let Some(state) = self.state.take() else {
             return;
         };
         let request = state
             .request
-            .get_mut()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !request.pending {
+        if !request.pending.get() {
             return;
         }
         let mut bytes = 0;
-        // SAFETY: exclusive access to this request; cancellation never frees
+        // SAFETY: serialized Rust access; cancellation never frees
         // its storage. FALSE observes completion without waiting on a redirector.
         let pending = unsafe {
-            CancelIoEx(
-                state.directory.as_raw_handle(),
-                &raw const request.overlapped,
-            );
+            CancelIoEx(state.directory.as_raw_handle(), request.overlapped());
             GetOverlappedResult(
                 state.directory.as_raw_handle(),
-                &raw const request.overlapped,
+                request.overlapped(),
                 &raw mut bytes,
                 0,
             ) == 0
                 && io::Error::last_os_error().raw_os_error()
                     == Some(ERROR_IO_INCOMPLETE.cast_signed())
         };
+        drop(request);
         if pending {
             state.retire();
         }
@@ -289,27 +308,25 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let mut watch = DirectoryWatch::new(root.path(), false).unwrap();
-        let mut state = watch.state.take().unwrap();
-        let request = state.request.get_mut().unwrap();
+        let state = watch.state.take().unwrap();
+        let request = state.request.lock().unwrap();
         let mut bytes = 0;
         // SAFETY: join real I/O on this test thread before substituting a
         // controlled, delayed kernel-completion signal on the same event.
         unsafe {
-            CancelIoEx(
-                state.directory.as_raw_handle(),
-                &raw const request.overlapped,
-            );
+            CancelIoEx(state.directory.as_raw_handle(), request.overlapped());
             GetOverlappedResult(
                 state.directory.as_raw_handle(),
-                &raw const request.overlapped,
+                request.overlapped(),
                 &raw mut bytes,
                 1,
             );
             ok(ResetEvent(state.event.as_raw_handle())).unwrap();
         }
+        drop(request);
         let signal = state.event.try_clone().unwrap();
         let (done, reclaimed) = mpsc::channel();
-        state.reclaimed = Some(done);
+        *state.reclaimed.lock().unwrap() = Some(done);
         let runtime: rt::Rt = Arc::new(rt::Threads::new(1));
         let (send, retired) = mpsc::channel();
         runtime.spawn(Box::pin(async move {

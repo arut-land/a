@@ -15,6 +15,9 @@ and buffer until completion. Drop never waits on a redirector. There is no
 cleanup timer or occupied blocking worker. See Microsoft's
 [buffer contract](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw)
 and [one-shot wait contract](https://learn.microsoft.com/en-us/windows/win32/api/threadpoolapiset/nf-threadpoolapiset-setthreadpoolwait).
+The pending storage is shared through Arc and UnsafeCell: Rust never creates
+an exclusive borrow of a live request or freezes memory the kernel can write.
+Only a completed buffer is borrowed for parsing.
 
 WatchEvent carries changes, overflow, rescan requests and unavailable
 subscriptions. Uncertainty invalidates all roots, including events without
