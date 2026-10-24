@@ -2,8 +2,9 @@
 
 The experiment compares one disabled mechanism with the full runtime policy on
 the same hosted runner. Its purpose is to separate startup, resident-code and
-allocation costs from changes in the active driver path. Runtime policy decisions
-remain pending until the measurements complete.
+allocation costs from changes in the active driver path. A mechanism stays only
+when it is neutral or better on memory, CPU and latency, or when it fixes a
+named native or reliability problem at a cost stated below.
 
 ## Method
 
@@ -168,17 +169,38 @@ pending. This does not add another public runtime interface.
 
 ## Decisions
 
-Windows and macOS storage lookups are removed. Its enabled-minus-disabled idle cost is
-55.4 KiB [31.6, 80.2] on x86_64 and 18.2 KiB [10.0, 26.8] on aarch64
-(20 paired rounds, bootstrap 95% intervals). It changes neither target's selected
-pool widths; ARM reports unknown media even with the query. The unadjusted x86_64 cold-reply delta is 1.88% [0.91, 2.95], while the
-same-source control is 2.43% [0.68, 4.46]; no cold-latency benefit is attributed
-to removing the query. The RSS cost has no qualified slow-disk benefit.
-The Intel Mac IOKit lookup adds 56.0 KiB [43.0, 68.4] at three seconds and
-63.8 KiB [50.8, 76.2] after worker retirement. Its disabled medium is unknown;
-the hosted solid-state lookup does not change selected worker limits. Linux
-retains its sysfs flag as an unqualified heuristic pending slow-disk measurements.
-The remaining decisions await the complete comparisons and same-build controls.
+Deltas are enabled-minus-disabled over 20 matched pairs with bootstrap 95%
+intervals; idle RSS in KiB, CPU and latency in percent. Same-source A/A
+controls reach +5.0 KiB [0.8, 9.4] idle RSS on Linux aarch64 and +0.88%
+[0.44, 1.30] driver CPU on Linux x86_64, and a mechanism whose code never runs
+on a target still moved it by up to 13 KiB. Within-run intervals therefore
+understate build-layout variation, and smaller deltas are treated as noise.
+
+| Mechanism | Per-target delta | Decision |
+| --- | --- | --- |
+| Storage-media lookup (sysfs, Windows disk kinds, IOKit) | Windows x86_64 +55.4 [31.6, 80.2], aarch64 +18.2 [10.0, 26.8], Intel macOS +56.0 [43.0, 68.4] KiB; Linux x86_64 +22.2 [−3.0, +51.2] KiB and attach p99 +16.75% [−0.88, +47.15]. No hosted runner selected a different pool width, and no slow-disk benefit is qualified | Drop on every OS |
+| Worker override (rotational storage width, async clamp in `Threads::new`) | No pool width changes on any runner; Linux x86_64 driver CPU +3.14% [2.22, 4.02] against a +0.88% control; Intel macOS large-JSON CPU +3.47% [0.24, 7.06] with idle RSS −14.8 KiB | Drop; `main`'s sizing remains |
+| Maintained `oneshot` 0.2 | Idle RSS Linux aarch64 +31.0 [26.4, 36.0], x86_64 +46.2 [3.0, 91.4], Windows aarch64 +11.6 [6.2, 16.6] KiB; Windows x86_64 large-JSON CPU +3.16% [1.24, 5.00]; Linux aarch64 large-JSON CPU −4.98% | Drop; the shared slot returns with its wake and displaced-waker drop outside the lock |
+| Compact oneshot revision | Idle RSS +18.4 to +39.6 KiB on three targets; Linux aarch64 cold reply +7.08% | Drop |
+| Generic and independent pressure revisions | Linux aarch64 large-JSON CPU about +2.5% and +4.8% relative to the selected implementation, no RSS saving | Drop |
+| Effective CPU discovery (Windows CPU sets and job rate) | Idle RSS +21.0 [14.4, 28.2] aarch64, +22.2 [2.0, 43.8] x86_64 KiB; CPU and cold reply within noise; x86_64 attach p99 −5.75% | Keep: the standard query ignores CPU sets and job hard caps, so a limited process would oversubscribe. Cost: about 21 KiB idle RSS on Windows |
+| Catalog admission | Idle RSS Linux aarch64 +12.8, Windows aarch64 +7.8 KiB, x86_64 within noise; driver CPU Linux aarch64 −1.23%, Windows aarch64 −4.89% | Keep: replay and rebuild share the storage limit and complete with one worker. Cost: up to 13 KiB idle RSS |
+| Scoped QoS (macOS) | Intel macOS idle RSS −39.6 [−59.8, −23.6] KiB, cold reply −9.97% [−24.18, −0.40], CPU within noise | Keep |
+| Pressure reclamation (macOS dispatch source) | Intel macOS idle RSS −6.4 [−21.8, +9.2] KiB, CPU and latency within noise; other targets compile it out and move only by layout noise | Keep: a populated 36 MiB log releases 74 MiB RSS on Intel macOS 15 and 72–129 MiB of live allocator bytes on Apple silicon |
+| Displaced receiver waker dropped outside the queue lock | Inside the assembled comparison; 10,000 Windows resumes without the pre-existing timeout | Keep: reliability, `consumer_wakes_and_discarded_values_never_run_under_the_queue_lock` |
+| Worker-lifetime QoS revision | No completed lane | Not adopted |
+
+`cancellation_allows_a_waker_to_poll_its_receiver` deadlocks with the shared
+slot as it was on `main` and passes once the waker runs after unlocking. That
+change costs nothing measurable: the oneshot variant above already measures
+the shared slot's code.
+
+The 5-round CPU regressions that started this attribution do not reproduce
+with 20 matched rounds: driver CPU is −2.88% [−8.72, +3.65] on Intel macOS
+and +0.27% [−4.35, +5.08] on Windows x86_64 for the full branch against
+`main`. Its idle RSS cost does reproduce, +124.2 KiB [101.6, 145.8] and
++86.2 KiB [62.0, 108.6]; storage lookup, the maintained oneshot and Windows CPU
+discovery account for most of it.
 
 ## Incomplete runs
 

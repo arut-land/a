@@ -1,38 +1,166 @@
 [
   {
-    "mechanism": "composed-vs-main",
+    "mechanism": "composed-setup-probe",
     "branch": "codex-w5rt",
     "sha": "2937e0489d3a0ac9cdd9403ee9ad4f5987ff3b42",
     "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
     "enabled_role": "candidate",
     "target": "ubuntu-latest",
-    "run_id": 40077749363
+    "run_id": 40077749363,
+    "superseded_reason": "Workflow retained the deleted runtime-facts copy entry; no build or timing took place."
   },
   {
-    "mechanism": "composed-vs-main",
+    "mechanism": "composed-setup-probe",
     "branch": "codex-w5rt",
     "sha": "2937e0489d3a0ac9cdd9403ee9ad4f5987ff3b42",
     "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
     "enabled_role": "candidate",
     "target": "ubuntu-24.04-arm",
-    "run_id": 40077751505
+    "run_id": 40077751505,
+    "superseded_reason": "Workflow retained the deleted runtime-facts copy entry; no build or timing took place."
   },
   {
-    "mechanism": "composed-vs-main",
+    "mechanism": "composed-setup-probe",
     "branch": "codex-w5rt",
     "sha": "2937e0489d3a0ac9cdd9403ee9ad4f5987ff3b42",
     "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
     "enabled_role": "candidate",
     "target": "windows-latest",
-    "run_id": 40077753563
+    "run_id": 40077753563,
+    "superseded_reason": "Workflow retained the deleted runtime-facts copy entry; no build or timing took place."
   },
   {
-    "mechanism": "composed-vs-main",
+    "mechanism": "composed-setup-probe",
     "branch": "codex-w5rt",
     "sha": "2937e0489d3a0ac9cdd9403ee9ad4f5987ff3b42",
     "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
     "enabled_role": "candidate",
     "target": "windows-11-arm",
-    "run_id": 40077755504
+    "run_id": 40077755504,
+    "superseded_reason": "Workflow retained the deleted runtime-facts copy entry; no build or timing took place."
+  },
+  {
+    "mechanism": "composed-superseded",
+    "branch": "codex-w5rt",
+    "sha": "2937e0489d3a0ac9cdd9403ee9ad4f5987ff3b42",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "ubuntu-latest",
+    "run_id": 40078141035,
+    "superseded_reason": "Measures the composition before the oneshot, storage and worker-override drops."
+  },
+  {
+    "mechanism": "composed-build-failure",
+    "branch": "codex-w5rt",
+    "sha": "5b80bcb12dfab5afb6a567ba97e18ffc5f3a3fdf",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "ubuntu-latest",
+    "run_id": 40080844769,
+    "superseded_reason": "The engine still called the removed Config::for_path; no timing took place."
+  },
+  {
+    "mechanism": "composed-build-failure",
+    "branch": "codex-w5rt",
+    "sha": "5b80bcb12dfab5afb6a567ba97e18ffc5f3a3fdf",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "ubuntu-24.04-arm",
+    "run_id": 40080846811,
+    "superseded_reason": "The engine still called the removed Config::for_path; no timing took place."
+  },
+  {
+    "mechanism": "composed-build-failure",
+    "branch": "codex-w5rt",
+    "sha": "5b80bcb12dfab5afb6a567ba97e18ffc5f3a3fdf",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "windows-latest",
+    "run_id": 40080849075,
+    "superseded_reason": "The engine still called the removed Config::for_path; no timing took place."
+  },
+  {
+    "mechanism": "composed-build-failure",
+    "branch": "codex-w5rt",
+    "sha": "5b80bcb12dfab5afb6a567ba97e18ffc5f3a3fdf",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "windows-11-arm",
+    "run_id": 40080851286,
+    "superseded_reason": "The engine still called the removed Config::for_path; no timing took place."
+  },
+  {
+    "mechanism": "composed-build-failure",
+    "branch": "codex-w5rt",
+    "sha": "5b80bcb12dfab5afb6a567ba97e18ffc5f3a3fdf",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "macos-15-intel",
+    "run_id": 40080853664,
+    "superseded_reason": "The engine still called the removed Config::for_path; no timing took place."
+  },
+  {
+    "mechanism": "composed-build-failure",
+    "branch": "codex-w5rt",
+    "sha": "5b80bcb12dfab5afb6a567ba97e18ffc5f3a3fdf",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "macos-latest",
+    "run_id": 40080855808,
+    "superseded_reason": "The engine still called the removed Config::for_path; no timing took place."
+  },
+  {
+    "mechanism": "composed-vs-main",
+    "branch": "codex-w5rt",
+    "sha": "442f8f69a8b129106839c7f58954a6d8fd2909e0",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "ubuntu-latest",
+    "run_id": 40081074776
+  },
+  {
+    "mechanism": "composed-vs-main",
+    "branch": "codex-w5rt",
+    "sha": "442f8f69a8b129106839c7f58954a6d8fd2909e0",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "ubuntu-24.04-arm",
+    "run_id": 40081076734
+  },
+  {
+    "mechanism": "composed-vs-main",
+    "branch": "codex-w5rt",
+    "sha": "442f8f69a8b129106839c7f58954a6d8fd2909e0",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "windows-latest",
+    "run_id": 40081078811
+  },
+  {
+    "mechanism": "composed-vs-main",
+    "branch": "codex-w5rt",
+    "sha": "442f8f69a8b129106839c7f58954a6d8fd2909e0",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "windows-11-arm",
+    "run_id": 40081080984
+  },
+  {
+    "mechanism": "composed-vs-main",
+    "branch": "codex-w5rt",
+    "sha": "442f8f69a8b129106839c7f58954a6d8fd2909e0",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "macos-15-intel",
+    "run_id": 40081083278
+  },
+  {
+    "mechanism": "composed-vs-main",
+    "branch": "codex-w5rt",
+    "sha": "442f8f69a8b129106839c7f58954a6d8fd2909e0",
+    "reference": "8a0388a7c06e18d59025dfe969c52ba85a0ba43a",
+    "enabled_role": "candidate",
+    "target": "macos-latest",
+    "run_id": 40081085297
   }
 ]
