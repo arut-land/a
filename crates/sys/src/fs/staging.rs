@@ -381,11 +381,11 @@ pub(super) fn rename(file: &File, parent: &File, to: &OsStr, replacing: bool) ->
         .map_err(|_| io::ErrorKind::InvalidInput)?;
     let mut buffer = vec![0u64; bytes.max(size_of::<FILE_RENAME_INFO>()).div_ceil(8)];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // SAFETY: aligned storage covers the header and UTF-16 tail. Both directory
-    // and source handles stay owned throughout this synchronous atomic rename.
     let mut status = IO_STATUS_BLOCK::default();
     // The Win32 wrapper expands relative names before honoring RootDirectory.
     // The native FileRenameInfoEx operation keeps both namespace anchors owned.
+    // SAFETY: aligned storage covers the header and UTF-16 tail. Both directory
+    // and source handles stay owned throughout this synchronous atomic rename.
     let result = unsafe {
         (*info).Anonymous.Flags = 0x2 | u32::from(replacing); // POSIX_SEMANTICS | REPLACE_IF_EXISTS
         (*info).RootDirectory = parent.as_raw_handle();
