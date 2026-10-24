@@ -58,7 +58,8 @@ backend's private runtime directory, so arbitrarily long isolated roots work;
 its discovery record stays under the isolated root. No native directory is
 created for isolated storage. Tests stop only their own isolated daemon.
 
-Daemon startup creates the resolved temporary directory privately. Launch passes
+Daemon startup creates the resolved temporary directory privately before
+registering extensions. Launch passes
 it as `TMPDIR`, and as `TMP` and `TEMP` on Windows. Cached shell facts use that
 same directory, including foreground starts; tool environments override attaching
 clients' temporary-directory values with it.

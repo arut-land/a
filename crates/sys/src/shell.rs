@@ -154,7 +154,6 @@ mod tests {
                         .as_nanos()
                 ));
                 let paths = crate::Paths::from(root.clone());
-                paths.prepare_temporary_dir().unwrap();
                 let mut command = child();
                 paths.daemon_env(&mut command);
                 let status = command.env(STAGE, "daemon").status().unwrap();

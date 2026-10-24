@@ -1191,7 +1191,6 @@ pub fn serve(
     build: &str,
     start: Start,
 ) -> io::Result<()> {
-    sys::shell::ExecutionFacts::initialize(home)?;
     let runtime = Arc::new(rt::Threads::default());
     let result = run(listener, home, config, build, start, &runtime);
     if let Err(error) = &result {
@@ -1265,6 +1264,7 @@ fn run(
         sys::Signal::Interrupt,
         sys::Signal::Hangup,
     ])?;
+    sys::shell::ExecutionFacts::initialize(home)?;
     let daemon = Daemon::load_on(home, &config, runtime)?;
     let signals = rt::Async::for_reading(&daemon.shared.rt.reactor(), signals)?;
     let signalled = async {
