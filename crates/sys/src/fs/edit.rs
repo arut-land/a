@@ -310,6 +310,8 @@ impl EditTransaction {
                 io::ErrorKind::ResourceBusy => EditError::Conflict(EditConflict::Changed),
                 _ => self.revalidate().err().unwrap_or(EditError::Io(error)),
             })?;
+        #[cfg(test)]
+        publication_step("staged");
         staged.file.rewind()?;
         for chunk in bytes.chunks(65536) {
             check_cancel(should_cancel, copied)?;
@@ -317,6 +319,8 @@ impl EditTransaction {
             copied += chunk.len() as u64;
         }
         staged.file.set_len(bytes.len() as u64)?;
+        #[cfg(test)]
+        publication_step("written");
         check_cancel(should_cancel, copied)?;
         if let Some((source, _)) = &self.source {
             #[cfg(target_vendor = "apple")]
@@ -339,11 +343,17 @@ impl EditTransaction {
             )?;
             preserve_metadata(source, &staged.file)?;
         }
+        #[cfg(test)]
+        publication_step("metadata");
         if durable {
             staged.file.sync_all()?;
         }
+        #[cfg(test)]
+        publication_step("file_sync");
         self.revalidate()?;
         check_cancel(should_cancel, copied)?;
+        #[cfg(test)]
+        publication_step("final_check");
         before_commit();
         let protection = self.commit(
             &mut staged,
@@ -361,6 +371,12 @@ impl EditTransaction {
         } else {
             Durability::NotRequested
         };
+        #[cfg(test)]
+        publication_step("parent_sync");
+        #[cfg(test)]
+        drop(staged);
+        #[cfg(test)]
+        publication_step("cleanup");
         Ok(EditReceipt {
             visible: true,
             durability,
@@ -379,6 +395,8 @@ impl EditTransaction {
         before_rollback: impl FnOnce(),
     ) -> Result<PublicationProtection, EditError> {
         cancel()?;
+        #[cfg(test)]
+        publication_step("before_replace");
         #[cfg(windows)]
         let _ = (bytes, exchange);
         #[cfg(unix)]
@@ -395,12 +413,16 @@ impl EditTransaction {
             })?
         {
             after_exchange();
+            #[cfg(test)]
+            publication_step("after_replace");
             let checked = staged
                 .displaced()
                 .map_err(EditError::from)
                 .and_then(|mut displaced| {
                     self.verify_displaced(&mut displaced, &staged.file, before)
                 });
+            #[cfg(test)]
+            publication_step("displaced_checked");
             if checked.is_err() {
                 // Once visible, even our inode may contain someone else's metadata.
                 // Retain every displaced version instead of deleting on rollback.
@@ -412,7 +434,11 @@ impl EditTransaction {
                         && check_bytes(&mut current, bytes).is_ok()
                 }) {
                     before_rollback();
+                    #[cfg(test)]
+                    publication_step("before_rollback");
                     let _ = staged.exchange(&self.name);
+                    #[cfg(test)]
+                    publication_step("after_rollback");
                 }
                 return Err(EditError::Conflict(EditConflict::Recovery(recovery)));
             }
@@ -472,6 +498,8 @@ impl EditTransaction {
             }
         })?;
         after_move();
+        #[cfg(test)]
+        publication_step("after_replace");
         let checked = staged
             .original()
             .map_err(EditError::from)
@@ -3406,5 +3434,21 @@ mod tests {
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         );
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod termination;
+
+#[cfg(test)]
+fn publication_step(step: &str) {
+    if std::env::var_os("A_EDIT_PUBLICATION_ROOT").is_some()
+        && std::env::var("A_EDIT_PUBLICATION_STEP").is_ok_and(|wanted| wanted == step)
+    {
+        println!("EDIT_AT:{step}");
+        io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
     }
 }
