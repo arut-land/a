@@ -284,15 +284,11 @@ impl Cx {
         self.host.progress(text);
     }
 
-    /// Side model requests on behalf of this call: see [`Models`](crate::Models).
-    pub fn models(&self) -> Option<&dyn crate::Models> {
-        self.service::<dyn crate::Models>()
-            .or_else(|| self.host.models())
-    }
-
-    pub fn sessions(&self) -> Option<&dyn crate::Sessions> {
-        self.service::<dyn crate::Sessions>()
-            .or_else(|| self.host.sessions())
+    /// The engine's side of this call's [`Conversation`](crate::Conversation)s.
+    #[doc(hidden)]
+    pub fn conversations(&self) -> Option<&dyn crate::Conversations> {
+        self.service::<dyn crate::Conversations>()
+            .or_else(|| self.host.conversations())
     }
 
     /// Service `S`, if an extension or the engine provides it.

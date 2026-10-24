@@ -2574,14 +2574,11 @@ fn calls_share_transport_pools_but_not_origin_authority() {
     session.cancelled(old.call);
     assert!(!old_origin.current(&session));
     assert!(current_origin.current(&session));
-    let side = ext::ModelTurn::new::<ext::ModelOnly>(
-        ext::ThreadKey::new::<Agents>("authority", ext::OwnerScope::Call(old.call)),
-        ext::TurnKey("initial".into()),
-        ext::ModelRole::Session,
-        ext::SideContext::None,
-        llm::Messages::default(),
-    );
-    assert!(rt::block_on(old.models().unwrap().call(&current, side)).is_err());
+    let side = ext::Conversation::turn::<Agents>("authority", "")
+        .per_call()
+        .key("initial")
+        .request(old.call);
+    assert!(rt::block_on(old.conversations().unwrap().turn(&current, side)).is_err());
     std::fs::remove_file(home).unwrap();
 }
 

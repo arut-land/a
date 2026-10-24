@@ -1559,19 +1559,17 @@ fn admitted_calls_never_resolve_services_from_a_newer_registry() {
     .into_iter()
     .enumerate()
     {
-        let side = ext::ModelTurn::new::<ext::ModelOnly>(
-            ext::ThreadKey::new::<Routes>(
-                &format!("route-{index}"),
-                ext::OwnerScope::Call(cx.call),
-            ),
-            ext::TurnKey("initial".into()),
-            role,
-            ext::SideContext::None,
-            llm::Messages::default(),
-        );
-        let error = rt::block_on(first(cx.models().unwrap().call(&cx, side), &mut h.actor))
-            .unwrap()
-            .unwrap_err();
+        let side = ext::Conversation::turn::<Routes>(&format!("route-{index}"), "")
+            .per_call()
+            .key("initial")
+            .role(role)
+            .request(cx.call);
+        let error = rt::block_on(first(
+            cx.conversations().unwrap().turn(&cx, side),
+            &mut h.actor,
+        ))
+        .unwrap()
+        .unwrap_err();
         assert!(error.to_string().contains("admitted"), "{error}");
     }
     h.finish();

@@ -39,8 +39,9 @@ pub mod point;
 pub mod schema;
 mod service;
 pub use conversation::{
-    Awaited, ContextPolicy, ContextSource, ConversationHandle, DepthBudget, Detached,
-    ModelOnlyKind, Runner, SendMessage, Spawn, SpawnRefusal,
+    Background, Context, ContextPolicy, Conversation, ConversationHandle, Conversations,
+    DepthBudget, Ephemeral, ModelTurn, OwnerScope, Persisted, Placement, Runner, SendMessage,
+    SideIdentity, Spawn, SpawnRefusal, Storage, Task, ThreadKey, Turn, TurnKey,
 };
 mod settings;
 pub mod shape;
@@ -65,10 +66,9 @@ pub use point::{
 pub use protocol::{Annotation, AnnotationLifetime, ExtensionFact};
 pub use schema::Schema;
 pub use service::{
-    Background, Budget, CwdOf, InboxAccess, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec,
-    ModelTurn, Models, OwnedProcess, OwnerScope, ProcessLease, ProcessOutput, ProcessPipe,
-    ProcessSignal, Processes, RunningProcess, Sessions, SideContext, SideIdentity, SideProvider,
-    SideRetry, SpawnError, ThreadKey, TurnKey,
+    Budget, CwdOf, InboxAccess, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec, OwnedProcess,
+    ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes, RunningProcess,
+    SideProvider, SideRetry, SpawnError,
 };
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};
