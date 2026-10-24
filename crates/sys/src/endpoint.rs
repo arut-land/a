@@ -93,7 +93,12 @@ impl Listener {
 
     #[cfg(unix)]
     pub(crate) fn activated(file: std::fs::File, home: &Home) -> io::Result<Self> {
-        imp::activated(file, &home.run_dir().join("daemon.endpoint")).map(Self)
+        imp::activated(
+            file,
+            &home.socket_link(),
+            &home.run_dir().join("daemon.endpoint"),
+        )
+        .map(Self)
     }
 
     /// Adopts the listener and claim our parent bound and passed down.
@@ -449,19 +454,24 @@ mod imp {
             Err(error) => return Err(error),
         }
         let listener = UnixListener::bind(&socket)?;
-        crate::fs::write_private(discovery, socket.as_os_str().as_encoded_bytes())?;
-        if fs::read_link(link).ok().as_deref() != Some(socket.as_path()) {
-            let _ = fs::remove_file(link);
-            // Only a convenience: a home on a filesystem without symlinks
-            // still works.
-            let _ = std::os::unix::fs::symlink(&socket, link);
-        }
+        publish(&socket, link, discovery)?;
         Ok(Listener {
             socket: listener,
             claim,
             retirement_taken: std::sync::atomic::AtomicBool::new(false),
             managed: false,
         })
+    }
+
+    fn publish(socket: &Path, link: &Path, discovery: &Path) -> io::Result<()> {
+        crate::fs::write_private(discovery, socket.as_os_str().as_encoded_bytes())?;
+        if fs::read_link(link).ok().as_deref() != Some(socket) {
+            let _ = fs::remove_file(link);
+            // Only a convenience: a home on a filesystem without symlinks
+            // still works.
+            let _ = std::os::unix::fs::symlink(socket, link);
+        }
+        Ok(())
     }
 
     /// A connection the daemon writes to without blocking: its send buffer
@@ -536,7 +546,7 @@ mod imp {
         })
     }
 
-    pub fn activated(file: fs::File, discovery: &Path) -> io::Result<Listener> {
+    pub fn activated(file: fs::File, link: &Path, discovery: &Path) -> io::Result<Listener> {
         crate::fs::private_dir(discovery.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
         let claim = claim(discovery)?;
         let fd = OwnedFd::from(file);
@@ -563,7 +573,7 @@ mod imp {
         // Darwin caches server credentials at listen: refresh launchd's
         // credentials to ours before publishing discovery to clients.
         rustix::net::listen(&socket, 128)?;
-        crate::fs::write_private(discovery, path.as_os_str().as_encoded_bytes())?;
+        publish(path, link, discovery)?;
         Ok(Listener {
             socket,
             claim,
@@ -780,22 +790,27 @@ mod tests {
         let home = home("activation-retirement");
         std::fs::create_dir_all(home.root()).unwrap();
         let parent = home.bind().unwrap();
-        let duplicate = || std::fs::File::from(parent.as_fd().try_clone_to_owned().unwrap());
+        let old_path = home.endpoint().path().to_owned();
+        let managed_path = old_path.with_extension("managed.sock");
+        let resource = std::os::unix::net::UnixListener::bind(&managed_path).unwrap();
+        let duplicate = || std::fs::File::from(resource.as_fd().try_clone_to_owned().unwrap());
         let descriptor = duplicate();
         let manager = duplicate();
-        std::fs::set_permissions(
-            home.endpoint().path(),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
+        std::fs::set_permissions(&managed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(
             super::Listener::activated(duplicate(), &home).is_err(),
             "a live home claim excludes managed writers too"
         );
-        drop(parent);
+        drop((parent, resource));
+        std::fs::remove_file(old_path).unwrap();
         std::fs::write(crate::activation::record(&home), "test").unwrap();
         let listener = super::Listener::activated(descriptor, &home).unwrap();
         let endpoint = home.endpoint();
+        assert_eq!(endpoint.path(), managed_path);
+        assert_eq!(
+            std::fs::read_link(home.socket_link()).unwrap(),
+            managed_path
+        );
         let identity = std::fs::metadata(endpoint.path()).unwrap().ino();
         assert!(
             rustix::io::fcntl_getfd(&listener)
