@@ -192,7 +192,20 @@ mod backend {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn probe_provider() -> String {
+        format!("{:?}", PROVIDER.id())
+    }
+
+    #[cfg(test)]
+    pub(super) fn probe_enabled() -> bool {
+        PROVIDER.enabled(tracelogging::Level::Informational, 0)
+    }
 }
+
+#[cfg(test)]
+mod measure;
 
 #[cfg(test)]
 mod tests {

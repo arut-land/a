@@ -1,0 +1,59 @@
+name: native diagnostics probe
+on:
+  push:
+    branches: [codex-w7diag]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-diagnostics-probe-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_BUILD_JOBS: 2
+  MISE_AUTO_INSTALL: false
+  CARGO_TERM_COLOR: always
+jobs:
+  collector:
+    name: collector (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Prove the replacement invariant catches the original failure
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p probe
+          git show 4ce7dc0d4d0369c86a26bbd8505fb17096bcde37:crates/sys/src/log/native.rs > crates/sys/src/log/native.rs
+          set +e
+          cargo test -p sys --lib log::native::backend::tests::journal_delivery_resumes_after_endpoint_replacement -- --exact > probe/original.log 2>&1
+          status=$?
+          set -e
+          git restore --source=HEAD -- crates/sys/src/log/native.rs
+          test "$status" -eq 101
+          rg 'journal_delivery_resumes_after_endpoint_replacement.*FAILED' probe/original.log
+          rg 'kind: WouldBlock' probe/original.log
+      - name: Verify replacement and full-queue behavior
+        if: runner.os == 'Linux'
+        run: cargo test -p sys --lib journal_delivery_
+      - name: Measure calls with a native collector and verify every record
+        run: python scripts/perf/native-diagnostics.py --output probe
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: native-collector-${{ matrix.os }}
+          path: probe
