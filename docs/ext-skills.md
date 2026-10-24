@@ -6,6 +6,9 @@ Put each skill in `$A_HOME/skills/<directory>/SKILL.md` or the workspace's
 `.a/skills/<directory>/SKILL.md`. The frontmatter name is its identity and
 command name. Workspace definitions override home definitions. Discovery is
 one directory deep, sorted by path; duplicate names within one root are errors.
+Discovery reads bounded frontmatter to resolve identities and precedence before
+capturing winning sources. Changes to a shadowed body cannot delay a settled
+workspace definition.
 A skill cannot replace an installed callable, including `skill` itself, or
 a client-owned command such as `/help` or `/new`. The CLI supplies that reserved
 namespace from the shared client command table.
@@ -61,7 +64,13 @@ replaying the recorded conversation.
 
 ## Generations
 
-Preparation snapshots UTF-8 skill files off the async worker. Bodies are held
+Preparation captures raw skill bytes off the async worker. Discovery reads
+only tentative names in priority order; invalid descriptions, other metadata
+and bodies in losing files cannot reject or delay a winner. Winning files
+and unidentifiable prefixes undergo native stability checks. Malformed
+observations remain snapshot inputs until the shared debounce and
+re-observation establish a stable rejection. Changed observations retry
+without requiring another filesystem callback. Bodies are held
 in the immutable generation to prevent a tool midway through a turn from
 reading a newer edit; they enter model context only on demand. Filesystem events
 prepare new candidates. There is no scan on a session burst or generation read.

@@ -46,6 +46,19 @@ impl Flag {
         })
     }
 
+    /// Cancellation drops the operation, including any registered timer.
+    pub async fn until<T>(&self, future: impl Future<Output = T>) -> Option<T> {
+        let mut future = std::pin::pin!(future);
+        let mut cancelled = std::pin::pin!(self.wait());
+        poll_fn(|cx| {
+            if cancelled.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            future.as_mut().poll(cx).map(Some)
+        })
+        .await
+    }
+
     fn waiting(&self) -> std::sync::MutexGuard<'_, Vec<Waker>> {
         self.0
             .waiting

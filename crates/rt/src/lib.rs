@@ -88,7 +88,7 @@ pub trait Runtime: Send + Sync + 'static {
 #[cfg(feature = "watch")]
 mod watch;
 #[cfg(feature = "watch")]
-pub use watch::Watcher;
+pub use watch::{WatchEvent, Watcher};
 
 /// A shared handle to the runtime a component was given.
 pub type Rt = Arc<dyn Runtime>;

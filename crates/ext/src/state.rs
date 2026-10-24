@@ -166,12 +166,14 @@ impl Held {
 #[derive(Default)]
 pub struct States {
     held: Vec<Held>,
+    retained: Vec<Image>,
     publications: protocol::publication::Publications,
 }
 
 impl States {
     pub(crate) fn new(decls: impl IntoIterator<Item = (Name, Decl)>) -> Self {
         Self {
+            retained: Vec::new(),
             publications: protocol::publication::Publications::default(),
             held: decls
                 .into_iter()
@@ -183,6 +185,25 @@ impl States {
                 })
                 .collect(),
         }
+    }
+
+    /// Missing registrations retain only their serialized value, never an old
+    /// reducer or VM. Registered values must already be rebuilt from the log
+    /// and a matching checkpoint; retained images never override replay.
+    pub fn adopt(&mut self, live: &Self) -> Result<(), String> {
+        self.validate(live)?;
+        self.retained = live
+            .retained
+            .iter()
+            .filter(|image| !self.registered(&image.ext, &image.state))
+            .cloned()
+            .collect();
+        for held in &live.held {
+            if !self.registered(&held.ext, &held.decl.name) {
+                self.retained.push(held.image()?);
+            }
+        }
+        Ok(())
     }
 
     /// Only declared settings of registrations present in the child travel.
@@ -322,7 +343,13 @@ impl States {
                 .iter()
                 .find(|h| h.ext == held.ext && h.decl.name == held.decl.name);
             for (seq, error) in &held.rejected {
-                if !previous.is_some_and(|h| h.rejected.contains_key(seq)) {
+                let previously_rejected = previous.is_some_and(|h| h.rejected.contains_key(seq))
+                    || live.retained.iter().any(|image| {
+                        image.ext == *held.ext
+                            && image.state == *held.decl.name
+                            && image.rejected.contains_key(seq)
+                    });
+                if !previously_rejected {
                     return Err(error.clone());
                 }
             }
@@ -341,25 +368,28 @@ impl States {
     /// its name: what a snapshot keeps. A state that cannot be encoded
     /// fails the lot: a snapshot is whole or not taken.
     pub fn image(&self) -> Result<Checkpoint, String> {
-        let folds = self
+        let mut folds: Vec<Image> = self
             .held
             .iter()
             .map(Held::image)
             .collect::<Result<_, _>>()?;
+        folds.extend(self.retained.iter().cloned());
         Ok(Checkpoint {
             folds,
             publications: self.publications.clone(),
         })
     }
 
-    /// The states as `images` left them: exactly one image per registered
-    /// state. One missing, extra, or with an image its state
-    /// cannot read fails the lot, the states left as they were: the
-    /// snapshot is of another build, and the log is folded instead.
+    /// Restore registered values and retain images of absent folds. Missing,
+    /// duplicate or unreadable registered images reject the whole checkpoint.
     pub fn restore(&mut self, checkpoint: &Checkpoint) -> Result<(), String> {
         let images = &checkpoint.folds;
-        if images.len() != self.held.len() {
-            return Err("checkpoint fold coverage differs".into());
+        let identities: std::collections::BTreeSet<_> = images
+            .iter()
+            .map(|image| (&image.ext, &image.state))
+            .collect();
+        if identities.len() != images.len() {
+            return Err("duplicate checkpoint fold".into());
         }
         let restored = (self.held.iter())
             .map(|h| {
@@ -377,6 +407,11 @@ impl States {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
+        self.retained = images
+            .iter()
+            .filter(|image| !self.registered(&image.ext, &image.state))
+            .cloned()
+            .collect();
         self.publications = checkpoint.publications.clone();
         for (held, (value, rejected)) in self.held.iter_mut().zip(restored) {
             held.value = value;
@@ -513,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn a_checkpoint_covers_exactly_the_registered_folds() {
+    fn a_checkpoint_requires_registered_folds_and_retains_absent_ones() {
         let mut states = States::new([(Name::from("counter"), Decl::of::<Count>())]);
         states.fold("counter", "count", &Json::encode(&2).unwrap());
         assert!(states.restore(&Checkpoint::default()).is_err());
@@ -524,8 +559,38 @@ mod tests {
             image: Json::default(),
             rejected: BTreeMap::new(),
         });
-        assert!(states.restore(&extra).is_err());
+        states.restore(&extra).unwrap();
+        assert_eq!(states.image().unwrap(), extra);
         assert_eq!(states.get::<Count>().unwrap().0, 2);
+    }
+
+    #[test]
+    fn an_omitted_fold_reattaches_its_value_after_an_empty_generation_and_checkpoint() {
+        let make = || States::new([(Name::from("counter"), Decl::of::<Count>())]);
+        let log = [Entry::new(
+            Seq::new(1).unwrap(),
+            protocol::Epoch::default(),
+            Body::Ext {
+                ext: "counter".into(),
+                state: "count".into(),
+                data: Json::encode(&42).unwrap(),
+            },
+        )];
+        let mut live = make();
+        live.replay(&log);
+        let mut absent = States::default();
+        absent.adopt(&live).unwrap();
+        assert!(!absent.registered("counter", "count"));
+        let mut restored_absent = States::default();
+        restored_absent.restore(&absent.image().unwrap()).unwrap();
+        restored_absent.adopt(&absent).unwrap();
+        let mut returned = make();
+        returned.replay(&log);
+        returned.adopt(&restored_absent).unwrap();
+        assert_eq!(returned.get::<Count>().unwrap().0, 42);
+        returned.fold("counter", "count", &Json::encode(&1).unwrap());
+        assert_eq!(returned.get::<Count>().unwrap().0, 43);
+        assert_eq!(returned.image().unwrap().folds.len(), 1);
     }
 
     #[test]

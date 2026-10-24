@@ -715,17 +715,121 @@ fn generation_adoption_rearms_deferred_sync_for_later_mutations() {
 }
 
 #[test]
-fn a_restored_fold_replays_changes_missing_from_the_checkpoint() {
+fn a_generation_omitting_a_fold_retains_its_value_through_a_checkpoint() {
     let mut h = ManualSession::with_registry(reload_registry(1, 1, false));
     let _ack = h.note();
+    let _second = h.note();
     h.complete();
     h.snapshot();
     h.replace(Registry::default().with(&Agents).unwrap());
     h.snapshot();
+    let states = h.session.session.state_view();
+    assert!(!lock(&states).registered("test", "value"));
+    let image = lock(&states).image().unwrap();
+    assert_eq!(
+        image
+            .folds
+            .iter()
+            .find(|f| f.ext == "test" && f.state == "value")
+            .unwrap()
+            .image
+            .parse::<u64>()
+            .unwrap(),
+        2
+    );
+    h.replace(reload_registry(2, 1, true));
+    h.request("reject incompatible replay");
+    assert!(!lock(&h.session.session.state_view()).registered("test", "value"));
     h.replace(reload_registry(1, 1, false));
     h.request("adopt");
     h.assert_replay(&reload_registry(1, 1, false));
     h.finish();
+}
+
+#[test]
+fn an_omitted_fold_with_a_changed_reducer_matches_restart() {
+    reattached_fold_matches_restart(2, false);
+}
+
+#[test]
+fn events_logged_during_fold_absence_match_restart_after_reattachment() {
+    reattached_fold_matches_restart(1, true);
+}
+
+fn reattached_fold_matches_restart(multiplier: u64, absent_event: bool) {
+    for checkpoint_after_return in [false, true] {
+        let mut h = ManualSession::with_registry(reload_registry(1, 1, false));
+        let _first = h.note();
+        let _second = h.note();
+        h.complete();
+        h.request("rest");
+        assert_eq!(h.value(), 2);
+        let (started, starts) = channel::unbounded();
+        h.replace(
+            Registry::default()
+                .with(&Agents)
+                .unwrap()
+                .with(&ControlledSleep(Arc::new(started), false))
+                .unwrap(),
+        );
+        h.request("sleep 0");
+        let release = rt::block_on(starts.recv()).unwrap();
+        let call = log_of(&h.session)
+            .iter()
+            .rev()
+            .find(|e| matches!(e.body, Body::ToolCall { .. }))
+            .unwrap()
+            .seq;
+        assert!(!lock(&h.session.session.state_view()).registered("test", "value"));
+        if absent_event {
+            h.session.send(Msg::Step(Event::Note {
+                call: CallId(call),
+                note: Note::State {
+                    ext: "test".into(),
+                    state: "value".into(),
+                    data: Json::encode(&"during absence").unwrap(),
+                },
+            }));
+            h.poll();
+        }
+        h.session.send(Msg::Step(Event::ToolDone {
+            call: CallId(call),
+            outcome: Outcome::Done {
+                output: Json::default(),
+            },
+            card: None,
+        }));
+        release.send(());
+        h.snapshot();
+        let registry = reload_registry(if multiplier == 1 { 1 } else { 2 }, multiplier, false);
+        h.replace(registry.clone());
+        h.request("reattach");
+        let expected = (2 + u64::from(absent_event)) * multiplier;
+        assert_eq!(h.value(), expected);
+        h.assert_replay(&registry);
+        if checkpoint_after_return {
+            h.snapshot();
+        }
+        let shared = Arc::clone(&h.session.session.shared);
+        let binding = bind(&Arc::new(registry.clone()), &h.session.session) as Arc<dyn Binding>;
+        let header = Header {
+            id: h.session.id,
+            workspace: h.session.workspace.clone(),
+            parent: None,
+        };
+        h.finish();
+        let (_, recovered) =
+            Folding::open(&header, &shared, Open::Load, &binding, &registry).unwrap();
+        assert_eq!(
+            recovered
+                .states
+                .erased("test", "value")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap(),
+            expected
+        );
+    }
 }
 
 #[test]
