@@ -1,0 +1,32 @@
+name: native diagnostics spare
+on:
+  push:
+    branches: [codex-w7diag]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-diagnostics-spare-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_BUILD_JOBS: 2
+  MISE_AUTO_INSTALL: false
+jobs:
+  collector:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Measure calls with a native collector and verify every record
+        run: PERF_CARGO="$(rustup which cargo)" python scripts/perf/native-diagnostics.py --output probe
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: native-collector-macos-15-intel
+          path: probe

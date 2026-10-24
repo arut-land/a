@@ -16,6 +16,8 @@ TEST = "log::native::measure::listening_collector_cost_per_record"
 
 
 def run(args, **kwargs):
+    if args[0] == "cargo" and "PERF_CARGO" in os.environ:
+        args = [os.environ["PERF_CARGO"], *args[1:]]
     print("+", args, flush=True)
     try:
         return subprocess.run(args, check=True, **kwargs)

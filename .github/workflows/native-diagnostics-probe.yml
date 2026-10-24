@@ -1,7 +1,5 @@
 name: native diagnostics probe
 on:
-  push:
-    branches: [codex-w7diag]
   workflow_dispatch:
 permissions:
   contents: read
