@@ -14,6 +14,7 @@ pub(super) const LOGIN: super::Login = super::Login::Spawn;
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const APPROVED: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 const NOT_FOUND: u32 = windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+const MORE_DATA: u32 = windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 
 fn name(home: &Home) -> String {
     format!("a-daemon-{:016x}", crate::endpoint::home_identity(home))
@@ -41,27 +42,41 @@ fn command(home: &Home) -> io::Result<String> {
 }
 
 fn read(name: &str) -> io::Result<Option<String>> {
-    let mut buffer = vec![0u16; 2048];
-    let mut bytes = u32::try_from(buffer.len() * 2).expect("small buffer");
     let (key, value) = (wide(RUN), wide(name));
-    // SAFETY: terminated key/value names and a writable, size-described buffer.
-    let code = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            key.as_ptr(),
-            value.as_ptr(),
-            RRF_RT_REG_SZ,
-            std::ptr::null_mut(),
-            buffer.as_mut_ptr().cast(),
-            &raw mut bytes,
-        )
+    let query = |buffer: *mut u16, bytes: &mut u32| {
+        // SAFETY: terminated key/value names; a null buffer asks only for the
+        // size, otherwise the buffer holds `bytes`.
+        unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buffer.cast(),
+                bytes,
+            )
+        }
     };
-    if code == NOT_FOUND {
-        return Ok(None);
+    // Another program may rewrite the value between the two calls: ask again
+    // for the size it has now.
+    loop {
+        let mut bytes = 0u32;
+        match query(std::ptr::null_mut(), &mut bytes) {
+            NOT_FOUND => return Ok(None),
+            code => status(code)?,
+        }
+        let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
+        match query(buffer.as_mut_ptr(), &mut bytes) {
+            NOT_FOUND => return Ok(None),
+            MORE_DATA => {}
+            code => {
+                status(code)?;
+                let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+                return Ok(Some(String::from_utf16_lossy(&buffer[..len])));
+            }
+        }
     }
-    status(code)?;
-    let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
-    Ok(Some(String::from_utf16_lossy(&buffer[..len])))
 }
 
 fn write(name: &str, command: &str) -> io::Result<()> {

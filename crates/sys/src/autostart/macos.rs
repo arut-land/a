@@ -81,16 +81,41 @@ pub(super) fn disable(home: &Home) -> io::Result<()> {
 
 pub(super) fn refresh(home: &Home) -> io::Result<bool> {
     let path = plist(home)?;
+    let disabled = disabled()?;
     if path.exists() {
         update(&path, contents(home)?.as_bytes())?;
-        return Ok(true);
+        return Ok(!switched_off(&disabled, &label(home)));
     }
     // The app's agent names its helper inside the bundle, so it never needs
     // rewriting; it is on while launchd has it loaded.
-    Ok(run(Command::new("launchctl")
-        .arg("print")
-        .arg(format!("{}/{APP_LABEL}", domain())))
-    .is_ok())
+    Ok(!switched_off(&disabled, APP_LABEL)
+        && run(Command::new("launchctl")
+            .arg("print")
+            .arg(format!("{}/{APP_LABEL}", domain())))
+        .is_ok())
+}
+
+/// launchd's override list for this user's domain, which the Login Items
+/// switch (Background Task Management) writes.
+fn disabled() -> io::Result<String> {
+    let output = Command::new("launchctl")
+        .arg("print-disabled")
+        .arg(domain())
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Whether `label` is listed off: `"label" => disabled` (or `=> true` from
+/// releases that print booleans).
+fn switched_off(listing: &str, label: &str) -> bool {
+    let quoted = format!("\"{label}\"");
+    listing.lines().any(|line| {
+        let line = line.trim();
+        line.strip_prefix(quoted.as_str())
+            .and_then(|rest| rest.trim_start().strip_prefix("=>"))
+            .is_some_and(|state| matches!(state.trim(), "disabled" | "true"))
+    })
 }
 
 #[cfg(test)]
@@ -104,6 +129,15 @@ mod tests {
         let two = Home::from(root.join("two"));
         assert_ne!(label(&one), label(&two));
         assert_ne!(plist(&one).unwrap(), plist(&two).unwrap());
+    }
+
+    #[test]
+    fn the_login_items_switch_turns_residency_off() {
+        let listing = "disabled services = {\n\t\"dev.a.daemon.1\" => disabled\n\t\"dev.a.daemon\" => enabled\n\t\"other\" => true\n}\n";
+        assert!(switched_off(listing, "dev.a.daemon.1"));
+        assert!(!switched_off(listing, "dev.a.daemon"));
+        assert!(switched_off(listing, "other"));
+        assert!(!switched_off(listing, "dev.a.daemon.2"));
     }
 
     #[test]

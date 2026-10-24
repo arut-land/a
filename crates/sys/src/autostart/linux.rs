@@ -52,7 +52,9 @@ fn unit(home: &Home) -> io::Result<String> {
     let mut env = Command::new("unused");
     home.daemon_env(&mut env);
     let mut settings = String::new();
-    for (key, value) in env.get_envs() {
+    // The user manager provides its own XDG_RUNTIME_DIR, the one the
+    // session's clients use; a baked copy would go stale across boots.
+    for (key, value) in env.get_envs().filter(|(key, _)| *key != "XDG_RUNTIME_DIR") {
         if let Some(value) = value {
             let mut assignment = key.to_os_string();
             assignment.push("=");
@@ -134,5 +136,6 @@ mod tests {
         assert!(unit.contains(" __daemon --login\n"));
         assert!(unit.ends_with("[Install]\nWantedBy=default.target\n"));
         assert!(!unit.contains("Restart=") && !unit.contains("Sockets="));
+        assert!(!unit.contains("XDG_RUNTIME_DIR"));
     }
 }
