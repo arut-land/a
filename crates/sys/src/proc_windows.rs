@@ -370,30 +370,32 @@ mod tests {
 
     #[test]
     fn daemon_bootstrap_never_replaces_resolved_temporary_environment() {
+        const CHILD: &str = "A_TEST_DAEMON_TEMP_BOOTSTRAP";
+        if std::env::var_os(CHILD).is_some() {
+            let home = crate::Home::from_env().unwrap();
+            for key in ["TMPDIR", "TMP", "TEMP"] {
+                assert_eq!(
+                    std::path::PathBuf::from(std::env::var_os(key).unwrap()),
+                    home.temporary_dir(),
+                );
+            }
+            return;
+        }
         let root = tempfile::Builder::new()
             .prefix("a daemon temp 'literal' ")
             .tempdir()
             .unwrap();
         let home = crate::Home::from(root.path().to_owned());
         home.prepare_temporary_dir().unwrap();
-        let mut command = Command::new(
-            std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-                .join("System32/cmd.exe"),
-        );
-        command.env_clear().args(["/D", "/C", "set"]);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.env_clear().env(CHILD, "1").args([
+            "--exact",
+            "proc::imp::tests::daemon_bootstrap_never_replaces_resolved_temporary_environment",
+        ]);
         home.daemon_env(&mut command);
         daemon_environment(&mut command, &home);
         let output = command.output().unwrap();
         assert!(output.status.success(), "{output:?}");
-        let output = String::from_utf8(output.stdout).unwrap();
-        for key in ["TMPDIR", "TMP", "TEMP"] {
-            assert!(
-                output
-                    .lines()
-                    .any(|line| line == format!("{key}={}", home.temporary_dir().display())),
-                "{output}"
-            );
-        }
     }
 
     #[test]
