@@ -71,8 +71,20 @@ list Settings > Apps > Startup and Task Manager show and let the user switch
 off; the daemon is resident only while Explorer's `StartupApproved` record
 allows it. A logon-triggered scheduled task was the alternative: it needs
 COM registration, does not appear in that list, and runs without a window
-only under a stored-credential or batch logon that standard users lack. The
-value runs `a __daemon --login` under `conhost.exe --headless`, because a
-console program started at logon otherwise opens a console window (a
-Terminal tab on Windows 11). That host ends with its process, so the entry
-starts a detached daemon exactly as a client does and exits.
+only under a stored-credential or batch logon that standard users lack.
+
+The value runs `a.exe __daemon --login`, which starts a detached daemon
+exactly as a client does and exits. A console program started at logon
+would otherwise get a console window (a Terminal tab on Windows 11), so
+`a.exe` embeds an application manifest whose `consoleAllocationPolicy` is
+`detached`: started by Explorer or the `Run` key it gets no console, while
+started from a console it shares that console as before. When something
+without a console starts `a` with no standard handles (Explorer, the Run
+dialog), `a` itself asks for the console the OS would have made
+(`AllocConsoleWithOptions`); the daemon never does. Windows releases before
+the policy ignore it and allocate a console as they always have, so there
+the window shows only for the moment the entry takes to start the daemon. A
+second, windows-subsystem launcher would avoid that moment on every release,
+at the cost of a second executable beside `a` in the install layout; the
+manifest keeps one binary and is how the Windows console team expects a
+console program to opt out of a console.

@@ -14,6 +14,7 @@
 pub mod autostart;
 mod awake;
 pub mod config;
+pub mod console;
 pub mod crash;
 mod desktop;
 #[cfg(windows)]

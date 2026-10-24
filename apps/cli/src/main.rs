@@ -41,6 +41,13 @@ use crate::args::{Args, Autostart, Cmd, Daemon};
 
 fn main() -> ExitCode {
     sys::small_footprint();
+    // The daemon never wants one: whoever starts it gives it no terminal.
+    if std::env::args_os()
+        .nth(1)
+        .is_none_or(|first| first != "__daemon")
+    {
+        sys::console::attach_when_launched_without_one();
+    }
     // Help, the version, completion requests and usage errors (status 2)
     // end the process here.
     let args = Args::parse();

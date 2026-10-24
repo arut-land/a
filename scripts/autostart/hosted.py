@@ -122,6 +122,25 @@ def resident(seconds):
     return before is not None and pid() == before
 
 
+def manifest():
+    """The application manifest the linker embedded in a.exe."""
+    import ctypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.LoadLibraryExW.restype = ctypes.c_void_p
+    kernel.FindResourceW.restype = ctypes.c_void_p
+    kernel.FindResourceW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    kernel.LoadResource.restype = ctypes.c_void_p
+    kernel.LoadResource.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel.LockResource.restype = ctypes.c_void_p
+    kernel.LockResource.argtypes = [ctypes.c_void_p]
+    kernel.SizeofResource.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    module = kernel.LoadLibraryExW(str(binary), None, 0x2)  # LOAD_LIBRARY_AS_DATAFILE
+    found = kernel.FindResourceW(module, ctypes.c_void_p(1), ctypes.c_void_p(24))  # RT_MANIFEST
+    assert found, "a.exe has no embedded manifest"
+    data = kernel.LockResource(kernel.LoadResource(module, found))
+    return ctypes.string_at(data, kernel.SizeofResource(module, found)).decode()
+
+
 samples = {"self_spawn_ms": [], "login_first_ms": [], "login_warm_ms": []}
 checks = {}
 try:
@@ -153,6 +172,8 @@ try:
         checks["registration_refreshed_by_a_daemon"] = True
     logout()
     if system == "Windows":
+        assert "<consoleAllocationPolicy" in manifest() and ">detached<" in manifest(), manifest()
+        checks["manifest_asks_for_no_console"] = True
         # The entry exactly as Explorer runs it, waited for: its host and the
         # entry itself must both succeed, leaving a daemon behind.
         a("daemon", "autostart", "on")

@@ -1,12 +1,9 @@
 //! The per-user `Run` key: what Settings > Apps > Startup and Task Manager
 //! list and let the user switch off (`StartupApproved`), with no
 //! credentials or elevation. A logon task would need COM registration, is
-//! invisible in that list, and shows the same console window.
+//! invisible in that list, and gets the same console allocation.
 
 use super::{Home, io};
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
-use std::path::PathBuf;
 use windows_sys::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
     RegSetKeyValueW,
@@ -33,30 +30,14 @@ fn status(code: u32) -> io::Result<()> {
     }
 }
 
-fn system_dir() -> io::Result<PathBuf> {
-    let mut buffer = [0u16; 260];
-    // SAFETY: the buffer is writable for the length passed.
-    let len = unsafe {
-        windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(buffer.as_mut_ptr(), 260)
-    };
-    let len = usize::try_from(len).map_err(|_| io::ErrorKind::InvalidData)?;
-    if len == 0 || len >= buffer.len() {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(OsString::from_wide(&buffer[..len]).into())
-}
-
-/// A console program started at logon gets a console window (a Terminal
-/// tab on Windows 11); a headless console host gives it none, and the entry
-/// leaves a detached daemon behind it ([`super::Login::Spawn`]).
+/// `a.exe`'s manifest asks for no console, so the entry opens no window
+/// where the policy exists; older releases show one only while the entry
+/// starts a detached daemon and exits ([`super::Login::Spawn`]).
 fn command(home: &Home) -> io::Result<String> {
-    let host = system_dir()?.join("conhost.exe");
     let exe = home.runtime().current_exe();
-    let (Some(host), Some(exe)) = (host.to_str(), exe.to_str()) else {
-        return Err(io::ErrorKind::InvalidInput.into());
-    };
+    let exe = exe.to_str().ok_or(io::ErrorKind::InvalidInput)?;
     // Windows paths cannot contain quotes, so quoting cannot be escaped.
-    Ok(format!("\"{host}\" --headless \"{exe}\" __daemon --login"))
+    Ok(format!("\"{exe}\" __daemon --login"))
 }
 
 fn read(name: &str) -> io::Result<Option<String>> {
@@ -164,10 +145,8 @@ mod tests {
     }
 
     #[test]
-    fn the_logon_entry_runs_the_daemon_without_a_console_window() {
+    fn the_logon_entry_runs_the_installed_daemon() {
         let command = command(&Home::from(std::env::temp_dir().join("a-autostart-run"))).unwrap();
-        assert!(command.starts_with('"'));
-        assert!(command.contains("conhost.exe\" --headless \""));
-        assert!(command.ends_with("\" __daemon --login"));
+        assert!(command.starts_with('"') && command.ends_with("a.exe\" __daemon --login"));
     }
 }
