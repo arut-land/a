@@ -164,8 +164,11 @@ impl InputReader {
             if !signals.is_empty() {
                 return Ok(Input::Signals(signals));
             }
-            if self.open && !self.control.paused() {
-                self.drain()?;
+            // A console that can no longer be read is closed input, as at
+            // EOF: the caller keeps receiving signals.
+            if self.open && !self.control.paused() && self.drain().is_err() {
+                self.open = false;
+                return Ok(Input::Closed);
             }
             if std::mem::take(&mut self.resized) {
                 return Ok(Input::Signals(vec![Signal::Resize]));
@@ -381,9 +384,11 @@ pub fn is_foreground() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::IntoRawHandle;
     use windows_sys::Win32::System::Console::{
         CTRL_BREAK_EVENT, CTRL_C_EVENT, FlushConsoleInputBuffer, GenerateConsoleCtrlEvent,
-        INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, WriteConsoleInputW,
+        INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, STD_INPUT_HANDLE, SetStdHandle,
+        WriteConsoleInputW,
     };
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
@@ -395,6 +400,30 @@ mod tests {
             eprintln!("panic restoration passed");
             let signals = Signals::catch(&[Signal::Interrupt, Signal::Terminate]).unwrap();
             assert_input_events(signals);
+        });
+    }
+
+    #[test]
+    fn a_failed_console_read_closes_input_and_still_delivers_signals() {
+        const NAME: &str =
+            "terminal::imp::tests::a_failed_console_read_closes_input_and_still_delivers_signals";
+        super::super::testing::with_console(NAME, || {
+            let signals = Signals::catch(&[Signal::Interrupt]).unwrap();
+            let _raw = super::super::RawMode::enter().unwrap();
+            let mut reader = InputReader::new(signals);
+            // Console record queries fail on a handle that is not a console.
+            let nul = std::fs::File::open("NUL").unwrap().into_raw_handle();
+            // SAFETY: the subprocess owns its standard-handle table; the
+            // leaked handle stays valid until it exits.
+            assert_ne!(unsafe { SetStdHandle(STD_INPUT_HANDLE, nul) }, 0);
+            let mut buf = [0; 32];
+            assert!(matches!(reader.read(&mut buf).unwrap(), Input::Closed));
+            // SAFETY: the fresh console contains only this test subprocess.
+            assert_ne!(unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) }, 0);
+            assert!(matches!(
+                reader.read(&mut buf).unwrap(),
+                Input::Signals(signals) if signals == [Signal::Interrupt]
+            ));
         });
     }
 

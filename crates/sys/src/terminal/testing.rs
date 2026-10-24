@@ -85,10 +85,12 @@ mod native {
         }
         let output = child.wait_with_output().unwrap();
         assert_eq!(ready, 0, "private console subprocess timed out");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        // A renamed test would otherwise run nothing and pass.
         assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stdout)
+            stdout.contains("test result: ok. 1 passed"),
+            "{name} did not run in its console: {stdout}"
         );
     }
 

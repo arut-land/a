@@ -237,12 +237,15 @@ pub fn write_stdout(
                     .unwrap_or_else(PoisonError::into_inner)
                     .take()
                     .unwrap();
-                // Completion wins when both events are ready. Still yield to
-                // the queued control instead of surfacing ERROR_OPERATION_ABORTED.
-                return if cancelled || (interruptible && output_interrupted()) {
-                    Err(io::ErrorKind::WouldBlock.into())
-                } else {
-                    result
+                // Bytes the console accepted are reported, so the caller's
+                // count stays exact; the queued control surfaces on its next
+                // call. A cancelled write yields to it instead of surfacing
+                // ERROR_OPERATION_ABORTED.
+                return match result {
+                    Err(_) if cancelled || (interruptible && output_interrupted()) => {
+                        Err(io::ErrorKind::WouldBlock.into())
+                    }
+                    result => result,
                 };
             }
             1 | WAIT_TIMEOUT => {}

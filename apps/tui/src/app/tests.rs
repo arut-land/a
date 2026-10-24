@@ -692,22 +692,7 @@ fn cancelled_output_preserves_settled_transcript_until_a_frame_succeeds() {
             Ok(())
         }
     }
-    let (mut app, _) = app(Viewport::Inline, &running_command());
-    app.fold(&entry(
-        6,
-        Body::ToolResult {
-            call: CallId::new(3).unwrap(),
-            outcome: Outcome::Done {
-                output: Json::encode(&json!({"output": "retained result", "exit": 0})).unwrap(),
-            },
-            card: Some(Card {
-                title: "$ ls".into(),
-                body: "retained result".into(),
-                note: "exit 0".into(),
-                ..Card::default()
-            }),
-        },
-    ));
+    let mut app = settled_result();
     let term = Term::default();
     let mut screen = Screen::new(Viewport::Inline, CancelOnce(term.clone(), true));
     assert_eq!(
@@ -724,6 +709,84 @@ fn cancelled_output_preserves_settled_transcript_until_a_frame_succeeds() {
     assert_eq!(app.committed, app.client.view().items.len());
     screen.draw(&mut app, (60, 20)).unwrap();
     assert!(!String::from_utf8_lossy(&term.take().1).contains("retained result"));
+}
+
+/// An inline app whose last item, a tool result, has just settled.
+fn settled_result() -> App {
+    let (mut app, _) = app(Viewport::Inline, &running_command());
+    app.fold(&entry(
+        6,
+        Body::ToolResult {
+            call: CallId::new(3).unwrap(),
+            outcome: Outcome::Done {
+                output: Json::encode(&json!({"output": "retained result", "exit": 0})).unwrap(),
+            },
+            card: Some(Card {
+                title: "$ ls".into(),
+                body: "retained result".into(),
+                note: "exit 0".into(),
+                ..Card::default()
+            }),
+        },
+    ));
+    app
+}
+
+#[test]
+fn scrollback_the_terminal_accepted_is_never_printed_again() {
+    /// Accepts the first `limit` bytes, then reports the write interrupted.
+    struct Partial(Term, Option<usize>);
+    impl std::io::Write for Partial {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let Some(limit) = &mut self.1 else {
+                return self.0.write(bytes);
+            };
+            if *limit == 0 {
+                self.1 = None;
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let n = bytes.len().min(*limit).min(7);
+            *limit -= n;
+            self.0.write(&bytes[..n])
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let whole = Term::default();
+    Screen::new(Viewport::Inline, whole.clone())
+        .draw(&mut settled_result(), (80, 24))
+        .unwrap();
+    let frame = whole.take().1;
+    let history = frame
+        .windows(b"retained result".len())
+        .rposition(|window| window == b"retained result")
+        .unwrap();
+    // Interrupted short of the item (it is printed again whole) and past
+    // the scrollback, short of the frame's end (it is not), in short writes.
+    for limit in [history, frame.len() - 1] {
+        let mut app = settled_result();
+        let term = Term::default();
+        let mut screen = Screen::new(Viewport::Inline, Partial(term.clone(), Some(limit)));
+        assert_eq!(
+            screen.draw(&mut app, (80, 24)).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        screen.resume();
+        screen.draw(&mut app, (80, 24)).unwrap();
+        screen.draw(&mut app, (80, 24)).unwrap();
+        let output = term.take().1;
+        let printed = output
+            .windows(b"retained result".len())
+            .filter(|window| *window == b"retained result")
+            .count();
+        assert_eq!(
+            printed,
+            1,
+            "limit {limit}: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
 }
 
 #[test]

@@ -40,6 +40,11 @@ pub struct Screen<W = Stdout> {
     /// Draw the next frame whole: the first, after a resize, Ctrl-L, or
     /// (inline) when the viewport moved or changed size.
     stale: bool,
+    /// Where this frame's scrollback lines end in `bytes`: once the
+    /// terminal accepted that many bytes, they are printed, even if the
+    /// rest of the frame is not.
+    history_end: Option<usize>,
+    history_sent: bool,
 }
 
 impl<W: Write> Screen<W> {
@@ -55,6 +60,8 @@ impl<W: Write> Screen<W> {
             colour: true,
             cursor_shown: true,
             stale: true,
+            history_end: None,
+            history_sent: false,
         }
     }
 
@@ -86,9 +93,11 @@ impl<W: Write> Screen<W> {
     /// a list nothing shows) writes nothing, not even the envelope.
     pub fn draw(&mut self, app: &mut App, size: (u16, u16)) -> io::Result<()> {
         let mut frame = app.begin_frame();
-        self.draw_frame(&mut frame, size)?;
-        frame.commit();
-        Ok(())
+        let drawn = self.draw_frame(&mut frame, size);
+        if std::mem::take(&mut self.history_sent) || drawn.is_ok() {
+            frame.commit();
+        }
+        drawn
     }
 
     fn draw_frame(&mut self, app: &mut App, (cols, rows): (u16, u16)) -> io::Result<()> {
@@ -166,10 +175,19 @@ impl<W: Write> Screen<W> {
 
     /// The frame's bytes, in one write.
     fn flush(&mut self) -> io::Result<()> {
-        let written = self
-            .out
-            .write_all(&self.bytes)
-            .and_then(|()| self.out.flush());
+        let mut sent = 0;
+        let written = loop {
+            if sent == self.bytes.len() {
+                break self.out.flush();
+            }
+            match self.out.write(&self.bytes[sent..]) {
+                Ok(0) => break Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => sent += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => break Err(e),
+            }
+        };
+        self.history_sent = self.history_end.take().is_some_and(|end| sent >= end);
         self.bytes.clear();
         if written.is_err() {
             // Planned cursor moves may never have reached the terminal. A
@@ -193,6 +211,7 @@ impl<W: Write> Screen<W> {
             self.repen(PLAIN);
             self.bytes.extend_from_slice(b"\r\n");
         }
+        self.history_end = Some(self.bytes.len());
         // The viewport starts on the row after them.
         (self.row, self.col) = (Some(0), Some(0));
         self.stale = true;
