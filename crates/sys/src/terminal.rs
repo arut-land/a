@@ -7,6 +7,10 @@ use std::time::{Duration, Instant};
 
 use crate::Signal;
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod testing;
+
 pub use imp::{InputReader, OutputGuard, is_foreground, output_interrupted, size, suspend};
 
 /// A panic restores modes before the previous hook prints diagnostics, even
@@ -116,7 +120,11 @@ pub const SUPPORTED: bool = cfg!(any(unix, windows));
 
 pub enum Input {
     Signals(Vec<Signal>),
-    Bytes(usize),
+    /// `more` keeps an escape sequence open across a bounded input batch.
+    Bytes {
+        len: usize,
+        more: bool,
+    },
     Closed,
 }
 
@@ -541,7 +549,12 @@ mod imp {
                         return Ok(Input::Signals(vec![crate::Signal::BackgroundRead]));
                     }
                     match rustix::io::read(stdin, &mut *buf) {
-                        Ok(n @ 1..) => return Ok(Input::Bytes(n)),
+                        Ok(n @ 1..) => {
+                            return Ok(Input::Bytes {
+                                len: n,
+                                more: n == buf.len(),
+                            });
+                        }
                         Err(Errno::INTR | Errno::AGAIN) => {}
                         Ok(0) | Err(_) => {
                             self.open = false;

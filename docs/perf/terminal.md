@@ -54,7 +54,10 @@ There is no tcsetpgrp that could take the foreground from the shell.
 Native tests use isolated pseudo-terminals or a private Windows console
 subprocess. They cover suspension, redraw and continued input, panic mode
 restoration, UTF-16 surrogate pairs, resize records, and native Ctrl-C and
-Ctrl-Break callbacks. ConPTY tests pause native console writes while keeping
+Ctrl-Break callbacks. The real TUI decoder consumes native VT records in small
+and large batches, covering arrows, Alt chords, Unicode paste and interleaved
+resize records. A cancelled-frame test rejects all bytes before retrying at
+a new size and verifies that settled transcript items survive. ConPTY tests pause native console writes while keeping
 the frontend drained; they verify cancellation, the panic cleanup deadline,
 mode/code-page restoration and zero idle worker CPU. Unix tests retain the
 parent's inherited tty description through acquisition, suspension, resume,

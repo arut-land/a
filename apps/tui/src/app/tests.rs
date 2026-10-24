@@ -679,6 +679,54 @@ fn inline_prints_settled_items_once_and_keeps_the_rest_live() {
 }
 
 #[test]
+fn cancelled_output_preserves_settled_transcript_until_a_frame_succeeds() {
+    struct CancelOnce(Term, bool);
+    impl std::io::Write for CancelOnce {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if std::mem::take(&mut self.1) {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            self.0.write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (mut app, _) = app(Viewport::Inline, &running_command());
+    app.fold(&entry(
+        6,
+        Body::ToolResult {
+            call: CallId::new(3).unwrap(),
+            outcome: Outcome::Done {
+                output: Json::encode(&json!({"output": "retained result", "exit": 0})).unwrap(),
+            },
+            card: Some(Card {
+                title: "$ ls".into(),
+                body: "retained result".into(),
+                note: "exit 0".into(),
+                ..Card::default()
+            }),
+        },
+    ));
+    let term = Term::default();
+    let mut screen = Screen::new(Viewport::Inline, CancelOnce(term.clone(), true));
+    assert_eq!(
+        screen.draw(&mut app, (80, 24)).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(term.take().1, [] as [u8; 0]);
+    assert_eq!(app.committed, 0);
+    screen.resume();
+    screen.draw(&mut app, (60, 20)).unwrap();
+    let bytes = term.take().1;
+    let output = String::from_utf8_lossy(&bytes);
+    assert!(output.contains("retained result"), "{output:?}");
+    assert_eq!(app.committed, app.client.view().items.len());
+    screen.draw(&mut app, (60, 20)).unwrap();
+    assert!(!String::from_utf8_lossy(&term.take().1).contains("retained result"));
+}
+
+#[test]
 fn draws_at_tiny_sizes_without_panicking() {
     let (mut app, _) = app(Viewport::Full, &asked_command());
     for (w, h) in [(1, 1), (10, 4), (3, 30)] {

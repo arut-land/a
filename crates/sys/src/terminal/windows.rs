@@ -10,8 +10,9 @@ use windows_sys::Win32::System::Console::{
     ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
     ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
     ENABLE_WINDOW_INPUT, GetConsoleCP, GetConsoleMode, GetConsoleOutputCP,
-    GetConsoleScreenBufferInfo, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, SetConsoleCP,
-    SetConsoleCtrlHandler, SetConsoleMode, SetConsoleOutputCP, WINDOW_BUFFER_SIZE_EVENT,
+    GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT,
+    ReadConsoleInputW, SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode, SetConsoleOutputCP,
+    WINDOW_BUFFER_SIZE_EVENT,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 
@@ -134,6 +135,7 @@ pub struct InputReader {
     open: bool,
     pending: VecDeque<u8>,
     high: Option<u16>,
+    resized: bool,
 }
 
 impl InputReader {
@@ -144,6 +146,7 @@ impl InputReader {
             open: true,
             pending: VecDeque::new(),
             high: None,
+            resized: false,
         }
     }
 
@@ -161,12 +164,20 @@ impl InputReader {
             if !signals.is_empty() {
                 return Ok(Input::Signals(signals));
             }
+            if self.open && !self.control.paused() {
+                self.drain(buf.len())?;
+            }
+            if std::mem::take(&mut self.resized) {
+                return Ok(Input::Signals(vec![Signal::Resize]));
+            }
             if !self.pending.is_empty() {
-                let n = buf.len().min(self.pending.len());
-                for byte in &mut buf[..n] {
+                let len = buf.len().min(self.pending.len());
+                for byte in &mut buf[..len] {
                     *byte = self.pending.pop_front().unwrap();
                 }
-                return Ok(Input::Bytes(n));
+                let more = !self.pending.is_empty()
+                    || (self.open && !self.control.paused() && self.available()? != 0);
+                return Ok(Input::Bytes { len, more });
             }
             let stdin = io::stdin();
             let handles = [
@@ -191,35 +202,55 @@ impl InputReader {
                 1 => {}
                 _ => return Err(io::Error::last_os_error()),
             }
-            let mut record = INPUT_RECORD::default();
+        }
+    }
+
+    fn available(&self) -> io::Result<u32> {
+        let mut count = 0;
+        // SAFETY: a borrowed console handle and writable count. This reader
+        // exclusively consumes console records, so draining cannot race a read.
+        ok(unsafe {
+            GetNumberOfConsoleInputEvents(io::stdin().as_handle().as_raw_handle(), &raw mut count)
+        })?;
+        Ok(count)
+    }
+
+    fn drain(&mut self, capacity: usize) -> io::Result<()> {
+        let mut available = self.available()?;
+        while self.pending.len() < capacity && available != 0 {
+            let mut records = [INPUT_RECORD::default(); 128];
             let mut count = 0;
-            // Reading one available record never waits for another. Unlike
-            // ReadFile, this retains native resize events alongside VT keys.
-            // SAFETY: valid console handle and writable record/count.
-            if unsafe { ReadConsoleInputW(handles[1], &raw mut record, 1, &raw mut count) } == 0 {
-                self.open = false;
-                return Ok(Input::Closed);
-            }
-            match u32::from(record.EventType) {
-                WINDOW_BUFFER_SIZE_EVENT => return Ok(Input::Signals(vec![Signal::Resize])),
-                KEY_EVENT => {
-                    // SAFETY: EventType identifies the initialized union member.
-                    let key = unsafe { record.Event.KeyEvent };
-                    if key.bKeyDown == 0 {
-                        continue;
+            // SAFETY: initialized writable records/count and a console handle.
+            // Only already available records are requested, so this never waits
+            // for the suffix of an escape sequence to arrive.
+            ok(unsafe {
+                ReadConsoleInputW(
+                    io::stdin().as_handle().as_raw_handle(),
+                    records.as_mut_ptr(),
+                    available.min(128),
+                    &raw mut count,
+                )
+            })?;
+            available -= count;
+            for record in &records[..count as usize] {
+                match u32::from(record.EventType) {
+                    WINDOW_BUFFER_SIZE_EVENT => self.resized = true,
+                    KEY_EVENT => {
+                        // SAFETY: EventType identifies the initialized member.
+                        let key = unsafe { record.Event.KeyEvent };
+                        // SAFETY: ReadConsoleInputW supplies the Unicode member.
+                        let unit = unsafe { key.uChar.UnicodeChar };
+                        if key.bKeyDown != 0 && unit != 0 {
+                            for _ in 0..key.wRepeatCount {
+                                self.character(unit);
+                            }
+                        }
                     }
-                    // SAFETY: ReadConsoleInputW supplies the Unicode member.
-                    let unit = unsafe { key.uChar.UnicodeChar };
-                    if unit == 0 {
-                        continue;
-                    }
-                    for _ in 0..key.wRepeatCount {
-                        self.character(unit);
-                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
+        Ok(())
     }
 
     fn character(&mut self, unit: u16) {
@@ -354,79 +385,21 @@ pub fn is_foreground() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::windows::io::IntoRawHandle;
-    use std::process::{Command, Stdio};
     use windows_sys::Win32::System::Console::{
-        AllocConsole, CTRL_BREAK_EVENT, CTRL_C_EVENT, FlushConsoleInputBuffer, FreeConsole,
-        GenerateConsoleCtrlEvent, INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
-        STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle, WriteConsoleInputW,
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, FlushConsoleInputBuffer, GenerateConsoleCtrlEvent,
+        INPUT_RECORD_0, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, WriteConsoleInputW,
     };
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     #[test]
     fn console_state_is_restored_after_a_panic_and_events_preserve_unicode_and_resize() {
         const NAME: &str = "terminal::imp::tests::console_state_is_restored_after_a_panic_and_events_preserve_unicode_and_resize";
-        if std::env::var_os("A_TEST_CONSOLE").is_none() {
-            run_console_test(NAME);
-            return;
-        }
-        let stderr = io::stderr().as_handle().try_clone_to_owned().unwrap();
-        // This subprocess owns a fresh console; no developer's terminal or
-        // other libtest worker can be affected by mode/control-event changes.
-        // SAFETY: process-local console attachment; no pointer arguments.
-        unsafe {
-            FreeConsole();
-            assert_ne!(AllocConsole(), 0);
-        }
-        // STARTF_USESTDHANDLES preserves libtest's redirected handles during
-        // AllocConsole. Give the process table explicit console handles;
-        // Windows owns them until this isolated subprocess exits.
-        let input = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open("CONIN$")
-            .unwrap();
-        let output = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open("CONOUT$")
-            .unwrap();
-        // SAFETY: these live handles are transferred to this subprocess's
-        // standard-handle table and are never closed before process exit.
-        unsafe {
-            assert_ne!(SetStdHandle(STD_ERROR_HANDLE, stderr.as_raw_handle()), 0);
-            assert_ne!(SetConsoleCtrlHandler(None, 0), 0);
-            assert_ne!(SetStdHandle(STD_INPUT_HANDLE, input.into_raw_handle()), 0);
-            assert_ne!(SetStdHandle(STD_OUTPUT_HANDLE, output.into_raw_handle()), 0);
-        }
-        eprintln!("private console allocated");
-        assert_panic_restores_state();
-        eprintln!("panic restoration passed");
-        let signals = Signals::catch(&[Signal::Interrupt, Signal::Terminate]).unwrap();
-        assert_input_events(signals);
-    }
-
-    fn run_console_test(name: &str) {
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--nocapture"])
-            .env("A_TEST_CONSOLE", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        // SAFETY: the child owns this process handle throughout the bounded wait.
-        let ready = unsafe { WaitForSingleObject(child.as_handle().as_raw_handle(), 20_000) };
-        if ready != 0 {
-            let _ = child.kill();
-        }
-        let output = child.wait_with_output().unwrap();
-        assert_eq!(ready, 0, "private console subprocess timed out");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
+        super::super::testing::with_console(NAME, || {
+            assert_panic_restores_state();
+            eprintln!("panic restoration passed");
+            let signals = Signals::catch(&[Signal::Interrupt, Signal::Terminate]).unwrap();
+            assert_input_events(signals);
+        });
     }
 
     fn assert_panic_restores_state() {
@@ -522,10 +495,11 @@ mod tests {
         }
         let mut got = vec![];
         let mut buf = [0; 32];
-        loop {
+        let mut resized = false;
+        while got.len() < "A🙂".len() || !resized {
             match reader.read(&mut buf).unwrap() {
-                Input::Bytes(n) => got.extend_from_slice(&buf[..n]),
-                Input::Signals(signals) if signals == [Signal::Resize] => break,
+                Input::Bytes { len, .. } => got.extend_from_slice(&buf[..len]),
+                Input::Signals(signals) if signals == [Signal::Resize] => resized = true,
                 _ => panic!("unexpected console input"),
             }
         }

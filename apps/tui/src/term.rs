@@ -298,8 +298,8 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) -> Control {
                     open = false;
                     input_control.request(&tx, Request::Closed);
                 }
-                Input::Bytes(n) => {
-                    for input in decoder.feed(&buf[..n], n == buf.len()) {
+                Input::Bytes { len, more } => {
+                    for input in decoder.feed(&buf[..len], more) {
                         if input == super::keys::Input::Key(super::keys::Key::Ctrl('z')) {
                             request_suspend(&tx, &input_control);
                             continue;
@@ -334,6 +334,59 @@ fn send_input(tx: &client::Post<Event>, control: &Control, input: super::keys::I
 mod tests {
     use super::super::keys::{Input as KeyInput, Key};
     use super::*;
+
+    #[test]
+    fn native_console_batches_preserve_vt_keys_and_pastes() {
+        sys::terminal::testing::with_console(
+            "term::tests::native_console_batches_preserve_vt_keys_and_pastes",
+            || {
+                let _raw = RawMode::enter().unwrap();
+                let paste = "🙂 pasted text ".repeat(30);
+                let text = format!("\x1b[A\x1b[B\x1bx\x1b[200~{paste}\x1b[201~");
+                for capacity in [1, 2, 4096] {
+                    let mut reader = InputReader::new(Signals::catch(&[Signal::Resize]).unwrap());
+                    sys::terminal::testing::input(&text);
+                    let mut decoder = Decoder::default();
+                    let mut buf = vec![0; capacity];
+                    let mut got = Vec::new();
+                    let mut received = 0;
+                    let mut resized = false;
+                    while received < text.len() {
+                        match reader.read(&mut buf).unwrap() {
+                            Input::Bytes { len, more } => {
+                                received += len;
+                                got.extend(decoder.feed(&buf[..len], more));
+                            }
+                            Input::Signals(signals) => {
+                                assert_eq!(signals, [Signal::Resize]);
+                                resized = true;
+                            }
+                            Input::Closed => panic!("native console closed"),
+                        }
+                    }
+                    assert!(resized);
+                    assert_eq!(
+                        got,
+                        [
+                            KeyInput::Key(Key::Up),
+                            KeyInput::Key(Key::Down),
+                            KeyInput::Key(Key::Alt('x')),
+                            KeyInput::Paste(paste.clone()),
+                        ],
+                        "input capacity {capacity}"
+                    );
+                    sys::terminal::testing::input("\x1b");
+                    loop {
+                        if let Input::Bytes { len, more } = reader.read(&mut buf).unwrap() {
+                            assert!(!more);
+                            assert_eq!(decoder.feed(&buf[..len], more), [KeyInput::Key(Key::Esc)]);
+                            break;
+                        }
+                    }
+                }
+            },
+        );
+    }
 
     #[test]
     fn lifecycle_controls_bypass_a_full_typing_backlog() {

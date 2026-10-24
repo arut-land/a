@@ -27,7 +27,9 @@ Windows uses the actual console handles, saved input/output modes and
 UTF-8 code pages. VT output and input are enabled, QuickEdit and line/echo
 input are disabled, and processed input routes Ctrl-C and Ctrl-Break through
 the console control handler. Input waits indefinitely on the console and
-the signal event; native resize records invalidate the viewport. The
+the signal event; native resize records invalidate the viewport. Available
+console records are drained in batches, with continuation metadata preserving
+VT keys and pastes across bounded reads and interleaved resizes. The
 output writer has its own thread, with cancellation on lifecycle controls and
 a deadline for screen cleanup even when the console stops consuming output. The line
 REPL changes only console output/encoding, preserving cooked input. A
@@ -220,7 +222,8 @@ crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
   the screen at the bottom) and moving back up; settled items are printed
   from its top with `\r\n`, so they scroll into the terminal's own
   scrollback, and the viewport is drawn whole under them. A resize or
-  Ctrl-L draws it whole from its top.
+  Ctrl-L draws it whole from its top. Settled items are committed only after
+  the frame's output succeeds; cancellation leaves them available to redraw.
 - Rows are wrapped lazily and cached per item and width: a frame wraps only
   what it shows, counted from the bottom or from the scroll anchor (an item
   and a row, which stays put as output arrives below). A 6000-item session

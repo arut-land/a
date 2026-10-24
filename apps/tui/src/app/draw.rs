@@ -30,7 +30,46 @@ pub struct Composed {
     overlay: Option<Vec<Line>>,
 }
 
+/// Scrollback progress belongs to the frame that delivered it. Dropping an
+/// unsuccessful frame makes its settled items available to the next redraw.
+pub struct Frame<'a> {
+    app: &'a mut App,
+    committed: usize,
+}
+
+impl Frame<'_> {
+    pub fn commit(mut self) {
+        self.committed = self.app.committed;
+    }
+}
+
+impl std::ops::Deref for Frame<'_> {
+    type Target = App;
+    fn deref(&self) -> &App {
+        self.app
+    }
+}
+
+impl std::ops::DerefMut for Frame<'_> {
+    fn deref_mut(&mut self) -> &mut App {
+        self.app
+    }
+}
+
+impl Drop for Frame<'_> {
+    fn drop(&mut self) {
+        self.app.committed = self.committed;
+    }
+}
+
 impl App {
+    pub fn begin_frame(&mut self) -> Frame<'_> {
+        Frame {
+            committed: self.committed,
+            app: self,
+        }
+    }
+
     /// Inline: the rows of the items that will not change any more, to
     /// print above the viewport; each item is taken once, in order.
     pub fn scrollback(&mut self, width: u16) -> Vec<Line> {

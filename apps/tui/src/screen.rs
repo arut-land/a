@@ -84,7 +84,14 @@ impl<W: Write> Screen<W> {
     /// Draws `app` on a `cols` × `rows` terminal: inline, its settled items
     /// go into the scrollback first. A frame that changed nothing (an ack,
     /// a list nothing shows) writes nothing, not even the envelope.
-    pub fn draw(&mut self, app: &mut App, (cols, rows): (u16, u16)) -> io::Result<()> {
+    pub fn draw(&mut self, app: &mut App, size: (u16, u16)) -> io::Result<()> {
+        let mut frame = app.begin_frame();
+        self.draw_frame(&mut frame, size)?;
+        frame.commit();
+        Ok(())
+    }
+
+    fn draw_frame(&mut self, app: &mut App, (cols, rows): (u16, u16)) -> io::Result<()> {
         self.bytes.extend_from_slice(OPEN);
         let (w, h) = match self.viewport {
             Viewport::Full => {
