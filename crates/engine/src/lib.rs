@@ -348,6 +348,8 @@ impl Daemon {
     }
 
     fn load_on(home: &Home, config: &Config, runtime: &Arc<impl rt::Runtime>) -> io::Result<Owner> {
+        // Extensions publish these facts as they register.
+        sys::shell::ExecutionFacts::initialize(home)?;
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
         let catalog = Catalog::open(home.catalog_file(), &*store)?;
         catalog.start(Arc::clone(runtime) as Arc<dyn rt::Runtime>);
@@ -1264,7 +1266,6 @@ fn run(
         sys::Signal::Interrupt,
         sys::Signal::Hangup,
     ])?;
-    sys::shell::ExecutionFacts::initialize(home)?;
     let daemon = Daemon::load_on(home, &config, runtime)?;
     let signals = rt::Async::for_reading(&daemon.shared.rt.reactor(), signals)?;
     let signalled = async {

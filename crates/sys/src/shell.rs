@@ -37,21 +37,36 @@ pub struct ExecutionFacts {
 static FACTS: OnceLock<ExecutionFacts> = OnceLock::new();
 
 impl ExecutionFacts {
+    /// The facts the daemon published; using them before
+    /// [`initialize`](Self::initialize) is a startup-order bug, never a
+    /// reason to resolve a different layout from the environment.
     pub fn current() -> &'static Self {
-        FACTS.get_or_init(|| {
-            let paths = crate::Paths::from_env().expect("resolve shell layout");
-            Self::resolve(&paths).expect("prepare shell temporary directory")
-        })
+        #[cfg(any(test, feature = "testing"))]
+        if FACTS.get().is_none() {
+            // One fixed root, so test processes leave nothing behind per run.
+            let root = std::env::temp_dir().join("a-test-shell");
+            Self::initialize(&crate::Paths::from(root)).expect("prepare test shell facts");
+        }
+        FACTS
+            .get()
+            .expect("the daemon initializes shell facts before extensions register")
     }
 
-    /// Called before registering extensions, including foreground daemon starts.
+    /// Called by the daemon before registering extensions. The facts live
+    /// for the process, so a second layout is refused rather than ignored.
     pub fn initialize(paths: &crate::Paths) -> std::io::Result<&'static Self> {
-        if let Some(facts) = FACTS.get() {
-            return Ok(facts);
+        if FACTS.get().is_none() {
+            let _ = FACTS.set(Self::resolve(paths)?);
         }
-        let facts = Self::resolve(paths)?;
-        let _ = FACTS.set(facts);
-        Ok(FACTS.get().expect("initialized shell facts"))
+        let facts = FACTS.get().expect("initialized shell facts");
+        if facts.temp != paths.temporary_dir() {
+            return Err(std::io::Error::other(format!(
+                "shell facts already use {}, not {}",
+                facts.temp.display(),
+                paths.temporary_dir().display()
+            )));
+        }
+        Ok(facts)
     }
 
     fn resolve(paths: &crate::Paths) -> std::io::Result<Self> {
@@ -121,6 +136,7 @@ mod tests {
                         0o700
                     );
                 }
+                crate::child::mark("tool");
             }
             Some("daemon") => {
                 let paths = crate::Paths::from_env().unwrap();
@@ -132,17 +148,16 @@ mod tests {
                     ("TEMP".into(), "/outside".into()),
                 ]);
                 facts.apply_environment(&mut env);
-                assert!(
-                    child()
-                        .env_clear()
-                        .envs(env)
-                        .env(STAGE, "tool")
-                        .env(ROOT, paths.root())
-                        .status()
-                        .unwrap()
-                        .success()
-                );
+                let output = child()
+                    .env_clear()
+                    .envs(env)
+                    .env(STAGE, "tool")
+                    .env(ROOT, paths.root())
+                    .output()
+                    .unwrap();
+                assert!(crate::child::ran(&output, "tool"), "{output:?}");
                 assert!(paths.temporary_dir().join("child-created").is_file());
+                crate::child::mark("daemon");
             }
             _ => {
                 let root = std::env::temp_dir().join(format!(
@@ -156,9 +171,9 @@ mod tests {
                 let paths = crate::Paths::from(root.clone());
                 let mut command = child();
                 paths.daemon_env(&mut command);
-                let status = command.env(STAGE, "daemon").status().unwrap();
+                let output = command.env(STAGE, "daemon").output().unwrap();
                 std::fs::remove_dir_all(root).unwrap();
-                assert!(status.success());
+                assert!(crate::child::ran(&output, "daemon"), "{output:?}");
             }
         }
     }

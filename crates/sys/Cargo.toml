@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# Shell facts for tests that register tools without starting a daemon.
+testing = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

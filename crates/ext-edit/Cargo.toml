@@ -15,7 +15,7 @@ serde_json.workspace = true
 [dev-dependencies]
 ext = { workspace = true, features = ["testing"] }
 # Where edits are made.
-ext-shell.workspace = true
+ext-shell = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true
