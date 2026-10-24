@@ -783,11 +783,12 @@ int main(int argc, char **argv) {
         );
         let cx = rig.cx();
         let pid = Mutex::new(None);
-        // Stdin holds the child until the test releases status acquisition.
+        // Check identity while stdin holds the child alive; exit can hide it before reaping.
         let mut launching = std::pin::pin!(launch(
             &cx,
             spec(&cx, "read -r line"),
             |child| {
+                assert!(sys::process_started(child.id()).is_some());
                 *lock(&pid) = Some(child.id());
                 child.kill().unwrap();
                 runtime.defer.store(true, Ordering::Release);

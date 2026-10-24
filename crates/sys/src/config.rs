@@ -249,7 +249,7 @@ impl Config {
             Err(e) => return Err(e),
         };
         let text = self.render(&old).map_err(|e| invalid(path, &e))?;
-        crate::fs::write_private(path, text.as_bytes())
+        crate::fs::write_private_durable(path, text.as_bytes())
     }
 
     /// `old` with the schema's keys replaced by this config's: in place
