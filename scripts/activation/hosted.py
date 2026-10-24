@@ -61,7 +61,7 @@ try:
                     time.sleep(.05)
                 command("daemon", "stop")
             samples["activation_ms" if managed else "self_spawn_ms"].append(connect())
-            pid = int((run_dir / "daemon.pid").read_text())
+            pid = int((run_dir / "daemon.pid").read_text().splitlines()[0])
             # Prove idle exit without opening the socket (which would reactivate it).
             deadline = time.monotonic() + 15
             while (run_dir / "daemon.pid").read_text().strip():

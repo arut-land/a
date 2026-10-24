@@ -138,6 +138,8 @@ pub(super) fn listener(home: &Home) -> io::Result<Listener> {
             "expected one launchd activation socket",
         ));
     }
+    // SAFETY: activation is consumed before runtime/child threads are started.
+    unsafe { std::env::remove_var("A_ACTIVATION_SOCKET") };
     Listener::activated(files.into_iter().next().unwrap(), home)
 }
 
@@ -145,7 +147,6 @@ pub(super) fn listener(home: &Home) -> io::Result<Listener> {
 mod tests {
     use super::*;
 
-    pub(super) const SUPPORTED: bool = true;
     #[test]
     fn plist_values_cannot_become_markup() {
         assert_eq!(xml("<&\"'>"), "&lt;&amp;&quot;&apos;&gt;");

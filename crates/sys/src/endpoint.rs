@@ -560,6 +560,8 @@ mod imp {
                 "activation socket is not private",
             ));
         }
+        // Darwin caches server credentials at listen: refresh launchd's
+        // credentials to ours before publishing discovery to clients.
         rustix::net::listen(&socket, 128)?;
         crate::fs::write_private(discovery, path.as_os_str().as_encoded_bytes())?;
         Ok(Listener {

@@ -89,7 +89,7 @@ pub(super) fn install(home: &Home, app: bool) -> io::Result<()> {
             .ok_or(io::ErrorKind::InvalidInput)?,
     )?;
     let socket = format!(
-        "[Unit]\nDescription=a per-user agent socket\n\n[Socket]\nListenStream={}\nSocketMode=0600\nAccept=no\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n",
+        "[Unit]\nDescription=a per-user agent socket\n\n[Socket]\nListenStream={}\nSocketMode=0600\nDirectoryMode=0700\nAccept=no\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n",
         socket_path(endpoint.path())?
     );
     let service = service(home)?;
@@ -135,6 +135,27 @@ pub(super) fn uninstall(home: &Home, app: bool) -> io::Result<()> {
 }
 
 pub(super) fn listener(home: &Home) -> io::Result<Listener> {
+    // listenfd also supports development supervisors. Admit only systemd's
+    // PID-scoped, fd-3 contract, and bound its descriptor-vector allocation.
+    let valid = std::env::var("LISTEN_PID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        == Some(std::process::id())
+        && std::env::var("LISTEN_FDS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            == Some(1);
+    // SAFETY: activation is consumed before runtime/child threads are started.
+    unsafe {
+        std::env::remove_var("LISTEN_FDS_FIRST_FD");
+        std::env::remove_var("LISTEN_FDNAMES");
+    }
+    if !valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected one activation socket for this process",
+        ));
+    }
     let mut descriptors = listenfd::ListenFd::from_env();
     if descriptors.len() != 1 {
         return Err(io::Error::new(
@@ -151,8 +172,6 @@ pub(super) fn listener(home: &Home) -> io::Result<Listener> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    pub(super) const SUPPORTED: bool = true;
 
     #[test]
     fn unit_paths_cannot_expand_specifiers_or_inject_directives() {

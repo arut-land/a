@@ -30,7 +30,7 @@ struct ActivationSettings: View {
         switch status {
         case .enabled: "Enabled"
         case .requiresApproval: "Awaiting approval in Login Items"
-        case .notRegistered: "Self-spawn"
+        case .notRegistered: "Disabled"
         case .notFound: "Agent unavailable"
         @unknown default: "Unknown status"
         }
@@ -40,8 +40,8 @@ struct ActivationSettings: View {
         busy = true
         problem = nil
         Task {
+            let helper = Bundle.main.bundleURL.appending(path: "Contents/Helpers/a")
             do {
-                let helper = Bundle.main.bundleURL.appending(path: "Contents/Helpers/a")
                 if enable {
                     try await Self.command(helper, "install-activation")
                     try service.register()
@@ -51,6 +51,9 @@ struct ActivationSettings: View {
                 }
             } catch {
                 problem = error.localizedDescription
+                if enable && service.status == .notRegistered {
+                    try? await Self.command(helper, "uninstall-activation")
+                }
             }
             status = service.status
             busy = false
