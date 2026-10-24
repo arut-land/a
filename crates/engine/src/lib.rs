@@ -1004,9 +1004,10 @@ impl Daemon {
         let mut stopped: Option<Instant> = None;
         let mut awake: Option<Option<sys::Awake>> = None;
         let pressure = Arc::new(rt::Notify::new());
+        // A warning delivered during subscription must remain pending.
+        let mut pressured = pressure.count();
         let notified = Arc::clone(&pressure);
         let _pressure_source = sys::resources::MemoryPressure::new(move || notified.notify());
-        let mut pressured = pressure.count();
         let mut pulsed = self.pulse.count();
         let mut jobs = self.jobs.count();
         loop {
