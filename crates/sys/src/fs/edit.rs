@@ -1,9 +1,8 @@
 //! Safe-save publication. Final-component links and multiply linked files are
 //! rejected: replacing either would silently change which object is edited.
-//! Unix exchange verifies displaced content and preserved metadata. Other paths
-//! move and verify the original, then publish without replacement. Contended
-//! restore operations retain displaced data and report a typed recovery conflict.
-//! Receipts distinguish atomic exchange visibility from a possible absence window.
+//! Publication is one atomic native rename, never evacuation or unlink. Exchange
+//! verifies displaced identity, bytes and metadata and swaps back on conflict.
+//! Receipts expose the non-exchange path race and writes through old descriptors.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -15,12 +14,20 @@ use serde::{Deserialize, Serialize};
 
 use super::staging::{Directory, Staged};
 
+// Checkpoints disappear entirely from non-test builds.
+macro_rules! publication_checkpoint {
+    ($step:literal) => {
+        #[cfg(test)]
+        publication_step($step);
+    };
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditConflict {
     Busy,
     Changed,
     Appeared,
-    Recovery(PathBuf),
+    RollbackFailed,
 }
 
 #[derive(Debug)]
@@ -80,10 +87,17 @@ pub enum Durability {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationProtection {
+    Unchanged,
     ExclusiveCreate,
     ExchangeVerified,
-    /// The target may be absent between verified removal and no-replace publication.
-    VacantNoReplace,
+    RevalidatedAtomicReplace,
+}
+
+/// Exclusions apply after the last complete identity/content/metadata check.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationLimitations {
+    pub path_replacement_after_check: bool,
+    pub writes_to_old_inode: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,7 +105,7 @@ pub struct EditReceipt {
     pub visible: bool,
     pub durability: Durability,
     pub protection: PublicationProtection,
-    pub absence_window: bool,
+    pub limitations: PublicationLimitations,
 }
 
 /// Owns the captured source and parent until publication or abort.
@@ -310,8 +324,7 @@ impl EditTransaction {
                 io::ErrorKind::ResourceBusy => EditError::Conflict(EditConflict::Changed),
                 _ => self.revalidate().err().unwrap_or(EditError::Io(error)),
             })?;
-        #[cfg(test)]
-        publication_step("staged");
+        publication_checkpoint!("staged");
         staged.file.rewind()?;
         for chunk in bytes.chunks(65536) {
             check_cancel(should_cancel, copied)?;
@@ -319,45 +332,25 @@ impl EditTransaction {
             copied += chunk.len() as u64;
         }
         staged.file.set_len(bytes.len() as u64)?;
-        #[cfg(test)]
-        publication_step("written");
+        publication_checkpoint!("written");
         check_cancel(should_cancel, copied)?;
+        #[cfg(unix)]
+        self.copy_metadata(&staged.file, metadata_content, &mut copied, should_cancel)?;
+        #[cfg(windows)]
         if let Some((source, _)) = &self.source {
-            #[cfg(target_vendor = "apple")]
-            copy_mac_xattrs(
-                source,
-                &staged.file,
-                metadata_content,
-                self.limit,
-                &mut copied,
-                should_cancel,
-            )?;
-            #[cfg(target_os = "linux")]
-            copy_xattrs(
-                source,
-                &staged.file,
-                metadata_content,
-                self.limit,
-                &mut copied,
-                should_cancel,
-            )?;
             preserve_metadata(source, &staged.file)?;
         }
-        #[cfg(test)]
-        publication_step("metadata");
+        publication_checkpoint!("metadata");
         if durable {
             staged.file.sync_all()?;
         }
-        #[cfg(test)]
-        publication_step("file_sync");
-        self.revalidate()?;
+        publication_checkpoint!("file_sync");
+        self.revalidate_staged(&staged.file)?;
         check_cancel(should_cancel, copied)?;
-        #[cfg(test)]
-        publication_step("final_check");
+        publication_checkpoint!("final_check");
         before_commit();
         let protection = self.commit(
             &mut staged,
-            bytes,
             exchange,
             || check_cancel(should_cancel, copied),
             || {},
@@ -371,36 +364,66 @@ impl EditTransaction {
         } else {
             Durability::NotRequested
         };
-        #[cfg(test)]
-        publication_step("parent_sync");
+        publication_checkpoint!("parent_sync");
         #[cfg(test)]
         drop(staged);
-        #[cfg(test)]
-        publication_step("cleanup");
+        publication_checkpoint!("cleanup");
         Ok(EditReceipt {
             visible: true,
             durability,
-            absence_window: protection == PublicationProtection::VacantNoReplace,
+            limitations: PublicationLimitations {
+                path_replacement_after_check: protection
+                    == PublicationProtection::RevalidatedAtomicReplace,
+                writes_to_old_inode: self.source.is_some(),
+            },
             protection,
         })
+    }
+
+    #[cfg(unix)]
+    fn copy_metadata(
+        &self,
+        staged: &File,
+        metadata_content: usize,
+        copied: &mut u64,
+        should_cancel: &(dyn Fn(u64) -> bool + Sync),
+    ) -> Result<(), EditError> {
+        if let Some((source, _)) = &self.source {
+            #[cfg(target_vendor = "apple")]
+            copy_mac_xattrs(
+                source,
+                staged,
+                metadata_content,
+                self.limit,
+                copied,
+                should_cancel,
+            )?;
+            #[cfg(target_os = "linux")]
+            copy_xattrs(
+                source,
+                staged,
+                metadata_content,
+                self.limit,
+                copied,
+                should_cancel,
+            )?;
+            preserve_metadata(source, staged)?;
+        }
+        Ok(())
     }
 
     fn commit(
         &self,
         staged: &mut Staged<'_>,
-        bytes: &[u8],
         exchange: bool,
         cancel: impl Fn() -> io::Result<()>,
         after_exchange: impl FnOnce(),
         before_rollback: impl FnOnce(),
     ) -> Result<PublicationProtection, EditError> {
         cancel()?;
-        #[cfg(test)]
-        publication_step("before_replace");
+        publication_checkpoint!("before_replace");
         #[cfg(windows)]
-        let _ = (bytes, exchange);
-        #[cfg(unix)]
-        let published = signature(&staged.file)?;
+        let _ = (exchange, before_rollback);
         #[cfg(unix)]
         if let Some((_, before)) = &self.source
             && exchange
@@ -413,160 +436,51 @@ impl EditTransaction {
             })?
         {
             after_exchange();
-            #[cfg(test)]
-            publication_step("after_replace");
+            publication_checkpoint!("after_replace");
             let checked = staged
                 .displaced()
                 .map_err(EditError::from)
                 .and_then(|mut displaced| {
                     self.verify_displaced(&mut displaced, &staged.file, before)
                 });
-            #[cfg(test)]
-            publication_step("displaced_checked");
+            publication_checkpoint!("displaced_checked");
             if checked.is_err() {
-                // Once visible, even our inode may contain someone else's metadata.
-                // Retain every displaced version instead of deleting on rollback.
-                let recovery = staged.retain();
-                if self.open_source().is_ok_and(|mut current| {
-                    same_object(&current, &staged.file).unwrap_or(false)
-                        && signature(&current)
-                            .is_ok_and(|now| moved_signature(now) == moved_signature(published))
-                        && check_bytes(&mut current, bytes).is_ok()
-                }) {
-                    before_rollback();
-                    #[cfg(test)]
-                    publication_step("before_rollback");
-                    let _ = staged.exchange(&self.name);
-                    #[cfg(test)]
-                    publication_step("after_rollback");
+                before_rollback();
+                publication_checkpoint!("before_rollback");
+                if !staged.exchange(&self.name).unwrap_or(false) {
+                    return Err(EditError::Conflict(EditConflict::RollbackFailed));
                 }
-                return Err(EditError::Conflict(EditConflict::Recovery(recovery)));
+                publication_checkpoint!("after_rollback");
+                return Err(EditError::Conflict(EditConflict::Changed));
             }
             return Ok(PublicationProtection::ExchangeVerified);
         }
-        self.commit_vacant(staged, cancel, after_exchange, before_rollback)
-    }
-
-    fn commit_vacant(
-        &self,
-        staged: &mut Staged<'_>,
-        cancel: impl Fn() -> io::Result<()>,
-        after_move: impl FnOnce(),
-        before_restore: impl FnOnce(),
-    ) -> Result<PublicationProtection, EditError> {
-        let Some((source, before)) = &self.source else {
-            return match staged.publish(&self.name) {
-                Ok(()) => Ok(PublicationProtection::ExclusiveCreate),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    Err(EditError::Conflict(EditConflict::Appeared))
-                }
-                Err(error) => Err(error.into()),
-            };
-        };
-        staged.prepare_vacancy()?;
-        #[cfg(windows)]
-        let authority = source_authority(source).map_err(|error| {
-            self.revalidate().err().unwrap_or_else(|| {
-                if error.raw_os_error() == Some(32) {
-                    EditError::Conflict(EditConflict::Busy)
-                } else {
-                    error.into()
-                }
-            })
-        })?;
-        // Denying delete opens pins the captured name during handle-bound unlink.
-        #[cfg(windows)]
-        self.revalidate()?;
         cancel()?;
-        #[cfg(unix)]
-        let taken = staged.take_original(source, &self.name);
-        #[cfg(windows)]
-        let taken = staged.take_original(&authority, &self.name);
-        #[cfg(windows)]
-        drop(authority);
-        taken.map_err(|error| {
-            if staged.has_original() {
-                return EditError::Conflict(EditConflict::Recovery(staged.retain_original()));
-            }
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists
-            ) {
-                EditError::Conflict(EditConflict::Changed)
-            } else {
-                self.revalidate().err().unwrap_or(EditError::Io(error))
-            }
-        })?;
-        after_move();
-        #[cfg(test)]
-        publication_step("after_replace");
-        let checked = staged
-            .original()
-            .map_err(EditError::from)
-            .and_then(|mut original| self.verify_displaced(&mut original, &staged.file, before));
-        let conflict = if checked.is_err() {
-            EditConflict::Changed
+        let protection = if self.source.is_some() {
+            staged.replace(&self.name)?;
+            PublicationProtection::RevalidatedAtomicReplace
         } else {
-            if let Err(cancelled) = cancel() {
-                before_restore();
-                return if staged.restore_original(source, &self.name).is_ok() {
-                    Err(cancelled.into())
-                } else {
-                    Err(EditError::Conflict(EditConflict::Recovery(
-                        staged.retain_original(),
-                    )))
-                };
-            }
             match staged.publish(&self.name) {
-                Ok(()) => {
-                    // The detached file can still have a writer holding an old descriptor.
-                    // Preserve it for recovery if that version changed during publication.
-                    let unchanged = staged.original().is_ok_and(|mut original| {
-                        self.verify_displaced(&mut original, &staged.file, before)
-                            .is_ok()
-                    });
-                    if unchanged && staged.reclaim_original(source).is_ok() {
-                        return Ok(PublicationProtection::VacantNoReplace);
-                    }
-                    return Err(EditError::Conflict(EditConflict::Recovery(
-                        staged.retain_original(),
-                    )));
-                }
+                Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    EditConflict::Appeared
+                    return Err(EditError::Conflict(EditConflict::Appeared));
                 }
-                Err(error) => {
-                    // A failed no-replace operation cannot justify discarding the original.
-                    before_restore();
-                    if staged.restore_original(source, &self.name).is_ok() {
-                        return Err(error.into());
-                    }
-                    return Err(EditError::Conflict(EditConflict::Recovery(
-                        staged.retain_original(),
-                    )));
-                }
+                Err(error) => return Err(error.into()),
             }
+            PublicationProtection::ExclusiveCreate
         };
-        before_restore();
-        if staged.restore_original(source, &self.name).is_ok() {
-            Err(EditError::Conflict(conflict))
-        } else {
-            Err(EditError::Conflict(EditConflict::Recovery(
-                staged.retain_original(),
-            )))
-        }
+        after_exchange();
+        publication_checkpoint!("after_replace");
+        Ok(protection)
     }
 
+    #[cfg(unix)]
     fn verify_displaced(
         &self,
         displaced: &mut File,
         snapshot: &File,
         before: &Signature,
     ) -> Result<(), EditError> {
-        #[cfg(windows)]
-        if accessible_links(displaced)? != 1 {
-            return Err(EditError::Conflict(EditConflict::Changed));
-        }
         let observed = signature(displaced)?;
         if moved_signature(*before) != moved_signature(observed) {
             return Err(EditError::Conflict(EditConflict::Changed));
@@ -584,6 +498,15 @@ impl EditTransaction {
         Ok(())
     }
 
+    fn revalidate_staged(&self, staged: &File) -> Result<(), EditError> {
+        if let Some((source, _)) = &self.source
+            && !preserved_metadata_matches(source, staged, self.limit)?
+        {
+            return Err(EditError::Conflict(EditConflict::Changed));
+        }
+        self.revalidate()
+    }
+
     fn stage(&self, should_cancel: &(dyn Fn(u64) -> bool + Sync)) -> io::Result<Staged<'_>> {
         check_cancel(should_cancel, 0)?;
         #[cfg(unix)]
@@ -594,7 +517,7 @@ impl EditTransaction {
         #[cfg(unix)]
         return Staged::create(directory);
         #[cfg(windows)]
-        Staged::copied(directory, self.source.is_some(), |directory| {
+        Staged::copied(directory, |directory| {
             stage_windows(self, directory, should_cancel)
         })
     }
@@ -624,12 +547,6 @@ fn moved_signature(mut signature: Signature) -> Signature {
     // Rename changes ctime itself; identity, mtime, mode and bytes must still match.
     signature.5 = 0;
     signature.6 = 0;
-    signature
-}
-
-#[cfg(windows)]
-fn moved_signature(mut signature: Signature) -> Signature {
-    signature.changed = 0;
     signature
 }
 
@@ -665,7 +582,7 @@ pub(super) fn temporary_name() -> OsString {
     .into()
 }
 
-fn open_parent(path: &Path) -> io::Result<File> {
+pub(super) fn open_parent(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         Ok(File::from(rustix::fs::open(
@@ -1007,6 +924,49 @@ pub(super) fn access_acl(source: Option<&File>, destination: &File) -> io::Resul
         acl_free(acl);
     }
     result
+}
+
+/// Establish the runtime directory policy once; ordinary private publications
+/// beneath this owned handle need no per-file inherited-ACL repair.
+#[cfg(target_vendor = "apple")]
+pub(super) fn private_directory_acl(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn acl_get_fd(fd: libc::c_int) -> *mut std::ffi::c_void;
+        fn acl_get_entry(
+            acl: *mut std::ffi::c_void,
+            entry_id: libc::c_int,
+            entry: *mut *mut std::ffi::c_void,
+        ) -> libc::c_int;
+        fn acl_free(acl: *mut std::ffi::c_void) -> libc::c_int;
+    }
+    // SAFETY: the descriptor is owned; the ACL is freed after the entry query.
+    let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    let mut entry = std::ptr::null_mut();
+    // Darwin returns zero for an entry and -1/EINVAL at the end of a valid ACL.
+    // https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/acl_get_entry.3.html
+    // SAFETY: acl is live and entry is a writable output slot.
+    let found = unsafe { acl_get_entry(acl, 0, &raw mut entry) };
+    let error = io::Error::last_os_error();
+    // SAFETY: acl_get_fd returned this allocation; ownership was not transferred.
+    unsafe {
+        acl_free(acl);
+    }
+    if found == 0 {
+        access_acl(None, file)
+    } else if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOENT)) {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1640,55 +1600,6 @@ fn stream_bytes(file: &File, limit: usize) -> io::Result<u64> {
 }
 
 #[cfg(windows)]
-pub(super) fn accessible_links(file: &File) -> io::Result<u32> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_STANDARD_LINK_INFORMATION, FileStandardLinkInformation, NtQueryInformationFile,
-    };
-    // The ULONG-only SDK record needs a quadword boundary for the native query.
-    #[repr(C, align(8))]
-    struct Aligned(FILE_STANDARD_LINK_INFORMATION);
-    let mut information = Aligned(FILE_STANDARD_LINK_INFORMATION::default());
-    let mut status = windows_sys::Win32::System::IO::IO_STATUS_BLOCK::default();
-    // SAFETY: file owns its handle; both outputs have the advertised writable size.
-    let result = unsafe {
-        NtQueryInformationFile(
-            file.as_raw_handle(),
-            &raw mut status,
-            (&raw mut information.0).cast(),
-            u32::try_from(size_of::<FILE_STANDARD_LINK_INFORMATION>())
-                .expect("fixed structure size"),
-            FileStandardLinkInformation,
-        )
-    };
-    if result < 0 {
-        // SAFETY: converts a scalar status without dereferencing any pointer.
-        let code =
-            unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(result) }.cast_signed();
-        return Err(if matches!(code, 1 | 50 | 87) {
-            io::ErrorKind::Unsupported.into()
-        } else {
-            io::Error::from_raw_os_error(code)
-        });
-    }
-    Ok(information.0.NumberOfAccessibleLinks)
-}
-
-#[cfg(windows)]
-fn source_authority(source: &File) -> io::Result<File> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::{
-        Foundation::GENERIC_READ,
-        Storage::FileSystem::{DELETE, FILE_SHARE_READ},
-    };
-    reopen_shared(
-        source.as_raw_handle(),
-        GENERIC_READ | DELETE,
-        FILE_SHARE_READ,
-    )
-}
-
-#[cfg(windows)]
 pub(super) fn reopen(
     handle: windows_sys::Win32::Foundation::HANDLE,
     access: u32,
@@ -1808,8 +1719,7 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
 #[cfg(windows)]
 fn copy_access_policy(source: &File, destination: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
-    // Read the stored descriptor, without synthesizing inherited ACE flags from
-    // the current parent spelling. That spelling changes during evacuation.
+    // Compare the stored descriptor, without parent-dependent ACE presentation flags.
     let policy = WindowsPolicy::read(source)?;
     // SAFETY: both the destination handle and aligned descriptor remain live.
     let status = unsafe {
@@ -1891,12 +1801,11 @@ mod tests {
     use std::path::PathBuf;
 
     #[cfg(unix)]
-    fn reclaim_recovery(result: Result<EditReceipt, EditError>, expected: &[u8]) {
-        let Err(EditError::Conflict(EditConflict::Recovery(path))) = result else {
-            panic!("{result:?}");
-        };
-        assert_eq!(fs::read(&path).unwrap(), expected);
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    fn assert_changed(result: &Result<EditReceipt, EditError>) {
+        assert!(
+            matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
+            "{result:?}"
+        );
     }
 
     struct Workspace(PathBuf);
@@ -1944,7 +1853,8 @@ mod tests {
         assert_eq!(receipt.durability, Durability::NotRequested);
         assert!(matches!(
             receipt.protection,
-            PublicationProtection::ExchangeVerified | PublicationProtection::VacantNoReplace
+            PublicationProtection::ExchangeVerified
+                | PublicationProtection::RevalidatedAtomicReplace
         ));
         let mut old = String::new();
         reader.read_to_string(&mut old).unwrap();
@@ -2163,14 +2073,7 @@ mod tests {
             if replacing {
                 preserve_metadata(&transaction.source.as_ref().unwrap().0, &staged.file).unwrap();
                 transaction
-                    .commit(
-                        &mut staged,
-                        b"replacement",
-                        !fallback,
-                        || Ok(()),
-                        || {},
-                        || {},
-                    )
+                    .commit(&mut staged, !fallback, || Ok(()), || {}, || {})
                     .unwrap();
             } else if fallback {
                 staged.fallback(&transaction.name).unwrap();
@@ -2789,7 +2692,7 @@ mod tests {
                     fs::write(work.target(), b"theirs").unwrap();
                 },
             );
-            reclaim_recovery(result, b"ours");
+            assert_changed(&result);
             assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
             work.only_target_remains();
         }
@@ -2797,160 +2700,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn fallback_publication_uses_a_verified_vacancy_and_no_replace() {
+    fn atomic_fallback_reports_the_final_path_replacement_window() {
         let work = Workspace::new();
         fs::write(work.target(), b"original").unwrap();
-        let transaction = work.capture();
-        let mut staged = transaction.stage(&|_| false).unwrap();
-        staged.file.write_all(b"ours").unwrap();
-        preserve_metadata(&transaction.source.as_ref().unwrap().0, &staged.file).unwrap();
-        transaction.revalidate().unwrap();
+        let receipt = work
+            .capture()
+            .publish_with_sync(b"ours", false, File::sync_all, &|_| false, false, || {
+                let incoming = work.0.join("incoming");
+                fs::write(&incoming, b"theirs").unwrap();
+                fs::rename(incoming, work.target()).unwrap();
+            })
+            .unwrap();
         assert_eq!(
-            transaction
-                .commit(
-                    &mut staged,
-                    b"ours",
-                    false,
-                    || Ok(()),
-                    || assert!(!work.target().exists()),
-                    || {}
-                )
-                .unwrap(),
-            PublicationProtection::VacantNoReplace
+            receipt.protection,
+            PublicationProtection::RevalidatedAtomicReplace
         );
-        drop(staged);
+        assert!(receipt.limitations.path_replacement_after_check);
+        assert!(receipt.limitations.writes_to_old_inode);
         assert_eq!(fs::read(work.target()).unwrap(), b"ours");
         work.only_target_remains();
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn rollback_races_retain_every_displaced_writer_version() {
-        for during_rollback in [false, true] {
-            let work = Workspace::new();
-            fs::write(work.target(), b"original").unwrap();
-            let transaction = work.capture();
-            let mut staged = transaction.stage(&|_| false).unwrap();
-            staged.file.write_all(b"ours").unwrap();
-            transaction.revalidate().unwrap();
-            fs::write(work.target(), b"first writer").unwrap();
-            let inject = || fs::write(work.target(), b"second writer").unwrap();
-            let result = transaction.commit(
-                &mut staged,
-                b"ours",
-                true,
-                || Ok(()),
-                || {
-                    if !during_rollback {
-                        inject();
-                    }
-                },
-                || {
-                    if during_rollback {
-                        inject();
-                    }
-                },
-            );
-            let Err(EditError::Conflict(EditConflict::Recovery(path))) = result else {
-                panic!("{result:?}");
-            };
-            drop(staged);
-            let target = fs::read(work.target()).unwrap();
-            let retained = fs::read(&path).unwrap();
-            assert!(
-                (target == b"first writer" && retained == b"second writer")
-                    || (target == b"second writer" && retained == b"first writer")
-            );
-            fs::remove_file(&path).unwrap();
-            fs::remove_dir(path.parent().unwrap()).unwrap();
-            work.only_target_remains();
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rollback_retains_metadata_written_to_the_visible_replacement() {
-        use rustix::fs::{XattrFlags, fgetxattr, fsetxattr};
-        let work = Workspace::new();
-        fs::write(work.target(), b"original").unwrap();
-        let transaction = work.capture();
-        let mut staged = transaction.stage(&|_| false).unwrap();
-        staged.file.write_all(b"ours").unwrap();
-        preserve_metadata(&transaction.source.as_ref().unwrap().0, &staged.file).unwrap();
-        transaction.revalidate().unwrap();
-        fs::write(work.target(), b"first writer").unwrap();
-        let result = transaction.commit(
-            &mut staged,
-            b"ours",
-            true,
-            || Ok(()),
-            || {
-                fsetxattr(
-                    File::open(work.target()).unwrap(),
-                    c"user.a-edit",
-                    b"second metadata",
-                    XattrFlags::empty(),
-                )
-                .unwrap();
-            },
-            || {},
-        );
-        let Err(EditError::Conflict(EditConflict::Recovery(path))) = result else {
-            panic!("{result:?}");
-        };
-        drop(staged);
-        assert_eq!(fs::read(work.target()).unwrap(), b"first writer");
-        assert_eq!(fs::read(&path).unwrap(), b"ours");
-        let mut value = [0; 32];
-        let size = fgetxattr(File::open(&path).unwrap(), c"user.a-edit", &mut value[..]).unwrap();
-        assert_eq!(&value[..size], b"second metadata");
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
-        work.only_target_remains();
-    }
-
     #[cfg(windows)]
     #[test]
-    fn evacuation_preserves_captured_windows_metadata() {
-        let work = Workspace::new();
-        fs::write(work.target(), b"original").unwrap();
-        let transaction = work.capture();
-        let (source, before) = transaction.source.as_ref().unwrap();
-        let mut staged = transaction.stage(&|_| false).unwrap();
-        staged.file.rewind().unwrap();
-        staged.file.write_all(b"ours").unwrap();
-        staged.file.set_len(4).unwrap();
-        preserve_metadata(source, &staged.file).unwrap();
-        transaction.revalidate().unwrap();
-        assert!(preserved_metadata_matches(source, &staged.file, transaction.limit).unwrap());
-        staged.prepare_vacancy().unwrap();
-        assert!(
-            windows_policy_matches(source, &staged.file).unwrap(),
-            "probe changed policy"
-        );
-        let authority = source_authority(source).unwrap();
-        transaction.revalidate().unwrap();
-        staged.take_original(&authority, &transaction.name).unwrap();
-        drop(authority);
-        assert!(!work.target().exists());
-        let mut original = staged.original().unwrap();
-        transaction
-            .verify_displaced(&mut original, &staged.file, before)
-            .unwrap();
-        staged.restore_original(source, &transaction.name).unwrap();
-        assert!(
-            preserved_metadata_matches(
-                &File::open(work.target()).unwrap(),
-                &staged.file,
-                transaction.limit
-            )
-            .unwrap()
-        );
-        assert_eq!(fs::read(work.target()).unwrap(), b"original");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn acl_changes_in_the_final_window_are_never_discarded() {
+    fn acl_changes_before_the_final_check_are_never_discarded() {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
@@ -2966,186 +2739,67 @@ mod tests {
             .open(work.target())
             .unwrap();
         let transaction = work.capture();
+        let staged = transaction.stage(&|_| false).unwrap();
         assert!(!windows_policy_matches(&authority, &policy.file).unwrap());
-        let result = transaction.publish_with_sync(
-            b"ours",
-            false,
-            File::sync_all,
-            &|_| false,
-            false,
-            || copy_access_policy(&policy.file, &authority).unwrap(),
+        copy_access_policy(&policy.file, &authority).unwrap();
+        let result = transaction.revalidate_staged(&staged.file);
+        assert!(
+            matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
+            "{result:?}"
         );
-        assert!(matches!(result, Err(EditError::Conflict(_))), "{result:?}");
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
         assert!(windows_policy_matches(&authority, &policy.file).unwrap());
+        drop(staged);
         drop(authority);
         drop(policy);
         work.only_target_remains();
     }
 
-    #[cfg(windows)]
+    #[cfg(unix)]
     #[test]
-    fn the_source_guard_blocks_existing_and_final_window_writers() {
-        let work = Workspace::new();
-        fs::write(work.target(), b"original").unwrap();
-        let writer = fs::OpenOptions::new()
-            .write(true)
-            .open(work.target())
-            .unwrap();
-        assert!(matches!(
-            EditTransaction::capture(&work.target(), 32),
-            Err(EditError::Conflict(EditConflict::Busy))
-        ));
-        drop(writer);
-        let transaction = work.capture();
-        let receipt = transaction
-            .publish_with_sync(b"ours", false, File::sync_all, &|_| false, true, || {
-                assert!(
-                    fs::OpenOptions::new()
-                        .write(true)
-                        .open(work.target())
-                        .is_err()
-                );
-            })
-            .unwrap();
-        assert_eq!(receipt.protection, PublicationProtection::VacantNoReplace);
-        assert!(receipt.absence_window);
-        assert_eq!(fs::read(work.target()).unwrap(), b"ours");
-        work.only_target_remains();
-    }
-    #[test]
-    fn replacement_in_the_final_window_is_never_overwritten_without_exchange() {
-        let work = Workspace::new();
-        fs::write(work.target(), b"original").unwrap();
-        let transaction = work.capture();
-        let result = transaction.publish_with_sync(
-            b"ours",
-            false,
-            File::sync_all,
-            &|_| false,
-            false,
-            || {
-                let other = work.0.join("other");
-                fs::write(&other, b"theirs").unwrap();
-                #[cfg(unix)]
-                super::super::replace(&other, &work.target()).unwrap();
-                #[cfg(windows)]
-                {
-                    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
-                    use windows_sys::Win32::Storage::FileSystem::{
-                        DELETE, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-                        FILE_SHARE_WRITE,
-                    };
-                    let file = fs::OpenOptions::new()
-                        .access_mode(DELETE)
-                        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-                        .open(other)
-                        .unwrap();
-                    let parent = open_parent(&work.0).unwrap();
-                    let name: Vec<u16> = std::ffi::OsStr::new("target").encode_wide().collect();
-                    let length = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2;
-                    let mut buffer =
-                        vec![0u64; length.max(size_of::<FILE_RENAME_INFO>()).div_ceil(8)];
-                    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-                    // SAFETY: aligned storage covers the header and UTF-16 tail; both
-                    // owned handles and the buffer remain live through the native call.
-                    let status = unsafe {
-                        (*info).Anonymous.Flags = 0x3; // REPLACE_IF_EXISTS | POSIX_SEMANTICS
-                        (*info).RootDirectory = parent.as_raw_handle();
-                        (*info).FileNameLength = u32::try_from(name.len() * 2).unwrap();
-                        std::ptr::copy_nonoverlapping(
-                            name.as_ptr(),
-                            (*info).FileName.as_mut_ptr(),
-                            name.len(),
-                        );
-                        let mut status = windows_sys::Win32::System::IO::IO_STATUS_BLOCK::default();
-                        windows_sys::Wdk::Storage::FileSystem::NtSetInformationFile(
-                            file.as_raw_handle(),
-                            &raw mut status,
-                            info.cast(),
-                            u32::try_from(length).unwrap(),
-                            windows_sys::Wdk::Storage::FileSystem::FileRenameInformationEx,
-                        )
-                    };
-                    assert!(
-                        status >= 0,
-                        "external POSIX replacement failed: {:#x}",
-                        status.cast_unsigned()
-                    );
-                }
-            },
-        );
-        assert!(matches!(result, Err(EditError::Conflict(_))), "{result:?}");
-        assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
-        if let Err(EditError::Conflict(EditConflict::Recovery(path))) = result {
-            assert_eq!(fs::read(&path).unwrap(), b"original");
-            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    fn writes_through_an_old_descriptor_cannot_change_the_published_file() {
+        for exchange in [false, true] {
+            let work = Workspace::new();
+            fs::write(work.target(), b"original").unwrap();
+            let mut old = fs::OpenOptions::new()
+                .write(true)
+                .open(work.target())
+                .unwrap();
+            let receipt = work
+                .capture()
+                .publish_with_sync(b"ours", false, File::sync_all, &|_| false, exchange, || {})
+                .unwrap();
+            old.write_all(b"late writer").unwrap();
+            assert_eq!(fs::read(work.target()).unwrap(), b"ours");
+            assert!(receipt.limitations.writes_to_old_inode);
+            work.only_target_remains();
         }
-        work.only_target_remains();
-    }
-
-    #[test]
-    fn moving_the_target_away_in_the_final_window_never_deletes_its_new_name() {
-        let work = Workspace::new();
-        fs::write(work.target(), b"original").unwrap();
-        let moved = work.0.join("moved");
-        let result = work.capture().publish_with_sync(
-            b"ours",
-            false,
-            File::sync_all,
-            &|_| false,
-            false,
-            || fs::rename(work.target(), &moved).unwrap(),
-        );
-        assert!(
-            matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
-            "{result:?}"
-        );
-        assert!(!work.target().exists());
-        assert_eq!(fs::read(&moved).unwrap(), b"original");
-        fs::remove_file(moved).unwrap();
-        assert_eq!(fs::read_dir(&work.0).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
     #[test]
     fn metadata_changes_in_the_final_window_are_restored() {
         use rustix::fs::{XattrFlags, fgetxattr, fsetxattr};
-        for exchange in [true, false] {
-            let work = Workspace::new();
-            fs::write(work.target(), b"original").unwrap();
-            let source = File::open(work.target()).unwrap();
-            fsetxattr(&source, c"user.a-edit", b"before", XattrFlags::empty()).unwrap();
-            let transaction = work.capture();
-            let result = transaction.publish_with_sync(
-                b"ours",
-                false,
-                File::sync_all,
-                &|_| false,
-                exchange,
-                || {
-                    fsetxattr(&source, c"user.a-edit", b"after!", XattrFlags::empty()).unwrap();
-                },
-            );
-            if exchange {
-                reclaim_recovery(result, b"ours");
-            } else {
-                assert!(
-                    matches!(result, Err(EditError::Conflict(EditConflict::Changed))),
-                    "{result:?}"
-                );
-            }
-            assert_eq!(fs::read(work.target()).unwrap(), b"original");
-            let mut value = [0; 32];
-            let count = fgetxattr(
-                File::open(work.target()).unwrap(),
-                c"user.a-edit",
-                &mut value[..],
-            )
-            .unwrap();
-            assert_eq!(&value[..count], b"after!");
-            work.only_target_remains();
-        }
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let source = File::open(work.target()).unwrap();
+        fsetxattr(&source, c"user.a-edit", b"before", XattrFlags::empty()).unwrap();
+        let transaction = work.capture();
+        let result =
+            transaction.publish_with_sync(b"ours", false, File::sync_all, &|_| false, true, || {
+                fsetxattr(&source, c"user.a-edit", b"after!", XattrFlags::empty()).unwrap();
+            });
+        assert_changed(&result);
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        let mut value = [0; 32];
+        let count = fgetxattr(
+            File::open(work.target()).unwrap(),
+            c"user.a-edit",
+            &mut value[..],
+        )
+        .unwrap();
+        assert_eq!(&value[..count], b"after!");
+        work.only_target_remains();
     }
 
     #[cfg(target_vendor = "apple")]
@@ -3169,7 +2823,7 @@ mod tests {
                     .unwrap();
             },
         );
-        reclaim_recovery(result, b"ours");
+        assert_changed(&result);
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
         let mut bytes = [0; 32];
         let count = rustix::fs::fgetxattr(
@@ -3231,79 +2885,6 @@ mod tests {
         work.only_target_remains();
     }
 
-    #[test]
-    fn cancellation_during_verification_never_publishes_or_discards_an_arrival() {
-        use std::sync::atomic::AtomicBool;
-        for arrival in [false, true] {
-            let work = Workspace::new();
-            fs::write(work.target(), b"original").unwrap();
-            let transaction = work.capture();
-            let mut staged = transaction.stage(&|_| false).unwrap();
-            staged.file.rewind().unwrap();
-            staged.file.write_all(b"ours").unwrap();
-            staged.file.set_len(4).unwrap();
-            preserve_metadata(&transaction.source.as_ref().unwrap().0, &staged.file).unwrap();
-            transaction.revalidate().unwrap();
-            let cancelled = AtomicBool::new(false);
-            let result = transaction.commit(
-                &mut staged,
-                b"ours",
-                false,
-                || check_cancel(&|_| cancelled.load(Ordering::Relaxed), 0),
-                || {
-                    if arrival {
-                        fs::write(work.target(), b"theirs").unwrap();
-                    }
-                    cancelled.store(true, Ordering::Relaxed);
-                },
-                || {},
-            );
-            drop(staged);
-            if arrival {
-                let Err(EditError::Conflict(EditConflict::Recovery(path))) = result else {
-                    panic!("{result:?}");
-                };
-                assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
-                assert_eq!(fs::read(&path).unwrap(), b"original");
-                fs::remove_dir_all(path.parent().unwrap()).unwrap();
-            } else {
-                assert!(matches!(result, Err(EditError::Cancelled)), "{result:?}");
-                assert_eq!(fs::read(work.target()).unwrap(), b"original");
-            }
-            work.only_target_remains();
-        }
-    }
-
-    #[test]
-    fn an_arrival_during_the_vacancy_is_preserved_with_the_displaced_original() {
-        let work = Workspace::new();
-        fs::write(work.target(), b"original").unwrap();
-        let transaction = work.capture();
-        let mut staged = transaction.stage(&|_| false).unwrap();
-        staged.file.rewind().unwrap();
-        staged.file.write_all(b"ours").unwrap();
-        staged.file.set_len(4).unwrap();
-        preserve_metadata(&transaction.source.as_ref().unwrap().0, &staged.file).unwrap();
-        transaction.revalidate().unwrap();
-        let result = transaction.commit(
-            &mut staged,
-            b"ours",
-            false,
-            || Ok(()),
-            || fs::write(work.target(), b"theirs").unwrap(),
-            || {},
-        );
-        let Err(EditError::Conflict(EditConflict::Recovery(path))) = result else {
-            panic!("{result:?}");
-        };
-        drop(staged);
-        drop(transaction);
-        assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
-        assert_eq!(fs::read(&path).unwrap(), b"original");
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
-        work.only_target_remains();
-    }
-
     #[cfg(target_vendor = "apple")]
     #[test]
     fn acl_changes_in_the_final_window_are_restored() {
@@ -3326,7 +2907,7 @@ mod tests {
                 );
             },
         );
-        reclaim_recovery(result, b"ours");
+        assert_changed(&result);
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
         let output = std::process::Command::new("/bin/ls")
             .arg("-le")

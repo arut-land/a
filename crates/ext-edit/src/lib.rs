@@ -7,12 +7,10 @@
 //! A private staging namespace shields content until publication. Metadata and
 //! stream copying are bounded and observe cancellation. Links are rejected.
 //! Receipts distinguish visibility, durability and conflict protection.
-//! Unix exchange verifies displaced content and preserved metadata before reclaiming
-//! the original. Other publication paths first move and verify the original, then
-//! use no-replace publication; the receipt reports that readers may see an absent
-//! target during that interval. Conflicts restore without replacing an arriving
-//! file. After a visible swap, rollback retains the displaced version and reports
-//! its recovery path, preserving writes to that briefly visible replacement.
+//! The target is always present across publication and process termination. Unix
+//! exchange verifies the displaced file and swaps back on conflict; other paths
+//! atomically replace after the final check. Receipts document the remaining
+//! non-exchange path-replacement race and writes through old inode descriptors.
 
 use ext::{Configured, CwdOf, Extension, Need, Refused, Registrar, Table, Text, Tool as _};
 
@@ -29,7 +27,7 @@ impl Configured for Edit {
 
 impl Extension for Edit {
     const NAME: &'static str = "edit";
-    const VERSION: u32 = 3;
+    const VERSION: u32 = 4;
     type Needs = (Need<dyn CwdOf>, ());
 
     fn contribute(&self, r: &mut Registrar) {

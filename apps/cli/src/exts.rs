@@ -236,7 +236,7 @@ mod tests {
                 ("fork", 1),
                 ("prompt", 1),
                 ("shell", 1),
-                ("edit", 3),
+                ("edit", 4),
                 #[cfg(feature = "mcp")]
                 ("mcp", 1),
                 ("compact", 1),

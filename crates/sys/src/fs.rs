@@ -9,7 +9,8 @@ use std::path::Path;
 mod edit;
 mod staging;
 pub use edit::{
-    Durability, EditConflict, EditError, EditReceipt, EditTransaction, PublicationProtection,
+    Durability, EditConflict, EditError, EditReceipt, EditTransaction, PublicationLimitations,
+    PublicationProtection,
 };
 
 /// Why discovery skipped a candidate instead of opening arbitrary filesystem objects.
@@ -365,6 +366,77 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
             io::ErrorKind::Unsupported,
             "publish names with write-through rename",
         ))
+    }
+}
+
+/// An owned private runtime namespace, checked once before publishing records.
+/// Its access policy must remain private for the lifetime of this capability.
+#[cfg(unix)]
+pub(crate) struct PrivateDirectory(File);
+
+#[cfg(unix)]
+impl PrivateDirectory {
+    pub(crate) fn create(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        private_dir(path)?;
+        let file = edit::open_parent(path)?;
+        let metadata = file.metadata()?;
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o777 != 0o700
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        #[cfg(target_vendor = "apple")]
+        edit::private_directory_acl(&file)?;
+        Ok(Self(file))
+    }
+
+    /// Reconstructible discovery records require visibility, not persistence.
+    pub(crate) fn write_private(&self, name: &std::ffi::OsStr, bytes: &[u8]) -> io::Result<()> {
+        if !matches!(
+            (
+                Path::new(name).components().next(),
+                Path::new(name).components().count()
+            ),
+            (Some(std::path::Component::Normal(_)), 1)
+        ) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let (temporary, mut file) = loop {
+            let temporary = edit::temporary_name();
+            #[cfg(unix)]
+            let created = rustix::fs::openat(
+                &self.0,
+                &temporary,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .map(File::from)
+            .map_err(io::Error::from);
+
+            match created {
+                Ok(file) => break (temporary, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        };
+        let result = (|| {
+            #[cfg(target_vendor = "apple")]
+            edit::access_acl(None, &file)?;
+            file.write_all(bytes)?;
+            #[cfg(unix)]
+            rustix::fs::renameat(&self.0, &temporary, &self.0, name)?;
+
+            Ok(())
+        })();
+        if result.is_err() {
+            #[cfg(unix)]
+            let _ = rustix::fs::unlinkat(&self.0, &temporary, rustix::fs::AtFlags::empty());
+        }
+        result
     }
 }
 
@@ -785,6 +857,57 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn discovery_publication_stays_in_the_owned_private_directory() {
+        let root = std::env::temp_dir().join(edit::temporary_name());
+        fs::create_dir(&root).unwrap();
+        let runtime = root.join("runtime");
+        let records = PrivateDirectory::create(&runtime).unwrap();
+        let moved = root.join("moved");
+        fs::rename(&runtime, &moved).unwrap();
+        fs::create_dir(&runtime).unwrap();
+        records
+            .write_private(std::ffi::OsStr::new("endpoint"), b"socket")
+            .unwrap();
+        assert_eq!(fs::read(moved.join("endpoint")).unwrap(), b"socket");
+        assert!(!runtime.join("endpoint").exists());
+        assert!(
+            records
+                .write_private(std::ffi::OsStr::new("../escape"), b"socket")
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn discovery_directory_removes_inheritable_access_before_publication() {
+        let root = std::env::temp_dir().join(edit::temporary_name());
+        fs::create_dir(&root).unwrap();
+        assert!(
+            std::process::Command::new("chmod")
+                .args(["+a", "everyone allow read,file_inherit,directory_inherit"])
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let runtime = root.join("runtime");
+        let records = PrivateDirectory::create(&runtime).unwrap();
+        records
+            .write_private(std::ffi::OsStr::new("endpoint"), b"socket")
+            .unwrap();
+        let listing = std::process::Command::new("ls")
+            .args(["-led"])
+            .arg(&runtime)
+            .arg(runtime.join("endpoint"))
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        assert!(!String::from_utf8_lossy(&listing.stdout).contains("everyone"));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn discovery_never_opens_a_fifo_or_directory() {
