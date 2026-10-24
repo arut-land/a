@@ -49,7 +49,7 @@ fn native(assistant: &Assistant, target: &Target<'_>) -> bool {
 /// conversion its producer's protocol owns.
 fn foreign<'a>(reasoning: &'a Reasoning, origin: &Origin) -> Option<Thought<'a>> {
     match origin.protocol {
-        ProtocolKey::OpenaiChat => chat::foreign(reasoning),
+        ProtocolKey::OpenaiChat => chat::foreign(reasoning, origin),
         ProtocolKey::OpenaiResponses => responses::foreign(reasoning),
         ProtocolKey::AnthropicMessages => messages::foreign(reasoning, origin),
         ProtocolKey::GoogleGemini => gemini::foreign(reasoning),

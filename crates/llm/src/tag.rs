@@ -254,6 +254,22 @@ mod tests {
         );
     }
 
+    /// The policy: what a model reads in a body is exactly what was given
+    /// (code, logs, markup), and an attribute value can never end its
+    /// quotes or the tag.
+    #[test]
+    fn a_body_is_never_escaped_and_an_attribute_always_is() {
+        let raw = "<b> & \"q\" > </steer>\n";
+        let tag = Tag::new("steer").attr("from", raw).body(raw);
+        let text = tag.to_string();
+        let (open, body) = text.split_once('>').unwrap();
+        assert_eq!(
+            open,
+            "<steer from=\"&lt;b&gt; &amp; &quot;q&quot; &gt; &lt;/steer&gt;&#10;\""
+        );
+        assert_eq!(body, format!("\n{raw}</steer>"));
+    }
+
     #[test]
     fn reasoning_names_its_source() {
         let source = Origin {

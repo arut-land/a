@@ -469,12 +469,13 @@ fn ciphertext(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-/// Every recorded reply that reasons, continued by every other protocol:
-/// its readable reasoning reaches the next model as context naming its
-/// source, and none of its ids, signatures or ciphertext does.
+/// Every recorded reply that reasons, continued by any other model, over
+/// its own protocol or another: its readable reasoning reaches the next
+/// model as context naming its source, and none of its ids, signatures or
+/// ciphertext does.
 #[test]
 fn foreign_reasoning_reaches_other_providers_tagged_and_never_its_ciphertext() {
-    let (mut shown, mut guarded) = (0, 0);
+    let (mut shown, mut switched, mut guarded) = (0, 0, 0);
     for (by, reply) in &replies() {
         let reasoning: Vec<&llm::Reasoning> = (reply.message.content.iter())
             .filter_map(|part| match part {
@@ -497,24 +498,34 @@ fn foreign_reasoning_reaches_other_providers_tagged_and_never_its_ciphertext() {
         let source = format!("source=\\\"{}/{}\\\"", origin.provider, origin.model);
         for (label, provider, models) in targets() {
             let key = provider.protocol.key();
-            if key == *by {
-                continue;
+            for model in models {
+                if *provider.id == origin.provider && *model == origin.model {
+                    continue;
+                }
+                let messages = vec![
+                    Message::user("hi"),
+                    Message::Assistant(reply.message.clone()),
+                    Message::user("go on"),
+                ];
+                let body = sent(&provider, &request(model, key, 4, messages));
+                let body = String::from_utf8_lossy(&body);
+                for secret in &secrets {
+                    assert!(
+                        !body.contains(secret.as_str()),
+                        "{label} {model} was sent {secret}"
+                    );
+                }
+                assert_eq!(body.contains(&source), readable, "{label} {model}: {body}");
+                shown += usize::from(readable);
+                switched += usize::from(readable && key == *by);
+                guarded += secrets.len();
             }
-            let messages = vec![
-                Message::user("hi"),
-                Message::Assistant(reply.message.clone()),
-                Message::user("go on"),
-            ];
-            let body = sent(&provider, &request(models[0], key, 4, messages));
-            let body = String::from_utf8_lossy(&body);
-            for secret in &secrets {
-                assert!(!body.contains(secret.as_str()), "{label} was sent {secret}");
-            }
-            assert_eq!(body.contains(&source), readable, "{label}: {body}");
-            shown += usize::from(readable);
-            guarded += secrets.len();
         }
     }
     assert!(shown > 0, "the cassettes hold readable reasoning");
+    assert!(
+        switched > 0,
+        "a model switch over the same protocol is covered"
+    );
     assert!(guarded > 0, "the cassettes hold reasoning state");
 }

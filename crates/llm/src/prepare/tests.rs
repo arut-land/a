@@ -309,3 +309,34 @@ fn separate_turns_keep_distinct_ids_and_all_results_even_with_native_calls() {
         }
     }
 }
+
+#[test]
+fn a_models_reasoning_reads_as_the_same_kind_over_every_wire_it_came_by() {
+    let reasoning = Reasoning {
+        text: "weighing it".into(),
+        redacted: false,
+        meta: Meta::new(),
+    };
+    let kind = |protocol, model: &str| {
+        let origin = Origin {
+            protocol,
+            provider: "p".into(),
+            model: model.into(),
+        };
+        foreign(&reasoning, &origin).map(|thought| thought.tag(&origin).name)
+    };
+    for model in ["claude-sonnet-4-5", "anthropic/claude-sonnet-4.5"] {
+        assert_eq!(
+            kind(ProtocolKey::OpenaiChat, model),
+            kind(ProtocolKey::AnthropicMessages, model)
+        );
+        assert_eq!(
+            kind(ProtocolKey::OpenaiChat, model),
+            Some("reasoning-summary")
+        );
+    }
+    assert_eq!(
+        kind(ProtocolKey::OpenaiChat, "deepseek-reasoner"),
+        Some("reasoning")
+    );
+}

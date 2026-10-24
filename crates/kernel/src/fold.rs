@@ -93,7 +93,12 @@ impl Fold {
                 segments,
                 taken: true,
                 ..
-            } => self.user(&segments.text(), registry),
+            } => match segments.as_text() {
+                Some(typed) => self.user(typed, registry),
+                None => Some(Input::User {
+                    text: segments.text(),
+                }),
+            },
             Body::Take { input } => {
                 let queued = self.ledger.untaken().iter().find(|q| q.seq == *input)?;
                 // A steer taken just before a model call is the model's to
@@ -103,11 +108,13 @@ impl Fold {
                         self.asked.front(),
                         Some(Next::Agent(Action::CallModel { .. }))
                     );
-                let text = queued.text.clone();
+                let (text, typed) = (queued.text.clone(), queued.typed);
                 if steers {
                     None
-                } else {
+                } else if typed {
                     self.user(&text, registry)
+                } else {
+                    Some(Input::User { text })
                 }
             }
             Body::Decision {

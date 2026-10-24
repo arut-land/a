@@ -179,6 +179,9 @@ pub struct Queued {
     pub seq: Seq,
     pub text: String,
     pub steer: bool,
+    /// Whether `text` was typed, not pasted or attached: only typed text
+    /// may be a slash command.
+    pub typed: bool,
 }
 
 /// A child session linked, and the input it starts with.
@@ -241,6 +244,7 @@ impl Ledger {
                         seq,
                         text: envelope.payload.clone(),
                         steer: false,
+                        typed: true,
                     });
                 }
             }
@@ -258,6 +262,7 @@ impl Ledger {
                         seq,
                         text: segments.text(),
                         steer: *mode == Mode::Steer,
+                        typed: segments.as_text().is_some(),
                     });
                 }
             }

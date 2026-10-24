@@ -814,6 +814,53 @@ fn slash_commands_run_without_a_turn() {
     ]);
 }
 
+/// A pasted `/jobs` line is what the user pasted, never a command, taken
+/// at once or after waiting.
+#[test]
+fn a_pasted_slash_line_is_input_not_a_command() {
+    let pasted = || protocol::Segments(vec![protocol::Segment::Paste("/jobs now".into())]);
+    let paste = || Event::Input {
+        segments: pasted(),
+        mode: Mode::Queue,
+        origin: None,
+        ticket: None,
+    };
+    let logged = |taken| Body::Input {
+        segments: pasted(),
+        mode: Mode::Queue,
+        taken,
+        origin: None,
+    };
+    echo().table(vec![
+        (
+            paste(),
+            (
+                vec![entry(1, logged(true)), entry(2, said("/jobs now"))],
+                vec![],
+            ),
+        ),
+        (
+            user("$ ls"),
+            (
+                vec![entry(3, input("$ ls")), entry(4, bash("ls"))],
+                vec![BUSY, run_bash(4, "ls")],
+            ),
+        ),
+        (paste(), (vec![entry(5, logged(false))], vec![])),
+        (
+            tool_done(4, done(json!("a\n"))),
+            (
+                vec![
+                    entry(6, tool_result(4, done(json!("a\n")))),
+                    entry(7, take(5)),
+                    entry(8, said("/jobs now")),
+                ],
+                vec![IDLE],
+            ),
+        ),
+    ]);
+}
+
 #[test]
 fn commands_obey_permission() {
     let mut s = Session::new(Reg::echo().policy(Policy::Deny(&["jobs"])).arc());

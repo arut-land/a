@@ -33,8 +33,8 @@ pub struct Transcript {
 
 /// Input waiting to be taken up.
 enum Waiting {
-    /// The user's, as the model reads it.
-    Input(String),
+    /// The user's, as it was given: rendered once it is known who takes it.
+    Input(Segments, Mode),
     /// Another session's message, as it sent it: a model-only thread reads
     /// its payload as the turn it asks for.
     Inbox(Envelope),
@@ -102,7 +102,7 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
             d: Verdict::OnStop { text },
             ..
         } => ContextValue::User(text.clone()),
-        Body::Input { segments, mode, .. } => ContextValue::Queued(model_text(segments, *mode)),
+        Body::Input { segments, mode, .. } => ContextValue::Queued(segments.clone(), *mode),
         Body::Enqueue { envelope } => ContextValue::Inbox(envelope.clone()),
         Body::Take { input } => ContextValue::Taken(*input),
         Body::Assistant { text } => ContextValue::Assistant(text.clone()),
@@ -183,8 +183,8 @@ impl Transcript {
     fn apply_input(&mut self, seq: Seq, value: ContextValue, fresh: Option<Assistant>) {
         let message = match value {
             ContextValue::User(text) => Message::user(text),
-            ContextValue::Queued(text) => {
-                self.waiting.insert(seq, Waiting::Input(text));
+            ContextValue::Queued(segments, mode) => {
+                self.waiting.insert(seq, Waiting::Input(segments, mode));
                 return;
             }
             ContextValue::Inbox(envelope) => {
@@ -193,8 +193,10 @@ impl Transcript {
             }
             ContextValue::Taken(input) => match self.waiting.remove(&input) {
                 Some(waiting) if self.model_only => {
+                    // As the side-thread runner reads it: what was given,
+                    // untagged.
                     let text = match waiting {
-                        Waiting::Input(text) => text,
+                        Waiting::Input(segments, _) => segments.text(),
                         Waiting::Inbox(envelope) => envelope.payload,
                     };
                     if let Ok((turn, _)) = ext::ModelTurn::from_intent(&text) {
@@ -206,7 +208,7 @@ impl Transcript {
                     }
                     Message::user(text)
                 }
-                Some(Waiting::Input(text)) => Message::user(text),
+                Some(Waiting::Input(segments, mode)) => Message::user(model_text(&segments, mode)),
                 Some(Waiting::Inbox(envelope)) => Message::user(inbox_text(&envelope)),
                 None => return,
             },
@@ -393,7 +395,7 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
             if completed.as_ref().is_some_and(|done| {
                 matches!(
                     value,
-                    ContextValue::ToolCall(..) | ContextValue::Queued(_) | ContextValue::Inbox(_)
+                    ContextValue::ToolCall(..) | ContextValue::Queued(..) | ContextValue::Inbox(_)
                 ) && !done.contains(&e.seq)
             }) {
                 continue;
@@ -536,6 +538,35 @@ mod tests {
             [format!(
                 "<message from=\"{sender}\" channel=\"subagent:message/0\">\nhello\n</message>"
             )]
+        );
+    }
+
+    #[test]
+    fn a_model_only_thread_reads_waiting_input_as_given_and_an_agent_reads_it_tagged() {
+        let pasted = Segments(vec![
+            Segment::Text("see ".into()),
+            Segment::Paste("x".into()),
+        ]);
+        let inputs = |runner| {
+            let seq = |n| Seq::new(n).unwrap();
+            vec![ContextLayer(
+                runner,
+                vec![
+                    ContextInput(seq(1), ContextValue::Queued(pasted.clone(), Mode::Steer)),
+                    ContextInput(seq(2), ContextValue::Taken(seq(1))),
+                ],
+            )]
+        };
+        let read = |runner| {
+            let transcript = project(inputs(runner), Arc::new(Registry::default()), "");
+            said(&transcript.into_messages().to_vec())
+        };
+        assert_eq!(read(RunnerKind::ModelOnly), ["see x"]);
+        assert_eq!(
+            read(RunnerKind::Agent),
+            [
+                "<steer from=\"user\">\nsee <pasted-content lines=\"1\" bytes=\"1\">\nx\n</pasted-content>\n</steer>"
+            ]
         );
     }
 

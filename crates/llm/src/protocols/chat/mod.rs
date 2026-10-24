@@ -17,7 +17,7 @@ use super::schema::{legal_call_id, short_hash};
 use crate::error::Error;
 use crate::models::Maker;
 use crate::protocol::{Decoder, Encoded, Host, Hosted, Protocol, Target};
-use crate::spec::{ProtocolKey, Reason, Reasoning, Request};
+use crate::spec::{Origin, ProtocolKey, Reason, Reasoning, Request};
 use crate::tag::Thought;
 
 /// Which protocol this is.
@@ -26,33 +26,35 @@ pub const PROTOCOL: ProtocolKey = ProtocolKey::OpenaiChat;
 /// Where this protocol's options and part state go.
 pub const KEY: &str = PROTOCOL.as_str();
 
-/// What another model is shown of this protocol's reasoning: the
-/// reasoning fields hosts stream (`reasoning_content`, `reasoning`) are
-/// raw reasoning, unless the part's `reasoning_details` hold only summaries
-/// (`reasoning.summary`, as `OpenRouter` relays them for models that keep
-/// their reasoning to themselves). Encrypted details are shown to no one.
-pub(crate) fn foreign(reasoning: &Reasoning) -> Option<Thought<'_>> {
+/// What another model is shown of this protocol's reasoning. The part's
+/// `reasoning_details` decide when they say: only summaries
+/// (`reasoning.summary`, as `OpenRouter` relays them) is a summary, any
+/// `reasoning.text` is raw. Otherwise the model decides, as it does over
+/// its own wire: a Claude that summarizes its thinking streams a summary
+/// on every wire, and the reasoning fields other hosts stream
+/// (`reasoning_content`, `reasoning`) are raw. Encrypted details are shown
+/// to no one.
+pub(crate) fn foreign<'a>(reasoning: &'a Reasoning, origin: &Origin) -> Option<Thought<'a>> {
     if reasoning.redacted {
         return None;
     }
     let item = crate::replay::item(&reasoning.meta, KEY);
-    let details = item
+    let kinds: Vec<&str> = item
         .as_ref()
         .and_then(|item| item.get(merge::REASONING_DETAILS))
         .and_then(Value::as_array)
-        .map(|details| {
-            details
-                .iter()
-                .filter_map(|detail| detail.get("type")?.as_str())
-        });
-    let summarized = details.is_some_and(|mut kinds| {
-        let mut any = false;
-        kinds.all(|kind| {
-            any |= kind == "reasoning.summary";
-            kind != "reasoning.text"
-        }) && any
-    });
-    if summarized {
+        .into_iter()
+        .flatten()
+        .filter_map(|detail| detail.get("type")?.as_str())
+        .collect();
+    let summary = if kinds.contains(&"reasoning.text") {
+        false
+    } else if kinds.contains(&"reasoning.summary") {
+        true
+    } else {
+        crate::models::anthropic::summarizes_thinking(&origin.model)
+    };
+    if summary {
         Thought::summary(&reasoning.text)
     } else {
         Thought::raw(&reasoning.text)

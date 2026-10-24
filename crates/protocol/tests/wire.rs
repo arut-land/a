@@ -72,7 +72,7 @@ fn context_image() -> protocol::publication::ContextImage {
     let values = [
         ContextValue::Inherited(1),
         ContextValue::User("summary at an excluded position".into()),
-        ContextValue::Queued("consumed input".into()),
+        ContextValue::Queued("consumed input".into(), Mode::Steer),
         ContextValue::Inbox(envelope()),
         ContextValue::Taken(Seq::new(3).unwrap()),
         ContextValue::Assistant("answer".into()),
