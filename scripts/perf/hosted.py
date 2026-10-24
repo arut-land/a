@@ -135,7 +135,7 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
 
 def budgets(output, binary=None, probe=None, samples=5):
     binary = str(binary or output / ("a-fixtures" + SUFFIX))
-    cold, rss, cpu, client_cpu, attach_p50, attach_p99 = [], [], [], [], [], []
+    cold, first_run, rss, cpu, client_cpu, attach_p50, attach_p99 = [], [], [], [], [], [], []
     root = os.environ.get("RUNNER_TEMP")
     for trial in range(samples):
         with tempfile.TemporaryDirectory(prefix="a-hosted-", dir=root) as directory:
@@ -147,7 +147,12 @@ def budgets(output, binary=None, probe=None, samples=5):
             def cli(*args):
                 return run([binary, *args], env=env, cwd=home, capture_output=True, timeout=60)
             try:
-                cli("ls")
+                started = time.perf_counter()
+                # Pipes wake on exit; the general timeout wrapper's file-backed
+                # capture waits with polling and quantizes short POSIX commands.
+                subprocess.run([binary, "ls"], env=env, cwd=home,
+                               capture_output=True, check=True, timeout=60)
+                first_run.append((time.perf_counter() - started) * 1000)
                 stop_daemon(binary, env, home)
                 started = time.perf_counter()
                 client = subprocess.Popen([binary], env=env, cwd=home, stdin=subprocess.PIPE,
@@ -209,7 +214,7 @@ def budgets(output, binary=None, probe=None, samples=5):
                         client.wait()
                 stop_daemon(binary, env, home)
     metrics = {name: distribution(values) for name, values in [
-        ("cold_reply_ms", cold), ("attach_p50_ms", attach_p50), ("attach_p99_ms", attach_p99),
+        ("cold_reply_ms", cold), ("first_run_ls_ms", first_run), ("attach_p50_ms", attach_p50), ("attach_p99_ms", attach_p99),
         ("idle_rss_kib", rss), ("idle_daemon_cpu_ms", cpu), ("idle_line_client_cpu_ms", client_cpu)]}
     metrics["idle_daemon_cpu_ms"]["windows"] = cpu
     metrics["idle_line_client_cpu_ms"]["windows"] = client_cpu

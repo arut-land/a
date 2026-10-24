@@ -563,16 +563,10 @@ fn stale_request<'a>(
                 session,
                 ContextRequest::Side {
                     registry: session.shared.registry.get(),
-                    side: ext::ModelTurn::new::<ext::ModelOnly>(
-                        ext::ThreadKey::new::<HeldHarbor>(
-                            "stale side",
-                            ext::OwnerScope::Call(old.call),
-                        ),
-                        ext::TurnKey("initial".into()),
-                        ext::ModelRole::Session,
-                        ext::SideContext::None,
-                        llm::Messages::default(),
-                    ),
+                    side: ext::Conversation::turn::<HeldHarbor>("stale side", "")
+                        .per_call()
+                        .key("initial")
+                        .request(old.call),
                     reply,
                 },
             );
@@ -580,15 +574,10 @@ fn stale_request<'a>(
             origin.send(
                 session,
                 ContextRequest::Child {
-                    request: ext::Spawn::new::<HeldHarbor>(
-                        "stale",
-                        "stale child".into(),
-                        ext::Runner::Agent {
-                            agent: ext::LOOP.into(),
-                            role: ext::ModelRole::Session,
-                        },
-                        ext::DepthBudget::new(1),
-                    ),
+                    request: ext::Conversation::task::<HeldHarbor>("stale", "stale child")
+                        .kind(ext::LOOP)
+                        .depth(1)
+                        .spawn(String::new),
                     reply: spawn::SpawnReply::Awaited(reply),
                 },
             );
@@ -609,33 +598,24 @@ fn stale_request<'a>(
     } else if matches!(probe, RetainedProbe::Child) {
         Box::pin(async move {
             let _ = old
-                .sessions()
+                .conversations()
                 .unwrap()
-                .spawn(
+                .task(
                     old,
-                    ext::Spawn::new::<HeldHarbor>(
-                        "stale",
-                        "stale child".into(),
-                        ext::Runner::Agent {
-                            agent: ext::LOOP.into(),
-                            role: ext::ModelRole::Session,
-                        },
-                        ext::DepthBudget::new(1),
-                    )
-                    .awaited(),
+                    ext::Conversation::task::<HeldHarbor>("stale", "stale child")
+                        .kind(ext::LOOP)
+                        .depth(1)
+                        .spawn(String::new),
                 )
                 .await;
         })
     } else {
         Box::pin(async move {
-            let side = ext::ModelTurn::new::<ext::ModelOnly>(
-                ext::ThreadKey::new::<HeldHarbor>("stale side", ext::OwnerScope::Call(old.call)),
-                ext::TurnKey("initial".into()),
-                ext::ModelRole::Session,
-                ext::SideContext::None,
-                [llm::Message::user("stale request")].into_iter().collect(),
-            );
-            let _ = old.models().unwrap().call(old, side).await;
+            let side = ext::Conversation::turn::<HeldHarbor>("stale side", "stale request")
+                .per_call()
+                .key("initial")
+                .request(old.call);
+            let _ = old.conversations().unwrap().turn(old, side).await;
         })
     }
 }
@@ -750,14 +730,11 @@ fn an_unadmitted_side_call_cannot_outlive_its_cancelled_parent() {
     let ack = enqueue(&session, "hello");
     input.started();
     let (cx, release) = started_harbor(&starts);
-    let side = ext::ModelTurn::new::<ext::ModelOnly>(
-        ext::ThreadKey::new::<HeldHarbor>("cancelled side", ext::OwnerScope::Call(cx.call)),
-        ext::TurnKey("initial".into()),
-        ext::ModelRole::Session,
-        ext::SideContext::None,
-        [llm::Message::user("Say hi.")].into_iter().collect(),
-    );
-    let mut answer = cx.models().unwrap().call(&cx, side);
+    let side = ext::Conversation::turn::<HeldHarbor>("cancelled side", "Say hi.")
+        .per_call()
+        .key("initial")
+        .request(cx.call);
+    let mut answer = cx.conversations().unwrap().turn(&cx, side);
     assert!(
         answer
             .as_mut()

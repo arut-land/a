@@ -23,7 +23,7 @@ fn registry_at(
     #[cfg(feature = "lua")]
     if !config.ext.disable.iter().any(|name| name == "lua") {
         layers.push(Arc::new(ext_lua::Loader::new(
-            home.root(),
+            home.config_dir(),
             config.ext.clone(),
         )?));
     }
@@ -33,7 +33,7 @@ fn registry_at(
             configured::<ext_skills::Skills>(config)?.reserving(client::COMMANDS.iter().flat_map(
                 |command| std::iter::once(command.name).chain(command.aliases.iter().copied()),
             ));
-        layers.push(Arc::new(ext_skills::Loader::new(home.root(), skills)));
+        layers.push(Arc::new(ext_skills::Loader::new(home.config_dir(), skills)));
     }
     let coordinator = Arc::new(Coordinator::new(registry.clone(), layers));
     registry.with_in(Tier::Pre, &coordinator)

@@ -6,7 +6,6 @@ publish.workspace = true
 
 [dependencies]
 ext.workspace = true
-llm.workspace = true
 protocol.workspace = true
 
 [dev-dependencies]

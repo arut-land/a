@@ -41,6 +41,12 @@ impl Endpoint {
     }
 }
 
+/// The endpoint backend owns validation and its non-desktop fallback policy.
+#[cfg(unix)]
+pub(crate) fn runtime_directory() -> PathBuf {
+    imp::socket_dir()
+}
+
 impl Home {
     /// The daemon's endpoint. Unix uses a short socket name in a private
     /// runtime directory; Windows discovers a process-generation pipe
@@ -628,7 +634,7 @@ mod imp {
         validate_directory(dir)
     }
 
-    fn socket_dir() -> PathBuf {
+    pub(crate) fn socket_dir() -> PathBuf {
         let fallback = PathBuf::from(format!("/tmp/a-{}", geteuid().as_raw()));
         // Pathname sockets retain filesystem access control. A missing XDG
         // directory also works without logind, in SSH sessions and containers;
@@ -660,10 +666,14 @@ mod imp {
             && dir.is_absolute()
             && validate_directory(&dir).is_ok()
             && fits_socket(&dir)
+            && rustix::fs::access(&dir, rustix::fs::Access::WRITE_OK).is_ok()
         {
             return dir;
         }
-        if validate_directory(login).is_ok() && fits_socket(login) {
+        if validate_directory(login).is_ok()
+            && fits_socket(login)
+            && rustix::fs::access(login, rustix::fs::Access::WRITE_OK).is_ok()
+        {
             return login.to_owned();
         }
         fallback

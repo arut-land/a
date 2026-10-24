@@ -122,7 +122,7 @@ fn windows_powershell(windows: &Path) -> (PathBuf, &'static str) {
     )
 }
 
-pub(super) fn discover() -> ExecutionFacts {
+pub(super) fn discover(temp: PathBuf) -> ExecutionFacts {
     let search = std::env::var("PATH").ok();
     let bash = find_bash(search.as_deref());
     let windows =
@@ -130,7 +130,13 @@ pub(super) fn discover() -> ExecutionFacts {
     let program_files = std::env::var_os("ProgramW6432")
         .or_else(|| std::env::var_os("ProgramFiles"))
         .map(PathBuf::from);
-    resolve(bash, search.as_deref(), program_files.as_deref(), &windows)
+    resolve(
+        bash,
+        search.as_deref(),
+        program_files.as_deref(),
+        &windows,
+        temp,
+    )
 }
 
 fn resolve(
@@ -138,6 +144,7 @@ fn resolve(
     search: Option<&str>,
     program_files: Option<&Path>,
     windows: &Path,
+    temp: PathBuf,
 ) -> ExecutionFacts {
     let (dialect, executable, mut syntax, paths) = if let Some(path) = bash {
         (
@@ -193,7 +200,7 @@ fn resolve(
         paths,
         utilities: "installed Windows executables and the selected shell's builtins",
         cleanup: "timeout/cancellation terminate the owned Windows job and its descendants; no Unix TERM grace; background work is session-owned; jobs die with the daemon; retained output stays in the session spill directory; command-created temporary files are not automatically removed",
-        temp: std::env::temp_dir(),
+        temp,
         cwd_command,
         runtime_bin,
     }
@@ -275,7 +282,13 @@ mod tests {
 
     #[test]
     fn no_bash_selects_only_the_powershell_identity() {
-        let facts = resolve(None, Some(""), None, Path::new(r"C:\Windows"));
+        let facts = resolve(
+            None,
+            Some(""),
+            None,
+            Path::new(r"C:\Windows"),
+            r"C:\startup-temp".into(),
+        );
         assert_eq!(facts.dialect, Dialect::WindowsPowerShell);
         assert_eq!(facts.tool(), "powershell");
         assert!(facts.syntax.contains("5.1"));
@@ -300,9 +313,14 @@ mod tests {
 
     #[test]
     fn shell_environment_preserves_client_path_priority_and_pins_temp() {
-        let mut facts = resolve(None, Some(""), None, Path::new(r"C:\Windows"));
+        let mut facts = resolve(
+            None,
+            Some(""),
+            None,
+            Path::new(r"C:\Windows"),
+            r"C:\startup-temp".into(),
+        );
         facts.runtime_bin = Some(r"C:\Git\usr\bin".into());
-        facts.temp = r"C:\startup-temp".into();
         let mut env = std::collections::BTreeMap::from([
             ("Path".into(), r"C:\client".into()),
             ("tmp".into(), r"C:\later-temp".into()),

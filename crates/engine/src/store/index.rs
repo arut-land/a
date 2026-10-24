@@ -10,7 +10,8 @@ use crate::outbox::FrameLog;
 pub(crate) struct Index {
     through: u64,
     fence: u64,
-    sides: Vec<(ext::SideIdentity, CallId)>,
+    /// Each side turn, with whether it continues its thread.
+    sides: Vec<(ext::SideIdentity, CallId, bool)>,
     results: Vec<(CallId, (Seq, bool))>,
     enqueues: Vec<(protocol::EnvelopeId, CallId)>,
     input: Option<CallId>,
@@ -52,7 +53,8 @@ impl Index {
                     && identity.thread.purpose == *purpose
                     && self.side(&identity).is_none()
                 {
-                    self.sides.push((identity, CallId(entry.seq)));
+                    let kept = ext::SideIdentity::keeps_thread(request);
+                    self.sides.push((identity, CallId(entry.seq), kept));
                 }
             }
             Body::ModelResult { call, outcome, .. } | Body::ToolResult { call, outcome, .. } => {
@@ -127,13 +129,13 @@ impl Index {
     pub(crate) fn thread(&self, key: &ext::ThreadKey) -> Option<CallId> {
         self.sides
             .iter()
-            .find_map(|(identity, call)| (&identity.thread == key).then_some(*call))
+            .find_map(|(identity, call, kept)| (*kept && &identity.thread == key).then_some(*call))
     }
 
     pub(crate) fn side(&self, identity: &ext::SideIdentity) -> Option<CallId> {
         self.sides
             .iter()
-            .find_map(|(key, call)| (key == identity).then_some(*call))
+            .find_map(|(key, call, _)| (key == identity).then_some(*call))
     }
 
     pub(crate) fn result(&self, call: CallId, durable: u64) -> Option<Seq> {
@@ -189,13 +191,10 @@ mod tests {
 
     fn history() -> (Vec<Entry>, ext::ModelTurn, SessionId, Envelope) {
         let child = SessionId::new();
-        let side = ext::ModelTurn::new::<ext::ModelOnly>(
-            ext::ThreadKey::new::<ext_title::Title>("index", ext::OwnerScope::Session),
-            ext::TurnKey("initial".into()),
-            ext::ModelRole::Fast,
-            ext::SideContext::None,
-            llm::Messages::default(),
-        );
+        let side = ext::Conversation::turn::<ext_title::Title>("index", "")
+            .key("initial")
+            .role(ext::ModelRole::Fast)
+            .request(CallId::new(1).unwrap());
         let owner = CallId::new(1).unwrap();
         let envelope = Envelope {
             id: EnvelopeId {
@@ -269,6 +268,46 @@ mod tests {
             child,
             envelope,
         )
+    }
+
+    fn side_call(seq: u64, side: &ext::ModelTurn) -> Entry {
+        Entry::new(
+            Seq::new(seq).unwrap(),
+            Epoch(0),
+            Body::ModelCall {
+                model: "test".into(),
+                attempt: 0,
+                choice: ToolChoice::default(),
+                r#for: Some(CallId::new(1).unwrap()),
+                purpose: Some(side.thread.purpose.clone()),
+                request: Some(
+                    protocol::publication::ThreadImage {
+                        turn: side.intent(None).unwrap(),
+                        authority: Json::null(),
+                    }
+                    .to_json()
+                    .unwrap(),
+                ),
+            },
+        )
+    }
+
+    /// A persisted turn opened after an ephemeral one in the same thread
+    /// freezes its own authority: an ephemeral turn is no thread history.
+    #[test]
+    fn an_ephemeral_turn_is_never_a_threads_first_turn() {
+        let turn = || ext::Conversation::turn::<ext_title::Title>("index", "");
+        let gone = turn()
+            .key("gone")
+            .ephemeral()
+            .request(CallId::new(1).unwrap());
+        let kept = turn().key("kept").request(CallId::new(2).unwrap());
+        let mut index = Index::default();
+        index.apply(&side_call(1, &gone));
+        assert_eq!(index.thread(&gone.thread), None);
+        assert_eq!(index.side(&gone.identity()), Some(CallId::new(1).unwrap()));
+        index.apply(&side_call(2, &kept));
+        assert_eq!(index.thread(&kept.thread), Some(CallId::new(2).unwrap()));
     }
 
     #[test]
