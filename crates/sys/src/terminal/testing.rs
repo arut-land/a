@@ -20,7 +20,7 @@ pub fn input(text: &str) {
 
 #[cfg(windows)]
 mod native {
-    use std::io;
+    use std::io::{self, Write};
     use std::os::windows::io::{AsHandle, AsRawHandle, IntoRawHandle};
     use std::process::{Command, Stdio};
     use windows_sys::Win32::System::Console::{
@@ -37,6 +37,8 @@ mod native {
             return;
         }
         let stderr = io::stderr().as_handle().try_clone_to_owned().unwrap();
+        // libtest's own summary goes to the console; the parent reads this pipe.
+        let report = io::stdout().as_handle().try_clone_to_owned().unwrap();
         // This subprocess owns a fresh console; no developer's terminal or
         // other libtest worker can be affected by mode/control-event changes.
         // SAFETY: process-local console attachment; no pointer arguments.
@@ -67,7 +69,11 @@ mod native {
         }
         eprintln!("private console allocated");
         check();
+        writeln!(std::fs::File::from(report), "{PASSED}").unwrap();
     }
+
+    /// What a console test that ran to the end reports to its parent.
+    const PASSED: &str = "private console test passed";
 
     fn run_console_test(name: &str) {
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -89,7 +95,7 @@ mod native {
         assert!(output.status.success(), "{stdout}");
         // A renamed test would otherwise run nothing and pass.
         assert!(
-            stdout.contains("test result: ok. 1 passed"),
+            stdout.contains(PASSED),
             "{name} did not run in its console: {stdout}"
         );
     }
