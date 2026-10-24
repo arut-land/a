@@ -1,9 +1,9 @@
 use windows_sys::Win32::System::{
     JobObjects::{
         JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
-        JOB_OBJECT_CPU_RATE_CONTROL_MIN_MAX_RATE,
-        JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
-        JobObjectCpuRateControlInformation, QueryInformationJobObject,
+        JOB_OBJECT_CPU_RATE_CONTROL_MIN_MAX_RATE, JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED,
+        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JobObjectCpuRateControlInformation,
+        QueryInformationJobObject,
     },
     SystemInformation::{
         CpuSetInformation, GROUP_AFFINITY, GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
