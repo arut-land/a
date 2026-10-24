@@ -78,6 +78,12 @@ fails the bounded test by deadlocking; the maintained implementation and the
 compact wrapper pass. Restoring the original channel unchanged would reintroduce
 that failure.
 
+The queue's lock-boundary invariant also covers replacement of a registered
+receiver waker. The expanded invariant fails when replacement drops that waker
+under the queue mutex and passes when the displaced waker is released after
+unlocking. This fix is included in the final composition; it is not assumed to
+explain the Windows timeout.
+
 An additional compact-oneshot variant retains the maintained state machine and
 uses a shared type-erased payload representation. It tests whether sharing the
 wake/cancel code across payload types reduces resident code enough to offset
@@ -96,11 +102,16 @@ three repetitions and both native Mac architectures. This measures the cache
 release benefit separately from the source subscription's idle cost; it does
 not manufacture system-wide memory pressure. The first probe releases
 74,064–74,068 KiB of RSS on Intel macOS. Apple silicon shows no immediate
-RSS release in these observations; the allocator retains freed memory. A
-follow-up repeats population and reclamation on one session and samples RSS
-after a delay, to distinguish reusable allocations from returned pages.
+RSS release in these observations; the allocator retains freed memory. The
+[one-session follow-up](resource-mechanisms/cache-reuse-observations.json) also
+shows increasing Apple-silicon RSS across repeated rebuild/reclaim cycles, with
+no delayed release after one second. This is not classified as a resource win.
+A native allocator probe measures live versus reserved bytes and an explicit
+pressure-relief diagnostic before deciding whether the hook is useful there.
 [Raw cache observations](resource-mechanisms/cache-benefit-observations.json)
-retain all three repetitions per architecture. Its patch and run provenance are
+retain all three repetitions per architecture. These hosted images also differ
+in OS version: Intel runs macOS 15 and ARM runs macOS 26; the allocator behavior
+is not attributed to architecture alone. Its patch and run provenance are
 retained beside the mechanism variants.
 
 Full-versus-full A/A comparisons on all six targets build the identical
