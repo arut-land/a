@@ -42,27 +42,13 @@ pub fn adopt_lock(_file: File, _home: &crate::Home) -> Result<File, super::Adopt
     Err(super::AdoptLockError::Unsupported)
 }
 
-pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::Result<Child> {
+pub fn spawn_daemon(cmd: &mut Command, home: &crate::Home, lock: File) -> io::Result<Child> {
     // Windows byte locks belong to processes. The start lock remains held
     // by the client until binding is acknowledged, serializing re-listen.
     drop(lock);
     cmd.arg("--detached")
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    for name in [
-        "SystemRoot",
-        "WINDIR",
-        "USERPROFILE",
-        "LOCALAPPDATA",
-        "ProgramFiles",
-        "TEMP",
-        "TMP",
-        "COMSPEC",
-        "PATHEXT",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            cmd.env(name, value);
-        }
-    }
+    daemon_environment(cmd, home);
     let (mut output, writer) = io::pipe()?;
     let input = File::open("NUL")?;
     let error = File::options().write(true).open("NUL")?;
@@ -96,6 +82,25 @@ pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::R
     }
     let _ = reader.join();
     Ok(child)
+}
+
+fn daemon_environment(cmd: &mut Command, home: &crate::Home) {
+    for name in [
+        "SystemRoot",
+        "WINDIR",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "ProgramFiles",
+        "TEMP",
+        "TMP",
+        "COMSPEC",
+        "PATHEXT",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
+    home.daemon_env(cmd);
 }
 
 pub fn daemon_ready() -> io::Result<()> {
@@ -361,6 +366,29 @@ pub fn read_boot_id() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_bootstrap_never_replaces_resolved_temporary_environment() {
+        let home = crate::Home::from(std::env::temp_dir().join("a daemon temp 'literal'"));
+        let mut command = Command::new(
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32/cmd.exe"),
+        );
+        command.env_clear().args(["/D", "/C", "set TMP& set TEMP"]);
+        home.daemon_env(&mut command);
+        daemon_environment(&mut command, &home);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            assert!(
+                output
+                    .lines()
+                    .any(|line| line == format!("{key}={}", home.temporary_dir().display())),
+                "{output}"
+            );
+        }
+    }
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
