@@ -167,6 +167,9 @@ pub(super) fn listener(home: &Home, executing_build: &str) -> io::Result<Listene
         ) -> libc::c_int;
     }
     super::current(home, executing_build)?;
+    // SAFETY: startup is single-threaded; clear before native check-in can
+    // initialize library workers, and before any tools inherit the environment.
+    unsafe { std::env::remove_var("A_ACTIVATION_SOCKET") };
     let mut fds = std::ptr::null_mut();
     let mut count = 0;
     // SAFETY: the name is terminated and both output pointers are writable.
@@ -197,8 +200,6 @@ pub(super) fn listener(home: &Home, executing_build: &str) -> io::Result<Listene
             "expected one launchd activation socket",
         ));
     }
-    // SAFETY: activation is consumed before runtime/child threads are started.
-    unsafe { std::env::remove_var("A_ACTIVATION_SOCKET") };
     Listener::activated(files.into_iter().next().unwrap(), home)
 }
 
