@@ -546,6 +546,7 @@ struct TestLayer {
     value: std::sync::atomic::AtomicU32,
     scans: std::sync::atomic::AtomicUsize,
     fail: std::sync::atomic::AtomicBool,
+    busy: std::sync::atomic::AtomicBool,
     changed: Mutex<Option<Arc<Changed>>>,
     during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -563,15 +564,19 @@ impl GenerationLayer for TestLayer {
         _: &Registry,
         _: Option<&PreparedLayer>,
         _: bool,
-    ) -> Result<PreparedLayer, Refused> {
+    ) -> Result<PreparedLayer, PrepareError> {
         use std::sync::atomic::Ordering::SeqCst;
         self.scans.fetch_add(1, SeqCst);
+        let value = self.value.load(SeqCst);
         let during = self.during.lock().unwrap().take();
         if let Some(during) = during {
             during();
         }
+        if self.busy.load(SeqCst) {
+            return Err(PrepareError::Retry(Refused("source busy".into())));
+        }
         if self.fail.load(SeqCst) {
-            return Err(Refused("invalid source".into()));
+            return Err(Refused("invalid source".into()).into());
         }
         Ok(PreparedLayer {
             inputs: Arc::new(()),
@@ -579,10 +584,13 @@ impl GenerationLayer for TestLayer {
                 Tier::User,
                 Arc::new(ImageExtension {
                     name: self.name,
-                    value: self.value.load(SeqCst),
+                    value,
                 }),
             )],
         })
+    }
+    fn delay(&self, duration: Duration) -> BoxFuture<'static, ()> {
+        rt::Reactor::AsyncIo.sleep(duration)
     }
     fn restore(&self, own_image: &[Installed]) -> Result<Registrations, Refused> {
         let [image] = own_image else {
@@ -736,6 +744,111 @@ fn event_bursts_schedule_one_pending_rebuild() {
 }
 
 #[test]
+fn resumed_writes_queue_a_capture_during_or_after_preparation() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for outcome in ["accepted", "rejected", "retry"] {
+        for during_preparation in [true, false] {
+            let layer = Arc::new(TestLayer {
+                name: "resumed",
+                ..TestLayer::default()
+            });
+            let queue = Arc::new(Mutex::new(Vec::new()));
+            let queued = queue.clone();
+            let workspace = Coordinator::new(Registry::default(), vec![layer.clone()])
+                .open(
+                    Path::new("/resumed"),
+                    Arc::new(|_| {}),
+                    Arc::new(move |work| queued.lock().unwrap().push(work)),
+                )
+                .unwrap();
+            let changed = layer.changed.lock().unwrap().clone().unwrap();
+            layer.value.store(1, SeqCst);
+            let partial = layer.clone();
+            let event = changed.clone();
+            *layer.during.lock().unwrap() = Some(Box::new(move || {
+                // The writer stays paused across the entire injected quiet
+                // window and all captures; even valid partial content can pass.
+                let captured = crate::source::prepare(
+                    || Ok(partial.value.load(SeqCst)),
+                    |_| {},
+                    |value| Ok(*value),
+                )
+                .unwrap();
+                assert_eq!(captured, 1);
+                partial.fail.store(outcome == "rejected", SeqCst);
+                partial.busy.store(outcome == "retry", SeqCst);
+                if during_preparation {
+                    partial.value.store(2, SeqCst);
+                    let next = partial.clone();
+                    *partial.during.lock().unwrap() = Some(Box::new(move || {
+                        next.fail.store(false, SeqCst);
+                        next.busy.store(false, SeqCst);
+                    }));
+                    event();
+                }
+            }));
+            changed();
+            let work = queue.lock().unwrap().pop().unwrap();
+            work();
+            if !during_preparation {
+                layer.fail.store(false, SeqCst);
+                layer.busy.store(false, SeqCst);
+                layer.value.store(2, SeqCst);
+                changed();
+                let work = queue.lock().unwrap().pop().unwrap();
+                work();
+            }
+            assert_eq!(
+                workspace.snapshot().registry.extensions().next().unwrap().1,
+                2
+            );
+            assert_eq!(layer.scans.load(SeqCst), 3);
+            assert!(queue.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn transient_reads_recover_without_another_callback_and_stop_when_healthy_or_dropped() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let layer = Arc::new(TestLayer {
+        name: "recover",
+        ..TestLayer::default()
+    });
+    let coordinator = Coordinator::new(Registry::default(), vec![layer.clone()]);
+    let runtime: rt::Rt = Arc::new(rt::Threads::new(1));
+    let (send, recv) = std::sync::mpsc::channel();
+    let workspace = coordinator
+        .open(
+            Path::new("/recover"),
+            Arc::new(move |task| runtime.spawn(task)),
+            Arc::new(move |work| {
+                let _ = send.send(work);
+            }),
+        )
+        .unwrap();
+    let changed = layer.changed.lock().unwrap().clone().unwrap();
+    layer.value.store(1, SeqCst);
+    layer.busy.store(true, SeqCst);
+    changed();
+    for _ in 0..3 {
+        recv.recv_timeout(Duration::from_secs(3)).unwrap()();
+        assert_eq!(workspace.snapshot().id, 1);
+    }
+    layer.busy.store(false, SeqCst); // Releasing a sharing conflict emits no callback.
+    recv.recv_timeout(Duration::from_secs(3)).unwrap()();
+    assert_eq!(workspace.snapshot().id, 2);
+    assert!(recv.recv_timeout(Duration::from_millis(500)).is_err());
+    layer.busy.store(true, SeqCst);
+    changed();
+    recv.recv_timeout(Duration::from_secs(3)).unwrap()();
+    let weak = Arc::downgrade(&workspace);
+    drop(workspace);
+    assert!(weak.upgrade().is_none());
+    assert!(recv.recv_timeout(Duration::from_millis(300)).is_err());
+}
+
+#[test]
 fn children_and_grandchildren_never_regain_excluded_registrations() {
     extension!(Kept, "kept", 1, |_r| {});
     extension!(Excluded, "excluded", 1, |_r| {});
@@ -844,4 +957,53 @@ fn opening_a_workspace_never_holds_the_global_reservation_map() {
         assert!(!Arc::ptr_eq(&first, &other));
         assert_eq!(layer.scans.load(std::sync::atomic::Ordering::SeqCst), 2);
     });
+}
+
+#[test]
+fn queued_preparation_does_not_retain_a_closed_workspace() {
+    let layer = Arc::new(TestLayer {
+        name: "queued",
+        ..TestLayer::default()
+    });
+    let coordinator = Coordinator::new(Registry::default(), vec![layer.clone()]);
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let queued = queue.clone();
+    let workspace = coordinator
+        .open(
+            Path::new("/queued"),
+            Arc::new(|_| {}),
+            Arc::new(move |work| queued.lock().unwrap().push(work)),
+        )
+        .unwrap();
+    let registry = Arc::downgrade(&workspace.snapshot().registry);
+    layer.changed.lock().unwrap().as_ref().unwrap()();
+    assert_eq!(queue.lock().unwrap().len(), 1);
+    drop(workspace);
+    assert!(registry.upgrade().is_none());
+    queue.lock().unwrap().pop().unwrap()();
+    assert!(registry.upgrade().is_none());
+}
+
+#[test]
+fn prepared_context_is_consumed_without_rereading_sources() {
+    #[derive(Clone)]
+    struct Source(Arc<Mutex<String>>);
+    impl Extension for Source {
+        const NAME: &'static str = "source";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut Registrar) {
+            let source = self.0.clone();
+            r.text(Text::context("source", 0, move |_| {
+                Some(source.lock().unwrap().clone())
+            }));
+        }
+    }
+    let source = Source(Arc::new(Mutex::new("captured".into())));
+    let registry = Registry::default().with(&source).unwrap();
+    let binding = Bound::new(Arc::new(registry), Arc::new(Bare), None);
+    binding.prepare_context();
+    *source.0.lock().unwrap() = "changed".into();
+    assert_eq!(binding.context().as_deref(), Some("captured"));
+    binding.prepare_context();
+    assert_eq!(binding.context().as_deref(), Some("changed"));
 }

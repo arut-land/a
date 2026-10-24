@@ -43,6 +43,7 @@ fn real_headers_preserve_the_reference_index() {
             ),
             _ => {
                 parse(&source, Path::new("skills")).unwrap();
+                assert_eq!(identity(source.as_bytes()).unwrap(), actual.name);
             }
         }
     }
@@ -166,4 +167,35 @@ fn maintained_yaml_accepts_portable_text_and_rejects_expansion() {
             "{extra}"
         );
     }
+}
+
+#[test]
+fn identity_discovery_keeps_yaml_names_independent_of_other_metadata() {
+    for metadata in [
+        "'name': review\ndescription: ok",
+        "\"na\\u006de\": review\ndescription: ok",
+        "description: ok\nname: \"re\\\n  view\"",
+        "{description: ok, name: review}",
+        "name: >-\n  review\ndescription: ok",
+    ] {
+        let text = format!("---\n{metadata}\n---\nbody");
+        assert_eq!(identity(text.as_bytes()).unwrap(), "review", "{text}");
+        assert_eq!(parse(&text, Path::new(".")).unwrap().0, "review");
+    }
+    for metadata in [
+        "description: [unfinished\n'name': review",
+        "  description: [unfinished\n  \"name\": review",
+        "{name: review, description: [unfinished}",
+    ] {
+        let text = format!("---\n{metadata}\n---\nbody");
+        assert_eq!(identity(text.as_bytes()).unwrap(), "review", "{text}");
+        assert!(parse(&text, Path::new(".")).is_err());
+    }
+    assert_eq!(
+        identity(b"---\ndescription: \xff\n\"name\": review\n---\n").unwrap(),
+        "review"
+    );
+    let error =
+        identity(b"---\n# comment\ndescription: [unfinished\nname: INVALID\n---\n").unwrap_err();
+    assert_eq!(error.line, 4);
 }
