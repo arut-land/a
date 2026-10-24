@@ -1211,9 +1211,7 @@ pub fn serve(
     build: &str,
     start: Start,
 ) -> io::Result<()> {
-    let runtime = Arc::new(rt::Threads::configured(rt::Config::for_path(
-        &home.sessions_dir(),
-    )?));
+    let runtime = Arc::new(rt::Threads::default());
     let result = run(listener, home, config, build, start, &runtime);
     if let Err(error) = &result {
         fact(Fact::Fault {
