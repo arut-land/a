@@ -109,7 +109,7 @@ impl Rig {
             session: self.session,
             call,
         };
-        self.blobs.places().stream(of).into()
+        blob::stream_path(self.blobs.streams(), of)
     }
 
     /// What the next call runs with.
@@ -130,9 +130,15 @@ impl Rig {
 
     /// Runs tool `tool` on `input`.
     pub fn call(&self, tool: &str, input: &Value) -> Outcome {
+        self.called(tool, input).outcome
+    }
+
+    /// Runs tool `tool` on `input`: how the call ended, what it holds
+    /// included.
+    pub fn called(&self, tool: &str, input: &Value) -> Called {
         let cx = self.cx();
         let input = Json::encode(input).expect("JSON");
-        rt::block_on(self.registry.tools().run(tool, &input, None, &cx)).outcome
+        rt::block_on(self.registry.tools().run(tool, &input, None, &cx))
     }
 
     /// The output of a call that must succeed.

@@ -56,8 +56,9 @@ pub enum ContextValue {
     Child(Outcome),
     /// The call's result is a placeholder: it went on in the background.
     Detached(CallId),
-    /// A queued outcome of a call that went on in the background.
-    Background(CallId, Outcome),
+    /// A queued outcome of a call that went on in the background, and
+    /// what it holds outside the log.
+    Background(CallId, Outcome, Vec<crate::Held>),
     /// A queued end of a process group call `call` left to the session.
     Job(CallId, String),
     Reply(Json),

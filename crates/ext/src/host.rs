@@ -148,18 +148,11 @@ impl Toolset {
     }
 
     /// What the model sees of a call's outcome.
-    pub fn to_model(
-        &self,
-        name: &str,
-        outcome: &Outcome,
-        places: &blob::Places,
-    ) -> (llm::Output, bool) {
+    pub fn to_model(&self, name: &str, outcome: &Outcome) -> (llm::Output, bool) {
         match outcome {
             Outcome::Done { output } => (
-                self.get(name).map_or_else(
-                    || llm::Output::Json(output.clone()),
-                    |t| t.to_model(output, places),
-                ),
+                self.get(name)
+                    .map_or_else(|| llm::Output::Json(output.clone()), |t| t.to_model(output)),
                 false,
             ),
             Outcome::Failed { error } => (llm::Output::Text(error.clone()), true),
@@ -427,13 +420,8 @@ impl Registry {
 
     /// What the model is shown of a call's outcome: its tool's own
     /// presentation, as the `present_result` handlers leave it.
-    pub fn present_result(
-        &self,
-        tool: &str,
-        outcome: &Outcome,
-        places: &blob::Places,
-    ) -> crate::point::Presented {
-        let (output, error) = self.tools.to_model(tool, outcome, places);
+    pub fn present_result(&self, tool: &str, outcome: &Outcome) -> crate::point::Presented {
+        let (output, error) = self.tools.to_model(tool, outcome);
         let ended = crate::point::Ended { tool, outcome };
         (self.hooks).present_result(ended, crate::point::Presented { output, error })
     }

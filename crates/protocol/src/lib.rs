@@ -1945,6 +1945,10 @@ pub struct Envelope {
     pub id: EnvelopeId,
     pub destination: SessionId,
     pub payload: String,
+    /// What the payload references outside the log: a detached call's
+    /// outcome holds what its result would have.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<Held>,
 }
 
 impl Envelope {
@@ -1961,7 +1965,15 @@ impl Envelope {
             },
             destination: session,
             payload,
+            held: Vec::new(),
         }
+    }
+
+    /// The envelope, holding `held`.
+    #[must_use]
+    pub fn holding(mut self, held: Vec<Held>) -> Self {
+        self.held = held;
+        self
     }
 
     /// Where it comes from, as the queue tells its items apart.
@@ -1992,6 +2004,7 @@ impl Outgoing {
             id: self.id.clone(),
             destination: to,
             payload: self.payload.clone(),
+            held: Vec::new(),
         }
     }
 }
@@ -2028,23 +2041,23 @@ pub struct OutputStream {
     pub call: CallId,
 }
 
-/// `stream:<call>`, as text names it, as `blob:<id>` names a blob.
+/// `stream:<call>`, as text names it without the store's path.
 impl fmt::Display for OutputStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "stream:{}", self.call)
     }
 }
 
-impl OutputStream {
+impl Outcome {
     /// The result a call detached as it ran is answered with at once:
-    /// done, naming where its output goes on.
-    pub fn placeholder(self) -> Outcome {
+    /// done, and marked so. Its stream is what the result holds.
+    pub fn detached() -> Self {
         #[derive(Serialize)]
         struct Placeholder {
-            detached: OutputStream,
+            detached: bool,
         }
-        Outcome::Done {
-            output: Json::encode(&Placeholder { detached: self }).unwrap_or_default(),
+        Self::Done {
+            output: Json::encode(&Placeholder { detached: true }).unwrap_or_default(),
         }
     }
 }

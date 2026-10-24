@@ -108,32 +108,39 @@ impl<'a> From<Pasted<'a>> for Tag<'a> {
 /// A paste the daemon kept apart from the input, by where it is.
 #[derive(Clone, Copy, Debug)]
 pub struct PastedRef<'a> {
-    /// Where the model can read it.
-    pub at: &'a str,
+    /// Where the model can read it, unless it cannot be read now.
+    pub at: Option<&'a str>,
     pub bytes: u64,
 }
 
 impl<'a> From<PastedRef<'a>> for Tag<'a> {
     fn from(paste: PastedRef<'a>) -> Self {
-        Tag::new("pasted-content")
-            .attr("path", paste.at)
-            .attr("bytes", paste.bytes.to_string())
+        let tag = Tag::new("pasted-content");
+        let tag = match paste.at {
+            Some(at) => tag.attr("path", at),
+            None => tag,
+        };
+        tag.attr("bytes", paste.bytes.to_string())
     }
 }
 
 /// A file the user attached, by where it is.
 #[derive(Clone, Copy, Debug)]
 pub struct Attached<'a> {
-    pub at: &'a str,
+    /// Where the model can read it, unless it cannot be read now.
+    pub at: Option<&'a str>,
     pub media_type: &'a str,
     pub bytes: u64,
 }
 
 impl<'a> From<Attached<'a>> for Tag<'a> {
     fn from(file: Attached<'a>) -> Self {
-        Tag::new("attachment")
-            .attr("path", file.at)
-            .attr("type", file.media_type)
+        let tag = Tag::new("attachment");
+        let tag = match file.at {
+            Some(at) => tag.attr("path", at),
+            None => tag,
+        };
+        tag.attr("type", file.media_type)
             .attr("bytes", file.bytes.to_string())
     }
 }

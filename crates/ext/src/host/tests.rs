@@ -228,7 +228,7 @@ impl DynTool for Declared {
             held: Vec::new(),
         }))
     }
-    fn to_model(&self, output: &Json, _places: &blob::Places) -> llm::Output {
+    fn to_model(&self, output: &Json) -> llm::Output {
         llm::Output::Json(output.clone())
     }
     fn present(&self, _: &Parsed) -> Option<Card> {

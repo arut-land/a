@@ -471,6 +471,7 @@ fn abandoned_inbox_work_is_terminal_for_every_owned_conversation() {
         },
         destination: SessionId::new(),
         payload: "hi".into(),
+        held: Vec::new(),
     };
     for taken in [false, true] {
         let mut bodies = vec![Body::Enqueue {

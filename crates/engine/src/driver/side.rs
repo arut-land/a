@@ -623,6 +623,7 @@ impl super::Daemon {
                     id,
                     destination: live.id,
                     payload: image.turn.raw().into(),
+                    held: Vec::new(),
                 },
                 cancel,
             )

@@ -2,8 +2,6 @@
 //! nothing withdrawn, and calls detached into the background.
 
 use super::*;
-use std::path::Path;
-
 use protocol::{Audience, Envelope, Epoch, Json, Mode, SessionId};
 
 const SESSION: SessionId = SessionId::NIL;
@@ -142,13 +140,12 @@ fn a_detached_call_answers_with_its_stream_and_its_outcome_is_read_once_taken() 
         Body::Detached { call: call(3) },
         Body::ToolResult {
             call: call(3),
-            outcome: OutputStream {
+            outcome: Outcome::detached(),
+            card: None,
+            held: vec![Held::Stream(OutputStream {
                 session: SESSION,
                 call: call(3),
-            }
-            .placeholder(),
-            card: None,
-            held: Vec::new(),
+            })],
         },
         Body::Enqueue {
             envelope: Envelope::own(SESSION, call(3), EnvelopeId::DETACHED, outcome.payload()),
@@ -178,17 +175,25 @@ fn a_detached_call_answers_with_its_stream_and_its_outcome_is_read_once_taken() 
 
 #[test]
 fn a_detached_calls_stream_is_named_for_the_session_whose_log_holds_it() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(blob_files::Files::open(home.path().join("blobs"), home.path()).unwrap());
+    let tree = Arc::new(blob_files::CacheDir::new(
+        home.path().join("cache"),
+        store.clone(),
+    ));
+    let session = |id| ext::blob::Blobs::new(store.clone(), tree.clone(), id);
     // As a child inherits it: the viewer is not the owner.
     let owner = OutputStream {
         session: SessionId::new(),
         call: call(3),
     };
+    let stream = session(owner.session).stream(call(3), 1 << 20).unwrap();
     let mut bodies = called();
     bodies.extend([
         Body::Detached { call: call(3) },
         Body::ToolResult {
             call: call(3),
-            outcome: owner.placeholder(),
+            outcome: Outcome::detached(),
             card: None,
             held: vec![Held::Stream(owner)],
         },
@@ -196,14 +201,65 @@ fn a_detached_calls_stream_is_named_for_the_session_whose_log_holds_it() {
     let entries: Vec<_> = (bodies.into_iter().zip(1..))
         .map(|(body, seq)| Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
         .collect();
-    let places = Places::new(Path::new("tree"), Path::new("streams"));
+    let places = session(SessionId::new()).places();
     let messages =
         Transcript::placed(&entries, Arc::new(Registry::default()), "", &places).into_messages();
     let Some(Message::Tool(answers)) = messages.iter().last() else {
         panic!("{messages:#?}");
     };
     let placeholder = texts(&answers.results[0].output).join("");
-    let shown = places.stream(owner);
+    let shown = stream.open.path().display().to_string();
     assert!(shown.contains(&owner.session.to_string()), "{shown}");
     assert!(placeholder.contains(&shown), "{placeholder}");
+}
+
+#[test]
+fn a_held_blob_is_named_only_once_it_can_be_read() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(blob_files::Files::open(home.path().join("blobs"), home.path()).unwrap());
+    let tree = Arc::new(blob_files::CacheDir::new(
+        home.path().join("cache"),
+        store.clone(),
+    ));
+    let places = ext::blob::Blobs::new(store.clone(), tree, SessionId::new()).places();
+    let mut writer = ext::blob::BlobStore::writer(&*store, 1 << 20).unwrap();
+    std::io::Write::write_all(&mut writer, b"whole").unwrap();
+    let kept = writer
+        .finish("text/plain", ext::blob::BlobOrigin::ToolOutput(call(3)))
+        .unwrap();
+    let mut gone = kept.clone();
+    gone.id = ext::blob::BlobId([9; 32]);
+    let shown = |blob: &ext::blob::BlobRef| {
+        let mut bodies = called();
+        bodies.push(Body::ToolResult {
+            call: call(3),
+            outcome: Outcome::Done {
+                output: Json::encode("cut").unwrap(),
+            },
+            card: None,
+            held: vec![Held::Blob(blob.clone())],
+        });
+        let entries: Vec<_> = (bodies.into_iter().zip(1..))
+            .map(|(body, seq)| Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
+            .collect();
+        let messages = Transcript::placed(&entries, Arc::new(Registry::default()), "", &places)
+            .into_messages();
+        let Some(Message::Tool(answers)) = messages.iter().last() else {
+            panic!("{messages:#?}");
+        };
+        texts(&answers.results[0].output).join("")
+    };
+    // As after a restart that lost the cache: naming it makes it again.
+    let text = shown(&kept);
+    let Some((_, path)) = (text.strip_suffix(']')).and_then(|t| t.rsplit_once("[full output: "))
+    else {
+        panic!("{text}")
+    };
+    let path = path.to_owned();
+    assert_eq!(std::fs::read(&path).unwrap(), b"whole");
+    std::fs::remove_dir_all(home.path().join("cache")).unwrap();
+    assert!(shown(&kept).ends_with(&format!("[full output: {path}]")));
+    assert_eq!(std::fs::read(&path).unwrap(), b"whole");
+    // One the store does not have is not named at all.
+    assert!(!shown(&gone).contains("full output"), "{}", shown(&gone));
 }

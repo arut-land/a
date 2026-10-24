@@ -1359,6 +1359,7 @@ fn envelope(purpose: &str) -> protocol::Envelope {
         },
         destination: SessionId::NIL,
         payload: purpose.into(),
+        held: Vec::new(),
     }
 }
 

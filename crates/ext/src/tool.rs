@@ -8,7 +8,6 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use blob::Places;
 use protocol::{Audience, CallId, Card, Environment, Held, Json, Outcome, Seq, SessionId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -421,14 +420,10 @@ pub trait Tool: Send + Sync + 'static {
         llm::Output::Json(output.clone())
     }
 
-    /// As [`Tool::to_model`], for an output that references blobs or
-    /// streams ([`Tool::held`]): `places` names where the model reads them.
-    fn to_model_with(output: &Json, _places: &Places) -> llm::Output {
-        Self::to_model(output)
-    }
-
     /// What an output references outside the log, which the store keeps
-    /// for as long as the call's result is logged.
+    /// for as long as the call's result is logged: the only place a
+    /// result's references are recorded, so the output need not name them.
+    /// The engine tells the model where each is.
     fn held(_output: &Self::Out) -> Vec<Held> {
         Vec::new()
     }
@@ -504,9 +499,8 @@ pub trait DynTool: Send + Sync {
     fn parse(&self, input: &Json) -> Result<Parsed, String>;
     /// Runs a call on an input [`DynTool::parse`] read.
     fn call<'a>(&'a self, input: Parsed, cx: &'a Cx) -> BoxFuture<'a, Called>;
-    /// What the model sees of a stored output, its references named by
-    /// `places`.
-    fn to_model(&self, output: &Json, places: &Places) -> llm::Output;
+    /// What the model sees of a stored output.
+    fn to_model(&self, output: &Json) -> llm::Output;
     fn present(&self, input: &Parsed) -> Option<Card>;
 }
 
@@ -581,8 +575,8 @@ where
         })
     }
 
-    fn to_model(&self, output: &Json, places: &Places) -> llm::Output {
-        T::to_model_with(output, places)
+    fn to_model(&self, output: &Json) -> llm::Output {
+        T::to_model(output)
     }
 
     fn present(&self, input: &Parsed) -> Option<Card> {

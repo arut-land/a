@@ -249,7 +249,7 @@ impl ext::DynTool for Command {
             }
         })
     }
-    fn to_model(&self, output: &ext::Json, _places: &ext::blob::Places) -> llm::Output {
+    fn to_model(&self, output: &ext::Json) -> llm::Output {
         llm::Output::Json(output.clone())
     }
     fn present(&self, _: &ext::Parsed) -> Option<protocol::Card> {

@@ -396,7 +396,7 @@ impl DynTool for Shape {
         )))
     }
 
-    fn to_model(&self, output: &Json, _places: &ext::blob::Places) -> llm::Output {
+    fn to_model(&self, output: &Json) -> llm::Output {
         llm::Output::Json(output.clone())
     }
 
@@ -978,7 +978,7 @@ pub fn placeholder(call: u64) -> Body {
     };
     Body::ToolResult {
         call: id(call),
-        outcome: stream.placeholder(),
+        outcome: Outcome::detached(),
         card: None,
         held: vec![protocol::Held::Stream(stream)],
     }

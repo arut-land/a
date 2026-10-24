@@ -98,10 +98,12 @@ Bytes too large for a log line (cut tool output now; pastes and attachments
 later) are blobs: content-addressed by SHA-256 (`protocol::BlobId`), owned by
 the store beside the logs that reference them, one namespace per daemon. An
 entry holds a `BlobRef { id, size, media_type, origin }`, never a path, so a
-fork or child references its parent's blobs rather than its files. A tool
-result says what it references outside the log in a typed field,
+fork or child references its parent's blobs rather than its files. What an
+entry references outside the log lives in one typed field and nowhere else:
 `ToolResult.held: Vec<Held>` (`Held::Blob` or `Held::Stream`), filled from the
-tool's `Tool::held(&Out)`: a sweep's reference index folds that field, never
+tool's `Tool::held(&Out)` (the one hook a tool adds; the output keeps at most a
+marker, such as `truncated` or `{"detached": true}`), and `Envelope.held` on a
+detached call's outcome. A sweep's reference index folds those fields, never
 tool output JSON.
 
 The seam is the `blob` crate (re-exported as `ext::blob`), which does no I/O:
@@ -117,17 +119,19 @@ output of a command whose leftover processes still write it) grows at
 `blobs/open/<session>/<call>.log`, named by the session whose log holds the
 call. It is sealed into a blob only once nothing writes it: a command that
 leaves processes behind keeps its whole output as a growing stream. Sealing a
-background job's stream when its group ends is to come with the queue's job
-facts.
+growing stream once its writers are gone is deferred to the queue (seam Q).
 
-References are named for the model when it reads them, not when they are
-logged: `Tool::to_model_with(output, &Places)` and the transcript name a blob
-`<cache>/tree/by-id/<id>` and a stream by its path in the store, from what the
-log records, whoever's session projects it. A projection without a store
-names a blob by its tree place and a stream `stream:<call>`. Making a named
-path exist before a model call shows it is deferred: a call materializes the
-blob it seals, but a paste, an attachment or a detached call's stream is not
-yet ensured by the projection.
+References are named for the model by the engine when it reads them, not by
+the tool and not when they are logged: the transcript adds a line for each
+item a result or detached outcome holds, naming it through `blob::Places`
+from what the log records, whoever's session projects it. A blob is named
+`<cache>/tree/by-id/<id>` only once `Materialize::ensure` (idempotent, a stat
+once made) has made it readable, so a path survives a restart or a deleted
+cache; a stream is named by its path in the store if it is there. What cannot
+be read is left unnamed. Pastes and attachments are named the same way. An
+entry that holds something is projected on a blocking worker, never folded
+into the live transcript on the session's actor. A projection without a store
+names a blob by its tree place and a stream `stream:<call>`.
 
 The JSONL backend (`blob_files::Files`) keeps `blobs/<aa>/<id>`, 0400 in a
 0700 directory. A writer hashes into `staging/` as it writes and refuses bytes
@@ -245,10 +249,9 @@ The shell process service admits at most 32 outstanding launches and running
 processes. Captured output crosses one 64 KiB buffer per process into an open
 blob stream, with storage back-pressure and a hard 64 MiB retention limit for
 foreground and background jobs. A foreground command whose output the model saw
-cut is sealed into a blob that its result references (`Ran.full`), unless
-processes it left running still write it (`Ran.growing`, the stream); otherwise
-the stream is discarded. A background job's stream (`Job.log`) stays open while
-it runs. Group observation is capped at 4096
+cut is sealed into a blob its result holds, unless processes it left running
+still write it: then the result holds the stream. Otherwise the stream is
+discarded. A background job's result holds its stream, open while it runs. Group observation is capped at 4096
 members; exceeding it revokes the live lease. Following streams and enumerating groups use admitted
 storage workers, leaving reactor workers available for other sessions. Once
 owned-scope cleanup ends, capture finishes accepted writes and drains at most

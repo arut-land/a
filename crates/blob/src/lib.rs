@@ -20,15 +20,14 @@
 //!   only, for the virtual backends.
 //!
 //! A call's output stream ([`OutputStream`]) grows in the store, where a
-//! reader follows it, and is sealed into a blob once nothing writes it.
+//! reader follows it, and may be sealed into a blob once nothing writes it.
 //!
 //! Blob bytes are as private as the log that references them, and are
 //! kept as they were written: environment redaction never applies to them.
 //!
-//! Deferred: making a named path exist before a model call shows it.
-//! Today a call ensures the blob it seals (`Blobs::materialize`); a paste,
-//! an attachment or a detached call's stream is named but not ensured
-//! until the projection calls [`Materialize::ensure`] before each request.
+//! A path is named only once it exists: [`Places`] ensures a blob as it
+//! names it. Sealing a growing stream once its writers are gone is
+//! deferred to the queue (seam Q).
 
 use std::fs::File;
 use std::future::Future;
@@ -249,48 +248,55 @@ impl Blobs {
         self.store.open(id)
     }
 
-    /// Makes `blob` readable where [`Places::blob`] names it.
-    pub fn materialize(&self, blob: &BlobRef) -> io::Result<()> {
-        self.tree.ensure(&TreePath::by_id(&blob.id), blob)
+    /// The directory the session's streams grow in, as [`stream_path`]
+    /// lays them out.
+    pub fn streams(&self) -> &Path {
+        self.store.streams()
     }
 
     /// How references are named for the model.
     pub fn places(&self) -> Places {
-        Places::new(self.tree.root(), self.store.streams())
+        Places::new(Arc::clone(&self.tree), self.store.streams())
     }
 }
 
-/// How a reference reads where the model is told of it: the path it is
-/// at. Pure, named from what the log records, so a projection of the log
-/// names it, whoever's session projects it; the default names a blob by
-/// its place within the tree and a stream by its call, for a projection
-/// that has no store.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Where the model reads a reference, named from what the log records,
+/// so a projection names it the same whoever's session projects it. A
+/// path is named only once it exists: a blob is materialized as it is
+/// named (idempotent, a stat once it is), a stream is named if it is
+/// there. Without a store, a blob is named by its place in the tree and a
+/// stream by its call.
+#[derive(Clone, Default)]
 pub struct Places {
-    roots: Option<(PathBuf, PathBuf)>,
+    store: Option<(Arc<dyn Materialize>, PathBuf)>,
 }
 
 impl Places {
-    /// The tree at `tree`, and streams under `streams`.
-    pub fn new(tree: &Path, streams: &Path) -> Self {
+    /// The tree `tree` shows, and streams under `streams`.
+    pub fn new(tree: Arc<dyn Materialize>, streams: &Path) -> Self {
         Self {
-            roots: Some((tree.to_path_buf(), streams.to_path_buf())),
+            store: Some((tree, streams.to_path_buf())),
         }
     }
 
-    pub fn blob(&self, blob: &BlobRef) -> String {
+    /// Where `blob` is read, made readable now; `None` if it cannot be.
+    /// Blocks: run it on a storage worker.
+    pub fn blob(&self, blob: &BlobRef) -> Option<String> {
         let at = TreePath::by_id(&blob.id);
-        match &self.roots {
-            Some((tree, _)) => at.under(tree).display().to_string(),
-            None => at.parts().collect::<Vec<_>>().join("/"),
-        }
+        let Some((tree, _)) = &self.store else {
+            return Some(at.parts().collect::<Vec<_>>().join("/"));
+        };
+        tree.ensure(&at, blob).ok()?;
+        Some(tree.path(&at).display().to_string())
     }
 
-    pub fn stream(&self, stream: OutputStream) -> String {
-        match &self.roots {
-            Some((_, streams)) => stream_path(streams, stream).display().to_string(),
-            None => stream.to_string(),
-        }
+    /// Where `stream` is read; `None` if it is not there.
+    pub fn stream(&self, stream: OutputStream) -> Option<String> {
+        let Some((_, streams)) = &self.store else {
+            return Some(stream.to_string());
+        };
+        let path = stream_path(streams, stream);
+        path.exists().then(|| path.display().to_string())
     }
 }
 

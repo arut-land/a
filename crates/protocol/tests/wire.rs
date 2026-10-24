@@ -46,6 +46,7 @@ fn envelope() -> protocol::Envelope {
         },
         destination: SessionId(Uuid::from_u128(0xc)),
         payload: "hello".into(),
+        held: Vec::new(),
     }
 }
 
@@ -96,6 +97,7 @@ fn context_image() -> protocol::publication::ContextImage {
         ContextValue::Background(
             CallId::new(9).unwrap(),
             Outcome::Interrupted { output: None },
+            Vec::new(),
         ),
         ContextValue::Reply(protocol::Json::null()),
         ContextValue::ToolCall("provider-id".into(), "example".into()),
@@ -842,13 +844,14 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         ),
         sample("entry_outbox", entry(1, Body::Outbox { envelope_id: envelope().id, recipients: vec![envelope().destination, SessionId(Uuid::from_u128(0xd))], payload: "hello".into() })),
         sample("entry_enqueue", entry(1, Body::Enqueue { envelope: envelope() })),
+        sample("entry_enqueue_detached", entry(19, Body::Enqueue { envelope: protocol::Envelope::own(SESSION, CallId::new(4).unwrap(), protocol::EnvelopeId::DETACHED, Outcome::Interrupted { output: None }.payload()).holding(vec![protocol::Held::Blob(protocol::BlobRef { id: protocol::BlobId([0x0f; 32]), size: 9000, media_type: "text/plain".into(), origin: protocol::BlobOrigin::ToolOutput(CallId::new(4).unwrap()) })]) })),
         sample("entry_enqueue_own", entry(18, Body::Enqueue { envelope: protocol::Envelope::own(SESSION, CallId::new(16).unwrap(), protocol::EnvelopeId::CHILD, Outcome::Interrupted { output: None }.payload()) })),
         sample("entry_ack", entry(2, Body::Ack { envelope_id: envelope().id, recipient: envelope().destination, refusal: None })),
         sample("entry_inbox_full", entry(2, Body::Ack { envelope_id: envelope().id, recipient: envelope().destination, refusal: Some(protocol::InboxRefusal::Full) })),
         sample("entry_withdraw", entry(5, Body::Withdraw { input: Seq::new(3).unwrap(), origin: None })),
         sample("entry_take_into", entry(6, Body::Take { input: Seq::new(3).unwrap(), into: CallId::new(4) })),
         sample("entry_detached", entry(7, Body::Detached { call: CallId::new(4).unwrap() })),
-        sample("entry_placeholder", entry(8, Body::ToolResult { call: CallId::new(4).unwrap(), outcome: protocol::OutputStream { session: SESSION, call: CallId::new(4).unwrap() }.placeholder(), card: None, held: vec![protocol::Held::Stream(protocol::OutputStream { session: SESSION, call: CallId::new(4).unwrap() })] })),
+        sample("entry_placeholder", entry(8, Body::ToolResult { call: CallId::new(4).unwrap(), outcome: Outcome::detached(), card: None, held: vec![protocol::Held::Stream(protocol::OutputStream { session: SESSION, call: CallId::new(4).unwrap() })] })),
         sample("entry_spawned_model_only", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::ModelOnly, authority: protocol::Json::null(), image: protocol::publication::ContextImage::default() }.to_json().unwrap() })),
         sample("entry_model_thread", entry(2, Body::ModelCall { model: "example:model".into(), attempt: 0, choice: protocol::ToolChoice::None, r#for: CallId::new(1), purpose: Some("example".into()), request: Some(protocol::publication::ThreadImage { turn: protocol::Json::null(), authority: protocol::Json::null() }.to_json().unwrap()) })),
         sample("entry_spawned", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::Agent, authority: protocol::Json::null(), image: context_image() }.to_json().unwrap() })),

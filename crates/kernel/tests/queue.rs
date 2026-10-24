@@ -5,7 +5,10 @@ mod common;
 
 use common::*;
 use kernel::{Boundary, Event, Load, Replied, Take, Ticket};
-use protocol::{Body, CallId, EnvelopeId, Outcome, Source};
+use protocol::{
+    BlobId, BlobOrigin, BlobRef, Body, CallId, EnvelopeId, Held, Outcome, OutputStream, SessionId,
+    Source,
+};
 use serde_json::json;
 
 fn modeled() -> Session {
@@ -257,22 +260,55 @@ fn a_restart_runs_a_safe_detached_call_again_and_reports_an_unsafe_one_cut_off()
     );
     assert!(!work(&fx).any(|w| matches!(w, Work::RunTool { .. })));
     assert_eq!(s.core.ledger().detached(), []);
-    let cut = fx
+    let envelope = fx
         .appends
         .iter()
         .find_map(|e| match &e.body {
-            Body::Enqueue { envelope } => Outcome::from_payload(&envelope.payload),
+            Body::Enqueue { envelope } => Some(envelope),
             _ => None,
         })
         .unwrap();
-    let Outcome::Interrupted {
+    let cut = Outcome::from_payload(&envelope.payload);
+    let Some(Outcome::Interrupted {
         output: Some(output),
-    } = cut
+    }) = cut
     else {
         panic!("{cut:?}");
     };
     assert!(output.contains("may not have completed"), "{output}");
-    assert!(output.contains("stream:2"), "{output}");
+    let stream = OutputStream {
+        session: SessionId::NIL,
+        call: id(2),
+    };
+    assert_eq!(envelope.held, [Held::Stream(stream)], "its output so far");
+}
+
+#[test]
+fn a_detached_calls_outcome_holds_what_its_result_would_have() {
+    let mut s = sleeping();
+    s.step(forced("now"));
+    s.step(Event::Detached { call: id(4) });
+    let blob = Held::Blob(BlobRef {
+        id: BlobId([7; 32]),
+        size: 1,
+        media_type: "text/plain".into(),
+        origin: BlobOrigin::ToolOutput(id(4)),
+    });
+    s.step(Event::ToolDone {
+        call: id(4),
+        outcome: done(json!("slept")),
+        card: None,
+        held: vec![blob.clone()],
+    });
+    let envelope = (s.bodies().into_iter())
+        .find_map(|b| match b {
+            Body::Enqueue { envelope } if envelope.id.purpose == EnvelopeId::DETACHED => {
+                Some(envelope)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(envelope.held, [blob]);
 }
 
 #[test]

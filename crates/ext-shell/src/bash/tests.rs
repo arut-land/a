@@ -64,13 +64,33 @@ fn run(rig: &Rig, command: &str) -> Ran {
     bash(rig, &json!({ "command": command }))
 }
 
-fn model(ran: &Ran) -> String {
-    placed(ran, &Places::default())
+/// A command's result, and what it holds outside the log.
+fn kept(rig: &Rig, input: &Value) -> (Ran, Vec<Held>) {
+    let called = rig.called("bash", input);
+    let Outcome::Done { output } = called.outcome else {
+        panic!("{input}: {:?}", called.outcome)
+    };
+    (output.parse().unwrap(), called.held)
 }
 
-/// What the model reads of `ran`, its references named by `places`.
-fn placed(ran: &Ran, places: &Places) -> String {
-    let llm::Output::Text(text) = Bash::to_model_with(&Json::encode(ran).unwrap(), places) else {
+/// The blob a command's result holds, its only reference.
+fn blob(held: &[Held]) -> &BlobRef {
+    let [Held::Blob(blob)] = held else {
+        panic!("{held:?}")
+    };
+    blob
+}
+
+/// The output stream of the rig's call `call`.
+fn stream(rig: &Rig, call: u64) -> OutputStream {
+    OutputStream {
+        session: rig.session,
+        call: protocol::CallId::new(call).unwrap(),
+    }
+}
+
+fn model(ran: &Ran) -> String {
+    let llm::Output::Text(text) = Bash::to_model(&Json::encode(ran).unwrap()) else {
         panic!("bash answers in text")
     };
     text
@@ -170,14 +190,17 @@ fn a_background_child_holding_the_pipe_does_not_hold_the_call() {
 #[test]
 fn output_a_lingering_process_still_writes_is_never_sealed() {
     let rig = rig("lingering-cut");
-    let ran = run(&rig, "(sleep 1; seq 1 50000) & seq 1 200000");
+    let (ran, held) = kept(
+        &rig,
+        &json!({ "command": "(sleep 1; seq 1 50000) & seq 1 200000" }),
+    );
     assert!(ran.truncated && ran.lingering.is_some(), "{ran:?}");
-    assert_eq!(ran.full, None, "a blob is never sealed under a writer");
-    let growing = ran.growing.unwrap();
-    assert_eq!(Bash::held(&ran), [Held::Stream(growing)]);
-    let places = rig.blobs.places();
-    let log = places.stream(growing);
-    assert!(placed(&ran, &places).contains(&format!("[full output, still being written: {log}]")));
+    assert_eq!(
+        held,
+        [Held::Stream(stream(&rig, 1))],
+        "the stream, never a blob"
+    );
+    let log = rig.stream(1);
     let before = std::fs::metadata(&log).unwrap().len();
     let deadline = Instant::now() + Duration::from_secs(10);
     while std::fs::metadata(&log).unwrap().len() == before {
@@ -198,41 +221,47 @@ fn output_a_lingering_process_still_writes_is_never_sealed() {
 #[test]
 fn huge_output_is_cut_and_kept_whole_as_a_blob() {
     let rig = rig("huge");
-    let ran = run(&rig, "seq 1 200000");
-    let blob = ran.full.clone().unwrap();
-    let full = rig.blobs.places().blob(&blob);
+    let (ran, held) = kept(&rig, &json!({ "command": "seq 1 200000" }));
+    let blob = blob(&held);
+    let full = rig.blobs.places().blob(blob).unwrap();
     let saved = std::fs::read_to_string(&full).unwrap();
     assert_eq!(blob.size, saved.len() as u64);
     assert_eq!(
         blob.origin,
         BlobOrigin::ToolOutput(protocol::CallId::new(1).unwrap())
     );
-    assert_eq!(Bash::held(&ran), [Held::Blob(blob)]);
     assert!(!rig.stream(1).exists(), "the stream was sealed");
+    assert!(
+        !Json::encode(&ran)
+            .unwrap()
+            .raw()
+            .contains(&blob.id.to_string()),
+        "the reference is held, not logged with the output"
+    );
     assert!(ran.truncated);
     assert_eq!(saved.lines().count(), 200_000);
     assert!(ran.output.starts_with("1\n2\n3\n"));
     assert!(ran.output.ends_with("199999\n200000\n"));
     assert!(ran.output.lines().count() <= crate::output::LINES + 1);
     assert!(ran.output.contains(" omitted]\n"));
-    assert!(
-        placed(&ran, &rig.blobs.places())
-            .ends_with(&format!("200000\n[full output: {full}]\n[exit code: 0]"))
-    );
+    assert!(model(&ran).ends_with("200000\n[exit code: 0]"));
 }
 
 #[test]
 fn binary_and_terminal_output_are_cleaned() {
     let rig = rig("clean");
-    let binary = run(&rig, "printf 'ELF\\0'; head -c 20000 /dev/zero");
+    let (binary, held) = kept(
+        &rig,
+        &json!({ "command": "printf 'ELF\\0'; head -c 20000 /dev/zero" }),
+    );
     assert!(
         binary.output.starts_with("[binary output: 20004 bytes]"),
         "{}",
         binary.output
     );
-    let blob = binary.full.unwrap();
+    let blob = blob(&held);
     assert_eq!(blob.media_type, "application/octet-stream");
-    let saved = std::fs::read(rig.blobs.places().blob(&blob)).unwrap();
+    let saved = std::fs::read(rig.blobs.places().blob(blob).unwrap()).unwrap();
     assert_eq!(saved.len(), 20004);
     let styled = run(
         &rig,
@@ -569,12 +598,15 @@ fn big_output_never_sits_in_memory() {
     let rig = rig("memory");
     run(&rig, "true");
     let before = ALLOC.reset();
-    let ran = run(&rig, "yes 'a line of output' | head -c 16000000");
+    let (ran, held) = kept(
+        &rig,
+        &json!({ "command": "yes 'a line of output' | head -c 16000000" }),
+    );
     let peak = ALLOC.peak() - before;
     assert!(ran.truncated && ran.exit == Some(0), "{ran:?}");
-    let full = ran.full.unwrap();
+    let full = blob(&held);
     assert_eq!(full.size, 16_000_000);
-    let path = rig.blobs.places().blob(&full);
+    let path = rig.blobs.places().blob(full).unwrap();
     assert_eq!(std::fs::metadata(path).unwrap().len(), 16_000_000);
     assert!(peak < 4 << 20, "{peak} bytes at most while 16 MB ran");
 }
@@ -582,13 +614,9 @@ fn big_output_never_sits_in_memory() {
 #[test]
 fn a_command_that_floods_its_output_is_stopped() {
     let rig = rig("flood");
-    let ran = run(&rig, "cat /dev/zero");
+    let (ran, held) = kept(&rig, &json!({ "command": "cat /dev/zero" }));
     assert_eq!(ran.flooded, Some(OUTPUT_CAP), "{ran:?}");
-    assert_eq!(
-        ran.full.as_ref().unwrap().size,
-        OUTPUT_CAP,
-        "kept up to its cap"
-    );
+    assert_eq!(blob(&held).size, OUTPUT_CAP, "kept up to its cap");
     assert!(model(&ran).contains("[stopped: its output passed 64 MiB]"));
 }
 
@@ -739,11 +767,10 @@ fn continuous_output_yields_to_other_sessions() {
 #[test]
 fn background_output_cannot_exceed_the_output_cap() {
     let rig = rig("bounded-background");
-    let ran = bash(&rig, &json!({ "command": "yes x", "background": true }));
+    let (ran, held) = kept(&rig, &json!({ "command": "yes x", "background": true }));
     let job = ran.background.as_ref().unwrap();
-    assert_eq!(Bash::held(&ran), [Held::Stream(job.log)]);
-    let log = rig.blobs.places().stream(job.log);
-    assert!(placed(&ran, &rig.blobs.places()).contains(&format!("output: {log}]")));
+    assert_eq!(held, [Held::Stream(stream(&rig, 1))]);
+    let log = rig.stream(1);
     wait_dead(job.pgid);
     assert_eq!(std::fs::metadata(log).unwrap().len(), OUTPUT_CAP);
 }

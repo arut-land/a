@@ -124,7 +124,7 @@ fn a_stream_is_read_where_it_is_named_while_it_grows_and_seals_into_the_same_blo
     let blobs = home.session(session);
     let Stream { mut file, open } = blobs.stream(call(7), 1 << 20).unwrap();
     assert_eq!(
-        open.path().display().to_string(),
+        Some(open.path().display().to_string()),
         blobs.places().stream(OutputStream {
             session,
             call: call(7)
@@ -183,12 +183,11 @@ fn a_sweep_keeps_what_a_log_references_and_every_stream_and_drops_the_rest() {
 }
 
 #[test]
-fn a_materialized_blob_is_a_read_only_file_where_any_session_names_it() {
+fn a_named_blob_is_a_read_only_file_where_any_session_names_it() {
     let home = Home::new();
     let blob = home.put(b"whole output");
     let blobs = home.session(SessionId::new());
-    blobs.materialize(&blob).unwrap();
-    let path = PathBuf::from(blobs.places().blob(&blob));
+    let path = PathBuf::from(blobs.places().blob(&blob).unwrap());
     assert_eq!(
         path,
         home.dir
@@ -200,7 +199,6 @@ fn a_materialized_blob_is_a_read_only_file_where_any_session_names_it() {
     assert_eq!(fs::read(&path).unwrap(), b"whole output");
     assert!(fs::metadata(&path).unwrap().permissions().readonly());
     let fork = home.session(SessionId::new());
-    fork.materialize(&blob).unwrap();
     assert_eq!(fork.places().blob(&blob), blobs.places().blob(&blob));
 }
 
@@ -239,16 +237,17 @@ fn a_reference_is_named_from_what_the_log_records_whoever_projects_it() {
         call: call(4),
     };
     let bare = Places::default();
-    assert_eq!(bare.blob(&blob), format!("by-id/{}", blob.id));
-    assert_eq!(bare.stream(stream), "stream:4");
-    let placed = Places::new(Path::new("tree"), Path::new("streams"));
+    assert_eq!(bare.blob(&blob), Some(format!("by-id/{}", blob.id)));
+    assert_eq!(bare.stream(stream).as_deref(), Some("stream:4"));
+    // A store names only what it can show.
+    let home = Home::new();
+    let placed = home.session(session).places();
+    assert_eq!(placed.blob(&blob), None, "a blob the store does not have");
+    assert_eq!(placed.stream(stream), None, "a stream not begun");
+    let begun = home.session(session).stream(call(4), 1).unwrap();
     assert_eq!(
         placed.stream(stream),
-        Path::new("streams")
-            .join(session.to_string())
-            .join("4.log")
-            .display()
-            .to_string()
+        Some(begun.open.path().display().to_string())
     );
 }
 

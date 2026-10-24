@@ -205,6 +205,7 @@ mod tests {
             },
             destination: child,
             payload: "message".into(),
+            held: Vec::new(),
         };
         let mut bodies = vec![
             Body::ModelCall {

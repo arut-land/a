@@ -220,6 +220,7 @@ impl Sending {
             id: self.id.clone(),
             destination: to,
             payload: self.payload.clone(),
+            held: Vec::new(),
         }
     }
 
@@ -922,7 +923,7 @@ mod durable_tests {
             Body::Detached { call },
             Body::ToolResult {
                 call,
-                outcome: crate::OutputStream { session, call }.placeholder(),
+                outcome: Outcome::detached(),
                 card: None,
                 held: Vec::new(),
             },

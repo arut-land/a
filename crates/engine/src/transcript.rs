@@ -69,7 +69,7 @@ fn model_text(segments: &Segments, mode: Mode, places: &Places) -> String {
             Segment::PasteRef(blob) => {
                 let at = places.blob(blob);
                 Tag::from(tag::PastedRef {
-                    at: &at,
+                    at: at.as_deref(),
                     bytes: blob.size,
                 })
                 .render(&mut text);
@@ -77,7 +77,7 @@ fn model_text(segments: &Segments, mode: Mode, places: &Places) -> String {
             Segment::Attachment(blob) => {
                 let at = places.blob(blob);
                 Tag::from(tag::Attached {
-                    at: &at,
+                    at: at.as_deref(),
                     media_type: &blob.media_type,
                     bytes: blob.size,
                 })
@@ -127,7 +127,7 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
             match envelope.source() {
                 Source::Child(_) => ContextValue::Child(outcome()?),
                 Source::Job(call) if envelope.id.purpose == EnvelopeId::DETACHED => {
-                    ContextValue::Background(call, outcome()?)
+                    ContextValue::Background(call, outcome()?, envelope.held.clone())
                 }
                 Source::Job(call) => ContextValue::Job(call, envelope.payload.clone()),
                 _ => ContextValue::Inbox(envelope.clone()),
@@ -341,7 +341,7 @@ impl Transcript {
 
     /// The result of call `call` the model made, in the tool message its
     /// reply's results share, in the calls' order: a detached call's is a
-    /// placeholder naming its stream.
+    /// placeholder, holding its stream.
     fn answer(&mut self, seq: Seq, call: CallId, outcome: &Outcome, held: &[Held]) {
         let Some((id, tool)) = self.calls.remove(&call) else {
             return;
@@ -352,18 +352,15 @@ impl Transcript {
             }
         }
         let ext::Presented { output, error } = if self.detached.contains(&call) {
-            let stream = self.stream(call);
-            let text = format!(
-                "[it goes on in the background; its output streams to {stream}, and \
-                 its result follows once it ends]"
-            );
+            let text = "[it goes on in the background; its result follows once it ends]";
             ext::Presented {
-                output: llm::Output::Text(text),
+                output: llm::Output::Text(text.to_owned()),
                 error: false,
             }
         } else {
-            self.registry.present_result(&tool, outcome, &self.places)
+            self.registry.present_result(&tool, outcome)
         };
+        let output = self.with_held(output, held);
         let result = ToolResult {
             id: id.into(),
             name: tool.into(),
@@ -398,7 +395,7 @@ impl Transcript {
                 return;
             }
             ContextValue::Child(outcome) => ext::child_result(&outcome),
-            ContextValue::Background(call, outcome) => self.background(call, &outcome),
+            ContextValue::Background(call, outcome, held) => self.background(call, &outcome, &held),
             ContextValue::Job(call, text) => self.ended(call, None, &text),
             _ => return,
         };
@@ -407,20 +404,44 @@ impl Transcript {
 
     /// What the model reads of the outcome of call `call`, which went on
     /// in the background.
-    fn background(&mut self, call: CallId, outcome: &Outcome) -> String {
+    fn background(&mut self, call: CallId, outcome: &Outcome, held: &[Held]) -> String {
         self.detached.remove(&call);
         let tool = self.tools.get(&call).cloned().unwrap_or_default();
-        let ext::Presented { output, .. } =
-            self.registry.present_result(&tool, outcome, &self.places);
+        let ext::Presented { output, .. } = self.registry.present_result(&tool, outcome);
+        let output = self.with_held(output, held);
         self.ended(call, Some(&text_of(output)), "")
+    }
+
+    /// `output`, telling the model where it reads what the result holds:
+    /// each reference named through the session's places, and left out
+    /// when it cannot be read.
+    fn with_held(&self, output: llm::Output, held: &[Held]) -> llm::Output {
+        let lines: Vec<String> = (held.iter())
+            .filter_map(|held| match held {
+                Held::Blob(blob) => Some(format!("[full output: {}]", self.places.blob(blob)?)),
+                Held::Stream(stream) => Some(format!(
+                    "[output, as it grows: {}]",
+                    self.places.stream(*stream)?
+                )),
+            })
+            .collect();
+        if lines.is_empty() {
+            return output;
+        }
+        let mut text = text_of(output);
+        for line in lines {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&line);
+        }
+        llm::Output::Text(text)
     }
 
     /// Where call `call`'s output streams, named by what its result held:
     /// the session whose log holds the call, whoever projects it.
-    fn stream(&self, call: CallId) -> String {
-        self.streams
-            .get(&call)
-            .map_or_else(|| format!("stream:{call}"), |s| self.places.stream(*s))
+    fn stream(&self, call: CallId) -> Option<String> {
+        self.places.stream(*self.streams.get(&call)?)
     }
 
     /// A call that went on in the background ended, as the model reads it:
@@ -433,7 +454,7 @@ impl Transcript {
             call: &id,
             command,
             exit: None,
-            log: Some(&stream),
+            log: stream.as_deref(),
             output: output.or(Some(note)),
         })
         .to_string()
@@ -742,6 +763,7 @@ mod tests {
             },
             destination: SessionId::new(),
             payload: "hello".into(),
+            held: Vec::new(),
         };
         let entries = [entry(1, Body::Enqueue { envelope }), entry(2, take(1))];
         assert_eq!(

@@ -1601,6 +1601,7 @@ fn cancelled_queued_turns_never_reappear_after_restart() {
         },
         destination: child.id,
         payload: "queued work".into(),
+        held: Vec::new(),
     }))
     .unwrap();
     session.interrupt_now();

@@ -12,9 +12,11 @@
 //! Output crosses a bounded capture pipe into an open blob stream.
 //! Storage admission applies back-pressure; the supervisor follows the
 //! stream, woken by its writes, keeping only what the model is shown, and
-//! the stream is sealed into a blob as the whole output when that was cut:
-//! the result references the blob, and names where it is materialized. A command whose output
-//! passes [`OUTPUT_CAP`] is stopped. Cancellation before or during process
+//! the stream is sealed into a blob as the whole output when that was cut,
+//! unless processes the command left running still write it. The result
+//! holds the blob or the stream ([`Tool::held`]); the engine tells the
+//! model where each is. A command whose output passes [`OUTPUT_CAP`] is
+//! stopped. Cancellation before or during process
 //! launch reports an aborted command, as cancellation during supervision does.
 
 use ext::{LaunchSpec, OwnedProcess, ProcessOutput, ProcessSignal, Processes};
@@ -32,7 +34,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::output::OUTPUT_CAP;
 use crate::output::{Ended, Live, Output, Rendered};
 use crate::state::Cwd;
-use ext::blob::{BlobOrigin, BlobRef, Held, Open, OutputStream, Places, Stream};
+use ext::blob::{BlobOrigin, BlobRef, Held, Open, OutputStream, Stream};
 use ext::shape::{self, Streams};
 use ext::{Cx, Json, Partials, Schema, SpawnSpec as Spawn, Tool};
 
@@ -123,13 +125,14 @@ pub struct Ran {
     pub output: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
-    /// The whole output, when it was cut.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The whole output, when it was cut. Held by the result
+    /// ([`Tool::held`]), never logged with the output.
+    #[serde(skip)]
     pub full: Option<BlobRef>,
-    /// The whole output, when it was cut while processes the command left
-    /// running still write it: its stream, which it goes on growing in,
-    /// never a blob sealed under them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The whole output, still growing: a background job's, or a cut one
+    /// that processes the command left running still write, never a blob
+    /// sealed under them. Held by the result, never logged with the output.
+    #[serde(skip)]
     pub growing: Option<OutputStream>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<Job>,
@@ -143,8 +146,6 @@ pub struct Ran {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     pub pgid: u32,
-    /// Its output, which grows for as long as the job runs.
-    pub log: OutputStream,
 }
 
 impl<D: crate::dialect::Dialect> Tool for ShellTool<D> {
@@ -168,22 +169,16 @@ impl<D: crate::dialect::Dialect> Tool for ShellTool<D> {
     }
 
     fn to_model(output: &Json) -> llm::Output {
-        Self::to_model_with(output, &Places::default())
-    }
-
-    fn to_model_with(output: &Json, places: &Places) -> llm::Output {
         output.parse().map_or_else(
             |_| llm::Output::Json(output.clone()),
-            |ran| llm::Output::Text(model_text(&ran, places)),
+            |ran| llm::Output::Text(model_text(&ran)),
         )
     }
 
     fn held(ran: &Ran) -> Vec<Held> {
         let full = ran.full.clone().map(Held::Blob);
-        let streams = [ran.growing, ran.background.as_ref().map(|job| job.log)];
-        full.into_iter()
-            .chain(streams.into_iter().flatten().map(Held::Stream))
-            .collect()
+        let growing = ran.growing.map(Held::Stream);
+        full.into_iter().chain(growing).collect()
     }
 
     fn present(input: &Command) -> Option<Card> {
@@ -254,7 +249,7 @@ fn mark(ran: &Ran) -> Mark {
 
 /// What the model reads: the output, then what became of the command,
 /// its exit status last.
-fn model_text(ran: &Ran, places: &Places) -> String {
+fn model_text(ran: &Ran) -> String {
     let mut text = ran.output.trim_end_matches('\n').to_owned();
     let mut trailer = |line: String| {
         if !text.is_empty() {
@@ -263,24 +258,11 @@ fn model_text(ran: &Ran, places: &Places) -> String {
         text.push_str(&line);
     };
     if let Some(job) = &ran.background {
-        trailer(format!(
-            "[running in the background: job {}; output: {}]",
-            job.pgid,
-            places.stream(job.log)
-        ));
+        trailer(format!("[running in the background: job {}]", job.pgid));
         return text;
     }
     if ran.output.is_empty() {
         trailer("(no output)".to_owned());
-    }
-    if let Some(full) = &ran.full {
-        trailer(format!("[full output: {}]", places.blob(full)));
-    }
-    if let Some(growing) = ran.growing {
-        trailer(format!(
-            "[full output, still being written: {}]",
-            places.stream(growing)
-        ));
     }
     if let Some(pgid) = ran.lingering {
         trailer(format!("[background processes still running: job {pgid}]"));
@@ -412,12 +394,10 @@ struct Kept {
 }
 
 /// What the model is shown of the ended output, and where the whole is
-/// kept when it saw less: sealed into a blob and materialized, or, while
-/// processes the command left behind still write it, left growing in its
-/// stream. A store that fails costs the whole output, not the command's
-/// result; a cache that fails costs only the path.
+/// kept when it saw less: sealed into a blob, or, while processes the
+/// command left behind still write it, left growing in its stream. A store
+/// that fails costs the whole output, not the command's result.
 async fn keep(cx: &Cx, log: Open, output: Ended, lingering: bool) -> io::Result<(Rendered, Kept)> {
-    let blobs = cx.blobs.clone();
     let stream = OutputStream {
         session: cx.session,
         call: cx.call,
@@ -440,7 +420,6 @@ async fn keep(cx: &Cx, log: Open, output: Ended, lingering: bool) -> io::Result<
         let Ok(blob) = log.seal(media_type, BlobOrigin::ToolOutput(stream.call)) else {
             return Ok((rendered, Kept::default()));
         };
-        let _ = blobs.materialize(&blob);
         let kept = Kept {
             blob: Some(blob),
             ..Kept::default()
@@ -462,12 +441,10 @@ async fn background(cx: &Cx, spawn: Spawn, file: File) -> io::Result<Ran> {
     Ok(Ran {
         cwd,
         duration_ms: duration_ms(started),
-        background: Some(Job {
-            pgid,
-            log: OutputStream {
-                session: cx.session,
-                call: cx.call,
-            },
+        background: Some(Job { pgid }),
+        growing: Some(OutputStream {
+            session: cx.session,
+            call: cx.call,
         }),
         ..Ran::default()
     })

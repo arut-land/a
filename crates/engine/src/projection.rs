@@ -297,7 +297,16 @@ impl Actor {
                 }
                 _ => None,
             };
-            if let Some(transcript) = &mut self.projection.transcript {
+            // Naming what an entry holds makes it readable (file I/O), so
+            // that is left to the next projection, on a blocking worker.
+            let holds = match &e.body {
+                Body::ToolResult { held, .. } => !held.is_empty(),
+                Body::Enqueue { envelope } => !envelope.held.is_empty(),
+                _ => false,
+            };
+            if holds {
+                self.projection.transcript = None;
+            } else if let Some(transcript) = &mut self.projection.transcript {
                 transcript.apply(e, replied.map(|(_, m)| m));
             }
             // A call ends with its result, unless it was detached: then

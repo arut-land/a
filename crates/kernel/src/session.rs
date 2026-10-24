@@ -218,7 +218,7 @@ impl Core {
             ),
             Event::Detached { call } => self.detached(call, &mut fx),
             Event::JobEnded { call, text } => {
-                self.own(call, EnvelopeId::JOB, text, &mut fx);
+                self.own(call, EnvelopeId::JOB, text, Vec::new(), &mut fx);
             }
             Event::Note { call, note } => self.note(call, note, &mut fx),
             Event::Waits { call, on } => self.waits(call, on, &mut fx),
@@ -594,9 +594,10 @@ impl Core {
         call: CallId,
         purpose: &str,
         payload: String,
+        held: Vec<Held>,
         fx: &mut StepPlan,
     ) -> Option<Seq> {
-        let envelope = Envelope::own(self.session, call, purpose, payload);
+        let envelope = Envelope::own(self.session, call, purpose, payload).holding(held);
         if self.fold.ledger.received(&envelope.id) {
             return None;
         }
@@ -1075,7 +1076,7 @@ impl Core {
         } = ended;
         if self.fold.ledger.detached().iter().any(|d| d.call == call) {
             if !self.dropped.contains(&call) {
-                self.own(call, EnvelopeId::DETACHED, outcome.payload(), fx);
+                self.own(call, EnvelopeId::DETACHED, outcome.payload(), held, fx);
             }
             return;
         }
@@ -1883,7 +1884,13 @@ impl Core {
     /// call waits on that have fired and are not queued yet.
     fn queue_children(&mut self, fx: &mut StepPlan) {
         for (watch, outcome) in mem::take(&mut self.fold.unqueued) {
-            self.own(CallId(watch), EnvelopeId::CHILD, outcome.payload(), fx);
+            self.own(
+                CallId(watch),
+                EnvelopeId::CHILD,
+                outcome.payload(),
+                Vec::new(),
+                fx,
+            );
         }
     }
 
@@ -1904,7 +1911,7 @@ impl Core {
     /// Calls a restart cut off in the background go on as each tool's
     /// replay says: one safe to run again runs again, still detached; any
     /// other's outcome is that it was cut off and may not have completed,
-    /// with where its output so far went.
+    /// holding the stream its output so far went to.
     fn recover_detached(&mut self, fx: &mut StepPlan) {
         for d in self.fold.ledger.detached().to_vec() {
             let safe = (self.registry.callable(&d.tool)).is_some_and(|c| c.replay == Replay::Safe);
@@ -1920,14 +1927,13 @@ impl Core {
                 session: self.session,
                 call: d.call,
             };
-            let output = format!(
-                "[the daemon stopped while this call ran in the background: it may not have \
-                 completed; its output so far is in {stream}]"
-            );
+            let output = "[the daemon stopped while this call ran in the background: it may \
+                          not have completed; its output so far is kept]";
             let outcome = Outcome::Interrupted {
-                output: Some(output),
+                output: Some(output.to_owned()),
             };
-            self.own(d.call, EnvelopeId::DETACHED, outcome.payload(), fx);
+            let held = vec![Held::Stream(stream)];
+            self.own(d.call, EnvelopeId::DETACHED, outcome.payload(), held, fx);
         }
     }
 
@@ -2092,7 +2098,7 @@ impl Core {
             call,
         };
         Ended {
-            outcome: stream.placeholder(),
+            outcome: Outcome::detached(),
             card: None,
             held: vec![Held::Stream(stream)],
         }

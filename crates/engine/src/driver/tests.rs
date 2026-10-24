@@ -1749,7 +1749,7 @@ fn a_forced_steer_detaches_a_running_call_whose_outcome_comes_back_on_the_queue(
     );
     assert!(log.iter().any(|e| matches!(&e.body,
         Body::ToolResult { call: c, outcome, held, .. } if *c == call
-            && *outcome == protocol::OutputStream { session: session.id, call }.placeholder()
+            && *outcome == Outcome::detached()
             && *held == [protocol::Held::Stream(protocol::OutputStream { session: session.id, call })])));
     // The call in the background keeps the session working.
     assert!(session.has_work());
@@ -1916,7 +1916,6 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
         &Outcome::Interrupted {
             output: Some("one\n".into()),
         },
-        &ext::blob::Places::default(),
     );
     assert!(error);
     assert_eq!(

@@ -16,6 +16,7 @@ fn a_failed_enqueue_releases_transport_for_retry() {
             },
             destination: harness.session.id,
             payload: "update".into(),
+            held: Vec::new(),
         };
         let (reply, mut received) = oneshot::channel();
         harness.faulty.fail_next_sync(failure);
