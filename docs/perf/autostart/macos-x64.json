@@ -1,0 +1,64 @@
+{
+  "platform": "macOS-15.7.9-x86_64-i386-64bit-Mach-O",
+  "binary_bytes": 4372936,
+  "samples": {
+    "self_spawn_ms": [
+      45.333519,
+      47.629217,
+      42.34021,
+      57.178804,
+      90.033121,
+      38.965137,
+      42.813685,
+      43.833367,
+      36.237524,
+      103.377469,
+      41.308926,
+      44.723957
+    ],
+    "login_first_ms": [
+      14.926938,
+      14.569229,
+      15.123627,
+      13.986015,
+      17.445579,
+      15.179014,
+      19.683109,
+      13.418604,
+      207.230678,
+      13.521571,
+      98.676467,
+      11.853195
+    ],
+    "login_warm_ms": [
+      15.31277,
+      14.779807,
+      14.857334,
+      15.172133,
+      16.561491,
+      13.645681,
+      14.695274,
+      12.291294,
+      88.376345,
+      12.874667,
+      36.657512,
+      10.488732
+    ]
+  },
+  "medians": {
+    "self_spawn_ms": 44.278662,
+    "login_first_ms": 15.0252825,
+    "login_warm_ms": 14.8185705
+  },
+  "login_first_minus_warm_ms": 0.20671199999999956,
+  "login_first_minus_self_spawn_ms": -29.253379499999998,
+  "checks": {
+    "isolated_homes_refused": true,
+    "idle_exit_without_autostart": true,
+    "resident_with_autostart": true,
+    "login_entry_defers_to_a_running_daemon": true,
+    "registration_refreshed_by_a_daemon": true,
+    "login_started_daemons_stay_resident": true,
+    "off_removes_the_registration": true
+  }
+}
