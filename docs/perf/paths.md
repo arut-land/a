@@ -117,6 +117,28 @@ tail increase did not reproduce either. Each paired run has five alternating
 reference/candidate rounds; each attach observation replays all expected log
 entries across 500 connections.
 
+## Intel cold reply
+
+The [50-round Intel probe](https://github.com/arut-land/a/actions/runs/40046341959)
+compares main `4b662d7a` with the same implementation, using fresh isolated
+homes and directly alternating the cold workloads without driver/decoder
+benchmarks between roles. [All samples](paths-macos-cold.json) include the
+separate in-process resolver timing.
+
+| macOS Intel measurement | Main | Candidate |
+| --- | ---: | ---: |
+| Cold-reply median | 55.692 ms | 57.926 ms |
+| In-process isolated path resolution median | 0.0046 ms | 0.0149 ms |
+
+The difference between role medians is +2.234 ms. The median of within-round
+differences is +0.709 ms; its fixed-seed, 10,000-resample percentile bootstrap
+95% interval is [-2.203, +3.139] ms. The point estimates remain positive, but
+this run does not establish a stable +3.6 ms paired effect or exact equality.
+The directly measured isolated resolver difference is +0.010 ms. It cannot
+explain the millisecond-scale aggregate variation. The avoidable Darwin temp
+lookup is attributed separately above and removed from IPC; the remaining
+cold-reply difference is unresolved within hosted sampling uncertainty.
+
 ## Paired integration measurements
 
 [Perf 40040797566](https://github.com/arut-land/a/actions/runs/40040797566)
@@ -152,9 +174,9 @@ in the linked hosted artifacts.
 The latest macOS ARM64 attach p99 difference is -0.048 ms, following +0.056
 and -0.482 ms in the earlier paired runs. Its original +0.878 ms increase
 does not recur. Intel cold differences after restoring the endpoint runtime
-policy are +2.554 and +4.775 ms in five-round runs; those observations require
-the larger cold-only sample rather than a claim that the lookup correction
-explains every end-to-end difference.
+policy are +2.554 and +4.775 ms in five-round runs. The larger cold-only sample
+above retains its positive point estimates and uncertainty rather than
+claiming the lookup correction explains every end-to-end difference.
 
 ## Validation
 
