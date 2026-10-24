@@ -49,10 +49,10 @@ impl State {
     fn retire(self: Box<Self>) {
         let cleanup = self.cleanup;
         let event = self.event.as_raw_handle();
+        let _ = Box::into_raw(self);
         // SAFETY: this one-shot wait is armed only after exclusive ownership
         // transfers to its callback. The event, OVERLAPPED and buffer remain
         // alive until the kernel signals completion; no timer or worker waits.
-        let _ = Box::into_raw(self);
         unsafe { SetThreadpoolWait(cleanup, event, std::ptr::null()) };
     }
 }
