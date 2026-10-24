@@ -1,0 +1,204 @@
+{
+  "method": "Release fixture daemon started with ls in a fresh isolated A_HOME; one module/working-set snapshot after three seconds per revision. System module basenames are normalized; the executable staging path is omitted. Snapshots attribute residency; paired timings are reported separately.",
+  "targets": {
+    "x86_64-pc-windows-msvc": {
+      "run": 40027460048,
+      "roles": {
+        "original-main": {
+          "revision": "781586d5a9fec1dd8b5e2b316a28b00a48470f8e",
+          "rss_kib": 8040.0,
+          "modules": [
+            "a.exe",
+            "advapi32.dll",
+            "apphelp.dll",
+            "bcryptprimitives.dll",
+            "crypt32.dll",
+            "kernel32.dll",
+            "kernelbase.dll",
+            "msvcrt.dll",
+            "ntdll.dll",
+            "rpcrt4.dll",
+            "sechost.dll",
+            "secur32.dll",
+            "sspicli.dll",
+            "ucrtbase.dll",
+            "userenv.dll",
+            "ws2_32.dll"
+          ]
+        },
+        "regressed": {
+          "revision": "9bec7823b1a97a5a23c917de2b9c89aae56d1e2c",
+          "rss_kib": 10276.0,
+          "modules": [
+            "a.exe",
+            "advapi32.dll",
+            "apphelp.dll",
+            "bcryptprimitives.dll",
+            "combase.dll",
+            "crypt32.dll",
+            "gdi32.dll",
+            "gdi32full.dll",
+            "imm32.dll",
+            "kernel32.dll",
+            "kernelbase.dll",
+            "msvcp_win.dll",
+            "msvcrt.dll",
+            "ntdll.dll",
+            "rpcrt4.dll",
+            "sechost.dll",
+            "secur32.dll",
+            "shell32.dll",
+            "sspicli.dll",
+            "ucrtbase.dll",
+            "user32.dll",
+            "win32u.dll",
+            "wintypes.dll",
+            "ws2_32.dll"
+          ]
+        },
+        "main": {
+          "revision": "4d978b0b94290ecbf5b851f08b6d987940c2da0c",
+          "rss_kib": 8100.0,
+          "modules": [
+            "a.exe",
+            "advapi32.dll",
+            "apphelp.dll",
+            "bcryptprimitives.dll",
+            "crypt32.dll",
+            "kernel32.dll",
+            "kernelbase.dll",
+            "msvcrt.dll",
+            "ntdll.dll",
+            "rpcrt4.dll",
+            "sechost.dll",
+            "secur32.dll",
+            "sspicli.dll",
+            "ucrtbase.dll",
+            "userenv.dll",
+            "ws2_32.dll"
+          ]
+        },
+        "fixed": {
+          "revision": "634038e699c7a13ce21c1fc33d59aa6e1871bee5",
+          "rss_kib": 8052.0,
+          "modules": [
+            "a.exe",
+            "advapi32.dll",
+            "apphelp.dll",
+            "bcryptprimitives.dll",
+            "crypt32.dll",
+            "kernel32.dll",
+            "kernelbase.dll",
+            "msvcrt.dll",
+            "ntdll.dll",
+            "rpcrt4.dll",
+            "sechost.dll",
+            "secur32.dll",
+            "sspicli.dll",
+            "ucrtbase.dll",
+            "ws2_32.dll"
+          ]
+        }
+      },
+      "direct_kernelbase_export_available": false,
+      "api_contract_hresult": 0
+    },
+    "aarch64-pc-windows-msvc": {
+      "run": 40029319314,
+      "roles": {
+        "original-main": {
+          "revision": "781586d5a9fec1dd8b5e2b316a28b00a48470f8e",
+          "rss_kib": 8888.0,
+          "modules": [
+            "a.exe",
+            "advapi32.dll",
+            "bcryptprimitives.dll",
+            "crypt32.dll",
+            "kernel32.dll",
+            "kernelbase.dll",
+            "msvcrt.dll",
+            "ntdll.dll",
+            "rpcrt4.dll",
+            "sechost.dll",
+            "secur32.dll",
+            "sspicli.dll",
+            "ucrtbase.dll",
+            "userenv.dll",
+            "ws2_32.dll"
+          ]
+        },
+        "regressed": {
+          "revision": "9bec7823b1a97a5a23c917de2b9c89aae56d1e2c",
+          "rss_kib": 11120.0,
+          "modules": [
+            "a.exe",
+            "advapi32.dll",
+            "bcryptprimitives.dll",
+            "combase.dll",
+            "crypt32.dll",
+            "gdi32.dll",
+            "gdi32full.dll",
+            "imm32.dll",
+            "kernel32.dll",
+            "kernelbase.dll",
+            "msvcp_win.dll",
+            "msvcrt.dll",
+            "ntdll.dll",
+            "rpcrt4.dll",
+            "sechost.dll",
+            "secur32.dll",
+            "shell32.dll",
+            "sspicli.dll",
+            "ucrtbase.dll",
+            "user32.dll",
+            "win32u.dll",
+            "ws2_32.dll"
+          ]
+        },
+        "main": {
+          "revision": "4d978b0b94290ecbf5b851f08b6d987940c2da0c",
+          "rss_kib": 8960.0,
+          "modules": [
+            "a.exe",
+            "advapi32.dll",
+            "bcryptprimitives.dll",
+            "crypt32.dll",
+            "kernel32.dll",
+            "kernelbase.dll",
+            "msvcrt.dll",
+            "ntdll.dll",
+            "rpcrt4.dll",
+            "sechost.dll",
+            "secur32.dll",
+            "sspicli.dll",
+            "ucrtbase.dll",
+            "userenv.dll",
+            "ws2_32.dll"
+          ]
+        },
+        "fixed": {
+          "revision": "62979ffb2331d4baaed465a44d423b2ec6a239ae",
+          "rss_kib": 8860.0,
+          "modules": [
+            "a.exe",
+            "advapi32.dll",
+            "bcryptprimitives.dll",
+            "crypt32.dll",
+            "kernel32.dll",
+            "kernelbase.dll",
+            "msvcrt.dll",
+            "ntdll.dll",
+            "rpcrt4.dll",
+            "sechost.dll",
+            "secur32.dll",
+            "sspicli.dll",
+            "ucrtbase.dll",
+            "ws2_32.dll"
+          ]
+        }
+      },
+      "direct_kernelbase_export_available": false,
+      "api_contract_hresult": 0
+    }
+  }
+}

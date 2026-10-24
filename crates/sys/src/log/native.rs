@@ -214,11 +214,10 @@ mod tests {
     #[test]
     fn daemon_spawn_preserves_default_and_explicit_home_modes() {
         let root = std::env::temp_dir().join("a-native-home-mode");
-        let native = crate::Home {
-            root: root.clone(),
-            isolated: false,
-        };
+        let native = crate::Home::native().unwrap();
         let isolated = crate::Home::from(root.clone());
+        assert!(!native.is_isolated());
+        assert!(isolated.is_isolated());
         for (home, expected) in [(native, None), (isolated, Some(root.as_os_str()))] {
             let mut command = std::process::Command::new("unused");
             command.env("A_HOME", "another-instance");
@@ -235,10 +234,7 @@ mod tests {
     #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn native_guards_can_overlap_and_reopen_without_emitting_a_record() {
-        let home = crate::Home {
-            root: std::env::temp_dir().join("a-native-guard"),
-            isolated: false,
-        };
+        let home = crate::Home::native().unwrap();
         let first = Native::for_home(&home);
         let second = Native::for_home(&home);
         assert!(first.0.is_some() && second.0.is_some());

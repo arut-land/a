@@ -60,6 +60,9 @@ impl Client {
             },
             |e| e.vars.clone(),
         );
+        // Servers share the tools' temporary storage; their own
+        // configuration still wins.
+        sys::shell::ExecutionFacts::current().apply_environment(&mut env);
         env.extend(server.env.clone());
         let spec = SpawnSpec {
             argv: argv.clone(),
@@ -215,6 +218,79 @@ mod tests {
         let mcp = crate::Mcp::new(vec![server.clone()], Duration::from_secs(5)).unwrap();
         let rig = Rig::new(name, Registry::default().with(&ext_shell::Shell).unwrap());
         (mcp, rig, server)
+    }
+
+    const ENV_OUT: &str = "A_TEST_MCP_ENV_OUT";
+    const TEMPORARY_TEST: &str =
+        "stdio::tests::stdio_servers_keep_temporary_files_in_the_homes_temporary_dir";
+
+    /// The environment a stdio server starts with: this test binary, rerun
+    /// as the server, writes its own to the file `ENV_OUT` names. Shells
+    /// would rewrite or requote the variables under test.
+    fn environment_of(rig: &Rig, mut env: BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let out = rig.cx().workspace.join(format!("env-{}.txt", env.len()));
+        env.insert(ENV_OUT.into(), out.to_str().unwrap().into());
+        let argv = vec![
+            std::env::current_exe().unwrap().to_str().unwrap().into(),
+            "--exact".into(),
+            TEMPORARY_TEST.into(),
+        ];
+        let server = Server {
+            name: "temporary-env".parse().unwrap(),
+            description: String::new(),
+            transport: Transport::Stdio(argv),
+            env,
+        };
+        let mcp = crate::Mcp::new(vec![server.clone()], Duration::from_secs(5)).unwrap();
+        let mut cx = rig.cx();
+        // A client whose own temporary directory lies outside the home.
+        let mut vars: BTreeMap<String, String> = std::env::vars()
+            .filter(|(k, _)| {
+                ["PATH", "SYSTEMROOT"]
+                    .iter()
+                    .any(|n| k.eq_ignore_ascii_case(n))
+            })
+            .collect();
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            vars.insert(name.into(), "/outside".into());
+        }
+        cx.env = Some(Arc::new(protocol::Environment {
+            cwd: cx.workspace.to_path_buf(),
+            vars,
+            ..Default::default()
+        }));
+        let client = rt::block_on(Client::start(&server, &cx, Arc::downgrade(&mcp.0))).unwrap();
+        let status = rt::block_on(client.child.process.wait()).unwrap();
+        assert!(status.success(), "the server exited with {status:?}");
+        let written = std::fs::read(&out).expect("the server ran this test as its child");
+        serde_json::from_slice(&written).unwrap()
+    }
+
+    #[test]
+    fn stdio_servers_keep_temporary_files_in_the_homes_temporary_dir() {
+        if let Some(out) = std::env::var_os(ENV_OUT) {
+            let env: BTreeMap<String, String> = std::env::vars()
+                .map(|(k, v)| (k.to_ascii_uppercase(), v))
+                .collect();
+            std::fs::write(out, serde_json::to_vec(&env).unwrap()).unwrap();
+            return;
+        }
+        let rig = Rig::new(
+            "temporary-env",
+            Registry::default().with(&ext_shell::Shell).unwrap(),
+        );
+        let env = environment_of(&rig, BTreeMap::new());
+        let temp = sys::shell::ExecutionFacts::current().temp.to_str().unwrap();
+        assert_eq!(env["TMPDIR"], temp);
+        #[cfg(windows)]
+        for name in ["TMP", "TEMP"] {
+            assert_eq!(env[name], temp);
+        }
+        let explicit = environment_of(
+            &rig,
+            BTreeMap::from([("TMPDIR".into(), "/explicit".into())]),
+        );
+        assert_eq!(explicit["TMPDIR"], "/explicit");
     }
 
     #[test]
