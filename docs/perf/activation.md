@@ -20,8 +20,9 @@ its inode across daemon exit/reactivation. Uninstall must leave another native
 home running and locate its own artifacts after a configuration-base change.
 A home without a registration cannot adopt an activation descriptor. A manager
 pinned to an older executable must serve a newer staged build after one drain;
-a fixture-only agent verifies the actual image, not just its advertised ID. Results contain every sample,
-medians, their difference and the measured executable's bytes. The activation
+a fixture-only agent verifies the actual image, not just its advertised ID.
+Results contain every sample, medians, their difference and the measured
+executable's bytes. The activation
 probe build includes fixtures; shipped binary size comes from the normal
 six-target perf workflow instead.
 
@@ -29,3 +30,19 @@ The ordinary perf workflow compares the unchanged unmanaged startup path
 against main in alternating same-runner rounds, including startup, attach,
 idle memory and CPU accounting. Native activation is optional and does not
 change the idle exit deadline or add a resident helper.
+
+The [native activation probe](https://github.com/arut-land/a/actions/runs/40064417121)
+at `0f37ccb2` produced the following alternating-round observations. Times are
+milliseconds; registration is excluded. Raw samples are retained alongside this
+document.
+
+| Hosted target | Self-spawn median | Activation median | Activation minus self-spawn |
+| --- | ---: | ---: | ---: |
+| [Linux ARM64](activation/linux-arm64.json) | 5.089 | 7.814 | +2.725 |
+| [Linux x64](activation/linux-x64.json) | 5.014 | 7.828 | +2.814 |
+
+Both Linux targets passed idle exit, socket inode preservation, cross-home
+uninstall, changed configuration-base uninstall, rejection without registration
+and upgrade from a manager pinned to an older executable. Activation is an
+opt-in lifecycle integration; these measurements do not support a latency
+advantage over self-spawn.

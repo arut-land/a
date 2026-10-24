@@ -75,6 +75,7 @@ pub(super) fn install(
 <key>RunAtLoad</key><true/>
 <key>Umask</key><integer>63</integer>
 <key>ExitTimeOut</key><integer>30</integer>
+<key>ThrottleInterval</key><integer>1</integer>
 <key>Sockets</key><dict><key>daemon</key><dict><key>SecureSocketWithKey</key><string>A_ACTIVATION_SOCKET</string><key>SockPathMode</key><integer>384</integer><key>SockType</key><string>stream</string><key>SockFamily</key><string>Unix</string></dict></dict>
 </dict></plist>
 "#,

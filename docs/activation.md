@@ -68,7 +68,10 @@ using a directory event and a bounded deadline, including app registration
 that is already enabled. Approval-required registration stays pending. The bundled plist does not interpolate `$HOME`,
 `$TMPDIR` or `~`. Socket mode is 0600, the process umask is 0077 and the stop
 timeout is 30 seconds. Subsequent connects use the published manager socket
-and the existing `getpeereid` checks. The managed daemon stays in the
+and the existing `getpeereid` checks. A one-second `ThrottleInterval` keeps
+rapid stop/connect cycles within the client's startup deadline while retaining
+launch throttling; the application's crash breaker also remains active.
+The managed daemon stays in the
 foreground and does not call `setsid` or spawn a successor. If a bundled
 entry point has been outranked by the executable selected by the install seam,
 it re-execs that executable in the same PID before consuming launchd resources.

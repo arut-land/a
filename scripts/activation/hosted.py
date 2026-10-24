@@ -149,6 +149,14 @@ try:
     result["activation_minus_self_spawn_ms"] = result["medians"]["activation_ms"] - result["medians"]["self_spawn_ms"]
     print(json.dumps(result, indent=2))
     Path("activation-result.json").write_text(json.dumps(result, indent=2) + "\n")
+except BaseException:
+    for log in root.rglob("daemon.jsonl"):
+        print(f"Daemon log {log}:\n{log.read_text()}", flush=True)
+    if platform.system() == "Darwin" and (run_dir / "activation").exists():
+        registration = json.loads((run_dir / "activation").read_text())
+        definition = plistlib.loads(Path(registration["Launchd"]["plist"]).read_bytes())
+        subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/" + definition["Label"]], check=False)
+    raise
 finally:
     command("daemon", "stop", check=False)
     command("daemon", "uninstall-activation", check=False)
