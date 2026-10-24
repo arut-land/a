@@ -76,3 +76,7 @@ privacy boundary and best-effort delivery.
 `a fork <session>[@<seq>]` creates a new session and prints its id. `/fork [seq]` copies the current conversation at a rest point and switches to it.
 Files stay as they are; this does not rewind or copy the workspace. The fork
 keeps its recorded cwd and environment. See [fork semantics](fork.md).
+
+`a daemon install-activation` opts into native user socket activation;
+`a daemon uninstall-activation` restores self-spawn. See [native activation](activation.md)
+for Linux systemd, macOS LaunchAgent/app registration and Windows behavior.

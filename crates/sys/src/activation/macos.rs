@@ -1,4 +1,6 @@
 use super::*;
+
+pub(super) const SUPPORTED: bool = true;
 use std::os::fd::FromRawFd;
 
 const LABEL: &str = "dev.a.daemon";
@@ -142,6 +144,8 @@ pub(super) fn listener(home: &Home) -> io::Result<Listener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) const SUPPORTED: bool = true;
     #[test]
     fn plist_values_cannot_become_markup() {
         assert_eq!(xml("<&\"'>"), "&lt;&amp;&quot;&apos;&gt;");

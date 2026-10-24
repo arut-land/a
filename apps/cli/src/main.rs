@@ -159,14 +159,15 @@ fn daemon_cmd(daemon: &client::Daemon, action: Daemon) -> io::Result<()> {
     let home = daemon.home()?;
     match action {
         Daemon::InstallActivation { app } => {
+            let installation = sys::activation::Installation::claim(home)?;
             if home.layout() == &sys::InstallLayout::Native && !sys::activation::installed(home)? {
                 client::stop(home)?;
             }
-            sys::activation::install(home, app)?;
+            installation.install(app)?;
             sayln!("native activation installed");
         }
         Daemon::UninstallActivation { app } => {
-            sys::activation::uninstall(home, app)?;
+            sys::activation::Installation::claim(home)?.uninstall(app)?;
             sayln!("native activation removed");
         }
         Daemon::Log => match std::fs::read_to_string(home.daemon_log()) {

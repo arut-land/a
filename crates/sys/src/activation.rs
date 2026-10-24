@@ -40,15 +40,40 @@ fn native_home(home: &Home) -> io::Result<()> {
     Ok(())
 }
 
-/// `app` prepares registration by the installed app's SMAppService UI.
-pub fn install(home: &Home, app: bool) -> io::Result<()> {
-    native_home(home)?;
-    native::install(home, app)
+/// Serializes registration changes with clients trying to self-spawn.
+pub struct Installation<'a> {
+    home: &'a Home,
+    _lock: std::fs::File,
 }
 
-pub fn uninstall(home: &Home, app: bool) -> io::Result<()> {
-    native_home(home)?;
-    native::uninstall(home, app)
+impl<'a> Installation<'a> {
+    pub fn claim(home: &'a Home) -> io::Result<Self> {
+        native_home(home)?;
+        if !native::SUPPORTED {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this platform uses per-user self-spawn",
+            ));
+        }
+        crate::fs::private_dir(&home.run_dir())?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(home.run_dir().join("start.lock"))?;
+        file.lock()?;
+        Ok(Self { home, _lock: file })
+    }
+
+    /// `app` prepares registration by the installed app's SMAppService UI.
+    pub fn install(&self, app: bool) -> io::Result<()> {
+        native::install(self.home, app)
+    }
+
+    pub fn uninstall(&self, app: bool) -> io::Result<()> {
+        native::uninstall(self.home, app)
+    }
 }
 
 /// Called before any runtime or child threads exist.
@@ -108,11 +133,7 @@ mod tests {
     fn isolated_instances_cannot_register_native_services() {
         let home = Home::from(std::env::temp_dir().join("a-activation-isolated"));
         assert_eq!(
-            install(&home, false).unwrap_err().kind(),
-            io::ErrorKind::Unsupported
-        );
-        assert_eq!(
-            uninstall(&home, false).unwrap_err().kind(),
+            Installation::claim(&home).err().unwrap().kind(),
             io::ErrorKind::Unsupported
         );
         assert_eq!(

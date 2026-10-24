@@ -1,5 +1,7 @@
 use super::*;
-use std::os::fd::{FromRawFd, IntoRawFd};
+
+pub(super) const SUPPORTED: bool = true;
+use std::os::fd::OwnedFd;
 use std::path::Path;
 
 const SOCKET: &str = "a-daemon.socket";
@@ -40,20 +42,25 @@ fn quote(path: &Path) -> io::Result<String> {
     Ok(out)
 }
 
+fn socket_path(path: &Path) -> io::Result<String> {
+    let value = path.to_str().ok_or(io::ErrorKind::InvalidInput)?;
+    if !path.is_absolute() || value.chars().any(char::is_control) {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    // ListenStream accepts the literal address, unlike ExecStart's word list.
+    Ok(value.replace('%', "%%"))
+}
+
 fn service(home: &Home) -> io::Result<String> {
     let mut env = Command::new("unused");
     home.daemon_env(&mut env);
     let mut settings = String::new();
     for (key, value) in env.get_envs() {
         if let Some(value) = value {
-            settings.push_str(&format!(
-                "Environment={}\n",
-                quote(Path::new(&format!(
-                    "{}={}",
-                    key.to_string_lossy(),
-                    value.to_string_lossy()
-                )))?
-            ));
+            let mut assignment = key.to_os_string();
+            assignment.push("=");
+            assignment.push(value);
+            settings.push_str(&format!("Environment={}\n", quote(Path::new(&assignment))?));
         }
     }
     Ok(format!(
@@ -83,7 +90,7 @@ pub(super) fn install(home: &Home, app: bool) -> io::Result<()> {
     )?;
     let socket = format!(
         "[Unit]\nDescription=a per-user agent socket\n\n[Socket]\nListenStream={}\nSocketMode=0600\nAccept=no\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n",
-        quote(endpoint.path())?
+        socket_path(endpoint.path())?
     );
     let service = service(home)?;
     let dir = units(home);
@@ -128,23 +135,24 @@ pub(super) fn uninstall(home: &Home, app: bool) -> io::Result<()> {
 }
 
 pub(super) fn listener(home: &Home) -> io::Result<Listener> {
-    let mut descriptors =
-        libsystemd::activation::receive_descriptors(true).map_err(io::Error::other)?;
+    let mut descriptors = listenfd::ListenFd::from_env();
     if descriptors.len() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "expected one systemd activation socket",
         ));
     }
-    let fd = descriptors.pop().unwrap().into_raw_fd();
-    // SAFETY: receive_descriptors transfers this inherited descriptor to us.
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    Listener::activated(file, home)
+    let socket = descriptors
+        .take_unix_listener(0)?
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    Listener::activated(std::fs::File::from(OwnedFd::from(socket)), home)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) const SUPPORTED: bool = true;
 
     #[test]
     fn unit_paths_cannot_expand_specifiers_or_inject_directives() {

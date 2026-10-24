@@ -28,7 +28,7 @@ else:
     config = root / "config/a"
     run_dir = root / "state/a/run"
 config.mkdir(parents=True)
-(config / "config.toml").write_text("idle_secs = 1\n")
+(config / "config.toml").write_text("[daemon]\nidle_secs = 1\n")
 
 
 def command(*words, check=True):

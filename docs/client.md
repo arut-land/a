@@ -30,7 +30,9 @@ transport (lib.rs, remote.rs)      Daemon { endpoint: Local(Home) | Ssh(host), s
   detached `a __daemon` and connects into its backlog; one client starts
   it at a time, under `start.lock`, and the others wait on that lock, not
   on a timer) or another machine's through `ssh <host> a bridge`, whose
-  stdio carries the same frames. `connect` completes the hello: a
+  stdio carries the same frames. With [native activation](activation.md),
+  the service manager holds the socket instead; a registered but unavailable
+  service produces an error instead of self-spawning. `connect` completes the hello: a
   `Welcome` (protocol and capabilities taken up, the slash commands the
   daemon advertises), a `Draining` daemon waited out and tried again, a
   mismatch as `Error::Mismatch { theirs, newer, host }`, whose `Display`

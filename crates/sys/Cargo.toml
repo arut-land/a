@@ -15,7 +15,7 @@ rustix = { workspace = true, features = ["stdio", "pipe", "event", "net", "termi
 libc.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libsystemd = { version = "0.7.2", default-features = false }
+listenfd = "1.0.2"
 
 [target.'cfg(windows)'.dependencies]
 # Ordinary executable names keep .NET Framework hosts working; preserve verbatim-only names.

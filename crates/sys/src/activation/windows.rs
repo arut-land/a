@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) const SUPPORTED: bool = false;
+
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
