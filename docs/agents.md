@@ -1,19 +1,64 @@
 # Conversations and agents
 
-This document specifies the conversation primitives for composable agents.
-Metrics are derived from qualified provider-attempt facts.
+Every conversation a call owns is one primitive, `ext::Conversation`: a
+title, a summary, the policy judge's verdict, an approval description and
+a sub-agent's task differ only in how they are built. This document
+specifies that primitive, its storage and lifecycle, inboxes, and the
+metrics derived from it. Metrics are derived from qualified provider-attempt
+facts.
 
-Implementation status: typed awaited and detached spawning, immutable prefix
-images, inherited registrations, nested storage, durable inbox transport and
-depth enforcement are implemented. `ext-subagent` supplies `task`, `fork_task`
-and `background_task`. Persistent model-only side threads power title, compact
-and judge. Named channels and questions remain follow-up compositions. The
+Implementation status: typed turns and tasks, awaited and detached
+execution, ephemeral turns, keyed reuse, immutable prefix images, inherited
+registrations, nested storage, durable inbox transport and depth
+enforcement are implemented. `ext-subagent` supplies `task`, `fork_task`
+and `background_task`; title, compact, judge and approval descriptions are
+turns. Named channels and questions remain follow-up compositions. The
 current inbox access policy permits parent and child edges; `InboxAccess` is
 the extension seam for other policies.
 
-A conversation owns an ordered log, an inbox and a
-runner. Main sessions, child agents and side threads differ in their runner
-and ownership, not in their durability rules.
+A conversation owns an ordered log, an inbox and a runner. Main sessions,
+child agents and side threads differ in their runner and ownership, not in
+their durability rules.
+
+## One primitive
+
+`Conversation<R, S = Persisted>` is built by the extension that wants it.
+Every dimension that differs between uses is a type or a builder method
+with a default, so an extension writes only what is different about its
+conversation, and an impossible combination does not compile:
+
+| Dimension | Types and methods | Default |
+| --- | --- | --- |
+| Runner | `Conversation::turn::<E>(purpose, prompt)` gives `R = Turn`: one model response per input, no tools, no agent loop. `Conversation::task::<E>(purpose, prompt)` gives `R = Task`: a registered agent kind's loop with inherited tools | |
+| Storage | `S = Persisted` keeps an owned child log; `.ephemeral()` (turns only) gives `S = Ephemeral` | persisted |
+| Keyed reuse | `.key(k)` (turns only): a repeated key returns the committed result; a task is its call's, once per purpose | the owning call |
+| Thread | `.per_call()` (turns only) scopes the thread to the owning call | the session |
+| Context | `.owner_context()`: the owner's conversation before the owning call. Turns project it per input; tasks copy it as a prefix image | fresh |
+| Bounds | `.bounds(exchanges, bytes)` (turns only), `.max_tokens(n)`, `.budget(b)`, `.depth(n)` (tasks only) | 8 exchanges, 64 KiB; 4096 tokens, 60 s; depth 8 |
+| Routing | `.fast()`, `.role(ModelRole)`; `.kind(name)` (tasks only) selects another registered agent kind | the session's model; the current kind |
+| Placement | `.placement(Placement::Here)` | here |
+| Execution | `.ask(cx)` awaits the committed result; `.detach()` gives a turn's `Background` observer, `.detach(cx)` a task's `ConversationHandle` | |
+
+There are no presets: title, compact, judge and descriptions are each a
+few builder calls in their own crate. Title is
+`turn::<Title>("title", prompt).fast().owner_context().bounds(2, 8192).max_tokens(32)`,
+detached under the key `initial` on its first model call and asked under
+the owning call's key by `/title`. A sub-agent is
+`task::<Subagent>("task", prompt)`, plus `.owner_context()` for
+`fork_task` and `.detach(cx)` for `background_task`.
+
+Compile-fail tests in `ext::conversation` hold the impossible combinations:
+an ephemeral task (an agent loop runs its tools from its own log), a keyed
+task, an agent kind on a turn, ephemeral twice, a question scope on an
+awaited turn, awaiting a `Background`, and polling a `ConversationHandle`.
+
+The engine implements one service, `ext::Conversations`, over the admitted
+forms the builder lowers to: `ModelTurn` for a turn and `Spawn` for a task.
+Neither has a public constructor, so the typed builder is the only way in.
+`Placement` is matched exhaustively at admission: each daemon stores its
+own sessions, so a conversation placed on another machine will be a root
+there, owned by the parent's address and keyed by its envelope id, rather
+than nested under `children/`. Only `Here` exists today.
 
 ## Identity, ownership and storage
 
@@ -27,32 +72,35 @@ Store roots at `sessions/<root>/log.jsonl`, children at
 owns its derived indexes and snapshots. The catalog maps ids to relative
 paths and parent ids; rebuilding it traverses conversation directories.
 Loading by id, resuming, listing and ordinary rest-point forks work equally
-for roots and descendants. No transcript depends on an ancestor file remaining
+for roots and descendants. Forking a child at rest is how it is promoted: the fork is
+a root with a copied history, owned by no call, which runs on and never
+reports to its old parent. No transcript depends on an ancestor file remaining
 present. Import publication syncs the containing directory and each newly
 created ancestor before acknowledging creation.
 
-## Spawn data and SDK types
+## Admitted requests
 
-`Spawn` contains a prompt, context source, runner selection and typed budget.
-Context is `Fresh` or `Prefix { session, seq }`, with an inclusive committed
-sequence. Runner selection consists of an agent name and a model role (session,
-fast, or an extension-defined role resolved by the model service). Resolve and
-freeze the concrete routing and extension generation in the spawn intent.
-Future configuration changes must not change admitted work. Persist admitted
+A task's `Spawn` contains a prompt, context, runner selection, typed budget
+and placement. Context is `Fresh` or `Owner`; an owner prefix runs through
+the owning call's sequence, which must be committed. Runner selection
+consists of an agent name and a model role (session, fast, or an
+extension-defined role resolved by the model service). Resolve and freeze
+the concrete routing and extension generation in the spawn intent. Future
+configuration changes must not change admitted work. Persist admitted
 authority separately from the public request, using a compact tuple codec. A
 shared protocol image envelope exposes context to transcript and publication
 reducers without requiring them to decode engine authority.
 
-`Awaited<Spawn>` and `Detached<Spawn>` are distinct request types. `Sessions`
-accepts the awaited type to return an `Outcome`; its detached method returns
-only a durable conversation handle after admission. A detached handle is not
-a future. Modes compose these constructors in tool implementations; no config
-flag selects execution semantics. An extension namespace and purpose name
-allow several children per call without positional identities. Calls can await
-several purposes in sequence or admit several detached children. The current
-kernel has one active child wait per tool call; overlapping awaited requests
-receive a typed refusal instead of replacing a live waiter. This initial limit
-keeps the existing wait lifecycle singular; a multi-watch join is follow-up.
+An awaited task returns its `Outcome`; a detached one returns only a durable
+conversation handle after admission. A detached handle is not a future, and
+`ConversationHandle::send::<E>` is how its owner messages it. Modes compose
+these in tool implementations; no config flag selects execution semantics.
+An extension namespace and purpose name allow several children per call
+without positional identities. Calls can await several purposes in sequence
+or admit several detached children. The current kernel has one active child
+wait per tool call; overlapping awaited requests receive a typed refusal
+instead of replacing a live waiter. This initial limit keeps the existing
+wait lifecycle singular; a multi-watch join is follow-up.
 
 `DepthBudget` is a private-field value constructed with a maximum remaining
 edge count. Descending consumes one level and returns a smaller budget or
@@ -187,48 +235,120 @@ membership and question presentation; the engine only validates the issued
 routing capability and performs durable transport. Cyclic waits need explicit
 cancellation or deadlines, not a hidden scheduler heuristic.
 
-## Side threads
+## Turns
 
-Model-only kinds declare `ModelOnlyKind::CONTEXT` in source. The frozen
-runner applies its exchange window and byte ceiling to the assembled request,
-including owner context, while retaining the admitted kind's system prompt
-and current instructions. Other system messages expire with their exchanges.
-Projection uses the owner's admitted image; recovery consumes inbox work
-only with typed evidence of a matching durable interrupted sender result.
+A turn runs on `Runner::ModelOnly`: one response per inbox input, with no
+tools, agent-loop hooks or recursive recovery handlers. A provider tool
+request cannot become executable work. Its frozen spawn authority uses the
+same registration intersection, settings, source-generation restoration,
+model role, routing and depth allowance as an agent child. There is no
+separate one-shot provider path.
 
-`Runner::Agent` selects a registered kind; `Runner::ModelOnly` performs one
-response per inbox input and offers no tools or agent-loop hooks. Both use
-owned conversation storage, frozen generation/route/settings authority, depth
-budgets and generation-scoped work. The public spawn image identifies the
-runner without making reducers decode execution authority.
+### Identity and keyed reuse
 
-`ThreadKey { extension, purpose, owner_scope }` selects a persistent owned
-conversation. `ThreadKey::new::<E>` namespaces the purpose by extension type and requires
-an explicit session or call owner scope. `ModelTurn::new` takes this thread
-key and a turn key. Each request supplies a `TurnKey`. Reusing a turn key returns
-its committed outcome; a new key appends an inbox input to the existing
-thread, including previous exchanges. Awaited `Models::call` and `Background`
-remain distinct types. Inbox admission and taking are durable; turns execute
-in order rather than steering or merging another turn's input.
+`ThreadKey { extension, purpose, owner_scope }` identifies the owned
+conversation: the extension's name, its purpose, and the session or the
+owning call. Each request carries a `TurnKey` independent of the prompt,
+budget and route. Repeating that key reuses the committed result, even after
+restart or derived-index eviction. Concurrent consumers share admission and
+result. A different key explicitly authorizes a new response in the same
+thread, which appends an inbox input and sees the previous exchanges.
 
-The parent retains explicitly side-classified intent/result facts, including
-the thread key, for extension consumers and client views. Conversation ids
-are derived from the current session owner; forks start fresh threads and
-cannot address a source-owned log. These facts and replies never enter the parent's model transcript.
-The child stores its own instructions, attempts and replies. Per-turn owner
-context is a sequence reference projected at execution, never retained in
-thread history. Inbox completion uses the same committed reply delivery as
-other calls. Recovery terminally resolves abandoned inbox inputs for every
-owned conversation, preserving dedup identities. Open parent requests and
-ambiguous model-only attempts recover as interrupted, including crashes in
-retry backoff. Recovery never initiates new spend for an existing key.
-Explicit new keys can continue a thread after interruption.
+A thread has a conversation id derived from its current session owner and
+thread key, through the existing UUID namespace derivation. Copied audit
+history carries no executable child id; a fork starts its own thread with
+fresh exchanges and cannot address a source-owned log.
 
-Title's initial background request uses a stable initial key. `/title`
-regenerates it, and `/title <instructions>` supplies naming instructions;
-each command uses its owning call as a new turn key in the same thread.
-Compaction and judge likewise continue session-scoped threads with one key
-per owning call. See [side-calls.md](side-calls.md) for the full contract.
+### Context and bounds
+
+`Fresh` supplies only the extension's messages. `Owner` records the owner
+sequence strictly before the owning call; execution projects that immutable
+prefix once as a per-turn input, retaining rich messages and opaque provider
+state. Only extension instructions and replies enter thread history; owner
+prefixes never accumulate there. Projection accepts an owner image coupling
+that prefix to its own admitted registry, including registrations excluded
+from the child.
+
+The turn's bounds, a recent-exchange window and an assembled message-byte
+ceiling, are frozen with the runner at admission; configuration cannot
+select them. The admitted kind's system prompt and the current input always
+survive. Oversized mandatory instructions fail with `InvalidRequest` before
+provider execution. Systems belonging to older exchanges expire with those
+exchanges. Optional context is removed in whole exchanges. Bounds never
+prune durable exchanges or keyed outcomes.
+
+### Persisted and ephemeral
+
+A persisted turn's inbox input is enqueued, deduplicated and taken durably
+in its child before influencing a request. Concurrent new turns are
+processed in order, without merging or steering the active turn. The child
+stores its own instructions, attempts and replies.
+
+An ephemeral turn writes no child log and keeps no thread history. Its
+admission, the four-request limit, its bounds, timeout and retries, and its
+keyed result are all in the owner's log, exactly as for a persisted turn, so
+a repeated key is still answered without spending again. It runs in the
+owner, from authority frozen at its own admission, and its provider attempts
+are counted as the owner's side work.
+
+### Durability, interruption and limits
+
+The parent's side `ModelCall` records the thread identity, frozen authority
+and turn payload. `ModelResult.for` classifies the result as side work even
+if edits remove its intent. Neither parent audit facts nor replies become
+main model context; normal extension edits can change that context.
+
+Admission commits before any provider is polled. Model attempts and retry
+decisions also cross durable barriers. A consumer is released only after the
+parent result commits; failed commits cannot acknowledge success. Open parent
+requests and ambiguous attempts recover as interrupted, including crashes
+during backoff. For every owned conversation, recovery terminally resolves
+inbox inputs only with positive evidence of a matching sender request's
+durable interrupted result. `CancelledInput` carries the owner and fact
+sequence justifying resolution. Missing owners, open requests and absent
+results do not prove abandonment. Existing take and interrupt facts
+terminally consume abandoned inputs without removing their dedup identities,
+even before a provider attempt exists. Recovery never repeats ambiguous
+spend; an extension may continue the thread under an explicit new key.
+
+`SideRetry` owns retry classification and backoff. Known failures may retry
+with the same frozen input, after a committed decision. They do not enter
+main `RequestError` handlers, so an overflow while summarizing cannot
+recursively compact. Typed failures retain provider classifications without
+putting prompts, credentials or provider bodies in diagnostics.
+
+Each owner admits at most four active turns. Excess work receives a logged
+typed failure. Each turn has a positive output-token limit and a timeout
+covering inbox wait, provider attempts and backoff. Output tokens are capped
+per attempt; these allowances are not aggregate currency caps.
+
+A successful owning call leaves a detached turn running; `while_waiting()`
+scopes one to the owner's current question instead, so answering it cancels
+the work. Owner failure, explicit interruption, generation retirement and
+shutdown cancel outstanding work. Cancellation wins over late success.
+Dropping a consumer future does not abandon admitted work.
+
+### The turns that ship
+
+Title's first model call detaches a turn under the session-wide `initial`
+key. `/title` regenerates it, and `/title <instructions>` supplies naming
+instructions; each command is a turn keyed by its owning call. Client views
+show the latest successful title. Compaction and the judge use
+session-scoped threads keyed by the owning call. Compaction asks with the
+owner's context, adds the user's `/compact <instructions>` to its summary
+prompt, and records its completion mark after its context edit. Its
+optional `threshold` is a percentage of the request's model's context
+window, from the model registry (`llm::models::context_window`); a model
+the registry does not know compacts only when its provider reports an
+overflow. Approval descriptions are detached per-call turns scoped to the
+question.
+
+`SideProvider` is an optional test transport supplied by `ext-fixtures`.
+It runs inside the same model-only executor, inbox, barriers and cancellation
+as real providers; release builds exclude it. Tests reuse recorded provider
+cassettes without editing them. Protocol envelopes identify runner kind and
+thread ownership; the wire corpus and view vectors are generated by their
+tests under the new `protocol::PROTO`, without compatibility adapters.
 
 ## Metrics
 
@@ -287,18 +407,19 @@ crates choose modes and policy.
 
 | Mode | Composition or contract work |
 | --- | --- |
-| Fresh awaited task | Tool composition: awaited fresh spawn (`ext-subagent`) |
-| Current-prefix task | Tool composition: awaited spawn with prefix context |
-| Detached task | Tool composition: detached spawn returning a conversation handle |
-| Parent sends while child works | Tool composition: `Sessions::send` to a conversation id |
+| Fresh awaited task | `Conversation::task` asked (`ext-subagent`) |
+| Current-prefix task | A task with `.owner_context()` |
+| Detached task | A task's `.detach(cx)`, returning a conversation handle |
+| Parent sends while child works | `ConversationHandle::send` |
 | Child asks parent | Tool composition: question and correlated reply fold in an `ext-*` crate |
 | Sibling chat | Policy and tool composition over durable inboxes addressed by conversation id |
 | Named channels | Needs SDK contracts for channel identity, admission, membership and recipient snapshots; current destinations are conversation ids |
-| Different agent/model | Tool composition: select a registered agent and model role; select `Runner::Agent` or `Runner::ModelOnly` |
+| Different agent/model | `.kind(name)` and `.role(role)`; a turn or a task |
 | Recursive same agent | Tool composition: inherit task registration; depth budget descends |
 | Root-only extension | Rust declaration or Lua `a.inherit(false)` excludes the whole generation |
 | Resumable/forkable children | Common store/catalog paths and existing fork policy |
-| Model-only side threads | Owned conversations over `Runner::ModelOnly`, keyed turns and source-declared request bounds |
+| Model-only side threads | `Conversation::turn`: keyed, bounded, persisted or ephemeral |
+| Conversations on other machines | `Placement` beyond `Here`: a root in the remote daemon's store, owned by address |
 | Usage/cost views | `ext-metrics` derives totals from execution settlements and ownership edges |
 
 Implementation must prove replay identity, terminal-result uniqueness across
