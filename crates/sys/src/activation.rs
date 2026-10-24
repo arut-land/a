@@ -69,7 +69,7 @@ impl<'a> Installation<'a> {
         Ok(Self { home, _lock: file })
     }
 
-    /// `app` prepares registration by the installed app's SMAppService UI.
+    /// `app` prepares registration by the installed app's `SMAppService` UI.
     pub fn install(&self, app: bool, stop: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
         native::install(self.home, app, stop)
     }

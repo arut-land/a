@@ -1,4 +1,4 @@
-use super::*;
+use super::{Command, Home, Listener, PathBuf, forget, installed, io, prepare, record, run};
 
 pub(super) const SUPPORTED: bool = true;
 use std::os::fd::FromRawFd;
@@ -121,7 +121,6 @@ pub(super) fn listener(home: &Home) -> io::Result<Listener> {
     if error != 0 {
         return Err(io::Error::from_raw_os_error(error));
     }
-    // SAFETY: on success launchd returns count descriptors in a malloc allocation.
     if count == 0 || fds.is_null() {
         // SAFETY: free accepts null or the allocation returned by launchd.
         unsafe { libc::free(fds.cast()) };
@@ -130,6 +129,7 @@ pub(super) fn listener(home: &Home) -> io::Result<Listener> {
             "launchd returned no socket",
         ));
     }
+    // SAFETY: on success launchd returns count descriptors in a malloc allocation.
     let files = unsafe {
         let files = std::slice::from_raw_parts(fds, count)
             .iter()
