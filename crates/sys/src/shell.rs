@@ -53,13 +53,14 @@ impl ExecutionFacts {
     }
 
     /// Called by the daemon before registering extensions. The facts live
-    /// for the process, so a second layout is refused rather than ignored.
+    /// for the process, so a second layout is refused rather than ignored;
+    /// test processes that load several homes keep the first.
     pub fn initialize(paths: &crate::Paths) -> std::io::Result<&'static Self> {
         if FACTS.get().is_none() {
             let _ = FACTS.set(Self::resolve(paths)?);
         }
         let facts = FACTS.get().expect("initialized shell facts");
-        if facts.temp != paths.temporary_dir() {
+        if !cfg!(feature = "testing") && facts.temp != paths.temporary_dir() {
             return Err(std::io::Error::other(format!(
                 "shell facts already use {}, not {}",
                 facts.temp.display(),

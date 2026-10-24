@@ -225,14 +225,12 @@ mod tests {
     fn environment_of(rig: &Rig, env: BTreeMap<String, String>) -> BTreeMap<String, String> {
         #[cfg(unix)]
         let argv = vec!["/bin/sh".into(), "-c".into(), "env > env.txt".into()];
-        // MSYS shells rewrite TMP and TEMP; cmd reports them as stored.
+        // MSYS shells rewrite TMP and TEMP; cmd reports them as stored. One
+        // quoted argument holding `>` would keep its quotes, so pass words.
         #[cfg(windows)]
-        let argv = vec![
-            "cmd.exe".into(),
-            "/d".into(),
-            "/c".into(),
-            "set > env.txt".into(),
-        ];
+        let argv = ["cmd.exe", "/d", "/c", "set", ">", "env.txt"]
+            .map(String::from)
+            .to_vec();
         let server = Server {
             name: "temporary-env".parse().unwrap(),
             description: String::new(),
