@@ -23,7 +23,22 @@ pre-release: formats change outright, without compatibility shims.
 
 ## Process model
 
-The CLI stages its executable into the home runtime directory. A local
+Commands that start or attach resolve an immutable installed image by content
+identity in the executable data directory. Daemon status, log and stop operate
+on the local home without touching executable installation. An unchanged source or installed image needs no
+executable read, copy, flush or reference publication. First installation
+verifies a private snapshot: reflink on Linux where supported, clonefile on
+macOS with a metadata-preserving copy fallback, CopyFile on Windows preserving
+alternate streams. Source files never share writable inodes with installed
+images. Installation is crash consistent rather than durable: each image and receipt
+is ordered before its name (a write barrier on Apple platforms, not a
+drive-cache flush), and a lost image or reference is recovered on the next
+start. Small installation receipts and source fingerprints survive image
+reclamation, preventing old or relocated sources from being installed again.
+macOS quarantine and code signatures are retained. Windows retires a mapped
+old image under a private name; a later installation reclaims it after process
+exit, without blocking replacement or adding cleanup work to ordinary starts.
+A local
 client first connects to the daemon's endpoint. On a cold start, clients
 serialize through `start.lock`, recheck the connection, take the daemon
 lock, then start a detached `a __daemon`. Unix passes the bound listener

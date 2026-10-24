@@ -74,16 +74,30 @@ state root. SSH discovery selects `sys::RemoteLayout` from the remote host's
 platform inside the SSH call, including that host's `A_HOME` or XDG overrides.
 It can find an installed remote build across client platforms; copying this
 build still requires a matching remote platform. Sync and async launch use
-the same layout scripts. Uploads stream binary bytes through SSH stdin to a
-private temporary file beside the destination, then publish it with a rename.
-The destination is a quoted positional argument, preserving spaces, apostrophes
-and shell metacharacters in native or overridden roots.
+the same layout scripts. Uploads stream binary bytes through SSH stdin into a
+private temporary directory beside the destination. A cut connection ends the
+stream with a clean EOF, so the host checks the POSIX `cksum` and length of the
+upload, syncs it, and only then publishes it with a hard link that never
+replaces a verified image. An installed image that fails the same check is a
+leftover of an interrupted upload and is replaced, never run. The destination
+is a quoted positional argument, preserving spaces, apostrophes and shell
+metacharacters in native or overridden roots.
 There is no migration from older layouts.
 
-Executable staging remains `data/runtime` and retains its existing publication
-behavior. Installer-owned executable identity and avoiding routine staging are
-a separate change; the data-directory seam supplies its location. A read-only
-or `noexec` data directory can still prevent staging until that change lands.
+Immutable executable images live in `data/runtime/<version+hash>`. Ordinary
+starts resolve an installed image from its source fingerprint and installation
+receipt, without copying, hashing, flushing or republishing it. Reclamation
+keeps the current and runner-up images and the eight newest older receipts
+with their fingerprints, so old or relocated sources do not recreate
+superseded images; older receipts, dangling fingerprints and the temporary
+names of crashed installers are removed under the installer lock. A
+fingerprint is the source's identity, size, times and birth time; when it
+cannot be read or changes during installation, the content-verified image is
+still installed, just not remembered.
+Initial installation needs a writable, executable data root; Linux can place
+it on a separate executable mount with `XDG_DATA_HOME`. After installation,
+unchanged sources resolve even when the executable data directory is read-only.
+A `noexec` data root cannot host daemon images.
 
 [Directory resolution measurements](perf/paths.md) include native module lists,
 first-lookup profiles, paired performance measurements and dependency cost.
