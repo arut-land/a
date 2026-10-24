@@ -1,8 +1,15 @@
 # Native runtime resources
 
-`rt::Config::default` sizes the daemon from
-`sys::resources::effective_parallelism`, read once at startup; there is no CPU
-or pressure polling loop. Explicit configurations remain available for hosts
+`rt::Config::daemon` sizes the daemon from
+`sys::resources::effective_parallelism`, read once at startup, and runs its
+blocking jobs at the foreground class; there is no CPU or pressure polling
+loop. Clients (`a`, `once`, the TUI, `a web`, the FFI) use `Config::default`:
+the standard `available_parallelism` and the caller's own scheduling class.
+They are short-lived, attach to a daemon that does the work, and would pay
+the daemon's measured costs (about 21 KiB idle RSS for the Windows CPU
+discovery, up to 44 KiB for scoped QoS on Apple silicon, three system calls
+per blocking job on macOS) without the benefits, which belong to sustained
+work under a job cap or on a busy Mac. Explicit configurations remain available for hosts
 and measurement harnesses. Each mechanism below was kept or dropped by a
 paired comparison with it disabled; the [mechanism comparisons](resource-mechanisms.md)
 hold the table and its evidence.
@@ -37,12 +44,15 @@ Linux uses Rust's `available_parallelism`, whose implementation intersects
 non-root controller mounts. This avoids another cgroup parser.
 
 Windows intersects process affinity and process-default CPU-set IDs within the
-calling processor group, then bounds capacity by the immediate job's CPU rate
-or maximum rate. Weight-based job scheduling is not a quota. A missing native
+calling thread's processor group, then bounds capacity by the immediate job's
+hard-capped CPU rate or maximum rate. A soft rate without `HARD_CAP` is
+exceeded whenever the host is idle, and weight-based scheduling is not a
+quota; neither bounds workers. Only the immediate job is queried, so a cap
+on an ancestor job is missed. CPU sets in other processor groups are not
+counted. If the process's CPU-set assignment changes between the size and
+fetch calls, the CPU-set bound fails open to affinity alone. A missing native
 query falls back to the available facts, with at least one worker. The standard
-scheduler's processor-group limit remains in effect. Parent job rates require
-parent handles and cannot be discovered through the public current-job query;
-this is an approximation in nested quota hierarchies. No thread is pinned to a
+scheduler's processor-group limit remains in effect. No thread is pinned to a
 guessed performance or efficiency core.
 
 No storage-media lookup runs on any OS. A media label does not establish
@@ -51,7 +61,7 @@ cost resident memory (Windows disk kinds 18–55 KiB, the macOS IOKit query
 56 KiB) without changing a selected pool width. Explicit configurations can
 limit a qualified slow filesystem to one storage worker.
 
-macOS blocking jobs use scoped user-initiated QoS; catalog recovery temporarily
+The daemon's macOS blocking jobs use scoped user-initiated QoS; catalog recovery temporarily
 uses utility QoS. The thread-bound guard restores the enclosing class even when
 a job unwinds. Async workers keep their normal class because one worker polls
 both foreground and maintenance tasks. A single `dispatch2` memory-pressure

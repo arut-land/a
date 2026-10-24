@@ -308,23 +308,29 @@ mod tests {
             assert_ne!(SetProcessAffinityMask(process, affinity), 0);
             check_cpu_sets(affinity);
 
+            let unrestricted = effective_parallelism();
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             assert!(!job.is_null());
-            let rate = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
-                ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
-                    | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
-                Anonymous: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0 { CpuRate: 1000 },
+            let set_rate = |flags| {
+                let rate = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+                    ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | flags,
+                    Anonymous: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0 { CpuRate: 1000 },
+                };
+                assert_ne!(
+                    SetInformationJobObject(
+                        job,
+                        JobObjectCpuRateControlInformation,
+                        (&raw const rate).cast(),
+                        u32::try_from(size_of_val(&rate)).expect("fixed-size job rate")
+                    ),
+                    0
+                );
             };
-            assert_ne!(
-                SetInformationJobObject(
-                    job,
-                    JobObjectCpuRateControlInformation,
-                    (&raw const rate).cast(),
-                    u32::try_from(size_of_val(&rate)).expect("fixed-size job rate")
-                ),
-                0
-            );
+            // A soft rate is exceeded whenever the host is idle: no bound.
+            set_rate(0);
             assert_ne!(AssignProcessToJobObject(job, process), 0);
+            assert_eq!(effective_parallelism(), unrestricted);
+            set_rate(JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP);
             let host = std::thread::available_parallelism().map_or(1, usize::from);
             assert!(effective_parallelism() <= (host / 10).max(1));
             windows_sys::Win32::Foundation::CloseHandle(job);

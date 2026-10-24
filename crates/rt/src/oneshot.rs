@@ -65,6 +65,13 @@ fn end(slot: &Mutex<Slot>) {
     }
 }
 
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        let waker = lock(&self.0).waker.take();
+        drop(waker);
+    }
+}
+
 impl<T: 'static> Future for Receiver<T> {
     type Output = Option<T>;
 
@@ -109,6 +116,42 @@ mod tests {
             let result = Pin::new(&mut *receiver).poll(&mut Context::from_waker(Waker::noop()));
             let _ = self.finished.send(matches!(result, Poll::Ready(None)));
         }
+    }
+
+    /// A waker that owns the sender: dropping it ends the channel.
+    struct Owner(Mutex<Option<Sender<usize>>>, mpsc::Sender<()>);
+
+    impl Wake for Owner {
+        fn wake(self: Arc<Self>) {
+            panic!("a dropped receiver is never woken");
+        }
+    }
+
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            drop(self.0.lock().unwrap().take());
+            let _ = self.1.send(());
+        }
+    }
+
+    #[test]
+    fn a_dropped_receiver_releases_its_waker_outside_the_lock() {
+        let (sender, mut receiver) = channel();
+        let (released, result) = mpsc::channel();
+        let waker = Waker::from(Arc::new(Owner(Mutex::new(Some(sender)), released)));
+        assert!(
+            Pin::new(&mut receiver)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(waker);
+        let dropped = std::thread::spawn(move || drop(receiver));
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "the waker's own sender must be able to end the channel"
+        );
+        dropped.join().unwrap();
     }
 
     #[test]

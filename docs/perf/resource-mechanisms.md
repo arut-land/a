@@ -16,8 +16,10 @@ runners and run IDs; the adjacent patches contain the production differences.
 
 Each lane starts with 20 alternating reference/candidate rounds. The harness
 retains individual matched pairs, user/kernel CPU, wall time, peak RSS, idle RSS,
-idle CPU, cold reply and attach latency. Runtime facts record effective and
-standard CPU counts, page bytes, detected medium and selected pool widths.
+idle CPU, cold reply and attach latency. In the experiment
+revisions, a temporary facts probe also recorded effective and standard CPU
+counts, page bytes, detected medium and selected pool widths; the probe, the
+page-size query and the media lookup are gone from the selected runtime.
 Memory-map diagnostics run after the idle accounting window. Compilers and
 profilers do not run during timing. Run provenance retains failures, superseded setup variants and partial rounds.
 Primary comparisons use complete matched lanes; incomplete lanes remain diagnostic

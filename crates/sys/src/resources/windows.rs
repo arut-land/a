@@ -1,6 +1,7 @@
 use windows_sys::Win32::System::{
     JobObjects::{
-        JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_MIN_MAX_RATE,
+        JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+        JOB_OBJECT_CPU_RATE_CONTROL_MIN_MAX_RATE,
         JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
         JobObjectCpuRateControlInformation, QueryInformationJobObject,
     },
@@ -36,15 +37,21 @@ pub(super) fn parallelism(mut count: usize) -> usize {
             && rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE != 0
             && rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED == 0
         {
+            // A plain CpuRate without HARD_CAP is a soft target the scheduler
+            // exceeds when the host is idle, so only a cap or maximum bounds.
             let maximum = if rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_MIN_MAX_RATE != 0 {
-                rate.Anonymous.Anonymous.MaxRate as usize
+                Some(rate.Anonymous.Anonymous.MaxRate as usize)
+            } else if rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP != 0 {
+                Some(rate.Anonymous.CpuRate as usize)
             } else {
-                rate.Anonymous.CpuRate as usize
+                None
             };
             // An immediate job rate bounds host capacity. Parent-job rates
             // require parent handles and are not exposed by this query.
-            let host = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) as usize;
-            count = count.min((host * maximum / 10_000).max(1));
+            if let Some(maximum) = maximum {
+                let host = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) as usize;
+                count = count.min((host * maximum / 10_000).max(1));
+            }
         }
     }
     count.max(1)

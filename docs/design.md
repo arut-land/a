@@ -253,9 +253,11 @@ HTTP authentication, sampling and elicitation remain unsupported.
 
 `rt::Runtime` supplies spawning, blocking work, time and a reactor. The
 default `Threads` implementation uses async-executor and async-io with owned
-workers and separately admitted blocking classes. Effective CPU parallelism
-bounds the default pools: async workers never exceed four and the default CPU
-ceiling is effective parallelism minus one (at least one). Catalog reconstruction
+workers and separately admitted blocking classes. Async workers never exceed
+four and the CPU ceiling is the CPU count minus one (at least one). The
+daemon's `Config::daemon` counts effective parallelism (Windows CPU sets and
+job caps) and runs blocking jobs at the foreground class; clients keep the
+standard count and their caller's class. Catalog reconstruction
 shares storage admission. macOS pressure events ask actors to release disposable
 projection caches while retaining session ownership. Platform calls and unsafe
 code belong in `sys`; `rt` owns admission and readiness integration.

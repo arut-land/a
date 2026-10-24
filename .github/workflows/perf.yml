@@ -84,7 +84,8 @@ jobs:
     needs: matrix
     name: perf (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    # Twenty-round ablations need longer than the standard paired suite.
+    timeout-minutes: ${{ inputs.ablation && 180 || 90 }}
     strategy:
       fail-fast: false
       matrix:
@@ -194,7 +195,7 @@ jobs:
             mise exec -- python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
           fi
       - name: Measure alternating reference and candidate rounds
-        timeout-minutes: 140
+        timeout-minutes: ${{ inputs.ablation && 140 || 45 }}
         if: ${{ !cancelled() && steps.build.outcome == 'success' && env.PERF_REFERENCE != '' && env.PERF_BUILD_ONLY != 'true' }}
         run: |
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
