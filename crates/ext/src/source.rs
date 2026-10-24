@@ -28,6 +28,9 @@ impl std::error::Error for Error {}
 /// Compare effective inputs, never notification counts: unrelated activity
 /// must not prevent a settled source from making progress. Each capture must
 /// validate its reads; equality describes content, not native version churn.
+/// Callers arm watches before capture and retain every event delivered during
+/// preparation as pending work, including after rejection or retry. A later
+/// write's queued notification, not this quiet window, causes its next capture.
 pub fn prepare<S: PartialEq, T>(
     mut capture: impl FnMut() -> Result<S, Error>,
     mut wait: impl FnMut(&S),

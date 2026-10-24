@@ -23,6 +23,9 @@ impl Backend {
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
                 Ok(event) if event.need_rescan() => changed(WatchEvent::Rescan),
+                Ok(event) if structural(event.kind) => {
+                    changed(WatchEvent::RescanPaths(event_paths(event.paths, &aliases)));
+                }
                 Ok(event) if !matches!(event.kind, notify::EventKind::Access(_)) => {
                     let paths = event_paths(event.paths, &aliases);
                     changed(WatchEvent::Changed(paths));
@@ -50,6 +53,18 @@ impl Backend {
 }
 
 #[cfg(not(windows))]
+fn structural(kind: notify::EventKind) -> bool {
+    // inotify reports new directories before notify installs their descendant
+    // watches. A synchronous rearm must precede the capture that consumes it.
+    matches!(
+        kind,
+        notify::EventKind::Create(notify::event::CreateKind::Folder)
+            | notify::EventKind::Remove(notify::event::RemoveKind::Folder)
+            | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+    )
+}
+
+#[cfg(not(windows))]
 fn event_paths(mut paths: Vec<PathBuf>, aliases: &[(PathBuf, PathBuf)]) -> Vec<PathBuf> {
     // A parent alias can cover a different canonical root. Preserve both
     // spellings so neither root loses events or ancestor invalidation.
@@ -67,6 +82,23 @@ fn event_paths(mut paths: Vec<PathBuf>, aliases: &[(PathBuf, PathBuf)]) -> Vec<P
 #[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structural_events_require_armed_descendants_before_capture() {
+        use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
+        for kind in [
+            notify::EventKind::Create(CreateKind::Folder),
+            notify::EventKind::Remove(RemoveKind::Folder),
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+        ] {
+            assert!(structural(kind));
+        }
+        let event = WatchEvent::RescanPaths(vec![PathBuf::from("/home/other")]);
+        assert!(!event.affects(&[PathBuf::from("/home/work/skills")]));
+        assert!(!structural(notify::EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+    }
 
     #[test]
     fn canonical_roots_under_aliased_parents_remain_observable() {

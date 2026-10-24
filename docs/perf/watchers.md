@@ -4,9 +4,17 @@ Linux uses notify's inotify backend. macOS uses FSEvents for existing
 source trees and kqueue vnode subscriptions for their parents. Windows
 uses overlapped ReadDirectoryChangesW requests awaited through the runtime's
 waitable-event reactor. Each request owns a DWORD-aligned 16 KiB buffer and
-an OVERLAPPED allocation until completion or joined cancellation. There is
+an OVERLAPPED allocation until completion or asynchronous cancellation. There is
 no notification thread or periodic wait on Windows. This avoids notify 8.2's
 100 ms idle wait and also surfaces zero-byte overflow and terminal read errors.
+Windows retains changes between ReadDirectoryChangesW requests in the
+directory handle's kernel buffer; each completion is rearmed before callback
+delivery. A one-shot native threadpool wait, allocated before the first request
+and armed only for pending cancellation, retains the handle, event, OVERLAPPED
+and buffer until completion. Drop never waits on a redirector. There is no
+cleanup timer or occupied blocking worker. See Microsoft's
+[buffer contract](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw)
+and [one-shot wait contract](https://learn.microsoft.com/en-us/windows/win32/api/threadpoolapiset/nf-threadpoolapiset-setthreadpoolwait).
 
 WatchEvent carries changes, overflow, rescan requests and unavailable
 subscriptions. Uncertainty invalidates all roots, including events without
@@ -19,6 +27,16 @@ exponential backoff from 100 ms to five seconds, independently of further
 filesystem events. A successful refresh cancels recovery; dropping the
 watcher cancels pending recovery and native requests. Healthy watches have
 no timer.
+
+Watches are armed before the first capture and replacement subscriptions are
+armed before old ones close. Linux directory creation/removal and rename
+events force rearming before capture: notify can deliver a new-directory event
+before installing its descendant watches. macOS streams cover descendants
+continuously; coalesced or dropped batches require a full rescan. Native queues
+are drained independently of preparation. No callback debounce suppresses an
+event because preparation is running: it marks another capture pending,
+including when that attempt rejects or retries. Events arriving after an
+attempt finishes schedule new work under the same coordinator lock.
 
 Lua resolves home/workspace precedence before opening winning sources.
 Skills discover tentative names in priority order before capturing winning
@@ -48,6 +66,12 @@ a weak owner. Settled sources leave no recurring timer.
 
 A quiet window is a debounce, not a writer-completion signal. Valid partial
 sources and temporary absence may publish generations with fewer commands.
+For a source on a filesystem supporting native notifications, a write after
+capture starts remains covered by an armed subscription: its later delivered
+event (or overflow/rescan) forces another capture. Thus once writes stop and
+their queued notifications are delivered, settled content is captured and
+applies if valid; invalid content retains the working generation. No finite
+quiet window proves completion, and healthy sources are never polled.
 Folded values are keyed by mod and fold name: adopting a generation that
 omits a fold retains its serialized image and rejection decisions for the
 session lifetime. Retained values are included in checkpoints. Returning

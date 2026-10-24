@@ -908,10 +908,8 @@ impl Workspace {
                 if result.is_ok() {
                     pending.attempts = 0;
                 }
-                let retry = matches!(result, Err(PrepareError::Retry(_)));
-                if !pending.dirty || retry {
+                if !pending.dirty {
                     pending.running = false;
-                    pending.dirty = false;
                     drop(pending);
                     if let Err(error) = result {
                         match error {

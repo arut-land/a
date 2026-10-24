@@ -15,6 +15,7 @@ type Spawn = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>;
 #[derive(Debug)]
 pub enum WatchEvent {
     Changed(Vec<PathBuf>),
+    RescanPaths(Vec<PathBuf>),
     Overflow,
     Rescan,
     Unavailable(io::Error),
@@ -23,7 +24,7 @@ pub enum WatchEvent {
 impl WatchEvent {
     pub fn affects(&self, roots: &[PathBuf]) -> bool {
         match self {
-            Self::Changed(paths) => paths.iter().any(|path| {
+            Self::Changed(paths) | Self::RescanPaths(paths) => paths.iter().any(|path| {
                 roots
                     .iter()
                     .any(|root| path.starts_with(root) || root.starts_with(path))
@@ -183,6 +184,7 @@ impl Watcher {
         let recovery = self.recovery.clone();
         Arc::new(move |event| {
             let rearm = match &event {
+                WatchEvent::RescanPaths(_) => event.affects(&roots),
                 WatchEvent::Changed(paths) => paths
                     .iter()
                     .any(|path| roots.iter().any(|root| root.starts_with(path))),
@@ -302,6 +304,53 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn writes_after_a_quiet_capture_deliver_another_event_during_preparation() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("a-resumed-watch-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let source = root.join("source");
+        let mut writer = fs::File::create(&source).unwrap();
+        let runtime: crate::Rt = Arc::new(crate::Threads::new(1));
+        let (send, events) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        let paused = Mutex::new(paused);
+        let first = AtomicBool::new(true);
+        let roots = [root.clone()];
+        let watcher = Watcher::new(
+            Arc::new(move |task| runtime.spawn(task)),
+            roots.clone(),
+            move |event| {
+                if event.affects(&roots) {
+                    let _ = send.send(());
+                    if first.swap(false, Ordering::AcqRel) {
+                        let _ = paused.lock().unwrap().recv();
+                    }
+                }
+            },
+        )
+        .unwrap();
+        // Drop this sender before the watcher on failure, releasing its callback.
+        let release = resume;
+        writer.write_all(b"partial").unwrap();
+        writer.sync_data().unwrap();
+        events.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"partial");
+        crate::block_on(crate::Reactor::AsyncIo.sleep(Duration::from_millis(100)));
+        assert_eq!(fs::read(&source).unwrap(), b"partial");
+        // The same writer resumes after debounce while the delivered callback
+        // still owns its batch. Its final write must remain queued independently.
+        writer.write_all(b" final").unwrap();
+        writer.sync_data().unwrap();
+        release.send(()).unwrap();
+        events.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"partial final");
+        drop(writer);
+        drop(watcher);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn changed(watcher: &mut Watcher, recv: &mpsc::Receiver<WatchEvent>, path: &Path, exact: bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut seen = std::collections::VecDeque::new();
@@ -316,7 +365,7 @@ mod tests {
             // Descendants cannot acknowledge root replacement. Uncertainty
             // instead requires a full scan, including the subscription inventory.
             let scan = match event {
-                WatchEvent::Changed(paths) => paths
+                WatchEvent::Changed(paths) | WatchEvent::RescanPaths(paths) => paths
                     .iter()
                     .any(|p| p == path || (!exact && path.starts_with(p))),
                 _ => true,

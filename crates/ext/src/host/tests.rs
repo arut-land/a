@@ -567,6 +567,7 @@ impl GenerationLayer for TestLayer {
     ) -> Result<PreparedLayer, PrepareError> {
         use std::sync::atomic::Ordering::SeqCst;
         self.scans.fetch_add(1, SeqCst);
+        let value = self.value.load(SeqCst);
         let during = self.during.lock().unwrap().take();
         if let Some(during) = during {
             during();
@@ -583,7 +584,7 @@ impl GenerationLayer for TestLayer {
                 Tier::User,
                 Arc::new(ImageExtension {
                     name: self.name,
-                    value: self.value.load(SeqCst),
+                    value,
                 }),
             )],
         })
@@ -740,6 +741,71 @@ fn event_bursts_schedule_one_pending_rebuild() {
     drop(retained);
     drop(workspace);
     assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn resumed_writes_queue_a_capture_during_or_after_preparation() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for outcome in ["accepted", "rejected", "retry"] {
+        for during_preparation in [true, false] {
+            let layer = Arc::new(TestLayer {
+                name: "resumed",
+                ..TestLayer::default()
+            });
+            let queue = Arc::new(Mutex::new(Vec::new()));
+            let queued = queue.clone();
+            let workspace = Coordinator::new(Registry::default(), vec![layer.clone()])
+                .open(
+                    Path::new("/resumed"),
+                    Arc::new(|_| {}),
+                    Arc::new(move |work| queued.lock().unwrap().push(work)),
+                )
+                .unwrap();
+            let changed = layer.changed.lock().unwrap().clone().unwrap();
+            layer.value.store(1, SeqCst);
+            let partial = layer.clone();
+            let event = changed.clone();
+            *layer.during.lock().unwrap() = Some(Box::new(move || {
+                // The writer stays paused across the entire injected quiet
+                // window and all captures; even valid partial content can pass.
+                let captured = crate::source::prepare(
+                    || Ok(partial.value.load(SeqCst)),
+                    |_| {},
+                    |value| Ok(*value),
+                )
+                .unwrap();
+                assert_eq!(captured, 1);
+                partial.fail.store(outcome == "rejected", SeqCst);
+                partial.busy.store(outcome == "retry", SeqCst);
+                if during_preparation {
+                    partial.value.store(2, SeqCst);
+                    let next = partial.clone();
+                    *partial.during.lock().unwrap() = Some(Box::new(move || {
+                        next.fail.store(false, SeqCst);
+                        next.busy.store(false, SeqCst);
+                    }));
+                    event();
+                }
+            }));
+            changed();
+            let work = queue.lock().unwrap().pop().unwrap();
+            work();
+            if !during_preparation {
+                layer.fail.store(false, SeqCst);
+                layer.busy.store(false, SeqCst);
+                layer.value.store(2, SeqCst);
+                changed();
+                let work = queue.lock().unwrap().pop().unwrap();
+                work();
+            }
+            assert_eq!(
+                workspace.snapshot().registry.extensions().next().unwrap().1,
+                2
+            );
+            assert_eq!(layer.scans.load(SeqCst), 3);
+            assert!(queue.lock().unwrap().is_empty());
+        }
+    }
 }
 
 #[test]
