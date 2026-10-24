@@ -70,6 +70,9 @@ pub enum Cmd {
     },
     #[usage(name = "__daemon", hide)]
     Serve {
+        /// Adopt the native service manager socket and remain in the foreground.
+        #[usage(long)]
+        activated: bool,
         #[usage(long)]
         listen_fd: Option<i32>,
         /// Start without a terminal and acknowledge the listener on stdout.
@@ -89,6 +92,17 @@ pub enum Cmd {
 pub enum Daemon {
     /// Read the current daemon diagnostic log (JSON lines); never starts it
     Log,
+    /// Install optional native socket activation for this user
+    InstallActivation {
+        /// Prepare registration by the installed app
+        #[usage(long, hide)]
+        app: bool,
+    },
+    /// Remove native activation and return to self-spawn
+    UninstallActivation {
+        #[usage(long, hide)]
+        app: bool,
+    },
     /// Show whether the daemon is running and responding
     Status,
     /// Stop the daemon; sessions resume when it next starts

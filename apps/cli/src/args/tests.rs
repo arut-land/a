@@ -119,6 +119,7 @@ fn flags_and_arguments_reach_their_command() {
 #[test]
 fn the_daemon_parses_what_a_client_spawns_it_with() {
     let serve = Cmd::Serve {
+        activated: false,
         listen_fd: Some(3),
         detached: false,
         lock_fd: Some(4),

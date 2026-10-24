@@ -68,11 +68,19 @@ fn main() -> ExitCode {
             Some(Cmd::Web { no_open }) => web(daemon, !no_open),
             Some(Cmd::Daemon { action }) => daemon_cmd(&daemon, action),
             Some(Cmd::Serve {
+                activated,
                 listen_fd,
                 detached,
                 lock_fd,
                 reset_breaker,
-            }) => serve(&daemon, listen_fd, lock_fd, reset_breaker, detached),
+            }) => serve(
+                &daemon,
+                listen_fd,
+                lock_fd,
+                reset_breaker,
+                detached,
+                activated,
+            ),
         };
         done.map(|()| ExitCode::SUCCESS)
     });
@@ -150,6 +158,17 @@ const RESTART: &str = "run `a daemon restart` to replace it";
 fn daemon_cmd(daemon: &client::Daemon, action: Daemon) -> io::Result<()> {
     let home = daemon.home()?;
     match action {
+        Daemon::InstallActivation { app } => {
+            if home.layout() == &sys::InstallLayout::Native && !sys::activation::installed(home)? {
+                client::stop(home)?;
+            }
+            sys::activation::install(home, app)?;
+            sayln!("native activation installed");
+        }
+        Daemon::UninstallActivation { app } => {
+            sys::activation::uninstall(home, app)?;
+            sayln!("native activation removed");
+        }
         Daemon::Log => match std::fs::read_to_string(home.daemon_log()) {
             Ok(text) => out(format_args!("{text}")),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -598,6 +617,7 @@ fn serve(
     lock_fd: Option<i32>,
     reset_breaker: bool,
     detached: bool,
+    activated: bool,
 ) -> io::Result<()> {
     let home = daemon.home()?;
     sys::crash::install(home.crash_dir(), sys::crash::Build::of(&daemon.staged.id));
@@ -605,7 +625,15 @@ fn serve(
         sys::detach_session()?;
         sys::log::discard_stderr()?;
     }
-    let listener = if let Some(fd) = listen_fd {
+    if activated && (listen_fd.is_some() || lock_fd.is_some() || detached) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "activation cannot use a client handoff",
+        ));
+    }
+    let listener = if activated {
+        sys::activation::listener(home)?
+    } else if let Some(fd) = listen_fd {
         sys::Listener::adopt(
             sys::InheritedNumber::from(fd).duplicate()?,
             &home.endpoint(),
@@ -618,7 +646,7 @@ fn serve(
             .map(|fd| sys::adopt_lock(sys::InheritedNumber::from(fd).duplicate()?, home))
             .transpose()?,
         reset_breaker,
-        logs: detached || listen_fd.is_some(),
+        logs: activated || detached || listen_fd.is_some(),
     };
     engine::serve(
         &listener,

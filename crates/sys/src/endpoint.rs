@@ -60,6 +60,7 @@ impl Home {
     /// Listens at [`Home::endpoint`], replacing a stale socket, and points
     /// [`Home::socket_link`] at it.
     pub fn bind(&self) -> io::Result<Listener> {
+        crate::activation::require_unmanaged(self)?;
         let endpoint = self.endpoint();
         imp::bind(&endpoint.0, &self.socket_link(), &endpoint.1).map(Listener)
     }
@@ -88,6 +89,11 @@ impl Listener {
     /// Retire it after session shutdown and before releasing the daemon record.
     pub fn retirement(&self) -> io::Result<EndpointRetirement> {
         imp::retirement(&self.0).map(EndpointRetirement)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn activated(file: std::fs::File, home: &Home) -> io::Result<Self> {
+        imp::activated(file, &home.run_dir().join("daemon.endpoint")).map(Self)
     }
 
     /// Adopts the listener and claim our parent bound and passed down.
@@ -316,6 +322,7 @@ mod imp {
         socket: UnixListener,
         pub(super) claim: fs::File,
         retirement_taken: std::sync::atomic::AtomicBool,
+        managed: bool,
     }
 
     impl AsFd for Listener {
@@ -382,6 +389,12 @@ mod imp {
     }
 
     pub fn remove(_path: &Path, discovery: &Path) {
+        if discovery
+            .parent()
+            .is_some_and(|dir| dir.join("activation").exists())
+        {
+            return;
+        }
         if let Ok(_claim) = claim(discovery)
             && let Ok(path) = discover(discovery)
         {
@@ -447,6 +460,7 @@ mod imp {
             socket: listener,
             claim,
             retirement_taken: std::sync::atomic::AtomicBool::new(false),
+            managed: false,
         })
     }
 
@@ -518,12 +532,47 @@ mod imp {
             socket: listener,
             claim,
             retirement_taken: std::sync::atomic::AtomicBool::new(false),
+            managed: false,
+        })
+    }
+
+    pub fn activated(file: fs::File, discovery: &Path) -> io::Result<Listener> {
+        crate::fs::private_dir(discovery.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+        let claim = claim(discovery)?;
+        let fd = OwnedFd::from(file);
+        if rustix::net::sockopt::socket_type(&fd)? != rustix::net::SocketType::STREAM {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        // No inherited descriptor may escape into tools. This also applies to
+        // launchd, whose contract differs from systemd's CLOEXEC handling.
+        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+        let socket = UnixListener::from(fd);
+        let address = socket.local_addr()?;
+        let path = address.as_pathname().ok_or(io::ErrorKind::InvalidInput)?;
+        validate_directory(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+        let metadata = fs::symlink_metadata(path)?;
+        if !std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type())
+            || metadata.uid() != geteuid().as_raw()
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "activation socket is not private",
+            ));
+        }
+        rustix::net::listen(&socket, 128)?;
+        crate::fs::write_private(discovery, path.as_os_str().as_encoded_bytes())?;
+        Ok(Listener {
+            socket,
+            claim,
+            retirement_taken: std::sync::atomic::AtomicBool::new(false),
+            managed: true,
         })
     }
 
     pub struct Retirement {
         claim: fs::File,
-        path: PathBuf,
+        path: Option<PathBuf>,
     }
 
     pub fn retirement(listener: &Listener) -> io::Result<Retirement> {
@@ -543,11 +592,17 @@ mod imp {
                 "endpoint retirement already taken",
             ));
         }
-        Ok(Retirement { claim, path })
+        Ok(Retirement {
+            claim,
+            path: (!listener.managed).then_some(path),
+        })
     }
 
     pub fn withdraw(retirement: &Retirement) -> io::Result<()> {
-        match fs::remove_file(&retirement.path) {
+        let Some(path) = &retirement.path else {
+            return Ok(());
+        };
+        match fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),

@@ -817,6 +817,9 @@ pub fn restart(
     client: Option<ClientId>,
 ) -> Result<Connection, Error> {
     stop(home)?;
+    if sys::activation::installed(home)? {
+        sys::crash::reset(home)?;
+    }
     drop(connect_or_spawn(home, true)?);
     Daemon::local(home.clone(), staged.clone()).connect_as(client, &|| {}, &|_| Ok(Vec::new()))
 }
@@ -900,6 +903,7 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
         Err(_) => {}
     }
 
+    sys::activation::require_unmanaged(home)?;
     sys::fs::private_dir(&home.run_dir())?;
     let open = |name: PathBuf| {
         File::options()

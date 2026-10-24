@@ -14,6 +14,9 @@ toml_edit = { version = "0.25", default-features = false, features = ["parse", "
 rustix = { workspace = true, features = ["stdio", "pipe", "event", "net", "termios"] }
 libc.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libsystemd = { version = "0.7.2", default-features = false }
+
 [target.'cfg(windows)'.dependencies]
 # Ordinary executable names keep .NET Framework hosts working; preserve verbatim-only names.
 dunce = "1.0.5"

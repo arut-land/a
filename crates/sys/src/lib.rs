@@ -11,6 +11,7 @@
 //! operations), so no crate above names a platform. Local daemon transports are Unix
 //! sockets and Windows named pipes with per-user security.
 
+pub mod activation;
 mod awake;
 pub mod config;
 pub mod crash;

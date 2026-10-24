@@ -24,6 +24,14 @@ targets:
     type: application
     platform: macOS
     sources: [App]
+    preBuildScripts:
+      - name: Bundle the socket activation agent
+        basedOnDependencyAnalysis: false
+        script: |
+          set -eu
+          dest="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LaunchAgents"
+          mkdir -p "$dest"
+          cp "$SRCROOT/LaunchAgents/dev.a.daemon.plist" "$dest/"
     dependencies:
       - package: AKit
     settings:
