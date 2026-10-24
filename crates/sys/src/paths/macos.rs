@@ -50,7 +50,17 @@ pub(super) fn resolve() -> io::Result<Paths> {
     }))
 }
 
-pub(super) fn daemon_env(_: &Paths, _: &mut Command) {}
+pub(super) fn daemon_env(paths: &Paths, command: &mut Command) {
+    // The daemon clears its environment; keep a caller-selected home rather
+    // than falling back to the passwd entry in the child.
+    let home = paths
+        .inner
+        .data
+        .ancestors()
+        .nth(3)
+        .expect("home/Library/Application Support/dev.a");
+    command.env("HOME", home);
+}
 
 #[cfg(test)]
 mod tests {

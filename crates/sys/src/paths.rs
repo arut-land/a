@@ -82,8 +82,17 @@ impl Paths {
                 // never select a different instance in the child.
                 Ok(std::path::absolute(root)?.into())
             }
-            None => native::resolve(),
+            None => Self::native(),
         }
+    }
+
+    pub(crate) fn native() -> io::Result<Self> {
+        native::resolve()
+    }
+
+    /// Explicit storage roots keep diagnostics local, including embedder roots.
+    pub fn is_isolated(&self) -> bool {
+        matches!(self.layout(), InstallLayout::Isolated(_))
     }
 
     pub fn layout(&self) -> &InstallLayout {
@@ -242,17 +251,19 @@ mod tests {
     #[test]
     fn remote_bootstrap_and_native_resolution_choose_the_same_build_directory() {
         use std::os::unix::ffi::OsStrExt;
-        let output = Command::new("sh")
+        let native = Paths::native().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.env_clear();
+        native.daemon_env(&mut command);
+        let output = command
             .arg("-c")
             .arg(format!(
                 "{}\nprintf '%s' \"$a_runtime\"",
                 RemoteLayout::for_platform(crate::Platform::CURRENT).runtime_script()
             ))
-            .env_remove("A_HOME")
             .output()
             .unwrap();
         assert!(output.status.success());
-        let native = native::resolve().unwrap();
         assert_eq!(output.stdout, native.runtime().dir().as_os_str().as_bytes());
     }
 

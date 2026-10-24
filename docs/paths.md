@@ -60,7 +60,8 @@ created for isolated storage. Tests stop only their own isolated daemon.
 
 Daemon launch preserves the selected layout through its cleared environment:
 isolated instances pass `A_HOME`; native instances pass the resolved XDG bases
-on Linux and use native directory lookup on macOS/Windows. Native launches do
+on Linux, preserve the resolved home on macOS, and use Known Folder lookup on
+Windows. Native launches do
 not turn their state directory into an isolated `A_HOME`. Extension and skill
 loaders use the configuration root, while endpoint ownership uses the durable
 state root. SSH discovery selects `sys::RemoteLayout` from the remote host's
