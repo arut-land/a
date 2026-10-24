@@ -220,17 +220,21 @@ mod tests {
         (mcp, rig, server)
     }
 
-    /// The child's environment as `name=value` lines, written to `env.txt`
-    /// in its working directory before it exits.
-    fn environment_of(rig: &Rig, env: BTreeMap<String, String>) -> BTreeMap<String, String> {
-        #[cfg(unix)]
-        let argv = vec!["/bin/sh".into(), "-c".into(), "env > env.txt".into()];
-        // MSYS shells rewrite TMP and TEMP; cmd reports them as stored. One
-        // quoted argument holding `>` would keep its quotes, so pass words.
-        #[cfg(windows)]
-        let argv = ["cmd.exe", "/d", "/c", "set", ">", "env.txt"]
-            .map(String::from)
-            .to_vec();
+    const ENV_OUT: &str = "A_TEST_MCP_ENV_OUT";
+    const TEMPORARY_TEST: &str =
+        "stdio::tests::stdio_servers_keep_temporary_files_in_the_homes_temporary_dir";
+
+    /// The environment a stdio server starts with: this test binary, rerun
+    /// as the server, writes its own to the file `ENV_OUT` names. Shells
+    /// would rewrite or requote the variables under test.
+    fn environment_of(rig: &Rig, mut env: BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let out = rig.cx().workspace.join(format!("env-{}.txt", env.len()));
+        env.insert(ENV_OUT.into(), out.to_str().unwrap().into());
+        let argv = vec![
+            std::env::current_exe().unwrap().to_str().unwrap().into(),
+            "--exact".into(),
+            TEMPORARY_TEST.into(),
+        ];
         let server = Server {
             name: "temporary-env".parse().unwrap(),
             description: String::new(),
@@ -256,17 +260,21 @@ mod tests {
             ..Default::default()
         }));
         let client = rt::block_on(Client::start(&server, &cx, Arc::downgrade(&mcp.0))).unwrap();
-        rt::block_on(client.child.process.ended());
-        std::fs::read_to_string(cx.dir().join("env.txt"))
-            .unwrap()
-            .lines()
-            .filter_map(|line| line.split_once('='))
-            .map(|(k, v)| (k.to_ascii_uppercase(), v.trim_end().to_owned()))
-            .collect()
+        let status = rt::block_on(client.child.process.wait()).unwrap();
+        assert!(status.success(), "the server exited with {status:?}");
+        let written = std::fs::read(&out).expect("the server ran this test as its child");
+        serde_json::from_slice(&written).unwrap()
     }
 
     #[test]
     fn stdio_servers_keep_temporary_files_in_the_homes_temporary_dir() {
+        if let Some(out) = std::env::var_os(ENV_OUT) {
+            let env: BTreeMap<String, String> = std::env::vars()
+                .map(|(k, v)| (k.to_ascii_uppercase(), v))
+                .collect();
+            std::fs::write(out, serde_json::to_vec(&env).unwrap()).unwrap();
+            return;
+        }
         let rig = Rig::new(
             "temporary-env",
             Registry::default().with(&ext_shell::Shell).unwrap(),
