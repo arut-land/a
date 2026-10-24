@@ -83,6 +83,13 @@ release benefit separately from the source subscription's idle cost; it does
 not manufacture system-wide memory pressure. Its patch and run provenance are
 retained beside the mechanism variants.
 
+Full-versus-full A/A comparisons on all six targets build the identical
+`e2b56c644a0f5456c639225352cf219db1069230` revision in both positions. These
+validate build-position effects and the observed runtime-control variation.
+The harness records binary hashes for both builds. This control was added after
+the first worker-sizing comparisons showed CPU differences despite matching
+worker counts.
+
 ## Decisions
 
 Pending hosted results.

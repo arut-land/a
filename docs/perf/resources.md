@@ -54,9 +54,9 @@ parent handles and cannot be discovered through the public current-job query;
 this is an approximation in nested quota hierarchies. No thread is pinned to a
 guessed performance or efficiency core.
 
-Windows disk classification uses maintained `sysinfo` with only its `disk`
-feature and kind refresh enabled. The longest canonical mount prefix selects
-the store's disk; process, capacity and I/O-rate refresh are disabled. macOS
+Windows leaves storage media unknown. Disk-kind enumeration adds resident
+memory and startup work without a qualified slow-disk benefit; its measured
+cost is recorded in the [mechanism comparisons](resource-mechanisms.md). macOS
 uses `statfs` for that mount and maintained `objc2-io-kit`/Core Foundation
 bindings to find its backing medium through the IOKit parent tree. A candidate
 using all-mount `sysinfo` measured Apple silicon idle RSS of 8656 → 10608 KiB

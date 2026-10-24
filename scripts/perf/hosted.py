@@ -176,15 +176,15 @@ def budgets(output, binary=None, probe=None, samples=5):
                     import psutil
                     diagnostic = {}
                     process = psutil.Process(pid)
-                    try:
-                        diagnostic["memory"] = process.memory_full_info()._asdict()
-                    except (psutil.Error, NotImplementedError) as error:
-                        diagnostic["memory_error"] = str(error)
                     if sys.platform == "darwin":
-                        maps = subprocess.run(["vmmap", "-summary", str(pid)], capture_output=True, text=True, timeout=20)
-                        diagnostic["vmmap"] = maps.stdout + maps.stderr
+                        try:
+                            maps = subprocess.run(["vmmap", "-summary", str(pid)], capture_output=True, text=True, timeout=10)
+                            diagnostic["vmmap"] = maps.stdout + maps.stderr
+                        except subprocess.TimeoutExpired:
+                            diagnostic["maps_error"] = "vmmap exceeded 10 seconds"
                     else:
                         try:
+                            diagnostic["memory"] = process.memory_full_info()._asdict()
                             diagnostic["maps"] = [m._asdict() for m in process.memory_maps(grouped=True)]
                         except (psutil.Error, NotImplementedError, AttributeError) as error:
                             diagnostic["maps_error"] = str(error)

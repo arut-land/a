@@ -57,6 +57,7 @@ pub fn page_size() -> io::Result<usize> {
 }
 
 pub fn storage(path: &Path) -> Storage {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let Some(path) = path.ancestors().find(|p| p.exists()) else {
         return Storage::Unknown;
     };
@@ -91,25 +92,8 @@ pub fn storage(path: &Path) -> Storage {
     }
     #[cfg(windows)]
     {
-        let Ok(path) = path.canonicalize() else {
-            return Storage::Unknown;
-        };
-        let disks = sysinfo::Disks::new_with_refreshed_list_specifics(
-            sysinfo::DiskRefreshKind::nothing().with_kind(),
-        );
-        disks
-            .iter()
-            .filter(|disk| {
-                disk.mount_point()
-                    .canonicalize()
-                    .is_ok_and(|mount| path.starts_with(mount))
-            })
-            .max_by_key(|disk| disk.mount_point().components().count())
-            .map_or(Storage::Unknown, |disk| match disk.kind() {
-                sysinfo::DiskKind::HDD => Storage::Rotational,
-                sysinfo::DiskKind::SSD => Storage::SolidState,
-                sysinfo::DiskKind::Unknown(_) => Storage::Unknown,
-            })
+        let _ = path;
+        Storage::Unknown
     }
     #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
