@@ -93,12 +93,7 @@ impl Fold {
                 segments,
                 taken: true,
                 ..
-            } => match segments.as_text() {
-                Some(typed) => self.user(typed, registry),
-                None => Some(Input::User {
-                    text: segments.text(),
-                }),
-            },
+            } => self.user(&segments.text(), segments.as_text().is_some(), registry),
             Body::Take { input } => {
                 let queued = self.ledger.untaken().iter().find(|q| q.seq == *input)?;
                 // A steer taken just before a model call is the model's to
@@ -111,10 +106,8 @@ impl Fold {
                 let (text, typed) = (queued.text.clone(), queued.typed);
                 if steers {
                     None
-                } else if typed {
-                    self.user(&text, registry)
                 } else {
-                    Some(Input::User { text })
+                    self.user(&text, typed, registry)
                 }
             }
             Body::Decision {
@@ -245,9 +238,10 @@ impl Fold {
         }
     }
 
-    /// Input `text` taken up: a user's command, or the agent's.
-    fn user(&mut self, text: &str, registry: &dyn Binding) -> Option<Input> {
-        match command(text, registry) {
+    /// Input `text` taken up: a user's command, or the agent's. Only
+    /// `typed` text is a command: a pasted `/name` line is what was pasted.
+    fn user(&mut self, text: &str, typed: bool, registry: &dyn Binding) -> Option<Input> {
+        match typed.then(|| command(text, registry)).flatten() {
             Some((name, args)) => {
                 self.asked.push_back(Next::Command {
                     name: name.to_owned(),

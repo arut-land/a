@@ -559,7 +559,7 @@ mod tests {
         };
         let read = |runner| {
             let transcript = project(inputs(runner), Arc::new(Registry::default()), "");
-            said(&transcript.into_messages().to_vec())
+            said(&transcript.into_messages())
         };
         assert_eq!(read(RunnerKind::ModelOnly), ["see x"]);
         assert_eq!(
