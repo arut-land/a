@@ -352,7 +352,7 @@ impl Daemon {
         // Extensions publish these facts as they register.
         sys::shell::ExecutionFacts::initialize(home)?;
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
-        let catalog = Catalog::open(home.catalog_file(), &*store)?;
+        let catalog = Catalog::open_on(home.catalog_file(), store.clone(), &**runtime)?;
         catalog.start(Arc::clone(runtime) as Arc<dyn rt::Runtime>);
         let records = catalog.records();
         let busy: Vec<bool> = records.iter().map(|r| r.busy).collect();
@@ -876,6 +876,12 @@ impl Daemon {
         }
     }
 
+    fn reclaim_idle(&self) {
+        for session in self.loaded() {
+            session.reclaim();
+        }
+    }
+
     /// Starts sending `outbox` the session list, now and on each change.
     fn watch_list(&self, outbox: &Outbox) {
         let sessions = self.list();
@@ -1002,6 +1008,12 @@ impl Daemon {
         // When the daemon last became idle.
         let mut since: Option<Instant> = None;
         let mut awake: Option<Option<sys::Awake>> = None;
+        let pressure = Arc::new(rt::Notify::new());
+        // Reclamation runs only at the top of the loop; reading the count
+        // before subscribing keeps a warning delivered meanwhile pending.
+        let mut pressured = pressure.count();
+        let notified = Arc::clone(&pressure);
+        let _pressure_source = sys::resources::MemoryPressure::new(move || notified.notify());
         let mut pulsed = self.pulse.count();
         let mut jobs = self.jobs.count();
         loop {
@@ -1011,6 +1023,10 @@ impl Daemon {
                 session: None,
                 detail: String::new(),
             });
+            if pressure.count() != pressured {
+                pressured = pressure.count();
+                self.reclaim_idle();
+            }
             self.hibernate(config.hibernate);
             self.publish_list();
             let stopping = *lock(&self.stopping);
@@ -1061,7 +1077,11 @@ impl Daemon {
                 self.jobs.changed(&mut jobs).await;
                 false
             };
-            let woken = rt::or(pulse, rt::or(ended, sleep));
+            let pressed = async {
+                pressure.changed(&mut pressured.clone()).await;
+                false
+            };
+            let woken = rt::or(pulse, rt::or(pressed, rt::or(ended, sleep)));
             if woken.await {
                 since = None;
             }
@@ -1191,7 +1211,7 @@ pub fn serve(
     build: &str,
     start: Start,
 ) -> io::Result<()> {
-    let runtime = Arc::new(rt::Threads::default());
+    let runtime = Arc::new(rt::Threads::configured(rt::Config::daemon()));
     let result = run(listener, home, config, build, start, &runtime);
     if let Err(error) = &result {
         fact(Fact::Fault {

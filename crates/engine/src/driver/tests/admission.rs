@@ -1267,7 +1267,7 @@ fn cancelled_before_provider_send_adds_no_executed_attempt() {
     assert_eq!(projection.own(session.id, &prices).attempts.executed, 0);
 }
 
-struct StaleProcess;
+pub(super) struct StaleProcess;
 impl ext::RunningProcess for StaleProcess {
     fn id(&self) -> u32 {
         42

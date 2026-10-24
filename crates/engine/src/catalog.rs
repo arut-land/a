@@ -100,31 +100,42 @@ impl Catalog {
         Self::with(None, Image::default())
     }
 
-    /// The catalog at `path` of the logs `store` keeps: read, or
-    /// rebuilt from the logs unless the last daemon left it clean.
+    pub fn open_on(
+        path: PathBuf,
+        store: Arc<dyn LogStore>,
+        runtime: &dyn rt::Runtime,
+    ) -> io::Result<Self> {
+        rt::block_on(async {
+            let opening = path.clone();
+            let (image, reason) = maintenance(runtime, move || prepare(&opening)).await?;
+            let rebuilt = image.is_none();
+            let image = match image {
+                Some(image) => image,
+                None => rebuild_on(runtime, Arc::clone(&store)).await?,
+            };
+            maintenance(runtime, move || {
+                Self::finish(path, &*store, image, rebuilt, reason)
+            })
+            .await
+        })
+    }
+
+    #[cfg(test)]
     pub fn open(path: PathBuf, store: &dyn LogStore) -> io::Result<Self> {
-        use ext_logging::CatalogReason;
-        let dirty = path.with_extension("dirty");
-        let (read, reason) = match fs::exists(&dirty) {
-            Ok(false) => match read(&path) {
-                Ok(state) => (Some(state), None),
-                Err(e) => (
-                    None,
-                    Some(if e.kind() == io::ErrorKind::NotFound {
-                        CatalogReason::Missing
-                    } else {
-                        CatalogReason::Unreadable
-                    }),
-                ),
-            },
-            _ => (None, Some(CatalogReason::Unclean)),
-        };
-        // No log may change while a clean catalog can survive a crash.
-        let pending = dirty.with_extension("dirty.new");
-        File::create(&pending)?.sync_all()?;
-        sys::fs::publish(&pending, &dirty)?;
-        let rebuilt = read.is_none();
-        let catalog = Self::with(Some(path), read.map_or_else(|| rebuild(store), Ok)?);
+        let (image, reason) = prepare(&path)?;
+        let rebuilt = image.is_none();
+        let image = image.map_or_else(|| rebuild(store), Ok)?;
+        Self::finish(path, store, image, rebuilt, reason)
+    }
+
+    fn finish(
+        path: PathBuf,
+        store: &dyn LogStore,
+        image: Image,
+        rebuilt: bool,
+        reason: Option<ext_logging::CatalogReason>,
+    ) -> io::Result<Self> {
+        let catalog = Self::with(Some(path), image);
         if let Some(reason) = reason {
             ext_logging::emit(ext_logging::Fact::CatalogRebuilt { reason });
         }
@@ -315,55 +326,120 @@ fn read(path: &Path) -> io::Result<Image> {
     Ok(image)
 }
 
-/// Every log read through: a session is busy if it was left with
-/// anything open or waiting.
-fn rebuild(store: &dyn LogStore) -> io::Result<Image> {
-    let headers = store.headers()?;
+fn prepare(path: &Path) -> io::Result<(Option<Image>, Option<ext_logging::CatalogReason>)> {
+    use ext_logging::CatalogReason;
+    let dirty = path.with_extension("dirty");
+    let (read, reason) = match fs::exists(&dirty) {
+        Ok(false) => match read(path) {
+            Ok(state) => (Some(state), None),
+            Err(e) => (
+                None,
+                Some(if e.kind() == io::ErrorKind::NotFound {
+                    CatalogReason::Missing
+                } else {
+                    CatalogReason::Unreadable
+                }),
+            ),
+        },
+        _ => (None, Some(CatalogReason::Unclean)),
+    };
+    // No log may change while a clean catalog can survive a crash.
+    let pending = dirty.with_extension("dirty.new");
+    File::create(&pending)?.sync_all()?;
+    sys::fs::publish(&pending, &dirty)?;
+    Ok((read, reason))
+}
+
+fn maintenance<T: Send + 'static>(
+    runtime: &dyn rt::Runtime,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> impl Future<Output = T> + Send + 'static {
+    rt::unblock_with(
+        runtime,
+        rt::BlockingClass::Storage,
+        rt::STORAGE_BYTES,
+        move || {
+            let _priority = sys::resources::Priority::utility();
+            work()
+        },
+    )
+}
+
+async fn rebuild_on(runtime: &dyn rt::Runtime, store: Arc<dyn LogStore>) -> io::Result<Image> {
+    let source = Arc::clone(&store);
+    let headers = maintenance(runtime, move || source.headers()).await?;
     let workers = headers.len().min(4);
-    let headers = Mutex::new(headers.into_iter());
-    let records = Mutex::new(BTreeMap::new());
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
+    let headers = Arc::new(Mutex::new(headers.into_iter()));
+    let records = Arc::new(Mutex::new(BTreeMap::new()));
+    let mut jobs = Vec::new();
+    for _ in 0..workers {
+        let (store, headers, records) = (
+            Arc::clone(&store),
+            Arc::clone(&headers),
+            Arc::clone(&records),
+        );
+        jobs.push(rt::spawn(
+            runtime,
+            maintenance(runtime, move || {
                 loop {
                     let Some(header) = lock(&headers).next() else {
                         break;
                     };
-                    let mut ledger = Ledger::default();
-                    let loaded =
-                        match store.load(header.id, &mut |_| false, &mut |e| ledger.apply(&e)) {
-                            Ok(loaded) => loaded,
-                            Err(e) => {
-                                ext_logging::emit(ext_logging::Fact::Fault {
-                                    session: Some(header.id),
-                                    operation: ext_logging::Operation::Reload,
-                                    kind: ext_logging::Fault(e.kind()),
-                                });
-                                continue;
-                            }
-                        };
-                    let activity = ledger.activity();
-                    let read_only = loaded.writer.read_only();
-                    lock(&records).insert(
-                        header.id.0.as_u128(),
-                        Record {
-                            busy: activity != Activity::Idle && read_only.is_none(),
-                            entries: loaded.seq,
-                            activity,
-                            read_only,
-                            header,
-                        },
-                    );
+                    if let Some(record) = replay(&*store, header) {
+                        lock(&records).insert(record.header.id.0.as_u128(), record);
+                    }
                 }
-            });
-        }
-    });
-    let records = records
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }),
+        ));
+    }
+    // Wait outside storage admission, including when only one worker is allowed.
+    for job in jobs {
+        job.await;
+    }
+    let records = std::mem::take(&mut *lock(&records));
     Ok(Image {
         lines: records.len(),
         records,
+    })
+}
+
+/// Every log read through: a session is busy if it was left with
+/// anything open or waiting.
+#[cfg(test)]
+fn rebuild(store: &dyn LogStore) -> io::Result<Image> {
+    let records: BTreeMap<_, _> = store
+        .headers()?
+        .into_iter()
+        .filter_map(|header| replay(store, header))
+        .map(|record| (record.header.id.0.as_u128(), record))
+        .collect();
+    Ok(Image {
+        lines: records.len(),
+        records,
+    })
+}
+
+fn replay(store: &dyn LogStore, header: Header) -> Option<Record> {
+    let mut ledger = Ledger::default();
+    let loaded = match store.load(header.id, &mut |_| false, &mut |entry| ledger.apply(&entry)) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            ext_logging::emit(ext_logging::Fact::Fault {
+                session: Some(header.id),
+                operation: ext_logging::Operation::Reload,
+                kind: ext_logging::Fault(error.kind()),
+            });
+            return None;
+        }
+    };
+    let activity = ledger.activity();
+    let read_only = loaded.writer.read_only();
+    Some(Record {
+        busy: activity != Activity::Idle && read_only.is_none(),
+        entries: loaded.seq,
+        activity,
+        read_only,
+        header,
     })
 }
 
@@ -495,8 +571,8 @@ mod tests {
     }
 
     #[test]
-    fn parallel_rebuild_matches_serial_replay() {
-        let store = Memory::default();
+    fn catalog_recovery_completes_under_single_worker_admission() {
+        let store = Arc::new(Memory::default());
         for n in 0..17 {
             let header = Header {
                 id: SessionId::new(),
@@ -535,7 +611,14 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(rebuild(&store).unwrap().records, serial);
+        let dir = std::env::temp_dir().join(format!("a-catalog-admitted-{}", SessionId::new()));
+        fs::create_dir(&dir).unwrap();
+        let runtime = rt::Threads::configured(rt::Config::for_cores(1));
+        let catalog = Catalog::open_on(dir.join("catalog"), store, &runtime).unwrap();
+        assert_eq!(catalog.records(), serial.into_values().collect::<Vec<_>>());
+        catalog.clean().unwrap();
+        runtime.shutdown();
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -1,0 +1,67 @@
+diff --git a/crates/engine/src/catalog.rs b/crates/engine/src/catalog.rs
+index f0ce3409..608e57cd 100644
+--- a/crates/engine/src/catalog.rs
++++ b/crates/engine/src/catalog.rs
+@@ -103,24 +103,12 @@ impl Catalog {
+     pub fn open_on(
+         path: PathBuf,
+         store: Arc<dyn LogStore>,
+-        runtime: &dyn rt::Runtime,
++        _runtime: &dyn rt::Runtime,
+     ) -> io::Result<Self> {
+-        rt::block_on(async {
+-            let opening = path.clone();
+-            let (image, reason) = maintenance(runtime, move || prepare(&opening)).await?;
+-            let rebuilt = image.is_none();
+-            let image = match image {
+-                Some(image) => image,
+-                None => rebuild_on(runtime, Arc::clone(&store)).await?,
+-            };
+-            maintenance(runtime, move || {
+-                Self::finish(path, &*store, image, rebuilt, reason)
+-            })
+-            .await
+-        })
++        let _priority = sys::resources::Priority::utility();
++        Self::open(path, &*store)
+     }
+ 
+-    #[cfg(test)]
+     pub fn open(path: PathBuf, store: &dyn LogStore) -> io::Result<Self> {
+         let (image, reason) = prepare(&path)?;
+         let rebuilt = image.is_none();
+@@ -405,14 +393,27 @@ async fn rebuild_on(runtime: &dyn rt::Runtime, store: Arc<dyn LogStore>) -> io::
+ 
+ /// Every log read through: a session is busy if it was left with
+ /// anything open or waiting.
+-#[cfg(test)]
+ fn rebuild(store: &dyn LogStore) -> io::Result<Image> {
+-    let records: BTreeMap<_, _> = store
+-        .headers()?
+-        .into_iter()
+-        .filter_map(|header| replay(store, header))
+-        .map(|record| (record.header.id.0.as_u128(), record))
+-        .collect();
++    let headers = store.headers()?;
++    let workers = headers.len().min(4);
++    let headers = Mutex::new(headers.into_iter());
++    let records = Mutex::new(BTreeMap::new());
++    std::thread::scope(|scope| {
++        for _ in 0..workers {
++            scope.spawn(|| {
++                let _priority = sys::resources::Priority::utility();
++                loop {
++                    let Some(header) = lock(&headers).next() else {
++                        break;
++                    };
++                    if let Some(record) = replay(store, header) {
++                        lock(&records).insert(record.header.id.0.as_u128(), record);
++                    }
++                }
++            });
++        }
++    });
++    let records = records.into_inner().unwrap();
+     Ok(Image {
+         lines: records.len(),
+         records,

@@ -1,0 +1,90 @@
+diff --git a/.github/workflows/o15-cache.yml b/.github/workflows/o15-cache.yml
+new file mode 100644
+index 00000000..580cb360
+--- /dev/null
++++ b/.github/workflows/o15-cache.yml
+@@ -0,0 +1,43 @@
++name: o15 cache benefit
++on:
++  push:
++    branches: [codex-w5rt-cache-probe]
++    paths: [.github/workflows/o15-cache.yml]
++permissions:
++  contents: read
++jobs:
++  cache:
++    strategy:
++      fail-fast: false
++      matrix:
++        os: [macos-latest, macos-15-intel]
++    runs-on: ${{ matrix.os }}
++    timeout-minutes: 90
++    env:
++      CARGO_BUILD_JOBS: 4
++      MISE_AUTO_INSTALL: false
++      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
++    steps:
++      - uses: actions/checkout@v7
++      - uses: actions/setup-python@v6
++        with:
++          python-version: '3.13'
++      - run: python -m pip install psutil==7.2.2
++      - uses: jdx/mise-action@v5
++        with:
++          install_args: rust
++      - uses: Swatinem/rust-cache@v2
++        with:
++          cache-all-crates: true
++      - name: Measure retained projections and reclamation
++        shell: bash
++        run: |
++          rustup component add rust-src
++          export A_PERF_PYTHON="$(command -v python)"
++          export A_PERF_PROCESS="$PWD/scripts/perf/process.py"
++          "$(rustup which cargo)" test --release -Zbuild-std=std,panic_unwind -Zbuild-std-features=panic-unwind,optimize_for_size -p engine --lib pressure_cache_release_measurement -- --ignored --nocapture 2>&1 | tee cache-benefit.log
++      - uses: actions/upload-artifact@v5
++        if: always()
++        with:
++          name: cache-benefit-${{ matrix.os }}
++          path: cache-benefit.log
+diff --git a/crates/engine/src/driver/tests.rs b/crates/engine/src/driver/tests.rs
+index 5efbacad..bb2333ac 100644
+--- a/crates/engine/src/driver/tests.rs
++++ b/crates/engine/src/driver/tests.rs
+@@ -2837,3 +2837,36 @@ fn environment_bursts_retain_one_payload_and_one_mailbox_marker() {
+     drop(fixture);
+     std::fs::remove_file(home).unwrap();
+ }
++
++#[test]
++#[ignore = "a hosted memory measurement"]
++fn pressure_cache_release_measurement() {
++    fn rss() -> u64 {
++        let out = std::process::Command::new(std::env::var("A_PERF_PYTHON").unwrap())
++            .args([
++                &std::env::var("A_PERF_PROCESS").unwrap(),
++                &std::process::id().to_string(),
++                "rss",
++            ])
++            .output()
++            .unwrap();
++        assert!(out.status.success());
++        String::from_utf8(out.stdout).unwrap().trim().parse().unwrap()
++    }
++    for round in 0..3 {
++        let fixture = Fixture::new(ext::LOOP, Registry::default(), openai(&Script::new(&[])));
++        let entries: Vec<_> = (1..=1024)
++            .map(|seq| entry(seq, echo(&"cached projection ".repeat(2048))))
++            .collect();
++        let session = fixture.start(&entries);
++        drop(entries);
++        let baseline = rss();
++        assert_eq!(session.projection_cache(true), [true; 3]);
++        let cached = rss();
++        session.reclaim();
++        assert_eq!(session.projection_cache(false), [false; 3]);
++        let reclaimed = rss();
++        eprintln!("RESOURCE_CACHE {{\"round\":{round},\"baseline_kib\":{baseline},\"cached_kib\":{cached},\"reclaimed_kib\":{reclaimed}}}");
++        session.halt();
++    }
++}
