@@ -162,5 +162,59 @@
     "enabled_role": "candidate",
     "target": "macos-latest",
     "run_id": 40081085297
+  },
+  {
+    "mechanism": "merged-vs-current-main",
+    "branch": "codex-w5rt",
+    "sha": "c6a01c02b86712abb8662644fb71258a81716e63",
+    "reference": "8e460c732ae32bb6d2452d786d27112d2516432c",
+    "enabled_role": "candidate",
+    "target": "ubuntu-latest",
+    "run_id": 40101713932
+  },
+  {
+    "mechanism": "merged-vs-current-main",
+    "branch": "codex-w5rt",
+    "sha": "c6a01c02b86712abb8662644fb71258a81716e63",
+    "reference": "8e460c732ae32bb6d2452d786d27112d2516432c",
+    "enabled_role": "candidate",
+    "target": "ubuntu-24.04-arm",
+    "run_id": 40101716294
+  },
+  {
+    "mechanism": "merged-vs-current-main",
+    "branch": "codex-w5rt",
+    "sha": "c6a01c02b86712abb8662644fb71258a81716e63",
+    "reference": "8e460c732ae32bb6d2452d786d27112d2516432c",
+    "enabled_role": "candidate",
+    "target": "windows-latest",
+    "run_id": 40101718731
+  },
+  {
+    "mechanism": "merged-vs-current-main",
+    "branch": "codex-w5rt",
+    "sha": "c6a01c02b86712abb8662644fb71258a81716e63",
+    "reference": "8e460c732ae32bb6d2452d786d27112d2516432c",
+    "enabled_role": "candidate",
+    "target": "windows-11-arm",
+    "run_id": 40101721050
+  },
+  {
+    "mechanism": "merged-vs-current-main",
+    "branch": "codex-w5rt",
+    "sha": "c6a01c02b86712abb8662644fb71258a81716e63",
+    "reference": "8e460c732ae32bb6d2452d786d27112d2516432c",
+    "enabled_role": "candidate",
+    "target": "macos-15-intel",
+    "run_id": 40101723309
+  },
+  {
+    "mechanism": "merged-vs-current-main",
+    "branch": "codex-w5rt",
+    "sha": "c6a01c02b86712abb8662644fb71258a81716e63",
+    "reference": "8e460c732ae32bb6d2452d786d27112d2516432c",
+    "enabled_role": "candidate",
+    "target": "macos-latest",
+    "run_id": 40101725666
   }
 ]
