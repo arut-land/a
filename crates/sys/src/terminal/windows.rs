@@ -197,25 +197,22 @@ impl InputReader {
                 )
             };
             match ready {
-                0 => continue,
-                1 => {}
+                0..=1 => {}
                 _ => return Err(io::Error::last_os_error()),
             }
         }
     }
 
-    fn available(&self) -> io::Result<u32> {
-        let mut count = 0;
+    fn drain(&mut self) -> io::Result<()> {
+        let mut available = 0;
         // SAFETY: a borrowed console handle and writable count. This reader
         // exclusively consumes console records, so draining cannot race a read.
         ok(unsafe {
-            GetNumberOfConsoleInputEvents(io::stdin().as_handle().as_raw_handle(), &raw mut count)
+            GetNumberOfConsoleInputEvents(
+                io::stdin().as_handle().as_raw_handle(),
+                &raw mut available,
+            )
         })?;
-        Ok(count)
-    }
-
-    fn drain(&mut self) -> io::Result<()> {
-        let mut available = self.available()?;
         while available != 0 {
             let mut records = [INPUT_RECORD::default(); 128];
             let mut count = 0;

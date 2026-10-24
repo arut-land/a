@@ -114,6 +114,15 @@ mod native {
                 });
             }
         }
+        // Non-character records beyond the native read chunk must not leave a
+        // lone Escape waiting for continuation bytes that will never arrive.
+        records.extend(std::iter::repeat_n(
+            INPUT_RECORD {
+                EventType: u16::try_from(KEY_EVENT).unwrap(),
+                ..Default::default()
+            },
+            256,
+        ));
         let mut count = 0;
         // SAFETY: the fixture owns this console; records/count are valid.
         unsafe {
