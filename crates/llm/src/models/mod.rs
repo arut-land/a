@@ -44,20 +44,27 @@ const WINDOWS: &[(&str, u32)] = &[
     ("gpt-4.1", 1_047_576),
     ("gpt-4o", 128_000),
     ("gpt-5-chat", 128_000),
+    ("gpt-5.1-chat", 128_000),
     ("gpt-5", 400_000),
     ("o1-mini", 128_000),
+    ("o1-preview", 128_000),
     ("o1", 200_000),
     ("o3", 200_000),
     ("o4-mini", 200_000),
     ("gemini-1.5-pro", 2_097_152),
     ("gemini-", 1_048_576),
     ("deepseek-", 128_000),
+    ("grok-4-fast", 2_000_000),
+    ("grok-4-1-fast", 2_000_000),
     ("grok-4", 256_000),
 ];
 
-/// The context window of `model`, past any `vendor/` prefix, if known.
+/// The context window of `model`, past any `vendor/` prefix and a
+/// Bedrock-style `[region.]anthropic.` one, if known.
 pub fn context_window(model: &str) -> Option<u32> {
-    by_prefix(WINDOWS, name(model))
+    let id = name(model);
+    let id = id.split_once("anthropic.").map_or(id, |(_, id)| id);
+    by_prefix(WINDOWS, id)
 }
 
 /// A thinking budget's range, in tokens.

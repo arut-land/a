@@ -115,6 +115,10 @@ impl Extension for Compact {
                 }))
             })
             .on::<Step>(move |cx, request| match threshold.zip(window(request)) {
+                None if threshold.is_some() => {
+                    unmeasured(cx.session);
+                    Rewrite::Pass
+                }
                 Some((share, window))
                     if estimate(request) > share.of(window)
                         && cx.call.is_some_and(|call| {
@@ -130,6 +134,19 @@ impl Extension for Compact {
                 }
                 _ => Rewrite::Pass,
             });
+    }
+}
+
+/// Says once per session, in the daemon log, that its threshold measures
+/// nothing: the model has no known window.
+fn unmeasured(session: protocol::SessionId) {
+    static NOTED: std::sync::Mutex<Vec<protocol::SessionId>> = std::sync::Mutex::new(Vec::new());
+    let mut noted = NOTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !noted.contains(&session) {
+        noted.push(session);
+        ext_logging::emit(ext_logging::Fact::ThresholdUnmeasured { session });
     }
 }
 

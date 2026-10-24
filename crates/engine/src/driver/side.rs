@@ -18,6 +18,7 @@ impl Actor {
 
     pub(super) async fn admit_side(&mut self, ticket: Ticket, side: Option<CallId>) {
         if let Some(PendingSide {
+            ephemeral,
             reply,
             thread,
             limited,
@@ -47,11 +48,17 @@ impl Actor {
             });
             reply.send(side.map_or(Opened::Closed, |id| {
                 self.inflight.insert(id, super::InFlight::Side);
+                let started = ephemeral.map(|role| {
+                    let started = Arc::new(Started::default());
+                    self.ephemeral.push((id, role, Arc::clone(&started)));
+                    started
+                });
                 Opened::Fresh(SideAdmitted {
                     id,
                     thread,
                     limited,
                     cancel,
+                    started,
                 })
             }));
         }
@@ -141,6 +148,7 @@ impl Actor {
         self.sides.insert(
             ticket,
             PendingSide {
+                ephemeral: side.is_ephemeral().then(|| side.role.clone()),
                 while_waiting: side.is_while_waiting(),
                 background,
                 cancel: Cancel::default(),
@@ -215,20 +223,22 @@ async fn side_call(
     let cancel = admitted.cancel.clone();
     let ephemeral = side.is_ephemeral();
     let mut execution = None;
+    let started = session.shared.rt.now();
     let work = async {
         if admitted.limited {
             return Err(invalid("four side calls are already running".into()));
         }
         if ephemeral {
-            return Ok(ephemeral_turn(
+            return ephemeral_turn(
                 session,
                 &origin,
                 &admitted,
                 &side,
                 registry,
+                started,
                 &mut execution,
             )
-            .await);
+            .await;
         }
         let Some(daemon) = session.shared.daemon.upgrade() else {
             return Ok((Outcome::Interrupted { output: None }, None));
@@ -245,7 +255,13 @@ async fn side_call(
         })
         .await
     };
-    let result = first(work, session.shared.rt.sleep(side.budget.timeout)).await;
+    // An ephemeral turn races its own deadline, so a timeout still settles
+    // the attempt it cut off.
+    let result = if ephemeral {
+        Some(work.await)
+    } else {
+        first(work, session.shared.rt.sleep(side.budget.timeout)).await
+    };
     if (result.is_none() || cancel.is_set())
         && !ephemeral
         && let Some(daemon) = session.shared.daemon.upgrade()
@@ -272,12 +288,20 @@ async fn side_call(
 }
 
 /// Where a model-only request's attempts are settled: the call they are
-/// recorded under, what cancels them, and the generation they belong to.
+/// recorded under, what cancels them, the generation they belong to, and,
+/// for an ephemeral turn, where the actor can read what each started.
 pub(super) struct Attempt<'a> {
     pub id: CallId,
     pub cancel: &'a Cancel,
     pub fence: u64,
+    pub started: Option<&'a Started>,
 }
+
+/// The attempt an ephemeral turn has under way: when it began, its number
+/// and model. An interrupt settles the turn in the owner's log before the
+/// turn reports, so the actor settles the attempt from this instead.
+#[derive(Default)]
+pub(super) struct Started(pub(super) std::sync::Mutex<Option<(std::time::Instant, u16, String)>>);
 
 #[allow(clippy::too_many_lines)]
 pub(super) async fn run_side(
@@ -289,7 +313,12 @@ pub(super) async fn run_side(
     at: Attempt<'_>,
     observed: &mut super::Observation,
 ) -> Replied {
-    let Attempt { id, cancel, fence } = at;
+    let Attempt {
+        id,
+        cancel,
+        fence,
+        started,
+    } = at;
     let ephemeral = side.is_ephemeral().then_some(&side.role);
     let start = session.shared.rt.now();
     let provider = cx.service::<dyn ext::SideProvider>();
@@ -315,6 +344,10 @@ pub(super) async fn run_side(
             model: name,
             ..super::Observation::default()
         };
+        if let Some(started) = started {
+            let _ = super::services::attempt_clock();
+            *lock(&started.0) = Some((session.shared.rt.now(), attempt, observed.model.clone()));
+        }
         let mut quiet = |_: &str| {};
         let result = contain(async {
             match (provider, &model) {
@@ -401,8 +434,9 @@ async fn ephemeral_turn(
     admitted: &SideAdmitted,
     side: &ext::ModelTurn,
     registry: &Arc<ext::host::Registry>,
+    started: std::time::Instant,
     execution: &mut Option<Json>,
-) -> (Outcome, Option<Json>) {
+) -> Result<(Outcome, Option<Json>), llm::Error> {
     let invalid = |e: String| llm::Error::new(llm::Kind::InvalidRequest, e);
     let prepared = async {
         let authority = super::spawn::SpawnIntent::from_json(&admitted.thread.authority)
@@ -445,7 +479,7 @@ async fn ephemeral_turn(
     };
     let (messages, model) = match prepared.await {
         Ok(prepared) => prepared,
-        Err(error) => return failed(&error),
+        Err(error) => return Ok(failed(&error)),
     };
     let cx = session.cx(origin.clone(), registry);
     let mut observed = super::Observation::default();
@@ -453,8 +487,13 @@ async fn ephemeral_turn(
         id: admitted.id,
         cancel: &admitted.cancel,
         fence: origin.fence,
+        started: admitted.started.as_deref(),
     };
-    let replied = super::unless(
+    let left = side
+        .budget
+        .timeout
+        .saturating_sub(session.shared.rt.now().saturating_duration_since(started));
+    let running = super::unless(
         &admitted.cancel,
         Box::pin(run_side(
             session,
@@ -465,18 +504,28 @@ async fn ephemeral_turn(
             at,
             &mut observed,
         )),
-    )
-    .await
-    .unwrap_or(Replied::Interrupted(None));
+    );
+    let replied = first(running, session.shared.rt.sleep(left)).await;
+    let timed_out = replied.is_none();
+    if timed_out {
+        admitted.cancel.set();
+    }
+    let replied = replied.flatten().unwrap_or(Replied::Interrupted(None));
     if matches!(replied, Replied::Interrupted(_)) {
         observed.usage = None;
     }
     *execution = session.execution(admitted.id, observed, "model_only".into(), Some(&side.role));
-    match replied {
+    if timed_out {
+        return Err(llm::Error::new(
+            llm::Kind::Transport,
+            "the side request timed out",
+        ));
+    }
+    Ok(match replied {
         Replied::Done(output) => (Outcome::Done { output }, None),
         Replied::Failed(error) => failed(&error),
         Replied::Interrupted(_) => (Outcome::Interrupted { output: None }, None),
-    }
+    })
 }
 
 fn failed(error: &llm::Error) -> (Outcome, Option<Json>) {

@@ -19,6 +19,7 @@ impl Conversations for Judge {
         side: ModelTurn,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         assert_eq!(&*side.thread.purpose, "judge");
+        assert!(side.is_ephemeral());
         let reply = self.0.map(|text| llm::Response {
             message: llm::Assistant {
                 content: vec![llm::AssistantPart::Text(llm::Text::new(text))],
@@ -205,6 +206,7 @@ impl Conversations for Descriptions {
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         assert!(side.is_background());
         assert!(side.is_while_waiting());
+        assert!(side.is_ephemeral());
         assert_eq!(side.thread.purpose, "approval-description");
         Box::pin(async {
             Ok(llm::Response {

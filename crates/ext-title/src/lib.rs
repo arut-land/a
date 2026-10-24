@@ -19,7 +19,7 @@ fn title(prompt: impl Into<String>) -> Conversation<Turn> {
         .fast()
         .owner_context()
         .bounds(2, 8192)
-        .max_tokens(32)
+        .max_tokens(const { std::num::NonZeroU32::new(32).unwrap() })
 }
 
 impl Configured for Title {

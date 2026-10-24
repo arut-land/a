@@ -159,6 +159,11 @@ pub enum Fact {
     RegistryWarnings {
         count: usize,
     },
+    /// A compaction threshold is configured but the session's model has no
+    /// known context window, so only provider overflows compact.
+    ThresholdUnmeasured {
+        session: SessionId,
+    },
     ExtensionRejected {
         module: u64,
     },

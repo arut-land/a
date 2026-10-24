@@ -148,9 +148,9 @@ impl<R, S> Conversation<R, S> {
         self.budget = budget;
         self
     }
-    pub fn max_tokens(mut self, tokens: u32) -> Self {
-        self.budget.max_tokens =
-            std::num::NonZeroU32::new(tokens).unwrap_or(std::num::NonZeroU32::MIN);
+    /// The output tokens each response may take.
+    pub fn max_tokens(mut self, tokens: std::num::NonZeroU32) -> Self {
+        self.budget.max_tokens = tokens;
         self
     }
     pub fn placement(mut self, placement: Placement) -> Self {
@@ -683,6 +683,18 @@ impl SideIdentity {
         let (identity, _): (Self, serde::de::IgnoredAny) = image.turn.parse()?;
         Ok(identity)
     }
+
+    /// Whether the turn a side intent admitted continues its thread: an
+    /// ephemeral one has none, so its authority is never adopted.
+    pub fn keeps_thread(intent: &llm::Json) -> bool {
+        #[derive(Deserialize)]
+        struct Kept {
+            ephemeral: bool,
+        }
+        protocol::publication::ThreadImage::from_json(intent)
+            .and_then(|image| image.turn.parse::<(Kept, serde::de::IgnoredAny)>())
+            .is_ok_and(|(kept, _)| !kept.ephemeral)
+    }
 }
 
 /// An admitted turn, as its owner logs it. Only a [`Conversation`] (or,
@@ -797,7 +809,7 @@ mod tests {
             .key("initial")
             .owner_context()
             .fast()
-            .max_tokens(1)
+            .max_tokens(std::num::NonZeroU32::MIN)
             .ephemeral()
             .request(of);
         assert_eq!(reworded.identity(), identity);

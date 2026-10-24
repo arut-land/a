@@ -337,9 +337,17 @@ impl Tool for Probe {
                 probe.per_call()
             }
         };
-        if args.args == "ephemeral" {
-            return probe()
-                .ephemeral()
+        if let Some(how) = args.args.strip_prefix("ephemeral") {
+            let probe = probe().ephemeral();
+            let probe = match how {
+                "-owner" => probe.owner_context(),
+                "-timeout" => probe.budget(ext::Budget {
+                    timeout: Duration::from_millis(50),
+                    ..ext::Budget::default()
+                }),
+                _ => probe,
+            };
+            return probe
                 .ask(cx)
                 .await
                 .map(|r| r.message.text())
@@ -480,6 +488,89 @@ fn an_ephemeral_turn_writes_no_child_log_and_still_reuses_its_key() {
     assert!(log.iter().any(|e| matches!(&e.body,
         Body::ToolResult { outcome: Outcome::Done { output }, .. }
             if output.raw().contains("crimson-harbor"))));
+}
+
+/// The provider attempts behind the only ephemeral side call in `log`.
+fn ephemeral_attempts(log: &[Entry]) -> Vec<protocol::CallFact> {
+    log.iter()
+        .filter_map(|e| e.execution.as_ref())
+        .map(|j| protocol::CallFact::from_json(j).unwrap())
+        .filter(|fact| fact.side)
+        .collect()
+}
+
+/// An ephemeral turn that sees its owner gets the owner's conversation in
+/// its request, though it keeps no thread of its own.
+#[test]
+fn an_ephemeral_turn_with_owner_context_sends_the_owners_conversation() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("ephemeral-owner").unwrap();
+    settle(&session);
+    session.halt();
+    let bodies = http.bodies();
+    assert_eq!(bodies.len(), 1);
+    let sent = bodies[0].to_string();
+    assert!(sent.contains("ephemeral-owner"), "{sent}");
+    assert!(sent.contains("Say hi."), "{sent}");
+}
+
+/// An ephemeral turn cut off by its deadline still settles the attempt it
+/// made, with no usage, and fails as a timeout.
+#[test]
+fn an_ephemeral_timeout_keeps_its_attempts_metrics() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("ephemeral-timeout").unwrap();
+    until(&session, "the side call failed", |log| {
+        log.iter().any(|e| {
+            matches!(
+                &e.body,
+                Body::ModelResult {
+                    r#for: Some(_),
+                    outcome: Outcome::Failed { .. },
+                    ..
+                }
+            )
+        })
+    });
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    let facts = ephemeral_attempts(&log);
+    assert_eq!(facts.len(), 1, "{log:#?}");
+    assert!(facts[0].usage.is_none());
+    assert!(facts[0].elapsed_ns.is_some_and(|ns| ns > 0));
+    assert_eq!(facts[0].id.executing_session, session.id);
+    assert_eq!(facts[0].id.call, sides(&log)[0].0);
+}
+
+/// An interrupt while an ephemeral turn is out cancels it before its call
+/// ends, and its attempt is still settled.
+#[test]
+fn an_ephemeral_turn_dies_with_its_call() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("ephemeral").unwrap();
+    http.wait_sent(1);
+    session.interrupt_now();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    let (side, ..) = sides(&log)[0];
+    let side_end = log.iter().position(|e| {
+        matches!(&e.body, Body::ModelResult { call, outcome: Outcome::Interrupted { .. }, .. }
+            if *call == side)
+    });
+    let call_end = log.iter().position(
+        |e| matches!(&e.body, Body::ToolResult { call, .. } if *call == CallId::new(2).unwrap()),
+    );
+    assert!(side_end.is_some() && call_end.is_some(), "{log:#?}");
+    assert!(side_end < call_end, "{log:#?}");
+    let facts = ephemeral_attempts(&log);
+    assert_eq!(facts.len(), 1, "{log:#?}");
+    assert!(facts[0].usage.is_none());
+    assert_eq!(http.sent(), 1);
 }
 
 #[test]
