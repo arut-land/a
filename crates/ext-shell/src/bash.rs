@@ -336,15 +336,19 @@ async fn execute<D: crate::dialect::Dialect>(
         let _ = std::fs::remove_file(&log);
     }
 
-    let ended = std::fs::read_to_string(&report).ok();
-    let _ = std::fs::remove_file(&report);
-    let cwd = ended
-        .map(|dir| sys::shell_directory(&dir))
-        .filter(|dir| dir.is_absolute() && dir.is_dir())
-        .unwrap_or_else(|| dir.clone());
-    // `pwd -P` resolves symlinks the starting directory may have.
-    let moved = (std::fs::canonicalize(&dir).ok().as_ref() != Some(&cwd))
-        .then(|| Cwd::change(&cwd, cx.env.as_ref().map(|env| env.cwd.as_path())));
+    let old_dir = dir.clone();
+    let (cwd, moved) = rt::unblock(runtime(cx)?, move || {
+        let ended = std::fs::read_to_string(&report).ok();
+        let _ = std::fs::remove_file(&report);
+        let cwd = ended
+            .map(|dir| sys::shell_directory(&dir))
+            .filter(|dir| dir.is_absolute() && dir.is_dir())
+            .unwrap_or_else(|| old_dir.clone());
+        let moved = std::fs::canonicalize(&old_dir).ok().as_ref() != Some(&cwd);
+        (cwd, moved)
+    })
+    .await;
+    let moved = moved.then(|| Cwd::change(&cwd, cx.env.as_ref().map(|env| env.cwd.as_path())));
     if done.lingering {
         done.process.detach(cx);
     }

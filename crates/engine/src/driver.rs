@@ -1102,7 +1102,7 @@ impl Actor {
             rt::STORAGE_BYTES,
             move || {
                 let start = Instant::now();
-                let ((), folding) =
+                let ((), mut folding) =
                     Folding::rebuild(&binding, &registry, &shared, |restore, each| {
                         let after = snapshot
                             .filter(|s| restore(s.clone()))
@@ -1136,10 +1136,8 @@ impl Actor {
                         }
                         Ok(())
                     })?;
-                folding
-                    .states
-                    .validate(&lock(&live))
-                    .map_err(io::Error::other)?;
+                let live = lock(&live);
+                folding.states.adopt(&live).map_err(io::Error::other)?;
                 Ok::<_, io::Error>(folding.states)
             },
         )
@@ -1624,6 +1622,27 @@ impl Actor {
             .await
     }
 
+    async fn prepare_context(
+        &mut self,
+        invocation: ext::point::InvocationContext,
+    ) -> std::thread::Result<()> {
+        if self.core.ledger().has_context()
+            || self.live.session.model_only()
+            || !self.bound.registry().has_context()
+        {
+            return Ok(());
+        }
+        let bound = Arc::downgrade(&self.bound);
+        rt::unblock(&*self.live.session.shared.rt, move || {
+            catch_unwind(AssertUnwindSafe(|| {
+                if let Some(bound) = bound.upgrade() {
+                    invocation.scope(|| bound.prepare_context());
+                }
+            }))
+        })
+        .await
+    }
+
     async fn step_mutations(
         &mut self,
         events: impl IntoIterator<Item = (Event, Option<oneshot::Sender<ext::MutationResult>>)>,
@@ -1664,7 +1683,10 @@ impl Actor {
                     }
                 }
             }
-            match catch_unwind(AssertUnwindSafe(|| context.scope(|| self.core.step(event)))) {
+            let prepared = self.prepare_context(context.clone()).await;
+            match prepared.and_then(|()| {
+                catch_unwind(AssertUnwindSafe(|| context.scope(|| self.core.step(event))))
+            }) {
                 Ok(more) => {
                     for entry in &more.appends {
                         if let Some(call) = self.projection.invocations.fold(entry) {
