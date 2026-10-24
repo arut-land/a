@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ext::host::Registry;
 use ext::testing::Rig;
-use ext::{BoxFuture, Gate, Gated, Gating, Models, Tier};
+use ext::{BoxFuture, Conversations, Gate, Gated, Gating, ModelTurn, Tier};
 use protocol::Json;
 use serde_json::json;
 use sys::config::Effect;
@@ -12,13 +12,14 @@ use super::*;
 /// A model asked aside that answers `reply`, or fails with none.
 struct Judge(Option<&'static str>);
 
-impl Models for Judge {
-    fn call<'a>(
+impl Conversations for Judge {
+    fn turn<'a>(
         &'a self,
         _: &'a Cx,
         side: ModelTurn,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         assert_eq!(&*side.thread.purpose, "judge");
+        assert!(side.is_ephemeral());
         let reply = self.0.map(|text| llm::Response {
             message: llm::Assistant {
                 content: vec![llm::AssistantPart::Text(llm::Text::new(text))],
@@ -43,7 +44,7 @@ impl Extension for Models_ {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.provide::<dyn Models>(Arc::new(Judge(self.0)));
+        r.provide::<dyn Conversations>(Arc::new(Judge(self.0)));
     }
 }
 
@@ -193,18 +194,19 @@ impl Extension for Descriptions {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.provide::<dyn Models>(Arc::new(Self));
+        r.provide::<dyn Conversations>(Arc::new(Self));
     }
 }
 
-impl Models for Descriptions {
-    fn call<'a>(
+impl Conversations for Descriptions {
+    fn turn<'a>(
         &'a self,
         _: &'a Cx,
         side: ModelTurn,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         assert!(side.is_background());
         assert!(side.is_while_waiting());
+        assert!(side.is_ephemeral());
         assert_eq!(side.thread.purpose, "approval-description");
         Box::pin(async {
             Ok(llm::Response {

@@ -581,6 +581,7 @@ name = "ext-compact"
 version = "0.0.0"
 dependencies = [
  "ext",
+ "ext-logging",
  "ext-retry",
  "llm",
  "protocol",
@@ -775,7 +776,6 @@ name = "ext-title"
 version = "0.0.0"
 dependencies = [
  "ext",
- "llm",
  "protocol",
 ]
 

@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 ext.workspace = true
+ext-logging.workspace = true
 llm.workspace = true
 protocol.workspace = true
 serde.workspace = true

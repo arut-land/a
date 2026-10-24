@@ -21,3 +21,22 @@ fn ids_name_what_models_do() {
     assert!(!reads_images("o3-mini"));
     assert!(reads_images("gpt-6-luna"));
 }
+
+#[test]
+fn a_window_is_known_only_for_ids_a_row_names() {
+    use super::context_window;
+    assert_eq!(context_window("anthropic/claude-sonnet-4-5"), Some(200_000));
+    assert_eq!(context_window("gpt-5-chat-latest"), Some(128_000));
+    assert_eq!(context_window("gpt-5-mini"), Some(400_000));
+    assert_eq!(context_window("gemini-1.5-pro-002"), Some(2_097_152));
+    assert_eq!(context_window("o1-preview-2024-09-12"), Some(128_000));
+    assert_eq!(context_window("gpt-5.1-chat-latest"), Some(128_000));
+    assert_eq!(context_window("grok-4-fast-reasoning"), Some(2_000_000));
+    assert_eq!(context_window("x-ai/grok-4-1-fast"), Some(2_000_000));
+    assert_eq!(context_window("grok-4-0709"), Some(256_000));
+    assert_eq!(
+        context_window("us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+        Some(200_000)
+    );
+    assert_eq!(context_window("my-deployment"), None);
+}
