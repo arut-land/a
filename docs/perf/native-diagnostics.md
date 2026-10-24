@@ -1,12 +1,18 @@
 # Native diagnostics
 
 Native delivery supplements the sealed JSON vocabulary and bounded local
-writer. Linux uses `std::os::unix::net::UnixDatagram`: one nonblocking send
+writer. Linux uses `std::os::unix::net::UnixDatagram`: a nonblocking send
 implements the journald native protocol, with no libsystemd link or runtime
 requirement. A systemd binding would add a library requirement for this single
 operation without replacing admission, encoding or file fallback. macOS uses
 `oslog` 0.2 without its optional logging facade; Windows uses Microsoft's
 `tracelogging` 1.2.4. Neither introduces another worker or timer.
+
+Linux retains the endpoint pathname and reconnects the existing socket on
+connection-refused, missing-endpoint, disconnected, reset, aborted or broken-pipe
+errors. Each record allows one reconnect and one resend. A restart gap consumes
+no background work: the next record attempts recovery. A full collector drops
+the native copy without reconnecting; the readable local copy is independent.
 
 `object` 0.40 parses mapped ELF notes and Mach-O load commands with only
 `read_core` and the target's format enabled. Compression, archives and other
@@ -48,10 +54,53 @@ conclusions and does not rule out an application regression. No active-workload
 performance improvement is claimed. Producer admission is unchanged; successful
 large-JSON processing does not emit diagnostic facts.
 
-The harness uses isolated `A_HOME`, so native delivery is disabled: these are
-application regression measurements, not a benchmark of enabled collector
-delivery. Enabled-collector latency and the cause of the positive CPU deltas
-remain unmeasured; the transport adds no idle worker, timer or retry queue.
+The application harness uses isolated `A_HOME`, so native delivery is disabled.
+Enabled-call costs are measured separately below. End-to-end collector latency
+and the cause of positive application CPU deltas remain unmeasured; the transport
+adds no idle worker, timer or retry queue.
+
+## Calls with a listening collector
+
+The opt-in `sys` release test exercises `Native::write` against real journald,
+unified logging and ETW collectors. Each run uses five rounds of 500 distinct
+128-byte JSONL records after 32 warmup records. A 10 ms sleep paces records
+outside the timed interval. JSON construction, local-file writes, collector
+draining and initialization are excluded. Timed calls include bounds/UTF-8
+checks, framing or string conversion, enabled checks and the native API.
+
+Collectors confirm readiness before timing: journald and `log stream` must
+observe a handshake; ETW must enable the registered provider. Every timed
+sequence must subsequently appear exactly once in `journalctl`, `log stream`
+or the `tracerpt`-decoded ETL file. Missing/duplicate records fail the probe.
+These are elapsed call costs including clock overhead and scheduling, without
+subtracting the disabled control. They measure API acceptance, not persistence
+latency or collector CPU. Different hosts do not establish an OS ranking.
+
+| Host / collector | Verified records | Call p50 µs | Call p95 µs | Round mean range µs | Disabled p50 µs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Linux x86_64 / journald | 2500/2500 | 12.109 | 15.163 | 11.826–13.545 | 0.080 |
+| macOS 15 Intel / os_log + live stream | 2500/2500 | 106.593 | 246.452 | 105.608–214.940 | 0.247 |
+| Windows x64 / ETW file session | 7500/7500 | 0.500–3.900 | 2.700–6.500 | 0.799–4.594 | 0.000–0.100 |
+
+Windows ranges retain all three successful runs, including slower observations:
+[run 1](https://github.com/arut-land/a/actions/runs/40048332733/job/120735062996),
+[run 2](https://github.com/arut-land/a/actions/runs/40048572362/job/120735823271),
+[run 3](https://github.com/arut-land/a/actions/runs/40048821964/job/120736617385).
+Zero control samples are below clock resolution, not evidence of zero call cost.
+[Linux](https://github.com/arut-land/a/actions/runs/40048821964/job/120736617189)
+and [macOS](https://github.com/arut-land/a/actions/runs/40050006439/job/120740374320)
+use one run each. The artifacts retain raw samples, platform/revision metadata
+and collector output. macOS's measured enabled cost is substantially higher on
+this host; it remains on the existing bounded storage worker, with producer
+admission unchanged.
+
+On an isolated hosted VM with permission to read its journal or start an ETW
+session, run `python scripts/perf/native-diagnostics.py --output <fresh-dir>`.
+It builds the ignored `listening_collector_cost_per_record` test with
+`cargo test -p sys --release --lib --no-run`. `PERF_CARGO` can select a native
+Cargo executable where the repository's cache wrapper is unavailable. This
+explicit probe bypasses home routing to exercise native delivery, never opens
+daemon state, and does not change normal isolated-`A_HOME` behavior.
 
 A separate [hosted static-musl probe](https://github.com/arut-land/a/actions/runs/39997996173)
 verifies ELF identity without symbol lookup in both static and PIC relocation

@@ -44,7 +44,10 @@ sink. The resolved home carries that distinction. Daemon spawn preserves an
 explicit override and leaves `A_HOME` unset for a default per-user home. Otherwise Linux connects a nonblocking datagram socket
 to `/run/systemd/journal/socket` and sends native journal entries with
 `SYSLOG_IDENTIFIER=a`, priority notice and the sealed JSON record as `MESSAGE`.
-A missing journal or a full socket never delays local delivery. macOS uses
+A missing journal or a full socket never delays local delivery. Endpoint-loss
+errors reconnect the same nonblocking socket to its pathname, then resend once.
+Each record permits at most one reconnect and one resend, including across a
+restart gap; a full collector never triggers reconnection. macOS uses
 unified logging under subsystem `land.arut.a`, category `daemon`, at default
 level with a static public string template. Windows uses the manifest-free
 TraceLogging provider `land.arut.a.daemon`, event `Fact`, field `Json` at
