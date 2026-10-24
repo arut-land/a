@@ -91,8 +91,6 @@ fn daemon_environment(cmd: &mut Command, home: &crate::Home) {
         "USERPROFILE",
         "LOCALAPPDATA",
         "ProgramFiles",
-        "TEMP",
-        "TMP",
         "COMSPEC",
         "PATHEXT",
     ] {
@@ -366,6 +364,9 @@ pub fn read_boot_id() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     #[test]
     fn daemon_bootstrap_never_replaces_resolved_temporary_environment() {
@@ -389,9 +390,6 @@ mod tests {
             );
         }
     }
-    use std::io::{BufRead, BufReader};
-    use std::process::Stdio;
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     #[test]
     fn job_owner() {
