@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -74,6 +73,8 @@ pub struct Edited {
     pub removed: usize,
     /// A unified diff of the change, for clients.
     pub diff: String,
+    /// Atomic visibility is confirmed; edits do not request power-loss durability.
+    pub publication: sys::fs::EditReceipt,
 }
 
 /// The hash of each file as this session last wrote it.
@@ -122,6 +123,11 @@ impl Tool for Edit {
                 cx.update::<Seen>(&wrote).await.map_err(|e| e.to_string())?;
                 return Err(format!(
                     "{shown} changed since this session last edited it; look at it again before editing it"
+                ));
+            }
+            Err(EditError::Conflict(reason)) => {
+                return Err(format!(
+                    "{shown}: edit conflict ({reason}); inspect the file and retry"
                 ));
             }
             Err(EditError::InvalidText) => return Err(format!("{shown} is not UTF-8 text")),
@@ -174,6 +180,7 @@ impl Tool for Edit {
 #[derive(Debug)]
 enum EditError {
     Stale(Wrote),
+    Conflict(sys::fs::EditConflict),
     InvalidText,
     Failed(String),
 }
@@ -181,6 +188,15 @@ enum EditError {
 impl From<std::io::Error> for EditError {
     fn from(error: std::io::Error) -> Self {
         Self::Failed(error.to_string())
+    }
+}
+
+impl From<sys::fs::EditError> for EditError {
+    fn from(error: sys::fs::EditError) -> Self {
+        match error {
+            sys::fs::EditError::Conflict(reason) => Self::Conflict(reason),
+            error => Self::Failed(error.to_string()),
+        }
     }
 }
 
@@ -225,24 +241,16 @@ impl Transaction<'_> {
         if captured > limits.file {
             return Err(EditError::Failed("edits exceed byte limit".into()));
         }
-        let (path, original) = self
+        let target = path.clone();
+        let transaction = self
             .run(Storage, limits.file * 2 + captured, move || {
-                let file = match std::fs::File::open(&path) {
-                    Ok(file) => file,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((path, None)),
-                    Err(e) => return Err(e.into()),
-                };
-                let mut bytes = Vec::new();
-                file.take(limits.file as u64 + 1).read_to_end(&mut bytes)?;
-                if bytes.len() > limits.file {
-                    return Err(EditError::Failed("file exceeds byte limit".into()));
-                }
-                Ok((path, Some(bytes)))
+                Ok(sys::fs::EditTransaction::capture(&target, limits.file)?)
             })
             .await?;
-        let (content, edited, hash) = self
+        let (transaction, content, edited, hash) = self
             .run(Cpu, limits.file * 5 + captured, move || {
-                if let Some(bytes) = &original {
+                let original = transaction.original();
+                if let Some(bytes) = original {
                     let current = hash(bytes);
                     if prior_hash.is_some_and(|prior| prior != current) {
                         return Err(EditError::Stale(Wrote {
@@ -252,8 +260,7 @@ impl Transaction<'_> {
                     }
                 }
                 let text = original
-                    .as_ref()
-                    .map(|bytes| std::str::from_utf8(bytes))
+                    .map(std::str::from_utf8)
                     .transpose()
                     .map_err(|_| EditError::InvalidText)?;
                 let (content, diff) = apply(text, &edits, limits).map_err(EditError::Failed)?;
@@ -265,17 +272,28 @@ impl Transaction<'_> {
                     added: diff.added,
                     removed: diff.removed,
                     diff: diff.text,
+                    publication: sys::fs::EditReceipt {
+                        visible: false,
+                        durability: sys::fs::Durability::NotRequested,
+                        protection: sys::fs::PublicationProtection::Unchanged,
+                        limitations: sys::fs::PublicationLimitations::default(),
+                    },
                 };
-                Ok((content, edited, hash))
+                Ok((transaction, content, edited, hash))
             })
             .await?;
-        self.run(Storage, content.len() + limits.diff_bytes * 2, move || {
-            if let Some(parent) = edited.path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&edited.path, content)?;
-            Ok((edited, hash))
-        })
+        let cancel = self.cancel.clone();
+        self.run(
+            Storage,
+            // Verification holds both bounded metadata values alongside the result.
+            limits.file * 2 + content.len() + limits.diff_bytes * 2,
+            move || {
+                let mut edited = edited;
+                edited.publication =
+                    transaction.publish(content.as_bytes(), false, &|_| cancel.is_set())?;
+                Ok((edited, hash))
+            },
+        )
         .await
     }
 }
@@ -699,6 +717,13 @@ mod tests {
             matches!(&created, Outcome::Done { output } if output.parse::<Value>().unwrap()["created"] == true)
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n");
+        let Outcome::Done { output } = &created else {
+            unreachable!()
+        };
+        assert_eq!(
+            output.parse::<Value>().unwrap()["publication"],
+            json!({"visible": true, "durability": "not_requested", "protection": "exclusive_create", "limitations": {"change_after_check": false, "writes_to_old_inode": false}})
+        );
         let Outcome::Done { output } = change(&rig, "notes.txt", &[("two", "2")]) else {
             panic!()
         };
