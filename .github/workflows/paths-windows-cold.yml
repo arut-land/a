@@ -1,0 +1,43 @@
+name: paths windows cold
+on:
+  push:
+    branches: [codex-w2paths]
+    paths: ['.github/workflows/paths-windows-cold.yml', 'scripts/perf/paths-windows-cold.py']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cold:
+    runs-on: windows-11-arm
+    env:
+      CARGO_BUILD_JOBS: 4
+      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+      MISE_AUTO_INSTALL: false
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install native LLVM toolchain
+        shell: pwsh
+        run: |
+          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches.Groups[1].Value
+          $toolchain = "$channel-aarch64-pc-windows-msvc"
+          "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+          rustup toolchain install $toolchain --profile minimal --component rust-src
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: mr-boxington
+      - run: python -m pip install psutil==7.2.2
+      - run: mise exec -- python scripts/perf/paths-windows-cold.py
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: paths-windows-cold-arm
+          path: target/paths-windows-cold/*.json
