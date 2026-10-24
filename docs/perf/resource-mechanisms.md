@@ -29,7 +29,10 @@ invariant and its test, and state their measured cost.
 Additional 20-round comparisons of the full branch against main
 `4b662d7ab8151802b8417e71378c8ec800834f34` on Intel macOS and Windows x86_64
 check the CPU regressions directly. The decoder is an unchanged control; its
-variation is reported alongside the runtime workloads.
+variation is reported alongside the runtime workloads. It is not subtracted
+from the runtime results: its source is unchanged, but it still participates in
+the build/dependency graph, so a change can also reflect code or dependency
+layout.
 
 ## Variants
 
@@ -46,6 +49,11 @@ variation is reported alongside the runtime workloads.
 The Linux/macOS effective-CPU implementation already delegates to the standard
 library used before O15, so there is no additional discovery mechanism to disable
 on those platforms. Non-macOS QoS guards are empty.
+
+The pinned Rust Windows implementation of `available_parallelism` reads
+`GetSystemInfo`. It does not apply process CPU sets or job quotas. Native child
+process tests exercise the additional affinity, CPU-set and hard-quota bounds;
+the final decision must report the measured cost of retaining those bounds.
 
 ## Cancellation reliability
 
@@ -66,6 +74,14 @@ A worker-QoS variant keeps foreground priority for the lifetime of each owned
 blocking worker and retains catalog utility scopes. It removes per-job
 get/set/restore transitions while leaving the requested class during each job
 unchanged. Both native Mac targets use the same 20-round protocol.
+
+A separate [cache-benefit probe](resource-mechanisms/cache-benefit-run.json)
+measures process RSS before populating projections, after populating them, and
+after an idle reclamation request. It uses a controlled 36 MiB in-memory log,
+three repetitions and both native Mac architectures. This measures the cache
+release benefit separately from the source subscription's idle cost; it does
+not manufacture system-wide memory pressure. Its patch and run provenance are
+retained beside the mechanism variants.
 
 ## Decisions
 

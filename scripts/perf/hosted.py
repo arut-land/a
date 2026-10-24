@@ -3,6 +3,7 @@ import argparse
 import faulthandler
 import importlib.machinery
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -101,6 +102,7 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
         revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
         variant=variant,
         shipped_bytes=(output / ("a" + SUFFIX)).stat().st_size,
+        shipped_sha256=hashlib.sha256((output / ("a" + SUFFIX)).read_bytes()).hexdigest(),
         fixture_bytes=(output / ("a-fixtures" + SUFFIX)).stat().st_size,
         windows_image=windows_image(output / ("a" + SUFFIX)) if os.name == "nt" else None,
     ), indent=2) + "\n")
@@ -125,6 +127,13 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
         run(["cargo", "build-release", "-p", "rt", "--example", "o15-facts", *overrides], cwd=source, env=env)
         facts = subprocess.check_output([release / "examples" / ("o15-facts" + SUFFIX)], text=True)
         (output / "facts.json").write_text(facts)
+    metadata = json.loads((output / "build.json").read_text())
+    metadata["executables"] = {
+        p.name: dict(bytes=p.stat().st_size, sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+        for p in output.iterdir()
+        if p.is_file() and p.name in ["a" + SUFFIX, "a-fixtures" + SUFFIX, "engine-bench" + SUFFIX, "llm-bench" + SUFFIX]
+    }
+    (output / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
     run(["rustc", ROOT / "scripts/perf/floor.rs", "-O", "-o", output / ("floor" + SUFFIX)], cwd=source)
 
 
@@ -302,6 +311,7 @@ def paired(output, source, reference):
                       regular_driver_turns=100, regular_large_json_results=20,
                       reference_revision=reference, candidate_revision=candidate_revision,
                       completed_rounds=completed, order=orders, trials=trials, host=host,
+                      builds={role: json.loads((directory / "build.json").read_text()) for role, directory in builds.items()},
                       roles={role: {name: distribution(samples) for name, samples in observed.items()}
                              for role, observed in values.items()})
         temporary = output / "paired.json.tmp"
