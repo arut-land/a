@@ -938,8 +938,8 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     {
         // Owning the polls distinguishes queued news from unsolicited wakes,
         // regardless of how long a worker would take to consume that news.
-        let resident = std::sync::atomic::AtomicBool::new(false);
-        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &resident));
+        let idling = super::Idling::new(super::Idling::TRANSIENT);
+        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling));
         let mut cx = Context::from_waker(Waker::noop());
         let before = EVENTS.count("wake");
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
@@ -960,16 +960,20 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
         assert_eq!(*super::lock(&runtime.1), [config.idle; 4]);
     }
     {
-        // A daemon the OS starts at login has no idle deadline to wake for.
+        // Neither a daemon the OS starts at login nor one still asking
+        // whether it is has an idle deadline to wake for.
         let exit = Exit {
             home: home.clone(),
             pid: std::fs::File::create(root.join("resident-pid")).unwrap(),
             endpoint: home.bind().unwrap().retirement().unwrap(),
         };
         super::lock(&runtime.1).clear();
-        let resident = std::sync::atomic::AtomicBool::new(true);
-        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &resident));
+        let idling = super::Idling::new(super::Idling::ASKING);
+        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling));
         let mut cx = Context::from_waker(Waker::noop());
+        assert!(supervisor.as_mut().poll(&mut cx).is_pending());
+        idling.answer(true);
+        daemon.pulse.notify();
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
         assert!(super::lock(&runtime.1).is_empty());
     }
@@ -1031,9 +1035,9 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     let (stop, done) = (ext::Flag::default(), ext::Flag::default());
     let (stopping, finished) = (stop.clone(), done.clone());
     daemon.shared.rt.spawn(Box::pin(async move {
-        let resident = std::sync::atomic::AtomicBool::new(false);
+        let idling = super::Idling::new(super::Idling::TRANSIENT);
         rt::or(
-            supervisor.supervise(&life, &config, exit, &resident),
+            supervisor.supervise(&life, &config, exit, &idling),
             stopping.wait(),
         )
         .await;

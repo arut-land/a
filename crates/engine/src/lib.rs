@@ -14,7 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -991,13 +991,7 @@ impl Daemon {
     /// something changed (a client came or went, a session's work began or
     /// ended), so an idle daemon does not wake at all. While work runs it
     /// holds off system sleep.
-    async fn supervise(
-        &self,
-        life: &Lifecycle,
-        config: &Config,
-        exit: Exit,
-        resident: &AtomicBool,
-    ) {
+    async fn supervise(&self, life: &Lifecycle, config: &Config, exit: Exit, idling: &Idling) {
         // When the daemon last became idle.
         let mut since: Option<Instant> = None;
         // When a drain out of grace stopped the calls still running.
@@ -1038,12 +1032,15 @@ impl Daemon {
                     exit.now(self, Stop::Upgrade).await;
                 }
                 next = Some(earliest(next, settled.unwrap_or(began + config.drain)));
-            } else if self.idle() && !resident.load(Ordering::SeqCst) {
+            } else if self.idle() && !idling.is(Idling::RESIDENT) {
                 let at = *since.get_or_insert(now) + config.idle;
-                if now >= at {
-                    exit.now(self, Stop::Idle).await;
+                // While the answer is pending, its pulse is what wakes us.
+                if idling.is(Idling::TRANSIENT) {
+                    if now >= at {
+                        exit.now(self, Stop::Idle).await;
+                    }
+                    next = Some(earliest(next, at));
                 }
-                next = Some(earliest(next, at));
             } else {
                 since = None;
             }
@@ -1192,6 +1189,34 @@ pub struct Start {
 /// How long a new daemon serves before asking [`Start::resident`].
 const SETTLED: Duration = Duration::from_secs(2);
 
+/// Whether idleness may end this daemon. Until [`Start::resident`] answers,
+/// it may not: a short idle limit must not end a daemon the OS starts at
+/// login before it learns so.
+struct Idling(AtomicU8);
+
+impl Idling {
+    const ASKING: u8 = 0;
+    const TRANSIENT: u8 = 1;
+    const RESIDENT: u8 = 2;
+
+    fn new(state: u8) -> Self {
+        Self(AtomicU8::new(state))
+    }
+
+    fn is(&self, state: u8) -> bool {
+        self.0.load(Ordering::SeqCst) == state
+    }
+
+    fn answer(&self, resident: bool) {
+        let state = if resident {
+            Self::RESIDENT
+        } else {
+            Self::TRANSIENT
+        };
+        self.0.store(state, Ordering::SeqCst);
+    }
+}
+
 /// Runs the daemon, as staged build `build`, until it has been idle for
 /// `config.idle` (no attached clients and no unfinished work) or has drained
 /// for a newer build. Sessions live in their logs, so the next client
@@ -1313,25 +1338,30 @@ fn run(
         pid,
         endpoint: listener.retirement()?,
     };
-    let resident = Arc::new(AtomicBool::new(false));
-    let stays = Arc::clone(&resident);
+    let idling = idling(&daemon, home, start.resident);
+    let answered = Arc::clone(&idling);
     daemon.shared.rt.spawn(Box::pin(async move {
-        monitor.supervise(&watch, &config, exit, &stays).await;
+        monitor.supervise(&watch, &config, exit, &answered).await;
     }));
-    if let Some(ask) = start.resident {
-        let (waker, home) = (Arc::clone(&daemon), home.clone());
-        daemon.shared.rt.spawn(Box::pin(async move {
-            let daemon = waker;
-            daemon.shared.rt.sleep(SETTLED).await;
-            if rt::unblock(&*daemon.shared.rt, move || ask(&home)).await {
-                resident.store(true, Ordering::SeqCst);
-                daemon.pulse.notify();
-            }
-        }));
-    }
     let listener = rt::Async::new(&daemon.shared.rt.reactor(), listener)?;
     // The signal lease is scoped to serving, including non-signal shutdown.
     rt::block_on(rt::or(server::accept(&listener, &daemon, &life), signalled))
+}
+
+/// Asks `resident`, if given, once the daemon has served for [`SETTLED`].
+fn idling(daemon: &Arc<Daemon>, home: &Home, resident: Option<fn(&Home) -> bool>) -> Arc<Idling> {
+    let Some(ask) = resident else {
+        return Arc::new(Idling::new(Idling::TRANSIENT));
+    };
+    let idling = Arc::new(Idling::new(Idling::ASKING));
+    let (answer, daemon, home) = (Arc::clone(&idling), Arc::clone(daemon), home.clone());
+    let runtime = Arc::clone(&daemon.shared.rt);
+    runtime.spawn(Box::pin(async move {
+        daemon.shared.rt.sleep(SETTLED).await;
+        answer.answer(rt::unblock(&*daemon.shared.rt, move || ask(&home)).await);
+        daemon.pulse.notify();
+    }));
+    idling
 }
 
 /// Whether a daemon may serve.
