@@ -206,9 +206,7 @@ retention without invoking a rebuild. Removing the reclamation guards makes
 both preservation tests fail with all three caches absent. Independently removing
 the idle/ownership guard fails attachment and process retention; removing the
 activity guard fails approval retention. Restoring both passes. An unprotected
-idle session still releases all three caches. A shared shell
-test checks deferred wait completion directly: PID metadata can disappear at
-exit before the child is reaped.
+idle session still releases all three caches.
 
 ## Sources and limits
 

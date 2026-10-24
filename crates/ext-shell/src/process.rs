@@ -782,10 +782,14 @@ int main(int argc, char **argv) {
                 .unwrap(),
         );
         let cx = rig.cx();
+        let pid = Mutex::new(None);
+        // Check identity while stdin holds the child alive; exit can hide it before reaping.
         let mut launching = std::pin::pin!(launch(
             &cx,
             spec(&cx, "read -r line"),
             |child| {
+                assert!(sys::process_started(child.id()).is_some());
+                *lock(&pid) = Some(child.id());
                 child.kill().unwrap();
                 runtime.defer.store(true, Ordering::Release);
                 Err(io::ErrorKind::NotFound.into())
@@ -793,8 +797,8 @@ int main(int argc, char **argv) {
             |reactor, input, _| rt::Async::new(reactor, input),
         ));
         let mut context = Context::from_waker(Waker::noop());
-        // PID metadata can disappear at exit, before wait collects the status.
         assert!(launching.as_mut().poll(&mut context).is_pending());
+        let id = lock(&pid).unwrap();
         let reaping = lock(&runtime.blocking)
             .pop()
             .expect("status acquisition was admitted");
@@ -808,6 +812,7 @@ int main(int argc, char **argv) {
         assert!(!status.success());
         assert_eq!(process.process.try_wait().unwrap(), Some(status));
         assert_eq!(rt::block_on(process.process.wait()).unwrap(), status);
+        assert!(sys::process_started(id).is_none());
         assert!(lock(&runtime.blocking).is_empty());
     }
 

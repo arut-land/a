@@ -22,3 +22,6 @@ vte = { version = "0.15", default-features = false }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+sys = { workspace = true, features = ["test-support"] }
