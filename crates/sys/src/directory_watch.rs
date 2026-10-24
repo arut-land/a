@@ -303,34 +303,40 @@ mod tests {
 
     #[test]
     fn delayed_cancellation_keeps_other_runtime_tasks_responsive() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, mpsc};
+        use windows_sys::Win32::Foundation::STATUS_PENDING;
         use windows_sys::Win32::System::Threading::SetEvent;
 
         let root = tempfile::tempdir().unwrap();
-        let mut watch = DirectoryWatch::new(root.path(), false).unwrap();
-        let state = watch.state.take().unwrap();
+        let watch = DirectoryWatch::new(root.path(), false).unwrap();
+        let state = watch.state.as_ref().unwrap();
         let request = state.request.lock().unwrap();
+        let overlapped = request.overlapped();
         let mut bytes = 0;
         // SAFETY: join real I/O on this test thread before substituting a
-        // controlled, delayed kernel-completion signal on the same event.
+        // controlled pending status and completion event. No real I/O remains.
         unsafe {
-            CancelIoEx(state.directory.as_raw_handle(), request.overlapped());
+            CancelIoEx(state.directory.as_raw_handle(), overlapped);
             GetOverlappedResult(
                 state.directory.as_raw_handle(),
-                request.overlapped(),
+                overlapped,
                 &raw mut bytes,
                 1,
             );
             ok(ResetEvent(state.event.as_raw_handle())).unwrap();
+            AtomicUsize::from_ptr(&raw mut (*overlapped).Internal)
+                .store(usize::try_from(STATUS_PENDING).unwrap(), Ordering::Release);
         }
         drop(request);
         let signal = state.event.try_clone().unwrap();
+        let storage = Arc::downgrade(state);
         let (done, reclaimed) = mpsc::channel();
         *state.reclaimed.lock().unwrap() = Some(done);
         let runtime: rt::Rt = Arc::new(rt::Threads::new(1));
         let (send, retired) = mpsc::channel();
         runtime.spawn(Box::pin(async move {
-            state.retire();
+            drop(watch);
             send.send(()).unwrap();
         }));
         let retirement = retired.recv_timeout(Duration::from_secs(3));
@@ -338,6 +344,13 @@ mod tests {
         runtime.spawn(Box::pin(async move { send.send(()).unwrap() }));
         let progressed = responsive.recv_timeout(Duration::from_secs(3));
         let retained = reclaimed.try_recv().is_err();
+        if let Some(_owner) = storage.upgrade() {
+            // SAFETY: the upgraded Arc keeps this controlled status live even
+            // if Drop is incorrectly waiting. Publish completion before signal.
+            unsafe {
+                AtomicUsize::from_ptr(&raw mut (*overlapped).Internal).store(0, Ordering::Release);
+            }
+        }
         // SAFETY: the duplicate keeps the event live until completion delivery.
         unsafe { ok(SetEvent(signal.as_raw_handle())).unwrap() };
         retirement.unwrap();
