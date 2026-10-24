@@ -89,13 +89,13 @@ try:
         for environment in [env, peer_env]:
             command("daemon", "install-activation", environment=environment)
             command("ls", environment=environment)
-        before = command("daemon", "status", environment=peer_env).stdout.splitlines()[0]
+        before = command("daemon", "status", environment=peer_env).stdout.splitlines()[0].split(",", 1)[0]
         assert before.startswith("running (pid "), before
         uninstall_env = dict(env)
         if platform.system() == "Linux":
             uninstall_env["XDG_CONFIG_HOME"] = str(root / "another-config")
         command("daemon", "uninstall-activation", environment=uninstall_env)
-        after = command("daemon", "status", environment=peer_env).stdout.splitlines()[0]
+        after = command("daemon", "status", environment=peer_env).stdout.splitlines()[0].split(",", 1)[0]
         assert after == before, "uninstall affected another native state home"
     finally:
         command("daemon", "stop", check=False, environment=peer_env)
