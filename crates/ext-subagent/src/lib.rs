@@ -92,10 +92,7 @@ impl Tool for ForkTask {
 
 fn child(purpose: &str, input: &Prompt) -> Conversation<Child> {
     let child = Conversation::task::<Subagent>(purpose, &input.prompt);
-    input
-        .kind
-        .iter()
-        .fold(child, Conversation::kind)
+    input.kind.iter().fold(child, Conversation::kind)
 }
 
 async fn awaited(child: Conversation<Child>, cx: &Cx) -> Result<String, String> {

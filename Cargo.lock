@@ -758,7 +758,6 @@ name = "ext-title"
 version = "0.0.0"
 dependencies = [
  "ext",
- "llm",
  "protocol",
 ]
 
