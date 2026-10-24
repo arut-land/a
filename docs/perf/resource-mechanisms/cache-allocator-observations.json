@@ -353,6 +353,178 @@
         "relief_bytes": 0,
         "relief_us": 450
       }
+    ],
+    "macos-latest": [
+      {
+        "round": 0,
+        "baseline_kib": 157008,
+        "cached_kib": 246560,
+        "reclaimed_kib": 246560,
+        "delayed_kib": 246560,
+        "baseline_heap": [
+          2075,
+          50569040,
+          0,
+          167772160
+        ],
+        "cached_heap": [
+          5168,
+          151700672,
+          0,
+          218103808
+        ],
+        "reclaimed_heap": [
+          2092,
+          50570352,
+          0,
+          218103808
+        ],
+        "relieved_heap": [
+          2092,
+          50570352,
+          0,
+          218103808
+        ],
+        "relieved_kib": 246560,
+        "relief_bytes": 0,
+        "relief_us": 1
+      },
+      {
+        "round": 1,
+        "baseline_kib": 246592,
+        "cached_kib": 283648,
+        "reclaimed_kib": 283648,
+        "delayed_kib": 283648,
+        "baseline_heap": [
+          2093,
+          50570416,
+          0,
+          218103808
+        ],
+        "cached_heap": [
+          5171,
+          151700864,
+          0,
+          218103808
+        ],
+        "reclaimed_heap": [
+          2093,
+          50570416,
+          0,
+          218103808
+        ],
+        "relieved_heap": [
+          2093,
+          50570416,
+          0,
+          218103808
+        ],
+        "relieved_kib": 283648,
+        "relief_bytes": 0,
+        "relief_us": 3
+      },
+      {
+        "round": 2,
+        "baseline_kib": 283664,
+        "cached_kib": 320688,
+        "reclaimed_kib": 320688,
+        "delayed_kib": 320688,
+        "baseline_heap": [
+          2093,
+          50570416,
+          0,
+          218103808
+        ],
+        "cached_heap": [
+          5171,
+          151700864,
+          0,
+          218103808
+        ],
+        "reclaimed_heap": [
+          2093,
+          50570416,
+          0,
+          218103808
+        ],
+        "relieved_heap": [
+          2093,
+          50570416,
+          0,
+          218103808
+        ],
+        "relieved_kib": 320688,
+        "relief_bytes": 0,
+        "relief_us": 0
+      },
+      {
+        "round": 3,
+        "baseline_kib": 320688,
+        "cached_kib": 357680,
+        "reclaimed_kib": 357680,
+        "delayed_kib": 357680,
+        "baseline_heap": [
+          2093,
+          50570416,
+          0,
+          218103808
+        ],
+        "cached_heap": [
+          5171,
+          151700864,
+          0,
+          218103808
+        ],
+        "reclaimed_heap": [
+          2093,
+          50570416,
+          0,
+          218103808
+        ],
+        "relieved_heap": [
+          2093,
+          50570416,
+          0,
+          218103808
+        ],
+        "relieved_kib": 357680,
+        "relief_bytes": 0,
+        "relief_us": 0
+      },
+      {
+        "round": 4,
+        "baseline_kib": 357680,
+        "cached_kib": 394672,
+        "reclaimed_kib": 394672,
+        "delayed_kib": 394672,
+        "baseline_heap": [
+          2093,
+          50570416,
+          0,
+          218103808
+        ],
+        "cached_heap": [
+          5171,
+          151700864,
+          0,
+          218103808
+        ],
+        "reclaimed_heap": [
+          2093,
+          50570416,
+          0,
+          218103808
+        ],
+        "relieved_heap": [
+          2093,
+          50570416,
+          0,
+          218103808
+        ],
+        "relieved_kib": 394672,
+        "relief_bytes": 0,
+        "relief_us": 0
+      }
     ]
   }
 }

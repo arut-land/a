@@ -123,8 +123,8 @@ worker counts.
 
 The [native allocator diagnostic](resource-mechanisms/cache-allocator-observations.json)
 records cache population, clearing, a one-second delay and explicit pressure
-relief. Reported live allocator bytes fall by about 72 MiB on Intel and 129 MiB
-on macOS 15 ARM. ARM RSS remains high. Explicit pressure relief reports zero
+relief. Reported live allocator bytes fall by about 72 MiB on Intel, 129 MiB
+on macOS 15 ARM and 96.5 MiB on macOS 26 ARM. ARM RSS remains high. Explicit pressure relief reports zero
 released bytes and does not justify an allocator policy change. Some ARM zone
 counters wrap after relief and the counters are advisory; none is substituted
 for RSS. The uninstrumented cache observations remain separate.
