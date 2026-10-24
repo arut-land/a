@@ -6,7 +6,7 @@ publish.workspace = true
 
 [features]
 # Startup shell facts for tests that register the tools without a daemon.
-testing = ["sys/testing"]
+testing = ["sys/test-support"]
 
 [dependencies]
 ext.workspace = true
@@ -22,7 +22,7 @@ vte = { version = "0.15", default-features = false }
 [dev-dependencies]
 tempfile = { version = "3", default-features = false }
 ext = { workspace = true, features = ["testing"] }
-sys = { workspace = true, features = ["testing"] }
+sys = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

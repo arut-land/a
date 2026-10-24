@@ -72,7 +72,7 @@ workspace = true
 features = ["tls-native"]
 
 [dev-dependencies]
-sys = { workspace = true, features = ["testing"] }
+sys = { workspace = true, features = ["test-support"] }
 tempfile = { version = "3", default-features = false }
 ext-mcp = { workspace = true, features = ["fixture"] }
 ext-fixtures = { workspace = true, features = ["on"] }

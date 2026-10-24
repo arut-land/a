@@ -41,7 +41,7 @@ impl ExecutionFacts {
     /// [`initialize`](Self::initialize) is a startup-order bug, never a
     /// reason to resolve a different layout from the environment.
     pub fn current() -> &'static Self {
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(any(test, feature = "test-support"))]
         if FACTS.get().is_none() {
             // One fixed root, so test processes leave nothing behind per run.
             let root = std::env::temp_dir().join("a-test-shell");
@@ -60,7 +60,7 @@ impl ExecutionFacts {
             let _ = FACTS.set(Self::resolve(paths)?);
         }
         let facts = FACTS.get().expect("initialized shell facts");
-        if !cfg!(feature = "testing") && facts.temp != paths.temporary_dir() {
+        if !cfg!(feature = "test-support") && facts.temp != paths.temporary_dir() {
             return Err(std::io::Error::other(format!(
                 "shell facts already use {}, not {}",
                 facts.temp.display(),

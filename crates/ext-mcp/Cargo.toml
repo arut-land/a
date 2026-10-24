@@ -20,7 +20,7 @@ serde_json.workspace = true
 sys.workspace = true
 
 [dev-dependencies]
-sys = { workspace = true, features = ["testing"] }
+sys = { workspace = true, features = ["test-support"] }
 ext = { workspace = true, features = ["testing"] }
 ext-shell = { workspace = true, features = ["testing"] }
 ext-policy.workspace = true
