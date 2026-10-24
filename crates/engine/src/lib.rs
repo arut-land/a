@@ -1267,7 +1267,7 @@ fn run(
         }
     };
     #[cfg(not(test))]
-    ext_logging::install(&(runtime.clone() as rt::Rt), home.daemon_log());
+    ext_logging::install(&(runtime.clone() as rt::Rt), home);
     if start.logs {
         sys::daemon_ready()?;
     }
