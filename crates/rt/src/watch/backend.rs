@@ -23,7 +23,7 @@ impl Backend {
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
                 Ok(event) if event.need_rescan() => changed(WatchEvent::Rescan),
-                Ok(event) if structural(event.kind) => {
+                Ok(event) if structural(&event) => {
                     changed(WatchEvent::RescanPaths(event_paths(event.paths, &aliases)));
                 }
                 Ok(event) if !matches!(event.kind, notify::EventKind::Access(_)) => {
@@ -53,15 +53,24 @@ impl Backend {
 }
 
 #[cfg(not(windows))]
-fn structural(kind: notify::EventKind) -> bool {
-    // inotify reports new directories before notify installs their descendant
-    // watches. A synchronous rearm must precede the capture that consumes it.
-    matches!(
-        kind,
-        notify::EventKind::Create(notify::event::CreateKind::Folder)
-            | notify::EventKind::Remove(notify::event::RemoveKind::Folder)
-            | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
-    )
+fn structural(event: &notify::Event) -> bool {
+    use notify::{
+        EventKind,
+        event::{CreateKind, ModifyKind},
+    };
+    // inotify watches each directory on its own and reports a new or
+    // moved-in directory before notify installs its descendant watches, so a
+    // synchronous rearm must precede the capture that consumes it. Rearming
+    // costs a new instance (a per-user limit) and a tree walk, so plain file
+    // renames such as atomic saves must not trigger it. Removed directories
+    // need nothing: notify drops their watches itself.
+    const PER_DIRECTORY: bool = cfg!(any(target_os = "linux", target_os = "android"));
+    PER_DIRECTORY
+        && match event.kind {
+            EventKind::Create(CreateKind::Folder) => true,
+            EventKind::Modify(ModifyKind::Name(_)) => event.paths.iter().any(|path| path.is_dir()),
+            _ => false,
+        }
 }
 
 #[cfg(not(windows))]
@@ -83,21 +92,44 @@ fn event_paths(mut paths: Vec<PathBuf>, aliases: &[(PathBuf, PathBuf)]) -> Vec<P
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn structural_events_require_armed_descendants_before_capture() {
+    fn only_new_or_moved_in_directories_require_a_rearm_before_capture() {
         use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
-        for kind in [
+        let root = std::env::temp_dir().join(format!("a-structural-{}", std::process::id()));
+        let directory = root.join("moved");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = root.join("SKILL.md");
+        std::fs::write(&file, "").unwrap();
+        let event = |kind, paths: &[&PathBuf]| {
+            notify::Event::new(kind).set_paths(paths.iter().map(|&p| p.clone()).collect())
+        };
+        let renamed = notify::EventKind::Modify(ModifyKind::Name(RenameMode::To));
+        assert!(structural(&event(
             notify::EventKind::Create(CreateKind::Folder),
+            &[&directory]
+        )));
+        assert!(structural(&event(renamed, &[&directory])));
+        assert!(!structural(&event(renamed, &[&file])));
+        assert!(!structural(&event(
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[&root.join("SKILL.md.tmp"), &file]
+        )));
+        assert!(!structural(&event(
             notify::EventKind::Remove(RemoveKind::Folder),
-            notify::EventKind::Modify(ModifyKind::Name(RenameMode::To)),
-        ] {
-            assert!(structural(kind));
-        }
+            &[&root.join("gone")]
+        )));
+        assert!(!structural(&event(
+            notify::EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            &[&file]
+        )));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rescans_outside_every_root_are_ignored() {
         let event = WatchEvent::RescanPaths(vec![PathBuf::from("/home/other")]);
         assert!(!event.affects(&[PathBuf::from("/home/work/skills")]));
-        assert!(!structural(notify::EventKind::Modify(ModifyKind::Data(
-            DataChange::Any
-        ))));
     }
 
     #[test]
