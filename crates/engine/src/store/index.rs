@@ -70,7 +70,8 @@ impl Index {
                 }
             }
             Body::Input { taken: true, .. } => self.input = None,
-            Body::Take { input } => {
+            // What goes into a call's result starts no turn of its own.
+            Body::Take { input, into: None } => {
                 self.input = Some(CallId(*input));
             }
             Body::ModelCall { r#for: None, .. } => {
@@ -239,12 +240,16 @@ mod tests {
             },
             Body::Take {
                 input: Seq::new(5).unwrap(),
+                into: None,
             },
             Body::Outbox {
-                envelope: envelope.clone(),
+                envelope_id: envelope.id.clone(),
+                recipients: vec![envelope.destination],
+                payload: envelope.payload.clone(),
             },
             Body::Ack {
                 envelope_id: envelope.id.clone(),
+                recipient: envelope.destination,
                 refusal: None,
             },
         ];

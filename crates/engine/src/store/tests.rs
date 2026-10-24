@@ -270,6 +270,7 @@ fn entry(seq: u64, epoch: u32) -> Entry {
             mode: protocol::Mode::Queue,
             taken: true,
             origin: None,
+            force: false,
         },
     )
 }

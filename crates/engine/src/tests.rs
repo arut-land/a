@@ -578,6 +578,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                force: false,
             },
             Body::Assistant { text: "hi".into() },
         ]
@@ -648,6 +649,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                force: false,
             },
             Body::ToolCall {
                 invoke: None,
@@ -676,6 +678,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         mode: protocol::Mode::Queue,
         taken: true,
         origin: None,
+        force: false,
     };
     let sleep = || Body::ToolCall {
         invoke: None,
@@ -849,6 +852,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
             mode: protocol::Mode::Queue,
             taken: true,
             origin: None,
+            force: false,
         },
         Body::ToolCall {
             invoke: None,

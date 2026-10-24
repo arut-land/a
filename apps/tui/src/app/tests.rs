@@ -127,6 +127,7 @@ fn asked_command() -> Vec<DaemonMsg> {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                force: false,
             },
         ),
         entry(
@@ -205,6 +206,7 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
+                    force: false,
                 },
             ),
             entry(
@@ -377,6 +379,7 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
+                    force: false,
                 },
             )
         })
@@ -396,6 +399,7 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
             mode: protocol::Mode::Queue,
             taken: true,
             origin: None,
+            force: false,
         },
     ));
     app.fold(&DaemonMsg::Activity {
@@ -497,6 +501,7 @@ fn ctrl_c_interrupts_a_running_model_call_too() {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                force: false,
             },
         ),
         entry(
@@ -1069,6 +1074,7 @@ fn render_cost() {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                force: false,
             },
         ));
         msgs.push(entry(
@@ -1432,6 +1438,7 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
+                    force: false,
                 },
             ),
             entry(
@@ -1492,6 +1499,7 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
             mode: protocol::Mode::Queue,
             taken: true,
             origin: None,
+            force: false,
         },
     ));
     assert_eq!(app.clock.before, 3);

@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 27;
+pub const PROTO: u32 = 28;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 27;
+pub const PROTO_MIN: u32 = 28;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -84,6 +84,10 @@ pub use json::Json;
 pub struct SessionId(pub Uuid);
 
 impl SessionId {
+    /// The id no session has: what a kernel that was not told its own
+    /// addresses itself by.
+    pub const NIL: Self = Self(Uuid::nil());
+
     pub fn new() -> Self {
         Self(Uuid::now_v7())
     }
@@ -281,11 +285,19 @@ kinds! {
         /// Input, logged on arrival so that it survives a crash and every
         /// client sees it. `taken` when it started work as it arrived;
         /// otherwise it waits, in order, for a `take`. A `steer` goes to
-        /// the running turn at its next step boundary rather than after it.
-        Input "input" { segments: Segments, mode: Mode = default, taken: bool = default, origin: Option<Author> = default } = Durable;
-        /// Waiting input `input` was taken up: it starts a turn, or a
-        /// `steer` is given to the running one.
-        Take "take" { input: Seq } = Durable;
+        /// the running turn at its next step boundary rather than after it;
+        /// a `force`d one cuts the model call short and detaches the
+        /// running calls that can go on in the background, so that
+        /// boundary comes now.
+        Input "input" { segments: Segments, mode: Mode = default, taken: bool = default, origin: Option<Author> = default, force: bool = default } = Durable;
+        /// Queued item `input` was taken up: it starts a turn, is read by
+        /// the next model call, or, `into` a call, is read with that
+        /// call's result, keeping each call beside its result.
+        Take "take" { input: Seq, into: Option<CallId> = default } = Durable;
+        /// Queued item `input` was taken back before it was taken up: it is
+        /// never read. Whichever of `withdraw` and `take` is logged first
+        /// wins. An edit is a withdraw and the edited input after it.
+        Withdraw "withdraw" { input: Seq, origin: Option<Author> = default } = Durable;
         /// The reply of an agent that is not a model's.
         Assistant "assistant" { text: String } = Durable;
         /// Facts about where the session runs (its directory, the workspace's
@@ -335,6 +347,11 @@ kinds! {
         /// committed as it runs: what an interrupted call reports, and what
         /// clients show meanwhile.
         Progress "progress" { call: CallId, text: String } = Durable;
+        /// Running call `call` was detached: the result logged next is a
+        /// placeholder naming its output stream ([`OutputStream`]), and its
+        /// outcome comes later, as the session's own envelope
+        /// ([`EnvelopeId::DETACHED`]).
+        Detached "detached" { call: CallId } = Durable;
         ToolResult "tool_result" {
             call: CallId,
             outcome: Outcome,
@@ -360,15 +377,22 @@ kinds! {
         /// is the call that owns the child; the child's id is chosen before the
         /// commit, so recovery finds the child instead of making another.
         Link "link" { child: SessionId, input: String, intent: Json } = Durable;
+        /// The committed intent to send `payload` to `recipients`, the set
+        /// the session's route resolved its address to, once: each is
+        /// delivered an [`Envelope`] under the one id.
+        Outbox "outbox" { envelope_id: EnvelopeId, recipients: Vec<SessionId>, payload: String } = Durable;
+        /// An envelope taken into this session's queue, once per id.
+        Enqueue "enqueue" { envelope: Envelope } = Durable;
+        /// Recipient `recipient` took in envelope `envelope_id`, or refused it.
+        Ack "ack" { envelope_id: EnvelopeId, recipient: SessionId, refusal: Option<InboxRefusal> = default } = Durable;
+        Spawned "spawned" { intent: Json } = Durable;
         /// A durable watch on `child`: when it settles, its result comes back
         /// as a `fired` under this entry's seq, which is the idempotency key.
-        Outbox "outbox" { envelope: Envelope } = Durable;
-        Enqueue "enqueue" { envelope: Envelope } = Durable;
-        Ack "ack" { envelope_id: EnvelopeId, refusal: Option<InboxRefusal> = default } = Durable;
-        Spawned "spawned" { intent: Json } = Durable;
         Watch "watch" { child: SessionId } = Durable;
         /// Watch `watch` fired, with its child's result. Logged at most once
-        /// per watch.
+        /// per watch. A call waiting on the child goes on with it; otherwise
+        /// it reaches the agent as the session's own envelope
+        /// ([`EnvelopeId::CHILD`]).
         Fired "fired" { watch: Seq, outcome: Outcome } = Durable;
         // ── environment and extensions ─────────────────────────────────
         /// The environment the session's commands run in from here on, as the
@@ -920,6 +944,19 @@ pub enum Outcome {
     },
 }
 
+impl Outcome {
+    /// The payload of an envelope that carries it ([`EnvelopeId::CHILD`],
+    /// [`EnvelopeId::DETACHED`]).
+    pub fn payload(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// The outcome such an envelope's payload carries.
+    pub fn from_payload(payload: &str) -> Option<Self> {
+        serde_json::from_str(payload).ok()
+    }
+}
+
 /// The durable ancestry of an independently imported conversation prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForkParent {
@@ -1387,7 +1424,8 @@ pub enum Rejection {
     Draining,
     /// A hook refused it.
     Refused,
-    /// The call is not waiting for approval.
+    /// What it answers waits no longer: the call is not waiting for
+    /// approval, the input to withdraw was taken up.
     NotWaiting,
     /// This client attached as a viewer.
     ReadOnly,
@@ -1432,8 +1470,13 @@ kinds! {
         /// Replaces the attached session's environment (`/env refresh`).
         Environment "environment" (Environment), read decode::environment_msg;
         /// Input; a `steer` goes to the running turn at its next step
-        /// boundary, and with no turn running is plain input.
-        Input "input" { segments: Segments, mode: Mode = default, client_seq: Option<u64> = default };
+        /// boundary, and with no turn running is plain input. A `force`d
+        /// steer brings that boundary on now: the model call is cut short
+        /// and the calls running that can go on in the background do.
+        Input "input" { segments: Segments, mode: Mode = default, force: bool = default, client_seq: Option<u64> = default };
+        /// Takes back the user's queued input `input` before it is taken up;
+        /// refused once it was. Editing it is this, then the new input.
+        Withdraw "withdraw" { input: Seq, client_seq: Option<u64> = default };
         List "list";
         Detach "detach";
         /// Asks for [`DaemonMsg::Sessions`] now and whenever a session's
@@ -1469,7 +1512,10 @@ impl ClientMsg {
         // increase a mutation's charge in the transport queue.
         if matches!(
             self,
-            Self::Input { .. } | Self::Approve { .. } | Self::Interrupt { .. }
+            Self::Input { .. }
+                | Self::Approve { .. }
+                | Self::Interrupt { .. }
+                | Self::Withdraw { .. }
         ) {
             count.count += self
                 .client_seq()
@@ -1509,6 +1555,7 @@ impl ClientMsg {
         Self::Input {
             segments: segments.into(),
             mode: Mode::Queue,
+            force: false,
             client_seq: None,
         }
     }
@@ -1526,6 +1573,7 @@ impl ClientMsg {
         match self {
             Self::Input { client_seq, .. }
             | Self::Approve { client_seq, .. }
+            | Self::Withdraw { client_seq, .. }
             | Self::Interrupt { client_seq } => *client_seq,
             _ => None,
         }
@@ -1537,6 +1585,7 @@ impl ClientMsg {
         match self {
             Self::Input { client_seq, .. }
             | Self::Approve { client_seq, .. }
+            | Self::Withdraw { client_seq, .. }
             | Self::Interrupt { client_seq } => Some(client_seq),
             Self::Hello { .. }
             | Self::Attach { .. }
@@ -1843,11 +1892,124 @@ pub struct EnvelopeId {
     pub call: CallId,
     pub purpose: String,
 }
+impl EnvelopeId {
+    /// The purpose of the envelope a child no call waits on settles into,
+    /// under its watch: its payload is the child's [`Outcome`].
+    pub const CHILD: &str = "child";
+    /// The purpose of a detached call's outcome, under the call: its
+    /// payload is the [`Outcome`].
+    pub const DETACHED: &str = "detached";
+    /// The purpose of the end of a process group a call left to the
+    /// session, under the call: its payload is text for the model.
+    pub const JOB: &str = "job";
+}
+
+/// What one recipient takes into its queue.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
     pub id: EnvelopeId,
     pub destination: SessionId,
     pub payload: String,
+}
+
+impl Envelope {
+    /// An envelope session `session` sends itself, about its own call
+    /// `call`: how what it started and stopped waiting on (a child, a
+    /// detached call, a background job) reaches it, on the one queue,
+    /// deduplicated by the id as any envelope is.
+    pub fn own(session: SessionId, call: CallId, purpose: &str, payload: String) -> Self {
+        Self {
+            id: EnvelopeId {
+                sender: session,
+                call,
+                purpose: purpose.to_owned(),
+            },
+            destination: session,
+            payload,
+        }
+    }
+
+    /// Where it comes from, as the queue tells its items apart.
+    pub fn source(&self) -> Source {
+        if self.id.sender != self.destination {
+            Source::Agent(self.id.sender)
+        } else if self.id.purpose == EnvelopeId::CHILD {
+            Source::Child(self.id.call.0)
+        } else {
+            Source::Job(self.id.call)
+        }
+    }
+}
+
+/// An envelope on its way out: the recipients the route resolved, each
+/// to be delivered `payload` under `id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outgoing {
+    pub id: EnvelopeId,
+    pub recipients: Vec<SessionId>,
+    pub payload: String,
+}
+
+impl Outgoing {
+    /// The envelope recipient `to` is delivered.
+    pub fn to(&self, to: SessionId) -> Envelope {
+        Envelope {
+            id: self.id.clone(),
+            destination: to,
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+/// Where a queued item comes from. A user's input is the queue's visible
+/// part, which clients show and a user may withdraw; the rest is hidden,
+/// shown at most as a status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    User,
+    /// Another session's message.
+    Agent(SessionId),
+    /// The outcome of the session's own call `call`, which went on in the
+    /// background: a detached call, or a process group it left.
+    Job(CallId),
+    /// The result of the child watched at this seq, no call waiting on it.
+    Child(Seq),
+}
+
+impl Source {
+    pub const fn visible(self) -> bool {
+        matches!(self, Self::User)
+    }
+}
+
+/// The output of call `call` as it streams: what a detached call's
+/// placeholder result names. The content-addressed blob it grows into is
+/// the blob store's to name; within a session the call names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputStream {
+    pub call: CallId,
+}
+
+/// `stream:<call>`, as text names it, as `blob:<id>` names a blob.
+impl fmt::Display for OutputStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "stream:{}", self.call)
+    }
+}
+
+impl OutputStream {
+    /// The result a call detached as it ran is answered with at once:
+    /// done, naming where its output goes on.
+    pub fn placeholder(self) -> Outcome {
+        #[derive(Serialize)]
+        struct Placeholder {
+            detached: OutputStream,
+        }
+        Outcome::Done {
+            output: Json::encode(&Placeholder { detached: self }).unwrap_or_default(),
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InboxRefusal {
@@ -1995,6 +2157,7 @@ mod tests {
                 mode: Mode::Queue,
                 taken: true,
                 origin: None,
+                force: false,
             },
         );
         assert_eq!(
@@ -2155,14 +2318,19 @@ mod tests {
                 mode: Mode::Queue,
                 taken: true,
                 origin: Some(author),
+                force: false,
             },
             Body::Input {
                 segments: "also".into(),
                 mode: Mode::Steer,
                 taken: false,
                 origin: None,
+                force: false,
             },
-            Body::Take { input: seq(2) },
+            Body::Take {
+                input: seq(2),
+                into: None,
+            },
             Body::ModelCall {
                 request: None,
                 model: "m".into(),

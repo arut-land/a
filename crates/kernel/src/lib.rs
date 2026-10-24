@@ -28,8 +28,8 @@ use std::time::Duration;
 
 pub use ext::host::Binding;
 pub use ext::{
-    Action, Actions, Agent, Answer, Callable, Chained, Concurrency, Gate, Gated, Input, Later,
-    LoopPoints, Name, Recover, Replay, Requirement,
+    Action, Actions, Agent, Answer, Boundary, Callable, Chained, Concurrency, Detach, Gate, Gated,
+    Input, Later, LoopPoints, Name, QueueView, Recover, Replay, Requirement, Take,
 };
 #[cfg(doc)]
 use protocol::ledger::Ledger;
@@ -116,10 +116,19 @@ pub enum Event {
     },
     /// Input from a client: started at once with nothing to wait for,
     /// otherwise queued. A `Steer` goes to the running turn before its next
-    /// model call.
+    /// model call; `force`d, that comes now: the model call is cut short
+    /// and the running calls that can go on in the background are
+    /// detached ([`Work::Detach`]).
     Input {
         segments: protocol::Segments,
         mode: Mode,
+        force: bool,
+        origin: Option<Author>,
+        ticket: Option<Ticket>,
+    },
+    /// A client takes back its queued input `input`, unless it was taken.
+    Withdraw {
+        input: Seq,
         origin: Option<Author>,
         ticket: Option<Ticket>,
     },
@@ -138,12 +147,19 @@ pub enum Event {
     },
     /// Model call `call` ended.
     ModelDone { call: CallId, replied: Replied },
-    /// Tool call `call` ended, its outcome shown as `card`.
+    /// Tool call `call` ended, its outcome shown as `card`. One detached
+    /// before it ended reaches the agent as the session's own envelope.
     ToolDone {
         call: CallId,
         outcome: Outcome,
         card: Option<Card>,
     },
+    /// The driver stopped waiting on running tool call `call`, which goes
+    /// on in the background ([`Work::Detach`]).
+    Detached { call: CallId },
+    /// A process group call `call` left to the session ended; `text` says
+    /// how, for the agent.
+    JobEnded { call: CallId, text: String },
     /// Tool call `call`, running, reports something to log.
     Note { call: CallId, note: Note },
     /// Tool call `call`, running, waits on a dialog or a client.
@@ -183,16 +199,19 @@ pub enum Event {
     ChildSettled { child: SessionId, outcome: Outcome },
     /// Ownership was durably cancelled; future input cannot revive it.
     OwnerCancelled,
+    /// Send an envelope to the recipients the session's route resolved.
     SendEnvelope {
-        envelope: protocol::Envelope,
+        outgoing: protocol::Outgoing,
         ticket: Ticket,
     },
     Enqueue {
         envelope: protocol::Envelope,
         ticket: Ticket,
     },
+    /// Recipient `recipient` took envelope `id` in, or refused it.
     Delivered {
         id: protocol::EnvelopeId,
+        recipient: SessionId,
         result: Result<(), protocol::InboxRefusal>,
         ticket: Option<Ticket>,
     },
@@ -353,6 +372,10 @@ pub enum Work {
     Sleep { call: CallId, after: Duration },
     /// Stop what runs, or sleeps, for call `call`; it reports as it ends.
     Cancel { call: CallId },
+    /// Stop waiting on running call `call`: its tool may hand its work to
+    /// the background, and one that is [`Detach::Background`] goes on
+    /// there, reported as [`Event::Detached`].
+    Detach { call: CallId },
     /// Start child session `child` on `input`, owned by link `link`,
     /// unless it runs already.
     StartChild {
@@ -404,7 +427,10 @@ impl Work {
     /// an owner answered, a child told, a process killed): what the entries
     /// before it must be durable ahead of.
     pub const fn external(&self) -> bool {
-        !matches!(self, Self::Cancel { .. } | Self::MarkBusy(_))
+        !matches!(
+            self,
+            Self::Cancel { .. } | Self::Detach { .. } | Self::MarkBusy(_)
+        )
     }
 }
 
@@ -509,6 +535,9 @@ impl CancelledInput {
 /// How a session's log is resumed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Load<'a> {
+    /// The session's id, which its own envelopes are addressed by; none
+    /// for a kernel that sends itself none it keeps (a scratch fork).
+    pub session: Option<SessionId>,
     /// The boot the daemon runs in: process groups logged under another
     /// one are gone, their ids reused.
     pub boot: Option<&'a str>,

@@ -118,7 +118,7 @@ impl Shared {
             .rev()
             .take_while(|e| !matches!(e.body, Body::Interrupt { .. }))
             .find_map(|e| match e.body {
-                Body::Take { input } => Some(input),
+                Body::Take { input, .. } => Some(input),
                 _ => None,
             });
         for entry in &entries {
@@ -367,6 +367,10 @@ pub enum Request {
     Input {
         segments: protocol::Segments,
         mode: Mode,
+        force: bool,
+    },
+    Withdraw {
+        input: protocol::Seq,
     },
     Interrupt,
     Answer {
@@ -386,6 +390,7 @@ enum Completion {
     },
     Delivered {
         id: protocol::EnvelopeId,
+        recipient: SessionId,
         result: Result<(), protocol::InboxRefusal>,
         ticket: Option<Ticket>,
     },
@@ -486,7 +491,9 @@ enum ContextRequest {
         reply: oneshot::Sender<Called>,
     },
     Send {
-        envelope: protocol::Envelope,
+        id: protocol::EnvelopeId,
+        to: ext::Address,
+        payload: String,
         reply: oneshot::Sender<Result<(), protocol::InboxRefusal>>,
     },
     /// A running call's report, answered once committed.
@@ -618,6 +625,7 @@ impl Live {
             Vec::new()
         };
         let load = Load {
+            session: Some(header.id),
             abandoned: &abandoned,
             boot: sys::boot_id(),
             fresh,
@@ -1330,10 +1338,20 @@ impl Actor {
                         self.pump_delivery();
                         return None;
                     }
-                    Completion::Delivered { id, result, ticket } => {
+                    Completion::Delivered {
+                        id,
+                        recipient,
+                        result,
+                        ticket,
+                    } => {
                         self.transport_active = false;
                         self.pump_delivery();
-                        Event::Delivered { id, result, ticket }
+                        Event::Delivered {
+                            id,
+                            recipient,
+                            result,
+                            ticket,
+                        }
                     }
                     Completion::SideFact {
                         side,
@@ -1499,26 +1517,41 @@ impl Actor {
                     None,
                 ))
             }
-            ContextRequest::Send { envelope, reply } => {
+            ContextRequest::Send {
+                id,
+                to,
+                payload,
+                reply,
+            } => {
                 let children: Vec<_> = self.core.ledger().links().iter().map(|l| l.child).collect();
-                let allowed = envelope.id.sender == self.live.id
-                    && envelope.id.call == call
-                    && self
-                        .registry
-                        .service::<dyn ext::InboxAccess>()
-                        .is_some_and(|access| {
-                            access.permits(
-                                envelope.destination,
-                                self.live.parent.map(|p| p.session),
-                                &children,
-                            )
-                        });
-                if !allowed {
-                    reply.send(Err(protocol::InboxRefusal::Unauthorized));
-                    return None;
-                }
+                let from = ext::Topology {
+                    session: self.live.id,
+                    parent: self.live.parent.map(|p| p.session),
+                    children: &children,
+                };
+                // The recipients are resolved once, as the send commits.
+                let resolved = if id.sender == self.live.id && id.call == call {
+                    (self.registry.service::<dyn ext::Route>())
+                        .map_or(Err(protocol::InboxRefusal::Unauthorized), |route| {
+                            route.resolve(from, &to)
+                        })
+                } else {
+                    Err(protocol::InboxRefusal::Unauthorized)
+                };
+                let recipients = match resolved {
+                    Ok(recipients) => recipients.into_vec(),
+                    Err(refusal) => {
+                        reply.send(Err(refusal));
+                        return None;
+                    }
+                };
+                let outgoing = protocol::Outgoing {
+                    id,
+                    recipients,
+                    payload,
+                };
                 let ticket = self.delivery_ticket(reply);
-                Some((Event::SendEnvelope { envelope, ticket }, None))
+                Some((Event::SendEnvelope { outgoing, ticket }, None))
             }
             ContextRequest::Note { note, done } => {
                 if let Note::State { ext, state, .. } = &note
@@ -1545,17 +1578,26 @@ impl Actor {
                 .map(|event| (event, None)),
             ContextRequest::Own { process } => {
                 lock(&session.jobs).push(Arc::clone(&process));
+                let fence = session.fence.load(Ordering::SeqCst);
                 self.live.session.spawn_work(
                     WorkId::Job(Arc::as_ptr(&process).cast::<()>() as usize),
                     origin.admission,
                     |cancel| {
                         Box::pin(async move {
                             let mut ended = pin!(process.ended());
-                            if unless(&cancel, &mut ended).await.is_none() {
+                            let stopped = unless(&cancel, &mut ended).await.is_none();
+                            if stopped {
                                 let _ = process.signal(ext::ProcessSignal::Kill);
                                 ended.await;
                             }
                             lock(&session.jobs).retain(|p| !Arc::ptr_eq(p, &process));
+                            // An end of its own reaches the agent, on the
+                            // queue; one the session stopped is its own doing.
+                            if !stopped {
+                                let text = job_ended(&**process);
+                                session
+                                    .emit(fence, Completion::Event(Event::JobEnded { call, text }));
+                            }
                             session.changed.notify();
                             if let Some(daemon) = session.shared.daemon.upgrade() {
                                 daemon.jobs.notify();
@@ -1593,9 +1635,19 @@ impl Actor {
         self.replies.clients.insert(ticket, reply);
         let ticket = Some(ticket);
         match request {
-            Request::Input { segments, mode } => Event::Input {
+            Request::Input {
                 segments,
                 mode,
+                force,
+            } => Event::Input {
+                segments,
+                mode,
+                force,
+                origin,
+                ticket,
+            },
+            Request::Withdraw { input } => Event::Withdraw {
+                input,
                 origin,
                 ticket,
             },
@@ -1826,7 +1878,7 @@ impl Actor {
         for effect in immediate {
             match effect {
                 Effect::Cancel { call } => self.cancel_pending(call, &mut after).await,
-                Effect::MarkBusy(true) => self.effect(effect).await,
+                Effect::MarkBusy(true) | Effect::Detach { .. } => self.effect(effect).await,
                 Effect::MarkBusy(false) => {}
                 _ => unreachable!("external work requires admission"),
             }
@@ -2103,6 +2155,7 @@ impl Actor {
         }
         self.publish();
         let load = Load {
+            session: Some(self.live.id),
             boot: sys::boot_id(),
             busy: self.live.has_work(),
             abandoned: &abandoned,
@@ -2200,6 +2253,14 @@ impl Actor {
             }
             Effect::Sleep { call, after } => {
                 self.later(call, shared.rt.sleep(after), move |()| Event::Woke { call });
+            }
+            // The call's handle, made now if it is still held behind
+            // admission: the run it admits takes the flag up.
+            Effect::Detach { call } => {
+                let fence = self.live.session.fence.load(Ordering::SeqCst);
+                if let Some(origin) = self.live.session.call_work(call, fence, None) {
+                    origin.detach.set();
+                }
             }
             Effect::Cancel { call } => {
                 self.inflight.remove(&call);
@@ -2564,9 +2625,24 @@ impl Actor {
             .with_invocation(self.replies.contexts.remove(&call).unwrap_or_default());
         let session = Arc::clone(&self.live.session);
         let id = self.live.id;
+        let detachable =
+            registry.tools().get(&tool).map(ext::DynTool::detach) == Some(ext::Detach::Background);
         origin.spawn(&*self.live.session.shared.rt, async move {
             let began = crate::stamp();
-            let called = contain(registry.tools().run(&tool, &input, parsed, &cx)).await;
+            let mut run = pin!(contain(registry.tools().run(&tool, &input, parsed, &cx)));
+            // A call that can go on in the background is stopped being
+            // waited on, not stopped: its outcome is reported all the same.
+            let waited = if detachable {
+                first(run.as_mut(), cx.detach.wait()).await
+            } else {
+                Some(run.as_mut().await)
+            };
+            let called = if let Some(called) = waited {
+                called
+            } else {
+                session.emit(fence, Completion::Event(Event::Detached { call }));
+                run.await
+            };
             crate::session_event("effect", id, || {
                 let elapsed = began.map_or(std::time::Duration::ZERO, |t| t.elapsed());
                 let how = match &called.outcome {
@@ -2603,6 +2679,7 @@ impl Live {
         let input = Request::Input {
             segments: text.into(),
             mode: Mode::Queue,
+            force: false,
         };
         rt::block_on(self.request(input, None))
     }
@@ -2752,6 +2829,7 @@ impl Session {
             fence: handle.fence,
             admission: handle.admission,
             cancel: handle.cancel.clone(),
+            detach: handle.detach.clone(),
             ended: handle.ended.clone(),
         })
     }
@@ -2897,6 +2975,18 @@ fn provider_error(session: SessionId, error: &llm::Error) {
         status: error.status,
         retryable: error.is_retryable(),
     });
+}
+
+/// What the agent is told of a background process group's end.
+fn job_ended(process: &dyn ext::RunningProcess) -> String {
+    let how = match process.try_wait() {
+        Ok(Some(status)) => status.code().map_or_else(
+            || "killed by a signal".to_owned(),
+            |code| format!("exit code {code}"),
+        ),
+        _ => "ended".to_owned(),
+    };
+    format!("[background job {} ended: {how}]", process.id())
 }
 
 fn store_fault(session: SessionId, operation: ext_logging::Operation, error: &io::Error) {

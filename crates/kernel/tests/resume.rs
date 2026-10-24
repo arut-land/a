@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use common::*;
 use kernel::{Load, Owner};
-use protocol::{Body, CallId, Json, Outcome, Permission, Seq, Verdict};
+use protocol::{Body, CallId, Json, Outcome, Permission, Seq, SessionId, Verdict};
 use serde_json::json;
 
 /// A session the daemon was running when it stopped.
@@ -18,6 +18,7 @@ const BUSY_LOAD: Load<'static> = Load {
     abandoned: &[],
     busy: true,
     created: false,
+    session: None,
 };
 
 fn resume(
@@ -359,9 +360,28 @@ fn links_are_rearmed() {
         watch: Seq::new(2).unwrap(),
         outcome: done(json!("ok")),
     };
-    let (_, fx) = resume(Reg::echo(), [link(), watch, fired], &Load::default());
-    // The agent is yet to say the child's result; the child is not started.
-    assert_plan(&fx, (vec![entry(4, said("child: \"ok\""))], vec![]));
+    let queued = Body::Enqueue {
+        envelope: protocol::Envelope::own(
+            SessionId::NIL,
+            id(2),
+            protocol::EnvelopeId::CHILD,
+            done(json!("ok")).payload(),
+        ),
+    };
+    let (_, fx) = resume(
+        Reg::echo(),
+        [link(), watch, fired, queued],
+        &Load::default(),
+    );
+    // The agent is yet to take the child's result up; the child is not
+    // started.
+    assert_plan(
+        &fx,
+        (
+            vec![entry(5, take(4)), entry(6, said("child: \"ok\""))],
+            vec![],
+        ),
+    );
 }
 
 /// A call waiting on a child whose result came in before the crash goes on
@@ -445,11 +465,11 @@ fn a_failed_commit_is_resume() {
 fn abandoned_inbox_work_is_terminal_for_every_owned_conversation() {
     let envelope = protocol::Envelope {
         id: protocol::EnvelopeId {
-            sender: protocol::SessionId::new(),
+            sender: SessionId::new(),
             call: CallId::new(1).unwrap(),
             purpose: "task".into(),
         },
-        destination: protocol::SessionId::new(),
+        destination: SessionId::new(),
         payload: "hi".into(),
     };
     for taken in [false, true] {
@@ -459,6 +479,7 @@ fn abandoned_inbox_work_is_terminal_for_every_owned_conversation() {
         if taken {
             bodies.push(Body::Take {
                 input: Seq::new(1).unwrap(),
+                into: None,
             });
         }
         let entries = log(bodies);

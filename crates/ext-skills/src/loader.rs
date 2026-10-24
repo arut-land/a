@@ -334,6 +334,7 @@ mod tests {
             mode: Mode::Queue,
             origin: None,
             ticket: None,
+            force: false,
         }
     }
 

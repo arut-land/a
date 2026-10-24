@@ -294,10 +294,25 @@ impl Actor {
             if let Some(transcript) = &mut self.projection.transcript {
                 transcript.apply(e, replied.map(|(_, m)| m));
             }
-            if let Body::ToolResult { call, .. } | Body::ModelResult { call, .. } = &e.body {
-                self.inflight.remove(call);
-                session.cancelled(*call);
-                self.bound.settled(*call);
+            // A call ends with its result, unless it was detached: then
+            // with its own envelope, its result a placeholder.
+            let ended = match &e.body {
+                Body::ToolResult { call, .. } | Body::ModelResult { call, .. } => {
+                    self.bound.settled(*call);
+                    let ledger = self.core.ledger();
+                    (!ledger.detached().iter().any(|d| d.call == *call)).then_some(*call)
+                }
+                Body::Enqueue { envelope }
+                    if envelope.id.purpose == protocol::EnvelopeId::DETACHED
+                        && envelope.source() == protocol::Source::Job(envelope.id.call) =>
+                {
+                    Some(envelope.id.call)
+                }
+                _ => None,
+            };
+            if let Some(call) = ended {
+                self.inflight.remove(&call);
+                session.cancelled(call);
             }
         }
     }

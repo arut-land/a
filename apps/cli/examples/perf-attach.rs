@@ -114,6 +114,7 @@ mod tests {
                         mode: protocol::Mode::Queue,
                         taken: true,
                         origin: None,
+                        force: false,
                     },
                 )
             })

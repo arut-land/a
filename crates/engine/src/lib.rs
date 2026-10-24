@@ -42,7 +42,8 @@ pub struct Config {
     pub idle: Duration,
     /// Unload a session after this long unused.
     pub hibernate: Duration,
-    /// How long an upgrade waits for in-flight work.
+    /// How long an upgrade waits for background process groups; running
+    /// sessions, and calls gone on in the background, it waits out.
     pub drain: Duration,
     /// The agent sessions run, by name: overrides the config files'
     /// `agent`.
@@ -736,6 +737,7 @@ impl Daemon {
             let input = Request::Input {
                 segments: input.into(),
                 mode: Mode::Queue,
+                force: false,
             };
             live.request(input, None).await.map_err(io::Error::other)?;
         }
@@ -991,9 +993,12 @@ impl Daemon {
     }
 
     /// Hibernates idle sessions, and exits once the whole daemon has been
-    /// idle for `config.idle`, or once a drain has no work left or runs out
-    /// of grace. Every entry is durable when written, so exiting is all a
-    /// drain needs; unfinished calls recover in the next daemon.
+    /// idle for `config.idle`, or once a drain has no work left. Running
+    /// sessions and calls detached into the background hold a drain for as
+    /// long as they run, so an upgrade never cuts them off; background
+    /// process groups only for its grace, since a drain refuses input
+    /// meanwhile and a server left running would hold it forever. Every
+    /// entry is durable when written, so exiting is all a drain needs.
     ///
     /// It sleeps until the next deadline or until [`Daemon::pulse`] says
     /// something changed (a client came or went, a session's work began or
@@ -1002,8 +1007,6 @@ impl Daemon {
     async fn supervise(&self, life: &Lifecycle, config: &Config, exit: Exit, idling: &Idling) {
         // When the daemon last became idle.
         let mut since: Option<Instant> = None;
-        // When a drain out of grace stopped the calls still running.
-        let mut stopped: Option<Instant> = None;
         let mut awake: Option<Option<sys::Awake>> = None;
         let pressure = Arc::new(rt::Notify::new());
         // Reclamation runs only at the top of the loop; reading the count
@@ -1038,19 +1041,14 @@ impl Daemon {
             }
             let mut next = self.next_hibernation(config.hibernate, now);
             if let Some(began) = draining {
-                if now >= began + config.drain && stopped.is_none() {
-                    for session in self.loaded() {
-                        session.interrupt();
-                    }
-                    stopped = Some(now);
-                }
-                // A stopped call gets the time its processes have to go
-                // and its outcome to commit.
-                let settled = stopped.map(|at| at + KILL_GRACE * 2);
-                if !self.has_work() || settled.is_some_and(|at| now >= at) {
+                let jobs = self.loaded().iter().any(|s| s.has_jobs());
+                let graced = now >= began + config.drain;
+                if !self.has_work() && (!jobs || graced) {
                     exit.now(self, Stop::Upgrade).await;
                 }
-                next = Some(earliest(next, settled.unwrap_or(began + config.drain)));
+                if !graced {
+                    next = Some(earliest(next, began + config.drain));
+                }
             } else if self.idle() {
                 match idling.next(*since.get_or_insert(now), config.idle, now) {
                     Idle::Exit => exit.now(self, Stop::Idle).await,

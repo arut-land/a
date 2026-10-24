@@ -47,9 +47,19 @@ pub enum ContextValue {
     /// A message another session sent, waiting to be taken up.
     Inbox(Envelope),
     Taken(Seq),
+    /// Taken into the result of a call, read with it.
+    Into(Seq, CallId),
+    Withdrawn(Seq),
     Assistant(String),
     Context(String, Option<Publication>),
+    /// A queued child result.
     Child(Outcome),
+    /// The call's result is a placeholder: it went on in the background.
+    Detached(CallId),
+    /// A queued outcome of a call that went on in the background.
+    Background(CallId, Outcome),
+    /// A queued end of a process group call `call` left to the session.
+    Job(CallId, String),
     Reply(Json),
     ToolCall(String, String),
     ToolResult(CallId, Outcome),

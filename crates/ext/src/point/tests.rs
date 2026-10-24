@@ -78,6 +78,7 @@ macro_rules! every_point {
             Reply,
             Resume,
             Step,
+            Dequeue,
             PresentResult
         )
     };
@@ -100,6 +101,7 @@ const TABLE: &[(&str, Merge)] = &[
     ("reply", Merge::Chain),
     ("resume", Merge::FirstSome),
     ("step", Merge::Chain),
+    ("dequeue", Merge::FirstSome),
     ("present_result", Merge::Chain),
 ];
 
@@ -279,6 +281,7 @@ fn every_point_declares_its_failure_policy() {
         ("reply", FailOpen),
         ("resume", FailOpen),
         ("step", FailOpen),
+        ("dequeue", FailOpen),
         ("present_result", FailOpen),
     ];
     assert_eq!(declared, want);

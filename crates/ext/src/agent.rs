@@ -40,6 +40,12 @@ pub enum Input {
         watch: Seq,
         outcome: Outcome,
     },
+    /// Call `call`, detached into the background, ended with `outcome`,
+    /// taken up as a turn ended: it starts one, as a child's result does.
+    Detached {
+        call: CallId,
+        outcome: Outcome,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]

@@ -55,6 +55,7 @@ transport (lib.rs, remote.rs)      Daemon { endpoint: Local(Home) | Ssh(host), s
   numbered `ClientMsg`s, kept until the daemon's ack; a message sent while
   reconnecting goes out once the connection is up again. `offer()` refuses
   with a typed `Notice` unless attached. Each intent (`input`, `steer`,
+  `force_steer`, `withdraw(seq)` of the user's queued input,
   `interrupt`, `approve(call)`, `refresh_env`) is accepted only when the
   turn takes it, otherwise returning a `Notice` saying why. `run(Cmd)`
   goes through the same offers and shows the notice. Cancellation has room beyond the normal mutation

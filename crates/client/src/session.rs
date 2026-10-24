@@ -196,6 +196,8 @@ pub enum Notice {
     NothingRunning,
     /// An answer for a call that is not waiting for one.
     NotAsking(CallId),
+    /// A withdrawal of input that is not the user's queued input.
+    NotQueued(protocol::Seq),
     /// `/env refresh` on a remote daemon, whose environment is its
     /// bridge's.
     RemoteEnv,
@@ -213,6 +215,7 @@ impl fmt::Display for Notice {
             }
             Self::NothingRunning => f.write_str("nothing is running"),
             Self::NotAsking(call) => write!(f, "call {call} is not waiting for an answer"),
+            Self::NotQueued(input) => write!(f, "input {input} is not queued"),
             Self::RemoteEnv => f.write_str(
                 "the host's environment is captured when `a` connects; reattach to refresh it",
             ),
@@ -646,6 +649,34 @@ impl Offer<'_> {
         self.send(ClientMsg::Input {
             segments: segments.into(),
             mode: Mode::Steer,
+            force: false,
+            client_seq: None,
+        })
+    }
+
+    /// Input for the running turn now: its model call is cut short and
+    /// the calls that can go on in the background do.
+    pub fn force_steer(self, segments: impl Into<Segments>) -> Result<Vec<Effect>, Notice> {
+        self.running()?;
+        self.send(ClientMsg::Input {
+            segments: segments.into(),
+            mode: Mode::Steer,
+            force: true,
+            client_seq: None,
+        })
+    }
+
+    /// Takes back the user's queued input `input`, as the queue shows it
+    /// ([`protocol::view::ViewState::queued`]); an edit sends the new text
+    /// after. The daemon refuses it once the input was taken up.
+    pub fn withdraw(self, input: protocol::Seq) -> Result<Vec<Effect>, Notice> {
+        self.view()?;
+        let queued = (self.0.view.state.queued()).any(|q| q.seq == input && q.source.visible());
+        if !queued {
+            return Err(Notice::NotQueued(input));
+        }
+        self.send(ClientMsg::Withdraw {
+            input,
             client_seq: None,
         })
     }
@@ -728,7 +759,10 @@ impl Offer<'_> {
 pub(crate) const fn is_mutation(msg: &ClientMsg) -> bool {
     matches!(
         msg,
-        ClientMsg::Input { .. } | ClientMsg::Approve { .. } | ClientMsg::Interrupt { .. }
+        ClientMsg::Input { .. }
+            | ClientMsg::Withdraw { .. }
+            | ClientMsg::Approve { .. }
+            | ClientMsg::Interrupt { .. }
     )
 }
 
@@ -860,6 +894,7 @@ mod tests {
                     mode: Mode::Queue,
                     taken: true,
                     origin: None,
+                    force: false,
                 },
             )),
         ));

@@ -279,6 +279,7 @@ mod tests {
                         mode: Mode::Queue,
                         taken: true,
                         origin: Some(id),
+                        force: false,
                     },
                 ),
                 Entry::new(

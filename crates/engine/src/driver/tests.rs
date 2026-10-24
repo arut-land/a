@@ -50,6 +50,7 @@ fn user(text: &str) -> Body {
         mode: Mode::Queue,
         taken: true,
         origin: None,
+        force: false,
     }
 }
 
@@ -60,6 +61,7 @@ fn queued(text: &str) -> Body {
         mode: Mode::Queue,
         taken: false,
         origin: None,
+        force: false,
     }
 }
 
@@ -407,6 +409,7 @@ impl Live {
         let steer = Request::Input {
             segments: text.into(),
             mode: Mode::Steer,
+            force: false,
         };
         rt::block_on(self.request(steer, None))
     }
@@ -882,9 +885,13 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
             &bodies(&log)[1..],
             [
                 Body::Fired { watch, outcome },
+                Body::Enqueue { envelope },
+                Body::Take { input, into: None },
                 Body::ModelCall { .. },
                 Body::ModelResult { r#for: None, failure: None, call, outcome: Outcome::Done { .. } },
-            ] if (watch.get(), call.get()) == (1, 3) && *outcome == found
+            ] if (watch.get(), input.get(), call.get()) == (1, 3, 5)
+                && *outcome == found
+                && envelope.source() == protocol::Source::Child(*watch)
         ),
         "{log:#?}"
     );
@@ -894,12 +901,23 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
         "{input}"
     );
 
-    // Stopped after the watch fired, recovery takes the same step.
+    // Stopped after the watch fired, before its result was queued,
+    // recovery queues it and takes the same step, in a session of its own.
     let script = Script::new(&replies[1..]);
     let resumed = fixture(&script).start(&log[..2]);
     let got = log_of(&resumed);
     resumed.halt();
-    assert_eq!(facts(&got), facts(&log));
+    let own = |log: &[Entry]| {
+        let mut log = log.to_vec();
+        for e in &mut log {
+            if let Body::Enqueue { envelope } = &mut e.body {
+                envelope.id.sender = SessionId::NIL;
+                envelope.destination = SessionId::NIL;
+            }
+        }
+        log
+    };
+    assert_eq!(facts(&own(&got)), facts(&own(&log)));
     assert_eq!(script.sent(), sent);
 }
 
@@ -1183,6 +1201,7 @@ fn an_interrupt_in_the_burst_that_approves_a_call_stops_it() {
         Request::Input {
             segments: "then".into(),
             mode: Mode::Queue,
+            force: false,
         },
         None,
     );
@@ -1595,6 +1614,36 @@ fn background_processes_keep_the_session_and_end_with_it() {
     assert!(!sys::RecordedIdentity(pgid).alive());
 }
 
+#[test]
+fn a_background_jobs_end_reaches_the_agent_on_the_queue_once() {
+    let registry = echoing(&Policy::default()).with(&Extras).unwrap();
+    let fixture = Fixture::new(ext_fixtures::ECHO, registry, openai(&Script::new(&[])));
+    let session = fixture.start(&[]);
+    session.submit("$ exit 3").unwrap();
+    let log = until(&session, "the job's end was taken up", |log| {
+        log.iter().any(
+            |e| matches!(&e.body, Body::Assistant { text } if text.starts_with("[background job")),
+        )
+    });
+    settle(&session);
+    let log = log_of(&session).into_iter().chain(log).collect::<Vec<_>>();
+    session.halt();
+    let call = (log.iter())
+        .find_map(|e| matches!(e.body, Body::ToolCall { .. }).then_some(CallId(e.seq)))
+        .unwrap();
+    let ends: std::collections::BTreeSet<_> = (log.iter())
+        .filter_map(|e| match &e.body {
+            Body::Enqueue { envelope } => {
+                assert_eq!(envelope.source(), protocol::Source::Job(call));
+                assert_eq!(envelope.id.purpose, protocol::EnvelopeId::JOB);
+                Some(e.seq)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends.len(), 1, "{log:#?}");
+}
+
 /// `lookup_harbor_label`, held until released or the turn is interrupted.
 struct Held(Arc<Flag>);
 
@@ -1623,6 +1672,89 @@ impl Extension for HeldHarbor {
     fn contribute(&self, r: &mut Registrar) {
         r.tool(Held(Arc::clone(&self.0)));
     }
+}
+
+/// `held`: like [`Held`], but it may go on in the background.
+struct Background(Arc<Flag>);
+
+impl Tool for Background {
+    type In = Nothing;
+    type Out = String;
+
+    const NAME: &'static str = "held";
+    const DESCRIPTION: &'static str = "Waits until released.";
+    const DETACH: ext::Detach = ext::Detach::Background;
+
+    async fn call(&self, _: &Nothing, cx: &Cx) -> Result<String, String> {
+        match unless(&cx.cancel, self.0.wait()).await {
+            Some(()) => Ok("released".into()),
+            None => Err("stopped".into()),
+        }
+    }
+}
+
+impl Extension for Background {
+    const NAME: &'static str = "held";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(Self(Arc::clone(&self.0)));
+    }
+}
+
+#[test]
+fn a_forced_steer_detaches_a_running_call_whose_outcome_comes_back_on_the_queue() {
+    let release = Arc::new(Flag::default());
+    let tools = Registry::default()
+        .with(&Background(Arc::clone(&release)))
+        .unwrap();
+    let fixture = Fixture::new(ext_fixtures::ECHO, tools, openai(&Script::new(&[])));
+    let session = fixture.start(&[]);
+    session.submit("call held {}").unwrap();
+    until(&session, "called the tool", tool_running);
+    let force = Request::Input {
+        segments: "now".into(),
+        mode: Mode::Steer,
+        force: true,
+    };
+    rt::block_on(session.request(force, None)).unwrap();
+    let log = until(&session, "the steer was taken up", |log| {
+        log.iter()
+            .any(|e| e.body == Body::Assistant { text: "now".into() })
+    });
+    let call = (log.iter())
+        .find_map(|e| matches!(e.body, Body::ToolCall { .. }).then_some(CallId(e.seq)))
+        .unwrap();
+    assert!(
+        log.iter().any(|e| e.body == Body::Detached { call }),
+        "{log:#?}"
+    );
+    assert!(log.iter().any(|e| matches!(&e.body,
+        Body::ToolResult { call: c, outcome, .. } if *c == call && *outcome == protocol::OutputStream { call }.placeholder())));
+    // The call in the background keeps the session working.
+    assert!(session.has_work());
+    release.set();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    let back = (log.iter())
+        .find_map(|e| match &e.body {
+            Body::Enqueue { envelope } if envelope.id.purpose == protocol::EnvelopeId::DETACHED => {
+                Outcome::from_payload(&envelope.payload)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        back,
+        Outcome::Done {
+            output: Json::encode("released").unwrap()
+        }
+    );
+    let results = (log.iter())
+        .filter(|e| matches!(e.body, Body::ToolResult { .. }))
+        .count();
+    assert_eq!(results, 1, "the call has the one result: {log:#?}");
 }
 
 fn tool_running(log: &[Entry]) -> bool {
@@ -1661,10 +1793,10 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
             &after_tool[..],
             [
                 Body::ToolResult { .. },
-                Body::Take { input: steered },
+                Body::Take { input: steered, .. },
                 Body::ModelCall { .. },
                 Body::ModelResult { .. },
-                Body::Take { input: then },
+                Body::Take { input: then, .. },
                 ..
             ] if steered.get() == 5 && then.get() == 6
         ),
@@ -2094,6 +2226,7 @@ fn one_fsync_per_burst() {
             mode: Mode::Queue,
             origin: None,
             ticket: None,
+            force: false,
         };
         session.send(Msg::Step(input));
     };
