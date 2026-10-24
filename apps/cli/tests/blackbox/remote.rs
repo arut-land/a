@@ -1,4 +1,4 @@
-//! `a bridge` and `a --host`, with ssh and scp simulated by scripts that run
+//! `a bridge` and `a --host`, with ssh simulated by scripts that run
 //! the "remote" command locally under a home of its own.
 
 use std::fs;
@@ -61,29 +61,30 @@ fn bridge_speaks_the_protocol_over_stdio() {
     assert!(child.wait().unwrap().success());
 }
 
-/// Fake `ssh` and `scp`: the remote is `<root>/remote`, with its own `HOME`
+/// Fake `ssh`: the remote has a literal path containing shell metacharacters,
+/// its own `HOME`
 /// and no `a` on its `PATH`, so the first connection installs this build.
 /// Returns `a --host box` for the test's own (local) home, and the host's.
 fn fake_remote(env: &mut Env, uname: &str) -> (Command, Home) {
-    let remote = env.root.join("remote");
+    let remote = env.root.join("remote space 'quote' $(touch injected)");
     let host = env.other_home(remote.join(".a"));
+    let quote =
+        |path: &std::path::Path| format!("'{}'", path.to_str().unwrap().replace('\'', r"'\''"));
     let ssh = env.script(
         "ssh",
         &format!(
             r#"shift
-echo "$*" >> '{log}'
+printf '%s\n' "$*" >> {log}
 [ "$*" = "uname -sm" ] && [ -n '{uname}' ] && {{ echo '{uname}'; exit; }}
-cd '{remote}' && exec env A_HOME='{remote}/.a' HOME='{remote}' PATH=/usr/bin:/bin sh -c "$*"
+cd {remote} && exec env A_HOME={home} HOME={remote} PATH=/usr/bin:/bin sh -c "$*"
 "#,
-            log = env.root.join("ssh.log").display(),
-            remote = remote.display(),
+            log = quote(&env.root.join("ssh.log")),
+            remote = quote(&remote),
+            home = quote(host.root()),
         ),
     );
-    let scp = env.script("scp", r#"cp "$2" "${3#*:}""#);
     let mut cmd = env.cmd(&["--host", "box"]);
-    cmd.env("A_SSH", ssh)
-        .env("A_SCP", scp)
-        .env("PATH", "/usr/bin:/bin");
+    cmd.env("A_SSH", ssh).env("PATH", "/usr/bin:/bin");
     (cmd, host)
 }
 
@@ -118,7 +119,7 @@ fn workspace_and_env(text: &str) -> (String, protocol::Environment) {
 }
 
 #[test]
-fn a_host_without_a_gets_this_build_installed() {
+fn a_remote_upload_preserves_bytes_under_literal_paths() {
     let mut env = Env::new("install");
     let (mut new, host) = fake_remote(&mut env, "");
     let session = ok(&new.arg("new").output().unwrap());

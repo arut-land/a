@@ -943,6 +943,7 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    home.prepare_temporary_dir()?;
     home.daemon_env(&mut cmd);
     let mut daemon = sys::spawn_daemon(&mut cmd, home, lock)?;
     thread::spawn(move || daemon.wait());

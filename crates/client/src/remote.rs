@@ -1,5 +1,5 @@
-//! `ssh <host> a bridge` with the system `ssh` (`A_SSH` overrides it, and
-//! `A_SCP` overrides `scp`). Installs this build on a host that lacks `a`.
+//! `ssh <host> a bridge` with the system `ssh` (`A_SSH` overrides it).
+//! Installs this build on a host that lacks `a`, streaming its bytes over SSH.
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader};
@@ -136,26 +136,29 @@ pub(crate) fn install(host: &str, staged: &Staged) -> io::Result<()> {
     let dir = dir.strip_suffix('\n').ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "ssh: missing runtime directory")
     })?;
-    let mut scp = command("A_SCP", "scp");
-    scp.arg("-q")
-        .arg(&staged.exe)
-        .arg(format!("{host}:{dir}/a"));
-    run(&mut scp)
-}
-
-fn run(command: &mut Command) -> io::Result<()> {
-    let status = command.stdin(Stdio::null()).status()?;
+    let upload = format!(
+        "{} -- '{}'",
+        sh(r#"set -eu
+umask 077
+target=$1
+tmp=$(mktemp "$target.tmp.XXXXXXXXXX")
+trap 'rm -f "$tmp"' 0
+trap 'exit 1' HUP INT TERM
+cat > "$tmp"
+chmod 700 "$tmp"
+mv -f "$tmp" "$target""#),
+        format!("{dir}/a").replace('\'', r"'\''")
+    );
+    let status = command("A_SSH", "ssh")
+        .arg(host)
+        .arg(upload)
+        .stdin(std::fs::File::open(&staged.exe)?)
+        .status()?;
     if status.success() {
         Ok(())
     } else {
-        // The command line as typed, not std's Debug of a whole Command.
-        let line: Vec<_> = std::iter::once(command.get_program())
-            .chain(command.get_args())
-            .map(|word| word.to_string_lossy())
-            .collect();
         Err(io::Error::other(format!(
-            "`{}` failed: {status}",
-            line.join(" ")
+            "ssh {host}: upload failed: {status}"
         )))
     }
 }

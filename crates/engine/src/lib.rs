@@ -1191,6 +1191,7 @@ pub fn serve(
     build: &str,
     start: Start,
 ) -> io::Result<()> {
+    sys::shell::ExecutionFacts::initialize(home)?;
     let runtime = Arc::new(rt::Threads::default());
     let result = run(listener, home, config, build, start, &runtime);
     if let Err(error) = &result {

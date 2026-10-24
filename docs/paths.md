@@ -58,6 +58,11 @@ backend's private runtime directory, so arbitrarily long isolated roots work;
 its discovery record stays under the isolated root. No native directory is
 created for isolated storage. Tests stop only their own isolated daemon.
 
+Daemon startup creates the resolved temporary directory privately. Launch passes
+it as `TMPDIR`, and as `TMP` and `TEMP` on Windows. Cached shell facts use that
+same directory, including foreground starts; tool environments override attaching
+clients' temporary-directory values with it.
+
 Daemon launch preserves the selected layout through its cleared environment:
 isolated instances pass `A_HOME`; native instances pass the resolved XDG bases
 on Linux, preserve the resolved home on macOS, and use Known Folder lookup on
@@ -68,7 +73,10 @@ state root. SSH discovery selects `sys::RemoteLayout` from the remote host's
 platform inside the SSH call, including that host's `A_HOME` or XDG overrides.
 It can find an installed remote build across client platforms; copying this
 build still requires a matching remote platform. Sync and async launch use
-the same layout scripts.
+the same layout scripts. Uploads stream binary bytes through SSH stdin to a
+private temporary file beside the destination, then publish it with a rename.
+The destination is a quoted positional argument, preserving spaces, apostrophes
+and shell metacharacters in native or overridden roots.
 There is no migration from older layouts.
 
 Executable staging remains `data/runtime` and retains its existing publication

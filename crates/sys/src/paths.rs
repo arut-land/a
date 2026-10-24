@@ -124,6 +124,12 @@ impl Paths {
         &self.inner.temporary
     }
 
+    /// Prepare the daemon's temporary storage before any child can use it.
+    pub fn prepare_temporary_dir(&self) -> io::Result<PathBuf> {
+        crate::fs::private_dir(self.temporary_dir())?;
+        Ok(self.temporary_dir().to_owned())
+    }
+
     /// IPC, never executable staging or retained output.
     pub fn runtime_dir(&self) -> &Path {
         &self.inner.runtime
@@ -131,6 +137,11 @@ impl Paths {
 
     /// Preserve directory purposes across the daemon's cleared environment.
     pub fn daemon_env(&self, command: &mut Command) {
+        command.env("TMPDIR", self.temporary_dir());
+        #[cfg(windows)]
+        command
+            .env("TMP", self.temporary_dir())
+            .env("TEMP", self.temporary_dir());
         match &self.inner.layout {
             InstallLayout::Isolated(root) => {
                 command.env("A_HOME", root);
