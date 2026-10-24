@@ -2,6 +2,7 @@ import ServiceManagement
 import SwiftUI
 
 struct ActivationSettings: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var status = SMAppService.agent(plistName: "dev.a.daemon.plist").status
     @State private var busy = false
     @State private var problem: String?
@@ -19,6 +20,9 @@ struct ActivationSettings: View {
                 }
             }
             .disabled(busy)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { status = service.status }
         }
         if status == .requiresApproval {
             Button("Open Login Items Settings") { SMAppService.openSystemSettingsLoginItems() }
