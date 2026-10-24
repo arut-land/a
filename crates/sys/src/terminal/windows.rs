@@ -165,7 +165,7 @@ impl InputReader {
                 return Ok(Input::Signals(signals));
             }
             if self.open && !self.control.paused() {
-                self.drain(buf.len())?;
+                self.drain()?;
             }
             if std::mem::take(&mut self.resized) {
                 return Ok(Input::Signals(vec![Signal::Resize]));
@@ -175,8 +175,7 @@ impl InputReader {
                 for byte in &mut buf[..len] {
                     *byte = self.pending.pop_front().unwrap();
                 }
-                let more = !self.pending.is_empty()
-                    || (self.open && !self.control.paused() && self.available()? != 0);
+                let more = !self.pending.is_empty();
                 return Ok(Input::Bytes { len, more });
             }
             let stdin = io::stdin();
@@ -215,9 +214,9 @@ impl InputReader {
         Ok(count)
     }
 
-    fn drain(&mut self, capacity: usize) -> io::Result<()> {
+    fn drain(&mut self) -> io::Result<()> {
         let mut available = self.available()?;
-        while self.pending.len() < capacity && available != 0 {
+        while available != 0 {
             let mut records = [INPUT_RECORD::default(); 128];
             let mut count = 0;
             // SAFETY: initialized writable records/count and a console handle.
