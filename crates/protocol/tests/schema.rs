@@ -74,7 +74,7 @@ fn a_log_replays_byte_identically() {
         );
         let frame = Frame::from_line(entry.seq.get(), &line).unwrap();
         assert_eq!(frame.as_bytes(), Frame::entry(&entry).unwrap().as_bytes());
-        let DaemonMsg::Entry(read) = DaemonMsg::from_json(&frame.as_bytes()[4..]).unwrap() else {
+        let DaemonMsg::Entry(read) = DaemonMsg::from_json(frame.body()).unwrap() else {
             panic!("{}", String::from_utf8_lossy(&line));
         };
         assert_eq!(read, entry);
@@ -117,7 +117,7 @@ fn a_payload_is_never_parsed_on_the_wire_path() {
     ];
     for (line, payload) in lines.iter().zip(payloads) {
         let frame = Frame::from_line(1, line).unwrap();
-        let DaemonMsg::Entry(entry) = DaemonMsg::from_json(&frame.as_bytes()[4..]).unwrap() else {
+        let DaemonMsg::Entry(entry) = DaemonMsg::from_json(frame.body()).unwrap() else {
             panic!();
         };
         let encoded = Frame::entry(&entry).unwrap();

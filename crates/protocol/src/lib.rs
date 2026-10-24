@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 25;
+pub const PROTO: u32 = 26;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 25;
+pub const PROTO_MIN: u32 = 26;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -71,12 +71,38 @@ impl Write for EncodeTarget<'_> {
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
+/// What a frame's body is, in the byte after its length: a reader refuses
+/// a kind it does not know, so binary frames (a blob's chunks) can follow
+/// without going through base64.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameKind {
+    Json = 0,
+}
+
+impl FrameKind {
+    fn of(byte: u8) -> io::Result<Self> {
+        match byte {
+            0 => Ok(Self::Json),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown frame kind {byte}"),
+            )),
+        }
+    }
+}
+
+/// The length, then the kind.
+const HEADER: usize = 5;
+
+pub mod blob;
 #[macro_use]
 mod decode;
 pub mod ledger;
 pub mod publication;
 pub mod view;
 
+pub use blob::{BlobId, BlobOrigin, BlobRef, Payload};
 pub use json::Json;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1543,8 +1569,8 @@ pub enum Class {
     Control,
 }
 
-/// Writes one frame: a little-endian u32 length followed by a JSON body,
-/// in one write.
+/// Writes one frame in one write: a little-endian u32 length of what
+/// follows, the [`FrameKind`] byte, then the JSON body.
 pub fn write_frame<T: Serialize>(w: &mut (impl Write + ?Sized), msg: &T) -> io::Result<()> {
     let mut bytes = Frame::start();
     serde_json::to_writer(
@@ -1559,7 +1585,8 @@ pub fn write_frame<T: Serialize>(w: &mut (impl Write + ?Sized), msg: &T) -> io::
     w.flush()
 }
 
-/// Fills in the length of the frame `bytes` holds after its first four.
+/// Fills in the length of the frame `bytes` holds after its first four,
+/// the kind byte included.
 fn prefix(bytes: &mut [u8]) -> io::Result<()> {
     let len = u32::try_from(bytes.len() - 4)
         .ok()
@@ -1619,11 +1646,11 @@ impl Frame {
         Self::finish(bytes, Some(entry.seq.get()), entry.body.class())
     }
 
-    /// Room for the length, and as much again as `serde_json::to_vec`
-    /// starts with.
+    /// Room for the header of a JSON frame, and as much again as
+    /// `serde_json::to_vec` starts with.
     fn start() -> Vec<u8> {
         let mut bytes = Vec::with_capacity(132);
-        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&[0, 0, 0, 0, FrameKind::Json as u8]);
         bytes
     }
 
@@ -1641,6 +1668,11 @@ impl Frame {
         &self.bytes
     }
 
+    /// The JSON the frame carries, past its header.
+    pub fn body(&self) -> &[u8] {
+        &self.bytes[HEADER..]
+    }
+
     /// Entry `seq`'s frame from the line a log stores for it, newline
     /// excluded: the bytes encoded at commit, tagged, not encoded again.
     pub fn from_line(seq: u64, line: &[u8]) -> io::Result<Self> {
@@ -1648,8 +1680,8 @@ impl Frame {
         let fields = line
             .strip_prefix(b"{")
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not an entry's line"))?;
-        let mut bytes = Vec::with_capacity(4 + TAG.len() + fields.len());
-        bytes.extend_from_slice(&[0; 4]);
+        let mut bytes = Vec::with_capacity(HEADER + TAG.len() + fields.len());
+        bytes.extend_from_slice(&[0, 0, 0, 0, FrameKind::Json as u8]);
         bytes.extend_from_slice(TAG);
         bytes.extend_from_slice(fields);
         // Every entry kind is durable so far; see `entry_class`.
@@ -1690,21 +1722,37 @@ pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
 }
 
 /// The frame `buf` starts with, once it holds all of it: its length,
-/// prefix included, and its body. For a reader that never blocks: it reads
-/// what is there and asks again.
+/// header included, and its JSON body. For a reader that never blocks: it
+/// reads what is there and asks again.
 pub fn frame_in(buf: &[u8]) -> io::Result<Option<(usize, &[u8])>> {
     let Some(&[a, b, c, d]) = buf.get(..4) else {
         return Ok(None);
     };
-    let len = u32::from_le_bytes([a, b, c, d]);
+    let len = length(u32::from_le_bytes([a, b, c, d]))?;
+    let end = 4 + len;
+    let Some(frame) = buf.get(4..end) else {
+        return Ok(None);
+    };
+    FrameKind::of(frame[0])?;
+    Ok(Some((end, &frame[1..])))
+}
+
+/// What a length prefix says follows it: a kind byte at least, and no
+/// more than [`MAX_FRAME`].
+fn length(len: u32) -> io::Result<usize> {
     if len > MAX_FRAME {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "frame too large",
         ));
     }
-    let end = 4 + len as usize;
-    Ok(buf.get(4..end).map(|body| (end, body)))
+    if len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame without a kind",
+        ));
+    }
+    Ok(len as usize)
 }
 
 /// The body of the next frame, read once for every type and stream.
@@ -1715,18 +1763,16 @@ fn read_body(r: &mut dyn Read) -> io::Result<Option<Vec<u8>>> {
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    let len = u32::from_le_bytes(len);
-    if len > MAX_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too large",
-        ));
-    }
+    let len = length(u32::from_le_bytes(len))?;
+    let mut kind = [0];
+    r.read_exact(&mut kind)?;
+    FrameKind::of(kind[0])?;
+    let len = len - 1;
     // Grown as the bytes arrive, so a length alone allocates no more than
     // the peer goes on to send.
-    let mut body = Vec::with_capacity((len as usize).min(64 * 1024));
-    r.take(u64::from(len)).read_to_end(&mut body)?;
-    if body.len() < len as usize {
+    let mut body = Vec::with_capacity(len.min(64 * 1024));
+    r.take(len as u64).read_to_end(&mut body)?;
+    if body.len() < len {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
     Ok(Some(body))
@@ -1768,7 +1814,7 @@ mod tests {
         assert_eq!(before, after);
         assert_eq!(
             msg.retained_bytes(),
-            size_of::<ClientMsg>() + after.len() - 4 + 34
+            size_of::<ClientMsg>() + after.len() - HEADER + 34
         );
         let msg = DaemonMsg::Error {
             message: "\"\n雪".into(),
@@ -1776,7 +1822,7 @@ mod tests {
         let frame = Frame::new(&msg).unwrap();
         assert_eq!(
             msg.retained_bytes(),
-            size_of::<DaemonMsg>() + frame.as_bytes().len() - 4
+            size_of::<DaemonMsg>() + frame.body().len()
         );
         let mut text = String::with_capacity(8192);
         text.push('x');
@@ -1842,11 +1888,32 @@ mod tests {
             }
         }
         let mut claim = MAX_FRAME.to_le_bytes().to_vec();
+        claim.push(FrameKind::Json as u8);
         claim.extend_from_slice(br#"{"t":"list"}"#);
         let mut r = Counted(&claim, 0);
         let err = read_frame::<ClientMsg>(&mut r).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert!(r.1 <= 128 * 1024, "asked for {} bytes at once", r.1);
+    }
+
+    /// Only the kinds this build knows are read: a binary frame from a
+    /// newer peer is refused, never parsed as JSON.
+    #[test]
+    fn a_frame_of_an_unknown_kind_is_refused() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &ClientMsg::Detach).unwrap();
+        assert_eq!(buf[4], FrameKind::Json as u8);
+        assert_eq!(frame_in(&buf).unwrap().map(|(end, _)| end), Some(buf.len()));
+        buf[4] = 1;
+        for err in [
+            frame_in(&buf).unwrap_err(),
+            read_frame::<ClientMsg>(&mut buf.as_slice()).unwrap_err(),
+        ] {
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        }
+        let empty = 0u32.to_le_bytes();
+        assert!(frame_in(&empty).is_err());
+        assert!(read_frame::<ClientMsg>(&mut empty.as_slice()).is_err());
     }
 
     #[test]
@@ -2182,7 +2249,7 @@ mod tests {
         }
         let frame =
             Frame::entry(&Entry::from_json(br#"{"seq":4,"epoch":2,"kind":"newer"}"#).unwrap());
-        let msg = DaemonMsg::from_json(&frame.unwrap().as_bytes()[4..]).unwrap();
+        let msg = DaemonMsg::from_json(frame.unwrap().body()).unwrap();
         assert!(
             matches!(msg, DaemonMsg::Unknown { seq: Some(4) }),
             "{msg:?}"

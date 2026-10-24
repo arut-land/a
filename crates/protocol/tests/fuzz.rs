@@ -124,7 +124,8 @@ fn view_reducer() {
             for (json, msg) in &msgs {
                 direct.fold(msg);
                 // As a daemon sends it, unknown kinds included.
-                wire.extend(u32::try_from(json.len()).unwrap().to_le_bytes());
+                wire.extend(u32::try_from(json.len() + 1).unwrap().to_le_bytes());
+                wire.push(protocol::FrameKind::Json as u8);
                 wire.extend(json);
             }
             let mut framed = SessionView::default();
