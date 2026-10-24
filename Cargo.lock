@@ -2090,6 +2090,7 @@ dependencies = [
  "libloading",
  "object",
  "oslog",
+ "rt",
  "rustix",
  "serde",
  "serde_json",

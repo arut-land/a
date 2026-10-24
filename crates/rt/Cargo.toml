@@ -14,7 +14,6 @@ watch = ["dep:notify"]
 [dependencies]
 # Already linked by async-io; producer wake never waits on registration.
 atomic-waker = "1"
-notify = { version = "8", optional = true }
 # Scheduler state must outlive wakes racing executor destruction (upstream #164).
 async-executor = { git = "https://github.com/smol-rs/async-executor", rev = "96a1f6a19ceb828c8eb8a10cb4b40daefdbdb945", optional = true }
 # The reactor and timers: one thread waiting
@@ -25,6 +24,7 @@ futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-lite = { version = "2", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
+notify = { version = "8", optional = true }
 rustix.workspace = true
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]

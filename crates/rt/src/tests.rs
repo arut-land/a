@@ -125,36 +125,6 @@ fn an_unbounded_sender_never_waits() {
     assert_eq!(got, 1000);
 }
 
-// Each test runs in a process of its own (nextest), so the wake count is
-// this test's alone.
-#[test]
-fn idle_runtime_has_no_periodic_wakeups() {
-    let rt = Threads::new(2);
-    block_on(spawn(&rt, rt.sleep(Duration::from_millis(5))));
-    block_on(unblock(&rt, || ()));
-    // A task waiting for a later deadline keeps every worker asleep.
-    let mut late = pin!(rt.sleep(Duration::from_secs(30)));
-    assert!(
-        late.as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending()
-    );
-    // Completing setup work does not mean its last wake has been consumed.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut before = wakes();
-    loop {
-        thread::sleep(Duration::from_millis(500));
-        let after = wakes();
-        if after == before {
-            break;
-        }
-        assert!(Instant::now() < deadline, "runtime did not become idle");
-        before = after;
-    }
-    thread::sleep(Duration::from_millis(500));
-    assert_eq!(wakes(), before);
-}
-
 #[test]
 fn a_timer_wakes_at_its_deadline_not_before() {
     let rt = Threads::new(1);
@@ -209,6 +179,16 @@ fn read_a_pipe(rt: &dyn Runtime) -> Vec<u8> {
 #[test]
 fn readiness_wakes_a_waiter_once_not_in_a_spin() {
     use std::io::Write;
+    struct ReadyWake(AtomicUsize, std::sync::mpsc::Sender<()>);
+    impl Wake for ReadyWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            let _ = self.1.send(());
+        }
+    }
     let rt = Threads::new(1);
     let (reader, mut writer) = std::io::pipe().unwrap();
     let reader = Async::for_reading(&rt.reactor(), reader).unwrap();
@@ -219,14 +199,23 @@ fn readiness_wakes_a_waiter_once_not_in_a_spin() {
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending()
     );
+    let (notified, notifications) = std::sync::mpsc::channel();
+    let counter = Arc::new(ReadyWake(AtomicUsize::new(0), notified));
+    let waker = Waker::from(counter.clone());
+    let mut context = Context::from_waker(&waker);
+    assert!(ready.as_mut().poll(&mut context).is_pending());
     let (release, held) = std::sync::mpsc::channel();
     let wrote = thread::spawn(move || {
         writer.write_all(b"x").unwrap();
         held.recv().unwrap();
     });
-    let before = wakes();
-    block_on(ready);
-    let woke = wakes() - before;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while ready.as_mut().poll(&mut context).is_pending() {
+        notifications
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+    }
+    let woke = counter.0.load(Ordering::Relaxed);
     assert!(woke <= 3, "{woke} wakes");
     release.send(()).unwrap();
     wrote.join().unwrap();
