@@ -83,11 +83,8 @@ impl App {
             Some(at) => at,
             None => self.bottom_start(width, body),
         };
-        if self.viewport == Viewport::Inline
-            && !self.verbose
-            && (i, row) < (self.committed, self.committed_row)
-        {
-            (i, row) = (self.committed, self.committed_row);
+        if self.viewport == Viewport::Inline && !self.verbose && i < self.committed {
+            (i, row) = (self.committed, 0);
         }
         let mut out = Vec::with_capacity(body);
         while out.len() < body && i < self.client.view().items.len() {

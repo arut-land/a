@@ -222,8 +222,9 @@ crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
   the screen at the bottom) and moving back up; settled items are printed
   from its top with `\r\n`, so they scroll into the terminal's own
   scrollback, and the viewport is drawn whole under them. A resize or
-  Ctrl-L draws it whole from its top. Settled items are committed only after
-  the frame's output succeeds; cancellation leaves them available to redraw.
+  Ctrl-L draws it whole from its top. A write cut short keeps the scrollback
+  lines the terminal did not accept and prints them first in the next frame,
+  at any width, and resumes the viewport from the row the cursor reached.
 - Rows are wrapped lazily and cached per item and width: a frame wraps only
   what it shows, counted from the bottom or from the scroll anchor (an item
   and a row, which stays put as output arrives below). A 6000-item session

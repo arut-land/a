@@ -40,12 +40,14 @@ pub struct Screen<W = Stdout> {
     /// Draw the next frame whole: the first, after a resize, Ctrl-L, or
     /// (inline) when the viewport moved or changed size.
     stale: bool,
-    /// Where each of this frame's scrollback lines ends in `bytes`. A line
-    /// the terminal accepted whole is printed even if the rest of the frame
-    /// is not; the next frame overwrites a partial one.
+    /// Inline: scrollback lines taken from the app but not yet accepted
+    /// by the terminal, printed first by the next frame at whatever width
+    /// (the terminal wraps them), so a cut write neither loses nor repeats
+    /// a row.
+    unprinted: Vec<Line>,
+    /// Where each line of `unprinted` ends in `bytes`; the next frame
+    /// overwrites a partial one.
     history_ends: Vec<usize>,
-    /// How many scrollback lines the last write delivered.
-    printed: usize,
     /// Inline: the viewport row the cursor is on once `bytes` up to each
     /// offset are written, so a cut-short frame resumes from where the
     /// cursor actually stopped.
@@ -65,8 +67,8 @@ impl<W: Write> Screen<W> {
             colour: true,
             cursor_shown: true,
             stale: true,
+            unprinted: Vec::new(),
             history_ends: Vec::new(),
-            printed: 0,
             marks: Vec::new(),
         }
     }
@@ -98,10 +100,7 @@ impl<W: Write> Screen<W> {
     /// go into the scrollback first. A frame that changed nothing (an ack,
     /// a list nothing shows) writes nothing, not even the envelope.
     pub fn draw(&mut self, app: &mut App, size: (u16, u16)) -> io::Result<()> {
-        let mut frame = app.begin_frame();
-        let drawn = self.draw_frame(&mut frame, size);
-        frame.printed(std::mem::take(&mut self.printed));
-        drawn
+        self.draw_frame(app, size)
     }
 
     fn draw_frame(&mut self, app: &mut App, (cols, rows): (u16, u16)) -> io::Result<()> {
@@ -120,9 +119,10 @@ impl<W: Write> Screen<W> {
             }
             Viewport::Inline => {
                 let w = cols.max(10);
-                let lines = app.scrollback(w);
+                let mut lines = std::mem::take(&mut self.unprinted);
+                lines.extend(app.scrollback(w));
                 if !lines.is_empty() {
-                    self.history(&lines);
+                    self.history(lines);
                 }
                 let h = app.height(w, rows.max(4)).clamp(1, rows.max(1));
                 self.place(w, h);
@@ -194,11 +194,12 @@ impl<W: Write> Screen<W> {
                 Err(e) => break Err(e),
             }
         };
-        self.printed = self
+        let printed = self
             .history_ends
             .iter()
             .take_while(|&&end| end <= sent)
             .count();
+        self.unprinted.drain(..printed);
         self.history_ends.clear();
         let reached = self.marks.iter().rev().find(|&&(at, _)| at <= sent);
         let row = reached.and_then(|&(_, row)| row);
@@ -220,11 +221,11 @@ impl<W: Write> Screen<W> {
 
     /// Inline: prints `lines` from the viewport's top, so they scroll into
     /// the scrollback; the viewport is drawn whole again under them.
-    fn history(&mut self, lines: &[Line]) {
+    fn history(&mut self, lines: Vec<Line>) {
         self.home();
         self.repen(PLAIN);
         self.bytes.extend_from_slice(b"\x1b[J");
-        for line in lines {
+        for line in &lines {
             for span in &line.spans {
                 self.repen(span.style);
                 self.bytes.extend_from_slice(span.text.as_bytes());
@@ -235,6 +236,8 @@ impl<W: Write> Screen<W> {
             // Each printed line moves the viewport's top down to the next.
             self.marks.push((self.bytes.len(), Some(0)));
         }
+        // Until the write delivers them.
+        self.unprinted = lines;
         // The viewport starts on the row after them.
         (self.row, self.col) = (Some(0), Some(0));
         self.stale = true;
@@ -264,6 +267,8 @@ impl<W: Write> Screen<W> {
     fn home(&mut self) {
         if let Some(row @ 1..) = self.row {
             csi(&mut self.bytes, row, b'A');
+            // A cut before the column part has still changed rows.
+            self.marks.push((self.bytes.len(), Some(0)));
         }
         self.bytes.push(b'\r');
         (self.row, self.col) = (Some(0), Some(0));
@@ -305,10 +310,13 @@ impl<W: Write> Screen<W> {
             }
             (Viewport::Inline, row) => {
                 let row = row.unwrap_or(y);
-                if y < row {
-                    csi(bytes, row - y, b'A');
-                } else if y > row {
-                    csi(bytes, y - row, b'B');
+                if y != row {
+                    if y < row {
+                        csi(bytes, row - y, b'A');
+                    } else {
+                        csi(bytes, y - row, b'B');
+                    }
+                    self.marks.push((bytes.len(), Some(y)));
                 }
                 if x == 0 {
                     bytes.push(b'\r');

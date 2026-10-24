@@ -30,57 +30,11 @@ pub struct Composed {
     overlay: Option<Vec<Line>>,
 }
 
-/// Scrollback progress belongs to the frame that delivered it: the frame
-/// says how many of its scrollback lines reached the terminal, and the
-/// rest are printed by the next redraw.
-pub struct Frame<'a> {
-    app: &'a mut App,
-    committed: (usize, usize),
-}
-
-impl Frame<'_> {
-    /// The first `lines` of this frame's scrollback were printed.
-    pub fn printed(mut self, lines: usize) {
-        if let Some(&at) = lines.checked_sub(1).and_then(|i| self.app.scrolled.get(i)) {
-            self.committed = at;
-        }
-    }
-}
-
-impl std::ops::Deref for Frame<'_> {
-    type Target = App;
-    fn deref(&self) -> &App {
-        self.app
-    }
-}
-
-impl std::ops::DerefMut for Frame<'_> {
-    fn deref_mut(&mut self) -> &mut App {
-        self.app
-    }
-}
-
-impl Drop for Frame<'_> {
-    fn drop(&mut self) {
-        (self.app.committed, self.app.committed_row) = self.committed;
-        self.app.scrolled.clear();
-    }
-}
-
 impl App {
-    pub fn begin_frame(&mut self) -> Frame<'_> {
-        Frame {
-            committed: (self.committed, self.committed_row),
-            app: self,
-        }
-    }
-
     /// Inline: the rows of the items that will not change any more, to
-    /// print above the viewport; each row is taken once, in order. Until
-    /// the frame says otherwise they count as printed.
+    /// print above the viewport; each item is taken once, in order.
     pub fn scrollback(&mut self, width: u16) -> Vec<Line> {
         let mut out = Vec::new();
-        self.scrolled.clear();
         if self.verbose {
             return out;
         }
@@ -91,19 +45,8 @@ impl App {
             .get(self.committed)
             .is_some_and(Item::settled)
         {
-            let (i, printed) = (self.committed, self.committed_row);
-            let rows = self.rows(i, usize::from(width));
-            // A row cursor kept across a resize may point past the rewrap.
-            let from = printed.min(rows.len());
-            out.extend_from_slice(&rows[from..]);
-            let len = rows.len();
-            self.scrolled
-                .extend((from + 1..len).map(|row| (i, row)).chain([(i + 1, 0)]));
-            if from == len {
-                // A settled item without rows still moves the cursor on.
-                self.scrolled.pop();
-            }
-            (self.committed, self.committed_row) = (i + 1, 0);
+            out.extend_from_slice(self.rows(self.committed, usize::from(width)));
+            self.committed += 1;
         }
         out
     }
@@ -117,12 +60,7 @@ impl App {
                 break;
             }
             let len = self.rows(i, width).len();
-            let printed = if i == self.committed {
-                self.committed_row.min(len)
-            } else {
-                0
-            };
-            let take = (len - printed).min(n - out.len());
+            let take = len.min(n - out.len());
             out.splice(0..0, (len - take..len).map(|row| (i, row)));
         }
         out
