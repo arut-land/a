@@ -57,7 +57,7 @@ pub fn page_size() -> io::Result<usize> {
 }
 
 pub fn storage(path: &Path) -> Storage {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     let Some(path) = path.ancestors().find(|p| p.exists()) else {
         return Storage::Unknown;
     };
@@ -86,16 +86,7 @@ pub fn storage(path: &Path) -> Storage {
         }
         Storage::Unknown
     }
-    #[cfg(target_os = "macos")]
-    {
-        macos::storage(path)
-    }
-    #[cfg(windows)]
-    {
-        let _ = path;
-        Storage::Unknown
-    }
-    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = path;
         Storage::Unknown
@@ -172,8 +163,6 @@ unsafe extern "C" {
     fn pthread_set_qos_class_self_np(class: u32, relative: i32) -> i32;
 }
 
-#[cfg(target_os = "macos")]
-mod macos;
 #[cfg(windows)]
 mod windows;
 

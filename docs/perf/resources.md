@@ -54,16 +54,10 @@ parent handles and cannot be discovered through the public current-job query;
 this is an approximation in nested quota hierarchies. No thread is pinned to a
 guessed performance or efficiency core.
 
-Windows leaves storage media unknown. Disk-kind enumeration adds resident
-memory and startup work without a qualified slow-disk benefit; its measured
-cost is recorded in the [mechanism comparisons](resource-mechanisms.md). macOS
-uses `statfs` for that mount and maintained `objc2-io-kit`/Core Foundation
-bindings to find its backing medium through the IOKit parent tree. A candidate
-using all-mount `sysinfo` measured Apple silicon idle RSS of 8656 → 10608 KiB
-and cold reply latency +42% relative to main in a
-[paired hosted trial](https://github.com/arut-land/a/actions/runs/39989529804);
-the selected-device query avoids CFURL's process caches. Unknown media remains
-explicit rather than guessing that a virtual or network mount is an SSD.
+Windows and macOS leave storage media unknown. Disk-kind enumeration and the
+IOKit lookup add resident memory without a qualified slow-disk benefit; their
+measured costs are in the [mechanism comparisons](resource-mechanisms.md).
+Explicit configurations can limit a qualified slow filesystem to one worker.
 
 macOS blocking jobs use scoped user-initiated QoS; catalog recovery temporarily
 uses utility QoS. The thread-bound guard restores the enclosing class even when

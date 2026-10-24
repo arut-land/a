@@ -159,12 +159,16 @@ pending. This does not add another public runtime interface.
 
 ## Decisions
 
-Windows storage lookup is removed. Its enabled-minus-disabled idle cost is
+Windows and macOS storage lookups are removed. Its enabled-minus-disabled idle cost is
 55.4 KiB [31.6, 80.2] on x86_64 and 18.2 KiB [10.0, 26.8] on aarch64
 (20 paired rounds, bootstrap 95% intervals). It changes neither target's selected
 pool widths; ARM reports unknown media even with the query. The unadjusted x86_64 cold-reply delta is 1.88% [0.91, 2.95], while the
 same-source control is 2.43% [0.68, 4.46]; no cold-latency benefit is attributed
 to removing the query. The RSS cost has no qualified slow-disk benefit.
+The Intel Mac IOKit lookup adds 56.0 KiB [43.0, 68.4] at three seconds and
+63.8 KiB [50.8, 76.2] after worker retirement. Its disabled medium is unknown;
+the hosted solid-state lookup does not change selected worker limits. Linux
+retains its sysfs flag as an unqualified heuristic pending slow-disk measurements.
 The remaining decisions await the complete comparisons and same-build controls.
 
 ## Incomplete runs

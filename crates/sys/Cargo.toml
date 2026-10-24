@@ -20,8 +20,6 @@ object = { version = "0.40", default-features = false, features = ["read_core", 
 [target.'cfg(target_os = "macos")'.dependencies]
 object = { version = "0.40", default-features = false, features = ["read_core", "macho"] }
 oslog = { version = "0.2", default-features = false }
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDictionary", "CFString"] }
-objc2-io-kit = { version = "0.3", default-features = false, features = ["std", "libc"] }
 dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
