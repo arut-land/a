@@ -103,7 +103,7 @@ pub fn wait(home: &Home) -> io::Result<()> {
 }
 
 /// Called before any runtime or child threads exist.
-pub fn listener(home: &Home) -> io::Result<Listener> {
+pub fn listener(home: &Home, executing_build: &str) -> io::Result<Listener> {
     native_home(home)?;
     if !installed(home)? {
         return Err(io::Error::new(
@@ -111,7 +111,29 @@ pub fn listener(home: &Home) -> io::Result<Listener> {
             "native activation is not installed for this home",
         ));
     }
-    native::listener(home)
+    native::listener(home, executing_build)
+}
+
+#[cfg(unix)]
+fn current(home: &Home, executing_build: &str) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let runtime = home.runtime();
+    if runtime
+        .current()
+        .is_some_and(|selected| selected != executing_build)
+    {
+        let executable = runtime.current_exe();
+        if executable.is_file() {
+            // A bundled helper is an activation entry point, not a pinned daemon
+            // version. Exec before check-in/CLOEXEC preserves the manager's PID,
+            // socket and bootstrap context without spawning a successor.
+            return Err(Command::new(executable)
+                .args(std::env::args_os().skip(1))
+                .exec());
+        }
+    }
+    Ok(())
 }
 
 /// A registered instance never silently becomes an unmanaged process, even
@@ -170,7 +192,7 @@ mod tests {
         );
         assert_eq!(wait(&home).unwrap_err().kind(), io::ErrorKind::Unsupported);
         assert_eq!(
-            listener(&home).err().unwrap().kind(),
+            listener(&home, "test").err().unwrap().kind(),
             io::ErrorKind::Unsupported
         );
     }

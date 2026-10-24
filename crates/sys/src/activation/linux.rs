@@ -168,7 +168,8 @@ pub(super) fn wait(_: &Home) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn listener(home: &Home) -> io::Result<Listener> {
+pub(super) fn listener(home: &Home, executing_build: &str) -> io::Result<Listener> {
+    super::current(home, executing_build)?;
     // listenfd also supports development supervisors. Admit only systemd's
     // PID-scoped, fd-3 contract, and bound its descriptor-vector allocation.
     let valid = std::env::var("LISTEN_PID")

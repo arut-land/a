@@ -69,7 +69,11 @@ that is already enabled. Approval-required registration stays pending. The bundl
 `$TMPDIR` or `~`. Socket mode is 0600, the process umask is 0077 and the stop
 timeout is 30 seconds. Subsequent connects use the published manager socket
 and the existing `getpeereid` checks. The managed daemon stays in the
-foreground and does not call `setsid` or spawn a successor.
+foreground and does not call `setsid` or spawn a successor. If a bundled
+entry point has been outranked by the executable selected by the install seam,
+it re-execs that executable in the same PID before consuming launchd resources.
+This preserves drain-and-upgrade behavior when the CLI and app have different
+builds. The same rule applies to an installed systemd entry point.
 
 ## Windows
 

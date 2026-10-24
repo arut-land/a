@@ -157,7 +157,7 @@ pub(super) fn wait(home: &Home) -> io::Result<()> {
     }
 }
 
-pub(super) fn listener(home: &Home) -> io::Result<Listener> {
+pub(super) fn listener(home: &Home, executing_build: &str) -> io::Result<Listener> {
     unsafe extern "C" {
         fn launch_activate_socket(
             name: *const libc::c_char,
@@ -165,6 +165,7 @@ pub(super) fn listener(home: &Home) -> io::Result<Listener> {
             count: *mut libc::size_t,
         ) -> libc::c_int;
     }
+    super::current(home, executing_build)?;
     let mut fds = std::ptr::null_mut();
     let mut count = 0;
     // SAFETY: the name is terminated and both output pointers are writable.

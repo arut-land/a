@@ -18,7 +18,9 @@ the timed interval. Each round proves idle exit without connecting to the
 socket; status inspection must leave it idle. An activated socket must keep
 its inode across daemon exit/reactivation. Uninstall must leave another native
 home running and locate its own artifacts after a configuration-base change.
-A home without a registration cannot adopt an activation descriptor. Results contain every sample,
+A home without a registration cannot adopt an activation descriptor. A manager
+pinned to an older executable must serve a newer staged build after one drain;
+a fixture-only agent verifies the actual image, not just its advertised ID. Results contain every sample,
 medians, their difference and the measured executable's bytes. The activation
 probe build includes fixtures; shipped binary size comes from the normal
 six-target perf workflow instead.

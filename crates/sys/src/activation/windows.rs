@@ -19,6 +19,6 @@ pub(super) fn wait(_: &Home) -> io::Result<()> {
     Err(unsupported())
 }
 
-pub(super) fn listener(_: &Home) -> io::Result<Listener> {
+pub(super) fn listener(_: &Home, _: &str) -> io::Result<Listener> {
     Err(unsupported())
 }

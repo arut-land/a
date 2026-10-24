@@ -621,19 +621,19 @@ fn serve(
     activated: bool,
 ) -> io::Result<()> {
     let home = daemon.home()?;
-    sys::crash::install(home.crash_dir(), sys::crash::Build::of(&daemon.staged.id));
-    if detached || listen_fd.is_some() {
-        sys::detach_session()?;
-        sys::log::discard_stderr()?;
-    }
     if activated && (listen_fd.is_some() || lock_fd.is_some() || detached) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "activation cannot use a client handoff",
         ));
     }
+    sys::crash::install(home.crash_dir(), sys::crash::Build::of(&daemon.staged.id));
+    if detached || listen_fd.is_some() {
+        sys::detach_session()?;
+        sys::log::discard_stderr()?;
+    }
     let listener = if activated {
-        sys::activation::listener(home)?
+        sys::activation::listener(home, &daemon.staged.id)?
     } else if let Some(fd) = listen_fd {
         sys::Listener::adopt(
             sys::InheritedNumber::from(fd).duplicate()?,
