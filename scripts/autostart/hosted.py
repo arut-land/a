@@ -178,7 +178,7 @@ try:
         # entry itself must both succeed, leaving a daemon behind.
         a("daemon", "autostart", "on")
         ran = subprocess.run(registration()[1], env=env, capture_output=True, text=True, timeout=60)
-        print(f"logon entry: {ran.returncode} {ran.stdout!r} {ran.stderr!r}", flush=True)
+        assert ran.returncode == 0, ran.stderr
         wait(lambda: pid() is not None, "the logon entry did not leave a daemon running")
         logout()
         checks["logon_entry_leaves_a_detached_daemon"] = True
