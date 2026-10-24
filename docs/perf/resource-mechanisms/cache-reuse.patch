@@ -1,0 +1,49 @@
+diff --git a/crates/engine/src/driver/tests.rs b/crates/engine/src/driver/tests.rs
+index 5efbacad..1e4fb315 100644
+--- a/crates/engine/src/driver/tests.rs
++++ b/crates/engine/src/driver/tests.rs
+@@ -2837,3 +2837,44 @@ fn environment_bursts_retain_one_payload_and_one_mailbox_marker() {
+     drop(fixture);
+     std::fs::remove_file(home).unwrap();
+ }
++
++#[test]
++#[ignore = "a hosted memory measurement"]
++fn pressure_cache_release_measurement() {
++    fn rss() -> u64 {
++        let out = std::process::Command::new(std::env::var("A_PERF_PYTHON").unwrap())
++            .args([
++                &std::env::var("A_PERF_PROCESS").unwrap(),
++                &std::process::id().to_string(),
++                "rss",
++            ])
++            .output()
++            .unwrap();
++        assert!(out.status.success());
++        String::from_utf8(out.stdout)
++            .unwrap()
++            .trim()
++            .parse()
++            .unwrap()
++    }
++    let fixture = Fixture::new(ext::LOOP, Registry::default(), openai(&Script::new(&[])));
++    let entries: Vec<_> = (1..=1024)
++        .map(|seq| entry(seq, echo(&"cached projection ".repeat(2048))))
++        .collect();
++    let session = fixture.start(&entries);
++    drop(entries);
++    for round in 0..5 {
++        let baseline = rss();
++        assert_eq!(session.projection_cache(true), [true; 3]);
++        let cached = rss();
++        session.reclaim();
++        assert_eq!(session.projection_cache(false), [false; 3]);
++        let reclaimed = rss();
++        std::thread::sleep(Duration::from_secs(1));
++        let delayed = rss();
++        eprintln!(
++            "RESOURCE_CACHE {{\"round\":{round},\"baseline_kib\":{baseline},\"cached_kib\":{cached},\"reclaimed_kib\":{reclaimed},\"delayed_kib\":{delayed}}}"
++        );
++    }
++    session.halt();
++}

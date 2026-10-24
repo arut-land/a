@@ -36,6 +36,18 @@ from the runtime results: its source is unchanged, but it still participates in
 the build/dependency graph, so a change can also reflect code or dependency
 layout.
 
+The retained [analysis script](resource-mechanisms/analyze.py) accepts an
+artifact directory grouped as `mechanism/runner`, the run manifest and an output
+directory. It validates source revisions and run IDs, then emits raw paired
+observations, geometric-mean time ratios, arithmetic-mean memory differences,
+paired medians, run-order estimates and bootstrap 95% intervals. A fixed random
+seed makes the interval calculation reproducible. Size has one observation per
+build; its repeated-looking interval is not a sampling confidence claim.
+
+```sh
+python3 docs/perf/resource-mechanisms/analyze.py ARTIFACTS --output REPORT
+```
+
 ## Variants
 
 | Mechanism | Targets | Disabled behavior |
@@ -82,7 +94,13 @@ measures process RSS before populating projections, after populating them, and
 after an idle reclamation request. It uses a controlled 36 MiB in-memory log,
 three repetitions and both native Mac architectures. This measures the cache
 release benefit separately from the source subscription's idle cost; it does
-not manufacture system-wide memory pressure. Its patch and run provenance are
+not manufacture system-wide memory pressure. The first probe releases
+74,064–74,068 KiB of RSS on Intel macOS. Apple silicon shows no immediate
+RSS release in these observations; the allocator retains freed memory. A
+follow-up repeats population and reclamation on one session and samples RSS
+after a delay, to distinguish reusable allocations from returned pages.
+[Raw cache observations](resource-mechanisms/cache-benefit-observations.json)
+retain all three repetitions per architecture. Its patch and run provenance are
 retained beside the mechanism variants.
 
 Full-versus-full A/A comparisons on all six targets build the identical

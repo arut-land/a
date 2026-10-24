@@ -1,0 +1,48 @@
+{
+  "run_id": 40056828919,
+  "source": "67091d6e2031eb932a7935d8efb6becb5c6223a7",
+  "observations": [
+    {
+      "target": "cache-benefit-macos-latest",
+      "round": 0,
+      "baseline_kib": 157024,
+      "cached_kib": 246592,
+      "reclaimed_kib": 246608
+    },
+    {
+      "target": "cache-benefit-macos-latest",
+      "round": 1,
+      "baseline_kib": 246848,
+      "cached_kib": 283856,
+      "reclaimed_kib": 283856
+    },
+    {
+      "target": "cache-benefit-macos-latest",
+      "round": 2,
+      "baseline_kib": 283888,
+      "cached_kib": 320896,
+      "reclaimed_kib": 320896
+    },
+    {
+      "target": "cache-benefit-macos-15-intel",
+      "round": 0,
+      "baseline_kib": 45912,
+      "cached_kib": 120584,
+      "reclaimed_kib": 46520
+    },
+    {
+      "target": "cache-benefit-macos-15-intel",
+      "round": 1,
+      "baseline_kib": 46632,
+      "cached_kib": 120836,
+      "reclaimed_kib": 46772
+    },
+    {
+      "target": "cache-benefit-macos-15-intel",
+      "round": 2,
+      "baseline_kib": 46764,
+      "cached_kib": 120908,
+      "reclaimed_kib": 46840
+    }
+  ]
+}
