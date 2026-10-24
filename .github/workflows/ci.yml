@@ -57,6 +57,12 @@ jobs:
       # release budgets run in their own jobs. Live-model tests stay
       # #[ignore]d; there are no secrets.
       - run: mise run check
+      - if: runner.os == 'Linux'
+        name: Repeat steady idle invariant
+        run: |
+          for repetition in {1..100}; do
+            mise exec -- cargo nextest run -p rt -E 'test(idle_runtime_has_no_periodic_wakeups)' --no-tests=fail
+          done
       # The Windows build, cross-linted: no platform cfg above `sys`/`rt`.
       - if: runner.os == 'Linux'
         run: mise run check:windows

@@ -139,7 +139,18 @@ fn idle_runtime_has_no_periodic_wakeups() {
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending()
     );
-    let before = wakes();
+    // Completing setup work does not mean its last wake has been consumed.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut before = wakes();
+    loop {
+        thread::sleep(Duration::from_millis(500));
+        let after = wakes();
+        if after == before {
+            break;
+        }
+        assert!(Instant::now() < deadline, "runtime did not become idle");
+        before = after;
+    }
     thread::sleep(Duration::from_millis(500));
     assert_eq!(wakes(), before);
 }
