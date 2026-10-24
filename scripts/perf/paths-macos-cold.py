@@ -1,4 +1,4 @@
-"""Temporary cold-only paired Windows measurement, with resolver attribution."""
+"""Temporary cold-only paired macOS measurement, with resolver attribution."""
 import json
 import os
 from pathlib import Path
@@ -15,7 +15,7 @@ import time
 from process import run_timed, stop_daemon
 
 ROOT = Path(__file__).resolve().parents[2]
-OUTPUT = ROOT / 'target/paths-windows-cold'
+OUTPUT = ROOT / 'target/paths-macos-cold'
 PROBE = '''fn main() {
     let started = std::time::Instant::now();
     let home = std::hint::black_box(sys::Home::from_env().unwrap());
@@ -70,8 +70,8 @@ def main():
                        cwd=source, env=env, check=True)
         directory = OUTPUT / role
         directory.mkdir()
-        shutil.copy2(OUTPUT / 'build/release/a.exe', directory / 'a.exe')
-        shutil.copy2(OUTPUT / 'build/release/examples/paths-measure.exe', directory / 'paths-measure.exe')
+        shutil.copy2(OUTPUT / 'build/release/a', directory / 'a')
+        shutil.copy2(OUTPUT / 'build/release/examples/paths-measure', directory / 'paths-measure')
         builds[role] = dict(directory=str(directory), revision=subprocess.check_output(
             ['git', 'rev-parse', 'HEAD'], cwd=source, text=True).strip())
     records, resolver = [], {role: [] for role in builds}
@@ -79,10 +79,10 @@ def main():
         order = ['main', 'candidate'] if trial % 2 == 0 else ['candidate', 'main']
         for role in order:
             directory = Path(builds[role]['directory'])
-            value = cold(directory / 'a.exe')
+            value = cold(directory / 'a')
             records.append(dict(trial=trial, role=role, cold_ms=value))
             env = dict(os.environ, A_HOME=str(OUTPUT / 'isolated-resolver'))
-            elapsed = subprocess.check_output([str(directory / 'paths-measure.exe')], env=env,
+            elapsed = subprocess.check_output([str(directory / 'paths-measure')], env=env,
                                                text=True, timeout=30)
             resolver[role].append(float(elapsed))
         (OUTPUT / 'samples.json').write_text(json.dumps(dict(builds=builds, records=records,
