@@ -772,6 +772,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn manager_owned_sockets_survive_daemon_retirement() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::MetadataExt;
+        let home = home("activation-retirement");
+        std::fs::create_dir_all(home.root()).unwrap();
+        let parent = home.bind().unwrap();
+        let duplicate = || std::fs::File::from(parent.as_fd().try_clone_to_owned().unwrap());
+        let descriptor = duplicate();
+        let manager = duplicate();
+        assert!(
+            super::Listener::activated(duplicate(), &home).is_err(),
+            "a live home claim excludes managed writers too"
+        );
+        drop(parent);
+        std::fs::write(crate::activation::record(&home), "test").unwrap();
+        let listener = super::Listener::activated(descriptor, &home).unwrap();
+        let endpoint = home.endpoint();
+        let identity = std::fs::metadata(endpoint.path()).unwrap().ino();
+        assert!(
+            rustix::io::fcntl_getfd(&listener)
+                .unwrap()
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        );
+        assert!(home.bind().is_err());
+        endpoint.remove();
+        let mut client = endpoint.connect().unwrap();
+        let mut server = listener.accept().unwrap();
+        client.write_all(b"verified").unwrap();
+        let mut bytes = [0; 8];
+        std::io::Read::read_exact(&mut server, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"verified");
+        let retirement = listener.retirement().unwrap();
+        retirement.withdraw().unwrap();
+        retirement.retire().unwrap();
+        drop(listener);
+        assert_eq!(std::fs::metadata(endpoint.path()).unwrap().ino(), identity);
+        let successor = super::Listener::activated(manager, &home).unwrap();
+        let _client = endpoint.connect().unwrap();
+        drop(successor.accept().unwrap());
+        successor.retirement().unwrap().retire().unwrap();
+        drop(successor);
+        std::fs::remove_file(crate::activation::record(&home)).unwrap();
+        endpoint.remove();
+        std::fs::remove_dir_all(home.root()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn an_inherited_listener_requires_its_original_exclusive_claim() {
         use std::os::fd::AsFd;
         let home = home("adopt");

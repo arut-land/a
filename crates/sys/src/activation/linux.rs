@@ -104,8 +104,9 @@ pub(super) fn install(home: &Home, app: bool) -> io::Result<()> {
         &home.run_dir().join("daemon.endpoint"),
         endpoint.path().as_os_str().as_encoded_bytes(),
     )?;
+    run(systemctl().arg("link").arg(dir.join(SERVICE)))?;
     run(systemctl().arg("daemon-reload"))?;
-    run(systemctl().args(["enable", "--now", SOCKET]))
+    run(systemctl().args(["enable", "--now"]).arg(dir.join(SOCKET)))
 }
 
 pub(super) fn uninstall(home: &Home, app: bool) -> io::Result<()> {
@@ -118,6 +119,7 @@ pub(super) fn uninstall(home: &Home, app: bool) -> io::Result<()> {
     // Stop the socket first, otherwise a reconnect could start another writer.
     run(systemctl().args(["disable", "--now", SOCKET]))?;
     run(systemctl().args(["stop", SERVICE]))?;
+    run(systemctl().args(["disable", SERVICE]))?;
     for name in [SOCKET, SERVICE] {
         std::fs::remove_file(units(home).join(name))?;
     }

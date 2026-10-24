@@ -1,0 +1,46 @@
+name: activation probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      CARGO_BUILD_JOBS: 4
+      MISE_AUTO_INSTALL: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust ${{ runner.os == 'Linux' && 'mold' || '' }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang pkg-config libssl-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build-release -p a --features fixtures
+      - if: runner.os == 'Linux'
+        name: User manager
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - run: python3 scripts/activation/hosted.py target/release/a
+      - if: failure()
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            journalctl --user -u a-daemon.service -u a-daemon.socket --no-pager -n 150
+          else
+            launchctl print "gui/$(id -u)/dev.a.daemon" || true
+          fi
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: activation-${{ matrix.runner }}
+          path: activation-result.json
