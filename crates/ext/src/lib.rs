@@ -44,6 +44,7 @@ pub use conversation::{
 };
 mod settings;
 pub mod shape;
+pub mod source;
 mod state;
 #[cfg(feature = "testing")]
 pub mod testing;

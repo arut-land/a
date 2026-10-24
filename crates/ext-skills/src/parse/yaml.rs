@@ -79,6 +79,37 @@ pub(super) fn header(source: &str) -> Result<Header, Error> {
     })
 }
 
+pub(super) fn identity(source: &str, first: bool) -> Result<Option<(String, usize)>, Error> {
+    use yaml_rust2::parser::Event;
+    let mut p = HeaderParser {
+        parser: yaml_rust2::parser::Parser::new_from_str(source),
+        name: None,
+        description: None,
+    };
+    p.expect(&Event::StreamStart)?;
+    p.expect(&Event::DocumentStart)?;
+    let (event, line) = p.next()?;
+    if !matches!(event, Event::MappingStart(..)) {
+        return Err(Error::new(line, Kind::Collection));
+    }
+    loop {
+        let (event, line) = p.next()?;
+        if event == Event::MappingEnd {
+            return Ok(None);
+        }
+        let key = HeaderParser::scalar(event, line)?;
+        if key.as_deref() == Some("name") {
+            let (event, line) = p.next()?;
+            return HeaderParser::scalar(event, line).map(|name| name.map(|name| (name, line)));
+        }
+        if first {
+            return Ok(None);
+        }
+        let (event, line) = p.next()?;
+        p.value(event, line, 2)?;
+    }
+}
+
 impl HeaderParser<'_> {
     fn next(&mut self) -> Result<(yaml_rust2::parser::Event, usize), Error> {
         self.parser

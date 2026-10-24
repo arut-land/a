@@ -35,3 +35,6 @@ workspace = true
 
 [dev-dependencies]
 tempfile = { version = "3", default-features = false }
+
+[target.'cfg(windows)'.dev-dependencies]
+rt = { path = "../rt", features = ["threads"] }
