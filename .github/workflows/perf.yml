@@ -65,7 +65,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, os
-          runners = ['ubuntu-latest', 'ubuntu-24.04-arm', 'windows-latest', 'windows-11-arm', 'macos-latest', 'macos-15-intel']
+          runners = ['ubuntu-latest', 'ubuntu-24.04-arm', 'windows-latest', 'windows-11-arm', 'macos-15', 'macos-26-intel']
           selected = os.environ['SELECTED']
           assert selected == 'all' or selected in runners, selected
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
@@ -139,7 +139,7 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           working_directory: harness
-          install_args: hyperfine ${{ matrix.runner != 'macos-15-intel' && 'mr-boxington' || '' }} ${{ runner.os == 'Linux' && 'mold' || '' }}
+          install_args: hyperfine ${{ (runner.os != 'macOS' || runner.arch != 'X64') && 'mr-boxington' || '' }} ${{ runner.os == 'Linux' && 'mold' || '' }}
       - if: inputs.bloat
         name: Install native size attribution tool
         run: |
@@ -149,7 +149,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
       # mbx publishes no Intel macOS executable; cache Cargo's native build there.
       - uses: Swatinem/rust-cache@v2
-        if: matrix.runner == 'macos-15-intel'
+        if: runner.os == 'macOS' && runner.arch == 'X64'
         with:
           workspaces: measured -> target/perf-build
           cache-all-crates: true
@@ -167,7 +167,7 @@ jobs:
           extra=()
           if [[ "$PERF_BUILD_ONLY" == true ]]; then extra+=(--build-only); fi
           if [[ "$PERF_BLOAT" == true ]]; then extra+=(--bloat); fi
-          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
+          if [[ "$RUNNER_OS" == macOS && "$RUNNER_ARCH" == X64 ]]; then
             PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase build --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' "${extra[@]}"
           else
             mise exec -- python scripts/perf/hosted.py --phase build --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' "${extra[@]}"
@@ -176,7 +176,7 @@ jobs:
         timeout-minutes: 20
         if: env.PERF_BUILD_ONLY != 'true'
         run: |
-          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
+          if [[ "$RUNNER_OS" == macOS && "$RUNNER_ARCH" == X64 ]]; then
             python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
           else
             mise exec -- python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
@@ -185,7 +185,7 @@ jobs:
         timeout-minutes: 45
         if: ${{ !cancelled() && steps.build.outcome == 'success' && env.PERF_REFERENCE != '' && env.PERF_BUILD_ONLY != 'true' }}
         run: |
-          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
+          if [[ "$RUNNER_OS" == macOS && "$RUNNER_ARCH" == X64 ]]; then
             PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase paired --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
           else
             mise exec -- python scripts/perf/hosted.py --phase paired --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
