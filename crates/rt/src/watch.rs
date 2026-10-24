@@ -313,6 +313,7 @@ mod tests {
         let source = root.join("source");
         let mut writer = fs::File::create(&source).unwrap();
         let runtime: crate::Rt = Arc::new(crate::Threads::new(1));
+        let resumed = root.join("resumed");
         let (send, events) = mpsc::channel();
         let (resume, paused) = mpsc::channel();
         let paused = Mutex::new(paused);
@@ -323,7 +324,7 @@ mod tests {
             roots.clone(),
             move |event| {
                 if event.affects(&roots) {
-                    let _ = send.send(());
+                    let _ = send.send(event);
                     if first.swap(false, Ordering::AcqRel) {
                         let _ = paused.lock().unwrap().recv();
                     }
@@ -339,13 +340,26 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), b"partial");
         crate::block_on(crate::Reactor::AsyncIo.sleep(Duration::from_millis(100)));
         assert_eq!(fs::read(&source).unwrap(), b"partial");
-        // The same writer resumes after debounce while the delivered callback
-        // still owns its batch. Its final write must remain queued independently.
-        writer.write_all(b" final").unwrap();
-        writer.sync_data().unwrap();
+        // A write resumes after debounce while the delivered callback still
+        // owns its batch. It goes to a second file so that a leftover callback
+        // from the first write cannot stand in for its event.
+        let mut later = fs::File::create(&resumed).unwrap();
+        later.write_all(b"final").unwrap();
+        later.sync_data().unwrap();
         release.send(()).unwrap();
-        events.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(fs::read(&source).unwrap(), b"partial final");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            if let WatchEvent::Changed(paths) | WatchEvent::RescanPaths(paths) = &event
+                && paths.contains(&resumed)
+            {
+                break;
+            }
+        }
+        assert_eq!(fs::read(&source).unwrap(), b"partial");
+        drop(later);
         drop(writer);
         drop(watcher);
         fs::remove_dir_all(root).unwrap();
