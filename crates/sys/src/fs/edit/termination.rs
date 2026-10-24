@@ -23,7 +23,7 @@ fn publication_child() {
         || {
             if conflict {
                 let incoming = target.with_file_name("incoming");
-                fs::write(&incoming, b"old").unwrap();
+                fs::write(&incoming, b"theirs").unwrap();
                 super::super::replace(&incoming, &target).unwrap();
             }
         },
@@ -81,9 +81,19 @@ fn terminate_at(step: &str, exchange: bool, conflict: bool) {
     );
     let content = fs::read(&target).unwrap_or_else(|error| panic!("{step}, exchange={exchange}, conflict={conflict}: target absent after termination: {error}"));
     assert!(
-        content == b"old" || content == b"new",
+        content == b"old" || content == b"new" || (conflict && content == b"theirs"),
         "{step}: torn content {content:?}"
     );
+    if conflict {
+        // The competing replacement is never lost: it is published or staged.
+        let staged = fs::read_dir(&work.0)
+            .unwrap()
+            .filter_map(|entry| fs::read(entry.ok()?.path().join("content")).ok());
+        assert!(
+            content == b"theirs" || staged.into_iter().any(|bytes| bytes == b"theirs"),
+            "{step}: the competing replacement was lost"
+        );
+    }
 }
 
 #[test]

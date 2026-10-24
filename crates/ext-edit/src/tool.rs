@@ -127,7 +127,7 @@ impl Tool for Edit {
             }
             Err(EditError::Conflict(reason)) => {
                 return Err(format!(
-                    "{shown}: edit conflict ({reason:?}); inspect the file and retry"
+                    "{shown}: edit conflict ({reason}); inspect the file and retry"
                 ));
             }
             Err(EditError::InvalidText) => return Err(format!("{shown} is not UTF-8 text")),
@@ -722,7 +722,7 @@ mod tests {
         };
         assert_eq!(
             output.parse::<Value>().unwrap()["publication"],
-            json!({"visible": true, "durability": "not_requested", "protection": "exclusive_create", "limitations": {"path_replacement_after_check": false, "writes_to_old_inode": false}})
+            json!({"visible": true, "durability": "not_requested", "protection": "exclusive_create", "limitations": {"change_after_check": false, "writes_to_old_inode": false}})
         );
         let Outcome::Done { output } = change(&rig, "notes.txt", &[("two", "2")]) else {
             panic!()

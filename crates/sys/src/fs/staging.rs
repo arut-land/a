@@ -104,6 +104,9 @@ pub(super) struct Staged<'a> {
     // Close the child before removing its directory on Windows.
     pub file: File,
     pub directory: Directory<'a>,
+    /// Set once a verified exchange leaves the captured original in staging.
+    #[cfg(unix)]
+    reclaim: bool,
     #[cfg(windows)]
     published: bool,
 }
@@ -122,7 +125,27 @@ impl<'a> Staged<'a> {
         )?);
         #[cfg(target_vendor = "apple")]
         super::edit::access_acl(None, &file)?;
-        Ok(Self { file, directory })
+        Ok(Self {
+            file,
+            directory,
+            reclaim: false,
+        })
+    }
+
+    /// Whether the staged name still holds the file this transaction wrote.
+    #[cfg(unix)]
+    pub fn holds_staged(&self) -> bool {
+        use rustix::fs::{AtFlags, fstat, statat};
+        matches!(
+            (fstat(&self.file), statat(&self.directory.file, CONTENT, AtFlags::SYMLINK_NOFOLLOW)),
+            (Ok(ours), Ok(named)) if (ours.st_dev, ours.st_ino) == (named.st_dev, named.st_ino)
+        )
+    }
+
+    /// The displaced original was verified against the capture: it may go.
+    #[cfg(unix)]
+    pub fn reclaim(&mut self) {
+        self.reclaim = true;
     }
 
     #[cfg(windows)]
@@ -223,8 +246,10 @@ fn no_replace(source: &File, from: &OsStr, target: &File, to: &OsStr) -> io::Res
 
 impl Drop for Staged<'_> {
     fn drop(&mut self) {
+        // Anything else under the staged name came from a concurrent writer
+        // (a failed or overtaken swap back): keep it, and with it the directory.
         #[cfg(unix)]
-        {
+        if self.reclaim || self.holds_staged() {
             let _ =
                 rustix::fs::unlinkat(&self.directory.file, CONTENT, rustix::fs::AtFlags::empty());
         }
@@ -390,7 +415,12 @@ pub(super) fn rename(file: &File, parent: &File, to: &OsStr, replacing: bool) ->
         (*info).Anonymous.Flags = 0x2 | u32::from(replacing); // POSIX_SEMANTICS | REPLACE_IF_EXISTS
         (*info).RootDirectory = parent.as_raw_handle();
         (*info).FileNameLength = u32::try_from(name.len() * 2).expect("checked buffer length");
-        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        // The tail pointer derives from the whole buffer, not the 1-element field.
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            (&raw mut (*info).FileName).cast::<u16>(),
+            name.len(),
+        );
         NtSetInformationFile(
             file.as_raw_handle(),
             &raw mut status,

@@ -10,7 +10,7 @@
 //! The target is always present across publication and process termination. Unix
 //! exchange verifies the displaced file and swaps back on conflict; other paths
 //! atomically replace after the final check. Receipts document the remaining
-//! non-exchange path-replacement race and writes through old inode descriptors.
+//! window before a non-exchange rename and Unix writes through old descriptors.
 
 use ext::{Configured, CwdOf, Extension, Need, Refused, Registrar, Table, Text, Tool as _};
 

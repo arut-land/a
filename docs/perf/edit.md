@@ -40,12 +40,19 @@ Edit version 4 receipts report `visible`, `durability`, `protection` and
 `revalidated_atomic_replace` records the final complete check before rename.
 Two concurrency exclusions are explicit:
 
-- `path_replacement_after_check`: a path replacement in the instant between the
-  final check and a non-exchange rename can be overwritten. Exchange verifies
-  such a replacement and swaps it back instead.
-- `writes_to_old_inode`: a writer with a descriptor still open on the old inode
-  can write to that inode after publication. Such writes do not reach the newly
-  published file. Preventing them requires mandatory locking.
+- `change_after_check`: any change to the target in the instant between the
+  final check and a non-exchange rename is overwritten: new content, a path
+  replacement, or an in-place mode, xattr, ACL or attribute change. Exchange
+  verifies the displaced file and swaps it back instead.
+- `writes_to_old_inode` (Unix only): a writer with a descriptor still open on
+  the old inode can write to that inode after publication. Such writes do not
+  reach the newly published file. Preventing them requires mandatory locking.
+  Windows denies write sharing from capture, so it never reports this.
+
+A swap back that fails, or that finds the name replaced again since the first
+exchange, never deletes what it displaced: the staging directory is kept and
+`RollbackFailed` names the retained file. A sharing violation on the Windows
+rename is a `Busy` conflict.
 
 Durability is independently `not_requested`, `confirmed`, or `failed` with the
 namespace already visible. Durable saves sync the staged file and parent;

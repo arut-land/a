@@ -14,6 +14,16 @@ use serde::{Deserialize, Serialize};
 
 use super::staging::{Directory, Staged};
 
+/// Another process holding the target open without sharing is a conflict.
+fn busy(error: io::Error) -> EditError {
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(32) {
+        // ERROR_SHARING_VIOLATION
+        return EditError::Conflict(EditConflict::Busy);
+    }
+    error.into()
+}
+
 // Checkpoints disappear entirely from non-test builds.
 macro_rules! publication_checkpoint {
     ($step:literal) => {
@@ -27,7 +37,26 @@ pub enum EditConflict {
     Busy,
     Changed,
     Appeared,
-    RollbackFailed,
+    /// The swap back did not restore the captured state; the displaced file
+    /// is never deleted and stays at `retained` for recovery.
+    RollbackFailed {
+        retained: PathBuf,
+    },
+}
+
+impl std::fmt::Display for EditConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("the file is in use"),
+            Self::Changed => f.write_str("the file changed"),
+            Self::Appeared => f.write_str("the file appeared"),
+            Self::RollbackFailed { retained } => write!(
+                f,
+                "restoring the changed file failed; its displaced version is kept at {}",
+                retained.display()
+            ),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -45,7 +74,7 @@ impl std::fmt::Display for EditError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Conflict(reason) => {
-                write!(f, "edit conflict: {reason:?}; inspect the file and retry")
+                write!(f, "edit conflict: {reason}; inspect the file and retry")
             }
             Self::NotRegular => {
                 f.write_str("edit requires a regular file; symbolic links are rejected")
@@ -96,7 +125,13 @@ pub enum PublicationProtection {
 /// Exclusions apply after the last complete identity/content/metadata check.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicationLimitations {
-    pub path_replacement_after_check: bool,
+    /// Any change to the target (content, a path replacement, mode, xattrs,
+    /// ACLs or attributes) between the final check and a non-exchange rename
+    /// is overwritten.
+    pub change_after_check: bool,
+    /// A descriptor still open on the old Unix inode can write to it after
+    /// publication; those writes never reach the published file. Windows
+    /// denies write sharing from capture, so this cannot happen there.
     pub writes_to_old_inode: bool,
 }
 
@@ -372,9 +407,8 @@ impl EditTransaction {
             visible: true,
             durability,
             limitations: PublicationLimitations {
-                path_replacement_after_check: protection
-                    == PublicationProtection::RevalidatedAtomicReplace,
-                writes_to_old_inode: self.source.is_some(),
+                change_after_check: protection == PublicationProtection::RevalidatedAtomicReplace,
+                writes_to_old_inode: cfg!(unix) && self.source.is_some(),
             },
             protection,
         })
@@ -447,17 +481,25 @@ impl EditTransaction {
             if checked.is_err() {
                 before_rollback();
                 publication_checkpoint!("before_rollback");
-                if !staged.exchange(&self.name).unwrap_or(false) {
-                    return Err(EditError::Conflict(EditConflict::RollbackFailed));
+                // A name replaced again since the first exchange swaps that
+                // newer file into staging: it is kept, never reclaimed.
+                if !staged.exchange(&self.name).unwrap_or(false) || !staged.holds_staged() {
+                    return Err(EditError::Conflict(EditConflict::RollbackFailed {
+                        retained: self
+                            .observed_parent
+                            .join(&staged.directory.name)
+                            .join(super::staging::CONTENT),
+                    }));
                 }
                 publication_checkpoint!("after_rollback");
                 return Err(EditError::Conflict(EditConflict::Changed));
             }
+            staged.reclaim();
             return Ok(PublicationProtection::ExchangeVerified);
         }
         cancel()?;
         let protection = if self.source.is_some() {
-            staged.replace(&self.name)?;
+            staged.replace(&self.name).map_err(busy)?;
             PublicationProtection::RevalidatedAtomicReplace
         } else {
             match staged.publish(&self.name) {
@@ -465,7 +507,7 @@ impl EditTransaction {
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     return Err(EditError::Conflict(EditConflict::Appeared));
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(busy(error)),
             }
             PublicationProtection::ExclusiveCreate
         };
@@ -1277,17 +1319,22 @@ fn stream_inventory(file: &File, limit: usize) -> io::Result<Vec<(OsString, u64)
         if at + size_of::<FILE_STREAM_INFO>() > 65536 {
             return Err(io::ErrorKind::InvalidData.into());
         }
+        let header = buffer
+            .as_ptr()
+            .wrapping_add(at / 8)
+            .cast::<FILE_STREAM_INFO>();
         // SAFETY: at is aligned and bounds cover the kernel-populated header.
-        let entry = unsafe { &*buffer.as_ptr().add(at / 8).cast::<FILE_STREAM_INFO>() };
+        let entry = unsafe { &*header };
         let length = entry.StreamNameLength as usize;
         if length % 2 != 0
             || at + std::mem::offset_of!(FILE_STREAM_INFO, StreamName) + length > 65536
         {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        // SAFETY: the checked length covers exactly this UTF-16 name in the live buffer.
+        // SAFETY: the checked length covers exactly this UTF-16 name in the live
+        // buffer; the pointer derives from the whole buffer, not the 1-element field.
         let name = OsString::from_wide(unsafe {
-            std::slice::from_raw_parts(entry.StreamName.as_ptr(), length / 2)
+            std::slice::from_raw_parts((&raw const (*header).StreamName).cast::<u16>(), length / 2)
         });
         let size = u64::try_from(entry.StreamSize).map_err(|_| io::ErrorKind::InvalidData)?;
         {
@@ -2700,7 +2747,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn atomic_fallback_reports_the_final_path_replacement_window() {
+    fn an_unrestored_swap_back_keeps_the_displaced_file() {
+        // A second replacement between the two exchanges, or a vanished name
+        // that makes the swap back fail, leaves another writer's file staged.
+        for vanished in [false, true] {
+            let work = Workspace::new();
+            fs::write(work.target(), b"original").unwrap();
+            let transaction = work.capture();
+            let mut staged = transaction.stage(&|_| false).unwrap();
+            staged.file.write_all(b"ours").unwrap();
+            preserve_metadata(&transaction.source.as_ref().unwrap().0, &staged.file).unwrap();
+            let replace = |bytes: &[u8]| {
+                let incoming = work.0.join("incoming");
+                fs::write(&incoming, bytes).unwrap();
+                fs::rename(incoming, work.target()).unwrap();
+            };
+            replace(b"theirs");
+            let result = transaction.commit(
+                &mut staged,
+                true,
+                || Ok(()),
+                || {},
+                || {
+                    if vanished {
+                        fs::remove_file(work.target()).unwrap();
+                    } else {
+                        replace(b"newer");
+                    }
+                },
+            );
+            let Err(EditError::Conflict(EditConflict::RollbackFailed { retained })) = result else {
+                panic!("{result:?}");
+            };
+            drop(staged);
+            let kept: &[u8] = if vanished { b"theirs" } else { b"newer" };
+            assert_eq!(fs::read(&retained).unwrap(), kept);
+            if !vanished {
+                assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_fallback_reports_the_final_change_window() {
         let work = Workspace::new();
         fs::write(work.target(), b"original").unwrap();
         let receipt = work
@@ -2715,7 +2805,7 @@ mod tests {
             receipt.protection,
             PublicationProtection::RevalidatedAtomicReplace
         );
-        assert!(receipt.limitations.path_replacement_after_check);
+        assert!(receipt.limitations.change_after_check);
         assert!(receipt.limitations.writes_to_old_inode);
         assert_eq!(fs::read(work.target()).unwrap(), b"ours");
         work.only_target_remains();
