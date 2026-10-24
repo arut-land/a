@@ -424,8 +424,6 @@ impl PrivateDirectory {
             }
         };
         let result = (|| {
-            #[cfg(target_vendor = "apple")]
-            edit::access_acl(None, &file)?;
             file.write_all(bytes)?;
             #[cfg(unix)]
             rustix::fs::renameat(&self.0, &temporary, &self.0, name)?;
