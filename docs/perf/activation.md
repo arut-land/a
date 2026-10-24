@@ -14,7 +14,9 @@ Windows-only listenfd dependencies are not built by this Linux dependency.
 its first daemon reply, with an already installed executable and warm file
 cache. It alternates twelve self-spawn and manager-activation rounds on the
 same hosted runner. Registration and initial discovery bootstrap are outside
-the timed interval. Each round proves idle exit without connecting to the
+the timed interval. Managed rounds check rapid stop/reconnect separately, then
+wait for a real idle exit before timing the next connect. Each round proves
+idle exit without connecting to the
 socket; status inspection must leave it idle. An activated socket must keep
 its inode across daemon exit/reactivation. Uninstall must leave another native
 home running and locate its own artifacts after a configuration-base change.
@@ -31,18 +33,26 @@ against main in alternating same-runner rounds, including startup, attach,
 idle memory and CPU accounting. Native activation is optional and does not
 change the idle exit deadline or add a resident helper.
 
-The [native activation probe](https://github.com/arut-land/a/actions/runs/40064417121)
-at `0f37ccb2` produced the following alternating-round observations. Times are
+The [native activation probe](https://github.com/arut-land/a/actions/runs/40065815817)
+at `6fac0d70` produced the following alternating-round observations. Times are
 milliseconds; registration is excluded. Raw samples are retained alongside this
 document.
 
 | Hosted target | Self-spawn median | Activation median | Activation minus self-spawn |
 | --- | ---: | ---: | ---: |
-| [Linux ARM64](activation/linux-arm64.json) | 5.089 | 7.814 | +2.725 |
-| [Linux x64](activation/linux-x64.json) | 5.014 | 7.828 | +2.814 |
+| [Linux ARM64](activation/linux-arm64.json) | 5.103 | 11.994 | +6.892 |
+| [Linux x64](activation/linux-x64.json) | 4.756 | 10.655 | +5.899 |
+| [macOS ARM64](activation/macos-arm64.json) | 27.038 | 33.719 | +6.681 |
+| [macOS x64](activation/macos-x64.json) | 30.970 | 37.547 | +6.576 |
 
-Both Linux targets passed idle exit, socket inode preservation, cross-home
-uninstall, changed configuration-base uninstall, rejection without registration
+These targets passed idle exit, socket inode preservation, cross-home
+uninstall, rejection without registration
 and upgrade from a manager pinned to an older executable. Activation is an
 opt-in lifecycle integration; these measurements do not support a latency
 advantage over self-spawn.
+
+Linux also passed uninstall after changing the configuration base. Both macOS
+targets passed rapid stop/reconnect with a one-second launchd throttle, as well
+as the idle-exit timing rounds. The Swift app build and tests passed in
+[CI](https://github.com/arut-land/a/actions/runs/40065827570). Interactive
+SMAppService approval on a signed installation remains a manual validation.
