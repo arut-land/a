@@ -40,11 +40,10 @@ pub struct Screen<W = Stdout> {
     /// Draw the next frame whole: the first, after a resize, Ctrl-L, or
     /// (inline) when the viewport moved or changed size.
     stale: bool,
-    /// Where this frame's scrollback lines end in `bytes`: once the
-    /// terminal accepted that many bytes, they are printed, even if the
-    /// rest of the frame is not.
+    /// Where this frame's scrollback lines end in `bytes`; after its
+    /// write, kept only if the terminal accepted that many bytes: those
+    /// lines are printed even if the rest of the frame is not.
     history_end: Option<usize>,
-    history_sent: bool,
 }
 
 impl<W: Write> Screen<W> {
@@ -61,7 +60,6 @@ impl<W: Write> Screen<W> {
             cursor_shown: true,
             stale: true,
             history_end: None,
-            history_sent: false,
         }
     }
 
@@ -94,7 +92,7 @@ impl<W: Write> Screen<W> {
     pub fn draw(&mut self, app: &mut App, size: (u16, u16)) -> io::Result<()> {
         let mut frame = app.begin_frame();
         let drawn = self.draw_frame(&mut frame, size);
-        if std::mem::take(&mut self.history_sent) || drawn.is_ok() {
+        if self.history_end.take().is_some() || drawn.is_ok() {
             frame.commit();
         }
         drawn
@@ -187,7 +185,7 @@ impl<W: Write> Screen<W> {
                 Err(e) => break Err(e),
             }
         };
-        self.history_sent = self.history_end.take().is_some_and(|end| sent >= end);
+        self.history_end = self.history_end.filter(|&end| sent >= end);
         self.bytes.clear();
         if written.is_err() {
             // Planned cursor moves may never have reached the terminal. A
