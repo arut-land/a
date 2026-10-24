@@ -1,0 +1,22 @@
+diff --git a/crates/rt/src/threads.rs b/crates/rt/src/threads.rs
+index 16db8439..f23ef07f 100644
+--- a/crates/rt/src/threads.rs
++++ b/crates/rt/src/threads.rs
+@@ -435,6 +435,7 @@ impl Blocking {
+         if let Some(gate) = lock(&self.start_gate).clone() {
+             gate.wait();
+         }
++        let _priority = sys::resources::Priority::user_initiated();
+         let mut state = lock(&self.state);
+         state.starting -= 1;
+         state.workers += 1;
+@@ -442,9 +443,7 @@ impl Blocking {
+             if let Some((bytes, work)) = state.queue.pop_front() {
+                 wake(&mut state);
+                 drop(state);
+-                let priority = sys::resources::Priority::user_initiated();
+                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+-                drop(priority);
+                 state = lock(&self.state);
+                 state.bytes -= bytes;
+                 wake(&mut state);

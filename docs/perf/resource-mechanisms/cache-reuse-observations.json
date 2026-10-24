@@ -1,0 +1,85 @@
+{
+  "run_id": 40063531333,
+  "observations": [
+    {
+      "target": "cache-benefit-macos-latest",
+      "round": 0,
+      "baseline_kib": 157040,
+      "cached_kib": 246592,
+      "reclaimed_kib": 246608,
+      "delayed_kib": 246608
+    },
+    {
+      "target": "cache-benefit-macos-latest",
+      "round": 1,
+      "baseline_kib": 246608,
+      "cached_kib": 283648,
+      "reclaimed_kib": 283648,
+      "delayed_kib": 283648
+    },
+    {
+      "target": "cache-benefit-macos-latest",
+      "round": 2,
+      "baseline_kib": 283648,
+      "cached_kib": 320624,
+      "reclaimed_kib": 320624,
+      "delayed_kib": 320592
+    },
+    {
+      "target": "cache-benefit-macos-latest",
+      "round": 3,
+      "baseline_kib": 320592,
+      "cached_kib": 357568,
+      "reclaimed_kib": 357568,
+      "delayed_kib": 357552
+    },
+    {
+      "target": "cache-benefit-macos-latest",
+      "round": 4,
+      "baseline_kib": 357552,
+      "cached_kib": 394528,
+      "reclaimed_kib": 394528,
+      "delayed_kib": 394528
+    },
+    {
+      "target": "cache-benefit-macos-15-intel",
+      "round": 0,
+      "baseline_kib": 45840,
+      "cached_kib": 120572,
+      "reclaimed_kib": 46508,
+      "delayed_kib": 46520
+    },
+    {
+      "target": "cache-benefit-macos-15-intel",
+      "round": 1,
+      "baseline_kib": 46528,
+      "cached_kib": 120664,
+      "reclaimed_kib": 46636,
+      "delayed_kib": 46636
+    },
+    {
+      "target": "cache-benefit-macos-15-intel",
+      "round": 2,
+      "baseline_kib": 46636,
+      "cached_kib": 120804,
+      "reclaimed_kib": 46736,
+      "delayed_kib": 46736
+    },
+    {
+      "target": "cache-benefit-macos-15-intel",
+      "round": 3,
+      "baseline_kib": 46736,
+      "cached_kib": 120804,
+      "reclaimed_kib": 46740,
+      "delayed_kib": 46740
+    },
+    {
+      "target": "cache-benefit-macos-15-intel",
+      "round": 4,
+      "baseline_kib": 46740,
+      "cached_kib": 120880,
+      "reclaimed_kib": 46812,
+      "delayed_kib": 46812
+    }
+  ]
+}

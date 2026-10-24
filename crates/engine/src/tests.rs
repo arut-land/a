@@ -158,6 +158,47 @@ fn idle_sessions_hibernate_and_reload_on_attach() {
     assert!(missing.is_err());
 }
 
+#[test]
+fn pressure_reclamation_retains_attached_sessions_and_pending_approvals() {
+    let (root, home) = home("pressure");
+    let config = Config {
+        ext: exts("[ext.policy]\nask = [\"bash\"]"),
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    let pending = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    pending.session().submit("$ echo hi").unwrap();
+    settle(&daemon);
+    assert_eq!(pending.session().summary().activity, Activity::Approval);
+    let pending_live = std::sync::Arc::clone(pending.session());
+    for live in [attachment.session(), &pending_live] {
+        assert_eq!(live.projection_cache(true), [true; 3]);
+    }
+    drop(pending);
+    daemon.reclaim_idle();
+    settle(&daemon);
+    for live in [attachment.session(), &pending_live] {
+        assert_eq!(
+            live.projection_cache(false),
+            [true; 3],
+            "protected projections are retained without rebuilding"
+        );
+    }
+    assert_eq!(pending_live.summary().activity, Activity::Approval);
+    let idle_live = std::sync::Arc::clone(attachment.session());
+    drop(attachment);
+    daemon.reclaim_idle();
+    settle(&daemon);
+    assert_eq!(idle_live.projection_cache(false), [false; 3]);
+    assert_eq!(pending_live.projection_cache(false), [true; 3]);
+    assert_eq!(daemon.loaded().len(), 2);
+    drop(pending_live);
+    drop(idle_live);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// A hibernated session's log is counted once, and counted again after it
 /// was loaded and grew.
 #[test]

@@ -1,0 +1,26 @@
+diff --git a/crates/engine/src/catalog.rs b/crates/engine/src/catalog.rs
+index f0ce3409..4b4c53ba 100644
+--- a/crates/engine/src/catalog.rs
++++ b/crates/engine/src/catalog.rs
+@@ -359,7 +359,6 @@ fn maintenance<T: Send + 'static>(
+         rt::BlockingClass::Storage,
+         rt::STORAGE_BYTES,
+         move || {
+-            let _priority = sys::resources::Priority::utility();
+             work()
+         },
+     )
+diff --git a/crates/rt/src/threads.rs b/crates/rt/src/threads.rs
+index 16db8439..3eb9ab02 100644
+--- a/crates/rt/src/threads.rs
++++ b/crates/rt/src/threads.rs
+@@ -442,9 +442,7 @@ impl Blocking {
+             if let Some((bytes, work)) = state.queue.pop_front() {
+                 wake(&mut state);
+                 drop(state);
+-                let priority = sys::resources::Priority::user_initiated();
+                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+-                drop(priority);
+                 state = lock(&self.state);
+                 state.bytes -= bytes;
+                 wake(&mut state);

@@ -28,6 +28,10 @@ pub struct Config {
     pub storage: PoolLimits,
     pub network: PoolLimits,
     pub cpu: PoolLimits,
+    /// Blocking jobs run at the platform's foreground class (user-initiated
+    /// quality of service on macOS). The daemon asks for it; a client
+    /// inherits its caller's.
+    pub foreground: bool,
 }
 
 impl Config {
@@ -49,6 +53,17 @@ impl Config {
                 queue: 8,
                 bytes: 64 << 20,
             },
+            foreground: false,
+        }
+    }
+
+    /// The daemon's runtime: native CPU limits (Windows CPU sets and job
+    /// caps) and foreground blocking jobs. Clients keep the plain default,
+    /// which costs them neither the discovery nor a class change per job.
+    pub fn daemon() -> Self {
+        Self {
+            foreground: true,
+            ..Self::for_cores(sys::resources::effective_parallelism())
         }
     }
 }
@@ -150,6 +165,7 @@ impl Drop for Worker {
 
 struct Blocking {
     limits: PoolLimits,
+    foreground: bool,
     lifecycle: Arc<Lifecycle>,
     #[cfg(test)]
     start_gate: Mutex<Option<Arc<Gate>>>,
@@ -202,6 +218,7 @@ impl Threads {
                 assert!(limits.workers > 0 && limits.queue > 0 && limits.bytes > 0);
                 Arc::new(Blocking {
                     limits,
+                    foreground: config.foreground,
                     lifecycle: Arc::clone(&lifecycle),
                     #[cfg(test)]
                     start_gate: Mutex::default(),
@@ -429,7 +446,11 @@ impl Blocking {
             if let Some((bytes, work)) = state.queue.pop_front() {
                 wake(&mut state);
                 drop(state);
+                let priority = self
+                    .foreground
+                    .then(sys::resources::Priority::user_initiated);
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+                drop(priority);
                 state = lock(&self.state);
                 state.bytes -= bytes;
                 wake(&mut state);
@@ -755,6 +776,13 @@ mod tests {
             runtime.shutdown();
             assert_eq!(observed, (expected, 0, expected * bytes));
         }
+    }
+
+    #[test]
+    fn only_the_daemon_runs_blocking_jobs_at_the_foreground_class() {
+        assert!(!Config::default().foreground);
+        assert!(!Config::for_cores(4).foreground);
+        assert!(Config::daemon().foreground);
     }
 
     #[test]

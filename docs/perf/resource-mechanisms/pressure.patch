@@ -1,0 +1,40 @@
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index b5f7a2de..4a866764 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -1003,10 +1003,6 @@ impl Daemon {
+         // When a drain out of grace stopped the calls still running.
+         let mut stopped: Option<Instant> = None;
+         let mut awake: Option<Option<sys::Awake>> = None;
+-        let pressure = Arc::new(rt::Notify::new());
+-        let notified = Arc::clone(&pressure);
+-        let _pressure_source = sys::resources::MemoryPressure::new(move || notified.notify());
+-        let mut pressured = pressure.count();
+         let mut pulsed = self.pulse.count();
+         let mut jobs = self.jobs.count();
+         loop {
+@@ -1016,10 +1012,6 @@ impl Daemon {
+                 session: None,
+                 detail: String::new(),
+             });
+-            if pressure.count() != pressured {
+-                pressured = pressure.count();
+-                self.reclaim_idle();
+-            }
+             self.hibernate(config.hibernate);
+             self.publish_list();
+             let stopping = *lock(&self.stopping);
+@@ -1075,12 +1067,7 @@ impl Daemon {
+                 self.jobs.changed(&mut jobs).await;
+                 false
+             };
+-            let reclaim = async {
+-                pressure.changed(&mut pressured).await;
+-                self.reclaim_idle();
+-                false
+-            };
+-            let woken = rt::or(pulse, rt::or(reclaim, rt::or(ended, sleep)));
++            let woken = rt::or(pulse, rt::or(ended, sleep));
+             if woken.await {
+                 since = None;
+             }

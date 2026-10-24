@@ -281,10 +281,17 @@ HTTP authentication, sampling and elicitation remain unsupported.
 ## Runtime, wire and clients
 
 `rt::Runtime` supplies spawning, blocking work, time and a reactor. The
-default `Threads` implementation uses async-executor and async-io plus a
-blocking pool. Alternative adapters are feature-gated; the optional Tokio
-adapter is not linked by `a`. Platform calls and production unsafe code
-belong in `sys`; `rt` owns readiness integration.
+default `Threads` implementation uses async-executor and async-io with owned
+workers and separately admitted blocking classes. Async workers never exceed
+four and the CPU ceiling is the CPU count minus one (at least one). The
+daemon's `Config::daemon` counts effective parallelism (Windows CPU sets and
+job caps) and runs blocking jobs at the foreground class; clients keep the
+standard count and their caller's class. Catalog reconstruction
+shares storage admission. macOS pressure events ask actors to release disposable
+projection caches while retaining session ownership. Platform calls and unsafe
+code belong in `sys`; `rt` owns admission and readiness integration.
+[Native resource measurements](perf/resources.md) describe the policy and channel
+comparisons.
 
 `json::Json` holds shared raw JSON bytes. Arguments, output, model responses
 and extension state pass through layers without decoding by non-owners.
