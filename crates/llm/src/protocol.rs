@@ -351,7 +351,7 @@ impl Host {
     }
 
     /// The provider for this host, `protocol` speaking to it, configured
-    /// from the variables `env` looks up (such as [`env`], this process's).
+    /// from the variables `env` looks up (such as [`env()`], this process's).
     pub fn provider(&self, protocol: impl Protocol, env: &Vars<'_>) -> Result<Provider, Error> {
         self.configure(Arc::new(protocol), env)
     }

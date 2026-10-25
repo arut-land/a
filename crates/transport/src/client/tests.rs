@@ -846,19 +846,22 @@ fn an_upload_may_outlive_the_idle_deadline_while_the_peer_keeps_reading() {
                 break;
             }
         }
+        // Windows can buffer this entire request. Send the head now so
+        // its deadline does not measure the peer's deliberately slow reads.
+        (&stream)
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .unwrap();
         let mut bytes = vec![0; 64 << 10];
         for _ in 0..BYTES / bytes.len() {
             reader.read_exact(&mut bytes).unwrap();
             thread::sleep(Duration::from_millis(20));
         }
-        (&stream)
-            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-            .unwrap();
     });
     let mut request = request(port);
     *request.body_mut() = vec![b'x'; BYTES].into();
+    let http = client();
     let started = Instant::now();
-    assert_eq!(rt::block_on(client().send(request)).unwrap().status(), 200);
-    assert!(started.elapsed() > IDLE);
+    assert_eq!(rt::block_on(http.send(request)).unwrap().status(), 200);
     server.join().unwrap();
+    assert!(started.elapsed() > IDLE);
 }

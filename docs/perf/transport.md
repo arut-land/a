@@ -52,7 +52,7 @@ What ureq gave the daemon, and what the client does now:
 | Reply head timeout | 300 s | 300 s without progress |
 | Body timeouts | none | 300 s idle between reads and individual socket writes, reset on progress; no total request duration limit |
 | TCP keep-alive | platform defaults | Kernel probes: 60 s idle, 10 s interval, 5 probes, with native socket options on each OS |
-| Redirects | 10, auth headers dropped | Curl method rules; Authorization, Proxy-Authorization, Cookie and body headers dropped; x-api-key, x-goog-api-key and api-key also dropped when the host changes |
+| Redirects | 10, auth headers dropped | 301/302/303 become GET (HEAD stays); 307/308 preserve the method but body resends are refused; Authorization, Proxy-Authorization, Cookie and body headers dropped; x-api-key, x-goog-api-key and api-key also dropped when the host changes |
 | Proxy | Environment, NO_PROXY, CONNECT | http_proxy for HTTP (uppercase HTTP_PROXY ignored); https_proxy before HTTPS_PROXY for HTTPS; scheme-specific before all_proxy / ALL_PROXY; NO_PROXY before no_proxy; bypass checked before reporting an unusable proxy |
 | Proxy schemes | HTTP CONNECT | HTTP CONNECT; an HTTPS or SOCKS proxy fails the requests routed through it, while bypassed requests still work |
 | Response compression | off | Advertises gzip, br, zstd and decodes incrementally, including SSE; removes Content-Encoding and Content-Length after decoding |
@@ -85,9 +85,9 @@ dependency tree. Candidates were checked before selecting the backend:
 The identical probe was 523,568 bytes without compression, 1,021,488 with
 libzstd and 1,404,528 with mzstd (macOS arm64, release, opt-level z, LTO,
 one codegen unit, stripped). These are probe deltas, not full daemon sizes.
-The selected backend adds 17 lockfile entries (16 normal/build dependency entries,
-plus the optional zlib-rs resolution);
-existing futures-io, thiserror, memchr and the runtime are reused. The
+The selected backend adds 17 lockfile entries (16 normal/build dependency
+entries, plus the optional zlib-rs resolution). Existing futures-io,
+thiserror, memchr and the runtime are reused. The
 maintained codecs own gzip/Brotli framing and zstd sessions. The local
 zstd adapter only drives input/output progress over AsyncRead: its upstream
 async-compression adapter is currently behind an unstable cfg. No codec,
@@ -192,8 +192,9 @@ eight, with ranges overlapping.
   and five times the RSS.
 - **CPU** is lower from 32 streams: no channel hop per chunk and no worker
   wake-ups.
-- **Memory** per active stream is its 16 KiB read buffer; an idle pooled
-  connection holds none. RSS at 128 concurrent streams equals ureq's
+- **Memory** per active stream includes its 16 KiB HTTP read buffer.
+  Pooling drops the exchange buffers; TLS sessions retain their record
+  buffers. Compressed replies also keep codec state and a decode buffer. RSS at 128 concurrent streams equals ureq's
   bounded eight.
 - **Cold first request** against `https://api.openai.com/v1/models`
   (401 reply, three runs each, from the same host): ureq 289–367 ms,
