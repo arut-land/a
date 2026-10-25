@@ -42,8 +42,8 @@ use std::time::Duration;
 
 use protocol::view::SessionList;
 use protocol::{
-    Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings,
-    SessionId, SessionSummary, SettingsChange, Versions, write_frame,
+    Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings, Host,
+    Peer, SessionId, SessionSummary, SettingsChange, Versions, write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, OwnedConnection, Signal, Staged};
@@ -60,7 +60,7 @@ pub enum Error {
     Mismatch {
         theirs: Versions,
         newer: Option<PathBuf>,
-        host: Option<String>,
+        host: Option<Host>,
     },
     /// The daemon took the connection but did not answer the hello in
     /// time; see [`diagnose`] and [`restart`].
@@ -154,6 +154,8 @@ pub struct Connection {
     /// The far host's environment, as its bridge captured it; `None` for
     /// this machine's daemon.
     pub remote: Option<Environment>,
+    /// The daemon, as the link and its welcome named it.
+    pub peer: Peer,
     /// What the hello settled.
     pub welcome: Welcome,
     /// The slash commands the daemon advertised.
@@ -567,20 +569,23 @@ fn locked(file: File, within: Option<Duration>) -> Option<File> {
 async fn reach(home: &Home, build: &str) -> Result<Connection, Error> {
     let link::Opened {
         stream,
+        via,
+        machine,
         mut buffered,
         remote,
         within,
     } = link::socket(&link::BLOCKING, home.endpoint().connect()?)?;
     let greeting = answered(
         within,
-        link::hello(&*stream, &mut buffered, build, None, &[]),
+        link::hello(&*stream, &mut buffered, build, None, machine, &[]),
     )
     .await?;
     match greeting {
-        (Greeting::Welcome, welcome, commands) => Ok(Connection {
+        (Greeting::Welcome(machine), welcome, commands) => Ok(Connection {
             stream,
             buffered,
             remote,
+            peer: Peer { machine, via },
             welcome,
             commands,
         }),
@@ -1020,6 +1025,7 @@ mod tests {
                             proto: PROTO,
                             build: "1.2.3+0123456789abcdef".into(),
                             caps: Caps::ALL,
+                            machine: protocol::MachineId([0; 16]),
                             commands: Vec::new(),
                         },
                     )

@@ -4,6 +4,7 @@
 use std::ffi::{OsStr, OsString};
 use std::process::Command;
 
+use protocol::Host;
 use usage_rs::embedded::{Exit, Outcome};
 
 use super::generate::commands;
@@ -94,14 +95,17 @@ fn flags_and_arguments_reach_their_command() {
         any: true,
     };
     assert_eq!(
-        (args.cmd, args.host.as_deref()),
+        (args.cmd, args.host.as_ref().map(Host::as_str)),
         (Some(resume), Some("box"))
     );
     let args = parse("--host=box daemon stop");
     let stop = Cmd::Daemon {
         action: Daemon::Stop,
     };
-    assert_eq!((args.cmd, args.host.as_deref()), (Some(stop), Some("box")));
+    assert_eq!(
+        (args.cmd, args.host.as_ref().map(Host::as_str)),
+        (Some(stop), Some("box"))
+    );
     let resume = Cmd::Resume {
         id: None,
         any: false,
@@ -138,7 +142,7 @@ fn a_flag_not_given_falls_back_to_its_variable() {
         let words = words(&argv.to_string_lossy());
         let refs: Vec<&OsStr> = words.iter().map(OsString::as_os_str).collect();
         let host = Args::parse_from(&refs).expect("a command line").host;
-        println!("host={host:?}");
+        println!("host={:?}", host.as_ref().map(Host::as_str));
         return;
     }
     for (argv, want) in [("ls", "box"), ("--host other ls", "other")] {
@@ -165,6 +169,8 @@ fn a_wrong_command_line_is_a_usage_error() {
     assert!(usage_error("attach").contains("<ID>"));
     assert!(usage_error("web --any").contains("'--any'"));
     assert!(usage_error("--host").contains("--host"));
+    // What ssh would read as an option never reaches it.
+    assert!(usage_error("--host=-oProxyCommand=x ls").contains("ssh would take it as an option"));
     assert!(usage_error("ls -x").contains("'-x'"));
     assert!(usage_error("__daemon --listen-fd x").contains("'x'"));
     // A group alone shows what it groups.

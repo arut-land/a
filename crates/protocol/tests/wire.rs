@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use protocol::view::SessionView;
 use protocol::{
     Activity, Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
-    ClientSeq, DaemonMsg, Decode, Entry, Environment, Epoch, HomeSettings, Installed, Mode,
-    Outcome, PROTO, Permission, ReadOnly, Rejection, Residency, Role, Seq, SessionId,
+    ClientSeq, DaemonMsg, Decode, Entry, Environment, Epoch, HomeSettings, Installed, MachineId,
+    Mode, Outcome, PROTO, Permission, ReadOnly, Rejection, Residency, Seq, SessionId,
     SessionSummary, SettingsChange, Target, Verdict, WaitOn,
 };
 use serde_json::json;
@@ -132,7 +132,6 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
         tty: true,
     };
     let decl = ClientDecl {
-        role: Role::Collaborator,
         tools: vec!["pick_file".into()],
         sites: vec!["dialog".into()],
     };
@@ -145,6 +144,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 min: None,
                 caps: Caps::NONE,
                 client: None,
+                machine: None,
             },
         ),
         sample(
@@ -155,6 +155,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 min: Some(PROTO),
                 caps: Caps::NONE,
                 client: Some(CLIENT),
+                machine: Some(MACHINE),
             },
         ),
         sample(
@@ -302,6 +303,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 min: None,
                 caps: Caps::NONE,
                 client: Some(CLIENT),
+                machine: None,
             },
         ),
     ]
@@ -309,6 +311,9 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
 
 /// A client, as it names itself across its connections.
 const CLIENT: ClientId = ClientId(Uuid::from_u128(0xc));
+
+/// A machine, as a welcome names the daemon's.
+const MACHINE: MachineId = MachineId(*b"machine-id-bytes");
 
 /// The entries about input, decisions, waits and answers.
 fn input_samples() -> Vec<Sample<DaemonMsg>> {
@@ -677,6 +682,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 proto: PROTO,
                 build: "0.0.0+0123456789abcdef".into(),
                 caps: Caps::NONE,
+                machine: MACHINE,
                 commands: Vec::new(),
             },
         ),
@@ -686,6 +692,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 proto: PROTO,
                 build: "0.0.0+0123456789abcdef".into(),
                 caps: Caps::NONE,
+                machine: MACHINE,
                 commands: vec![protocol::CommandInfo {
                     name: "model".into(),
                     description: "show or set the model".into(),
@@ -1181,6 +1188,7 @@ fn capabilities_and_versions_negotiate() {
         min: None,
         caps,
         client: None,
+        machine: None,
     };
     assert_eq!(
         serde_json::to_string(&hello).unwrap(),
@@ -1196,8 +1204,6 @@ fn capabilities_and_versions_negotiate() {
 
 #[test]
 fn values_from_a_newer_build_read_as_their_safest() {
-    let role: Role = serde_json::from_str(r#""admin""#).unwrap();
-    assert_eq!(role, Role::Viewer);
     let activity: Activity = serde_json::from_str(r#""migrating_soon""#).unwrap();
     assert_eq!(activity, Activity::Other);
     let reason: Rejection = serde_json::from_str(r#""quota""#).unwrap();

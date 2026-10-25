@@ -39,7 +39,10 @@ exit 255
         std::env::set_var("A_SSH", &ssh);
     }
 
-    let batch = Daemon::new(SshLink::new("box", Prompt::Never), staged.clone());
+    let batch = Daemon::new(
+        SshLink::new("box".parse().unwrap(), Prompt::Never, home.clone()),
+        staged.clone(),
+    );
     assert!(!batch.link.needs_terminal());
     let err = batch.connect(&|| {}).err().expect("ssh failed");
     assert!(
@@ -47,7 +50,10 @@ exit 255
         "{err:?}"
     );
 
-    let terminal = Daemon::new(SshLink::new("box", Prompt::Terminal), staged);
+    let terminal = Daemon::new(
+        SshLink::new("box".parse().unwrap(), Prompt::Terminal, home),
+        staged,
+    );
     assert!(terminal.link.needs_terminal());
     let err = terminal.connect(&|| {}).err().expect("ssh failed");
     assert!(

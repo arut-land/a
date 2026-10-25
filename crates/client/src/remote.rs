@@ -13,9 +13,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use protocol::{ClientMsg, Versions};
+use protocol::{ClientMsg, Host, MachineId, Versions, Via};
 use rt::{BoxFuture, Rt};
-use sys::{Platform, Prompt, Staged};
+use sys::{Home, Platform, Prompt, Staged};
 
 use crate::Error;
 use crate::link::{Link, LinkError, Opened, Pipe, Start, Stream};
@@ -39,19 +39,17 @@ const SSH_FAILED: i32 = 255;
 
 /// Another machine's daemon over `ssh <host>`: the `a` on its `PATH`, else
 /// the one a previous install staged, else this build after installing it
-/// there.
+/// there. `home` is this machine's, whose machine id the hello names.
 #[derive(Clone, Debug)]
 pub struct SshLink {
-    host: String,
+    host: Host,
     prompt: Prompt,
+    home: Home,
 }
 
 impl SshLink {
-    pub fn new(host: impl Into<String>, prompt: Prompt) -> Self {
-        Self {
-            host: host.into(),
-            prompt,
-        }
+    pub const fn new(host: Host, prompt: Prompt, home: Home) -> Self {
+        Self { host, prompt, home }
     }
 }
 
@@ -73,16 +71,22 @@ impl Link for SshLink {
                 )
                 .into());
             }
+            let home = self.home.clone();
+            let machine = rt::unblock(&**rt, move || sys::machine_id(&home)).await?;
+            let opened = |opened: Opened| Opened {
+                machine: Some(MachineId(machine)),
+                ..opened
+            };
             let token = token();
             match self.bridge(rt, Bootstrap::Find, &token).await? {
-                Bridge::Ready(opened) => return Ok(opened),
+                Bridge::Ready(ready) => return Ok(opened(ready)),
                 Bridge::Ended(ended) if ended.shell && ended.code == Some(NOT_FOUND) => {}
                 Bridge::Ended(ended) if ended.shell => return Err(self.ended(&ended)),
                 // No POSIX shell ran discovery (a Windows host, say): only an
                 // `a` its login shell finds can serve.
                 Bridge::Ended(_) => {
                     return match self.bridge(rt, Bootstrap::Direct, &token).await? {
-                        Bridge::Ready(opened) => Ok(opened),
+                        Bridge::Ready(ready) => Ok(opened(ready)),
                         Bridge::Ended(ended) => Err(self.ended(&ended)),
                     };
                 }
@@ -96,7 +100,7 @@ impl Link for SshLink {
                 .bridge(rt, Bootstrap::Installed(&build.id), &token)
                 .await?
             {
-                Bridge::Ready(opened) => Ok(opened),
+                Bridge::Ready(ready) => Ok(opened(ready)),
                 Bridge::Ended(_) => Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("the `a` installed on {} does not run", self.host),
@@ -220,6 +224,10 @@ impl SshLink {
                 };
                 return Ok(Bridge::Ready(Opened {
                     stream: Box::new(pipe),
+                    via: Via::Ssh {
+                        host: self.host.clone(),
+                    },
+                    machine: None,
                     buffered,
                     remote: Some(env),
                     // It may have just started the daemon there.

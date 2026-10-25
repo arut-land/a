@@ -75,6 +75,26 @@ matching. A client with no one at its terminal (`a web`) runs ssh in batch
 mode, and a host that would ask for a password is a typed error. Later
 transports are further `Link` types.
 
+Every home has a machine identity: `protocol::MachineId`, the first 128
+bits of the SHA-256 of an X25519 public key whose secret `sys::machine_id`
+makes the first time the home needs one and keeps in the state directory
+(mode 0600; sealed with DPAPI on Windows; see
+[the measurements](perf/machine-key.md)). The daemon reads it on the
+blocking pool while it loads, and its welcome names it. A client of this
+machine's daemon names no machine in its hello; one over another link names
+its own home's, so the daemon knows whether a client shares its files. Each
+side ends with a `protocol::Peer { machine, via }`: the client's
+`Connection::peer` is the daemon as its link reached it, and the daemon's
+is the client, always `Via::Local`, since a bridge connects locally. The
+daemon decides what a connection may do (`server::Role`) from its peer,
+never from the client: trust is this user on a transport that authenticated
+this user, which the endpoint's peer check and `ssh` both are, so every peer
+owns the daemon today. A transport that does not prove that (another
+person's pinned key, later) decides there. No key is exchanged yet. The
+peer is not logged: it decides nothing a replay must reproduce, and the log
+names a mutation's client already. `--host` is a `protocol::Host`, which is
+never something ssh would read as an option.
+
 See [the client SDK](client.md) and [CLI](cli.md), and the staging and
 endpoint types in `crates/sys`. The daemon targets macOS, Linux and Windows.
 Windows uses SID-restricted named pipes, overlapped completion events over

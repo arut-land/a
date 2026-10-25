@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use protocol::{
     Author, Caps, ClientDecl, ClientId, ClientMsg, ClientSeq, DaemonMsg, Decode, Environment,
-    Frame, HomeSettings, PROTO, Rejection, Role, SettingsChange, Versions,
+    Frame, HomeSettings, PROTO, Peer, Rejection, SettingsChange, Versions, Via,
 };
 use rt::{Async, BoxFuture, Reactor};
 use sys::{Listener, OwnedConnection as Stream};
@@ -191,27 +191,60 @@ async fn write_out(io: Arc<Async<Stream>>, outbox: Outbox, rt: rt::Rt) {
     let _ = io.get_ref().shutdown(std::net::Shutdown::Both);
 }
 
-/// Serves connection `stream` until the client hangs up.
+/// What a connection may do: the daemon decides it from who is on the
+/// connection, never the client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role {
+    Owner,
+    /// Read-only: its mutations are rejected.
+    Viewer,
+}
+
+impl Role {
+    /// The trust rule: this user, on a transport that authenticated this
+    /// user, owns the daemon. Every [`Via`] is one such transport today; one
+    /// that is not (another person's pinned key) decides here.
+    pub(crate) const fn of(peer: &Peer) -> Self {
+        match peer.via {
+            Via::Local | Via::Ssh { .. } => Self::Owner,
+        }
+    }
+}
+
+/// Serves connection `stream` until the client hangs up. The daemon's
+/// endpoint lets only this user connect, so every connection comes
+/// [`Via::Local`], a bridged one included.
 pub(crate) async fn handle(
     daemon: &Arc<Daemon>,
     life: &Lifecycle,
     stream: Stream,
 ) -> io::Result<()> {
+    handle_as(daemon, life, stream, Role::of).await
+}
+
+/// [`handle`], with the connection's role as `role` decides it.
+pub(crate) async fn handle_as(
+    daemon: &Arc<Daemon>,
+    life: &Lifecycle,
+    stream: Stream,
+    role: fn(&Peer) -> Role,
+) -> io::Result<()> {
     let io = Arc::new(Async::new(&daemon.shared.rt.reactor(), stream)?);
     let mut frames = Frames::new(Arc::clone(&io));
-    let (verdict, theirs, caps, client) = match frames.next().await? {
+    let (verdict, theirs, caps, client, machine) = match frames.next().await? {
         Some(ClientMsg::Hello {
             proto,
             build,
             min,
             caps,
             client,
+            machine,
         }) => {
             let theirs = Versions::new(min, proto);
             let caps = caps & Caps::SERVED;
-            (life.verdict(theirs, &build), theirs, caps, client)
+            (life.verdict(theirs, &build), theirs, caps, client, machine)
         }
-        _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE, None),
+        _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE, None, None),
     };
     let outbox = Outbox::new();
     let writer = write_out(
@@ -225,26 +258,41 @@ pub(crate) async fn handle(
             // Whatever the client sent behind a hello that is not welcomed is read
             // and dropped, never acted on.
             let result = match (verdict, Versions::OURS.common(theirs)) {
-                (Verdict::Welcome, Some(proto)) => {
-                    let _registered = life.register(outbox.clone());
-                    let mut conn = Conn {
-                        daemon,
-                        life,
-                        outbox: &outbox,
-                        // One that does not name itself is one client for as long
-                        // as its connection lasts.
-                        client: client.unwrap_or_default(),
-                        attached: None,
-                        decl: ClientDecl::default(),
-                    };
-                    conn.reply(&DaemonMsg::Welcome {
-                        proto,
-                        build: life.build.clone(),
-                        caps,
-                        commands: driver::commands(&daemon.shared.registry.get()),
-                    });
-                    conn.serve(&mut frames).await
-                }
+                (Verdict::Welcome, Some(proto)) => match daemon.machine.id().await {
+                    Ok(ours) => {
+                        let _registered = life.register(outbox.clone());
+                        // One that names no machine is on the daemon's.
+                        let peer = Peer {
+                            machine: machine.unwrap_or(ours),
+                            via: Via::Local,
+                        };
+                        let mut conn = Conn {
+                            daemon,
+                            life,
+                            outbox: &outbox,
+                            // One that does not name itself is one client for as
+                            // long as its connection lasts.
+                            client: client.unwrap_or_default(),
+                            role: role(&peer),
+                            peer,
+                            attached: None,
+                            decl: ClientDecl::default(),
+                        };
+                        conn.reply(&DaemonMsg::Welcome {
+                            proto,
+                            build: life.build.clone(),
+                            caps,
+                            machine: ours,
+                            commands: driver::commands(&daemon.shared.registry.get()),
+                        });
+                        conn.serve(&mut frames).await
+                    }
+                    Err(message) => {
+                        reply(&outbox, &DaemonMsg::Error { message });
+                        within(&daemon.shared.rt.reactor(), REFUSED_GRACE, frames.drain()).await;
+                        Ok(())
+                    }
+                },
                 (Verdict::Drain, _) => {
                     life.drain();
                     daemon.pulse.notify();
@@ -305,6 +353,8 @@ struct Conn<'a> {
     /// that the log holds already is a resend, answered as the first was,
     /// across reconnects and daemon restarts.
     client: ClientId,
+    peer: Peer,
+    role: Role,
     attached: Option<Attachment>,
     decl: ClientDecl,
 }
@@ -399,7 +449,7 @@ impl Conn<'_> {
                         .unwrap_or(u32::MAX),
                     known: u32::try_from(lock(&self.daemon.slots).len()).unwrap_or(u32::MAX),
                 }),
-                ClientMsg::Shutdown if self.decl.role == Role::Viewer => {
+                ClientMsg::Shutdown if self.role == Role::Viewer => {
                     self.error("this client is a viewer".into());
                 }
                 ClientMsg::Shutdown => {
@@ -429,9 +479,7 @@ impl Conn<'_> {
         env: Option<Environment>,
         decl: ClientDecl,
     ) {
-        if matches!(target, protocol::Target::Fork { .. })
-            && (self.decl.role == Role::Viewer || decl.role == Role::Viewer)
-        {
+        if matches!(target, protocol::Target::Fork { .. }) && self.role == Role::Viewer {
             self.reply(&DaemonMsg::ForkRejected {
                 reason: protocol::ForkError::Viewer,
             });
@@ -467,7 +515,9 @@ impl Conn<'_> {
                     return;
                 }
                 s.session().attach(self.outbox.clone(), since).await;
-                session_event("attach", s.session().id, || format!("since {since}"));
+                session_event("attach", s.session().id, || {
+                    format!("since {since} from {}", self.peer.machine)
+                });
                 self.attached = Some(s);
             }
             Err(e) => self.error(e.to_string()),
@@ -478,7 +528,7 @@ impl Conn<'_> {
     /// daemon is the file's one writer, writing it off the async workers.
     async fn settings(&self, change: Option<SettingsChange>) -> DaemonMsg {
         let shared = Arc::clone(&self.daemon.shared);
-        let viewer = self.decl.role == Role::Viewer;
+        let viewer = self.role == Role::Viewer;
         let rt = Arc::clone(&shared.rt);
         let (file, refused) = rt::unblock(&*rt, move || {
             let home = &shared.models.settings.home;
@@ -509,7 +559,7 @@ impl Conn<'_> {
         let refused =
             |answer: Answer| -> BoxFuture<'static, Answer> { Box::pin(std::future::ready(answer)) };
         let session = match &self.attached {
-            _ if self.decl.role == Role::Viewer => {
+            _ if self.role == Role::Viewer => {
                 return refused(Err((Rejection::ReadOnly, "this client is a viewer".into())));
             }
             Some(s) => s.session(),

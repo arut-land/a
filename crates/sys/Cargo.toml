@@ -10,8 +10,13 @@ publish.workspace = true
 test-support = []
 
 [dependencies]
+# The machine key: X25519 alone, no signatures; its id hashes with the
+# SHA-256 blobs already link. See docs/perf/machine-key.md.
+ed25519-compact = { version = "2.6", default-features = false, features = ["x25519", "disable-signatures"] }
+getrandom = { version = "0.4", default-features = false, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = { version = "0.11", default-features = false }
 # config.toml, edited in place so a hand-edited file keeps its comments.
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 
@@ -32,7 +37,7 @@ tracelogging = "1.2.4"
 # Ordinary executable names keep .NET Framework hosts working; preserve verbatim-only names.
 dunce = "1.0.5"
 libloading = "0.9"
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Registry", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_System_Power", "Win32_System_SystemServices", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Registry", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_System_Power", "Win32_System_SystemServices", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader"] }
 
 [lints]
 workspace = true

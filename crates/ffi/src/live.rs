@@ -583,6 +583,7 @@ mod tests {
             proto: protocol::PROTO,
             build: "test".into(),
             caps: Caps::ALL,
+            machine: protocol::MachineId([0; 16]),
             commands: Vec::new(),
         };
         read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
@@ -684,6 +685,7 @@ mod tests {
             proto: protocol::PROTO,
             build: "test".into(),
             caps: Caps::ALL,
+            machine: protocol::MachineId([0; 16]),
             commands: Vec::new(),
         };
         session.send("unanswered".into()).unwrap();

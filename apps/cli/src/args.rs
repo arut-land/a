@@ -20,7 +20,7 @@ mod tests;
 pub struct Args {
     /// Use the daemon on HOST, reached with `ssh HOST a bridge`
     #[usage(long, global, env = "A_HOST", value_name = "HOST")]
-    pub host: Option<String>,
+    pub host: Option<protocol::Host>,
     /// Run one turn on PROMPT (and stdin, if piped), print the reply, exit
     #[usage(short = 'p', long, value_name = "PROMPT")]
     pub prompt: Option<String>,

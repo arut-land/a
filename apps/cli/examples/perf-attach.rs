@@ -18,6 +18,7 @@ fn attach(home: &sys::Home, target: Target) -> (protocol::SessionId, Vec<Entry>,
             min: None,
             caps: protocol::Caps::NONE,
             client: None,
+            machine: None,
         },
     )
     .unwrap();
