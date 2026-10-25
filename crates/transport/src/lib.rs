@@ -96,6 +96,15 @@ pub fn body(chunks: impl IntoIterator<Item = Vec<u8>>) -> Body {
     Box::pin(Ready(chunks.into_iter().collect::<Vec<_>>().into_iter()))
 }
 
+/// A request-body content coding supported by its provider. Insert into
+/// the HTTP request's extensions to let the client select compressed bytes
+/// when they reduce the upload; absence leaves the body unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compression {
+    Gzip,
+    Zstd,
+}
+
 /// Whether transport may resend a request at another URL.
 #[derive(Clone, Copy, Debug)]
 pub enum RedirectPolicy {

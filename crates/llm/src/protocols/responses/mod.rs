@@ -127,6 +127,7 @@ impl Protocol for Responses {
 pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
+            compression: Some(transport::Compression::Zstd),
             base_url_env: &["OPENAI_BASE_URL"],
             ..Host::bearer("openai", "https://api.openai.com/v1", &["OPENAI_API_KEY"])
         },

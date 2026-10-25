@@ -239,6 +239,7 @@ const ANTHROPIC: (Host, Quirks) = (
         base_url_env: &["ANTHROPIC_BASE_URL"],
         key: KeyStyle::Header("x-api-key"),
         keyless: false,
+        compression: None,
     },
     Quirks::ANTHROPIC,
 );

@@ -48,9 +48,13 @@ pub(super) struct Config {
 
 #[cfg(not(any(feature = "tls-native", feature = "tls-rustls")))]
 impl Config {
-    #[expect(clippy::unused_self, reason = "the TLS variants keep their configuration")]
+    #[expect(
+        clippy::unused_self,
+        reason = "the TLS variants keep their configuration"
+    )]
     pub fn connect(
         &self,
+        _: &rt::Rt,
         _: &str,
         _: rt::Async<TcpStream>,
     ) -> impl Future<Output = io::Result<Stream>> + use<> {
@@ -63,11 +67,11 @@ impl Config {
 
 #[cfg(not(any(feature = "tls-native", feature = "tls-rustls")))]
 impl Stream {
-    pub fn read(&mut self, _: &mut [u8]) -> std::future::Ready<io::Result<usize>> {
+    pub fn read(&mut self, _: &rt::Rt, _: &mut [u8]) -> std::future::Ready<io::Result<usize>> {
         match *self {}
     }
 
-    pub fn write_all(&mut self, _: &[u8]) -> std::future::Ready<io::Result<()>> {
+    pub fn write_all(&mut self, _: &rt::Rt, _: &[u8]) -> std::future::Ready<io::Result<()>> {
         match *self {}
     }
 
@@ -80,7 +84,10 @@ impl Stream {
 impl Config {
     #[cfg_attr(
         not(test),
-        expect(clippy::unused_self, reason = "only tests trust a certificate of their own")
+        expect(
+            clippy::unused_self,
+            reason = "only tests trust a certificate of their own"
+        )
     )]
     fn trusted(&self) -> Option<&[u8]> {
         #[cfg(test)]
@@ -92,7 +99,12 @@ impl Config {
 
 #[cfg(feature = "tls-native")]
 impl Config {
-    pub async fn connect(&self, host: &str, socket: rt::Async<TcpStream>) -> io::Result<Stream> {
+    pub async fn connect(
+        &self,
+        rt: &rt::Rt,
+        host: &str,
+        socket: rt::Async<TcpStream>,
+    ) -> io::Result<Stream> {
         let connector = if let Some(connector) = self.built.get() {
             connector
         } else {
@@ -109,11 +121,11 @@ impl Config {
         loop {
             match handshake {
                 Ok(mut session) => {
-                    session.get_mut().drain().await?;
+                    session.get_mut().drain(rt).await?;
                     return Ok(Stream(Box::new(session)));
                 }
                 Err(native_tls::HandshakeError::WouldBlock(mut mid)) => {
-                    mid.get_mut().drain().await?;
+                    mid.get_mut().drain(rt).await?;
                     mid.get_ref().socket.readable().await;
                     handshake = mid.handshake();
                 }
@@ -127,7 +139,12 @@ impl Config {
 
 #[cfg(feature = "tls-rustls")]
 impl Config {
-    pub async fn connect(&self, host: &str, socket: rt::Async<TcpStream>) -> io::Result<Stream> {
+    pub async fn connect(
+        &self,
+        rt: &rt::Rt,
+        host: &str,
+        socket: rt::Async<TcpStream>,
+    ) -> io::Result<Stream> {
         use std::sync::Arc;
         let config = if let Some(config) = self.built.get() {
             config
@@ -147,20 +164,21 @@ impl Config {
                     }
                     builder.with_root_certificates(roots)
                 }
-                None => rustls_platform_verifier::BuilderVerifierExt::with_platform_verifier(
-                    builder,
-                )
-                .map_err(io::Error::other)?,
+                None => {
+                    rustls_platform_verifier::BuilderVerifierExt::with_platform_verifier(builder)
+                        .map_err(io::Error::other)?
+                }
             };
             self.built
                 .get_or_init(|| Arc::new(builder.with_no_client_auth()))
         };
-        handshake(Arc::clone(config), host, socket).await
+        handshake(rt, Arc::clone(config), host, socket).await
     }
 }
 
 #[cfg(feature = "tls-rustls")]
 async fn handshake(
+    rt: &rt::Rt,
     config: std::sync::Arc<rustls::ClientConfig>,
     host: &str,
     socket: rt::Async<TcpStream>,
@@ -171,7 +189,7 @@ async fn handshake(
     let mut tls = rustls::StreamOwned::new(session, Io::new(socket));
     while tls.conn.is_handshaking() {
         let progress = tls.conn.complete_io(&mut tls.sock);
-        tls.sock.drain().await?;
+        tls.sock.drain(rt).await?;
         match progress {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => tls.sock.socket.readable().await,
@@ -183,20 +201,20 @@ async fn handshake(
 
 #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
 impl Stream {
-    pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.run(|tls| tls.read(buf)).await
+    pub async fn read(&mut self, rt: &rt::Rt, buf: &mut [u8]) -> io::Result<usize> {
+        self.run(rt, |tls| tls.read(buf)).await
     }
 
-    pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+    pub async fn write_all(&mut self, rt: &rt::Rt, bytes: &[u8]) -> io::Result<()> {
         for mut slice in bytes.chunks(SLICE) {
             while !slice.is_empty() {
-                match self.run(|tls| tls.write(slice)).await? {
+                match self.run(rt, |tls| tls.write(slice)).await? {
                     0 => return Err(io::ErrorKind::WriteZero.into()),
                     n => slice = &slice[n..],
                 }
             }
         }
-        self.run(io::Write::flush).await
+        self.run(rt, io::Write::flush).await
     }
 
     pub fn socket(&self) -> &TcpStream {
@@ -205,13 +223,25 @@ impl Stream {
 
     /// Runs one library call, sends what it wrote, and waits for the peer
     /// while the call would block reading.
-    async fn run<R>(&mut self, mut op: impl FnMut(&mut Session) -> io::Result<R>) -> io::Result<R> {
+    async fn run<R>(
+        &mut self,
+        rt: &rt::Rt,
+        mut op: impl FnMut(&mut Session) -> io::Result<R>,
+    ) -> io::Result<R> {
         loop {
             let result = op(&mut self.0);
-            self.io_mut().drain().await?;
+            self.io_mut().drain(rt).await?;
             match result {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.io().socket.readable().await;
+                    super::within(
+                        rt,
+                        async {
+                            self.io().socket.readable().await;
+                            Ok(())
+                        },
+                        "waiting for TLS",
+                    )
+                    .await?;
                 }
                 result => return result,
             }
@@ -256,14 +286,17 @@ impl Io {
         }
     }
 
-    async fn drain(&mut self) -> io::Result<()> {
+    async fn drain(&mut self, rt: &rt::Rt) -> io::Result<()> {
         let Self { socket, out } = self;
         let mut sent = 0;
         while sent < out.len() {
             let end = out.len().min(sent + SLICE);
-            match socket
-                .write_with(|mut socket| socket.write(&out[sent..end]))
-                .await?
+            match super::within(
+                rt,
+                socket.write_with(|mut socket| socket.write(&out[sent..end])),
+                "sending TLS records",
+            )
+            .await?
             {
                 0 => return Err(io::ErrorKind::WriteZero.into()),
                 n => sent += n,

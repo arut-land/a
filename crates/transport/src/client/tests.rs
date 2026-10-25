@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::pin::Pin;
 use std::sync::mpsc;
 use std::thread;
@@ -93,7 +93,7 @@ fn server(reply: &'static [u8]) -> (u16, rt::oneshot::Receiver<()>, mpsc::Receiv
         got.send(());
         // EOF or a reset: either way the client is gone.
         let _ = reader.read_to_end(&mut Vec::new());
-        closed.send(()).unwrap();
+        let _ = closed.send(());
     });
     (port, got_rx, closed_rx)
 }
@@ -150,7 +150,7 @@ fn dropping_a_streaming_body_closes_the_connection() {
     let (port, _, closed) = server(
         b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
           transfer-encoding: chunked\r\n\r\n\
-          10\r\ndata: thinking\n\n\r\n",
+          20\r\ndata: thinking\n\n",
     );
     let reply = rt::block_on(client().send(request(port))).unwrap();
     let mut body = reply.into_body();
@@ -320,7 +320,7 @@ fn redirects_follow_by_policy_and_drop_credentials() {
         let mut request = request(port);
         request
             .headers_mut()
-            .insert(http::header::AUTHORIZATION, "secret".parse().unwrap());
+            .insert(AUTHORIZATION, "secret".parse().unwrap());
         let reply = rt::block_on(clients.client(policy).send(request)).unwrap();
         let status = reply.status();
         let mut body = reply.into_body();
@@ -372,7 +372,7 @@ fn credentials_never_cross_transport_scopes() {
         if let Some(value) = credential {
             request
                 .headers_mut()
-                .insert(http::header::AUTHORIZATION, value.parse().unwrap());
+                .insert(AUTHORIZATION, value.parse().unwrap());
         }
         let reply = rt::block_on(clients.client(policy).send(request)).unwrap();
         let mut body = reply.into_body();
@@ -394,7 +394,9 @@ fn a_reply_left_at_its_last_chunk_leaves_its_connection_to_the_next() {
         for _ in 0..2 {
             read_request(&mut reader);
             (&stream)
-                .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+                )
                 .unwrap();
         }
     });
@@ -404,6 +406,51 @@ fn a_reply_left_at_its_last_chunk_leaves_its_connection_to_the_next() {
         let mut body = reply.into_body();
         assert_eq!(&next_chunk(&mut body).unwrap().unwrap()[..], b"hello");
     }
+    server.join().unwrap();
+}
+
+#[test]
+fn a_delayed_terminator_returns_a_dropped_replys_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (dropped, wait) = mpsc::channel();
+    let (reused, done) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(IDLE)).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        read_request(&mut reader);
+        (&stream)
+            .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n")
+            .unwrap();
+        wait.recv().unwrap();
+        (&stream).write_all(b"0\r\n\r\n").unwrap();
+        read_request(&mut reader);
+        (&stream)
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .unwrap();
+        reused.send(()).unwrap();
+    });
+    let http = client();
+    let reply = rt::block_on(http.send(request(port))).unwrap();
+    let mut body = reply.into_body();
+    assert_eq!(next_chunk(&mut body).unwrap().unwrap(), b"hello");
+    drop(body);
+    dropped.send(()).unwrap();
+    // Wait for the background drain to return the connection, without
+    // sending another request on a new socket in the meantime.
+    let target = Target::try_from(request(port).uri()).unwrap();
+    let started = Instant::now();
+    loop {
+        if let Some(conn) = http.0.pool.take(&target, http.0.rt.now()) {
+            http.0.pool.put(target.clone(), conn, http.0.rt.now());
+            break;
+        }
+        assert!(started.elapsed() < IDLE);
+        thread::sleep(Duration::from_millis(1));
+    }
+    let _reply = rt::block_on(http.send(request(port))).unwrap();
+    done.recv_timeout(IDLE).unwrap();
     server.join().unwrap();
 }
 
@@ -423,9 +470,8 @@ fn a_reply_after_an_informational_one_in_the_same_read_is_not_waited_for() {
 
 #[test]
 fn a_reply_gone_silent_between_chunks_times_out() {
-    let (port, _, _) = server(
-        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
-    );
+    let (port, _, _) =
+        server(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n");
     let reply = rt::block_on(client().send(request(port))).unwrap();
     let mut body = reply.into_body();
     assert_eq!(&next_chunk(&mut body).unwrap().unwrap()[..], b"hello");
@@ -448,7 +494,9 @@ fn a_redirect_to_another_host_drops_the_provider_key() {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let headers = read_request(&mut reader);
             let reply = if headers.starts_with("get /same") {
-                format!("HTTP/1.1 302 Found\r\nlocation: http://localhost:{port}/other\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                format!(
+                    "HTTP/1.1 302 Found\r\nlocation: http://localhost:{port}/other\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
             } else if headers.starts_with("get /other") {
                 "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
             } else {
@@ -463,9 +511,7 @@ fn a_redirect_to_another_host_drops_the_provider_key() {
     let http = Client::new(Arc::new(rt::Threads::new(1)), RedirectPolicy::Follow);
     let mut request = request(port);
     for (name, value) in [("x-api-key", "key"), ("authorization", "Bearer key")] {
-        request
-            .headers_mut()
-            .insert(name, value.parse().unwrap());
+        request.headers_mut().insert(name, value.parse().unwrap());
     }
     let reply = rt::block_on(http.send(request)).unwrap();
     assert_eq!(reply.status(), 200);
@@ -478,6 +524,8 @@ fn a_redirect_to_another_host_drops_the_provider_key() {
 
 #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
 mod tls_data {
+    use std::net::TcpStream;
+
     use super::*;
 
     const CERT: &[u8] = include_bytes!("testdata/localhost.pem");
@@ -572,7 +620,9 @@ mod tls_data {
         // literal the certificate also names.
         let request = {
             let (mut parts, body) = request.into_parts();
-            parts.uri = format!("https://127.0.0.1:{port}/v1/responses").parse().unwrap();
+            parts.uri = format!("https://127.0.0.1:{port}/v1/responses")
+                .parse()
+                .unwrap();
             http::Request::from_parts(parts, body)
         };
         let reply = rt::block_on(trusting().send(request)).unwrap();
@@ -582,6 +632,222 @@ mod tls_data {
             next_chunk(&mut body).unwrap().unwrap(),
             BODY.to_string().into_bytes()
         );
+        drop(body);
         server.join().unwrap();
     }
+}
+
+#[test]
+fn request_lines_and_headers_grow_without_a_transport_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let headers = read_request(&mut reader);
+        assert!(headers.lines().next().unwrap().len() > 16 << 10);
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.starts_with("x-large: ") && line.len() > 64 << 10)
+        );
+        (&stream)
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .unwrap();
+    });
+    let request = http::Request::post(format!("http://127.0.0.1:{port}/{}", "x".repeat(32 << 10)))
+        .header("x-large", "y".repeat(128 << 10))
+        .body(Payload::default())
+        .unwrap();
+    assert_eq!(rt::block_on(client().send(request)).unwrap().status(), 200);
+    server.join().unwrap();
+}
+
+fn compressed_events(coding: &str) -> (Vec<u8>, Vec<u8>) {
+    use futures_lite::io::AsyncWriteExt as _;
+    macro_rules! encode {
+        ($encoder:ty) => {{
+            rt::block_on(async {
+                let mut encoder = <$encoder>::new(Vec::new());
+                encoder.write_all(b"data: first\n\n").await.unwrap();
+                encoder.flush().await.unwrap();
+                let first = encoder.get_ref().clone();
+                encoder.write_all(b"data: last\n\n").await.unwrap();
+                encoder.close().await.unwrap();
+                (first, encoder.into_inner())
+            })
+        }};
+    }
+    match coding {
+        "gzip" => encode!(async_compression::futures::write::GzipEncoder<Vec<u8>>),
+        "br" => encode!(async_compression::futures::write::BrotliEncoder<Vec<u8>>),
+        "zstd" => {
+            let mut compressor = mzstd::Compressor::new(mzstd::EncoderConfig::default()).unwrap();
+            let mut output = Vec::new();
+            let mut writer = compressor.writer(&mut output, mzstd::StreamConfig::default());
+            writer.write_all(b"data: first\n\n").unwrap();
+            writer.flush().unwrap();
+            let first = (*writer.get_ref()).clone();
+            writer.write_all(b"data: last\n\n").unwrap();
+            writer.finish().unwrap();
+            (first, output)
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn compressed_events_arrive_before_the_next_event_or_footer() {
+    for coding in ["gzip", "br", "zstd"] {
+        let (first, all) = compressed_events(coding);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (received, wait) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert!(read_request(&mut reader).contains("accept-encoding: gzip, br, zstd"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-encoding: {coding}\r\ncontent-length: {}\r\n\r\n",
+                all.len()
+            )
+            .unwrap();
+            stream.write_all(&first).unwrap();
+            wait.recv_timeout(IDLE)
+                .expect("decoder held an event until EOF");
+            stream.write_all(&all[first.len()..]).unwrap();
+        });
+        let reply = rt::block_on(client().send(request(port))).unwrap();
+        assert!(!reply.headers().contains_key(CONTENT_ENCODING));
+        assert!(!reply.headers().contains_key(CONTENT_LENGTH));
+        let mut body = reply.into_body();
+        assert_eq!(
+            next_chunk(&mut body).unwrap().unwrap(),
+            b"data: first\n\n",
+            "{coding}"
+        );
+        received.send(()).unwrap();
+        let mut rest = Vec::new();
+        while let Some(chunk) = next_chunk(&mut body) {
+            rest.extend(chunk.unwrap());
+        }
+        assert_eq!(rest, b"data: last\n\n", "{coding}");
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn truncated_compression_is_an_error() {
+    for coding in ["gzip", "br", "zstd"] {
+        let (first, _) = compressed_events(coding);
+        let response = http::Response::builder()
+            .header(CONTENT_ENCODING, coding)
+            .body(crate::body([first]))
+            .unwrap();
+        let mut body = compression::decode(response).unwrap().into_body();
+        let mut error = false;
+        while let Some(chunk) = next_chunk(&mut body) {
+            error |= chunk.is_err();
+        }
+        assert!(error, "{coding} ended successfully without its footer");
+    }
+}
+
+#[test]
+fn compressed_uploads_keep_every_payload_piece_and_set_the_wire_length() {
+    for coding in [crate::Compression::Gzip, crate::Compression::Zstd] {
+        let payload: Payload = (0..4096).map(|i| Arc::<[u8]>::from(format!("message {i}: the conversation includes code and tool output with repeated keys\n").into_bytes())).collect::<Vec<_>>().into();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let original = payload.len();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            let mut encoding = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-encoding:") {
+                    encoding = value.trim().to_owned();
+                }
+            }
+            assert_eq!(
+                encoding,
+                match coding {
+                    crate::Compression::Gzip => "gzip",
+                    crate::Compression::Zstd => "zstd",
+                }
+            );
+            assert!(length < original);
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\ncontent-encoding: {encoding}\r\ncontent-length: {length}\r\n\r\n").unwrap();
+            stream.write_all(&bytes).unwrap();
+        });
+        let mut request = request(port);
+        *request.body_mut() = payload.clone();
+        request.extensions_mut().insert(coding);
+        let mut body = rt::block_on(client().send(request)).unwrap().into_body();
+        let mut received = Vec::new();
+        while let Some(chunk) = next_chunk(&mut body) {
+            received.extend(chunk.unwrap());
+        }
+        assert_eq!(received, payload.to_vec());
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn a_dropped_boundary_without_a_terminator_is_closed_by_the_drain_deadline() {
+    let (port, _, closed) =
+        server(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n");
+    let http = client();
+    let mut body = rt::block_on(http.send(request(port))).unwrap().into_body();
+    assert_eq!(next_chunk(&mut body).unwrap().unwrap(), b"hello");
+    let started = Instant::now();
+    drop(body);
+    closed
+        .recv_timeout(IDLE + PROMPT)
+        .expect("terminator drain outlived its deadline");
+    assert!(started.elapsed() >= IDLE);
+}
+
+#[test]
+fn an_upload_may_outlive_the_idle_deadline_while_the_peer_keeps_reading() {
+    const BYTES: usize = 16 << 20;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let mut bytes = vec![0; 64 << 10];
+        for _ in 0..BYTES / bytes.len() {
+            reader.read_exact(&mut bytes).unwrap();
+            thread::sleep(Duration::from_millis(20));
+        }
+        (&stream)
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .unwrap();
+    });
+    let mut request = request(port);
+    *request.body_mut() = vec![b'x'; BYTES].into();
+    let started = Instant::now();
+    assert_eq!(rt::block_on(client().send(request)).unwrap().status(), 200);
+    assert!(started.elapsed() > IDLE);
+    server.join().unwrap();
 }

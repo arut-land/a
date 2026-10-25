@@ -4,10 +4,12 @@
 //! whichever task awaits them. A reply's body is read from the socket only
 //! as the caller pulls it, so a slow reader holds the peer back rather than
 //! buffering it. Dropping the reply, before its head or during its body,
-//! closes its connection at once: the provider sees the request go away
-//! rather than generating on. The chunk that completes a body returns the
-//! connection to the pool.
+//! closes its connection. At a chunk boundary after returning data, a
+//! bounded background read accepts a delayed terminator; further data
+//! closes the connection. A completed body returns its connection to the
+//! pool.
 
+mod compression;
 mod conn;
 mod pool;
 mod proxy;
@@ -18,8 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, COOKIE, HeaderName, LOCATION, PROXY_AUTHORIZATION,
-    USER_AGENT,
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, COOKIE, HeaderName,
+    LOCATION, PROXY_AUTHORIZATION, USER_AGENT,
 };
 use http::{HeaderValue, Method, StatusCode};
 use ureq_proto::BodyMode;
@@ -120,11 +122,46 @@ impl Shared {
             .headers
             .entry(ACCEPT)
             .or_insert(HeaderValue::from_static("*/*"));
+        parts
+            .headers
+            .entry(ACCEPT_ENCODING)
+            .or_insert(HeaderValue::from_static("gzip, br, zstd"));
+        if !parts.headers.contains_key(CONTENT_ENCODING)
+            && let Some(coding) = parts.extensions.get::<crate::Compression>().copied()
+            && (coding != crate::Compression::Zstd || payload.len() <= 128 << 20)
+        {
+            let encoded = compression::encode(&payload, coding).await?;
+            // OpenAI's documented zstd envelope is at most 128 MiB and
+            // 100:1. Outside it send the original bytes, never reject a
+            // request merely because its conversation grew.
+            let allowed =
+                coding != crate::Compression::Zstd || payload.len().div_ceil(100) <= encoded.len();
+            if allowed && encoded.len() < payload.len() {
+                parts.headers.insert(
+                    CONTENT_ENCODING,
+                    HeaderValue::from_static(match coding {
+                        crate::Compression::Gzip => "gzip",
+                        crate::Compression::Zstd => "zstd",
+                    }),
+                );
+                payload = encoded;
+            }
+        }
         for _ in 0..=MAX_REDIRECTS {
             // Only the first request carries a body: a redirect that would
             // resend one is refused.
             parts = match self.exchange(&parts, std::mem::take(&mut payload)).await? {
-                Exchange::Reply(reply) => return Ok(reply),
+                Exchange::Reply(reply) => {
+                    return if parts.method == Method::HEAD
+                        || matches!(
+                            reply.status(),
+                            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+                        ) {
+                        Ok(reply)
+                    } else {
+                        compression::decode(reply)
+                    };
+                }
                 Exchange::Redirect { status, location } => redirected(parts, status, &location)?,
             };
         }
@@ -138,9 +175,7 @@ impl Shared {
     ) -> io::Result<Exchange> {
         let follow = matches!(self.redirects, RedirectPolicy::Follow);
         let mut parts = parts.clone();
-        parts
-            .headers
-            .insert(CONTENT_LENGTH, payload.len().into());
+        parts.headers.insert(CONTENT_LENGTH, payload.len().into());
         let target = Target::try_from(&parts.uri)?;
         let call = Call::new(http::Request::from_parts(parts, ())).map_err(protocol)?;
         let conn = if let Some(conn) = self.pool.take(&target, self.rt.now()) {
@@ -184,6 +219,7 @@ impl Shared {
         let mut reader = Reader {
             body: Some((call, wire)),
             closed: false,
+            yielded: false,
             target,
             shared: Arc::clone(self),
         };
@@ -233,7 +269,13 @@ fn redirected(
         _ if parts.method == Method::HEAD => Method::HEAD,
         _ => Method::GET,
     };
-    for name in [AUTHORIZATION, PROXY_AUTHORIZATION, COOKIE, CONTENT_LENGTH] {
+    for name in [
+        AUTHORIZATION,
+        PROXY_AUTHORIZATION,
+        COOKIE,
+        CONTENT_LENGTH,
+        CONTENT_ENCODING,
+    ] {
         parts.headers.remove(name);
     }
     if uri.host() != parts.uri.host() {
@@ -318,7 +360,7 @@ impl Wire {
         let Self {
             conn, rt, buf, end, ..
         } = self;
-        let n = within(rt, conn.read(&mut buf[*end..]), "waiting for the reply").await?;
+        let n = within(rt, conn.read(rt, &mut buf[*end..]), "waiting for the reply").await?;
         self.end += n;
         Ok(n)
     }
@@ -331,10 +373,17 @@ impl Wire {
         // Nothing is read before the request is sent, so the read buffer
         // holds the head on its way out.
         while !call.can_proceed() {
-            let n = call.write(&mut self.buf).map_err(protocol)?;
-            let head = self.conn.write_all(&self.buf[..n]);
-            within(&self.rt, head, "sending the request").await?;
+            let n = match call.write(&mut self.buf) {
+                Ok(n) => n,
+                Err(ureq_proto::Error::OutputOverflow) => {
+                    self.buf.resize(self.buf.len() * 2, 0);
+                    continue;
+                }
+                Err(error) => return Err(protocol(error)),
+            };
+            self.conn.write_all(&self.rt, &self.buf[..n]).await?;
         }
+        self.buf.resize(CHUNK, 0);
         let mut call = match call
             .proceed()
             .map_err(protocol)?
@@ -351,7 +400,7 @@ impl Wire {
         // are, never copied into one buffer.
         for piece in payload.pieces() {
             call.consume_direct_write(piece.len()).map_err(protocol)?;
-            within(&self.rt, self.conn.write_all(piece), "sending the request").await?;
+            self.conn.write_all(&self.rt, piece).await?;
         }
         call.proceed()
             .ok_or_else(|| io::Error::other("the request body is shorter than its length"))
@@ -428,6 +477,7 @@ struct Reader {
     body: Option<(Call<RecvBody>, Wire)>,
     /// The peer closed its end.
     closed: bool,
+    yielded: bool,
     target: Target,
     shared: Arc<Shared>,
 }
@@ -445,6 +495,7 @@ impl Reader {
             if !wire.input().is_empty() {
                 let (used, chunk) = wire.decode(call)?;
                 if !chunk.is_empty() {
+                    self.yielded = true;
                     // A caller that stops at the last event, as a model
                     // stream does, still leaves the connection for the next.
                     if complete(call) {
@@ -501,17 +552,62 @@ impl Reader {
     }
 
     fn into_body(self) -> crate::Body {
-        Box::pin(futures_lite::stream::unfold(self, |mut reader| async move {
-            match reader.next().await {
-                Ok(Some(chunk)) => Some((Ok(chunk), reader)),
-                Ok(None) => None,
-                Err(error) => {
-                    // A failed body ends here, and its connection with it.
-                    reader.body = None;
-                    Some((Err(error), reader))
+        Box::pin(futures_lite::stream::unfold(
+            self,
+            |mut reader| async move {
+                match reader.next().await {
+                    Ok(Some(chunk)) => Some((Ok(chunk), reader)),
+                    Ok(None) => None,
+                    Err(error) => {
+                        // A failed body ends here, and its connection with it.
+                        reader.body = None;
+                        Some((Err(error), reader))
+                    }
                 }
-            }
-        }))
+            },
+        ))
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        let Some((mut call, mut wire)) = self.body.take() else {
+            return;
+        };
+        if !self.yielded
+            || self.closed
+            || call.body_mode() != BodyMode::Chunked
+            || !call.is_on_chunk_boundary()
+        {
+            return;
+        }
+        let shared = Arc::clone(&self.shared);
+        let target = self.target.clone();
+        self.shared.rt.spawn(Box::pin(async move {
+            let drain = async {
+                loop {
+                    // Read framing only. A further payload byte means the
+                    // caller cancelled a live body; close it immediately.
+                    let (used, n) = call.read(wire.input(), &mut [0]).map_err(protocol)?;
+                    wire.consume(used);
+                    if n > 0 {
+                        return Ok(());
+                    }
+                    if call.can_proceed() {
+                        let close = match call.proceed().expect("a complete body proceeds") {
+                            RecvBodyResult::Redirect(call) => call.must_close_connection(),
+                            RecvBodyResult::Cleanup(call) => call.must_close_connection(),
+                        };
+                        shared.release(target, wire, close);
+                        return Ok(());
+                    }
+                    if used == 0 && wire.fill().await? == 0 {
+                        return Ok(());
+                    }
+                }
+            };
+            let _ = within(&shared.rt.clone(), drain, "draining the reply terminator").await;
+        }));
     }
 }
 

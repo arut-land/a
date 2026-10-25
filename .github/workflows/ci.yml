@@ -57,6 +57,13 @@ jobs:
       # release budgets run in their own jobs. Live-model tests stay
       # #[ignore]d; there are no secrets.
       - run: mise run check
+      - &transport-features
+        name: Transport without TLS and with rustls
+        run: |
+          for feature in client tls-rustls; do
+            mise exec -- cargo clippy -p transport --all-targets --features "$feature" -- -D warnings
+            mise exec -- cargo nextest run -p transport --features "$feature" --no-tests=fail
+          done
       # The Windows build, cross-linted: no platform cfg above `sys`/`rt`.
       - if: runner.os == 'Linux'
         run: mise run check:windows
@@ -190,6 +197,7 @@ jobs:
       - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
       - run: mise exec -- cargo build -p a
       - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
+      - *transport-features
       - run: mise run acceptance
 
   # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the

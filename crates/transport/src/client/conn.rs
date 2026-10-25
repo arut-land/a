@@ -75,7 +75,7 @@ impl Conn {
                 proxy.tunnel(&socket, target).await?;
             }
             Ok(if target.https {
-                Self::Tls(tls.connect(&target.host, socket).await?)
+                Self::Tls(tls.connect(rt, &target.host, socket).await?)
             } else {
                 Self::Plain(socket)
             })
@@ -90,17 +90,32 @@ impl Conn {
         .await
     }
 
-    pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    pub async fn read(&mut self, rt: &rt::Rt, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Plain(socket) => socket.read_with(|mut socket| socket.read(buf)).await,
-            Self::Tls(tls) => tls.read(buf).await,
+            Self::Tls(tls) => tls.read(rt, buf).await,
         }
     }
 
-    pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+    pub async fn write_all(&mut self, rt: &rt::Rt, mut bytes: &[u8]) -> io::Result<()> {
         match self {
-            Self::Plain(socket) => socket.write_all(bytes).await,
-            Self::Tls(tls) => tls.write_all(bytes).await,
+            Self::Plain(socket) => {
+                use std::io::Write as _;
+                while !bytes.is_empty() {
+                    let n = super::within(
+                        rt,
+                        socket.write_with(|mut socket| socket.write(bytes)),
+                        "sending the request",
+                    )
+                    .await?;
+                    if n == 0 {
+                        return Err(io::ErrorKind::WriteZero.into());
+                    }
+                    bytes = &bytes[n..];
+                }
+                Ok(())
+            }
+            Self::Tls(tls) => tls.write_all(rt, bytes).await,
         }
     }
 

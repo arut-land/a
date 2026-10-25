@@ -66,7 +66,11 @@ impl Proxies {
 
     /// The proxy a request to `target` goes through, if any.
     pub fn route(&self, target: &Target) -> io::Result<Option<&Proxy>> {
-        let setting = if target.https { &self.https } else { &self.http };
+        let setting = if target.https {
+            &self.https
+        } else {
+            &self.http
+        };
         let Some(setting) = setting else {
             return Ok(None);
         };
@@ -97,14 +101,11 @@ impl Proxy {
             ));
         }
         let authority = uri.authority().ok_or_else(invalid)?;
-        let authorization = authority
-            .as_str()
-            .rsplit_once('@')
-            .map(|(credentials, _)| {
-                let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
-                let token = base64::prelude::BASE64_STANDARD.encode(format!("{user}:{password}"));
-                format!("Basic {token}")
-            });
+        let authorization = authority.as_str().rsplit_once('@').map(|(credentials, _)| {
+            let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
+            let token = base64::prelude::BASE64_STANDARD.encode(format!("{user}:{password}"));
+            format!("Basic {token}")
+        });
         Ok(Self {
             host: authority.host().to_owned(),
             port: authority.port_u16().unwrap_or(80),
@@ -231,14 +232,32 @@ mod tests {
             ("HTTPS_PROXY", "secure.test:2"),
             ("HTTP_PROXY", "cgi-header.test:3"),
         ]);
-        assert_eq!(via(&proxies, true, "a.test").as_deref(), Some("secure.test:2"));
-        // Upper-case HTTP_PROXY is ignored, as curl ignores it.
-        assert_eq!(via(&proxies, false, "a.test").as_deref(), Some("all.test:1"));
         assert_eq!(
-            via(&self::proxies(&[("http_proxy", "plain.test:4")]), false, "a.test").as_deref(),
+            via(&proxies, true, "a.test").as_deref(),
+            Some("secure.test:2")
+        );
+        // Upper-case HTTP_PROXY is ignored, as curl ignores it.
+        assert_eq!(
+            via(&proxies, false, "a.test").as_deref(),
+            Some("all.test:1")
+        );
+        assert_eq!(
+            via(
+                &self::proxies(&[("http_proxy", "plain.test:4")]),
+                false,
+                "a.test"
+            )
+            .as_deref(),
             Some("plain.test:4")
         );
-        assert_eq!(via(&self::proxies(&[("http_proxy", "plain.test:4")]), true, "a.test"), None);
+        assert_eq!(
+            via(
+                &self::proxies(&[("http_proxy", "plain.test:4")]),
+                true,
+                "a.test"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -246,7 +265,10 @@ mod tests {
         for url in ["https://proxy.test", "socks5://proxy.test:1080"] {
             let proxies = proxies(&[("ALL_PROXY", url), ("NO_PROXY", "localhost")]);
             assert_eq!(
-                proxies.route(&target(true, "api.openai.com")).unwrap_err().kind(),
+                proxies
+                    .route(&target(true, "api.openai.com"))
+                    .unwrap_err()
+                    .kind(),
                 io::ErrorKind::Unsupported
             );
             assert_eq!(via(&proxies, true, "localhost"), None);

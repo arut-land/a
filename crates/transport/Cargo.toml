@@ -7,7 +7,7 @@ publish.workspace = true
 [features]
 # The HTTP/1.1 client, async over the `rt` reactor; with neither TLS feature
 # it speaks plain http only.
-client = ["dep:rt", "dep:sys", "dep:ureq-proto", "dep:base64", "dep:futures-lite"]
+client = ["dep:rt", "dep:sys", "dep:ureq-proto", "dep:base64", "dep:futures-lite", "dep:async-compression", "dep:mzstd"]
 # Binaries select TLS features; this library makes no platform choice.
 # Host crypto and trust (Security.framework, SChannel, OpenSSL), without a
 # bundled crypto implementation or certificate bundle.
@@ -16,12 +16,14 @@ tls-native = ["client", "dep:native-tls"]
 tls-rustls = ["client", "dep:rustls", "dep:rustls-platform-verifier"]
 
 [dependencies]
+async-compression = { version = "0.4", default-features = false, features = ["futures-io", "gzip", "brotli"], optional = true }
 # Proxy credentials; ureq-proto links it already.
 base64 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 # `stream::unfold`: rt links it already.
-futures-lite = { version = "2", default-features = false, optional = true }
+futures-lite = { version = "2", default-features = false, features = ["std"], optional = true }
 http.workspace = true
+mzstd = { version = "0.2.8", default-features = false, features = ["std", "compression", "decompression"], optional = true }
 native-tls = { version = "0.2.14", default-features = false, optional = true }
 rt = { workspace = true, optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }

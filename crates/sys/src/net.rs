@@ -43,7 +43,7 @@ fn keep_alive_with(
         IPPROTO_TCP, SO_KEEPALIVE, SOCKET, SOL_SOCKET, TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL,
         WSAGetLastError, setsockopt,
     };
-    let raw = socket.as_raw_socket() as SOCKET;
+    let raw = SOCKET::try_from(socket.as_raw_socket()).expect("socket fits the platform handle");
     let seconds = |d: Duration| u32::try_from(d.as_secs()).unwrap_or(u32::MAX);
     // TCP_KEEPIDLE and friends take seconds (Windows 10 1709 and later).
     for (level, name, value) in [
@@ -60,7 +60,7 @@ fn keep_alive_with(
                 level,
                 name,
                 (&raw const value).cast(),
-                size_of::<u32>() as i32,
+                i32::try_from(size_of::<u32>()).expect("u32 size fits i32"),
             )
         } != 0;
         if failed {
@@ -91,13 +91,15 @@ mod tests {
     #[cfg(windows)]
     fn probing(socket: &TcpStream) -> bool {
         use std::os::windows::io::AsRawSocket as _;
-        use windows_sys::Win32::Networking::WinSock::{SO_KEEPALIVE, SOCKET, SOL_SOCKET, getsockopt};
+        use windows_sys::Win32::Networking::WinSock::{
+            SO_KEEPALIVE, SOCKET, SOL_SOCKET, getsockopt,
+        };
         let mut value = 0u32;
-        let mut len = size_of::<u32>() as i32;
+        let mut len = i32::try_from(size_of::<u32>()).expect("u32 size fits i32");
         // SAFETY: `value` and `len` outlive the call and describe a u32.
         let ok = unsafe {
             getsockopt(
-                socket.as_raw_socket() as SOCKET,
+                SOCKET::try_from(socket.as_raw_socket()).expect("socket fits the platform handle"),
                 SOL_SOCKET,
                 SO_KEEPALIVE,
                 (&raw mut value).cast(),

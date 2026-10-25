@@ -179,6 +179,7 @@ pub enum Auth {
 
 #[derive(Clone)]
 pub struct Provider {
+    pub compression: Option<transport::Compression>,
     pub id: SmolStr,
     pub base_url: String,
     pub auth: Auth,
@@ -210,6 +211,7 @@ impl Provider {
     fn build(id: SmolStr, base_url: String, auth: Auth, protocol: Arc<dyn Protocol>) -> Self {
         Self {
             id,
+            compression: None,
             base_url: String::new(),
             auth,
             headers: Vec::new(),
@@ -222,6 +224,9 @@ impl Provider {
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         let mut base_url = base_url.into();
         base_url.truncate(base_url.trim_end_matches('/').len());
+        if self.base_url != base_url {
+            self.compression = None;
+        }
         self.base_url = base_url;
         self
     }
@@ -265,6 +270,9 @@ impl Provider {
         }
         for (name, value) in self.headers.iter().chain(&request.headers) {
             builder = builder.header(name.as_str(), value.as_str());
+        }
+        if let Some(compression) = self.compression {
+            builder = builder.extension(compression);
         }
         builder
             .body(encoded.payload())
@@ -311,6 +319,8 @@ impl KeyStyle {
 /// from, with the protocol (and its quirks) that speaks to it.
 #[derive(Clone, Copy, Debug)]
 pub struct Host {
+    /// Only set when this endpoint documents accepting the content coding.
+    pub compression: Option<transport::Compression>,
     pub id: &'static str,
     pub base_url: &'static str,
     /// Environment variables naming the credential, first set wins.
@@ -336,6 +346,7 @@ impl Host {
             base_url_env: &[],
             key: KeyStyle::Bearer,
             keyless: false,
+            compression: None,
         }
     }
 
@@ -359,11 +370,10 @@ impl Host {
         };
         let base_url = self.base_url_env.iter().find_map(|name| var(env, name));
         let base_url = base_url.as_deref().unwrap_or(self.base_url);
-        Ok(Provider::build(
-            self.id.into(),
-            base_url.into(),
-            auth,
-            protocol,
-        ))
+        let mut provider = Provider::build(self.id.into(), base_url.into(), auth, protocol);
+        if base_url == self.base_url {
+            provider.compression = self.compression;
+        }
+        Ok(provider)
     }
 }
