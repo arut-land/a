@@ -477,7 +477,7 @@ pub(crate) fn spawn_intent(call: u64, prompt: &str) -> Json {
     .unwrap()
 }
 
-fn fired(bodies: &[Body]) -> Vec<&Outcome> {
+fn fired(bodies: &[Body]) -> Vec<&protocol::ToolOutcome> {
     bodies
         .iter()
         .filter_map(|b| match b {
@@ -554,7 +554,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
             Body::Fired {
                 watch: Seq::new(6).unwrap(),
                 outcome: Outcome::Done {
-                    output: Json::encode("hi").unwrap()
+                    output: Json::encode("hi").unwrap().into()
                 }
             },
             Body::ToolResult {
@@ -691,9 +691,10 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         card: None,
         by: Audience::Model,
     };
-    let slept = Outcome::Done {
+    let slept: protocol::ToolOutcome = Outcome::Done {
         output: Json::encode(&json!({ "slept": 0 })).unwrap(),
-    };
+    }
+    .into();
     let mut parents = Vec::new();
 
     // Killed while the child ran.
@@ -718,7 +719,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     write(&parent, spawned(child.id), true);
     let done = Body::ToolResult {
         call: CallId::new(3).unwrap(),
-        outcome: slept.clone().into(),
+        outcome: slept.clone(),
         card: None,
         held: Vec::new(),
     };
@@ -1868,7 +1869,7 @@ fn detached_messages_wait_for_a_boundary_and_the_parent_hears_once() {
         2
     );
     assert!(child_log.iter().all(|b| !matches!(b, Body::Take { .. })));
-    assert_eq!(fired(&parent_log), [] as [&Outcome; 0]);
+    assert_eq!(fired(&parent_log), [] as [&protocol::ToolOutcome; 0]);
     assert!(rt::block_on(daemon.fork(&id.to_string(), None)).is_err());
     assert!(rt::block_on(daemon.fork(&child.to_string(), None)).is_err());
     BACKGROUND_CONTROL.1.set();
@@ -1958,7 +1959,7 @@ fn interrupt_cancels_detached_descendants_after_the_spawning_call_completes() {
         id,
         child,
         Outcome::Done {
-            output: Json::encode("late").unwrap(),
+            output: Json::encode("late").unwrap().into(),
         },
     ));
     parent.session().barrier();
@@ -2091,7 +2092,7 @@ impl ext::Tool for PairTasks {
                 .ask(cx)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
-            results.push(ext::child_result(&result));
+            results.push(ext::child_result(&result, None));
         }
         Ok(results)
     }
@@ -2254,7 +2255,7 @@ mod inheritance {
                 .depth(4)
                 .ask(cx)
                 .await
-                .map(|outcome| ext::child_result(&outcome))
+                .map(|outcome| ext::child_result(&outcome, None))
                 .map_err(|e| format!("{e:?}"))
         }
     }

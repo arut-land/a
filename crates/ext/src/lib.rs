@@ -26,7 +26,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use protocol::Outcome;
+use protocol::{Outcome, Payload, ToolOutcome};
 
 mod agent;
 mod assemble;
@@ -100,12 +100,28 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub const CHILD_RESULT_LIMIT: usize = 32 * 1024;
 
 /// A child's result as its parent's agent reads it, cut to
-/// [`CHILD_RESULT_LIMIT`].
-pub fn child_result(outcome: &Outcome) -> String {
+/// [`CHILD_RESULT_LIMIT`]: of one a blob holds, `shown`, what its blob
+/// shows the model as read back (as [`Registry::present_result`] shows a
+/// tool's), when it can be read.
+///
+/// [`Registry::present_result`]: crate::host::Registry::present_result
+pub fn child_result(outcome: &ToolOutcome, shown: Option<&str>) -> String {
     let text = match outcome {
-        Outcome::Done { output } => match output.parse::<String>() {
+        Outcome::Done {
+            output: Payload::Inline(output),
+        } => match output.parse::<String>() {
             Ok(text) => format!("The child session finished:\n{text}"),
             Err(_) => format!("The child session finished:\n{output}"),
+        },
+        Outcome::Done {
+            output: Payload::Blob(blob),
+        } => match shown {
+            Some(shown) => format!("The child session finished:\n{shown}"),
+            None => format!(
+                "The child session finished: its {} bytes of result are held as blob {}, \
+                 unreadable now.",
+                blob.size, blob.id
+            ),
         },
         Outcome::Failed { error } => format!("The child session failed: {error}"),
         Outcome::Interrupted { .. } => "The child session was interrupted.".to_owned(),
@@ -150,15 +166,21 @@ mod tests {
     #[test]
     fn a_childs_result_is_cut_for_the_model() {
         let long = "é".repeat(CHILD_RESULT_LIMIT);
-        let text = child_result(&Outcome::Done {
-            output: Json::encode(&long).unwrap(),
-        });
+        let text = child_result(
+            &Outcome::Done {
+                output: Json::encode(&long).unwrap().into(),
+            },
+            None,
+        );
         let (shown, note) = text.rsplit_once('\n').unwrap();
         assert!(shown.len() <= CHILD_RESULT_LIMIT);
         assert!(note.starts_with('[') && note.ends_with("more bytes not shown]"));
         let failed = Outcome::Failed {
             error: "boom".into(),
         };
-        assert_eq!(child_result(&failed), "The child session failed: boom");
+        assert_eq!(
+            child_result(&failed, None),
+            "The child session failed: boom"
+        );
     }
 }

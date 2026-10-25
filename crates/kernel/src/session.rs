@@ -218,7 +218,7 @@ impl Core {
             ),
             Event::Detached { call } => self.detached(call, &mut fx),
             Event::JobEnded { call, text, held } => {
-                self.own(call, Carried::Text(text), held, &mut fx);
+                self.own(call, Carried::Job(text), held, &mut fx);
             }
             Event::Note { call, note } => self.note(call, note, &mut fx),
             Event::Waits { call, on } => self.waits(call, on, &mut fx),
@@ -568,7 +568,7 @@ impl Core {
             return Ok(());
         }
         let queued =
-            (self.fold.ledger.untaken().iter()).any(|q| q.seq == input && q.source.visible());
+            (self.fold.ledger.untaken().iter()).any(|q| q.seq == input && q.source().visible());
         if !queued {
             return Err(format!("input {input} is no longer queued"));
         }
@@ -1153,7 +1153,7 @@ impl Core {
             if self.registry.runner() == RunnerKind::ModelOnly && boundary != Boundary::TurnEnd {
                 visible = items
                     .iter()
-                    .filter(|q| q.source.visible())
+                    .filter(|q| q.source().visible())
                     .cloned()
                     .collect();
                 &visible[..]
@@ -1280,7 +1280,7 @@ impl Core {
     /// Fires the watches on `child`. A call waiting on it goes on with its
     /// result; otherwise the result is queued, as the session's own
     /// envelope under the watch, for the agent to take up.
-    fn child_settled(&mut self, child: SessionId, outcome: &Outcome, fx: &mut StepPlan) {
+    fn child_settled(&mut self, child: SessionId, outcome: &ToolOutcome, fx: &mut StepPlan) {
         let Some(call) = self.fold.owner(child) else {
             self.fire(child, outcome, fx);
             self.queue_children(fx);
@@ -1303,7 +1303,7 @@ impl Core {
     fn fire(
         &mut self,
         child: SessionId,
-        outcome: &Outcome,
+        outcome: &ToolOutcome,
         fx: &mut StepPlan,
     ) -> SmallVec<[Seq; 1]> {
         let watches: SmallVec<[Seq; 1]> = (self.fold.ledger.armed())
@@ -2188,7 +2188,7 @@ fn outcome(replied: Replied) -> Outcome {
     }
 }
 
-fn to_json(outcome: &Outcome) -> Json {
+fn to_json(outcome: &ToolOutcome) -> Json {
     Json::encode(outcome).unwrap_or_default()
 }
 

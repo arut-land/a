@@ -161,13 +161,17 @@ marker, such as `truncated` or `{"detached": true}`), and `Envelope.held` on a
 detached call's outcome or a job's end; and a tool's outcome itself
 (`ToolOutcome`, `Outcome<Payload>`), whose value is either in its line
 (`"output":…`) or, too large for it, the blob that holds it (`"blob":{…}`),
-never both. Only a tool's outcome can be a blob: a model's reply, a child's
-or a query's is `Outcome<Json>`, so a blob there does not compile, and a
-line that holds one does not decode. A detached call's outcome and a
-child's travel typed in their envelopes (`Carried::Detached`,
-`Carried::Child`), never as text to parse. `Body::blobs` lists every
-reference an entry holds, wherever in it: what a projection must not name
-on the session's actor, and what a sweep keeps.
+never both. Only a tool's outcome can be a blob, and so a session's result
+(its last settled call's, which a child reports): a model's reply or a
+query's is `Outcome<Json>`, so a blob there does not compile, and a line
+that holds one does not decode. What an envelope carries is typed
+(`Carried::{Message, Job, Child, Detached}`), never text to parse, and
+fixes the purpose it is sent under and where it comes from: one under
+another payload's purpose does not decode. A child's result held as a blob
+is read back for its parent as a tool's is. `Body::blobs` lists every
+reference an entry holds, wherever in it, a spawn's context image included:
+what a projection must not name on the session's actor, and what a sweep
+keeps.
 
 The seam is the `blob` crate (re-exported as `ext::blob`), which does no I/O:
 `BlobStore` (`writer`, `stream`, `open`, `materialize`, `sweep`),

@@ -74,11 +74,11 @@ impl Take {
             Boundary::BeforeModel => {
                 let ahead = items
                     .iter()
-                    .position(|q| q.source.visible())
+                    .position(|q| q.source().visible())
                     .unwrap_or(items.len());
                 let these: SmallVec<_> = (items.iter().enumerate())
                     .filter(|&(at, q)| {
-                        q.steer || matches!(q.source, Source::Child(_)) || at < ahead
+                        q.steer || matches!(q.source(), Source::Child(_)) || at < ahead
                     })
                     .map(|(_, q)| q.seq)
                     .collect();
@@ -89,7 +89,7 @@ impl Take {
                 }
             }
             Boundary::TurnEnd => {
-                let own = |q: &&Queued| matches!(q.source, Source::Child(_) | Source::Job(_));
+                let own = |q: &&Queued| matches!(q.source(), Source::Child(_) | Source::Job(_));
                 let mut starts = items.iter().filter(|q| !q.notice());
                 let first = (starts.clone().find(|q| !own(q)))
                     .or_else(|| starts.next())
@@ -124,13 +124,20 @@ impl Take {
 mod tests {
     use super::*;
     use protocol::SessionId;
+    use protocol::ledger::Item;
 
+    /// An item from `source`, as text where it carries any.
     fn item(seq: u64, steer: bool, source: Source) -> Queued {
+        let failed = || protocol::ToolOutcome::Failed { error: "e".into() };
         Queued {
             seq: Seq::new(seq).unwrap(),
-            payload: String::new().into(),
+            item: match source {
+                Source::User => Item::Input(String::new()),
+                Source::Agent(sender) => Item::Message(sender, String::new()),
+                Source::Job(call) => Item::Job(call, String::new()),
+                Source::Child(watch) => Item::Child(watch, failed()),
+            },
             steer,
-            source,
             typed: Default::default(),
         }
     }
@@ -210,9 +217,10 @@ mod tests {
         let child = item(7, false, Source::Child(Seq::new(3).unwrap()));
         assert_eq!(at_end(&[ended.clone(), child]), seqs(&[7]));
         let outcome = Queued {
-            payload: protocol::Carried::Detached(protocol::ToolOutcome::Failed {
-                error: "e".into(),
-            }),
+            item: Item::Detached(
+                CallId::new(4).unwrap(),
+                protocol::ToolOutcome::Failed { error: "e".into() },
+            ),
             ..item(8, false, job)
         };
         assert_eq!(at_end(&[ended.clone(), outcome]), seqs(&[8]));

@@ -26,8 +26,8 @@ use ext::Flag;
 use ext_logging::{Build, Fact, Fault, Operation, Stop, emit as fact};
 use outbox::Outbox;
 use protocol::{
-    Body, DaemonMsg, Entry, Environment, Frame, Json, MachineId, Mode, Outcome, SessionId,
-    SessionSummary, Target,
+    Body, DaemonMsg, Entry, Environment, Frame, Json, MachineId, Mode, SessionId, SessionSummary,
+    Target,
 };
 use rt::oneshot;
 use server::reply;
@@ -873,7 +873,7 @@ impl Daemon {
     /// unloaded: a session with a watch armed has work, so it is loaded
     /// (at startup, marked busy in the catalog), and one with none has heard from
     /// every child it watched.
-    async fn report(&self, parent: SessionId, child: SessionId, outcome: Outcome) {
+    async fn report(&self, parent: SessionId, child: SessionId, outcome: protocol::ToolOutcome) {
         let Some(slot) = self.slot(parent) else {
             return;
         };

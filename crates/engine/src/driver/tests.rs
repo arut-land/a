@@ -898,7 +898,7 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
     let found = Outcome::Done {
         output: Json::encode("found it").unwrap(),
     };
-    session.settled(child, found.clone());
+    session.settled(child, found.clone().into());
     settle(&session);
     let log = log_of(&session);
     session.halt();
@@ -914,7 +914,7 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
                 Body::ModelCall { .. },
                 Body::ModelResult { r#for: None, failure: None, call, outcome: Outcome::Done { .. } },
             ] if (watch.get(), input.get(), call.get()) == (1, 3, 5)
-                && *outcome == found
+                && *outcome == found.into()
                 && envelope.source() == protocol::Source::Child(*watch)
         ),
         "{log:#?}"
@@ -1672,7 +1672,10 @@ fn a_background_jobs_end_is_queued_once_holding_its_output_and_starts_no_turn() 
     assert_eq!(end.id.purpose, protocol::EnvelopeId::JOB);
     assert_eq!(
         end.payload,
-        format!("[background job {} ended: exit code 3]", job_of(&log)).into()
+        protocol::Carried::Job(format!(
+            "[background job {} ended: exit code 3]",
+            job_of(&log)
+        ))
     );
     let [protocol::Held::Blob(blob)] = &end.held[..] else {
         panic!("{end:?}")

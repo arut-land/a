@@ -5,10 +5,8 @@
 
 use std::collections::VecDeque;
 
-use protocol::ledger::{Call, Ledger};
-use protocol::{
-    Audience, Body, CallId, Carried, Entry, Json, Outcome, Seq, Source, Verdict, WaitOn,
-};
+use protocol::ledger::{Call, Item, Ledger};
+use protocol::{Audience, Body, CallId, Entry, Json, Seq, Source, ToolOutcome, Verdict, WaitOn};
 
 use crate::{Action, Agent, Binding, Input};
 
@@ -35,14 +33,14 @@ pub struct Fold {
     /// The tool calls waiting on a child, by the child's link.
     owners: Vec<(Seq, CallId)>,
     /// Results of children that calls wait on, not yet handed to them.
-    fired: Vec<(CallId, Outcome)>,
+    fired: Vec<(CallId, ToolOutcome)>,
     /// The calls the agent refused, with why, until answered: a crash
     /// before the answer commits must not run them.
     refused: Vec<(CallId, String)>,
     /// Results of children no call waits on, by watch, until the envelope
     /// that queues each is folded: a crash between the two must not lose
     /// one.
-    pub unqueued: Vec<(Seq, Outcome)>,
+    pub unqueued: Vec<(Seq, ToolOutcome)>,
 }
 
 impl Fold {
@@ -204,17 +202,16 @@ impl Fold {
         if read {
             return None;
         }
-        let text = match (&queued.payload, queued.source) {
-            (Carried::Child(outcome), Source::Child(watch)) => {
-                let outcome = outcome.clone();
+        let text = match &queued.item {
+            Item::Child(watch, outcome) => {
+                let (watch, outcome) = (*watch, outcome.clone());
                 return Some(Input::ChildDone { watch, outcome });
             }
-            (Carried::Detached(outcome), Source::Job(call)) => {
-                let outcome = outcome.clone();
+            Item::Detached(call, outcome) => {
+                let (call, outcome) = (*call, outcome.clone());
                 return Some(Input::Detached { call, outcome });
             }
-            (Carried::Text(text), _) => text.clone(),
-            (Carried::Child(_) | Carried::Detached(_), _) => return None,
+            Item::Input(text) | Item::Message(_, text) | Item::Job(_, text) => text.clone(),
         };
         self.user(&text, queued.typed, registry)
     }
@@ -326,7 +323,7 @@ impl Fold {
     }
 
     /// The result of the child call `call` waits on, once it fired.
-    pub fn fired(&self, call: CallId) -> Option<&Outcome> {
+    pub fn fired(&self, call: CallId) -> Option<&ToolOutcome> {
         self.fired
             .iter()
             .find_map(|(c, outcome)| (*c == call).then_some(outcome))

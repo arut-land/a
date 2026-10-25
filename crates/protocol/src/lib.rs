@@ -104,7 +104,7 @@ pub mod publication;
 pub mod view;
 
 pub use address::{Address, HostPath};
-pub use blob::{BlobId, BlobOrigin, BlobRef, Held, Payload, Reference};
+pub use blob::{BlobId, BlobOrigin, BlobRef, Held, Payload};
 pub use json::Json;
 pub use peer::{MachineId, Role};
 
@@ -425,7 +425,7 @@ kinds! {
         /// per watch. A call waiting on the child goes on with it; otherwise
         /// it reaches the agent as the session's own envelope
         /// ([`EnvelopeId::CHILD`]).
-        Fired "fired" { watch: Seq, outcome: Outcome } = Durable;
+        Fired "fired" { watch: Seq, outcome: ToolOutcome } = Durable;
         // ── environment and extensions ─────────────────────────────────
         /// The environment the session's commands run in from here on, as the
         /// attaching client captured it, secrets redacted.
@@ -454,48 +454,77 @@ impl Body {
 
     /// Every reference the entry holds outside the log: what its `held`
     /// fields list, a tool outcome held as a blob (logged, replaced by a
-    /// `post_tool` decision, or carried by a detached call's envelope), and
-    /// input pasted or attached by reference. What a sweep keeps, and what
-    /// a projection reads or names with I/O.
-    pub fn blobs(&self) -> Vec<Reference<'_>> {
-        fn payload(outcome: &ToolOutcome) -> Option<Reference<'_>> {
-            match outcome {
-                Outcome::Done {
-                    output: Payload::Blob(blob),
-                } => Some(Reference::Blob(blob)),
-                _ => None,
-            }
-        }
+    /// `post_tool` decision, a child's, or carried by an envelope), input
+    /// pasted or attached by reference, and all of these in the context
+    /// image a child is spawned with. What a sweep keeps, and what a
+    /// projection reads or names with I/O.
+    pub fn blobs(&self) -> Vec<Held> {
+        let mut found = Vec::new();
         match self {
-            Self::ToolResult { outcome, held, .. } => held
-                .iter()
-                .map(Reference::from)
-                .chain(payload(outcome))
-                .collect(),
+            Self::ToolResult { outcome, held, .. } => {
+                found.extend(held.iter().cloned());
+                outcome_blob(outcome, &mut found);
+            }
             Self::Decision {
                 d: Verdict::PostTool { original },
                 ..
-            } => payload(original).into_iter().collect(),
-            Self::Enqueue { envelope } => {
-                let carried = match &envelope.payload {
-                    Carried::Detached(outcome) => payload(outcome),
-                    Carried::Text(_) | Carried::Child(_) => None,
-                };
-                (envelope.held.iter().map(Reference::from))
-                    .chain(carried)
-                    .collect()
-            }
-            Self::Input { segments, .. } => (segments.0.iter())
-                .filter_map(|segment| match segment {
-                    Segment::PasteRef(blob) | Segment::Attachment(blob) => {
-                        Some(Reference::Blob(blob))
+            } => outcome_blob(original, &mut found),
+            Self::Fired { outcome, .. } => outcome_blob(outcome, &mut found),
+            Self::Enqueue { envelope } => envelope_blobs(envelope, &mut found),
+            Self::Input { segments, .. } => segment_blobs(segments, &mut found),
+            // A malformed image is refused where the child is restored.
+            Self::Spawned { intent } => {
+                let image = publication::SpawnImage::from_json(intent);
+                for publication::ContextInput(_, value) in image
+                    .into_iter()
+                    .flat_map(|image| image.image)
+                    .flat_map(|publication::ContextLayer(_, inputs)| inputs)
+                {
+                    use publication::ContextValue::{
+                        Assistant, Background, Child, Context, Detached, Inbox, Inherited, Into,
+                        Job, Queued, Reply, Taken, ToolCall, ToolResult, User, Withdrawn,
+                    };
+                    match value {
+                        Queued(segments, _) => segment_blobs(&segments, &mut found),
+                        Child(outcome) => outcome_blob(&outcome, &mut found),
+                        Background(_, outcome, held) | ToolResult(_, outcome, held) => {
+                            found.extend(held);
+                            outcome_blob(&outcome, &mut found);
+                        }
+                        Job(_, _, held) => found.extend(held),
+                        Inherited(_) | User(_) | Inbox(..) | Taken(_) | Into(..) | Withdrawn(_)
+                        | Assistant(_) | Context(..) | Detached(_) | Reply(_) | ToolCall(..) => {}
                     }
-                    Segment::Text(_) | Segment::Paste(_) => None,
-                })
-                .collect(),
-            _ => Vec::new(),
+                }
+            }
+            _ => {}
         }
+        found
     }
+}
+
+fn outcome_blob(outcome: &ToolOutcome, found: &mut Vec<Held>) {
+    if let Outcome::Done {
+        output: Payload::Blob(blob),
+    } = outcome
+    {
+        found.push(Held::Blob((**blob).clone()));
+    }
+}
+
+fn envelope_blobs(envelope: &Envelope, found: &mut Vec<Held>) {
+    found.extend(envelope.held.iter().cloned());
+    match &envelope.payload {
+        Carried::Child(outcome) | Carried::Detached(outcome) => outcome_blob(outcome, found),
+        Carried::Message(_) | Carried::Job(_) => {}
+    }
+}
+
+fn segment_blobs(segments: &Segments, found: &mut Vec<Held>) {
+    found.extend(segments.0.iter().filter_map(|segment| match segment {
+        Segment::PasteRef(blob) | Segment::Attachment(blob) => Some(Held::Blob(blob.clone())),
+        Segment::Text(_) | Segment::Paste(_) => None,
+    }));
 }
 
 /// A piece of input as its client composed it: what the user typed, what
@@ -2098,33 +2127,52 @@ impl EnvelopeId {
     pub const JOB: &str = "job";
 }
 
-/// What an envelope carries, typed: text, or an outcome its session reads
-/// as such, never parsed from text.
+/// What an envelope carries, typed: what the recipient reads it as, and so
+/// where it comes from ([`Envelope::source`]) and the purpose it is sent
+/// under, never parsed from text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Carried {
-    /// A message, or a process group's end, as the model reads it.
-    Text(String),
-    /// A child's outcome ([`EnvelopeId::CHILD`]).
-    Child(Outcome),
+    /// Another session's message, under a purpose of its own.
+    Message(String),
+    /// The end of a process group a call left to the session, as the model
+    /// reads it ([`EnvelopeId::JOB`]).
+    Job(String),
+    /// The outcome of a child no call waits on ([`EnvelopeId::CHILD`]).
+    Child(ToolOutcome),
     /// A detached call's outcome ([`EnvelopeId::DETACHED`]).
     Detached(ToolOutcome),
 }
 
+impl Carried {
+    /// The purpose it is sent under, unless the sender names one.
+    pub const fn purpose(&self) -> Option<&'static str> {
+        match self {
+            Self::Message(_) => None,
+            Self::Job(_) => Some(EnvelopeId::JOB),
+            Self::Child(_) => Some(EnvelopeId::CHILD),
+            Self::Detached(_) => Some(EnvelopeId::DETACHED),
+        }
+    }
+}
+
 impl From<String> for Carried {
     fn from(text: String) -> Self {
-        Self::Text(text)
+        Self::Message(text)
     }
 }
 
 impl From<&str> for Carried {
     fn from(text: &str) -> Self {
-        Self::Text(text.to_owned())
+        Self::Message(text.to_owned())
     }
 }
 
-/// What one recipient takes into its queue.
+/// What one recipient takes into its queue. Read only when its purpose is
+/// the one what it carries is sent under: a message never under a reserved
+/// one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "EnvelopeFields")]
 pub struct Envelope {
     pub id: EnvelopeId,
     pub destination: SessionId,
@@ -2135,22 +2183,48 @@ pub struct Envelope {
     pub held: Vec<Held>,
 }
 
+#[derive(Deserialize)]
+struct EnvelopeFields {
+    id: EnvelopeId,
+    destination: SessionId,
+    payload: Carried,
+    #[serde(default)]
+    held: Vec<Held>,
+}
+
+impl TryFrom<EnvelopeFields> for Envelope {
+    type Error = &'static str;
+
+    fn try_from(f: EnvelopeFields) -> Result<Self, Self::Error> {
+        let reserved = [EnvelopeId::JOB, EnvelopeId::CHILD, EnvelopeId::DETACHED];
+        let fits = match f.payload.purpose() {
+            Some(purpose) => f.id.purpose == purpose,
+            None => !reserved.contains(&f.id.purpose.as_str()),
+        };
+        if !fits {
+            return Err("an envelope's purpose is not the one its payload is sent under");
+        }
+        Ok(Self {
+            id: f.id,
+            destination: f.destination,
+            payload: f.payload,
+            held: f.held,
+        })
+    }
+}
+
 impl Envelope {
     /// An envelope session `session` sends itself, about its own call
     /// `call`: how what it started and stopped waiting on (a child, a
     /// detached call, a background job) reaches it, on the one queue,
-    /// deduplicated by the id as any envelope is.
+    /// deduplicated by the id as any envelope is; under the purpose its
+    /// payload is sent under.
     pub fn own(session: SessionId, call: CallId, payload: Carried) -> Self {
-        let purpose = match &payload {
-            Carried::Text(_) => EnvelopeId::JOB,
-            Carried::Child(_) => EnvelopeId::CHILD,
-            Carried::Detached(_) => EnvelopeId::DETACHED,
-        };
         Self {
             id: EnvelopeId {
                 sender: session,
                 call,
-                purpose: purpose.to_owned(),
+                purpose: payload.purpose().unwrap_or("message").to_owned(),
             },
             destination: session,
             payload,
@@ -2165,14 +2239,13 @@ impl Envelope {
         self
     }
 
-    /// Where it comes from, as the queue tells its items apart.
-    pub fn source(&self) -> Source {
-        if self.id.sender != self.destination {
-            Source::Agent(self.id.sender)
-        } else if self.id.purpose == EnvelopeId::CHILD {
-            Source::Child(self.id.call.0)
-        } else {
-            Source::Job(self.id.call)
+    /// Where it comes from, as the queue tells its items apart: what it
+    /// carries says.
+    pub const fn source(&self) -> Source {
+        match &self.payload {
+            Carried::Message(_) => Source::Agent(self.id.sender),
+            Carried::Job(_) | Carried::Detached(_) => Source::Job(self.id.call),
+            Carried::Child(_) => Source::Child(self.id.call.0),
         }
     }
 }
@@ -2192,7 +2265,7 @@ impl Outgoing {
         Envelope {
             id: self.id.clone(),
             destination: to,
-            payload: Carried::Text(self.payload.clone()),
+            payload: Carried::Message(self.payload.clone()),
             held: Vec::new(),
         }
     }
@@ -2264,6 +2337,55 @@ pub const INBOX_CAPACITY: usize = 128;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An envelope is read only under the purpose what it carries is sent
+    /// under, so where it comes from follows from what it carries.
+    #[test]
+    fn an_envelope_under_another_payloads_purpose_is_refused() {
+        let own = Envelope::own(
+            SessionId::NIL,
+            CallId::new(2).unwrap(),
+            Carried::Job("ended".into()),
+        );
+        let line = serde_json::to_string(&own).unwrap();
+        assert_eq!(serde_json::from_str::<Envelope>(&line).unwrap(), own);
+        let child = line.replace(r#""purpose":"job""#, r#""purpose":"child""#);
+        assert!(serde_json::from_str::<Envelope>(&child).is_err());
+        let message = line.replace(r#"{"job":"ended"}"#, r#"{"message":"ended"}"#);
+        assert!(serde_json::from_str::<Envelope>(&message).is_err());
+    }
+
+    /// What a child is spawned with references what its parent's entries
+    /// did: the sweep keeps it, and no projection names it on the actor.
+    #[test]
+    fn a_spawn_image_lists_the_blobs_its_context_holds() {
+        use publication::{ContextInput, ContextLayer, ContextValue, RunnerKind, SpawnImage};
+        let blob = BlobRef {
+            id: BlobId([0x5a; 32]),
+            size: 1,
+            media_type: "text/plain".into(),
+            origin: BlobOrigin::ToolOutput(CallId::new(1).unwrap()),
+        };
+        let result = ContextValue::ToolResult(
+            CallId::new(1).unwrap(),
+            ToolOutcome::Done {
+                output: Payload::Blob(Box::new(blob.clone())),
+            },
+            Vec::new(),
+        );
+        let image = SpawnImage {
+            runner: RunnerKind::Agent,
+            authority: Json::null(),
+            image: vec![ContextLayer(
+                RunnerKind::Agent,
+                vec![ContextInput(Seq::new(2).unwrap(), result)],
+            )],
+        };
+        let spawned = Body::Spawned {
+            intent: image.to_json().unwrap(),
+        };
+        assert_eq!(spawned.blobs(), [Held::Blob(blob)]);
+    }
 
     /// A tool's outcome is in its line or in a blob, and only a tool's is
     /// ever in a blob: anything else is refused where it is read.

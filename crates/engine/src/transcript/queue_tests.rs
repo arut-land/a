@@ -263,3 +263,49 @@ fn a_held_blob_is_named_only_once_it_can_be_read() {
     // One the store does not have is not named at all.
     assert!(!shown(&gone).contains("full output"), "{}", shown(&gone));
 }
+
+/// A child whose last result a blob holds settles with that blob: its
+/// envelope lists it, and its parent's model reads it back, as a tool's.
+#[test]
+fn a_childs_result_held_as_a_blob_is_read_back_for_its_parent() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(blob_files::Files::open(home.path().join("blobs"), home.path()).unwrap());
+    let tree = Arc::new(blob_files::CacheDir::new(
+        home.path().join("cache"),
+        store.clone(),
+    ));
+    let places = ext::blob::Blobs::new(store.clone(), tree, SessionId::new()).places();
+    let mut writer = ext::blob::BlobStore::writer(&*store, 1 << 20).unwrap();
+    std::io::Write::write_all(&mut writer, b"the child's whole answer").unwrap();
+    let blob = writer
+        .finish("text/plain", BlobOrigin::ToolOutput(call(3)))
+        .unwrap();
+    let settled = Body::Enqueue {
+        envelope: Envelope::own(
+            SESSION,
+            call(2),
+            Carried::Child(Outcome::Done {
+                output: Payload::Blob(Box::new(blob.clone())),
+            }),
+        ),
+    };
+    assert_eq!(settled.blobs(), [Held::Blob(blob)]);
+    let entries: Vec<_> = ([
+        settled,
+        Body::Take {
+            input: Seq::new(1).unwrap(),
+            into: None,
+        },
+    ]
+    .into_iter()
+    .zip(1..))
+    .map(|(body, seq)| Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
+    .collect();
+    let messages =
+        Transcript::placed(&entries, Arc::new(Registry::default()), "", &places).into_messages();
+    let said = format!("{messages:?}");
+    assert!(
+        said.contains("The child session finished:\\nthe child's whole answer"),
+        "{said}"
+    );
+}

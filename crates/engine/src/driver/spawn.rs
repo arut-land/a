@@ -1,7 +1,7 @@
 //! Admission freezes authority before any child is created.
 use super::{
     Actor, Arc, Body, BoxFuture, CallId, CallPorts, Child, ContextRequest, Cx, Event, InFlight,
-    Json, Live, Open, Outcome, Registry, SessionId, Shared, lock, oneshot, or,
+    Json, Live, Open, Registry, SessionId, Shared, lock, oneshot, or,
 };
 use crate::store::Header;
 use ext::{DepthBudget, SpawnRefusal};
@@ -125,7 +125,7 @@ impl Actor {
                         Ok(outcome) => outcome,
                         Err(error) => {
                             reply.send(
-                                Json::encode(&Result::<Outcome, _>::Err(
+                                Json::encode(&Result::<protocol::ToolOutcome, _>::Err(
                                     SpawnRefusal::Unavailable(error.to_string()),
                                 ))
                                 .unwrap(),
@@ -139,7 +139,7 @@ impl Actor {
                             .and_then(|i| i.refusal);
                         let value = refusal.map_or_else(
                             || Json::encode(&outcome).unwrap(),
-                            |r| Json::encode(&Result::<Outcome, _>::Err(r)).unwrap(),
+                            |r| Json::encode(&Result::<protocol::ToolOutcome, _>::Err(r)).unwrap(),
                         );
                         reply.send(value);
                         return None;
@@ -150,9 +150,9 @@ impl Actor {
                 };
                 if matches!(child, Child::Waiting(_)) {
                     reply.send(
-                        Json::encode(&Result::<Outcome, _>::Err(SpawnRefusal::Unavailable(
-                            "the call already awaits a child".into(),
-                        )))
+                        Json::encode(&Result::<protocol::ToolOutcome, _>::Err(
+                            SpawnRefusal::Unavailable("the call already awaits a child".into()),
+                        ))
                         .unwrap(),
                     );
                     return None;
@@ -400,7 +400,7 @@ impl ext::Conversations for CallPorts {
         &'a self,
         _cx: &'a Cx,
         request: ext::Spawn,
-    ) -> BoxFuture<'a, Result<Outcome, SpawnRefusal>> {
+    ) -> BoxFuture<'a, Result<protocol::ToolOutcome, SpawnRefusal>> {
         Box::pin(async move {
             let session = &self.session;
             if !self.origin.current(session) {

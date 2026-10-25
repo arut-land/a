@@ -7,7 +7,7 @@
       "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"edit me\"}],\"seq\":3,\"t\":\"entry\"}",
       "{\"epoch\":0,\"input\":3,\"kind\":\"withdraw\",\"seq\":4,\"t\":\"entry\"}",
       "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"edited\"}],\"seq\":5,\"t\":\"entry\"}",
-      "{\"envelope\":{\"destination\":\"00000000-0000-0000-0000-00000000000a\",\"id\":{\"call\":1,\"purpose\":\"job\",\"sender\":\"00000000-0000-0000-0000-00000000000a\"},\"payload\":{\"text\":\"[background job 7 ended: exit code 0]\"}},\"epoch\":0,\"kind\":\"enqueue\",\"seq\":6,\"t\":\"entry\"}",
+      "{\"envelope\":{\"destination\":\"00000000-0000-0000-0000-00000000000a\",\"id\":{\"call\":1,\"purpose\":\"message\",\"sender\":\"00000000-0000-0000-0000-00000000000a\"},\"payload\":{\"message\":\"[background job 7 ended: exit code 0]\"}},\"epoch\":0,\"kind\":\"enqueue\",\"seq\":6,\"t\":\"entry\"}",
       "{\"epoch\":0,\"input\":6,\"kind\":\"take\",\"seq\":7,\"t\":\"entry\"}",
       "{\"epoch\":0,\"input\":2,\"kind\":\"take\",\"seq\":8,\"t\":\"entry\"}",
       "{\"seq\":8,\"t\":\"synced\"}"
@@ -76,11 +76,11 @@
           "destination": "00000000-0000-0000-0000-00000000000a",
           "id": {
             "call": 1,
-            "purpose": "job",
+            "purpose": "message",
             "sender": "00000000-0000-0000-0000-00000000000a"
           },
           "payload": {
-            "text": "[background job 7 ended: exit code 0]"
+            "message": "[background job 7 ended: exit code 0]"
           }
         },
         "epoch": 0,

@@ -10,8 +10,8 @@ use ext::host::Registry;
 use llm::{Assistant, Message, Messages, Tag, ToolMessage, ToolResult, tag};
 use protocol::publication::{ContextImage, ContextInput, ContextLayer, ContextValue, RunnerKind};
 use protocol::{
-    Body, CallId, Carried, Entry, Envelope, EnvelopeId, Held, Mode, Outcome, OutputStream, Payload,
-    Segment, Segments, Seq, Source, ToolOutcome, Verdict,
+    Body, CallId, Carried, Entry, EnvelopeId, Held, Mode, Outcome, OutputStream, Payload, Segment,
+    Segments, Seq, ToolOutcome, Verdict,
 };
 
 /// Provider replies remain intact; live updates and recovery share projection rules.
@@ -125,17 +125,15 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
             ..
         } => ContextValue::User(text.clone()),
         Body::Input { segments, mode, .. } => ContextValue::Queued(segments.clone(), *mode),
-        Body::Enqueue { envelope } => match (&envelope.payload, envelope.source()) {
-            (Carried::Child(outcome), _) => ContextValue::Child(outcome.clone()),
-            (Carried::Detached(outcome), Source::Job(call)) => {
-                ContextValue::Background(call, outcome.clone(), envelope.held.clone())
+        Body::Enqueue { envelope } => {
+            let (call, held) = (envelope.id.call, envelope.held.clone());
+            match &envelope.payload {
+                Carried::Message(text) => ContextValue::Inbox(envelope.id.clone(), text.clone()),
+                Carried::Job(text) => ContextValue::Job(call, text.clone(), held),
+                Carried::Child(outcome) => ContextValue::Child(outcome.clone()),
+                Carried::Detached(outcome) => ContextValue::Background(call, outcome.clone(), held),
             }
-            (Carried::Text(text), Source::Job(call)) => {
-                ContextValue::Job(call, text.clone(), envelope.held.clone())
-            }
-            (Carried::Text(_), _) => ContextValue::Inbox(envelope.clone()),
-            (Carried::Detached(_), _) => return None,
-        },
+        }
         Body::Take { input, into: None } => ContextValue::Taken(*input),
         Body::Take {
             input,
@@ -305,11 +303,7 @@ impl Transcript {
                 self.waiting.insert(seq, Waiting::Input(segments, mode));
                 return;
             }
-            ContextValue::Inbox(Envelope {
-                id,
-                payload: Carried::Text(text),
-                ..
-            }) => {
+            ContextValue::Inbox(id, text) => {
                 self.waiting.insert(seq, Waiting::Inbox(id, text));
                 return;
             }
@@ -373,8 +367,7 @@ impl Transcript {
             ContextValue::ToolResult(call, outcome, held) => {
                 return self.answer(seq, call, &outcome, &held);
             }
-            // Another session sends text alone.
-            ContextValue::Inbox(_) | ContextValue::Inherited(_) => return,
+            ContextValue::Inherited(_) => return,
         };
         self.messages.push(message);
         self.last = seq.get();
@@ -434,7 +427,16 @@ impl Transcript {
                 self.detached.insert(call);
                 return;
             }
-            ContextValue::Child(outcome) => ext::child_result(&outcome),
+            ContextValue::Child(outcome) => {
+                // Read back as a tool's result is, where a blob holds it.
+                let shown = match &outcome {
+                    Outcome::Done {
+                        output: Payload::Blob(_),
+                    } => Some(text_of(self.present("", &outcome, &[]).output)),
+                    _ => None,
+                };
+                ext::child_result(&outcome, shown.as_deref())
+            }
             ContextValue::Background(call, outcome, held) => self.background(call, &outcome, &held),
             ContextValue::Job(call, text, held) => {
                 // Its stream, sealed as the group ended, is read as a blob.
@@ -666,7 +668,7 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
                     value,
                     ContextValue::ToolCall(..)
                         | ContextValue::Queued(..)
-                        | ContextValue::Inbox(_)
+                        | ContextValue::Inbox(..)
                         | ContextValue::Child(_)
                         | ContextValue::Background(..)
                         | ContextValue::Job(..)
@@ -813,7 +815,7 @@ mod tests {
     #[test]
     fn another_sessions_message_names_its_sender_and_channel() {
         let sender = SessionId::new();
-        let envelope = Envelope {
+        let envelope = protocol::Envelope {
             id: EnvelopeId {
                 sender,
                 call: CallId::new(3).unwrap(),

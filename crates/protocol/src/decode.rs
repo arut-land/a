@@ -596,7 +596,7 @@ struct ItemFields {
     decision: Option<Json>,
     child: Option<SessionId>,
     watch: Option<Seq>,
-    fired: Option<Outcome>,
+    fired: Option<ToolOutcome>,
     cwd: Option<crate::HostPath>,
 }
 

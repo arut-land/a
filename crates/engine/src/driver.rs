@@ -755,7 +755,7 @@ impl Live {
         Ok(())
     }
 
-    pub(crate) fn settled(&self, child: SessionId, outcome: Outcome) {
+    pub(crate) fn settled(&self, child: SessionId, outcome: protocol::ToolOutcome) {
         self.send(Msg::Step(Event::ChildSettled { child, outcome }));
     }
 

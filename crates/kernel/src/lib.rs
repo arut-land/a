@@ -202,7 +202,10 @@ pub enum Event {
         answered: Option<(Name, Replied)>,
     },
     /// Child session `child` settled with `outcome`.
-    ChildSettled { child: SessionId, outcome: Outcome },
+    ChildSettled {
+        child: SessionId,
+        outcome: protocol::ToolOutcome,
+    },
     /// Ownership was durably cancelled; future input cannot revive it.
     OwnerCancelled,
     /// Send an envelope to the recipients the session's route resolved.
@@ -392,7 +395,7 @@ pub enum Work {
     /// Interrupt child session `child`'s turn.
     Interrupt { child: SessionId },
     /// Hand this child session's result to its owner.
-    Report { outcome: Outcome },
+    Report { outcome: protocol::ToolOutcome },
     /// Kill process group `pgid`, left over from a run cut off.
     Kill { pgid: u32 },
     /// Whether the session has work in flight, which a restart recovers.

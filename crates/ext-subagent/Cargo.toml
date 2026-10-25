@@ -9,6 +9,7 @@ ext.workspace = true
 ext-compact.workspace = true
 llm.workspace = true
 protocol.workspace = true
+rt.workspace = true
 serde.workspace = true
 
 [lints]

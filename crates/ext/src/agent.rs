@@ -38,7 +38,7 @@ pub enum Input {
     /// linked child's result is its tool call's.
     ChildDone {
         watch: Seq,
-        outcome: Outcome,
+        outcome: ToolOutcome,
     },
     /// Call `call`, detached into the background, ended with `outcome`,
     /// taken up as a turn ended: it starts one, as a child's result does.

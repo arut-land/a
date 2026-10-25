@@ -358,13 +358,13 @@ fn links_are_rearmed() {
     assert_plan(&fx, (vec![], vec![BUSY, start()]));
     let fired = Body::Fired {
         watch: Seq::new(2).unwrap(),
-        outcome: done(json!("ok")),
+        outcome: done(json!("ok")).into(),
     };
     let queued = Body::Enqueue {
         envelope: protocol::Envelope::own(
             SessionId::NIL,
             id(2),
-            protocol::Carried::Child(done(json!("ok"))),
+            protocol::Carried::Child(done(json!("ok")).into()),
         ),
     };
     let (_, fx) = resume(
@@ -401,7 +401,7 @@ fn a_call_whose_child_settled_before_a_crash_resumes_with_its_result() {
         Body::Watch { child: child() },
         Body::Fired {
             watch: Seq::new(5).unwrap(),
-            outcome: ok.clone(),
+            outcome: ok.clone().into(),
         },
     ];
     let (_, fx) = resume(Reg::echo(), bodies, &BUSY_LOAD);

@@ -42,7 +42,7 @@ pub struct Ledger {
     publications: crate::publication::Publications,
     /// The last mutation logged of each client that named itself.
     clients: Vec<(ClientId, ClientSeq)>,
-    result: Option<Outcome>,
+    result: Option<ToolOutcome>,
     /// The seq of the input that started the current turn; 0 before the
     /// first.
     turn: u64,
@@ -182,21 +182,57 @@ impl OutcomeKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Queued {
     pub seq: Seq,
-    /// Input's text, or what an envelope carries.
-    pub payload: Carried,
+    pub item: Item,
     pub steer: bool,
-    pub source: Source,
     /// Whether the text was typed, not pasted or attached: only typed text
     /// may be a slash command.
     pub typed: bool,
 }
 
+/// What is queued, and from whom.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Item {
+    /// The user's input, as text.
+    Input(String),
+    /// Another session's message.
+    Message(SessionId, String),
+    /// The end of a process group call `.0` left to the session.
+    Job(CallId, String),
+    /// The outcome of the child watched at `.0`.
+    Child(Seq, ToolOutcome),
+    /// The outcome of call `.0`, which went on in the background.
+    Detached(CallId, ToolOutcome),
+}
+
+impl From<&crate::Envelope> for Item {
+    fn from(envelope: &crate::Envelope) -> Self {
+        let (sender, call) = (envelope.id.sender, envelope.id.call);
+        match &envelope.payload {
+            Carried::Message(text) => Self::Message(sender, text.clone()),
+            Carried::Job(text) => Self::Job(call, text.clone()),
+            Carried::Child(outcome) => Self::Child(call.0, outcome.clone()),
+            Carried::Detached(outcome) => Self::Detached(call, outcome.clone()),
+        }
+    }
+}
+
 impl Queued {
+    /// Where it comes from: what it is says.
+    pub const fn source(&self) -> Source {
+        match &self.item {
+            Item::Input(_) => Source::User,
+            Item::Message(sender, _) => Source::Agent(*sender),
+            Item::Job(call, _) | Item::Detached(call, _) => Source::Job(*call),
+            Item::Child(watch, _) => Source::Child(*watch),
+        }
+    }
+
     /// News of a process group the session owned ending: read with the
     /// next model call, it starts no turn and is no work of its own, so a
     /// session holding only these is at rest.
     pub const fn notice(&self) -> bool {
-        matches!(self.source, Source::Job(_)) && !matches!(self.payload, Carried::Detached(_))
+        matches!(self.item, Item::Job(..))
     }
 }
 
@@ -226,7 +262,7 @@ impl Sending {
         crate::Envelope {
             id: self.id.clone(),
             destination: to,
-            payload: Carried::Text(self.payload.clone()),
+            payload: Carried::Message(self.payload.clone()),
             held: Vec::new(),
         }
     }
@@ -315,18 +351,17 @@ impl Ledger {
                     .or_default()
                     .insert((envelope.id.sender.0.as_u128(), envelope.id.call.0.get()))
                 {
-                    let source = envelope.source();
-                    if matches!(envelope.payload, Carried::Detached(_)) {
-                        self.detached.retain(|d| d.call != envelope.id.call);
+                    let item = Item::from(envelope);
+                    if let Item::Detached(call, _) = item {
+                        self.detached.retain(|d| d.call != call);
                     }
                     self.received.push(seq);
                     self.untaken.push(Queued {
                         seq,
-                        payload: envelope.payload.clone(),
-                        steer: false,
-                        source,
                         // What the session sends itself is no command.
-                        typed: matches!(source, Source::Agent(_)),
+                        typed: matches!(item, Item::Message(..)),
+                        item,
+                        steer: false,
                     });
                 }
             }
@@ -343,9 +378,8 @@ impl Ledger {
                 } else {
                     self.untaken.push(Queued {
                         seq,
-                        payload: Carried::Text(segments.text()),
+                        item: Item::Input(segments.text()),
                         steer: *mode == Mode::Steer,
-                        source: Source::User,
                         typed: segments.as_text().is_some(),
                     });
                 }
@@ -391,7 +425,7 @@ impl Ledger {
             Body::Interrupt { origin } => {
                 self.author(*origin);
                 self.detached.clear();
-                self.result = Some(Outcome::Interrupted { output: None });
+                self.result = Some(ToolOutcome::Interrupted { output: None });
             }
             Body::Link {
                 child,
@@ -405,7 +439,7 @@ impl Ledger {
             }),
             Body::Assistant { text } => {
                 self.result = Some(Outcome::Done {
-                    output: Json::encode(text.as_str()).unwrap_or_default(),
+                    output: Payload::Inline(Json::encode(text.as_str()).unwrap_or_default()),
                 });
             }
             Body::Environment(env) => self.env = Some(env.clone()),
@@ -474,8 +508,8 @@ impl Ledger {
                     open.ran();
                 }
             }
-            Body::ToolResult { call, outcome, .. } => self.settle(*call, reported(outcome)),
-            Body::ModelResult { call, outcome, .. } => self.settle(*call, outcome.clone()),
+            Body::ToolResult { call, outcome, .. } => self.settle(*call, outcome.clone()),
+            Body::ModelResult { call, outcome, .. } => self.settle(*call, outcome.clone().into()),
             Body::Decision {
                 call: Some(call),
                 d,
@@ -516,7 +550,7 @@ impl Ledger {
         );
     }
 
-    fn settle(&mut self, call: CallId, outcome: Outcome) {
+    fn settle(&mut self, call: CallId, outcome: ToolOutcome) {
         let Some(open) = self.open.remove(call) else {
             return;
         };
@@ -641,7 +675,7 @@ impl Ledger {
     pub fn inbox_len(&self) -> usize {
         self.untaken
             .iter()
-            .filter(|q| matches!(q.source, Source::Agent(_)))
+            .filter(|q| matches!(q.item, Item::Message(..)))
             .count()
     }
     pub fn pending_outbox(&self) -> impl Iterator<Item = &Sending> {
@@ -702,7 +736,7 @@ impl Ledger {
     }
 
     /// What the session last settled with: its last answer or outcome.
-    pub const fn result(&self) -> Option<&Outcome> {
+    pub const fn result(&self) -> Option<&ToolOutcome> {
         self.result.as_ref()
     }
 
@@ -811,29 +845,6 @@ impl<K: Ord + Copy, V> Keyed<K, V> {
 
 fn identity(id: &EnvelopeId) -> (u128, u64, &str) {
     (id.sender.0.as_u128(), id.call.0.get(), &id.purpose)
-}
-
-/// A tool's outcome as the session's result: one a blob holds is reported
-/// as the reference, which the parent may read, not the bytes.
-fn reported(outcome: &ToolOutcome) -> Outcome {
-    match outcome {
-        Outcome::Done {
-            output: Payload::Inline(output),
-        } => Outcome::Done {
-            output: output.clone(),
-        },
-        Outcome::Done {
-            output: Payload::Blob(blob),
-        } => Outcome::Done {
-            output: Json::encode(&**blob).unwrap_or_default(),
-        },
-        Outcome::Failed { error } => Outcome::Failed {
-            error: error.clone(),
-        },
-        Outcome::Interrupted { output } => Outcome::Interrupted {
-            output: output.clone(),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -963,7 +974,7 @@ mod durable_tests {
         let done = fold(detached.into_iter().chain([back]));
         assert_eq!(done.detached(), []);
         let item = done.untaken().last().unwrap();
-        assert_eq!(item.source, Source::Job(call));
-        assert!(!item.source.visible());
+        assert_eq!(item.source(), Source::Job(call));
+        assert!(!item.source().visible());
     }
 }

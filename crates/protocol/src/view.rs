@@ -143,7 +143,7 @@ impl ViewState {
                 seq: e.seq,
                 // An outcome is hidden, shown as no text.
                 text: match &envelope.payload {
-                    Carried::Text(text) => text.clone(),
+                    Carried::Message(text) | Carried::Job(text) => text.clone(),
                     Carried::Child(_) | Carried::Detached(_) => String::new(),
                 },
                 steer: false,
@@ -358,7 +358,7 @@ pub enum Item {
         child: SessionId,
         input: String,
         watch: Option<Seq>,
-        fired: Option<Outcome>,
+        fired: Option<ToolOutcome>,
     },
     Environment {
         seq: Seq,

@@ -267,7 +267,7 @@ impl Session {
                 let outcome = outcome(rng, &json!({ "slept": 1 }));
                 self.commit(Body::Fired {
                     watch: Seq::new(watch).unwrap(),
-                    outcome,
+                    outcome: outcome.into(),
                 });
             }
         }
@@ -941,7 +941,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::Fired {
                         watch: Seq::new(2).unwrap(),
                         outcome: Outcome::Done {
-                            output: Json::encode(&json!({ "slept": 1 })).unwrap(),
+                            output: Json::encode(&json!({ "slept": 1 })).unwrap().into(),
                         },
                     },
                 ),

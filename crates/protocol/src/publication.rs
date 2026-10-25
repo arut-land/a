@@ -1,6 +1,6 @@
 //! Named model context is recorded with its identity in the same sealed line.
 
-use crate::{Body, CallId, Entry, Envelope, Json, Mode, Outcome, Segments, Seq};
+use crate::{Body, CallId, Entry, Json, Mode, Segments, Seq};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -45,7 +45,7 @@ pub enum ContextValue {
     /// it depends on who takes it.
     Queued(Segments, Mode),
     /// A message another session sent, waiting to be taken up.
-    Inbox(Envelope),
+    Inbox(crate::EnvelopeId, String),
     Taken(Seq),
     /// Taken into the result of a call, read with it.
     Into(Seq, CallId),
@@ -53,7 +53,7 @@ pub enum ContextValue {
     Assistant(String),
     Context(String, Option<Publication>),
     /// A queued child result.
-    Child(Outcome),
+    Child(crate::ToolOutcome),
     /// The call's result is a placeholder: it went on in the background.
     Detached(CallId),
     /// A queued outcome of a call that went on in the background, and

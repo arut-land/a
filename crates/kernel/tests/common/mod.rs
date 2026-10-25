@@ -517,7 +517,6 @@ impl Agent for Echo {
         let text = match input {
             Input::User { text } => text,
             Input::ChildDone { outcome, .. } => {
-                let outcome = outcome.into();
                 return Actions::from_iter([Action::Say(format!("child: {}", told(&outcome)))]);
             }
             Input::Detached { call, outcome } => {
@@ -928,7 +927,7 @@ pub fn own_child(watch: u64, outcome: &Outcome) -> Body {
         envelope: protocol::Envelope::own(
             SessionId::NIL,
             id(watch),
-            protocol::Carried::Child(outcome.clone()),
+            protocol::Carried::Child(outcome.clone().into()),
         ),
     }
 }

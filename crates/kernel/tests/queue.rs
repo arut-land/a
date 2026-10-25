@@ -222,7 +222,7 @@ fn a_childs_result_never_jumps_ahead_of_the_users_queued_input() {
     });
     s.step(Event::ChildSettled {
         child: child(),
-        outcome: done(json!("ok")),
+        outcome: done(json!("ok")).into(),
     });
     s.step(user("next"));
     s.step(tool_done(2, done(json!(null))));
@@ -445,7 +445,7 @@ fn a_child_no_call_waits_on_is_queued_by_its_watch_once() {
     });
     let settled = || Event::ChildSettled {
         child: child(),
-        outcome: done(json!("ok")),
+        outcome: done(json!("ok")).into(),
     };
     s.step(settled());
     s.step(settled());

@@ -623,7 +623,7 @@ impl super::Daemon {
                 protocol::Envelope {
                     id,
                     destination: live.id,
-                    payload: Carried::Text(image.turn.raw().into()),
+                    payload: Carried::Message(image.turn.raw().into()),
                     held: Vec::new(),
                 },
                 cancel,
@@ -647,7 +647,7 @@ impl Actor {
             Body::Enqueue {
                 envelope:
                     protocol::Envelope {
-                        payload: Carried::Text(text),
+                        payload: Carried::Message(text),
                         ..
                     },
             } => (text.clone(), true),
