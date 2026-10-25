@@ -2476,3 +2476,58 @@ fn busy_session_recovery_admits_independent_loads_concurrently() {
 }
 
 mod runtime_demand;
+
+/// A task placed on another machine, which this engine cannot run.
+struct Elsewhere;
+
+impl ext::Extension for Elsewhere {
+    const NAME: &'static str = "elsewhere";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut ext::Registrar) {
+        r.tool(Self);
+    }
+}
+impl ext::Tool for Elsewhere {
+    type In = NoInput;
+    type Out = String;
+    const NAME: &'static str = "elsewhere";
+    const DESCRIPTION: &'static str = "Asks for a task on another machine.";
+    const REPLAY: ext::Replay = ext::Replay::Safe;
+    async fn call(&self, _: &NoInput, cx: &ext::Cx) -> Result<String, String> {
+        let placement = ext::Placement::Machine(protocol::MachineId([7; 16]));
+        match ext::Conversation::task::<Self>("remote", "hi")
+            .placement(placement)
+            .ask(cx)
+            .await
+        {
+            Err(ext::SpawnRefusal::Placement(refused)) if refused == placement => {
+                Ok("refused".into())
+            }
+            other => Err(format!("{other:?}")),
+        }
+    }
+}
+
+#[test]
+fn a_task_placed_on_another_machine_is_refused_and_starts_no_child() {
+    let (root, home) = home("placement");
+    let config = Config {
+        extensions: |c| configured(c)?.with(&Elsewhere),
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    let id = parent.session().id;
+    parent.session().submit("call elsewhere {}").unwrap();
+    settle(&daemon);
+    let log = bodies(&*daemon.shared.store, id);
+    assert!(log.iter().any(|b| matches!(
+        b,
+        Body::ToolResult { outcome: Outcome::Done { output }, .. }
+            if output.parse::<String>().unwrap() == "refused"
+    )));
+    assert_eq!(daemon.shared.store.headers().unwrap().len(), 1);
+    drop(parent);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}

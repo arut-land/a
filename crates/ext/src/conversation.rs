@@ -25,7 +25,7 @@
 use std::marker::PhantomData;
 
 use crate::{BoxFuture, Budget, Cx, Extension, ModelRole};
-use protocol::{CallId, Outcome, SessionId};
+use protocol::{CallId, MachineId, Outcome, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub use llm::ContextPolicy;
@@ -107,12 +107,18 @@ pub enum Context {
 }
 
 /// Where the conversation runs. Each daemon stores its own sessions, so a
-/// conversation placed elsewhere will be a root there, owned by address,
-/// rather than nested under its owner here.
+/// conversation placed on another machine is a root session in that
+/// daemon's store, owned by its owner's [`protocol::Address`], never
+/// nested under the owner's log here; the owner records the spawn as a
+/// durable intent and outcome keyed by its [`protocol::EnvelopeId`], an
+/// external call that recovery settles as interrupted rather than repeat.
+/// Only `Here` runs yet: the engine refuses the rest
+/// ([`SpawnRefusal::Placement`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Placement {
     #[default]
     Here,
+    Machine(MachineId),
 }
 
 impl<R, S> Conversation<R, S> {
@@ -480,6 +486,8 @@ pub enum SpawnRefusal {
     DepthExhausted,
     Unavailable(String),
     Interrupted,
+    /// This engine cannot run a conversation there.
+    Placement(Placement),
 }
 
 /// The engine's side of [`Conversation`]: it admits, runs and settles

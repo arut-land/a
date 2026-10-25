@@ -296,8 +296,8 @@ impl Actor {
             .map(|m| m.freeze());
         let mut image = protocol::publication::ContextImage::default();
         let installed = registry.installed();
-        match request.placement {
-            ext::Placement::Here => {}
+        if request.placement != ext::Placement::Here {
+            refusal = Some(SpawnRefusal::Placement(request.placement));
         }
         if let ext::Context::Owner = request.context {
             let seq = call.0;
