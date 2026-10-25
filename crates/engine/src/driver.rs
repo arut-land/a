@@ -1691,6 +1691,7 @@ impl Actor {
         | Event::Woke { call } = &event
         {
             self.inflight.remove(call);
+            lock(&self.live.session.resumable).retain(|resumed| resumed.call != *call);
         }
         Some((event, None))
     }

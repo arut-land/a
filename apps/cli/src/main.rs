@@ -729,9 +729,11 @@ fn serve(
         // Only a home that can register asks, so an isolated daemon has no
         // question pending and nothing to wake for.
         resident: sys::autostart::applies(home).then_some(sys::autostart::refresh),
+        // The next build runs with this daemon's environment, which is
+        // what its first client gave it.
         successor: Some(|exe| {
             let mut cmd = std::process::Command::new(exe);
-            cmd.arg("__daemon");
+            cmd.arg("__daemon").envs(std::env::vars_os());
             cmd
         }),
         handed,
