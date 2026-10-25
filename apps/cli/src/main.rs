@@ -833,52 +833,54 @@ mod parity {
             let mut view = SessionView::default();
             for m in vector["messages"].as_array().unwrap() {
                 view.fold(&DaemonMsg::from_json(m.to_string().as_bytes()).unwrap());
-            }
-            for item in &view.items {
-                let p = item.present();
-                if p.kind == Kind::Side {
-                    continue;
-                }
-                items += 1;
-                let look = tui::view::Look {
-                    verbose: true,
-                    ..tui::view::Look::default()
-                };
-                let tui = tui::view::texts(&tui::view::rows(item, 200, look)).join("\n");
-                let web = text_of_html(&web::view::html(web::view::ItemRow { item, view: &view }));
-                // The line printer prints an item as it is added, asks when it
-                // asks, and ends it once settled: in between it says nothing.
-                let mut repl = super::added(item);
-                let asking = p.buttons != protocol::view::Buttons::None;
-                if asking {
-                    repl.push(super::ask(&p));
-                }
-                if item.settled() {
-                    repl.extend(super::outcome(&p));
-                }
-                let repl = repl.join("\n");
-                let repl_status = item.settled() || asking;
-                // A reply's title is its model, shown with its usage, which the
-                // terminal keeps in its status line.
-                let title = if p.kind == Kind::Reply { "" } else { &p.title };
-                let said = [
-                    bare(title),
-                    bare(&p.status),
-                    match &p.body {
-                        Shown::None => String::new(),
-                        body => bare(body.text().lines().next().unwrap_or_default()),
-                    },
-                ];
-                for (name, shown) in [("tui", &tui), ("web", &web), ("repl", &repl)] {
-                    let shown = bare(shown);
-                    for (n, word) in said.iter().enumerate() {
-                        if n == 1 && name == "repl" && !repl_status {
-                            continue;
+                for item in &view.items {
+                    let p = view.present(item);
+                    if p.kind == Kind::Side {
+                        continue;
+                    }
+                    items += 1;
+                    let look = tui::view::Look {
+                        verbose: true,
+                        ..tui::view::Look::default()
+                    };
+                    let tui = tui::view::texts(&tui::view::presented_rows(item, &p, 200, look))
+                        .join("\n");
+                    let web =
+                        text_of_html(&web::view::html(web::view::ItemRow { item, view: &view }));
+                    // The line printer prints an item as it is added, asks when it
+                    // asks, and ends it once settled: in between it says nothing.
+                    let mut repl = super::added(item);
+                    let asking = p.buttons != protocol::view::Buttons::None;
+                    if asking {
+                        repl.push(super::ask(&p));
+                    }
+                    if item.settled() {
+                        repl.extend(super::outcome(&p));
+                    }
+                    let repl = repl.join("\n");
+                    let repl_status = item.settled() || asking;
+                    // A reply's title is its model, shown with its usage, which the
+                    // terminal keeps in its status line.
+                    let title = if p.kind == Kind::Reply { "" } else { &p.title };
+                    let said = [
+                        bare(title),
+                        bare(&p.status),
+                        match &p.body {
+                            Shown::None => String::new(),
+                            body => bare(body.text().lines().next().unwrap_or_default()),
+                        },
+                    ];
+                    for (name, shown) in [("tui", &tui), ("web", &web), ("repl", &repl)] {
+                        let shown = bare(shown);
+                        for (n, word) in said.iter().enumerate() {
+                            if n == 1 && name == "repl" && !repl_status {
+                                continue;
+                            }
+                            assert!(
+                                shown.contains(word.as_str()),
+                                "{name} leaves {word:?} out of {item:?}:\n{shown}"
+                            );
                         }
-                        assert!(
-                            shown.contains(word.as_str()),
-                            "{name} leaves {word:?} out of {item:?}:\n{shown}"
-                        );
                     }
                 }
             }

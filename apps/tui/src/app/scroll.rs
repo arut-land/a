@@ -34,7 +34,7 @@ impl App {
                 }),
             };
             if let Some(state) = &mut rows.live {
-                state.update(&mut rows.lines, &live.text, width);
+                state.update(&mut rows.lines, live, width);
             }
         } else if slot
             .as_ref()

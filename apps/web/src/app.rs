@@ -136,18 +136,7 @@ impl App {
             }
             (&Method::POST, "/api/send", _) => match signals(&body) {
                 Some(Signals { draft, .. }) if draft.trim().is_empty() => done(true),
-                Some(Signals { tab, draft }) => {
-                    if self.tell(&tab, TabIn::Line(draft)) {
-                        // Empties the composer.
-                        whole(
-                            StatusCode::OK,
-                            "application/json",
-                            br#"{"draft":""}"#.to_vec(),
-                        )
-                    } else {
-                        done(false)
-                    }
-                }
+                Some(Signals { tab, draft }) => done(self.tell(&tab, TabIn::Line(draft))),
                 None => done(false),
             },
             (&Method::POST, "/api/approve", _) => {
@@ -263,12 +252,16 @@ impl Live {
                 return None;
             }
             for input in Self::batch(&self.inbox).await? {
+                let submitted = matches!(&input, TabIn::Line(_));
                 let effects = match input {
                     TabIn::Client(event) => self.page.client.step(event),
                     TabIn::Line(text) => self.page.line(&text),
                     TabIn::Cmd(cmd) => self.page.command(cmd),
                 };
                 self.driver.pump(&mut self.page, effects);
+                if submitted {
+                    self.page.admitted();
+                }
             }
             self.page.settle();
             rt::yield_now().await;

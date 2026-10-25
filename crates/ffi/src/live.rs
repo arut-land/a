@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use boltffi::{EventSubscription, StreamProducer, export};
-use client::{Attach, Cmd, Daemon, Daemons, Driver, Effect, Env, Member, Notice, SessionClient};
+use client::{
+    Attach, Cmd, Daemon, Daemons, Driver, Effect, Env, Member, Notice, SessionClient, Show,
+};
 use protocol::{Environment, HomeSettings, HostPath, SessionId, SettingsChange, Target};
 use rt::Threads;
 use sys::install::CliLink;
@@ -556,7 +558,7 @@ impl Session {
         lock(&self.feed).subscribe()
     }
 
-    /// A conservative byte charge for all view payloads received since opening.
+    /// A conservative byte charge for current view payloads and retained updates.
     pub fn retained_bytes(&self) -> u64 {
         lock(&self.feed).retained_bytes as u64
     }
@@ -710,8 +712,26 @@ impl Session {
             return Err(ClientError::NotOpen);
         }
         let effects = feed.client.run(cmd);
-        self.driver.pump(&mut *feed, effects);
-        Ok(())
+        if let Some(notice) = effects.iter().find_map(|effect| match effect {
+            Effect::Show(Show::Notice(notice)) => Some(notice.clone()),
+            _ => None,
+        }) {
+            return Err(notice.into());
+        }
+        let mut rejected = None;
+        client::pump(
+            |io| {
+                self.driver
+                    .io(io)
+                    .inspect_err(|error| rejected = Some(error.clone()))
+            },
+            &mut *feed,
+            effects,
+        );
+        match rejected {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
     }
 }
 

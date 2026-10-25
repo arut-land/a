@@ -46,6 +46,9 @@ pub(crate) struct Feed {
     rev: u64,
     bytes: usize,
     pub retained_bytes: usize,
+    // Charge each current item in Rust and its rendered copy in Swift.
+    item_bytes: Vec<usize>,
+    payload_bytes: usize,
     recent: VecDeque<ChangeBatch>,
     producer: StreamProducer<ChangeBatch>,
 }
@@ -57,6 +60,8 @@ impl Feed {
             rev: 0,
             bytes: 0,
             retained_bytes: 0,
+            item_bytes: Vec::new(),
+            payload_bytes: 0,
             recent: VecDeque::with_capacity(BUDGET.requests),
             producer: StreamProducer::new(BUFFER),
         }
@@ -67,6 +72,42 @@ impl Feed {
     }
 
     fn publish(&mut self, changes: Vec<ViewChange>) {
+        for change in &changes {
+            match change {
+                ViewChange::Attached { reset: true, .. } | ViewChange::Snapshot { .. } => {
+                    self.item_bytes = self
+                        .client
+                        .view()
+                        .items
+                        .iter()
+                        .map(|item| {
+                            serde_json::to_vec(item)
+                                .expect("view item serializes")
+                                .len()
+                                * 2
+                        })
+                        .collect();
+                    self.payload_bytes = self.item_bytes.iter().sum();
+                }
+                ViewChange::Added { index, .. } | ViewChange::Updated { index, .. } => {
+                    let index = *index as usize;
+                    if let Some(item) = self.client.view().items.get(index) {
+                        let bytes = serde_json::to_vec(item)
+                            .expect("view item serializes")
+                            .len()
+                            * 2;
+                        if matches!(change, ViewChange::Updated { .. }) {
+                            self.payload_bytes -= self.item_bytes[index];
+                            self.item_bytes[index] = bytes;
+                        } else {
+                            self.item_bytes.insert(index, bytes);
+                        }
+                        self.payload_bytes += bytes;
+                    }
+                }
+                _ => {}
+            }
+        }
         self.rev += 1;
         let view = self.client.view();
         let mut update = ChangeBatch {
@@ -74,11 +115,13 @@ impl Feed {
             seq: view.seq,
             changes,
             turn: self.client.turn().into(),
-            streaming: view.streaming.as_ref().map(|s| s.call.get()),
+            streaming: view.streaming.as_ref().map(|s| crate::StreamId {
+                call: s.call.get(),
+                attempt: s.attempt,
+            }),
             title: view.side(TITLE).map(str::to_owned),
         };
         let mut bytes = update.retained_bytes();
-        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
         if bytes > BUDGET.bytes / BUFFER {
             self.recent.clear();
             self.bytes = 0;
@@ -97,6 +140,14 @@ impl Feed {
         }
         self.bytes += bytes;
         self.recent.push_back(update);
+        self.retained_bytes = self.payload_bytes
+            + self.bytes
+            + self
+                .client
+                .view()
+                .streaming
+                .as_ref()
+                .map_or(0, |s| s.text.len() * 2);
     }
 
     pub fn details(&self, key: u64) -> Option<String> {
@@ -247,6 +298,48 @@ impl Reducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_payload_releases_replaced_views_and_evicted_updates() {
+        let reducer = Reducer::new();
+        let message = DaemonMsg::Entry(protocol::Entry::new(
+            protocol::Seq::new(1).unwrap(),
+            protocol::Epoch(0),
+            protocol::Body::Assistant {
+                text: "x".repeat(1 << 20),
+            },
+        ));
+        reducer
+            .fold(&serde_json::to_string(&message).unwrap())
+            .unwrap();
+        assert!(lock(&reducer.feed).retained_bytes >= 2 << 20);
+        let empty =
+            DaemonMsg::Snapshot(Box::new(protocol::view::SessionView::default().snapshot()));
+        reducer
+            .fold(&serde_json::to_string(&empty).unwrap())
+            .unwrap();
+        let mut feed = lock(&reducer.feed);
+        for _ in 0..BUDGET.requests * 2 {
+            feed.publish(vec![ViewChange::Error {
+                message: "x".repeat(16 << 10),
+            }]);
+        }
+        let retained = feed.retained_bytes;
+        assert!(retained <= BUDGET.bytes);
+        for _ in 0..BUDGET.requests * 2 {
+            feed.publish(vec![ViewChange::Error {
+                message: "x".repeat(16 << 10),
+            }]);
+        }
+        assert_eq!(
+            feed.retained_bytes, retained,
+            "lifetime traffic is not retained payload"
+        );
+        for _ in 0..BUDGET.requests * 2 {
+            feed.publish(vec![ViewChange::Activity]);
+        }
+        assert!(feed.retained_bytes < 128 << 10);
+    }
 
     #[test]
     fn oversized_updates_force_a_snapshot_instead_of_retaining_payload_copies() {

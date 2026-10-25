@@ -58,7 +58,19 @@ impl Page {
     pub fn line(&mut self, text: &str) -> Vec<Effect> {
         match client::parse(text, self.client.turn().asking) {
             None => Vec::new(),
-            Some(cmd) => self.command(cmd),
+            Some(cmd) => {
+                self.error = None;
+                self.command(cmd)
+            }
+        }
+    }
+
+    /// Clears the composer after the pump admitted the submission.
+    pub fn admitted(&mut self) {
+        if self.error.is_none() {
+            self.out.extend_from_slice(
+                b"event: datastar-patch-signals\ndata: signals {\"draft\":\"\"}\n\n",
+            );
         }
     }
 
@@ -382,6 +394,44 @@ mod tests {
     fn events(page: &mut Page) -> Vec<String> {
         let out = String::from_utf8(page.take()).unwrap();
         out.split_terminator("\n\n").map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn the_composer_clears_only_when_the_sdk_admits_the_line() {
+        let mut page = synced();
+        let effects = page.line("/interrupt");
+        client::pump(|_| Ok(()), &mut page, effects);
+        page.admitted();
+        assert!(
+            !String::from_utf8(page.take())
+                .unwrap()
+                .contains("datastar-patch-signals")
+        );
+        let mut page = synced();
+        let effects = page.line("send this draft");
+        client::pump(|_| Ok(()), &mut page, effects);
+        page.admitted();
+        assert!(
+            String::from_utf8(page.take())
+                .unwrap()
+                .contains("data: signals {\"draft\":\"\"}")
+        );
+        let effects = page.line("transport rejected");
+        client::pump(|_| Err(Error::Busy), &mut page, effects);
+        page.admitted();
+        assert!(
+            !String::from_utf8(page.take())
+                .unwrap()
+                .contains("datastar-patch-signals")
+        );
+        let effects = page.line("/help");
+        client::pump(|_| Ok(()), &mut page, effects);
+        page.admitted();
+        assert!(
+            !String::from_utf8(page.take())
+                .unwrap()
+                .contains("datastar-patch-signals")
+        );
     }
 
     #[test]
