@@ -65,31 +65,21 @@ enum Waiting {
 /// user pasted or attached tagged as such; a steer, given to a turn already
 /// running, says who gave it.
 fn model_text(segments: &Segments, mode: Mode, places: &Places) -> String {
-    let at: Vec<Option<String>> = (segments.0.iter())
-        .map(|segment| match segment {
-            Segment::PasteRef(blob) | Segment::Attachment(blob) => places.blob(blob),
-            Segment::Text(_) | Segment::Paste(_) => None,
+    let parts = segments.0.iter().map(|segment| match segment {
+        Segment::Text(typed) => Part::Text(typed.into()),
+        Segment::Paste(pasted) => Tag::from(tag::Pasted(pasted)).into(),
+        Segment::PasteRef(blob) => Tag::from(tag::PastedRef {
+            at: places.blob(blob).map(Into::into),
+            bytes: blob.size,
         })
-        .collect();
-    let parts = segments
-        .0
-        .iter()
-        .zip(&at)
-        .map(|(segment, at)| match segment {
-            Segment::Text(typed) => Part::Text(typed.into()),
-            Segment::Paste(pasted) => Tag::from(tag::Pasted(pasted)).into(),
-            Segment::PasteRef(blob) => Tag::from(tag::PastedRef {
-                at: at.as_deref(),
-                bytes: blob.size,
-            })
-            .into(),
-            Segment::Attachment(blob) => Tag::from(tag::Attached {
-                at: at.as_deref(),
-                media_type: &blob.media_type,
-                bytes: blob.size,
-            })
-            .into(),
-        });
+        .into(),
+        Segment::Attachment(blob) => Tag::from(tag::Attached {
+            at: places.blob(blob).map(Into::into),
+            media_type: &blob.media_type,
+            bytes: blob.size,
+        })
+        .into(),
+    });
     match mode {
         // Typed text outside any tag is the user's own, so it goes as typed.
         Mode::Queue => {
