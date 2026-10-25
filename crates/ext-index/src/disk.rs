@@ -377,7 +377,7 @@ impl<R: Read> In<R> {
 
 /// Opening refreshes cache age without rewriting the snapshot.
 fn touch(path: &Path) {
-    if let Ok(file) = File::open(path) {
+    if let Ok(file) = File::options().write(true).open(path) {
         let _ = file.set_modified(SystemTime::now());
     }
 }
@@ -421,6 +421,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opening_a_snapshot_refreshes_its_cache_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let place = Place::new(dir.path(), &root);
+        write(&place, &root, 0, &Files::default(), None).unwrap();
+        File::options()
+            .write(true)
+            .open(&place.files)
+            .unwrap()
+            .set_modified(SystemTime::now() - MAX_AGE - Duration::from_hours(24))
+            .unwrap();
+        assert!(read(&place, &root).is_some());
+        prune(dir.path(), &Place::new(dir.path(), Path::new("another")));
+        assert!(
+            place.files.exists(),
+            "a recently opened snapshot is retained"
+        );
+    }
+
+    #[test]
     fn rest_reclaims_only_derived_files_unopened_for_thirty_days() {
         let dir = tempfile::tempdir().unwrap();
         let current = Place::new(dir.path(), Path::new("current"));
@@ -439,7 +459,9 @@ mod tests {
             File::create(path).unwrap();
         }
         for path in [&stale.files, &stale.bigrams, &current.files, &unrelated] {
-            File::open(path)
+            File::options()
+                .write(true)
+                .open(path)
                 .unwrap()
                 .set_modified(SystemTime::now() - Duration::from_hours(24 * 31))
                 .unwrap();
