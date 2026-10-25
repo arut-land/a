@@ -65,6 +65,12 @@ impl Home {
     /// Listens at [`Home::endpoint`], replacing a stale socket, and points
     /// [`Home::socket_link`] at it.
     pub fn bind(&self) -> io::Result<Listener> {
+        // An isolated root may be a directory the user made, shared with
+        // others; it is the private namespace of everything the daemon
+        // creates beneath it, which on Windows inherits the root's access.
+        if let crate::InstallLayout::Isolated(root) = self.layout() {
+            crate::fs::private_dir(root)?;
+        }
         let endpoint = self.endpoint();
         imp::bind(&endpoint.0, &self.socket_link(), &endpoint.1).map(Listener)
     }

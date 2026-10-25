@@ -25,6 +25,30 @@ cancelling and retrying that flush never resubmits bytes. Synchronous client
 transports delegate flush to their stream. Async client, daemon and MCP
 writers flush at their message boundaries.
 
+## Private storage
+
+A file's access comes from its own DACL, not from a parent's traversal
+check, so a private file or directory carries its policy from the create
+call: `CreateDirectoryW`/`CreateFileW` receive a protected descriptor and
+nothing is ever reachable under the parent's inherited access. A private
+directory's single ACE allows the user all file rights and is inherited by
+objects and containers (`D:P(A;OICI;FA;;;<user>)`), so whatever `std` or a
+later version creates beneath it is private too. Rights are spelled out
+because an inherited generic right splits into a mapped and an inherit-only
+ACE. Pipes, jobs and single files keep a non-inheritable descriptor.
+
+The daemon binding an isolated home (`A_HOME`) brings the root under this
+policy first (0700 on Unix), whatever the directory above it shares. An existing root, or
+any existing private directory, owned by this user (or by Administrators
+when the user's token holds that group, even deny-only, as Git's
+`safe.directory` accepts, so one elevated run does not lock the user out)
+whose DACL is anything else is replaced with
+`SetSecurityInfo`, which carries the inheritable ACE to every inheriting
+descendant; a reparse point or another user's directory is refused. The
+native layout under LocalAppData inherits the profile's ACL, as Windows
+applications do. The policy grants SYSTEM and Administrators nothing; backup
+and restore go through their privileges rather than the DACL.
+
 The Win32 bindings use `windows-sys` 0.61.2 and `windows-link` 0.2.1, already
 in the dependency graph. They avoid hand-maintained ABI layouts.
 `interprocess` 2.x requires Tokio for asynchronous named pipes; reusing

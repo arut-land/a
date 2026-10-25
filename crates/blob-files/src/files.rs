@@ -190,7 +190,7 @@ impl Inner {
         loop {
             let n = self.staged.fetch_add(1, Ordering::Relaxed);
             let path = dir.join(format!("{}-{n}", std::process::id()));
-            match sys::fs::private_file().read(true).open(&path) {
+            match sys::fs::private_file().readable().open(&path) {
                 Ok(file) => return Ok((file, path)),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(e),
