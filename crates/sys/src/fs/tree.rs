@@ -652,7 +652,7 @@ mod native {
     pub(super) fn mark_placeholder(path: &Path) -> io::Result<bool> {
         use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
         let attributes = std::fs::metadata(path)?.file_attributes();
-        let path = wide(path.as_os_str());
+        let path = wide(verbatim(path)?.as_os_str());
         // SAFETY: path is NUL-terminated.
         if unsafe { SetFileAttributesW(path.as_ptr(), attributes | FILE_ATTRIBUTE_OFFLINE) } == 0 {
             return Err(io::Error::last_os_error());
