@@ -30,8 +30,8 @@ pub struct Ledger {
     /// Every child linked, in order, and the children ever watched.
     links: Vec<Link>,
     watched: Vec<u128>,
-    /// Background process groups started, with the boot they ran in.
-    background: Vec<(u32, String)>,
+    /// Background process groups started.
+    background: Vec<Background>,
     env: Option<Environment>,
     extensions: Option<Vec<Installed>>,
     context: bool,
@@ -243,6 +243,16 @@ pub struct Detached {
     pub call: CallId,
     pub tool: String,
     pub input: Json,
+}
+
+/// A process group a call left to the session, which owns it until it
+/// ends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Background {
+    pub call: CallId,
+    pub pgid: u32,
+    /// The boot it ran in.
+    pub boot: String,
 }
 
 /// An envelope on its way out, and the recipients yet to take it.
@@ -499,7 +509,11 @@ impl Ledger {
                     open.ran();
                 }
                 if *background {
-                    self.background.push((*pgid, boot.clone()));
+                    self.background.push(Background {
+                        call: *call,
+                        pgid: *pgid,
+                        boot: boot.clone(),
+                    });
                 }
             }
             Body::Progress { call, text } => {
@@ -702,8 +716,8 @@ impl Ledger {
         self.watched.binary_search(&child.0.as_u128()).is_ok()
     }
 
-    /// The background process groups started, with the boot each ran in.
-    pub fn background(&self) -> &[(u32, String)] {
+    /// The background process groups started.
+    pub fn background(&self) -> &[Background] {
         &self.background
     }
 

@@ -29,7 +29,8 @@
 //! A blob's path is named only once it exists: [`Places`] ensures a blob
 //! as it names it. A stream's is named from its reference alone. A stream whose writers are gone is sealed by whoever owned
 //! them: the shell, as a process group the session owns ends, into the
-//! blob that end's queued notice holds.
+//! blob that end's queued notice holds. One a restart cut off is copied
+//! into a blob by the engine, as what wrote it may still.
 
 use std::fs::File;
 use std::future::Future;
@@ -323,6 +324,19 @@ impl Places {
             return stream.to_string();
         };
         stream_path(store.streams(), stream).display().to_string()
+    }
+}
+
+/// How much of a stream's start [`media_type`] reads.
+pub const SNIFFED: usize = 8 * 1024;
+
+/// The media type of output that starts with `head`, its first
+/// [`SNIFFED`] bytes: binary if they hold a NUL, text otherwise.
+pub fn media_type(head: &[u8]) -> &'static str {
+    if head[..head.len().min(SNIFFED)].contains(&0) {
+        "application/octet-stream"
+    } else {
+        "text/plain; charset=utf-8"
     }
 }
 

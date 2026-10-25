@@ -283,9 +283,11 @@ daemon neither idle-exits nor finishes an upgrade drain while one runs. An
 interrupt cancels detached calls, and its `interrupt` entry ends them:
 nothing of theirs is queued, so they start nothing. A restart answers a
 detached call whose placeholder a crash cut off with it, then runs the call
-again if its tool is `Replay::Safe`; otherwise its outcome is an
-interruption saying it may not have completed, with where its output went.
-Either way the call is recovered once. A detached call's outcome taken up
+again if its tool is `Replay::Safe`; otherwise its stream is ended
+(`Work::EndStream`) and its outcome, once the kernel hears back
+(`Event::StreamEnded`), is an interruption saying it may not have
+completed, holding the blob its output so far was sealed into. Either way
+the call is recovered once. A detached call's outcome taken up
 as a turn ends reaches the agent as `Input::Detached`, as a child's does as
 `Input::ChildDone`.
 

@@ -3,7 +3,6 @@
 //! on the queue.
 
 use std::fmt::Write as _;
-use std::io::Read as _;
 
 use protocol::{BlobRef, EnvelopeId, Held, OutputStream};
 

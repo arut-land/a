@@ -12,7 +12,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
-use std::io;
+use std::io::{self, Read as _, Write as _};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
@@ -687,10 +687,10 @@ impl Live {
             Vec::new()
         };
         let handed = crate::handover::take(&shared.handed, header.id);
-        let adopted: Vec<CallId> = (handed.iter())
-            .filter(|handed| matches!(handed.owner.kind, crate::handover::Kind::Call { .. }))
-            .map(|handed| handed.owner.call)
-            .collect();
+        let (adopted, reheld): (Vec<_>, Vec<_>) = (handed.iter())
+            .partition(|handed| matches!(handed.owner.kind, crate::handover::Kind::Call { .. }));
+        let adopted: Vec<CallId> = adopted.iter().map(|handed| handed.owner.call).collect();
+        let reheld: Vec<CallId> = reheld.iter().map(|handed| handed.owner.call).collect();
         *lock(&session.adopting) = handed;
         let load = Load {
             session: Some(header.id),
@@ -701,6 +701,7 @@ impl Live {
             busy,
             created: matches!(open, Open::Create),
             adopted: &adopted,
+            reheld: &reheld,
         };
         // A log kept as it is is shown, never resumed or stepped: nothing
         // would commit.
@@ -2501,6 +2502,7 @@ impl Actor {
             }
             // A replayed process number carries no live OS ownership.
             Effect::Kill { .. } => {}
+            Effect::EndStream { stream, cut } => self.end_stream(stream, cut),
             Effect::MarkBusy(busy) => {
                 self.live.busy.store(busy, Ordering::SeqCst);
                 let how = if busy { "busy" } else { "settled" };
@@ -2508,6 +2510,21 @@ impl Actor {
                 self.live.touch();
             }
         }
+    }
+
+    /// Ends stream `stream`, cut off, on a storage worker; the kernel hears
+    /// what became of it.
+    fn end_stream(&self, stream: protocol::OutputStream, cut: kernel::CutOff) {
+        let session = Arc::clone(&self.live.session);
+        let fence = session.fence.load(Ordering::SeqCst);
+        let shared = &session.shared;
+        let store = Arc::clone(&shared.blobs);
+        let ended = rt::unblock(&*shared.rt, move || end_cut_off(&*store, stream));
+        Arc::clone(&shared.rt).spawn(Box::pin(async move {
+            let end = ended.await;
+            let ended = Event::StreamEnded { stream, cut, end };
+            session.emit(fence, Completion::Event(ended));
+        }));
     }
 
     fn resume_tool(&mut self, call: CallId, tool: String, input: Json, value: Json) {
@@ -3215,6 +3232,49 @@ fn job_ended(process: &dyn ext::RunningProcess) -> String {
         _ => "ended".to_owned(),
     };
     format!("[background job {} ended: {how}]", process.id())
+}
+
+/// Ends stream `of`, which a restart cut off: its bytes so far are copied
+/// into a blob, and it is removed. Copied, never sealed in place: a group
+/// the crash left behind may write it still, and would change a blob named
+/// by what it holds.
+fn end_cut_off(store: &dyn ext::blob::BlobStore, of: protocol::OutputStream) -> kernel::StreamEnd {
+    let open = match store.reopen(of, u64::MAX) {
+        Ok(stream) => stream.open,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return kernel::StreamEnd::Missing,
+        Err(_) => return kernel::StreamEnd::Kept,
+    };
+    match copied(store, open.path(), of.call) {
+        Ok(blob) => {
+            // Left behind, it is only a stream no one names.
+            let _ = open.discard();
+            blob.map_or(kernel::StreamEnd::Discarded, kernel::StreamEnd::Sealed)
+        }
+        Err(_) => kernel::StreamEnd::Kept,
+    }
+}
+
+/// The bytes at `path`, as they are now, in a new blob of call `call`'s
+/// output; none if there are none.
+fn copied(
+    store: &dyn ext::blob::BlobStore,
+    path: &Path,
+    call: CallId,
+) -> io::Result<Option<protocol::BlobRef>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = (&file).take(file.metadata()?.len());
+    let mut head = Vec::with_capacity(ext::blob::SNIFFED);
+    (&mut bytes)
+        .take(ext::blob::SNIFFED as u64)
+        .read_to_end(&mut head)?;
+    if head.is_empty() {
+        return Ok(None);
+    }
+    let mut blob = store.writer(u64::MAX)?;
+    blob.write_all(&head)?;
+    io::copy(&mut bytes, &mut blob)?;
+    let origin = protocol::BlobOrigin::ToolOutput(call);
+    blob.finish(ext::blob::media_type(&head), origin).map(Some)
 }
 
 fn store_fault(session: SessionId, operation: ext_logging::Operation, error: &io::Error) {

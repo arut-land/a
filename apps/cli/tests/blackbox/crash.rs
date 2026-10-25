@@ -3,11 +3,12 @@
 //! order, and the log never keeps a torn entry. A run prints its seed;
 //! `A_CRASH_SEED=<seed>` replays it.
 
+use std::fs;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::common::{Conn, Env, assert_contiguous};
-use protocol::{Body, DaemonMsg, Entry, SessionId, Target};
+use crate::common::{Conn, Env, assert_contiguous, wait_for};
+use protocol::{BlobRef, Body, Carried, DaemonMsg, Entry, Held, Outcome, SessionId, Target};
 use sys::Signal;
 
 const ROUNDS: usize = 12;
@@ -112,4 +113,100 @@ fn attach(env: &Env, session: Option<SessionId>) -> (Conn, SessionId, Vec<Entry>
     let mut conn = env.connect();
     let (id, replay) = conn.attach(session.map_or(Target::New, Target::Id), &env.ws);
     (conn, id, replay)
+}
+
+/// A crash cuts off a call gone on in the background and the groups calls
+/// left to the session, their streams still open. The first load after
+/// ends each: what it wrote so far is sealed into the blob its interrupted
+/// outcome or its end's news holds, one empty is discarded, and no stream
+/// is left open.
+#[test]
+fn a_crash_leaves_no_stream_open_and_what_it_cut_off_holds_what_it_wrote() {
+    let env = Env::new("crash-streams");
+    env.daemon("crash_limit = 0");
+    env.ext("shell", "timeout = 1");
+    env.start();
+    let mut conn = env.connect();
+    let (id, _) = conn.attach(Target::New, &env.ws);
+    for command in ["sleep 300 &", "echo job; sleep 300 &"] {
+        conn.input(&format!("$ {command}"));
+        conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
+    }
+    conn.input("$ echo start; sleep 300");
+    conn.until(|e| matches!(e.body, Body::Detached { .. }));
+    let open = env.home.blobs_dir().join("open").join(id.to_string());
+    assert_eq!(fs::read_dir(&open).unwrap().count(), 3, "a stream each");
+    drop(conn);
+    env.kill_daemon();
+    // Whatever the crash left running is the test's to stop.
+    let groups: Vec<u32> = (env.log(id).iter())
+        .filter_map(|e| match e.body {
+            Body::ToolProcess { pgid, .. } => Some(pgid),
+            _ => None,
+        })
+        .collect();
+    let _stop = Stop(groups);
+
+    env.start();
+    let mut conn = env.connect();
+    conn.attach(Target::Id(id), &env.ws);
+    let queued = || {
+        (env.log(id).into_iter())
+            .filter_map(|e| match e.body {
+                Body::Enqueue { envelope } => Some((envelope.payload, envelope.held)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    wait_for("all three ends queued", || queued().len() == 3);
+    let queued = queued();
+    let held = |is: fn(&Carried) -> bool| -> Vec<Vec<u8>> {
+        let (_, held) = queued.iter().find(|(payload, _)| is(payload)).unwrap();
+        held.iter().map(|held| bytes(&env, held)).collect()
+    };
+    assert_eq!(
+        held(|p| matches!(p, Carried::Detached(Outcome::Interrupted { .. }))),
+        [b"start\n"],
+        "{queued:#?}"
+    );
+    let mut jobs: Vec<_> = (queued.iter())
+        .filter(|(payload, _)| matches!(payload, Carried::Job(_)))
+        .map(|(_, held)| {
+            held.iter()
+                .map(|held| bytes(&env, held))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    jobs.sort();
+    assert_eq!(jobs, [vec![], vec![b"job\n".to_vec()]], "{queued:#?}");
+    let left: Vec<_> = (fs::read_dir(&open).unwrap())
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(
+        left,
+        Vec::<std::path::PathBuf>::new(),
+        "nothing is left open"
+    );
+}
+
+/// What a sealed blob holds.
+fn bytes(env: &Env, held: &Held) -> Vec<u8> {
+    let Held::Blob(BlobRef { id, .. }) = held else {
+        panic!("not sealed: {held:?}");
+    };
+    fs::read(env.home.blobs_dir().join(id.fan()).join(id.to_string())).unwrap()
+}
+
+/// Kills these process groups as it drops.
+struct Stop(Vec<u32>);
+
+impl Drop for Stop {
+    fn drop(&mut self) {
+        for &pgid in &self.0 {
+            let pgid = rustix::process::Pid::from_raw(i32::try_from(pgid).unwrap());
+            if let Some(pgid) = pgid {
+                let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+            }
+        }
+    }
 }
