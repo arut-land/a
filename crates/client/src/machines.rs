@@ -10,11 +10,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 
 use protocol::MachineId;
 use rt::Rt;
+use rt::watch::{Event, Hub, Subscription, Watch};
 use sys::Home;
 
 use crate::Host;
@@ -167,42 +168,43 @@ impl Sources {
     }
 
     /// Calls `sink` with what [`Sources::resolve`] finds, now and whenever
-    /// either file changes, until the watch is dropped.
+    /// either file changes, until the watch is dropped. A directory made
+    /// since (`~/.ssh`, say) is followed by `hub` itself.
     pub fn watch(
         &self,
-        rt: &Rt,
+        hub: &Hub,
         sink: impl Fn(io::Result<Vec<Known>>) + Send + Sync + 'static,
-    ) -> io::Result<MachineWatch> {
-        let files: Vec<PathBuf> = std::iter::once(self.machines.clone())
+    ) -> MachineWatch {
+        let files: Arc<[PathBuf]> = std::iter::once(self.machines.clone())
             .chain(self.ssh.as_ref().map(|ssh| ssh.path().to_owned()))
-            .collect();
-        let dirs: Vec<PathBuf> = files
-            .iter()
-            .filter_map(|file| file.parent().map(Path::to_owned))
             .collect();
         let shared = Arc::new(Watched {
             sources: self.clone(),
-            rt: rt.clone(),
+            rt: Arc::clone(hub.runtime()),
             sink: Box::new(sink),
             generation: AtomicU64::new(0),
-            watcher: Mutex::new(None),
         });
-        let spawner = rt.clone();
-        let changed = Arc::downgrade(&shared);
-        let watcher = rt::Watcher::new(
-            Arc::new(move |task| spawner.spawn(task)),
-            dirs,
-            move |event| {
-                if event.affects(&files)
-                    && let Some(shared) = changed.upgrade()
-                {
-                    shared.changed();
-                }
-            },
-        )?;
-        *lock(&shared.watcher) = Some(watcher);
+        let subscriptions = (files.iter())
+            .filter_map(|file| file.parent())
+            .map(|dir| {
+                let (files, changed) = (Arc::clone(&files), Arc::downgrade(&shared));
+                hub.subscribe(Watch::entered(dir), move |events| {
+                    let ours = events.iter().any(|event| match event {
+                        Event::Changed(paths) => paths.iter().any(|p| files.contains(p)),
+                        Event::Created(path) => files.contains(path),
+                        Event::Rescan(_) | Event::Unavailable(_) => true,
+                    });
+                    if ours && let Some(shared) = changed.upgrade() {
+                        shared.changed();
+                    }
+                })
+            })
+            .collect();
         shared.changed();
-        Ok(MachineWatch { _watched: shared })
+        MachineWatch {
+            _watched: shared,
+            _subscriptions: subscriptions,
+        }
     }
 
     fn route(&self, host: &Host) -> Option<Route> {
@@ -247,6 +249,7 @@ impl Machine {
 /// The machines as they change; dropping it stops watching.
 pub struct MachineWatch {
     _watched: Arc<Watched>,
+    _subscriptions: Vec<Subscription>,
 }
 
 struct Watched {
@@ -256,7 +259,6 @@ struct Watched {
     /// Bumped on each change: only the latest change's answer is told, so
     /// a slow resolve never overwrites a newer one.
     generation: AtomicU64,
-    watcher: Mutex<Option<rt::Watcher>>,
 }
 
 impl Watched {
@@ -272,13 +274,7 @@ impl Watched {
                 &*shared.rt,
                 rt::BlockingClass::Network,
                 64 << 10,
-                move || {
-                    // A directory made since (`~/.ssh`, say) is watched from now on.
-                    if let Some(watcher) = lock(&resolving.watcher).as_mut() {
-                        let _ = watcher.refresh();
-                    }
-                    resolving.sources.resolve()
-                },
+                move || resolving.sources.resolve(),
             )
             .await;
             if shared.generation.load(Ordering::Acquire) == generation {
@@ -376,10 +372,6 @@ fn invalid(path: &Path, why: &dyn std::fmt::Display) -> io::Error {
         io::ErrorKind::InvalidData,
         format!("{}: {why}", path.display()),
     )
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]

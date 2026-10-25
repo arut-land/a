@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ext::host::{Changed, GenerationLayer, PreparedLayer, Registrations, Registry, Spawn};
+use ext::host::{GenerationLayer, PreparedLayer, Registrations, Registry};
 use ext::source::Error as PrepareError;
 use ext::{Extension, Refused, Tier};
 
@@ -40,6 +40,12 @@ impl Loader {
             skills,
         }
     }
+}
+
+impl GenerationLayer for Loader {
+    fn name(&self) -> &'static str {
+        "skills"
+    }
 
     fn roots(&self, workspace: &Path) -> Vec<PathBuf> {
         let mut roots: Vec<_> = self
@@ -56,33 +62,6 @@ impl Loader {
             }
         }
         roots
-    }
-}
-
-impl GenerationLayer for Loader {
-    fn name(&self) -> &'static str {
-        "skills"
-    }
-
-    fn watch(
-        &self,
-        workspace: &Path,
-        spawn: Spawn,
-        changed: Arc<Changed>,
-    ) -> Result<Box<ext::host::Refresh>, Refused> {
-        let roots = self.roots(workspace);
-        let mut watcher = rt::Watcher::new(spawn, roots.clone(), move |event| {
-            if event.affects(&roots) {
-                changed();
-            }
-        })
-        .map_err(|e| Refused(e.to_string()))?;
-        Ok(Box::new(move || {
-            // Failure is a typed watch event; the watcher owns recovery even
-            // when the current source inventory can already be prepared.
-            let _ = watcher.refresh();
-            Ok(())
-        }))
     }
 
     fn prepare(
@@ -614,6 +593,7 @@ mod tests {
                 &rig.workspace(),
                 Arc::new(move |task| rt.spawn(task)),
                 Arc::new(|_| {}),
+                ext::testing::watch(),
             )
             .unwrap();
         let old = workspace.snapshot().registry;

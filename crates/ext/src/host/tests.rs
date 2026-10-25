@@ -541,6 +541,17 @@ impl DynExtension for ImageExtension {
     fn contribute(&self, _: &mut Registrar) {}
 }
 
+/// Hands each layer the `changed` its watched root is given, as the
+/// engine's watcher would call it.
+fn watching(layers: Vec<Arc<TestLayer>>) -> Watch {
+    Arc::new(move |root, changed| {
+        if let Some(layer) = layers.iter().find(|l| Path::new(l.name) == root) {
+            *layer.changed.lock().unwrap() = Some(changed);
+        }
+        Box::new(())
+    })
+}
+
 #[derive(Default)]
 struct TestLayer {
     name: &'static str,
@@ -555,9 +566,8 @@ impl GenerationLayer for TestLayer {
     fn name(&self) -> &'static str {
         self.name
     }
-    fn watch(&self, _: &Path, _: Spawn, changed: Arc<Changed>) -> Result<Box<Refresh>, Refused> {
-        *self.changed.lock().unwrap() = Some(changed);
-        Ok(Box::new(|| Ok(())))
+    fn roots(&self, _: &Path) -> Vec<PathBuf> {
+        vec![PathBuf::from(self.name)]
     }
     fn prepare(
         &self,
@@ -672,7 +682,12 @@ fn a_layer_never_decodes_another_layers_image() {
         .unwrap();
     let coordinator = Coordinator::new(base, vec![one.clone(), two.clone()]);
     let workspace = coordinator
-        .open(Path::new("/layers"), Arc::new(|_| {}), Arc::new(|_| {}))
+        .open(
+            Path::new("/layers"),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            watching(vec![one.clone(), two.clone()]),
+        )
         .unwrap();
     let installed = workspace.snapshot().registry.installed();
     one.value.store(5, std::sync::atomic::Ordering::SeqCst);
@@ -698,6 +713,7 @@ fn event_bursts_schedule_one_pending_rebuild() {
             Path::new("/events"),
             Arc::new(|_| {}),
             Arc::new(move |work| queued.lock().unwrap().push(work)),
+            watching(vec![layer.clone()]),
         )
         .unwrap();
     let changed = layer.changed.lock().unwrap().clone().unwrap();
@@ -733,6 +749,7 @@ fn event_bursts_schedule_one_pending_rebuild() {
             Path::new("/events"),
             Arc::new(|_| {}),
             Arc::new(|_| panic!("duplicate subscription")),
+            watching(vec![layer.clone()]),
         )
         .unwrap();
     assert!(Arc::ptr_eq(&shared, &workspace));
@@ -760,6 +777,7 @@ fn resumed_writes_queue_a_capture_during_or_after_preparation() {
                     Path::new("/resumed"),
                     Arc::new(|_| {}),
                     Arc::new(move |work| queued.lock().unwrap().push(work)),
+                    watching(vec![layer.clone()]),
                 )
                 .unwrap();
             let changed = layer.changed.lock().unwrap().clone().unwrap();
@@ -826,6 +844,7 @@ fn transient_reads_recover_without_another_callback_and_stop_when_healthy_or_dro
             Arc::new(move |work| {
                 let _ = send.send(work);
             }),
+            watching(vec![layer.clone()]),
         )
         .unwrap();
     let changed = layer.changed.lock().unwrap().clone().unwrap();
@@ -935,14 +954,24 @@ fn opening_a_workspace_never_holds_the_global_reservation_map() {
     std::thread::scope(|scope| {
         let first = scope.spawn(|| {
             coordinator
-                .open(Path::new("/first"), Arc::new(|_| {}), Arc::new(|_| {}))
+                .open(
+                    Path::new("/first"),
+                    Arc::new(|_| {}),
+                    Arc::new(|_| {}),
+                    Arc::new(|_, _| Box::new(())),
+                )
                 .unwrap()
         });
         entering.recv_timeout(Duration::from_secs(5)).unwrap();
         let (sent, completed) = channel();
         let coordinator = &coordinator;
         scope.spawn(move || {
-            let other = coordinator.open(Path::new("/other"), Arc::new(|_| {}), Arc::new(|_| {}));
+            let other = coordinator.open(
+                Path::new("/other"),
+                Arc::new(|_| {}),
+                Arc::new(|_| {}),
+                Arc::new(|_, _| Box::new(())),
+            );
             sent.send(other).unwrap();
         });
         let other = completed.recv_timeout(Duration::from_secs(5));
@@ -952,7 +981,12 @@ fn opening_a_workspace_never_holds_the_global_reservation_map() {
             .unwrap();
         let first = first.join().unwrap();
         let shared = coordinator
-            .open(Path::new("/first"), Arc::new(|_| {}), Arc::new(|_| {}))
+            .open(
+                Path::new("/first"),
+                Arc::new(|_| {}),
+                Arc::new(|_| {}),
+                Arc::new(|_, _| Box::new(())),
+            )
             .unwrap();
         assert!(Arc::ptr_eq(&first, &shared));
         assert!(!Arc::ptr_eq(&first, &other));
@@ -974,6 +1008,7 @@ fn queued_preparation_does_not_retain_a_closed_workspace() {
             Path::new("/queued"),
             Arc::new(|_| {}),
             Arc::new(move |work| queued.lock().unwrap().push(work)),
+            watching(vec![layer.clone()]),
         )
         .unwrap();
     let registry = Arc::downgrade(&workspace.snapshot().registry);

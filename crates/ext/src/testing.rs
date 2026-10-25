@@ -19,14 +19,28 @@ use blob_files::{CacheDir, Files};
 /// The runtime the calls run on, as the engine provides it.
 static RT: LazyLock<rt::Rt> = LazyLock::new(|| Arc::new(rt::Threads::default()));
 
+/// The file watcher, as the engine provides it.
+static HUB: LazyLock<Arc<rt::watch::Hub>> =
+    LazyLock::new(|| Arc::new(rt::watch::Hub::new(Arc::clone(&RT))));
+
 /// Shared independently of call authority, as in the engine.
 static SERVICES: LazyLock<Arc<SessionServices>> = LazyLock::new(|| {
     Arc::new(
         SessionServices::default()
             .with::<dyn rt::Runtime>(Arc::clone(&RT))
+            .with::<rt::watch::Hub>(Arc::clone(&HUB))
             .with::<dyn transport::HttpClients>(Arc::new(transport::Clients::new(Arc::clone(&RT)))),
     )
 });
+
+/// The trees a generation source watches, over the rig's watcher, as
+/// the engine hands them to [`Sources::open`](crate::host::Sources::open).
+pub fn watch() -> crate::host::Watch {
+    Arc::new(|root, changed| {
+        let watch = rt::watch::Watch::tree(root);
+        Box::new(HUB.subscribe(watch, move |_| changed()))
+    })
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
