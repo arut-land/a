@@ -549,6 +549,7 @@ fn serve(home: &Home, port: u16, variant: &str) -> (crate::Owner, Arc<rt::Thread
     }
     .unwrap();
     // The locked daemon record is how a Windows client finds the pipe.
+    std::fs::create_dir_all(home.daemon_pid_file().parent().unwrap()).unwrap();
     let crate::Claim::Serve(record) = crate::claim(home, "bench", None, false, 0).unwrap() else {
         panic!("the bench home's breaker tripped");
     };
