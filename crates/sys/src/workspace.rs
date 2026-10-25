@@ -98,7 +98,7 @@ fn work_tree(dir: &Path, git: &GitEnv, device: impl Fn(&Path) -> Option<u64>) ->
 }
 
 /// Whether `dir` holds a `.git` directory, or a `.git` file pointing at one.
-fn is_repository_root(dir: &Path) -> bool {
+pub(crate) fn is_repository_root(dir: &Path) -> bool {
     let git = dir.join(".git");
     match fs::metadata(&git) {
         Ok(meta) if meta.is_dir() => true,

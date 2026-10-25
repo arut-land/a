@@ -52,6 +52,15 @@ impl Rules {
         if let Some(overrides) = &self.overrides {
             walk.overrides(overrides.clone());
         }
+        if sys::fs::PLACEHOLDERS {
+            // Listing a placeholder directory fetches its listing.
+            walk.filter_entry(|entry| {
+                !(entry.file_type().is_some_and(|t| t.is_dir())
+                    && entry
+                        .metadata()
+                        .is_ok_and(|meta| sys::fs::is_placeholder(&meta)))
+            });
+        }
         walk
     }
 

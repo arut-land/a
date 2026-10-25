@@ -11,7 +11,8 @@ type KnownFolder = unsafe extern "system" fn(
 ) -> i32;
 type Free = unsafe extern "system" fn(*mut std::ffi::c_void);
 
-fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
+/// A known folder of the current user, as the shell resolves it.
+pub(crate) fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
     // The API contract preserves redirection without importing Shell32 into every
     // process. Each loader reference ends after the returned path is copied.
     // SAFETY: system-only search selects Windows API contracts. Their initialization
@@ -62,12 +63,12 @@ fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
             raw, len,
         )));
         free(raw.cast());
-        Ok(path.join("a"))
+        Ok(path)
     }
 }
 
 pub(super) fn resolve() -> io::Result<Paths> {
-    let local = known_folder(&FOLDERID_LocalAppData)?;
+    let local = known_folder(&FOLDERID_LocalAppData)?.join("a");
     Ok(Paths::new(Locations {
         layout: InstallLayout::Native,
         // Provider keys and machine-specific tool paths are not roaming preferences.
@@ -115,7 +116,7 @@ mod tests {
     #[test]
     fn credentials_and_machine_state_never_use_roaming_storage() {
         let paths = resolve().unwrap();
-        let local = known_folder(&FOLDERID_LocalAppData).unwrap();
+        let local = known_folder(&FOLDERID_LocalAppData).unwrap().join("a");
         assert_eq!(paths.config_dir(), local.join("config"));
         for path in [
             paths.config_dir(),

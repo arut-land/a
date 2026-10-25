@@ -19,6 +19,8 @@ mod native;
 #[cfg(windows)]
 #[path = "paths/windows.rs"]
 mod native;
+#[cfg(windows)]
+pub(crate) use native::known_folder;
 
 /// Native per-user locations or an explicit, self-contained instance.
 #[derive(Clone, Debug, PartialEq, Eq)]

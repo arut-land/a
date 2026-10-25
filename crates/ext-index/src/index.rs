@@ -9,6 +9,12 @@
 //! holds the old one. The content index is built on the first grep, in
 //! chunks of files that blocking jobs fill, and only within the memory
 //! the workspace may use; above that, grep reads every file instead.
+//!
+//! What the root is decides how it is kept ([`sys::fs::Tree`], asked as
+//! the first walk begins): a volume, a home or a system tree is never
+//! walked, and a root whose filesystem's notifications cannot be trusted
+//! has no watcher: a search of files [`REVALIDATE`] old is answered from
+//! them as another walk starts, and grep reads every file.
 
 use std::collections::BTreeSet;
 use std::io::{self, Read as _};
@@ -20,6 +26,7 @@ use std::time::{Duration, Instant};
 use ext::{Cancel, WorkspaceShared};
 use rt::watch::{Event, Hub, Rescan, Subscription, Unavailable, Watch};
 use rt::{BlockingClass, Rt};
+use sys::fs::Tree;
 
 use crate::fff::grep::{self, Grep, GrepMatch, GrepOptions, Known, Prefilter};
 use crate::fff::index::{
@@ -118,6 +125,10 @@ struct State {
     watching: Option<Arc<Watching>>,
     last_used: Option<Instant>,
     keeper: bool,
+    /// What the root is, from the first walk on.
+    tree: Option<Tree>,
+    /// When the last walk began: how old the files of an unwatched root are.
+    walked_at: Option<Instant>,
 }
 
 /// The index's subscriptions: the tree, entered as it is walked, and the
@@ -217,6 +228,9 @@ const WINDOW: usize = 4;
 /// Files one content-index job reads: a multiple of 64, so chunks merge
 /// by whole bitset words.
 const BUILD_CHUNK: usize = 4096;
+/// How old the files of an unwatched root may be before a search starts
+/// another walk of it: an @-mention completing starts one at most.
+const REVALIDATE: Duration = Duration::from_secs(2);
 
 impl WorkspaceIndex {
     fn state(&self) -> MutexGuard<'_, State> {
@@ -257,53 +271,106 @@ impl WorkspaceIndex {
     }
 
     /// The files as the last walk and the changes since left them, after
-    /// the first walk if it has not finished.
-    async fn files(&self) -> Arc<Files> {
+    /// the first walk if it has not finished. Those of an unwatched root
+    /// [`REVALIDATE`] old are answered from while another walk starts. An
+    /// error says why the root is never walked.
+    async fn files(&self) -> Result<Arc<Files>, String> {
         self.used();
-        let walk = {
+        let now = self.rt.now();
+        let (epoch, walk) = {
             let mut state = self.state();
-            if let Some(files) = &state.files {
-                return Arc::clone(files);
+            if let Some(Tree::Refused(refusal)) = state.tree {
+                return Err(refused(&self.root, refusal));
             }
-            let idle = state.busy == Busy::Idle;
-            if idle {
-                state.busy = Busy::Walking;
+            let old = matches!(state.tree, Some(Tree::Unwatched(_)))
+                && state.walked_at.is_some_and(|at| now >= at + REVALIDATE);
+            if let Some(files) = &state.files
+                && !old
+            {
+                return Ok(Arc::clone(files));
             }
-            idle
+            let walked = state.files.clone();
+            let walk = match state.busy {
+                Busy::Idle => {
+                    state.busy = Busy::Walking;
+                    true
+                }
+                Busy::Walking => false,
+                Busy::Applying => {
+                    state.pending.rescan = true;
+                    false
+                }
+            };
+            if let Some(files) = walked {
+                drop(state);
+                if walk {
+                    self.walk();
+                }
+                return Ok(files);
+            }
+            (state.epoch, walk)
         };
         if walk {
             self.walk();
         }
-        let mut files = None;
+        let mut walked = None;
         self.changed
             .until(|| {
-                files.clone_from(&self.state().files);
-                files.is_some()
+                let state = self.state();
+                walked = match (state.tree, &state.files) {
+                    (Some(Tree::Refused(refusal)), _) => Some(Err(refused(&self.root, refusal))),
+                    (_, Some(files)) if state.epoch > epoch => Some(Ok(Arc::clone(files))),
+                    _ => None,
+                };
+                walked.is_some()
             })
             .await;
-        files.expect("checked")
+        walked.expect("checked")
     }
 
-    /// Walks the root again on the blocking pool, entering each directory
-    /// in a new subscription as it goes. The old one is kept until the walk
-    /// is installed, so nothing that changes meanwhile is missed. The
-    /// caller set [`Busy::Walking`].
+    /// Walks the root again on the blocking pool, once the first walk has
+    /// found what the root is: a refused one is never walked nor watched,
+    /// a watched one is walked into a new subscription, each directory
+    /// entered as the walk goes; the old one is kept until the walk is
+    /// installed, so nothing that changes meanwhile is missed. The caller
+    /// set [`Busy::Walking`].
     fn walk(&self) {
-        let watching = Arc::new(self.watch());
         let weak = Weak::clone(&self.own);
         let (rt, root, closed) = (
             Arc::clone(&self.rt),
             Arc::clone(&self.root),
             Arc::clone(&self.closed),
         );
+        let tree = self.state().tree;
         self.rt.spawn(Box::pin(async move {
-            let (rules, files) = walk(&rt, root, closed, Arc::clone(&watching)).await;
+            let tree = if let Some(tree) = tree {
+                tree
+            } else {
+                let root = Arc::clone(&root);
+                rt::unblock_with(&*rt, BlockingClass::Storage, 0, move || Tree::of(&root)).await
+            };
+            let watching = {
+                let Some(index) = weak.upgrade() else { return };
+                index.state().tree = Some(tree);
+                match tree {
+                    Tree::Refused(_) => {
+                        index.state().busy = Busy::Idle;
+                        index.changed.notify();
+                        return;
+                    }
+                    Tree::Watched => Some(Arc::new(index.watch())),
+                    Tree::Unwatched(_) => None,
+                }
+            };
+            let began = rt.now();
+            let (rules, files) = walk(&rt, root, closed, watching.clone()).await;
             let Some(index) = weak.upgrade() else { return };
             {
                 let mut state = index.state();
                 state.files = Some(Arc::new(files));
                 state.rules = Some(rules);
-                state.watching = Some(watching);
+                state.watching = watching;
+                state.walked_at = Some(began);
                 state.epoch += 1;
                 state.busy = Busy::Idle;
                 // Its bit positions were the old walk's.
@@ -479,15 +546,15 @@ impl WorkspaceIndex {
     /// for it since the walk; no index when it would take more than the
     /// workspace may use. Both are taken under one lock: the index's bits
     /// are positions in these files.
-    async fn content(&self) -> (Arc<Files>, Option<Arc<ContentIndex>>) {
-        self.files().await;
+    async fn content(&self) -> Result<(Arc<Files>, Option<Arc<ContentIndex>>), String> {
+        self.files().await?;
         loop {
             let (files, build) = {
                 let mut state = self.state();
                 let files = Arc::clone(state.files.as_ref().expect("walked once"));
                 match &state.content {
-                    Content::Ready(content) => return (files, Some(Arc::clone(content))),
-                    Content::Refused => return (files, None),
+                    Content::Ready(content) => return Ok((files, Some(Arc::clone(content)))),
+                    Content::Refused => return Ok((files, None)),
                     Content::Building { .. } => (files, None),
                     Content::Absent => {
                         // The whole of both builders, and the chunk builders
@@ -495,9 +562,12 @@ impl WorkspaceIndex {
                         let estimate = build_bytes(files.walked_count())
                             + WINDOW * build_bytes(BUILD_CHUNK)
                             + files.heap_bytes();
-                        if estimate > self.limits.memory {
+                        // Unwatched, an edited file's bigrams would go stale
+                        // unseen, and grep would miss what it now holds.
+                        let unwatched = matches!(state.tree, Some(Tree::Unwatched(_)));
+                        if unwatched || estimate > self.limits.memory {
                             state.content = Content::Refused;
-                            return (files, None);
+                            return Ok((files, None));
                         }
                         let epoch = state.epoch;
                         state.content = Content::Building {
@@ -550,8 +620,8 @@ impl WorkspaceIndex {
     }
 
     /// The best `limit` files for `query`, as an @-mention completes.
-    pub async fn search(&self, query: String, limit: usize) -> Searched {
-        let files = self.files().await;
+    pub async fn search(&self, query: String, limit: usize) -> Result<Searched, String> {
+        let files = self.files().await?;
         let query = Arc::<str>::from(query);
         let (on, asked) = (Arc::clone(&files), Arc::clone(&query));
         let working = rt::unblock_with(&*self.rt, BlockingClass::Cpu, 0, move || {
@@ -591,7 +661,7 @@ impl WorkspaceIndex {
                 .map(|(slot, _)| files.path(&files.items()[*slot]))
                 .collect();
             let ranges = score::match_ranges(&parsed, &paths);
-            Searched {
+            Ok(Searched {
                 files: (paths.iter().zip(&found.items).zip(ranges))
                     .map(|((path, (_, score)), ranges)| SearchedFile {
                         path: (*path).to_owned(),
@@ -601,7 +671,7 @@ impl WorkspaceIndex {
                     .collect(),
                 matched: found.total_matched,
                 total: files.live_count(),
-            }
+            })
         })
         .await
     }
@@ -610,7 +680,7 @@ impl WorkspaceIndex {
     /// a pattern with a `/` matches whole relative paths, one without
     /// matches file names.
     pub async fn glob(&self, pattern: String, limit: usize) -> Result<Searched, String> {
-        let files = self.files().await;
+        let files = self.files().await?;
         rt::unblock_with(&*self.rt, BlockingClass::Cpu, 0, move || {
             let whole_path = pattern.contains('/');
             let glob = globset::GlobBuilder::new(&pattern)
@@ -662,7 +732,7 @@ impl WorkspaceIndex {
         let Some(grep) = Grep::new(&parsed, query.options) else {
             return Ok(GrepSummary::default());
         };
-        let (files, content) = self.content().await;
+        let (files, content) = self.content().await?;
         let mut run = Run {
             files: &files,
             content: content.as_deref(),
@@ -812,6 +882,7 @@ fn grep_chunk(
     chunk: &[usize],
     stop: &AtomicBool,
 ) -> (usize, Vec<Grepped>) {
+    let _never = sys::fs::NeverFetch::new();
     let mut buf = Vec::new();
     let mut found = Vec::new();
     let mut searched = 0;
@@ -841,12 +912,14 @@ async fn walk(
     rt: &Rt,
     root: Arc<Path>,
     closed: Arc<AtomicBool>,
-    watching: Arc<Watching>,
+    watching: Option<Arc<Watching>>,
 ) -> (Arc<Rules>, Files) {
     rt::unblock_with(&**rt, BlockingClass::Storage, 0, move || {
         let rules = Rules::of(&root);
         let files = Files::walked(rules.walk(&|| closed.load(Ordering::Acquire), &|dir| {
-            watching.tree.enter(dir);
+            if let Some(watching) = &watching {
+                watching.tree.enter(dir);
+            }
         }));
         (Arc::new(rules), files)
     })
@@ -920,6 +993,7 @@ fn build_chunk(
     len: usize,
     closed: &AtomicBool,
 ) -> Option<Chunk> {
+    let _never = sys::fs::NeverFetch::new();
     let mut consec = BigramIndexBuilder::new(len);
     let mut skip = BigramIndexBuilder::new(len);
     let mut binary = vec![0u64; len.div_ceil(64)];
@@ -979,6 +1053,7 @@ fn look(
     read_content: bool,
     enter: &dyn Fn(&Path),
 ) -> Vec<Change> {
+    let _never = sys::fs::NeverFetch::new();
     let mut buf = Vec::new();
     let mut content = |found: Found| {
         let read = read_content.then(|| {
@@ -1045,6 +1120,14 @@ fn look(
     changes
 }
 
+/// What a search of a refused root replies.
+fn refused(root: &Path, refusal: sys::fs::Refusal) -> String {
+    format!(
+        "{} is {refusal}, which is never indexed: start in a project directory to search it",
+        root.display()
+    )
+}
+
 /// A change to what decides which files the walk finds: a full walk is
 /// the only way to know what it changed.
 fn changes_ignore_rules(relative: &str) -> bool {
@@ -1052,7 +1135,8 @@ fn changes_ignore_rules(relative: &str) -> bool {
     matches!(name, ".gitignore" | ".ignore" | ".rgignore") || relative == ".git/info/exclude"
 }
 
-/// Reads at most `limit` bytes of the regular file at `path` into `buf`.
+/// Reads at most `limit` bytes of the regular file at `path` into `buf`;
+/// a cloud placeholder is never opened (it would be fetched to be read).
 fn read(path: &Path, limit: u64, buf: &mut Vec<u8>) -> io::Result<()> {
     buf.clear();
     let sys::fs::RegularFile::Open(file) = sys::fs::open_regular(path)? else {
@@ -1065,4 +1149,53 @@ fn read(path: &Path, limit: u64, buf: &mut Vec<u8>) -> io::Result<()> {
 /// Whether content looks binary: a NUL early on, as ripgrep decides.
 fn is_binary(content: &[u8]) -> bool {
     memchr::memchr(0, &content[..content.len().min(8 << 10)]).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unwatched_root_is_walked_again_once_its_files_are_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("alpha.txt"), "needle").unwrap();
+        let rt: Rt = Arc::new(rt::Threads::new(2));
+        let hub = Arc::new(Hub::new(Arc::clone(&rt)));
+        let indexes = Indexes::new(Limits::default());
+        let index = indexes.open(&root, rt, hub);
+        // As a network volume's root is: no notification can be trusted.
+        index.state().tree = Some(Tree::Unwatched(sys::fs::Filesystem::Network));
+        let found = |query: &str| -> Vec<String> {
+            let found = rt::block_on(index.search(query.to_owned(), 10)).unwrap();
+            found.files.into_iter().map(|f| f.path).collect()
+        };
+        assert_eq!(found("alpha"), ["alpha.txt"]);
+        assert!(index.state().watching.is_none());
+
+        std::fs::write(root.join("beta.txt"), "needle").unwrap();
+        assert_eq!(found("beta"), Vec::<String>::new());
+        std::thread::sleep(REVALIDATE);
+        // Answered from the old walk at once, as another starts.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while found("beta").is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the walk again finds the new file"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(index.state().watching.is_none());
+
+        // An edit would go unseen by a content index: grep reads every file.
+        let query = GrepQuery {
+            pattern: Pattern::Typed("needle".to_owned()),
+            options: GrepOptions::default(),
+            limit: 10,
+        };
+        let summary = rt::block_on(index.grep(query, &Cancel::default(), |_| {})).unwrap();
+        assert_eq!(summary.matched_files, 2);
+        assert!(!summary.prefiltered);
+    }
 }
