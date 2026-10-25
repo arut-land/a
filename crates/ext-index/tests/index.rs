@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use ext::Cancel;
 use ext_index::{
-    GrepOptions, GrepQuery, GrepSummary, Grepped, Indexes, Limits, Pattern, WorkspaceIndex,
+    GrepOptions, GrepQuery, GrepSummary, Grepped, Indexes, Limits, Pattern, Stopped, WorkspaceIndex,
 };
 
 fn runtime() -> rt::Rt {
@@ -209,7 +209,7 @@ fn a_grep_is_cancelled_mid_stream() {
         cancel.set();
     }))
     .unwrap();
-    assert!(summary.truncated);
+    assert_eq!(summary.stopped, Some(Stopped::Cancelled));
     assert!(summary.searched < 4000, "{summary:?}");
     assert!(seen.load(Ordering::SeqCst) < 4000);
 }

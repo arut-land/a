@@ -56,8 +56,11 @@ pub fn open_regular(path: &Path) -> io::Result<RegularFile> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        // Open a replaced link itself, never its device target.
-        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+        // Open a replaced link itself, never its device target; and ask
+        // that data in remote storage stay there (FILE_FLAG_OPEN_NO_RECALL),
+        // so a file that became a placeholder since the check fails to read
+        // rather than being fetched, as `NeverFetch` makes it on macOS.
+        options.custom_flags(0x0020_0000 | 0x0010_0000);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {

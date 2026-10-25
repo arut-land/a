@@ -40,7 +40,7 @@ mod index;
 
 pub use fff::grep::{Casing, GrepMatch, GrepMode, GrepOptions};
 pub use index::{
-    GrepQuery, GrepSummary, Grepped, Indexes, Limits, Pattern, Searched, SearchedFile,
+    GrepQuery, GrepSummary, Grepped, Indexes, Limits, Pattern, Searched, SearchedFile, Stopped,
     WorkspaceIndex,
 };
 
@@ -225,7 +225,7 @@ impl From<GrepSummary> for GrepReply {
             searched: summary.searched,
             files: summary.matched_files,
             matches: summary.matches,
-            truncated: summary.truncated,
+            truncated: summary.stopped == Some(Stopped::AtLimit),
             regex_error: summary.regex_error,
         }
     }

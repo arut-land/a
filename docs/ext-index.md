@@ -91,37 +91,53 @@ nothing changes or asks costs no wake-ups.
 What the root is is asked once, as the first walk begins, on the blocking
 pool (`sys::fs::Tree::of`): nothing at daemon start pays for it.
 
-**Refused.** A volume's root (`/`, `C:\`, `/Volumes/X`, a mount root, a
-mounted folder), the home directory and the directory of every home
-(`/Users`, `/home`, `C:\Users`, and the home's parent), and the system's
-own trees (the FHS top-level directories, `/Applications`, `/Library`,
-`/private` and everything under `/System` on macOS; Program Files,
-ProgramData and everything under the Windows directory, as the shell's
-known folders name them), and a kernel filesystem (procfs, sysfs, devfs,
-…) are never walked nor watched: `files.search`, `files.grep`, `glob` and
-`grep` reply with an error saying so. A session started in one has search
-without a whole-disk walk, and on macOS without the privacy prompts a walk
-of the home's Desktop, Documents and Downloads would raise. A mount root
-that is the top of a git working tree is a project (a checkout a
-container or VM mounts) and is walked; `/` and a drive's root never are.
+**Refused.** The root of a whole filesystem (`/`, `C:\`, `/Volumes/X`, a
+disk mounted at its own root, a volume mounted in a folder), the home
+directory and the directory of every home (`/Users`, `/home`, `C:\Users`,
+the home's parent, and from WSL the Windows homes in `/mnt/c/Users`), the
+system's own trees (the FHS top-level directories and `/nix`;
+`/Applications`, `/Library`, `/private` and everything under `/System` on
+macOS; Program Files, ProgramData and everything under the Windows
+directory, as the shell's known folders name them), and a kernel
+filesystem (procfs, sysfs, devfs, …) are never walked nor watched:
+`files.search`, `files.grep`, `glob` and `grep` reply with an error saying
+so. A session started in one has search without a whole-disk walk, and on
+macOS without the privacy prompts a walk of the home's Desktop, Documents
+and Downloads would raise. A whole filesystem's root that is the top of a
+git working tree is a project and is walked; `/` and a drive's root never
+are.
+
+What counts as a whole filesystem's root is each OS's own notion. On
+Linux, `statx`'s `STATX_ATTR_MOUNT_ROOT` says a mount is rooted at the
+directory, and `/proc/self/mountinfo`'s root field for its mount id says
+whether it mounts its filesystem's root (`/`) or a directory within it: a
+bind mount (`docker -v $PWD:/app`) or a btrfs subvolume is a directory,
+and walked. Before Linux 5.8 a change of device from the parent is all
+there is to go by. On macOS, `statfs`'s `f_mntonname` is the directory:
+a firmlink (`/Users`) is not a volume, and a path through the Data volume
+(`/System/Volumes/Data/Users/me`) is judged by the name it has
+(`/Users/me`). On Windows, `GetVolumePathNameW` names the directory.
 
 **Unwatched.** On a filesystem whose change notifications miss what other
-machines or processes do, no watcher is armed: a search of files two
-seconds old or more is answered from them at once and starts another walk
-in the background (only the first walk is waited for), so the next search
-sees what changed; and no content index is built (an edited file's bigrams would go stale
-unseen), so grep reads every file. Which filesystems, by each OS's own
+machines or processes do, the watcher still sees what is done here (the
+agent's own edits), and walks see the rest: a search of files two seconds
+old or more (counted from when the last walk finished) is answered from
+them at once and starts another walk in the background (only the first
+walk is waited for), so the next search sees what changed elsewhere; and
+no content index is built (a file edited elsewhere would keep stale
+bigrams), so grep reads every file. Which filesystems, by each OS's own
 account:
 
 - Linux, by `statfs`'s `f_type`: NFS, SMB/CIFS, Ceph, AFS, Coda, GFS2 and
-  Lustre (network); FUSE (virtiofs included), 9p (WSL's Windows drives)
-  and VirtualBox's shared folders (virtual). inotify(7): "Inotify reports
-  only events that a user-space program triggers through the filesystem
-  API. As a result, it does not catch remote events that occur on network
-  filesystems. (Applications must fall back to polling the filesystem to
-  catch such events.) Furthermore, various pseudo-filesystems such as
-  /proc, /sys, and /dev/pts are not monitorable with inotify." overlayfs
-  is watched: a container's changes go through it.
+  Lustre (network); FUSE (virtiofs included), 9p (WSL 2's Windows
+  drives), WSL 1's drvfs and VirtualBox's shared folders (virtual).
+  inotify(7): "Inotify reports only events that a user-space program
+  triggers through the filesystem API. As a result, it does not catch
+  remote events that occur on network filesystems. (Applications must
+  fall back to polling the filesystem to catch such events.) Furthermore,
+  various pseudo-filesystems such as /proc, /sys, and /dev/pts are not
+  monitorable with inotify." overlayfs is watched: a container's changes
+  go through it.
 - macOS, by `statfs`: `MNT_LOCAL` unset, or `f_fstypename` one of nfs,
   smbfs, afpfs, webdav, cifs, ftp (network) or macfuse/osxfuse/fuse*
   (virtual). FSEvents reports what this Mac's kernel does to a volume;
@@ -130,9 +146,10 @@ account:
 - Windows: a UNC path (`\\server\share`, `\\wsl$\…`) or a drive whose
   `GetDriveTypeW` is `DRIVE_REMOTE` (network); a volume whose filesystem
   (`GetVolumeInformationW`) is none Windows ships, NTFS, ReFS, FAT, exFAT,
-  CDFS or UDF, is a driver's (WinFsp, Dokan) and virtual.
-  `ReadDirectoryChangesW` on a share reports what the server's redirector
-  passes on, and fails outright for a buffer over 64 KB.
+  CDFS or UDF, is a driver's (WinFsp, Dokan) and virtual. On a share,
+  `ReadDirectoryChangesW` relies on SMB change notification, which the
+  server drives: what it reports depends on the server (and a buffer over
+  64 KB fails outright), so it is not relied on alone.
 
 **Cloud placeholders** are listed, never opened: grep and the content
 index skip them, and the walk does not enter a placeholder directory,
@@ -146,7 +163,10 @@ directory (`SF_DATALESS` in `st_flags`, from `lstat`: iCloud Drive and
 File Provider), which reading materializes; on Windows,
 `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`, `FILE_ATTRIBUTE_RECALL_ON_OPEN`
 (Cloud Files: OneDrive and other sync engines) or `FILE_ATTRIBUTE_OFFLINE`,
-read with `GetFileAttributesW`, which opens no handle. Microsoft's
+read with `GetFileAttributesW` on the verbatim (`\\?\`) path, which
+opens no handle and reaches past `MAX_PATH`; a file that became one since
+is opened with `FILE_FLAG_OPEN_NO_RECALL`, the documented request that its
+data stay in remote storage. Microsoft's
 attribute reference: reading such a file or enumerating such a directory
 "will cause at least some of the file/directory content to be fetched from
 a remote store".

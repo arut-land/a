@@ -10,9 +10,10 @@
 //!
 //! What the root is decides how it is kept ([`sys::fs::Tree`], asked as
 //! the first walk begins): a volume, a home or a system tree is never
-//! walked, and a root whose filesystem's notifications cannot be trusted
-//! has no watcher: a search of files [`REVALIDATE`] old is answered from
-//! them as another walk starts, and grep reads every file.
+//! walked, and on a root whose filesystem's notifications miss what other
+//! machines do the watcher sees only what is done here: a search of files
+//! [`REVALIDATE`] old is answered from them as another walk starts, and
+//! grep reads every file.
 
 use std::collections::BTreeSet;
 use std::io::{self, Read as _};
@@ -124,7 +125,9 @@ struct State {
     root_identity: Option<sys::fs::FileIdentity>,
     /// What the root is, from the first walk on.
     tree: Option<Tree>,
-    /// When the last walk began: how old the files of an unwatched root are.
+    /// When the last walk was installed: how old the files of an unwatched
+    /// root are. From its end, so a walk longer than [`REVALIDATE`] is not
+    /// stale as it lands.
     walked_at: Option<Instant>,
 }
 
@@ -199,11 +202,20 @@ pub struct GrepSummary {
     pub searched: usize,
     pub matched_files: usize,
     pub matches: usize,
-    /// It stopped at its limit with files left to read.
-    pub truncated: bool,
+    /// Why it stopped with files left to read.
+    pub stopped: Option<Stopped>,
     /// The content index narrowed which files were read.
     pub prefiltered: bool,
     pub regex_error: Option<String>,
+}
+
+/// Why a grep stopped before it read every file it would.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stopped {
+    /// At its limit of matches.
+    AtLimit,
+    /// Cancelled: what it found is all it read, not all there is.
+    Cancelled,
 }
 
 /// Files a grep job reads at once: few enough that a cancel or a full
@@ -320,8 +332,8 @@ impl WorkspaceIndex {
 
     /// Walks the root again on the blocking pool, once the first walk has
     /// found what the root is: a refused one is never walked nor watched,
-    /// a watched one has the watcher armed first so nothing that changes
-    /// during the walk is missed. The caller set [`Busy::Walking`] and let
+    /// any other has the watcher armed first so nothing it reports during
+    /// the walk is missed. The caller set [`Busy::Walking`] and let
     /// the lock go: the watcher may call back into the index as it arms.
     fn walk(&self) {
         let weak = Weak::clone(&self.own);
@@ -347,11 +359,11 @@ impl WorkspaceIndex {
                         index.changed.notify();
                         return;
                     }
-                    Tree::Watched => index.arm(),
-                    Tree::Unwatched(_) => {}
+                    // On a network or virtual root the watcher sees what is
+                    // done here (the agent's own edits); walks see the rest.
+                    Tree::Watched | Tree::Unwatched(_) => index.arm(),
                 }
             }
-            let began = rt.now();
             let (rules, files, identity) = walk(&rt, root, closed).await;
             let Some(index) = weak.upgrade() else { return };
             {
@@ -359,7 +371,7 @@ impl WorkspaceIndex {
                 state.files = Some(Arc::new(files));
                 state.rules = Some(rules);
                 state.root_identity = identity;
-                state.walked_at = Some(began);
+                state.walked_at = Some(index.rt.now());
                 state.epoch += 1;
                 state.busy = Busy::Idle;
                 // Its bit positions were the old walk's.
@@ -760,7 +772,7 @@ impl WorkspaceIndex {
         // Constraint parsing can swallow tokens meant literally (`!=` as an
         // exclusion): a constrained search that found nothing is retried as
         // the whole raw text, keeping only a file path it named.
-        if summary.matches == 0 && !summary.truncated && !parsed.constraints.is_empty() {
+        if summary.matches == 0 && summary.stopped.is_none() && !parsed.constraints.is_empty() {
             let literal = parsed.literal();
             if let Some(retry) = Grep::new(&literal, query.options) {
                 summary = self.grep_files(&mut run, &literal, &Arc::new(retry)).await;
@@ -818,7 +830,7 @@ impl WorkspaceIndex {
             };
             let (searched, chunk) = next.await;
             if cancel.is_set() {
-                summary.truncated = true;
+                summary.stopped = Some(Stopped::Cancelled);
                 return summary;
             }
             summary.searched += searched;
@@ -827,7 +839,7 @@ impl WorkspaceIndex {
                 summary.matches += grepped.matches.len();
                 (run.found)(grepped);
                 if summary.matches >= limit {
-                    summary.truncated = true;
+                    summary.stopped = Some(Stopped::AtLimit);
                     return summary;
                 }
             }
@@ -1162,7 +1174,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_unwatched_root_is_walked_again_once_its_files_are_old() {
+    fn an_unwatched_root_sees_local_changes_at_once_and_remote_ones_by_walking_again() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap().join("ws");
         std::fs::create_dir_all(&root).unwrap();
@@ -1177,21 +1189,25 @@ mod tests {
             found.files.into_iter().map(|f| f.path).collect()
         };
         assert_eq!(found("alpha"), ["alpha.txt"]);
-        assert!(index.state().watcher.is_none());
-
+        // What is done here, the watcher sees at once.
+        assert!(index.state().watcher.is_some());
         std::fs::write(root.join("beta.txt"), "needle").unwrap();
-        assert_eq!(found("beta"), Vec::<String>::new());
+        eventually("the watcher finds the new file", REVALIDATE / 2, || {
+            found("beta") == ["beta.txt"]
+        });
+
+        // What another machine does, it never sees: a walk does, once a
+        // search finds the files old.
+        let watcher = index.state().watcher.take();
+        drop(watcher);
+        std::fs::write(root.join("gamma.txt"), "needle").unwrap();
+        assert_eq!(found("gamma"), Vec::<String>::new());
         std::thread::sleep(REVALIDATE);
-        // Answered from the old walk at once, as another starts.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while found("beta").is_empty() {
-            assert!(
-                Instant::now() < deadline,
-                "the walk again finds the new file"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(index.state().watcher.is_none());
+        eventually(
+            "the walk again finds the new file",
+            Duration::from_secs(10),
+            || found("gamma") == ["gamma.txt"],
+        );
 
         // An edit would go unseen by a content index: grep reads every file.
         let query = GrepQuery {
@@ -1200,7 +1216,15 @@ mod tests {
             limit: 10,
         };
         let summary = rt::block_on(index.grep(query, &Cancel::default(), |_| {})).unwrap();
-        assert_eq!(summary.matched_files, 2);
+        assert_eq!(summary.matched_files, 3);
         assert!(!summary.prefiltered);
+    }
+
+    fn eventually(what: &str, within: Duration, mut check: impl FnMut() -> bool) {
+        let deadline = Instant::now() + within;
+        while !check() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
