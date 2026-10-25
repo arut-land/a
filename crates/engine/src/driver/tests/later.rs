@@ -45,7 +45,7 @@ fn muted() -> (Registry, Arc<AtomicUsize>) {
     };
     let registry = Registry::default()
         .with_in(ext::Tier::Pre, &mute)
-        .and_then(|r| r.with(&ext_shell::Shell))
+        .and_then(|r| r.with(&ext_shell::Shell::default()))
         .unwrap();
     (registry, ended)
 }

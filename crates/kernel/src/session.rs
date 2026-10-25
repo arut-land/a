@@ -217,8 +217,8 @@ impl Core {
                 &mut fx,
             ),
             Event::Detached { call } => self.detached(call, &mut fx),
-            Event::JobEnded { call, text } => {
-                self.own(call, EnvelopeId::JOB, text, Vec::new(), &mut fx);
+            Event::JobEnded { call, text, held } => {
+                self.own(call, EnvelopeId::JOB, text, held, &mut fx);
             }
             Event::Note { call, note } => self.note(call, note, &mut fx),
             Event::Waits { call, on } => self.waits(call, on, &mut fx),
@@ -282,14 +282,15 @@ impl Core {
         &self.turn
     }
 
-    /// Whether nothing is in flight, asked for, queued or in the
+    /// Whether nothing is in flight, asked for, queued (but news of a
+    /// job's end, which waits for the next model call) or in the
     /// background: the ledger alone says where the session stands, so a
     /// snapshot of it restores the session ([`Core::restore`]).
     pub fn at_rest(&self) -> bool {
         self.turn == Turn::Idle
             && self.failed.is_none()
             && self.fold.at_rest()
-            && self.fold.ledger.untaken().is_empty()
+            && self.fold.ledger.untaken().iter().all(Queued::notice)
             && self.fold.ledger.detached().is_empty()
             && self.fold.ledger.open_calls().next().is_none()
             && self.fold.ledger.pending_outbox().next().is_none()
@@ -1746,7 +1747,7 @@ impl Core {
     fn marks(&mut self, fx: &mut StepPlan) {
         let ledger = &self.fold.ledger;
         let armed = ledger.armed().next().is_some();
-        let queued = !ledger.untaken().is_empty();
+        let queued = !ledger.untaken().iter().all(Queued::notice);
         let working = match &self.turn {
             Turn::Idle => false,
             // A call waiting on its child waits on work of its own.

@@ -16,7 +16,21 @@ directory. Unix process-group cleanup permits descendants to escape their group;
 Windows cleanup owns a kill-on-close job. Command-created temporary files remain
 the command's responsibility. Foreground cwd receipts are best effort; truncated
 output is sealed into a blob the result references, and background output stays
-an open blob stream while the job runs.
+an open blob stream while the job runs, sealed as its group ends.
+
+## Timeout moves a command to the background
+
+A command's timeout (`[ext.shell] timeout`, 120 s by default; per call at most
+600 s) is how long the session waits on it, not how long it may run. Past it,
+the shell sets the call's `Cx::detach`, the flag a forced steer sets: the call
+is answered with a placeholder naming its output stream, and its result comes
+back on the queue once the command ends, holding its whole output as a blob
+when the model saw it cut. There is no hard upper bound on a backgrounded
+command: like a `background: true` job it is session-owned work, ended by an
+interrupt, its session's end or the 64 MiB output cap. Only a call another
+call invoked (a Lua script's) is stopped at its timeout, since its caller
+must wait for it. After the timeout passes the supervisor arms no timer: it
+waits only on output, the shell's exit and cancellation.
 
 ## Windows executable names
 

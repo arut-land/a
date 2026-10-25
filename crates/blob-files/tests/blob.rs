@@ -130,7 +130,7 @@ fn a_stream_is_read_where_it_is_named_while_it_grows_and_seals_into_the_same_blo
     let blobs = home.session(session);
     let Stream { mut file, open } = blobs.stream(call(7), 1 << 20).unwrap();
     assert_eq!(
-        Some(open.path().display().to_string()),
+        open.path().display().to_string(),
         blobs.places().stream(OutputStream {
             session,
             call: call(7)
@@ -363,17 +363,17 @@ fn a_reference_is_named_from_what_the_log_records_whoever_projects_it() {
     };
     let bare = Places::default();
     assert_eq!(bare.blob(&blob), Some(format!("by-id/{}", blob.id)));
-    assert_eq!(bare.stream(stream).as_deref(), Some("stream:4"));
-    // A store names only what it can show.
+    assert_eq!(bare.stream(stream), "stream:4");
+    // A store names only a blob it can show; a stream, by its reference
+    // alone, the same before it begins, while it grows and once it ended.
     let home = Home::new();
     let placed = home.session(session).places();
     assert_eq!(placed.blob(&blob), None, "a blob the store does not have");
-    assert_eq!(placed.stream(stream), None, "a stream not begun");
+    let named = placed.stream(stream);
     let begun = home.session(session).stream(call(4), 1).unwrap();
-    assert_eq!(
-        placed.stream(stream),
-        Some(begun.open.path().display().to_string())
-    );
+    assert_eq!(named, begun.open.path().display().to_string());
+    begun.open.discard().unwrap();
+    assert_eq!(placed.stream(stream), named);
 }
 
 #[test]

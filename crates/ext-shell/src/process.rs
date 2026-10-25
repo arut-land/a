@@ -543,7 +543,7 @@ int main(int argc, char **argv) {
             } else {
                 "escaped-capture-timeout"
             },
-            Registry::default().with(&crate::Shell).unwrap(),
+            Registry::default().with(&crate::Shell::default()).unwrap(),
         );
         let executable = escaped_holder(&rig.dir);
         {
@@ -553,7 +553,7 @@ int main(int argc, char **argv) {
                 } else {
                     "escaped-timeout"
                 },
-                Registry::default().with(&crate::Shell).unwrap(),
+                Registry::default().with(&crate::Shell::default()).unwrap(),
             );
             let socket = rig.dir.join("release.sock");
             let listener = UnixListener::bind(&socket).unwrap();

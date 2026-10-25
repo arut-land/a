@@ -58,14 +58,15 @@ impl<'a> QueueView<'a> {
 }
 
 impl Take {
-    /// The answer with no handler, as the kernel took items before the
-    /// point existed. Nothing goes into a result. Before a model call,
-    /// steers and children's results are read, and so are messages and
-    /// background outcomes, unless the user's input is queued ahead of
-    /// them, which starts its own turn first. At a turn's end the first
-    /// input or message starts the next turn, and only with none queued
-    /// does the first of the session's own results (a child's, a
-    /// background call's), so none jumps ahead of the user.
+    /// The answer with no handler. Nothing goes into a result. Before a
+    /// model call, steers and children's results are read, and so are
+    /// messages, background outcomes and jobs' ends, unless the user's
+    /// input is queued ahead of them, which starts its own turn first. At
+    /// a turn's end the first input or message starts the next turn, and
+    /// only with none queued does the first of the session's own results
+    /// (a child's, a background call's), so none jumps ahead of the user.
+    /// A job's end ([`Queued::notice`]) starts no turn: it waits for the
+    /// next model call.
     pub fn default_at(boundary: Boundary, queue: QueueView<'_>) -> Self {
         let items = queue.items();
         match boundary {
@@ -89,8 +90,9 @@ impl Take {
             }
             Boundary::TurnEnd => {
                 let own = |q: &&Queued| matches!(q.source, Source::Child(_) | Source::Job(_));
-                let first = (items.iter().find(|q| !own(q)))
-                    .or_else(|| items.first())
+                let mut starts = items.iter().filter(|q| !q.notice());
+                let first = (starts.clone().find(|q| !own(q)))
+                    .or_else(|| starts.next())
                     .map(|q| q.seq);
                 first.map_or(Self::None, |seq| Self::These(SmallVec::from_elem(seq, 1)))
             }
@@ -195,5 +197,26 @@ mod tests {
             at_end(&[item(5, false, child), item(6, false, agent)]),
             seqs(&[6])
         );
+    }
+
+    #[test]
+    fn a_jobs_end_never_starts_a_turn_and_a_background_calls_outcome_does() {
+        let job = Source::Job(CallId::new(4).unwrap());
+        let at_end = |queue: &[Queued]| {
+            let view = QueueView::new(queue);
+            Take::default_at(Boundary::TurnEnd, view).of(Boundary::TurnEnd, view)
+        };
+        let ended = item(6, false, job);
+        assert_eq!(at_end(std::slice::from_ref(&ended)), seqs(&[]));
+        let child = item(7, false, Source::Child(Seq::new(3).unwrap()));
+        assert_eq!(at_end(&[ended.clone(), child]), seqs(&[7]));
+        let outcome = Queued {
+            outcome: true,
+            ..item(8, false, job)
+        };
+        assert_eq!(at_end(&[ended.clone(), outcome]), seqs(&[8]));
+        let before = Boundary::BeforeModel;
+        let view = QueueView::new(std::slice::from_ref(&ended));
+        assert_eq!(Take::default_at(before, view).of(before, view), seqs(&[6]));
     }
 }

@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use super::*;
 
 mod admission;
+mod background;
 mod bench;
 mod durable;
 mod interrupt;
@@ -949,7 +950,7 @@ fn extensions_are_logged_when_they_change() {
     let script = Script::new(&[]);
     let registry = Registry::default()
         .with(&Harbor)
-        .and_then(|r| r.with(&ext_shell::Shell))
+        .and_then(|r| r.with(&ext_shell::Shell::default()))
         .unwrap();
     let fixture = Fixture::new(ext_fixtures::ECHO, registry, openai(&script));
     // Created with these extensions: nothing to log.
@@ -1641,33 +1642,58 @@ fn background_processes_keep_the_session_and_end_with_it() {
 }
 
 #[test]
-fn a_background_jobs_end_reaches_the_agent_on_the_queue_once() {
+fn a_background_jobs_end_is_queued_once_holding_its_output_and_starts_no_turn() {
     let registry = echoing(&Policy::default()).with(&Extras).unwrap();
     let fixture = Fixture::new(ext_fixtures::ECHO, registry, openai(&Script::new(&[])));
     let session = fixture.start(&[]);
-    session.submit("$ exit 3").unwrap();
-    let log = until(&session, "the job's end was taken up", |log| {
-        log.iter().any(
-            |e| matches!(&e.body, Body::Assistant { text } if text.starts_with("[background job")),
-        )
+    session.submit("$ printf 'its output'; exit 3").unwrap();
+    until(&session, "the job's end was queued", |log| {
+        log.iter().any(|e| matches!(e.body, Body::Enqueue { .. }))
     });
     settle(&session);
-    let log = log_of(&session).into_iter().chain(log).collect::<Vec<_>>();
+    let log = log_of(&session);
     session.halt();
     let call = (log.iter())
         .find_map(|e| matches!(e.body, Body::ToolCall { .. }).then_some(CallId(e.seq)))
         .unwrap();
-    let ends: std::collections::BTreeSet<_> = (log.iter())
+    let ends: Vec<_> = (log.iter())
         .filter_map(|e| match &e.body {
-            Body::Enqueue { envelope } => {
-                assert_eq!(envelope.source(), protocol::Source::Job(call));
-                assert_eq!(envelope.id.purpose, protocol::EnvelopeId::JOB);
-                Some(e.seq)
-            }
+            Body::Enqueue { envelope } => Some(envelope),
             _ => None,
         })
         .collect();
-    assert_eq!(ends.len(), 1, "{log:#?}");
+    let [end] = ends[..] else { panic!("{log:#?}") };
+    assert_eq!(end.source(), protocol::Source::Job(call));
+    assert_eq!(end.id.purpose, protocol::EnvelopeId::JOB);
+    assert_eq!(
+        end.payload,
+        format!("[background job {} ended: exit code 3]", job_of(&log))
+    );
+    let [protocol::Held::Blob(blob)] = &end.held[..] else {
+        panic!("{end:?}")
+    };
+    assert_eq!(background::read(&fixture, blob), "its output");
+    background::nothing_open(&fixture, session.id);
+    // News for the next model call: nothing took it up, nor works on it.
+    assert!(
+        !log.iter().any(|e| matches!(e.body, Body::Take { .. })),
+        "{log:#?}"
+    );
+    assert!(!session.has_work());
+}
+
+/// The process group of the job `log` started.
+fn job_of(log: &[Entry]) -> u32 {
+    (log.iter())
+        .find_map(|e| match e.body {
+            Body::ToolProcess {
+                pgid,
+                background: true,
+                ..
+            } => Some(pgid),
+            _ => None,
+        })
+        .unwrap()
 }
 
 /// `lookup_harbor_label`, held until released or the turn is interrupted.

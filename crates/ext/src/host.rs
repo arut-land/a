@@ -100,7 +100,6 @@ pub struct Parts {
     pub model: Arc<str>,
     pub blobs: blob::Blobs,
     pub cancel: Cancel,
-    pub detach: crate::Flag,
     pub services: Arc<SessionServices>,
 }
 

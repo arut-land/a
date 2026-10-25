@@ -78,7 +78,9 @@ fn shown(outbox: &Outbox, done: impl Fn(&[Entry]) -> bool) -> Vec<Entry> {
 #[test]
 fn a_seq_shown_to_a_client_survives_a_power_cut() {
     let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
-    let registry = Registry::default().with(&ext_shell::Shell).unwrap();
+    let registry = Registry::default()
+        .with(&ext_shell::Shell::default())
+        .unwrap();
     let store: Arc<dyn LogStore> = Arc::clone(&faulty) as _;
     let fixture = Fixture::on(
         store,
@@ -1229,7 +1231,7 @@ fn final_sync_publishes_activity_after_its_entries() {
         reload_registry(1, 1, false)
             .with(&HeldGate)
             .unwrap()
-            .with(&ext_shell::Shell)
+            .with(&ext_shell::Shell::default())
             .unwrap(),
         openai(&Script::new(&[])),
     );

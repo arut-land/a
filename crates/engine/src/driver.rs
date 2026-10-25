@@ -1594,14 +1594,22 @@ impl Actor {
                                 let _ = process.signal(ext::ProcessSignal::Kill);
                                 ended.await;
                             }
-                            lock(&session.jobs).retain(|p| !Arc::ptr_eq(p, &process));
                             // An end of its own reaches the agent, on the
-                            // queue; one the session stopped is its own doing.
+                            // queue, holding what the group left (its
+                            // output, sealed now that nothing writes it);
+                            // one the session stopped is its own doing. The
+                            // job holds the session until its end is sent,
+                            // so no unload or drain comes between.
                             if !stopped {
                                 let text = job_ended(&**process);
-                                session
-                                    .emit(fence, Completion::Event(Event::JobEnded { call, text }));
+                                let held = match process.holds() {
+                                    Some(holds) => rt::unblock(&*session.shared.rt, holds).await,
+                                    None => Vec::new(),
+                                };
+                                let ended = Event::JobEnded { call, text, held };
+                                session.emit(fence, Completion::Event(ended));
                             }
+                            lock(&session.jobs).retain(|p| !Arc::ptr_eq(p, &process));
                             session.changed.notify();
                             if let Some(daemon) = session.shared.daemon.upgrade() {
                                 daemon.jobs.notify();
@@ -2628,19 +2636,31 @@ impl Actor {
             .session
             .cx(origin.clone(), &registry)
             .with_invocation(self.replies.contexts.remove(&call).unwrap_or_default());
+        // A call another invoked is waited on by it, as long as it runs.
+        let invoked = matches!(
+            self.core.ledger().call(call).map(|open| &open.call),
+            Some(protocol::ledger::Call::Tool {
+                invoke: Some(_),
+                ..
+            })
+        );
+        let background =
+            registry.tools().get(&tool).map(ext::DynTool::detach) == Some(ext::Detach::Background);
+        let cx = if background && !invoked {
+            cx.detachable(origin.detach.clone())
+        } else {
+            cx
+        };
         let session = Arc::clone(&self.live.session);
         let id = self.live.id;
-        let detachable =
-            registry.tools().get(&tool).map(ext::DynTool::detach) == Some(ext::Detach::Background);
         origin.spawn(&*self.live.session.shared.rt, async move {
             let began = crate::stamp();
             let mut run = pin!(contain(registry.tools().run(&tool, &input, parsed, &cx)));
             // A call that can go on in the background is stopped being
             // waited on, not stopped: its outcome is reported all the same.
-            let waited = if detachable {
-                first(run.as_mut(), cx.detach.wait()).await
-            } else {
-                Some(run.as_mut().await)
+            let waited = match &cx.detach {
+                Some(detach) => first(run.as_mut(), detach.wait()).await,
+                None => Some(run.as_mut().await),
             };
             let called = if let Some(called) = waited {
                 called

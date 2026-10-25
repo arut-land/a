@@ -2,9 +2,13 @@
 //! starts where the last command left off.
 //!
 //! A command runs in an owned native process scope with no stdin or
-//! terminal. Timeout/cancellation stops that scope; `ExecutionFacts` describes
-//! the platform's containment limits. Its stdout and stderr share one pipe, in the order
-//! written. The directory it ends in is reported through an exit trap and
+//! terminal. Cancellation stops that scope; `ExecutionFacts` describes the
+//! platform's containment limits. Its timeout is how long the session waits:
+//! past it the call goes on in the background ([`ext::Detach::Background`]),
+//! the way a forced steer sends it, and its result reaches the agent on the
+//! queue. A call the session must wait on (one another call invoked) is
+//! stopped at its timeout instead. Its stdout and stderr share one pipe, in
+//! the order written. The directory it ends in is reported through an exit trap and
 //! kept as the `shell` extension's `cwd` state, so `cd` persists across
 //! calls and restarts. Its calls are exclusive ([`ext::Concurrency`]): a
 //! session runs one at a time, so commands never race for that directory.
@@ -12,12 +16,15 @@
 //! Output crosses a bounded capture pipe into an open blob stream.
 //! Storage admission applies back-pressure; the supervisor follows the
 //! stream, woken by its writes, keeping only what the model is shown, and
-//! the stream is sealed into a blob as the whole output when that was cut,
-//! unless processes the command left running still write it. The result
+//! the stream is sealed into a blob as the whole output when that was cut;
+//! while processes the command left running still write it, the result
+//! holds the stream instead, cut or not. The result
 //! holds the blob or the stream ([`Tool::held`]); the engine tells the
-//! model where each is. A command whose output passes [`OUTPUT_CAP`] is
-//! stopped. Cancellation before or during process
-//! launch reports an aborted command, as cancellation during supervision does.
+//! model where each is. A stream a group the session owns writes is sealed
+//! as the group ends, held by the end's queued notice
+//! ([`ext::ProcessLease::holding`]). A command whose output passes
+//! [`OUTPUT_CAP`] is stopped. Cancellation before or during process launch
+//! reports an aborted command, as cancellation during supervision does.
 
 use ext::{LaunchSpec, OwnedProcess, ProcessOutput, ProcessSignal, Processes};
 use std::collections::BTreeMap;
@@ -40,6 +47,8 @@ use ext::{Cx, Json, Partials, Schema, SpawnSpec as Spawn, Tool};
 
 pub struct ShellTool<D> {
     facts: &'static sys::shell::ExecutionFacts,
+    /// Seconds a call that does not say is waited for.
+    timeout: u64,
     description: String,
     dialect: std::marker::PhantomData<D>,
 }
@@ -49,9 +58,10 @@ pub type PowerShell = ShellTool<crate::dialect::PowerShell>;
 pub type WindowsPowerShell = ShellTool<crate::dialect::WindowsPowerShell>;
 
 impl<D: crate::dialect::Dialect> ShellTool<D> {
-    pub(crate) fn new(facts: &'static sys::shell::ExecutionFacts) -> Self {
+    pub(crate) fn new(facts: &'static sys::shell::ExecutionFacts, timeout: u64) -> Self {
         Self {
             facts,
+            timeout,
             description: format!("{}\n{}", D::DESCRIPTION, facts.context()),
             dialect: std::marker::PhantomData,
         }
@@ -67,7 +77,8 @@ fn runtime(cx: &Cx) -> io::Result<&dyn rt::Runtime> {
         .ok_or_else(|| io::Error::other("the engine provides no runtime"))
 }
 
-/// Seconds a command may run when the call does not say.
+/// Seconds a command is waited for when the call does not say, unless
+/// `[ext.shell] timeout` sets another.
 pub const TIMEOUT: u64 = 120;
 pub const MAX_TIMEOUT: u64 = 600;
 /// After the shell exits, how long output may pause before the call ends
@@ -95,7 +106,7 @@ const QUIET: [(&str, &str); 5] = [
 pub struct Command {
     /// The command line.
     pub command: String,
-    /// Seconds before the command is stopped; 120 by default.
+    /// Seconds to wait before the command moves to the background, still running; its result arrives later.
     #[serde(default)]
     #[schema(min = 1, max = 600)]
     pub timeout: Option<u64>,
@@ -110,7 +121,8 @@ pub struct Ran {
     pub exit: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<String>,
-    /// The limit, in seconds, that it ran into.
+    /// The limit, in seconds, that it ran into: it was stopped, as the
+    /// session had to wait on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timed_out: Option<u64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -129,9 +141,9 @@ pub struct Ran {
     /// ([`Tool::held`]), never logged with the output.
     #[serde(skip)]
     pub full: Option<BlobRef>,
-    /// The whole output, still growing: a background job's, or a cut one
-    /// that processes the command left running still write, never a blob
-    /// sealed under them. Held by the result, never logged with the output.
+    /// The whole output, still growing: a background job's, or one that
+    /// processes the command left running still write, never a blob
+    /// sealed under them; sealed as their group ends. Held by the result, never logged with the output.
     #[serde(skip)]
     pub growing: Option<OutputStream>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,6 +166,7 @@ impl<D: crate::dialect::Dialect> Tool for ShellTool<D> {
 
     const NAME: &'static str = D::NAME;
     const DESCRIPTION: &'static str = D::DESCRIPTION;
+    const DETACH: ext::Detach = ext::Detach::Background;
 
     fn description(&self) -> &str {
         &self.description
@@ -162,7 +175,7 @@ impl<D: crate::dialect::Dialect> Tool for ShellTool<D> {
     /// Streams: its output as it comes is its progress.
     fn call(&self, input: &Command, cx: &Cx) -> impl shape::Output<Ran, Streams<String>> {
         ext::stream(|output| async move {
-            run::<D>(self.facts, input, cx, output)
+            run::<D>(self.facts, self.timeout, input, cx, output)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -286,11 +299,12 @@ fn model_text(ran: &Ran) -> String {
 
 async fn run<D: crate::dialect::Dialect>(
     facts: &sys::shell::ExecutionFacts,
+    timeout: u64,
     input: &Command,
     cx: &Cx,
     progress: Partials<String>,
 ) -> io::Result<Ran> {
-    match execute::<D>(facts, input, cx, progress).await {
+    match execute::<D>(facts, timeout, input, cx, progress).await {
         // Launch can observe cancellation after the initial check, before
         // bash has a process to supervise and mark aborted.
         Err(error) if error.kind() == io::ErrorKind::Interrupted && cx.cancel.is_set() => Ok(Ran {
@@ -304,6 +318,7 @@ async fn run<D: crate::dialect::Dialect>(
 
 async fn execute<D: crate::dialect::Dialect>(
     facts: &sys::shell::ExecutionFacts,
+    timeout: u64,
     input: &Command,
     cx: &Cx,
     progress: Partials<String>,
@@ -326,6 +341,7 @@ async fn execute<D: crate::dialect::Dialect>(
             cx,
             spawn_with::<D>(facts, &input.command, &dir, env, None)?,
             file,
+            log,
         )
         .await;
     }
@@ -338,7 +354,7 @@ async fn execute<D: crate::dialect::Dialect>(
     let child = launch(cx, spawn, file).await?;
     let pgid = child.id();
     cx.spawned(pgid, false);
-    let limit = input.timeout.unwrap_or(TIMEOUT).clamp(1, MAX_TIMEOUT);
+    let limit = input.timeout.unwrap_or(timeout).clamp(1, MAX_TIMEOUT);
     let output = Followed {
         log: log.path(),
         written,
@@ -359,8 +375,12 @@ async fn execute<D: crate::dialect::Dialect>(
     })
     .await;
     let moved = moved.then(|| Cwd::change(&cwd, cx.env.as_ref().map(|env| env.cwd.local())));
+    let growing = kept.growing.is_some().then_some(OutputStream {
+        session: cx.session,
+        call: cx.call,
+    });
     if done.lingering {
-        done.process.detach(cx);
+        leave(cx, done.process, kept.growing);
     }
     let ran = Ran {
         exit: done.status.code(),
@@ -373,7 +393,7 @@ async fn execute<D: crate::dialect::Dialect>(
         output: text,
         truncated,
         full: kept.blob,
-        growing: kept.growing,
+        growing,
         background: None,
         lingering: done.lingering.then_some(pgid),
     };
@@ -390,7 +410,8 @@ async fn execute<D: crate::dialect::Dialect>(
 #[derive(Default)]
 struct Kept {
     blob: Option<BlobRef>,
-    growing: Option<OutputStream>,
+    /// The stream, while processes the command left still write it.
+    growing: Option<Open>,
 }
 
 /// What the model is shown of the ended output, and where the whole is
@@ -398,26 +419,25 @@ struct Kept {
 /// command left behind still write it, left growing in its stream. A store
 /// that fails costs the whole output, not the command's result.
 async fn keep(cx: &Cx, log: Open, output: Ended, lingering: bool) -> io::Result<(Rendered, Kept)> {
-    let stream = OutputStream {
-        session: cx.session,
-        call: cx.call,
-    };
+    let call = cx.call;
     rt::unblock_with(runtime(cx)?, rt::BlockingClass::Storage, 0, move || {
         let cut = output.cut();
         let media_type = output.media_type();
         let rendered = output.render();
-        if !cut {
-            let _ = log.discard();
-            return Ok((rendered, Kept::default()));
-        }
+        // What processes the command left still write is kept, whether
+        // or not the model saw all of it so far.
         if lingering {
             let kept = Kept {
-                growing: Some(stream),
+                growing: Some(log),
                 ..Kept::default()
             };
             return Ok((rendered, kept));
         }
-        let Ok(blob) = log.seal(media_type, BlobOrigin::ToolOutput(stream.call)) else {
+        if !cut {
+            let _ = log.discard();
+            return Ok((rendered, Kept::default()));
+        }
+        let Ok(blob) = log.seal(media_type, BlobOrigin::ToolOutput(call)) else {
             return Ok((rendered, Kept::default()));
         };
         let kept = Kept {
@@ -430,14 +450,14 @@ async fn keep(cx: &Cx, log: Open, output: Ended, lingering: bool) -> io::Result<
 }
 
 /// Starts the command with its output going straight to its stream, and
-/// leaves it running: the session owns it from here, and the stream stays
-/// open.
-async fn background(cx: &Cx, spawn: Spawn, file: File) -> io::Result<Ran> {
+/// leaves it running: the session owns it from here, and the stream grows
+/// until the group ends.
+async fn background(cx: &Cx, spawn: Spawn, file: File, log: Open) -> io::Result<Ran> {
     let started = runtime(cx)?.now();
     let cwd = spawn.cwd.clone();
     let child = launch(cx, spawn, file).await?;
     let pgid = child.id();
-    child.detach(cx);
+    leave(cx, child, Some(log));
     Ok(Ran {
         cwd,
         duration_ms: duration_ms(started),
@@ -448,6 +468,59 @@ async fn background(cx: &Cx, spawn: Spawn, file: File) -> io::Result<Ran> {
         }),
         ..Ran::default()
     })
+}
+
+/// Leaves `process` to the session, which owns it until its group ends:
+/// then `output`, the stream it writes, is sealed into the blob the end
+/// holds, or dropped if empty. A group the session stops first leaves no
+/// stream behind.
+fn leave(cx: &Cx, process: OwnedProcess, output: Option<Open>) {
+    let Some(output) = output else {
+        return process.detach(cx);
+    };
+    let output = Written(Some(output));
+    let call = cx.call;
+    cx.own(process.process.holding(move || output.seal(call)));
+}
+
+/// A stream nothing but a group the session owns writes: sealed once the
+/// group has ended, discarded when dropped unsealed.
+struct Written(Option<Open>);
+
+impl Written {
+    /// The blob it seals into, of the media type its start shows; nothing
+    /// for a stream that is empty or cannot be read.
+    fn seal(mut self, call: protocol::CallId) -> Vec<Held> {
+        let Some(open) = &self.0 else {
+            return Vec::new();
+        };
+        let Ok(file) = File::open(open.path()) else {
+            return Vec::new();
+        };
+        let mut head = Vec::with_capacity(crate::output::HEAD);
+        let Ok(1..) = file.take(crate::output::HEAD as u64).read_to_end(&mut head) else {
+            // Dropped unsealed, an empty stream is discarded.
+            return Vec::new();
+        };
+        let Some(open) = self.0.take() else {
+            return Vec::new();
+        };
+        let mut sniffed = Output::default();
+        sniffed.push(&head);
+        let media_type = sniffed.finish().media_type();
+        (open.seal(media_type, BlobOrigin::ToolOutput(call)))
+            .map(Held::Blob)
+            .into_iter()
+            .collect()
+    }
+}
+
+impl Drop for Written {
+    fn drop(&mut self) {
+        if let Some(open) = self.0.take() {
+            let _ = open.discard();
+        }
+    }
 }
 
 async fn launch(cx: &Cx, process: Spawn, file: File) -> io::Result<OwnedProcess> {
@@ -521,8 +594,8 @@ enum Stop {
 /// Where a command stands, as its supervisor drives it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Run {
-    /// The shell runs, until `deadline`.
-    Running { deadline: Instant },
+    /// The shell runs, until `deadline`, if it is to be stopped at one.
+    Running { deadline: Option<Instant> },
     /// It is being stopped, for `why`.
     Stopping { why: Stop, kill: KillPhase },
     /// The shell exited `at`; what it left running may still write.
@@ -573,7 +646,7 @@ impl Run {
                     Stop::Aborted
                 } else if seen.flooded {
                     Stop::Flooded
-                } else if now >= deadline {
+                } else if deadline.is_some_and(|deadline| now >= deadline) {
                     Stop::TimedOut
                 } else {
                     return (self, None);
@@ -599,7 +672,7 @@ impl Run {
     /// output was last heard `heard`; `None` for never.
     fn deadline(self, heard: Instant) -> Option<Instant> {
         match self {
-            Self::Running { deadline } => Some(deadline),
+            Self::Running { deadline } => deadline,
             Self::Stopping {
                 kill: KillPhase::Term { at },
                 ..
@@ -647,7 +720,7 @@ async fn supervise(
     let (mut output, mut live) = (Output::default(), Live::default());
     let start = rt.now();
     let mut run = Run::Running {
-        deadline: start + limit,
+        deadline: Some(start + limit),
     };
     let (mut heard, mut reported) = (start, start);
     let (mut unreported, mut behind) = (false, false);
@@ -690,6 +763,15 @@ async fn supervise(
                 progress.send(text);
                 reported = now;
             }
+        }
+        // Past its timeout, or no longer waited on, a call that may go on
+        // in the background does, and its timeout no longer stops it: a
+        // forced steer and the timeout take the one path.
+        if let (Run::Running { deadline: Some(at) }, Some(detach)) = (run, &cx.detach)
+            && (detach.is_set() || now >= at)
+        {
+            detach.set();
+            run = Run::Running { deadline: None };
         }
         let seen = Seen {
             exited: if exited { None } else { child.try_wait()? },

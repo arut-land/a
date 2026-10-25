@@ -14,7 +14,9 @@ use serde_json::json;
 fn a_quiet_command_wakes_nothing_while_it_runs() {
     let rig = Rig::new(
         "quiet",
-        Registry::default().with(&ext_shell::Shell).unwrap(),
+        Registry::default()
+            .with(&ext_shell::Shell::default())
+            .unwrap(),
     );
     rig.done("bash", &json!({ "command": "true" }));
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
