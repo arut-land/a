@@ -43,12 +43,19 @@ fn create(path: &Path) -> io::Result<[u8; 32]> {
     let mut nonce = [0; 8];
     getrandom::fill(&mut nonce)?;
     let staged = dir.join(format!(".machine.key.{:x}", u64::from_ne_bytes(nonce)));
-    let made = (|| {
+    let made = (|| -> io::Result<()> {
         let mut file = crate::fs::private_file().open(&staged)?;
+        native::exclude_from_backups(&file);
         file.write_all(&native::seal(&secret)?)?;
         crate::fs::sync_data(&file)?;
         drop(file);
-        crate::fs::publish_ordered(&staged, path)
+        crate::fs::publish_ordered(&staged, path)?;
+        // Clients are told the id next, and may pin it (`machines.toml`):
+        // a key a crash took back would make this home another machine.
+        if crate::fs::SEPARATE_CACHE_FLUSH {
+            crate::fs::flush_cache(&fs::File::open(path)?)?;
+        }
+        Ok(())
     })();
     match made {
         Ok(()) => Ok(secret),
@@ -61,6 +68,13 @@ fn create(path: &Path) -> io::Result<[u8; 32]> {
         }
     }
 }
+
+/// The attribute `tmutil addexclusion` sets, and its value: a binary
+/// property list of the one string `com.apple.backupd`.
+#[cfg(target_os = "macos")]
+const BACKUP_EXCLUDED: &std::ffi::CStr = c"com.apple.metadata:com_apple_backup_excludeItem";
+#[cfg(target_os = "macos")]
+const BACKUP_EXCLUDED_BY: &[u8] = b"bplist00_\x10\x11com.apple.backupd\x08\0\0\0\0\0\0\x01\x01\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x1c";
 
 fn unseal(path: &Path, sealed: &[u8]) -> io::Result<[u8; 32]> {
     native::unseal(sealed)
@@ -77,7 +91,32 @@ fn unseal(path: &Path, sealed: &[u8]) -> io::Result<[u8; 32]> {
 
 #[cfg(unix)]
 mod native {
+    use std::fs::File;
     use std::io;
+
+    /// Time Machine leaves the key out, as `tmutil addexclusion` would
+    /// (the attribute goes with the file): a home restored onto another
+    /// Mac, or beside this one, is another machine. Best effort: a file
+    /// system without extended attributes keeps the key all the same.
+    #[cfg(target_os = "macos")]
+    pub fn exclude_from_backups(file: &File) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` keeps the descriptor open; both buffers outlive
+        // the call.
+        unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                super::BACKUP_EXCLUDED.as_ptr(),
+                super::BACKUP_EXCLUDED_BY.as_ptr().cast(),
+                super::BACKUP_EXCLUDED_BY.len(),
+                0,
+                0,
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn exclude_from_backups(_: &File) {}
 
     /// The file's mode keeps it the user's.
     #[allow(clippy::unnecessary_wraps, reason = "as Windows seals")]
@@ -93,6 +132,7 @@ mod native {
 
 #[cfg(windows)]
 mod native {
+    use std::fs::File;
     use std::io;
     use std::ptr::{null, null_mut};
 
@@ -100,6 +140,11 @@ mod native {
     use windows_sys::Win32::Security::Cryptography::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
     };
+
+    /// File History and Windows Backup copy the profile, but a key sealed
+    /// with DPAPI opens only under this logon: a copy restored elsewhere is
+    /// unreadable there, not a second machine.
+    pub fn exclude_from_backups(_: &File) {}
 
     pub fn seal(secret: &[u8]) -> io::Result<Vec<u8>> {
         let input = blob(secret)?;
@@ -207,6 +252,42 @@ mod tests {
         // Sealed: the secret is not in the file as it is.
         #[cfg(windows)]
         assert!(stored.len() > 32);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn time_machine_leaves_the_key_out_as_tmutil_would() {
+        use std::os::unix::ffi::OsStrExt;
+        let attribute = |path: &Path| {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let mut value = [0_u8; 256];
+            // SAFETY: both buffers outlive the call, which writes at most
+            // `value.len()` bytes.
+            let len = unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    BACKUP_EXCLUDED.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            };
+            value[..usize::try_from(len).unwrap_or(0)].to_vec()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let home = Paths::from(root.path().to_owned());
+        machine_id(&home).unwrap();
+        let excluded = root.path().join("excluded");
+        fs::write(&excluded, b"").unwrap();
+        let added = std::process::Command::new("tmutil")
+            .arg("addexclusion")
+            .arg(&excluded)
+            .status()
+            .unwrap();
+        assert!(added.success());
+        assert_eq!(attribute(&excluded), BACKUP_EXCLUDED_BY);
+        assert_eq!(attribute(&home.machine_key_file()), BACKUP_EXCLUDED_BY);
     }
 
     #[test]
