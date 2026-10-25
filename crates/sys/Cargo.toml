@@ -27,8 +27,10 @@ sha2 = { version = "0.11", default-features = false }
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
 libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"], optional = true }
-snmalloc-rs = { version = "0.7.6", default-features = false, features = ["build_cc"], optional = true }
 rpmalloc = { version = "0.2.2", default-features = false, optional = true }
+
+[target.'cfg(not(windows))'.dependencies]
+snmalloc-rs = { version = "0.7.6", default-features = false, features = ["build_cc"], optional = true }
 
 # jemalloc has no MSVC port.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
@@ -48,6 +50,8 @@ oslog = { version = "0.2", default-features = false }
 dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
+# Upstream's defaults use CMake and Windows' WaitOnAddress.
+snmalloc-rs = { version = "0.7.6", optional = true }
 tracelogging = "1.2.4"
 # Ordinary executable names keep .NET Framework hosts working; preserve verbatim-only names.
 dunce = "1.0.5"
