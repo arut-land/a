@@ -184,7 +184,7 @@ impl Sources {
         )?;
         *lock(&shared.watcher) = Some(watcher);
         shared.changed();
-        Ok(MachineWatch(shared))
+        Ok(MachineWatch { _watched: shared })
     }
 
     fn route(&self, host: &Host) -> Option<Route> {
@@ -216,7 +216,9 @@ impl Sources {
 }
 
 /// The machines as they change; dropping it stops watching.
-pub struct MachineWatch(#[allow(dead_code, reason = "held for its watcher")] Arc<Watched>);
+pub struct MachineWatch {
+    _watched: Arc<Watched>,
+}
 
 struct Watched {
     sources: Sources,

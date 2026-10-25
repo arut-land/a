@@ -69,17 +69,6 @@ impl Daemons {
         }]))
     }
 
-    /// This machine's daemon, then every machine `sources` names, over ssh.
-    pub fn known(home: &Home, staged: &Staged, prompt: Prompt) -> io::Result<Self> {
-        let here = Self::one(Member::LOCAL, Daemon::local(home.clone(), staged.clone()));
-        Ok(Sources::of(home)
-            .machines()?
-            .into_iter()
-            .fold(here, |set, machine| {
-                set.with(Member::ssh(machine, prompt, home, staged))
-            }))
-    }
-
     /// This set with the machine `target` names (`mac2:3f9a`), from
     /// `sources`, where the set lacks it.
     pub fn naming(
