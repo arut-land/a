@@ -86,7 +86,7 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
     client.draw()?;
     client
         .app
-        .in_workspace(sys::workspace_of(&std::env::current_dir()?));
+        .in_workspace(sys::workspace_of(&std::env::current_dir()?).try_into()?);
     client.driver.pump(&mut client.app, first);
     let exit = client.run(&rx);
     let _ = client.screen.close_terminal();

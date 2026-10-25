@@ -6,13 +6,13 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use boltffi::{EventSubscription, StreamProducer, export};
 use client::{Attach, Cmd, Daemon, Driver, Effect, Env, Notice, SessionClient};
-use protocol::{Environment, HomeSettings, SessionId, SettingsChange, Target};
+use protocol::{Environment, HomeSettings, HostPath, SessionId, SettingsChange, Target};
 use rt::Threads;
 use sys::install::CliLink;
 use sys::{Home, Staged};
@@ -395,7 +395,7 @@ impl Session {
         let driver = Driver::with_origin(
             || {
                 Ok(Environment::new(
-                    std::env::current_dir()?,
+                    std::env::current_dir()?.try_into()?,
                     session_vars(),
                     false,
                 ))
@@ -470,7 +470,7 @@ impl Session {
     pub fn open(&self, target: OpenTarget) -> Result<(), ClientError> {
         let attach = match target {
             OpenTarget::New { workspace } => {
-                let dir = PathBuf::from(workspace);
+                let dir = HostPath::from(workspace);
                 let env = Environment::new(dir.clone(), self.vars.clone(), false);
                 Attach {
                     workspace: Some(dir),
@@ -481,7 +481,7 @@ impl Session {
                 workspace,
                 any_workspace,
             } => Attach {
-                workspace: Some(PathBuf::from(workspace)),
+                workspace: Some(HostPath::from(workspace)),
                 ..Attach::new(Target::Latest { any_workspace }, Env::Keep)
             },
             OpenTarget::Id { id } => Attach::new(Target::Id(parse_id(&id)?), Env::Keep),
@@ -641,14 +641,26 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn fixture() -> (Session, Home, PathBuf, sys::Listener, std::fs::File) {
+    fn fixture() -> (
+        Session,
+        Home,
+        std::path::PathBuf,
+        sys::Listener,
+        std::fs::File,
+    ) {
         let (client, home, root, listener, owner) = client_fixture();
         (Session::new(&client), home, root, listener, owner)
     }
 
     /// A client of a daemon that is this test: it holds the lock and
     /// listens, and the test answers for it.
-    fn client_fixture() -> (Client, Home, PathBuf, sys::Listener, std::fs::File) {
+    fn client_fixture() -> (
+        Client,
+        Home,
+        std::path::PathBuf,
+        sys::Listener,
+        std::fs::File,
+    ) {
         let root = tempfile::Builder::new()
             .prefix("a-ffi-order-")
             .tempdir()
@@ -786,7 +798,7 @@ mod tests {
             &mut peer,
             &DaemonMsg::Attached {
                 session: id,
-                workspace: root.clone(),
+                workspace: root.clone().try_into().unwrap(),
             },
         )
         .unwrap();
@@ -885,7 +897,7 @@ mod tests {
             &mut peer,
             &DaemonMsg::Attached {
                 session: id,
-                workspace: root.clone(),
+                workspace: root.clone().try_into().unwrap(),
             },
         )
         .unwrap();

@@ -488,7 +488,7 @@ impl Screen {
                 session, workspace, ..
             } => {
                 self.synced = false;
-                sayln!("[session {} · {}]", session.short(), workspace.display());
+                sayln!("[session {} · {}]", session.short(), workspace);
             }
             Change::Added { item, .. } => {
                 if !matches!(item, Item::Assistant { .. }) {

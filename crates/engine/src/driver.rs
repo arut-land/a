@@ -949,7 +949,7 @@ const SNAPSHOT_EVERY: u64 = 64 << 10;
 fn summary(header: &Header, ledger: &Ledger) -> SessionSummary {
     SessionSummary {
         id: header.id,
-        workspace: header.workspace.clone(),
+        workspace: protocol::HostPath::lossy(&header.workspace),
         entries: ledger.seq(),
         clients: 0,
         activity: ledger.activity(),

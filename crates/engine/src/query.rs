@@ -69,7 +69,7 @@ impl Queries {
         };
         let at = match scope {
             Scope::Daemon => At::Daemon,
-            Scope::Workspace(dir) => At::Workspace(Arc::from(workspace_of(&dir, None))),
+            Scope::Workspace(dir) => At::Workspace(Arc::from(workspace_of(dir.local(), None))),
             Scope::Session(session) => match daemon.slot(session) {
                 Some(slot) => At::Session(session, Arc::from(slot.header.workspace.as_path())),
                 None => return failed(format!("no session {session}")),

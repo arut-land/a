@@ -373,7 +373,7 @@ impl Actor {
         let mut frames = Vec::new();
         let attached = DaemonMsg::Attached {
             session: live.id,
-            workspace: live.workspace.clone(),
+            workspace: protocol::HostPath::lossy(&live.workspace),
         };
         frames.extend(Frame::new(&attached).ok().map(|f| (cursor, f)));
         frames.extend(snapshot.map(|frame| (seq, frame)));
@@ -412,7 +412,7 @@ impl Actor {
                     Some(view) => view,
                     None => SessionView::from_log(
                         live.id,
-                        live.workspace.clone(),
+                        protocol::HostPath::lossy(&live.workspace),
                         live.frames.entries().ok()?,
                     ),
                 };

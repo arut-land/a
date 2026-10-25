@@ -1,5 +1,4 @@
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use protocol::{
@@ -17,8 +16,8 @@ use crate::render::{Grid, Viewport};
 use crate::screen::Screen;
 use crate::text::{Line, Modifier};
 
-fn ws() -> PathBuf {
-    PathBuf::from("/work/project")
+fn ws() -> protocol::HostPath {
+    "/work/project".into()
 }
 
 fn entry(seq: u64, body: Body) -> DaemonMsg {

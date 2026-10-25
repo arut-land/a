@@ -358,7 +358,7 @@ async fn execute<D: crate::dialect::Dialect>(
         (cwd, moved)
     })
     .await;
-    let moved = moved.then(|| Cwd::change(&cwd, cx.env.as_ref().map(|env| env.cwd.as_path())));
+    let moved = moved.then(|| Cwd::change(&cwd, cx.env.as_ref().map(|env| env.cwd.local())));
     if done.lingering {
         done.process.detach(cx);
     }

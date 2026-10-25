@@ -1631,7 +1631,7 @@ fn a_fork_keeps_the_selected_recorded_environment_without_live_secrets() {
     let daemon = Daemon::load(&home, &echo()).unwrap();
     let source = daemon.attach_to(&Target::New, std::env::temp_dir).unwrap();
     let old = Environment {
-        cwd: root.join("old"),
+        cwd: root.join("old").try_into().unwrap(),
         vars: std::collections::BTreeMap::from([
             ("EXAMPLE".into(), "old".into()),
             ("PASSWORD".into(), "fixture-secret".into()),
@@ -1645,7 +1645,7 @@ fn a_fork_keeps_the_selected_recorded_environment_without_live_secrets() {
     source
         .session()
         .set_env(Environment {
-            cwd: root.join("new"),
+            cwd: root.join("new").try_into().unwrap(),
             ..Environment::default()
         })
         .unwrap();

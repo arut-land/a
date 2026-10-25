@@ -810,7 +810,7 @@ mod tests {
         let state = queue.state.lock().unwrap();
         assert_eq!(state.items.len(), 2);
         assert!(
-            matches!(&state.items[0].2, Request::Io(io) if matches!(&**io, Io::Send(ClientMsg::Environment(env)) if env.cwd == std::path::Path::new("kept")))
+            matches!(&state.items[0].2, Request::Io(io) if matches!(&**io, Io::Send(ClientMsg::Environment(env)) if env.cwd.as_str() == "kept"))
         );
         drop(state);
         send(Io::Hangup).unwrap();
@@ -835,7 +835,7 @@ mod tests {
             panic!("expected environment");
         };
         assert!(
-            matches!(*io, Io::Send(ClientMsg::Environment(env)) if env.cwd == std::path::Path::new("latest"))
+            matches!(*io, Io::Send(ClientMsg::Environment(env)) if env.cwd.as_str() == "latest")
         );
     }
 

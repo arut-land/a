@@ -487,7 +487,7 @@ impl Conn {
     pub fn attach(&mut self, target: Target, ws: &Path) -> (SessionId, Vec<Entry>) {
         self.send(&ClientMsg::Attach {
             target,
-            workspace: ws.into(),
+            workspace: ws.to_owned().try_into().unwrap(),
             since: 0,
             env: None,
             decl: protocol::ClientDecl::default(),

@@ -91,7 +91,7 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
     assert!(matches!(opened, Body::Extensions { .. }), "{opened:?}");
     let attached = bodies.remove(0);
     assert!(
-        matches!(&attached, Body::Environment(shell) if shell.cwd == env.ws),
+        matches!(&attached, Body::Environment(shell) if shell.cwd.local() == env.ws),
         "{attached:?}"
     );
     assert_eq!(
@@ -336,7 +336,7 @@ fn a_command_run_by_the_agent_uses_the_attaching_shells_path_and_virtualenv() {
 
     // A refresh (`/env refresh`) from a shell that left the venv.
     let mut outside = protocol::Environment {
-        cwd: env.ws.clone(),
+        cwd: env.ws.clone().try_into().unwrap(),
         ..Default::default()
     };
     outside.vars.insert("PATH".into(), "/usr/bin:/bin".into());

@@ -26,7 +26,7 @@ fn bridge_speaks_the_protocol_over_stdio() {
     let Some(ClientMsg::Environment(shell)) = read_frame(&mut stdout).unwrap() else {
         panic!("no environment after the sync line");
     };
-    assert_eq!(shell.cwd, env.ws);
+    assert_eq!(shell.cwd.local(), env.ws);
 
     let mut send = |msg: &ClientMsg| write_frame(&mut stdin, msg).unwrap();
     send(&hello());
@@ -368,7 +368,7 @@ fn a_remote_session_runs_in_the_hosts_directory_and_environment() {
     let (workspace, shell) = workspace_and_env(&text);
     let remote = host.root().parent().unwrap();
     assert_eq!(workspace, remote.to_str().unwrap());
-    assert_eq!(shell.cwd, remote);
+    assert_eq!(shell.cwd.local(), remote);
     assert_eq!(shell.vars["PATH"], "/usr/bin:/bin");
 }
 
@@ -384,7 +384,7 @@ fn a_remote_session_started_in_a_subdirectory_works_in_its_git_root() {
 
     let (workspace, shell) = workspace_and_env(&only_log(&host));
     assert_eq!(workspace, env.root.to_str().unwrap());
-    assert_eq!(shell.cwd, host.root().parent().unwrap());
+    assert_eq!(shell.cwd.local(), host.root().parent().unwrap());
 }
 
 #[test]

@@ -703,7 +703,7 @@ fn the_daemon_finds_the_workspace_from_the_clients_directory_and_git_variables()
         peer.send(&hello(Caps::NONE));
         peer.send(&ClientMsg::Attach {
             target: Target::New,
-            workspace: repo.join("src/deep"),
+            workspace: repo.join("src/deep").try_into().unwrap(),
             since: 0,
             env,
             decl: ClientDecl::default(),
@@ -714,13 +714,13 @@ fn the_daemon_finds_the_workspace_from_the_clients_directory_and_git_variables()
         };
         workspace
     };
-    assert_eq!(attached(None), repo);
+    assert_eq!(attached(None).local(), repo);
     let work_tree = Environment::new(
-        repo.join("src/deep"),
+        repo.join("src/deep").try_into().unwrap(),
         [("GIT_WORK_TREE".into(), repo.join("other").into_os_string())],
         false,
     );
-    assert_eq!(attached(Some(work_tree)), repo.join("other"));
+    assert_eq!(attached(Some(work_tree)).local(), repo.join("other"));
 }
 
 #[test]

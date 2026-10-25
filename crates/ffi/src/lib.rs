@@ -192,7 +192,7 @@ impl From<&SessionSummary> for SessionInfo {
         Self {
             id: s.id.to_string(),
             short: s.id.short().to_string(),
-            workspace: s.workspace.display().to_string(),
+            workspace: s.workspace.to_string(),
             entries: s.entries,
             clients: s.clients,
             activity: s.activity.name().to_owned(),
@@ -740,7 +740,7 @@ impl ViewChange {
                 reset,
             } => Self::Attached {
                 session: session.to_string(),
-                workspace: workspace.display().to_string(),
+                workspace: workspace.to_string(),
                 reset: *reset,
             },
             Change::Added { index: i, item } => Self::Added {
@@ -761,7 +761,7 @@ impl ViewChange {
             },
             Change::Snapshot => Self::Snapshot {
                 session: view.session.map(|s| s.to_string()),
-                workspace: view.workspace.display().to_string(),
+                workspace: view.workspace.to_string(),
                 items: view
                     .items
                     .iter()
@@ -836,7 +836,7 @@ impl SessionSnapshot {
             rev,
             seq: view.seq,
             session: view.session.map(|s| s.to_string()),
-            workspace: view.workspace.display().to_string(),
+            workspace: view.workspace.to_string(),
             items: view
                 .items
                 .iter()

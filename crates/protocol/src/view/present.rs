@@ -213,7 +213,7 @@ impl Item {
             }
             Self::Environment { cwd, .. } => plain(
                 Kind::Environment,
-                format!("env {}", cwd.display()).into(),
+                format!("env {}", cwd).into(),
                 Shown::None,
             ),
         }

@@ -1173,7 +1173,7 @@ fn compacted_forks_keep_loaded_skills_in_context_and_background_results_out() {
     assert_eq!(messages[1], llm::Message::user("summary"));
     assert_eq!(messages[2], llm::Message::user("/review"));
     assert_eq!(messages[3], llm::Message::user("/review"));
-    let view = SessionView::from_log(fork.id, fork.workspace, &copied);
+    let view = SessionView::from_log(fork.id, protocol::HostPath::lossy(&fork.workspace), &copied);
     assert_eq!(view.side("probe"), Some("fixture probe"));
     drop(branch);
     drop(session);
@@ -1317,7 +1317,11 @@ fn answering_an_approval_cancels_its_description_without_cancelling_the_tool() {
         let asked = until(&session, "approval before description", |log| {
             !inbox(log).is_empty()
         });
-        let view = SessionView::from_log(session.id, session.workspace.clone(), &asked);
+        let view = SessionView::from_log(
+            session.id,
+            protocol::HostPath::lossy(&session.workspace),
+            &asked,
+        );
         let tool = view
             .items
             .iter()

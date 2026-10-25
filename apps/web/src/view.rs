@@ -57,7 +57,7 @@ pub fn sessions_page(listed: &Result<Vec<SessionSummary>, String>) -> String {
                                 a style=(style::CARD) href={ "/s/" (format_args!("{}", summary.id)) } {
                                     span style=(style::MONO) { (format_args!("{}", summary.id.short())) }
                                     span style="flex: 1; min-width: 12rem; overflow-wrap: anywhere;" {
-                                        (format_args!("{}", summary.workspace.display()))
+                                        (format_args!("{}", summary.workspace))
                                     }
                                     span style=(style::DIM) {
                                         (summary.entries) " entries"

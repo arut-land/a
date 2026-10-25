@@ -18,7 +18,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
 
 use serde::de::{Deserializer, Error as _, Visitor};
 use serde::{Deserialize, forward_to_deserialize_any};
@@ -276,7 +275,7 @@ same!(
     Activity,
     Author,
     SessionId,
-    PathBuf,
+    crate::HostPath,
     Caps,
     crate::MachineId,
     Rejection,
@@ -467,7 +466,7 @@ pub(crate) struct EntryFields {
     pub(crate) origin: Option<Author>,
     pub(crate) child: Option<SessionId>,
     pub(crate) watch: Option<u64>,
-    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) cwd: Option<crate::HostPath>,
     pub(crate) vars: Option<BTreeMap<String, String>>,
     pub(crate) redacted: Option<Vec<String>>,
     pub(crate) tty: Option<bool>,
@@ -508,7 +507,7 @@ pub(crate) struct MsgFields {
     pub(crate) supported: Option<u32>,
     pub(crate) min: Option<u32>,
     pub(crate) session: Option<SessionId>,
-    pub(crate) workspace: Option<PathBuf>,
+    pub(crate) workspace: Option<crate::HostPath>,
     pub(crate) sessions: Option<Json>,
     pub(crate) activity: Option<Activity>,
     pub(crate) tools: Option<Vec<String>>,
@@ -524,7 +523,7 @@ pub(crate) struct MsgFields {
     pub(crate) known: Option<u32>,
     pub(crate) settings: Option<HomeSettings>,
     pub(crate) error: Option<String>,
-    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) cwd: Option<crate::HostPath>,
     pub(crate) vars: Option<BTreeMap<String, String>>,
     pub(crate) redacted: Option<Vec<String>>,
     pub(crate) tty: Option<bool>,
@@ -579,7 +578,7 @@ struct ItemFields {
     child: Option<SessionId>,
     watch: Option<Seq>,
     fired: Option<Outcome>,
-    cwd: Option<PathBuf>,
+    cwd: Option<crate::HostPath>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -597,7 +596,7 @@ enum Type {
 
 /// An [`Environment`]'s fields, wherever they are.
 fn environment(
-    cwd: Option<PathBuf>,
+    cwd: Option<crate::HostPath>,
     vars: Option<BTreeMap<String, String>>,
     redacted: Option<Vec<String>>,
     tty: Option<bool>,

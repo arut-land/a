@@ -9,7 +9,6 @@ mod scroll;
 mod tests;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 use super::editor::{Edit, Editor};
 use super::keys::{Input, Key, Mouse};
@@ -18,7 +17,7 @@ use super::text::{Action, Color, Line, Style};
 use super::view::{Live, MUTED};
 use client::{Cmd, Env, Link, Renderer, SessionClient, Show};
 use protocol::view::{Change, Item, SessionView, Update, Usage, mismatch_line};
-use protocol::{SessionSummary, Target};
+use protocol::{HostPath, SessionSummary, Target};
 
 /// What the event loop does for the app.
 #[derive(Debug, PartialEq, Eq)]
@@ -68,7 +67,7 @@ pub struct App {
     pub client: SessionClient,
     viewport: Viewport,
     /// This shell's workspace: the picker starts on its latest session.
-    workspace: PathBuf,
+    workspace: HostPath,
     /// Per item, its rows when last drawn; `None` is out of date.
     cache: Vec<Option<Rows>>,
     collapsed: HashSet<protocol::Seq>,
@@ -172,7 +171,7 @@ impl App {
         Self {
             client: SessionClient::new(Env::Origin),
             viewport,
-            workspace: PathBuf::new(),
+            workspace: HostPath::default(),
             cache: Vec::new(),
             collapsed: HashSet::new(),
             verbose: false,
@@ -199,7 +198,7 @@ impl App {
 
     /// The shell's workspace, which the picker starts on: found after the
     /// first frame, as it walks up to a git root.
-    pub fn in_workspace(&mut self, workspace: PathBuf) {
+    pub fn in_workspace(&mut self, workspace: HostPath) {
         self.workspace = workspace;
     }
 

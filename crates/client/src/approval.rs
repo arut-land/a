@@ -83,11 +83,9 @@ fn reason_text(reason: &protocol::ApprovalReason) -> String {
             ),
             None => format!("an operator rule requires approval for {tool}"),
         },
-        ApprovalReason::OutsideWorkspace { path, workspace } => format!(
-            "{} is outside the workspace {}",
-            path.display(),
-            workspace.display()
-        ),
+        ApprovalReason::OutsideWorkspace { path, workspace } => {
+            format!("{path} is outside the workspace {workspace}")
+        }
         ApprovalReason::Classifier { reason } => {
             format!("the classifier requested approval: {reason}")
         }

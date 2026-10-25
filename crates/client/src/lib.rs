@@ -314,7 +314,7 @@ pub fn matching<'a, T>(
 /// This process's environment, for the commands a session runs for it.
 pub fn capture() -> io::Result<Environment> {
     Ok(Environment::new(
-        std::env::current_dir()?,
+        std::env::current_dir()?.try_into()?,
         std::env::vars_os(),
         io::stdin().is_terminal(),
     ))

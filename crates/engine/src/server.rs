@@ -502,7 +502,7 @@ impl Conn<'_> {
     async fn attach(
         &mut self,
         target: protocol::Target,
-        workspace: PathBuf,
+        workspace: protocol::HostPath,
         since: u64,
         env: Option<Environment>,
         decl: ClientDecl,
@@ -512,7 +512,7 @@ impl Conn<'_> {
         } else {
             env
         };
-        let found = || workspace_of(&workspace, env.as_ref());
+        let found = || workspace_of(workspace.local(), env.as_ref());
         let resolved = match &target {
             protocol::Target::Fork { session, seq } => {
                 match self.daemon.fork(session, *seq).await {

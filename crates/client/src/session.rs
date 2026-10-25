@@ -14,7 +14,6 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::path::PathBuf;
 
 use protocol::view::{Change, SessionList, SessionView, Update};
 use protocol::{
@@ -108,7 +107,7 @@ pub struct Attach {
     pub env: Env,
     /// The directory the daemon finds the workspace from; `None` is the
     /// environment's.
-    pub workspace: Option<PathBuf>,
+    pub workspace: Option<protocol::HostPath>,
 }
 
 impl Attach {
@@ -430,7 +429,7 @@ impl SessionClient {
                                 session: session.to_string(),
                                 seq,
                             },
-                            workspace: PathBuf::new(),
+                            workspace: protocol::HostPath::default(),
                             since: 0,
                             env: None,
                             decl: protocol::ClientDecl::default(),
@@ -768,7 +767,6 @@ pub(crate) const fn is_mutation(msg: &ClientMsg) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use protocol::{Audience, Body, Caps, Entry, Epoch, Json, Permission, Seq, SessionId, Verdict};
 
@@ -881,7 +879,7 @@ mod tests {
             1,
             DaemonMsg::Attached {
                 session,
-                workspace: PathBuf::from("/w"),
+                workspace: "/w".into(),
             },
         ));
         client.step(msg(
@@ -1213,7 +1211,7 @@ mod tests {
             3,
             DaemonMsg::Attached {
                 session: b,
-                workspace: PathBuf::from("/b"),
+                workspace: "/b".into(),
             },
         ));
         client.step(msg(3, bash_call(2)));

@@ -12,7 +12,7 @@ use crate::support::{Isolated, deadline};
 
 /// A daemon with one session, which `a` started in the home's root, and
 /// the session's workspace.
-fn started(name: &str) -> (Isolated, Daemon, client::Answers, std::path::PathBuf) {
+fn started(name: &str) -> (Isolated, Daemon, client::Answers, protocol::HostPath) {
     let env = Isolated::new(name);
     env.run(&["-p", "hello"]);
     let staged = (env.home.runtime())
@@ -30,7 +30,7 @@ fn started(name: &str) -> (Isolated, Daemon, client::Answers, std::path::PathBuf
 /// The home's root, where the session started: a directory names its
 /// workspace as an attach from it finds it.
 fn here(env: &Isolated) -> Scope {
-    Scope::Workspace(env.home.root().to_path_buf())
+    Scope::Workspace(env.home.root().to_path_buf().try_into().unwrap())
 }
 
 fn hold(text: &str) -> Json {
@@ -47,7 +47,7 @@ fn update(text: &str) -> Answer {
     Answer::Update(Json::encode(text).unwrap())
 }
 
-fn echoed(text: &str, workspace: &Path) -> Answer {
+fn echoed(text: &str, workspace: &protocol::HostPath) -> Answer {
     let output = Json::encode(&json!({ "text": text, "workspace": workspace })).unwrap();
     Answer::Reply(Outcome::Done { output })
 }
