@@ -1,568 +1,715 @@
-use std::collections::BTreeMap;
+//! One file watcher for the whole process, which every feature subscribes
+//! to: a [`Hub`]. A subscription names a root and how much of it it wants
+//! ([`Watch`]); the hub keeps one native watch per directory (Linux) or
+//! per outermost root (macOS, Windows), shared and counted across
+//! subscriptions, and closes it with its last subscriber.
+//!
+//! Sinks run on the runtime's tasks, never on a native thread, one batch
+//! at a time. Nothing is debounced here. The hub follows its roots itself:
+//! a root that appears, is replaced or goes away is rearmed by the hub
+//! before the subscriber hears [`Event::Rescan`] or [`Unavailable::Gone`],
+//! so subscribers never refresh a watch. Only an I/O failure retries on a
+//! timer; a watch limit or an unsupported filesystem waits for something
+//! to change (a directory removed, a new subscription).
+//!
+//! Not observed: a directory above a root's parent renamed or replaced,
+//! and a linked root retargeted, until something at the root itself
+//! changes (macOS's `WatchRoot` does follow its ancestors). A tree is
+//! walked and armed under the hub's lock (Linux), which suits the small
+//! trees subscribed whole; a large one is entered as it is walked.
+
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-mod backend;
+use crate::{Rt, lock};
 
-use crate::BoxFuture;
-
-type Spawn = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>;
-
-/// Uncertainty invalidates the entire source inventory, even without paths.
-#[derive(Debug)]
-pub enum WatchEvent {
-    Changed(Vec<PathBuf>),
-    RescanPaths(Vec<PathBuf>),
-    Overflow,
-    Rescan,
-    Unavailable(io::Error),
-}
-
-impl WatchEvent {
-    pub fn affects(&self, roots: &[PathBuf]) -> bool {
-        match self {
-            Self::Changed(paths) | Self::RescanPaths(paths) => paths.iter().any(|path| {
-                roots
-                    .iter()
-                    .any(|root| path.starts_with(root) || root.starts_with(path))
-            }),
-            _ => true,
-        }
-    }
-}
-
-type Changed = Arc<dyn Fn(WatchEvent) + Send + Sync>;
-
-/// Owned directory trees, including roots created later. Refresh before
-/// rescanning after a change to follow newly created or replaced roots.
-pub struct Watcher {
-    roots: Arc<[PathBuf]>,
-    changed: Changed,
-    invalidated: Arc<AtomicBool>,
-    recursive: Option<backend::Backend>,
-    watched: BTreeMap<PathBuf, bool>,
-    spawn: Spawn,
-    recovery: Arc<Recovery>,
-    #[cfg(target_os = "macos")]
-    parents: Vec<Parent>,
-}
-
-impl Watcher {
-    pub fn new(
-        spawn: Spawn,
-        roots: impl IntoIterator<Item = impl AsRef<Path>>,
-        changed: impl Fn(WatchEvent) + Send + Sync + 'static,
-    ) -> io::Result<Self> {
-        let changed: Changed = Arc::new(changed);
-        let recovery = Arc::new(Recovery {
-            spawn: spawn.clone(),
-            changed: changed.clone(),
-            timer: Mutex::default(),
-            closed: AtomicBool::new(false),
-        });
-        let mut watcher = Self {
-            roots: roots.into_iter().map(|p| p.as_ref().to_owned()).collect(),
-            changed,
-            invalidated: Arc::new(AtomicBool::new(true)),
-            recursive: None,
-            watched: BTreeMap::new(),
-            spawn,
-            recovery,
-            #[cfg(target_os = "macos")]
-            parents: Vec::new(),
-        };
-        let _ = watcher.refresh();
-        Ok(watcher)
-    }
-
-    pub fn refresh(&mut self) -> io::Result<()> {
-        self.refresh_using(backend::Backend::new)
-    }
-
-    fn refresh_using(
-        &mut self,
-        mut arm: impl FnMut(&Spawn, &BTreeMap<PathBuf, bool>, &Changed) -> io::Result<backend::Backend>,
-    ) -> io::Result<()> {
-        let result = self.rearm(&mut arm);
-        match &result {
-            Ok(()) => self.recovery.healthy(),
-            Err(error) if self.recovery.start() => {
-                (self.changed)(WatchEvent::Unavailable(io::Error::new(
-                    error.kind(),
-                    error.to_string(),
-                )));
-            }
-            Err(_) => {}
-        }
-        result
-    }
-
-    fn rearm(
-        &mut self,
-        arm: &mut impl FnMut(&Spawn, &BTreeMap<PathBuf, bool>, &Changed) -> io::Result<backend::Backend>,
-    ) -> io::Result<()> {
-        for _ in 0..8 {
-            let (wanted, parents) = self.paths();
-            if !self.invalidated.swap(false, Ordering::AcqRel) && wanted == self.watched {
-                return Ok(());
-            }
-            // Rearm even unchanged paths after ancestor events: a replacement can
-            // have the same name while the old watch still names its removed inode.
-            let changed = self.callback();
-            let result: io::Result<()> = (|| {
-                let watcher = if wanted.is_empty() {
-                    None
-                } else {
-                    let watcher = arm(&self.spawn, &wanted, &changed)?;
-                    Some(watcher)
-                };
-                #[cfg(target_os = "macos")]
-                let parent_watches = parents
-                    .iter()
-                    .map(|path| Parent::new(&self.spawn, path.clone(), Arc::clone(&changed)))
-                    .collect::<io::Result<Vec<_>>>()?;
-                self.recursive = watcher;
-                self.watched = wanted;
-                #[cfg(target_os = "macos")]
-                {
-                    self.parents = parent_watches;
-                }
-                Ok(())
-            })();
-            if result.is_err() {
-                self.invalidated.store(true, Ordering::Release);
-            }
-            result?;
-            // An ancestor can be created between stat and registration. Recheck
-            // after arming, before the consumer scans, so its descendants stay observable.
-            let (after, parent_paths) = self.paths();
-            if after == self.watched && parent_paths == parents {
-                return Ok(());
-            }
-            self.invalidated.store(true, Ordering::Release);
-        }
-        Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "directory roots changed during subscription",
-        ))
-    }
-
-    fn paths(&self) -> (BTreeMap<PathBuf, bool>, Vec<PathBuf>) {
-        let mut wanted = BTreeMap::new();
-        let mut parents = Vec::new();
-        for root in &*self.roots {
-            if root.is_dir() {
-                wanted.insert(root.clone(), true);
-            }
-            // The parent observes removal/replacement of the root itself.
-            // Until it exists, watch only its nearest existing ancestor.
-            let mut parent = root.parent();
-            while let Some(path) = parent {
-                if path.is_dir() {
-                    parents.push(path.to_owned());
-                    break;
-                }
-                parent = path.parent();
-            }
-        }
-        parents.sort();
-        parents.dedup();
-        #[cfg(not(target_os = "macos"))]
-        for parent in &parents {
-            wanted.entry(parent.clone()).or_insert(false);
-        }
-        (wanted, parents)
-    }
-
-    fn callback(&self) -> Changed {
-        let roots = Arc::clone(&self.roots);
-        let invalidated = Arc::clone(&self.invalidated);
-        let changed = Arc::clone(&self.changed);
-        let recovery = self.recovery.clone();
-        Arc::new(move |event| {
-            let rearm = match &event {
-                WatchEvent::RescanPaths(_) => event.affects(&roots),
-                WatchEvent::Changed(paths) => paths
-                    .iter()
-                    .any(|path| roots.iter().any(|root| root.starts_with(path))),
-                _ => true,
-            };
-            if rearm {
-                invalidated.store(true, Ordering::Release);
-            }
-            if matches!(event, WatchEvent::Unavailable(_)) {
-                let _ = recovery.start();
-            }
-            changed(event);
-        })
-    }
-}
-
-impl Drop for Watcher {
-    fn drop(&mut self) {
-        self.recovery.closed.store(true, Ordering::Release);
-        self.recovery.healthy();
-    }
-}
-
-struct Recovery {
-    spawn: Spawn,
-    changed: Changed,
-    timer: Mutex<Option<Arc<crate::Wakeup>>>,
-    closed: AtomicBool,
-}
-
-impl Recovery {
-    fn healthy(&self) {
-        if let Some(stop) = self.timer.lock().unwrap().take() {
-            stop.notify();
-        }
-    }
-
-    fn start(self: &Arc<Self>) -> bool {
-        let mut timer = self.timer.lock().unwrap();
-        if timer.is_some() || self.closed.load(Ordering::Acquire) {
-            return false;
-        }
-        let stop = Arc::new(crate::Wakeup::new());
-        *timer = Some(stop.clone());
-        let weak = Arc::downgrade(self);
-        (self.spawn)(Box::pin(async move {
-            let mut delay = Duration::from_millis(100);
-            loop {
-                let due = crate::or(
-                    async {
-                        crate::Reactor::AsyncIo.sleep(delay).await;
-                        true
-                    },
-                    async {
-                        stop.wait().await;
-                        false
-                    },
-                )
-                .await;
-                if !due {
-                    break;
-                }
-                let Some(recovery) = weak.upgrade() else {
-                    break;
-                };
-                if recovery.closed.load(Ordering::Acquire) {
-                    break;
-                }
-                (recovery.changed)(WatchEvent::Rescan);
-                delay = (delay * 2).min(Duration::from_secs(5));
-            }
-        }));
-        true
-    }
-}
-
-#[cfg(target_os = "macos")]
-struct Parent(Arc<crate::Wakeup>);
-
-#[cfg(target_os = "macos")]
-impl Parent {
-    fn new(spawn: &Spawn, path: PathBuf, changed: Changed) -> io::Result<Self> {
-        let io = crate::Async::for_reading(&crate::Reactor::AsyncIo, sys::write_watch(&path)?)?;
-        let stop = Arc::new(crate::Wakeup::new());
-        let stopped = Arc::clone(&stop);
-        spawn(Box::pin(async move {
-            crate::or(
-                async {
-                    loop {
-                        if let Err(error) = io.readable_result().await {
-                            changed(WatchEvent::Unavailable(error));
-                            break;
-                        }
-                        io.get_ref().clear();
-                        changed(WatchEvent::Changed(vec![path.clone()]));
-                    }
-                },
-                stopped.wait(),
-            )
-            .await;
-        }));
-        Ok(Self(stop))
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for Parent {
-    fn drop(&mut self) {
-        self.0.notify();
-    }
-}
+#[cfg_attr(
+    any(target_os = "linux", target_os = "android"),
+    path = "watch/linux.rs"
+)]
+#[cfg_attr(target_os = "macos", path = "watch/macos.rs")]
+#[cfg_attr(windows, path = "watch/windows.rs")]
+#[cfg_attr(
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )),
+    path = "watch/none.rs"
+)]
+mod native;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+mod tests;
 
-    #[test]
-    fn writes_after_a_quiet_capture_deliver_another_event_during_preparation() {
-        use std::io::Write;
-        let root = std::env::temp_dir().join(format!("a-resumed-watch-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap();
-        let source = root.join("source");
-        let mut writer = fs::File::create(&source).unwrap();
-        let runtime: crate::Rt = Arc::new(crate::Threads::new(1));
-        let resumed = root.join("resumed");
-        let (send, events) = mpsc::channel();
-        let (resume, paused) = mpsc::channel();
-        let paused = Mutex::new(paused);
-        let first = AtomicBool::new(true);
-        let roots = [root.clone()];
-        let watcher = Watcher::new(
-            Arc::new(move |task| runtime.spawn(task)),
-            roots.clone(),
-            move |event| {
-                if event.affects(&roots) {
-                    let _ = send.send(event);
-                    if first.swap(false, Ordering::AcqRel) {
-                        let _ = paused.lock().unwrap().recv();
+/// How much of its root a subscription is told about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    /// Everything under the root.
+    Tree,
+    /// The root's entries, and those of each directory the subscriber
+    /// [entered](Subscription::enter): on Linux only those directories
+    /// take a native watch.
+    Entered,
+}
+
+/// What to watch: a root, how much of it, and the paths under it that
+/// never wake the subscriber.
+#[derive(Clone, Debug)]
+pub struct Watch {
+    root: PathBuf,
+    scope: Scope,
+    exclude: Vec<PathBuf>,
+}
+
+impl Watch {
+    /// Everything under `root`.
+    pub fn tree(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            scope: Scope::Tree,
+            exclude: Vec::new(),
+        }
+    }
+
+    /// `root`'s entries, and those of the directories entered.
+    pub fn entered(root: impl Into<PathBuf>) -> Self {
+        Self {
+            scope: Scope::Entered,
+            ..Self::tree(root)
+        }
+    }
+
+    /// Leaves out `relative` (to the root) and everything under it: it is
+    /// neither watched nor reported.
+    #[must_use]
+    pub fn excluding(mut self, relative: impl Into<PathBuf>) -> Self {
+        self.exclude.push(relative.into());
+        self
+    }
+}
+
+/// What a subscriber is told. Paths are spelled under the root as it was
+/// subscribed, whatever links or letter case the filesystem resolved it by.
+#[derive(Debug)]
+pub enum Event {
+    /// Something at each path changed: it may be a file or a directory,
+    /// and may be gone. A subscriber looks at what is there now, and at
+    /// all of a directory: what a new one holds, or what changed in one
+    /// whose changes were coalesced, may not have been reported.
+    Changed(Vec<PathBuf>),
+    /// Changes were lost, or the root is back or another directory now:
+    /// look at the whole root again.
+    Rescan,
+    /// The root cannot be watched now. It is followed still, and its
+    /// return is an [`Event::Rescan`].
+    Unavailable(Unavailable),
+}
+
+#[derive(Debug)]
+pub enum Unavailable {
+    /// The OS ran out of watches. Changes may go unreported until a
+    /// directory is removed somewhere under a watch, or the subscriber
+    /// subscribes again.
+    Limit,
+    /// The filesystem the root is on reports no changes.
+    Unsupported,
+    /// The root is not there, or is not a directory.
+    Gone,
+    /// Watching failed; the hub retries, with backoff, until it succeeds.
+    Io(io::Error),
+}
+
+/// The process's watcher, shared as an `Arc`.
+pub struct Hub(Arc<Shared>);
+
+/// A subscription; dropping it unsubscribes, and the native watches
+/// nothing else needs close.
+pub struct Subscription {
+    hub: Arc<Shared>,
+    id: u64,
+}
+
+type Sink = Box<dyn FnMut(Vec<Event>) + Send>;
+
+struct Shared {
+    rt: Rt,
+    state: Mutex<State>,
+    /// What native threads report, routed by a task on the runtime.
+    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+    inbox: Mutex<Inbox>,
+}
+
+#[derive(Default)]
+#[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+struct Inbox {
+    raws: Vec<Raw>,
+    draining: bool,
+}
+
+struct State {
+    rt: Rt,
+    me: Weak<Shared>,
+    subs: BTreeMap<u64, Sub>,
+    next: u64,
+    native: native::Native,
+}
+
+struct Sub {
+    /// As subscribed: how paths are reported.
+    root: PathBuf,
+    /// As the filesystem resolves it: how the native watch names paths.
+    real: PathBuf,
+    scope: Scope,
+    exclude: Vec<PathBuf>,
+    entered: HashSet<PathBuf>,
+    status: Status,
+    out: Arc<Delivery>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Live(Option<sys::fs::FileIdentity>),
+    Gone,
+    Limit,
+    Unsupported,
+    /// Failed, retried for the `n`th time next.
+    Io(u32),
+}
+
+/// What a native backend reports, in the filesystem's spelling.
+#[derive(Debug)]
+enum Raw {
+    Changed(PathBuf),
+    /// A directory made; Windows tells only of a change.
+    #[cfg_attr(windows, expect(dead_code))]
+    Created(PathBuf),
+    /// Lost or coalesced changes under a path, or (`None`) anywhere: every
+    /// watch is rearmed.
+    Rescan(Option<PathBuf>),
+    /// The native watch of a directory is gone, and no other watches what
+    /// is at its path now: entered there, it is entered again only when
+    /// asked.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        expect(dead_code)
+    )]
+    Unwatched(PathBuf),
+    /// The OS removed a watch of its own accord: a watch is free again.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        expect(dead_code)
+    )]
+    Freed,
+    /// The native watch over a path, or (`None`) every one, failed.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", windows)),
+        expect(dead_code)
+    )]
+    Failed(Option<PathBuf>, io::Error),
+}
+
+impl Hub {
+    pub fn new(rt: Rt) -> Self {
+        Self(Arc::new_cyclic(|me: &Weak<Shared>| Shared {
+            rt: Arc::clone(&rt),
+            state: Mutex::new(State {
+                native: native::Native::new(me.clone(), Arc::clone(&rt)),
+                rt,
+                me: me.clone(),
+                subs: BTreeMap::new(),
+                next: 0,
+            }),
+            inbox: Mutex::default(),
+        }))
+    }
+
+    /// The runtime its sinks run on.
+    pub fn runtime(&self) -> &Rt {
+        &self.0.rt
+    }
+
+    /// Watches `watch`, armed before this returns: what changes after is
+    /// told to `sink`. A root that is not there yet is not an error; its
+    /// arrival is an [`Event::Rescan`].
+    pub fn subscribe(
+        &self,
+        watch: Watch,
+        sink: impl FnMut(Vec<Event>) + Send + 'static,
+    ) -> Subscription {
+        let mut state = lock(&self.0.state);
+        let id = state.next;
+        state.next += 1;
+        state.subs.insert(
+            id,
+            Sub {
+                real: PathBuf::new(),
+                root: watch.root,
+                scope: watch.scope,
+                exclude: watch.exclude,
+                entered: HashSet::new(),
+                status: Status::Gone,
+                out: Arc::new(Delivery {
+                    queue: Mutex::default(),
+                    sink: Mutex::new(Box::new(sink)),
+                }),
+            },
+        );
+        // A root missing is what the subscriber's first look sees too.
+        state.rearm(id);
+        drop(state);
+        Subscription {
+            hub: Arc::clone(&self.0),
+            id,
+        }
+    }
+
+    /// The native watches open: inotify watches on Linux, streams on
+    /// macOS, directory handles on Windows.
+    pub fn watches(&self) -> usize {
+        lock(&self.0.state).native.watches()
+    }
+}
+
+impl Subscription {
+    /// Watches `dir` (under the root, as subscribed) too, for a
+    /// [`Scope::Entered`] subscription: its entries are reported from now.
+    pub fn enter(&self, dir: &Path) {
+        let mut state = lock(&self.hub.state);
+        let State {
+            subs, native, rt, ..
+        } = &mut *state;
+        let Some(sub) = subs.get_mut(&self.id) else {
+            return;
+        };
+        let Some(real) = sub.entering(dir) else {
+            return;
+        };
+        // Asked again even when entered: a watch the OS has not yet said
+        // it dropped may name a directory gone and made again.
+        sub.entered.insert(real.clone());
+        if let Err(error) = native.enter(self.id, &real) {
+            sub.entered.remove(&real);
+            // Gone already, or not watchable: nothing is missed.
+            if matches!(error, Unavailable::Limit) {
+                sub.limited(rt);
+            }
+        }
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let mut state = lock(&self.hub.state);
+        let sub = state.subs.remove(&self.id);
+        state.native.disarm(self.id);
+        drop(state);
+        // The sink goes after the lock: what it owns may unsubscribe too.
+        if let Some(sub) = sub {
+            lock(&sub.out.queue).closed = true;
+        }
+    }
+}
+
+impl Shared {
+    /// Routes what `report` returns, under the lock it is given.
+    fn handle(&self, report: impl FnOnce(&mut State) -> Vec<Raw>) {
+        let mut state = lock(&self.state);
+        let raws = report(&mut state);
+        state.route(raws);
+    }
+
+    /// Routes `raws` from a native thread, on a task of the runtime.
+    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+    fn post(self: &Arc<Self>, raws: Vec<Raw>) {
+        let mut inbox = lock(&self.inbox);
+        inbox.raws.extend(raws);
+        if std::mem::replace(&mut inbox.draining, true) {
+            return;
+        }
+        let me = Arc::downgrade(self);
+        self.rt.spawn(Box::pin(async move {
+            while let Some(shared) = me.upgrade() {
+                let raws = {
+                    let mut inbox = lock(&shared.inbox);
+                    if inbox.raws.is_empty() {
+                        inbox.draining = false;
+                        return;
+                    }
+                    std::mem::take(&mut inbox.raws)
+                };
+                shared.handle(|_| raws);
+            }
+        }));
+    }
+}
+
+impl State {
+    fn route(&mut self, raws: Vec<Raw>) {
+        let mut roots = Vec::new();
+        for raw in raws {
+            match raw {
+                Raw::Changed(path) => self.changed(&path, false, &mut roots),
+                Raw::Created(path) => self.changed(&path, true, &mut roots),
+                Raw::Rescan(None) => {
+                    for id in self.ids() {
+                        if self.rearm(id) == Armed::Live {
+                            self.tell(id, Event::Rescan);
+                        }
                     }
                 }
-            },
-        )
-        .unwrap();
-        // Drop this sender before the watcher on failure, releasing its callback.
-        let release = resume;
-        writer.write_all(b"partial").unwrap();
-        writer.sync_data().unwrap();
-        events.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(fs::read(&source).unwrap(), b"partial");
-        crate::block_on(crate::Reactor::AsyncIo.sleep(Duration::from_millis(100)));
-        assert_eq!(fs::read(&source).unwrap(), b"partial");
-        // A write resumes after debounce while the delivered callback still
-        // owns its batch. It goes to a second file so that a leftover callback
-        // from the first write cannot stand in for its event.
-        let mut later = fs::File::create(&resumed).unwrap();
-        later.write_all(b"final").unwrap();
-        later.sync_data().unwrap();
-        release.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let event = events
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap();
-            if let WatchEvent::Changed(paths) | WatchEvent::RescanPaths(paths) = &event
-                && paths.contains(&resumed)
+                Raw::Rescan(Some(path)) => {
+                    for id in self.ids() {
+                        let sub = &self.subs[&id];
+                        let event = if sub.real.starts_with(&path) {
+                            Event::Rescan
+                        } else if let Some(reported) =
+                            sub.visible(&path).then(|| sub.reported(&path)).flatten()
+                        {
+                            Event::Changed(vec![reported])
+                        } else {
+                            continue;
+                        };
+                        self.tell(id, event);
+                    }
+                }
+                Raw::Unwatched(path) => {
+                    for sub in self.subs.values_mut() {
+                        sub.entered.remove(&path);
+                    }
+                }
+                Raw::Freed => {
+                    for id in self.ids() {
+                        if self.subs[&id].status == Status::Limit {
+                            self.recover(id);
+                        }
+                    }
+                }
+                Raw::Failed(path, error) => {
+                    for id in self.ids() {
+                        let sub = &self.subs[&id];
+                        if path
+                            .as_ref()
+                            .is_some_and(|p| !sub.real.starts_with(p) && !p.starts_with(&sub.real))
+                        {
+                            continue;
+                        }
+                        self.failed(id, &error);
+                    }
+                }
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        for id in roots {
+            self.root_changed(id);
+        }
+    }
+
+    fn ids(&self) -> Vec<u64> {
+        self.subs.keys().copied().collect()
+    }
+
+    /// Something at `path` changed (`created`, a directory appeared there).
+    fn changed(&mut self, path: &Path, created: bool, roots: &mut Vec<u64>) {
+        let State {
+            subs, native, rt, ..
+        } = self;
+        for (&id, sub) in subs.iter_mut() {
+            // A change under a root thought gone shows it back, even when
+            // what made it again was coalesced away.
+            if sub.real.starts_with(path)
+                || (sub.status == Status::Gone && path.starts_with(&sub.real))
             {
-                break;
+                roots.push(id);
+                continue;
             }
-        }
-        assert_eq!(fs::read(&source).unwrap(), b"partial");
-        drop(later);
-        drop(writer);
-        drop(watcher);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    fn changed(watcher: &mut Watcher, recv: &mpsc::Receiver<WatchEvent>, path: &Path, exact: bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut seen = std::collections::VecDeque::new();
-        loop {
-            let event = recv
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or_else(|error| panic!("{error}: expected {path:?}, exact={exact}, exists={}, watches={:?}, observed={seen:?}", path.exists(), watcher.watched));
-            if seen.len() == 16 {
-                seen.pop_front();
+            // An entered directory that went is entered again only when
+            // asked, as Linux's watch on it is gone.
+            if sub.entered.contains(path) && !path.is_dir() {
+                sub.entered.retain(|dir| !dir.starts_with(path));
             }
-            seen.push_back(format!("{event:?}"));
-            // Descendants cannot acknowledge root replacement. Uncertainty
-            // instead requires a full scan, including the subscription inventory.
-            let scan = match event {
-                WatchEvent::Changed(paths) | WatchEvent::RescanPaths(paths) => paths
-                    .iter()
-                    .any(|p| p == path || (!exact && path.starts_with(p))),
-                _ => true,
+            let Some(reported) = sub.visible(path).then(|| sub.reported(path)).flatten() else {
+                continue;
             };
-            if scan {
-                watcher.refresh().unwrap();
-                return;
+            // Its directories are watched before it is told of them.
+            if created && sub.scope == Scope::Tree && native.grow(id, sub, path).is_err() {
+                sub.limited(rt);
             }
+            sub.out.push(Event::Changed(vec![reported]), rt);
         }
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn linked_roots_report_changes_in_the_configured_spelling() {
-        let base = std::env::temp_dir().join(format!("a-linked-watch-{}", std::process::id()));
-        fs::create_dir_all(base.join("real")).unwrap();
-        let base = base.canonicalize().unwrap();
-        let alias = base.join("alias");
-        std::os::unix::fs::symlink(base.join("real"), &alias).unwrap();
-        let runtime: crate::Rt = Arc::new(crate::Threads::new(1));
-        let (send, recv) = mpsc::channel();
-        let roots = [alias.clone()];
-        let mut watcher = Watcher::new(
-            Arc::new(move |task| runtime.spawn(task)),
-            roots.clone(),
-            move |event| {
-                if event.affects(&roots) {
-                    let _ = send.send(event);
+    /// The root, or a directory above it, changed: it may be gone, back,
+    /// or another directory now.
+    fn root_changed(&mut self, id: u64) {
+        let sub = &self.subs[&id];
+        let now = identity(&sub.root);
+        match (sub.status, now) {
+            (Status::Live(Some(was)), Some(now)) if was == now => {}
+            // What is missing above it may have moved: follow it closer.
+            // A backend watches above the root before it looks at it, so a
+            // root made meanwhile is armed now or heard of next.
+            (Status::Gone, None) => {
+                if self.rearm(id) == Armed::Live {
+                    self.tell(id, Event::Rescan);
+                }
+            }
+            // Back already, by the time it is rearmed.
+            (_, None) => match self.rearm(id) {
+                Armed::Live => self.tell(id, Event::Rescan),
+                Armed::Gone | Armed::Failed => {
+                    self.tell(id, Event::Unavailable(Unavailable::Gone));
                 }
             },
-        )
-        .unwrap();
-        fs::write(base.join("real/source"), "visible through the alias").unwrap();
-        changed(&mut watcher, &recv, &alias.join("source"), true);
-        drop(watcher);
-        fs::remove_dir_all(base).unwrap();
+            (_, Some(_)) => match self.rearm(id) {
+                Armed::Live => self.tell(id, Event::Rescan),
+                Armed::Gone => self.tell(id, Event::Unavailable(Unavailable::Gone)),
+                Armed::Failed => {}
+            },
+        }
     }
 
-    #[test]
-    fn uncertainty_without_paths_rescans_and_rearms_all_roots() {
-        let root = std::env::temp_dir().join(format!("a-uncertain-watch-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap();
-        let runtime: crate::Rt = Arc::new(crate::Threads::new(1));
-        let (send, recv) = mpsc::channel();
-        let mut watcher = Watcher::new(
-            Arc::new(move |task| runtime.spawn(task)),
-            [&root],
-            move |event| {
-                let _ = send.send(event);
-            },
-        )
-        .unwrap();
-        for event in [
-            WatchEvent::Overflow,
-            WatchEvent::Rescan,
-            WatchEvent::Unavailable(io::Error::other("lost subscription")),
-        ] {
-            assert!(event.affects(std::slice::from_ref(&root)));
-            watcher.callback()(event);
-            assert!(watcher.invalidated.load(Ordering::Acquire));
-            watcher.refresh().unwrap();
-        }
-        let path = root.join("after-rearm");
-        fs::write(&path, "observable").unwrap();
-        changed(&mut watcher, &recv, &path, true);
-        drop(watcher);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn unavailable_subscriptions_retry_failed_rearms_without_filesystem_callbacks() {
-        let root = std::env::temp_dir().join(format!("a-watch-recover-{}", std::process::id()));
-        fs::create_dir_all(root.join("nested")).unwrap();
-        let root = root.canonicalize().unwrap();
-        let runtime: crate::Rt = Arc::new(crate::Threads::new(1));
-        let (send, recv) = mpsc::channel();
-        let mut watcher = Watcher::new(
-            Arc::new(move |task| runtime.spawn(task)),
-            [&root],
-            move |event| {
-                let _ = send.send(event);
-            },
-        )
-        .unwrap();
-        watcher.callback()(WatchEvent::Changed(vec![root.join("nested")]));
-        watcher.callback()(WatchEvent::Unavailable(io::Error::other("lost watch")));
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if matches!(
-                recv.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .unwrap(),
-                WatchEvent::Unavailable(_)
-            ) {
-                break;
-            }
-        }
-        assert!(
-            watcher
-                .refresh_using(|_, _, _| Err(io::Error::new(io::ErrorKind::WouldBlock, "busy")))
-                .is_err()
-        );
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if matches!(
-                recv.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .unwrap(),
-                WatchEvent::Rescan
-            ) {
-                break;
-            }
-        }
-        watcher.refresh().unwrap();
-        assert!(watcher.recovery.timer.lock().unwrap().is_none());
-        let no_rescan = || {
-            let deadline = Instant::now() + Duration::from_millis(300);
-            while let Ok(event) =
-                recv.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            {
-                assert!(!matches!(event, WatchEvent::Rescan));
+    /// Watches what `id`'s root is now in place of what it watched. A
+    /// failure other than [`Unavailable::Gone`] is told as it begins, and
+    /// an I/O failure retried.
+    fn rearm(&mut self, id: u64) -> Armed {
+        let State {
+            subs, native, rt, ..
+        } = self;
+        let sub = subs.get_mut(&id).expect("subscribed");
+        sub.real = resolve(&sub.root);
+        sub.entered.clear();
+        let identity = identity(&sub.root);
+        let was = sub.status;
+        let (status, error) = match native.arm(id, sub) {
+            Ok(()) => (Status::Live(identity), None),
+            Err(Unavailable::Gone) => (Status::Gone, None),
+            Err(Unavailable::Limit) => (Status::Limit, Some(Unavailable::Limit)),
+            Err(Unavailable::Unsupported) => (Status::Unsupported, Some(Unavailable::Unsupported)),
+            Err(error @ Unavailable::Io(_)) => {
+                let attempt = if let Status::Io(n) = was { n + 1 } else { 0 };
+                (Status::Io(attempt), Some(error))
             }
         };
-        no_rescan();
-        let path = root.join("nested/after-recovery");
-        fs::write(&path, "observed").unwrap();
-        changed(&mut watcher, &recv, &path, true);
-        let recovery = watcher.recovery.clone();
-        watcher.callback()(WatchEvent::Unavailable(io::Error::other(
-            "cancel pending retry",
-        )));
-        let _ = recv.recv_timeout(Duration::from_secs(3)).unwrap();
-        drop(watcher);
-        assert!(recovery.timer.lock().unwrap().is_none());
-        no_rescan();
-        fs::remove_dir_all(root).unwrap();
+        sub.status = status;
+        if let Some(error) = error
+            && std::mem::discriminant(&was) != std::mem::discriminant(&status)
+        {
+            sub.out.push(Event::Unavailable(error), rt);
+        }
+        match status {
+            Status::Live(_) => Armed::Live,
+            Status::Gone => Armed::Gone,
+            Status::Io(attempt) => {
+                self.retry(id, attempt);
+                Armed::Failed
+            }
+            Status::Limit | Status::Unsupported => Armed::Failed,
+        }
     }
 
-    #[test]
-    fn missing_trees_are_lazy_and_creation_and_replacement_remain_observable() {
-        let root = std::env::temp_dir().join(format!("a-root-watch-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap();
-        let tree = root.join("missing/tree");
-        let runtime: crate::Rt = Arc::new(crate::Threads::new(1));
-        let rt = Arc::clone(&runtime);
-        let (send, recv) = mpsc::channel();
-        let mut watcher = Watcher::new(
-            Arc::new(move |task| rt.spawn(task)),
-            [&tree],
-            move |paths| {
-                let _ = send.send(paths);
-            },
-        )
-        .unwrap();
-        #[cfg(target_os = "macos")]
-        assert!(
-            watcher.recursive.is_none(),
-            "no recursive watcher for absent trees"
-        );
-
-        fs::create_dir_all(tree.join("nested")).unwrap();
-        changed(&mut watcher, &recv, &tree, false);
-        assert!(watcher.recursive.is_some());
-        let file = tree.join("nested/first");
-        fs::write(&file, "created after subscription").unwrap();
-        changed(&mut watcher, &recv, &file, true);
-
-        fs::rename(&tree, root.join("retired")).unwrap();
-        fs::create_dir_all(tree.join("nested")).unwrap();
-        changed(&mut watcher, &recv, &tree, false);
-        let replacement = tree.join("nested/replacement");
-        fs::write(&replacement, "new inode at the same root").unwrap();
-        changed(&mut watcher, &recv, &replacement, true);
-
-        fs::remove_dir_all(&tree).unwrap();
-        changed(&mut watcher, &recv, &tree, false);
-        #[cfg(target_os = "macos")]
-        assert!(
-            watcher.recursive.is_none(),
-            "absent trees release recursive watches"
-        );
-        drop(watcher);
-        drop(runtime);
-        fs::remove_dir_all(root).unwrap();
+    /// A watch is free again: a subscription that ran out tries again.
+    fn recover(&mut self, id: u64) {
+        let sub = self.subs.get_mut(&id).expect("listed");
+        // An entered subscription enters again as it rescans.
+        if sub.scope == Scope::Entered {
+            sub.status = Status::Live(identity(&sub.root));
+            self.tell(id, Event::Rescan);
+            return;
+        }
+        if self.rearm(id) == Armed::Live {
+            self.tell(id, Event::Rescan);
+        }
     }
+
+    /// The native watch of `id` failed: it is told, and rearmed after a
+    /// while.
+    fn failed(&mut self, id: u64, error: &io::Error) {
+        let Some(sub) = self.subs.get_mut(&id) else {
+            return;
+        };
+        if matches!(sub.status, Status::Io(_)) {
+            return;
+        }
+        sub.status = Status::Io(0);
+        sub.out
+            .push(Event::Unavailable(Unavailable::Io(copy(error))), &self.rt);
+        self.retry(id, 0);
+    }
+
+    /// Rearms `id` after the backoff of its `attempt`th retry, unless it
+    /// was unsubscribed or recovered meanwhile.
+    fn retry(&self, id: u64, attempt: u32) {
+        let delay = Duration::from_millis(100 << attempt.min(6)).min(Duration::from_secs(5));
+        let (me, rt) = (self.me.clone(), Arc::clone(&self.rt));
+        self.rt.spawn(Box::pin(async move {
+            rt.sleep(delay).await;
+            let Some(shared) = me.upgrade() else { return };
+            let mut state = lock(&shared.state);
+            if state
+                .subs
+                .get(&id)
+                .is_none_or(|s| s.status != Status::Io(attempt))
+            {
+                return;
+            }
+            match state.rearm(id) {
+                Armed::Live => state.tell(id, Event::Rescan),
+                Armed::Gone => state.tell(id, Event::Unavailable(Unavailable::Gone)),
+                Armed::Failed => {}
+            }
+        }));
+    }
+
+    fn tell(&self, id: u64, event: Event) {
+        if let Some(sub) = self.subs.get(&id) {
+            sub.out.push(event, &self.rt);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Armed {
+    Live,
+    Gone,
+    Failed,
+}
+
+impl Sub {
+    /// The OS ran out of watches for it: told once.
+    fn limited(&mut self, rt: &Rt) {
+        if self.status != Status::Limit {
+            self.status = Status::Limit;
+            self.out.push(Event::Unavailable(Unavailable::Limit), rt);
+        }
+    }
+
+    /// `path` (in the filesystem's spelling) as the subscriber names it.
+    fn reported(&self, path: &Path) -> Option<PathBuf> {
+        let relative = path.strip_prefix(&self.real).ok()?;
+        (!relative.as_os_str().is_empty()).then(|| self.root.join(relative))
+    }
+
+    /// Whether `path` (in the filesystem's spelling) is left out.
+    fn excluded(&self, path: &Path) -> bool {
+        (path.strip_prefix(&self.real))
+            .is_ok_and(|relative| self.exclude.iter().any(|e| relative.starts_with(e)))
+    }
+
+    /// Whether a change at `path` (strictly under the root) is told.
+    fn visible(&self, path: &Path) -> bool {
+        if !path.starts_with(&self.real) || self.excluded(path) {
+            return false;
+        }
+        match self.scope {
+            Scope::Tree => true,
+            Scope::Entered => path
+                .parent()
+                .is_some_and(|parent| parent == self.real || self.entered.contains(parent)),
+        }
+    }
+
+    /// `dir` (as the subscriber names it) as the filesystem does, if an
+    /// [`Scope::Entered`] subscription can enter it.
+    fn entering(&self, dir: &Path) -> Option<PathBuf> {
+        if self.scope != Scope::Entered {
+            return None;
+        }
+        let relative = dir.strip_prefix(&self.root).ok()?;
+        if relative.as_os_str().is_empty() || self.exclude.iter().any(|e| relative.starts_with(e)) {
+            return None;
+        }
+        Some(self.real.join(relative))
+    }
+}
+
+/// Where a subscriber's events wait for its sink, which takes one batch
+/// at a time.
+struct Delivery {
+    queue: Mutex<Queue>,
+    sink: Mutex<Sink>,
+}
+
+#[derive(Default)]
+struct Queue {
+    events: Vec<Event>,
+    running: bool,
+    closed: bool,
+}
+
+impl Delivery {
+    fn push(self: &Arc<Self>, event: Event, rt: &Rt) {
+        let mut queue = lock(&self.queue);
+        if queue.closed {
+            return;
+        }
+        match (queue.events.last_mut(), event) {
+            (Some(Event::Changed(paths)), Event::Changed(more)) => paths.extend(more),
+            (_, event) => queue.events.push(event),
+        }
+        if std::mem::replace(&mut queue.running, true) {
+            return;
+        }
+        let delivery = Arc::clone(self);
+        rt.spawn(Box::pin(async move {
+            loop {
+                let batch = {
+                    let mut queue = lock(&delivery.queue);
+                    if queue.closed || queue.events.is_empty() {
+                        queue.running = false;
+                        return;
+                    }
+                    std::mem::take(&mut queue.events)
+                };
+                (lock(&delivery.sink))(batch);
+            }
+        }));
+    }
+}
+
+/// `root` as the filesystem resolves it, links followed and letter case
+/// as on disk; a part that is missing is kept as written, under what
+/// resolves of the rest.
+fn resolve(root: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut at = root;
+    loop {
+        if let Ok(real) = at.canonicalize() {
+            return missing
+                .iter()
+                .rev()
+                .fold(real, |path, part| path.join(part));
+        }
+        let (Some(parent), Some(name)) = (at.parent(), at.file_name()) else {
+            return root.to_owned();
+        };
+        missing.push(name);
+        at = parent;
+    }
+}
+
+/// What directory `root` is now, if it is one.
+fn identity(root: &Path) -> Option<sys::fs::FileIdentity> {
+    std::fs::metadata(root)
+        .is_ok_and(|meta| meta.is_dir())
+        .then(|| sys::fs::identity(root).ok())
+        .flatten()
+}
+
+fn copy(error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), error.to_string())
+}
+
+/// The nearest directory strictly above `path` that exists.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android", windows)),
+    expect(dead_code)
+)]
+fn existing_parent(path: &Path) -> Option<&Path> {
+    path.ancestors().skip(1).find(|dir| dir.is_dir())
 }

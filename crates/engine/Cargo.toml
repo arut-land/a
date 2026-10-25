@@ -18,7 +18,7 @@ ext.workspace = true
 kernel.workspace = true
 llm = { workspace = true, features = ["client"] }
 memchr.workspace = true
-rt.workspace = true
+rt = { workspace = true, features = ["watch"] }
 serde.workspace = true
 serde_json.workspace = true
 protocol.workspace = true

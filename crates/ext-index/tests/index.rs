@@ -14,6 +14,12 @@ fn runtime() -> rt::Rt {
     Arc::new(rt::Threads::new(2))
 }
 
+/// The index of `root`, kept current by a watcher on `rt`.
+fn open(indexes: &Indexes, root: &Path, rt: rt::Rt) -> Arc<WorkspaceIndex> {
+    let hub = Arc::new(rt::watch::Hub::new(Arc::clone(&rt)));
+    indexes.open(root, rt, hub)
+}
+
 /// A workspace: a git working tree, its root canonical as the daemon
 /// resolves one. It is a directory of its own temporary one: the watcher
 /// watches the root's parent too, which other tests' temporary
@@ -81,7 +87,7 @@ fn an_at_mention_search_finds_a_new_file_after_it_is_created() {
     tree.write("src/main.rs", "fn main() {}");
     tree.write("README.md", "hello");
     let indexes = Indexes::new(Limits::default());
-    let index = indexes.open(tree.root(), runtime());
+    let index = open(&indexes, tree.root(), runtime());
     assert_eq!(search(&index, "main")[0], "src/main.rs");
     assert!(!search(&index, "widget").contains(&"src/ui/widget.rs".to_owned()));
 
@@ -104,7 +110,7 @@ fn gitignored_files_never_appear() {
     tree.write("build/out.rs", "needle");
     tree.write("trace.log", "needle");
     let indexes = Indexes::new(Limits::default());
-    let index = indexes.open(tree.root(), runtime());
+    let index = open(&indexes, tree.root(), runtime());
     let listed = search(&index, "");
     assert!(listed.contains(&"kept.rs".to_owned()), "{listed:?}");
     assert!(
@@ -146,7 +152,7 @@ fn grep_reads_only_what_the_content_index_lets_through_and_stays_current() {
     }
     tree.write("src/target.rs", "let unicorn = 1;\n");
     let indexes = Indexes::new(Limits::default());
-    let index = indexes.open(tree.root(), runtime());
+    let index = open(&indexes, tree.root(), runtime());
     let (found, summary) = grep(&index, "unicorn");
     assert_eq!(found, ["src/target.rs"]);
     assert!(summary.prefiltered);
@@ -182,7 +188,7 @@ fn above_its_memory_a_workspace_greps_every_file_without_a_content_index() {
         memory: 1,
         ..Limits::default()
     });
-    let index = indexes.open(tree.root(), runtime());
+    let index = open(&indexes, tree.root(), runtime());
     let (found, summary) = grep(&index, "beta");
     assert_eq!(found, ["b.rs"]);
     assert!(!summary.prefiltered);
@@ -196,7 +202,7 @@ fn a_grep_is_cancelled_mid_stream() {
         tree.write(&format!("f/{i}.txt"), "needle\n");
     }
     let indexes = Indexes::new(Limits::default());
-    let index = indexes.open(tree.root(), runtime());
+    let index = open(&indexes, tree.root(), runtime());
     let cancel = Cancel::default();
     let seen = AtomicUsize::new(0);
     let query = GrepQuery {
@@ -224,7 +230,7 @@ fn the_index_is_gone_after_its_last_user() {
         ..Limits::default()
     });
     let rt = runtime();
-    let index = indexes.open(tree.root(), Arc::clone(&rt));
+    let index = open(&indexes, tree.root(), Arc::clone(&rt));
     assert_eq!(search(&index, "a.rs"), ["a.rs"]);
     let weak: Weak<WorkspaceIndex> = Arc::downgrade(&index);
     drop(index);
@@ -232,7 +238,7 @@ fn the_index_is_gone_after_its_last_user() {
     assert!(weak.upgrade().is_some());
     eventually("the index closes", || weak.upgrade().is_none());
     // Opened again, it walks again.
-    let index = indexes.open(tree.root(), rt);
+    let index = open(&indexes, tree.root(), rt);
     assert_eq!(search(&index, "a.rs"), ["a.rs"]);
 }
 
@@ -241,7 +247,7 @@ fn an_open_index_nothing_changes_or_asks_never_wakes() {
     let tree = Tree::new();
     tree.write("a.rs", "alpha\n");
     let indexes = Indexes::new(Limits::default());
-    let index = indexes.open(tree.root(), runtime());
+    let index = open(&indexes, tree.root(), runtime());
     assert_eq!(grep(&index, "alpha").0, ["a.rs"]);
     // The writes above may still be arriving as events: let them settle.
     std::thread::sleep(Duration::from_millis(1500));
@@ -268,7 +274,7 @@ fn a_rescan_during_the_first_content_build_never_installs_a_stale_index() {
         tree.write(&format!("zzz/{i}.txt"), text);
     }
     let indexes = Indexes::new(Limits::default());
-    let index = indexes.open(tree.root(), runtime());
+    let index = open(&indexes, tree.root(), runtime());
     let expected: Vec<String> = (0..3000)
         .filter(|i| i % 10 == 0)
         .map(|i| format!("zzz/{i}.txt"))
@@ -294,7 +300,7 @@ fn a_flood_of_changes_in_an_ignored_tree_keeps_the_index_current() {
     tree.write(".gitignore", "build/\n");
     tree.write("src/a.rs", "");
     let indexes = Indexes::new(Limits::default());
-    let index = indexes.open(tree.root(), runtime());
+    let index = open(&indexes, tree.root(), runtime());
     assert_eq!(search(&index, "a.rs")[0], "src/a.rs");
     let started = Instant::now();
     for i in 0..3000 {
@@ -312,6 +318,30 @@ fn a_flood_of_changes_in_an_ignored_tree_keeps_the_index_current() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn ignored_directories_take_no_watch() {
+    let tree = Tree::new();
+    tree.write(".gitignore", "target/\n");
+    tree.write("src/a.rs", "");
+    for i in 0..50 {
+        tree.write(&format!("target/debug/deps/{i}/x.o"), "");
+    }
+    let rt = runtime();
+    let hub = Arc::new(rt::watch::Hub::new(Arc::clone(&rt)));
+    let indexes = Indexes::new(Limits::default());
+    let index = indexes.open(tree.root(), rt, Arc::clone(&hub));
+    assert_eq!(search(&index, "a.rs")[0], "src/a.rs");
+    // The root's parent, the root, `src`, and `.git`, above the `info/`
+    // that is not there: nothing under `target`.
+    assert_eq!(hub.watches(), 4);
+    tree.write("src/new/b.rs", "");
+    eventually("a directory made later is watched", || {
+        search(&index, "b.rs").contains(&"src/new/b.rs".to_owned())
+    });
+    assert_eq!(hub.watches(), 5);
+}
+
 #[test]
 fn a_home_or_a_volume_root_is_refused_without_a_walk() {
     let home = std::env::home_dir().unwrap().canonicalize().unwrap();
@@ -319,7 +349,7 @@ fn a_home_or_a_volume_root_is_refused_without_a_walk() {
     let volume = temp.ancestors().last().unwrap().to_owned();
     let indexes = Indexes::new(Limits::default());
     for root in [home, volume] {
-        let index = indexes.open(&root, runtime());
+        let index = open(&indexes, &root, runtime());
         let began = Instant::now();
         let refused = rt::block_on(index.search("a".to_owned(), 10)).unwrap_err();
         assert!(refused.contains("never indexed"), "{refused}");
@@ -346,7 +376,7 @@ fn a_placeholder_is_listed_but_its_content_never_read() {
         return;
     }
     let indexes = Indexes::new(Limits::default());
-    let index = indexes.open(tree.root(), runtime());
+    let index = open(&indexes, tree.root(), runtime());
     let listed = rt::block_on(index.glob("*.txt".to_owned(), 10)).unwrap();
     let mut listed: Vec<_> = listed.files.into_iter().map(|f| f.path).collect();
     listed.sort();

@@ -64,22 +64,24 @@ are not UTF-8 are left out.
 
 The first query or call about a workspace opens its index: the walk runs
 on the runtime's blocking pool (ripgrep's parallel walker, its threads
-scoped to the walk), with the native watcher armed first so nothing that
+scoped to the walk), with the watch armed first so nothing that
 changes during it is missed. The walk's threads are as many as the
 daemon's storage lane has workers. Changes are applied as they arrive: a
 changed file is looked at again, a changed directory walked again, a
 removed one dropped, all by bisection of the sorted file list. A change
 to an ignore file or a watcher overflow or rescan walks the whole root
-again, and so does a change to the root or a directory above it once the
-root is not what it was (`sys::fs::identity`: device and inode, or volume
-and file id): gone, back, or replaced at its path by another. The watcher's callback only
-queues events for a task on the runtime: rearming or dropping the watcher
-from its own thread would wait on that thread.
+again, and so does the root going, coming back or being replaced at its
+path by another, which the watcher tells.
 
-On Linux the native watcher watches every directory under the root,
-ignored ones (`target/`, `node_modules`) included, one inotify watch each;
-watching only the directories the walk enters belongs to the daemon-wide
-watcher being designed separately, not to this extension.
+The index subscribes to the daemon's watcher (`rt::watch::Hub`, see
+[watchers](perf/watchers.md)) with its root entered and `.git` left out,
+and enters each directory its walk descends into, and each one a change
+brings: on Linux only those take an inotify watch, so an ignored
+`target/` or `node_modules` takes none. A second subscription follows
+`.git/info`, whose `exclude` changes what the walk finds. Each walk
+enters into a new subscription, which replaces the last once the walk is
+installed; the hub follows the root itself, and its going, return or
+replacement is a full walk.
 
 The index stays open for five minutes after its last use, held by one
 sleeping task, then closes with its watcher. A daemon nobody searches

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use ext::{Concurrency, Cx, Extension, Json, Need, Registrar, Replay, Schema, Tool};
 use ext_index::{
-    GrepFile, GrepMode, GrepOptions, GrepQuery, GrepReply, Indexes, Line, Pattern, runtime,
+    GrepFile, GrepMode, GrepOptions, GrepQuery, GrepReply, Indexes, Line, Pattern, runtime, watcher,
 };
 use serde::{Deserialize, Serialize};
 
@@ -69,7 +69,11 @@ impl Tool for Glob {
     const CONCURRENCY: Concurrency = Concurrency::Shared;
 
     async fn call(&self, input: &GlobInput, cx: &Cx) -> Result<Globbed, String> {
-        let index = indexes(cx)?.open(&cx.workspace, runtime(cx.service_arc())?);
+        let index = indexes(cx)?.open(
+            &cx.workspace,
+            runtime(cx.service_arc())?,
+            watcher(cx.service_arc())?,
+        );
         let found = index.glob(input.pattern.clone(), GLOB_LIMIT).await?;
         Ok(Globbed {
             more: (found.matched > found.files.len()).then_some(found.matched),
@@ -129,7 +133,11 @@ impl Tool for Grep {
     const CONCURRENCY: Concurrency = Concurrency::Shared;
 
     async fn call(&self, input: &GrepInput, cx: &Cx) -> Result<GrepOut, String> {
-        let index = indexes(cx)?.open(&cx.workspace, runtime(cx.service_arc())?);
+        let index = indexes(cx)?.open(
+            &cx.workspace,
+            runtime(cx.service_arc())?,
+            watcher(cx.service_arc())?,
+        );
         let context = input.context.unwrap_or(0);
         let query = GrepQuery {
             pattern: Pattern::Exact {

@@ -37,7 +37,6 @@ ignore = true
 [bans]
 multiple-versions = "deny"
 skip = [
-    { crate = "windows-sys@0.60.2", reason = "notify 8 pins 0.60; sys and the async reactor use 0.61. The watcher backend does not exchange Windows types with them" },
     { crate = "syn@2.0.119", reason = "hypertext-macros (web) is on syn 2; serde_derive, usage-derive, thiserror-impl and ext-derive on 3. Goes when hypertext moves" },
 ]
 wildcards = "deny"

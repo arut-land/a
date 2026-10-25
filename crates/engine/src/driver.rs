@@ -68,6 +68,8 @@ pub(crate) mod spawn;
 pub struct Shared {
     pub http_clients: std::sync::OnceLock<Arc<dyn transport::HttpClients>>,
     pub rt: rt::Rt,
+    /// The daemon's one file watcher, which every extension subscribes to.
+    pub hub: Arc<rt::watch::Hub>,
     pub store: Arc<dyn crate::store::LogStore>,
     pub catalog: crate::catalog::Catalog,
     pub registry: ext::host::Current,
@@ -106,6 +108,13 @@ impl Shared {
                             let _ = admitted.await;
                         }));
                     }),
+                    {
+                        let hub = Arc::clone(&self.hub);
+                        Arc::new(move |root, changed| {
+                            let watch = rt::watch::Watch::tree(root);
+                            Box::new(hub.subscribe(watch, move |_| changed()))
+                        })
+                    },
                 )
             })
             .transpose()
@@ -621,6 +630,12 @@ impl Drop for Attachment {
 impl Live {
     async fn entries(&self) -> io::Result<Vec<Entry>> {
         self.frames.read_entries(&*self.session.shared.rt).await
+    }
+
+    /// Whether the session's log references blob `blob`.
+    pub(crate) async fn references(&self, blob: protocol::BlobId) -> io::Result<bool> {
+        let frames = Arc::clone(&self.frames);
+        rt::unblock(&*self.session.shared.rt, move || frames.references(&blob)).await
     }
 
     /// Opens session `header`'s log, folds it into a kernel and starts the
@@ -3033,6 +3048,7 @@ impl Session {
                 SessionServices::default()
                     .with::<dyn ext::Layers>(Arc::new(SessionLayers(session.clone())))
                     .with::<dyn rt::Runtime>(Arc::clone(&shared.rt))
+                    .with::<rt::watch::Hub>(Arc::clone(&shared.hub))
                     .with::<dyn ext::Logs>(Arc::new(services::SessionLogs(Arc::clone(shared))))
                     .with::<dyn transport::HttpClients>(Arc::clone(
                         shared.http_clients.get_or_init(|| {

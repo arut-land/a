@@ -23,6 +23,10 @@ mod directory_watch;
 pub use directory_watch::DirectoryWatch;
 mod endpoint;
 pub mod fs;
+#[cfg(target_os = "macos")]
+mod fsevents;
+#[cfg(target_os = "macos")]
+pub use fsevents::{FsEvent, FsEventKind, FsEventStream};
 pub mod handover;
 pub mod install;
 pub mod log;

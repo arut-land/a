@@ -292,6 +292,7 @@ same!(
     Vec<CommandInfo>,
     Vec<crate::QueryInfo>,
     crate::Scope,
+    crate::BlobId,
     Vec<SessionSummary>,
     Vec<Item>,
 );
@@ -564,6 +565,10 @@ pub(crate) struct MsgFields {
     pub(crate) scope: Option<crate::Scope>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) body: Option<Json>,
+    // A fetch's.
+    pub(crate) blob: Option<crate::BlobId>,
+    pub(crate) offset: Option<u64>,
+    pub(crate) len: Option<u64>,
     // A reply's; read as a tool's, so an entry frame's reads too.
     pub(crate) outcome: Option<ToolOutcome>,
     pub(crate) queries: Option<Vec<crate::QueryInfo>>,
