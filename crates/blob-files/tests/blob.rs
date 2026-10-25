@@ -224,6 +224,71 @@ fn the_cache_is_made_again_after_it_is_deleted_or_evicted() {
 }
 
 #[test]
+fn a_write_through_a_materialized_path_never_reaches_the_store() {
+    let home = Home::new();
+    let tree = home.tree();
+    let blob = home.put(b"original");
+    let at = TreePath::by_id(&blob.id);
+    tree.ensure(&at, &blob).unwrap();
+    let path = tree.path(&at);
+    let mut writable = fs::metadata(&path).unwrap().permissions();
+    #[expect(clippy::permissions_set_readonly_false, reason = "what a user may do")]
+    writable.set_readonly(false);
+    fs::set_permissions(&path, writable).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"OVERWROTE")
+        .unwrap();
+    assert_eq!(home.read(&blob.id), b"original");
+}
+
+#[test]
+fn concurrent_ensures_of_one_blob_each_see_a_complete_file() {
+    let home = Home::new();
+    let bytes: Vec<u8> = (0..=u8::MAX).cycle().take(8 << 20).collect();
+    let mut writer = home.files.writer(16 << 20).unwrap();
+    writer.write_all(&bytes).unwrap();
+    let blob = writer.finish("text/plain", BlobOrigin::Paste).unwrap();
+    let at = TreePath::by_id(&blob.id);
+    let start = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                let tree = home.tree();
+                start.wait();
+                tree.ensure(&at, &blob).unwrap();
+                assert!(fs::read(tree.path(&at)).unwrap() == bytes);
+            });
+        }
+    });
+    let dir = home.tree().path(&at);
+    assert_eq!(
+        names(dir.parent().unwrap()),
+        [blob.id.to_string()],
+        "no copy left half made"
+    );
+}
+
+#[test]
+fn a_place_holding_another_blob_is_made_again() {
+    let home = Home::new();
+    let tree = home.tree();
+    let (first, second) = (home.put(b"first"), home.put(b"the second"));
+    let at = TreePath::new("sessions/x/attachments/a.txt").unwrap();
+    tree.ensure(&at, &first).unwrap();
+    tree.ensure(&at, &second).unwrap();
+    assert_eq!(fs::read(tree.path(&at)).unwrap(), b"the second");
+    assert!(
+        fs::metadata(tree.path(&at))
+            .unwrap()
+            .permissions()
+            .readonly()
+    );
+}
+
+#[test]
 fn a_reference_is_named_from_what_the_log_records_whoever_projects_it() {
     let blob = BlobRef {
         id: BlobId([1; 32]),
