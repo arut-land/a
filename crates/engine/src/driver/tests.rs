@@ -3014,6 +3014,7 @@ fn environment_bursts_retain_one_payload_and_one_mailbox_marker() {
         parent: None,
         frames: Arc::new(FrameLog::new(loaded.lines, 0)),
         followers: Mutex::default(),
+        early: Mutex::default(),
         busy: AtomicBool::new(false),
         has_input: AtomicBool::new(false),
         attached: AtomicUsize::new(0),

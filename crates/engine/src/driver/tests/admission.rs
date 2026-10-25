@@ -120,6 +120,53 @@ fn enqueue(session: &Live, text: &str) -> oneshot::Receiver<Result<(), String>> 
     received
 }
 
+/// Live text a reply streams while its call waits for its flush reaches
+/// followers once the call is shown, in order and after it: a stream that
+/// outruns durability, as concurrent streams sharing the flush lane do,
+/// loses none of it.
+#[test]
+fn no_delta_is_lost_when_a_stream_outruns_its_calls_flush() {
+    let (fixture, faulty, script) = pipeline(Registry::default().with(&Harbor).unwrap());
+    let session = fixture.create();
+    settle(&session);
+    let outbox = Outbox::new();
+    session.follow(&outbox, 0);
+    let held = faulty.hold_next_flush();
+    let ack = enqueue(&session, "hello");
+    held.started();
+    session.wait("both replies streamed", PATIENCE, || {
+        lock(&script.sent).len() == 2 && !session.has_work()
+    });
+    held.release();
+    assert_eq!(rt::block_on(ack), Some(Ok(())));
+    settle(&session);
+    let mut shown = Vec::new();
+    let mut streamed = String::new();
+    while let Some(frame) = outbox.try_next() {
+        match protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes()) {
+            Ok(Some(DaemonMsg::Entry(e))) => shown.push(e.seq),
+            Ok(Some(DaemonMsg::Delta { call, text, .. })) => {
+                assert!(
+                    shown.contains(&call.0),
+                    "a delta of call {call:?} preceded it"
+                );
+                streamed.push_str(&text);
+            }
+            _ => {}
+        }
+    }
+    let recorded: String = (retry::text_reply().split_inclusive("\n\n"))
+        .filter(|event| event.starts_with("event: response.output_text.delta"))
+        .map(|event| {
+            let data = event.split_once("data: ").unwrap().1;
+            let data: Value = serde_json::from_str(data.trim()).unwrap();
+            data["delta"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(streamed, recorded);
+    session.halt();
+}
+
 #[test]
 fn publication_never_crosses_the_durable_prefix() {
     let (fixture, faulty, script) = pipeline(Registry::default().with(&Harbor).unwrap());
