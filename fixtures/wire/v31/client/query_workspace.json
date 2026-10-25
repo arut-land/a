@@ -1,1 +1,0 @@
-{"t":"query","id":2,"service":"files.search","scope":{"workspace":"/work/a/src"},"body":{"limit":20,"query":"lib"}}

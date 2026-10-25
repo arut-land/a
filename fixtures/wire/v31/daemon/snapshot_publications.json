@@ -1,1 +1,0 @@
-{"t":"snapshot","session":"00000000-0000-0000-0000-00000000000a","workspace":"/w","seq":2,"state":{"calls":[],"queued":[],"turn":0,"taken":[],"publications":{"1":[{"namespace":"skills","key":"loaded-publication"}],"2":[{"namespace":"mcp-schemas","key":"loaded-publication"}]}},"items":[]}

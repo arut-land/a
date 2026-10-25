@@ -1,1 +1,0 @@
-{"t":"entry","seq":3,"epoch":0,"kind":"tool_call","invoke":{"parent":2,"name":"lookup"},"tool":"bash","input":{"command":"ls"}}

@@ -1,1 +1,0 @@
-{"t":"attach","target":{"id":"00000000-0000-0000-0000-00000000000a"},"workspace":"/w","since":7,"env":{"cwd":"/w","vars":{"PATH":"/bin"},"redacted":["GITHUB_TOKEN"],"tty":true},"decl":{"tools":["pick_file"],"sites":["dialog"]}}

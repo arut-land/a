@@ -1,1 +1,0 @@
-{"t":"entry","seq":2,"epoch":0,"kind":"tool_call","tool":"bash","input":{"command":"ls"},"id":"call_1","card":{"title":"$ ls"}}
