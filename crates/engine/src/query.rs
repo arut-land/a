@@ -93,10 +93,13 @@ impl Queries {
             };
             // A query that panics fails, as a tool's call does.
             let answer = contain(query.answer(&body, &at, asked, &updates));
+            // A query that sees the cancel and returns what it had (a grep
+            // stopping between chunks) can finish within the same poll as
+            // the cancel lands: it was interrupted all the same.
             let outcome = match cancel.until(answer).await {
-                Some(Ok(output)) => Outcome::Done { output },
+                Some(Ok(output)) if !cancel.is_set() => Outcome::Done { output },
                 Some(Err(error)) => Outcome::Failed { error },
-                None => Outcome::Interrupted { output: None },
+                Some(Ok(_)) | None => Outcome::Interrupted { output: None },
             };
             lock(&running).remove(&id);
             reply(&outbox, &DaemonMsg::Reply { id, outcome });
