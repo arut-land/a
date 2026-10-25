@@ -49,10 +49,9 @@ Fuzzy search, warm, top 20 (ms):
 | `zstddecomp` | 0.9 | 2.3 | 1.5 |
 
 The port's ranking is FFF's: the same first result for every query
-(ties go to the more recently modified file, so a fresh clone, every file
-the same age, can break a tie differently)
 (`Kconfig` for `kconfig`, `lib/zstd/zstd_decompress_module.c` for
-`zstddecomp`). nucleo matches far fewer files (no typo tolerance: 2,953
+`zstddecomp`). Ties go to the more recently modified file, so a fresh
+clone, every file the same age, can break a tie (`main.c`) differently. nucleo matches far fewer files (no typo tolerance: 2,953
 for `main.c` against 56,467) and ranks differently.
 
 Grep, whole tree, every match (ms):
