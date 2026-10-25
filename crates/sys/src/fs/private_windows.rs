@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, LocalFree};
@@ -69,16 +69,19 @@ pub(super) fn dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Creates a new file under the private file policy.
-pub(super) fn file(path: &Path, read: bool) -> io::Result<File> {
+pub(super) fn file(path: &Path, access: super::Access) -> io::Result<File> {
     let security = Security::private_file()?;
     let attributes = security.attributes();
-    let name = wide(extended(path)?.as_os_str());
+    let name = wide(super::extended(path)?.as_os_str());
     // SAFETY: a NUL-terminated path and live attributes; the returned handle
     // is checked and owned. The sharing matches `std`'s default.
     let handle = owned(unsafe {
         CreateFileW(
             name.as_ptr(),
-            GENERIC_WRITE | if read { GENERIC_READ } else { 0 },
+            match access {
+                super::Access::Write => GENERIC_WRITE,
+                super::Access::ReadWrite => GENERIC_READ | GENERIC_WRITE,
+            },
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             &raw const attributes,
             CREATE_NEW,
@@ -87,18 +90,6 @@ pub(super) fn file(path: &Path, read: bool) -> io::Result<File> {
         )
     })?;
     Ok(File::from(handle))
-}
-
-/// An extended-length path whose canonical parent does not follow the
-/// final component: a link there is itself the object operated on.
-pub(super) fn extended(path: &Path) -> io::Result<PathBuf> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    Ok(parent
-        .canonicalize()?
-        .join(path.file_name().ok_or(io::ErrorKind::InvalidInput)?))
 }
 
 /// Refuses a link or another user's directory, and replaces a policy that
@@ -117,7 +108,7 @@ fn secure_existing(dir: &Path) -> io::Result<()> {
     }
     let identity = Identity::current()?;
     let current = Descriptor::of(&handle)?;
-    if !identity.owns(current.owner) {
+    if !identity.owns(current.owner)? {
         return Err(super::not_private(dir));
     }
     if current.is_private_directory(identity.user())? {
@@ -218,6 +209,7 @@ impl Drop for Descriptor {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::process::Command;
 
     struct Temporary(PathBuf);
@@ -333,7 +325,7 @@ mod tests {
     fn a_private_file_ignores_what_its_directory_shares() {
         let parent = Temporary::shared("acl-file");
         let file = parent.0.join("secret");
-        super::super::private_file().read(true).open(&file).unwrap();
+        super::super::private_file().readable().open(&file).unwrap();
         assert_owners_alone(std::slice::from_ref(&file));
         assert_eq!(
             super::super::private_file().open(&file).unwrap_err().kind(),
@@ -362,6 +354,46 @@ mod tests {
         let mut all = vec![home];
         all.extend(contents);
         assert_owners_alone(&all);
+    }
+
+    #[test]
+    fn a_directory_an_elevated_run_gave_to_administrators_stays_usable() {
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        let parent = Temporary::shared("acl-elevated");
+        let home = parent.0.join("home");
+        fs::create_dir(&home).unwrap();
+        let text = wide(std::ffi::OsStr::new("S-1-5-32-544"));
+        let mut administrators = null_mut();
+        // SAFETY: a terminated SID string; the output is LocalAlloc'd.
+        ok(unsafe { ConvertStringSidToSidW(text.as_ptr(), &raw mut administrators) }).unwrap();
+        let handle = OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ | windows_sys::Win32::Storage::FileSystem::WRITE_OWNER)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&home)
+            .unwrap();
+        // SAFETY: the handle and SID remain valid during the call.
+        let status = unsafe {
+            SetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                administrators,
+                null_mut(),
+                null(),
+                null(),
+            )
+        };
+        // SAFETY: ConvertStringSidToSidW allocated the SID.
+        unsafe { LocalFree(administrators) };
+        drop(handle);
+        // Only an elevated token may assign the group; hosted runners are.
+        if status == windows_sys::Win32::Foundation::ERROR_INVALID_OWNER {
+            eprintln!("not elevated: Administrators cannot own the directory");
+            return;
+        }
+        assert_eq!(status, 0);
+        super::super::private_dir(&home).unwrap();
+        assert_owners_alone(std::slice::from_ref(&home));
     }
 
     #[test]

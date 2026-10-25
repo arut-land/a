@@ -12,7 +12,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     ACL, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation, PSID, SECURITY_ATTRIBUTES,
-    TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
+    TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenUser,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken,
@@ -78,18 +78,31 @@ pub fn user_sid(pid: Option<u32>) -> io::Result<String> {
     sid_string(unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid })
 }
 
-/// The SIDs this process's new objects are attributed to: its user, and
-/// the token's default owner, which is the Administrators group when elevated.
+/// Who this process is when judging an existing object's owner.
 pub struct Identity {
     user: Vec<usize>,
-    owner: Vec<usize>,
+    /// The token holds BUILTIN\Administrators, even deny-only: an elevated
+    /// run of the same user gives its objects to that group.
+    administrator: bool,
 }
+
+const ADMINISTRATORS: &str = "S-1-5-32-544";
 
 impl Identity {
     pub fn current() -> io::Result<Self> {
+        let groups = token_information(None, TokenGroups)?;
+        // SAFETY: a successful TokenGroups query filled this aligned buffer
+        // with `GroupCount` entries, each SID within it.
+        let groups = unsafe {
+            let groups = &*groups.as_ptr().cast::<TOKEN_GROUPS>();
+            std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
+                .iter()
+                .map(|group| sid_string(group.Sid))
+                .collect::<io::Result<Vec<_>>>()?
+        };
         Ok(Self {
             user: token_information(None, TokenUser)?,
-            owner: token_information(None, TokenOwner)?,
+            administrator: groups.iter().any(|sid| sid == ADMINISTRATORS),
         })
     }
 
@@ -98,12 +111,18 @@ impl Identity {
         unsafe { (*self.user.as_ptr().cast::<TOKEN_USER>()).User.Sid }
     }
 
-    /// Whether `sid` is one this process assigns its own objects to.
-    pub fn owns(&self, sid: PSID) -> bool {
-        // SAFETY: the buffer holds a successful TokenOwner query.
-        let owner = unsafe { (*self.owner.as_ptr().cast::<TOKEN_OWNER>()).Owner };
-        // SAFETY: all three SIDs are valid and outlive the comparisons.
-        !sid.is_null() && unsafe { EqualSid(sid, self.user()) != 0 || EqualSid(sid, owner) != 0 }
+    /// Whether an object owned by `sid` is this user's: owned by the user,
+    /// or by Administrators when the user is one, as Git's `safe.directory`
+    /// accepts, so one elevated run does not lock the user out.
+    pub fn owns(&self, sid: PSID) -> io::Result<bool> {
+        if sid.is_null() {
+            return Ok(false);
+        }
+        // SAFETY: both SIDs are valid and outlive the comparison.
+        if unsafe { EqualSid(sid, self.user()) } != 0 {
+            return Ok(true);
+        }
+        Ok(self.administrator && sid_string(sid)? == ADMINISTRATORS)
     }
 }
 

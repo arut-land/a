@@ -507,8 +507,8 @@ fn move_file(from: &Path, to: &Path, replacing: bool, durable: bool) -> io::Resu
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
     // A rename moves a link itself, never its target.
-    let from = crate::windows::wide(private::extended(from)?.as_os_str());
-    let to = crate::windows::wide(private::extended(to)?.as_os_str());
+    let from = crate::windows::wide(extended(from)?.as_os_str());
+    let to = crate::windows::wide(extended(to)?.as_os_str());
     // WRITE_THROUGH waits for the move on disk; COPY_ALLOWED is deliberately
     // absent so publication cannot degrade to a cross-volume copy/delete.
     // Microsoft does not document FlushFileBuffers as a directory barrier.
@@ -525,6 +525,19 @@ fn move_file(from: &Path, to: &Path, replacing: bool, durable: bool) -> io::Resu
             }) | if durable { MOVEFILE_WRITE_THROUGH } else { 0 },
         )
     })
+}
+
+#[cfg(windows)]
+/// An extended-length path whose canonical parent does not follow the
+/// final component: a link there is itself the object operated on.
+fn extended(path: &Path) -> io::Result<std::path::PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Ok(parent
+        .canonicalize()?
+        .join(path.file_name().ok_or(io::ErrorKind::InvalidInput)?))
 }
 
 /// Publishes an already flushed file, including its directory entry.
@@ -737,7 +750,14 @@ pub fn open_log(path: &Path, header: Option<&[u8]>) -> io::Result<(File, Publica
 /// given to the create call, whatever the directory grants.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PrivateFile {
-    read: bool,
+    access: Access,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum Access {
+    #[default]
+    Write,
+    ReadWrite,
 }
 
 pub fn private_file() -> PrivateFile {
@@ -745,8 +765,9 @@ pub fn private_file() -> PrivateFile {
 }
 
 impl PrivateFile {
-    pub fn read(&mut self, read: bool) -> &mut Self {
-        self.read = read;
+    /// Opens the new file for reading as well as writing.
+    pub fn readable(&mut self) -> &mut Self {
+        self.access = Access::ReadWrite;
         self
     }
 
@@ -755,14 +776,14 @@ impl PrivateFile {
         {
             use std::os::unix::fs::OpenOptionsExt;
             OpenOptions::new()
-                .read(self.read)
+                .read(matches!(self.access, Access::ReadWrite))
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(path)
         }
         #[cfg(windows)]
-        private::file(path.as_ref(), self.read)
+        private::file(path.as_ref(), self.access)
     }
 }
 

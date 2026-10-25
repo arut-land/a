@@ -38,9 +38,11 @@ because an inherited generic right splits into a mapped and an inherit-only
 ACE. Pipes, jobs and single files keep a non-inheritable descriptor.
 
 The daemon binding an isolated home (`A_HOME`) brings the root under this
-policy first, whatever the directory above it shares. An existing root, or
-any existing private directory, owned by this user (or by the elevated
-token's default owner) whose DACL is anything else is replaced with
+policy first (0700 on Unix), whatever the directory above it shares. An existing root, or
+any existing private directory, owned by this user (or by Administrators
+when the user's token holds that group, even deny-only, as Git's
+`safe.directory` accepts, so one elevated run does not lock the user out)
+whose DACL is anything else is replaced with
 `SetSecurityInfo`, which carries the inheritable ACE to every inheriting
 descendant; a reparse point or another user's directory is refused. The
 native layout under LocalAppData inherits the profile's ACL, as Windows
