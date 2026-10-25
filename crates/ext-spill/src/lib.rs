@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use ext::point::{PresentResult, Presenting};
 use ext::{
-    BoxFuture, Called, Configured, Cx, DynTool, Extension, Placed, Presented, Provides, Record,
-    Refused, Registrar, Rewrite, Table,
+    BoxFuture, Called, Configured, Cx, DynTool, Extension, Presented, Provides, Record, Refused,
+    Registrar, Rewrite, Table,
 };
 use llm::{Tag, tag};
 use protocol::{BlobOrigin, BlobRef, Held, Outcome};
@@ -84,8 +84,11 @@ impl Record for Spill {
             let (Outcome::Done { output }, []) = (&called.outcome, &called.held[..]) else {
                 return called;
             };
-            let Some((text, media_type)) = text(tool.to_model(output)) else {
-                return called;
+            // Content (images) is not text a file could hold.
+            let (text, media_type) = match tool.to_model(output) {
+                llm::Output::Text(text) => (text, "text/plain"),
+                llm::Output::Json(json) => (json.raw().to_owned(), "application/json"),
+                llm::Output::Content(_) => return called,
             };
             if text.len() <= self.limit {
                 return called;
@@ -113,7 +116,14 @@ impl Spill {
     /// `shown` cut to its ends, if it holds its spill and is long enough to
     /// cut: what follows from the text and the spill alone.
     fn present(&self, shown: &Presenting<'_>) -> Rewrite<Presented> {
-        let Some(at) = shown.held.iter().find_map(spilled) else {
+        let spill = shown.held.iter().find_map(|placed| match &placed.held {
+            Held::Blob(BlobRef {
+                origin: BlobOrigin::Spilled(_),
+                ..
+            }) => placed.at.as_deref(),
+            _ => None,
+        });
+        let Some(at) = spill else {
             return Rewrite::Pass;
         };
         let text = match &shown.presented.output {
@@ -137,27 +147,6 @@ impl Spill {
             output: llm::Output::Text(out),
             error: shown.presented.error,
         })
-    }
-}
-
-/// Where a result's spill is read, if it holds one that can be.
-fn spilled(placed: &Placed) -> Option<&str> {
-    match &placed.held {
-        Held::Blob(BlobRef {
-            origin: BlobOrigin::Spilled(_),
-            ..
-        }) => placed.at.as_deref(),
-        _ => None,
-    }
-}
-
-/// What the model reads of `output` as text, and its media type: none for
-/// content (images) a file of text could not hold.
-fn text(output: llm::Output) -> Option<(String, &'static str)> {
-    match output {
-        llm::Output::Text(text) => Some((text, "text/plain")),
-        llm::Output::Json(json) => Some((json.raw().to_owned(), "application/json")),
-        llm::Output::Content(_) => None,
     }
 }
 

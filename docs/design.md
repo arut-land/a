@@ -196,8 +196,9 @@ already (the shell's own cut output) is left as its tool made it. Its
 inside a character) around `<truncated bytes=… path=…/>`; the transcript
 names every other reference itself. The cut is a function of the logged text
 and settings alone, so every projection shows the same bytes and a
-provider's prompt cache holds. The log keeps the outcome too, so a spilled
-output's bytes are stored twice until outcomes themselves move to blobs.
+provider's prompt cache holds. The log keeps the outcome too: a spilled
+output is stored twice until outcomes move to blobs. Its settings are in
+[agents.md](agents.md).
 
 ### Kernel and driver
 

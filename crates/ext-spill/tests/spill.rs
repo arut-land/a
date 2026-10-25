@@ -4,7 +4,6 @@
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 
-use ext::blob::Places;
 use ext::host::Registry;
 use ext::testing::Rig;
 use ext::{Called, Cx, Extension, Placed, Registrar, Schema, Tool};
@@ -119,16 +118,16 @@ fn registry() -> Registry {
         .unwrap()
 }
 
-/// What the model is shown of `called`, its references named by `places`
-/// as the engine's transcript names them.
-fn shown(rig: &Rig, tool: &str, called: &Called, places: &Places) -> String {
+/// Where the engine would name what a result holds: naming is its
+/// projection's (the engine's `transcript` tests), the cut is spill's.
+const AT: &str = "tree/by-id/spilled";
+
+/// What the model is shown of `called`.
+fn shown(rig: &Rig, tool: &str, called: &Called) -> String {
     let held: Vec<Placed> = (called.held.iter())
         .map(|held| Placed {
-            at: match held {
-                Held::Blob(blob) => places.blob(blob),
-                Held::Stream(stream) => places.stream(*stream),
-            },
             held: held.clone(),
+            at: Some(AT.to_owned()),
         })
         .collect();
     match rig
@@ -168,16 +167,14 @@ fn a_result_over_the_limit_is_shown_as_its_ends_and_where_the_whole_is() {
     assert_eq!((read(&rig, blob), blob.size), (whole.clone(), 11_000));
     assert_eq!(blob.media_type, "text/plain");
 
-    let text = shown(&rig, "print", &called, &rig.blobs.places());
-    let path = rig.blobs.places().blob(blob).unwrap();
+    let text = shown(&rig, "print", &called);
     // 186 whole lines of 11 bytes each end: 2046 bytes.
     let (head, tail) = (&whole[..2046], &whole[whole.len() - 2046..]);
     let tag = format!(
-        "<truncated bytes=\"{}\" path=\"{path}\"/>",
+        "<truncated bytes=\"{}\" path=\"{AT}\"/>",
         whole.len() - 2 * 2046
     );
     assert_eq!(text, format!("{head}{tag}\n{tail}"));
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), whole);
 }
 
 #[test]
@@ -190,7 +187,7 @@ fn a_json_result_is_spilled_as_the_json_the_model_reads() {
     let blob = spill(&called);
     assert_eq!(read(&rig, blob), output.raw());
     assert_eq!(blob.media_type, "application/json");
-    let text = shown(&rig, "dump", &called, &rig.blobs.places());
+    let text = shown(&rig, "dump", &called);
     assert!(text.starts_with("\"line 00000\\nline 00001"), "{text}");
     assert!(text.len() < output.raw().len() / 2, "{}", text.len());
 }
@@ -205,26 +202,20 @@ fn a_result_within_the_limit_is_shown_as_the_tool_shows_it() {
     let alone = plain.called("print", &json!({ "count": 372 }));
     assert_eq!(called.outcome, alone.outcome);
     assert_eq!(
-        shown(&rig, "print", &called, &rig.blobs.places()),
-        shown(&plain, "print", &alone, &plain.blobs.places()),
+        shown(&rig, "print", &called),
+        shown(&plain, "print", &alone),
     );
 }
 
+/// Recovery reruns a safe call: the same spill, shown the same. (Across
+/// a reload, with the cache gone: the engine's `spill` driver test.)
 #[test]
-fn what_the_model_is_shown_is_the_same_on_every_replay() {
-    let rig = Rig::new("spill-replay", registry());
+fn a_call_run_again_records_the_same_spill() {
+    let rig = Rig::new("spill-again", registry());
     let called = rig.called("print", &json!({ "count": 5000 }));
-    let first = shown(&rig, "print", &called, &rig.blobs.places());
-    // The materialized copy gone, as a cache evicts it: named again, made
-    // again, the same.
-    let path = rig.blobs.places().blob(spill(&called)).unwrap();
-    std::fs::remove_file(&path).unwrap();
-    assert_eq!(shown(&rig, "print", &called, &rig.blobs.places()), first);
-    assert!(std::path::Path::new(&path).exists());
-    // Run again, as recovery reruns a call: the same blob, shown the same.
     let again = rig.called("print", &json!({ "count": 5000 }));
     assert_eq!(spill(&again).id, spill(&called).id);
-    assert_eq!(shown(&rig, "print", &again, &rig.blobs.places()), first);
+    assert_eq!(shown(&rig, "print", &again), shown(&rig, "print", &called));
 }
 
 #[test]
@@ -238,8 +229,5 @@ fn a_result_that_holds_its_output_already_is_never_spilled_again() {
         full.origin,
         BlobOrigin::ToolOutput(protocol::CallId::new(1).unwrap())
     );
-    assert_eq!(
-        shown(&rig, "keep", &called, &rig.blobs.places()),
-        "line 00000\n".repeat(1000)
-    );
+    assert_eq!(shown(&rig, "keep", &called), "line 00000\n".repeat(1000));
 }

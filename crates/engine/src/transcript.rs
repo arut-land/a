@@ -173,7 +173,6 @@ impl Waiting {
     }
 }
 
-/// An output as text, for a message of text alone.
 /// `output`, telling the model where it reads what the result holds: each
 /// reference left out when it cannot be read, and a spill, which the
 /// presentation that cut the result names.
@@ -201,6 +200,7 @@ fn with_held(output: llm::Output, held: &[ext::Placed]) -> llm::Output {
     llm::Output::Text(text)
 }
 
+/// An output as text, for a message of text alone.
 fn text_of(output: llm::Output) -> String {
     match output {
         llm::Output::Text(text) => text,

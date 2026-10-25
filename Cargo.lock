@@ -546,6 +546,7 @@ dependencies = [
  "ext-settings",
  "ext-shell",
  "ext-skills",
+ "ext-spill",
  "ext-subagent",
  "ext-title",
  "futures-core",

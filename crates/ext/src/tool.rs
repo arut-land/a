@@ -421,9 +421,10 @@ pub trait Tool: Send + Sync + 'static {
     }
 
     /// What an output references outside the log, which the store keeps
-    /// for as long as the call's result is logged: the only place a
-    /// result's references are recorded, so the output need not name them.
-    /// The engine tells the model where each is.
+    /// for as long as the call's result is logged: with what the
+    /// [`Record`](crate::Record) service adds as the call ends, the only
+    /// place a result's references are recorded, so the output need not
+    /// name them. The engine tells the model where each is.
     fn held(_output: &Self::Out) -> Vec<Held> {
         Vec::new()
     }
