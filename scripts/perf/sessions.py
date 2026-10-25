@@ -80,7 +80,7 @@ def main():
     labels = layouts(cores)
     counts = [int(n) for n in args.sessions.split(",")]
     raw = args.output / "sessions.jsonl"
-    records = []
+    records, failures = [], []
     for round in range(args.rounds):
         order = labels if round % 2 == 0 else list(reversed(labels))
         for sessions in counts:
@@ -90,15 +90,24 @@ def main():
                 try:
                     result = subprocess.run(
                         [str(args.binary), TEST, "--exact", "--ignored", "--nocapture", "--test-threads=1"],
-                        env=env, capture_output=True, text=True, timeout=600)
+                        env=env, capture_output=True, text=True, timeout=300)
+                    failed = result.returncode and f"exit {result.returncode}"
+                    out, err = result.stdout, result.stderr
                 except subprocess.TimeoutExpired as error:
-                    print(error.stdout, error.stderr, sep="\n", file=sys.stderr, flush=True)
-                    raise
-                if result.returncode:
-                    print(result.stdout, result.stderr, sep="\n", file=sys.stderr, flush=True)
-                    result.check_returncode()
+                    failed = "timed out"
+                    out, err = (text.decode(errors="replace") if isinstance(text, bytes) else text or ""
+                                for text in (error.stdout, error.stderr))
+                if failed:
+                    # A stalled layout is a finding, not the end of the others' samples.
+                    failure = dict(label=label, runtime=runtime, sessions=sessions, round=round,
+                                   failed=failed, stdout=out[-4000:], stderr=err[-4000:])
+                    failures.append(failure)
+                    with (args.output / "failures.jsonl").open("a") as stream:
+                        stream.write(json.dumps(failure) + "\n")
+                    print(label, runtime, sessions, round, failed, err[-2000:], sep="\n", flush=True)
+                    continue
                 # The harness prints the test's name on the line its record starts.
-                line = next(line for line in result.stdout.splitlines() if '{"' in line)
+                line = next(line for line in out.splitlines() if '{"' in line)
                 record = json.loads(line[line.index('{"'):])
                 record.update(label=label, round=round)
                 records.append(record)
@@ -108,9 +117,12 @@ def main():
                       f"p99={percentile(record['delta_ms'], 0.99):.3f}ms rss={record['idle_rss_kib']:.0f}KiB",
                       flush=True)
     summary = summarize(records)
-    (args.output / "sessions.json").write_text(json.dumps(dict(cores=cores, summary=summary), indent=2) + "\n")
+    stalled = [(f["label"], f["sessions"], f["round"], f["failed"]) for f in failures]
+    (args.output / "sessions.json").write_text(
+        json.dumps(dict(cores=cores, summary=summary, failures=stalled), indent=2) + "\n")
     (args.output / "sessions.md").write_text(table(summary))
     print(table(summary))
+    print("failed samples:", stalled)
     if summary_file := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(summary_file, "a") as stream:
             stream.write(f"Concurrent sessions ({cores} cores)\n\n" + table(summary))

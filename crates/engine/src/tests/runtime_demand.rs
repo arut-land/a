@@ -548,6 +548,11 @@ fn serve(home: &Home, port: u16, variant: &str) -> (crate::Owner, Arc<rt::Thread
         Daemon::load_on(home, &config, &runtime, Vec::new())
     }
     .unwrap();
+    // The locked daemon record is how a Windows client finds the pipe.
+    let crate::Claim::Serve(record) = crate::claim(home, "bench", None, false, 0).unwrap() else {
+        panic!("the bench home's breaker tripped");
+    };
+    std::mem::forget(record);
     let listener: &'static sys::Listener = Box::leak(Box::new(home.bind().unwrap()));
     let life = Arc::new(crate::Lifecycle::new("bench".into(), home.runtime()));
     let serving = (Arc::clone(&daemon.0), life);
