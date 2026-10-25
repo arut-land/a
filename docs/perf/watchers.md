@@ -68,9 +68,39 @@ latency is a write to the sink seeing it, 200 writes; threads and RSS
 are the whole process after arming, a two-worker runtime included.
 Median of five alternating rounds.
 
-MEASUREMENTS
+| Host | Watcher | Arm | inotify watches | RSS added | Threads after | Latency p50 / p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Linux x86_64 (ubuntu-latest) | notify, tree | 99.9 ms | 4,476 | 1,780 KiB | 2 | 86 / 136 µs |
+| | hub, tree | 64.0 ms | 4,476 | 1,040 KiB | 4 | 191 / 246 µs |
+| | hub, entered | 2.2 ms | 423 | 272 KiB | 4 | 183 / 231 µs |
+| Linux aarch64 (ubuntu-24.04-arm) | notify, tree | 53.5 ms | 4,476 | 1,604 KiB | 2 | 185 / 240 µs |
+| | hub, tree | 37.0 ms | 4,476 | 936 KiB | 4 | 336 / 597 µs |
+| | hub, entered | 1.4 ms | 423 | 164 KiB | 4 | 343 / 638 µs |
+| macOS arm64 (macos-latest) | notify, tree | 3.6 ms | — | 1,024 KiB | 6 | 14.4 / 18.8 ms |
+| | hub, tree | 1.8 ms | — | 112 KiB | 2 | 14.2 / 18.9 ms |
+| | hub, entered | 2.1 ms | — | 160 KiB | 2 | 15.0 / 19.0 ms |
+| Windows x86_64 (windows-latest) | old `rt::Watcher`, tree | 0.5 ms | — | 460 KiB | 6 | 166 / 384 µs |
+| | hub, tree | 0.6 ms | — | 500 KiB | 6 | 171 / 362 µs |
+| | hub, entered | 1.2 ms | — | 556 KiB | 6 | 175 / 390 µs |
 
-Release `a` size: SIZE
+Threads are the process's: the old Linux harness never starts the
+runtime's workers (notify calls its sink on its own thread, the one
+thread added), while the hub routes and delivers on the runtime, whose
+reactor and two workers the daemon runs anyway; the hub adds no thread of
+its own anywhere. On macOS notify's run-loop thread and its helpers go.
+Windows already used `sys::DirectoryWatch` before, so its numbers are
+the same backend under the new router. Linux latency gains about
+100 µs (two runtime hops, reactor to router task to the sink's task,
+where notify called the sink on its thread); every consumer debounces or
+walks for longer than that. macOS latency is fseventsd's own, 12 to 19 ms
+at latency 0, the same either way. An entered subscription, as the index makes, takes a
+tenth of the watches on a tree with an ignored `target/`.
+
+The release `a` (perf workflow, paired against main 6efcaf01, three
+rounds): Linux x86_64 −25.9 KiB, Linux aarch64 −22.3 KiB, macOS
+−1.6 KiB, Windows aarch64 +28.5 KiB (the router, where nothing was
+removed). Idle daemon RSS and CPU and attach latency stay within the
+rounds' spread on all four (an idle daemon holds no subscription).
 
 The hand-rolled backends replace notify (and mio, inotify, kqueue,
 fsevent-sys, walkdir and notify's own windows-sys 0.60 with them) because
