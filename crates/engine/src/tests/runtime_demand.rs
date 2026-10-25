@@ -392,6 +392,8 @@ fn concurrent_active_sessions() {
         load.pace,
     );
     let (daemon, runtime, workers) = serve(&home, port, &variant);
+    // Phases on stderr, so a stalled sample says where it stalled.
+    eprintln!("bench: serving");
     let start = Arc::new(std::sync::Barrier::new(load.sessions + 1));
     let (done, finished) = std::sync::mpsc::channel();
     let (release, hold) = std::sync::mpsc::channel::<()>();
@@ -414,6 +416,7 @@ fn concurrent_active_sessions() {
     // A client that panics hangs up its sender, failing the receive below.
     drop(done);
     start.wait();
+    eprintln!("bench: attached");
     let active = usage();
     let started = Instant::now();
     let seen: Vec<(usize, Seen)> = (0..load.sessions)
@@ -421,6 +424,7 @@ fn concurrent_active_sessions() {
         .collect();
     let wall = started.elapsed();
     let ended = usage();
+    eprintln!("bench: turns done");
     let turns: Vec<_> = (seen.iter())
         .flat_map(|(_, seen)| seen.turns.iter().map(|t| t.as_secs_f64() * 1000.0))
         .collect();
@@ -454,6 +458,7 @@ fn concurrent_active_sessions() {
             "idle_cpu_ms": cpu(&settled, &idle),
         })
     );
+    eprintln!("bench: measured");
     drop(release);
     for client in clients {
         client.join().unwrap();

@@ -87,9 +87,13 @@ def main():
             for label, runtime in order:
                 env = dict(os.environ, A_BENCH_RUNTIME=runtime, A_BENCH_SESSIONS=str(sessions),
                            A_BENCH_TURNS=str(args.turns), A_BENCH_PACE_MS=str(args.pace_ms))
-                result = subprocess.run(
-                    [str(args.binary), TEST, "--exact", "--ignored", "--nocapture", "--test-threads=1"],
-                    env=env, capture_output=True, text=True, timeout=600)
+                try:
+                    result = subprocess.run(
+                        [str(args.binary), TEST, "--exact", "--ignored", "--nocapture", "--test-threads=1"],
+                        env=env, capture_output=True, text=True, timeout=600)
+                except subprocess.TimeoutExpired as error:
+                    print(error.stdout, error.stderr, sep="\n", file=sys.stderr, flush=True)
+                    raise
                 if result.returncode:
                     print(result.stdout, result.stderr, sep="\n", file=sys.stderr, flush=True)
                     result.check_returncode()
