@@ -70,9 +70,14 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
             if let update = try reducer.fold(message: message) {
                 store.apply(update)
                 store.apply(update)
+                let snapshot = reducer.snapshot()
+                #expect(store.items == snapshot.items, "\(vector.name)")
+                #expect(store.streaming == snapshot.streaming, "\(vector.name)")
+                #expect(store.turn == snapshot.turn, "\(vector.name)")
+                #expect(store.rev == snapshot.rev && store.seq == snapshot.seq, "\(vector.name)")
             }
-            expectInStep(store, reducer, vector.name)
         }
+        expectInStep(store, reducer, vector.name)
         #expect(store.resyncs == 0)
     }
 }
