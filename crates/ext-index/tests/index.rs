@@ -43,7 +43,7 @@ impl Tree {
 }
 
 fn search(index: &WorkspaceIndex, query: &str) -> Vec<String> {
-    let found = rt::block_on(index.search(query.to_owned(), 50));
+    let found = rt::block_on(index.search(query.to_owned(), 50)).unwrap();
     found.files.into_iter().map(|f| f.path).collect()
 }
 
@@ -310,4 +310,48 @@ fn a_flood_of_changes_in_an_ignored_tree_keeps_the_index_current() {
         "{:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn a_home_or_a_volume_root_is_refused_without_a_walk() {
+    let home = std::env::home_dir().unwrap().canonicalize().unwrap();
+    let temp = std::env::temp_dir().canonicalize().unwrap();
+    let volume = temp.ancestors().last().unwrap().to_owned();
+    let indexes = Indexes::new(Limits::default());
+    for root in [home, volume] {
+        let index = indexes.open(&root, runtime());
+        let began = Instant::now();
+        let refused = rt::block_on(index.search("a".to_owned(), 10)).unwrap_err();
+        assert!(refused.contains("never indexed"), "{refused}");
+        assert!(rt::block_on(index.glob("*".to_owned(), 10)).is_err());
+        let query = GrepQuery {
+            pattern: Pattern::Typed("needle".to_owned()),
+            options: GrepOptions::default(),
+            limit: 10,
+        };
+        assert!(rt::block_on(index.grep(query, &Cancel::default(), |_| {})).is_err());
+        // A walk of either would take far longer than asking what it is.
+        assert!(began.elapsed() < Duration::from_secs(2), "{root:?}");
+    }
+}
+
+#[test]
+fn a_placeholder_is_listed_but_its_content_never_read() {
+    let tree = Tree::new();
+    tree.write("local.txt", "needle");
+    tree.write("cloud.txt", "needle");
+    if !sys::fs::mark_placeholder(&tree.root().join("cloud.txt")).unwrap() {
+        // No program may make one here (macOS, Linux): `sys` tests the
+        // classification.
+        return;
+    }
+    let indexes = Indexes::new(Limits::default());
+    let index = indexes.open(tree.root(), runtime());
+    let listed = rt::block_on(index.glob("*.txt".to_owned(), 10)).unwrap();
+    let mut listed: Vec<_> = listed.files.into_iter().map(|f| f.path).collect();
+    listed.sort();
+    assert_eq!(listed, ["cloud.txt", "local.txt"]);
+    // Once as the content index is built, once through it.
+    assert_eq!(grep(&index, "needle").0, ["local.txt"]);
+    assert_eq!(grep(&index, "needle").0, ["local.txt"]);
 }

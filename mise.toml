@@ -93,8 +93,9 @@ extra=()
 if [[ $(uname -s) == Darwin ]]; then
   extra=(--skip a_record_reads_back_and_knows_its_process --skip the_reaper_writes_its_record_from_the_start --skip the_boot_id_is_the_kernels_and_stable)
 fi
+# A tree's filesystem is asked with statfs, a raw syscall to Miri.
 MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p sys --lib -- \
-  --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version \
+  --skip fs::tree:: --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version \
   --skip tests::a_group_leader --skip tests::kills --skip fs::tests --skip awake::tests \
   --skip panic_content_cannot_enter_a_bounded_report --skip an_exit_watch_turns_readable \
   --skip signals:: --skip endpoint::tests --skip fs::publication_tests \
