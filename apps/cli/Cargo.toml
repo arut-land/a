@@ -18,6 +18,7 @@ ext-fixtures.workspace = true
 ext-mcp = { workspace = true, optional = true }
 ext-fork = { workspace = true, optional = true }
 ext-index = { workspace = true, optional = true }
+ext-search = { workspace = true, optional = true }
 ext-lua = { workspace = true, optional = true }
 ext-policy = { workspace = true, optional = true }
 ext-prompt = { workspace = true, optional = true }
@@ -36,7 +37,7 @@ usage-rs.workspace = true
 web = { workspace = true, optional = true }
 
 [features]
-default = ["mcp", "fork", "web", "policy", "prompt", "shell", "edit", "compact", "retry", "settings", "spill", "subagent", "title", "skills", "index"]
+default = ["mcp", "fork", "web", "policy", "prompt", "shell", "edit", "compact", "retry", "settings", "spill", "subagent", "title", "skills", "index", "search"]
 # User mods; opt-in until quiet-machine startup has been verified.
 lua = ["dep:ext-lua"]
 fork = ["dep:ext-fork"]
@@ -66,9 +67,10 @@ skills = ["dep:ext-skills"]
 title = ["dep:ext-title"]
 # `task`, which runs a piece of work in a child session.
 subagent = ["dep:ext-subagent"]
-# One file index per workspace: `files.search` and `files.grep` for
-# clients, `glob` and `grep` for the model.
+# One file index per workspace: `files.search` and `files.grep` for clients.
 index = ["dep:ext-index"]
+# `glob` and `grep` for the model, over the index.
+search = ["index", "dep:ext-search"]
 # The `echo` agent and `sleep` tool; the tests build them in, as the
 # dev-dependency below turns them on.
 fixtures = ["ext-fixtures/on"]

@@ -137,13 +137,18 @@ impl Files {
 
     /// Slots of the live files under `dir` (a relative path, no trailing
     /// `/`): what a removed directory takes with it.
+    /// The walked files are sorted, so theirs are one range, found by
+    /// bisection: `dir/…` sorts from `dir/` to before `dir0`, `0` being
+    /// the byte after `/`. Only the few created since are scanned.
     pub(crate) fn under(&self, dir: &str) -> Vec<usize> {
-        let within = |path: &str| {
-            path.strip_prefix(dir)
-                .is_some_and(|rest| rest.starts_with('/'))
-        };
-        (0..self.items.len())
-            .filter(|&i| !self.items[i].deleted && within(self.path(&self.items[i])))
+        let walked = &self.items[..self.walked];
+        let (from, to) = (format!("{dir}/"), format!("{dir}0"));
+        let start = walked.partition_point(|f| self.path(f) < from.as_str());
+        let end = walked.partition_point(|f| self.path(f) < to.as_str());
+        let within = |path: &str| path.starts_with(from.as_str());
+        (start..end)
+            .chain((self.walked..self.items.len()).filter(|&i| within(self.path(&self.items[i]))))
+            .filter(|&i| !self.items[i].deleted)
             .collect()
     }
 
@@ -174,6 +179,30 @@ pub(crate) fn recent_first(files: &Files, a: &FileItem, b: &FileItem) -> Orderin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flood_of_changes_under_one_directory_never_scans_every_file() {
+        let mut files = Files::walked(
+            (0..100_000)
+                .map(|i| found(&format!("src/m{}/f{i}.rs", i % 100)))
+                .collect(),
+        );
+        files.upsert(&found("target/new.rs"));
+        let started = std::time::Instant::now();
+        for i in 0..5000 {
+            assert_eq!(files.remove(&format!("target/debug/{i}.o")), None);
+            assert_eq!(files.under(&format!("target/debug/{i}")), [0_usize; 0]);
+        }
+        // A scan of every file per change takes seconds here.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(files.under("target"), [100_000]);
+        assert_eq!(files.under("src/m7").len(), 1000);
+        assert_eq!(files.under("src/m").len(), 0);
+    }
 
     fn found(path: &str) -> Found {
         Found {

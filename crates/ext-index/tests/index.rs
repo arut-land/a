@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use ext::Cancel;
@@ -48,15 +48,14 @@ fn search(index: &WorkspaceIndex, query: &str) -> Vec<String> {
 }
 
 fn grep_with(index: &WorkspaceIndex, query: &str, cancel: &Cancel) -> (Vec<Grepped>, GrepSummary) {
-    let found = Mutex::new(Vec::new());
+    let mut found = Vec::new();
     let query = GrepQuery {
         pattern: Pattern::Typed(query.to_owned()),
         options: GrepOptions::default(),
         limit: usize::MAX,
     };
-    let summary =
-        rt::block_on(index.grep(query, cancel, |g| found.lock().unwrap().push(g))).unwrap();
-    (found.into_inner().unwrap(), summary)
+    let summary = rt::block_on(index.grep(query, cancel, |g| found.push(g))).unwrap();
+    (found, summary)
 }
 
 fn grep(index: &WorkspaceIndex, query: &str) -> (Vec<String>, GrepSummary) {
@@ -254,4 +253,61 @@ fn an_open_index_nothing_changes_or_asks_never_wakes() {
     }
     assert!(seen.iter().all(|w| *w == 0), "{seen:?}");
     drop(index);
+}
+
+#[test]
+fn a_rescan_during_the_first_content_build_never_installs_a_stale_index() {
+    let tree = Tree::new();
+    // Many files, so the build is still running as the rules change; the
+    // first ones sort before the rest and their removal moves every slot.
+    for i in 0..3000 {
+        tree.write(&format!("aaa/{i}.txt"), "filler\n");
+    }
+    for i in 0..3000 {
+        let text = if i % 10 == 0 { "needle\n" } else { "filler\n" };
+        tree.write(&format!("zzz/{i}.txt"), text);
+    }
+    let indexes = Indexes::new(Limits::default());
+    let index = indexes.open(tree.root(), runtime());
+    let expected: Vec<String> = (0..3000)
+        .filter(|i| i % 10 == 0)
+        .map(|i| format!("zzz/{i}.txt"))
+        .collect();
+    let mut expected = expected;
+    expected.sort();
+    std::thread::scope(|s| {
+        s.spawn(|| grep(&index, "needle"));
+        std::thread::sleep(Duration::from_millis(5));
+        tree.write(".gitignore", "aaa/\n");
+    });
+    eventually("the ignored tree is gone", || {
+        !search(&index, "").iter().any(|p| p.starts_with("aaa/"))
+    });
+    eventually("the content index matches the files", || {
+        grep(&index, "needle").0 == expected
+    });
+}
+
+#[test]
+fn a_flood_of_changes_in_an_ignored_tree_keeps_the_index_current() {
+    let tree = Tree::new();
+    tree.write(".gitignore", "build/\n");
+    tree.write("src/a.rs", "");
+    let indexes = Indexes::new(Limits::default());
+    let index = indexes.open(tree.root(), runtime());
+    assert_eq!(search(&index, "a.rs")[0], "src/a.rs");
+    let started = Instant::now();
+    for i in 0..3000 {
+        tree.write(&format!("build/out/{i}.o"), "x");
+    }
+    tree.write("src/fresh.rs", "");
+    eventually("the kept file is found behind the flood", || {
+        search(&index, "fresh").contains(&"src/fresh.rs".to_owned())
+    });
+    assert!(!search(&index, "").iter().any(|p| p.starts_with("build/")));
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
 }

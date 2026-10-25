@@ -1516,15 +1516,15 @@ fn windows_information(
     Ok(information)
 }
 
+/// The volume and file id of `file`: what names it whatever its path.
 #[cfg(windows)]
-fn signature(file: &File) -> io::Result<Signature> {
+pub(super) fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_BASIC_INFO, FILE_ID_INFO, FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx,
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
     };
     let mut identity = FILE_ID_INFO::default();
-    let mut basic = FILE_BASIC_INFO::default();
-    // SAFETY: both output buffers have their advertised type and size; file owns the handle.
+    // SAFETY: the output buffer has its advertised type and size; file owns the handle.
     unsafe {
         crate::windows::ok(GetFileInformationByHandleEx(
             file.as_raw_handle(),
@@ -1532,6 +1532,20 @@ fn signature(file: &File) -> io::Result<Signature> {
             (&raw mut identity).cast(),
             u32::try_from(size_of::<FILE_ID_INFO>()).expect("fixed structure size"),
         ))?;
+    }
+    Ok((identity.VolumeSerialNumber, identity.FileId.Identifier))
+}
+
+#[cfg(windows)]
+fn signature(file: &File) -> io::Result<Signature> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+    };
+    let (volume, identity) = file_id(file)?;
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: the output buffer has its advertised type and size; file owns the handle.
+    unsafe {
         crate::windows::ok(GetFileInformationByHandleEx(
             file.as_raw_handle(),
             FileBasicInfo,
@@ -1540,8 +1554,8 @@ fn signature(file: &File) -> io::Result<Signature> {
         ))?;
     }
     Ok(Signature {
-        volume: identity.VolumeSerialNumber,
-        identity: identity.FileId.Identifier,
+        volume,
+        identity,
         size: file.metadata()?.len(),
         modified: basic.LastWriteTime,
         changed: basic.ChangeTime,

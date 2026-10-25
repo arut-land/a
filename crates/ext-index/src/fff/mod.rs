@@ -3,7 +3,8 @@
 //! as `llm` owns its copy of rig: the fuzzy scorer, the bigram content
 //! prefilter, query constraints, grep over byte slices and the query
 //! parser. `searcher` is FFF's simplification of ripgrep's
-//! `grep-searcher` (MIT or Unlicense, Andrew Gallant).
+//! `grep-searcher` (Andrew Gallant), taken under the Unlicense, one of
+//! the two licenses it is offered under (the other MIT).
 //!
 //! What FFF ran itself is left out: its threads and pools, watcher,
 //! databases, git status and memory maps. Paths live in one contiguous

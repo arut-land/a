@@ -20,6 +20,7 @@ dependencies = [
  "ext-policy",
  "ext-prompt",
  "ext-retry",
+ "ext-search",
  "ext-settings",
  "ext-shell",
  "ext-skills",
@@ -710,7 +711,6 @@ dependencies = [
  "ext",
  "globset",
  "ignore",
- "llm",
  "memchr",
  "neo_frizbee",
  "regex",
@@ -806,6 +806,16 @@ version = "0.0.0"
 dependencies = [
  "ext",
  "llm",
+]
+
+[[package]]
+name = "ext-search"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "ext-index",
+ "llm",
+ "serde",
 ]
 
 [[package]]

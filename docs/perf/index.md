@@ -49,6 +49,8 @@ Fuzzy search, warm, top 20 (ms):
 | `zstddecomp` | 0.9 | 2.3 | 1.5 |
 
 The port's ranking is FFF's: the same first result for every query
+(ties go to the more recently modified file, so a fresh clone, every file
+the same age, can break a tie differently)
 (`Kconfig` for `kconfig`, `lib/zstd/zstd_decompress_module.c` for
 `zstddecomp`). nucleo matches far fewer files (no typo tolerance: 2,953
 for `main.c` against 56,467) and ranks differently.
@@ -85,8 +87,10 @@ time grep and ranking use.
 
 - **Walk**: one `ignore` walker thread took 560 ms, one blocking job per
   top-level directory 380 ms (`drivers/` dominates), `ignore`'s parallel
-  walker 165–200 ms. Its threads are scoped to the walk, inside one
-  blocking job; no pool outlives it.
+  walker 165–200 ms with eight threads, 180 ms with four (the daemon's
+  storage lane on this machine, which is what it now takes: the CPUs the
+  process may use, halved, at most four). Its threads are scoped to the
+  walk, inside one blocking job; no pool outlives it.
 - **Content build**: jobs awaited in order ran one at a time (14 s): a
   blocking job is admitted when its future is first polled. Spawned, so
   four run at once: 2.0–2.3 s.

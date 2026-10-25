@@ -62,6 +62,9 @@ fn linked(config: &Config) -> Result<Registry, Refused> {
     let built = built.with(Tier::Pre, &configured::<ext_mcp::Mcp>(config)?)?;
     #[cfg(feature = "index")]
     let built = built.with(Tier::Pre, &configured::<ext_index::Index>(config)?)?;
+    // Needs the index: without it, this does not compile.
+    #[cfg(feature = "search")]
+    let built = built.with(Tier::Pre, &configured::<ext_search::Search>(config)?)?;
     #[cfg(feature = "compact")]
     let built = built.with(Tier::Pre, &configured::<ext_compact::Compact>(config)?)?;
     #[cfg(feature = "skills")]
@@ -223,9 +226,9 @@ mod tests {
             [
                 "bash",
                 "edit",
-                #[cfg(feature = "index")]
+                #[cfg(feature = "search")]
                 "glob",
-                #[cfg(feature = "index")]
+                #[cfg(feature = "search")]
                 "grep",
                 "skill",
                 "task",
@@ -251,6 +254,8 @@ mod tests {
                 ("mcp", 1),
                 #[cfg(feature = "index")]
                 ("index", 1),
+                #[cfg(feature = "search")]
+                ("search", 1),
                 ("compact", 1),
                 ("skills", 1),
                 ("settings", 1),
@@ -306,8 +311,10 @@ mod tests {
             ("settings", &[], 0),
             ("skills", &["skill"], 0),
             ("subagent", &["task", "fork_task", "background_task"], 1),
-            #[cfg(feature = "index")]
-            ("index", &["glob", "grep"], 0),
+            #[cfg(feature = "search")]
+            ("search", &["glob", "grep"], 0),
+            #[cfg(feature = "search")]
+            ("index", &[], 0),
         ];
         for &(name, tools_of, texts_of) in own {
             let without = Config {
@@ -322,6 +329,14 @@ mod tests {
                 // The operator's floor is guarded: nothing of the user's
                 // takes it away.
                 assert!(rest.err().unwrap().0.contains("guarded"));
+                continue;
+            }
+            #[cfg(feature = "search")]
+            if name == "index" {
+                // The tools search the index's indexes: without it, they
+                // are refused, not left without one.
+                let refused = rest.err().unwrap();
+                assert!(refused.0.contains("search needs"), "{refused}");
                 continue;
             }
             if name == "shell" {
@@ -485,12 +500,15 @@ mod tests {
         for kind in KINDS {
             assert!(listed(kind));
             // Each extension alone: the others disabled, but the guarded
-            // floor and the shell `edit` needs, which answer no failure.
+            // floor, the shell `edit` needs and the index `search` needs,
+            // which answer no failure.
             let owners: Vec<String> = names
                 .iter()
                 .filter_map(|name| {
                     let others = (names.iter())
-                        .filter(|n| *n != name && *n != "policy-floor" && *n != "shell")
+                        .filter(|n| {
+                            *n != name && !["policy-floor", "shell", "index"].contains(&n.as_str())
+                        })
                         .cloned()
                         .collect();
                     let alone = Config {

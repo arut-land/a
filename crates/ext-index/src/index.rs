@@ -25,7 +25,7 @@ use crate::fff::index::{
 };
 use crate::fff::query::{Constraint, FFFQuery, FuzzyQuery, QueryParser};
 use crate::fff::types::{Files, Found, recent_first};
-use crate::fff::walk::{Rules, is_git_path};
+use crate::fff::walk::{Rules, is_git_path, relative};
 use crate::fff::{MAX_FILE_SIZE, MAX_INDEXABLE_FILE_SIZE, score};
 
 /// What a workspace's index may use, and how long it outlives its last
@@ -67,7 +67,7 @@ impl Indexes {
     /// open, and kept open for [`Limits::linger`] from now.
     pub fn open(&self, root: &Path, rt: Rt) -> Arc<WorkspaceIndex> {
         let index = self.open.get_or_make(root, |own| WorkspaceIndex {
-            rules: Arc::new(Rules::of(root)),
+            root: Arc::from(root),
             rt,
             limits: self.limits,
             state: Mutex::default(),
@@ -82,7 +82,7 @@ impl Indexes {
 
 /// A workspace's files and, once a grep asked for it, its content index.
 pub struct WorkspaceIndex {
-    rules: Arc<Rules>,
+    root: Arc<Path>,
     rt: Rt,
     limits: Limits,
     state: Mutex<State>,
@@ -102,6 +102,8 @@ impl Drop for WorkspaceIndex {
 #[derive(Default)]
 struct State {
     files: Option<Arc<Files>>,
+    /// How the last walk walked: what changes are looked at by.
+    rules: Option<Arc<Rules>>,
     /// Counts the walks installed: what a content index was built from.
     epoch: u64,
     busy: Busy,
@@ -110,8 +112,9 @@ struct State {
     watcher: Option<rt::Watcher>,
     last_used: Option<Instant>,
     keeper: bool,
-    /// The root was missing when last looked at.
-    root_missing: bool,
+    /// What the root was when the last walk began, `None` if missing: a
+    /// root replaced at its path is another, and is walked again.
+    root_identity: Option<sys::fs::FileIdentity>,
 }
 
 /// What changes the file list now: at most one thing at a time.
@@ -128,8 +131,12 @@ enum Busy {
 enum Content {
     #[default]
     Absent,
-    /// Slots that changed while it was built, to be read again after.
-    Building(Vec<String>),
+    /// Being built from the files of walk `epoch`; `touched`, the paths
+    /// that changed meanwhile, to be read again into it after.
+    Building {
+        epoch: u64,
+        touched: Vec<String>,
+    },
     Ready(Arc<ContentIndex>),
     /// Over [`Limits::memory`]: grep reads every file.
     Refused,
@@ -142,12 +149,6 @@ pub(crate) struct ContentIndex {
     overlay: BigramOverlay,
     /// One bit per walked file: binary, never searched.
     binary: Arc<Vec<u64>>,
-}
-
-impl ContentIndex {
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.filter.heap_bytes() + self.binary.len() * 8
-    }
 }
 
 #[derive(Default)]
@@ -287,17 +288,19 @@ impl WorkspaceIndex {
         };
         self.state().watcher = watcher;
         let weak = Weak::clone(&self.own);
-        let (rt, rules, closed) = (
+        let (rt, root, closed) = (
             Arc::clone(&self.rt),
-            Arc::clone(&self.rules),
+            Arc::clone(&self.root),
             Arc::clone(&self.closed),
         );
         self.rt.spawn(Box::pin(async move {
-            let files = walk(&rt, rules, closed).await;
+            let (rules, files, identity) = walk(&rt, root, closed).await;
             let Some(index) = weak.upgrade() else { return };
             {
                 let mut state = index.state();
                 state.files = Some(Arc::new(files));
+                state.rules = Some(rules);
+                state.root_identity = identity;
                 state.epoch += 1;
                 state.busy = Busy::Idle;
                 // Its bit positions were the old walk's.
@@ -318,7 +321,7 @@ impl WorkspaceIndex {
         let inbox: Arc<Mutex<(Vec<WatchEvent>, bool)>> = Arc::default();
         rt::Watcher::new(
             Arc::new(move |task| spawn_rt.spawn(task)),
-            [self.rules.root()],
+            [&*self.root],
             move |event| {
                 let mut queued = inbox.lock().unwrap_or_else(PoisonError::into_inner);
                 queued.0.push(event);
@@ -348,17 +351,15 @@ impl WorkspaceIndex {
             match event {
                 WatchEvent::Changed(paths) | WatchEvent::RescanPaths(paths) => {
                     for path in paths {
-                        if self.rules.root().starts_with(&path) {
+                        if self.root.starts_with(&path) {
                             // The root or a directory above it: the root
-                            // may be gone, or back after it was.
-                            let missing = !self.rules.root().is_dir();
-                            if missing != state.root_missing {
-                                state.root_missing = missing;
+                            // may be gone, back, or replaced by another.
+                            if sys::fs::identity(&self.root).ok() != state.root_identity {
                                 state.pending.rescan = true;
                             }
                             continue;
                         }
-                        let Some(relative) = self.rules.relative(&path) else {
+                        let Some(relative) = relative(&self.root, &path) else {
                             continue;
                         };
                         if changes_ignore_rules(&relative) {
@@ -393,11 +394,13 @@ impl WorkspaceIndex {
         if state.pending.paths.is_empty() {
             return;
         }
+        let Some(rules) = state.rules.clone() else {
+            return;
+        };
         let paths = std::mem::take(&mut state.pending.paths);
-        let read = matches!(state.content, Content::Ready(_) | Content::Building(_));
+        let read = matches!(state.content, Content::Ready(_) | Content::Building { .. });
         state.busy = Busy::Applying;
         drop(state);
-        let rules = Arc::clone(&self.rules);
         let seen = rt::unblock_with(&*self.rt, BlockingClass::Storage, 0, move || {
             look(&rules, &paths, read)
         });
@@ -424,7 +427,7 @@ impl WorkspaceIndex {
         let walked = files.walked_count();
         let mut ready = match content {
             Content::Ready(ready) => Some(Arc::make_mut(ready)),
-            Content::Building(touched) => {
+            Content::Building { touched, .. } => {
                 touched.extend(changes.iter().flat_map(Change::paths));
                 None
             }
@@ -477,73 +480,77 @@ impl WorkspaceIndex {
                 ready.overlay.delete_file(slot);
             }
         }
-        let root = self.rules.root();
+        let root = &self.root;
         pending
             .paths
             .extend(unread.into_iter().map(|path| root.join(path)));
     }
 
-    /// The content index, built now if no grep has asked for it since the
-    /// walk, or `None` when it would take more than the workspace may use.
-    async fn content(&self, files: &Arc<Files>) -> Option<Arc<ContentIndex>> {
+    /// The files and their content index, built now if no grep has asked
+    /// for it since the walk; no index when it would take more than the
+    /// workspace may use. Both are taken under one lock: the index's bits
+    /// are positions in these files.
+    async fn content(&self) -> (Arc<Files>, Option<Arc<ContentIndex>>) {
+        self.files().await;
         loop {
-            let build = {
+            let (files, build) = {
                 let mut state = self.state();
+                let files = Arc::clone(state.files.as_ref().expect("walked once"));
                 match &state.content {
-                    Content::Ready(content) => return Some(Arc::clone(content)),
-                    Content::Refused => return None,
-                    Content::Building(_) => None,
+                    Content::Ready(content) => return (files, Some(Arc::clone(content))),
+                    Content::Refused => return (files, None),
+                    Content::Building { .. } => (files, None),
                     Content::Absent => {
-                        let estimate = build_bytes(files.walked_count()) + files.heap_bytes();
+                        // The whole of both builders, and the chunk builders
+                        // in flight beside them.
+                        let estimate = build_bytes(files.walked_count())
+                            + WINDOW * build_bytes(BUILD_CHUNK)
+                            + files.heap_bytes();
                         if estimate > self.limits.memory {
                             state.content = Content::Refused;
-                            return None;
+                            return (files, None);
                         }
-                        state.content = Content::Building(Vec::new());
-                        Some(state.epoch)
+                        let epoch = state.epoch;
+                        state.content = Content::Building {
+                            epoch,
+                            touched: Vec::new(),
+                        };
+                        (files, Some(epoch))
                     }
                 }
             };
             if let Some(epoch) = build {
-                self.build(Arc::clone(files), epoch);
+                self.build(Arc::clone(&files), epoch);
             }
             self.changed
-                .until(|| !matches!(self.state().content, Content::Building(_)))
+                .until(|| !matches!(self.state().content, Content::Building { .. }))
                 .await;
         }
     }
 
     fn build(&self, files: Arc<Files>, epoch: u64) {
         let rt = Arc::clone(&self.rt);
-        let root = self.rules.root().to_owned();
+        let root = Arc::clone(&self.root);
         let closed = Arc::clone(&self.closed);
-        let memory = self.limits.memory;
         let weak = Weak::clone(&self.own);
         self.rt.spawn(Box::pin(async move {
-            let built = build(&rt, root, Arc::clone(&files), closed).await;
+            let built = build(&rt, &root, files, closed).await;
             let Some(index) = weak.upgrade() else { return };
             let touched = {
                 let mut state = index.state();
-                if state.epoch == epoch {
-                    let touched = match std::mem::take(&mut state.content) {
-                        Content::Building(touched) => touched,
-                        _ => Vec::new(),
-                    };
-                    state.content = match built {
-                        Some(content) if content.heap_bytes() + files.heap_bytes() <= memory => {
-                            Content::Ready(Arc::new(content))
-                        }
-                        _ => Content::Refused,
-                    };
-                    touched
-                } else {
-                    state.content = Content::Absent;
-                    Vec::new()
+                // A walk since installed other files, and set the content
+                // index aside for one built from them.
+                if !matches!(state.content, Content::Building { epoch: e, .. } if e == epoch) {
+                    return;
                 }
+                let Content::Building { touched, .. } = std::mem::take(&mut state.content) else {
+                    unreachable!("matched above");
+                };
+                state.content = built.map_or(Content::Refused, |c| Content::Ready(Arc::new(c)));
+                touched
             };
             index.changed.notify();
             // What changed while it was built is read again into it.
-            let root = index.rules.root().to_owned();
             index
                 .state()
                 .pending
@@ -660,30 +667,29 @@ impl WorkspaceIndex {
         &self,
         query: GrepQuery,
         cancel: &Cancel,
-        found: impl Fn(Grepped) + Send + Sync,
+        mut found: impl FnMut(Grepped) + Send,
     ) -> Result<GrepSummary, String> {
-        let files = self.files().await;
         let parsed = query.parse();
         let Some(grep) = Grep::new(&parsed, query.options) else {
             return Ok(GrepSummary::default());
         };
-        let content = self.content(&files).await;
-        let run = Run {
+        let (files, content) = self.content().await;
+        let mut run = Run {
             files: &files,
             content: content.as_deref(),
             limit: query.limit,
             cancel,
-            found: &found,
+            found: &mut found,
         };
         let grep = Arc::new(grep);
-        let mut summary = self.grep_files(&run, &parsed, &grep).await;
+        let mut summary = self.grep_files(&mut run, &parsed, &grep).await;
         // Constraint parsing can swallow tokens meant literally (`!=` as an
         // exclusion): a constrained search that found nothing is retried as
         // the whole raw text, keeping only a file path it named.
         if summary.matches == 0 && !summary.truncated && !parsed.constraints.is_empty() {
             let literal = parsed.literal();
             if let Some(retry) = Grep::new(&literal, query.options) {
-                summary = self.grep_files(&run, &literal, &Arc::new(retry)).await;
+                summary = self.grep_files(&mut run, &literal, &Arc::new(retry)).await;
             }
         }
         summary.regex_error = grep.regex_error().map(str::to_owned);
@@ -692,17 +698,11 @@ impl WorkspaceIndex {
 
     async fn grep_files(
         &self,
-        run: &Run<'_, impl Fn(Grepped) + Send + Sync>,
+        run: &mut Run<'_, impl FnMut(Grepped) + Send>,
         parsed: &FFFQuery<'_>,
         grep: &Arc<Grep>,
     ) -> GrepSummary {
-        let Run {
-            files,
-            content,
-            limit,
-            cancel,
-            found,
-        } = *run;
+        let (files, content, limit, cancel) = (run.files, run.content, run.limit, run.cancel);
         let candidates = content.and_then(|content| {
             let (filter, overlay) = (Some(&*content.filter), Some(&content.overlay));
             match grep.prefilter() {
@@ -729,7 +729,7 @@ impl WorkspaceIndex {
                 && let Some(chunk) = chunks.next()
             {
                 let (files, grep, stop) = (Arc::clone(files), Arc::clone(grep), Arc::clone(&stop));
-                let root = self.rules.root().to_owned();
+                let root = Arc::clone(&self.root);
                 // Spawned, so it is admitted now rather than when awaited.
                 let job = rt::unblock_with(
                     &*self.rt,
@@ -751,7 +751,7 @@ impl WorkspaceIndex {
             for grepped in chunk {
                 summary.matched_files += 1;
                 summary.matches += grepped.matches.len();
-                found(grepped);
+                (run.found)(grepped);
                 if summary.matches >= limit {
                     summary.truncated = true;
                     return summary;
@@ -768,7 +768,7 @@ struct Run<'a, F> {
     content: Option<&'a ContentIndex>,
     limit: usize,
     cancel: &'a Cancel,
-    found: &'a F,
+    found: &'a mut F,
 }
 
 /// What a grep is asked.
@@ -846,10 +846,18 @@ fn grep_chunk(
     (searched, found)
 }
 
-/// Every file under the root, from one blocking job.
-async fn walk(rt: &Rt, rules: Arc<Rules>, closed: Arc<AtomicBool>) -> Files {
+/// Every file under the root, from one blocking job, with the rules it
+/// was walked by and what the root was as it began.
+async fn walk(
+    rt: &Rt,
+    root: Arc<Path>,
+    closed: Arc<AtomicBool>,
+) -> (Arc<Rules>, Files, Option<sys::fs::FileIdentity>) {
     rt::unblock_with(&**rt, BlockingClass::Storage, 0, move || {
-        Files::walked(rules.walk(&|| closed.load(Ordering::Acquire)))
+        let identity = sys::fs::identity(&root).ok();
+        let rules = Rules::of(&root);
+        let files = Files::walked(rules.walk(&|| closed.load(Ordering::Acquire)));
+        (Arc::new(rules), files, identity)
     })
     .await
 }
@@ -858,7 +866,7 @@ async fn walk(rt: &Rt, rules: Arc<Rules>, closed: Arc<AtomicBool>) -> Files {
 /// time on the blocking pool, `None` if the index went first.
 async fn build(
     rt: &Rt,
-    root: PathBuf,
+    root: &Arc<Path>,
     files: Arc<Files>,
     closed: Arc<AtomicBool>,
 ) -> Option<ContentIndex> {
@@ -872,7 +880,7 @@ async fn build(
         while running.len() < WINDOW
             && let Some(first) = firsts.next()
         {
-            let (root, files, closed) = (root.clone(), Arc::clone(&files), Arc::clone(&closed));
+            let (root, files, closed) = (Arc::clone(root), Arc::clone(&files), Arc::clone(&closed));
             let job = rt::unblock_with(
                 &**rt,
                 BlockingClass::Storage,

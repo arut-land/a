@@ -9,8 +9,13 @@ shared by every client and session working there, and answers from it:
 | --- | --- | --- |
 | `files.search` | workspace query, at once | The best files for what is typed: an @-mention completing |
 | `files.grep` | workspace query, streamed | The lines that match, one update per file, then a summary |
-| `glob` | model tool | The files a glob matches, most recently modified first |
-| `grep` | model tool | The lines that match, as ripgrep prints them |
+| `glob` | model tool (`search`) | The files a glob matches, most recently modified first |
+| `grep` | model tool (`search`) | The lines that match, as ripgrep prints them |
+
+The tools are a second extension, `search` (`crates/ext-search`, the
+`search` feature, on by default), over the indexes `index` provides: it
+is dropped with `[ext] disable = ["search"]` and keeps the index and its
+queries; without `index` it is refused.
 
 A query about a session answers about the session's workspace; a client
 can ask about a workspace no session has started in, as an @-mention
@@ -46,7 +51,9 @@ matches.
 
 ## What is indexed
 
-The files a ripgrep walk of the workspace finds: inside git, what
+The files a ripgrep walk of the workspace finds: inside a git working
+tree (as `sys` finds one: `.git` files, `GIT_DIR`, `GIT_WORK_TREE`,
+ceilings), what
 `.gitignore`, `.ignore`, `.git/info/exclude` and the global excludes leave,
 hidden files included, `.git` itself excluded; outside git, hidden files
 and the usual tool and cache trees (`node_modules`, `target/debug`,
@@ -58,12 +65,21 @@ are not UTF-8 are left out.
 The first query or call about a workspace opens its index: the walk runs
 on the runtime's blocking pool (ripgrep's parallel walker, its threads
 scoped to the walk), with the native watcher armed first so nothing that
-changes during it is missed. Changes are applied as they arrive: a changed
-file is looked at again, a changed directory walked again, a removed one
-dropped; a change to an ignore file, a watcher overflow or rescan, or the
-root going away, walks the whole root again. The watcher's callback only
+changes during it is missed. The walk's threads are as many as the
+daemon's storage lane has workers. Changes are applied as they arrive: a
+changed file is looked at again, a changed directory walked again, a
+removed one dropped, all by bisection of the sorted file list. A change
+to an ignore file or a watcher overflow or rescan walks the whole root
+again, and so does a change to the root or a directory above it once the
+root is not what it was (`sys::fs::identity`: device and inode, or volume
+and file id): gone, back, or replaced at its path by another. The watcher's callback only
 queues events for a task on the runtime: rearming or dropping the watcher
 from its own thread would wait on that thread.
+
+On Linux the native watcher watches every directory under the root,
+ignored ones (`target/`, `node_modules`) included, one inotify watch each;
+watching only the directories the walk enters belongs to the daemon-wide
+watcher being designed separately, not to this extension.
 
 The index stays open for five minutes after its last use, held by one
 sleeping task, then closes with its watcher. A daemon nobody searches
@@ -79,11 +95,12 @@ regex or fuzzy), plus those created since; a file edited since has its
 bigrams kept beside the index. The build reads files in chunks of 4096 on
 the blocking pool, each chunk its own builder merged by bit position.
 
-`[ext.index] memory_mib` (default 128) bounds what one workspace's file
-list and content index may take. A content index whose builders could take
-more is not built, and one that turned out larger is dropped: grep then
-reads every file. About 100k files fit in the default
-([perf/index.md](perf/index.md)).
+`[ext.index] memory_mib` (default 128) bounds the content index of one
+workspace: one is built only if its builders could not take more, the
+whole of both and the chunk builders in flight beside them, counted with
+the file list. Above that, grep reads every file. About 100k files fit in
+the default ([perf/index.md](perf/index.md)). It does not bound the file
+list itself: a walk of a very large root keeps every file it finds.
 
 ## Copied from FFF
 

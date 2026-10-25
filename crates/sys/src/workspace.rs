@@ -59,14 +59,26 @@ pub fn workspace_in(dir: &Path, git: &GitEnv) -> PathBuf {
     search(dir, git, device)
 }
 
+/// The top of the git working tree `dir` is in, as git finds it with the
+/// variables `git` holds, or `None` outside one.
+pub fn work_tree_in(dir: &Path, git: &GitEnv) -> Option<PathBuf> {
+    work_tree(&canonical(dir), git, device)
+}
+
 /// [`workspace_in`], with `device` naming the filesystem a directory is on.
 fn search(dir: &Path, git: &GitEnv, device: impl Fn(&Path) -> Option<u64>) -> PathBuf {
     let dir = canonical(dir);
+    work_tree(&dir, git, device).unwrap_or(dir)
+}
+
+/// [`work_tree_in`] for a canonical `dir`.
+fn work_tree(dir: &Path, git: &GitEnv, device: impl Fn(&Path) -> Option<u64>) -> Option<PathBuf> {
+    let dir = dir.to_path_buf();
     if let Some(top) = &git.work_tree {
-        return canonical(&dir.join(top));
+        return Some(canonical(&dir.join(top)));
     }
     if git.dir.is_some() {
-        return dir;
+        return Some(dir);
     }
     let start = device(&dir);
     for candidate in dir.ancestors() {
@@ -79,10 +91,10 @@ fn search(dir: &Path, git: &GitEnv, device: impl Fn(&Path) -> Option<u64>) -> Pa
             break;
         }
         if is_repository_root(candidate) {
-            return candidate.to_path_buf();
+            return Some(candidate.to_path_buf());
         }
     }
-    dir
+    None
 }
 
 /// Whether `dir` holds a `.git` directory, or a `.git` file pointing at one.

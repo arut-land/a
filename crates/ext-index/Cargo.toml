@@ -6,7 +6,6 @@ publish.workspace = true
 
 [dependencies]
 ext.workspace = true
-llm.workspace = true
 sys.workspace = true
 rt = { workspace = true, features = ["watch"] }
 serde.workspace = true

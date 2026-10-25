@@ -628,19 +628,6 @@ impl BigramFilter {
         self.sparse_offsets.len().saturating_sub(1)
     }
 
-    /// Bytes held by the sparse (gap-encoded) columns.
-    pub fn sparse_bytes(&self) -> usize {
-        self.sparse_data.len() + self.sparse_offsets.len() * size_of::<u32>()
-    }
-
-    /// Total heap bytes used by this index (lookup + dense + sparse + skip).
-    pub fn heap_bytes(&self) -> usize {
-        let lookup_bytes = self.lookup.len() * size_of::<u16>();
-        let dense_bytes = self.dense.capacity() * size_of::<u64>();
-        let skip_bytes = self.skip_index.as_ref().map_or(0, |s| s.heap_bytes());
-        lookup_bytes + self.rare_keys.len() * 8 + dense_bytes + self.sparse_bytes() + skip_bytes
-    }
-
     /// Check whether a bigram key is present in this index.
     #[cfg(test)]
     pub fn has_key(&self, key: u16) -> bool {

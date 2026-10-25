@@ -22,8 +22,10 @@ pub(crate) struct Rules {
 }
 
 impl Rules {
+    /// The rules of `root`: git's when it is in a working tree as git
+    /// finds one (`.git` files, `GIT_DIR`, `GIT_WORK_TREE`, ceilings).
     pub(crate) fn of(root: &Path) -> Self {
-        let git = root.ancestors().any(|dir| dir.join(".git").exists());
+        let git = sys::work_tree_in(root, &sys::GitEnv::from_env()).is_some();
         Self {
             root: root.to_owned(),
             git,
@@ -56,9 +58,11 @@ impl Rules {
     /// Every file under the root, unless `stop` says to give up first.
     /// The walk's threads are its own, scoped to it: ripgrep's parallel
     /// walker, a third of the time a single thread takes on a large tree
-    /// (docs/perf/index.md).
+    /// (docs/perf/index.md). As many as the daemon's storage lane has
+    /// workers, which follows the CPUs the process may use (CPU sets and
+    /// job limits on Windows, affinity and quotas on Linux).
     pub(crate) fn walk(&self, stop: &(dyn Fn() -> bool + Sync)) -> Vec<Found> {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+        let threads = rt::Config::daemon().storage.workers;
         let found = Mutex::new(Vec::new());
         self.builder(&self.root)
             .threads(threads)
@@ -155,15 +159,9 @@ impl Rules {
         })
     }
 
-    /// `path` as the index names it: relative to the root, `/`-separated.
-    /// Paths that are not UTF-8 are left out: a query could not name them.
+    /// `path` as the index names it: see [`relative`].
     pub(crate) fn relative(&self, path: &Path) -> Option<String> {
-        let relative = path.strip_prefix(&self.root).ok()?.to_str()?;
-        Some(if MAIN_SEPARATOR == '/' {
-            relative.to_owned()
-        } else {
-            relative.replace(MAIN_SEPARATOR, "/")
-        })
+        relative(&self.root, path)
     }
 }
 
@@ -173,6 +171,17 @@ impl Drop for Batch<'_> {
     fn drop(&mut self) {
         (self.1.lock().unwrap_or_else(PoisonError::into_inner)).append(&mut self.0);
     }
+}
+
+/// `path` as the index names it: relative to `root`, `/`-separated.
+/// Paths that are not UTF-8 are left out: a query could not name them.
+pub(crate) fn relative(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?.to_str()?;
+    Some(if MAIN_SEPARATOR == '/' {
+        relative.to_owned()
+    } else {
+        relative.replace(MAIN_SEPARATOR, "/")
+    })
 }
 
 /// The repository's own files, which no walk shows.

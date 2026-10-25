@@ -68,7 +68,7 @@ pub use runtime::{Runtime, Staged, VERSION};
 pub use signals::{Signals, reraise};
 #[cfg(windows)]
 pub use windows::CompletionSource;
-pub use workspace::{GitEnv, workspace_in, workspace_of};
+pub use workspace::{GitEnv, work_tree_in, workspace_in, workspace_of};
 
 /// What [`ProcessLease::signal`] send, and [`Signals`]
 /// catches. On Windows, console control events stand for the ones a
