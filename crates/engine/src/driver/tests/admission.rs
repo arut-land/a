@@ -793,13 +793,14 @@ fn submitted_input_is_cancelled_while_its_publication_flush_is_held() {
             },
             remote: false,
             commands: Vec::new(),
+            machine: protocol::MachineId([0; 16]),
         },
     );
     feed(
         &mut client,
         client::EventKind::Msg(DaemonMsg::Attached {
             session: session.id,
-            workspace: session.workspace.clone(),
+            workspace: protocol::HostPath::lossy(&session.workspace),
         }),
     );
     for entry in log_of(&session) {
@@ -1010,7 +1011,11 @@ fn activity_waits_for_the_current_ledgers_flush_on_live_snapshot_and_since_repla
     });
     let (ordered, durable) = positions(&session);
     assert!(ordered > durable);
-    let mut view = SessionView::from_log(session.id, session.workspace.clone(), history);
+    let mut view = SessionView::from_log(
+        session.id,
+        protocol::HostPath::lossy(&session.workspace),
+        history,
+    );
     for msg in messages(&live) {
         assert!(
             !matches!(msg, DaemonMsg::Activity { .. }),

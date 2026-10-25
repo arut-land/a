@@ -209,6 +209,12 @@ impl Paths {
         self.inner.config.join("config.toml")
     }
 
+    /// The machines this home's clients reach by name; see
+    /// [`crate::config::machines`].
+    pub fn machines_file(&self) -> PathBuf {
+        self.inner.config.join("machines.toml")
+    }
+
     /// The operator's permission rules, which only tighten; see
     /// [`crate::config::rules`].
     pub fn policy_file(&self) -> PathBuf {

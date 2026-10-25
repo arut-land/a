@@ -5,7 +5,6 @@
 //! bench -- --ignored --nocapture`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
@@ -100,7 +99,7 @@ fn attach_to_a_logged_session() {
             std::hint::black_box(&out);
         }
     });
-    let fold = || SessionView::from_log(SessionId::new(), PathBuf::from("/w"), &entries);
+    let fold = || SessionView::from_log(SessionId::new(), "/w".into(), &entries);
     measure("fold the view", 10, || {
         std::hint::black_box(fold());
     });

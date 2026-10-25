@@ -51,7 +51,7 @@ impl Record {
     pub fn summary(&self) -> SessionSummary {
         SessionSummary {
             id: self.header.id,
-            workspace: self.header.workspace.clone(),
+            workspace: protocol::HostPath::lossy(&self.header.workspace),
             entries: self.entries,
             clients: 0,
             activity: self.activity,

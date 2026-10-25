@@ -55,10 +55,22 @@ awaited turn, awaiting a `Background`, and polling a `ConversationHandle`.
 The engine implements one service, `ext::Conversations`, over the admitted
 forms the builder lowers to: `ModelTurn` for a turn and `Spawn` for a task.
 Neither has a public constructor, so the typed builder is the only way in.
-`Placement` is matched exhaustively at admission: each daemon stores its
-own sessions, so a conversation placed on another machine will be a root
-there, owned by the parent's address and keyed by its envelope id, rather
-than nested under `children/`. Only `Here` exists today.
+`Placement` is `Here` or `Machine(MachineId)`, and the engine admits only
+`Here`: any other is refused at admission as `SpawnRefusal::Placement`,
+before a child exists. Each daemon stores its own sessions, so the model for
+a conversation placed on another machine is fixed now, before it runs:
+
+- the child is a root session in that machine's daemon's store, owned by
+  the parent's `protocol::Address` (machine and session), never nested
+  under `children/` here, and its id is that daemon's to make;
+- the parent records the spawn as a durable intent and then its outcome,
+  keyed by the call's `EnvelopeId`, as for any external call that is
+  unsafe to replay: recovery settles an intent without an outcome as
+  interrupted rather than spawn twice, and the remote daemon admits a
+  repeated envelope id once;
+- what crosses machines is envelopes, so `Envelope::destination` becomes an
+  `Address` when the first remote placement runs; the kernel's one child
+  wait per call is unchanged.
 
 ## Identity, ownership and storage
 
@@ -313,8 +325,8 @@ timeout = 120  # seconds a command is waited for before it moves to the backgrou
 ### Routing and transport
 
 Messaging uses an envelope with a durable id `(sender, call, purpose)`, sender,
-destination and payload. A sender names an `Address`: a conversation, its
-parent, or a name its route gives meaning (a channel, a group); `Address::send`
+destination and payload. A sender names a `Recipient`: a conversation, its
+parent, or a name its route gives meaning (a channel, a group); `Recipient::send`
 sends to one, and `ConversationHandle::send` to a conversation. Exactly one
 extension provides `Route`, which resolves the address against the sender's
 `Topology` (its id, parent and children) to the recipients, or a typed
@@ -568,7 +580,7 @@ crates choose modes and policy.
 | Parent sends while child works | `ConversationHandle::send` |
 | Child asks parent | Tool composition: question and correlated reply fold in an `ext-*` crate |
 | Sibling chat | Policy and tool composition over durable inboxes addressed by conversation id |
-| Named channels | A `Route` provider resolving `Address::Named`, with membership as ordered facts of its own; recipients are recorded on each `outbox` |
+| Named channels | A `Route` provider resolving `Recipient::Named`, with membership as ordered facts of its own; recipients are recorded on each `outbox` |
 | Different agent/model | `.kind(name)` and `.role(role)`; a turn or a task |
 | Recursive same agent | Tool composition: inherit task registration; depth budget descends |
 | Root-only extension | Rust declaration or Lua `a.inherit(false)` excludes the whole generation |

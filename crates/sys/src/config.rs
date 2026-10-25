@@ -220,6 +220,49 @@ impl FromStr for Effect {
     }
 }
 
+/// The machines of a `machines.toml`, in the file's order: each table of
+/// its `machine` table is one, by the name a client calls it (`a attach
+/// mac2:3f9a`), with the `ssh` host that reaches it (the name itself by
+/// default) and, once known, its machine `id`, which pins it: a daemon
+/// there that names another machine is refused.
+///
+/// ```toml
+/// [machine.mac2]
+/// ssh = "me@mac2.local"
+/// id = "abcdefghijklmnopqrstuvwxyz"
+/// ```
+pub fn machines(text: &str) -> Result<Vec<Machine>, ParseError> {
+    let doc: DocumentMut = text.parse()?;
+    let Some(machines) = doc.get("machine") else {
+        return Ok(Vec::new());
+    };
+    let machines = machines
+        .as_table_like()
+        .ok_or_else(|| ParseError("machine must be a table".into()))?;
+    machines
+        .iter()
+        .map(|(name, item)| {
+            let scope = format!("machine.{name}.");
+            let table = item
+                .as_table_like()
+                .ok_or_else(|| ParseError(format!("machine.{name} must be a table")))?;
+            Ok(Machine {
+                name: name.to_owned(),
+                ssh: string(table, "ssh", &scope)?,
+                id: string(table, "id", &scope)?,
+            })
+        })
+        .collect()
+}
+
+/// One machine of a `machines.toml`, as the file spells it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Machine {
+    pub name: String,
+    pub ssh: Option<String>,
+    pub id: Option<String>,
+}
+
 impl Config {
     /// The file at `path`; a missing file is the empty config.
     pub fn read(path: &Path) -> io::Result<Self> {
@@ -564,6 +607,29 @@ model = "not this one"
             bad.to_string(),
             "rule.effect: no effect maybe: allow, ask or deny"
         );
+    }
+
+    #[test]
+    fn machines_keep_the_files_order_and_default_to_their_name() {
+        let text = "[machine.zed]\nssh = \"me@zed.local\"\nid = \"x\"\n\n[machine.alpha]\n";
+        assert_eq!(
+            machines(text).unwrap(),
+            [
+                Machine {
+                    name: "zed".into(),
+                    ssh: Some("me@zed.local".into()),
+                    id: Some("x".into()),
+                },
+                Machine {
+                    name: "alpha".into(),
+                    ssh: None,
+                    id: None,
+                }
+            ]
+        );
+        assert_eq!(machines("").unwrap(), []);
+        let bad = machines("[machine.a]\nssh = 1\n").unwrap_err();
+        assert_eq!(bad.to_string(), "machine.a.ssh must be a string");
     }
 
     #[test]

@@ -14,7 +14,6 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::path::PathBuf;
 
 use protocol::view::{Change, SessionList, SessionView, Update};
 use protocol::{
@@ -108,7 +107,7 @@ pub struct Attach {
     pub env: Env,
     /// The directory the daemon finds the workspace from; `None` is the
     /// environment's.
-    pub workspace: Option<PathBuf>,
+    pub workspace: Option<protocol::HostPath>,
 }
 
 impl Attach {
@@ -136,6 +135,8 @@ pub enum EventKind {
         welcome: Welcome,
         remote: bool,
         commands: Vec<CommandInfo>,
+        /// The daemon's machine, as its welcome named it.
+        machine: protocol::MachineId,
     },
     Msg(DaemonMsg),
     /// A daemon draining for a newer build is waited out before the
@@ -430,7 +431,7 @@ impl SessionClient {
                                 session: session.to_string(),
                                 seq,
                             },
-                            workspace: PathBuf::new(),
+                            workspace: None,
                             since: 0,
                             env: None,
                             decl: protocol::ClientDecl::default(),
@@ -493,6 +494,7 @@ impl SessionClient {
                 welcome,
                 remote,
                 commands,
+                ..
             } => {
                 self.commands = commands;
                 // Neither answered nor refused on the last connection: sent
@@ -768,7 +770,6 @@ pub(crate) const fn is_mutation(msg: &ClientMsg) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use protocol::{Audience, Body, Caps, Entry, Epoch, Json, Permission, Seq, SessionId, Verdict};
 
@@ -784,6 +785,7 @@ mod tests {
                 },
                 remote: false,
                 commands: Vec::new(),
+                machine: protocol::MachineId([0; 16]),
             },
         }
     }
@@ -881,7 +883,7 @@ mod tests {
             1,
             DaemonMsg::Attached {
                 session,
-                workspace: PathBuf::from("/w"),
+                workspace: "/w".into(),
             },
         ));
         client.step(msg(
@@ -1213,7 +1215,7 @@ mod tests {
             3,
             DaemonMsg::Attached {
                 session: b,
-                workspace: PathBuf::from("/b"),
+                workspace: "/b".into(),
             },
         ));
         client.step(msg(3, bash_call(2)));

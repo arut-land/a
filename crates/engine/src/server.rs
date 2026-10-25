@@ -502,7 +502,7 @@ impl Conn<'_> {
     async fn attach(
         &mut self,
         target: protocol::Target,
-        workspace: PathBuf,
+        workspace: Option<protocol::HostPath>,
         since: u64,
         env: Option<Environment>,
         decl: ClientDecl,
@@ -512,7 +512,13 @@ impl Conn<'_> {
         } else {
             env
         };
-        let found = || workspace_of(&workspace, env.as_ref());
+        // Only a new or the latest session asks for one; without it, none.
+        let found = || {
+            let dir = workspace
+                .as_ref()
+                .map_or(Path::new(""), protocol::HostPath::local);
+            workspace_of(dir, env.as_ref())
+        };
         let resolved = match &target {
             protocol::Target::Fork { session, seq } => {
                 match self.daemon.fork(session, *seq).await {

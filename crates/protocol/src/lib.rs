@@ -5,7 +5,6 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::num::NonZeroU64;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::de::Error as _;
@@ -13,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 32;
+pub const PROTO: u32 = 33;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 32;
+pub const PROTO_MIN: u32 = 33;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -95,6 +94,7 @@ impl FrameKind {
 /// The length, then the kind.
 const HEADER: usize = 5;
 
+mod address;
 pub mod blob;
 #[macro_use]
 mod decode;
@@ -103,6 +103,7 @@ mod peer;
 pub mod publication;
 pub mod view;
 
+pub use address::{Address, HostPath};
 pub use blob::{BlobId, BlobOrigin, BlobRef, Held, Payload};
 pub use json::Json;
 pub use peer::{MachineId, Role};
@@ -806,7 +807,7 @@ pub struct Installed {
 /// until a client attaches or refreshes again.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Environment {
-    pub cwd: PathBuf,
+    pub cwd: HostPath,
     pub vars: BTreeMap<String, String>,
     /// Secrets whose values were left out of `vars`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -854,7 +855,7 @@ impl Environment {
 
     /// Captures `vars`, leaving out denied names and anything not UTF-8.
     pub fn new(
-        cwd: PathBuf,
+        cwd: HostPath,
         vars: impl IntoIterator<Item = (OsString, OsString)>,
         tty: bool,
     ) -> Self {
@@ -926,7 +927,7 @@ pub enum Permission {
 pub enum ApprovalReason {
     Mode { mode: String },
     OperatorRule { tool: String, input: Option<String> },
-    OutsideWorkspace { path: PathBuf, workspace: PathBuf },
+    OutsideWorkspace { path: HostPath, workspace: HostPath },
     Classifier { reason: String },
 }
 
@@ -1044,7 +1045,7 @@ pub enum Target {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: SessionId,
-    pub workspace: PathBuf,
+    pub workspace: HostPath,
     pub entries: u64,
     pub clients: u32,
     pub activity: Activity,
@@ -1081,7 +1082,7 @@ impl fmt::Display for SessionSummary {
             self.activity.name(),
             self.residency.name(),
             self.entries,
-            self.workspace.display()
+            self.workspace
         )?;
         if let Some(why) = self.read_only {
             write!(f, "  ({why})")?;
@@ -1423,7 +1424,7 @@ pub struct QueryInfo {
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
     Daemon,
-    Workspace(PathBuf),
+    Workspace(HostPath),
     Session(SessionId),
 }
 
@@ -1493,10 +1494,11 @@ kinds! {
         /// `env` is the client's, for the commands the session runs; without
         /// one the session keeps the environment it had. `workspace` is the
         /// directory the client is in: the daemon takes the git working tree it
-        /// is in (with `env`'s git variables) as the workspace.
+        /// is in (with `env`'s git variables) as the workspace; none where
+        /// the target needs none (a fork's source names its own).
         Attach "attach" {
             target: Target,
-            workspace: PathBuf,
+            workspace: Option<HostPath> = default,
             since: u64,
             env: Option<Environment> = default,
             decl: ClientDecl = default,
@@ -1670,7 +1672,7 @@ kinds! {
         /// new build, and re-attach to replay what they missed. Sent as the reply
         /// to a hello, or to connections already open when the drain began.
         Draining "draining" = Control;
-        Attached "attached" { session: SessionId, workspace: PathBuf } = Durable;
+        Attached "attached" { session: SessionId, workspace: HostPath } = Durable;
         Entry "entry" (Entry) = (entry_class), read decode::entry_msg;
         /// Live text of an unfinished model call, of its `attempt`th try: a
         /// client shows the text of the latest only. Never logged: the

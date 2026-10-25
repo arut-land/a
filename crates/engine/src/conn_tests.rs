@@ -237,7 +237,7 @@ fn a_resend_after_restart_runs_once() {
 fn attach(target: Target, since: u64, decl: ClientDecl) -> ClientMsg {
     ClientMsg::Attach {
         target,
-        workspace: "/w".into(),
+        workspace: Some("/w".into()),
         since,
         env: None,
         decl,
@@ -432,7 +432,7 @@ fn a_viewer_writes_nothing_by_any_request() {
     peer.send(&hello(Caps::ALL));
     peer.send(&ClientMsg::Attach {
         target: Target::Id(session),
-        workspace: "/w".into(),
+        workspace: Some("/w".into()),
         since: 0,
         env: Some(env.clone()),
         decl: ClientDecl::default(),
@@ -703,7 +703,7 @@ fn the_daemon_finds_the_workspace_from_the_clients_directory_and_git_variables()
         peer.send(&hello(Caps::NONE));
         peer.send(&ClientMsg::Attach {
             target: Target::New,
-            workspace: repo.join("src/deep"),
+            workspace: Some(repo.join("src/deep").try_into().unwrap()),
             since: 0,
             env,
             decl: ClientDecl::default(),
@@ -714,13 +714,13 @@ fn the_daemon_finds_the_workspace_from_the_clients_directory_and_git_variables()
         };
         workspace
     };
-    assert_eq!(attached(None), repo);
+    assert_eq!(attached(None).local(), repo);
     let work_tree = Environment::new(
-        repo.join("src/deep"),
+        repo.join("src/deep").try_into().unwrap(),
         [("GIT_WORK_TREE".into(), repo.join("other").into_os_string())],
         false,
     );
-    assert_eq!(attached(Some(work_tree)), repo.join("other"));
+    assert_eq!(attached(Some(work_tree)).local(), repo.join("other"));
 }
 
 #[test]

@@ -104,7 +104,28 @@ environment, a new or forked session, the settings, a shutdown) is refused,
 and its attach keeps the session's environment. No key is exchanged yet.
 The client's machine is not logged: it decides nothing a replay must
 reproduce, and the log names a mutation's client already. `--host` is a
-`client::Host`, which is never something ssh would read as an option.
+`client::Host`, which is never something ssh would read as an option. A
+new key is flushed to the drive (`F_FULLFSYNC` on Apple) before any welcome
+names its id, since a client may pin the id from then on, and on macOS it
+carries the attribute `tmutil addexclusion` sets, so a home restored from a
+backup onto another Mac is not a second machine of the same id.
+
+Each daemon stores and names only its own sessions and paths, and a client
+may hold several. A path the wire carries (`Environment::cwd`, an attach's
+and a summary's `workspace`, a query's `Scope::Workspace`, an approval's
+`OutsideWorkspace`) is a `protocol::HostPath`: the daemon's machine's own
+spelling, which a client shows and hands back but never joins, compares as
+a path or canonicalizes, since that machine may be another OS; only the
+daemon reads it as a path (`HostPath::local`). A session elsewhere is a
+`protocol::Address { machine, session }`, which routes and is never logged:
+a daemon's entries need no machine, and a client learns each daemon's from
+its welcome. The client SDK's `Daemons` is the set, one `Member` per
+machine, with the names `machines.toml` and the ssh configuration's `Host`
+lines give (each resolved by `ssh -G`, never parsed for meaning, and
+watched with `rt::Watcher`); `mac2:3f9a` resolves on the client to a
+member and the prefix it asks there, and `SessionWatch` merges the
+members' lists. Every app holds a set of one today. See
+[the client SDK](client.md).
 
 See [the client SDK](client.md) and [CLI](cli.md), and the staging and
 endpoint types in `crates/sys`. The daemon targets macOS, Linux and Windows.

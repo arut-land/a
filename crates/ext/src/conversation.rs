@@ -25,7 +25,7 @@
 use std::marker::PhantomData;
 
 use crate::{BoxFuture, Budget, Cx, Extension, ModelRole};
-use protocol::{CallId, Outcome, SessionId};
+use protocol::{CallId, MachineId, Outcome, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub use llm::ContextPolicy;
@@ -107,12 +107,18 @@ pub enum Context {
 }
 
 /// Where the conversation runs. Each daemon stores its own sessions, so a
-/// conversation placed elsewhere will be a root there, owned by address,
-/// rather than nested under its owner here.
+/// conversation placed on another machine is a root session in that
+/// daemon's store, owned by its owner's [`protocol::Address`], never
+/// nested under the owner's log here; the owner records the spawn as a
+/// durable intent and outcome keyed by its [`protocol::EnvelopeId`], an
+/// external call that recovery settles as interrupted rather than repeat.
+/// Only `Here` runs yet: the engine refuses the rest
+/// ([`SpawnRefusal::Placement`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Placement {
     #[default]
     Here,
+    Machine(MachineId),
 }
 
 impl<R, S> Conversation<R, S> {
@@ -431,14 +437,14 @@ impl ConversationHandle {
         purpose: &str,
         payload: String,
     ) -> Result<(), protocol::InboxRefusal> {
-        Address::from(self).send::<E>(cx, purpose, payload).await
+        Recipient::from(self).send::<E>(cx, purpose, payload).await
     }
 }
 
 /// Who a message is for, as its sender names it: the session's
 /// [`Route`](crate::Route) resolves it to the sessions that receive it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Address {
+pub enum Recipient {
     Conversation(ConversationHandle),
     /// The session that owns the sender.
     Parent,
@@ -446,13 +452,13 @@ pub enum Address {
     Named(crate::Name),
 }
 
-impl From<ConversationHandle> for Address {
+impl From<ConversationHandle> for Recipient {
     fn from(handle: ConversationHandle) -> Self {
         Self::Conversation(handle)
     }
 }
 
-impl Address {
+impl Recipient {
     /// Sends `payload` to whoever the route resolves this to, as `E`'s
     /// `purpose`, which with the call keeps the message's identity across
     /// retries.
@@ -480,6 +486,8 @@ pub enum SpawnRefusal {
     DepthExhausted,
     Unavailable(String),
     Interrupted,
+    /// This engine cannot run a conversation there.
+    Placement(Placement),
 }
 
 /// The engine's side of [`Conversation`]: it admits, runs and settles
@@ -800,7 +808,7 @@ impl ModelTurn {
 pub struct SendMessage {
     owner: &'static str,
     purpose: String,
-    to: Address,
+    to: Recipient,
     payload: String,
 }
 
@@ -811,7 +819,7 @@ impl SendMessage {
         self,
         sender: SessionId,
         call: CallId,
-    ) -> (protocol::EnvelopeId, Address, String) {
+    ) -> (protocol::EnvelopeId, Recipient, String) {
         let id = protocol::EnvelopeId {
             sender,
             call,

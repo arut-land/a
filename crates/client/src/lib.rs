@@ -7,10 +7,12 @@
 
 mod approval;
 mod command;
+mod daemons;
 mod drive;
 mod host;
 mod inbox;
 pub mod link;
+mod machines;
 #[cfg(test)]
 mod one_rule;
 mod query;
@@ -24,17 +26,19 @@ mod watch;
 
 pub use approval::{ApprovalPart, approval_parts, approval_text};
 pub use command::{COMMANDS, Cmd, Command, help, parse, parse_input};
+pub use daemons::{Daemons, Listed, Member};
 pub use drive::{ClientHandle, Driver, Renderer, pump};
 pub use host::Host;
 pub use inbox::{Inbox, PUMP_BATCH, Post, QueueBudget, inbox};
 pub use link::{LinkError, LocalLink, Start};
+pub use machines::{Known, Machine, MachineWatch, Route, Sources, SshConfig};
 pub use query::{Answer, Answers, Canceller};
 pub use remote::SshLink;
 pub use session::{
     Attach, ConnId, Effect, End, Env, Event, EventKind, Io, Link, Notice, Offer, SessionClient,
     Show, TurnView,
 };
-pub use watch::SessionWatch;
+pub use watch::{Problem, SessionWatch};
 
 use std::fmt;
 use std::fs::{self, File};
@@ -78,6 +82,12 @@ pub enum Error {
     Closed,
     /// The link to the daemon could not be opened, as it says.
     Link(LinkError),
+    /// The daemon reached names a machine other than the one pinned for
+    /// it: the host now leads elsewhere, or the machine was made anew.
+    OtherMachine {
+        pinned: MachineId,
+        found: MachineId,
+    },
     /// The socket, `ssh` or the spawn failed.
     Io(io::ErrorKind, String),
 }
@@ -114,6 +124,10 @@ impl fmt::Display for Error {
             Self::NotResponding => f.write_str("the daemon is not responding"),
             Self::Refused(why) | Self::Io(_, why) => f.write_str(why),
             Self::Busy => f.write_str("the client transport is busy; try again"),
+            Self::OtherMachine { pinned, found } => write!(
+                f,
+                "the daemon reached is machine {found}, not {pinned} as machines.toml pins"
+            ),
             Self::Closed => f.write_str("the daemon closed the connection"),
         }
     }
@@ -144,6 +158,7 @@ impl From<Error> for io::Error {
             Error::Link(LinkError::NeedsInteractiveAuth(_)) => io::ErrorKind::PermissionDenied,
             Error::Link(LinkError::Unreachable(_)) => io::ErrorKind::HostUnreachable,
             Error::Closed => io::ErrorKind::UnexpectedEof,
+            Error::OtherMachine { .. } => io::ErrorKind::InvalidData,
             Error::Io(kind, _) => *kind,
         };
         Self::new(kind, e.to_string())
@@ -272,10 +287,7 @@ fn attaching(
         Env::Origin => Some(origin()?),
         Env::Given(env) => Some(env.clone()),
     };
-    let workspace = attach
-        .workspace
-        .clone()
-        .unwrap_or_else(|| env.as_ref().map_or_default(|env| env.cwd.clone()));
+    let workspace = (attach.workspace.clone()).or_else(|| env.as_ref().map(|env| env.cwd.clone()));
     Ok(ClientMsg::Attach {
         target: attach.target.clone(),
         workspace,
@@ -314,18 +326,20 @@ pub fn matching<'a, T>(
 /// This process's environment, for the commands a session runs for it.
 pub fn capture() -> io::Result<Environment> {
     Ok(Environment::new(
-        std::env::current_dir()?,
+        std::env::current_dir()?.try_into()?,
         std::env::vars_os(),
         io::stdin().is_terminal(),
     ))
 }
 
-/// A daemon as a client reaches it: the link to it, and this build (which
-/// a connection may start, or install on a host that lacks `a`).
+/// A daemon as a client reaches it: the link to it, this build (which a
+/// connection may start, or install on a host that lacks `a`), and the
+/// machine it must be, where that is pinned.
 #[derive(Clone, Debug)]
 pub struct Daemon {
     pub link: Arc<dyn link::Link>,
     pub staged: Staged,
+    pub pinned: Option<MachineId>,
 }
 
 impl Daemon {
@@ -333,6 +347,7 @@ impl Daemon {
         Self {
             link: Arc::new(link),
             staged,
+            pinned: None,
         }
     }
 
@@ -371,8 +386,7 @@ impl Daemon {
     ) -> Result<Connection, Error> {
         rt::block_on(link::connect(
             &link::BLOCKING,
-            &self.link,
-            &self.staged,
+            self,
             client,
             start,
             first,

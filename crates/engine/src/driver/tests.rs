@@ -804,7 +804,11 @@ fn model_calls_take_credentials_from_the_client_then_the_config() {
         if let Some(key) = client {
             let vars = [("OPENAI_API_KEY".into(), key.into())];
             session
-                .set_env(Environment::new(dir.clone(), vars, false))
+                .set_env(Environment::new(
+                    dir.clone().try_into().unwrap(),
+                    vars,
+                    false,
+                ))
                 .unwrap();
         }
         session.submit("Call the tool, then answer.").unwrap();
@@ -2499,7 +2503,7 @@ fn in_process_recovery_preserves_the_attached_environment() {
     );
     let session = fixture.create();
     let env = Arc::new(Environment::new(
-        std::env::temp_dir(),
+        std::env::temp_dir().try_into().unwrap(),
         [("OPENAI_API_KEY".into(), "client-test-key".into())],
         false,
     ));
@@ -3018,7 +3022,7 @@ fn environment_bursts_retain_one_payload_and_one_mailbox_marker() {
     assert!(matches!(rx.try_recv(), Some(Msg::Env)));
     assert!(rx.try_recv().is_none());
     let latest = lock(&live.session.pending_env).take().unwrap();
-    assert_eq!(latest.cwd, PathBuf::from("999"));
+    assert_eq!(latest.cwd, "999".into());
     live.set_env(Environment::new("next".into(), Vec::new(), false))
         .unwrap();
     assert!(matches!(rx.try_recv(), Some(Msg::Env)));

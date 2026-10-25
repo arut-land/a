@@ -26,13 +26,13 @@ fn bridge_speaks_the_protocol_over_stdio() {
     let Some(ClientMsg::Environment(shell)) = read_frame(&mut stdout).unwrap() else {
         panic!("no environment after the sync line");
     };
-    assert_eq!(shell.cwd, env.ws);
+    assert_eq!(shell.cwd.local(), env.ws);
 
     let mut send = |msg: &ClientMsg| write_frame(&mut stdin, msg).unwrap();
     send(&hello());
     send(&ClientMsg::Attach {
         target: Target::New,
-        workspace: "/w".into(),
+        workspace: Some("/w".into()),
         since: 0,
         env: None,
         decl: protocol::ClientDecl::default(),
@@ -368,7 +368,7 @@ fn a_remote_session_runs_in_the_hosts_directory_and_environment() {
     let (workspace, shell) = workspace_and_env(&text);
     let remote = host.root().parent().unwrap();
     assert_eq!(workspace, remote.to_str().unwrap());
-    assert_eq!(shell.cwd, remote);
+    assert_eq!(shell.cwd.local(), remote);
     assert_eq!(shell.vars["PATH"], "/usr/bin:/bin");
 }
 
@@ -384,7 +384,7 @@ fn a_remote_session_started_in_a_subdirectory_works_in_its_git_root() {
 
     let (workspace, shell) = workspace_and_env(&only_log(&host));
     assert_eq!(workspace, env.root.to_str().unwrap());
-    assert_eq!(shell.cwd, host.root().parent().unwrap());
+    assert_eq!(shell.cwd.local(), host.root().parent().unwrap());
 }
 
 #[test]
@@ -396,4 +396,33 @@ fn a_host_of_another_platform_is_refused() {
     assert!(!output.status.success());
     assert!(stderr.contains("not installed on box"), "{stderr}");
     assert!(!host.root().join("runtime").exists());
+}
+
+/// `a attach mac2:<id>` reaches the machine `machines.toml` calls mac2,
+/// and only the one it pins.
+#[test]
+fn a_session_on_a_named_machine_is_attached_by_the_machines_name() {
+    let mut env = Env::new("machines");
+    let (mut new, host) = fake_remote(&mut env, "");
+    let session = ok(&new.arg("new").output().unwrap());
+    let attach = |machines: &str| {
+        fs::write(env.home.machines_file(), machines).unwrap();
+        env.cmd(&["-p", "hi", "attach", &format!("mac2:{}", session.trim())])
+            .env("A_SSH", env.root.join("ssh"))
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap()
+    };
+    let other = protocol::MachineId([7; 16]);
+    let refused = attach(&format!(
+        "[machine.mac2]\nssh = \"box\"\nid = \"{other}\"\n"
+    ));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success());
+    assert!(stderr.contains("as machines.toml pins"), "{stderr}");
+
+    ok(&attach("[machine.mac2]\nssh = \"box\"\n"));
+    let text = only_log(&host);
+    assert!(text.contains(r#""segments":[{"text":"hi""#), "{text}");
+    assert!(!env.home.sessions_dir().exists(), "a session at home");
 }

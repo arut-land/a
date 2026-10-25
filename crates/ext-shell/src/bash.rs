@@ -468,7 +468,7 @@ async fn finish(
         (cwd, moved)
     })
     .await;
-    let moved = moved.then(|| Cwd::change(&cwd, cx.env.as_ref().map(|env| env.cwd.as_path())));
+    let moved = moved.then(|| Cwd::change(&cwd, cx.env.as_ref().map(|env| env.cwd.local())));
     let growing = kept.growing.is_some().then_some(OutputStream {
         session: cx.session,
         call: cx.call,

@@ -6,13 +6,13 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use boltffi::{EventSubscription, StreamProducer, export};
-use client::{Attach, Cmd, Daemon, Driver, Effect, Env, Notice, SessionClient};
-use protocol::{Environment, HomeSettings, SessionId, SettingsChange, Target};
+use client::{Attach, Cmd, Daemon, Daemons, Driver, Effect, Env, Member, Notice, SessionClient};
+use protocol::{Environment, HomeSettings, HostPath, SessionId, SettingsChange, Target};
 use rt::Threads;
 use sys::install::CliLink;
 use sys::{Home, Staged};
@@ -79,8 +79,15 @@ fn session_path() -> OsString {
 /// The per-user daemon, as the CLI reaches it: the native layout or explicit `$A_HOME`.
 pub struct Client {
     home: Home,
-    daemon: Daemon,
+    /// This machine's daemon alone, for now.
+    daemons: Daemons,
     vars: Vec<(OsString, OsString)>,
+}
+
+impl Client {
+    fn daemon(&self) -> &Daemon {
+        &self.daemons.first().daemon
+    }
 }
 
 #[export]
@@ -91,7 +98,7 @@ impl Client {
         let home = Home::from_env()?;
         let staged: Staged = home.runtime().stage(Path::new(helper))?;
         Ok(Self {
-            daemon: Daemon::local(home.clone(), staged),
+            daemons: Daemons::one(Member::LOCAL, Daemon::local(home.clone(), staged)),
             home,
             vars: session_vars(),
         })
@@ -99,7 +106,7 @@ impl Client {
 
     /// The staged build's id, `<version>+<hash>`.
     pub fn build(&self) -> String {
-        self.daemon.staged.id.clone()
+        self.daemon().staged.id.clone()
     }
 
     pub fn daemon_log(&self) -> String {
@@ -119,7 +126,7 @@ impl Client {
     /// The model and provider variables sessions fall back on, as the
     /// daemon has them.
     pub async fn settings(&self) -> Result<Settings, ClientError> {
-        let daemon = self.daemon.clone();
+        let daemon = self.daemon().clone();
         blocking(move || Ok(daemon.connect(&|| {})?.settings(None)?.into())).await
     }
 
@@ -132,7 +139,7 @@ impl Client {
         to: Settings,
     ) -> Result<Settings, ClientError> {
         let change = SettingsChange::between(&HomeSettings::from(from), &HomeSettings::from(to));
-        let daemon = self.daemon.clone();
+        let daemon = self.daemon().clone();
         blocking(move || Ok(daemon.connect(&|| {})?.settings(Some(change))?.into())).await
     }
 
@@ -171,7 +178,7 @@ impl Client {
 
     /// Replaces a daemon that stopped answering (`not_responding`).
     pub async fn restart_daemon(&self) -> Result<(), ClientError> {
-        let daemon = self.daemon.clone();
+        let daemon = self.daemon().clone();
         blocking(move || {
             daemon.restart()?;
             Ok(())
@@ -189,7 +196,7 @@ impl Client {
 /// The daemon's session list as it changes, pushed by the daemon over one
 /// connection: subscribe to `updates`, then `start`.
 pub struct SessionWatch {
-    daemon: Daemon,
+    daemons: Daemons,
     producer: Arc<StreamProducer<SessionListUpdate>>,
     /// Watches until dropped.
     watch: Mutex<Option<client::SessionWatch>>,
@@ -199,7 +206,7 @@ pub struct SessionWatch {
 impl SessionWatch {
     pub fn new(client: &Client) -> Self {
         Self {
-            daemon: client.daemon.clone(),
+            daemons: client.daemons.clone(),
             producer: Arc::new(StreamProducer::new(64)),
             watch: Mutex::new(None),
         }
@@ -220,19 +227,14 @@ impl SessionWatch {
             return;
         }
         let producer = Arc::clone(&self.producer);
+        let rt: rt::Rt = runtime().clone();
         *watch = Some(client::SessionWatch::start(
-            runtime().clone(),
-            self.daemon.clone(),
-            move |list| {
-                producer.push(match list {
-                    Ok(sessions) => SessionListUpdate {
-                        sessions: sessions.iter().map(Into::into).collect(),
-                        problem: None,
-                    },
-                    Err(problem) => SessionListUpdate {
-                        sessions: Vec::new(),
-                        problem: Some(problem.to_string()),
-                    },
+            &rt,
+            &self.daemons,
+            move |sessions, problems| {
+                producer.push(SessionListUpdate {
+                    sessions: sessions.iter().map(|l| (&l.summary).into()).collect(),
+                    problem: problems.first().map(|p| p.error.to_string()),
                 });
             },
         ));
@@ -298,7 +300,7 @@ impl QueryStream {
         let (sender, answers) = rt::channel::bounded(16);
         Ok(Self {
             asked: Mutex::new(Some(Asked {
-                daemon: client.daemon.clone(),
+                daemon: client.daemon().clone(),
                 query: (service, scope, body),
                 answers: sender,
             })),
@@ -395,7 +397,7 @@ impl Session {
         let driver = Driver::with_origin(
             || {
                 Ok(Environment::new(
-                    std::env::current_dir()?,
+                    std::env::current_dir()?.try_into()?,
                     session_vars(),
                     false,
                 ))
@@ -412,7 +414,7 @@ impl Session {
                 driver.pump(&mut *feed, effects);
             },
         )
-        .start(runtime().clone(), client.daemon.clone());
+        .start(runtime().clone(), client.daemon().clone());
         Self {
             feed,
             driver,
@@ -470,7 +472,7 @@ impl Session {
     pub fn open(&self, target: OpenTarget) -> Result<(), ClientError> {
         let attach = match target {
             OpenTarget::New { workspace } => {
-                let dir = PathBuf::from(workspace);
+                let dir = HostPath::from(workspace);
                 let env = Environment::new(dir.clone(), self.vars.clone(), false);
                 Attach {
                     workspace: Some(dir),
@@ -481,7 +483,7 @@ impl Session {
                 workspace,
                 any_workspace,
             } => Attach {
-                workspace: Some(PathBuf::from(workspace)),
+                workspace: Some(HostPath::from(workspace)),
                 ..Attach::new(Target::Latest { any_workspace }, Env::Keep)
             },
             OpenTarget::Id { id } => Attach::new(Target::Id(parse_id(&id)?), Env::Keep),
@@ -641,14 +643,26 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn fixture() -> (Session, Home, PathBuf, sys::Listener, std::fs::File) {
+    fn fixture() -> (
+        Session,
+        Home,
+        std::path::PathBuf,
+        sys::Listener,
+        std::fs::File,
+    ) {
         let (client, home, root, listener, owner) = client_fixture();
         (Session::new(&client), home, root, listener, owner)
     }
 
     /// A client of a daemon that is this test: it holds the lock and
     /// listens, and the test answers for it.
-    fn client_fixture() -> (Client, Home, PathBuf, sys::Listener, std::fs::File) {
+    fn client_fixture() -> (
+        Client,
+        Home,
+        std::path::PathBuf,
+        sys::Listener,
+        std::fs::File,
+    ) {
         let root = tempfile::Builder::new()
             .prefix("a-ffi-order-")
             .tempdir()
@@ -673,7 +687,7 @@ mod tests {
         .unwrap();
         let listener = home.bind().unwrap();
         let client = Client {
-            daemon: Daemon::local(home.clone(), staged),
+            daemons: Daemons::one(Member::LOCAL, Daemon::local(home.clone(), staged)),
             home: home.clone(),
             vars: Vec::new(),
         };
@@ -786,7 +800,7 @@ mod tests {
             &mut peer,
             &DaemonMsg::Attached {
                 session: id,
-                workspace: root.clone(),
+                workspace: root.clone().try_into().unwrap(),
             },
         )
         .unwrap();
@@ -885,7 +899,7 @@ mod tests {
             &mut peer,
             &DaemonMsg::Attached {
                 session: id,
-                workspace: root.clone(),
+                workspace: root.clone().try_into().unwrap(),
             },
         )
         .unwrap();

@@ -24,8 +24,13 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
                                    Error, Connection, stop/status/restart/diagnose, bridge
 ```
 
-- **Transport.** `Daemon { link, staged }` is the daemon as a client
-  reaches it. A `Link` (`link.rs`) opens a byte stream to one daemon,
+- **Transport.** `Daemon { link, staged, pinned }` is the daemon as a
+  client reaches it; `pinned` is the machine it must be, where
+  `machines.toml` says, and a welcome naming another is
+  `Error::OtherMachine`, before anything the connection would send behind
+  the hello (an attach and its environment) goes out. The pin refuses a
+  mismatch; it does not authenticate, since the far daemon's claim of its
+  machine is unproven until keys are exchanged. A `Link` (`link.rs`) opens a byte stream to one daemon,
   ready for the hello, and says what only it knows: whether opening may
   need the person at the terminal (`needs_terminal`), what can be told of
   a daemon that never answered (`unanswered`), and which side to update
@@ -67,7 +72,7 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   the attach right behind the hello, saving a round trip. `Error` is the
   typed reason a daemon could not be reached or stopped serving
   (`Mismatch`, `NotResponding`, `Refused`, `Closed`, `Link(LinkError)`,
-  `Io`); it converts to `io::Error` for the commands that report that
+  `OtherMachine`, `Io`); it converts to `io::Error` for the commands that report that
   way. `stop`, `status`, `restart` and `diagnose` are what `a daemon …`
   runs; none starts a daemon but `restart`. The daemon lists sessions
   newest first; no client sorts, and `SessionSummary` prints the `a ls`
@@ -113,8 +118,43 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   driver's and the input threads: a lock around a `VecDeque` rather than
   `mpsc`, which instantiates all three channel flavours per type (7–15 KiB
   each).
-- **`SessionWatch`.** The daemon's session list as it changes, over a
-  connection of its own that is made again when the daemon goes.
+- **`Daemons`.** The daemons a client holds, one per machine, each a
+  `Member { name, daemon }`; the first is the default, where a new session
+  starts. Every app holds one today (this machine's as `local`, or
+  `--host`'s), so nothing changes for it; `a attach mac2:3f9a` adds the
+  machine it names. `resolve(target)` says which member a target is on and
+  what to ask it: `mac2:<prefix>` (a member's name, or its pinned machine
+  id) goes to that member as `<prefix>`, a bare prefix to the one member,
+  or with several to the one whose list holds it (`Target::Id`; a prefix
+  found nowhere names the machines that did not answer, where it may be),
+  and what makes a session to the first. `sessions()` asks every member at once and
+  answers each machine's list, or why it could not, apart: one machine
+  away never hides the others. A `Listed` is a summary with its member's
+  name and machine (`address()`, a `protocol::Address`), shown
+  `mac2:3f9a…`. No daemon ever stores an address for its own sessions:
+  each lists only its own, and the machine comes from the connection.
+- **Machines.** `Sources { machines, ssh }` is where the names come from:
+  `machines.toml` (`sys::config::machines`; a machine's name, its `ssh`
+  host, its pinned `id`) first, then each `Host` of the ssh configuration
+  that is not a pattern and that no machine is named for, its `Include`s
+  followed where they stand as ssh follows them (`~` the home, a relative
+  path in `~/.ssh`, globs in order, at most 16 deep). `named(name)` reads
+  the ssh configuration only when `machines.toml` names none. Only `Host`
+  and `Include` lines are read; what a host is comes from the system `ssh -G` (`Route {
+  user, hostname, port }`), so `Match`, `Include`, tokens and the system
+  file mean what ssh says, and a second alias of one route is left out.
+  `resolve()` runs one `ssh -G` per machine, all at once, and only when
+  asked: no command's start reads either file unless a target names a
+  machine. `watch(rt, sink)` tells the list again whenever either file
+  changes (`rt::Watcher` on their directories, the latest change's answer
+  only; an included file outside `~/.ssh` is read again with them, but its
+  own change is not watched). DNS-SD browsing is a later source beside
+  these.
+- **`SessionWatch`.** Every member's session list as it changes, each over
+  a connection of its own that is made again when its daemon goes, merged
+  in the set's order. The sink gets the merged list and a `Problem { on,
+  error }` for each member that cannot list now, which lists nothing until
+  it is reached again; the others' lists stay.
 - **Queries.** `Daemon::query(service, scope, body)` (or
   `Connection::query`) asks one of the queries the welcome advertised
   (`Connection::queries`) over a connection of its own, so its answers

@@ -16,7 +16,7 @@ use protocol::{
 use rt::{BoxFuture, Rt, Runtime};
 use sys::{Home, Staged};
 
-use crate::{Connection, Diagnosis, Error, Welcome};
+use crate::{Connection, Daemon, Diagnosis, Error, Welcome};
 
 /// A way to one daemon.
 pub trait Link: fmt::Debug + Send + Sync + 'static {
@@ -322,13 +322,13 @@ pub(crate) enum Greeting {
 /// on none of `first`, so each try sends it again.
 pub(crate) async fn connect(
     rt: &Rt,
-    link: &Arc<dyn Link>,
-    build: &Staged,
+    daemon: &Daemon,
     client: Option<ClientId>,
     start: Start,
     first: &(dyn Fn(Option<&Environment>) -> io::Result<Vec<ClientMsg>> + Sync),
     on_drain: &(dyn Fn() + Sync),
 ) -> Result<Connection, Error> {
+    let (link, build) = (&daemon.link, &daemon.staged);
     let mut start = start;
     for _ in 0..3 {
         let Opened {
@@ -340,8 +340,15 @@ pub(crate) async fn connect(
         } = link.open(rt, build, start).await?;
         start = start.again();
         let first = first(remote.as_ref())?;
+        // To a pinned machine, nothing (an environment, say) goes out
+        // before its welcome says it is that machine.
+        let behind = if daemon.pinned.is_some() {
+            &[][..]
+        } else {
+            &first
+        };
         let greeting = rt::or(
-            hello(&*stream, &mut buffered, &build.id, client, machine, &first),
+            hello(&*stream, &mut buffered, &build.id, client, machine, behind),
             async {
                 rt.sleep(within).await;
                 Err(Error::NotResponding)
@@ -350,6 +357,17 @@ pub(crate) async fn connect(
         .await;
         match greeting {
             Ok((Greeting::Welcome(theirs), welcome, commands, queries)) => {
+                if let Some(pinned) = daemon.pinned.filter(|&pinned| pinned != theirs) {
+                    return Err(Error::OtherMachine {
+                        pinned,
+                        found: theirs,
+                    });
+                }
+                if daemon.pinned.is_some() {
+                    for msg in &first {
+                        stream.send(msg).await?;
+                    }
+                }
                 return Ok(Connection {
                     stream,
                     buffered,

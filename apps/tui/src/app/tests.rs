@@ -1,5 +1,4 @@
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use protocol::{
@@ -17,8 +16,8 @@ use crate::render::{Grid, Viewport};
 use crate::screen::Screen;
 use crate::text::{Line, Modifier};
 
-fn ws() -> PathBuf {
-    PathBuf::from("/work/project")
+fn ws() -> protocol::HostPath {
+    "/work/project".into()
 }
 
 fn entry(seq: u64, body: Body) -> DaemonMsg {
@@ -63,6 +62,7 @@ fn connect(app: &mut App, remote: bool) {
             },
             remote,
             commands: Vec::new(),
+            machine: protocol::MachineId([0; 16]),
         },
     });
     client::pump(|_| Ok(()), app, connected);

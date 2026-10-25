@@ -40,6 +40,7 @@ mod tui;
 mod web;
 
 mod daemon_acceptance;
+mod daemons;
 mod query;
 
 mod support;

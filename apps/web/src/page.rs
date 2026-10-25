@@ -276,7 +276,6 @@ impl Renderer for Page {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use client::{ConnId, Error, Event, EventKind, Welcome};
     use protocol::{Body, CallId, Caps, DaemonMsg, Entry, Epoch, Json, Outcome, Seq, SessionId};
@@ -293,6 +292,7 @@ mod tests {
                 },
                 remote: false,
                 commands: Vec::new(),
+                machine: protocol::MachineId([0; 16]),
             },
         }
     }
@@ -364,7 +364,7 @@ mod tests {
         page.fold(&[
             DaemonMsg::Attached {
                 session: SessionId::new(),
-                workspace: PathBuf::from("/w"),
+                workspace: "/w".into(),
             },
             user(1, "hi"),
             DaemonMsg::Activity {
@@ -389,7 +389,7 @@ mod tests {
         page.fold(&[
             DaemonMsg::Attached {
                 session: SessionId::new(),
-                workspace: PathBuf::from("/w"),
+                workspace: "/w".into(),
             },
             user(1, "hi"),
         ]);
@@ -530,7 +530,7 @@ mod tests {
         page.fold(&[
             DaemonMsg::Attached {
                 session,
-                workspace: PathBuf::from("/w"),
+                workspace: "/w".into(),
             },
             user(2, "again"),
         ]);

@@ -1317,7 +1317,7 @@ fn attaching_behind_a_deferred_write_gets_activity_after_sync_or_recovery() {
         let since = h.session.frames.seq();
         let mut view = SessionView::from_log(
             h.session.id,
-            h.session.workspace.clone(),
+            protocol::HostPath::lossy(&h.session.workspace),
             h.session.frames.entries().unwrap(),
         );
         let _note = h.note();

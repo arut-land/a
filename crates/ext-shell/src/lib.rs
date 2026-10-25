@@ -118,7 +118,7 @@ fn contribute(r: &mut Registrar, facts: &'static sys::shell::ExecutionFacts, tim
 /// removed since is skipped.
 impl CwdOf for Shell {
     fn dir(&self, workspace: &Path, env: Option<&Environment>, states: &States) -> PathBuf {
-        let base = env.map(|env| env.cwd.as_path());
+        let base = env.map(|env| env.cwd.local());
         let last = states.get::<state::Cwd>().and_then(|cwd| cwd.after(base));
         last.into_iter()
             .chain(base)

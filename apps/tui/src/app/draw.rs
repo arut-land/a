@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use client::{End, Link};
+use protocol::HostPath;
 use protocol::view::{Item, Usage, recap_line};
 
 use super::super::render::{Canvas, Viewport, ellipsize, fit};
@@ -545,12 +546,19 @@ fn clip(line: &Line, cols: usize) -> Line {
 }
 
 /// A path with the home directory as `~`.
-fn tilde(path: &Path) -> String {
-    let rest =
-        std::env::home_dir().and_then(|home| path.strip_prefix(home).ok().map(Path::to_owned));
+fn tilde(path: &HostPath) -> String {
+    let path = path.as_str();
+    let home = std::env::home_dir();
+    let rest = home
+        .as_deref()
+        .and_then(Path::to_str)
+        .and_then(|home| path.strip_prefix(home));
     match rest {
-        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
+        Some("") => "~".to_owned(),
+        Some(rest) => match rest.strip_prefix(std::path::MAIN_SEPARATOR) {
+            Some(rest) => format!("~/{rest}"),
+            None => path.to_owned(),
+        },
+        None => path.to_owned(),
     }
 }

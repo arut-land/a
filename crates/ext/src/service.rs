@@ -317,7 +317,7 @@ impl Default for Budget {
 }
 
 /// Where a session's messages go: the one extension that provides it
-/// resolves each [`Address`](crate::Address) a send names to the sessions
+/// resolves each [`Recipient`](crate::Recipient) a send names to the sessions
 /// that receive it, once, as the send commits, so a broadcast's recipients
 /// are those of when it was sent. The engine only validates the issued
 /// route and carries the envelopes; who may reach whom (parent and child
@@ -327,7 +327,7 @@ pub trait Route: Send + Sync {
     fn resolve(
         &self,
         from: Topology<'_>,
-        to: &crate::Address,
+        to: &crate::Recipient,
     ) -> Result<Recipients, protocol::InboxRefusal>;
 }
 

@@ -298,6 +298,9 @@ impl Actor {
         let installed = registry.installed();
         match request.placement {
             ext::Placement::Here => {}
+            ext::Placement::Machine(_) => {
+                refusal = Some(SpawnRefusal::Placement(request.placement));
+            }
         }
         if let ext::Context::Owner = request.context {
             let seq = call.0;

@@ -236,8 +236,10 @@ impl Env {
         cmd.process_group(self.group.pgid.cast_signed())
             .current_dir(&self.ws)
             .env("A_HOME", self.home.root())
-            // Never the developer's host.
+            // Never the developer's host, nor anything under their home
+            // (`~/.ssh/config`, say).
             .env_remove("A_HOST")
+            .env("HOME", self.root.join("user"))
             .envs(self.vars.iter().copied());
         cmd
     }
@@ -487,7 +489,7 @@ impl Conn {
     pub fn attach(&mut self, target: Target, ws: &Path) -> (SessionId, Vec<Entry>) {
         self.send(&ClientMsg::Attach {
             target,
-            workspace: ws.into(),
+            workspace: Some(ws.to_owned().try_into().unwrap()),
             since: 0,
             env: None,
             decl: protocol::ClientDecl::default(),

@@ -81,3 +81,22 @@ keeps its recorded cwd and environment. See [fork semantics](fork.md).
 `a daemon autostart off` removes that registration. See [autostart](autostart.md)
 for the systemd user unit, the macOS LaunchAgent and app login item, and the
 Windows `Run` entry.
+
+## Other machines
+
+`a --host HOST …` runs any command against the daemon on `HOST`, over
+`ssh HOST a bridge` ([client.md](client.md)). A session elsewhere is
+also reached by its machine's name: `a attach mac2:3f9a` (and `a resume
+mac2:3f9a`, `a fork mac2:3f9a`) opens session `3f9a…` on the machine
+called `mac2`, which is one `machines.toml` names, in the configuration
+directory beside `config.toml`, else a `Host` of `~/.ssh/config`:
+
+```toml
+[machine.mac2]
+ssh = "me@mac2.local"           # the ssh host; the name itself by default
+id = "abcdefghijklmnopqrstuvwxyz" # its machine id: a daemon there that names another is refused
+```
+
+`local` is this machine. The files are read only when a target names a
+machine, so an id alone costs nothing more than before. Each machine's
+daemon stores its own sessions; `a ls` lists the one daemon it reaches.

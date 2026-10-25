@@ -260,7 +260,7 @@ mod tests {
             vars.insert(name.into(), "/outside".into());
         }
         cx.env = Some(Arc::new(protocol::Environment {
-            cwd: cx.workspace.to_path_buf(),
+            cwd: cx.workspace.to_path_buf().try_into().unwrap(),
             vars,
             ..Default::default()
         }));

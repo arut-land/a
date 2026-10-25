@@ -19,15 +19,14 @@ mod present;
 use std::borrow::{Borrow, Cow};
 use std::collections::VecDeque;
 use std::io;
-use std::path::PathBuf;
 
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ledger::{Keyed, OutcomeKind, Phase};
 use crate::{
-    Activity, ApprovalReason, Audience, Body, CallId, Card, DaemonMsg, Entry, Json, Outcome,
-    Permission, Seq, SessionId, SessionSummary, Verdict, WaitOn,
+    Activity, ApprovalReason, Audience, Body, CallId, Card, DaemonMsg, Entry, HostPath, Json,
+    Outcome, Permission, Seq, SessionId, SessionSummary, Verdict, WaitOn,
 };
 
 pub use present::{
@@ -39,7 +38,7 @@ pub use present::{
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ViewSnapshot {
     pub session: Option<SessionId>,
-    pub workspace: PathBuf,
+    pub workspace: HostPath,
     pub seq: u64,
     pub state: ViewState,
     pub items: Vec<Item>,
@@ -241,7 +240,7 @@ pub struct SessionView {
     #[serde(skip)]
     pub activity: Option<Activity>,
     pub session: Option<SessionId>,
-    pub workspace: PathBuf,
+    pub workspace: HostPath,
     /// The last entry folded: a reconnect attaches with it as `since`.
     pub seq: u64,
     pub state: ViewState,
@@ -359,7 +358,7 @@ pub enum Item {
     },
     Environment {
         seq: Seq,
-        cwd: PathBuf,
+        cwd: HostPath,
     },
 }
 
@@ -453,7 +452,7 @@ pub enum Change {
     /// so the view started over.
     Attached {
         session: SessionId,
-        workspace: PathBuf,
+        workspace: HostPath,
         reset: bool,
     },
     Added {
@@ -524,7 +523,7 @@ impl SessionView {
     /// connection sees.
     pub fn from_log(
         session: SessionId,
-        workspace: PathBuf,
+        workspace: HostPath,
         entries: impl IntoIterator<Item = impl Borrow<Entry>>,
     ) -> Self {
         let mut view = Self {

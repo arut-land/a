@@ -383,7 +383,7 @@ fn a_moved_client_starts_commands_where_it_is() {
     let ws = rig.workspace();
     std::fs::create_dir_all(ws.join("a/b")).unwrap();
     let env = |dir: &str| Environment {
-        cwd: ws.join(dir),
+        cwd: ws.join(dir).try_into().unwrap(),
         vars: [("PATH".to_owned(), "/usr/bin:/bin".to_owned())].into(),
         ..Default::default()
     };
@@ -401,7 +401,7 @@ fn a_moved_client_starts_commands_where_it_is() {
 fn commands_get_the_session_environment_quieted() {
     let mut rig = rig("env");
     rig.env = Some(Environment {
-        cwd: rig.workspace(),
+        cwd: rig.workspace().try_into().unwrap(),
         vars: [
             ("PATH", "/usr/bin:/bin"),
             ("ONLY_HERE", "1"),
