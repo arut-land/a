@@ -371,9 +371,29 @@ def paired(output, source, reference):
             checkpoint()
 
 
+def sessions(source, output):
+    """Build only the engine's measurements, then run the concurrent-session layouts."""
+    env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
+               CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
+    result = run(["cargo", "test", "--release", *STD, "-p", "engine", "--lib", "--no-run",
+                  "--message-format=json"], cwd=source, env=env, stdout=subprocess.PIPE, text=True)
+    executables = [record["executable"] for line in result.stdout.splitlines()
+                   if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
+    assert len(executables) == 1, executables
+    binary = output / ("engine-bench" + SUFFIX)
+    shutil.copy2(executables[0], binary)
+    os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
+    run([sys.executable, ROOT / "scripts/perf/sessions.py", binary, "--output", output / "sessions",
+         "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5")], cwd=source)
+    (output / "sessions" / "host.json").write_text(json.dumps(dict(
+        platform=platform.platform(), machine=platform.machine(), hardware=hardware(),
+        revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
+    ), indent=2) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", choices=["all", "build", "measure", "paired"], default="all")
+    parser.add_argument("--phase", choices=["all", "build", "measure", "paired", "sessions"], default="all")
     parser.add_argument("--source", type=Path, default=ROOT)
     parser.add_argument("--output", type=Path, default=ROOT / "target/hosted-perf")
     parser.add_argument("--variant", default="{}", help='JSON: {"rustflags": [...], "config": [...]}')
@@ -387,6 +407,9 @@ def main():
         parser.error("measurement output must be empty; select a new --output directory")
     output.mkdir(parents=True, exist_ok=True)
     variant = json.loads(args.variant or "{}")
+    if args.phase == "sessions":
+        sessions(source, output)
+        return
     if args.phase in ["all", "build"]:
         build(source, output, variant, benchmarks=not args.build_only)
         if args.bloat:

@@ -763,7 +763,15 @@ impl Live {
                 ..Projection::default()
             },
         };
-        shared.rt.spawn(Box::pin(actor.run(rx, first)));
+        let run = Box::pin(actor.run(rx, first));
+        // The sessions-on-threads measurement (docs/perf/runtime-demand.md)
+        // runs each actor on an executor of its own; nothing shipped does.
+        #[cfg(test)]
+        if let Some(spawn) = crate::tests::runtime_demand::ACTORS.get() {
+            spawn(run);
+            return Ok(live);
+        }
+        shared.rt.spawn(run);
         Ok(live)
     }
 

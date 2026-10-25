@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-#MISE description="Measure concurrent file-backed session loads and snapshots"
+#MISE description="Measure concurrent session loads and snapshots; with `sessions`, active sessions per runtime layout"
 set -euo pipefail
+if [[ "${1:-}" == sessions ]]; then
+  binary="$(cargo test --release -p engine --lib --no-run --message-format=json \
+    | python3 -c 'import json,sys; print(next(r["executable"] for r in map(json.loads, sys.stdin) if r.get("executable") and r.get("profile", {}).get("test")))')"
+  exec python3 scripts/perf/sessions.py "$binary" "${@:2}"
+fi
 cargo nextest run --release -p engine --lib \
   -E 'test(tests::runtime_demand::concurrent_session_sizing)' \
   --run-ignored only --test-threads 1 --no-capture --no-tests fail
