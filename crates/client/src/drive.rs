@@ -483,7 +483,11 @@ async fn failure(rt: &Rt, daemon: &Daemon, error: Error) -> EventKind {
         return EventKind::Failed(error);
     }
     let link = daemon.link.clone();
-    match rt::unblock(&**rt, move || link.unanswered()).await {
+    let diagnosis = rt::unblock(&**rt, move || {
+        link.unanswered();
+        link.diagnose()
+    });
+    match diagnosis.await {
         Some(diagnosis) => EventKind::Wedged(diagnosis),
         None => EventKind::Failed(error),
     }

@@ -178,7 +178,7 @@ fn connect(daemon: &client::Daemon) -> io::Result<client::Connection> {
 /// link can.
 fn wedged(daemon: &client::Daemon, e: client::Error) -> io::Error {
     if e == client::Error::NotResponding
-        && let Some(diagnosis) = daemon.link.unanswered()
+        && let Some(diagnosis) = daemon.link.diagnose()
     {
         report(&diagnosis);
         return io::Error::new(io::ErrorKind::TimedOut, RESTART);

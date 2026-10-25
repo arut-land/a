@@ -1,9 +1,11 @@
 //! Another machine's daemon, through the system `ssh` (`A_SSH` overrides
 //! it) to `a bridge` there, whose stdio carries the frames. The remote
-//! login shell is given only plain words (`sh -s`, `a bridge <token>`,
-//! `uname -sm`), which sh, csh, fish, cmd and PowerShell all run alike;
-//! a script goes to `sh` on stdin. Installs this build on a host that
-//! lacks `a`, streaming its bytes over SSH.
+//! login shell is given only plain words, which any shell parses alike: a
+//! POSIX host (whatever its login shell, csh and fish included) runs
+//! `sh -s` with the script on stdin; one without `sh` (cmd or PowerShell
+//! on Windows) is asked for `a bridge <token>`, which serves where its `a`
+//! is on PATH. Installs this build on a POSIX host that lacks `a`,
+//! streaming its bytes over SSH.
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -20,6 +22,9 @@ use crate::link::{Link, LinkError, Opened, Pipe, Start, Stream};
 
 /// What the bridge prints, with its token, once it is connected.
 pub const SYNC: &str = "A-BRIDGE";
+
+/// What a script says first, with its token: a POSIX shell runs it.
+const SHELL: &str = "A-SH";
 
 /// Ends a sync line followed by the host's environment, as a frame.
 pub const WITH_ENV: &[u8] = b" env";
@@ -56,30 +61,29 @@ impl Link for SshLink {
         rt: &'a Rt,
         build: &'a Staged,
         start: Start,
-    ) -> BoxFuture<'a, Result<Opened, LinkError>> {
+    ) -> BoxFuture<'a, Result<Opened, Error>> {
         Box::pin(async move {
             if start == Start::Replace {
-                return Err(LinkError::Io(
+                return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!(
                         "this command acts on this machine; run it on {} instead",
                         self.host
                     ),
-                ));
+                )
+                .into());
             }
             let token = token();
             match self.bridge(rt, Bootstrap::Find, &token).await? {
                 Bridge::Ready(opened) => return Ok(opened),
-                Bridge::Ended(Some(NOT_FOUND)) => {}
-                // No POSIX shell there to run discovery (a Windows host, say):
-                // only an `a` on its PATH can serve.
+                Bridge::Ended(ended) if ended.shell && ended.code == Some(NOT_FOUND) => {}
+                Bridge::Ended(ended) if ended.shell => return Err(self.ended(&ended)),
+                // No POSIX shell ran discovery (a Windows host, say): only an
+                // `a` its login shell finds can serve.
                 Bridge::Ended(_) => {
                     return match self.bridge(rt, Bootstrap::Direct, &token).await? {
                         Bridge::Ready(opened) => Ok(opened),
-                        Bridge::Ended(_) => Err(LinkError::Io(
-                            io::ErrorKind::NotFound,
-                            format!("ssh {}: the bridge ended before it was ready", self.host),
-                        )),
+                        Bridge::Ended(ended) => Err(self.ended(&ended)),
                     };
                 }
             }
@@ -93,10 +97,11 @@ impl Link for SshLink {
                 .await?
             {
                 Bridge::Ready(opened) => Ok(opened),
-                Bridge::Ended(_) => Err(LinkError::Io(
+                Bridge::Ended(_) => Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("the `a` installed on {} does not run", self.host),
-                )),
+                )
+                .into()),
             }
         })
     }
@@ -127,8 +132,16 @@ enum Bootstrap<'a> {
 
 enum Bridge {
     Ready(Opened),
-    /// It ended before it was ready, with this status.
-    Ended(Option<i32>),
+    Ended(Ended),
+}
+
+/// A bridge that ended before it was ready.
+struct Ended {
+    /// Whether a POSIX shell ran the script: it says so first.
+    shell: bool,
+    code: Option<i32>,
+    /// What it said on stderr, where that is not the person's terminal.
+    said: String,
 }
 
 impl SshLink {
@@ -142,8 +155,25 @@ impl SshLink {
         cmd
     }
 
+    /// Why the bridge `ended`, as the error to report.
+    fn ended(&self, ended: &Ended) -> Error {
+        let status = ended
+            .code
+            .map_or_else(|| "a signal".to_owned(), |code| format!("status {code}"));
+        let said = if ended.said.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", ended.said)
+        };
+        io::Error::other(format!(
+            "ssh {}: the bridge ended with {status} before it was ready{said}",
+            self.host
+        ))
+        .into()
+    }
+
     /// Starts the bridge as `how` says and waits for its sync line.
-    async fn bridge(&self, rt: &Rt, how: Bootstrap<'_>, token: &str) -> Result<Bridge, LinkError> {
+    async fn bridge(&self, rt: &Rt, how: Bootstrap<'_>, token: &str) -> Result<Bridge, Error> {
         let mut cmd = self.ssh();
         let script = match how {
             Bootstrap::Find => Some(find_script(token)),
@@ -177,8 +207,11 @@ impl SshLink {
             let _ = stream.write_all(script.as_bytes()).await;
         }
         let sync = format!("{SYNC} {token}");
+        let ran = format!("{SHELL} {token}");
+        let mut shell = false;
         let mut buffered = Vec::new();
         while let Some(line) = stream.line(&mut buffered).await? {
+            shell |= line.trim_ascii_end() == ran.as_bytes();
             if line.trim_ascii_end().strip_prefix(sync.as_bytes()) == Some(WITH_ENV) {
                 let Some(ClientMsg::Environment(env)) = stream.recv(&mut buffered).await? else {
                     return Err(
@@ -195,14 +228,14 @@ impl SshLink {
             }
         }
         let code = pipe.guard_mut().exited().await?;
-        if code != Some(SSH_FAILED) {
-            return Ok(Bridge::Ended(code));
-        }
         let said = match report {
             Some(report) => report.said().await,
             None => String::new(),
         };
-        Err(if needs_person(&said) {
+        if code != Some(SSH_FAILED) {
+            return Ok(Bridge::Ended(Ended { shell, code, said }));
+        }
+        Err(Error::Link(if needs_person(&said) {
             LinkError::NeedsInteractiveAuth(format!(
                 "ssh {} needs a password or a host key confirmed, which this client cannot ask for; run `ssh {}` at a terminal once",
                 self.host, self.host
@@ -211,7 +244,7 @@ impl SshLink {
             LinkError::Unreachable(format!("ssh {} failed", self.host))
         } else {
             LinkError::Unreachable(format!("ssh {}: {said}", self.host))
-        })
+        }))
     }
 
     /// Copies this build to the host layout's `runtime/<id>/a`; a host of
@@ -286,7 +319,8 @@ fn grouped(body: &str) -> String {
 
 pub(crate) fn find_script(token: &str) -> String {
     grouped(&format!(
-        r#"if command -v a >/dev/null 2>&1; then exec a bridge {token}; fi
+        r#"echo {SHELL} {token}
+if command -v a >/dev/null 2>&1; then exec a bridge {token}; fi
 {}
 if [ -x "$a_runtime/current/a" ]; then exec "$a_runtime/current/a" bridge {token}; else exit {NOT_FOUND}; fi"#,
         sys::RemoteLayout::discovery_script()
@@ -295,7 +329,7 @@ if [ -x "$a_runtime/current/a" ]; then exec "$a_runtime/current/a" bridge {token
 
 pub(crate) fn installed_script(id: &str, token: &str) -> String {
     grouped(&format!(
-        "{}\nexec \"$a_runtime/{id}/a\" bridge {token}",
+        "echo {SHELL} {token}\n{}\nexec \"$a_runtime/{id}/a\" bridge {token}",
         sys::RemoteLayout::for_platform(Platform::CURRENT).runtime_script()
     ))
 }

@@ -140,7 +140,7 @@ impl From<Error> for io::Error {
             Error::Link(LinkError::NeedsInteractiveAuth(_)) => io::ErrorKind::PermissionDenied,
             Error::Link(LinkError::Unreachable(_)) => io::ErrorKind::HostUnreachable,
             Error::Closed => io::ErrorKind::UnexpectedEof,
-            Error::Link(LinkError::Io(kind, _)) | Error::Io(kind, _) => *kind,
+            Error::Io(kind, _) => *kind,
         };
         Self::new(kind, e.to_string())
     }

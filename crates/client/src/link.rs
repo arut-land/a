@@ -19,13 +19,14 @@ use crate::{Connection, Diagnosis, Error, Welcome};
 /// A way to one daemon.
 pub trait Link: fmt::Debug + Send + Sync + 'static {
     /// Opens a byte stream to the daemon, ready for the hello. `build` is
-    /// this client's, which a link may install where `a` is missing.
+    /// this client's, which a link may install where `a` is missing. A link
+    /// that refuses says why as [`Error::Link`]; else it fails as its I/O did.
     fn open<'a>(
         &'a self,
         rt: &'a Rt,
         build: &'a Staged,
         start: Start,
-    ) -> BoxFuture<'a, Result<Opened, LinkError>>;
+    ) -> BoxFuture<'a, Result<Opened, Error>>;
 
     /// Whether opening may need the person at this terminal (a password, a
     /// host key to confirm), so a full-screen client opens it before it
@@ -34,11 +35,13 @@ pub trait Link: fmt::Debug + Send + Sync + 'static {
         false
     }
 
-    /// The daemon took the connection and did not answer the hello in time:
-    /// what this side can tell about it without talking to it, the timeout
-    /// recorded where the daemon will find it. `None` where nothing can be
-    /// told. Blocking.
-    fn unanswered(&self) -> Option<Diagnosis> {
+    /// The daemon took the connection and did not answer the hello in
+    /// time: records that where the daemon will find it. Blocking.
+    fn unanswered(&self) {}
+
+    /// What this side can tell about the daemon without talking to it;
+    /// `None` where nothing can be told. Blocking.
+    fn diagnose(&self) -> Option<Diagnosis> {
         None
     }
 
@@ -199,35 +202,21 @@ pub enum LinkError {
     NeedsInteractiveAuth(String),
     /// The other machine could not be reached, as the text says.
     Unreachable(String),
-    /// Opening failed here: the socket, a spawn, or a bridge that ended.
-    Io(io::ErrorKind, String),
 }
 
 impl fmt::Display for LinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NeedsInteractiveAuth(why) | Self::Unreachable(why) | Self::Io(_, why) => {
-                f.write_str(why)
-            }
+            Self::NeedsInteractiveAuth(why) | Self::Unreachable(why) => f.write_str(why),
         }
     }
 }
 
 impl std::error::Error for LinkError {}
 
-impl From<io::Error> for LinkError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e.kind(), e.to_string())
-    }
-}
-
 impl From<LinkError> for Error {
     fn from(e: LinkError) -> Self {
-        match e {
-            // As any I/O error reads: a timeout is a daemon not responding.
-            LinkError::Io(kind, why) => io::Error::new(kind, why).into(),
-            e => Self::Link(e),
-        }
+        Self::Link(e)
     }
 }
 
@@ -251,7 +240,7 @@ impl Link for LocalLink {
         rt: &'a Rt,
         _: &'a Staged,
         start: Start,
-    ) -> BoxFuture<'a, Result<Opened, LinkError>> {
+    ) -> BoxFuture<'a, Result<Opened, Error>> {
         let home = self.0.clone();
         Box::pin(async move {
             let (stream, started) =
@@ -273,10 +262,13 @@ impl Link for LocalLink {
         })
     }
 
-    fn unanswered(&self) -> Option<Diagnosis> {
+    fn unanswered(&self) {
         if let Some(daemon) = crate::live_daemon(&self.0) {
             crate::note_timeout(&self.0, &daemon, &Error::NotResponding);
         }
+    }
+
+    fn diagnose(&self) -> Option<Diagnosis> {
         Some(crate::diagnose(&self.0))
     }
 
@@ -364,10 +356,10 @@ pub(crate) async fn connect(
             }
             Ok((Greeting::Draining, ..)) => {
                 on_drain();
-                // One still draining past its grace is tried again.
+                // One still draining past its grace is wedged.
                 rt::or(stream.drained(&mut buffered), async {
                     rt.sleep(crate::DRAIN_TIMEOUT).await;
-                    Ok(())
+                    Err(Error::NotResponding)
                 })
                 .await?;
             }

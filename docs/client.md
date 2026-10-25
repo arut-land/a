@@ -42,12 +42,15 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   - `SshLink { host, prompt }` (`remote.rs`): another machine's, through
     the system `ssh` to `a bridge`, whose stdio carries the same frames
     after a sync line and the host's environment. The remote login shell
-    is given only plain words, so sh, csh, fish, cmd and PowerShell run
-    them alike: `sh -s` with a discovery script on stdin (the `a` on
-    `PATH`, else the one its runtime directory holds, as the host's
-    `A_HOME` or native layout says), `a bridge <token>` where there is no
-    POSIX shell, and `uname -sm` before installing this build where
-    neither finds `a`. A script is grouped, so `sh` reads it whole before
+    is given only plain words, which any shell parses alike. A POSIX host
+    (whatever its login shell, csh and fish included) runs `sh -s` with a
+    discovery script on stdin, which says `A-SH <token>` first and then
+    runs the `a` on `PATH`, else the one its runtime directory holds (as
+    the host's `A_HOME` or native layout says); `uname -sm` comes before
+    installing this build where neither is found. Only a host that never
+    said `A-SH` (no `sh`: cmd or PowerShell on Windows) is asked for
+    `a bridge <token>` directly, which serves where its `a` is on PATH; an
+    `a` that sh found and that failed is reported as it failed. A script is grouped, so `sh` reads it whole before
     running any of it; the upload follows only once the script says
     `ready`, since a shell such as dash reads ahead. `Prompt::Never`
     (`a web`) runs ssh with `BatchMode=yes` and no terminal, and reads

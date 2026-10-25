@@ -52,8 +52,11 @@ only by the per-call box measured above.
 ## Elsewhere
 
 - The blocking API (`Daemon::connect`, `status`, `stop`) now runs the
-  same async hello on its caller's thread through a runtime whose
-  blocking work runs inline: no thread is started for it, and nothing
-  polls (`crates/client/tests/no_polling.rs` still holds).
+  same async hello on its caller's thread, through a runtime whose
+  blocking work runs inline, so it starts no worker of its own. It does
+  wake async-io's reactor thread, once per process, which waits in
+  kqueue, epoll or IOCP and never polls (`crates/client/tests/no_polling.rs`
+  still holds); an ssh link that may not prompt (`Prompt::Never`) adds a
+  thread per connection that reads ssh's stderr until it exits.
 - The read buffer is the frame buffer's spare capacity, not an 8 KiB
   array on the stack, which kept the hello's future under 17 KiB.

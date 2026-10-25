@@ -145,6 +145,7 @@ fn a_host_reuses_its_installed_identity_when_discovery_is_lost() {
     assert!(listed.starts_with(session.trim()), "{listed}");
     let log = fs::read_to_string(env.root.join("ssh.log")).unwrap();
     assert_eq!(log.matches("uname -sm").count(), 1, "{log}");
+    assert_eq!(installs(&log), 1, "{log}");
     // The remote root's command substitution stayed literal.
     let remote = host.root().parent().unwrap();
     assert!(!remote.join("injected").exists());
@@ -154,10 +155,91 @@ fn a_host_reuses_its_installed_identity_when_discovery_is_lost() {
     fs::remove_file(host.runtime().dir().join("current")).unwrap();
     let (mut ls, _) = fake_remote(&mut env, "");
     assert!(ok(&ls.arg("ls").output().unwrap()).starts_with(session.trim()));
+    // Asked again, the host finds the image in place and takes no upload.
+    let log = fs::read_to_string(env.root.join("ssh.log")).unwrap();
+    assert_eq!(installs(&log), 2, "{log}");
     assert_eq!(
         fs::metadata(installed).unwrap().modified().unwrap(),
         modified
     );
+}
+
+/// The install sessions in an ssh log: `sh -s <crc> <size>`.
+fn installs(log: &str) -> usize {
+    log.lines()
+        .filter(|command| {
+            command.strip_prefix("sh -s ").is_some_and(|rest| {
+                rest.split(' ').count() == 2
+                    && rest
+                        .split(' ')
+                        .all(|word| word.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+        .count()
+}
+
+/// Fake `ssh` to a host whose `a` on PATH is `a`, run by `login` (a shell
+/// command line in `$cmd`); returns `a --host box` and the host's home.
+fn host_with(env: &mut Env, a: &std::path::Path, login: &str) -> (Command, Home) {
+    let remote = env.root.join("remote");
+    let bin = remote.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(a, bin.join("a")).unwrap();
+    let host = env.other_home(remote.join(".a"));
+    let ssh = env.script(
+        "ssh",
+        &format!(
+            r#"shift
+cmd="$*"
+printf '%s\n' "$cmd" >> '{log}'
+cd '{remote}' || exit
+export A_HOME='{home}' HOME='{remote}' PATH='{bin}:/usr/bin:/bin'
+{login}
+"#,
+            log = env.root.join("ssh.log").display(),
+            remote = remote.display(),
+            home = host.root().display(),
+            bin = bin.display(),
+        ),
+    );
+    let mut cmd = env.cmd(&["--host", "box"]);
+    cmd.env("A_SSH", ssh).env("PATH", "/usr/bin:/bin");
+    (cmd, host)
+}
+
+#[test]
+fn a_host_without_sh_is_served_by_the_a_its_login_shell_finds() {
+    let mut env = Env::new("remote-no-sh");
+    let exe = env.exe.clone();
+    // As cmd or PowerShell: no `sh`, but `a` on PATH runs.
+    let (mut ls, _) = host_with(
+        &mut env,
+        &exe,
+        r#"case "$cmd" in "sh -s"*) echo "'sh' is not recognized as an internal or external command" >&2; exit 1;; esac
+exec sh -c "$cmd""#,
+    );
+    ok(&ls.arg("ls").output().unwrap());
+    let log = fs::read_to_string(env.root.join("ssh.log")).unwrap();
+    let commands: Vec<_> = log.lines().collect();
+    assert!(
+        matches!(commands[..], ["sh -s", direct] if direct.starts_with("a bridge ")),
+        "{log}"
+    );
+}
+
+#[test]
+fn an_a_that_sh_found_and_that_failed_is_reported_not_retried() {
+    let mut env = Env::new("remote-a-fails");
+    let broken = env.script("broken", "echo 'a: no daemon here' >&2\nexit 3\n");
+    let (mut ls, host) = host_with(&mut env, &broken, r#"exec sh -c "$cmd""#);
+    let output = ls.arg("ls").output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("a: no daemon here"), "{stderr}");
+    assert!(stderr.contains("status 3"), "{stderr}");
+    let log = fs::read_to_string(env.root.join("ssh.log")).unwrap();
+    assert_eq!(log.lines().collect::<Vec<_>>(), ["sh -s"], "{log}");
+    assert!(!host.root().join("runtime").exists());
 }
 
 #[test]
