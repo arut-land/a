@@ -30,7 +30,7 @@ use kernel::{
 use protocol::ledger::Ledger;
 use protocol::{
     Audience, Author, Body, CallId, ClientId, ClientSeq, Entry, Epoch, Installed, Json, Mode,
-    Outcome, Permission, Segments, Seq, SessionId, ToolChoice, Verdict, WaitOn,
+    Outcome, Permission, Segments, Seq, SessionId, ToolChoice, ToolOutcome, Verdict, WaitOn,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -275,8 +275,8 @@ impl Binding for Harness {
         call: CallId,
         tool: &str,
         input: &Json,
-        outcome: Outcome,
-    ) -> kernel::Chained<Outcome> {
+        outcome: ToolOutcome,
+    ) -> kernel::Chained<ToolOutcome> {
         self.bound.post_tool(call, tool, input, outcome)
     }
 
@@ -603,9 +603,14 @@ impl Agent for Modeled {
 }
 
 /// What an outcome says, for the echo agent.
-fn told(outcome: &Outcome) -> String {
+fn told(outcome: &ToolOutcome) -> String {
     match outcome {
-        Outcome::Done { output } => output.to_string(),
+        Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        } => output.to_string(),
+        Outcome::Done {
+            output: protocol::Payload::Blob(blob),
+        } => format!("blob {}", blob.id),
         Outcome::Failed { error } => format!("failed: {error}"),
         Outcome::Interrupted { .. } => "interrupted".to_owned(),
     }
@@ -796,7 +801,7 @@ pub fn approve(call: u64, approved: bool) -> Event {
 pub fn tool_done(call: u64, outcome: Outcome) -> Event {
     Event::ToolDone {
         call: id(call),
-        outcome,
+        outcome: outcome.into(),
         card: None,
         held: Vec::new(),
     }
@@ -922,8 +927,7 @@ pub fn own_child(watch: u64, outcome: &Outcome) -> Body {
         envelope: protocol::Envelope::own(
             SessionId::NIL,
             id(watch),
-            protocol::EnvelopeId::CHILD,
-            outcome.payload(),
+            protocol::Carried::Child(outcome.clone().into()),
         ),
     }
 }
@@ -963,7 +967,7 @@ pub fn sleep_call(seconds: u64) -> Body {
 pub fn tool_result(call: u64, outcome: Outcome) -> Body {
     Body::ToolResult {
         call: CallId::new(call).unwrap(),
-        outcome,
+        outcome: outcome.into(),
         card: None,
         held: Vec::new(),
     }

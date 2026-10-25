@@ -7,7 +7,7 @@
       "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"edit me\"}],\"seq\":3,\"t\":\"entry\"}",
       "{\"epoch\":0,\"input\":3,\"kind\":\"withdraw\",\"seq\":4,\"t\":\"entry\"}",
       "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"edited\"}],\"seq\":5,\"t\":\"entry\"}",
-      "{\"envelope\":{\"destination\":\"00000000-0000-0000-0000-00000000000a\",\"id\":{\"call\":1,\"purpose\":\"job\",\"sender\":\"00000000-0000-0000-0000-00000000000a\"},\"payload\":\"[background job 7 ended: exit code 0]\"},\"epoch\":0,\"kind\":\"enqueue\",\"seq\":6,\"t\":\"entry\"}",
+      "{\"envelope\":{\"destination\":\"00000000-0000-0000-0000-00000000000a\",\"id\":{\"call\":1,\"purpose\":\"message\",\"sender\":\"00000000-0000-0000-0000-00000000000a\"},\"payload\":{\"message\":\"[background job 7 ended: exit code 0]\"}},\"epoch\":0,\"kind\":\"enqueue\",\"seq\":6,\"t\":\"entry\"}",
       "{\"epoch\":0,\"input\":6,\"kind\":\"take\",\"seq\":7,\"t\":\"entry\"}",
       "{\"epoch\":0,\"input\":2,\"kind\":\"take\",\"seq\":8,\"t\":\"entry\"}",
       "{\"seq\":8,\"t\":\"synced\"}"
@@ -76,10 +76,12 @@
           "destination": "00000000-0000-0000-0000-00000000000a",
           "id": {
             "call": 1,
-            "purpose": "job",
+            "purpose": "message",
             "sender": "00000000-0000-0000-0000-00000000000a"
           },
-          "payload": "[background job 7 ended: exit code 0]"
+          "payload": {
+            "message": "[background job 7 ended: exit code 0]"
+          }
         },
         "epoch": 0,
         "kind": "enqueue",
@@ -3626,6 +3628,142 @@
         },
         "rev": 9,
         "seq": 5
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"epoch\":0,\"input\":{\"count\":1000},\"kind\":\"tool_call\",\"seq\":1,\"t\":\"entry\",\"tool\":\"print\"}",
+      "{\"call\":1,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"blob\":{\"id\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\",\"media_type\":\"text/plain\",\"origin\":{\"tool_output\":1},\"size\":11000},\"status\":\"done\"},\"seq\":2,\"t\":\"entry\"}",
+      "{\"seq\":2,\"t\":\"synced\"}"
+    ],
+    "hash": "fd2828388e886e10",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "input": {
+          "count": 1000
+        },
+        "kind": "tool_call",
+        "seq": 1,
+        "t": "entry",
+        "tool": "print"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "tool_result",
+        "outcome": {
+          "blob": {
+            "id": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+            "media_type": "text/plain",
+            "origin": {
+              "tool_output": 1
+            },
+            "size": 11000
+          },
+          "status": "done"
+        },
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "seq": 2,
+        "t": "synced"
+      }
+    ],
+    "name": "a result held as a blob shows what it is and its reference",
+    "state": {
+      "items": [
+        {
+          "call": 1,
+          "input": {
+            "count": 1000
+          },
+          "outcome": {
+            "blob": {
+              "id": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+              "media_type": "text/plain",
+              "origin": {
+                "tool_output": 1
+              },
+              "size": 11000
+            },
+            "status": "done"
+          },
+          "phase": {
+            "settled": "done"
+          },
+          "tool": "print",
+          "type": "tool"
+        }
+      ],
+      "seq": 2,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "taken": [],
+        "turn": 0
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "input": {
+              "count": 1000
+            },
+            "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
+            "tool": "print",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "outcome"
+          }
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 4,
+        "seq": 2
       }
     ]
   },

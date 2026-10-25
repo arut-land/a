@@ -113,7 +113,7 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
             Body::ToolResult {
                 call: CallId(call),
                 outcome: Outcome::Done {
-                    output: Json::encode(&json!({ "slept": 1 })).unwrap()
+                    output: Json::encode(&json!({ "slept": 1 })).unwrap().into()
                 },
                 card: None,
                 held: Vec::new(),
@@ -154,7 +154,10 @@ fn two_terminals_on_one_session_see_identical_state() {
     }
     let done = |e: &protocol::Entry| match &e.body {
         Body::ToolResult {
-            outcome: Outcome::Done { output },
+            outcome:
+                Outcome::Done {
+                    output: protocol::Payload::Inline(output),
+                },
             ..
         } => output.parse::<serde_json::Value>().unwrap()["slept"] == 0,
         _ => false,
@@ -212,7 +215,7 @@ fn a_safe_tool_reruns_after_the_daemon_is_killed() {
     assert_eq!(
         results,
         [&Outcome::Done {
-            output: Json::encode(&json!({ "slept": 2 })).unwrap()
+            output: Json::encode(&json!({ "slept": 2 })).unwrap().into()
         }]
     );
 }
@@ -458,7 +461,8 @@ fn a_parents_watch_fires_exactly_once_after_the_daemon_is_killed_mid_child() {
         .collect();
     let slept = Outcome::Done {
         output: Json::encode(&json!({ "slept": 2 })).unwrap(),
-    };
+    }
+    .into();
     assert_eq!(fired, [&slept]);
     let child_log = env.log(child);
     assert_contiguous(&child_log);

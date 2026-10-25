@@ -186,7 +186,10 @@ fn interrupting_an_active_call_kills_its_server() {
             ..
         } => {}
         Body::ToolResult {
-            outcome: Outcome::Done { output },
+            outcome:
+                Outcome::Done {
+                    output: protocol::Payload::Inline(output),
+                },
             ..
         } => {
             // The tool can observe cancellation before the driver's race;

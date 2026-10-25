@@ -25,8 +25,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ledger::{Keyed, OutcomeKind, Phase};
 use crate::{
-    Activity, ApprovalReason, Audience, Body, CallId, Card, DaemonMsg, Entry, HostPath, Json,
-    Outcome, Permission, Seq, SessionId, SessionSummary, Verdict, WaitOn,
+    Activity, ApprovalReason, Audience, Body, CallId, Card, Carried, DaemonMsg, Entry, HostPath,
+    Json, Outcome, Permission, Seq, SessionId, SessionSummary, ToolOutcome, Verdict, WaitOn,
 };
 
 pub use present::{
@@ -141,7 +141,11 @@ impl ViewState {
             }
             Body::Enqueue { envelope } => self.queued.push_back(Queued {
                 seq: e.seq,
-                text: envelope.payload.clone(),
+                // An outcome is hidden, shown as no text.
+                text: match &envelope.payload {
+                    Carried::Message(text) | Carried::Job(text) => text.clone(),
+                    Carried::Child(_) | Carried::Detached(_) => String::new(),
+                },
                 steer: false,
                 source: envelope.source(),
                 origin: None,
@@ -328,7 +332,7 @@ pub enum Item {
         /// Where it stands, as the ledger has it: once it has its outcome,
         /// settled with that outcome's kind.
         phase: Phase,
-        outcome: Option<Outcome>,
+        outcome: Option<ToolOutcome>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<Box<ApprovalReason>>,
         /// How the tool presents the call, or once it has one, its outcome.
@@ -354,7 +358,7 @@ pub enum Item {
         child: SessionId,
         input: String,
         watch: Option<Seq>,
-        fired: Option<Outcome>,
+        fired: Option<ToolOutcome>,
     },
     Environment {
         seq: Seq,

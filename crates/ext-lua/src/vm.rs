@@ -13,7 +13,7 @@ use ext::{
 };
 use mlua::chunk::ChunkMode;
 use mlua::{Function, HookTriggers, Lua, LuaSerdeExt, StdLib, Table, Value, VmState};
-use protocol::{Audience, Card, Json, Outcome};
+use protocol::{Audience, Card, Json, Outcome, Payload};
 
 #[derive(Clone, Copy)]
 pub struct Limits {
@@ -909,7 +909,12 @@ impl Callbacks {
                     let called = cx.invoke(&name, &tool, &input).await;
                     data.permit.acquire().await?;
                     match called.outcome {
-                        Outcome::Done { output } => decode(&lua, &output),
+                        Outcome::Done {
+                            output: Payload::Inline(output),
+                        } => decode(&lua, &output),
+                        Outcome::Done {
+                            output: Payload::Blob(_),
+                        } => Err(mlua::Error::runtime("delegated tool output held as a blob")),
                         Outcome::Failed { error } => Err(mlua::Error::runtime(error)),
                         Outcome::Interrupted { .. } => {
                             Err(mlua::Error::runtime("delegated tool interrupted"))
@@ -1113,7 +1118,9 @@ impl DynTool for LuaTool {
             };
             match self.execute(input, cx).await {
                 Ok(output) => Called {
-                    outcome: Outcome::Done { output },
+                    outcome: Outcome::Done {
+                        output: output.into(),
+                    },
                     card: None,
                     held: Vec::new(),
                 },

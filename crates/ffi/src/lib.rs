@@ -565,7 +565,7 @@ impl From<&Presented<'_>> for Presentation {
                     Shown::Diff(_) => BodyKind::Diff,
                     Shown::Json(_) => BodyKind::Json,
                     Shown::Markdown(_) => BodyKind::Markdown,
-                    Shown::None | Shown::Text(_) => BodyKind::Text,
+                    Shown::None | Shown::Text(_) | Shown::Held(_) => BodyKind::Text,
                 },
                 text: body.text().into_owned(),
             }),

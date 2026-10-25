@@ -3,15 +3,20 @@
 //! what the model sees stays a pure projection of it:
 //!
 //! - **Recorded** ([`ext::Record`]): as a call ends, a result whose text
-//!   (what its tool shows the model) is over `limit` bytes is written whole
-//!   to a blob, which the result then holds
-//!   ([`BlobOrigin::Spilled`]): durable with the entry, and swept with it.
-//!   The outcome is logged as the tool gave it. A result that holds
-//!   something already (the shell's, which keeps its own whole output) is
-//!   left as it is: its tool decided what to show.
-//! - **Presented** ([`PresentResult`]): a result holding its spill is shown
+//!   (what its tool shows the model) is over `limit` bytes moves into a
+//!   blob, and the outcome is logged holding the blob in its place
+//!   ([`Payload::Blob`]): one copy, durable before the entry is. The blob
+//!   is that text, `text/plain` (or the JSON the model reads,
+//!   `application/json`): the bytes the ends are cut from are the file the
+//!   model greps. A result that holds something already (the shell's,
+//!   which keeps its own whole output) is left as it is: its tool decided
+//!   what to show. This runs before the kernel's `post_tool` chain, which
+//!   so sees, and may replace, the payload as it is logged: of a spilled
+//!   result, the reference alone.
+//! - **Presented** ([`PresentResult`]): a payload held as a blob is shown
 //!   as its first `head` and last `tail` bytes around a
-//!   `<truncated bytes=".." path=".."/>` tag naming the blob's file. The
+//!   `<truncated bytes=".." path=".."/>` tag naming the blob's file (no
+//!   path where it cannot be named). The
 //!   cut is a function of the text alone, at line ends where one is near
 //!   and never inside a character, so every projection of the log shows the
 //!   same bytes and a provider's prompt cache holds.
@@ -22,10 +27,10 @@ use std::sync::Arc;
 use ext::point::{PresentResult, Presenting};
 use ext::{
     BoxFuture, Called, Configured, Cx, DynTool, Extension, Presented, Provides, Record, Refused,
-    Registrar, Rewrite, Table,
+    Registrar, Rewrite, Stored, Table,
 };
 use llm::{Tag, tag};
-use protocol::{BlobOrigin, BlobRef, Held, Outcome};
+use protocol::{BlobOrigin, BlobRef, Outcome, Payload};
 
 /// The `spill` extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,14 +86,18 @@ impl Record for Spill {
         cx: &'a Cx,
     ) -> BoxFuture<'a, Called> {
         Box::pin(async move {
-            let (Outcome::Done { output }, []) = (&called.outcome, &called.held[..]) else {
+            let (
+                Outcome::Done {
+                    output: Payload::Inline(output),
+                },
+                [],
+            ) = (&called.outcome, &called.held[..])
+            else {
                 return called;
             };
             // Content (images) is not text a file could hold.
-            let (text, media_type) = match tool.to_model(output) {
-                llm::Output::Text(text) => (text, "text/plain"),
-                llm::Output::Json(json) => (json.raw().to_owned(), "application/json"),
-                llm::Output::Content(_) => return called,
+            let Some((text, media_type)) = Stored::encode(tool.to_model(output)) else {
+                return called;
             };
             if text.len() <= self.limit {
                 return called;
@@ -100,12 +109,14 @@ impl Record for Spill {
             let sealed = rt::unblock(rt, move || -> std::io::Result<BlobRef> {
                 let mut writer = blobs.writer(text.len() as u64)?;
                 writer.write_all(text.as_bytes())?;
-                writer.finish(media_type, BlobOrigin::Spilled(call))
+                writer.finish(media_type, BlobOrigin::ToolOutput(call))
             })
             .await;
-            // Unsealed, the result is shown whole: nothing is lost.
+            // Unsealed, the result is logged whole: nothing is lost.
             if let Ok(blob) = sealed {
-                called.held.push(Held::Blob(blob));
+                called.outcome = Outcome::Done {
+                    output: Payload::Blob(Box::new(blob)),
+                };
             }
             called
         })
@@ -113,19 +124,17 @@ impl Record for Spill {
 }
 
 impl Spill {
-    /// `shown` cut to its ends, if it holds its spill and is long enough to
-    /// cut: what follows from the text and the spill alone.
+    /// `shown` cut to its ends, if its payload is held as a blob and is
+    /// long enough to cut: a function of the text alone, naming where the
+    /// whole is when it can be read.
     fn present(&self, shown: &Presenting<'_>) -> Rewrite<Presented> {
-        let spill = shown.held.iter().find_map(|placed| match &placed.held {
-            Held::Blob(BlobRef {
-                origin: BlobOrigin::Spilled(_),
-                ..
-            }) => placed.at.as_deref(),
-            _ => None,
-        });
-        let Some(at) = spill else {
+        let Outcome::Done {
+            output: Payload::Blob(_),
+        } = shown.outcome
+        else {
             return Rewrite::Pass;
         };
+        let at = shown.stored;
         let text = match &shown.presented.output {
             llm::Output::Text(text) => text.as_str(),
             llm::Output::Json(json) => json.raw(),
@@ -134,7 +143,7 @@ impl Spill {
         let Some((head, tail)) = cut(text, self.head, self.tail) else {
             return Rewrite::Pass;
         };
-        let mut out = String::with_capacity(head.len() + tail.len() + at.len() + 48);
+        let mut out = String::with_capacity(head.len() + tail.len() + 128);
         out.push_str(head);
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');

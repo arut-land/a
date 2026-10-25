@@ -97,7 +97,21 @@ fn child(purpose: &str, input: &Prompt) -> Conversation<Child> {
 
 async fn awaited(child: Conversation<Child>, cx: &Cx) -> Result<String, String> {
     let outcome = child.ask(cx).await.map_err(|e| format!("{e:?}"))?;
-    Ok(ext::child_result(&outcome))
+    let shown = match &outcome {
+        protocol::Outcome::Done {
+            output: protocol::Payload::Blob(blob),
+        } => read(cx, blob).await,
+        _ => None,
+    };
+    Ok(ext::child_result(&outcome, shown.as_deref()))
+}
+
+/// What a child's result held as a blob shows the model (its text, kept
+/// whole), read back on a storage worker.
+async fn read(cx: &Cx, blob: &protocol::BlobRef) -> Option<String> {
+    let rt = cx.service::<dyn rt::Runtime>()?;
+    let (places, blob) = (cx.blobs.places(), blob.clone());
+    rt::unblock(rt, move || places.read(&blob)).await
 }
 
 /// Detached work keeps running after this call returns its handle.

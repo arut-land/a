@@ -63,11 +63,12 @@ fn blob_holds(env: &Env, text: &str) -> bool {
         .any(|blob| fs::read(blob.path()).is_ok_and(|bytes| bytes == text.as_bytes()))
 }
 
-fn detached_outcome(entries: &[Entry]) -> Option<&str> {
+fn detached_outcome(entries: &[Entry]) -> Option<String> {
     entries.iter().find_map(|e| match &e.body {
-        Body::Enqueue { envelope } if envelope.id.purpose == EnvelopeId::DETACHED => {
-            Some(envelope.payload.as_str())
-        }
+        Body::Enqueue { envelope } => match &envelope.payload {
+            protocol::Carried::Detached(outcome) => serde_json::to_string(outcome).ok(),
+            _ => None,
+        },
         _ => None,
     })
 }
@@ -140,7 +141,7 @@ fn an_upgrade_hands_running_work_to_the_newer_build_live() {
         std::time::Duration::from_secs(30),
         || detached_outcome(&env.log(id)).is_some(),
     );
-    let outcome = detached_outcome(&env.log(id)).unwrap().to_owned();
+    let outcome = detached_outcome(&env.log(id)).unwrap();
     assert!(outcome.contains(r#""exit":7"#), "{outcome}");
     assert!(outcome.contains(r"start\nend"), "{outcome}");
     wait_within("the job's end", std::time::Duration::from_secs(30), || {

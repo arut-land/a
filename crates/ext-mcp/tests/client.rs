@@ -160,7 +160,10 @@ fn cancellation_kills_the_process_even_when_the_server_ignores_it() {
             std::future::pending().await
         };
         let called = rt::or(call, cancel).await;
-        let protocol::Outcome::Done { output } = called.outcome else {
+        let protocol::Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        } = called.outcome
+        else {
             panic!("no typed output")
         };
         let value: Value = output.parse().unwrap();
@@ -297,7 +300,10 @@ fn coalesced_progress_is_published_even_when_the_peer_goes_quiet() {
         )
         .await
     });
-    let protocol::Outcome::Done { output } = called.outcome else {
+    let protocol::Outcome::Done {
+        output: protocol::Payload::Inline(output),
+    } = called.outcome
+    else {
         panic!("no typed result")
     };
     let fact: Value = output.parse().unwrap();

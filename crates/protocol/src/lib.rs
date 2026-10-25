@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 34;
+pub const PROTO: u32 = 35;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 34;
+pub const PROTO_MIN: u32 = 35;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -383,7 +383,7 @@ kinds! {
         Detached "detached" { call: CallId } = Durable;
         ToolResult "tool_result" {
             call: CallId,
-            outcome: Outcome,
+            outcome: ToolOutcome,
             /// How clients show the outcome, as the tool presents it.
             card: Option<Card> = default,
             /// What the outcome references outside the log, which the
@@ -425,7 +425,7 @@ kinds! {
         /// per watch. A call waiting on the child goes on with it; otherwise
         /// it reaches the agent as the session's own envelope
         /// ([`EnvelopeId::CHILD`]).
-        Fired "fired" { watch: Seq, outcome: Outcome } = Durable;
+        Fired "fired" { watch: Seq, outcome: ToolOutcome } = Durable;
         // ── environment and extensions ─────────────────────────────────
         /// The environment the session's commands run in from here on, as the
         /// attaching client captured it, secrets redacted.
@@ -451,6 +451,80 @@ kinds! {
 impl Body {
     /// An interrupt no client asked for.
     pub const INTERRUPT: Self = Self::Interrupt { origin: None };
+
+    /// Every reference the entry holds outside the log: what its `held`
+    /// fields list, a tool outcome held as a blob (logged, replaced by a
+    /// `post_tool` decision, a child's, or carried by an envelope), input
+    /// pasted or attached by reference, and all of these in the context
+    /// image a child is spawned with. What a sweep keeps, and what a
+    /// projection reads or names with I/O.
+    pub fn blobs(&self) -> Vec<Held> {
+        let mut found = Vec::new();
+        match self {
+            Self::ToolResult { outcome, held, .. } => {
+                found.extend(held.iter().cloned());
+                outcome_blob(outcome, &mut found);
+            }
+            Self::Decision {
+                d: Verdict::PostTool { original },
+                ..
+            } => outcome_blob(original, &mut found),
+            Self::Fired { outcome, .. } => outcome_blob(outcome, &mut found),
+            Self::Enqueue { envelope } => envelope_blobs(envelope, &mut found),
+            Self::Input { segments, .. } => segment_blobs(segments, &mut found),
+            // A malformed image is refused where the child is restored.
+            Self::Spawned { intent } => {
+                let image = publication::SpawnImage::from_json(intent);
+                for publication::ContextInput(_, value) in image
+                    .into_iter()
+                    .flat_map(|image| image.image)
+                    .flat_map(|publication::ContextLayer(_, inputs)| inputs)
+                {
+                    use publication::ContextValue::{
+                        Assistant, Background, Child, Context, Detached, Inbox, Inherited, Into,
+                        Job, Queued, Reply, Taken, ToolCall, ToolResult, User, Withdrawn,
+                    };
+                    match value {
+                        Queued(segments, _) => segment_blobs(&segments, &mut found),
+                        Child(outcome) => outcome_blob(&outcome, &mut found),
+                        Background(_, outcome, held) | ToolResult(_, outcome, held) => {
+                            found.extend(held);
+                            outcome_blob(&outcome, &mut found);
+                        }
+                        Job(_, _, held) => found.extend(held),
+                        Inherited(_) | User(_) | Inbox(..) | Taken(_) | Into(..) | Withdrawn(_)
+                        | Assistant(_) | Context(..) | Detached(_) | Reply(_) | ToolCall(..) => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        found
+    }
+}
+
+fn outcome_blob(outcome: &ToolOutcome, found: &mut Vec<Held>) {
+    if let Outcome::Done {
+        output: Payload::Blob(blob),
+    } = outcome
+    {
+        found.push(Held::Blob((**blob).clone()));
+    }
+}
+
+fn envelope_blobs(envelope: &Envelope, found: &mut Vec<Held>) {
+    found.extend(envelope.held.iter().cloned());
+    match &envelope.payload {
+        Carried::Child(outcome) | Carried::Detached(outcome) => outcome_blob(outcome, found),
+        Carried::Message(_) | Carried::Job(_) => {}
+    }
+}
+
+fn segment_blobs(segments: &Segments, found: &mut Vec<Held>) {
+    found.extend(segments.0.iter().filter_map(|segment| match segment {
+        Segment::PasteRef(blob) | Segment::Attachment(blob) => Some(Held::Blob(blob.clone())),
+        Segment::Text(_) | Segment::Paste(_) => None,
+    }));
 }
 
 /// A piece of input as its client composed it: what the user typed, what
@@ -614,7 +688,7 @@ kinds! {
         /// An extension answered the call's permission `ask` itself.
         Approval "approval" { approved: bool };
         /// The call's outcome was replaced; `original` is what it replaced.
-        PostTool "post_tool" { original: Outcome };
+        PostTool "post_tool" { original: ToolOutcome };
         /// The agent stopped and was given `text` to continue with.
         OnStop "on_stop" { text: String };
         /// The user's input was rewritten: the input entry that follows holds
@@ -944,11 +1018,13 @@ impl Permission {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum Outcome {
+/// How a call ended. `P` is what a done one holds: JSON in its line for a
+/// model's reply, a child's or a query's, and for a tool's a [`Payload`]
+/// ([`ToolOutcome`]), the one outcome whose value may be held as a blob.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome<P = Json> {
     Done {
-        output: Json,
+        output: P,
     },
     Failed {
         error: String,
@@ -957,21 +1033,92 @@ pub enum Outcome {
     /// or the daemon stopped and the tool is not safe to rerun. `output` is
     /// what it had produced by then.
     Interrupted {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
     },
 }
 
-impl Outcome {
-    /// The payload of an envelope that carries it ([`EnvelopeId::CHILD`],
-    /// [`EnvelopeId::DETACHED`]).
-    pub fn payload(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+/// A tool call's outcome.
+pub type ToolOutcome = Outcome<Payload>;
+
+/// What a done [`Outcome`] holds, as the fields beside its status.
+pub trait OutcomeValue: Sized + sealed::OutcomeValue {
+    #[doc(hidden)]
+    fn fields<M: serde::ser::SerializeMap>(&self, map: &mut M) -> Result<(), M::Error>;
+    #[doc(hidden)]
+    fn read(output: Option<Json>, blob: Option<BlobRef>) -> Result<Self, &'static str>;
+}
+
+mod sealed {
+    pub trait OutcomeValue {}
+    impl OutcomeValue for crate::Json {}
+    impl OutcomeValue for crate::Payload {}
+}
+
+impl OutcomeValue for Json {
+    fn fields<M: serde::ser::SerializeMap>(&self, map: &mut M) -> Result<(), M::Error> {
+        map.serialize_entry("output", self)
     }
 
-    /// The outcome such an envelope's payload carries.
-    pub fn from_payload(payload: &str) -> Option<Self> {
-        serde_json::from_str(payload).ok()
+    fn read(output: Option<Json>, blob: Option<BlobRef>) -> Result<Self, &'static str> {
+        match (output, blob) {
+            (Some(output), None) => Ok(output),
+            (_, Some(_)) => Err("only a tool's outcome is held as a blob"),
+            (None, None) => Err("missing field `output`"),
+        }
+    }
+}
+
+impl OutcomeValue for Payload {
+    fn fields<M: serde::ser::SerializeMap>(&self, map: &mut M) -> Result<(), M::Error> {
+        match self {
+            Self::Inline(output) => map.serialize_entry("output", output),
+            Self::Blob(blob) => map.serialize_entry("blob", blob),
+        }
+    }
+
+    fn read(output: Option<Json>, blob: Option<BlobRef>) -> Result<Self, &'static str> {
+        match (output, blob) {
+            (Some(output), None) => Ok(Self::Inline(output)),
+            (None, Some(blob)) => Ok(Self::Blob(Box::new(blob))),
+            (Some(_), Some(_)) => Err("an outcome is in its line or in a blob, never both"),
+            (None, None) => Err("missing field `output`"),
+        }
+    }
+}
+
+impl<P: OutcomeValue> Serialize for Outcome<P> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = s.serialize_map(None)?;
+        match self {
+            Self::Done { output } => {
+                map.serialize_entry("status", "done")?;
+                output.fields(&mut map)?;
+            }
+            Self::Failed { error } => {
+                map.serialize_entry("status", "failed")?;
+                map.serialize_entry("error", error)?;
+            }
+            Self::Interrupted { output } => {
+                map.serialize_entry("status", "interrupted")?;
+                if let Some(output) = output {
+                    map.serialize_entry("output", output)?;
+                }
+            }
+        }
+        map.end()
+    }
+}
+
+impl From<Outcome> for ToolOutcome {
+    fn from(outcome: Outcome) -> Self {
+        match outcome {
+            Outcome::Done { output } => Self::Done {
+                output: Payload::Inline(output),
+            },
+            Outcome::Failed { error } => Self::Failed { error },
+            Outcome::Interrupted { output } => Self::Interrupted { output },
+        }
     }
 }
 
@@ -1975,39 +2122,114 @@ pub struct EnvelopeId {
 }
 impl EnvelopeId {
     /// The purpose of the envelope a child no call waits on settles into,
-    /// under its watch: its payload is the child's [`Outcome`].
+    /// under its watch: it carries the child's outcome ([`Carried::Child`]).
     pub const CHILD: &str = "child";
-    /// The purpose of a detached call's outcome, under the call: its
-    /// payload is the [`Outcome`].
+    /// The purpose of a detached call's outcome, under the call
+    /// ([`Carried::Detached`]).
     pub const DETACHED: &str = "detached";
     /// The purpose of the end of a process group a call left to the
     /// session, under the call: its payload is text for the model.
     pub const JOB: &str = "job";
 }
 
-/// What one recipient takes into its queue.
+/// What an envelope carries, typed: what the recipient reads it as, and so
+/// where it comes from ([`Envelope::source`]) and the purpose it is sent
+/// under, never parsed from text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Carried {
+    /// Another session's message, under a purpose of its own.
+    Message(String),
+    /// The end of a process group a call left to the session, as the model
+    /// reads it ([`EnvelopeId::JOB`]).
+    Job(String),
+    /// The outcome of a child no call waits on ([`EnvelopeId::CHILD`]).
+    Child(ToolOutcome),
+    /// A detached call's outcome ([`EnvelopeId::DETACHED`]).
+    Detached(ToolOutcome),
+}
+
+impl Carried {
+    /// The purpose it is sent under, unless the sender names one.
+    pub const fn purpose(&self) -> Option<&'static str> {
+        match self {
+            Self::Message(_) => None,
+            Self::Job(_) => Some(EnvelopeId::JOB),
+            Self::Child(_) => Some(EnvelopeId::CHILD),
+            Self::Detached(_) => Some(EnvelopeId::DETACHED),
+        }
+    }
+}
+
+impl From<String> for Carried {
+    fn from(text: String) -> Self {
+        Self::Message(text)
+    }
+}
+
+impl From<&str> for Carried {
+    fn from(text: &str) -> Self {
+        Self::Message(text.to_owned())
+    }
+}
+
+/// What one recipient takes into its queue. Read only when its purpose is
+/// the one what it carries is sent under: a message never under a reserved
+/// one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "EnvelopeFields")]
 pub struct Envelope {
     pub id: EnvelopeId,
     pub destination: SessionId,
-    pub payload: String,
+    pub payload: Carried,
     /// What the payload references outside the log: a detached call's
     /// outcome holds what its result would have.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held: Vec<Held>,
 }
 
+#[derive(Deserialize)]
+struct EnvelopeFields {
+    id: EnvelopeId,
+    destination: SessionId,
+    payload: Carried,
+    #[serde(default)]
+    held: Vec<Held>,
+}
+
+impl TryFrom<EnvelopeFields> for Envelope {
+    type Error = &'static str;
+
+    fn try_from(f: EnvelopeFields) -> Result<Self, Self::Error> {
+        let reserved = [EnvelopeId::JOB, EnvelopeId::CHILD, EnvelopeId::DETACHED];
+        let fits = match f.payload.purpose() {
+            Some(purpose) => f.id.purpose == purpose,
+            None => !reserved.contains(&f.id.purpose.as_str()),
+        };
+        if !fits {
+            return Err("an envelope's purpose is not the one its payload is sent under");
+        }
+        Ok(Self {
+            id: f.id,
+            destination: f.destination,
+            payload: f.payload,
+            held: f.held,
+        })
+    }
+}
+
 impl Envelope {
     /// An envelope session `session` sends itself, about its own call
     /// `call`: how what it started and stopped waiting on (a child, a
     /// detached call, a background job) reaches it, on the one queue,
-    /// deduplicated by the id as any envelope is.
-    pub fn own(session: SessionId, call: CallId, purpose: &str, payload: String) -> Self {
+    /// deduplicated by the id as any envelope is; under the purpose its
+    /// payload is sent under.
+    pub fn own(session: SessionId, call: CallId, payload: Carried) -> Self {
         Self {
             id: EnvelopeId {
                 sender: session,
                 call,
-                purpose: purpose.to_owned(),
+                purpose: payload.purpose().unwrap_or("message").to_owned(),
             },
             destination: session,
             payload,
@@ -2022,14 +2244,13 @@ impl Envelope {
         self
     }
 
-    /// Where it comes from, as the queue tells its items apart.
-    pub fn source(&self) -> Source {
-        if self.id.sender != self.destination {
-            Source::Agent(self.id.sender)
-        } else if self.id.purpose == EnvelopeId::CHILD {
-            Source::Child(self.id.call.0)
-        } else {
-            Source::Job(self.id.call)
+    /// Where it comes from, as the queue tells its items apart: what it
+    /// carries says.
+    pub const fn source(&self) -> Source {
+        match &self.payload {
+            Carried::Message(_) => Source::Agent(self.id.sender),
+            Carried::Job(_) | Carried::Detached(_) => Source::Job(self.id.call),
+            Carried::Child(_) => Source::Child(self.id.call.0),
         }
     }
 }
@@ -2049,7 +2270,7 @@ impl Outgoing {
         Envelope {
             id: self.id.clone(),
             destination: to,
-            payload: self.payload.clone(),
+            payload: Carried::Message(self.payload.clone()),
             held: Vec::new(),
         }
     }
@@ -2094,7 +2315,7 @@ impl fmt::Display for OutputStream {
     }
 }
 
-impl Outcome {
+impl ToolOutcome {
     /// The result a call detached as it ran is answered with at once:
     /// done, and marked so. Its stream is what the result holds.
     pub fn detached() -> Self {
@@ -2103,7 +2324,9 @@ impl Outcome {
             detached: bool,
         }
         Self::Done {
-            output: Json::encode(&Placeholder { detached: true }).unwrap_or_default(),
+            output: Payload::Inline(
+                Json::encode(&Placeholder { detached: true }).unwrap_or_default(),
+            ),
         }
     }
 }
@@ -2119,6 +2342,75 @@ pub const INBOX_CAPACITY: usize = 128;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An envelope is read only under the purpose what it carries is sent
+    /// under, so where it comes from follows from what it carries.
+    #[test]
+    fn an_envelope_under_another_payloads_purpose_is_refused() {
+        let own = Envelope::own(
+            SessionId::NIL,
+            CallId::new(2).unwrap(),
+            Carried::Job("ended".into()),
+        );
+        let line = serde_json::to_string(&own).unwrap();
+        assert_eq!(serde_json::from_str::<Envelope>(&line).unwrap(), own);
+        let child = line.replace(r#""purpose":"job""#, r#""purpose":"child""#);
+        assert!(serde_json::from_str::<Envelope>(&child).is_err());
+        let message = line.replace(r#"{"job":"ended"}"#, r#"{"message":"ended"}"#);
+        assert!(serde_json::from_str::<Envelope>(&message).is_err());
+    }
+
+    /// What a child is spawned with references what its parent's entries
+    /// did: the sweep keeps it, and no projection names it on the actor.
+    #[test]
+    fn a_spawn_image_lists_the_blobs_its_context_holds() {
+        use publication::{ContextInput, ContextLayer, ContextValue, RunnerKind, SpawnImage};
+        let blob = BlobRef {
+            id: BlobId([0x5a; 32]),
+            size: 1,
+            media_type: "text/plain".into(),
+            origin: BlobOrigin::ToolOutput(CallId::new(1).unwrap()),
+        };
+        let result = ContextValue::ToolResult(
+            CallId::new(1).unwrap(),
+            ToolOutcome::Done {
+                output: Payload::Blob(Box::new(blob.clone())),
+            },
+            Vec::new(),
+        );
+        let image = SpawnImage {
+            runner: RunnerKind::Agent,
+            authority: Json::null(),
+            image: vec![ContextLayer(
+                RunnerKind::Agent,
+                vec![ContextInput(Seq::new(2).unwrap(), result)],
+            )],
+        };
+        let spawned = Body::Spawned {
+            intent: image.to_json().unwrap(),
+        };
+        assert_eq!(spawned.blobs(), [Held::Blob(blob)]);
+    }
+
+    /// A tool's outcome is in its line or in a blob, and only a tool's is
+    /// ever in a blob: anything else is refused where it is read.
+    #[test]
+    fn a_done_line_holds_its_value_once_and_only_a_tool_result_holds_a_blob() {
+        let blob = format!(
+            r#""blob":{{"id":"{}","size":1,"media_type":"text/plain","origin":{{"tool_output":1}}}}"#,
+            "5a".repeat(32)
+        );
+        let line = |kind: &str, fields: &str| {
+            format!(
+                r#"{{"seq":2,"epoch":0,"kind":"{kind}","call":1,"outcome":{{"status":"done",{fields}}}}}"#
+            )
+        };
+        let read = |line: String| Entry::from_json(line.as_bytes());
+        assert!(read(line("tool_result", &blob)).is_ok());
+        assert!(read(line("tool_result", r#""output":1"#)).is_ok());
+        assert!(read(line("tool_result", &format!(r#""output":1,{blob}"#))).is_err());
+        assert!(read(line("model_result", &blob)).is_err());
+    }
 
     #[test]
     fn byte_accounting_and_frames_share_the_same_encoder() {

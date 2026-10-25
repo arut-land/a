@@ -2,7 +2,7 @@
 //! nothing withdrawn, and calls detached into the background.
 
 use super::*;
-use protocol::{Audience, Envelope, Epoch, Json, Mode, SessionId};
+use protocol::{Audience, BlobOrigin, Envelope, Epoch, Json, Mode, SessionId};
 
 const SESSION: SessionId = SessionId::NIL;
 
@@ -93,7 +93,7 @@ fn what_is_taken_into_a_result_is_read_with_it_and_never_between_a_call_and_its_
         Body::ToolResult {
             call: call(3),
             outcome: Outcome::Done {
-                output: Json::encode("slept").unwrap(),
+                output: Json::encode("slept").unwrap().into(),
             },
             card: None,
             held: Vec::new(),
@@ -134,7 +134,7 @@ fn a_withdrawn_input_is_never_read() {
 fn a_detached_call_answers_with_its_stream_and_its_outcome_is_read_once_taken() {
     let mut bodies = called();
     let outcome = Outcome::Done {
-        output: Json::encode("slept").unwrap(),
+        output: Json::encode("slept").unwrap().into(),
     };
     bodies.extend([
         Body::Detached { call: call(3) },
@@ -148,7 +148,7 @@ fn a_detached_call_answers_with_its_stream_and_its_outcome_is_read_once_taken() 
             })],
         },
         Body::Enqueue {
-            envelope: Envelope::own(SESSION, call(3), EnvelopeId::DETACHED, outcome.payload()),
+            envelope: Envelope::own(SESSION, call(3), Carried::Detached(outcome.clone())),
         },
     ]);
     let waiting = transcript(bodies.clone());
@@ -234,7 +234,7 @@ fn a_held_blob_is_named_only_once_it_can_be_read() {
         bodies.push(Body::ToolResult {
             call: call(3),
             outcome: Outcome::Done {
-                output: Json::encode("cut").unwrap(),
+                output: Json::encode("cut").unwrap().into(),
             },
             card: None,
             held: vec![Held::Blob(blob.clone())],
@@ -262,4 +262,50 @@ fn a_held_blob_is_named_only_once_it_can_be_read() {
     assert_eq!(std::fs::read(&path).unwrap(), b"whole");
     // One the store does not have is not named at all.
     assert!(!shown(&gone).contains("full output"), "{}", shown(&gone));
+}
+
+/// A child whose last result a blob holds settles with that blob: its
+/// envelope lists it, and its parent's model reads it back, as a tool's.
+#[test]
+fn a_childs_result_held_as_a_blob_is_read_back_for_its_parent() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(blob_files::Files::open(home.path().join("blobs"), home.path()).unwrap());
+    let tree = Arc::new(blob_files::CacheDir::new(
+        home.path().join("cache"),
+        store.clone(),
+    ));
+    let places = ext::blob::Blobs::new(store.clone(), tree, SessionId::new()).places();
+    let mut writer = ext::blob::BlobStore::writer(&*store, 1 << 20).unwrap();
+    std::io::Write::write_all(&mut writer, b"the child's whole answer").unwrap();
+    let blob = writer
+        .finish("text/plain", BlobOrigin::ToolOutput(call(3)))
+        .unwrap();
+    let settled = Body::Enqueue {
+        envelope: Envelope::own(
+            SESSION,
+            call(2),
+            Carried::Child(Outcome::Done {
+                output: Payload::Blob(Box::new(blob.clone())),
+            }),
+        ),
+    };
+    assert_eq!(settled.blobs(), [Held::Blob(blob)]);
+    let entries: Vec<_> = ([
+        settled,
+        Body::Take {
+            input: Seq::new(1).unwrap(),
+            into: None,
+        },
+    ]
+    .into_iter()
+    .zip(1..))
+    .map(|(body, seq)| Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
+    .collect();
+    let messages =
+        Transcript::placed(&entries, Arc::new(Registry::default()), "", &places).into_messages();
+    let said = format!("{messages:?}");
+    assert!(
+        said.contains("The child session finished:\\nthe child's whole answer"),
+        "{said}"
+    );
 }

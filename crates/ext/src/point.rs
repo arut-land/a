@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
-use protocol::{CallId, Entry, Held, Json, Outcome, Segments, SessionId, Verdict};
+use protocol::{BlobRef, CallId, Entry, Held, Json, Segments, SessionId, ToolOutcome, Verdict};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -639,7 +639,7 @@ pub struct ToolUse<'a> {
 pub struct Finished<'a> {
     pub tool: &'a str,
     pub input: &'a Json,
-    pub outcome: &'a Outcome,
+    pub outcome: &'a ToolOutcome,
 }
 
 /// A failed model request, as `request_error` handlers see it.
@@ -677,7 +677,7 @@ fn pre_tool<'a, 'b: 'a>(tool: &'b str, input: &'a Json) -> ToolUse<'a> {
     ToolUse { tool, input }
 }
 
-fn post_tool<'a, 'b: 'a>(call: ToolUse<'b>, outcome: &'a Outcome) -> Finished<'a> {
+fn post_tool<'a, 'b: 'a>(call: ToolUse<'b>, outcome: &'a ToolOutcome) -> Finished<'a> {
     Finished {
         tool: call.tool,
         input: call.input,
@@ -689,9 +689,12 @@ fn post_tool<'a, 'b: 'a>(call: ToolUse<'b>, outcome: &'a Outcome) -> Finished<'a
 #[derive(Clone, Copy, Debug)]
 pub struct Ended<'a> {
     pub tool: &'a str,
-    pub outcome: &'a Outcome,
+    pub outcome: &'a ToolOutcome,
     /// What the result holds outside the log, named.
     pub held: &'a [Placed],
+    /// Where the model reads the outcome's payload, when it is held as a
+    /// blob ([`Payload::Blob`](protocol::Payload::Blob)) and can be read.
+    pub stored: Option<&'a str>,
 }
 
 /// A reference a result holds, and where the model reads it: named before
@@ -702,6 +705,42 @@ pub struct Placed {
     /// `None` when it cannot be read now.
     pub at: Option<String>,
 }
+
+/// An outcome's payload held as a blob, read back before the presentation
+/// is asked, so its handlers do no I/O.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stored {
+    /// Where the model reads it; `None` when it cannot be read now.
+    pub at: Option<String>,
+    /// What it holds, as text; `None` when that cannot be read now.
+    pub text: Option<String>,
+}
+
+impl Stored {
+    /// What a blob holds of `output`, the model's view of a result, and
+    /// its media type: the bytes its ends are cut from, and the file the
+    /// model greps. `None` for content (images), which no text holds.
+    pub fn encode(output: llm::Output) -> Option<(String, &'static str)> {
+        match output {
+            llm::Output::Text(text) => Some((text, "text/plain")),
+            llm::Output::Json(json) => Some((json.raw().to_owned(), JSON)),
+            llm::Output::Content(_) => None,
+        }
+    }
+
+    /// `text`, read back from `blob`, as [`Stored::encode`] had it.
+    pub fn decode(blob: &BlobRef, text: String) -> llm::Output {
+        if blob.media_type != JSON {
+            return llm::Output::Text(text);
+        }
+        match serde_json::from_str::<Box<serde_json::value::RawValue>>(&text) {
+            Ok(raw) => llm::Output::Json(Json::from(raw)),
+            Err(_) => llm::Output::Text(text),
+        }
+    }
+}
+
+const JSON: &str = "application/json";
 
 /// What the model is shown of a call's outcome.
 #[derive(Clone, Debug, PartialEq)]
@@ -714,11 +753,13 @@ pub struct Presented {
 #[derive(Clone, Copy, Debug)]
 pub struct Presenting<'a> {
     pub tool: &'a str,
-    pub outcome: &'a Outcome,
+    pub outcome: &'a ToolOutcome,
     /// What the model is shown, as the handlers before left it: first,
     /// the tool's own [`to_model`](crate::Tool::to_model).
     pub presented: &'a Presented,
     pub held: &'a [Placed],
+    /// As [`Ended::stored`].
+    pub stored: Option<&'a str>,
 }
 
 fn presenting<'a, 'b: 'a>(ended: Ended<'b>, presented: &'a Presented) -> Presenting<'a> {
@@ -727,6 +768,7 @@ fn presenting<'a, 'b: 'a>(ended: Ended<'b>, presented: &'a Presented) -> Present
         outcome: ended.outcome,
         presented,
         held: ended.held,
+        stored: ended.stored,
     }
 }
 
@@ -884,7 +926,7 @@ points! {
         PointCx<'c>, (), &'a crate::SpawnSpec, Rewrite<crate::SpawnSpec, String>, same;
     /// A replacement for a call's outcome, before it is committed.
     PostTool(post_tool) = "post_tool", -, FailOpen,
-        PointCx<'c>, ToolUse<'a>, Finished<'a>, Rewrite<Outcome>, post_tool;
+        PointCx<'c>, ToolUse<'a>, Finished<'a>, Rewrite<ToolOutcome>, post_tool;
     /// Text to continue with once the agent stopped. A handler that reads
     /// the session's log folds what it needs of it as typed state.
     OnStop(on_stop) = "on_stop", wire, FailOpen,
@@ -1406,8 +1448,8 @@ impl Hooks {
         &self,
         cx: &PointCx<'_>,
         (tool, input): (&str, &Json),
-        mut outcome: Outcome,
-    ) -> Chained<Outcome> {
+        mut outcome: ToolOutcome,
+    ) -> Chained<ToolOutcome> {
         let mut decisions = Decided::new();
         let facts = ToolUse { tool, input };
         let Ok(()) = self.run::<PostTool>(cx, facts, &mut outcome, &mut |name, original, _| {

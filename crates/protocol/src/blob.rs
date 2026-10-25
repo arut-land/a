@@ -87,11 +87,9 @@ pub enum BlobOrigin {
     Attachment {
         name: String,
     },
-    /// The whole output of a call that showed less.
+    /// The whole output of a call that showed less: one its tool kept, or
+    /// its result's payload, too large for the log line.
     ToolOutput(CallId),
-    /// Everything the model would be shown of a call's result, which it
-    /// is shown the ends of: what a presentation cut, kept whole.
-    Spilled(CallId),
     /// The output of a call's background job.
     JobLog(CallId),
 }
@@ -105,10 +103,22 @@ pub enum Held {
     Stream(OutputStream),
 }
 
-/// A value too large for its log line is held as a blob.
+/// A value, in its log line or, too large for one, held as a blob in its
+/// place: the one copy, never both. Keyed by which, so a result's line
+/// reads `"output":…` or `"blob":{…}` beside its status.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Payload {
+    #[serde(rename = "output")]
     Inline(Json),
-    Blob(BlobRef),
+    /// What the model is shown of the value, as text, held whole: the
+    /// bytes its ends are cut from, and the file it greps. Boxed, so an
+    /// outcome stays as small as the common inline one.
+    Blob(Box<BlobRef>),
+}
+
+impl From<Json> for Payload {
+    fn from(json: Json) -> Self {
+        Self::Inline(json)
+    }
 }

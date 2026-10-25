@@ -399,7 +399,7 @@ mod tests {
 
     use super::*;
 
-    fn tool(outcome: Option<Outcome>, phase: Phase) -> Item {
+    fn tool(outcome: Option<protocol::ToolOutcome>, phase: Phase) -> Item {
         Item::Tool {
             invoke: None,
             call: CallId::new(7).unwrap(),
@@ -417,7 +417,9 @@ mod tests {
     fn a_finished_card_shows_its_exit_and_output_tail() {
         let stdout = (1..=15).fold(String::new(), |s, n| s + &format!("line {n}\n"));
         let done = Outcome::Done {
-            output: Json::encode(&json!({"output": stdout, "exit": 0})).unwrap(),
+            output: Json::encode(&json!({"output": stdout, "exit": 0}))
+                .unwrap()
+                .into(),
         };
         let mut finished = tool(Some(done.clone()), Phase::Running);
         if let Item::Tool { card, .. } = &mut finished {
@@ -556,7 +558,9 @@ mod tests {
     #[test]
     fn command_output_escapes_are_stripped_and_a_bad_mark_shows_red() {
         let done = Outcome::Done {
-            output: Json::encode(&json!({"output": "\x1b[31mred\x1b[0m\n", "exit": 1})).unwrap(),
+            output: Json::encode(&json!({"output": "\x1b[31mred\x1b[0m\n", "exit": 1}))
+                .unwrap()
+                .into(),
         };
         let mut ran = tool(Some(done), Phase::Running);
         if let Item::Tool { card, .. } = &mut ran {
@@ -582,7 +586,7 @@ mod tests {
             phase: Phase::Running,
             reason: None,
             outcome: Some(Outcome::Done {
-                output: Json::encode(&json!({"path": "a.txt"})).unwrap(),
+                output: Json::encode(&json!({"path": "a.txt"})).unwrap().into(),
             }),
             card: Some(protocol::Card {
                 title: "edit a.txt".into(),

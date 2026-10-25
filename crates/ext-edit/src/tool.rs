@@ -693,7 +693,7 @@ mod tests {
             .unwrap()
     }
 
-    fn change(rig: &Rig, path: &str, pairs: &[(&str, &str)]) -> Outcome {
+    fn change(rig: &Rig, path: &str, pairs: &[(&str, &str)]) -> protocol::ToolOutcome {
         let edits: Vec<Value> = pairs
             .iter()
             .map(|(old, new)| json!({ "old": old, "new": new }))
@@ -701,7 +701,7 @@ mod tests {
         rig.call("edit", &json!({ "path": path, "edits": edits }))
     }
 
-    fn failed(outcome: Outcome) -> String {
+    fn failed(outcome: protocol::ToolOutcome) -> String {
         match outcome {
             Outcome::Failed { error } => error,
             other => panic!("{other:?}"),
@@ -714,17 +714,23 @@ mod tests {
         let file = rig.workspace().join("notes.txt");
         let created = change(&rig, "notes.txt", &[("", "one\ntwo\n")]);
         assert!(
-            matches!(&created, Outcome::Done { output } if output.parse::<Value>().unwrap()["created"] == true)
+            matches!(&created, Outcome::Done { output: protocol::Payload::Inline(output) } if output.parse::<Value>().unwrap()["created"] == true)
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n");
-        let Outcome::Done { output } = &created else {
+        let Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        } = &created
+        else {
             unreachable!()
         };
         assert_eq!(
             output.parse::<Value>().unwrap()["publication"],
             json!({"visible": true, "durability": "not_requested", "protection": "exclusive_create", "limitations": {"change_after_check": false, "writes_to_old_inode": false}})
         );
-        let Outcome::Done { output } = change(&rig, "notes.txt", &[("two", "2")]) else {
+        let Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        } = change(&rig, "notes.txt", &[("two", "2")])
+        else {
             panic!()
         };
         assert_eq!(

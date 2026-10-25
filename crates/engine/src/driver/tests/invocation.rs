@@ -4,7 +4,7 @@ use ext::Concurrency;
 struct Owner<const SHARED: bool>;
 impl<const SHARED: bool> Tool for Owner<SHARED> {
     type In = ext::Args;
-    type Out = Outcome;
+    type Out = protocol::ToolOutcome;
     const NAME: &'static str = if SHARED { "shared_owner" } else { "owner" };
     const DESCRIPTION: &'static str = "invoke owned work";
     const REPLAY: Replay = Replay::Safe;
@@ -13,7 +13,7 @@ impl<const SHARED: bool> Tool for Owner<SHARED> {
     } else {
         Concurrency::Exclusive
     };
-    async fn call(&self, args: &ext::Args, cx: &Cx) -> Result<Outcome, String> {
+    async fn call(&self, args: &ext::Args, cx: &Cx) -> Result<protocol::ToolOutcome, String> {
         let input = Json::encode(args).unwrap();
         let tool = match args.args.as_str() {
             "safe" => "safe_effect",
@@ -358,7 +358,9 @@ impl Tool for InvocationProbe {
             .await
             .outcome
         {
-            Outcome::Done { output } => output.parse().map_err(|e| e.to_string()),
+            Outcome::Done {
+                output: protocol::Payload::Inline(output),
+            } => output.parse().map_err(|e| e.to_string()),
             outcome => Err(format!("unexpected invocation result: {outcome:?}")),
         }
     }
@@ -387,6 +389,6 @@ fn ordered_callees_inherit_context_before_the_durable_acknowledgement() {
         .find(|entry| matches!(entry.body, Body::ToolCall { invoke: None, .. }))
         .unwrap()
         .seq;
-    assert!(log.iter().any(|entry| matches!(&entry.body, Body::ToolResult { call, outcome: Outcome::Done { output }, .. } if call.0 == root && output.parse::<usize>().unwrap() == 2)));
+    assert!(log.iter().any(|entry| matches!(&entry.body, Body::ToolResult { call, outcome: Outcome::Done { output: protocol::Payload::Inline(output) }, .. } if call.0 == root && output.parse::<usize>().unwrap() == 2)));
     session.halt();
 }

@@ -209,14 +209,17 @@ impl<'a> From<BackgroundResult<'a>> for Tag<'a> {
 pub struct Truncated<'a> {
     /// The bytes left out here.
     pub bytes: u64,
-    pub at: &'a str,
+    /// Where the whole is read, unless it cannot be read now.
+    pub at: Option<&'a str>,
 }
 
 impl<'a> From<Truncated<'a>> for Tag<'a> {
     fn from(cut: Truncated<'a>) -> Self {
-        Tag::new("truncated")
-            .attr("bytes", cut.bytes.to_string())
-            .attr("path", cut.at)
+        let tag = Tag::new("truncated").attr("bytes", cut.bytes.to_string());
+        match cut.at {
+            Some(at) => tag.attr("path", at),
+            None => tag,
+        }
     }
 }
 

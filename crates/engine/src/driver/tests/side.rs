@@ -449,7 +449,7 @@ fn repeating_a_turn_key_never_calls_the_provider_again() {
     assert_eq!(replay.sent(), 0);
     assert_eq!(sides(&log).len(), 1);
     assert!(log.iter().any(|e| matches!(&e.body,
-        Body::ToolResult { outcome: Outcome::Done { output }, .. }
+        Body::ToolResult { outcome: Outcome::Done { output: protocol::Payload::Inline(output) }, .. }
             if output.raw().contains("crimson-harbor"))));
 }
 
@@ -486,7 +486,7 @@ fn an_ephemeral_turn_writes_no_child_log_and_still_reuses_its_key() {
     session.halt();
     assert_eq!(replay.sent(), 0);
     assert!(log.iter().any(|e| matches!(&e.body,
-        Body::ToolResult { outcome: Outcome::Done { output }, .. }
+        Body::ToolResult { outcome: Outcome::Done { output: protocol::Payload::Inline(output) }, .. }
             if output.raw().contains("crimson-harbor"))));
 }
 
@@ -1122,7 +1122,10 @@ fn compacted_forks_keep_loaded_skills_in_context_and_background_results_out() {
             .find_map(|e| match &e.body {
                 Body::ToolResult {
                     call: result,
-                    outcome: Outcome::Done { output },
+                    outcome:
+                        Outcome::Done {
+                            output: protocol::Payload::Inline(output),
+                        },
                     ..
                 } if result.0 == call => Some(output),
                 _ => None,

@@ -23,7 +23,7 @@ fn drive(s: &mut Session, fx: impl IntoIterator<Item = Work>) {
         let event = match effect {
             Work::RunTool { call, tool, .. } | Work::Resume { call, tool, .. } => Event::ToolDone {
                 call,
-                outcome: done(json!(tool)),
+                outcome: done(json!(tool)).into(),
                 card: None,
                 held: Vec::new(),
             },
@@ -419,7 +419,7 @@ fn an_interrupt_never_starts_work() {
                 },
                 Work::Interrupt { child } => Event::ChildSettled {
                     child,
-                    outcome: INTERRUPTED,
+                    outcome: INTERRUPTED.into(),
                 },
                 _ => continue,
             };
@@ -481,7 +481,7 @@ fn the_same_events_give_the_same_log() {
         });
         s.step(Event::ChildSettled {
             child: child(),
-            outcome: done(json!("ok")),
+            outcome: done(json!("ok")).into(),
         });
         s.step(tool_done(call.get(), done(json!("ok"))));
         s
@@ -747,7 +747,7 @@ fn a_watch_fires_once() {
     for _ in 0..3 {
         s.step(Event::ChildSettled {
             child: child(),
-            outcome: done(json!("ok")),
+            outcome: done(json!("ok")).into(),
         });
     }
     s.step(tool_done(2, done(json!(null))));

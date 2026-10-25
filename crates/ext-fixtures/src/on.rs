@@ -37,7 +37,7 @@ impl Agent for Echo {
         let text = match input {
             Input::User { text } => text,
             Input::ChildDone { outcome, .. } => {
-                let text = ext::child_result(&outcome);
+                let text = ext::child_result(&outcome, None);
                 return Actions::from_elem(Action::Say(text), 1);
             }
             Input::Detached { call, outcome } => {
@@ -258,7 +258,7 @@ mod tests {
         let done = Input::ChildDone {
             watch: protocol::Seq::new(3).unwrap(),
             outcome: Outcome::Done {
-                output: Json::encode("hi").unwrap(),
+                output: Json::encode("hi").unwrap().into(),
             },
         };
         assert_eq!(

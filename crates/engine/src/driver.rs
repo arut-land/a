@@ -824,7 +824,7 @@ impl Live {
         Ok(())
     }
 
-    pub(crate) fn settled(&self, child: SessionId, outcome: Outcome) {
+    pub(crate) fn settled(&self, child: SessionId, outcome: protocol::ToolOutcome) {
         self.send(Msg::Step(Event::ChildSettled { child, outcome }));
     }
 
@@ -2825,7 +2825,8 @@ impl Actor {
             .session
             .cx(origin.clone(), &registry)
             .with_invocation(self.replies.contexts.remove(&call).unwrap_or_default());
-        // A call another invoked is waited on by it, as long as it runs.
+        // A call another invoked is waited on by it, as long as it runs,
+        // and its result is the invoker's to read, unrecorded.
         let invoked = matches!(
             self.core.ledger().call(call).map(|open| &open.call),
             Some(protocol::ledger::Call::Tool {
@@ -2844,7 +2845,13 @@ impl Actor {
         let id = self.live.id;
         origin.spawn(&*self.live.session.shared.rt, async move {
             let began = crate::stamp();
-            let mut run = pin!(contain(registry.tools().run(&tool, &input, parsed, &cx)));
+            let tools = registry.tools();
+            let run = if invoked {
+                tools.call(&tool, &input, parsed, &cx)
+            } else {
+                tools.run(&tool, &input, parsed, &cx)
+            };
+            let mut run = pin!(contain(run));
             // A call that can go on in the background is stopped being
             // waited on, not stopped: its outcome is reported all the same.
             let waited = match &cx.detach {

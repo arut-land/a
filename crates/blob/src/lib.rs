@@ -1,7 +1,8 @@
 //! Blobs: bytes too large for a log line, owned by the session store and
-//! named by their content. An entry holds a [`BlobRef`] (and says so in
-//! its `held` field), never a path; a path is named from the reference
-//! when the model is told of it, and is a copy that can be made again.
+//! named by their content. An entry holds a [`BlobRef`] (in its `held`
+//! field, or as an outcome's [`Payload`]), never a path; a path is named
+//! from the reference when the model is told of it, and is a copy that can
+//! be made again.
 //!
 //! Three seams, each behind a trait so a backend plugs in without the
 //! tools or the store changing:
@@ -267,9 +268,9 @@ impl Blobs {
         self.store.streams()
     }
 
-    /// How references are named for the model.
+    /// How references are named for the model, and read for it.
     pub fn places(&self) -> Places {
-        Places::new(Arc::clone(&self.tree), self.store.streams())
+        Places::new(Arc::clone(&self.store), Arc::clone(&self.tree))
     }
 }
 
@@ -277,18 +278,18 @@ impl Blobs {
 /// so a projection names it the same whoever's session projects it, and
 /// whenever. A blob is materialized as it is named (idempotent, a stat
 /// once it is); a stream is named where it grows, there or not. Without a
-/// store, a blob is named by its place in the tree and a
-/// stream by its call.
+/// store, a blob is named by its place in the tree, read as nothing, and
+/// a stream is named by its call.
 #[derive(Clone, Default)]
 pub struct Places {
-    store: Option<(Arc<dyn Materialize>, PathBuf)>,
+    store: Option<(Arc<dyn BlobStore>, Arc<dyn Materialize>)>,
 }
 
 impl Places {
-    /// The tree `tree` shows, and streams under `streams`.
-    pub fn new(tree: Arc<dyn Materialize>, streams: &Path) -> Self {
+    /// `store`'s blobs, in the tree `tree` shows.
+    pub fn new(store: Arc<dyn BlobStore>, tree: Arc<dyn Materialize>) -> Self {
         Self {
-            store: Some((tree, streams.to_path_buf())),
+            store: Some((store, tree)),
         }
     }
 
@@ -296,11 +297,21 @@ impl Places {
     /// Blocks: run it on a storage worker.
     pub fn blob(&self, blob: &BlobRef) -> Option<String> {
         let at = TreePath::by_id(&blob.id);
-        let Some((tree, _)) = &self.store else {
+        let Some((_, tree)) = &self.store else {
             return Some(at.parts().collect::<Vec<_>>().join("/"));
         };
         tree.ensure(&at, blob).ok()?;
         Some(tree.path(&at).display().to_string())
+    }
+
+    /// What `blob` holds, as text: a payload the log holds by reference,
+    /// read back for the model. `None` if it cannot be read, or is not
+    /// text. Blocks: run it on a storage worker.
+    pub fn read(&self, blob: &BlobRef) -> Option<String> {
+        let (store, _) = self.store.as_ref()?;
+        let mut text = String::with_capacity(usize::try_from(blob.size).ok()?);
+        store.open(&blob.id).ok()?.read_to_string(&mut text).ok()?;
+        Some(text)
     }
 
     /// Where `stream` is read, named from the reference alone: once it
@@ -308,10 +319,10 @@ impl Places {
     /// its end names the blob it became, so every projection of a log
     /// names a stream alike, then and later.
     pub fn stream(&self, stream: OutputStream) -> String {
-        let Some((_, streams)) = &self.store else {
+        let Some((store, _)) = &self.store else {
             return stream.to_string();
         };
-        stream_path(streams, stream).display().to_string()
+        stream_path(store.streams(), stream).display().to_string()
     }
 }
 

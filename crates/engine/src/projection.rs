@@ -29,7 +29,11 @@ impl super::Shared {
             current
         };
         let system = registry.system_prompt();
-        Ok(Transcript::of(&entries, Arc::clone(&registry), system).into_messages())
+        // Named and read as the owner's own transcript does: a payload its
+        // log holds as a blob is read back from the store.
+        let blobs = ext::blob::Blobs::new(Arc::clone(&self.blobs), Arc::clone(&self.tree), owner);
+        let places = blobs.places();
+        Ok(Transcript::placed(&entries, Arc::clone(&registry), system, &places).into_messages())
     }
 }
 
@@ -142,30 +146,40 @@ impl Invocations {
 
 impl super::Waiter {
     fn reply(self, body: &Body) {
-        let interrupted = protocol::Outcome::Interrupted { output: None };
-        let (outcome, failure, card, held) = match body {
-            Body::ToolResult {
-                outcome,
-                card,
-                held,
-                ..
-            } => (outcome, None, card.as_ref(), held.as_slice()),
-            Body::ModelResult {
-                outcome, failure, ..
-            } => (outcome, failure.as_ref(), None, &[][..]),
-            Body::Interrupt { .. } => (&interrupted, None, None, &[][..]),
+        let interrupted = || protocol::Outcome::Interrupted { output: None };
+        match (self, body) {
+            (
+                Self::Tool(reply),
+                Body::ToolResult {
+                    outcome,
+                    card,
+                    held,
+                    ..
+                },
+            ) => reply.send(super::Called {
+                outcome: outcome.clone(),
+                card: card.clone(),
+                held: held.clone(),
+            }),
+            (Self::Tool(reply), Body::Interrupt { .. }) => reply.send(super::Called {
+                outcome: interrupted().into(),
+                card: None,
+                held: Vec::new(),
+            }),
+            (
+                Self::Model(reply),
+                Body::ModelResult {
+                    outcome, failure, ..
+                },
+            ) => reply.send(super::Opened::Cached {
+                outcome: outcome.clone(),
+                failure: failure.clone(),
+            }),
+            (Self::Model(reply), Body::Interrupt { .. }) => reply.send(super::Opened::Cached {
+                outcome: interrupted(),
+                failure: None,
+            }),
             _ => unreachable!("committed result"),
-        };
-        match self {
-            Self::Tool(reply) => reply.send(super::Called {
-                outcome: outcome.clone(),
-                card: card.cloned(),
-                held: held.to_vec(),
-            }),
-            Self::Model(reply) => reply.send(super::Opened::Cached {
-                outcome: outcome.clone(),
-                failure: failure.cloned(),
-            }),
         }
     }
 }
@@ -297,16 +311,14 @@ impl Actor {
                 }
                 _ => None,
             };
-            // Naming what an entry holds makes it readable (file I/O), so
-            // that is left to the next projection, on a blocking worker.
-            let holds = match &e.body {
-                Body::ToolResult { held, .. } => !held.is_empty(),
-                Body::Enqueue { envelope } => !envelope.held.is_empty(),
-                _ => false,
-            };
-            if holds {
-                self.projection.transcript = None;
-            } else if let Some(transcript) = &mut self.projection.transcript {
+            // Naming or reading what an entry references is file I/O, so
+            // the transcript stops short of it, and the next projection
+            // goes on from there on a blocking worker; as it does from
+            // any entry it stopped short of before.
+            if let Some(transcript) = &mut self.projection.transcript
+                && transcript.through() + 1 == e.seq.get()
+                && e.body.blobs().is_empty()
+            {
                 transcript.apply(e, replied.map(|(_, m)| m));
             }
             // A call ends with its result, unless it was detached: then
@@ -426,12 +438,12 @@ impl Actor {
         frame
     }
 
-    /// The conversation the model sees before entry `call`.
+    /// The conversation the model sees before entry `call`: the
+    /// transcript as it stands, gone on with on a blocking worker from
+    /// where it stopped short, or, with none, made from the whole log.
     pub(super) async fn conversation(&mut self, call: CallId) -> io::Result<llm::Messages> {
-        if let Some(messages) = self
-            .projection
-            .transcript
-            .as_ref()
+        if let Some(messages) = (self.projection.transcript.as_ref())
+            .filter(|t| t.through() + 1 >= call.get())
             .and_then(|t| t.before(call.get()))
         {
             return Ok(messages.clone());
@@ -441,35 +453,42 @@ impl Actor {
         let pending: Vec<_> = self.pending_entries().collect();
         let model_only = self.live.session.model_only();
         let places = self.live.session.blobs.places();
+        let kept = self.projection.transcript.take();
         let (transcript, messages) = rt::unblock_with(
             &*self.live.session.shared.rt,
             Cpu,
             rt::STORAGE_BYTES,
             move || {
-                let entries: Vec<_> = frames.entries()?.into_iter().chain(pending).collect();
                 let system = if model_only {
                     ""
                 } else {
                     registry.system_prompt()
                 };
-                let transcript = Transcript::placed(
-                    entries.iter().cloned(),
+                // Each entry is read once: what was folded stays.
+                let transcript = if let Some(mut transcript) = kept {
+                    let through = transcript.through();
+                    let after = frames.entries_after(through)?;
+                    for e in (after.iter().chain(&pending)).filter(|e| e.seq.get() > through) {
+                        transcript.apply(e, None);
+                    }
+                    transcript
+                } else {
+                    let entries = frames.entries()?.into_iter().chain(pending.iter().cloned());
+                    Transcript::placed(entries, Arc::clone(&registry), system, &places)
+                };
+                if let Some(messages) = transcript.before(call.get()).cloned() {
+                    return io::Result::Ok((transcript, messages));
+                }
+                let entries = frames.entries()?.into_iter().chain(pending);
+                let messages = Transcript::placed(
+                    entries.filter(|e| {
+                        e.seq < call.0 || matches!(e.body, Body::Context { .. } | Body::Edit { .. })
+                    }),
                     Arc::clone(&registry),
                     system,
                     &places,
-                );
-                let messages = transcript.before(call.get()).cloned().unwrap_or_else(|| {
-                    Transcript::placed(
-                        entries.into_iter().filter(|e| {
-                            e.seq < call.0
-                                || matches!(e.body, Body::Context { .. } | Body::Edit { .. })
-                        }),
-                        Arc::clone(&registry),
-                        system,
-                        &places,
-                    )
-                    .into_messages()
-                });
+                )
+                .into_messages();
                 io::Result::Ok((transcript, messages))
             },
         )
@@ -507,7 +526,7 @@ mod tests {
         ));
         for outcome in [
             Outcome::Done {
-                output: Json::encode(&"result").unwrap(),
+                output: Json::encode(&"result").unwrap().into(),
             },
             Outcome::Failed {
                 error: "failed".into(),

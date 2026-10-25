@@ -5,6 +5,7 @@ use super::{
     Event, Json, Model, Msg, Opened, Outcome, PendingSide, Phase, Replied, Session, SideAdmitted,
     SideFact, Ticket, contain, first, lock, oneshot, replied, reply,
 };
+use protocol::Carried;
 
 impl Actor {
     // Successful settlement revokes mutation authority, but a background
@@ -622,7 +623,7 @@ impl super::Daemon {
                 protocol::Envelope {
                     id,
                     destination: live.id,
-                    payload: image.turn.raw().into(),
+                    payload: Carried::Message(image.turn.raw().into()),
                     held: Vec::new(),
                 },
                 cancel,
@@ -643,7 +644,13 @@ impl Actor {
             entry = self.indexed_entry(input).await.map_err(|e| e.to_string())?;
         }
         let (text, keyed) = match &entry.body {
-            Body::Enqueue { envelope } => (envelope.payload.clone(), true),
+            Body::Enqueue {
+                envelope:
+                    protocol::Envelope {
+                        payload: Carried::Message(text),
+                        ..
+                    },
+            } => (text.clone(), true),
             Body::Input { segments, .. } => (segments.text(), false),
             _ => return Err("model-only turn has no admitted input".into()),
         };

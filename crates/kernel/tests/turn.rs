@@ -1045,7 +1045,7 @@ fn fired(seq: u64, watch: u64, outcome: Outcome) -> protocol::Entry {
         seq,
         Body::Fired {
             watch: Seq::new(watch).unwrap(),
-            outcome,
+            outcome: outcome.into(),
         },
     )
 }
@@ -1066,7 +1066,7 @@ fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
         (
             Event::ChildSettled {
                 child: child(),
-                outcome: ok.clone(),
+                outcome: ok.clone().into(),
             },
             (
                 vec![fired(6, 5, ok.clone())],
@@ -1082,7 +1082,7 @@ fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
         (
             Event::ChildSettled {
                 child: child(),
-                outcome: ok.clone(),
+                outcome: ok.clone().into(),
             },
             (vec![], vec![]),
         ),
@@ -1113,7 +1113,7 @@ fn an_interrupt_stops_the_child_first() {
         (
             Event::ChildSettled {
                 child: child(),
-                outcome: INTERRUPTED,
+                outcome: INTERRUPTED.into(),
             },
             (
                 vec![
@@ -1143,7 +1143,7 @@ fn a_background_childs_result_starts_a_turn_of_its_own() {
         (
             Event::ChildSettled {
                 child: child(),
-                outcome: ok.clone(),
+                outcome: ok.clone().into(),
             },
             (
                 vec![fired(5, 4, ok.clone()), entry(6, own_child(4, &ok))],
@@ -1173,7 +1173,7 @@ fn a_child_reports_each_time_it_settles() {
     let (mut s, fx) = Session::resume(Reg::echo().arc(), log([input("hi")]), &load);
     let report = |text: &str| Work::Report {
         outcome: Outcome::Done {
-            output: Json::encode(&text).unwrap(),
+            output: Json::encode(&text).unwrap().into(),
         },
     };
     assert_plan(&fx, (vec![entry(2, said("hi"))], vec![report("hi")]));
@@ -1345,7 +1345,10 @@ fn outgoing(envelope: &protocol::Envelope) -> protocol::Outgoing {
     protocol::Outgoing {
         id: envelope.id.clone(),
         recipients: vec![envelope.destination],
-        payload: envelope.payload.clone(),
+        payload: match &envelope.payload {
+            protocol::Carried::Message(text) => text.clone(),
+            other => panic!("{other:?}"),
+        },
     }
 }
 
@@ -1501,13 +1504,13 @@ fn cancel_wins_once_over_a_detached_result_even_after_reload() {
     assert!(work(&fx).any(|e| matches!(e, Work::Interrupt { child: c } if *c == child())));
     s.step(Event::ChildSettled {
         child: child(),
-        outcome: done(json!("late")),
+        outcome: done(json!("late")).into(),
     });
     let (mut restored, fx) = Session::resume(Reg::echo().arc(), s.log, &Load::default());
     assert!(!work(&fx).any(|e| matches!(e, Work::StartChild { .. })));
     restored.step(Event::ChildSettled {
         child: child(),
-        outcome: done(json!("later")),
+        outcome: done(json!("later")).into(),
     });
     let results: Vec<_> = restored
         .log
@@ -1558,7 +1561,7 @@ fn detached_results_and_messages_enter_before_the_next_provider_step() {
     });
     s.step(Event::ChildSettled {
         child: child(),
-        outcome: done(json!("result")),
+        outcome: done(json!("result")).into(),
     });
     s.step(Event::Enqueue {
         envelope: envelope("update"),
@@ -1568,7 +1571,7 @@ fn detached_results_and_messages_enter_before_the_next_provider_step() {
     assert!(s.log.iter().all(|e| !matches!(e.body, Body::Take { .. })));
     s.step(Event::ToolDone {
         call,
-        outcome: done(json!("handle")),
+        outcome: done(json!("handle")).into(),
         card: None,
         held: Vec::new(),
     });

@@ -282,7 +282,7 @@ fn busy_sessions_recover_at_startup() {
         })
     };
     assert!(
-        matches!(result(1), Some(Outcome::Done { output }) if output.parse::<serde_json::Value>().unwrap()["slept"] == 0),
+        matches!(result(1), Some(Outcome::Done { output: protocol::Payload::Inline(output) }) if output.parse::<serde_json::Value>().unwrap()["slept"] == 0),
         "{got:#?}"
     );
     assert_eq!(result(2), Some(&Outcome::Interrupted { output: None }));
@@ -477,7 +477,7 @@ pub(crate) fn spawn_intent(call: u64, prompt: &str) -> Json {
     .unwrap()
 }
 
-fn fired(bodies: &[Body]) -> Vec<&Outcome> {
+fn fired(bodies: &[Body]) -> Vec<&protocol::ToolOutcome> {
     bodies
         .iter()
         .filter_map(|b| match b {
@@ -554,13 +554,15 @@ fn a_parent_hears_from_its_child_exactly_once() {
             Body::Fired {
                 watch: Seq::new(6).unwrap(),
                 outcome: Outcome::Done {
-                    output: Json::encode("hi").unwrap()
+                    output: Json::encode("hi").unwrap().into()
                 }
             },
             Body::ToolResult {
                 call: CallId::new(3).unwrap(),
                 outcome: Outcome::Done {
-                    output: Json::encode("The child session finished:\nhi").unwrap()
+                    output: Json::encode("The child session finished:\nhi")
+                        .unwrap()
+                        .into()
                 },
                 card: None,
                 held: Vec::new(),
@@ -689,9 +691,10 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         card: None,
         by: Audience::Model,
     };
-    let slept = Outcome::Done {
+    let slept: protocol::ToolOutcome = Outcome::Done {
         output: Json::encode(&json!({ "slept": 0 })).unwrap(),
-    };
+    }
+    .into();
     let mut parents = Vec::new();
 
     // Killed while the child ran.
@@ -804,7 +807,7 @@ fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
 
     assert_eq!(owned.len(), 1);
     assert_eq!(busy, Duration::ZERO);
-    let aborted = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.parse::<serde_json::Value>().unwrap()["aborted"] == true);
+    let aborted = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output: protocol::Payload::Inline(output) }, .. } if output.parse::<serde_json::Value>().unwrap()["aborted"] == true);
     assert!(child_log.iter().any(aborted), "{child_log:#?}");
     // The child settles first, then its parent's call, then the turn.
     let interrupted = Outcome::Interrupted { output: None };
@@ -1426,7 +1429,7 @@ fn an_unclean_stop_rebuilds_the_catalog_and_recovers_the_call() {
         })
     };
     assert!(
-        matches!(result(1), Some(Outcome::Done { output }) if output.parse::<serde_json::Value>().unwrap()["slept"] == 0),
+        matches!(result(1), Some(Outcome::Done { output: protocol::Payload::Inline(output) }) if output.parse::<serde_json::Value>().unwrap()["slept"] == 0),
         "{got:#?}"
     );
     assert_eq!(result(2), Some(&Outcome::Interrupted { output: None }));
@@ -1875,7 +1878,7 @@ fn detached_messages_wait_for_a_boundary_and_the_parent_hears_once() {
         2
     );
     assert!(child_log.iter().all(|b| !matches!(b, Body::Take { .. })));
-    assert_eq!(fired(&parent_log), [] as [&Outcome; 0]);
+    assert_eq!(fired(&parent_log), [] as [&protocol::ToolOutcome; 0]);
     assert!(rt::block_on(daemon.fork(&id.to_string(), None)).is_err());
     assert!(rt::block_on(daemon.fork(&child.to_string(), None)).is_err());
     BACKGROUND_CONTROL.1.set();
@@ -1965,7 +1968,7 @@ fn interrupt_cancels_detached_descendants_after_the_spawning_call_completes() {
         id,
         child,
         Outcome::Done {
-            output: Json::encode("late").unwrap(),
+            output: Json::encode("late").unwrap().into(),
         },
     ));
     parent.session().barrier();
@@ -2098,7 +2101,7 @@ impl ext::Tool for PairTasks {
                 .ask(cx)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
-            results.push(ext::child_result(&result));
+            results.push(ext::child_result(&result, None));
         }
         Ok(results)
     }
@@ -2158,7 +2161,9 @@ fn replay_reuses_each_named_child_and_its_own_result() {
     assert_eq!(restored.shared.store.headers().unwrap().len(), 3);
     assert!(matches!(log.last(), Some(Body::ToolResult { outcome, .. }) if outcome == &expected));
     let results: Vec<String> = match expected {
-        Outcome::Done { output } => output.parse().unwrap(),
+        Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        } => output.parse().unwrap(),
         other => panic!("{other:?}"),
     };
     assert!(results[0].ends_with("first"));
@@ -2259,7 +2264,7 @@ mod inheritance {
                 .depth(4)
                 .ask(cx)
                 .await
-                .map(|outcome| ext::child_result(&outcome))
+                .map(|outcome| ext::child_result(&outcome, None))
                 .map_err(|e| format!("{e:?}"))
         }
     }
@@ -2532,7 +2537,7 @@ fn a_task_placed_on_another_machine_is_refused_and_starts_no_child() {
     let log = bodies(&*daemon.shared.store, id);
     assert!(log.iter().any(|b| matches!(
         b,
-        Body::ToolResult { outcome: Outcome::Done { output }, .. }
+        Body::ToolResult { outcome: Outcome::Done { output: protocol::Payload::Inline(output) }, .. }
             if output.parse::<String>().unwrap() == "refused"
     )));
     assert_eq!(daemon.shared.store.headers().unwrap().len(), 1);

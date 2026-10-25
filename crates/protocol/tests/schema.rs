@@ -190,7 +190,10 @@ fn said(ledger: &Ledger) -> Said {
         untaken: ledger
             .untaken()
             .iter()
-            .map(|q| (q.text.clone(), q.steer))
+            .map(|q| match &q.item {
+                protocol::ledger::Item::Input(text) => (text.clone(), q.steer),
+                other => (format!("{other:?}"), q.steer),
+            })
             .collect(),
         result: ledger.result().map(|r| format!("{r:?}")),
         activity: ledger.activity(),

@@ -25,7 +25,7 @@
 use std::marker::PhantomData;
 
 use crate::{BoxFuture, Budget, Cx, Extension, ModelRole};
-use protocol::{CallId, MachineId, Outcome, SessionId};
+use protocol::{CallId, MachineId, SessionId, ToolOutcome};
 use serde::{Deserialize, Serialize};
 
 pub use llm::ContextPolicy;
@@ -340,7 +340,7 @@ impl Conversation<Task> {
     /// What the child settles with. The child is the call's own: started
     /// once however often the call runs again (as recovery runs it), and
     /// heard from once. An interrupt of the call's turn reaches it first.
-    pub async fn ask(self, cx: &Cx) -> Result<Outcome, SpawnRefusal> {
+    pub async fn ask(self, cx: &Cx) -> Result<ToolOutcome, SpawnRefusal> {
         let conversations = cx.conversations().ok_or_else(Self::unavailable)?;
         let spawn = self.spawn(|| conversations.kind());
         conversations.task(cx, spawn).await
@@ -502,7 +502,7 @@ pub trait Conversations: Send + Sync {
         cx: &'a Cx,
         turn: ModelTurn,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>>;
-    fn task<'a>(&'a self, _: &'a Cx, _: Spawn) -> BoxFuture<'a, Result<Outcome, SpawnRefusal>> {
+    fn task<'a>(&'a self, _: &'a Cx, _: Spawn) -> BoxFuture<'a, Result<ToolOutcome, SpawnRefusal>> {
         Box::pin(std::future::ready(Err(SpawnRefusal::Unavailable(
             "no child sessions here".into(),
         ))))

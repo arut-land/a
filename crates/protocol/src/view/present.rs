@@ -7,7 +7,8 @@ use std::borrow::Cow;
 use crate::ledger::Phase;
 use crate::view::{Item, Recap, Status, Usage};
 use crate::{
-    ApprovalReason, Audience, CallId, Card, Json, Mark, Outcome, Permission, Verdict, WaitOn,
+    ApprovalReason, Audience, BlobRef, CallId, Card, Json, Mark, Outcome, Payload, Permission,
+    ToolOutcome, Verdict, WaitOn,
 };
 
 /// What an item is, for the layout a renderer gives it.
@@ -77,6 +78,9 @@ pub enum Shown<'a> {
     Json(&'a Json),
     /// A reply's text.
     Markdown(&'a str),
+    /// A tool's output held outside the log, no card presents: what it
+    /// is and its reference, whose bytes the daemon serves.
+    Held(&'a BlobRef),
 }
 
 impl Shown<'_> {
@@ -87,6 +91,10 @@ impl Shown<'_> {
             Self::Text(text) => Cow::Borrowed(text),
             Self::Diff(text) | Self::Markdown(text) => Cow::Borrowed(text),
             Self::Json(json) => Cow::Owned(json.to_string()),
+            Self::Held(blob) => Cow::Owned(format!(
+                "{} bytes of {}, held as blob {}",
+                blob.size, blob.media_type, blob.id
+            )),
         }
     }
 }
@@ -256,7 +264,7 @@ fn standing<'a>(
     p: &mut Presented<'a>,
     call: CallId,
     phase: &Phase,
-    outcome: Option<&'a Outcome>,
+    outcome: Option<&'a ToolOutcome>,
     card: Option<&'a Card>,
 ) {
     let Some(outcome) = outcome else {
@@ -294,10 +302,13 @@ fn standing<'a>(
                         Shown::Text(text.into())
                     }
                 }
-                None if output.raw() == "null" => Shown::None,
-                None => match output.parse::<String>() {
-                    Ok(text) => Shown::Text(text.into()),
-                    Err(_) => Shown::Json(output),
+                None => match output {
+                    Payload::Blob(blob) => Shown::Held(blob),
+                    Payload::Inline(output) if output.raw() == "null" => Shown::None,
+                    Payload::Inline(output) => match output.parse::<String>() {
+                        Ok(text) => Shown::Text(text.into()),
+                        Err(_) => Shown::Json(output),
+                    },
                 },
             };
         }

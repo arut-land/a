@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use protocol::publication::Publication;
-use protocol::view::{Change, Recap, SessionView, Update};
+use protocol::view::{Change, Recap, SessionView, Shown, Update};
 use protocol::{
     Audience, Body, CallId, Card, DaemonMsg, Decode, Entry, Environment, Epoch, Json, Mode,
     Outcome, Permission, Seq, SessionId, Verdict,
@@ -204,7 +204,7 @@ impl Session {
             let outcome = outcome(rng, &json!({ "output": "x\n", "exit": 0 }));
             self.commit(Body::ToolResult {
                 call: id,
-                outcome,
+                outcome: outcome.into(),
                 card: Some(Card {
                     title: "$ echo".into(),
                     body: "x\n".into(),
@@ -267,7 +267,7 @@ impl Session {
                 let outcome = outcome(rng, &json!({ "slept": 1 }));
                 self.commit(Body::Fired {
                     watch: Seq::new(watch).unwrap(),
-                    outcome,
+                    outcome: outcome.into(),
                 });
             }
         }
@@ -524,7 +524,6 @@ fn queue_entries() -> Vec<Entry> {
     let job = protocol::Envelope::own(
         SESSION,
         CallId::new(1).unwrap(),
-        protocol::EnvelopeId::JOB,
         "[background job 7 ended: exit code 0]".into(),
     );
     let seq = |n| Seq::new(n).unwrap();
@@ -639,7 +638,9 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         },
     };
     let echoed = || Outcome::Done {
-        output: Json::encode(&json!({ "exit": 0, "output": "hi\n" })).unwrap(),
+        output: Json::encode(&json!({ "exit": 0, "output": "hi\n" }))
+            .unwrap()
+            .into(),
     };
     let card = || Card {
         title: "$ echo hi".into(),
@@ -940,7 +941,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::Fired {
                         watch: Seq::new(2).unwrap(),
                         outcome: Outcome::Done {
-                            output: Json::encode(&json!({ "slept": 1 })).unwrap(),
+                            output: Json::encode(&json!({ "slept": 1 })).unwrap().into(),
                         },
                     },
                 ),
@@ -1028,7 +1029,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::ToolResult {
                         call: CallId::new(5).unwrap(),
                         outcome: Outcome::Done {
-                            output: Json::encode("no jobs").unwrap(),
+                            output: Json::encode("no jobs").unwrap().into(),
                         },
                         card: None, held: Vec::new(),
                     },
@@ -1092,6 +1093,40 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                         text: "done".into(),
                     },
                 ),
+            ]
+        }),
+        ("a result held as a blob shows what it is and its reference", {
+            let blob = protocol::BlobRef {
+                id: protocol::BlobId([0x5a; 32]),
+                size: 11_000,
+                media_type: "text/plain".into(),
+                origin: protocol::BlobOrigin::ToolOutput(CallId::new(1).unwrap()),
+            };
+            vec![
+                attached(),
+                entry(
+                    1,
+                    Body::ToolCall {
+                        invoke: None,
+                        tool: "print".into(),
+                        input: Json::encode(&json!({ "count": 1000 })).unwrap(),
+                        id: None,
+                        card: None,
+                        by: Audience::Model,
+                    },
+                ),
+                entry(
+                    2,
+                    Body::ToolResult {
+                        call: CallId::new(1).unwrap(),
+                        outcome: Outcome::Done {
+                            output: protocol::Payload::Blob(Box::new(blob)),
+                        },
+                        card: None,
+                        held: Vec::new(),
+                    },
+                ),
+                msg(DaemonMsg::Synced { seq: 2 }),
             ]
         }),
         ("generated session 7", generated(7)),
@@ -1569,4 +1604,30 @@ fn call_annotations_present_generic_cards_until_the_call_finishes() {
         },
     )));
     assert_eq!(view.present(&view.items[0]).title, "custom");
+}
+
+/// A client never has a blob's bytes: it shows what the result is and the
+/// reference the daemon serves it by.
+#[test]
+fn a_result_held_as_a_blob_is_shown_as_its_reference() {
+    let (_, messages) = scenarios()
+        .into_iter()
+        .find(|(name, _)| name.starts_with("a result held as a blob"))
+        .unwrap();
+    let mut view = SessionView::default();
+    for value in messages {
+        view.fold(&DaemonMsg::from_json(value.to_string().as_bytes()).unwrap());
+    }
+    let shown = view.present(&view.items[0]);
+    let Shown::Held(blob) = shown.body else {
+        panic!("{shown:?}");
+    };
+    assert_eq!(blob.size, 11_000);
+    assert_eq!(
+        shown.body.text(),
+        format!(
+            "11000 bytes of text/plain, held as blob {}",
+            "5a".repeat(32)
+        )
+    );
 }

@@ -222,7 +222,7 @@ impl DynTool for Declared {
     fn call<'a>(&'a self, _: Parsed, _: &'a Cx) -> BoxFuture<'a, Called> {
         Box::pin(std::future::ready(Called {
             outcome: Outcome::Done {
-                output: Json::encode(&json!("declared")).unwrap(),
+                output: Json::encode(&json!("declared")).unwrap().into(),
             },
             card: None,
             held: Vec::new(),

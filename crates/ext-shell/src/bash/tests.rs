@@ -71,7 +71,10 @@ fn run(rig: &Rig, command: &str) -> Ran {
 /// A command's result, and what it holds outside the log.
 fn kept(rig: &Rig, input: &Value) -> (Ran, Vec<Held>) {
     let called = rig.called("bash", input);
-    let Outcome::Done { output } = called.outcome else {
+    let Outcome::Done {
+        output: protocol::Payload::Inline(output),
+    } = called.outcome
+    else {
         panic!("{input}: {:?}", called.outcome)
     };
     (output.parse().unwrap(), called.held)

@@ -60,7 +60,10 @@ fn backgrounded(fixture: &Fixture, session: &Live, log: &[Entry], call: CallId) 
             _ => None,
         })
         .unwrap();
-    let Some(Outcome::Done { output }) = Outcome::from_payload(&back.payload) else {
+    let protocol::Carried::Detached(Outcome::Done {
+        output: protocol::Payload::Inline(output),
+    }) = &back.payload
+    else {
         panic!("{back:?}")
     };
     let ran: ext_shell::bash::Ran = output.parse().unwrap();
@@ -144,12 +147,12 @@ struct Nest;
 
 impl Tool for Nest {
     type In = Nothing;
-    type Out = Outcome;
+    type Out = protocol::ToolOutcome;
 
     const NAME: &'static str = "nest";
     const DESCRIPTION: &'static str = "Runs a slow command through bash.";
 
-    async fn call(&self, _: &Nothing, cx: &Cx) -> Result<Outcome, String> {
+    async fn call(&self, _: &Nothing, cx: &Cx) -> Result<protocol::ToolOutcome, String> {
         let input = Json::encode(&json!({ "command": "sleep 30", "timeout": 1 })).unwrap();
         Ok(cx
             .invoke("slow", ext_shell::Bash::NAME, &input)
@@ -194,7 +197,10 @@ fn a_command_another_call_invoked_is_still_stopped_at_its_timeout() {
     let inner = (log.iter())
         .find_map(|e| match &e.body {
             Body::ToolResult {
-                outcome: Outcome::Done { output },
+                outcome:
+                    Outcome::Done {
+                        output: protocol::Payload::Inline(output),
+                    },
                 ..
             } => output.parse::<ext_shell::bash::Ran>().ok(),
             _ => None,

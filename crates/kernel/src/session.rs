@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use protocol::ledger::{Call, Ledger, OutcomeKind, Phase, Queued};
 use protocol::{
-    Audience, Author, Body, CallId, Entry, Envelope, EnvelopeId, Held, Json, Mode, Outcome,
-    OutputStream, Seq, SessionId, ToolChoice, Verdict, WaitOn,
+    Audience, Author, Body, CallId, Carried, Entry, Envelope, EnvelopeId, Held, Json, Mode,
+    Outcome, OutputStream, Seq, SessionId, ToolChoice, ToolOutcome, Verdict, WaitOn,
 };
 use smallvec::SmallVec;
 
@@ -30,7 +30,7 @@ pub const RESTART_CAP: u16 = 10;
 
 /// How a tool call ended, as its result is logged.
 struct Ended {
-    outcome: Outcome,
+    outcome: ToolOutcome,
     card: Option<Card>,
     held: Vec<Held>,
 }
@@ -218,7 +218,7 @@ impl Core {
             ),
             Event::Detached { call } => self.detached(call, &mut fx),
             Event::JobEnded { call, text, held } => {
-                self.own(call, EnvelopeId::JOB, text, held, &mut fx);
+                self.own(call, Carried::Job(text), held, &mut fx);
             }
             Event::Note { call, note } => self.note(call, note, &mut fx),
             Event::Waits { call, on } => self.waits(call, on, &mut fx),
@@ -574,7 +574,7 @@ impl Core {
             return Ok(());
         }
         let queued =
-            (self.fold.ledger.untaken().iter()).any(|q| q.seq == input && q.source.visible());
+            (self.fold.ledger.untaken().iter()).any(|q| q.seq == input && q.source().visible());
         if !queued {
             return Err(format!("input {input} is no longer queued"));
         }
@@ -599,12 +599,11 @@ impl Core {
     fn own(
         &mut self,
         call: CallId,
-        purpose: &str,
-        payload: String,
+        payload: Carried,
         held: Vec<Held>,
         fx: &mut StepPlan,
     ) -> Option<Seq> {
-        let envelope = Envelope::own(self.session, call, purpose, payload).holding(held);
+        let envelope = Envelope::own(self.session, call, payload).holding(held);
         if self.fold.ledger.received(&envelope.id) {
             return None;
         }
@@ -1083,7 +1082,7 @@ impl Core {
         } = ended;
         if self.fold.ledger.detached().iter().any(|d| d.call == call) {
             if !self.dropped.contains(&call) {
-                self.own(call, EnvelopeId::DETACHED, outcome.payload(), held, fx);
+                self.own(call, Carried::Detached(outcome), held, fx);
             }
             return;
         }
@@ -1160,7 +1159,7 @@ impl Core {
             if self.registry.runner() == RunnerKind::ModelOnly && boundary != Boundary::TurnEnd {
                 visible = items
                     .iter()
-                    .filter(|q| q.source.visible())
+                    .filter(|q| q.source().visible())
                     .cloned()
                     .collect();
                 &visible[..]
@@ -1287,7 +1286,7 @@ impl Core {
     /// Fires the watches on `child`. A call waiting on it goes on with its
     /// result; otherwise the result is queued, as the session's own
     /// envelope under the watch, for the agent to take up.
-    fn child_settled(&mut self, child: SessionId, outcome: &Outcome, fx: &mut StepPlan) {
+    fn child_settled(&mut self, child: SessionId, outcome: &ToolOutcome, fx: &mut StepPlan) {
         let Some(call) = self.fold.owner(child) else {
             self.fire(child, outcome, fx);
             self.queue_children(fx);
@@ -1310,7 +1309,7 @@ impl Core {
     fn fire(
         &mut self,
         child: SessionId,
-        outcome: &Outcome,
+        outcome: &ToolOutcome,
         fx: &mut StepPlan,
     ) -> SmallVec<[Seq; 1]> {
         let watches: SmallVec<[Seq; 1]> = (self.fold.ledger.armed())
@@ -1891,13 +1890,7 @@ impl Core {
     /// call waits on that have fired and are not queued yet.
     fn queue_children(&mut self, fx: &mut StepPlan) {
         for (watch, outcome) in mem::take(&mut self.fold.unqueued) {
-            self.own(
-                CallId(watch),
-                EnvelopeId::CHILD,
-                outcome.payload(),
-                Vec::new(),
-                fx,
-            );
+            self.own(CallId(watch), Carried::Child(outcome), Vec::new(), fx);
         }
     }
 
@@ -1945,11 +1938,11 @@ impl Core {
             };
             let output = "[the daemon stopped while this call ran in the background: it may \
                           not have completed; its output so far is kept]";
-            let outcome = Outcome::Interrupted {
+            let outcome = ToolOutcome::Interrupted {
                 output: Some(output.to_owned()),
             };
             let held = vec![Held::Stream(stream)];
-            self.own(d.call, EnvelopeId::DETACHED, outcome.payload(), held, fx);
+            self.own(d.call, Carried::Detached(outcome), held, fx);
         }
     }
 
@@ -2097,7 +2090,7 @@ impl Core {
             },
             Some(Call::Tool { .. }) => Body::ToolResult {
                 call,
-                outcome,
+                outcome: outcome.into(),
                 card: None,
                 held: Vec::new(),
             },
@@ -2114,7 +2107,7 @@ impl Core {
             call,
         };
         Ended {
-            outcome: Outcome::detached(),
+            outcome: ToolOutcome::detached(),
             card: None,
             held: vec![Held::Stream(stream)],
         }
@@ -2210,7 +2203,7 @@ fn outcome(replied: Replied) -> Outcome {
     }
 }
 
-fn to_json(outcome: &Outcome) -> Json {
+fn to_json(outcome: &ToolOutcome) -> Json {
     Json::encode(outcome).unwrap_or_default()
 }
 

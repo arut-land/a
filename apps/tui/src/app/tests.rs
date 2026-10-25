@@ -313,7 +313,8 @@ fn a_card_folds_on_click_and_ctrl_o_shows_all_output() {
                 output: Json::encode(
                     &json!({"output": stdout, "exit": 0, "cwd": "/w", "duration_ms": 1}),
                 )
-                .unwrap(),
+                .unwrap()
+                .into(),
             },
             card: Some(Card {
                 title: "$ ls".into(),
@@ -347,7 +348,9 @@ fn tool_success_can_precede_the_idle_frame_that_makes_ctrl_c_detach() {
         Body::ToolResult {
             call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
-                output: Json::encode(&json!({"output": "first\n", "exit": 0})).unwrap(),
+                output: Json::encode(&json!({"output": "first\n", "exit": 0}))
+                    .unwrap()
+                    .into(),
             },
             card: Some(Card {
                 title: "$ ls".into(),
@@ -467,7 +470,8 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
                 output: Json::encode(
                     &json!({"output": "", "exit": null, "signal": "SIGTERM", "aborted": true}),
                 )
-                .unwrap(),
+                .unwrap()
+                .into(),
             },
             card: Some(Card {
                 title: "$ ls".into(),
@@ -669,7 +673,9 @@ fn inline_prints_settled_items_once_and_keeps_the_rest_live() {
         Body::ToolResult {
             call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
-                output: Json::encode(&json!({"output": "a\n", "exit": 0})).unwrap(),
+                output: Json::encode(&json!({"output": "a\n", "exit": 0}))
+                    .unwrap()
+                    .into(),
             },
             card: Some(Card {
                 title: "$ ls".into(),
@@ -695,7 +701,9 @@ fn settled_result() -> App {
         Body::ToolResult {
             call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
-                output: Json::encode(&json!({"output": "retained result", "exit": 0})).unwrap(),
+                output: Json::encode(&json!({"output": "retained result", "exit": 0}))
+                    .unwrap()
+                    .into(),
             },
             card: Some(Card {
                 title: "$ ls".into(),
@@ -921,7 +929,9 @@ fn session(viewport: Viewport) -> Vec<(&'static str, usize, Vec<u8>)> {
         Body::ToolResult {
             call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
-                output: Json::encode(&json!({"output": "a\n", "exit": 0})).unwrap(),
+                output: Json::encode(&json!({"output": "a\n", "exit": 0}))
+                    .unwrap()
+                    .into(),
             },
             card: Some(Card {
                 title: "$ ls".into(),
@@ -1318,7 +1328,9 @@ fn no_timer_runs_unless_a_turn_is_working() {
         Body::ToolResult {
             call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
-                output: Json::encode(&json!({"output": "", "exit": 0})).unwrap(),
+                output: Json::encode(&json!({"output": "", "exit": 0}))
+                    .unwrap()
+                    .into(),
             },
             card: None,
             held: Vec::new(),
@@ -1387,7 +1399,9 @@ fn running_tools_show_each_progress_update_and_then_the_finished_card() {
             Body::ToolResult {
                 call: CallId::new(3).unwrap(),
                 outcome: Outcome::Done {
-                    output: Json::encode(&json!({"output":"final", "exit":0})).unwrap(),
+                    output: Json::encode(&json!({"output":"final", "exit":0}))
+                        .unwrap()
+                        .into(),
                 },
                 card: Some(Card {
                     body: "final".into(),
@@ -1411,7 +1425,9 @@ fn inline_review_expands_finished_cards_without_printing_history_twice() {
         Body::ToolResult {
             call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
-                output: Json::encode(&json!({"output":"done", "exit":0})).unwrap(),
+                output: Json::encode(&json!({"output":"done", "exit":0}))
+                    .unwrap()
+                    .into(),
             },
             card: Some(Card {
                 body: (1..=30).fold(String::new(), |s, n| s + &format!("output {n}\n")),
@@ -1490,7 +1506,7 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
         Body::ToolResult {
             call: CallId::new(4).unwrap(),
             outcome: Outcome::Done {
-                output: Json::encode(&0).unwrap(),
+                output: Json::encode(&0).unwrap().into(),
             },
             card: None,
             held: Vec::new(),

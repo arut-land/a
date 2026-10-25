@@ -373,7 +373,7 @@ fn a_failing_handler_answers_its_points_failure_policy() {
     let gated = denies.gate(&cx, "t", &input).now().unwrap();
     assert_eq!(gated.gate, Gate::Refuse("broken denied this call".into()));
     // Open: passed over.
-    let outcome = Outcome::Interrupted { output: None };
+    let outcome = ToolOutcome::Interrupted { output: None };
     let after = broken.post_tool(&cx, ("t", &input), outcome.clone());
     assert_eq!(after, Chained::new(outcome));
     assert_eq!(broken.on_stop(&cx), None);
@@ -427,7 +427,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
         env: BTreeMap::new(),
         cwd: "/".into(),
     };
-    let failed = |error: &str| Outcome::Failed {
+    let failed = |error: &str| ToolOutcome::Failed {
         error: error.into(),
     };
     let input = Json::encode(&json!({})).unwrap();
@@ -528,7 +528,7 @@ fn a_point_with_no_handler_costs_nothing() {
         r.on::<OnStop>(|cx, ()| Some(cx.model()));
     })]);
     for hooks in [Hooks::default(), elsewhere] {
-        let outcome = Outcome::Interrupted { output: None };
+        let outcome = ToolOutcome::Interrupted { output: None };
         let text = hooks.input(&cx, "hi".into());
         assert_eq!(text, Ok(Chained::new("hi".into())));
         let subject = input.clone();
@@ -759,8 +759,8 @@ fn input_rejections_name_who_and_post_tool_logs_the_original() {
             _ => Rewrite::Replace(format!("{input}1").into()),
         })
         .on::<PostTool>(|_, done| {
-            assert!(matches!(done.outcome, Outcome::Interrupted { .. }));
-            Rewrite::Replace(Outcome::Failed {
+            assert!(matches!(done.outcome, ToolOutcome::Interrupted { .. }));
+            Rewrite::Replace(ToolOutcome::Failed {
                 error: done.tool.into(),
             })
         });
@@ -770,15 +770,15 @@ fn input_rejections_name_who_and_post_tool_logs_the_original() {
     assert!(matches!(&decisions[..], [(_, Verdict::Input { original })] if original == "hi"));
     assert_eq!(set.input(&cx, "no".into()), Err("a: not that".into()));
 
-    let outcome = Outcome::Interrupted { output: None };
+    let outcome = ToolOutcome::Interrupted { output: None };
     let Chained { value, decisions } = set.post_tool(&cx, ("t", &Json::null()), outcome);
-    assert_eq!(value, Outcome::Failed { error: "t".into() });
+    assert_eq!(value, ToolOutcome::Failed { error: "t".into() });
     assert!(matches!(
         &decisions[..],
         [(
             _,
             Verdict::PostTool {
-                original: Outcome::Interrupted { output: None }
+                original: ToolOutcome::Interrupted { output: None }
             }
         )]
     ));
