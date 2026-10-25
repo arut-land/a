@@ -27,11 +27,27 @@ release build, Apple M-series, macOS 27, quiet machine; three rounds:
 
 About 40 ns a frame, under 10 % of a syscall-bound write of the smallest
 frame, and less than the `Vec` each frame is already encoded into. Reads
-take 8 KiB per call, so their box is amortized over many frames. No
-budget (`mise run budgets`: cold start, attach latency, idle RSS) moves
-by that; the perf workflow's comparison with main on this branch is the
-measurement of record for size, latency and RSS (see the report of the
-`link-trait` merge).
+take 8 KiB per call, so their box is amortized over many frames.
+
+## Against main, on hosted runners
+
+The perf workflow (run 40148803457, branch head `f047dd01`, alternating
+with main) on each native runner:
+
+| Runner | size | idle RSS | attach p50 | cold reply |
+| --- | --- | --- | --- | --- |
+| ubuntu-latest | +11.3 KiB (+0.3 %) | +0 KiB | +0.013 ms (+3.0 %) | noise |
+| ubuntu-24.04-arm | +11.0 KiB (+0.3 %) | noise | +0.011 ms (+2.6 %) | noise |
+| macos-latest | +16.3 KiB (+0.5 %) | +144 KiB (+1.6 %) | noise | noise |
+| macos-15-intel | +12.1 KiB (+0.3 %) | noise | noise | noise |
+| windows-latest | +11.5 KiB (+0.2 %) | noise | -0.49 ms (-49 %) | -10 ms (-38 %) |
+| windows-11-arm | +17.0 KiB (+0.3 %) | noise | noise | noise |
+
+The size is the new SSH bootstrap (scripts, stderr report, batch mode)
+and the erased stream; RSS and latency are within noise but for the
+single macOS idle reading and two Linux attach readings of about 12 µs,
+none of which a generic `Daemon<L>` would remove: its hot path differs
+only by the per-call box measured above.
 
 ## Elsewhere
 
