@@ -154,6 +154,90 @@ startup accounting, reservation release, storage progress under network
 saturation, one-worker loading, cold replay, owned shutdown, and idle
 wake counts in isolated nextest processes.
 
+## Concurrently active sessions
+
+Question: would sessions benefit from running on threads of their own
+(an executor per session) instead of as actor futures on the shared async
+workers? Answer, measured on every hosted OS/architecture: no. Sessions stay
+on the shared `min(cores, 4)` workers; nothing shipped changed.
+
+The harness is `tests::runtime_demand::concurrent_active_sessions` (an
+ignored engine test, one fresh process per sample), driven by
+[sessions.py](../../scripts/perf/sessions.py):
+
+```sh
+CARGO_BUILD_JOBS=2 mise run perf:runtime-demand sessions --rounds 1
+gh workflow run perf --ref <branch> -f sessions=true   # every hosted runner
+```
+
+Each sample is a daemon in an isolated home serving its real endpoint, with
+1, 8, 32 or 128 clients. Every client attaches to a new session over the
+endpoint and runs three turns of the default loop. The model is
+`openai/streaming_grammar/tool_then_followup_text.yaml`, served unchanged over
+loopback HTTP through the real ureq transport, one SSE event every 10 ms. Its
+tool call is answered by one real call of the shell extension (`echo`, through
+bash or PowerShell), and the recorded answer streams nine text deltas. The
+delta latency is the time from the provider writing a delta's event to the
+client reading its `delta` frame. Turn latency runs from input sent to
+idle. CPU is process CPU while the turns run. Idle RSS and threads are
+sampled 12 s after the last turn, once blocking workers have retired; the
+clients stay attached. The provider and the client threads are in the same
+process and count toward CPU, RSS and threads equally in every layout.
+
+Layouts, interleaved and reversed on alternate rounds, five rounds each:
+`A` and `A2` (the default, four async workers; their gap is the A/A noise
+band), `cores` (one worker per core, run only where cores differ from four:
+macos-latest has three), `threads` (each session actor on a one-worker
+executor of its own, with every task spawned from it kept there; the blocking
+lanes, flushes and reactor stay shared), and `network` (the default with 128
+network-lane workers, a diagnostic and not a candidate). The `threads` layout
+is test-only: a `#[cfg(test)]` hook where the actor is spawned
+(`driver.rs`, `ACTORS`) and a `Runtime` wrapper in the harness.
+
+Run [40201401042](https://github.com/arut-land/a/actions/runs/40201401042),
+2026-10-25. Pooled delta p99 (ms), turn p99 (ms), active CPU (ms) and idle RSS
+(MiB) at 128 sessions, as A / A2 / threads. [All rows](runtime-sessions.csv)
+cover every layout and session count.
+
+| Runner | Delta p99 | Turn p99 | CPU | Idle RSS |
+| --- | ---: | ---: | ---: | ---: |
+| ubuntu-latest | 0.32 / 0.31 / 0.45 | 4997 / 5011 / 11249 | 3730 / 3620 / 4600 | 31.0 / 31.1 / 50.1 |
+| ubuntu-24.04-arm | 0.29 / 0.31 / 0.28 | 4724 / 4775 / 11542 | 3820 / 3770 / 4480 | 30.1 / 29.7 / 48.7 |
+| macos-latest | 1.73 / 1.79 / 2.91 | 27770 / 28428 / 27543 | 6940 / 7163 / 8596 | 35.2 / 35.2 / 44.9 |
+| macos-15-intel | 1.96 / 2.12 / 3.91 | 21135 / 20479 / 25369 | 11348 / 10605 / 18994 | 28.0 / 28.0 / 36.0 |
+| windows-latest | 0.15 / 0.15 / 0.36 | 17670 / 18618 / 22253 | 5172 / 5062 / 9125 | 41.0 / 39.4 / 50.0 |
+| windows-11-arm | 0.80 / 0.73 / 1.16 | 11226 / 11002 / 13154 | 6766 / 6766 / 10016 | 37.2 / 37.3 / 46.4 |
+
+- **Threads per session lose.** Delta p99 is worse than both A runs, beyond
+  the A/A band, at 32 sessions on all six runners and at 128 on five
+  (ubuntu-24.04-arm is within noise there). Turn p99 roughly
+  doubles on Linux at 128. CPU rises by up to 76% (Windows x64), and idle RSS
+  grows by 8 to 20 MiB at 128 sessions (one thread and executor per idle
+  session). At 1 and 8 sessions every layout is within noise. The adoption
+  bar (p99 better beyond noise, no idle-RSS cost) is not met anywhere.
+- **More async workers do not help either.** On macos-latest, three workers
+  (`cores`) are within the A/A band of four at every count. Delta latency is
+  well under a frame interval (p99 0.1 to 3 ms) under all loads.
+- **The network lane bounds concurrent turns, not the async workers.** A
+  ureq stream holds a network blocking worker for its whole reply, and the
+  lane has eight. At 128 sessions, turns wait their turn: ubuntu-latest turn
+  p50 is 3945 ms with the default and 532 ms with 128 network workers. The
+  cost is delta p99 rising to about 6.5 ms and idle RSS doubling to 68 MiB
+  (allocator retention after 128 concurrent streams). Windows is the
+  exception: its turns are bound by PowerShell start-up, and the wider lane
+  changes nothing there.
+- **Under load, live deltas are dropped at the start of a reply.** With 128
+  concurrent streams, macos-15-intel lost 9384 of 17280 deltas
+  (54%). macos-latest lost 57, and the default layouts lost none.
+  Drops cluster on a reply's first delta. This fits `Live::delta` discarding
+  deltas until the frame log holds the call's `model_call` entry. The final
+  text is unaffected (`model_result` is the fact).
+- **Three of about 400 samples stalled** (`failures.jsonl` in the run's
+  artifacts): `threads`/32 on macos-15-intel, `A2`/32 on ubuntu-24.04-arm and
+  `network`/128 on ubuntu-latest. In the first two, the transport closed a
+  provider connection mid-request-body. In all three, a session's turn then
+  made no progress for 120 s. The sampler records the stall and moves on.
+
 ## Acceptance and integration
 
 All six required invariants are exercised by name:
