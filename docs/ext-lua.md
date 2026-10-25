@@ -76,7 +76,8 @@ separate VM without effects. On every application, live or replayed, the host
 re-evaluates the source in a fresh environment and resets the private VM's PRNG.
 Closure upvalues and global mutations cannot survive an application; only the
 JSON state passed in and returned carries session data. Another session's
-reductions therefore cannot change replay. A failed reduction leaves its
+reductions therefore cannot change replay. Reducers spend instruction fuel only;
+wall-clock deadlines apply to non-durable calls. A failed reduction leaves its
 previous value intact. Tool, hook and agent globals remain generation-wide,
 shared by sessions and discarded on reload.
 

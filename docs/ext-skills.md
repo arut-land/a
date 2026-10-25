@@ -56,8 +56,9 @@ retry. Snapshots retain this same edit-aware projection. An edited body or reloc
 can be loaded again after adoption. Unknown names return the typed
 `LoadError::UnknownSkill { name }` inside the tool's result and publish nothing.
 Loads are exclusive, so concurrent model requests cannot publish the same
-instructions twice. An interrupted load is unsafe to replay: recovery does not
-rerun it against current files. The transcript reads the recorded context; the
+instructions twice. An interrupted load is unsafe to replay: its publication may
+already be committed without its result. Repeating it could change the result
+or publish command arguments twice. Calls read the retained catalog, not files. The transcript reads the recorded context; the
 publication projection reads only log entries. Neither reopens a skill during replay.
 Opening a workspace subscription does prepare current files, independently of
 replaying the recorded conversation.

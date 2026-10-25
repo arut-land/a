@@ -46,30 +46,40 @@ impl Default for Limits {
     }
 }
 
-#[cfg(not(test))]
-fn now() -> Instant {
-    Instant::now()
-}
-
-#[cfg(test)]
-fn now() -> Instant {
-    // Descheduling must not spend a unit test's execution budget.
-    static TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    *TIME.get_or_init(Instant::now)
-}
-
-struct Budget {
-    left: AtomicU64,
+struct WallBudget {
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     until: Mutex<Instant>,
     remaining: Mutex<Duration>,
 }
 
+struct Budget {
+    left: AtomicU64,
+    wall: Option<WallBudget>,
+}
+
 impl Budget {
     fn new(limits: Limits) -> Arc<Self> {
+        Self::with_clock(limits, Instant::now)
+    }
+
+    fn with_clock(
+        limits: Limits,
+        clock: impl Fn() -> Instant + Send + Sync + 'static,
+    ) -> Arc<Self> {
         Arc::new(Self {
             left: AtomicU64::new(limits.instructions),
-            until: Mutex::new(now() + limits.slice),
-            remaining: Mutex::new(limits.slice),
+            wall: Some(WallBudget {
+                until: Mutex::new(clock() + limits.slice),
+                remaining: Mutex::new(limits.slice),
+                clock: Arc::new(clock),
+            }),
+        })
+    }
+
+    fn fuel(limits: Limits) -> Arc<Self> {
+        Arc::new(Self {
+            left: AtomicU64::new(limits.instructions),
+            wall: None,
         })
     }
 
@@ -84,15 +94,20 @@ impl Budget {
                 self.check()?;
                 return run();
             }
-            let start = now();
-            *locked(&self.until) = start + *locked(&self.remaining);
+            let start = self.wall.as_ref().map(|wall| {
+                let start = (wall.clock)();
+                *locked(&wall.until) = start + *locked(&wall.remaining);
+                start
+            });
             lua.set_app_data(Arc::clone(self));
             let result = catch_unwind(AssertUnwindSafe(|| self.check().and_then(|_| run())));
             lua.remove_app_data::<Arc<Budget>>();
-            let mut remaining = locked(&self.remaining);
-            *remaining = remaining.saturating_sub(now().duration_since(start));
-            if remaining.is_zero() {
-                return Err(mlua::Error::runtime("lua execution budget exhausted"));
+            if let Some((wall, start)) = self.wall.as_ref().zip(start) {
+                let mut remaining = locked(&wall.remaining);
+                *remaining = remaining.saturating_sub((wall.clock)().duration_since(start));
+                if remaining.is_zero() {
+                    return Err(mlua::Error::runtime("lua execution budget exhausted"));
+                }
             }
             result.unwrap_or_else(|panic| resume_unwind(panic))
         })
@@ -111,7 +126,11 @@ impl Budget {
     }
 
     fn check_time(&self) -> mlua::Result<VmState> {
-        if now() >= *locked(&self.until) {
+        if self
+            .wall
+            .as_ref()
+            .is_some_and(|wall| (wall.clock)() >= *locked(&wall.until))
+        {
             Err(mlua::Error::runtime("lua execution budget exhausted"))
         } else {
             Ok(VmState::Continue)
@@ -230,7 +249,13 @@ impl Contributions {
     }
 }
 
-fn sandbox(limits: Limits, fold_only: bool) -> mlua::Result<(Lua, Callbacks, Table)> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VmMode {
+    Live,
+    Fold,
+}
+
+fn sandbox(limits: Limits, vm_mode: VmMode) -> mlua::Result<(Lua, Callbacks, Table)> {
     let lua = Lua::new_with(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH,
         mlua::LuaOptions::default(),
@@ -265,7 +290,7 @@ fn sandbox(limits: Limits, fold_only: bool) -> mlua::Result<(Lua, Callbacks, Tab
         let library: Table = lua.globals().get(name)?;
         lua.globals().set(name, readonly(&lua, library)?)?;
     }
-    if fold_only {
+    if vm_mode == VmMode::Fold {
         lua.globals()
             .get::<Table>("math")?
             .get::<Function>("randomseed")?
@@ -452,8 +477,15 @@ impl Mod {
                 "lua {name}: lua preparation source exceeds budget"
             )));
         }
-        Self::compile(name, source, tools, limits, false, &Budget::new(limits))
-            .map_err(|why| Refused(format!("lua {name}: {why}")))
+        Self::compile(
+            name,
+            source,
+            tools,
+            limits,
+            VmMode::Live,
+            &Budget::new(limits),
+        )
+        .map_err(|why| Refused(format!("lua {name}: {why}")))
     }
 
     fn compile(
@@ -461,11 +493,11 @@ impl Mod {
         source: &str,
         tools: &[String],
         limits: Limits,
-        fold_only: bool,
+        vm_mode: VmMode,
         budget: &Arc<Budget>,
     ) -> mlua::Result<Self> {
         budget.check_time()?;
-        let (lua, callbacks, globals) = sandbox(limits, fold_only)?;
+        let (lua, callbacks, globals) = sandbox(limits, vm_mode)?;
         let made = register(&lua, &lua.globals())?;
         let hook = Arc::clone(budget);
         let thread = lua.create_thread(
@@ -495,7 +527,7 @@ impl Mod {
             folds: Vec::new(),
             agents: Vec::new(),
         };
-        if !fold_only {
+        if vm_mode == VmMode::Live {
             for spec in made.agents {
                 result.agents.push((
                     text_field(&spec, "name", 128)?,
@@ -546,11 +578,11 @@ impl Mod {
                 ));
             }
         }
-        if !fold_only && !made.folds.is_empty() {
+        if vm_mode == VmMode::Live && !made.folds.is_empty() {
             // Folding happens under the session state lock. Its VM must never
             // share a lock with callbacks that read that session's state.
-            result.folds = Self::compile(&name, source, tools, limits, true, budget)?.folds;
-        } else if fold_only {
+            result.folds = Self::compile(&name, source, tools, limits, VmMode::Fold, budget)?.folds;
+        } else if vm_mode == VmMode::Fold {
             let source: Arc<str> = source.into();
             for (slot, spec) in made.folds.into_iter().enumerate() {
                 result.folds.push(Arc::new(LuaFold {
@@ -724,7 +756,8 @@ impl DynFold for LuaFold {
     fn apply(&self, state: &Json, change: &Json) -> Result<Json, String> {
         self.lua
             .scope(|_| {
-                let budget = Budget::new(self.limits);
+                // Acceptance of a durable change must not depend on scheduling.
+                let budget = Budget::fuel(self.limits);
                 budget.dispatch(&self.lua, || {
                     let environment = self.lua.create_table()?;
                     for pair in self.globals.pairs::<Value, Value>() {
@@ -1188,7 +1221,7 @@ mod tests {
                 .value,
             "fast"
         );
-        let (lua, _, _) = sandbox(limits, false).unwrap();
+        let (lua, _, _) = sandbox(limits, VmMode::Live).unwrap();
         let inner = lua
             .load("return function() local n=0; for i=1,1000 do n=n+i end; return n end")
             .eval::<Function>()
@@ -1367,6 +1400,62 @@ mod tests {
     }
 
     #[test]
+    fn durable_reducers_ignore_deadlines_but_replay_fuel_rejections() {
+        let source = "a.fold{name='count',initial=0,apply=function(state,change) if change<0 then while true do end end; return state+change end}; a.tool{name='test',description='test',input={type='object'},run=function(_,cx) cx.update('count',1); return cx.state('count') end}";
+        let mut module = Mod::load("test", source, &[], Limits::default()).unwrap();
+        Arc::get_mut(&mut module.folds[0]).unwrap().limits.slice = Duration::ZERO;
+        let rig = Rig::new(
+            "lua-fuel-replay",
+            Registry::default()
+                .with_dyn(ext::Tier::User, &module)
+                .unwrap(),
+        );
+        assert_eq!(rig.done("test", &json!({})), 1);
+        let rejected = rt::block_on(rig.cx().update_erased(
+            "test",
+            "count",
+            Json::encode(&-1).unwrap(),
+        ));
+        assert!(
+            matches!(&rejected, Err(ext::MutationError::Rejected(error)) if error.contains("budget"))
+        );
+        let mut replay = rig.registry.states();
+        let log = rig.log.lock().unwrap();
+        replay.replay(log.iter());
+        assert_eq!(
+            replay
+                .erased("test", "count")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap(),
+            1
+        );
+        assert_eq!(replay.mutation_result(log.last().unwrap()), rejected);
+    }
+
+    #[test]
+    fn non_durable_native_work_spends_the_injected_clock_budget() {
+        let start = Instant::now();
+        let elapsed = Arc::new(AtomicU64::new(0));
+        let budget = Budget::with_clock(Limits::default(), {
+            let elapsed = Arc::clone(&elapsed);
+            move || start + Duration::from_millis(elapsed.load(Ordering::Relaxed))
+        });
+        let lua = Lua::new();
+        assert!(
+            budget
+                .dispatch(&lua, || {
+                    elapsed.store(100, Ordering::Relaxed);
+                    Ok(())
+                })
+                .unwrap_err()
+                .to_string()
+                .contains("budget")
+        );
+        assert!(lua.app_data_ref::<Arc<Budget>>().is_none());
+    }
+
+    #[test]
     fn fold_replay_has_no_tool_vm_state() {
         let source = "local transient=0; a.tool{name='test',description='test',input={type='object'},run=function(_,cx) transient=transient+1; cx.update('count',1); return transient end}; a.fold{name='count',initial=0,apply=function(state,change) return state+change+transient end}";
         let module = Mod::load("test", source, &[], Limits::default()).unwrap();
@@ -1456,9 +1545,9 @@ mod tests {
                 .contains("preparation source")
         );
         let budget = Budget::new(limits);
-        *locked(&budget.until) = now();
+        *locked(&budget.wall.as_ref().unwrap().until) = Instant::now();
         assert!(
-            Mod::compile("deadline", "return", &[], limits, false, &budget)
+            Mod::compile("deadline", "return", &[], limits, VmMode::Live, &budget)
                 .err()
                 .unwrap()
                 .to_string()
