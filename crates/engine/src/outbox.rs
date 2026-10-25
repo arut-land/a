@@ -26,25 +26,38 @@ pub(crate) const BUDGET: QueueBudget = QueueBudget {
 // Reservations cover queued session requests until their durable answer resolves.
 static QUEUED: Mutex<(usize, usize)> = Mutex::new((0, 0));
 
-pub(super) struct QueuePermit(usize);
+// Queries count apart, for as long as each runs: however many are held
+// open, none takes a mutation's place.
+static ASKED: Mutex<(usize, usize)> = Mutex::new((0, 0));
+
+pub(super) struct QueuePermit(&'static Mutex<(usize, usize)>, usize);
 
 impl QueuePermit {
     pub(super) fn acquire(bytes: usize, control: bool) -> Option<Self> {
-        let mut queued = lock(&QUEUED);
+        Self::from(&QUEUED, bytes, control)
+    }
+
+    /// A running query's.
+    pub(super) fn query(bytes: usize) -> Option<Self> {
+        Self::from(&ASKED, bytes, false)
+    }
+
+    fn from(pool: &'static Mutex<(usize, usize)>, bytes: usize, control: bool) -> Option<Self> {
+        let mut queued = lock(pool);
         if !BUDGET.admits(queued.1.saturating_add(bytes), queued.0, control) {
             return None;
         }
         queued.0 += 1;
         queued.1 += bytes;
-        Some(Self(bytes))
+        Some(Self(pool, bytes))
     }
 }
 
 impl Drop for QueuePermit {
     fn drop(&mut self) {
-        let mut queued = lock(&QUEUED);
+        let mut queued = lock(self.0);
         queued.0 -= 1;
-        queued.1 -= self.0;
+        queued.1 -= self.1;
     }
 }
 
@@ -241,6 +254,9 @@ struct Shared {
     queue: Mutex<Queue>,
     /// Notified as there may be more to write: the writer's one wake.
     ready: rt::Notify,
+    /// Notified as the writer takes frames, or the connection ends: what
+    /// waits to send paced waits here.
+    room: rt::Notify,
 }
 
 #[derive(Default)]
@@ -276,6 +292,7 @@ impl Outbox {
             shared: Arc::new(Shared {
                 queue: Mutex::default(),
                 ready: rt::Notify::new(),
+                room: rt::Notify::new(),
             }),
             following: 0,
         }
@@ -290,6 +307,23 @@ impl Outbox {
         let mut q = self.queue();
         let after = q.follow.as_ref().map_or(0, |f| f.log.seq());
         self.push(&mut q, after, frame)
+    }
+
+    /// [`Outbox::send`], once what waits to be written fits in half the
+    /// budget with `frame`, or nothing waits: a producer that can wait (a
+    /// query's streamed answer) never overruns a slow client, and leaves
+    /// room for the control frames that cannot wait.
+    pub async fn send_paced(&self, frame: Frame) -> Result<(), Closed> {
+        let len = frame.as_bytes().len();
+        let room = || {
+            let q = self.queue();
+            q.closed
+                || q.frames.is_empty()
+                || (q.frames.len() < BUDGET.requests / 2
+                    && q.bytes.saturating_add(len) <= BUDGET.bytes / 2)
+        };
+        self.shared.room.until(room).await;
+        self.send(frame)
     }
 
     /// Queues `frame` behind entry `after`. Callers pass the seq of the
@@ -335,6 +369,7 @@ impl Outbox {
             q.frames.clear();
             q.bytes = 0;
             self.shared.ready.notify();
+            self.shared.room.notify();
             return Err(Closed);
         }
         q.bytes += len;
@@ -403,7 +438,10 @@ impl Outbox {
                     self.accept_read(cursor, follows, ahead);
                     continue;
                 }
-                Step::Frame(frame) => return Some(frame),
+                Step::Frame(frame) => {
+                    self.shared.room.notify();
+                    return Some(frame);
+                }
                 Step::Nothing | Step::Read(..) => {}
             }
             if self.queue().closed {
@@ -418,7 +456,10 @@ impl Outbox {
     pub fn try_ready(&self) -> Option<Frame> {
         loop {
             let (log, cursor, follows) = match self.queue().step() {
-                Step::Frame(frame) => return Some(frame),
+                Step::Frame(frame) => {
+                    self.shared.room.notify();
+                    return Some(frame);
+                }
                 Step::Nothing => return None,
                 Step::Read(log, cursor, follows) => (log, cursor, follows),
             };
@@ -466,6 +507,7 @@ impl Outbox {
     pub fn close(&self) {
         self.queue().closed = true;
         self.shared.ready.notify();
+        self.shared.room.notify();
     }
 
     /// Ends the connection now, dropping what is queued: the writer failed.
@@ -476,6 +518,7 @@ impl Outbox {
         q.frames.clear();
         q.bytes = 0;
         self.shared.ready.notify();
+        self.shared.room.notify();
     }
 }
 
@@ -679,6 +722,26 @@ mod tests {
         let reconnected = Outbox::new();
         let _session = reconnected.follow(log.frames(), 0, Vec::new());
         assert_eq!(written(&reconnected), [Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn a_paced_sender_waits_for_the_writer_and_never_closes_the_connection() {
+        use std::future::Future;
+        let outbox = Outbox::new();
+        let frame = Frame::new(&DaemonMsg::Ack { client_seq: 1 }).unwrap();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut written = 0;
+        for _ in 0..BUDGET.requests * 4 {
+            let mut send = std::pin::pin!(outbox.send_paced(frame.clone()));
+            while send.as_mut().poll(&mut cx).is_pending() {
+                assert!(outbox.try_next().is_some());
+                written += 1;
+            }
+            let q = outbox.queue();
+            assert!(!q.closed);
+            assert!(q.frames.len() <= BUDGET.requests / 2);
+        }
+        assert!(written > 0, "the sender never waited");
     }
 
     fn delta() -> Frame {

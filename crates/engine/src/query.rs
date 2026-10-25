@@ -6,25 +6,15 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use ext::Cancel;
-use ext::host::{Registry, SessionServices};
-use ext::query::{Asked, At};
-use protocol::{DaemonMsg, Json, Outcome, QueryInfo, Role, Scope};
+use ext::host::Registry;
+use ext::query::{Asked, At, Sink};
+use ext::{BoxFuture, Cancel};
+use protocol::{DaemonMsg, Frame, Json, Outcome, QueryInfo, Role, Scope};
 
 use crate::driver::contain;
 use crate::outbox::{Outbox, QueuePermit};
 use crate::server::{reply, workspace_of};
 use crate::{Daemon, lock};
-
-/// What a query is answered with.
-pub(crate) struct Ask {
-    pub id: u64,
-    pub service: String,
-    pub scope: Scope,
-    pub body: Json,
-    /// What the query frame weighed, as admission counts it.
-    pub bytes: usize,
-}
 
 /// A connection's running queries, by the client's ids: cancelled as the
 /// client asks or, all of them, as it hangs up.
@@ -32,23 +22,26 @@ pub(crate) struct Ask {
 pub(crate) struct Queries(Arc<Mutex<BTreeMap<u64, Cancel>>>);
 
 impl Queries {
-    /// Answers `ask` on its own task, if it is admitted.
-    pub(crate) fn ask(&self, daemon: &Daemon, outbox: &Outbox, role: Role, ask: Ask) {
-        let Ask {
-            id,
-            service,
-            scope,
-            body,
-            bytes,
-        } = ask;
+    /// Answers query `id` on its own task, if it is admitted; `bytes` is
+    /// what its frame weighed.
+    pub(crate) fn ask(
+        &self,
+        daemon: &Daemon,
+        outbox: &Outbox,
+        role: Role,
+        (id, service, scope, body): (u64, String, Scope, Json),
+        bytes: usize,
+    ) {
+        // Not a reply: that would read as the running query's.
+        if lock(&self.0).contains_key(&id) {
+            let message = format!("query {id} is running already");
+            return reply(outbox, &DaemonMsg::Error { message });
+        }
         let failed = |error: String| {
             let outcome = Outcome::Failed { error };
             reply(outbox, &DaemonMsg::Reply { id, outcome });
         };
-        if lock(&self.0).contains_key(&id) {
-            return failed(format!("query {id} is running already"));
-        }
-        let Some(permit) = QueuePermit::acquire(bytes, false) else {
+        let Some(permit) = QueuePermit::query(bytes) else {
             return failed("daemon admission is full".into());
         };
         let registry = daemon.shared.registry.get();
@@ -68,17 +61,18 @@ impl Queries {
         let asked = Asked {
             role,
             cancel: cancel.clone(),
-            services: Arc::new(
-                SessionServices::default().with::<dyn rt::Runtime>(Arc::clone(&daemon.shared.rt)),
-            ),
+            services: Arc::clone(&daemon.queried),
             registry,
         };
         let (running, outbox) = (Arc::clone(&self.0), outbox.clone());
         daemon.shared.rt.spawn(Box::pin(async move {
             let _permit = permit;
-            let update = |body| reply(&outbox, &DaemonMsg::Update { id, body });
+            let updates = Paced {
+                outbox: &outbox,
+                id,
+            };
             // A query that panics fails, as a tool's call does.
-            let answer = contain(query.answer(&body, &at, asked, &update));
+            let answer = contain(query.answer(&body, &at, asked, &updates));
             let outcome = match cancel.until(answer).await {
                 Some(Ok(output)) => Outcome::Done { output },
                 Some(Err(error)) => Outcome::Failed { error },
@@ -100,6 +94,25 @@ impl Queries {
 impl Drop for Queries {
     fn drop(&mut self) {
         lock(&self.0).values().for_each(Cancel::set);
+    }
+}
+
+/// Query `id`'s updates, each sent once its client has room for it.
+struct Paced<'a> {
+    outbox: &'a Outbox,
+    id: u64,
+}
+
+impl Sink for Paced<'_> {
+    fn send(&self, body: Json) -> BoxFuture<'_, ()> {
+        let id = self.id;
+        Box::pin(async move {
+            // The writer ends with the connection; a lost update needs no
+            // handling, as the query is cancelled with it.
+            if let Ok(frame) = Frame::new(&DaemonMsg::Update { id, body }) {
+                let _ = self.outbox.send_paced(frame).await;
+            }
+        })
     }
 }
 

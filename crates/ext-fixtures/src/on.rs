@@ -137,7 +137,8 @@ impl Tool for Sleep {
 
 /// The `echo` query: says `text` back `times` times as updates, then
 /// replies with it and the workspace it was asked about; with `hold`, only
-/// once cancelled, so tests can watch a query that runs.
+/// once cancelled, so tests can watch a query that runs, and with `panic`
+/// never.
 pub struct Said;
 
 #[derive(Deserialize)]
@@ -147,6 +148,8 @@ pub struct Say {
     pub times: u32,
     #[serde(default)]
     pub hold: bool,
+    #[serde(default)]
+    pub panic: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -173,6 +176,7 @@ impl Query for Said {
             if say.hold {
                 std::future::pending::<()>().await;
             }
+            assert!(!say.panic, "asked to");
             Ok(Echoed {
                 text: say.text,
                 workspace,

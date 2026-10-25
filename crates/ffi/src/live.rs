@@ -240,13 +240,20 @@ impl SessionWatch {
 }
 
 /// One query's answers, as the daemon sends them, over a connection of
-/// its own: subscribe to `answers`, then `start`. Dropping it cancels the
-/// query.
+/// its own: `start` it, then take each answer with `next`. None is ever
+/// dropped: the daemon streams no faster than they are taken. Dropping it
+/// cancels the query.
 pub struct QueryStream {
-    daemon: Daemon,
-    asked: Mutex<Option<(String, protocol::Scope, protocol::Json)>>,
-    producer: Arc<StreamProducer<QueryAnswer>>,
+    asked: Mutex<Option<Asked>>,
+    answers: rt::channel::Receiver<QueryAnswer>,
     cancel: Arc<Cancel>,
+}
+
+/// A query not yet asked, and where its answers go.
+struct Asked {
+    daemon: Daemon,
+    query: (String, protocol::Scope, protocol::Json),
+    answers: rt::channel::BlockingSender<QueryAnswer>,
 }
 
 /// A query's cancel, which may come before it is connected.
@@ -286,40 +293,53 @@ impl QueryStream {
         let scope = serde_json::from_value(query["scope"].take())
             .map_err(|e| invalid(format!("scope: {e}")))?;
         let body = protocol::Json::encode(&query["body"]).map_err(|e| invalid(e.to_string()))?;
+        // A few answers ahead of the app; past them the socket, then the
+        // daemon's query, waits.
+        let (sender, answers) = rt::channel::bounded(16);
         Ok(Self {
-            daemon: client.daemon.clone(),
-            asked: Mutex::new(Some((service, scope, body))),
-            producer: Arc::new(StreamProducer::new(64)),
+            asked: Mutex::new(Some(Asked {
+                daemon: client.daemon.clone(),
+                query: (service, scope, body),
+                answers: sender,
+            })),
+            answers,
             cancel: Arc::default(),
         })
     }
 
-    #[ffi_stream(item = QueryAnswer)]
-    pub fn answers(&self) -> Arc<EventSubscription<QueryAnswer>> {
-        self.producer.subscribe()
-    }
-
     /// Asks it, starting the daemon if needed. Starts once.
     pub fn start(&self) {
-        let Some((service, scope, body)) = lock(&self.asked).take() else {
+        let Some(Asked {
+            daemon,
+            query: (service, scope, body),
+            answers,
+        }) = lock(&self.asked).take()
+        else {
             return;
         };
-        let (daemon, producer, cancel) = (
-            self.daemon.clone(),
-            Arc::clone(&self.producer),
-            Arc::clone(&self.cancel),
-        );
+        let cancel = Arc::clone(&self.cancel);
         // Detached, as the client SDK's connection threads are: it ends
-        // with the query's reply or its connection.
+        // with the query's reply, its connection, or this stream.
         std::thread::spawn(move || match daemon.query(&service, scope, body) {
-            Ok(answers) => {
-                cancel.connected(answers.canceller());
-                answers.for_each(|answer| producer.push(answer.into()));
+            Ok(read) => {
+                cancel.connected(read.canceller());
+                for answer in read {
+                    if answers.send(answer.into()).is_err() {
+                        break;
+                    }
+                }
             }
-            Err(error) => producer.push(QueryAnswer::Failed {
-                error: error.to_string(),
-            }),
+            Err(error) => {
+                let error = error.to_string();
+                let _ = answers.send(QueryAnswer::Failed { error });
+            }
         });
+    }
+
+    /// The next answer, once there is one; none after the last, which is
+    /// never an update.
+    pub async fn next(&self) -> Option<QueryAnswer> {
+        self.answers.recv().await
     }
 
     /// Stops it: its last answer says it was cancelled, unless it ended
@@ -661,14 +681,13 @@ mod tests {
     }
 
     #[test]
-    fn a_query_streams_its_answers_and_a_cancel_reaches_the_daemon() {
+    fn a_query_loses_no_answer_and_a_cancel_reaches_the_daemon() {
         let (client, home, root, listener, _owner) = client_fixture();
         let query = QueryStream::new(
             &client,
             r#"{"service":"echo","scope":{"workspace":"/w"},"body":{"text":"hi"}}"#,
         )
         .unwrap();
-        let answers = query.answers();
         query.start();
         let mut peer = listener.accept().unwrap();
         assert!(matches!(
@@ -691,8 +710,12 @@ mod tests {
         };
         assert_eq!(service, "echo");
         assert_eq!(scope, protocol::Scope::Workspace("/w".into()));
+        // More than the stream holds ahead of the app, which has taken none.
         let body = protocol::Json::encode("hi").unwrap();
-        write_frame(&mut peer, &DaemonMsg::Update { id, body }).unwrap();
+        for _ in 0..40 {
+            let body = body.clone();
+            write_frame(&mut peer, &DaemonMsg::Update { id, body }).unwrap();
+        }
         query.cancel();
         assert!(matches!(
             read_frame::<ClientMsg>(&mut peer).unwrap(),
@@ -700,21 +723,16 @@ mod tests {
         ));
         let outcome = protocol::Outcome::Interrupted { output: None };
         write_frame(&mut peer, &DaemonMsg::Reply { id, outcome }).unwrap();
-        let got: Vec<_> = (0..2)
-            .map(|_| {
-                answers.wait_for_events(30_000);
-                answers.pop_event()
-            })
-            .collect();
-        assert_eq!(
-            got,
-            [
-                Some(QueryAnswer::Update {
-                    body: r#""hi""#.into()
-                }),
-                Some(QueryAnswer::Cancelled)
-            ]
+        let got: Vec<_> = (0..42).map(|_| rt::block_on(query.next())).collect();
+        let update = QueryAnswer::Update {
+            body: r#""hi""#.into(),
+        };
+        assert!(
+            got[..40]
+                .iter()
+                .all(|answer| answer.as_ref() == Some(&update))
         );
+        assert_eq!(got[40..], [Some(QueryAnswer::Cancelled), None]);
         drop(listener);
         home.endpoint().remove();
         std::fs::remove_dir_all(root).unwrap();

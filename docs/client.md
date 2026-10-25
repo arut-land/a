@@ -91,8 +91,10 @@ transport (lib.rs, remote.rs)      Daemon { endpoint: Local(Home) | Ssh(host), s
   (`Connection::queries`) over a connection of its own, so its answers
   never wait behind a session's replay. `Answers` iterates its `Update`s,
   then its `Reply(Outcome)`; a `Canceller` stops it from another thread,
-  and dropping both hangs up, which cancels it too. The FFI's
-  `QueryStream` is this, as a stream of `QueryAnswer`s.
+  and dropping both hangs up, which cancels it too. The query goes out
+  right behind the hello. The FFI's `QueryStream` is this, its answers
+  taken with an async `next()` a few ahead of the app: none is dropped,
+  as the daemon streams no faster than the app takes them.
 
 ## How an app drives it
 

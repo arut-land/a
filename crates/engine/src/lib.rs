@@ -233,6 +233,8 @@ struct Daemon {
     stopping: Mutex<Option<Stop>>,
     /// When it started, in seconds since the Unix epoch.
     started: u64,
+    /// The engine's services every query is given beside the extensions'.
+    queried: Arc<ext::host::SessionServices>,
 }
 
 /// A session the daemon knows about.
@@ -401,6 +403,9 @@ impl Daemon {
             jobs: rt::Notify::new(),
             watchers: Mutex::default(),
             stopping: Mutex::new(None),
+            queried: Arc::new(
+                ext::host::SessionServices::default().with::<dyn rt::Runtime>(runtime.clone()),
+            ),
             started: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),

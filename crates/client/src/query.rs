@@ -35,9 +35,17 @@ pub struct Answers {
 pub struct Canceller(Arc<Mutex<Writer>>);
 
 impl Daemon {
-    /// Asks query `service` about `scope`, over a connection of its own.
+    /// Asks query `service` about `scope`, over a connection of its own:
+    /// sent right behind the hello.
     pub fn query(&self, service: &str, scope: Scope, body: Json) -> Result<Answers, Error> {
-        Ok(self.connect(&|| {})?.query(service, scope, body)?)
+        let query = ClientMsg::Query {
+            id: ID,
+            service: service.to_owned(),
+            scope,
+            body,
+        };
+        let conn = self.connect_as(None, &|| {}, &|_| Ok(vec![query.clone()]))?;
+        Ok(Answers::of(conn))
     }
 }
 
@@ -51,15 +59,19 @@ impl Connection {
             scope,
             body,
         })?;
-        Ok(Answers {
-            reader: self.reader,
-            writer: Arc::new(Mutex::new(self.writer)),
-            done: false,
-        })
+        Ok(Answers::of(self))
     }
 }
 
 impl Answers {
+    fn of(conn: Connection) -> Self {
+        Self {
+            reader: conn.reader,
+            writer: Arc::new(Mutex::new(conn.writer)),
+            done: false,
+        }
+    }
+
     pub fn canceller(&self) -> Canceller {
         Canceller(Arc::clone(&self.writer))
     }

@@ -59,11 +59,21 @@ impl Extension for Queries {
     }
 }
 
+/// Keeps every update, as its text.
+#[derive(Default)]
+struct Kept(Mutex<Vec<String>>);
+
+impl Sink for Kept {
+    fn send(&self, update: Json) -> BoxFuture<'_, ()> {
+        self.0.lock().unwrap().push(update.to_string());
+        Box::pin(std::future::ready(()))
+    }
+}
+
 fn ask(name: &str, body: &str, at: &At) -> (Vec<String>, Result<Json, String>) {
     let registry = Arc::new(Registry::default().with(&Queries).unwrap());
     let query = registry.query(name).unwrap();
-    let updates = Mutex::new(Vec::new());
-    let update = |body: Json| updates.lock().unwrap().push(body.to_string());
+    let updates = Kept::default();
     let asked = Asked {
         role: Role::Viewer,
         cancel: Cancel::default(),
@@ -71,8 +81,8 @@ fn ask(name: &str, body: &str, at: &At) -> (Vec<String>, Result<Json, String>) {
         registry: Arc::clone(&registry),
     };
     let body = serde_json::from_str::<Json>(body).unwrap();
-    let reply = rt::block_on(query.answer(&body, at, asked, &update));
-    (updates.into_inner().unwrap(), reply)
+    let reply = rt::block_on(query.answer(&body, at, asked, &updates));
+    (updates.0.into_inner().unwrap(), reply)
 }
 
 #[test]

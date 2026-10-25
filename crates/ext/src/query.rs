@@ -140,8 +140,15 @@ pub struct Asked {
     pub registry: Arc<Registry>,
 }
 
-/// Where a streamed answer's updates go, each as it is made.
-pub type Updates<'a> = &'a (dyn Fn(Json) + Send + Sync);
+/// Where a streamed answer's updates go, each as it is made. Sending one
+/// waits until the client has room for it, and the answer is not polled
+/// meanwhile: a query streams no faster than its client reads.
+pub trait Sink: Send + Sync {
+    fn send(&self, update: Json) -> BoxFuture<'_, ()>;
+}
+
+/// A query's [`Sink`].
+pub type Updates<'a> = &'a dyn Sink;
 
 /// What a query's `answer` may return, by shape `M`: the answer, run to
 /// its reply, its updates sent.
@@ -187,7 +194,8 @@ where
             loop {
                 match self.next().await {
                     Next::Partial(partial) => {
-                        updates(Json::encode(&partial).map_err(|e| e.to_string())?);
+                        let update = Json::encode(&partial).map_err(|e| e.to_string())?;
+                        updates.send(update).await;
                     }
                     Next::Done(reply) => return reply,
                 }

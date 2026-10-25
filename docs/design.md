@@ -276,7 +276,9 @@ is asked about its scope or a narrower one that implies it. `QueryCx`
 has no way to append, publish or change state, so a query can never
 write a log. Welcome advertises the queries; each is ephemeral,
 correlated by the client's id, cancelled by `Cancel` or a hangup, and
-admitted against the daemon's `QueueBudget`. Queries come from the
+admitted against a `QueueBudget` of its own, so queries held open never
+take a mutation's place. A streamed answer is paced: each update waits for
+room in the connection's outbox, and the answer is not polled meanwhile. Queries come from the
 daemon's linked registry, not a workspace's generation layers.
 `WorkspaceShared<T>` keeps one value per workspace, made on first use and
 dropped with its last user; the generation `Coordinator` holds its

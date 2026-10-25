@@ -23,7 +23,7 @@ use sys::{Listener, OwnedConnection as Stream};
 
 use crate::driver::{self, Attachment, Request};
 use crate::outbox::{BUDGET, Outbox};
-use crate::query::{Ask, Queries};
+use crate::query::Queries;
 use crate::upgrade::{Lifecycle, Verdict};
 use crate::{Daemon, config, lock, session_event};
 
@@ -239,12 +239,13 @@ pub(crate) async fn handle(
                         decl: ClientDecl::default(),
                         queries: Queries::default(),
                     };
+                    let registry = daemon.shared.registry.get();
                     conn.reply(&DaemonMsg::Welcome {
                         proto,
                         build: life.build.clone(),
                         caps,
-                        commands: driver::commands(&daemon.shared.registry.get()),
-                        queries: crate::query::advertised(&daemon.shared.registry.get()),
+                        commands: driver::commands(&registry),
+                        queries: crate::query::advertised(&registry),
                     });
                     conn.serve(&mut frames).await
                 }
@@ -327,6 +328,7 @@ impl Conn<'_> {
     /// are read: an interrupt behind an input does not wait for its fsync.
     /// Queries and their cancels read no log, so neither waits either.
     /// Anything else waits until what was asked before it is answered.
+    #[allow(clippy::too_many_lines, reason = "one match over what a client sends")]
     async fn serve(&mut self, frames: &mut Frames) -> io::Result<()> {
         let mut pending: VecDeque<(Option<u64>, BoxFuture<'static, Answer>)> = VecDeque::new();
         let result = loop {
@@ -399,7 +401,14 @@ impl Conn<'_> {
                     self.reply(&settings);
                 }
                 ClientMsg::WatchSessions => self.daemon.watch_list(self.outbox),
-                ClientMsg::Status => self.reply(&self.status()),
+                ClientMsg::Status => self.reply(&DaemonMsg::Status {
+                    pid: std::process::id(),
+                    build: self.life.build.clone(),
+                    started: self.daemon.started,
+                    clients: u32::try_from(self.daemon.clients.load(Ordering::SeqCst))
+                        .unwrap_or(u32::MAX),
+                    known: u32::try_from(lock(&self.daemon.slots).len()).unwrap_or(u32::MAX),
+                }),
                 ClientMsg::Shutdown if self.decl.role == Role::Viewer => {
                     self.error("this client is a viewer".into());
                 }
@@ -424,17 +433,6 @@ impl Conn<'_> {
         result
     }
 
-    /// The answer to [`ClientMsg::Status`].
-    fn status(&self) -> DaemonMsg {
-        DaemonMsg::Status {
-            pid: std::process::id(),
-            build: self.life.build.clone(),
-            started: self.daemon.started,
-            clients: u32::try_from(self.daemon.clients.load(Ordering::SeqCst)).unwrap_or(u32::MAX),
-            known: u32::try_from(lock(&self.daemon.slots).len()).unwrap_or(u32::MAX),
-        }
-    }
-
     /// Asks or cancels a query, or hands back any other message.
     fn query(&self, msg: ClientMsg, bytes: usize) -> Option<ClientMsg> {
         match msg {
@@ -444,15 +442,8 @@ impl Conn<'_> {
                 scope,
                 body,
             } => {
-                let ask = Ask {
-                    id,
-                    service,
-                    scope,
-                    body,
-                    bytes,
-                };
-                self.queries
-                    .ask(self.daemon, self.outbox, self.decl.role, ask);
+                let asked = (id, service, scope, body);
+                (self.queries).ask(self.daemon, self.outbox, self.decl.role, asked, bytes);
                 None
             }
             ClientMsg::Cancel { id } => {
