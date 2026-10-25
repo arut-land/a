@@ -128,6 +128,15 @@ pub enum Via {
     Ssh { host: Host },
 }
 
+/// What a connection may do. The daemon decides it from the connection's
+/// [`Peer`]; a client never says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Owner,
+    /// Read-only: its mutations are rejected.
+    Viewer,
+}
+
 /// Who is on the other side of a connection: the machine it runs on, and
 /// how it came.
 #[derive(Clone, Debug, PartialEq, Eq)]

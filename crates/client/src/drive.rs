@@ -638,6 +638,7 @@ mod tests {
                     caps: Caps::ALL,
                     machine: protocol::MachineId([0; 16]),
                     commands: Vec::new(),
+                    queries: Vec::new(),
                 },
             )
             .unwrap();
@@ -1004,6 +1005,7 @@ mod tests {
                 caps: Caps::ALL,
                 machine: protocol::MachineId([0; 16]),
                 commands: Vec::new(),
+                queries: Vec::new(),
             },
         )
         .unwrap();
@@ -1079,6 +1081,7 @@ mod tests {
                 caps: Caps::ALL,
                 machine: protocol::MachineId([0; 16]),
                 commands: Vec::new(),
+                queries: Vec::new(),
             },
         )
         .unwrap();

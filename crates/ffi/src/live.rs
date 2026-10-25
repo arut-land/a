@@ -19,8 +19,8 @@ use sys::{Home, Staged};
 
 use crate::feed::{Feed, lock};
 use crate::{
-    AppAction, ChangeBatch, CliStatus, ClientError, CommandHelp, OpenTarget, Resync, SessionInfo,
-    SessionListUpdate, SessionSnapshot, Settings, TurnInfo,
+    AppAction, ChangeBatch, CliStatus, ClientError, CommandHelp, OpenTarget, QueryAnswer, Resync,
+    SessionInfo, SessionListUpdate, SessionSnapshot, Settings, TurnInfo,
 };
 
 fn runtime() -> &'static Arc<Threads> {
@@ -236,6 +236,122 @@ impl SessionWatch {
                 });
             },
         ));
+    }
+}
+
+/// One query's answers, as the daemon sends them, over a connection of
+/// its own: `start` it, then take each answer with `next`. None is ever
+/// dropped: the daemon streams no faster than they are taken. Dropping it
+/// cancels the query.
+pub struct QueryStream {
+    asked: Mutex<Option<Asked>>,
+    answers: rt::channel::Receiver<QueryAnswer>,
+    cancel: Arc<Cancel>,
+}
+
+/// A query not yet asked, and where its answers go.
+struct Asked {
+    daemon: Daemon,
+    query: (String, protocol::Scope, protocol::Json),
+    answers: rt::channel::BlockingSender<QueryAnswer>,
+}
+
+/// A query's cancel, which may come before it is connected.
+#[derive(Default)]
+struct Cancel(Mutex<(bool, Option<client::Canceller>)>);
+
+impl Cancel {
+    fn cancel(&self) {
+        let mut cancel = lock(&self.0);
+        cancel.0 = true;
+        if let Some(canceller) = &cancel.1 {
+            let _ = canceller.cancel();
+        }
+    }
+
+    fn connected(&self, canceller: client::Canceller) {
+        let mut cancel = lock(&self.0);
+        if cancel.0 {
+            let _ = canceller.cancel();
+        }
+        cancel.1 = Some(canceller);
+    }
+}
+
+#[export]
+impl QueryStream {
+    /// The query `query` asks, as JSON: `{"service": "…", "scope":
+    /// "daemon" | {"workspace": "<dir>"} | {"session": "<id>"}, "body":
+    /// …}`, the body as the query reads it.
+    pub fn new(client: &Client, query: &str) -> Result<Self, ClientError> {
+        let invalid = |message: String| ClientError::InvalidArgument { message };
+        let mut query: serde_json::Value =
+            serde_json::from_str(query).map_err(|e| invalid(e.to_string()))?;
+        let service = (query["service"].as_str())
+            .ok_or_else(|| invalid("a query names its service".into()))?
+            .to_owned();
+        let scope = serde_json::from_value(query["scope"].take())
+            .map_err(|e| invalid(format!("scope: {e}")))?;
+        let body = protocol::Json::encode(&query["body"]).map_err(|e| invalid(e.to_string()))?;
+        // A few answers ahead of the app; past them the socket, then the
+        // daemon's query, waits.
+        let (sender, answers) = rt::channel::bounded(16);
+        Ok(Self {
+            asked: Mutex::new(Some(Asked {
+                daemon: client.daemon.clone(),
+                query: (service, scope, body),
+                answers: sender,
+            })),
+            answers,
+            cancel: Arc::default(),
+        })
+    }
+
+    /// Asks it, starting the daemon if needed. Starts once.
+    pub fn start(&self) {
+        let Some(Asked {
+            daemon,
+            query: (service, scope, body),
+            answers,
+        }) = lock(&self.asked).take()
+        else {
+            return;
+        };
+        let cancel = Arc::clone(&self.cancel);
+        // Detached, as the client SDK's connection threads are: it ends
+        // with the query's reply, its connection, or this stream.
+        std::thread::spawn(move || match daemon.query(&service, scope, body) {
+            Ok(read) => {
+                cancel.connected(read.canceller());
+                for answer in read {
+                    if answers.send(answer.into()).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(error) => {
+                let error = error.to_string();
+                let _ = answers.send(QueryAnswer::Failed { error });
+            }
+        });
+    }
+
+    /// The next answer, once there is one; none after the last, which is
+    /// never an update.
+    pub async fn next(&self) -> Option<QueryAnswer> {
+        self.answers.recv().await
+    }
+
+    /// Stops it: its last answer says it was cancelled, unless it ended
+    /// first.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+}
+
+impl Drop for QueryStream {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -526,6 +642,13 @@ mod tests {
     }
 
     fn fixture() -> (Session, Home, PathBuf, sys::Listener, std::fs::File) {
+        let (client, home, root, listener, owner) = client_fixture();
+        (Session::new(&client), home, root, listener, owner)
+    }
+
+    /// A client of a daemon that is this test: it holds the lock and
+    /// listens, and the test answers for it.
+    fn client_fixture() -> (Client, Home, PathBuf, sys::Listener, std::fs::File) {
         let root = tempfile::Builder::new()
             .prefix("a-ffi-order-")
             .tempdir()
@@ -549,12 +672,71 @@ mod tests {
         )
         .unwrap();
         let listener = home.bind().unwrap();
-        let session = Session::new(&Client {
+        let client = Client {
             daemon: Daemon::local(home.clone(), staged),
             home: home.clone(),
             vars: Vec::new(),
-        });
-        (session, home, root, listener, owner)
+        };
+        (client, home, root, listener, owner)
+    }
+
+    #[test]
+    fn a_query_loses_no_answer_and_a_cancel_reaches_the_daemon() {
+        let (client, home, root, listener, _owner) = client_fixture();
+        let query = QueryStream::new(
+            &client,
+            r#"{"service":"echo","scope":{"workspace":"/w"},"body":{"text":"hi"}}"#,
+        )
+        .unwrap();
+        query.start();
+        let mut peer = listener.accept().unwrap();
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Hello { .. })
+        ));
+        let welcome = DaemonMsg::Welcome {
+            proto: protocol::PROTO,
+            build: "test".into(),
+            caps: Caps::ALL,
+            machine: protocol::MachineId([0; 16]),
+            commands: Vec::new(),
+            queries: Vec::new(),
+        };
+        write_frame(&mut peer, &welcome).unwrap();
+        let Some(ClientMsg::Query {
+            id, service, scope, ..
+        }) = read_frame::<ClientMsg>(&mut peer).unwrap()
+        else {
+            panic!("no query");
+        };
+        assert_eq!(service, "echo");
+        assert_eq!(scope, protocol::Scope::Workspace("/w".into()));
+        // More than the stream holds ahead of the app, which has taken none.
+        let body = protocol::Json::encode("hi").unwrap();
+        for _ in 0..40 {
+            let body = body.clone();
+            write_frame(&mut peer, &DaemonMsg::Update { id, body }).unwrap();
+        }
+        query.cancel();
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Cancel { id: cancelled }) if cancelled == id
+        ));
+        let outcome = protocol::Outcome::Interrupted { output: None };
+        write_frame(&mut peer, &DaemonMsg::Reply { id, outcome }).unwrap();
+        let got: Vec<_> = (0..42).map(|_| rt::block_on(query.next())).collect();
+        let update = QueryAnswer::Update {
+            body: r#""hi""#.into(),
+        };
+        assert!(
+            got[..40]
+                .iter()
+                .all(|answer| answer.as_ref() == Some(&update))
+        );
+        assert_eq!(got[40..], [Some(QueryAnswer::Cancelled), None]);
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn paused_input(
@@ -585,6 +767,7 @@ mod tests {
             caps: Caps::ALL,
             machine: protocol::MachineId([0; 16]),
             commands: Vec::new(),
+            queries: Vec::new(),
         };
         read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
         read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
@@ -687,6 +870,7 @@ mod tests {
             caps: Caps::ALL,
             machine: protocol::MachineId([0; 16]),
             commands: Vec::new(),
+            queries: Vec::new(),
         };
         session.send("unanswered".into()).unwrap();
         write_frame(&mut peer, &welcome).unwrap();

@@ -184,6 +184,7 @@ pub struct Registry {
     source_manifest: Option<Vec<Installed>>,
     installed: Vec<Loaded>,
     tools: Toolset,
+    queries: Vec<Arc<dyn crate::query::DynQuery>>,
     hooks: Hooks,
     texts: Vec<Text>,
     agents: Vec<RegisteredAgent>,
@@ -356,6 +357,7 @@ impl Registry {
 
     fn rebuild(&mut self) {
         let mut tools = Vec::new();
+        let mut queries = Vec::new();
         let mut texts = Vec::new();
         let mut agents = Vec::new();
         let mut hooks = Hooks::default();
@@ -375,6 +377,15 @@ impl Registry {
                     (by(), Arc::clone(tool)),
                     |t| t.1.name(),
                     "tool",
+                    warn,
+                );
+            }
+            for query in &made.queries {
+                replace(
+                    &mut queries,
+                    (by(), Arc::clone(query)),
+                    |q| q.1.name(),
+                    "query",
                     warn,
                 );
             }
@@ -403,6 +414,7 @@ impl Registry {
         self.warnings = warnings;
         texts.sort_by_key(|t| t.1.order);
         self.tools = Toolset(tools.into_iter().map(|t| t.1).collect());
+        self.queries = queries.into_iter().map(|q| q.1).collect();
         self.texts = texts.into_iter().map(|t| t.1).collect();
         self.agents = agents.into_iter().map(|a| a.1).collect();
         self.hooks = hooks;
@@ -437,6 +449,16 @@ impl Registry {
         (self.tools.0.iter())
             .map(|t| &**t)
             .filter(|t| t.audience() == Audience::User)
+    }
+
+    /// The queries clients may ask, in registration order.
+    pub fn queries(&self) -> impl Iterator<Item = &dyn crate::query::DynQuery> {
+        self.queries.iter().map(|q| &**q)
+    }
+
+    /// The query named `name`, to answer on a task of its own.
+    pub fn query(&self, name: &str) -> Option<Arc<dyn crate::query::DynQuery>> {
+        self.queries.iter().find(|q| q.name() == name).cloned()
     }
 
     /// A new loop of the agent named `name`: with none named, or the
@@ -685,7 +707,7 @@ struct LayerImage {
 pub struct Coordinator {
     base: Arc<Registry>,
     layers: Vec<Arc<dyn GenerationLayer>>,
-    workspaces: Mutex<BTreeMap<PathBuf, Weak<Workspace>>>,
+    workspaces: crate::WorkspaceShared<Workspace>,
 }
 
 struct Workspace {
@@ -716,7 +738,7 @@ impl Coordinator {
         Self {
             base: Arc::new(base),
             layers,
-            workspaces: Mutex::default(),
+            workspaces: crate::WorkspaceShared::default(),
         }
     }
 }
@@ -736,18 +758,7 @@ impl Sources for Coordinator {
         spawn: Spawn,
         prepare: Prepare,
     ) -> Result<Arc<dyn Generations>, Refused> {
-        let mut index = lock(&self.workspaces);
-        index.retain(|_, slot| slot.strong_count() > 0);
-        if let Some(workspace) = index.get(path).and_then(Weak::upgrade) {
-            drop(index);
-            workspace
-                .opened
-                .wait()
-                .as_ref()
-                .map_err(|e| Refused(e.clone()))?;
-            return Ok(workspace);
-        }
-        let workspace = Arc::new_cyclic(|weak: &Weak<Workspace>| {
+        let workspace = self.workspaces.get_or_make(path, |weak: &Weak<Workspace>| {
             let refresh = weak.clone();
             let weak = weak.clone();
             Workspace {
@@ -758,7 +769,7 @@ impl Sources for Coordinator {
                 opened: OnceLock::new(),
                 preparing: Mutex::default(),
                 pending: Mutex::default(),
-                spawn: spawn.clone(),
+                spawn,
                 watches: Mutex::default(),
                 updates: Updates::default(),
                 rebuild: Arc::new(move || {
@@ -785,31 +796,33 @@ impl Sources for Coordinator {
                 }),
             }
         });
-        index.insert(path.to_owned(), Arc::downgrade(&workspace));
-        drop(index);
-        let result = (|| {
-            for layer in &workspace.layers {
-                let watch = layer.watch(path, spawn.clone(), workspace.changed.clone())?;
-                lock(&workspace.watches).push(watch);
-            }
-            match workspace.rebuild(true) {
-                Ok(()) => Ok(()),
-                Err(PrepareError::Rejected(error)) => Err(error),
-                Err(PrepareError::Retry(_)) => {
-                    workspace.retry();
-                    Ok(())
-                }
-            }
-        })();
-        let _ = workspace
+        // Whoever comes first opens it; the rest wait for that, not for
+        // any other workspace.
+        workspace
             .opened
-            .set(result.as_ref().copied().map_err(|e| e.0.clone()));
-        result?;
+            .get_or_init(|| workspace.open().map_err(|e| e.0))
+            .clone()
+            .map_err(Refused)?;
         Ok(workspace)
     }
 }
 
 impl Workspace {
+    fn open(self: &Arc<Self>) -> Result<(), Refused> {
+        for layer in &self.layers {
+            let watch = layer.watch(&self.path, self.spawn.clone(), self.changed.clone())?;
+            lock(&self.watches).push(watch);
+        }
+        match self.rebuild(true) {
+            Ok(()) => Ok(()),
+            Err(PrepareError::Rejected(error)) => Err(error),
+            Err(PrepareError::Retry(_)) => {
+                self.retry();
+                Ok(())
+            }
+        }
+    }
+
     fn compose_layer(
         &self,
         mut registry: Registry,

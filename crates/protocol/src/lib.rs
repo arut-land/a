@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 30;
+pub const PROTO: u32 = 31;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 30;
+pub const PROTO_MIN: u32 = 31;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -105,7 +105,7 @@ pub mod view;
 
 pub use blob::{BlobId, BlobOrigin, BlobRef, Held, Payload};
 pub use json::Json;
-pub use peer::{Host, MachineId, Peer, Via};
+pub use peer::{Host, MachineId, Peer, Role, Via};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -1407,6 +1407,46 @@ pub struct CommandInfo {
     pub description: String,
 }
 
+/// A query the daemon's extensions answer, for clients to discover rather
+/// than know: asked with [`ClientMsg::Query`] about its `scope` or one
+/// narrower.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryInfo {
+    pub name: String,
+    pub description: String,
+    pub scope: ScopeKind,
+}
+
+/// What a query is asked about. A workspace is named by a directory in it,
+/// found as an attach finds its workspace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    Daemon,
+    Workspace(PathBuf),
+    Session(SessionId),
+}
+
+/// The kinds of [`Scope`], widest first: a query of one kind may be asked
+/// about any kind after it, which implies it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeKind {
+    Daemon,
+    Workspace,
+    Session,
+}
+
+impl fmt::Display for ScopeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Daemon => "daemon",
+            Self::Workspace => "workspace",
+            Self::Session => "session",
+        })
+    }
+}
+
 /// Why the daemon refused a mutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1493,6 +1533,14 @@ kinds! {
         /// Stops the attached session's turn: its running model or tool call
         /// and, bottom-up, the turns of the sessions it started.
         Interrupt "interrupt" { client_seq: Option<u64> = default };
+        /// Asks query `service` about `scope`, never logged: answered by
+        /// [`DaemonMsg::Update`]s, if it streams, then one
+        /// [`DaemonMsg::Reply`], all naming `id`, which the client picks
+        /// and does not reuse while the query runs.
+        Query "query" { id: u64, service: String, scope: Scope, body: Json };
+        /// Stops query `id`: its reply follows, interrupted unless it was
+        /// sent already.
+        Cancel "cancel" { id: u64 };
     }
     else Err(serde_json::Error::custom("unknown client message"))
 }
@@ -1592,7 +1640,9 @@ impl ClientMsg {
             | Self::WatchSessions
             | Self::Status
             | Self::Shutdown
-            | Self::Settings { .. } => None,
+            | Self::Settings { .. }
+            | Self::Query { .. }
+            | Self::Cancel { .. } => None,
         }
     }
 }
@@ -1603,13 +1653,14 @@ kinds! {
         /// The hello is accepted at protocol `proto`. `caps` are the client's
         /// capabilities the daemon takes up. `machine` is the daemon's.
         /// `commands` are the slash commands the daemon runs, for help and
-        /// completion.
+        /// completion; `queries` what it answers [`ClientMsg::Query`] about.
         Welcome "welcome" {
             proto: u32,
             build: String,
             caps: Caps = default,
             machine: MachineId,
             commands: Vec<CommandInfo> = default,
+            queries: Vec<QueryInfo> = default,
         } = Control;
         /// The daemon speaks protocols `min..=supported` (just `supported`
         /// without `min`), none of the client's.
@@ -1659,6 +1710,11 @@ kinds! {
         Ack "ack" { client_seq: u64 } = Control;
         /// This connection's mutation numbered `client_seq` was refused.
         Rejected "rejected" { client_seq: u64, reason: Rejection, message: String = default } = Control;
+        /// One of query `id`'s streamed partial answers, in order.
+        Update "update" { id: u64, body: Json } = Control;
+        /// How query `id` ended: its answer, why not, or that it was
+        /// cancelled. Nothing about `id` follows.
+        Reply "reply" { id: u64, outcome: Outcome } = Control;
     }
     /// A message, or an entry, of a kind this build does not know: a newer
     /// daemon's. Never sent; decoding yields it so a client skips what it

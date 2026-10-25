@@ -11,12 +11,13 @@ use crate::store::{Header, Jsonl, LogStore};
 use protocol::view::SessionView;
 use protocol::{
     Body, CallId, Caps, ClientDecl, ClientId, ClientMsg, DaemonMsg, Entry, Environment, Epoch,
-    MachineId, PROTO, Rejection, Seq, SessionId, SettingsChange, Target, read_frame, write_frame,
+    MachineId, PROTO, Rejection, Role, Seq, SessionId, SettingsChange, Target, read_frame,
+    write_frame,
 };
 use sys::Home;
 
 use super::outbox::Outbox;
-use super::server::{Role, handle, handle_as};
+use super::server::{handle, handle_as};
 use super::{Config, Daemon, Lifecycle, Owner};
 
 struct Fixture {

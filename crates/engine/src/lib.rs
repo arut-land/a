@@ -5,6 +5,7 @@ pub mod config;
 mod driver;
 mod model;
 mod outbox;
+mod query;
 mod server;
 mod store;
 mod transcript;
@@ -233,6 +234,8 @@ struct Daemon {
     /// When it started, in seconds since the Unix epoch.
     started: u64,
     machine: Arc<Machine>,
+    /// The engine's services every query is given beside the extensions'.
+    queried: Arc<ext::host::SessionServices>,
 }
 
 /// This home's machine identity, read (made, the first time) on the
@@ -431,6 +434,9 @@ impl Daemon {
             jobs: rt::Notify::new(),
             watchers: Mutex::default(),
             stopping: Mutex::new(None),
+            queried: Arc::new(
+                ext::host::SessionServices::default().with::<dyn rt::Runtime>(runtime.clone()),
+            ),
             started: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),

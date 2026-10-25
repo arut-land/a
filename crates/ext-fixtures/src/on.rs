@@ -1,8 +1,11 @@
+use std::future::Future;
+use std::path::PathBuf;
 use std::time::Duration;
 
+use ext::query::Workspace;
 use ext::{
-    Action, Actions, Agent, Concurrency, Cx, Extension, Input, LoopPoints, Registrar, Replay,
-    Schema, Tool,
+    Action, Actions, Agent, Concurrency, Cx, Extension, Input, LoopPoints, Query, QueryCx,
+    Registrar, Replay, Schema, Streamed, Tool, stream,
 };
 use protocol::Json;
 use serde::{Deserialize, Serialize};
@@ -16,7 +19,9 @@ impl Extension for Fixtures {
 
     fn contribute(&self, r: &mut Registrar) {
         r.provide::<dyn ext::SideProvider>(std::sync::Arc::new(Fixtures));
-        r.tool(Sleep).agent(crate::ECHO, || Box::new(Echo));
+        r.tool(Sleep)
+            .query(Said)
+            .agent(crate::ECHO, || Box::new(Echo));
     }
 }
 
@@ -126,6 +131,56 @@ impl Tool for Sleep {
         rt.sleep(Duration::from_secs(input.seconds)).await;
         Ok(Slept {
             slept: input.seconds,
+        })
+    }
+}
+
+/// The `echo` query: says `text` back `times` times as updates, then
+/// replies with it and the workspace it was asked about; with `hold`, only
+/// once cancelled, so tests can watch a query that runs, and with `panic`
+/// never.
+pub struct Said;
+
+#[derive(Deserialize)]
+pub struct Say {
+    pub text: String,
+    #[serde(default)]
+    pub times: u32,
+    #[serde(default)]
+    pub hold: bool,
+    #[serde(default)]
+    pub panic: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Echoed {
+    pub text: String,
+    pub workspace: PathBuf,
+}
+
+impl Query for Said {
+    const NAME: &'static str = crate::ECHO;
+    const DESCRIPTION: &'static str = "Says the text back, about a workspace.";
+    type Scope = Workspace;
+    type Request = Say;
+    type Reply = Echoed;
+
+    fn answer(
+        &self,
+        say: Say,
+        cx: &QueryCx<Workspace>,
+    ) -> Streamed<String, impl Future<Output = Result<Echoed, String>> + Send, Echoed> {
+        let workspace = cx.scope.path.to_path_buf();
+        stream(move |updates| async move {
+            (0..say.times).for_each(|_| updates.send(say.text.clone()));
+            if say.hold {
+                std::future::pending::<()>().await;
+            }
+            assert!(!say.panic, "asked to");
+            Ok(Echoed {
+                text: say.text,
+                workspace,
+            })
         })
     }
 }

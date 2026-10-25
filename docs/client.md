@@ -20,8 +20,8 @@ Driver (drive.rs)                  pump: the one fixpoint loop; threads: connect
   │                                connection, one writer
   ▼
 transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: connect, connect_as,
-           remote.rs)              sessions, new_session; the one hello over any Link; Error,
-                                   Connection, stop/status/restart/diagnose, bridge
+           remote.rs, query.rs)    sessions, new_session, query; the one hello over any Link;
+                                   Error, Connection, stop/status/restart/diagnose, bridge
 ```
 
 - **Transport.** `Daemon { link, staged }` is the daemon as a client
@@ -116,6 +116,15 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   each).
 - **`SessionWatch`.** The daemon's session list as it changes, over a
   connection of its own that is made again when the daemon goes.
+- **Queries.** `Daemon::query(service, scope, body)` (or
+  `Connection::query`) asks one of the queries the welcome advertised
+  (`Connection::queries`) over a connection of its own, so its answers
+  never wait behind a session's replay. `Answers` iterates its `Update`s,
+  then its `Reply(Outcome)`; a `Canceller` stops it from another thread,
+  and dropping both hangs up, which cancels it too. The query goes out
+  right behind the hello. The FFI's `QueryStream` is this, its answers
+  taken with an async `next()` a few ahead of the app: none is dropped,
+  as the daemon streams no faster than the app takes them.
 
 ## How an app drives it
 

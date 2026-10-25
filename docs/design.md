@@ -299,6 +299,26 @@ replacement by name allow overrides; the operator's policy floor is guarded.
 The engine itself offers the model no tools. Extensions communicate through
 the log (`observe`), typed state, services and points.
 
+Queries are what clients ask the extensions without touching a log: the
+files of a workspace for an @-mention, say. `r.query(Q)` registers one;
+like a tool, its answer's shape (at once, a future, or streamed updates
+before the reply) is the type `answer` returns, and its `Scope` type
+(`Daemon`, `Workspace`, `Session`) is what its `QueryCx` holds. A query
+is asked about its scope or a narrower one that implies it, and its
+`QueryCx` names who asks (`peer`, so a query can tell a client on the
+daemon's machine from one elsewhere) and the `role` the daemon gave it.
+`QueryCx` has no way to append, publish or change state, so a query can never
+write a log. Welcome advertises the queries; each is ephemeral,
+correlated by the client's id, cancelled by `Cancel` or a hangup, and
+admitted against a `QueueBudget` of its own, so queries held open never
+take a mutation's place. A streamed answer is paced: each update waits
+for room in the connection's outbox, and the answer is not polled
+meanwhile. Queries come from the daemon's linked registry, not a
+workspace's generation layers.
+`WorkspaceShared<T>` keeps one value per workspace, made on first use and
+dropped with its last user; the generation `Coordinator` holds its
+workspaces in one, and a workspace index will be another.
+
 `Built<L>` checks typed Rust needs and provides at compile time;
 `Configured` lets each extension read its own settings table. Dynamic
 contributions are validated by the host. A tool's Rust return type determines
@@ -404,7 +424,10 @@ exist; a reader refuses a kind it does not know, so binary frames (blob
 chunks, without base64) can be added. `protocol::PROTO` defines the current version. Typed ids and message classes distinguish durable entries,
 ephemeral traffic and control. Hello negotiates a supported version; attach
 replays from a seq or supplies a view snapshot, ends replay with `Synced`,
-then follows live entries. A wire encoding change requires a new version
+then follows live entries. `Query { id, service, scope, body }` is
+answered by `Update`s, if it streams, then exactly one `Reply { id,
+outcome }`, on any connection, attached or not; `Cancel { id }` makes the
+reply interrupted. A wire encoding change requires a new version
 and a generated corpus; there is no older-format fallback.
 
 `protocol::view` is the shared reducer; `Item::present()` supplies common

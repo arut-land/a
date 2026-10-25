@@ -2925,7 +2925,7 @@ async fn unless<T>(cancel: &Flag, work: impl Future<Output = T>) -> Option<T> {
 
 /// Runs `effect` so that a panic inside it fails the call instead of
 /// taking the actor down.
-async fn contain<T: Failure>(effect: impl Future<Output = T>) -> T {
+pub(crate) async fn contain<T: Failure>(effect: impl Future<Output = T>) -> T {
     let mut effect = pin!(effect);
     poll_fn(|cx| {
         catch_unwind(AssertUnwindSafe(|| effect.as_mut().poll(cx)))
@@ -2934,7 +2934,7 @@ async fn contain<T: Failure>(effect: impl Future<Output = T>) -> T {
     .await
 }
 
-trait Failure {
+pub(crate) trait Failure {
     fn failed(error: String) -> Self;
 }
 

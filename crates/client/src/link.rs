@@ -354,7 +354,7 @@ pub(crate) async fn connect(
         )
         .await;
         match greeting {
-            Ok((Greeting::Welcome(machine), welcome, commands)) => {
+            Ok((Greeting::Welcome(machine), welcome, commands, queries)) => {
                 return Ok(Connection {
                     stream,
                     buffered,
@@ -362,6 +362,7 @@ pub(crate) async fn connect(
                     peer: Peer { machine, via },
                     welcome,
                     commands,
+                    queries,
                 });
             }
             Ok((Greeting::Mismatch(theirs), ..)) => {
@@ -393,7 +394,15 @@ pub(crate) async fn hello(
     client: Option<ClientId>,
     machine: Option<MachineId>,
     first: &[ClientMsg],
-) -> Result<(Greeting, Welcome, Vec<protocol::CommandInfo>), Error> {
+) -> Result<
+    (
+        Greeting,
+        Welcome,
+        Vec<protocol::CommandInfo>,
+        Vec<protocol::QueryInfo>,
+    ),
+    Error,
+> {
     stream
         .send(&ClientMsg::Hello {
             proto: PROTO,
@@ -419,19 +428,23 @@ pub(crate) async fn hello(
             caps,
             machine,
             commands,
+            queries,
             ..
         }) => {
             sent?;
-            Ok((
-                Greeting::Welcome(machine),
-                Welcome { proto, caps },
-                commands,
-            ))
+            let welcome = Welcome { proto, caps };
+            Ok((Greeting::Welcome(machine), welcome, commands, queries))
         }
-        Some(DaemonMsg::Draining) => Ok((Greeting::Draining, Welcome::default(), Vec::new())),
+        Some(DaemonMsg::Draining) => Ok((
+            Greeting::Draining,
+            Welcome::default(),
+            Vec::new(),
+            Vec::new(),
+        )),
         Some(DaemonMsg::Mismatch { supported, min }) => Ok((
             Greeting::Mismatch(Versions::new(min, supported)),
             Welcome::default(),
+            Vec::new(),
             Vec::new(),
         )),
         // A daemon refusing to serve at all, after a crash loop.

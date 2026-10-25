@@ -290,6 +290,8 @@ same!(
     Vec<SessionId>,
     Vec<Installed>,
     Vec<CommandInfo>,
+    Vec<crate::QueryInfo>,
+    crate::Scope,
     Vec<SessionSummary>,
     Vec<Item>,
 );
@@ -539,6 +541,14 @@ pub(crate) struct MsgFields {
     // A withdrawal's seq; JSON, as other messages carry a tool's input.
     #[serde(default, deserialize_with = "present")]
     pub(crate) input: Option<Json>,
+    // A query's.
+    pub(crate) id: Option<u64>,
+    pub(crate) service: Option<String>,
+    pub(crate) scope: Option<crate::Scope>,
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) body: Option<Json>,
+    pub(crate) outcome: Option<Outcome>,
+    pub(crate) queries: Option<Vec<crate::QueryInfo>>,
 }
 
 /// An [`Item`] of a snapshot.

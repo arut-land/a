@@ -281,6 +281,34 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             },
         ),
         sample("status", ClientMsg::Status),
+        sample(
+            "query_daemon",
+            ClientMsg::Query {
+                id: 1,
+                service: "models".into(),
+                scope: protocol::Scope::Daemon,
+                body: protocol::Json::null(),
+            },
+        ),
+        sample(
+            "query_workspace",
+            ClientMsg::Query {
+                id: 2,
+                service: "files.search".into(),
+                scope: protocol::Scope::Workspace("/work/a/src".into()),
+                body: protocol::Json::encode(&json!({"query": "lib", "limit": 20})).unwrap(),
+            },
+        ),
+        sample(
+            "query_session",
+            ClientMsg::Query {
+                id: 3,
+                service: "files.search".into(),
+                scope: protocol::Scope::Session(SESSION),
+                body: protocol::Json::encode(&json!({"query": "lib"})).unwrap(),
+            },
+        ),
+        sample("cancel", ClientMsg::Cancel { id: 2 }),
         sample("shutdown", ClientMsg::Shutdown),
         sample(
             "settings_change",
@@ -684,6 +712,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 caps: Caps::NONE,
                 machine: MACHINE,
                 commands: Vec::new(),
+                queries: Vec::new(),
             },
         ),
         sample(
@@ -697,6 +726,54 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                     name: "model".into(),
                     description: "show or set the model".into(),
                 }],
+                queries: Vec::new(),
+            },
+        ),
+        sample(
+            "welcome_queries",
+            DaemonMsg::Welcome {
+                proto: PROTO,
+                build: "0.0.0+0123456789abcdef".into(),
+                caps: Caps::NONE,
+                machine: MACHINE,
+                commands: Vec::new(),
+                queries: vec![protocol::QueryInfo {
+                    name: "files.search".into(),
+                    description: "the workspace's files that match".into(),
+                    scope: protocol::ScopeKind::Workspace,
+                }],
+            },
+        ),
+        sample(
+            "update",
+            DaemonMsg::Update {
+                id: 7,
+                body: protocol::Json::encode(&json!({"path": "src/lib.rs"})).unwrap(),
+            },
+        ),
+        sample(
+            "reply",
+            DaemonMsg::Reply {
+                id: 7,
+                outcome: Outcome::Done {
+                    output: protocol::Json::encode(&json!(["src/lib.rs"])).unwrap(),
+                },
+            },
+        ),
+        sample(
+            "reply_failed",
+            DaemonMsg::Reply {
+                id: 7,
+                outcome: Outcome::Failed {
+                    error: "no query named files.grep".into(),
+                },
+            },
+        ),
+        sample(
+            "reply_cancelled",
+            DaemonMsg::Reply {
+                id: 7,
+                outcome: Outcome::Interrupted { output: None },
             },
         ),
         sample(

@@ -12,6 +12,7 @@ mod inbox;
 pub mod link;
 #[cfg(test)]
 mod one_rule;
+mod query;
 mod remote;
 mod session;
 mod stream;
@@ -25,6 +26,7 @@ pub use command::{COMMANDS, Cmd, Command, help, parse, parse_input};
 pub use drive::{ClientHandle, Driver, Renderer, pump};
 pub use inbox::{Inbox, PUMP_BATCH, Post, QueueBudget, inbox};
 pub use link::{LinkError, LocalLink, Start};
+pub use query::{Answer, Answers, Canceller};
 pub use remote::SshLink;
 pub use session::{
     Attach, ConnId, Effect, End, Env, Event, EventKind, Io, Link, Notice, Offer, SessionClient,
@@ -43,7 +45,7 @@ use std::time::Duration;
 use protocol::view::SessionList;
 use protocol::{
     Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings, Host,
-    Peer, SessionId, SessionSummary, SettingsChange, Versions, write_frame,
+    Peer, QueryInfo, SessionId, SessionSummary, SettingsChange, Versions, write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, OwnedConnection, Signal, Staged};
@@ -160,6 +162,8 @@ pub struct Connection {
     pub welcome: Welcome,
     /// The slash commands the daemon advertised.
     pub commands: Vec<CommandInfo>,
+    /// The queries it answers.
+    pub queries: Vec<QueryInfo>,
 }
 
 /// What the daemon's welcome settled for a connection.
@@ -581,13 +585,14 @@ async fn reach(home: &Home, build: &str) -> Result<Connection, Error> {
     )
     .await?;
     match greeting {
-        (Greeting::Welcome(machine), welcome, commands) => Ok(Connection {
+        (Greeting::Welcome(machine), welcome, commands, queries) => Ok(Connection {
             stream,
             buffered,
             remote,
             peer: Peer { machine, via },
             welcome,
             commands,
+            queries,
         }),
         _ => Err(Error::Refused("the daemon cannot be asked".to_owned())),
     }
@@ -1027,6 +1032,7 @@ mod tests {
                             caps: Caps::ALL,
                             machine: protocol::MachineId([0; 16]),
                             commands: Vec::new(),
+                            queries: Vec::new(),
                         },
                     )
                     .unwrap();

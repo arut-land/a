@@ -16,13 +16,14 @@ use std::time::Duration;
 
 use protocol::{
     Author, Caps, ClientDecl, ClientId, ClientMsg, ClientSeq, DaemonMsg, Decode, Environment,
-    Frame, HomeSettings, PROTO, Peer, Rejection, SettingsChange, Versions, Via,
+    Frame, HomeSettings, PROTO, Peer, Rejection, Role, SettingsChange, Versions, Via,
 };
 use rt::{Async, BoxFuture, Reactor};
 use sys::{Listener, OwnedConnection as Stream};
 
 use crate::driver::{self, Attachment, Request};
 use crate::outbox::{BUDGET, Outbox};
+use crate::query::Queries;
 use crate::upgrade::{Lifecycle, Verdict};
 use crate::{Daemon, config, lock, session_event};
 
@@ -191,23 +192,12 @@ async fn write_out(io: Arc<Async<Stream>>, outbox: Outbox, rt: rt::Rt) {
     let _ = io.get_ref().shutdown(std::net::Shutdown::Both);
 }
 
-/// What a connection may do: the daemon decides it from who is on the
-/// connection, never the client.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Role {
-    Owner,
-    /// Read-only: its mutations are rejected.
-    Viewer,
-}
-
-impl Role {
-    /// The trust rule: this user, on a transport that authenticated this
-    /// user, owns the daemon. Every [`Via`] is one such transport today; one
-    /// that is not (another person's pinned key) decides here.
-    pub(crate) const fn of(peer: &Peer) -> Self {
-        match peer.via {
-            Via::Local | Via::Ssh { .. } => Self::Owner,
-        }
+/// The trust rule: this user, on a transport that authenticated this
+/// user, owns the daemon. Every [`Via`] is one such transport today; one
+/// that is not (another person's pinned key) decides here.
+const fn role_of(peer: &Peer) -> Role {
+    match peer.via {
+        Via::Local | Via::Ssh { .. } => Role::Owner,
     }
 }
 
@@ -219,7 +209,7 @@ pub(crate) async fn handle(
     life: &Lifecycle,
     stream: Stream,
 ) -> io::Result<()> {
-    handle_as(daemon, life, stream, Role::of).await
+    handle_as(daemon, life, stream, role_of).await
 }
 
 /// [`handle`], with the connection's role as `role` decides it.
@@ -277,13 +267,16 @@ pub(crate) async fn handle_as(
                             peer,
                             attached: None,
                             decl: ClientDecl::default(),
+                            queries: Queries::default(),
                         };
+                        let registry = daemon.shared.registry.get();
                         conn.reply(&DaemonMsg::Welcome {
                             proto,
                             build: life.build.clone(),
                             caps,
                             machine: ours,
-                            commands: driver::commands(&daemon.shared.registry.get()),
+                            commands: driver::commands(&registry),
+                            queries: crate::query::advertised(&registry),
                         });
                         conn.serve(&mut frames).await
                     }
@@ -329,7 +322,7 @@ pub(crate) async fn handle_as(
 /// The workspace a client in `dir` works in: the git working tree `dir` is
 /// in, found with the client's git variables (`GIT_DIR`, ceilings), not the
 /// daemon's, so every client, local or bridged, gets the same rule.
-fn workspace_of(dir: &Path, env: Option<&Environment>) -> PathBuf {
+pub(crate) fn workspace_of(dir: &Path, env: Option<&Environment>) -> PathBuf {
     let var = |name: &str| env?.vars.get(name).map(Into::into);
     sys::workspace_in(dir, &sys::GitEnv::from_vars(var))
 }
@@ -357,6 +350,7 @@ struct Conn<'a> {
     role: Role,
     attached: Option<Attachment>,
     decl: ClientDecl,
+    queries: Queries,
 }
 
 impl Conn<'_> {
@@ -371,7 +365,9 @@ impl Conn<'_> {
     /// Takes the client's frames as they come. Mutations are sent on at
     /// once and answered in order as they commit, while the next frames
     /// are read: an interrupt behind an input does not wait for its fsync.
+    /// Queries and their cancels read no log, so neither waits either.
     /// Anything else waits until what was asked before it is answered.
+    #[expect(clippy::too_many_lines, reason = "one match over what a client sends")]
     async fn serve(&mut self, frames: &mut Frames) -> io::Result<()> {
         let mut pending: VecDeque<(Option<u64>, BoxFuture<'static, Answer>)> = VecDeque::new();
         let result = loop {
@@ -412,6 +408,17 @@ impl Conn<'_> {
                 }
                 continue;
             }
+            let taken = (self.queries).take(
+                self.daemon,
+                self.outbox,
+                &self.peer,
+                self.role,
+                msg,
+                frames.bytes,
+            );
+            let Some(msg) = taken else {
+                continue;
+            };
             while let Some((client_seq, answer)) = pending.pop_front() {
                 self.answered(client_seq, answer.await);
             }
@@ -461,7 +468,9 @@ impl Conn<'_> {
                 | ClientMsg::Input { .. }
                 | ClientMsg::Withdraw { .. }
                 | ClientMsg::Approve { .. }
-                | ClientMsg::Interrupt { .. } => {}
+                | ClientMsg::Interrupt { .. }
+                | ClientMsg::Query { .. }
+                | ClientMsg::Cancel { .. } => {}
             }
         };
         while let Some((client_seq, answer)) = pending.pop_front() {

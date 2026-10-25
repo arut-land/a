@@ -371,6 +371,7 @@ impl Fixture {
             started: 0,
             // No connection is served here.
             machine: Arc::default(),
+            queried: Arc::default(),
         });
         Self(Arc::clone(&daemon.shared), counting, daemon, scratch)
     }
