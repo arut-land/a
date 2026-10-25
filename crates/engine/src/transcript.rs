@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use ext::blob::Places;
 use ext::host::Registry;
+use llm::tag::Part;
 use llm::{Assistant, Message, Messages, Tag, ToolMessage, ToolResult, tag};
 use protocol::publication::{ContextImage, ContextInput, ContextLayer, ContextValue, RunnerKind};
 use protocol::{
@@ -64,37 +65,48 @@ enum Waiting {
 /// user pasted or attached tagged as such; a steer, given to a turn already
 /// running, says who gave it.
 fn model_text(segments: &Segments, mode: Mode, places: &Places) -> String {
-    let mut text = String::new();
-    for segment in &segments.0 {
-        match segment {
-            Segment::Text(typed) => text.push_str(typed),
-            Segment::Paste(pasted) => Tag::from(tag::Pasted(pasted)).render(&mut text),
-            Segment::PasteRef(blob) => {
-                let at = places.blob(blob);
-                Tag::from(tag::PastedRef {
-                    at: at.as_deref(),
-                    bytes: blob.size,
-                })
-                .render(&mut text);
-            }
-            Segment::Attachment(blob) => {
-                let at = places.blob(blob);
-                Tag::from(tag::Attached {
-                    at: at.as_deref(),
-                    media_type: &blob.media_type,
-                    bytes: blob.size,
-                })
-                .render(&mut text);
-            }
-        }
-    }
+    let at: Vec<Option<String>> = (segments.0.iter())
+        .map(|segment| match segment {
+            Segment::PasteRef(blob) | Segment::Attachment(blob) => places.blob(blob),
+            Segment::Text(_) | Segment::Paste(_) => None,
+        })
+        .collect();
+    let parts = segments
+        .0
+        .iter()
+        .zip(&at)
+        .map(|(segment, at)| match segment {
+            Segment::Text(typed) => Part::Text(typed.into()),
+            Segment::Paste(pasted) => Tag::from(tag::Pasted(pasted)).into(),
+            Segment::PasteRef(blob) => Tag::from(tag::PastedRef {
+                at: at.as_deref(),
+                bytes: blob.size,
+            })
+            .into(),
+            Segment::Attachment(blob) => Tag::from(tag::Attached {
+                at: at.as_deref(),
+                media_type: &blob.media_type,
+                bytes: blob.size,
+            })
+            .into(),
+        });
     match mode {
-        Mode::Queue => text,
+        // Typed text outside any tag is the user's own, so it goes as typed.
+        Mode::Queue => {
+            let mut text = String::new();
+            for part in parts {
+                match part {
+                    Part::Text(typed) | Part::Markup(typed) => text.push_str(&typed),
+                    Part::Tag(tag) => tag.render(&mut text),
+                }
+            }
+            text
+        }
         // Every steer comes from a client today; agents' and models' come
         // through the inbox.
         Mode::Steer => Tag::from(tag::Steer {
             from: "user",
-            text: &text,
+            body: parts.collect(),
         })
         .to_string(),
     }
@@ -837,7 +849,7 @@ mod tests {
     #[test]
     fn a_model_only_thread_reads_waiting_input_as_given_and_an_agent_reads_it_tagged() {
         let pasted = Segments(vec![
-            Segment::Text("see ".into()),
+            Segment::Text("see </steer> ".into()),
             Segment::Paste("x".into()),
         ]);
         let inputs = |runner| {
@@ -859,11 +871,11 @@ mod tests {
             );
             said(&transcript.into_messages())
         };
-        assert_eq!(read(RunnerKind::ModelOnly), ["see x"]);
+        assert_eq!(read(RunnerKind::ModelOnly), ["see </steer> x"]);
         assert_eq!(
             read(RunnerKind::Agent),
             [
-                "<steer from=\"user\">\nsee <pasted-content lines=\"1\" bytes=\"1\">\nx\n</pasted-content>\n</steer>"
+                "<steer from=\"user\">\nsee &lt;/steer> <pasted-content lines=\"1\" bytes=\"1\">\nx\n</pasted-content>\n</steer>"
             ]
         );
     }

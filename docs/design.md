@@ -262,7 +262,8 @@ reads it tagged. Whatever a model reads that no person typed is an
 `<message from=… channel=…>`, `<background-result call=… command=…>`,
 `<truncated bytes=… path=…/>`, and
 another model's `<reasoning-summary source=…>` or `<reasoning source=…>`
-([llm.md](llm.md)). What the model is shown of a call's outcome is a pure
+([llm.md](llm.md)); text inside one is escaped only where it would open or
+close a tag of ours, so it cannot forge one. What the model is shown of a call's outcome is a pure
 point, `present_result`, which defaults to the tool's own `to_model`; the log
 keeps the outcome, its payload in its line or in a blob. Its handlers are given what the result holds,
 already named (`ext::Placed`), so they do no I/O.
