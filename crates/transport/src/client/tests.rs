@@ -411,47 +411,58 @@ fn a_reply_left_at_its_last_chunk_leaves_its_connection_to_the_next() {
 
 #[test]
 fn a_delayed_terminator_returns_a_dropped_replys_connection() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (dropped, wait) = mpsc::channel();
-    let (reused, done) = mpsc::channel();
-    let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(IDLE)).unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        read_request(&mut reader);
-        (&stream)
-            .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n")
-            .unwrap();
-        wait.recv().unwrap();
-        (&stream).write_all(b"0\r\n\r\n").unwrap();
-        read_request(&mut reader);
-        (&stream)
-            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-            .unwrap();
-        reused.send(()).unwrap();
-    });
-    let http = client();
-    let reply = rt::block_on(http.send(request(port))).unwrap();
-    let mut body = reply.into_body();
-    assert_eq!(next_chunk(&mut body).unwrap().unwrap(), b"hello");
-    drop(body);
-    dropped.send(()).unwrap();
-    // Wait for the background drain to return the connection, without
-    // sending another request on a new socket in the meantime.
-    let target = Target::try_from(request(port).uri()).unwrap();
-    let started = Instant::now();
-    loop {
-        if let Some(conn) = http.0.pool.take(&target, http.0.rt.now()) {
-            http.0.pool.put(target.clone(), conn, http.0.rt.now());
-            break;
+    for (prefix, suffix) in [
+        (&b"5\r\nhello\r\n"[..], &b"0\r\n\r\n"[..]),
+        (&b"5\r\nhello\r\n0\r\n"[..], &b"\r\n"[..]),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (dropped, wait) = mpsc::channel();
+        let (reused, done) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(IDLE)).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            read_request(&mut reader);
+            (&stream)
+                .write_all(
+                    &[
+                        &b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"[..],
+                        prefix,
+                    ]
+                    .concat(),
+                )
+                .unwrap();
+            wait.recv().unwrap();
+            (&stream).write_all(suffix).unwrap();
+            read_request(&mut reader);
+            (&stream)
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
+            reused.send(()).unwrap();
+        });
+        let http = client();
+        let reply = rt::block_on(http.send(request(port))).unwrap();
+        let mut body = reply.into_body();
+        assert_eq!(next_chunk(&mut body).unwrap().unwrap(), b"hello");
+        drop(body);
+        dropped.send(()).unwrap();
+        // Wait for the background drain to return the connection, without
+        // sending another request on a new socket in the meantime.
+        let target = Target::try_from(request(port).uri()).unwrap();
+        let started = Instant::now();
+        loop {
+            if let Some(conn) = http.0.pool.take(&target, http.0.rt.now()) {
+                http.0.pool.put(target.clone(), conn, http.0.rt.now());
+                break;
+            }
+            assert!(started.elapsed() < IDLE);
+            thread::sleep(Duration::from_millis(1));
         }
-        assert!(started.elapsed() < IDLE);
-        thread::sleep(Duration::from_millis(1));
+        let _reply = rt::block_on(http.send(request(port))).unwrap();
+        done.recv_timeout(IDLE).unwrap();
+        server.join().unwrap();
     }
-    let _reply = rt::block_on(http.send(request(port))).unwrap();
-    done.recv_timeout(IDLE).unwrap();
-    server.join().unwrap();
 }
 
 #[test]

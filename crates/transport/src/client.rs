@@ -577,7 +577,7 @@ impl Drop for Reader {
         if !self.yielded
             || self.closed
             || call.body_mode() != BodyMode::Chunked
-            || !call.is_on_chunk_boundary()
+            || !(call.is_on_chunk_boundary() || call.is_ended_chunked())
         {
             return;
         }
