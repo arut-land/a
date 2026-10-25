@@ -29,7 +29,10 @@ impl super::Shared {
             current
         };
         let system = registry.system_prompt();
-        Ok(Transcript::of(&entries, Arc::clone(&registry), system).into_messages())
+        // Named and read as the owner's own transcript does: a payload its
+        // log holds as a blob is read back from the store.
+        let places = ext::blob::Places::new(Arc::clone(&self.blobs), Arc::clone(&self.tree));
+        Ok(Transcript::placed(&entries, Arc::clone(&registry), system, &places).into_messages())
     }
 }
 
