@@ -14,6 +14,24 @@ from stats import distribution
 
 
 class Comparison(unittest.TestCase):
+    def test_allocator_effects_pair_rounds_before_resampling(self):
+        import json
+        import tempfile
+        import allocator_effects
+        records = [dict(label=label, sessions=1, round=round, idle_rss_kib=rss,
+                        delta_ms=[1], turn_ms=[2], dropped_deltas=0)
+                   for label, round, rss in [("A", 0, 10), ("A", 1, 1000), ("A", 2, 100),
+                                             ("A2", 2, 103), ("A2", 0, 13)]]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sessions.jsonl"
+            path.write_text("\n".join(map(json.dumps, records)))
+            row = allocator_effects.sessions(path)["A2/1/idle_rss_kib"]
+        self.assertEqual(row["rounds"], [0, 2])
+        self.assertEqual(row["pairs"], 2)
+        self.assertEqual(row["delta"], 3)
+        self.assertEqual(row["ci95"], [3, 3])
+        self.assertEqual(row["by_order"], {"0": 3})
+
     def test_a_failed_sibling_lane_never_blocks_a_successful_main_baseline(self):
         import io
         import json
