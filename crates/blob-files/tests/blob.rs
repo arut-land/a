@@ -193,6 +193,7 @@ fn a_named_blob_is_a_read_only_file_where_any_session_names_it() {
         home.dir
             .path()
             .join("cache")
+            .join("tree")
             .join("by-id")
             .join(blob.id.to_string())
     );
@@ -269,6 +270,59 @@ fn concurrent_ensures_of_one_blob_each_see_a_complete_file() {
         [blob.id.to_string()],
         "no copy left half made"
     );
+    assert_eq!(
+        names(&home.dir.path().join("cache/staging")),
+        [] as [&str; 0]
+    );
+}
+
+#[test]
+fn eviction_during_a_materialize_never_breaks_it() {
+    let home = Home::new();
+    let bytes: Vec<u8> = (0..=u8::MAX).cycle().take(8 << 20).collect();
+    let mut writer = home.files.writer(16 << 20).unwrap();
+    writer.write_all(&bytes).unwrap();
+    let blob = writer.finish("text/plain", BlobOrigin::Paste).unwrap();
+    let small = home.put(b"small");
+    let tree = home.tree();
+    tree.ensure(&TreePath::by_id(&small.id), &small).unwrap();
+    let start = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            start.wait();
+            for _ in 0..64 {
+                tree.evict(0).unwrap();
+            }
+        });
+        start.wait();
+        for n in 0..16 {
+            let at = TreePath::new(&format!("sessions/x/{n}")).unwrap();
+            tree.ensure(&at, &blob).unwrap();
+        }
+    });
+    for n in 0..16 {
+        let at = TreePath::new(&format!("sessions/x/{n}")).unwrap();
+        tree.ensure(&at, &blob).unwrap();
+        assert!(fs::read(tree.path(&at)).unwrap() == bytes);
+    }
+}
+
+#[test]
+fn the_tree_never_holds_what_a_crash_left_mid_copy() {
+    let home = Home::new();
+    let staging = home.dir.path().join("cache/staging");
+    fs::create_dir_all(&staging).unwrap();
+    // As a copy cut off by a crash, under a name a tree path could take.
+    fs::write(staging.join("by-id"), b"half a cop").unwrap();
+    let tree = home.tree();
+    let blob = home.put(b"whole");
+    let at = TreePath::by_id(&blob.id);
+    tree.ensure(&at, &blob).unwrap();
+    assert_eq!(fs::read(tree.path(&at)).unwrap(), b"whole");
+    assert_eq!(names(&staging), [] as [&str; 0], "leftovers are swept");
+    assert_eq!(names(tree.root()), ["by-id"]);
+    fs::write(staging.join("left"), b"another crash").unwrap();
+    assert_eq!(tree.evict(0).unwrap(), 5, "only the tree is counted");
 }
 
 #[test]
