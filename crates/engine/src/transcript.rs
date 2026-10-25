@@ -454,7 +454,7 @@ impl Transcript {
             .map(|held| ext::Placed {
                 at: match held {
                     Held::Blob(blob) => self.places.blob(blob),
-                    Held::Stream(stream) => self.places.stream(*stream),
+                    Held::Stream(stream) => Some(self.places.stream(*stream)),
                 },
                 held: held.clone(),
             })
@@ -464,7 +464,7 @@ impl Transcript {
     /// Where call `call`'s output streams, named by what its result held:
     /// the session whose log holds the call, whoever projects it.
     fn stream(&self, call: CallId) -> Option<String> {
-        self.places.stream(*self.streams.get(&call)?)
+        Some(self.places.stream(*self.streams.get(&call)?))
     }
 
     /// A call that went on in the background ended, as the model reads it:

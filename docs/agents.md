@@ -288,6 +288,16 @@ steer is taken as the turn goes on), and every running call whose tool can
 go on in the background is detached. Force-steering and detaching are one
 mechanism.
 
+The shell's timeout is the same mechanism on a clock: a command still
+running after it goes to the background rather than stopping, and only a
+call another call invoked is stopped there. A call's `timeout` (1 to 600
+seconds) overrides the default.
+
+```toml
+[ext.shell]
+timeout = 120  # seconds a command is waited for before it moves to the background, 1 to 600
+```
+
 ### Routing and transport
 
 Messaging uses an envelope with a durable id `(sender, call, purpose)`, sender,

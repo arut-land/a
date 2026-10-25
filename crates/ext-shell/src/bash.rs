@@ -16,8 +16,9 @@
 //! Output crosses a bounded capture pipe into an open blob stream.
 //! Storage admission applies back-pressure; the supervisor follows the
 //! stream, woken by its writes, keeping only what the model is shown, and
-//! the stream is sealed into a blob as the whole output when that was cut,
-//! unless processes the command left running still write it. The result
+//! the stream is sealed into a blob as the whole output when that was cut;
+//! while processes the command left running still write it, the result
+//! holds the stream instead, cut or not. The result
 //! holds the blob or the stream ([`Tool::held`]); the engine tells the
 //! model where each is. A stream a group the session owns writes is sealed
 //! as the group ends, held by the end's queued notice
@@ -140,9 +141,9 @@ pub struct Ran {
     /// ([`Tool::held`]), never logged with the output.
     #[serde(skip)]
     pub full: Option<BlobRef>,
-    /// The whole output, still growing: a background job's, or a cut one
-    /// that processes the command left running still write, never a blob
-    /// sealed under them. Held by the result, never logged with the output.
+    /// The whole output, still growing: a background job's, or one that
+    /// processes the command left running still write, never a blob
+    /// sealed under them; sealed as their group ends. Held by the result, never logged with the output.
     #[serde(skip)]
     pub growing: Option<OutputStream>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -423,16 +424,18 @@ async fn keep(cx: &Cx, log: Open, output: Ended, lingering: bool) -> io::Result<
         let cut = output.cut();
         let media_type = output.media_type();
         let rendered = output.render();
-        if !cut {
-            let _ = log.discard();
-            return Ok((rendered, Kept::default()));
-        }
+        // What processes the command left still write is kept, whether
+        // or not the model saw all of it so far.
         if lingering {
             let kept = Kept {
                 growing: Some(log),
                 ..Kept::default()
             };
             return Ok((rendered, kept));
+        }
+        if !cut {
+            let _ = log.discard();
+            return Ok((rendered, Kept::default()));
         }
         let Ok(blob) = log.seal(media_type, BlobOrigin::ToolOutput(call)) else {
             return Ok((rendered, Kept::default()));
@@ -488,16 +491,15 @@ impl Written {
     /// The blob it seals into, of the media type its start shows; nothing
     /// for a stream that is empty or cannot be read.
     fn seal(mut self, call: protocol::CallId) -> Vec<Held> {
+        let Some(open) = &self.0 else {
+            return Vec::new();
+        };
+        let Ok(file) = File::open(open.path()) else {
+            return Vec::new();
+        };
         let mut head = Vec::with_capacity(crate::output::HEAD);
-        let read = (self.0.as_ref().map(|open| File::open(open.path())))
-            .and_then(Result::ok)
-            .and_then(|file| {
-                (file.take(crate::output::HEAD as u64))
-                    .read_to_end(&mut head)
-                    .ok()
-            });
-        // Dropped unsealed, an empty stream is discarded.
-        let Some(1..) = read else {
+        let Ok(1..) = file.take(crate::output::HEAD as u64).read_to_end(&mut head) else {
+            // Dropped unsealed, an empty stream is discarded.
             return Vec::new();
         };
         let Some(open) = self.0.take() else {

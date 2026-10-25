@@ -1594,11 +1594,12 @@ impl Actor {
                                 let _ = process.signal(ext::ProcessSignal::Kill);
                                 ended.await;
                             }
-                            lock(&session.jobs).retain(|p| !Arc::ptr_eq(p, &process));
                             // An end of its own reaches the agent, on the
                             // queue, holding what the group left (its
                             // output, sealed now that nothing writes it);
-                            // one the session stopped is its own doing.
+                            // one the session stopped is its own doing. The
+                            // job holds the session until its end is sent,
+                            // so no unload or drain comes between.
                             if !stopped {
                                 let text = job_ended(&**process);
                                 let held = match process.holds() {
@@ -1608,6 +1609,7 @@ impl Actor {
                                 let ended = Event::JobEnded { call, text, held };
                                 session.emit(fence, Completion::Event(ended));
                             }
+                            lock(&session.jobs).retain(|p| !Arc::ptr_eq(p, &process));
                             session.changed.notify();
                             if let Some(daemon) = session.shared.daemon.upgrade() {
                                 daemon.jobs.notify();

@@ -25,8 +25,8 @@
 //! Blob bytes are as private as the log that references them, and are
 //! kept as they were written: environment redaction never applies to them.
 //!
-//! A path is named only once it exists: [`Places`] ensures a blob as it
-//! names it. A stream whose writers are gone is sealed by whoever owned
+//! A blob's path is named only once it exists: [`Places`] ensures a blob
+//! as it names it. A stream's is named from its reference alone. A stream whose writers are gone is sealed by whoever owned
 //! them: the shell, as a process group the session owns ends, into the
 //! blob that end's queued notice holds.
 
@@ -261,10 +261,10 @@ impl Blobs {
 }
 
 /// Where the model reads a reference, named from what the log records,
-/// so a projection names it the same whoever's session projects it. A
-/// path is named only once it exists: a blob is materialized as it is
-/// named (idempotent, a stat once it is), a stream is named if it is
-/// there. Without a store, a blob is named by its place in the tree and a
+/// so a projection names it the same whoever's session projects it, and
+/// whenever. A blob is materialized as it is named (idempotent, a stat
+/// once it is); a stream is named where it grows, there or not. Without a
+/// store, a blob is named by its place in the tree and a
 /// stream by its call.
 #[derive(Clone, Default)]
 pub struct Places {
@@ -290,13 +290,15 @@ impl Places {
         Some(tree.path(&at).display().to_string())
     }
 
-    /// Where `stream` is read; `None` if it is not there.
-    pub fn stream(&self, stream: OutputStream) -> Option<String> {
+    /// Where `stream` is read, named from the reference alone: once it
+    /// ends it is gone from there (sealed, or dropped), and what reports
+    /// its end names the blob it became, so every projection of a log
+    /// names a stream alike, then and later.
+    pub fn stream(&self, stream: OutputStream) -> String {
         let Some((_, streams)) = &self.store else {
-            return Some(stream.to_string());
+            return stream.to_string();
         };
-        let path = stream_path(streams, stream);
-        path.exists().then(|| path.display().to_string())
+        stream_path(streams, stream).display().to_string()
     }
 }
 

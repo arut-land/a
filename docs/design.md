@@ -282,9 +282,11 @@ The shell process service admits at most 32 outstanding launches and running
 processes. Captured output crosses one 64 KiB buffer per process into an open
 blob stream, with storage back-pressure and a hard 64 MiB retention limit for
 foreground and background jobs. A foreground command whose output the model saw
-cut is sealed into a blob its result holds, unless processes it left running
-still write it: then the result holds the stream. Otherwise the stream is
-discarded. A background job's result holds its stream, open while it runs;
+cut is sealed into a blob its result holds. One that left processes running
+has its result hold the stream they still write, cut or not. Otherwise the
+stream is discarded. A stream is named from its reference alone
+(`blob::Places::stream`), whether or not it is still there, so a log projects
+the same before and after a job ends. A background job's result holds its stream, open while it runs;
 a group the session owns has its stream sealed as it ends, held by its end's
 queued notice, which waits for the next model call rather than starting a
 turn. A command's `timeout` (`[ext.shell] timeout`, 120 s by default, at
