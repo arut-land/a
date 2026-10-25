@@ -748,6 +748,7 @@ impl Live {
             resuming: false,
             frozen: None,
             deferred: std::collections::VecDeque::new(),
+            rested: false,
             journal: Journal {
                 writer: Some(loaded.writer),
                 fold_snapshot,
@@ -1110,6 +1111,8 @@ struct Actor {
     frozen: Option<handing::Frozen>,
     /// Messages a thaw lets through, before any newer.
     deferred: std::collections::VecDeque<Msg>,
+    /// At rest but for what runs in the background, as of the last burst.
+    rested: bool,
 
     journal: Journal,
     projection: Projection,
@@ -1403,6 +1406,13 @@ impl Actor {
             self.mark().await;
             self.publish();
             self.live.session.changed.notify();
+            // Come to rest but for what runs in the background, the session
+            // may be handed over: an upgrade waiting on it hears so.
+            let rested = self.core.at_rest_but_background();
+            if rested && !self.rested {
+                self.live.touch();
+            }
+            self.rested = rested;
             if self.journal.since_snapshot >= SNAPSHOT_EVERY {
                 self.keep_snapshot().await;
             }
