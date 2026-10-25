@@ -151,7 +151,10 @@ impl Tool for Nest {
 
     async fn call(&self, _: &Nothing, cx: &Cx) -> Result<Outcome, String> {
         let input = Json::encode(&json!({ "command": "sleep 30", "timeout": 1 })).unwrap();
-        Ok(cx.invoke("slow", ext_shell::Bash::NAME, &input).await.outcome)
+        Ok(cx
+            .invoke("slow", ext_shell::Bash::NAME, &input)
+            .await
+            .outcome)
     }
 }
 
@@ -180,8 +183,14 @@ fn a_command_another_call_invoked_is_still_stopped_at_its_timeout() {
     });
     settle(&session);
     session.halt();
-    assert!(started.elapsed() < Duration::from_secs(10), "it was stopped");
-    assert!(!log.iter().any(|e| matches!(e.body, Body::Detached { .. })), "{log:#?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "it was stopped"
+    );
+    assert!(
+        !log.iter().any(|e| matches!(e.body, Body::Detached { .. })),
+        "{log:#?}"
+    );
     let inner = (log.iter())
         .find_map(|e| match &e.body {
             Body::ToolResult {
@@ -271,7 +280,10 @@ fn a_job_holds_its_session_until_its_end_is_queued() {
     let session = fixture.start(&[]);
     session.submit("call leaves {}").unwrap();
     session.wait("its end is being made", PATIENCE, || sealing.is_set());
-    assert!(session.has_jobs(), "the job is gone before its end is queued");
+    assert!(
+        session.has_jobs(),
+        "the job is gone before its end is queued"
+    );
     release.set();
     until(&session, "its end was queued", |log| {
         log.iter().any(|e| matches!(e.body, Body::Enqueue { .. }))

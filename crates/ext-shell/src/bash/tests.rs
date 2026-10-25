@@ -218,7 +218,10 @@ fn a_lingering_groups_stream_is_sealed_as_the_group_ends_and_not_before() {
 fn what_a_lingering_process_writes_after_a_short_command_is_kept() {
     let rig = rig("lingering-short");
     let mut seen = rig.ends.count();
-    let (ran, held) = kept(&rig, &json!({ "command": "(sleep 1; echo later) & echo now" }));
+    let (ran, held) = kept(
+        &rig,
+        &json!({ "command": "(sleep 1; echo later) & echo now" }),
+    );
     assert!(!ran.truncated && ran.lingering.is_some(), "{ran:?}");
     assert_eq!(held, [Held::Stream(stream(&rig, 1))]);
     rt::block_on(rig.ends.changed(&mut seen));
