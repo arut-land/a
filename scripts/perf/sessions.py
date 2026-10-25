@@ -99,7 +99,7 @@ def paired(records, reference="A"):
 
 def paired_table(rows):
     names = list(PAIRED)
-    lines = ["| layout − A | sessions | pairs | " + " | ".join(names) + " |",
+    lines = ["| layout - A | sessions | pairs | " + " | ".join(names) + " |",
              "| --- | ---: | ---: | " + " | ".join("---:" for _ in names) + " |"]
     for row in rows.values():
         cells = ["{median:+.3g} [{low:+.3g}, {high:+.3g}]".format(**row[name]) for name in names]
@@ -126,7 +126,7 @@ def paired_trips(trips, reference="A"):
 
 
 def trips_table(rows):
-    lines = ["| round trip − A | pairs | A median: " + " | ".join(TRIP) + " |",
+    lines = ["| round trip - A | pairs | A median: " + " | ".join(TRIP) + " |",
              "| --- | ---: | " + " | ".join("---:" for _ in TRIP) + " |"]
     for row in rows.values():
         cells = ["{reference:.4g}: {median:+.3g} [{low:+.3g}, {high:+.3g}]".format(**row[name]) for name in TRIP]
@@ -165,11 +165,20 @@ def main():
     for round in range(args.rounds):
         order = labels if round % 2 == 0 else list(reversed(labels))
         for label, _, extra in order if args.round_trip else []:
-            result = subprocess.run(
-                [str(args.round_trip), "reactor_round_trip", "--exact", "--ignored", "--nocapture",
-                 "--test-threads=1"], env=dict(os.environ, **extra), capture_output=True, text=True, timeout=300)
-            if result.returncode:
-                print(label, "round trip", round, result.stderr[-2000:], sep="\n", flush=True)
+            try:
+                result = subprocess.run(
+                    [str(args.round_trip), "reactor_round_trip", "--exact", "--ignored", "--nocapture",
+                     "--test-threads=1"], env=dict(os.environ, **extra), capture_output=True, text=True,
+                    timeout=300)
+                failed = result.returncode and f"exit {result.returncode}"
+            except subprocess.TimeoutExpired:
+                failed, result = "timed out", None
+            if failed:
+                # A stalled echo is a finding, as a stalled session sample is.
+                failures.append(dict(label=label, runtime="round trip", sessions=0, round=round, failed=failed))
+                with (args.output / "failures.jsonl").open("a") as stream:
+                    stream.write(json.dumps(failures[-1]) + "\n")
+                print(label, "round trip", round, failed, result and result.stderr[-2000:], sep="\n", flush=True)
                 continue
             line = next(line for line in result.stdout.splitlines() if '{"' in line)
             trip = dict(json.loads(line[line.index('{"'):]), label=label, round=round)
