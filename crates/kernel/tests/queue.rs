@@ -268,12 +268,11 @@ fn a_restart_runs_a_safe_detached_call_again_and_reports_an_unsafe_one_cut_off()
             _ => None,
         })
         .unwrap();
-    let cut = Outcome::from_payload(&envelope.payload);
-    let Some(Outcome::Interrupted {
+    let protocol::Carried::Detached(Outcome::Interrupted {
         output: Some(output),
-    }) = cut
+    }) = &envelope.payload
     else {
-        panic!("{cut:?}");
+        panic!("{:?}", envelope.payload);
     };
     assert!(output.contains("may not have completed"), "{output}");
     let stream = OutputStream {
@@ -296,7 +295,7 @@ fn a_detached_calls_outcome_holds_what_its_result_would_have() {
     });
     s.step(Event::ToolDone {
         call: id(4),
-        outcome: done(json!("slept")),
+        outcome: done(json!("slept")).into(),
         card: None,
         held: vec![blob.clone()],
     });

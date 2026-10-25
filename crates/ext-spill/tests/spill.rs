@@ -125,6 +125,11 @@ const AT: &str = "tree/by-id/spilled";
 /// What the model is shown of `called`: its payload read back from the
 /// rig's store when a blob holds it.
 fn shown(rig: &Rig, tool: &str, called: &Called) -> String {
+    shown_at(rig, tool, called, Some(AT))
+}
+
+/// As [`shown`], its blob named at `at`, or nowhere.
+fn shown_at(rig: &Rig, tool: &str, called: &Called, at: Option<&str>) -> String {
     let held: Vec<Placed> = (called.held.iter())
         .map(|held| Placed {
             held: held.clone(),
@@ -135,7 +140,7 @@ fn shown(rig: &Rig, tool: &str, called: &Called) -> String {
         Outcome::Done {
             output: Payload::Blob(blob),
         } => Some(Stored {
-            at: Some(AT.to_owned()),
+            at: at.map(str::to_owned),
             text: Some(read(rig, blob)),
         }),
         _ => None,
@@ -256,4 +261,16 @@ fn a_result_that_holds_its_output_already_is_never_spilled_again() {
         BlobOrigin::ToolOutput(protocol::CallId::new(1).unwrap())
     );
     assert_eq!(shown(&rig, "keep", &called), "line 00000\n".repeat(1000));
+}
+
+/// Where the whole cannot be named, the cut is the same; only the tag says
+/// nothing of where.
+#[test]
+fn a_spill_whose_file_cannot_be_named_is_cut_the_same() {
+    let rig = Rig::new("spill-nowhere", registry());
+    let called = rig.called("print", &json!({ "count": 1000 }));
+    let named = shown(&rig, "print", &called);
+    let nowhere = shown_at(&rig, "print", &called, None);
+    assert_eq!(nowhere, named.replace(&format!(" path=\"{AT}\""), ""));
+    assert!(nowhere.contains("<truncated bytes="), "{nowhere}");
 }

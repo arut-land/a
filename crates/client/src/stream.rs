@@ -246,7 +246,7 @@ mod tests {
                 output: Json::encode(
                     &serde_json::json!({"message":{"content":[{"type":"text","text":"hello"}]}}),
                 )
-                .unwrap().into(),
+                .unwrap(),
             },
         },
     )));

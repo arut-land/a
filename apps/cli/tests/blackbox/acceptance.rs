@@ -460,7 +460,7 @@ fn a_parents_watch_fires_exactly_once_after_the_daemon_is_killed_mid_child() {
         })
         .collect();
     let slept = Outcome::Done {
-        output: Json::encode(&json!({ "slept": 2 })).unwrap().into(),
+        output: Json::encode(&json!({ "slept": 2 })).unwrap(),
     };
     assert_eq!(fired, [&slept]);
     let child_log = env.log(child);
@@ -469,7 +469,7 @@ fn a_parents_watch_fires_exactly_once_after_the_daemon_is_killed_mid_child() {
         .iter()
         .filter_map(|e| result_of(e, call))
         .collect();
-    assert_eq!(results, [&slept]);
+    assert_eq!(results, [&slept.into()]);
 }
 
 #[test]

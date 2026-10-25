@@ -471,7 +471,7 @@ fn successful_recovery_keeps_the_crashed_attempts_usage_unknown() {
         call: CallId::new(1).unwrap(),
         r#for: None,
         outcome: protocol::Outcome::Done {
-            output: Json::encode(&"recovered").unwrap().into(),
+            output: Json::encode(&"recovered").unwrap(),
         },
         failure: None,
     };

@@ -58,7 +58,7 @@ pub enum ContextValue {
     Detached(CallId),
     /// A queued outcome of a call that went on in the background, and
     /// what it holds outside the log.
-    Background(CallId, Outcome, Vec<crate::Held>),
+    Background(CallId, crate::ToolOutcome, Vec<crate::Held>),
     /// A queued end of a process group call `call` left to the session,
     /// and what it holds outside the log: the group's output, sealed.
     Job(CallId, String, Vec<crate::Held>),
@@ -66,7 +66,7 @@ pub enum ContextValue {
     ToolCall(String, String),
     /// A result, and what it holds outside the log: how its references
     /// are named, by whoever projects it.
-    ToolResult(CallId, Outcome, Vec<crate::Held>),
+    ToolResult(CallId, crate::ToolOutcome, Vec<crate::Held>),
 }
 
 /// Execution identity belongs to the owner, never to copied audit history.

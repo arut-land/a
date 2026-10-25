@@ -437,7 +437,7 @@ fn response_entry(seq: u64, response: &llm::Response) -> Entry {
         Body::ModelResult {
             call: CallId::new(seq).unwrap(),
             outcome: Outcome::Done {
-                output: Json::encode(response).unwrap().into(),
+                output: Json::encode(response).unwrap(),
             },
             r#for: None,
             failure: None,

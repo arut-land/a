@@ -8,7 +8,7 @@ use crate::ledger::Phase;
 use crate::view::{Item, Recap, Status, Usage};
 use crate::{
     ApprovalReason, Audience, BlobRef, CallId, Card, Json, Mark, Outcome, Payload, Permission,
-    Verdict, WaitOn,
+    ToolOutcome, Verdict, WaitOn,
 };
 
 /// What an item is, for the layout a renderer gives it.
@@ -264,7 +264,7 @@ fn standing<'a>(
     p: &mut Presented<'a>,
     call: CallId,
     phase: &Phase,
-    outcome: Option<&'a Outcome>,
+    outcome: Option<&'a ToolOutcome>,
     card: Option<&'a Card>,
 ) {
     let Some(outcome) = outcome else {

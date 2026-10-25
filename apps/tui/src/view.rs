@@ -399,7 +399,7 @@ mod tests {
 
     use super::*;
 
-    fn tool(outcome: Option<Outcome>, phase: Phase) -> Item {
+    fn tool(outcome: Option<protocol::ToolOutcome>, phase: Phase) -> Item {
         Item::Tool {
             invoke: None,
             call: CallId::new(7).unwrap(),

@@ -756,7 +756,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             DaemonMsg::Reply {
                 id: 7,
                 outcome: Outcome::Done {
-                    output: protocol::Json::encode(&json!(["src/lib.rs"])).unwrap().into(),
+                    output: protocol::Json::encode(&json!(["src/lib.rs"])).unwrap(),
                 },
             },
         ),
@@ -928,8 +928,8 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         ),
         sample("entry_outbox", entry(1, Body::Outbox { envelope_id: envelope().id, recipients: vec![envelope().destination, SessionId(Uuid::from_u128(0xd))], payload: "hello".into() })),
         sample("entry_enqueue", entry(1, Body::Enqueue { envelope: envelope() })),
-        sample("entry_enqueue_detached", entry(19, Body::Enqueue { envelope: protocol::Envelope::own(SESSION, CallId::new(4).unwrap(), protocol::EnvelopeId::DETACHED, Outcome::Interrupted { output: None }.payload()).holding(vec![protocol::Held::Blob(protocol::BlobRef { id: protocol::BlobId([0x0f; 32]), size: 9000, media_type: "text/plain".into(), origin: protocol::BlobOrigin::ToolOutput(CallId::new(4).unwrap()) })]) })),
-        sample("entry_enqueue_own", entry(18, Body::Enqueue { envelope: protocol::Envelope::own(SESSION, CallId::new(16).unwrap(), protocol::EnvelopeId::CHILD, Outcome::Interrupted { output: None }.payload()) })),
+        sample("entry_enqueue_detached", entry(19, Body::Enqueue { envelope: protocol::Envelope::own(SESSION, CallId::new(4).unwrap(), protocol::Carried::Detached(protocol::ToolOutcome::Interrupted { output: None })).holding(vec![protocol::Held::Blob(protocol::BlobRef { id: protocol::BlobId([0x0f; 32]), size: 9000, media_type: "text/plain".into(), origin: protocol::BlobOrigin::ToolOutput(CallId::new(4).unwrap()) })]) })),
+        sample("entry_enqueue_own", entry(18, Body::Enqueue { envelope: protocol::Envelope::own(SESSION, CallId::new(16).unwrap(), protocol::Carried::Child(Outcome::Interrupted { output: None })) })),
         sample("entry_ack", entry(2, Body::Ack { envelope_id: envelope().id, recipient: envelope().destination, refusal: None })),
         sample("entry_inbox_full", entry(2, Body::Ack { envelope_id: envelope().id, recipient: envelope().destination, refusal: Some(protocol::InboxRefusal::Full) })),
         sample("entry_withdraw", entry(5, Body::Withdraw { input: Seq::new(3).unwrap(), origin: None })),
@@ -956,7 +956,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 Body::Fired {
                     watch: Seq::new(16).unwrap(),
                     outcome: Outcome::Done {
-                        output: protocol::Json::encode(&json!({ "text": "found it" })).unwrap().into(),
+                        output: protocol::Json::encode(&json!({ "text": "found it" })).unwrap(),
                     },
                 },
             ),

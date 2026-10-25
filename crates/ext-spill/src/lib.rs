@@ -11,10 +11,12 @@
 //!   model greps. A result that holds something already (the shell's,
 //!   which keeps its own whole output) is left as it is: its tool decided
 //!   what to show. This runs before the kernel's `post_tool` chain, which
-//!   so sees, and may replace, the payload as it is logged.
+//!   so sees, and may replace, the payload as it is logged: of a spilled
+//!   result, the reference alone.
 //! - **Presented** ([`PresentResult`]): a payload held as a blob is shown
 //!   as its first `head` and last `tail` bytes around a
-//!   `<truncated bytes=".." path=".."/>` tag naming the blob's file. The
+//!   `<truncated bytes=".." path=".."/>` tag naming the blob's file (no
+//!   path where it cannot be named). The
 //!   cut is a function of the text alone, at line ends where one is near
 //!   and never inside a character, so every projection of the log shows the
 //!   same bytes and a provider's prompt cache holds.
@@ -122,19 +124,17 @@ impl Record for Spill {
 }
 
 impl Spill {
-    /// `shown` cut to its ends, if its payload is held as a blob, can be
-    /// read, and is long enough to cut: what follows from the text and the
-    /// blob's place alone.
+    /// `shown` cut to its ends, if its payload is held as a blob and is
+    /// long enough to cut: a function of the text alone, naming where the
+    /// whole is when it can be read.
     fn present(&self, shown: &Presenting<'_>) -> Rewrite<Presented> {
-        let (
-            Outcome::Done {
-                output: Payload::Blob(_),
-            },
-            Some(at),
-        ) = (shown.outcome, shown.stored)
+        let Outcome::Done {
+            output: Payload::Blob(_),
+        } = shown.outcome
         else {
             return Rewrite::Pass;
         };
+        let at = shown.stored;
         let text = match &shown.presented.output {
             llm::Output::Text(text) => text.as_str(),
             llm::Output::Json(json) => json.raw(),
@@ -143,7 +143,7 @@ impl Spill {
         let Some((head, tail)) = cut(text, self.head, self.tail) else {
             return Rewrite::Pass;
         };
-        let mut out = String::with_capacity(head.len() + tail.len() + at.len() + 48);
+        let mut out = String::with_capacity(head.len() + tail.len() + 128);
         out.push_str(head);
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');

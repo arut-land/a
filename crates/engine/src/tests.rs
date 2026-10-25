@@ -554,7 +554,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
             Body::Fired {
                 watch: Seq::new(6).unwrap(),
                 outcome: Outcome::Done {
-                    output: Json::encode("hi").unwrap().into()
+                    output: Json::encode("hi").unwrap()
                 }
             },
             Body::ToolResult {
@@ -692,7 +692,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         by: Audience::Model,
     };
     let slept = Outcome::Done {
-        output: Json::encode(&json!({ "slept": 0 })).unwrap().into(),
+        output: Json::encode(&json!({ "slept": 0 })).unwrap(),
     };
     let mut parents = Vec::new();
 
@@ -718,7 +718,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     write(&parent, spawned(child.id), true);
     let done = Body::ToolResult {
         call: CallId::new(3).unwrap(),
-        outcome: slept.clone(),
+        outcome: slept.clone().into(),
         card: None,
         held: Vec::new(),
     };
@@ -1958,7 +1958,7 @@ fn interrupt_cancels_detached_descendants_after_the_spawning_call_completes() {
         id,
         child,
         Outcome::Done {
-            output: Json::encode("late").unwrap().into(),
+            output: Json::encode("late").unwrap(),
         },
     ));
     parent.session().barrier();

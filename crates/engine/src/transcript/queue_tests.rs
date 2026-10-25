@@ -58,7 +58,7 @@ fn called() -> Vec<Body> {
             call: call(2),
             r#for: None,
             outcome: Outcome::Done {
-                output: Json::encode(&reply).unwrap().into(),
+                output: Json::encode(&reply).unwrap(),
             },
             failure: None,
         },
@@ -148,7 +148,7 @@ fn a_detached_call_answers_with_its_stream_and_its_outcome_is_read_once_taken() 
             })],
         },
         Body::Enqueue {
-            envelope: Envelope::own(SESSION, call(3), EnvelopeId::DETACHED, outcome.payload()),
+            envelope: Envelope::own(SESSION, call(3), Carried::Detached(outcome.clone())),
         },
     ]);
     let waiting = transcript(bodies.clone());

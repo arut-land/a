@@ -57,8 +57,17 @@ impl Index {
                     self.sides.push((identity, CallId(entry.seq), kept));
                 }
             }
-            Body::ModelResult { call, outcome, .. } | Body::ToolResult { call, outcome, .. } => {
-                let done = matches!(outcome, protocol::Outcome::Done { .. });
+            Body::ModelResult { call, .. } | Body::ToolResult { call, .. } => {
+                let done = matches!(
+                    &entry.body,
+                    Body::ModelResult {
+                        outcome: protocol::Outcome::Done { .. },
+                        ..
+                    } | Body::ToolResult {
+                        outcome: protocol::Outcome::Done { .. },
+                        ..
+                    }
+                );
                 if let Some(input) = self.input(*call) {
                     self.resolve(input, entry.seq, done);
                 }
@@ -227,7 +236,7 @@ mod tests {
                 call: owner,
                 r#for: Some(owner),
                 outcome: Outcome::Done {
-                    output: Json::encode(&"x".repeat(32768)).unwrap().into(),
+                    output: Json::encode(&"x".repeat(32768)).unwrap(),
                 },
                 failure: None,
             },
@@ -246,7 +255,7 @@ mod tests {
             Body::Outbox {
                 envelope_id: envelope.id.clone(),
                 recipients: vec![envelope.destination],
-                payload: envelope.payload.clone(),
+                payload: "message".into(),
             },
             Body::Ack {
                 envelope_id: envelope.id.clone(),
@@ -259,7 +268,7 @@ mod tests {
                 call: CallId::new(20 + n).unwrap(),
                 r#for: Some(owner),
                 outcome: Outcome::Done {
-                    output: Json::encode(&"y".repeat(32768)).unwrap().into(),
+                    output: Json::encode(&"y".repeat(32768)).unwrap(),
                 },
                 failure: None,
             });

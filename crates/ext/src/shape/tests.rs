@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use protocol::{Json, Outcome, SessionId};
+use protocol::{Json, SessionId, ToolOutcome};
 use serde::Deserialize;
 
 use super::*;
@@ -136,7 +136,7 @@ impl Host for Recorded {
     }
 }
 
-fn run(tool: &str, input: u64) -> (Outcome, String) {
+fn run(tool: &str, input: u64) -> (ToolOutcome, String) {
     let host = Arc::new(Recorded {
         registry: Registry::default().with(&Tools).unwrap(),
         progress: Mutex::default(),
@@ -167,8 +167,8 @@ fn run(tool: &str, input: u64) -> (Outcome, String) {
     (called.outcome, progress)
 }
 
-fn done(n: u64) -> Outcome {
-    Outcome::Done {
+fn done(n: u64) -> ToolOutcome {
+    ToolOutcome::Done {
         output: Json::encode(&n).unwrap().into(),
     }
 }

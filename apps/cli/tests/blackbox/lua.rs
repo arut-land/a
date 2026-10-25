@@ -9,7 +9,7 @@ fn write(dir: &Path, name: &str, source: &str) {
     sys::fs::write_private(&dir.join(format!("{name}.lua")), source.as_bytes()).unwrap();
 }
 
-fn command(conn: &mut crate::common::Conn, text: &str) -> Outcome {
+fn command(conn: &mut crate::common::Conn, text: &str) -> protocol::ToolOutcome {
     conn.input(text);
     let entries = conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
     match &entries.last().unwrap().body {

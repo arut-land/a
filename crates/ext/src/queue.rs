@@ -128,10 +128,9 @@ mod tests {
     fn item(seq: u64, steer: bool, source: Source) -> Queued {
         Queued {
             seq: Seq::new(seq).unwrap(),
-            text: String::new(),
+            payload: String::new().into(),
             steer,
             source,
-            outcome: false,
             typed: Default::default(),
         }
     }
@@ -211,7 +210,9 @@ mod tests {
         let child = item(7, false, Source::Child(Seq::new(3).unwrap()));
         assert_eq!(at_end(&[ended.clone(), child]), seqs(&[7]));
         let outcome = Queued {
-            outcome: true,
+            payload: protocol::Carried::Detached(protocol::ToolOutcome::Failed {
+                error: "e".into(),
+            }),
             ..item(8, false, job)
         };
         assert_eq!(at_end(&[ended.clone(), outcome]), seqs(&[8]));

@@ -454,9 +454,7 @@ mod tests {
                 failure: None,
                 call: CallId::new(2).unwrap(),
                 outcome: Outcome::Done {
-                    output: Json::encode(&serde_json::json!({ "text": "a <b> c d" }))
-                        .unwrap()
-                        .into(),
+                    output: Json::encode(&serde_json::json!({ "text": "a <b> c d" })).unwrap(),
                 },
             },
         )]);
@@ -504,7 +502,7 @@ mod tests {
                 failure: None,
                 call: CallId::new(2).unwrap(),
                 outcome: Outcome::Done {
-                    output: Json::encode(&reply).unwrap().into(),
+                    output: Json::encode(&reply).unwrap(),
                 },
             },
         )]);

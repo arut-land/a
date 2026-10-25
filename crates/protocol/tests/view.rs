@@ -204,7 +204,7 @@ impl Session {
             let outcome = outcome(rng, &json!({ "output": "x\n", "exit": 0 }));
             self.commit(Body::ToolResult {
                 call: id,
-                outcome,
+                outcome: outcome.into(),
                 card: Some(Card {
                     title: "$ echo".into(),
                     body: "x\n".into(),
@@ -326,7 +326,7 @@ fn outcome(rng: &mut Rng, output: &Value) -> Outcome {
         0 => Outcome::Failed { error: "f".into() },
         1 => Outcome::Interrupted { output: None },
         _ => Outcome::Done {
-            output: Json::encode(output).unwrap().into(),
+            output: Json::encode(output).unwrap(),
         },
     }
 }
@@ -524,7 +524,6 @@ fn queue_entries() -> Vec<Entry> {
     let job = protocol::Envelope::own(
         SESSION,
         CallId::new(1).unwrap(),
-        protocol::EnvelopeId::JOB,
         "[background job 7 ended: exit code 0]".into(),
     );
     let seq = |n| Seq::new(n).unwrap();
@@ -669,7 +668,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         entry(3, ask(1)),
         msg(DaemonMsg::Activity { seq: 3, activity: protocol::Activity::Approval }),
         entry(4, Body::ModelCall { model: "fast".into(), attempt: 0, choice: protocol::ToolChoice::Auto, r#for: Some(call(1)), purpose: Some("approval-description".into()), request: None }),
-        entry(5, Body::ModelResult { call: call(4), r#for: Some(call(1)), failure: None, outcome: Outcome::Done { output: Json::encode(&json!({"message":{"content":[{"type":"text","text":"Only lists files."}]}})).unwrap().into() } }),
+        entry(5, Body::ModelResult { call: call(4), r#for: Some(call(1)), failure: None, outcome: Outcome::Done { output: Json::encode(&json!({"message":{"content":[{"type":"text","text":"Only lists files."}]}})).unwrap() } }),
         entry(6, annotation(1, "Only lists files.")),
         msg(DaemonMsg::Synced { seq: 6 }),
     ]
@@ -733,7 +732,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 }),
                 entry(4, Body::ModelResult {
                     call: call(3), r#for: Some(call(1)), failure: None,
-                    outcome: Outcome::Done { output: Json::encode(&json!({"message":{"content":[{"type":"text","text":"Lists files in the current directory."}]}})).unwrap().into() },
+                    outcome: Outcome::Done { output: Json::encode(&json!({"message":{"content":[{"type":"text","text":"Lists files in the current directory."}]}})).unwrap() },
                 }),
                 entry(5, annotation(1, "Lists files in the current directory.")),
                 msg(DaemonMsg::Synced { seq: 5 }),
@@ -842,7 +841,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                                 "message": { "content": [{ "type": "text", "text": "hello" }] },
                                 "usage": { "input": 4, "output": 2 },
                             }))
-                            .unwrap().into(),
+                            .unwrap(),
                         },
                     },
                 ),
@@ -942,7 +941,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::Fired {
                         watch: Seq::new(2).unwrap(),
                         outcome: Outcome::Done {
-                            output: Json::encode(&json!({ "slept": 1 })).unwrap().into(),
+                            output: Json::encode(&json!({ "slept": 1 })).unwrap(),
                         },
                     },
                 ),

@@ -60,9 +60,9 @@ fn backgrounded(fixture: &Fixture, session: &Live, log: &[Entry], call: CallId) 
             _ => None,
         })
         .unwrap();
-    let Some(Outcome::Done {
+    let protocol::Carried::Detached(Outcome::Done {
         output: protocol::Payload::Inline(output),
-    }) = Outcome::from_payload(&back.payload)
+    }) = &back.payload
     else {
         panic!("{back:?}")
     };
@@ -147,12 +147,12 @@ struct Nest;
 
 impl Tool for Nest {
     type In = Nothing;
-    type Out = Outcome;
+    type Out = protocol::ToolOutcome;
 
     const NAME: &'static str = "nest";
     const DESCRIPTION: &'static str = "Runs a slow command through bash.";
 
-    async fn call(&self, _: &Nothing, cx: &Cx) -> Result<Outcome, String> {
+    async fn call(&self, _: &Nothing, cx: &Cx) -> Result<protocol::ToolOutcome, String> {
         let input = Json::encode(&json!({ "command": "sleep 30", "timeout": 1 })).unwrap();
         Ok(cx
             .invoke("slow", ext_shell::Bash::NAME, &input)

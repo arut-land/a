@@ -29,8 +29,8 @@ use crate::view::{Item, Status, Usage, ViewSnapshot, ViewState};
 use crate::{
     Activity, Audience, Author, BlobRef, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
     CommandInfo, DaemonMsg, Decode, Entry, Environment, Epoch, ForkError, HomeSettings, Installed,
-    Json, Mode, Outcome, Payload, Permission, Rejection, Seq, SessionId, SessionSummary,
-    SettingsChange, Target, ToolChoice, Verdict, WaitOn,
+    Json, Mode, Outcome, OutcomeValue, Payload, Permission, Rejection, Seq, SessionId,
+    SessionSummary, SettingsChange, Target, ToolChoice, ToolOutcome, Verdict, WaitOn,
 };
 
 /// Declares a tagged union of the wire, one line per kind:
@@ -268,6 +268,7 @@ same!(
     Card,
     crate::ExtensionFact,
     Outcome,
+    ToolOutcome,
     Permission,
     Mode,
     ToolChoice,
@@ -312,12 +313,28 @@ parsed!(
     String,
     u32,
     Seq,
-    Outcome,
+    ToolOutcome,
     ClientId,
     ViewState,
     Vec<Item>,
     Vec<SessionSummary>
 );
+
+/// A reply's outcome, read where a tool's is: no blob holds it.
+impl Field<ToolOutcome> for Outcome {
+    fn read(field: ToolOutcome) -> Result<Self> {
+        Ok(match field {
+            Outcome::Done {
+                output: Payload::Inline(output),
+            } => Self::Done { output },
+            Outcome::Done {
+                output: Payload::Blob(_),
+            } => return Err(Error::custom("only a tool's outcome is held as a blob")),
+            Outcome::Failed { error } => Self::Failed { error },
+            Outcome::Interrupted { output } => Self::Interrupted { output },
+        })
+    }
+}
 
 /// A call is an entry's seq, never 0.
 impl Field<u64> for CallId {
@@ -447,7 +464,8 @@ pub(crate) struct EntryFields {
     pub(crate) pgid: Option<u32>,
     pub(crate) boot: Option<String>,
     pub(crate) background: Option<bool>,
-    pub(crate) outcome: Option<Outcome>,
+    // A tool's, or a reply's, which no blob holds.
+    pub(crate) outcome: Option<ToolOutcome>,
     pub(crate) model: Option<String>,
     pub(crate) attempt: Option<u16>,
     pub(crate) choice: Option<ToolChoice>,
@@ -546,7 +564,8 @@ pub(crate) struct MsgFields {
     pub(crate) scope: Option<crate::Scope>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) body: Option<Json>,
-    pub(crate) outcome: Option<Outcome>,
+    // A reply's; read as a tool's, so an entry frame's reads too.
+    pub(crate) outcome: Option<ToolOutcome>,
     pub(crate) queries: Option<Vec<crate::QueryInfo>>,
 }
 
@@ -569,7 +588,7 @@ struct ItemFields {
     #[serde(default, deserialize_with = "present")]
     input: Option<Json>,
     phase: Option<Phase>,
-    outcome: Option<Outcome>,
+    outcome: Option<ToolOutcome>,
     card: Option<Card>,
     by: Option<String>,
     hook: Option<String>,
@@ -872,13 +891,10 @@ struct OutcomeFields {
 }
 
 impl OutcomeFields {
-    fn outcome(&mut self) -> Result<Outcome> {
+    fn outcome<P: OutcomeValue>(&mut self) -> Result<Outcome<P>> {
         Ok(match self.status {
             Ending::Done => Outcome::Done {
-                output: match self.blob.take() {
-                    Some(blob) => Payload::Blob(Box::new(blob)),
-                    None => Payload::Inline(req(self.output.take(), "output")?),
-                },
+                output: P::read(self.output.take(), self.blob.take()).map_err(Error::custom)?,
             },
             Ending::Failed => Outcome::Failed {
                 error: req(self.error.take(), "error")?,
@@ -911,7 +927,7 @@ impl<'de> Deserialize<'de> for Status {
     }
 }
 
-impl<'de> Deserialize<'de> for Outcome {
+impl<'de, P: OutcomeValue> Deserialize<'de> for Outcome<P> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         OutcomeFields::deserialize(MapOnly(d))?
             .outcome()

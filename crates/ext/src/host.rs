@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use protocol::{
     Audience, CallId, Card, Environment, Installed, Json, Outcome, Payload, Segments, Seq,
-    SessionId,
+    SessionId, ToolOutcome,
 };
 
 use crate::ext::RegisteredAgent;
@@ -190,7 +190,7 @@ impl Toolset {
     pub fn to_model(
         &self,
         name: &str,
-        outcome: &Outcome,
+        outcome: &ToolOutcome,
         text: Option<String>,
     ) -> (llm::Output, bool) {
         match outcome {
@@ -496,7 +496,7 @@ impl Registry {
     pub fn present_result(
         &self,
         tool: &str,
-        outcome: &Outcome,
+        outcome: &ToolOutcome,
         held: &[crate::point::Placed],
         stored: Option<crate::point::Stored>,
     ) -> crate::point::Presented {
@@ -1211,8 +1211,8 @@ pub trait Binding: Send + Sync {
         _call: CallId,
         _tool: &str,
         _input: &Json,
-        outcome: Outcome,
-    ) -> Chained<Outcome> {
+        outcome: ToolOutcome,
+    ) -> Chained<ToolOutcome> {
         Chained::new(outcome)
     }
 
@@ -1498,8 +1498,8 @@ impl<V: View + Send + Sync + 'static> Binding for Bound<V> {
         call: CallId,
         tool: &str,
         input: &Json,
-        outcome: Outcome,
-    ) -> Chained<Outcome> {
+        outcome: ToolOutcome,
+    ) -> Chained<ToolOutcome> {
         (self.registry.hooks()).post_tool(&self.about(call), (tool, input), outcome)
     }
 

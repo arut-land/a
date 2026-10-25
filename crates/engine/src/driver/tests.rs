@@ -721,7 +721,7 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
                 Body::ToolCall { tool, id: Some(id), .. },
                 Body::ToolResult { call: b, outcome: Outcome::Done { output: protocol::Payload::Inline(output) }, card: None, .. },
                 Body::ModelCall { .. },
-                Body::ModelResult { r#for: None, failure: None, call: c, outcome: Outcome::Done { output: protocol::Payload::Inline(answer) } },
+                Body::ModelResult { r#for: None, failure: None, call: c, outcome: Outcome::Done { output: answer } },
             ] if (a.get(), b.get(), c.get()) == (2, 4, 6) && tool == "lookup_harbor_label" && id == call_id && output.parse::<Value>().unwrap() == "crimson-harbor"
                 && answer.parse::<Value>().unwrap()["message"]["content"][1]["text"] == "The harbor label is crimson-harbor."
         ),
@@ -896,7 +896,7 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
     let script = Script::new(&replies[1..]);
     let session = fixture(&script).load(&[entry(1, Body::Watch { child })]);
     let found = Outcome::Done {
-        output: Json::encode("found it").unwrap().into(),
+        output: Json::encode("found it").unwrap(),
     };
     session.settled(child, found.clone());
     settle(&session);
@@ -1672,7 +1672,7 @@ fn a_background_jobs_end_is_queued_once_holding_its_output_and_starts_no_turn() 
     assert_eq!(end.id.purpose, protocol::EnvelopeId::JOB);
     assert_eq!(
         end.payload,
-        format!("[background job {} ended: exit code 3]", job_of(&log))
+        format!("[background job {} ended: exit code 3]", job_of(&log)).into()
     );
     let [protocol::Held::Blob(blob)] = &end.held[..] else {
         panic!("{end:?}")
@@ -1798,9 +1798,13 @@ fn a_forced_steer_detaches_a_running_call_whose_outcome_comes_back_on_the_queue(
     session.halt();
     let back = (log.iter())
         .find_map(|e| match &e.body {
-            Body::Enqueue { envelope } if envelope.id.purpose == protocol::EnvelopeId::DETACHED => {
-                Outcome::from_payload(&envelope.payload)
-            }
+            Body::Enqueue {
+                envelope:
+                    protocol::Envelope {
+                        payload: protocol::Carried::Detached(outcome),
+                        ..
+                    },
+            } => Some(outcome.clone()),
             _ => None,
         })
         .unwrap();

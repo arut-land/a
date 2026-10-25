@@ -10,8 +10,8 @@ use ext::host::Registry;
 use llm::{Assistant, Message, Messages, Tag, ToolMessage, ToolResult, tag};
 use protocol::publication::{ContextImage, ContextInput, ContextLayer, ContextValue, RunnerKind};
 use protocol::{
-    Body, CallId, Entry, Envelope, EnvelopeId, Held, Mode, Outcome, OutputStream, Payload, Segment,
-    Segments, Seq, Source, Verdict,
+    Body, CallId, Carried, Entry, Envelope, EnvelopeId, Held, Mode, Outcome, OutputStream, Payload,
+    Segment, Segments, Seq, Source, ToolOutcome, Verdict,
 };
 
 /// Provider replies remain intact; live updates and recovery share projection rules.
@@ -39,6 +39,9 @@ pub struct Transcript {
     detached: HashSet<CallId>,
     /// The seq of the last entry that changed the messages.
     last: u64,
+    /// The seq of the last entry folded: the transcript goes on from the
+    /// entry after it.
+    through: u64,
     registry: Arc<Registry>,
     /// How references are named for the model.
     places: Places,
@@ -51,8 +54,8 @@ enum Waiting {
     /// The user's, as it was given: rendered once it is known who takes it.
     Input(Segments, Mode),
     /// Another session's message, as it sent it: a model-only thread reads
-    /// its payload as the turn it asks for.
-    Inbox(Envelope),
+    /// its text as the turn it asks for.
+    Inbox(EnvelopeId, String),
     /// What the session's own envelope brought back, as the model reads it.
     Own(String),
 }
@@ -98,12 +101,12 @@ fn model_text(segments: &Segments, mode: Mode, places: &Places) -> String {
 }
 
 /// Another session's message, as the model reads it.
-fn inbox_text(envelope: &Envelope) -> String {
-    let from = envelope.id.sender.to_string();
+fn inbox_text(id: &EnvelopeId, text: &str) -> String {
+    let from = id.sender.to_string();
     Tag::from(tag::Inbox {
         from: &from,
-        channel: &envelope.id.purpose,
-        text: &envelope.payload,
+        channel: &id.purpose,
+        text,
     })
     .to_string()
 }
@@ -122,19 +125,17 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
             ..
         } => ContextValue::User(text.clone()),
         Body::Input { segments, mode, .. } => ContextValue::Queued(segments.clone(), *mode),
-        Body::Enqueue { envelope } => {
-            let outcome = || Outcome::from_payload(&envelope.payload);
-            match envelope.source() {
-                Source::Child(_) => ContextValue::Child(outcome()?),
-                Source::Job(call) if envelope.id.purpose == EnvelopeId::DETACHED => {
-                    ContextValue::Background(call, outcome()?, envelope.held.clone())
-                }
-                Source::Job(call) => {
-                    ContextValue::Job(call, envelope.payload.clone(), envelope.held.clone())
-                }
-                _ => ContextValue::Inbox(envelope.clone()),
+        Body::Enqueue { envelope } => match (&envelope.payload, envelope.source()) {
+            (Carried::Child(outcome), _) => ContextValue::Child(outcome.clone()),
+            (Carried::Detached(outcome), Source::Job(call)) => {
+                ContextValue::Background(call, outcome.clone(), envelope.held.clone())
             }
-        }
+            (Carried::Text(text), Source::Job(call)) => {
+                ContextValue::Job(call, text.clone(), envelope.held.clone())
+            }
+            (Carried::Text(_), _) => ContextValue::Inbox(envelope.clone()),
+            (Carried::Detached(_), _) => return None,
+        },
         Body::Take { input, into: None } => ContextValue::Taken(*input),
         Body::Take {
             input,
@@ -148,10 +149,7 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
         }
         Body::ModelResult {
             r#for: None,
-            outcome:
-                Outcome::Done {
-                    output: Payload::Inline(output),
-                },
+            outcome: Outcome::Done { output },
             ..
         } => ContextValue::Reply(output.clone()),
         Body::ToolCall {
@@ -172,7 +170,7 @@ impl Waiting {
     fn text(self, places: &Places) -> String {
         match self {
             Self::Input(segments, mode) => model_text(&segments, mode, places),
-            Self::Inbox(envelope) => inbox_text(&envelope),
+            Self::Inbox(id, text) => inbox_text(&id, &text),
             Self::Own(text) => text,
         }
     }
@@ -242,15 +240,19 @@ impl Transcript {
         places: &Places,
     ) -> Self {
         let entries: Vec<_> = entries.into_iter().collect();
-        project(
-            normalize(
-                &entries.iter().map(Borrow::borrow).collect::<Vec<_>>(),
-                false,
-            ),
-            registry,
-            system,
-            places,
-        )
+        let through = entries.last().map_or(0, |e| e.borrow().seq.get());
+        Self {
+            through,
+            ..project(
+                normalize(
+                    &entries.iter().map(Borrow::borrow).collect::<Vec<_>>(),
+                    false,
+                ),
+                registry,
+                system,
+                places,
+            )
+        }
     }
 
     fn empty(registry: Arc<Registry>, system: &str, places: &Places) -> Self {
@@ -265,6 +267,7 @@ impl Transcript {
             tools: HashMap::new(),
             detached: HashSet::new(),
             last: 0,
+            through: 0,
             registry,
             places: places.clone(),
             streams: HashMap::new(),
@@ -274,6 +277,7 @@ impl Transcript {
     /// Folds entry `e`. `fresh` is the message of the reply this daemon
     /// just had, which `e` stores: taken as it is rather than read again.
     pub fn apply(&mut self, e: &Entry, fresh: Option<Assistant>) {
+        self.through = e.seq.get();
         if let Body::Spawned { intent } = &e.body {
             if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
                 self.model_only = image.runner == RunnerKind::ModelOnly;
@@ -301,8 +305,12 @@ impl Transcript {
                 self.waiting.insert(seq, Waiting::Input(segments, mode));
                 return;
             }
-            ContextValue::Inbox(envelope) => {
-                self.waiting.insert(seq, Waiting::Inbox(envelope));
+            ContextValue::Inbox(Envelope {
+                id,
+                payload: Carried::Text(text),
+                ..
+            }) => {
+                self.waiting.insert(seq, Waiting::Inbox(id, text));
                 return;
             }
             ContextValue::Taken(input) => match self.waiting.remove(&input) {
@@ -311,8 +319,7 @@ impl Transcript {
                     // untagged.
                     let text = match waiting {
                         Waiting::Input(segments, _) => segments.text(),
-                        Waiting::Inbox(envelope) => envelope.payload,
-                        Waiting::Own(text) => text,
+                        Waiting::Inbox(_, text) | Waiting::Own(text) => text,
                     };
                     if let Ok((turn, _)) = ext::ModelTurn::from_intent(&text) {
                         for message in turn.messages.iter() {
@@ -366,7 +373,8 @@ impl Transcript {
             ContextValue::ToolResult(call, outcome, held) => {
                 return self.answer(seq, call, &outcome, &held);
             }
-            ContextValue::Inherited(_) => return,
+            // Another session sends text alone.
+            ContextValue::Inbox(_) | ContextValue::Inherited(_) => return,
         };
         self.messages.push(message);
         self.last = seq.get();
@@ -375,7 +383,7 @@ impl Transcript {
     /// The result of call `call` the model made, in the tool message its
     /// reply's results share, in the calls' order: a detached call's is a
     /// placeholder, holding its stream.
-    fn answer(&mut self, seq: Seq, call: CallId, outcome: &Outcome, held: &[Held]) {
+    fn answer(&mut self, seq: Seq, call: CallId, outcome: &ToolOutcome, held: &[Held]) {
         let Some((id, tool)) = self.calls.remove(&call) else {
             return;
         };
@@ -440,7 +448,7 @@ impl Transcript {
 
     /// What the model reads of the outcome of call `call`, which went on
     /// in the background.
-    fn background(&mut self, call: CallId, outcome: &Outcome, held: &[Held]) -> String {
+    fn background(&mut self, call: CallId, outcome: &ToolOutcome, held: &[Held]) -> String {
         self.detached.remove(&call);
         let tool = self.tools.get(&call).cloned().unwrap_or_default();
         let ext::Presented { output, .. } = self.present(&tool, outcome, held);
@@ -450,7 +458,7 @@ impl Transcript {
     /// What the model is shown of a call of `tool` that ended in
     /// `outcome`, holding `held`: each reference named, and a payload a
     /// blob holds read back, before the presentation is asked.
-    fn present(&self, tool: &str, outcome: &Outcome, held: &[Held]) -> ext::Presented {
+    fn present(&self, tool: &str, outcome: &ToolOutcome, held: &[Held]) -> ext::Presented {
         let held = self.name_held(held);
         let stored = match outcome {
             Outcome::Done {
@@ -521,6 +529,11 @@ impl Transcript {
         parts.push(llm::UserPart::Text(llm::Text::new(text)));
         *result = llm::Output::Content(parts);
         Ok(())
+    }
+
+    /// The seq of the last entry folded.
+    pub const fn through(&self) -> u64 {
+        self.through
     }
 
     /// Whether the tools of `registry` presented the results.

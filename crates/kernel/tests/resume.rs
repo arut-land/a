@@ -364,8 +364,7 @@ fn links_are_rearmed() {
         envelope: protocol::Envelope::own(
             SessionId::NIL,
             id(2),
-            protocol::EnvelopeId::CHILD,
-            done(json!("ok")).payload(),
+            protocol::Carried::Child(done(json!("ok"))),
         ),
     };
     let (_, fx) = resume(

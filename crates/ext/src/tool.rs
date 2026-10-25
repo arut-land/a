@@ -8,7 +8,9 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use protocol::{Audience, CallId, Card, Environment, Held, Json, Outcome, Seq, SessionId};
+use protocol::{
+    Audience, CallId, Card, Environment, Held, Json, Outcome, Seq, SessionId, ToolOutcome,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -476,7 +478,7 @@ impl fmt::Debug for Parsed {
 /// How a call ended: its outcome, and how clients show it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Called {
-    pub outcome: Outcome,
+    pub outcome: ToolOutcome,
     pub card: Option<Card>,
     /// What the outcome references outside the log.
     pub held: Vec<Held>,

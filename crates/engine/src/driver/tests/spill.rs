@@ -68,9 +68,23 @@ struct Spilled {
     again: String,
     /// What the file the result names held, after the reload.
     whole: Option<String>,
+    /// The conversation the second turn's request sent.
+    request: String,
 }
 
 fn spilled(registry: Registry) -> Spilled {
+    spilled_by(registry, Reload::Yes)
+}
+
+/// Whether the second turn runs on a session loaded again, its transcript
+/// made from the log, or on the live one, its transcript gone on with.
+#[derive(Clone, Copy)]
+enum Reload {
+    Yes,
+    No,
+}
+
+fn spilled_by(registry: Registry, reload: Reload) -> Spilled {
     let dir = tempfile::tempdir().unwrap();
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let script = Script::new(&[replies[0].clone(), replies[1].clone(), replies[1].clone()]);
@@ -81,16 +95,21 @@ fn spilled(registry: Registry) -> Spilled {
     session.submit("Call the tool, then answer.").unwrap();
     settle(&session);
     let log = log_of(&session);
-    session.halt();
-
-    // None was made for a result logged inline.
-    let cache = fixture.3.path().join("cache");
-    if cache.exists() {
-        std::fs::remove_dir_all(cache).unwrap();
-    }
-    let loaded = Live::start(&header, &fixture.0, Open::Load, Owner::None).unwrap();
-    settle(&loaded);
-    assert_eq!(log_of(&loaded), log);
+    let loaded = match reload {
+        Reload::No => session,
+        Reload::Yes => {
+            session.halt();
+            // None was made for a result logged inline.
+            let cache = fixture.3.path().join("cache");
+            if cache.exists() {
+                std::fs::remove_dir_all(cache).unwrap();
+            }
+            let loaded = Live::start(&header, &fixture.0, Open::Load, Owner::None).unwrap();
+            settle(&loaded);
+            assert_eq!(log_of(&loaded), log);
+            loaded
+        }
+    };
     loaded.submit("And again.").unwrap();
     settle(&loaded);
     loaded.halt();
@@ -102,6 +121,14 @@ fn spilled(registry: Registry) -> Spilled {
         shown,
         again: sent_result(&script, 2),
         whole,
+        // Named under the fixture's own home, which each run has apart.
+        request: {
+            let home = serde_json::to_string(&fixture.3.path().display().to_string()).unwrap();
+            let home = home.trim_matches('"');
+            script.sent()[2]["input"]
+                .to_string()
+                .replace(home, "<home>")
+        },
     }
 }
 
@@ -118,6 +145,7 @@ fn a_spilled_result_is_logged_as_its_blob_alone_and_shown_alike_after_reload() {
         shown,
         again,
         whole,
+        ..
     } = spilled(spill_registry());
     let result = log.iter().find_map(|e| match &e.body {
         Body::ToolResult {
@@ -317,4 +345,114 @@ fn an_invoked_result_reaches_its_invoker_as_its_tool_gave_it() {
         ],
         "{log:#?}"
     );
+}
+
+/// The live transcript stops short of a result held as a blob and goes on
+/// from there on a worker, reading each blob once: what it sends is what a
+/// transcript made again from the whole log sends.
+#[test]
+fn a_live_transcript_past_a_spill_reads_as_one_made_from_the_log() {
+    let live = spilled_by(spill_registry(), Reload::No);
+    let rebuilt = spilled_by(spill_registry(), Reload::Yes);
+    assert!(live.again.contains("<truncated"), "{}", live.again);
+    assert_eq!(live.request, rebuilt.request);
+}
+
+/// Runs until the session stops waiting on it, then answers at length.
+struct Lingering;
+
+impl Tool for Lingering {
+    type In = Nothing;
+    type Out = String;
+
+    const NAME: &'static str = "linger";
+    const DESCRIPTION: &'static str = "Answers at length once sent away.";
+    const DETACH: ext::Detach = ext::Detach::Background;
+
+    async fn call(&self, _: &Nothing, cx: &Cx) -> Result<String, String> {
+        if let Some(detach) = &cx.detach {
+            detach.wait().await;
+        }
+        Ok(long())
+    }
+
+    fn to_model(label: &Json) -> llm::Output {
+        llm::Output::Text(label.parse().unwrap())
+    }
+}
+
+struct Lingers;
+
+impl Extension for Lingers {
+    const NAME: &'static str = "lingers";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(Lingering);
+    }
+}
+
+fn detached_back(log: &[Entry]) -> Option<&Entry> {
+    log.iter().find(|e| {
+        matches!(&e.body, Body::Enqueue { envelope }
+            if envelope.id.purpose == protocol::EnvelopeId::DETACHED)
+    })
+}
+
+/// A detached call's result is recorded as any other: its envelope
+/// carries the blob, typed, which the entry lists as a reference and the
+/// model reads cut, as it would have read the result.
+#[test]
+fn a_detached_calls_spilled_result_comes_back_as_its_blob() {
+    let registry = (Registry::default().with(&Lingers))
+        .and_then(|r| r.with(&ext_spill::Spill::default()))
+        .unwrap();
+    let fixture = Fixture::new(
+        ext_fixtures::ECHO,
+        registry.clone(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.start(&[]);
+    session.submit("call linger {}").unwrap();
+    until(&session, "the call runs", |log| {
+        log.iter().any(|e| matches!(e.body, Body::ToolCall { .. }))
+    });
+    let force = Request::Input {
+        segments: "now".into(),
+        mode: Mode::Steer,
+        force: true,
+    };
+    rt::block_on(session.request(force, None)).unwrap();
+    until(&session, "its outcome came back", |log| {
+        detached_back(log).is_some()
+    });
+    settle(&session);
+    let log = log_of(&session);
+    let places = ext::blob::Blobs::new(
+        Arc::clone(&fixture.0.blobs),
+        Arc::clone(&fixture.0.tree),
+        session.id,
+    )
+    .places();
+    session.halt();
+    let back = detached_back(&log).unwrap();
+    let Body::Enqueue {
+        envelope:
+            protocol::Envelope {
+                payload:
+                    protocol::Carried::Detached(Outcome::Done {
+                        output: Payload::Blob(blob),
+                    }),
+                ..
+            },
+    } = &back.body
+    else {
+        panic!("{back:?}")
+    };
+    assert_eq!(back.body.blobs(), [protocol::Reference::Blob(blob)]);
+    assert_eq!(background::read(&fixture, blob), long());
+    let messages = Transcript::placed(&log, Arc::new(registry), "", &places).into_messages();
+    let said = format!("{messages:?}");
+    assert!(said.contains("<truncated bytes="), "{said}");
+    assert!(!said.contains("line 00500"), "{said}");
 }

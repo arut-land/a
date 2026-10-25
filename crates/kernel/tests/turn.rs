@@ -324,7 +324,7 @@ fn an_interrupt_cancels_every_call_of_the_reply_running() {
                         model_result(
                             2,
                             Outcome::Done {
-                                output: reply(&calls).into(),
+                                output: reply(&calls),
                             },
                         ),
                     ),
@@ -379,7 +379,7 @@ fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
                         model_result(
                             2,
                             Outcome::Done {
-                                output: reply(&[("bash", a.clone()), ("bash", b.clone())]).into(),
+                                output: reply(&[("bash", a.clone()), ("bash", b.clone())]),
                             },
                         ),
                     ),
@@ -431,7 +431,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
                         model_result(
                             2,
                             Outcome::Done {
-                                output: reply(&[("sleep", sleep.clone())]).into(),
+                                output: reply(&[("sleep", sleep.clone())]),
                             },
                         ),
                     ),
@@ -457,15 +457,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
             model_done(9, &[]),
             (
                 vec![
-                    entry(
-                        10,
-                        model_result(
-                            9,
-                            Outcome::Done {
-                                output: reply(&[]).into(),
-                            },
-                        ),
-                    ),
+                    entry(10, model_result(9, Outcome::Done { output: reply(&[]) })),
                     entry(11, take(6)),
                     entry(12, model_call(0)),
                 ],
@@ -566,12 +558,7 @@ fn a_failed_model_call_is_retried_as_the_request_error_point_asks() {
             (
                 vec![entry(
                     4,
-                    model_result(
-                        2,
-                        Outcome::Done {
-                            output: reply(&[]).into(),
-                        },
-                    ),
+                    model_result(2, Outcome::Done { output: reply(&[]) }),
                 )],
                 vec![IDLE],
             ),
@@ -605,12 +592,7 @@ fn a_step_decision_is_logged_before_the_request_is_sent() {
             (
                 vec![entry(
                     4,
-                    model_result(
-                        2,
-                        Outcome::Done {
-                            output: reply(&[]).into(),
-                        },
-                    ),
+                    model_result(2, Outcome::Done { output: reply(&[]) }),
                 )],
                 vec![IDLE],
             ),
@@ -633,15 +615,7 @@ fn a_step_answer_stands_as_the_reply_and_nothing_is_sent() {
         (
             vec![
                 entry(3, decision("cache", Some(2), Verdict::Answered)),
-                entry(
-                    4,
-                    model_result(
-                        2,
-                        Outcome::Done {
-                            output: reply(&[]).into(),
-                        },
-                    ),
-                ),
+                entry(4, model_result(2, Outcome::Done { output: reply(&[]) })),
             ],
             vec![IDLE],
         ),
@@ -1199,7 +1173,7 @@ fn a_child_reports_each_time_it_settles() {
     let (mut s, fx) = Session::resume(Reg::echo().arc(), log([input("hi")]), &load);
     let report = |text: &str| Work::Report {
         outcome: Outcome::Done {
-            output: Json::encode(&text).unwrap().into(),
+            output: Json::encode(&text).unwrap(),
         },
     };
     assert_plan(&fx, (vec![entry(2, said("hi"))], vec![report("hi")]));
@@ -1371,7 +1345,10 @@ fn outgoing(envelope: &protocol::Envelope) -> protocol::Outgoing {
     protocol::Outgoing {
         id: envelope.id.clone(),
         recipients: vec![envelope.destination],
-        payload: envelope.payload.clone(),
+        payload: match &envelope.payload {
+            protocol::Carried::Text(text) => text.clone(),
+            other => panic!("{other:?}"),
+        },
     }
 }
 
@@ -1594,7 +1571,7 @@ fn detached_results_and_messages_enter_before_the_next_provider_step() {
     assert!(s.log.iter().all(|e| !matches!(e.body, Body::Take { .. })));
     s.step(Event::ToolDone {
         call,
-        outcome: done(json!("handle")),
+        outcome: done(json!("handle")).into(),
         card: None,
         held: Vec::new(),
     });

@@ -626,7 +626,7 @@ pub fn assert_contiguous(entries: &[Entry]) {
     assert_eq!(seqs, want, "gaps or duplicates");
 }
 
-pub fn result_of(e: &Entry, call: Seq) -> Option<&Outcome> {
+pub fn result_of(e: &Entry, call: Seq) -> Option<&protocol::ToolOutcome> {
     match &e.body {
         Body::ToolResult {
             call: c, outcome, ..

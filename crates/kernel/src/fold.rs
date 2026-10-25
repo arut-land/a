@@ -6,7 +6,9 @@
 use std::collections::VecDeque;
 
 use protocol::ledger::{Call, Ledger};
-use protocol::{Audience, Body, CallId, Entry, Json, Outcome, Seq, Source, Verdict, WaitOn};
+use protocol::{
+    Audience, Body, CallId, Carried, Entry, Json, Outcome, Seq, Source, Verdict, WaitOn,
+};
 
 use crate::{Action, Agent, Binding, Input};
 
@@ -202,20 +204,19 @@ impl Fold {
         if read {
             return None;
         }
-        match queued.source {
-            Source::Child(watch) => {
-                let outcome = Outcome::from_payload(&queued.text)?;
+        let text = match (&queued.payload, queued.source) {
+            (Carried::Child(outcome), Source::Child(watch)) => {
+                let outcome = outcome.clone();
                 return Some(Input::ChildDone { watch, outcome });
             }
-            // A detached call's outcome; a job's end is text.
-            Source::Job(call) if queued.outcome => {
-                let outcome = Outcome::from_payload(&queued.text)?;
+            (Carried::Detached(outcome), Source::Job(call)) => {
+                let outcome = outcome.clone();
                 return Some(Input::Detached { call, outcome });
             }
-            _ => {}
-        }
-        let (text, typed) = (queued.text.clone(), queued.typed);
-        self.user(&text, typed, registry)
+            (Carried::Text(text), _) => text.clone(),
+            (Carried::Child(_) | Carried::Detached(_), _) => return None,
+        };
+        self.user(&text, queued.typed, registry)
     }
 
     /// An intent folded: it carries out what was asked for next.

@@ -158,11 +158,16 @@ entry references outside the log lives in one typed field and nowhere else:
 `ToolResult.held: Vec<Held>` (`Held::Blob` or `Held::Stream`), filled from the
 tool's `Tool::held(&Out)` (the one hook a tool adds; the output keeps at most a
 marker, such as `truncated` or `{"detached": true}`), and `Envelope.held` on a
-detached call's outcome or a job's end; and an outcome's own payload
-(`Outcome::Done { output: Payload }`), which is either in its line
+detached call's outcome or a job's end; and a tool's outcome itself
+(`ToolOutcome`, `Outcome<Payload>`), whose value is either in its line
 (`"output":…`) or, too large for it, the blob that holds it (`"blob":{…}`),
-never both. A sweep's reference index folds those fields, never tool output
-JSON.
+never both. Only a tool's outcome can be a blob: a model's reply, a child's
+or a query's is `Outcome<Json>`, so a blob there does not compile, and a
+line that holds one does not decode. A detached call's outcome and a
+child's travel typed in their envelopes (`Carried::Detached`,
+`Carried::Child`), never as text to parse. `Body::blobs` lists every
+reference an entry holds, wherever in it: what a projection must not name
+on the session's actor, and what a sweep keeps.
 
 The seam is the `blob` crate (re-exported as `ext::blob`), which does no I/O:
 `BlobStore` (`writer`, `stream`, `open`, `materialize`, `sweep`),
@@ -252,7 +257,11 @@ invoked is never recorded: its invoker reads the output as the tool gave it
 Recording comes before the kernel's `post_tool` chain, which keeps the kernel
 pure (no I/O between the chain and the append) and keeps one value: the
 chain sees the payload as it is logged, and a rewrite replaces it, the
-original (by reference) logged with the decision. The transcript reads a
+original (by reference) logged with the decision. Of a spilled result,
+`post_tool` sees only the reference, never the bytes. The live transcript
+stops short of an entry that references a blob and goes on from there on a
+blocking worker as the next request is made, so each blob is read once and
+never on the actor. The transcript reads a
 payload's blob back through `Places::read` and names it through
 `Places::blob` before the presentation is asked (`ext::Stored`), so the
 default `present_result` shows the whole text and spill's handler shows its
@@ -260,9 +269,11 @@ first `head` and last `tail` bytes (2 KiB each, cut at a near line end,
 never inside a character) around `<truncated bytes=… path=…/>`; the
 transcript names every reference in `held` itself. The cut is a function of
 the blob's text and settings alone, so every projection shows the same bytes
-and a provider's prompt cache holds. Clients never read the bytes: a
-result held as a blob with no card is shown as what it is and its reference
-(`Shown::Held`). Its settings are in
+and a provider's prompt cache holds; where the blob cannot be named, the
+tag names no path. Clients never read the bytes: a result held as a blob
+with no card is shown as what it is and its reference (`Shown::Held`).
+Known gap: no client can fetch a blob's bytes yet, so a client shows such a
+result as that summary alone. Its settings are in
 [agents.md](agents.md).
 
 ### Kernel and driver

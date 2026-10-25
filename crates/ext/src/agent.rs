@@ -1,6 +1,6 @@
 //! Agents: what a session does with its inputs, as a fold over its log.
 
-use protocol::{CallId, Json, Outcome, Seq, ToolChoice};
+use protocol::{CallId, Json, Outcome, Seq, ToolChoice, ToolOutcome};
 use smallvec::SmallVec;
 
 use crate::LoopPoints;
@@ -27,7 +27,7 @@ pub enum Input {
     },
     ToolDone {
         call: CallId,
-        outcome: Outcome,
+        outcome: ToolOutcome,
     },
     ModelDone {
         call: CallId,
@@ -44,7 +44,7 @@ pub enum Input {
     /// taken up as a turn ended: it starts one, as a child's result does.
     Detached {
         call: CallId,
-        outcome: Outcome,
+        outcome: ToolOutcome,
     },
 }
 

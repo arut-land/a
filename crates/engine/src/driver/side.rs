@@ -5,7 +5,7 @@ use super::{
     Event, Json, Model, Msg, Opened, Outcome, PendingSide, Phase, Replied, Session, SideAdmitted,
     SideFact, Ticket, contain, first, lock, oneshot, replied, reply,
 };
-use protocol::Payload;
+use protocol::Carried;
 
 impl Actor {
     // Successful settlement revokes mutation authority, but a background
@@ -523,12 +523,7 @@ async fn ephemeral_turn(
         ));
     }
     Ok(match replied {
-        Replied::Done(output) => (
-            Outcome::Done {
-                output: output.into(),
-            },
-            None,
-        ),
+        Replied::Done(output) => (Outcome::Done { output }, None),
         Replied::Failed(error) => failed(&error),
         Replied::Interrupted(_) => (Outcome::Interrupted { output: None }, None),
     })
@@ -549,16 +544,8 @@ fn side_answer(outcome: Outcome, failure: Option<Json>) -> Result<llm::Response,
             .unwrap_or_else(|e| llm::Error::new(llm::Kind::Decode, e.to_string())));
     }
     match outcome {
-        Outcome::Done {
-            output: Payload::Inline(output),
-        } => llm::Response::from_json(output.raw())
+        Outcome::Done { output } => llm::Response::from_json(output.raw())
             .map_err(|e| llm::Error::new(llm::Kind::Decode, e.to_string())),
-        Outcome::Done {
-            output: Payload::Blob(blob),
-        } => Err(llm::Error::new(
-            llm::Kind::Decode,
-            format!("a reply held as blob {}", blob.id),
-        )),
         Outcome::Failed { error } => Err(llm::Error::new(llm::Kind::Other, error)),
         Outcome::Interrupted { .. } => Err(llm::Error::incomplete()),
     }
@@ -636,7 +623,7 @@ impl super::Daemon {
                 protocol::Envelope {
                     id,
                     destination: live.id,
-                    payload: image.turn.raw().into(),
+                    payload: Carried::Text(image.turn.raw().into()),
                     held: Vec::new(),
                 },
                 cancel,
@@ -657,7 +644,13 @@ impl Actor {
             entry = self.indexed_entry(input).await.map_err(|e| e.to_string())?;
         }
         let (text, keyed) = match &entry.body {
-            Body::Enqueue { envelope } => (envelope.payload.clone(), true),
+            Body::Enqueue {
+                envelope:
+                    protocol::Envelope {
+                        payload: Carried::Text(text),
+                        ..
+                    },
+            } => (text.clone(), true),
             Body::Input { segments, .. } => (segments.text(), false),
             _ => return Err("model-only turn has no admitted input".into()),
         };

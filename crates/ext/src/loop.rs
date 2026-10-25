@@ -13,7 +13,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use protocol::{Outcome, Payload, ToolChoice};
+use protocol::{Outcome, ToolChoice};
 use serde_json::value::RawValue;
 
 use crate::point::{self, Hooks};
@@ -127,10 +127,7 @@ impl Agent for Loop {
                 points.turn(&input, model(ToolChoice::Auto))
             }
             Input::ModelDone {
-                outcome:
-                    Outcome::Done {
-                        output: Payload::Inline(output),
-                    },
+                outcome: Outcome::Done { output },
                 ..
             } => {
                 let Ok(reply) = llm::Response::from_json(output.raw()) else {

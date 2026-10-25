@@ -103,6 +103,25 @@ pub enum Held {
     Stream(OutputStream),
 }
 
+/// A reference an entry holds, wherever in it: what [`Body::blobs`]
+/// lists.
+///
+/// [`Body::blobs`]: crate::Body::blobs
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reference<'a> {
+    Blob(&'a BlobRef),
+    Stream(&'a OutputStream),
+}
+
+impl<'a> From<&'a Held> for Reference<'a> {
+    fn from(held: &'a Held) -> Self {
+        match held {
+            Held::Blob(blob) => Self::Blob(blob),
+            Held::Stream(stream) => Self::Stream(stream),
+        }
+    }
+}
+
 /// A value, in its log line or, too large for one, held as a blob in its
 /// place: the one copy, never both. Keyed by which, so a result's line
 /// reads `"output":…` or `"blob":{…}` beside its status.
@@ -115,16 +134,6 @@ pub enum Payload {
     /// bytes its ends are cut from, and the file it greps. Boxed, so an
     /// outcome stays as small as the common inline one.
     Blob(Box<BlobRef>),
-}
-
-impl Payload {
-    /// The value, when the line holds it.
-    pub fn inline(&self) -> Option<&Json> {
-        match self {
-            Self::Inline(json) => Some(json),
-            Self::Blob(_) => None,
-        }
-    }
 }
 
 impl From<Json> for Payload {

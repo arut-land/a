@@ -693,7 +693,7 @@ mod tests {
             .unwrap()
     }
 
-    fn change(rig: &Rig, path: &str, pairs: &[(&str, &str)]) -> Outcome {
+    fn change(rig: &Rig, path: &str, pairs: &[(&str, &str)]) -> protocol::ToolOutcome {
         let edits: Vec<Value> = pairs
             .iter()
             .map(|(old, new)| json!({ "old": old, "new": new }))
@@ -701,7 +701,7 @@ mod tests {
         rig.call("edit", &json!({ "path": path, "edits": edits }))
     }
 
-    fn failed(outcome: Outcome) -> String {
+    fn failed(outcome: protocol::ToolOutcome) -> String {
         match outcome {
             Outcome::Failed { error } => error,
             other => panic!("{other:?}"),

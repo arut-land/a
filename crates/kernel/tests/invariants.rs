@@ -23,7 +23,7 @@ fn drive(s: &mut Session, fx: impl IntoIterator<Item = Work>) {
         let event = match effect {
             Work::RunTool { call, tool, .. } | Work::Resume { call, tool, .. } => Event::ToolDone {
                 call,
-                outcome: done(json!(tool)),
+                outcome: done(json!(tool)).into(),
                 card: None,
                 held: Vec::new(),
             },
@@ -67,10 +67,7 @@ fn conversation(log: &[Entry]) -> Vec<String> {
             Body::ToolCall { tool, input, .. } => Some(format!("call {tool} {input}")),
             Body::ToolResult { outcome, .. } => Some(format!("result {outcome:?}")),
             Body::ModelResult {
-                outcome:
-                    Outcome::Done {
-                        output: protocol::Payload::Inline(output),
-                    },
+                outcome: Outcome::Done { output },
                 ..
             } => Some(format!("reply {output}")),
             _ => None,

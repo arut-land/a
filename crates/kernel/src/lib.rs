@@ -152,7 +152,7 @@ pub enum Event {
     /// agent as the session's own envelope.
     ToolDone {
         call: CallId,
-        outcome: Outcome,
+        outcome: protocol::ToolOutcome,
         card: Option<Card>,
         held: Vec<protocol::Held>,
     },

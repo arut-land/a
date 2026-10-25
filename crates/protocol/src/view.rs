@@ -25,8 +25,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ledger::{Keyed, OutcomeKind, Phase};
 use crate::{
-    Activity, ApprovalReason, Audience, Body, CallId, Card, DaemonMsg, Entry, HostPath, Json,
-    Outcome, Permission, Seq, SessionId, SessionSummary, Verdict, WaitOn,
+    Activity, ApprovalReason, Audience, Body, CallId, Card, Carried, DaemonMsg, Entry, HostPath,
+    Json, Outcome, Permission, Seq, SessionId, SessionSummary, ToolOutcome, Verdict, WaitOn,
 };
 
 pub use present::{
@@ -141,7 +141,11 @@ impl ViewState {
             }
             Body::Enqueue { envelope } => self.queued.push_back(Queued {
                 seq: e.seq,
-                text: envelope.payload.clone(),
+                // An outcome is hidden, shown as no text.
+                text: match &envelope.payload {
+                    Carried::Text(text) => text.clone(),
+                    Carried::Child(_) | Carried::Detached(_) => String::new(),
+                },
                 steer: false,
                 source: envelope.source(),
                 origin: None,
@@ -328,7 +332,7 @@ pub enum Item {
         /// Where it stands, as the ledger has it: once it has its outcome,
         /// settled with that outcome's kind.
         phase: Phase,
-        outcome: Option<Outcome>,
+        outcome: Option<ToolOutcome>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<Box<ApprovalReason>>,
         /// How the tool presents the call, or once it has one, its outcome.
@@ -1090,9 +1094,7 @@ impl SessionView {
         };
         *status = match outcome {
             Outcome::Done { output } => {
-                let reply = (output.inline())
-                    .and_then(|output| output.parse::<Reply>().ok())
-                    .unwrap_or_default();
+                let reply = output.parse::<Reply>().unwrap_or_default();
                 *usage = reply.usage.and_then(ReplyUsage::counts);
                 *text = reply.message.content.0;
                 Status::Done
