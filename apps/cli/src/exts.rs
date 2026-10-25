@@ -18,7 +18,7 @@ fn registry_at(
     config: &Config,
     #[allow(unused_variables)] home: &sys::Home,
 ) -> Result<Registry, Refused> {
-    let registry = linked(config)?;
+    let registry = linked(config, home)?;
     let mut layers: Vec<Arc<dyn GenerationLayer>> = Vec::new();
     #[cfg(feature = "lua")]
     if !config.ext.disable.iter().any(|name| name == "lua") {
@@ -39,7 +39,10 @@ fn registry_at(
     registry.with_in(Tier::Pre, &coordinator)
 }
 
-fn linked(config: &Config) -> Result<Registry, Refused> {
+fn linked(
+    config: &Config,
+    #[allow(unused_variables)] home: &sys::Home,
+) -> Result<Registry, Refused> {
     let built = Built::new().with(Tier::Pre, &configured::<ext::StepLimit>(config)?)?;
     #[cfg(feature = "policy")]
     let built = {
@@ -61,7 +64,10 @@ fn linked(config: &Config) -> Result<Registry, Refused> {
     #[cfg(feature = "mcp")]
     let built = built.with(Tier::Pre, &configured::<ext_mcp::Mcp>(config)?)?;
     #[cfg(feature = "index")]
-    let built = built.with(Tier::Pre, &configured::<ext_index::Index>(config)?)?;
+    let built = built.with(
+        Tier::Pre,
+        &configured::<ext_index::Index>(config)?.kept_in(home.cache_dir().join("index")),
+    )?;
     // Needs the index: without it, this does not compile.
     #[cfg(feature = "search")]
     let built = built.with(Tier::Pre, &configured::<ext_search::Search>(config)?)?;

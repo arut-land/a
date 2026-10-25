@@ -15,6 +15,7 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crc::{CRC_32_ISCSI, CRC_64_XZ, Crc, NoTable, Table};
 
@@ -23,6 +24,9 @@ use crate::fff::types::Files;
 
 /// Bumped with any change to what either file holds or means.
 const FORMAT: u32 = 1;
+
+/// Idle caches are retained for a month; reclamation happens only at rest.
+pub(crate) const MAX_AGE: Duration = Duration::from_hours(720);
 const FILES: [u8; 8] = *b"a-files\0";
 const BIGRAMS: [u8; 8] = *b"a-bigrm\0";
 
@@ -153,6 +157,8 @@ pub(crate) fn read(place: &Place, root: &Path) -> Option<Stored> {
             binary,
         })
     });
+    touch(&place.files);
+    touch(&place.bigrams);
     Some(Stored {
         files,
         taken,
@@ -333,6 +339,19 @@ impl<R: Read> In<R> {
         self.each(u64::from_le_bytes)
     }
 
+    /// Decodes into storage already allocated by the owning type, including
+    /// anonymous mappings that release their pages when the index rests.
+    pub(crate) fn read_words(&mut self, words: &mut [u64]) -> io::Result<()> {
+        let mut buf = [0u8; 8192];
+        for chunk in words.chunks_mut(buf.len() / 8) {
+            self.get(&mut buf[..chunk.len() * 8])?;
+            for (word, bytes) in chunk.iter_mut().zip(buf.as_chunks::<8>().0) {
+                *word = u64::from_le_bytes(*bytes);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn halves(&mut self) -> io::Result<Vec<u16>> {
         self.each(u16::from_le_bytes)
     }
@@ -353,5 +372,85 @@ impl<R: Read> In<R> {
             rest -= n;
         }
         Ok(values)
+    }
+}
+
+/// Opening refreshes cache age without rewriting the snapshot.
+fn touch(path: &Path) {
+    if let Ok(file) = File::open(path) {
+        let _ = file.set_modified(SystemTime::now());
+    }
+}
+
+/// Derived files unopened for thirty days are reclaimed during rest, never
+/// by a periodic task. The current workspace is being written right now.
+pub(crate) fn prune(dir: &Path, current: &Place) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == current.files || path == current.bigrams {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.len() != 16
+            || !name.bytes().all(|b| b.is_ascii_hexdigit())
+            || !path
+                .extension()
+                .is_some_and(|e| e == "files" || e == "bigrams")
+        {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|at| SystemTime::now().duration_since(at).ok())
+            .is_some_and(|age| age > MAX_AGE);
+        if old {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rest_reclaims_only_derived_files_unopened_for_thirty_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = Place::new(dir.path(), Path::new("current"));
+        let stale = Place::new(dir.path(), Path::new("stale"));
+        let recent = Place::new(dir.path(), Path::new("recent"));
+        let unrelated = dir.path().join("notes.files");
+        for path in [
+            &current.files,
+            &current.bigrams,
+            &stale.files,
+            &stale.bigrams,
+            &recent.files,
+            &recent.bigrams,
+            &unrelated,
+        ] {
+            File::create(path).unwrap();
+        }
+        for path in [&stale.files, &stale.bigrams, &current.files, &unrelated] {
+            File::open(path)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_hours(24 * 31))
+                .unwrap();
+        }
+        prune(dir.path(), &current);
+        assert!(!stale.files.exists());
+        assert!(!stale.bigrams.exists());
+        assert!(current.files.exists());
+        assert!(current.bigrams.exists());
+        assert!(recent.files.exists());
+        assert!(recent.bigrams.exists());
+        assert!(unrelated.exists());
     }
 }

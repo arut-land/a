@@ -17,6 +17,7 @@ pub fn small_footprint() {
 /// once. The allocator would keep a freed block this large for reuse (on
 /// macOS, in its deferred-reclaim cache, as resident memory) after a
 /// search index is built in it.
+#[derive(Debug)]
 pub struct ZeroedWords {
     ptr: std::ptr::NonNull<u64>,
     len: usize,

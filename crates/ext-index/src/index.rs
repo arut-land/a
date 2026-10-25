@@ -1,14 +1,12 @@
-//! One [`WorkspaceIndex`] per workspace: opened by the first search or grep that
-//! asks about it, walked on the runtime's blocking pool, kept current by
-//! the daemon's file watcher, and dropped once nothing has used it for a
-//! while. Only the directories the walk enters are watched (on Linux, each
-//! takes an inotify watch): an ignored `target/` takes none.
+//! One [`WorkspaceIndex`] per workspace, warmed by session lifecycle hooks
+//! or opened by the first query. File walks, content builds and persistence
+//! run on the runtime's blocking pool. At linger expiry, a configured store
+//! persists changed state and releases the large in-memory structures.
 //!
-//! The file list is a snapshot ([`Files`] behind an `Arc`): a search
-//! reads the one it took, a change copies it only while a search still
-//! holds the old one. The content index is built on the first grep, in
-//! chunks of files that blocking jobs fill, and only within the memory
-//! the workspace may use; above that, grep reads every file instead.
+//! The file list is a snapshot ([`Files`] behind an `Arc`): a search reads
+//! the one it took, and a change copies it only while a search still holds
+//! the old one. Content is built in chunks within the workspace's memory
+//! budget; above that, grep reads every file instead.
 //!
 //! What the root is decides how it is kept ([`sys::fs::Tree`], asked as
 //! the first walk begins): a volume, a home or a system tree is never
@@ -56,7 +54,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             memory: 128 << 20,
-            linger: Duration::from_secs(300),
+            linger: Duration::from_secs(30),
         }
     }
 }
@@ -74,6 +72,31 @@ pub struct Indexes {
 struct Store {
     dir: PathBuf,
     resting: Mutex<BTreeMap<PathBuf, Arc<WorkspaceIndex>>>,
+}
+
+impl Store {
+    fn retire(&self, now: Instant) {
+        let retired: Vec<_> = {
+            let mut resting = lock(&self.resting);
+            let stale: Vec<_> = resting
+                .iter()
+                .filter_map(|(root, index)| {
+                    let state = index.state();
+                    (state.files.is_none()
+                        && state
+                            .last_used
+                            .is_some_and(|at| now.duration_since(at) > disk::MAX_AGE))
+                    .then(|| root.clone())
+                })
+                .collect();
+            stale
+                .into_iter()
+                .filter_map(|root| resting.remove(&root))
+                .collect()
+        };
+        // Unsubscribing may deliver events to other workspaces.
+        drop(retired);
+    }
 }
 
 impl Indexes {
@@ -108,7 +131,7 @@ impl Indexes {
             hub,
             limits: self.limits,
             store: (self.store.as_ref())
-                .map(|store| (Arc::clone(store), disk::Place::new(&store.dir, root))),
+                .map(|store| (Arc::downgrade(store), disk::Place::new(&store.dir, root))),
             state: Mutex::new(State {
                 stored: if self.store.is_some() {
                     Stored::Unseen
@@ -146,7 +169,7 @@ pub struct WorkspaceIndex {
     rt: Rt,
     hub: Arc<Hub>,
     limits: Limits,
-    store: Option<(Arc<Store>, disk::Place)>,
+    store: Option<(Weak<Store>, disk::Place)>,
     state: Mutex<State>,
     /// Notified as a walk or a content index is installed.
     changed: rt::Notify,
@@ -173,6 +196,7 @@ struct State {
     pending: Pending,
     /// What the last walk installed watches.
     watching: Option<Arc<Watching>>,
+    watch_limited: bool,
     last_used: Option<Instant>,
     keeper: bool,
     /// What the root is, from the first walk on.
@@ -385,10 +409,14 @@ impl WorkspaceIndex {
     /// or used meanwhile; it closes, as with no store, if it cannot be
     /// written.
     async fn rest(&self) -> bool {
-        let Some((store, place)) = &self.store else {
+        let Some((store, place)) = self
+            .store
+            .as_ref()
+            .and_then(|(store, place)| store.upgrade().map(|store| (store, place)))
+        else {
             return true;
         };
-        let (files, content, used, write_bigrams) = {
+        let (files, content, used, mut write_bigrams) = {
             let mut state = self.state();
             if state.busy != Busy::Idle || matches!(state.content, Content::Building { .. }) {
                 state.last_used = Some(self.rt.now());
@@ -404,9 +432,7 @@ impl WorkspaceIndex {
             let write_bigrams = content
                 .as_ref()
                 .is_some_and(|content| state.bigrams_on_disk != Some(content.id));
-            if state.dirty {
-                state.busy = Busy::Persisting;
-            }
+            state.busy = Busy::Persisting;
             (
                 state.dirty.then_some(files),
                 content,
@@ -414,27 +440,18 @@ impl WorkspaceIndex {
                 write_bigrams,
             )
         };
-        let written = match files {
+        let (files, content, compacted) = self.compact(files, content).await;
+        write_bigrams |= compacted && content.is_some();
+        let written = match &files {
             None => Ok(()),
             Some(files) => {
-                let (root, dir, place) = (Arc::clone(&self.root), store.dir.clone(), place.clone());
-                let content = content.clone();
-                rt::unblock_with(&*self.rt, BlockingClass::Storage, 0, move || {
-                    sys::fs::private_dir(&dir)?;
-                    let content = content.as_ref().map(|content| disk::Content {
-                        id: content.id,
-                        filter: write_bigrams.then_some(&*content.filter),
-                        overlay: &content.overlay,
-                        binary: &content.binary,
-                    });
-                    disk::write(
-                        &place,
-                        &root,
-                        seconds(SystemTime::now()),
-                        &files,
-                        content.as_ref(),
-                    )
-                })
+                self.persist(
+                    store.dir.clone(),
+                    place.clone(),
+                    Arc::clone(files),
+                    content.clone(),
+                    write_bigrams,
+                )
                 .await
             }
         };
@@ -449,6 +466,12 @@ impl WorkspaceIndex {
             return true;
         }
         state.dirty = false;
+        if compacted {
+            state.files = files;
+            state.content = content
+                .as_ref()
+                .map_or(Content::Absent, |c| Content::Ready(Arc::clone(c)));
+        }
         if let Some(content) = &content {
             state.bigrams_on_disk = Some(content.id);
         }
@@ -461,12 +484,108 @@ impl WorkspaceIndex {
         state.files = None;
         state.content = Content::Absent;
         state.walked_at = None;
-        state.stored = Stored::Watched;
+        let release = if state.watch_limited {
+            state.stored = Stored::Unseen;
+            state.watching.take()
+        } else {
+            state.stored = Stored::Watched;
+            None
+        };
         drop(state);
+        drop(release);
+        store.retire(self.rt.now());
         if let Some(me) = self.me() {
             lock(&store.resting).insert(self.root.to_path_buf(), me);
         }
         true
+    }
+
+    async fn persist(
+        &self,
+        dir: PathBuf,
+        place: disk::Place,
+        files: Arc<Files>,
+        content: Option<Arc<ContentIndex>>,
+        write_bigrams: bool,
+    ) -> io::Result<()> {
+        let root = Arc::clone(&self.root);
+        rt::unblock_with(&*self.rt, BlockingClass::Storage, 0, move || {
+            sys::fs::private_dir(&dir)?;
+            disk::prune(&dir, &place);
+            let content = content.as_ref().map(|content| disk::Content {
+                id: content.id,
+                filter: write_bigrams.then_some(&*content.filter),
+                overlay: &content.overlay,
+                binary: &content.binary,
+            });
+            disk::write(
+                &place,
+                &root,
+                seconds(SystemTime::now()),
+                &files,
+                content.as_ref(),
+            )
+        })
+        .await
+    }
+
+    /// At a quarter of slots changed, compact at rest rather than retaining
+    /// tombstones and an ever-growing overlay. Only new files need reading.
+    async fn compact(
+        &self,
+        files: Option<Arc<Files>>,
+        content: Option<Arc<ContentIndex>>,
+    ) -> (Option<Arc<Files>>, Option<Arc<ContentIndex>>, bool) {
+        if let Some(files) = files {
+            let changed = files.items().len() - files.live_count() + files.items().len()
+                - files.walked_count()
+                + content.as_ref().map_or(0, |c| c.overlay.modified_count());
+            if changed > files.items().len() / 4 {
+                let root = Arc::clone(&self.root);
+                let (files, content) =
+                    rt::unblock_with(&*self.rt, BlockingClass::Storage, 0, move || {
+                        let slots = files.compact_slots();
+                        let content = content.map(|content| {
+                            let mut overlay = content.overlay.clone();
+                            let mut binary = vec![0u64; slots.len().div_ceil(64)];
+                            let mut buf = Vec::new();
+                            for (new, &old) in slots.iter().enumerate() {
+                                let is_binary = if old < files.walked_count() {
+                                    content.binary[old / 64] & (1 << (old % 64)) != 0
+                                } else {
+                                    match content_of(
+                                        &root,
+                                        files.path(&files.items()[old]),
+                                        &mut buf,
+                                    ) {
+                                        Read::Text(bigrams) => {
+                                            overlay.modify_bigrams(old, bigrams);
+                                            false
+                                        }
+                                        Read::Binary => true,
+                                    }
+                                };
+                                if is_binary {
+                                    binary[new / 64] |= 1 << (new % 64);
+                                }
+                            }
+                            Arc::new(ContentIndex {
+                                id: build_id(),
+                                filter: Arc::new(content.filter.compact(&slots, &overlay)),
+                                overlay: BigramOverlay::new(slots.len()),
+                                binary: Arc::new(binary),
+                            })
+                        });
+                        (Arc::new(files.compact(&slots)), content)
+                    })
+                    .await;
+                (Some(files), content, true)
+            } else {
+                (Some(files), content, false)
+            }
+        } else {
+            (None, content, false)
+        }
     }
 
     /// What the file list and content index take in memory now.
@@ -688,6 +807,7 @@ impl WorkspaceIndex {
     }
 
     fn watch(&self) -> Watching {
+        self.state().watch_limited = false;
         let sink = || {
             let weak = Weak::clone(&self.own);
             move |events| {
@@ -703,6 +823,7 @@ impl WorkspaceIndex {
     }
 
     fn changed_on_disk(&self, events: Vec<Event>) {
+        let mut release = None;
         {
             let mut state = self.state();
             for event in events {
@@ -710,6 +831,15 @@ impl WorkspaceIndex {
                     Event::Changed(paths) => paths,
                     Event::Rescan | Event::Unavailable(Unavailable::Gone) => {
                         state.pending.rescan = true;
+                        continue;
+                    }
+                    Event::Unavailable(Unavailable::Limit) => {
+                        state.watch_limited = true;
+                        if state.files.is_none() {
+                            state.pending.rescan = true;
+                            state.stored = Stored::Unseen;
+                            release = state.watching.take();
+                        }
                         continue;
                     }
                     // Watching is short of watches or retrying: what the
@@ -734,6 +864,7 @@ impl WorkspaceIndex {
                 state.pending.rescan = true;
             }
         }
+        drop(release);
         self.apply();
     }
 
@@ -1588,6 +1719,98 @@ mod tests {
         let summary = rt::block_on(index.grep(query, &Cancel::default(), |_| {})).unwrap();
         assert_eq!(summary.matched_files, 3);
         assert!(!summary.prefiltered);
+    }
+
+    #[test]
+    fn resting_compaction_preserves_edits_new_files_and_binary_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        for i in 0..128 {
+            std::fs::write(root.join(format!("f{i}.txt")), format!("word{i} abcdef")).unwrap();
+        }
+        let rt: Rt = Arc::new(rt::Threads::new(2));
+        let hub = Arc::new(Hub::new(Arc::clone(&rt)));
+        let indexes = Indexes::new(Limits::default()).kept_in(dir.path().join("cache"));
+        let index = indexes.open(&root, rt, hub);
+        rt::block_on(index.content()).unwrap();
+        // Use the real change reader and installer, with the watcher removed
+        // so the batch and the rest have a deterministic boundary.
+        drop(index.state().watching.take());
+        let mut paths = BTreeSet::new();
+        for i in 0..64 {
+            let path = root.join(format!("f{i}.txt"));
+            std::fs::remove_file(&path).unwrap();
+            paths.insert(path);
+        }
+        std::fs::write(root.join("f70.txt"), "newneedle").unwrap();
+        std::fs::write(root.join("added.txt"), "newneedle").unwrap();
+        std::fs::write(root.join("binary.txt"), b"newneedle\0").unwrap();
+        paths.extend([
+            root.join("f70.txt"),
+            root.join("added.txt"),
+            root.join("binary.txt"),
+        ]);
+        let rules = index.state().rules.clone().unwrap();
+        index.install(look(&rules, &paths, true, &|_| {}));
+        eventually("the index rests", Duration::from_secs(10), || {
+            rt::block_on(index.rest())
+        });
+        assert_eq!(index.resident(), 0);
+        let (_, place) = index.store.as_ref().unwrap();
+        let stored = disk::read(place, &root).unwrap();
+        assert_eq!(stored.files.items().len(), 66);
+        assert_eq!(stored.files.walked_count(), 66);
+        assert_eq!(stored.content.as_ref().unwrap().overlay.modified_count(), 0);
+        for query in ["newneedle", "word99", "abcdef"] {
+            let query = GrepQuery {
+                pattern: Pattern::Typed(query.into()),
+                options: GrepOptions::default(),
+                limit: usize::MAX,
+            };
+            let mut filtered = Vec::new();
+            rt::block_on(index.grep(query.clone(), &Cancel::default(), |g| filtered.push(g.path)))
+                .unwrap();
+            index.state().content = Content::Refused;
+            let mut scanned = Vec::new();
+            rt::block_on(index.grep(query, &Cancel::default(), |g| scanned.push(g.path))).unwrap();
+            filtered.sort();
+            scanned.sort();
+            assert_eq!(filtered, scanned);
+            index.state().content = Content::Absent;
+            rt::block_on(index.load());
+        }
+    }
+
+    #[test]
+    fn a_resting_index_releases_limited_watches_and_verifies_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("before.txt"), "hello").unwrap();
+        let rt: Rt = Arc::new(rt::Threads::new(2));
+        let hub = Arc::new(Hub::new(Arc::clone(&rt)));
+        let indexes = Indexes::new(Limits::default()).kept_in(dir.path().join("cache"));
+        let index = indexes.open(&root, rt, hub);
+        rt::block_on(index.content()).unwrap();
+        index.changed_on_disk(vec![Event::Unavailable(Unavailable::Limit)]);
+        eventually("the index rests", Duration::from_secs(10), || {
+            rt::block_on(index.rest())
+        });
+        assert!(index.state().watching.is_none());
+        std::fs::write(root.join("after.txt"), "hello").unwrap();
+        let _ = rt::block_on(index.files()).unwrap();
+        eventually(
+            "a reload verifies unwatched changes",
+            Duration::from_secs(10),
+            || {
+                index
+                    .state()
+                    .files
+                    .as_ref()
+                    .is_some_and(|files| files.find("after.txt").is_some())
+            },
+        );
     }
 
     fn eventually(what: &str, within: Duration, mut check: impl FnMut() -> bool) {

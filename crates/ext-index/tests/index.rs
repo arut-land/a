@@ -467,6 +467,7 @@ fn an_index_another_daemon_kept_is_checked_against_the_tree_before_it_is_trusted
 
 #[test]
 fn a_damaged_or_older_index_on_disk_is_rebuilt_never_trusted() {
+    type Damage = fn(&mut Vec<u8>);
     let tree = Tree::new();
     let store = tempfile::tempdir().unwrap();
     tree.write("alpha.rs", "needle\n");
@@ -482,7 +483,7 @@ fn a_damaged_or_older_index_on_disk_is_rebuilt_never_trusted() {
         .map(|entry| entry.unwrap().path())
         .collect();
     assert_eq!(kept_files.len(), 2, "{kept_files:?}");
-    let damages: [(&str, fn(&mut Vec<u8>)); 4] = [
+    let damages: [(&str, Damage); 4] = [
         // A path that is not there, with its checksum as it was.
         ("a renamed path", |bytes| {
             let at = bytes.windows(5).position(|w| w == b"alpha").unwrap();
@@ -490,10 +491,12 @@ fn a_damaged_or_older_index_on_disk_is_rebuilt_never_trusted() {
         }),
         ("a torn write", |bytes| bytes.truncate(bytes.len() / 2)),
         ("another format", |bytes| {
-            bytes[8] = bytes[8].wrapping_add(1)
+            bytes[8] = bytes[8].wrapping_add(1);
         }),
         ("noise", |bytes| {
-            bytes.iter_mut().for_each(|b| *b = b.wrapping_mul(31))
+            for b in bytes {
+                *b = b.wrapping_mul(31);
+            }
         }),
     ];
     for (damage, apply) in damages {
@@ -566,4 +569,22 @@ fn a_query_while_the_index_is_got_ready_waits_for_it_and_is_answered() {
     let (found, summary) = grep(&index, "unicorn");
     assert_eq!(found, ["d7/target.txt"]);
     assert!(summary.prefiltered);
+}
+
+#[test]
+fn dropping_the_index_store_releases_its_resting_indexes() {
+    let tree = Tree::new();
+    tree.write("kept.txt", "hello");
+    let store = tempfile::tempdir().unwrap();
+    let indexes = kept(store.path(), Duration::from_millis(200));
+    let index = open(&indexes, tree.root(), runtime());
+    assert_eq!(search(&index, "kept"), ["kept.txt"]);
+    rested(&index);
+    let weak = Arc::downgrade(&index);
+    drop(index);
+    drop(indexes);
+    eventually(
+        "the store owns resting indexes without an ownership cycle",
+        || weak.upgrade().is_none(),
+    );
 }

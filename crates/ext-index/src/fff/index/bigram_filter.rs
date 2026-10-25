@@ -12,6 +12,46 @@ use std::io::{self, Read, Write};
 
 use crate::disk::{In, Out, invalid};
 
+/// Large retained columns must return their pages at rest. The ordinary
+/// allocator can retain freed blocks indefinitely (macOS deferred reclaim).
+#[derive(Debug)]
+enum Columns {
+    Mapped(sys::ZeroedWords),
+    Heap(Vec<u64>),
+}
+
+impl Columns {
+    fn new(len: usize) -> Self {
+        sys::ZeroedWords::new(len).map_or_else(|_| Self::Heap(vec![0; len]), Self::Mapped)
+    }
+
+    fn copied(words: &[u64]) -> Self {
+        let mut columns = Self::new(words.len());
+        columns.copy_from_slice(words);
+        columns
+    }
+}
+
+impl std::ops::Deref for Columns {
+    type Target = [u64];
+
+    fn deref(&self) -> &[u64] {
+        match self {
+            Self::Mapped(words) => words,
+            Self::Heap(words) => words,
+        }
+    }
+}
+
+impl std::ops::DerefMut for Columns {
+    fn deref_mut(&mut self) -> &mut [u64] {
+        match self {
+            Self::Mapped(words) => words,
+            Self::Heap(words) => words,
+        }
+    }
+}
+
 /// Maximum number of distinct bigrams tracked in the inverted index.
 /// 95 printable ASCII chars (32..=126) after lowercasing → ~70 distinct → 4900 possible.
 /// We cap at 5000 to cover all printable bigrams with margin.
@@ -365,7 +405,7 @@ impl BigramIndexBuilder {
             lookup[slot] = dense_count as u16;
             dense_count += 1;
         }
-        let dense = slab[..dense_count * words].to_vec();
+        let dense = Columns::copied(&slab[..dense_count * words]);
         drop(slab);
 
         for (i, slot) in sparse_slots.into_iter().enumerate() {
@@ -459,7 +499,7 @@ pub struct BigramFilter {
     lookup: Vec<u16>,
     rare_keys: Vec<u64>,
     /// The dense columns side by side, `words` each.
-    dense: Vec<u64>,
+    dense: Columns,
     dense_count: usize,
     /// Sparse columns are numbered after the dense ones: column `dense_count + i`
     /// lives at `sparse_data[sparse_offsets[i]..sparse_offsets[i + 1]]`.
@@ -720,6 +760,10 @@ impl BigramOverlay {
         }
     }
 
+    pub(crate) fn modified_count(&self) -> usize {
+        self.modified.len()
+    }
+
     /// Records the bigrams a modified file holds now.
     pub(crate) fn modify_bigrams(&mut self, file_idx: usize, bigrams: Vec<u16>) {
         self.modified.insert(file_idx, bigrams);
@@ -763,6 +807,73 @@ impl BigramOverlay {
 }
 
 impl BigramFilter {
+    /// Remaps live slots and folds their overlay, one column at a time.
+    /// Skip pairs of edited files are conservatively retained: the overlay
+    /// stores consecutive pairs alone, so excluding any skip pair is unsound.
+    pub(crate) fn compact(&self, slots: &[usize], overlay: &BigramOverlay) -> Self {
+        self.compact_columns(slots, overlay, false)
+    }
+
+    fn compact_columns(&self, slots: &[usize], overlay: &BigramOverlay, skip: bool) -> Self {
+        let mut compact = Self {
+            lookup: vec![NO_COLUMN; BIGRAM_KEY_SLOTS],
+            rare_keys: self.rare_keys.clone(),
+            dense: Columns::new(
+                self.lookup.iter().filter(|&&col| col != NO_COLUMN).count()
+                    * slots.len().div_ceil(64),
+            ),
+            dense_count: 0,
+            sparse_offsets: vec![0],
+            sparse_data: Vec::new(),
+            words: slots.len().div_ceil(64),
+            file_count: slots.len(),
+            populated: slots.len(),
+            skip_index: None,
+        };
+        let mut sparse_slots = Vec::new();
+        for (key_slot, &col) in self.lookup.iter().enumerate() {
+            if col == NO_COLUMN {
+                continue;
+            }
+            let key = (((key_slot / 95 + 32) << 8) | (key_slot % 95 + 32)) as u16;
+            let old = self.column_bitset(key).expect("stored column");
+            let mut bits = vec![0; compact.words];
+            for (new, &old_slot) in slots.iter().enumerate() {
+                let present = if let Some(bigrams) = overlay.modified.get(&old_slot) {
+                    skip || bigrams.contains(&key)
+                } else {
+                    old.get(old_slot / 64)
+                        .is_some_and(|word| word & (1 << (old_slot % 64)) != 0)
+                };
+                if present {
+                    bits[new / 64] |= 1 << (new % 64);
+                }
+            }
+            let mut gaps = Vec::new();
+            encode_sparse_column(&bits, &mut gaps);
+            if gaps.len() < bits.len() * size_of::<u64>() {
+                sparse_slots.push(key_slot);
+                compact.sparse_data.extend(gaps);
+                compact
+                    .sparse_offsets
+                    .push(compact.sparse_data.len() as u32);
+            } else {
+                compact.lookup[key_slot] = compact.dense_count as u16;
+                let start = compact.dense_count * compact.words;
+                compact.dense[start..start + compact.words].copy_from_slice(&bits);
+                compact.dense_count += 1;
+            }
+        }
+        for (i, slot) in sparse_slots.into_iter().enumerate() {
+            compact.lookup[slot] = (compact.dense_count + i) as u16;
+        }
+        compact.skip_index = self
+            .skip_index
+            .as_ref()
+            .map(|index| Box::new(index.compact_columns(slots, overlay, true)));
+        compact
+    }
+
     /// How many files it covers: the walked files it was built from.
     pub(crate) fn file_count(&self) -> usize {
         self.file_count
@@ -771,7 +882,7 @@ impl BigramFilter {
     /// What its columns take, the skip-1 index's included.
     pub(crate) fn heap_bytes(&self) -> usize {
         self.lookup.capacity() * size_of::<u16>()
-            + (self.rare_keys.capacity() + self.dense.capacity()) * size_of::<u64>()
+            + (self.rare_keys.capacity() + self.dense.len()) * size_of::<u64>()
             + self.sparse_offsets.capacity() * size_of::<u32>()
             + self.sparse_data.capacity()
             + self.skip_index.as_ref().map_or(0, |skip| skip.heap_bytes())
@@ -783,7 +894,7 @@ impl BigramFilter {
         out.len(self.dense_count)?;
         out.halves(&self.lookup)?;
         out.words(&self.rare_keys)?;
-        out.words(&self.dense)?;
+        out.words(&self.dense[..self.dense_count * self.words])?;
         out.u32s(&self.sparse_offsets)?;
         out.bytes(&self.sparse_data)?;
         match &self.skip_index {
@@ -804,7 +915,8 @@ impl BigramFilter {
         let dense_count = input.usize()?;
         let lookup = input.halves()?;
         let rare_keys = input.words()?;
-        let dense = input.words()?;
+        let mut dense = Columns::new(input.len(8)?);
+        input.read_words(&mut dense)?;
         let sparse_offsets = input.u32s()?;
         let sparse_data = input.bytes()?;
         let skip_index = match input.u8()? {

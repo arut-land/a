@@ -157,6 +157,31 @@ impl Files {
             .collect()
     }
 
+    /// Live slots in path order: the mapping used when an idle index compacts.
+    pub(crate) fn compact_slots(&self) -> Vec<usize> {
+        let mut slots: Vec<_> = (0..self.items.len())
+            .filter(|&slot| !self.items[slot].deleted)
+            .collect();
+        slots.sort_unstable_by(|&a, &b| self.path(&self.items[a]).cmp(self.path(&self.items[b])));
+        slots
+    }
+
+    pub(crate) fn compact(&self, slots: &[usize]) -> Self {
+        Self::walked(
+            slots
+                .iter()
+                .map(|&slot| {
+                    let file = &self.items[slot];
+                    Found {
+                        path: self.path(file).to_owned(),
+                        size: file.size,
+                        modified: file.modified,
+                    }
+                })
+                .collect(),
+        )
+    }
+
     /// What the arena and the slots take.
     pub(crate) fn heap_bytes(&self) -> usize {
         self.arena.capacity() + self.items.capacity() * size_of::<FileItem>()

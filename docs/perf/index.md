@@ -111,3 +111,83 @@ The `index` feature adds 1.30 MiB to `a` (3.53 → 4.83 MiB, macOS arm64):
 `regex`'s engines, `ignore` and `globset`, `aho-corasick`, `neo_frizbee`
 and the port. No index is open in the idle RSS scenario (nothing asks),
 so the idle budget does not move.
+
+## Eager lifetime and persistence (2026-10-26)
+
+Measured on the same Apple M3 (16 GiB), macOS 27.0.1, using the Linux
+v6.12 release tarball in a temporary directory with an empty `.git`
+directory so the checked-in ignore rules apply: **86,602 files**. A
+standalone probe calls the real `Indexes`/`WorkspaceIndex` APIs over
+`rt::Threads::new(4)`, with the repository's size-oriented release settings
+(`opt-level = "z"`, fat LTO, one codegen unit). The probe gives content
+building 1 GiB, as in the earlier large-tree comparison; it uses a ten-second
+linger to observe held and resting states. Production defaults remain a
+128 MiB content-build budget and now a thirty-second linger.
+
+Three independent processes, separate initially empty caches, no deliberate
+page-cache eviction. Other sessions share this development host; load
+average was around four to six. The first run was slower (423 ms walk,
+7.22 s build); all runs are included below. These are local measurements
+on the Linux source tree, not measurements on a Linux host. Raw output,
+probe source, phase CPU/RSS samples and `footprint` reports are retained
+outside the worktree in `/private/tmp/index-eager-measure`.
+
+| Operation | Median | Range (three runs) |
+| --- | ---: | ---: |
+| Cold walk to searchable files | 218 ms | 201–424 ms |
+| Content build after the walk | 2.34 s | 2.30–7.22 s |
+| Same-daemon reload and first grep | 45.8 ms | 45.6–46.0 ms |
+| New-daemon snapshot read and first search | 42.2 ms | 41.1–49.5 ms |
+| New-daemon reload through verified search results | 337 ms | 296–403 ms |
+| CPU, same-daemon reload and first grep | 45.8 ms | 45.6–45.9 ms |
+| CPU, new-daemon reload and verification workload | 1.59 s | 1.45–1.62 s |
+| Raw cache reads into ordinary buffers, after verification | 4.21 ms | 4.15–4.69 ms |
+| CRC-32C over cached bytes, ten iterations per run | 8.00 ms | 7.71–9.33 ms |
+
+The same-daemon measurement includes decoding, CRC validation and the first
+grep. The new-daemon probe creates one file after the old store is dropped,
+then searches until that file appears; its CPU figure includes repeated
+fuzzy searches as well as the background verify walk and change comparison.
+Verification does not reread unchanged source contents. Initial searches
+can use the snapshot while that verification runs. The earlier cold
+baseline was 185 ms walk plus 2.0 s build; the repeated current measurements
+are the closer comparison. Same-daemon reload avoids both operations.
+
+The cache is **37,229,401 bytes (35.50 MiB)**, file list and bigram columns
+combined. The live list/content heap accounting is **37,836,849 bytes**,
+falling to zero at rest; subscriptions and ignore rules remain. Persistence
+used 33–63 ms of process CPU; its wall time was observed behind the linger
+deadline and a ten-millisecond sampling interval, so is not reported as a
+separate write-latency measurement.
+
+| Memory | Held | Resting |
+| --- | ---: | ---: |
+| RSS, median | 66.95 MiB | 46.70 MiB |
+| RSS, range | 65.88–75.86 MiB | 45.62–52.38 MiB |
+| `footprint` physical footprint, median | 62 MB | 42 MB |
+
+Dropping ordinary `Vec` columns did not reliably reduce RSS: one initial
+process went from 70.3 MB held to 73.7 MB resting, with macOS retaining freed
+large allocations. Dense retained columns now use the existing
+`sys::ZeroedWords` anonymous mappings, including when decoded directly from
+disk. Dropping those returns their pages immediately; mapping refusal uses
+ordinary allocations so queries still work. File-list and smaller build
+allocations can remain in the allocator, and retained watcher/rule state
+also contributes to the resting process footprint. Resting is a reduction,
+not a promise to return a previously busy process to its startup RSS.
+
+**File-backed mmap is not taken.** Streaming load, validation and first
+query cost about 46 ms for 35.5 MiB; raw reads cost four milliseconds and
+CRC eight. A mapped format would still need validation and an implementation
+of the owned structures, would need an additional unsafe seam, and would
+complicate truncation and replacement (SIGBUS on Unix, replacement of
+mapped files on Windows). Anonymous owned mappings solve the observed
+allocator-retention problem without mapping cache files.
+
+**Linger is thirty seconds rather than five minutes.** Reload is about
+56 times cheaper than this run's median cold walk plus build. Thirty
+seconds retains a working index between nearby requests and replies,
+while releasing its large structures ten times sooner. A session's
+subsequent model replies renew the deadline. No periodic cleanup or idle
+polling was added: the retained regression tests observe zero runtime
+wake-ups for both quiet active and resting indexes.
