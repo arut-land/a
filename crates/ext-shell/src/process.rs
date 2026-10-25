@@ -438,6 +438,8 @@ async fn reap_output(
             return Ok(());
         };
         lock(&owned.1.group).take();
+        // Nothing of the group is left to hand over: the last owner reaps it.
+        owned.0.take();
         scope_done.set();
         result
     };
