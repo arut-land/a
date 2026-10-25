@@ -53,7 +53,7 @@ use std::time::Duration;
 use protocol::view::SessionList;
 use protocol::{
     Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings,
-    MachineId, QueryInfo, SessionId, SessionSummary, SettingsChange, Versions, write_frame,
+    MachineId, QueryInfo, SessionId, SessionSummary, SettingsChange, write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, OwnedConnection, Signal, Staged};
@@ -68,7 +68,7 @@ pub enum Error {
     /// would only start it again: that build is the one to run. On another
     /// `host`, one side or the other is to be updated.
     Mismatch {
-        theirs: Versions,
+        theirs: u32,
         newer: Option<PathBuf>,
         host: Option<Host>,
     },
@@ -96,7 +96,7 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mine = Versions::OURS;
+        let mine = protocol::PROTO;
         match self {
             Self::Mismatch {
                 theirs,
@@ -104,7 +104,7 @@ impl fmt::Display for Error {
                 ..
             } => write!(
                 f,
-                "the daemon runs a newer a ({theirs}) than this one ({mine}); run {} instead, or update this a",
+                "the daemon runs a newer a (protocol {theirs}) than this one (protocol {mine}); run {} instead, or update this a",
                 newer.display()
             ),
             Self::Mismatch {
@@ -113,12 +113,12 @@ impl fmt::Display for Error {
                 ..
             } => write!(
                 f,
-                "the daemon on {host} speaks {theirs}, this a {mine}; update a on one side"
+                "the daemon on {host} speaks protocol {theirs}, this a protocol {mine}; update a on one side"
             ),
             Self::Mismatch { theirs, .. } => {
                 write!(
                     f,
-                    "the daemon speaks {theirs}, this a {mine}; restart the daemon"
+                    "the daemon speaks protocol {theirs}, this a protocol {mine}; restart the daemon"
                 )
             }
             Self::Fork(reason) => reason.fmt(f),
@@ -946,7 +946,7 @@ mod tests {
         let old = build("old", 1);
         let new = build("new", 2);
 
-        let theirs = Versions::from(PROTO + 1);
+        let theirs = PROTO + 1;
         let told = LocalLink::new(home.clone()).mismatch(&old, theirs);
         let current = home.runtime().current_exe();
         assert_eq!(

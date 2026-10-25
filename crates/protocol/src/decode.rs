@@ -524,7 +524,6 @@ pub(crate) struct MsgFields {
     pub(crate) machine: Option<crate::MachineId>,
     pub(crate) commands: Option<Vec<CommandInfo>>,
     pub(crate) supported: Option<u32>,
-    pub(crate) min: Option<u32>,
     pub(crate) session: Option<SessionId>,
     pub(crate) workspace: Option<crate::HostPath>,
     pub(crate) sessions: Option<Json>,

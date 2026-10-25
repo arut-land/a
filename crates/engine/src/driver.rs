@@ -146,7 +146,7 @@ impl Shared {
             if Some(seq) != active && !ledger.untaken().iter().any(|q| q.seq == seq) {
                 continue;
             }
-            let id = &envelope.id;
+            let id = envelope.id();
             let entries = if let Some(live) = self
                 .daemon
                 .upgrade()
@@ -204,10 +204,7 @@ fn cancelled_watch(entries: impl IntoIterator<Item = Entry>, child: SessionId) -
     for entry in entries {
         match entry.body {
             Body::Watch { child: watched } if watched == child => watch = Some(entry.seq),
-            Body::Fired {
-                watch: fired,
-                outcome: Outcome::Interrupted { .. },
-            } if watch == Some(fired) => return true,
+            Body::Unwatch { watch: cancelled } if watch == Some(cancelled) => return true,
             _ => {}
         }
     }
@@ -714,7 +711,6 @@ impl Live {
         let load = Load {
             session: Some(header.id),
             abandoned: &abandoned,
-            boot: sys::boot_id(),
             fresh,
             owner,
             busy,
@@ -2386,7 +2382,6 @@ impl Actor {
         self.publish();
         let load = Load {
             session: Some(self.live.id),
-            boot: sys::boot_id(),
             busy: self.live.has_work(),
             abandoned: &abandoned,
             owner,
@@ -2528,8 +2523,6 @@ impl Actor {
                     );
                 }
             }
-            // A replayed process number carries no live OS ownership.
-            Effect::Kill { .. } => {}
             Effect::EndStream { stream, cut } => self.end_stream(stream, cut),
             Effect::DiscardStream { stream } => {
                 let store = Arc::clone(&shared.blobs);

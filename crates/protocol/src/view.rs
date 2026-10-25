@@ -142,7 +142,7 @@ impl ViewState {
             Body::Enqueue { envelope } => self.queued.push_back(Queued {
                 seq: e.seq,
                 // An outcome is hidden, shown as no text.
-                text: match &envelope.payload {
+                text: match envelope.payload() {
                     Carried::Message(text) | Carried::Job(text) => text.clone(),
                     Carried::Child(_) | Carried::Detached(_) => String::new(),
                 },
@@ -1103,7 +1103,10 @@ impl SessionView {
             Outcome::Failed { error } => Status::Failed {
                 error: error.clone(),
             },
-            Outcome::Interrupted { .. } => Status::Interrupted,
+            Outcome::Interrupted { output } => {
+                *text = output.clone().unwrap_or_default();
+                Status::Interrupted
+            }
         };
         Some(Change::Updated {
             index: at,

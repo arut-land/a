@@ -1973,15 +1973,25 @@ fn interrupt_cancels_detached_descendants_after_the_spawning_call_completes() {
     ));
     parent.session().barrier();
     let log = bodies(&*daemon.shared.store, id);
-    assert_eq!(fired(&log), [&Outcome::Interrupted { output: None }]);
+    assert_eq!(fired(&log), [] as [&protocol::ToolOutcome; 0]);
+    assert_eq!(
+        log.iter()
+            .filter(|b| matches!(b, Body::Unwatch { .. }))
+            .count(),
+        1
+    );
     assert!(daemon.list().iter().all(|s| s.activity == Activity::Idle));
     drop(parent);
     drop(daemon);
     let again = Daemon::load(&home, &config).unwrap();
     settle(&again);
+    let log = bodies(&*again.shared.store, id);
+    assert_eq!(fired(&log), [] as [&protocol::ToolOutcome; 0]);
     assert_eq!(
-        fired(&bodies(&*again.shared.store, id)),
-        [&Outcome::Interrupted { output: None }]
+        log.iter()
+            .filter(|b| matches!(b, Body::Unwatch { .. }))
+            .count(),
+        1
     );
     drop(again);
     std::fs::remove_dir_all(root).unwrap();
@@ -2019,20 +2029,12 @@ fn a_cancelled_detached_child_stays_cancelled_across_partial_delivery() {
     let parent_log = daemon.shared.store.entries(id).unwrap();
     assert_eq!(
         fired(&bodies(&*daemon.shared.store, id)),
-        [&Outcome::Interrupted { output: None }]
+        [] as [&protocol::ToolOutcome; 0]
     );
     let child_log = daemon.shared.store.entries(child.id).unwrap();
     let terminal = parent_log
         .iter()
-        .position(|e| {
-            matches!(
-                e.body,
-                Body::Fired {
-                    outcome: Outcome::Interrupted { .. },
-                    ..
-                }
-            )
-        })
+        .position(|e| matches!(e.body, Body::Unwatch { .. }))
         .unwrap()
         + 1;
     assert!(child_log.len() > before_interrupt.len());

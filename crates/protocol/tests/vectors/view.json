@@ -2139,6 +2139,162 @@
       "{\"seq\":0,\"t\":\"synced\"}",
       "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"hi\"}],\"seq\":1,\"t\":\"entry\",\"taken\":true}",
       "{\"epoch\":0,\"kind\":\"model_call\",\"model\":\"m\",\"seq\":2,\"t\":\"entry\"}",
+      "{\"call\":2,\"t\":\"delta\",\"text\":\"partial\"}",
+      "{\"call\":2,\"epoch\":0,\"kind\":\"model_result\",\"outcome\":{\"output\":\"durable partial\",\"status\":\"interrupted\"},\"seq\":3,\"t\":\"entry\"}"
+    ],
+    "hash": "7685eb3adf346ea7",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "seq": 0,
+        "t": "synced"
+      },
+      {
+        "epoch": 0,
+        "kind": "input",
+        "segments": [
+          {
+            "text": "hi"
+          }
+        ],
+        "seq": 1,
+        "t": "entry",
+        "taken": true
+      },
+      {
+        "epoch": 0,
+        "kind": "model_call",
+        "model": "m",
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "call": 2,
+        "t": "delta",
+        "text": "partial"
+      },
+      {
+        "call": 2,
+        "epoch": 0,
+        "kind": "model_result",
+        "outcome": {
+          "output": "durable partial",
+          "status": "interrupted"
+        },
+        "seq": 3,
+        "t": "entry"
+      }
+    ],
+    "name": "an interrupted reply keeps its durable text",
+    "state": {
+      "items": [
+        {
+          "seq": 1,
+          "text": "hi",
+          "type": "user"
+        },
+        {
+          "call": 2,
+          "model": "m",
+          "status": {
+            "status": "interrupted"
+          },
+          "text": "durable partial",
+          "type": "reply",
+          "usage": null
+        }
+      ],
+      "seq": 3,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "taken": [],
+        "turn": 1
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 2,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "seq": 1,
+            "text": "hi",
+            "type": "user"
+          }
+        },
+        "rev": 3,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "call": 2,
+            "model": "m",
+            "status": {
+              "status": "running"
+            },
+            "text": "",
+            "type": "reply",
+            "usage": null
+          }
+        },
+        "rev": 4,
+        "seq": 2
+      },
+      {
+        "change": {
+          "call": 2,
+          "change": "delta",
+          "text": "partial"
+        },
+        "rev": 5,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 1,
+          "part": {
+            "part": "outcome"
+          }
+        },
+        "rev": 6,
+        "seq": 3
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"seq\":0,\"t\":\"synced\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"hi\"}],\"seq\":1,\"t\":\"entry\",\"taken\":true}",
+      "{\"epoch\":0,\"kind\":\"model_call\",\"model\":\"m\",\"seq\":2,\"t\":\"entry\"}",
       "{\"call\":2,\"t\":\"delta\",\"text\":\"hel\"}",
       "{\"call\":2,\"t\":\"delta\",\"text\":\"lo\"}",
       "{\"call\":2,\"epoch\":0,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"hello\",\"type\":\"text\"}]},\"usage\":{\"input\":4,\"output\":2}},\"status\":\"done\"},\"seq\":3,\"t\":\"entry\"}"

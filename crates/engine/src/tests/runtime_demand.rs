@@ -585,7 +585,6 @@ impl Client {
         client.send(&protocol::ClientMsg::Hello {
             proto: protocol::PROTO,
             build: "bench".into(),
-            min: None,
             caps: protocol::Caps::NONE,
             client: None,
             machine: None,
