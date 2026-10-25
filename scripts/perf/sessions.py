@@ -3,7 +3,10 @@
 Runs the engine's `concurrent_active_sessions` measurement in a fresh process
 per sample (idle RSS must not inherit an earlier layout's heap), alternating
 layout order each round. `workers=4` runs twice under two labels; the gap
-between them is the noise band any other layout must clear.
+between them is the noise band any other layout must clear. With `--round-trip`,
+rt's echoed-byte timing runs in each layout's environment every round too.
+Each layout is also compared with `A` round by round: median paired differences
+with bootstrap 95% intervals.
 """
 import argparse
 import json
@@ -23,10 +26,13 @@ def percentile(values, q):
 
 def layouts(cores):
     """(label, A_BENCH_RUNTIME, extra environment) for each layout."""
-    # TEMPORARY (B1): async workers parking on the thread, as main does, against
-    # workers that wait in the reactor; A/A2 is the reference's noise band.
-    park = {"A_RT_PARK": "thread"}
-    return [("A", "workers=4", park), ("A2", "workers=4", park), ("reactor", "workers=4", {})]
+    labels = [("A", "workers=4", {}), ("A2", "workers=4", {})]
+    if cores != 4:
+        labels.append(("cores", f"workers={cores}", {}))
+    labels.append(("threads", "threads", {}))
+    # Not a candidate: what each streamed request holding a network worker costs.
+    labels.append(("network", "workers=4,network=128", {}))
+    return labels
 
 
 def summarize(records):

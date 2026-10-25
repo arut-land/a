@@ -93,7 +93,7 @@ pub use watch::{WatchEvent, Watcher};
 /// A shared handle to the runtime a component was given.
 pub type Rt = Arc<dyn Runtime>;
 
-/// How many times a thread waiting in [`block_on`], or an async worker, has woken.
+/// How many times a thread waiting in [`block_on`] has woken.
 static WAKES: AtomicU64 = AtomicU64::new(0);
 
 /// Drives `future` to completion on the calling thread, which sleeps
@@ -124,22 +124,8 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// `future`, counting each poll after its first in [`wakes`]: a thread
-/// driving it polls again only once it has woken.
-#[cfg(feature = "threads")]
-fn counted<F: Future>(future: F) -> impl Future<Output = F::Output> {
-    let mut future = Box::pin(future);
-    let mut first = true;
-    std::future::poll_fn(move |cx| {
-        if !std::mem::take(&mut first) {
-            WAKES.fetch_add(1, Ordering::Relaxed);
-        }
-        future.as_mut().poll(cx)
-    })
-}
-
 /// How many times, since the process started, a thread waiting in
-/// [`block_on`] or an async worker of [`Threads`] has woken: how
+/// [`block_on`] (an async worker of [`Threads`] among them) has woken: how
 /// an idle process shows it stays asleep.
 pub fn wakes() -> u64 {
     WAKES.load(Ordering::Relaxed)
