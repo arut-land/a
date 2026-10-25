@@ -2334,6 +2334,7 @@ dependencies = [
  "rt",
  "rustls",
  "rustls-platform-verifier",
+ "sys",
  "ureq-proto",
 ]
 
