@@ -49,10 +49,16 @@ pub(crate) fn build_bytes(file_count: usize) -> usize {
 }
 
 /// A dense bigram index being built: one bitset column per bigram seen,
-/// one bit per file.
+/// one bit per file, the columns side by side in one slab.
+///
+/// The slab is mapped zeroed at its full size on the first column: only
+/// the columns used take memory, and dropping it gives the pages back at
+/// once ([`sys::ZeroedWords`]). Without one (the OS refused the mapping)
+/// nothing is recorded, and the index filters nothing.
 pub struct BigramIndexBuilder {
     lookup: Vec<u16>,
-    columns: Vec<Box<[u64]>>,
+    slab: sys::ZeroedWords,
+    columns: usize,
     words: usize,
     file_count: usize,
     populated: usize,
@@ -64,7 +70,8 @@ impl BigramIndexBuilder {
     pub fn new(file_count: usize) -> Self {
         Self {
             lookup: vec![NO_COLUMN; BIGRAM_KEY_SLOTS],
-            columns: Vec::new(),
+            slab: sys::ZeroedWords::new(0).expect("an empty slab maps nothing"),
+            columns: 0,
             words: file_count.div_ceil(64),
             file_count,
             populated: 0,
@@ -79,20 +86,32 @@ impl BigramIndexBuilder {
         if current != NO_COLUMN {
             return current;
         }
-        if self.columns.len() >= MAX_BIGRAM_COLUMNS {
+        if self.columns >= MAX_BIGRAM_COLUMNS {
             return NO_COLUMN;
         }
-        let col = self.columns.len() as u16;
-        self.columns.push(vec![0; self.words].into_boxed_slice());
+        if self.slab.is_empty() {
+            match sys::ZeroedWords::new(MAX_BIGRAM_COLUMNS * self.words) {
+                Ok(slab) if !slab.is_empty() => self.slab = slab,
+                _ => return NO_COLUMN,
+            }
+        }
+        let col = self.columns as u16;
+        self.columns += 1;
         self.lookup[slot] = col;
         col
+    }
+
+    #[inline]
+    fn column_mut(&mut self, col: u16) -> &mut [u64] {
+        let start = col as usize * self.words;
+        &mut self.slab[start..start + self.words]
     }
 
     #[inline]
     fn set(&mut self, key: u16, word_idx: usize, bit_mask: u64) {
         let col = self.get_or_alloc_column(key);
         if col != NO_COLUMN {
-            self.columns[col as usize][word_idx] |= bit_mask;
+            self.column_mut(col)[word_idx] |= bit_mask;
         }
     }
 
@@ -248,11 +267,8 @@ impl BigramIndexBuilder {
             if into == NO_COLUMN {
                 continue;
             }
-            let from = &chunk.columns[col as usize];
-            for (dst, src) in self.columns[into as usize][start..]
-                .iter_mut()
-                .zip(from.iter())
-            {
+            let from = chunk.column(col);
+            for (dst, src) in self.column_mut(into)[start..].iter_mut().zip(from.iter()) {
                 *dst |= src;
             }
         }
@@ -264,17 +280,17 @@ impl BigramIndexBuilder {
     }
 
     pub fn columns_used(&self) -> u16 {
-        self.columns.len() as u16
+        self.columns as u16
     }
 
-    /// What its columns take now.
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.columns.len() * self.words * size_of::<u64>()
+    fn column(&self, col: u16) -> &[u64] {
+        let start = col as usize * self.words;
+        &self.slab[start..start + self.words]
     }
 
     #[cfg(test)]
     fn column_bitset(&self, col: u16) -> &[u64] {
-        &self.columns[col as usize]
+        self.column(col)
     }
 
     /// Compress the dense builder into a compact `BigramFilter`.
@@ -286,18 +302,15 @@ impl BigramIndexBuilder {
         let file_count = self.file_count;
         let populated = self.populated;
         let dense_bytes = words * 8; // cost of one dense column
-        let mut columns: Vec<Option<Box<[u64]>>> = self.columns.into_iter().map(Some).collect();
 
-        // Pass 1: pick the columns worth keeping.
+        // Pass 1: pick the columns worth keeping, in slab order so the in-place
+        // compaction below only ever moves a column towards the front.
         let mut kept: Vec<(usize, u16, u32)> = Vec::new();
         for (slot, &col) in self.lookup.iter().enumerate() {
             if col == NO_COLUMN {
                 continue;
             }
-            let Some(bitset) = columns[col as usize].as_deref() else {
-                continue;
-            };
-            let popcount: u32 = bitset.iter().map(|w| w.count_ones()).sum();
+            let popcount: u32 = self.column(col).iter().map(|w| w.count_ones()).sum();
 
             if min_density_pct.is_some_and(|min_pct| {
                 populated == 0 || (popcount as usize) * 100 < populated * min_pct as usize
@@ -324,20 +337,20 @@ impl BigramIndexBuilder {
         }
 
         // Pass 2: low-density columns become gap lists when that encodes
-        // smaller than a dense bitset; the rest stay as they are.
+        // smaller than a dense bitset; dense ones are compacted to the
+        // front of the builder's slab, and copied out of it.
+        let mut slab = self.slab;
         let mut lookup: Vec<u16> = vec![NO_COLUMN; BIGRAM_KEY_SLOTS];
-        let mut dense: Vec<Box<[u64]>> = Vec::new();
+        let mut dense_count: usize = 0;
         let mut sparse_slots: Vec<usize> = Vec::new();
         let mut sparse_offsets: Vec<u32> = vec![0];
         let mut sparse_data: Vec<u8> = Vec::new();
 
         for &(slot, col, popcount) in &kept {
-            let Some(bitset) = columns[col as usize].take() else {
-                continue;
-            };
+            let src = col as usize * words;
             if (popcount as usize) < dense_bytes {
                 let mut out = Vec::with_capacity(popcount as usize + 8);
-                encode_sparse_column(&bitset, &mut out);
+                encode_sparse_column(&slab[src..src + words], &mut out);
                 if out.len() < dense_bytes {
                     sparse_slots.push(slot);
                     sparse_data.extend_from_slice(&out);
@@ -345,21 +358,26 @@ impl BigramIndexBuilder {
                     continue;
                 }
             }
-            lookup[slot] = dense.len() as u16;
-            dense.push(bitset);
+            let dst = dense_count * words;
+            if src != dst {
+                slab.copy_within(src..src + words, dst);
+            }
+            lookup[slot] = dense_count as u16;
+            dense_count += 1;
         }
-        drop(columns);
+        let dense = slab[..dense_count * words].to_vec();
+        drop(slab);
 
         for (i, slot) in sparse_slots.into_iter().enumerate() {
-            lookup[slot] = (dense.len() + i) as u16;
+            lookup[slot] = (dense_count + i) as u16;
         }
         sparse_data.shrink_to_fit();
-        dense.shrink_to_fit();
 
         BigramFilter {
             rare_keys,
             lookup,
             dense,
+            dense_count,
             sparse_offsets,
             sparse_data,
             words,
@@ -439,10 +457,10 @@ pub(crate) enum ColumnRef<'a> {
 pub struct BigramFilter {
     lookup: Vec<u16>,
     rare_keys: Vec<u64>,
-    /// The dense columns, `words` long each: one allocation per column,
-    /// so compressing never copies the builder's columns into a new slab.
-    dense: Vec<Box<[u64]>>,
-    /// Sparse columns are numbered after the dense ones: column `dense.len() + i`
+    /// The dense columns side by side, `words` each.
+    dense: Vec<u64>,
+    dense_count: usize,
+    /// Sparse columns are numbered after the dense ones: column `dense_count + i`
     /// lives at `sparse_data[sparse_offsets[i]..sparse_offsets[i + 1]]`.
     sparse_offsets: Vec<u32>,
     sparse_data: Vec<u8>,
@@ -540,10 +558,13 @@ impl BigramFilter {
             return None;
         }
         let col = col as usize;
-        if let Some(dense) = self.dense.get(col) {
-            Some(ColumnRef::Dense(dense))
+        if col < self.dense_count {
+            let offset = col * self.words;
+            self.dense
+                .get(offset..offset + self.words)
+                .map(ColumnRef::Dense)
         } else {
-            let i = col - self.dense.len();
+            let i = col - self.dense_count;
             let start = *self.sparse_offsets.get(i)? as usize;
             let end = *self.sparse_offsets.get(i + 1)? as usize;
             self.sparse_data.get(start..end).map(ColumnRef::Sparse)
@@ -607,7 +628,7 @@ impl BigramFilter {
     }
 
     pub fn columns_used(&self) -> usize {
-        self.dense.len() + self.sparse_count()
+        self.dense_count + self.sparse_count()
     }
 
     /// Number of columns stored as varint gap lists.
@@ -623,7 +644,7 @@ impl BigramFilter {
     /// Total heap bytes used by this index (lookup + dense + sparse + skip).
     pub fn heap_bytes(&self) -> usize {
         let lookup_bytes = self.lookup.len() * std::mem::size_of::<u16>();
-        let dense_bytes = self.dense.len() * self.words * size_of::<u64>();
+        let dense_bytes = self.dense.capacity() * size_of::<u64>();
         let skip_bytes = self.skip_index.as_ref().map_or(0, |s| s.heap_bytes());
         lookup_bytes + self.rare_keys.len() * 8 + dense_bytes + self.sparse_bytes() + skip_bytes
     }
@@ -651,7 +672,7 @@ impl BigramFilter {
 
     #[cfg(test)]
     fn dense_count(&self) -> usize {
-        self.dense.len()
+        self.dense_count
     }
 }
 

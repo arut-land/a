@@ -4,10 +4,11 @@
 use std::collections::HashMap;
 use std::fs::Metadata;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::UNIX_EPOCH;
 
-use ignore::WalkBuilder;
 use ignore::overrides::Override;
+use ignore::{DirEntry, WalkBuilder, WalkState};
 
 use super::ignore::non_git_repo_overrides;
 use super::types::Found;
@@ -53,14 +54,40 @@ impl Rules {
     }
 
     /// Every file under the root, unless `stop` says to give up first.
-    pub(crate) fn walk(&self, stop: &dyn Fn() -> bool) -> Vec<Found> {
-        self.files_under(&self.root, None, stop)
+    /// The walk's threads are its own, scoped to it: ripgrep's parallel
+    /// walker, a third of the time a single thread takes on a large tree
+    /// (docs/perf/index.md).
+    pub(crate) fn walk(&self, stop: &(dyn Fn() -> bool + Sync)) -> Vec<Found> {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+        let found = Mutex::new(Vec::new());
+        self.builder(&self.root)
+            .threads(threads)
+            .build_parallel()
+            .run(|| {
+                // Each thread's files, handed over as its walk ends.
+                let mut batch = Batch(Vec::new(), &found);
+                Box::new(move |entry| {
+                    if batch.0.len() % 256 == 0 && stop() {
+                        return WalkState::Quit;
+                    }
+                    if let Some(file) = entry.ok().and_then(|entry| self.found(&entry)) {
+                        batch.0.push(file);
+                    }
+                    WalkState::Continue
+                })
+            });
+        found.into_inner().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Every file under `dir` (relative to the root): what a directory
     /// that appeared brings.
     pub(crate) fn walk_dir(&self, dir: &str) -> Vec<Found> {
-        self.files_under(&self.root.join(dir), None, &|| false)
+        self.walk_dir_until(dir, &|| false)
+    }
+
+    /// [`Rules::walk_dir`], unless `stop` says to give up first.
+    pub(crate) fn walk_dir_until(&self, dir: &str, stop: &dyn Fn() -> bool) -> Vec<Found> {
+        self.files_under(&self.root.join(dir), None, stop)
     }
 
     /// The files among `names` (relative paths, all in directory `dir`)
@@ -106,24 +133,26 @@ impl Rules {
             if found.len() % 256 == 0 && stop() {
                 break;
             }
-            let Ok(entry) = entry else { continue };
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            let Some(path) = self.relative(entry.path()) else {
-                continue;
-            };
-            if is_git_path(&path) {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            found.push(Found {
-                path,
-                size: meta.len(),
-                modified: modified(&meta),
-            });
+            found.extend(entry.ok().and_then(|entry| self.found(&entry)));
         }
         found
+    }
+
+    /// The file a walk's `entry` is, if it is one the index holds.
+    fn found(&self, entry: &DirEntry) -> Option<Found> {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            return None;
+        }
+        let path = self.relative(entry.path())?;
+        if is_git_path(&path) {
+            return None;
+        }
+        let meta = entry.metadata().ok()?;
+        Some(Found {
+            path,
+            size: meta.len(),
+            modified: modified(&meta),
+        })
     }
 
     /// `path` as the index names it: relative to the root, `/`-separated.
@@ -135,6 +164,14 @@ impl Rules {
         } else {
             relative.replace(MAIN_SEPARATOR, "/")
         })
+    }
+}
+
+struct Batch<'a>(Vec<Found>, &'a Mutex<Vec<Found>>);
+
+impl Drop for Batch<'_> {
+    fn drop(&mut self) {
+        (self.1.lock().unwrap_or_else(PoisonError::into_inner)).append(&mut self.0);
     }
 }
 

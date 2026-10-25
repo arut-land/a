@@ -13,6 +13,7 @@ dependencies = [
  "ext-edit",
  "ext-fixtures",
  "ext-fork",
+ "ext-index",
  "ext-lua",
  "ext-mcp",
  "ext-metrics",

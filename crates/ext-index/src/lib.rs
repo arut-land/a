@@ -7,7 +7,7 @@
 //!   is read, until the limit or a cancel.
 //! - `glob` and `grep`, the model's tools over the same index.
 //!
-//! The index of a workspace ([`Index`]) opens with the first of these
+//! The index of a workspace ([`WorkspaceIndex`]) opens with the first of these
 //! that asks about it and closes once none has for [`Limits::linger`]: a
 //! daemon nobody searches holds none.
 
@@ -38,15 +38,16 @@ mod index;
 
 pub use fff::grep::{Casing, GrepMatch, GrepMode, GrepOptions};
 pub use index::{
-    GrepQuery, GrepSummary, Grepped, Index, Indexes, Limits, Pattern, Searched, SearchedFile,
+    GrepQuery, GrepSummary, Grepped, Indexes, Limits, Pattern, Searched, SearchedFile,
+    WorkspaceIndex,
 };
 
 /// The `index` extension: its queries and tools share one [`Indexes`].
-pub struct IndexExt {
+pub struct Index {
     indexes: Arc<Indexes>,
 }
 
-impl Configured for IndexExt {
+impl Configured for Index {
     fn configure(table: &impl Table) -> Result<Self, Refused> {
         let mut limits = Limits::default();
         if let Some(mib) = table.whole("memory_mib")? {
@@ -62,7 +63,7 @@ impl Configured for IndexExt {
     }
 }
 
-impl Extension for IndexExt {
+impl Extension for Index {
     const NAME: &'static str = "index";
     const VERSION: u32 = 1;
 

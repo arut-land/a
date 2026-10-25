@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use ext::Cancel;
-use ext_index::{GrepOptions, GrepQuery, GrepSummary, Grepped, Index, Indexes, Limits, Pattern};
+use ext_index::{
+    GrepOptions, GrepQuery, GrepSummary, Grepped, Indexes, Limits, Pattern, WorkspaceIndex,
+};
 
 fn runtime() -> rt::Rt {
     Arc::new(rt::Threads::new(2))
@@ -37,12 +39,12 @@ impl Tree {
     }
 }
 
-fn search(index: &Index, query: &str) -> Vec<String> {
+fn search(index: &WorkspaceIndex, query: &str) -> Vec<String> {
     let found = rt::block_on(index.search(query.to_owned(), 50));
     found.files.into_iter().map(|f| f.path).collect()
 }
 
-fn grep_with(index: &Index, query: &str, cancel: &Cancel) -> (Vec<Grepped>, GrepSummary) {
+fn grep_with(index: &WorkspaceIndex, query: &str, cancel: &Cancel) -> (Vec<Grepped>, GrepSummary) {
     let found = Mutex::new(Vec::new());
     let query = GrepQuery {
         pattern: Pattern::Typed(query.to_owned()),
@@ -54,7 +56,7 @@ fn grep_with(index: &Index, query: &str, cancel: &Cancel) -> (Vec<Grepped>, Grep
     (found.into_inner().unwrap(), summary)
 }
 
-fn grep(index: &Index, query: &str) -> (Vec<String>, GrepSummary) {
+fn grep(index: &WorkspaceIndex, query: &str) -> (Vec<String>, GrepSummary) {
     let (found, summary) = grep_with(index, query, &Cancel::default());
     let mut paths: Vec<_> = found.into_iter().map(|g| g.path).collect();
     paths.sort();
@@ -222,7 +224,7 @@ fn the_index_is_gone_after_its_last_user() {
     let rt = runtime();
     let index = indexes.open(tree.root(), Arc::clone(&rt));
     assert_eq!(search(&index, "a.rs"), ["a.rs"]);
-    let weak: Weak<Index> = Arc::downgrade(&index);
+    let weak: Weak<WorkspaceIndex> = Arc::downgrade(&index);
     drop(index);
     // Kept for the linger after its last use, not longer.
     assert!(weak.upgrade().is_some());

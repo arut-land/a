@@ -11,3 +11,124 @@ pub fn small_footprint() {
         unsafe { libc::mallopt(libc::M_ARENA_MAX, 2) };
     }
 }
+
+/// Zeroed words mapped straight from the OS: a page takes memory once it
+/// is first written, and dropping the mapping gives every page back at
+/// once. The allocator would keep a freed block this large for reuse (on
+/// macOS, in its deferred-reclaim cache, as resident memory) after a
+/// search index is built in it.
+pub struct ZeroedWords {
+    ptr: std::ptr::NonNull<u64>,
+    len: usize,
+}
+
+// SAFETY: the mapping is owned exclusively, like a `Box<[u64]>`.
+unsafe impl Send for ZeroedWords {}
+// SAFETY: shared access is only through `&[u64]`.
+unsafe impl Sync for ZeroedWords {}
+
+impl ZeroedWords {
+    /// `len` zeroed words, or the OS's refusal.
+    pub fn new(len: usize) -> std::io::Result<Self> {
+        let bytes = len
+            .checked_mul(size_of::<u64>())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        if bytes == 0 {
+            return Ok(Self {
+                ptr: std::ptr::NonNull::dangling(),
+                len: 0,
+            });
+        }
+        let ptr = map(bytes)?;
+        Ok(Self { ptr, len })
+    }
+}
+
+impl std::ops::Deref for ZeroedWords {
+    type Target = [u64];
+
+    fn deref(&self) -> &[u64] {
+        // SAFETY: `ptr` maps `len` zero-initialised words owned by `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl std::ops::DerefMut for ZeroedWords {
+    fn deref_mut(&mut self) -> &mut [u64] {
+        // SAFETY: as in `deref`, and `&mut self` makes the access unique.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for ZeroedWords {
+    fn drop(&mut self) {
+        if self.len > 0 {
+            unmap(self.ptr, self.len * size_of::<u64>());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn map(bytes: usize) -> std::io::Result<std::ptr::NonNull<u64>> {
+    // SAFETY: a private anonymous mapping aliases nothing; the kernel
+    // zero-fills its pages on first touch.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    std::ptr::NonNull::new(ptr.cast()).ok_or_else(|| std::io::Error::other("mapped at null"))
+}
+
+#[cfg(unix)]
+fn unmap(ptr: std::ptr::NonNull<u64>, bytes: usize) {
+    // SAFETY: `ptr` and `bytes` are exactly a mapping `map` made, unmapped once.
+    unsafe { libc::munmap(ptr.as_ptr().cast(), bytes) };
+}
+
+#[cfg(windows)]
+fn map(bytes: usize) -> std::io::Result<std::ptr::NonNull<u64>> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+    };
+    // SAFETY: a fresh private allocation aliases nothing; committed pages
+    // are zero-filled and take physical memory on first touch.
+    let ptr = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            bytes,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+    };
+    std::ptr::NonNull::new(ptr.cast()).ok_or_else(std::io::Error::last_os_error)
+}
+
+#[cfg(windows)]
+fn unmap(ptr: std::ptr::NonNull<u64>, _: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+    // SAFETY: `ptr` is the base of an allocation `map` made, released once.
+    unsafe { VirtualFree(ptr.as_ptr().cast(), 0, MEM_RELEASE) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapped_words_start_zeroed_and_hold_what_is_written() {
+        let mut words = ZeroedWords::new(1 << 20).unwrap();
+        assert!(words.iter().all(|w| *w == 0));
+        words[12345] = 7;
+        assert_eq!(words[12345], 7);
+        assert!(ZeroedWords::new(0).unwrap().is_empty());
+    }
+}

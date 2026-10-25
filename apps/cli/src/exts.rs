@@ -60,6 +60,8 @@ fn linked(config: &Config) -> Result<Registry, Refused> {
     let built = built.with(Tier::Pre, &configured::<ext_edit::Edit>(config)?)?;
     #[cfg(feature = "mcp")]
     let built = built.with(Tier::Pre, &configured::<ext_mcp::Mcp>(config)?)?;
+    #[cfg(feature = "index")]
+    let built = built.with(Tier::Pre, &configured::<ext_index::Index>(config)?)?;
     #[cfg(feature = "compact")]
     let built = built.with(Tier::Pre, &configured::<ext_compact::Compact>(config)?)?;
     #[cfg(feature = "skills")]
@@ -221,6 +223,10 @@ mod tests {
             [
                 "bash",
                 "edit",
+                #[cfg(feature = "index")]
+                "glob",
+                #[cfg(feature = "index")]
+                "grep",
                 "skill",
                 "task",
                 "fork_task",
@@ -243,6 +249,8 @@ mod tests {
                 ("edit", 4),
                 #[cfg(feature = "mcp")]
                 ("mcp", 1),
+                #[cfg(feature = "index")]
+                ("index", 1),
                 ("compact", 1),
                 ("skills", 1),
                 ("settings", 1),
@@ -285,7 +293,7 @@ mod tests {
             r.system_prompt().split("\n\n").map(str::to_owned).collect()
         };
         // What each contributes that the others do not.
-        let own: [(&str, &[&str], usize); 12] = [
+        let own: &[(&str, &[&str], usize)] = &[
             ("title", &[], 0),
             ("compact", &[], 0),
             ("policy-floor", &[], 0),
@@ -298,8 +306,10 @@ mod tests {
             ("settings", &[], 0),
             ("skills", &["skill"], 0),
             ("subagent", &["task", "fork_task", "background_task"], 1),
+            #[cfg(feature = "index")]
+            ("index", &["glob", "grep"], 0),
         ];
-        for (name, tools_of, texts_of) in own {
+        for &(name, tools_of, texts_of) in own {
             let without = Config {
                 ext: sys::config::Exts {
                     disable: vec![name.to_owned()],

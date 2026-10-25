@@ -1,4 +1,4 @@
-//! One [`Index`] per workspace: opened by the first search or grep that
+//! One [`WorkspaceIndex`] per workspace: opened by the first search or grep that
 //! asks about it, walked on the runtime's blocking pool, kept current by
 //! the native watcher, and dropped once nothing has used it for a while.
 //!
@@ -51,7 +51,7 @@ impl Default for Limits {
 
 /// The open indexes, one per workspace.
 pub struct Indexes {
-    open: WorkspaceShared<Index>,
+    open: WorkspaceShared<WorkspaceIndex>,
     limits: Limits,
 }
 
@@ -65,8 +65,8 @@ impl Indexes {
 
     /// The index of the workspace at `root`, opened now if no one has it
     /// open, and kept open for [`Limits::linger`] from now.
-    pub fn open(&self, root: &Path, rt: Rt) -> Arc<Index> {
-        let index = self.open.get_or_make(root, |own| Index {
+    pub fn open(&self, root: &Path, rt: Rt) -> Arc<WorkspaceIndex> {
+        let index = self.open.get_or_make(root, |own| WorkspaceIndex {
             rules: Arc::new(Rules::of(root)),
             rt,
             limits: self.limits,
@@ -81,7 +81,7 @@ impl Indexes {
 }
 
 /// A workspace's files and, once a grep asked for it, its content index.
-pub struct Index {
+pub struct WorkspaceIndex {
     rules: Arc<Rules>,
     rt: Rt,
     limits: Limits,
@@ -90,10 +90,10 @@ pub struct Index {
     changed: rt::Notify,
     /// Set as the index goes: the work it handed off stops.
     closed: Arc<AtomicBool>,
-    own: Weak<Index>,
+    own: Weak<WorkspaceIndex>,
 }
 
-impl Drop for Index {
+impl Drop for WorkspaceIndex {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
     }
@@ -194,7 +194,7 @@ const WINDOW: usize = 4;
 /// by whole bitset words.
 const BUILD_CHUNK: usize = 4096;
 
-impl Index {
+impl WorkspaceIndex {
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -270,13 +270,13 @@ impl Index {
         };
         self.state().watcher = watcher;
         let weak = Weak::clone(&self.own);
-        let rules = Arc::clone(&self.rules);
-        let closed = Arc::clone(&self.closed);
-        let walked = rt::unblock_with(&*self.rt, BlockingClass::Storage, 0, move || {
-            Files::walked(rules.walk(&|| closed.load(Ordering::Acquire)))
-        });
+        let (rt, rules, closed) = (
+            Arc::clone(&self.rt),
+            Arc::clone(&self.rules),
+            Arc::clone(&self.closed),
+        );
         self.rt.spawn(Box::pin(async move {
-            let files = walked.await;
+            let files = walk(&rt, rules, closed).await;
             let Some(index) = weak.upgrade() else { return };
             {
                 let mut state = index.state();
@@ -691,12 +691,14 @@ impl Index {
             {
                 let (files, grep, stop) = (Arc::clone(files), Arc::clone(grep), Arc::clone(&stop));
                 let root = self.rules.root().to_owned();
-                running.push_back(rt::unblock_with(
+                // Spawned, so it is admitted now rather than when awaited.
+                let job = rt::unblock_with(
                     &*self.rt,
                     BlockingClass::Storage,
                     2 * MAX_FILE_SIZE as usize,
                     move || grep_chunk(&root, &files, &grep, &chunk, &stop),
-                ));
+                );
+                running.push_back(rt::spawn(&*self.rt, job));
             }
             let Some(next) = running.pop_front() else {
                 break;
@@ -796,6 +798,14 @@ fn grep_chunk(
     (searched, found)
 }
 
+/// Every file under the root, from one blocking job.
+async fn walk(rt: &Rt, rules: Arc<Rules>, closed: Arc<AtomicBool>) -> Files {
+    rt::unblock_with(&**rt, BlockingClass::Storage, 0, move || {
+        Files::walked(rules.walk(&|| closed.load(Ordering::Acquire)))
+    })
+    .await
+}
+
 /// Builds the content index of `files`' walked files, `BUILD_CHUNK` at a
 /// time on the blocking pool, `None` if the index went first.
 async fn build(
@@ -815,7 +825,7 @@ async fn build(
             && let Some(first) = firsts.next()
         {
             let (root, files, closed) = (root.clone(), Arc::clone(&files), Arc::clone(&closed));
-            running.push_back(rt::unblock_with(
+            let job = rt::unblock_with(
                 &**rt,
                 BlockingClass::Storage,
                 rt::STORAGE_BYTES,
@@ -823,7 +833,8 @@ async fn build(
                     let len = (files.walked_count() - first).min(BUILD_CHUNK);
                     (first, build_chunk(&root, &files, first, len, &closed))
                 },
-            ));
+            );
+            running.push_back(rt::spawn(&**rt, job));
         }
         let Some(next) = running.pop_front() else {
             break;
