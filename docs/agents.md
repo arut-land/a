@@ -55,10 +55,22 @@ awaited turn, awaiting a `Background`, and polling a `ConversationHandle`.
 The engine implements one service, `ext::Conversations`, over the admitted
 forms the builder lowers to: `ModelTurn` for a turn and `Spawn` for a task.
 Neither has a public constructor, so the typed builder is the only way in.
-`Placement` is matched exhaustively at admission: each daemon stores its
-own sessions, so a conversation placed on another machine will be a root
-there, owned by the parent's address and keyed by its envelope id, rather
-than nested under `children/`. Only `Here` exists today.
+`Placement` is `Here` or `Machine(MachineId)`, and the engine admits only
+`Here`: any other is refused at admission as `SpawnRefusal::Placement`,
+before a child exists. Each daemon stores its own sessions, so the model for
+a conversation placed on another machine is fixed now, before it runs:
+
+- the child is a root session in that machine's daemon's store, owned by
+  the parent's `protocol::Address` (machine and session), never nested
+  under `children/` here, and its id is that daemon's to make;
+- the parent records the spawn as a durable intent and then its outcome,
+  keyed by the call's `EnvelopeId`, as for any external call that is
+  unsafe to replay: recovery settles an intent without an outcome as
+  interrupted rather than spawn twice, and the remote daemon admits a
+  repeated envelope id once;
+- what crosses machines is envelopes, so `Envelope::destination` becomes an
+  `Address` when the first remote placement runs; the kernel's one child
+  wait per call is unchanged.
 
 ## Identity, ownership and storage
 

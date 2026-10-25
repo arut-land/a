@@ -44,7 +44,7 @@ pub enum Cmd {
         #[usage(long)]
         any: bool,
     },
-    /// Attach to a session by id
+    /// Attach to a session by id, or by MACHINE:id to one on another machine
     Attach { id: String },
     /// Fork conversation history at a rest point; workspace files stay as they are
     Fork { session: String },

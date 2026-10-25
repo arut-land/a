@@ -42,6 +42,19 @@ credentials with DPAPI, `CryptProtectData`, which needs no crate beyond
 making a home's first key agree on one. A file that is not a key is
 reported, never replaced: a new key would be a new machine.
 
+`publish_ordered` only orders the name behind the write; on Apple the
+drive cache still holds both until a full flush. A client may pin the id
+in `machines.toml` as soon as a welcome names it, and a key a power cut
+took back would make the home another machine, so a new key is flushed
+(`F_FULLFSYNC`, once per home, before the id is known) where the platform
+keeps a separate cache. On macOS the staged file also carries
+`com.apple.metadata:com_apple_backup_excludeItem` (the sticky exclusion
+`tmutil addexclusion` writes, a 61-byte property list, set with one
+`fsetxattr`): a Time Machine restore onto another Mac, or beside this
+home, would otherwise be a second machine with this one's id. Windows
+needs neither: its publish is write-through, and a DPAPI-sealed key
+restored under another logon does not open there.
+
 The macOS keychain was considered and left out. A legacy (file-based)
 keychain item trusts the code signature of the program that made it, and
 `a` is ad-hoc signed, so every new build would raise an access prompt
