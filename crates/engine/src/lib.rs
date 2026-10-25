@@ -1111,7 +1111,7 @@ impl Daemon {
                 {
                     // Whatever holds off sleep for this build (a process
                     // of its own on Linux) must not outlive it.
-                    drop(awake.take());
+                    awake.take();
                     exit.hand_over(self, record, handles, successor, command)
                         .await;
                 }

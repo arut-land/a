@@ -24,7 +24,9 @@ fn rerun() -> Command {
 /// The process execs into a new image, and the group it started, with
 /// what it wrote but nobody read yet, is the new image's: its exit status
 /// is still there to wait for, and its pipe still holds its output.
+// Miri runs no processes and validates no descriptors.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn an_exec_keeps_a_group_waitable_and_its_unread_output() {
     match std::env::var(STAGE).ok().as_deref() {
         Some("give") => {
@@ -97,6 +99,7 @@ fn an_exec_keeps_a_group_waitable_and_its_unread_output() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn a_handed_number_that_is_not_this_processs_child_is_refused() {
     let (reader, _writer) = io::pipe().unwrap();
     let number = std::os::fd::OwnedFd::from(reader);
