@@ -11,16 +11,22 @@ mod edit;
 #[path = "fs/private_windows.rs"]
 mod private;
 mod staging;
+mod tree;
 pub use edit::{
     Durability, EditConflict, EditError, EditReceipt, EditTransaction, PublicationLimitations,
     PublicationProtection,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use tree::mark_placeholder;
+pub use tree::{Filesystem, PLACEHOLDERS, Refusal, Tree, is_placeholder};
 
 /// Why discovery skipped a candidate instead of opening arbitrary filesystem objects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectedFile {
     NotRegular,
     OutsideRoot,
+    /// A cloud placeholder ([`is_placeholder`]): reading it would fetch it.
+    Placeholder,
 }
 
 /// A regular file or a typed discovery rejection; IO failures remain errors.
@@ -32,7 +38,11 @@ pub enum RegularFile {
 
 /// Checking metadata first avoids opening devices; nonblocking open and a
 /// second check on the handle also cover replacement by a FIFO during discovery.
+/// A placeholder is found before anything opens it, and never opened.
 pub fn open_regular(path: &Path) -> io::Result<RegularFile> {
+    if tree::placeholder_at(path)? {
+        return Ok(RegularFile::Skipped(RejectedFile::Placeholder));
+    }
     if !fs::metadata(path)?.is_file() {
         return Ok(RegularFile::Skipped(RejectedFile::NotRegular));
     }

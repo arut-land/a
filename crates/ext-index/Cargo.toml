@@ -24,6 +24,7 @@ bstr = { version = "1.12", default-features = false, features = ["std"] }
 smallvec = { version = "1.15", features = ["const_generics", "union", "serde"] }
 
 [dev-dependencies]
+sys = { workspace = true, features = ["test-support"] }
 tempfile = { version = "3", default-features = false }
 
 [lints]
