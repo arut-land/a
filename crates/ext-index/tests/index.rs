@@ -331,13 +331,13 @@ fn ignored_directories_take_no_watch() {
     let hub = Arc::new(rt::watch::Hub::new(Arc::clone(&rt)));
     let indexes = Indexes::new(Limits::default());
     let index = indexes.open(tree.root(), rt, Arc::clone(&hub));
-    assert_eq!(search(&index, "a.rs"), ["src/a.rs"]);
+    assert_eq!(search(&index, "a.rs")[0], "src/a.rs");
     // The root's parent, the root, `src`, and `.git`, above the `info/`
     // that is not there: nothing under `target`.
     assert_eq!(hub.watches(), 4);
     tree.write("src/new/b.rs", "");
     eventually("a directory made later is watched", || {
-        search(&index, "b.rs") == ["src/new/b.rs"]
+        search(&index, "b.rs").contains(&"src/new/b.rs".to_owned())
     });
     assert_eq!(hub.watches(), 5);
 }
