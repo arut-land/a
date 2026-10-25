@@ -79,15 +79,13 @@ fn the_host_list_follows_its_files() {
     let (_dir, sources) = sources("", "Host one\n  HostName one.example\n");
     let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
     let into = Arc::clone(&seen);
-    let rt: rt::Rt = Arc::new(rt::Threads::default());
-    let _watch = sources
-        .watch(&rt, move |known: io::Result<Vec<Known>>| {
-            let known = known.unwrap();
-            into.lock()
-                .unwrap()
-                .push(known.into_iter().map(|k| k.machine.name).collect());
-        })
-        .unwrap();
+    let hub = rt::watch::Hub::new(Arc::new(rt::Threads::default()));
+    let _watch = sources.watch(&hub, move |known: io::Result<Vec<Known>>| {
+        let known = known.unwrap();
+        into.lock()
+            .unwrap()
+            .push(known.into_iter().map(|k| k.machine.name).collect());
+    });
     let until = |names: &[&str]| {
         let deadline = Instant::now() + Duration::from_secs(20);
         while seen.lock().unwrap().last().is_none_or(|last| last != names) {

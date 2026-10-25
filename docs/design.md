@@ -123,7 +123,7 @@ a daemon's entries need no machine, and a client learns each daemon's from
 its welcome. The client SDK's `Daemons` is the set, one `Member` per
 machine, with the names `machines.toml` and the ssh configuration's `Host`
 lines give (each resolved by `ssh -G`, never parsed for meaning, and
-watched with `rt::Watcher`); `mac2:3f9a` resolves on the client to a
+watched through an `rt::watch::Hub`); `mac2:3f9a` resolves on the client to a
 member and the prefix it asks there, and `SessionWatch` merges the
 members' lists. Every app holds a set of one today. See
 [the client SDK](client.md).

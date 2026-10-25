@@ -68,6 +68,8 @@ pub(crate) mod spawn;
 pub struct Shared {
     pub http_clients: std::sync::OnceLock<Arc<dyn transport::HttpClients>>,
     pub rt: rt::Rt,
+    /// The daemon's one file watcher, which every extension subscribes to.
+    pub hub: Arc<rt::watch::Hub>,
     pub store: Arc<dyn crate::store::LogStore>,
     pub catalog: crate::catalog::Catalog,
     pub registry: ext::host::Current,
@@ -106,6 +108,13 @@ impl Shared {
                             let _ = admitted.await;
                         }));
                     }),
+                    {
+                        let hub = Arc::clone(&self.hub);
+                        Arc::new(move |root, changed| {
+                            let watch = rt::watch::Watch::tree(root);
+                            Box::new(hub.subscribe(watch, move |_| changed()))
+                        })
+                    },
                 )
             })
             .transpose()
@@ -3039,6 +3048,7 @@ impl Session {
                 SessionServices::default()
                     .with::<dyn ext::Layers>(Arc::new(SessionLayers(session.clone())))
                     .with::<dyn rt::Runtime>(Arc::clone(&shared.rt))
+                    .with::<rt::watch::Hub>(Arc::clone(&shared.hub))
                     .with::<dyn ext::Logs>(Arc::new(services::SessionLogs(Arc::clone(shared))))
                     .with::<dyn transport::HttpClients>(Arc::clone(
                         shared.http_clients.get_or_init(|| {

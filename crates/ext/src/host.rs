@@ -769,7 +769,6 @@ pub trait Generations: Send + Sync {
     fn restore(self: Arc<Self>, installed: &[Installed]) -> Result<Arc<Registry>, Refused>;
 }
 
-pub type Refresh = dyn FnMut() -> Result<(), Refused> + Send + Sync;
 pub type Rebuild = dyn Fn() -> Result<(), Refused> + Send + Sync;
 pub type Registrations = Vec<(Tier, Arc<dyn DynExtension>)>;
 
@@ -782,12 +781,10 @@ pub struct PreparedLayer {
 /// Scanning and compilation belong to the extension that understands the image.
 pub trait GenerationLayer: Send + Sync {
     fn name(&self) -> &'static str;
-    fn watch(
-        &self,
-        workspace: &Path,
-        spawn: Spawn,
-        changed: Arc<Changed>,
-    ) -> Result<Box<Refresh>, Refused>;
+    /// The directories its sources are read from, each watched as a
+    /// whole tree whether it exists yet or not: a change in any prepares
+    /// the next generation.
+    fn roots(&self, workspace: &Path) -> Vec<PathBuf>;
     fn prepare(
         &self,
         workspace: &Path,
@@ -828,7 +825,8 @@ struct Workspace {
     preparing: Mutex<Vec<PreparedLayer>>,
     pending: Mutex<Preparation>,
     spawn: Spawn,
-    watches: Mutex<Vec<Box<Refresh>>>,
+    watch: Watch,
+    watches: Mutex<Vec<Box<dyn Any + Send + Sync>>>,
     changed: Arc<Changed>,
     rebuild: Arc<Rebuild>,
     updates: Updates,
@@ -866,6 +864,7 @@ impl Sources for Coordinator {
         path: &Path,
         spawn: Spawn,
         prepare: Prepare,
+        watch: Watch,
     ) -> Result<Arc<dyn Generations>, Refused> {
         let workspace = self.workspaces.get_or_make(path, |weak: &Weak<Workspace>| {
             let refresh = weak.clone();
@@ -879,6 +878,7 @@ impl Sources for Coordinator {
                 preparing: Mutex::default(),
                 pending: Mutex::default(),
                 spawn,
+                watch,
                 watches: Mutex::default(),
                 updates: Updates::default(),
                 rebuild: Arc::new(move || {
@@ -918,10 +918,12 @@ impl Sources for Coordinator {
 
 impl Workspace {
     fn open(self: &Arc<Self>) -> Result<(), Refused> {
-        for layer in &self.layers {
-            let watch = layer.watch(&self.path, self.spawn.clone(), self.changed.clone())?;
-            lock(&self.watches).push(watch);
-        }
+        // Watched before the first capture, so nothing after it is missed.
+        let watches = (self.layers.iter())
+            .flat_map(|layer| layer.roots(&self.path))
+            .map(|root| (self.watch)(&root, Arc::clone(&self.changed)))
+            .collect();
+        *lock(&self.watches) = watches;
         match self.rebuild(true) {
             Ok(()) => Ok(()),
             Err(PrepareError::Rejected(error)) => Err(error),
@@ -961,9 +963,6 @@ impl Workspace {
 
     fn rebuild(&self, initial: bool) -> Result<(), PrepareError> {
         let mut previous = lock(&self.preparing);
-        for watch in lock(&self.watches).iter_mut() {
-            watch()?;
-        }
         let mut registry = (*self.base).clone();
         let mut prepared = Vec::new();
         for (index, layer) in self.layers.iter().enumerate() {
@@ -1131,12 +1130,17 @@ pub type Prepare = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 /// Schedules owned asynchronous subscription work on the host runtime.
 pub type Spawn = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>;
 
+/// Watches the tree at a path, calling `changed` on anything that happens
+/// in it, until what it returns is dropped: the engine's file watcher.
+pub type Watch = Arc<dyn Fn(&Path, Arc<Changed>) -> Box<dyn Any + Send + Sync> + Send + Sync>;
+
 pub trait Sources: Send + Sync {
     fn open(
         &self,
         workspace: &Path,
         spawn: Spawn,
         prepare: Prepare,
+        watch: Watch,
     ) -> Result<Arc<dyn Generations>, Refused>;
 }
 

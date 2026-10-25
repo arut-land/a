@@ -1,6 +1,8 @@
 //! One [`WorkspaceIndex`] per workspace: opened by the first search or grep that
 //! asks about it, walked on the runtime's blocking pool, kept current by
-//! the native watcher, and dropped once nothing has used it for a while.
+//! the daemon's file watcher, and dropped once nothing has used it for a
+//! while. Only the directories the walk enters are watched (on Linux, each
+//! takes an inotify watch): an ignored `target/` takes none.
 //!
 //! The file list is a snapshot ([`Files`] behind an `Arc`): a search
 //! reads the one it took, a change copies it only while a search still
@@ -23,7 +25,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use ext::{Cancel, WorkspaceShared};
-use rt::{BlockingClass, Rt, WatchEvent};
+use rt::watch::{Event, Hub, Subscription, Unavailable, Watch};
+use rt::{BlockingClass, Rt};
 use sys::fs::Tree;
 
 use crate::fff::grep::{self, Grep, GrepMatch, GrepOptions, Known, Prefilter};
@@ -73,10 +76,11 @@ impl Indexes {
 
     /// The index of the workspace at `root`, opened now if no one has it
     /// open, and kept open for [`Limits::linger`] from now.
-    pub fn open(&self, root: &Path, rt: Rt) -> Arc<WorkspaceIndex> {
+    pub fn open(&self, root: &Path, rt: Rt, hub: Arc<Hub>) -> Arc<WorkspaceIndex> {
         let index = self.open.get_or_make(root, |own| WorkspaceIndex {
             root: Arc::from(root),
             rt,
+            hub,
             limits: self.limits,
             state: Mutex::default(),
             changed: rt::Notify::new(),
@@ -92,6 +96,7 @@ impl Indexes {
 pub struct WorkspaceIndex {
     root: Arc<Path>,
     rt: Rt,
+    hub: Arc<Hub>,
     limits: Limits,
     state: Mutex<State>,
     /// Notified as a walk or a content index is installed.
@@ -117,18 +122,23 @@ struct State {
     busy: Busy,
     content: Content,
     pending: Pending,
-    watcher: Option<rt::Watcher>,
+    /// What the last walk installed watches.
+    watching: Option<Arc<Watching>>,
     last_used: Option<Instant>,
     keeper: bool,
-    /// What the root was when the last walk began, `None` if missing: a
-    /// root replaced at its path is another, and is walked again.
-    root_identity: Option<sys::fs::FileIdentity>,
     /// What the root is, from the first walk on.
     tree: Option<Tree>,
     /// When the last walk was installed: how old the files of an unwatched
     /// root are. From its end, so a walk longer than [`REVALIDATE`] is not
     /// stale as it lands.
     walked_at: Option<Instant>,
+}
+
+/// The index's subscriptions: the tree, entered as it is walked, and the
+/// repository's `info/`, whose `exclude` decides what the walk finds.
+struct Watching {
+    tree: Subscription,
+    _info: Subscription,
 }
 
 /// What changes the file list now: at most one thing at a time.
@@ -332,9 +342,10 @@ impl WorkspaceIndex {
 
     /// Walks the root again on the blocking pool, once the first walk has
     /// found what the root is: a refused one is never walked nor watched,
-    /// any other has the watcher armed first so nothing it reports during
-    /// the walk is missed. The caller set [`Busy::Walking`] and let
-    /// the lock go: the watcher may call back into the index as it arms.
+    /// a watched one is walked into a new subscription, each directory
+    /// entered as the walk goes; the old one is kept until the walk is
+    /// installed, so nothing that changes meanwhile is missed. The caller
+    /// set [`Busy::Walking`].
     fn walk(&self) {
         let weak = Weak::clone(&self.own);
         let (rt, root, closed) = (
@@ -350,7 +361,7 @@ impl WorkspaceIndex {
                 let root = Arc::clone(&root);
                 rt::unblock_with(&*rt, BlockingClass::Storage, 0, move || Tree::of(&root)).await
             };
-            {
+            let watching = {
                 let Some(index) = weak.upgrade() else { return };
                 index.state().tree = Some(tree);
                 match tree {
@@ -361,16 +372,16 @@ impl WorkspaceIndex {
                     }
                     // On a network or virtual root the watcher sees what is
                     // done here (the agent's own edits); walks see the rest.
-                    Tree::Watched | Tree::Unwatched(_) => index.arm(),
+                    Tree::Watched | Tree::Unwatched(_) => Arc::new(index.watch()),
                 }
-            }
-            let (rules, files, identity) = walk(&rt, root, closed).await;
+            };
+            let (rules, files) = walk(&rt, root, closed, Arc::clone(&watching)).await;
             let Some(index) = weak.upgrade() else { return };
             {
                 let mut state = index.state();
                 state.files = Some(Arc::new(files));
                 state.rules = Some(rules);
-                state.root_identity = identity;
+                state.watching = Some(watching);
                 state.walked_at = Some(index.rt.now());
                 state.epoch += 1;
                 state.busy = Busy::Idle;
@@ -382,78 +393,44 @@ impl WorkspaceIndex {
         }));
     }
 
-    /// Arms the watcher, or has it look at the root again if it is armed.
-    fn arm(&self) {
-        let watcher = match self.state().watcher.take() {
-            Some(mut watcher) => {
-                let _ = watcher.refresh();
-                Some(watcher)
-            }
-            None => self.watch().ok(),
-        };
-        self.state().watcher = watcher;
-    }
-
-    /// The watcher's callback runs on the watcher's own thread, where
-    /// rearming or dropping the watcher would wait on that thread: events
-    /// go to an inbox, which a task on the runtime empties.
-    fn watch(&self) -> io::Result<rt::Watcher> {
-        let rt = Arc::clone(&self.rt);
-        let spawn_rt = Arc::clone(&self.rt);
-        let weak = Weak::clone(&self.own);
-        let inbox: Arc<Mutex<(Vec<WatchEvent>, bool)>> = Arc::default();
-        rt::Watcher::new(
-            Arc::new(move |task| spawn_rt.spawn(task)),
-            [&*self.root],
-            move |event| {
-                let mut queued = inbox.lock().unwrap_or_else(PoisonError::into_inner);
-                queued.0.push(event);
-                if std::mem::replace(&mut queued.1, true) {
-                    return;
+    fn watch(&self) -> Watching {
+        let sink = || {
+            let weak = Weak::clone(&self.own);
+            move |events| {
+                if let Some(index) = weak.upgrade() {
+                    index.changed_on_disk(events);
                 }
-                let (inbox, weak) = (Arc::clone(&inbox), Weak::clone(&weak));
-                rt.spawn(Box::pin(async move {
-                    let events = {
-                        let mut queued = inbox.lock().unwrap_or_else(PoisonError::into_inner);
-                        queued.1 = false;
-                        std::mem::take(&mut queued.0)
-                    };
-                    if let Some(index) = weak.upgrade() {
-                        for event in events {
-                            index.changed_on_disk(event);
-                        }
-                    }
-                }));
-            },
-        )
+            }
+        };
+        Watching {
+            tree: (self.hub).subscribe(Watch::entered(&*self.root).excluding(".git"), sink()),
+            _info: (self.hub).subscribe(Watch::entered(self.root.join(".git/info")), sink()),
+        }
     }
 
-    fn changed_on_disk(&self, event: WatchEvent) {
+    fn changed_on_disk(&self, events: Vec<Event>) {
         {
             let mut state = self.state();
-            match event {
-                WatchEvent::Changed(paths) | WatchEvent::RescanPaths(paths) => {
-                    for path in paths {
-                        if self.root.starts_with(&path) {
-                            // The root or a directory above it: the root
-                            // may be gone, back, or replaced by another.
-                            if sys::fs::identity(&self.root).ok() != state.root_identity {
-                                state.pending.rescan = true;
-                            }
-                            continue;
-                        }
-                        let Some(relative) = relative(&self.root, &path) else {
-                            continue;
-                        };
-                        if changes_ignore_rules(&relative) {
-                            state.pending.rescan = true;
-                        } else if !is_git_path(&relative) {
-                            state.pending.paths.insert(path);
-                        }
+            for event in events {
+                let paths = match event {
+                    Event::Changed(paths) => paths,
+                    Event::Rescan | Event::Unavailable(Unavailable::Gone) => {
+                        state.pending.rescan = true;
+                        continue;
                     }
-                }
-                WatchEvent::Overflow | WatchEvent::Rescan | WatchEvent::Unavailable(_) => {
-                    state.pending.rescan = true;
+                    // Watching is short of watches or retrying: what the
+                    // walk found stands, and a recovery is a rescan.
+                    Event::Unavailable(_) => continue,
+                };
+                for path in paths {
+                    let Some(relative) = relative(&self.root, &path) else {
+                        continue;
+                    };
+                    if changes_ignore_rules(&relative) {
+                        state.pending.rescan = true;
+                    } else if !is_git_path(&relative) {
+                        state.pending.paths.insert(path);
+                    }
                 }
             }
         }
@@ -482,10 +459,17 @@ impl WorkspaceIndex {
         };
         let paths = std::mem::take(&mut state.pending.paths);
         let read = matches!(state.content, Content::Ready(_) | Content::Building { .. });
+        let watching = state.watching.clone();
         state.busy = Busy::Applying;
         drop(state);
         let seen = rt::unblock_with(&*self.rt, BlockingClass::Storage, 0, move || {
-            look(&rules, &paths, read)
+            // A directory that appeared is entered as it is looked at.
+            let enter = |dir: &Path| {
+                if let Some(watching) = &watching {
+                    watching.tree.enter(dir);
+                }
+            };
+            look(&rules, &paths, read, &enter)
         });
         let weak = Weak::clone(&self.own);
         self.rt.spawn(Box::pin(async move {
@@ -934,17 +918,19 @@ fn grep_chunk(
 }
 
 /// Every file under the root, from one blocking job, with the rules it
-/// was walked by and what the root was as it began.
+/// was walked by; each directory it enters is entered in `watching`.
 async fn walk(
     rt: &Rt,
     root: Arc<Path>,
     closed: Arc<AtomicBool>,
-) -> (Arc<Rules>, Files, Option<sys::fs::FileIdentity>) {
+    watching: Arc<Watching>,
+) -> (Arc<Rules>, Files) {
     rt::unblock_with(&**rt, BlockingClass::Storage, 0, move || {
-        let identity = sys::fs::identity(&root).ok();
         let rules = Rules::of(&root);
-        let files = Files::walked(rules.walk(&|| closed.load(Ordering::Acquire)));
-        (Arc::new(rules), files, identity)
+        let files = Files::walked(rules.walk(&|| closed.load(Ordering::Acquire), &|dir| {
+            watching.tree.enter(dir);
+        }));
+        (Arc::new(rules), files)
     })
     .await
 }
@@ -1070,7 +1056,12 @@ enum Read {
 
 /// What `paths` (absolute) are now: files the walk would find, the
 /// directories they are in, or gone.
-fn look(rules: &Rules, paths: &BTreeSet<PathBuf>, read_content: bool) -> Vec<Change> {
+fn look(
+    rules: &Rules,
+    paths: &BTreeSet<PathBuf>,
+    read_content: bool,
+    enter: &dyn Fn(&Path),
+) -> Vec<Change> {
     let _never = sys::fs::NeverFetch::new();
     let mut buf = Vec::new();
     let mut content = |found: Found| {
@@ -1106,7 +1097,7 @@ fn look(rules: &Rules, paths: &BTreeSet<PathBuf>, read_content: bool) -> Vec<Cha
                     continue;
                 }
                 let found = rules
-                    .walk_dir(&relative)
+                    .walk_dir(&relative, enter)
                     .into_iter()
                     .map(&mut content)
                     .collect();
@@ -1180,8 +1171,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("alpha.txt"), "needle").unwrap();
         let rt: Rt = Arc::new(rt::Threads::new(2));
+        let hub = Arc::new(Hub::new(Arc::clone(&rt)));
         let indexes = Indexes::new(Limits::default());
-        let index = indexes.open(&root, rt);
+        let index = indexes.open(&root, rt, hub);
         // As a network volume's root is: no notification can be trusted.
         index.state().tree = Some(Tree::Unwatched(sys::fs::Filesystem::Network));
         let found = |query: &str| -> Vec<String> {
@@ -1190,7 +1182,7 @@ mod tests {
         };
         assert_eq!(found("alpha"), ["alpha.txt"]);
         // What is done here, the watcher sees at once.
-        assert!(index.state().watcher.is_some());
+        assert!(index.state().watching.is_some());
         std::fs::write(root.join("beta.txt"), "needle").unwrap();
         eventually("the watcher finds the new file", REVALIDATE / 2, || {
             found("beta") == ["beta.txt"]
@@ -1198,8 +1190,8 @@ mod tests {
 
         // What another machine does, it never sees: a walk does, once a
         // search finds the files old.
-        let watcher = index.state().watcher.take();
-        drop(watcher);
+        let watching = index.state().watching.take();
+        drop(watching);
         std::fs::write(root.join("gamma.txt"), "needle").unwrap();
         assert_eq!(found("gamma"), Vec::<String>::new());
         std::thread::sleep(REVALIDATE);
