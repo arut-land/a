@@ -328,9 +328,8 @@ fn a_directory_removed_and_made_again_is_watched_again() {
     until(&events, "a change in it", changed(&first));
     fs::remove_dir_all(dir.path("entered")).unwrap();
     until(&events, "its removal", changed(&dir.path("entered")));
-    // Its watch is gone once the OS says so; the subscriber hears of it
-    // made again and enters it, as the index does.
-    std::thread::sleep(Duration::from_millis(200));
+    // The subscriber hears of it made again and enters it, as the index
+    // does, whether or not the OS has said yet that its watch went.
     fs::create_dir(dir.path("entered")).unwrap();
     until(&events, "its return", changed(&dir.path("entered")));
     sub.enter(&dir.path("entered"));
@@ -385,4 +384,57 @@ fn a_tree_hears_directories_moved_in_and_not_those_moved_out() {
         }
         changed(&own)(event)
     });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_held_open_while_made_again_is_watched_again() {
+    let dir = Dir::new();
+    let entered = dir.path("entered");
+    fs::create_dir(&entered).unwrap();
+    let hub = hub();
+    let (sub, events) = subscribe(&hub, Watch::entered(&dir.base));
+    sub.enter(&entered);
+    // Held open, its removal is not the end of its watch, which the OS
+    // drops only once it is closed: after the directory is made again.
+    let held = fs::File::open(&entered).unwrap();
+    fs::remove_dir(&entered).unwrap();
+    until(&events, "its removal", changed(&entered));
+    fs::create_dir(&entered).unwrap();
+    until(&events, "its return", changed(&entered));
+    sub.enter(&entered);
+    let first = dir.write("entered/first");
+    until(&events, "a change in it made again", changed(&first));
+    drop(held);
+    let second = dir.write("entered/second");
+    until(
+        &events,
+        "a change after the old watch went",
+        changed(&second),
+    );
+}
+
+#[test]
+fn a_new_outer_subscriber_hears_nothing_from_before_it_subscribed() {
+    let dir = Dir::new();
+    fs::create_dir_all(dir.path("outer/inner")).unwrap();
+    fs::create_dir_all(dir.path("outer/sibling")).unwrap();
+    let hub = hub();
+    let (_inner, inner) = subscribe(&hub, Watch::tree(dir.path("outer/inner")));
+    for i in 0..200 {
+        dir.write(&format!("outer/sibling/{i}"));
+    }
+    let own = dir.write("outer/inner/before");
+    until(&inner, "the inner root's change", changed(&own));
+    std::thread::sleep(Duration::from_millis(500));
+    let (_outer, outer) = subscribe(&hub, Watch::tree(dir.path("outer")));
+    quiet(&outer);
+    let after = dir.write("outer/sibling/after");
+    until(&outer, "a change after subscribing", changed(&after));
+    let later = dir.write("outer/inner/later");
+    until(
+        &inner,
+        "the inner root's change through the outer stream",
+        changed(&later),
+    );
 }

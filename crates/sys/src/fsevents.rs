@@ -37,11 +37,7 @@ type Callback = Box<dyn Fn(Vec<FsEvent>) + Send + Sync>;
 
 /// A started stream over one path and everything under it; dropping it
 /// stops the stream on its queue, after any callback in progress.
-pub struct FsEventStream {
-    stream: Stream,
-    /// The volume's last event as it started.
-    began: u64,
-}
+pub struct FsEventStream(Stream);
 
 struct Stream(*mut c_void);
 
@@ -51,12 +47,9 @@ unsafe impl Send for Stream {}
 
 impl FsEventStream {
     /// Watches `path` (which need not exist yet: its creation is a
-    /// [`FsEventKind::Root`] event), calling `events` on the shared queue,
-    /// from just after event `since` ([`FsEventStream::seen`] of a stream
-    /// it takes over) or from now.
+    /// [`FsEventKind::Root`] event), calling `events` on the shared queue.
     pub fn new(
         path: &Path,
-        since: Option<u64>,
         events: impl Fn(Vec<FsEvent>) + Send + Sync + 'static,
     ) -> io::Result<Self> {
         let path = CString::new(path.as_os_str().as_bytes())
@@ -96,7 +89,7 @@ impl FsEventStream {
                 callback,
                 &raw const context,
                 paths,
-                since.unwrap_or(SINCE_NOW),
+                SINCE_NOW,
                 0.0,
                 FILE_EVENTS | WATCH_ROOT | NO_DEFER,
             );
@@ -107,18 +100,13 @@ impl FsEventStream {
             }
             stream
         };
-        // SAFETY: no argument; reads the volume's event counter.
-        let began = unsafe { FSEventsGetCurrentEventId() };
         let queue = queue();
         // SAFETY: a live stream, scheduled on a queue that lives forever.
         let started = unsafe {
             FSEventStreamSetDispatchQueue(stream, (&raw const **queue).cast());
             FSEventStreamStart(stream) != 0
         };
-        let stream = Self {
-            stream: Stream(stream),
-            began,
-        };
+        let stream = Self(Stream(stream));
         if started {
             Ok(stream)
         } else {
@@ -128,20 +116,18 @@ impl FsEventStream {
 }
 
 impl FsEventStream {
-    /// The last event it delivered, or the volume's last as it started:
-    /// a stream taking over from it starts after this.
-    pub fn seen(&self) -> u64 {
-        // SAFETY: a live stream; reads its last delivered id.
-        match unsafe { FSEventStreamGetLatestEventId(self.stream.0) } {
-            SINCE_NOW => self.began,
-            id => id,
-        }
+    /// Delivers what the stream holds, returning once its callback has
+    /// had it: a stream taking over from this one misses nothing between.
+    /// Never call it from the callback.
+    pub fn flush(&self) {
+        // SAFETY: a live, started stream; called off its queue.
+        unsafe { FSEventStreamFlushSync(self.0.0) };
     }
 }
 
 impl Drop for FsEventStream {
     fn drop(&mut self) {
-        let stream = Stream(std::mem::replace(&mut self.stream.0, std::ptr::null_mut()));
+        let stream = Stream(std::mem::replace(&mut self.0.0, std::ptr::null_mut()));
         // On the queue, so no callback runs during or after it, and the
         // caller never waits for one.
         queue().exec_async(move || {
@@ -181,16 +167,14 @@ extern "C" fn callback(
     let events = paths
         .iter()
         .zip(flags)
-        .filter_map(|(&path, &flags)| {
-            Some(FsEvent {
-                kind: kind(flags)?,
-                // SAFETY: each path is NUL-terminated.
-                path: PathBuf::from(std::ffi::OsString::from_vec(
-                    unsafe { std::ffi::CStr::from_ptr(path) }
-                        .to_bytes()
-                        .to_vec(),
-                )),
-            })
+        .map(|(&path, &flags)| FsEvent {
+            // SAFETY: each path is NUL-terminated.
+            path: PathBuf::from(std::ffi::OsString::from_vec(
+                unsafe { std::ffi::CStr::from_ptr(path) }
+                    .to_bytes()
+                    .to_vec(),
+            )),
+            kind: kind(flags),
         })
         .collect();
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(events)));
@@ -201,28 +185,22 @@ extern "C" fn release(info: *const c_void) {
     drop(unsafe { Box::from_raw(info.cast_mut().cast::<Callback>()) });
 }
 
-fn kind(flags: u32) -> Option<FsEventKind> {
-    // The end of a replay from `since`: it names nothing.
-    if flags & HISTORY_DONE != 0 {
-        return None;
+fn kind(flags: u32) -> FsEventKind {
+    if flags & (USER_DROPPED | KERNEL_DROPPED | IDS_WRAPPED) != 0 {
+        FsEventKind::Dropped
+    } else if flags & MUST_SCAN_SUBDIRS != 0 {
+        FsEventKind::ScanTree
+    } else if flags & ROOT_CHANGED != 0 {
+        FsEventKind::Root
+    } else if flags & (MOUNT | UNMOUNT) != 0 {
+        FsEventKind::Mount
+    } else if flags & (ITEM_CREATED | IS_DIR) == ITEM_CREATED | IS_DIR
+        && flags & (ITEM_REMOVED | ITEM_RENAMED) == 0
+    {
+        FsEventKind::DirCreated
+    } else {
+        FsEventKind::Item
     }
-    Some(
-        if flags & (USER_DROPPED | KERNEL_DROPPED | IDS_WRAPPED) != 0 {
-            FsEventKind::Dropped
-        } else if flags & MUST_SCAN_SUBDIRS != 0 {
-            FsEventKind::ScanTree
-        } else if flags & ROOT_CHANGED != 0 {
-            FsEventKind::Root
-        } else if flags & (MOUNT | UNMOUNT) != 0 {
-            FsEventKind::Mount
-        } else if flags & (ITEM_CREATED | IS_DIR) == ITEM_CREATED | IS_DIR
-            && flags & (ITEM_REMOVED | ITEM_RENAMED) == 0
-        {
-            FsEventKind::DirCreated
-        } else {
-            FsEventKind::Item
-        },
-    )
 }
 
 const SINCE_NOW: u64 = u64::MAX;
@@ -233,7 +211,6 @@ const MUST_SCAN_SUBDIRS: u32 = 0x01;
 const USER_DROPPED: u32 = 0x02;
 const KERNEL_DROPPED: u32 = 0x04;
 const IDS_WRAPPED: u32 = 0x08;
-const HISTORY_DONE: u32 = 0x10;
 const ROOT_CHANGED: u32 = 0x20;
 const MOUNT: u32 = 0x40;
 const UNMOUNT: u32 = 0x80;
@@ -286,6 +263,5 @@ unsafe extern "C" {
     fn FSEventStreamStop(stream: *mut c_void);
     fn FSEventStreamInvalidate(stream: *mut c_void);
     fn FSEventStreamRelease(stream: *mut c_void);
-    fn FSEventStreamGetLatestEventId(stream: *mut c_void) -> u64;
-    fn FSEventsGetCurrentEventId() -> u64;
+    fn FSEventStreamFlushSync(stream: *mut c_void);
 }

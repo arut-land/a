@@ -70,39 +70,22 @@ impl Native {
         result
     }
 
+    /// What is above the root is watched before the root is looked at,
+    /// so a root made meanwhile is either seen here or heard of there.
     fn arm_into(&mut self, held: &mut Held, sub: &Sub) -> Result<(), Unavailable> {
-        if sub.real.is_dir() {
-            let shared = (sub.real.ancestors())
-                .find(|dir| (self.trees.get(*dir)).is_some_and(|h| h.identity == identity(dir)));
-            let key = if let Some(dir) = shared {
-                dir.to_owned()
-            } else {
-                self.open_tree(&sub.real)?;
-                sub.real.clone()
-            };
-            let handle = self.trees.get_mut(&key).expect("opened");
-            handle.refs += 1;
-            held.tree = Some((key, handle.serial));
-        }
         let parent = existing_parent(&sub.real);
         let covering = parent.and_then(|parent| {
-            (self.trees.keys())
-                .find(|tree| parent.starts_with(tree))
-                .cloned()
+            (parent.ancestors())
+                .find(|dir| (self.trees.get(*dir)).is_some_and(|h| h.identity == identity(dir)))
+                .map(Path::to_owned)
         });
-        // A missing root inside another's tree is followed by that tree,
-        // held so that it outlives the one who opened it.
-        if held.tree.is_none()
-            && let Some(key) = covering.clone()
-        {
+        if let Some(key) = covering {
+            // Another's tree follows the root, held so that it outlives
+            // the one who opened it.
             let handle = self.trees.get_mut(&key).expect("listed");
             handle.refs += 1;
             held.tree = Some((key, handle.serial));
-            return Err(Unavailable::Gone);
-        }
-        if let Some(parent) = parent
-            && covering.is_none()
-        {
+        } else if let Some(parent) = parent {
             if !self.parents.contains_key(parent) {
                 let handle = self.open(parent, Depth::Entries)?;
                 self.parents.insert(parent.to_owned(), handle);
@@ -111,11 +94,22 @@ impl Native {
             handle.refs += 1;
             held.parent = Some((parent.to_owned(), handle.serial));
         }
-        if held.tree.is_some() {
-            Ok(())
-        } else {
-            Err(Unavailable::Gone)
+        if !sub.real.is_dir() {
+            return Err(Unavailable::Gone);
         }
+        if held.tree.is_none() {
+            let shared = self
+                .trees
+                .get(&sub.real)
+                .is_some_and(|h| h.identity == identity(&sub.real));
+            if !shared {
+                self.open_tree(&sub.real)?;
+            }
+            let handle = self.trees.get_mut(&sub.real).expect("opened");
+            handle.refs += 1;
+            held.tree = Some((sub.real.clone(), handle.serial));
+        }
+        Ok(())
     }
 
     pub(super) fn disarm(&mut self, id: u64) {

@@ -191,8 +191,9 @@ enum Raw {
     /// Lost or coalesced changes under a path, or (`None`) anywhere: every
     /// watch is rearmed.
     Rescan(Option<PathBuf>),
-    /// The native watches at and under a path are gone with it: what was
-    /// entered there is entered again only when asked.
+    /// The native watch of a directory is gone, and no other watches what
+    /// is at its path now: entered there, it is entered again only when
+    /// asked.
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),
         expect(dead_code)
@@ -288,9 +289,9 @@ impl Subscription {
         let Some(real) = sub.entering(dir) else {
             return;
         };
-        if !sub.entered.insert(real.clone()) {
-            return;
-        }
+        // Asked again even when entered: a watch the OS has not yet said
+        // it dropped may name a directory gone and made again.
+        sub.entered.insert(real.clone());
         if let Err(error) = native.enter(self.id, &real) {
             sub.entered.remove(&real);
             // Gone already, or not watchable: nothing is missed.
@@ -378,7 +379,7 @@ impl State {
                 }
                 Raw::Unwatched(path) => {
                     for sub in self.subs.values_mut() {
-                        sub.entered.retain(|dir| !dir.starts_with(&path));
+                        sub.entered.remove(&path);
                     }
                 }
                 Raw::Freed => {
@@ -450,13 +451,11 @@ impl State {
         let now = identity(&sub.root);
         match (sub.status, now) {
             (Status::Live(Some(was)), Some(now)) if was == now => {}
-            // What is missing above it may have moved: follow it closer,
-            // and look again once that is armed, for what was made before.
+            // What is missing above it may have moved: follow it closer.
+            // A backend watches above the root before it looks at it, so a
+            // root made meanwhile is armed now or heard of next.
             (Status::Gone, None) => {
-                if self.rearm(id) == Armed::Gone
-                    && identity(&self.subs[&id].root).is_some()
-                    && self.rearm(id) == Armed::Live
-                {
+                if self.rearm(id) == Armed::Live {
                     self.tell(id, Event::Rescan);
                 }
             }

@@ -311,7 +311,11 @@ impl Native {
             }
             if note.flags.contains(ReadFlags::IGNORED) {
                 if let Some(path) = self.forget(note.wd) {
-                    raws.push(Raw::Unwatched(path));
+                    // Dropped late (it was held open), its path may name a
+                    // directory made since and watched anew.
+                    if !self.dirs.values().any(|w| w.path == path) {
+                        raws.push(Raw::Unwatched(path));
+                    }
                     freed = true;
                 }
                 continue;
@@ -336,8 +340,7 @@ impl Native {
             }
             if dir && note.flags.contains(ReadFlags::MOVED_FROM) {
                 // Its watches follow it out, naming paths it no longer has.
-                self.forget_under(&path);
-                raws.push(Raw::Unwatched(path.clone()));
+                raws.extend(self.forget_under(&path).into_iter().map(Raw::Unwatched));
             }
             raws.push(Raw::Changed(path));
         }
@@ -359,17 +362,20 @@ impl Native {
         Some(watched.path)
     }
 
-    fn forget_under(&mut self, path: &Path) {
+    /// Drops the watches at and under `path`: the paths they watched.
+    fn forget_under(&mut self, path: &Path) -> Vec<PathBuf> {
         let gone: Vec<Wd> = (self.dirs.iter())
             .filter(|(_, w)| w.path.starts_with(path))
             .map(|(&wd, _)| wd)
             .collect();
-        for wd in gone {
-            if let Some(open) = &self.open {
-                let _ = inotify::remove_watch(open.fd.get_ref(), wd);
-            }
-            self.forget(wd);
-        }
+        (gone.into_iter())
+            .filter_map(|wd| {
+                if let Some(open) = &self.open {
+                    let _ = inotify::remove_watch(open.fd.get_ref(), wd);
+                }
+                self.forget(wd)
+            })
+            .collect()
     }
 }
 

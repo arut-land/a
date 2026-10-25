@@ -87,13 +87,8 @@ impl Native {
             .filter(|key| key.starts_with(root))
             .cloned()
             .collect();
-        // From the earliest event a stream it takes over has not delivered:
-        // nothing under a nested root falls between the two.
-        let since = (nested.iter())
-            .map(|key| self.streams[key].stream.seen())
-            .min();
         let (me, key) = (self.me.clone(), root.to_owned());
-        let stream = FsEventStream::new(root, since, move |events| {
+        let stream = FsEventStream::new(root, move |events| {
             if let Some(shared) = me.upgrade() {
                 shared.post(events.into_iter().map(|e| raw(e, &key)).collect());
             }
@@ -104,7 +99,11 @@ impl Native {
         })?;
         let mut refs = 0;
         for key in nested {
-            refs += self.streams.remove(&key).expect("listed").refs;
+            let nested = self.streams.remove(&key).expect("listed");
+            // What it holds is delivered before it goes, the new stream
+            // already running: nothing under it falls between the two.
+            nested.stream.flush();
+            refs += nested.refs;
             for held in self.held.values_mut().filter(|held| **held == key) {
                 root.clone_into(held);
             }
