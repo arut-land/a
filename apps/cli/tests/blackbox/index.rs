@@ -2,6 +2,7 @@
 //! `files.search` and `files.grep` about a workspace no session has
 //! been started in.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -41,8 +42,19 @@ fn ask(env: &Isolated, daemon: &Daemon, service: &str, tree: &Path, body: &Value
     let body = Json::encode(body).unwrap();
     // A daemon that went away says why in its log.
     let failed = |error: &dyn std::fmt::Display| -> ! {
-        let log = fs::read_to_string(env.home.daemon_log()).unwrap_or_default();
-        panic!("{service}: {error}\ndaemon log:\n{log}")
+        let mut said = String::new();
+        for dir in [env.home.logs_dir(), env.home.crash_dir()] {
+            for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let text = fs::read_to_string(entry.path()).unwrap_or_default();
+                let _ = writeln!(said, "{}:\n{text}", entry.path().display());
+            }
+        }
+        let status = env
+            .command(&["daemon", "status"])
+            .output()
+            .map(|o| o.stdout);
+        let status = String::from_utf8_lossy(&status.unwrap_or_default()).into_owned();
+        panic!("{service}: {error}\ndaemon status: {status}\n{said}")
     };
     let answers = daemon
         .query(service, scope, body)
@@ -94,7 +106,7 @@ fn an_at_mention_search_answers_from_the_workspace_index() {
             break;
         }
         assert!(Instant::now() < until, "{found}");
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
