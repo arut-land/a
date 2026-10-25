@@ -30,6 +30,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 use std::thread;
 
+use client::Host;
 use client::{Driver, End, Env, Event, Link, Renderer, SessionClient, Show};
 use protocol::Target;
 use protocol::view::{
@@ -54,9 +55,9 @@ fn main() -> ExitCode {
     let (prompt, mode) = (args.prompt, args.mode);
     let result = match args.cmd {
         Some(Cmd::Daemon { action }) if prompt.is_none() => {
-            daemon_cmd(args.host.as_deref(), action).map(|()| ExitCode::SUCCESS)
+            daemon_cmd(args.host.as_ref(), action).map(|()| ExitCode::SUCCESS)
         }
-        cmd => daemon_of(args.host.as_deref(), cmd.as_ref()).and_then(|(home, daemon)| {
+        cmd => daemon_of(args.host.as_ref(), cmd.as_ref()).and_then(|(home, daemon)| {
             let done = match cmd {
                 None => return session(&daemon, Target::New, prompt, mode),
                 Some(Cmd::Resume { id: None, any }) => {
@@ -73,7 +74,7 @@ fn main() -> ExitCode {
                 Some(Cmd::New) => new(&daemon),
                 Some(Cmd::Fork { session }) => fork(&daemon, &session),
                 Some(Cmd::Bridge { token }) => client::bridge(
-                    here(&home, args.host.as_deref())?,
+                    here(&home, args.host.as_ref())?,
                     token.as_deref().unwrap_or(&daemon.staged.id),
                 ),
                 Some(Cmd::Web { no_open }) => web(daemon, !no_open),
@@ -87,7 +88,7 @@ fn main() -> ExitCode {
                     lock_fd,
                     reset_breaker,
                 }) => serve(
-                    here(&home, args.host.as_deref())?,
+                    here(&home, args.host.as_ref())?,
                     &daemon.staged,
                     listen_fd,
                     lock_fd,
@@ -142,7 +143,7 @@ fn write(mut output: impl Write + IsTerminal, stream: usize, args: fmt::Argument
 /// Entry points that attach resolve their installed image first, so a daemon
 /// they may spawn runs the newest installed build. `a web` serves pages, not
 /// a person at its terminal, so ssh may not ask there.
-fn daemon_of(host: Option<&str>, cmd: Option<&Cmd>) -> io::Result<(Home, client::Daemon)> {
+fn daemon_of(host: Option<&Host>, cmd: Option<&Cmd>) -> io::Result<(Home, client::Daemon)> {
     let home = Home::from_env()?;
     let staged = home.runtime().stage(&std::env::current_exe()?)?;
     let prompt = match cmd {
@@ -150,14 +151,17 @@ fn daemon_of(host: Option<&str>, cmd: Option<&Cmd>) -> io::Result<(Home, client:
         _ => sys::Prompt::Terminal,
     };
     let daemon = match host {
-        Some(host) => client::Daemon::new(client::SshLink::new(host, prompt), staged),
+        Some(host) => client::Daemon::new(
+            client::SshLink::new(host.clone(), prompt, home.clone()),
+            staged,
+        ),
         None => client::Daemon::local(home.clone(), staged),
     };
     Ok((home, daemon))
 }
 
 /// This machine's home, for a command that acts on this machine only.
-fn here<'a>(home: &'a Home, host: Option<&str>) -> io::Result<&'a Home> {
+fn here<'a>(home: &'a Home, host: Option<&Host>) -> io::Result<&'a Home> {
     match host {
         None => Ok(home),
         Some(host) => Err(io::Error::other(format!(
@@ -188,7 +192,7 @@ fn wedged(daemon: &client::Daemon, e: client::Error) -> io::Error {
 
 const RESTART: &str = "run `a daemon restart` to replace it";
 
-fn daemon_cmd(host: Option<&str>, action: Daemon) -> io::Result<()> {
+fn daemon_cmd(host: Option<&Host>, action: Daemon) -> io::Result<()> {
     let home = Home::from_env()?;
     let home = here(&home, host)?.clone();
     match action {

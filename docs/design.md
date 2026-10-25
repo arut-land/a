@@ -75,6 +75,31 @@ matching. A client with no one at its terminal (`a web`) runs ssh in batch
 mode, and a host that would ask for a password is a typed error. Later
 transports are further `Link` types.
 
+Every home has a machine identity: `protocol::MachineId`, the first 128
+bits of the SHA-256 of an X25519 public key whose secret `sys::machine_id`
+makes the first time the home needs one and keeps in the state directory
+(mode 0600; sealed with DPAPI on Windows; see
+[the measurements](perf/machine-key.md)). The daemon reads it on the
+blocking pool while it loads, and its welcome names it. A client of this
+machine's daemon names no machine in its hello; one over another link names
+its own home's, so the daemon knows whether a client shares its files. That
+claim is unauthenticated (any process of this user may claim any machine),
+which the trust rule allows: it attributes, it never decides. The client's
+`Connection::machine` is the daemon's. What a connection may do
+(`protocol::Role`) the daemon decides in one place, `server::role_of`, from
+how the connection came, never from the client: trust is this user on a way
+in that authenticated this user. The daemon's one way in is its endpoint,
+which the OS opens to this user alone, and a client bridged over ssh comes
+through it too, so every connection owns the daemon today; a way that does
+not prove that (another person's pinned key, later) is a new `server::Way`
+decided there. Every request is admitted once, by `Conn::admit`, before
+anything acts on it: a viewer's that would write (a mutation, an
+environment, a new or forked session, the settings, a shutdown) is refused,
+and its attach keeps the session's environment. No key is exchanged yet.
+The client's machine is not logged: it decides nothing a replay must
+reproduce, and the log names a mutation's client already. `--host` is a
+`client::Host`, which is never something ssh would read as an option.
+
 See [the client SDK](client.md) and [CLI](cli.md), and the staging and
 endpoint types in `crates/sys`. The daemon targets macOS, Linux and Windows.
 Windows uses SID-restricted named pipes, overlapped completion events over
@@ -314,8 +339,11 @@ files of a workspace for an @-mention, say. `r.query(Q)` registers one;
 like a tool, its answer's shape (at once, a future, or streamed updates
 before the reply) is the type `answer` returns, and its `Scope` type
 (`Daemon`, `Workspace`, `Session`) is what its `QueryCx` holds. A query
-is asked about its scope or a narrower one that implies it. `QueryCx`
-has no way to append, publish or change state, so a query can never
+is asked about its scope or a narrower one that implies it, and its
+`QueryCx` names who asks (`machine`, the client's claimed machine, so a
+query can tell a client on the daemon's machine from one elsewhere) and the
+`role` the daemon gave it.
+`QueryCx` has no way to append, publish or change state, so a query can never
 write a log. Welcome advertises the queries; each is ephemeral,
 correlated by the client's id, cancelled by `Cancel` or a hangup, and
 admitted against a `QueueBudget` of its own, so queries held open never

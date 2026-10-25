@@ -26,6 +26,7 @@ pub mod fs;
 pub mod install;
 pub mod log;
 mod login;
+mod machine;
 mod memory;
 mod paths;
 mod platform;
@@ -50,6 +51,7 @@ pub use desktop::open_browser;
 pub use endpoint::{Endpoint, EndpointRetirement, Listener, OwnedConnection, Stream};
 pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
+pub use machine::machine_id;
 pub use memory::small_footprint;
 /// The resolved locations belonging to one daemon.
 pub use paths::Paths as Home;

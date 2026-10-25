@@ -199,6 +199,11 @@ impl Paths {
         self.run_dir().join("daemon.sock")
     }
 
+    /// The home's long-term key; see [`crate::machine_id`].
+    pub fn machine_key_file(&self) -> PathBuf {
+        self.inner.state.join("machine.key")
+    }
+
     /// The user's settings; see [`crate::Config`].
     pub fn config_file(&self) -> PathBuf {
         self.inner.config.join("config.toml")

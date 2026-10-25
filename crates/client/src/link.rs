@@ -10,7 +10,9 @@ use std::sync::{Arc, LazyLock};
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use protocol::{Caps, ClientId, ClientMsg, DaemonMsg, Decode, Environment, PROTO, Versions};
+use protocol::{
+    Caps, ClientId, ClientMsg, DaemonMsg, Decode, Environment, MachineId, PROTO, Versions,
+};
 use rt::{BoxFuture, Rt, Runtime};
 use sys::{Home, Staged};
 
@@ -82,6 +84,9 @@ impl Start {
 /// A byte stream a [`Link`] opened.
 pub struct Opened {
     pub stream: Box<dyn Stream>,
+    /// This machine, as the hello names it to a daemon on another; `None`
+    /// to this machine's own.
+    pub machine: Option<MachineId>,
     /// What the link read past its own preamble: the start of the daemon's
     /// answer.
     pub buffered: Vec<u8>,
@@ -294,6 +299,7 @@ pub(crate) fn socket(rt: &Rt, stream: sys::OwnedConnection) -> io::Result<Opened
             rt::Async::new(&reactor, stream)?,
             (),
         )),
+        machine: None,
         buffered: Vec::new(),
         remote: None,
         within: crate::HELLO_TIMEOUT,
@@ -301,7 +307,8 @@ pub(crate) fn socket(rt: &Rt, stream: sys::OwnedConnection) -> io::Result<Opened
 }
 
 pub(crate) enum Greeting {
-    Welcome,
+    /// The daemon's machine.
+    Welcome(MachineId),
     Draining,
     /// The daemon's versions.
     Mismatch(Versions),
@@ -326,6 +333,7 @@ pub(crate) async fn connect(
     for _ in 0..3 {
         let Opened {
             stream,
+            machine,
             mut buffered,
             remote,
             within,
@@ -333,7 +341,7 @@ pub(crate) async fn connect(
         start = start.again();
         let first = first(remote.as_ref())?;
         let greeting = rt::or(
-            hello(&*stream, &mut buffered, &build.id, client, &first),
+            hello(&*stream, &mut buffered, &build.id, client, machine, &first),
             async {
                 rt.sleep(within).await;
                 Err(Error::NotResponding)
@@ -341,11 +349,12 @@ pub(crate) async fn connect(
         )
         .await;
         match greeting {
-            Ok((Greeting::Welcome, welcome, commands, queries)) => {
+            Ok((Greeting::Welcome(theirs), welcome, commands, queries)) => {
                 return Ok(Connection {
                     stream,
                     buffered,
                     remote,
+                    machine: theirs,
                     welcome,
                     commands,
                     queries,
@@ -371,12 +380,14 @@ pub(crate) async fn connect(
     Err(Error::Closed)
 }
 
-/// Sends the hello and `first` back to back, then reads the answer.
+/// Sends the hello, from `machine` if it is named, and `first` back to
+/// back, then reads the answer.
 pub(crate) async fn hello(
     stream: &dyn Stream,
     buffered: &mut Vec<u8>,
     build: &str,
     client: Option<ClientId>,
+    machine: Option<MachineId>,
     first: &[ClientMsg],
 ) -> Result<
     (
@@ -394,6 +405,7 @@ pub(crate) async fn hello(
             min: Versions::OURS.min_field(),
             caps: Caps::ALL,
             client,
+            machine,
         })
         .await?;
     // A daemon that refuses the hello may hang up before reading these, so
@@ -409,13 +421,14 @@ pub(crate) async fn hello(
         Some(DaemonMsg::Welcome {
             proto,
             caps,
+            machine,
             commands,
             queries,
             ..
         }) => {
             sent?;
             let welcome = Welcome { proto, caps };
-            Ok((Greeting::Welcome, welcome, commands, queries))
+            Ok((Greeting::Welcome(machine), welcome, commands, queries))
         }
         Some(DaemonMsg::Draining) => Ok((
             Greeting::Draining,

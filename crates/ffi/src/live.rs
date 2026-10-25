@@ -698,6 +698,7 @@ mod tests {
             proto: protocol::PROTO,
             build: "test".into(),
             caps: Caps::ALL,
+            machine: protocol::MachineId([0; 16]),
             commands: Vec::new(),
             queries: Vec::new(),
         };
@@ -764,6 +765,7 @@ mod tests {
             proto: protocol::PROTO,
             build: "test".into(),
             caps: Caps::ALL,
+            machine: protocol::MachineId([0; 16]),
             commands: Vec::new(),
             queries: Vec::new(),
         };
@@ -866,6 +868,7 @@ mod tests {
             proto: protocol::PROTO,
             build: "test".into(),
             caps: Caps::ALL,
+            machine: protocol::MachineId([0; 16]),
             commands: Vec::new(),
             queries: Vec::new(),
         };

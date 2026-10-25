@@ -26,8 +26,8 @@ use ext::Flag;
 use ext_logging::{Build, Fact, Fault, Operation, Stop, emit as fact};
 use outbox::Outbox;
 use protocol::{
-    Body, DaemonMsg, Entry, Environment, Frame, Json, Mode, Outcome, SessionId, SessionSummary,
-    Target,
+    Body, DaemonMsg, Entry, Environment, Frame, Json, MachineId, Mode, Outcome, SessionId,
+    SessionSummary, Target,
 };
 use rt::oneshot;
 use server::reply;
@@ -233,8 +233,38 @@ struct Daemon {
     stopping: Mutex<Option<Stop>>,
     /// When it started, in seconds since the Unix epoch.
     started: u64,
+    machine: Arc<Machine>,
     /// The engine's services every query is given beside the extensions'.
     queried: Arc<ext::host::SessionServices>,
+}
+
+/// This home's machine identity, read (made, the first time) on the
+/// blocking pool while the daemon loads: a welcome waits for it, nothing
+/// else does.
+#[derive(Default)]
+struct Machine {
+    id: std::sync::OnceLock<Result<MachineId, String>>,
+    known: Flag,
+}
+
+impl Machine {
+    fn read(home: &Home, rt: &dyn rt::Runtime) -> Arc<Self> {
+        let machine = Arc::new(Self::default());
+        let (known, home) = (Arc::clone(&machine), home.clone());
+        let read = rt::unblock(rt, move || sys::machine_id(&home));
+        rt.spawn(Box::pin(async move {
+            let id = read.await.map(MachineId).map_err(|e| e.to_string());
+            let _ = known.id.set(id);
+            known.known.set();
+        }));
+        machine
+    }
+
+    /// The id, or why the home has none.
+    async fn id(&self) -> Result<MachineId, String> {
+        self.known.wait().await;
+        self.id.get().cloned().expect("read before it is known")
+    }
 }
 
 /// A session the daemon knows about.
@@ -352,6 +382,7 @@ impl Daemon {
     }
 
     fn load_on(home: &Home, config: &Config, runtime: &Arc<impl rt::Runtime>) -> io::Result<Owner> {
+        let machine = Machine::read(home, &**runtime);
         // Extensions publish these facts as they register.
         sys::shell::ExecutionFacts::initialize(home)?;
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
@@ -409,6 +440,7 @@ impl Daemon {
             started: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
+            machine,
         });
         // Mark every slot before scheduling any load, so an immediate child
         // report finds its parent. Spawn every admission future before waiting:

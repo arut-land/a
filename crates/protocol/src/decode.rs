@@ -30,8 +30,8 @@ use crate::view::{Item, Status, Usage, ViewSnapshot, ViewState};
 use crate::{
     Activity, Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
     CommandInfo, DaemonMsg, Decode, Entry, Environment, Epoch, ForkError, HomeSettings, Installed,
-    Json, Mode, Outcome, Permission, Rejection, Role, Seq, SessionId, SessionSummary,
-    SettingsChange, Target, ToolChoice, Verdict, WaitOn,
+    Json, Mode, Outcome, Permission, Rejection, Seq, SessionId, SessionSummary, SettingsChange,
+    Target, ToolChoice, Verdict, WaitOn,
 };
 
 /// Declares a tagged union of the wire, one line per kind:
@@ -278,6 +278,7 @@ same!(
     SessionId,
     PathBuf,
     Caps,
+    crate::MachineId,
     Rejection,
     Target,
     Environment,
@@ -502,6 +503,7 @@ pub(crate) struct MsgFields {
     pub(crate) build: Option<String>,
     pub(crate) caps: Option<Caps>,
     pub(crate) client: Option<Json>,
+    pub(crate) machine: Option<crate::MachineId>,
     pub(crate) commands: Option<Vec<CommandInfo>>,
     pub(crate) supported: Option<u32>,
     pub(crate) min: Option<u32>,
@@ -531,7 +533,6 @@ pub(crate) struct MsgFields {
     pub(crate) since: Option<u64>,
     pub(crate) env: Option<Environment>,
     pub(crate) decl: Option<ClientDecl>,
-    pub(crate) role: Option<Role>,
     pub(crate) sites: Option<Vec<String>>,
     pub(crate) client_seq: Option<u64>,
     pub(crate) approved: Option<bool>,
@@ -657,7 +658,6 @@ pub(crate) fn snapshot_msg(f: &mut MsgFields) -> Result<DaemonMsg> {
 #[allow(clippy::unnecessary_wraps, reason = "as `kinds!` calls it")]
 pub(crate) fn declare_msg(f: &mut MsgFields) -> Result<ClientMsg> {
     Ok(ClientMsg::Declare(ClientDecl {
-        role: f.role.take().unwrap_or_default(),
         tools: f.tools.take().unwrap_or_default(),
         sites: f.sites.take().unwrap_or_default(),
     }))

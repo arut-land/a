@@ -11,13 +11,14 @@ use crate::store::{Header, Jsonl, LogStore};
 use protocol::view::SessionView;
 use protocol::{
     Body, CallId, Caps, ClientDecl, ClientId, ClientMsg, DaemonMsg, Entry, Environment, Epoch,
-    PROTO, Rejection, Role, Seq, SessionId, SettingsChange, Target, read_frame, write_frame,
+    MachineId, PROTO, Rejection, Role, Seq, SessionId, SettingsChange, Target, read_frame,
+    write_frame,
 };
 use sys::Home;
 
 use super::outbox::Outbox;
-use super::server::handle;
-use super::{Config, Daemon, Lifecycle, Owner};
+use super::server::{Way, handle, handle_as};
+use super::{Config, Daemon, Lifecycle, Owner, lock};
 
 struct Fixture {
     root: PathBuf,
@@ -62,18 +63,27 @@ impl Fixture {
 
     /// A client connection, served as the daemon serves one.
     fn connect(&self) -> Peer<'_> {
+        self.served(None)
+    }
+
+    /// A connection the daemon serves as a viewer: one no transport
+    /// makes yet.
+    fn connect_viewer(&self) -> Peer<'_> {
+        self.served(Some(|_| Role::Viewer))
+    }
+
+    fn served(&self, role: Option<fn(Way) -> Role>) -> Peer<'_> {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let (daemon, life) = (Arc::clone(&self.daemon), Arc::clone(&self.life));
         let rt = Arc::clone(&daemon.shared.rt);
         let finished = ext::Flag::default();
         let done = finished.clone();
         rt.spawn(Box::pin(async move {
-            let _ = handle(
-                &daemon,
-                &life,
-                sys::OwnedConnection::try_from(theirs).unwrap(),
-            )
-            .await;
+            let stream = sys::OwnedConnection::try_from(theirs).unwrap();
+            let _ = match role {
+                None => handle(&daemon, &life, stream).await,
+                Some(role) => handle_as(&daemon, &life, stream, role).await,
+            };
             done.set();
         }));
         ours.set_read_timeout(Some(Duration::from_secs(10)))
@@ -164,6 +174,7 @@ fn hello(caps: Caps) -> ClientMsg {
         min: None,
         caps,
         client: None,
+        machine: None,
     }
 }
 
@@ -175,6 +186,7 @@ fn hello_as(client: ClientId) -> ClientMsg {
         min: None,
         caps: Caps::ALL,
         client: Some(client),
+        machine: None,
     }
 }
 
@@ -395,29 +407,100 @@ fn a_repeated_mutation_is_answered_again_but_not_done_again() {
     assert_eq!(inputs, 1);
 }
 
+/// A role is the daemon's to give, and checked once for everything a
+/// client sends: a viewer writes nothing by any request (a mutation, an
+/// environment, a new or forked session, the settings, a shutdown), even
+/// after it declares itself again, and attaches without its environment.
 #[test]
-fn a_viewer_cannot_change_the_session() {
+fn a_viewer_writes_nothing_by_any_request() {
     let fixture = Fixture::new("viewer");
-    let mut peer = fixture.connect();
-    peer.send(&hello(Caps::ALL));
-    let viewer = ClientDecl {
-        role: Role::Viewer,
-        ..ClientDecl::default()
+    let session = {
+        let mut owner = fixture.connect();
+        owner.send(&hello(Caps::ALL));
+        owner.send(&attach(Target::New, 0, ClientDecl::default()));
+        assert!(matches!(owner.answer(), DaemonMsg::Welcome { .. }));
+        let DaemonMsg::Attached { session, .. } = owner.answer() else {
+            panic!("not attached");
+        };
+        session
     };
-    peer.send(&attach(Target::New, 0, viewer));
+    fixture.settle();
+    let logged = || fixture.daemon.shared.store.entries(session).unwrap().len();
+    let before = logged();
+    let env = Environment::new("/w".into(), [("VIEWER".into(), "1".into())], false);
+    let mut peer = fixture.connect_viewer();
+    peer.send(&hello(Caps::ALL));
+    peer.send(&ClientMsg::Attach {
+        target: Target::Id(session),
+        workspace: "/w".into(),
+        since: 0,
+        env: Some(env.clone()),
+        decl: ClientDecl::default(),
+    });
+    assert!(matches!(peer.answer(), DaemonMsg::Welcome { .. }));
+    assert!(matches!(peer.answer(), DaemonMsg::Attached { .. }));
     peer.send(&input("hi", 1));
     peer.send(&ClientMsg::Declare(ClientDecl::default()));
     peer.send(&input("hi", 2));
-    assert!(matches!(peer.answer(), DaemonMsg::Welcome { .. }));
-    assert!(matches!(peer.answer(), DaemonMsg::Attached { .. }));
+    for _ in 0..2 {
+        assert!(matches!(
+            peer.answer(),
+            DaemonMsg::Rejected {
+                reason: Rejection::ReadOnly,
+                ..
+            }
+        ));
+    }
+    peer.send(&ClientMsg::Environment(env));
+    assert!(matches!(peer.answer(), DaemonMsg::Error { .. }));
+    peer.send(&attach(Target::New, 0, ClientDecl::default()));
+    assert!(matches!(peer.answer(), DaemonMsg::Error { .. }));
+    peer.send(&attach(
+        Target::Fork {
+            session: session.to_string(),
+            seq: None,
+        },
+        0,
+        ClientDecl::default(),
+    ));
     assert!(matches!(
         peer.answer(),
-        DaemonMsg::Rejected {
-            reason: Rejection::ReadOnly,
-            ..
+        DaemonMsg::ForkRejected {
+            reason: protocol::ForkError::Viewer
         }
     ));
-    assert!(matches!(peer.answer(), DaemonMsg::Ack { client_seq: o } if o == origin(1, 2)));
+    peer.send(&ClientMsg::Settings {
+        change: Some(SettingsChange {
+            model: Some("a:b".into()),
+            ..SettingsChange::default()
+        }),
+    });
+    assert!(matches!(
+        peer.answer(),
+        DaemonMsg::Settings { error: Some(_), .. }
+    ));
+    peer.send(&ClientMsg::Shutdown);
+    assert!(matches!(peer.answer(), DaemonMsg::Error { .. }));
+    drop(peer);
+    fixture.settle();
+    assert_eq!(logged(), before);
+    assert_eq!(fixture.daemon.shared.store.headers().unwrap().len(), 1);
+    assert!(!fixture.root.join("config.toml").exists());
+    assert!(lock(&fixture.daemon.stopping).is_none());
+}
+
+/// A client asks its home for the machine id the daemon names itself by:
+/// one key, whichever process of the home made it.
+#[test]
+fn the_welcome_names_the_homes_machine() {
+    let fixture = Fixture::new("machine");
+    let mut peer = fixture.connect();
+    peer.send(&hello(Caps::NONE));
+    let DaemonMsg::Welcome { machine, .. } = peer.recv() else {
+        panic!("no welcome");
+    };
+    let home = Home::from(fixture.root.clone());
+    assert_eq!(machine, MachineId(sys::machine_id(&home).unwrap()));
 }
 
 #[test]
@@ -430,6 +513,7 @@ fn a_mismatched_hello_gets_the_range_and_nothing_behind_it_is_done() {
         min: Some(PROTO + 1),
         caps: Caps::ALL,
         client: None,
+        machine: None,
     });
     peer.send(&attach(Target::New, 0, ClientDecl::default()));
     peer.send(&input("hi", 1));
@@ -451,6 +535,7 @@ fn a_mismatched_hello_gets_the_range_and_nothing_behind_it_is_done() {
         min: Some(PROTO),
         caps: Caps::NONE,
         client: None,
+        machine: None,
     });
     assert!(matches!(
         peer.recv(),
@@ -657,33 +742,21 @@ fn fork_refusals_are_typed_and_leave_the_source_attachment_usable() {
         .find(|entry| matches!(entry.body, Body::Input { .. }))
         .unwrap()
         .seq;
-    for (source, seq, decl, expected) in [
+    for (source, seq, expected) in [
         (
             "no-such-session".to_owned(),
             None,
-            ClientDecl::default(),
             protocol::ForkError::SourceNotFound,
         ),
         (
             session.to_string(),
             Seq::new(u64::MAX),
-            ClientDecl::default(),
             protocol::ForkError::InvalidSequence,
         ),
         (
             session.to_string(),
             Some(pending),
-            ClientDecl::default(),
             protocol::ForkError::Unfinished,
-        ),
-        (
-            session.to_string(),
-            None,
-            ClientDecl {
-                role: Role::Viewer,
-                ..ClientDecl::default()
-            },
-            protocol::ForkError::Viewer,
         ),
     ] {
         peer.send(&attach(
@@ -692,7 +765,7 @@ fn fork_refusals_are_typed_and_leave_the_source_attachment_usable() {
                 seq,
             },
             0,
-            decl,
+            ClientDecl::default(),
         ));
         assert!(matches!(peer.answer(), DaemonMsg::ForkRejected { reason } if reason == expected));
     }

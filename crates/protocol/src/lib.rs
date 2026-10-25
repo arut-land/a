@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 31;
+pub const PROTO: u32 = 32;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 31;
+pub const PROTO_MIN: u32 = 32;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -99,11 +99,13 @@ pub mod blob;
 #[macro_use]
 mod decode;
 pub mod ledger;
+mod peer;
 pub mod publication;
 pub mod view;
 
 pub use blob::{BlobId, BlobOrigin, BlobRef, Held, Payload};
 pub use json::Json;
+pub use peer::{MachineId, Role};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -1390,35 +1392,12 @@ impl fmt::Display for Versions {
 /// declared the tool, and UI contributions to those that render the site.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientDecl {
-    #[serde(default, skip_serializing_if = "Role::is_owner")]
-    pub role: Role,
     /// Tools this client runs itself, by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
     /// UI sites it renders, such as `dialog` or `status`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sites: Vec<String>,
-}
-
-/// What a client may do to a session.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    #[default]
-    Owner,
-    Collaborator,
-    /// Read-only: its mutations are rejected. A role this build does not
-    /// know counts as this one.
-    #[serde(other)]
-    Viewer,
-}
-
-impl Role {
-    // A reference, as `skip_serializing_if` passes it.
-    #[allow(clippy::trivially_copy_pass_by_ref)]
-    const fn is_owner(&self) -> bool {
-        matches!(self, Self::Owner)
-    }
 }
 
 /// A slash command the daemon runs: input `/name args`.
@@ -1501,13 +1480,15 @@ kinds! {
         /// connections, so that its numbered mutations are logged with their
         /// [`Author`] and a resend, after a reconnect or a daemon restart, is
         /// answered as the first was; without it, the connection is the
-        /// client.
+        /// client. `machine` is the client's, where that is not the
+        /// daemon's: a client of this machine's daemon leaves it out.
         Hello "hello" {
             proto: u32,
             build: String,
             min: Option<u32> = default,
             caps: Caps = default,
             client: Option<ClientId> = default,
+            machine: Option<MachineId> = default,
         };
         /// `env` is the client's, for the commands the session runs; without
         /// one the session keeps the environment it had. `workspace` is the
@@ -1670,13 +1651,14 @@ kinds! {
     #[derive(Clone, Debug, Serialize)]
     pub enum DaemonMsg: t = "t" in MsgFields, class {
         /// The hello is accepted at protocol `proto`. `caps` are the client's
-        /// capabilities the daemon takes up. `commands` are the slash
-        /// commands the daemon runs, for help and completion; `queries`
-        /// what it answers [`ClientMsg::Query`] about.
+        /// capabilities the daemon takes up. `machine` is the daemon's.
+        /// `commands` are the slash commands the daemon runs, for help and
+        /// completion; `queries` what it answers [`ClientMsg::Query`] about.
         Welcome "welcome" {
             proto: u32,
             build: String,
             caps: Caps = default,
+            machine: MachineId,
             commands: Vec<CommandInfo> = default,
             queries: Vec<QueryInfo> = default,
         } = Control;

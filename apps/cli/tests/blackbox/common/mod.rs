@@ -403,6 +403,7 @@ pub fn hello() -> ClientMsg {
         min: None,
         caps: protocol::Caps::NONE,
         client: None,
+        machine: None,
     }
 }
 
