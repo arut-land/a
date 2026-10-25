@@ -452,6 +452,41 @@ impl Body {
     /// An interrupt no client asked for.
     pub const INTERRUPT: Self = Self::Interrupt { origin: None };
 
+    /// The client mutation that logged the entry, if one did.
+    pub const fn origin(&self) -> Option<Author> {
+        match self {
+            Self::Input { origin, .. }
+            | Self::Withdraw { origin, .. }
+            | Self::Answer { origin, .. }
+            | Self::Interrupt { origin } => *origin,
+            Self::Take { .. }
+            | Self::Assistant { .. }
+            | Self::Context { .. }
+            | Self::ModelCall { .. }
+            | Self::ModelResult { .. }
+            | Self::ToolCall { .. }
+            | Self::ToolProcess { .. }
+            | Self::Fact { .. }
+            | Self::Progress { .. }
+            | Self::Detached { .. }
+            | Self::ToolResult { .. }
+            | Self::Decision { .. }
+            | Self::Wait { .. }
+            | Self::Link { .. }
+            | Self::Outbox { .. }
+            | Self::Enqueue { .. }
+            | Self::Ack { .. }
+            | Self::Spawned { .. }
+            | Self::Watch { .. }
+            | Self::Fired { .. }
+            | Self::Environment { .. }
+            | Self::Extensions { .. }
+            | Self::Ext { .. }
+            | Self::Edit { .. }
+            | Self::Unknown { .. } => None,
+        }
+    }
+
     /// Every reference the entry holds outside the log: what its `held`
     /// fields list, a tool outcome held as a blob (logged, replaced by a
     /// `post_tool` decision, a child's, or carried by an envelope), input
