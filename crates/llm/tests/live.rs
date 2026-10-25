@@ -3,19 +3,19 @@
 //! (the TLS the platform gives). They read keys and base URLs from the
 //! environment.
 
-#![cfg(feature = "ureq")]
+#![cfg(feature = "client")]
 
 use std::sync::Arc;
 
 use llm::protocols::{chat, messages, responses};
 use llm::{
     Assistant, AssistantPart, Message, Output, Provider, Reason, Request, Tool, ToolMessage,
-    ToolResult, Ureq,
+    ToolResult,
 };
 use serde_json::json;
 
-fn http() -> Ureq {
-    Ureq::new(Arc::new(rt::Threads::new(1)), llm::Redirects::Follow)
+fn http() -> llm::Client {
+    llm::Client::new(Arc::new(rt::Threads::new(1)), llm::Redirects::Follow)
 }
 
 fn openai() -> Provider {

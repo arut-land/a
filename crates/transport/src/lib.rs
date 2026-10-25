@@ -107,7 +107,7 @@ pub trait HttpClients: Send + Sync {
     fn client(&self, policy: RedirectPolicy) -> Arc<dyn Http>;
 }
 
-#[cfg(feature = "ureq")]
-mod ureq;
-#[cfg(feature = "ureq")]
-pub use ureq::{Clients, Ureq};
+#[cfg(feature = "client")]
+mod client;
+#[cfg(feature = "client")]
+pub use client::{Client, Clients};

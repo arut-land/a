@@ -40,7 +40,7 @@ fn the_sdk_does_no_io() {
         "sys",
         "engine",
         "kernel",
-        "ureq",
+        "ureq-proto",
         "mio",
         "rustix",
         "tokio",

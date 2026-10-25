@@ -50,8 +50,8 @@ deny = [
     # builds free of it.
     { crate = "tokio", reason = "the engine runs on rt; rt's tokio adapter is opt-in" },
     { crate = "async-std", reason = "the engine runs on rt" },
-    { crate = "hyper", reason = "ureq is the HTTP client" },
-    { crate = "reqwest", reason = "ureq is the HTTP client" },
+    { crate = "hyper", reason = "transport is the HTTP client, async over rt" },
+    { crate = "reqwest", reason = "transport is the HTTP client, async over rt" },
     # The optional rustls transport uses ring; the binary uses native TLS.
     { crate = "aws-lc-sys", reason = "rustls uses ring" },
 ]
@@ -59,11 +59,9 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Require immutable revisions for the two upstream fixes.
+# Require immutable revisions for upstream fixes.
 required-git-spec = "rev"
 allow-git = [
-    # Native TLS without an unused Mozilla certificate bundle.
-    "https://github.com/algesten/ureq",
     # Scheduler state must outlive wakes racing executor destruction.
     "https://github.com/smol-rs/async-executor",
 ]

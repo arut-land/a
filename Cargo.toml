@@ -53,8 +53,6 @@ libc = { version = "0.2.191", default-features = false }
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
-# Upstream fixes native-tls-no-default so platform roots need no bundled copy.
-ureq = { git = "https://github.com/algesten/ureq", rev = "8fcd72a7881354400c432157e1a60222d61efc5c", default-features = false }
 usage-rs = { version = "=7.1.0", default-features = false, features = ["help", "diagnostics", "completions"] }
 uuid = { version = "1", default-features = false, features = ["std", "v5", "v7", "serde"] }
 

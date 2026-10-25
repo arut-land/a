@@ -31,5 +31,5 @@ pub use prepare::NO_RESULT;
 pub use protocol::{Auth, Decoder, Encoded, Flow, Frame, Protocol, Provider, Secret, Target};
 pub use spec::*;
 pub use tag::Tag;
-#[cfg(feature = "ureq")]
-pub use transport::{RedirectPolicy as Redirects, Ureq};
+#[cfg(feature = "client")]
+pub use transport::{Client, RedirectPolicy as Redirects};

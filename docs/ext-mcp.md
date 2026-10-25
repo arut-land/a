@@ -83,7 +83,7 @@ There is no `initialize` fallback. Cancellation attempts a nonblocking
 servers that ignore notifications. HTTP refuses all redirects before any
 resend, including same-origin redirects: configure the final endpoint
 explicitly. Provider HTTP callers choose their redirect policy explicitly.
-HTTP uses `llm::Ureq` over the existing runtime, supports JSON and
+HTTP uses `llm::Client` over the existing runtime, supports JSON and
 request-scoped SSE, and closes its response stream on cancellation. It mirrors method, tool name and valid
 `x-mcp-header` parameters, using the prescribed Base64 sentinel encoding
 when necessary. Invalid header annotations are excluded from HTTP tool

@@ -18,7 +18,7 @@ everything around them is our own and small.
 | Prepare | `prepare.rs` | Runs before every encode: turns from another protocol, provider or model lose opaque items and state, and keep their readable reasoning as tagged context naming its source; foreign tool ids are fitted; unanswered calls get error results. |
 | Tags | `tag.rs` | Model-facing markers (`Tag`, one renderer) and their vocabulary: pastes, steers, inbox messages, background results, another model's reasoning. Attribute values are escaped; bodies go in verbatim. |
 | Client | `client.rs` | `stream` joins a provider, a protocol and an `Http` into a stream of events that ends with exactly one `Finish` or one error. `generate` accumulates it. No retries: `Error::is_retryable` says whether to. |
-| HTTP | `http.rs`, `ureq.rs` | `Http` sends one request and returns status, headers and a body stream. `Ureq` (feature `ureq`) runs ureq on the `rt` runtime's blocking pool. |
+| HTTP | `crates/transport` | `Http` sends one request and returns status, headers and a body stream. `Client` (feature `client`) speaks HTTP/1.1 over sockets on the `rt` reactor, holding no thread ([perf/transport.md](perf/transport.md)). |
 | Hosts | `hosts.rs` | `host:model` specs (`openrouter:anthropic/claude-sonnet-5`, `openai@chat:gpt-4.1`) to a configured provider, over every `Hosted` protocol's table. |
 
 Protocols live in `protocols/<name>/` with a `KEY`, a protocol type holding

@@ -26,10 +26,10 @@ would require replacing their runtime-dependent client implementation.
 We therefore implement only the tool client subset over `json` (through
 `protocol::Json`), serde_json, `rt` and the existing process spawner.
 
-Streamable HTTP reuses `llm::Http` / `llm::Ureq`, including backpressure
-and socket shutdown when dropped. There is no second reactor, HTTP
+Streamable HTTP reuses `llm::Http` / `llm::Client`, including backpressure
+and closing the connection when dropped. There is no second reactor, HTTP
 implementation or TLS configuration. Base64 uses maintained `base64`
-0.23, already present through ureq, rather than a custom encoder.
+0.23, already present through ureq-proto, rather than a custom encoder.
 
 ## Release size
 
@@ -80,7 +80,7 @@ JSON/SSE, response identity and safe mirrored HTTP headers.
 ## Review hardening
 
 The HTTP transport now requires an explicit `Redirects` policy at every
-`llm::Ureq` construction. MCP chooses `Refuse`: even same-origin redirects
+`llm::Client` construction. MCP chooses `Refuse`: even same-origin redirects
 return a typed outcome before a second request. The cross-host leak proof
 and a same-origin 307 test exercise the real HTTP transport.
 

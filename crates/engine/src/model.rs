@@ -1,5 +1,5 @@
 //! The model a session calls: a provider and model id from its settings
-//! (`host:model`, or a bare model on `OpenAI`), sent over ureq.
+//! (`host:model`, or a bare model on `OpenAI`), sent over `transport`.
 
 use std::path::Path;
 use std::sync::Arc;

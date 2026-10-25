@@ -22,7 +22,7 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
   the listener and each connection wait on their sockets through its
   reactor (`rt::Async`), so neither a request nor an open tab holds a
   thread, and the app runs on its async workers. `httparse` parses; the
-  `http` types are the ones `ureq`
+  `http` types are the ones `transport`
   already links. No tokio, hyper or axum (`deny.toml`).
 - **Gate** (`http.rs`, `Gate`): who may use the UI. The printed link
   carries a one-time token; redeeming it sets a cookie for that host.
