@@ -43,18 +43,19 @@ fn a_query_is_answered_by_id_and_never_logged() {
     );
     drop(welcome);
 
-    let about = env.home.root().join("about");
-    std::fs::create_dir(&about).unwrap();
-    let streamed = echo(
-        &daemon,
-        Scope::Workspace(about.clone()),
-        &json!({ "text": "hi", "times": 2 }),
+    // A directory names its workspace as an attach from it finds it: the
+    // session's, which `a` started there.
+    let dir = Scope::Workspace(env.home.root().to_path_buf());
+    let streamed = echo(&daemon, dir.clone(), &json!({ "text": "hi", "times": 2 }));
+    let workspace = &session.workspace;
+    assert_eq!(
+        streamed,
+        [update("hi"), update("hi"), echoed("hi", workspace)]
     );
-    assert_eq!(streamed, [update("hi"), update("hi"), echoed("hi", &about)]);
     // A workspace query about a session answers about its workspace.
     assert_eq!(
         echo(&daemon, Scope::Session(session.id), &json!({ "text": "s" })),
-        [echoed("s", &session.workspace)]
+        [echoed("s", workspace)]
     );
     let [Answer::Reply(Outcome::Failed { error })] =
         &echo(&daemon, Scope::Daemon, &json!({ "text": "d" }))[..]
@@ -64,9 +65,7 @@ fn a_query_is_answered_by_id_and_never_logged() {
     assert_eq!(error, "echo answers about a workspace");
 
     let held = Json::encode(&json!({ "text": "held", "times": 1, "hold": true })).unwrap();
-    let mut answers = daemon
-        .query("echo", Scope::Workspace(about.clone()), held)
-        .unwrap();
+    let mut answers = daemon.query("echo", dir, held).unwrap();
     assert_eq!(answers.next().unwrap().unwrap(), update("held"));
     answers.canceller().cancel().unwrap();
     assert_eq!(
