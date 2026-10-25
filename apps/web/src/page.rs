@@ -65,13 +65,9 @@ impl Page {
         }
     }
 
-    /// Clears the composer after the pump admitted the submission.
-    pub fn admitted(&mut self) {
-        if self.error.is_none() {
-            self.out.extend_from_slice(
-                b"event: datastar-patch-signals\ndata: signals {\"draft\":\"\"}\n\n",
-            );
-        }
+    /// Whether the last line was admitted by the SDK and driver pump.
+    pub fn admitted(&self) -> bool {
+        self.error.is_none()
     }
 
     pub fn command(&mut self, cmd: Cmd) -> Vec<Effect> {
@@ -397,41 +393,20 @@ mod tests {
     }
 
     #[test]
-    fn the_composer_clears_only_when_the_sdk_admits_the_line() {
+    fn submission_admission_includes_sdk_and_driver_rejection() {
         let mut page = synced();
         let effects = page.line("/interrupt");
         client::pump(|_| Ok(()), &mut page, effects);
-        page.admitted();
-        assert!(
-            !String::from_utf8(page.take())
-                .unwrap()
-                .contains("datastar-patch-signals")
-        );
-        let mut page = synced();
+        assert!(!page.admitted());
         let effects = page.line("send this draft");
         client::pump(|_| Ok(()), &mut page, effects);
-        page.admitted();
-        assert!(
-            String::from_utf8(page.take())
-                .unwrap()
-                .contains("data: signals {\"draft\":\"\"}")
-        );
+        assert!(page.admitted());
         let effects = page.line("transport rejected");
         client::pump(|_| Err(Error::Busy), &mut page, effects);
-        page.admitted();
-        assert!(
-            !String::from_utf8(page.take())
-                .unwrap()
-                .contains("datastar-patch-signals")
-        );
+        assert!(!page.admitted());
         let effects = page.line("/help");
         client::pump(|_| Ok(()), &mut page, effects);
-        page.admitted();
-        assert!(
-            !String::from_utf8(page.take())
-                .unwrap()
-                .contains("datastar-patch-signals")
-        );
+        assert!(!page.admitted());
     }
 
     #[test]
