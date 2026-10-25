@@ -619,6 +619,12 @@ impl Live {
         self.frames.read_entries(&*self.session.shared.rt).await
     }
 
+    /// Whether the session's log references blob `blob`.
+    pub(crate) async fn references(&self, blob: protocol::BlobId) -> io::Result<bool> {
+        let frames = Arc::clone(&self.frames);
+        rt::unblock(&*self.session.shared.rt, move || frames.references(&blob)).await
+    }
+
     /// Opens session `header`'s log, folds it into a kernel and starts the
     /// actor, which resumes it: the only way a session recovers. It blocks
     /// on the store, so it runs on a thread that may.

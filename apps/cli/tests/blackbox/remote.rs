@@ -2,11 +2,13 @@
 //! the "remote" command locally under a home of its own.
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Output, Stdio};
 
 use crate::common::{Env, hello};
-use protocol::{Body, ClientMsg, DaemonMsg, PROTO, Target, read_frame, write_frame};
+use protocol::{
+    Body, ClientMsg, DaemonMsg, Decode, PROTO, SessionId, Target, read_frame, write_frame,
+};
 use sys::Home;
 
 #[test]
@@ -57,6 +59,77 @@ fn bridge_speaks_the_protocol_over_stdio() {
 
     // Closing stdin ends the connection, and with it the bridge.
     drop(send);
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}
+
+/// What ssh carries is the bridge's stdio: a blob's chunk frames cross it
+/// as they are, binary, with the reply after them.
+#[test]
+fn a_blob_fetched_over_a_bridge_arrives_byte_identical() {
+    let env = Env::new("bridge-fetch");
+    env.run(&["--mode", "auto", "-p", "$ seq 1 100000"]);
+    let dir = fs::read_dir(env.home.sessions_dir())
+        .unwrap()
+        .next()
+        .unwrap();
+    let name = dir.unwrap().file_name().into_string().unwrap();
+    let session: SessionId = serde_json::from_value(name.into()).unwrap();
+    let blob = (env.log(session).into_iter())
+        .flat_map(|entry| entry.body.blobs())
+        .find_map(|held| match held {
+            protocol::Held::Blob(blob) => Some(blob.id),
+            protocol::Held::Stream(_) => None,
+        })
+        .expect("the shell kept its output whole");
+    let stored = fs::read(env.home.blobs_dir().join(blob.fan()).join(blob.to_string())).unwrap();
+
+    let mut child = env
+        .cmd(&["bridge", "tok"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    stdout.read_line(&mut String::new()).unwrap();
+    read_frame::<ClientMsg>(&mut stdout).unwrap().unwrap();
+    write_frame(&mut stdin, &hello()).unwrap();
+    let fetch = ClientMsg::Fetch {
+        id: 1,
+        session,
+        blob,
+        offset: 0,
+        len: None,
+    };
+    write_frame(&mut stdin, &fetch).unwrap();
+    assert!(matches!(
+        read_frame::<DaemonMsg>(&mut stdout).unwrap(),
+        Some(DaemonMsg::Welcome { .. })
+    ));
+    let mut fetched = Vec::new();
+    let sent = loop {
+        let mut frame = vec![0; 4];
+        stdout.read_exact(&mut frame).unwrap();
+        let len = u32::from_le_bytes(frame[..4].try_into().unwrap());
+        frame.resize(4 + len as usize, 0);
+        stdout.read_exact(&mut frame[4..]).unwrap();
+        match protocol::frame_in(&frame).unwrap().unwrap().1 {
+            protocol::Framed::Chunk(chunk) => {
+                assert_eq!((chunk.blob, chunk.offset), (blob, fetched.len() as u64));
+                fetched.extend_from_slice(chunk.bytes);
+            }
+            protocol::Framed::Json(json) => match DaemonMsg::from_json(json).unwrap() {
+                DaemonMsg::Reply {
+                    id: 1,
+                    outcome: protocol::Outcome::Done { output },
+                } => break output.parse::<u64>().unwrap(),
+                other => panic!("{other:?}"),
+            },
+        }
+    };
+    assert_eq!(sent, stored.len() as u64);
+    assert!(fetched == stored, "the bytes differ from the stored");
     drop(stdin);
     assert!(child.wait().unwrap().success());
 }

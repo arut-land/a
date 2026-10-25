@@ -150,7 +150,7 @@ impl dyn Stream + '_ {
     pub(crate) async fn recv<T: Decode>(&self, buffered: &mut Vec<u8>) -> io::Result<Option<T>> {
         loop {
             if let Some((len, body)) = protocol::frame_in(buffered)? {
-                let msg = T::from_json(body)?;
+                let msg = T::from_json(body.json()?)?;
                 buffered.drain(..len);
                 return Ok(Some(msg));
             }
@@ -189,7 +189,7 @@ impl dyn Stream + '_ {
     }
 
     /// Reads more into `buffered`; `false` at the end of the stream.
-    async fn fill(&self, buffered: &mut Vec<u8>) -> io::Result<bool> {
+    pub(crate) async fn fill(&self, buffered: &mut Vec<u8>) -> io::Result<bool> {
         let kept = buffered.len();
         buffered.resize(kept + 8192, 0);
         let read = self.read(&mut buffered[kept..]).await;

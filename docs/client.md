@@ -20,8 +20,8 @@ Driver (drive.rs)                  pump: the one fixpoint loop; threads: connect
   │                                connection, one writer
   ▼
 transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: connect, connect_as,
-           remote.rs, query.rs)    sessions, new_session, query; the one hello over any Link;
-                                   Error, Connection, stop/status/restart/diagnose, bridge
+           remote.rs, query.rs,    sessions, new_session, query, fetch; the one hello over any
+           fetch.rs)               Link; Error, Connection, stop/status/restart/diagnose, bridge
 ```
 
 - **Transport.** `Daemon { link, staged, pinned }` is the daemon as a
@@ -171,6 +171,16 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   right behind the hello. The FFI's `QueryStream` is this, its answers
   taken with an async `next()` a few ahead of the app: none is dropped,
   as the daemon streams no faster than the app takes them.
+- **Blobs.** `Daemon::fetch(session, blob, range)` (or
+  `Connection::fetch`) reads a blob a session's log references, as its
+  `BlobRef` names it, over a connection of its own: `range` is any
+  `RangeBounds<u64>` (`..`, `..4096` for a head), clamped to the blob's
+  end. `Fetched` is an `io::Read` of the bytes in order; the read that
+  ends them fails if the daemon refused or stopped the fetch, or if a
+  chunk came out of place or the count sent differs from what arrived.
+  Its `canceller()` is a query's. The FFI's `BlobFetch` hands the pieces
+  to the app with an async `next()` (`Bytes`, then `Done` or `Failed`),
+  paced as a query's answers are.
 
 ## How an app drives it
 

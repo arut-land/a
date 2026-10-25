@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 35;
+pub const PROTO: u32 = 36;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 35;
+pub const PROTO_MIN: u32 = 36;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -71,18 +71,20 @@ impl Write for EncodeTarget<'_> {
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
 /// What a frame's body is, in the byte after its length: a reader refuses
-/// a kind it does not know, so binary frames (a blob's chunks) can follow
-/// without going through base64.
+/// a kind it does not know.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameKind {
     Json = 0,
+    /// A blob's bytes, as they are: never base64 ([`Chunk`]).
+    Chunk = 1,
 }
 
 impl FrameKind {
     fn of(byte: u8) -> io::Result<Self> {
         match byte {
             0 => Ok(Self::Json),
+            1 => Ok(Self::Chunk),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown frame kind {byte}"),
@@ -93,6 +95,64 @@ impl FrameKind {
 
 /// The length, then the kind.
 const HEADER: usize = 5;
+
+/// A chunk's blob id, then its offset.
+const CHUNK_HEADER: usize = 32 + 8;
+
+/// A frame's body, as its kind reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Framed<'a> {
+    Json(&'a [u8]),
+    Chunk(Chunk<'a>),
+}
+
+/// Bytes `offset..` of blob `blob`. Its frame's body is the blob's id, the
+/// offset as a little-endian u64, then the bytes. Named by content, not by
+/// the request they answer: a chunk is the same whoever asked for it, as
+/// an upload's will be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chunk<'a> {
+    pub blob: BlobId,
+    pub offset: u64,
+    pub bytes: &'a [u8],
+}
+
+impl<'a> Framed<'a> {
+    fn read(kind: FrameKind, body: &'a [u8]) -> io::Result<Self> {
+        match kind {
+            FrameKind::Json => Ok(Self::Json(body)),
+            FrameKind::Chunk => {
+                let Some((blob, offset, bytes)) = body
+                    .split_first_chunk::<32>()
+                    .and_then(|(blob, rest)| Some((blob, rest.split_first_chunk::<8>()?)))
+                    .map(|(blob, (offset, bytes))| (blob, offset, bytes))
+                else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "a chunk frame shorter than its header",
+                    ));
+                };
+                Ok(Self::Chunk(Chunk {
+                    blob: BlobId(*blob),
+                    offset: u64::from_le_bytes(*offset),
+                    bytes,
+                }))
+            }
+        }
+    }
+
+    /// The JSON of a frame that must hold a message: a chunk where one is
+    /// due is a peer's mistake.
+    pub fn json(self) -> io::Result<&'a [u8]> {
+        match self {
+            Self::Json(body) => Ok(body),
+            Self::Chunk(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a chunk frame where a message was due",
+            )),
+        }
+    }
+}
 
 mod address;
 pub mod blob;
@@ -1725,6 +1785,12 @@ kinds! {
         /// Stops query `id`: its reply follows, interrupted unless it was
         /// sent already.
         Cancel "cancel" { id: u64 };
+        /// Asks for blob `blob`'s bytes from `offset`, `len` of them or all
+        /// to its end, as session `session`'s log references it: answered
+        /// by their [`Chunk`] frames in order, then one
+        /// [`DaemonMsg::Reply`] naming `id`, whose output is how many bytes
+        /// were sent. `id` is a query's, cancelled as one is.
+        Fetch "fetch" { id: u64, session: SessionId, blob: BlobId, offset: u64 = default, len: Option<u64> = default };
     }
     else Err(serde_json::Error::custom("unknown client message"))
 }
@@ -1826,7 +1892,8 @@ impl ClientMsg {
             | Self::Shutdown
             | Self::Settings { .. }
             | Self::Query { .. }
-            | Self::Cancel { .. } => None,
+            | Self::Cancel { .. }
+            | Self::Fetch { .. } => None,
         }
     }
 }
@@ -2038,9 +2105,20 @@ impl Frame {
         &self.bytes
     }
 
-    /// The JSON the frame carries, past its header.
+    /// What the frame carries, past its header.
     pub fn body(&self) -> &[u8] {
         &self.bytes[HEADER..]
+    }
+
+    /// The frame of `chunk`: about the connection, as the request it
+    /// answers is.
+    pub fn chunk(chunk: Chunk<'_>) -> io::Result<Self> {
+        let mut bytes = Vec::with_capacity(HEADER + CHUNK_HEADER + chunk.bytes.len());
+        bytes.extend_from_slice(&[0, 0, 0, 0, FrameKind::Chunk as u8]);
+        bytes.extend_from_slice(&chunk.blob.0);
+        bytes.extend_from_slice(&chunk.offset.to_le_bytes());
+        bytes.extend_from_slice(chunk.bytes);
+        Self::finish(bytes, None, Class::Control)
     }
 
     /// Entry `seq`'s frame from the line a log stores for it, newline
@@ -2092,9 +2170,9 @@ pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
 }
 
 /// The frame `buf` starts with, once it holds all of it: its length,
-/// header included, and its JSON body. For a reader that never blocks: it
+/// header included, and its body. For a reader that never blocks: it
 /// reads what is there and asks again.
-pub fn frame_in(buf: &[u8]) -> io::Result<Option<(usize, &[u8])>> {
+pub fn frame_in(buf: &[u8]) -> io::Result<Option<(usize, Framed<'_>)>> {
     let Some(&[a, b, c, d]) = buf.get(..4) else {
         return Ok(None);
     };
@@ -2103,8 +2181,8 @@ pub fn frame_in(buf: &[u8]) -> io::Result<Option<(usize, &[u8])>> {
     let Some(frame) = buf.get(4..end) else {
         return Ok(None);
     };
-    FrameKind::of(frame[0])?;
-    Ok(Some((end, &frame[1..])))
+    let body = Framed::read(FrameKind::of(frame[0])?, &frame[1..])?;
+    Ok(Some((end, body)))
 }
 
 /// What a length prefix says follows it: a kind byte at least, and no
@@ -2136,7 +2214,12 @@ fn read_body(r: &mut dyn Read) -> io::Result<Option<Vec<u8>>> {
     let len = length(u32::from_le_bytes(len))?;
     let mut kind = [0];
     r.read_exact(&mut kind)?;
-    FrameKind::of(kind[0])?;
+    if FrameKind::of(kind[0])? != FrameKind::Json {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a chunk frame where a message was due",
+        ));
+    }
     let len = len - 1;
     // Grown as the bytes arrive, so a length alone allocates no more than
     // the peer goes on to send.
@@ -2539,6 +2622,42 @@ mod tests {
         assert!(r.1 <= 128 * 1024, "asked for {} bytes at once", r.1);
     }
 
+    /// A chunk's bytes cross as they are, behind the blob and offset they
+    /// are at; a reader of messages refuses one rather than parse it.
+    #[test]
+    fn a_chunk_frame_carries_its_bytes_unencoded() {
+        let bytes = [0, 0xff, b'"', b'\n'];
+        let chunk = Chunk {
+            blob: BlobId([7; 32]),
+            offset: 1 << 40,
+            bytes: &bytes,
+        };
+        let frame = Frame::chunk(chunk).unwrap();
+        let wire = frame.as_bytes();
+        assert_eq!(wire.len(), HEADER + CHUNK_HEADER + bytes.len());
+        assert!(wire.ends_with(&bytes));
+        assert_eq!(
+            frame_in(wire).unwrap(),
+            Some((wire.len(), Framed::Chunk(chunk)))
+        );
+        assert_eq!(frame.class, Class::Control);
+        let err = read_frame::<DaemonMsg>(&mut &wire[..]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let (_, framed) = frame_in(wire).unwrap().unwrap();
+        assert_eq!(
+            framed.json().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        // One shorter than its header is refused, not read short.
+        let mut cut = wire[..HEADER + CHUNK_HEADER - 1].to_vec();
+        let len = u32::try_from(cut.len() - 4).unwrap();
+        cut[..4].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(
+            frame_in(&cut).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
     /// Only the kinds this build knows are read: a binary frame from a
     /// newer peer is refused, never parsed as JSON.
     #[test]
@@ -2547,7 +2666,7 @@ mod tests {
         write_frame(&mut buf, &ClientMsg::Detach).unwrap();
         assert_eq!(buf[4], FrameKind::Json as u8);
         assert_eq!(frame_in(&buf).unwrap().map(|(end, _)| end), Some(buf.len()));
-        buf[4] = 1;
+        buf[4] = 2;
         for err in [
             frame_in(&buf).unwrap_err(),
             read_frame::<ClientMsg>(&mut buf.as_slice()).unwrap_err(),

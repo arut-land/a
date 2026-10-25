@@ -25,7 +25,7 @@ use protocol::view::{
 use protocol::{CommandInfo, SessionSummary};
 
 pub use feed::Reducer;
-pub use live::{Client, QueryStream, Session, SessionWatch, find_session};
+pub use live::{BlobFetch, Client, QueryStream, Session, SessionWatch, find_session};
 
 /// The purpose of the side request that titles a session, as the app
 /// reads its reply from the view.
@@ -508,6 +508,23 @@ impl From<io::Result<client::Answer>> for QueryAnswer {
             },
         }
     }
+}
+
+/// A piece of a blob as it arrives, in order; nothing follows any but
+/// bytes.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlobPiece {
+    Bytes {
+        bytes: Vec<u8>,
+    },
+    /// Every byte asked for came.
+    Done,
+    /// Why not: refused (no session it can be fetched through references
+    /// it), cancelled, or the connection's failure.
+    Failed {
+        error: String,
+    },
 }
 
 /// Ordered approval content from the client SDK.

@@ -1,7 +1,7 @@
-//! Queries a connection asks the extensions, each answered on a task of
-//! its own and never logged: the session's log is not touched, and the
-//! connection goes on reading while one runs. Every query admitted ends
-//! with one [`DaemonMsg::Reply`].
+//! Queries a connection asks the extensions, and the blobs it fetches,
+//! each answered on a task of its own and never logged: the session's log
+//! is not touched, and the connection goes on reading while one runs.
+//! Every one admitted ends with one [`DaemonMsg::Reply`].
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -12,6 +12,7 @@ use ext::{BoxFuture, Cancel};
 use protocol::{ClientMsg, DaemonMsg, Frame, Json, MachineId, Outcome, QueryInfo, Role, Scope};
 
 use crate::driver::contain;
+use crate::fetch::Fetch;
 use crate::outbox::{Outbox, QueuePermit};
 use crate::server::{reply, workspace_of};
 use crate::{Daemon, lock};
@@ -22,25 +23,40 @@ use crate::{Daemon, lock};
 pub(crate) struct Queries(Arc<Mutex<BTreeMap<u64, Cancel>>>);
 
 impl Queries {
-    /// Takes a query, answered on its own task if it is admitted, or its
-    /// cancel; hands back any other message. `bytes` is what its frame
-    /// weighed.
+    /// Takes a query or a fetch, answered on its own task if it is
+    /// admitted, or a cancel of either; hands back any other message.
+    /// `bytes` is what its frame weighed.
     pub(crate) fn take(
         &self,
-        daemon: &Daemon,
+        daemon: &Arc<Daemon>,
         outbox: &Outbox,
         machine: MachineId,
         role: Role,
         msg: ClientMsg,
         bytes: usize,
     ) -> Option<ClientMsg> {
-        let (id, service, scope, body) = match msg {
+        let (id, ask) = match msg {
             ClientMsg::Query {
                 id,
                 service,
                 scope,
                 body,
-            } => (id, service, scope, body),
+            } => (id, Ask::Query(service, scope, body)),
+            ClientMsg::Fetch {
+                id,
+                session,
+                blob,
+                offset,
+                len,
+            } => (
+                id,
+                Ask::Fetch(Fetch {
+                    session,
+                    blob,
+                    offset,
+                    len,
+                }),
+            ),
             ClientMsg::Cancel { id } => {
                 if let Some(cancel) = lock(&self.0).get(&id) {
                     cancel.set();
@@ -63,36 +79,53 @@ impl Queries {
         let Some(permit) = QueuePermit::query(bytes) else {
             return failed("daemon admission is full".into());
         };
-        let registry = daemon.shared.registry.get();
-        let Some(query) = registry.query(&service) else {
-            return failed(format!("no query named {service}"));
-        };
-        let at = match scope {
-            Scope::Daemon => At::Daemon,
-            Scope::Workspace(dir) => At::Workspace(Arc::from(workspace_of(dir.local(), None))),
-            Scope::Session(session) => match daemon.slot(session) {
-                Some(slot) => At::Session(session, Arc::from(slot.header.workspace.as_path())),
-                None => return failed(format!("no session {session}")),
-            },
-        };
         let cancel = Cancel::default();
-        lock(&self.0).insert(id, cancel.clone());
-        let asked = Asked {
-            machine,
-            role,
-            cancel: cancel.clone(),
-            services: Arc::clone(&daemon.queried),
-            registry,
+        let answer: BoxFuture<'static, Result<Json, String>> = match ask {
+            Ask::Query(service, scope, body) => {
+                let registry = daemon.shared.registry.get();
+                let Some(query) = registry.query(&service) else {
+                    return failed(format!("no query named {service}"));
+                };
+                let at = match scope {
+                    Scope::Daemon => At::Daemon,
+                    Scope::Workspace(dir) => {
+                        At::Workspace(Arc::from(workspace_of(dir.local(), None)))
+                    }
+                    Scope::Session(session) => match daemon.slot(session) {
+                        Some(slot) => {
+                            At::Session(session, Arc::from(slot.header.workspace.as_path()))
+                        }
+                        None => return failed(format!("no session {session}")),
+                    },
+                };
+                let asked = Asked {
+                    machine,
+                    role,
+                    cancel: cancel.clone(),
+                    services: Arc::clone(&daemon.queried),
+                    registry,
+                };
+                let outbox = outbox.clone();
+                Box::pin(async move {
+                    let updates = Paced {
+                        outbox: &outbox,
+                        id,
+                    };
+                    query.answer(&body, &at, asked, &updates).await
+                })
+            }
+            Ask::Fetch(fetch) => Box::pin(crate::fetch::answer(
+                Arc::clone(daemon),
+                outbox.clone(),
+                fetch,
+            )),
         };
+        lock(&self.0).insert(id, cancel.clone());
         let (running, outbox) = (Arc::clone(&self.0), outbox.clone());
         daemon.shared.rt.spawn(Box::pin(async move {
             let _permit = permit;
-            let updates = Paced {
-                outbox: &outbox,
-                id,
-            };
-            // A query that panics fails, as a tool's call does.
-            let answer = contain(query.answer(&body, &at, asked, &updates));
+            // One that panics fails, as a tool's call does.
+            let answer = contain(answer);
             // A query that sees the cancel and returns what it had (a grep
             // stopping between chunks) can finish within the same poll as
             // the cancel lands: it was interrupted all the same.
@@ -106,6 +139,12 @@ impl Queries {
         }));
         None
     }
+}
+
+/// What a client asks that runs beside its connection.
+enum Ask {
+    Query(String, Scope, Json),
+    Fetch(Fetch),
 }
 
 impl Drop for Queries {

@@ -7,6 +7,7 @@ extension Session: @retroactive @unchecked Sendable {}
 extension Reducer: @retroactive @unchecked Sendable {}
 extension SessionWatch: @retroactive @unchecked Sendable {}
 extension QueryStream: @retroactive @unchecked Sendable {}
+extension BlobFetch: @retroactive @unchecked Sendable {}
 
 /// Where a store's updates come from, and where it catches up after a gap:
 /// a daemon session, or a reducer fed by hand.

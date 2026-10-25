@@ -5,13 +5,13 @@
 //! frame for the entries before it; ephemeral frames are dropped once too
 //! many wait.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::store::Lines;
-use protocol::{Class, Decode, Entry, Frame};
+use protocol::{BlobId, Class, Decode, Entry, Frame, Held};
 
 use crate::lock;
 
@@ -76,6 +76,16 @@ pub struct FrameLog {
     /// they commit under, after the log holds them.
     seq: AtomicU64,
     tail: Mutex<Tail>,
+    /// The blobs the entries reference, folded only as far as a client
+    /// last asked about one: a session nobody fetches from pays nothing.
+    held: Mutex<Referenced>,
+}
+
+#[derive(Default)]
+struct Referenced {
+    /// The seq of the last entry folded.
+    through: u64,
+    blobs: HashSet<BlobId>,
 }
 
 /// The frames of the newest entries, contiguous up to the last shown.
@@ -92,7 +102,34 @@ impl FrameLog {
             lines: Mutex::new(lines),
             seq: AtomicU64::new(seq),
             tail: Mutex::default(),
+            held: Mutex::default(),
         }
+    }
+
+    /// Whether an entry committed so far references blob `blob`: what a
+    /// client may fetch through the session. Blocks: reads the entries
+    /// not folded yet.
+    pub fn references(&self, blob: &BlobId) -> io::Result<bool> {
+        let mut folded = lock(&self.held);
+        if folded.blobs.contains(blob) {
+            return Ok(true);
+        }
+        for batch in self.batches_after(folded.through) {
+            for entry in batch? {
+                folded.through = entry.seq.get();
+                folded.blobs.extend(
+                    entry
+                        .body
+                        .blobs()
+                        .into_iter()
+                        .filter_map(|held| match held {
+                            Held::Blob(blob) => Some(blob.id),
+                            Held::Stream(_) => None,
+                        }),
+                );
+            }
+        }
+        Ok(folded.blobs.contains(blob))
     }
 
     /// A reload replaces the reader after taking a new writer lease.
