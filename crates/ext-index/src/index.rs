@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use ext::{Cancel, WorkspaceShared};
-use rt::watch::{Event, Hub, Rescan, Subscription, Unavailable, Watch};
+use rt::watch::{Event, Hub, Subscription, Unavailable, Watch};
 use rt::{BlockingClass, Rt};
 use sys::fs::Tree;
 
@@ -402,8 +402,7 @@ impl WorkspaceIndex {
             for event in events {
                 let paths = match event {
                     Event::Changed(paths) => paths,
-                    Event::Created(path) | Event::Rescan(Rescan::Path(path)) => vec![path],
-                    Event::Rescan(Rescan::Root) | Event::Unavailable(Unavailable::Gone) => {
+                    Event::Rescan | Event::Unavailable(Unavailable::Gone) => {
                         state.pending.rescan = true;
                         continue;
                     }

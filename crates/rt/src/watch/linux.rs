@@ -141,20 +141,6 @@ impl Native {
         result
     }
 
-    pub(super) fn leave(&mut self, id: u64, dir: &Path) {
-        let Some(held) = self.held.get_mut(&id) else {
-            return;
-        };
-        let found = held.iter().copied().find(|(wd, role)| {
-            *role == Role::Dir && self.dirs.get(wd).is_some_and(|w| w.path == dir)
-        });
-        if let Some(watch @ (wd, role)) = found {
-            held.remove(&watch);
-            self.release(wd, role);
-            self.close_if_idle();
-        }
-    }
-
     /// Watches `dir`, which appeared under `sub`'s tree, and what it holds.
     pub(super) fn grow(&mut self, id: u64, sub: &Sub, dir: &Path) -> Result<(), Unavailable> {
         let mut held = self.held.remove(&id).unwrap_or_default();
@@ -229,9 +215,6 @@ impl Native {
             dirs: 0,
             parents: 0,
         });
-        if watched.path != path {
-            path.clone_into(&mut watched.path);
-        }
         if held.insert((wd, role)) {
             match role {
                 Role::Dir => watched.dirs += 1,
@@ -254,8 +237,8 @@ impl Native {
             self.dirs.remove(&wd);
             let _ = inotify::remove_watch(open.fd.get_ref(), wd);
         } else if role == Role::Dir && watched.dirs == 0 {
-            // Back to a parent's events only, unless the path names
-            // another directory by now.
+            // Back to a parent's events only (replacing the mask, not
+            // adding to it), unless the path names another directory by now.
             match inotify::add_watch(open.fd.get_ref(), &watched.path, PARENT | OPTIONS) {
                 Ok(same) if same == wd => {}
                 Ok(other) if !self.dirs.contains_key(&other) => {
@@ -320,14 +303,16 @@ impl Native {
 
     fn translate(&mut self, notes: Vec<Note>) -> Vec<Raw> {
         let mut raws = Vec::new();
+        let mut freed = false;
         for note in notes {
             if note.flags.contains(ReadFlags::QUEUE_OVERFLOW) {
                 raws.push(Raw::Rescan(None));
                 continue;
             }
             if note.flags.contains(ReadFlags::IGNORED) {
-                if self.forget(note.wd) {
-                    raws.push(Raw::Freed);
+                if let Some(path) = self.forget(note.wd) {
+                    raws.push(Raw::Unwatched(path));
+                    freed = true;
                 }
                 continue;
             }
@@ -352,23 +337,26 @@ impl Native {
             if dir && note.flags.contains(ReadFlags::MOVED_FROM) {
                 // Its watches follow it out, naming paths it no longer has.
                 self.forget_under(&path);
+                raws.push(Raw::Unwatched(path.clone()));
             }
             raws.push(Raw::Changed(path));
+        }
+        // However many went, those out of watches try again once.
+        if freed {
+            raws.push(Raw::Freed);
         }
         self.close_if_idle();
         raws
     }
 
-    /// The OS dropped watch `wd`, if it was one.
-    fn forget(&mut self, wd: Wd) -> bool {
-        if self.dirs.remove(&wd).is_none() {
-            return false;
-        }
+    /// The OS dropped watch `wd`: the path it watched, if it was one.
+    fn forget(&mut self, wd: Wd) -> Option<PathBuf> {
+        let watched = self.dirs.remove(&wd)?;
         for held in self.held.values_mut() {
             held.remove(&(wd, Role::Dir));
             held.remove(&(wd, Role::Parent));
         }
-        true
+        Some(watched.path)
     }
 
     fn forget_under(&mut self, path: &Path) {

@@ -14,8 +14,8 @@ it `enter`s, as the index enters what its walk does not ignore.
 | OS | Native watch | Shared how | Above the root |
 | --- | --- | --- | --- |
 | Linux | one inotify descriptor per hub, read by a task on the runtime's reactor; one watch per directory | counted per directory across subscriptions (inotify gives one inode one watch) | the nearest existing parent, for its entries coming and going |
-| macOS | FSEvents streams (`FileEvents`, `WatchRoot`, `NoDefer`, latency 0) on one serial dispatch queue in `sys` | one stream per outermost root; a nested root rides it, filtered by prefix; a stream opened for an outer root takes over the nested ones before they close | nothing: a stream follows its path, and `WatchRoot` reports the root going and coming back |
-| Windows | overlapped `ReadDirectoryChangesW` (`sys::DirectoryWatch`) awaited through the reactor | one recursive handle per outermost root, as on macOS | a non-recursive handle on the nearest existing parent, unless a tree covers it; a handle follows its directory, so a root replaced at its path is opened again |
+| macOS | FSEvents streams (`FileEvents`, `WatchRoot`, `NoDefer`, latency 0) on one serial dispatch queue in `sys` | one stream per outermost root; a nested root rides it, filtered by prefix; a stream opened for an outer root starts from the earliest event the nested ones have not delivered, then they close | nothing: a stream follows its path, and `WatchRoot` reports the root going and coming back |
+| Windows | overlapped `ReadDirectoryChangesW` (`sys::DirectoryWatch`) awaited through the reactor | one recursive handle per outermost root, as on macOS; a closing handle tells what completed in its buffer first; a missing root inside another's tree holds that tree | a non-recursive handle on the nearest existing parent, unless a tree covers it; a handle follows its directory, so a root replaced at its path is opened again |
 
 The router runs under the hub's lock, on a runtime task (macOS hands
 its dispatch-queue batches to one), and decides everything before a
@@ -24,8 +24,8 @@ an entered subscription has not entered, or naming a sibling of the root
 in a watched parent wakes nothing. An event at the root or above it
 compares the root's identity (device and inode, volume and file id)
 with what it was: unchanged is nothing; replaced is rearmed and told
-`Rescan::Root`; missing is told `Unavailable::Gone` and followed from
-its nearest existing parent until it is back (`Rescan::Root`). A change
+`Rescan`; missing is told `Unavailable::Gone` and followed from
+its nearest existing parent until it is back (`Rescan`). A change
 under a root believed gone counts as its return, so a coalesced creation
 is not missed. Paths come in the filesystem's spelling (links resolved,
 letter case as on disk, which is how FSEvents and Windows report them)
@@ -33,10 +33,21 @@ and are told in the subscriber's, so a differently cased root on APFS or
 NTFS hears its changes.
 
 On Linux a directory that appears in a tree is watched, with everything
-in it, before `Created` is told: a subscriber that looks at it then sees
+in it, before its change is told: a subscriber that looks at it then sees
 what was made before the watch, and hears of the rest. A directory moved
 out drops its watches, which would name paths it no longer has. A queue
-overflow rearms every subscription and tells `Rescan::Root`.
+overflow rearms every subscription and tells `Rescan`. A directory
+removed or moved away loses its watches and leaves what was entered:
+made again, it is entered again when the subscriber looks at it. However
+many watches the OS drops in one read, a subscription out of watches
+walks again once.
+
+Not observed: a directory above a root's parent renamed or replaced, or
+a linked root retargeted, until something at the root itself changes
+(macOS's `WatchRoot` follows the whole path). A tree is walked and armed
+under the hub's lock on Linux, which suits the small trees subscribed
+whole (skills, Lua); the index's large roots are entered as its walk,
+off the lock, goes.
 
 Sinks run on runtime tasks, never on a native thread, one batch at a
 time: a busy sink's next batch holds what came meanwhile (consecutive

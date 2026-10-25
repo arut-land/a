@@ -1,16 +1,22 @@
 //! One file watcher for the whole process, which every feature subscribes
 //! to: a [`Hub`]. A subscription names a root and how much of it it wants
-//! ([`Scope`]); the hub keeps one native watch per directory (Linux) or
+//! ([`Watch`]); the hub keeps one native watch per directory (Linux) or
 //! per outermost root (macOS, Windows), shared and counted across
 //! subscriptions, and closes it with its last subscriber.
 //!
 //! Sinks run on the runtime's tasks, never on a native thread, one batch
 //! at a time. Nothing is debounced here. The hub follows its roots itself:
 //! a root that appears, is replaced or goes away is rearmed by the hub
-//! before the subscriber hears [`Rescan::Root`] or [`Unavailable::Gone`],
+//! before the subscriber hears [`Event::Rescan`] or [`Unavailable::Gone`],
 //! so subscribers never refresh a watch. Only an I/O failure retries on a
 //! timer; a watch limit or an unsupported filesystem waits for something
 //! to change (a directory removed, a new subscription).
+//!
+//! Not observed: a directory above a root's parent renamed or replaced,
+//! and a linked root retargeted, until something at the root itself
+//! changes (macOS's `WatchRoot` does follow its ancestors). A tree is
+//! walked and armed under the hub's lock (Linux), which suits the small
+//! trees subscribed whole; a large one is entered as it is walked.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io;
@@ -42,7 +48,7 @@ mod tests;
 
 /// How much of its root a subscription is told about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scope {
+enum Scope {
     /// Everything under the root.
     Tree,
     /// The root's entries, and those of each directory the subscriber
@@ -51,7 +57,7 @@ pub enum Scope {
     Entered,
 }
 
-/// What to watch: a root, its [`Scope`], and the paths under it that
+/// What to watch: a root, how much of it, and the paths under it that
 /// never wake the subscriber.
 #[derive(Clone, Debug)]
 pub struct Watch {
@@ -92,23 +98,16 @@ impl Watch {
 #[derive(Debug)]
 pub enum Event {
     /// Something at each path changed: it may be a file or a directory,
-    /// and may be gone. A subscriber looks at what is there now.
+    /// and may be gone. A subscriber looks at what is there now, and at
+    /// all of a directory: what a new one holds, or what changed in one
+    /// whose changes were coalesced, may not have been reported.
     Changed(Vec<PathBuf>),
-    /// A directory appeared. What it holds may not have been reported:
-    /// a subscriber looks at all of it.
-    Created(PathBuf),
-    /// Changes were lost or coalesced: look at the whole of this again.
-    Rescan(Rescan),
+    /// Changes were lost, or the root is back or another directory now:
+    /// look at the whole root again.
+    Rescan,
     /// The root cannot be watched now. It is followed still, and its
-    /// return is a [`Rescan::Root`].
+    /// return is an [`Event::Rescan`].
     Unavailable(Unavailable),
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Rescan {
-    /// The whole root, which may also be another directory than before.
-    Root,
-    Path(PathBuf),
 }
 
 #[derive(Debug)]
@@ -125,8 +124,7 @@ pub enum Unavailable {
     Io(io::Error),
 }
 
-/// The process's watcher. Cloning it shares it.
-#[derive(Clone)]
+/// The process's watcher, shared as an `Arc`.
 pub struct Hub(Arc<Shared>);
 
 /// A subscription; dropping it unsubscribes, and the native watches
@@ -193,6 +191,13 @@ enum Raw {
     /// Lost or coalesced changes under a path, or (`None`) anywhere: every
     /// watch is rearmed.
     Rescan(Option<PathBuf>),
+    /// The native watches at and under a path are gone with it: what was
+    /// entered there is entered again only when asked.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        expect(dead_code)
+    )]
+    Unwatched(PathBuf),
     /// The OS removed a watch of its own accord: a watch is free again.
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),
@@ -229,7 +234,7 @@ impl Hub {
 
     /// Watches `watch`, armed before this returns: what changes after is
     /// told to `sink`. A root that is not there yet is not an error; its
-    /// arrival is a [`Rescan::Root`].
+    /// arrival is an [`Event::Rescan`].
     pub fn subscribe(
         &self,
         watch: Watch,
@@ -294,29 +299,18 @@ impl Subscription {
             }
         }
     }
-
-    /// Stops watching `dir`, entered before.
-    pub fn leave(&self, dir: &Path) {
-        let mut state = lock(&self.hub.state);
-        let State { subs, native, .. } = &mut *state;
-        let Some(sub) = subs.get_mut(&self.id) else {
-            return;
-        };
-        if let Some(real) = sub.entering(dir)
-            && sub.entered.remove(&real)
-        {
-            native.leave(self.id, &real);
-        }
-    }
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
         let mut state = lock(&self.hub.state);
-        if let Some(sub) = state.subs.remove(&self.id) {
+        let sub = state.subs.remove(&self.id);
+        state.native.disarm(self.id);
+        drop(state);
+        // The sink goes after the lock: what it owns may unsubscribe too.
+        if let Some(sub) = sub {
             lock(&sub.out.queue).closed = true;
         }
-        state.native.disarm(self.id);
     }
 }
 
@@ -363,7 +357,7 @@ impl State {
                 Raw::Rescan(None) => {
                     for id in self.ids() {
                         if self.rearm(id) == Armed::Live {
-                            self.tell(id, Event::Rescan(Rescan::Root));
+                            self.tell(id, Event::Rescan);
                         }
                     }
                 }
@@ -371,13 +365,20 @@ impl State {
                     for id in self.ids() {
                         let sub = &self.subs[&id];
                         let event = if sub.real.starts_with(&path) {
-                            Rescan::Root
-                        } else if let Some(reported) = sub.reported(&path) {
-                            Rescan::Path(reported)
+                            Event::Rescan
+                        } else if let Some(reported) =
+                            sub.visible(&path).then(|| sub.reported(&path)).flatten()
+                        {
+                            Event::Changed(vec![reported])
                         } else {
                             continue;
                         };
-                        self.tell(id, Event::Rescan(event));
+                        self.tell(id, event);
+                    }
+                }
+                Raw::Unwatched(path) => {
+                    for sub in self.subs.values_mut() {
+                        sub.entered.retain(|dir| !dir.starts_with(&path));
                     }
                 }
                 Raw::Freed => {
@@ -426,18 +427,19 @@ impl State {
                 roots.push(id);
                 continue;
             }
+            // An entered directory that went is entered again only when
+            // asked, as Linux's watch on it is gone.
+            if sub.entered.contains(path) && !path.is_dir() {
+                sub.entered.retain(|dir| !dir.starts_with(path));
+            }
             let Some(reported) = sub.visible(path).then(|| sub.reported(path)).flatten() else {
                 continue;
             };
-            if !created {
-                sub.out.push(Event::Changed(vec![reported]), rt);
-                continue;
-            }
             // Its directories are watched before it is told of them.
-            if sub.scope == Scope::Tree && native.grow(id, sub, path).is_err() {
+            if created && sub.scope == Scope::Tree && native.grow(id, sub, path).is_err() {
                 sub.limited(rt);
             }
-            sub.out.push(Event::Created(reported), rt);
+            sub.out.push(Event::Changed(vec![reported]), rt);
         }
     }
 
@@ -454,13 +456,13 @@ impl State {
             }
             // Back already, by the time it is rearmed.
             (_, None) => match self.rearm(id) {
-                Armed::Live => self.tell(id, Event::Rescan(Rescan::Root)),
+                Armed::Live => self.tell(id, Event::Rescan),
                 Armed::Gone | Armed::Failed => {
                     self.tell(id, Event::Unavailable(Unavailable::Gone));
                 }
             },
             (_, Some(_)) => match self.rearm(id) {
-                Armed::Live => self.tell(id, Event::Rescan(Rescan::Root)),
+                Armed::Live => self.tell(id, Event::Rescan),
                 Armed::Gone => self.tell(id, Event::Unavailable(Unavailable::Gone)),
                 Armed::Failed => {}
             },
@@ -512,11 +514,11 @@ impl State {
         // An entered subscription enters again as it rescans.
         if sub.scope == Scope::Entered {
             sub.status = Status::Live(identity(&sub.root));
-            self.tell(id, Event::Rescan(Rescan::Root));
+            self.tell(id, Event::Rescan);
             return;
         }
         if self.rearm(id) == Armed::Live {
-            self.tell(id, Event::Rescan(Rescan::Root));
+            self.tell(id, Event::Rescan);
         }
     }
 
@@ -552,7 +554,7 @@ impl State {
                 return;
             }
             match state.rearm(id) {
-                Armed::Live => state.tell(id, Event::Rescan(Rescan::Root)),
+                Armed::Live => state.tell(id, Event::Rescan),
                 Armed::Gone => state.tell(id, Event::Unavailable(Unavailable::Gone)),
                 Armed::Failed => {}
             }

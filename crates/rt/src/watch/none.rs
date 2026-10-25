@@ -28,8 +28,6 @@ impl Native {
         Err(Unavailable::Unsupported)
     }
 
-    pub(super) fn leave(&mut self, _: u64, _: &Path) {}
-
     pub(super) fn grow(&mut self, _: u64, _: &Sub, _: &Path) -> Result<(), Unavailable> {
         Err(Unavailable::Unsupported)
     }

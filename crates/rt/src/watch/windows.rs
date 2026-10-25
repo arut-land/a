@@ -84,8 +84,24 @@ impl Native {
             handle.refs += 1;
             held.tree = Some((key, handle.serial));
         }
-        if let Some(parent) = existing_parent(&sub.real)
-            && !self.trees.keys().any(|tree| parent.starts_with(tree))
+        let parent = existing_parent(&sub.real);
+        let covering = parent.and_then(|parent| {
+            (self.trees.keys())
+                .find(|tree| parent.starts_with(tree))
+                .cloned()
+        });
+        // A missing root inside another's tree is followed by that tree,
+        // held so that it outlives the one who opened it.
+        if held.tree.is_none()
+            && let Some(key) = covering.clone()
+        {
+            let handle = self.trees.get_mut(&key).expect("listed");
+            handle.refs += 1;
+            held.tree = Some((key, handle.serial));
+            return Err(Unavailable::Gone);
+        }
+        if let Some(parent) = parent
+            && covering.is_none()
         {
             if !self.parents.contains_key(parent) {
                 let handle = self.open(parent, Depth::Entries)?;
@@ -117,13 +133,6 @@ impl Native {
     pub(super) fn enter(&mut self, _: u64, _: &Path) -> Result<(), Unavailable> {
         Ok(())
     }
-
-    #[allow(
-        clippy::unused_self,
-        clippy::unnecessary_wraps,
-        reason = "one interface for every backend"
-    )]
-    pub(super) fn leave(&mut self, _: u64, _: &Path) {}
 
     #[allow(
         clippy::unused_self,
@@ -178,28 +187,38 @@ impl Native {
         let serial = self.serial;
         let stop = Arc::new(Wakeup::new());
         let (me, key, stopped) = (self.me.clone(), path.to_owned(), Arc::clone(&stop));
-        self.rt.spawn(Box::pin(crate::or(
-            async move {
-                loop {
-                    let read = watch.read_with(sys::DirectoryWatch::take).await;
-                    let Some(shared) = me.upgrade() else { return };
-                    match read {
-                        Ok(Some(paths)) => {
-                            shared.handle(|_| paths.into_iter().map(Raw::Changed).collect());
-                        }
-                        Ok(None) => shared.handle(|_| vec![Raw::Rescan(Some(key.clone()))]),
-                        Err(error) => {
-                            shared.handle(|state| {
-                                state.native.lost(&key, serial);
-                                vec![Raw::Failed(Some(key.clone()), error)]
-                            });
-                            return;
+        self.rt.spawn(Box::pin(async move {
+            crate::or(
+                async {
+                    loop {
+                        let read = watch.read_with(sys::DirectoryWatch::take).await;
+                        let Some(shared) = me.upgrade() else { return };
+                        match read {
+                            Ok(Some(paths)) => {
+                                shared.handle(|_| paths.into_iter().map(Raw::Changed).collect());
+                            }
+                            Ok(None) => shared.handle(|_| vec![Raw::Rescan(Some(key.clone()))]),
+                            Err(error) => {
+                                shared.handle(|state| {
+                                    state.native.lost(&key, serial);
+                                    vec![Raw::Failed(Some(key.clone()), error)]
+                                });
+                                return;
+                            }
                         }
                     }
-                }
-            },
-            async move { stopped.wait().await },
-        )));
+                },
+                stopped.wait(),
+            )
+            .await;
+            // Closed, perhaps for a handle that took over: what completed
+            // meanwhile is still told.
+            if let Ok(Some(paths)) = watch.get_ref().take()
+                && let Some(shared) = me.upgrade()
+            {
+                shared.handle(|_| paths.into_iter().map(Raw::Changed).collect());
+            }
+        }));
         Ok(Handle {
             serial,
             refs: 0,

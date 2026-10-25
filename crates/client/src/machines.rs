@@ -191,8 +191,7 @@ impl Sources {
                 hub.subscribe(Watch::entered(dir), move |events| {
                     let ours = events.iter().any(|event| match event {
                         Event::Changed(paths) => paths.iter().any(|p| files.contains(p)),
-                        Event::Created(path) => files.contains(path),
-                        Event::Rescan(_) | Event::Unavailable(_) => true,
+                        Event::Rescan | Event::Unavailable(_) => true,
                     });
                     if ours && let Some(shared) = changed.upgrade() {
                         shared.changed();

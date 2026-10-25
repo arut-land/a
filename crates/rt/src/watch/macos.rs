@@ -21,7 +21,7 @@ pub(super) struct Native {
 
 struct Stream {
     refs: usize,
-    _stream: FsEventStream,
+    stream: FsEventStream,
 }
 
 impl Native {
@@ -66,13 +66,6 @@ impl Native {
         Ok(())
     }
 
-    #[allow(
-        clippy::unused_self,
-        clippy::unnecessary_wraps,
-        reason = "one interface for every backend"
-    )]
-    pub(super) fn leave(&mut self, _: u64, _: &Path) {}
-
     /// A stream covers what appears under its root by itself.
     #[allow(
         clippy::unused_self,
@@ -90,8 +83,17 @@ impl Native {
     /// Starts a stream at `root`, which then serves the subscriptions of
     /// the streams under it: those close once it runs.
     fn open(&mut self, root: &Path) -> Result<(), Unavailable> {
+        let nested: Vec<PathBuf> = (self.streams.keys())
+            .filter(|key| key.starts_with(root))
+            .cloned()
+            .collect();
+        // From the earliest event a stream it takes over has not delivered:
+        // nothing under a nested root falls between the two.
+        let since = (nested.iter())
+            .map(|key| self.streams[key].stream.seen())
+            .min();
         let (me, key) = (self.me.clone(), root.to_owned());
-        let stream = FsEventStream::new(root, move |events| {
+        let stream = FsEventStream::new(root, since, move |events| {
             if let Some(shared) = me.upgrade() {
                 shared.post(events.into_iter().map(|e| raw(e, &key)).collect());
             }
@@ -100,10 +102,6 @@ impl Native {
             std::io::ErrorKind::Unsupported => Unavailable::Unsupported,
             _ => Unavailable::Io(error),
         })?;
-        let nested: Vec<PathBuf> = (self.streams.keys())
-            .filter(|key| key.starts_with(root))
-            .cloned()
-            .collect();
         let mut refs = 0;
         for key in nested {
             refs += self.streams.remove(&key).expect("listed").refs;
@@ -111,13 +109,8 @@ impl Native {
                 root.clone_into(held);
             }
         }
-        self.streams.insert(
-            root.to_owned(),
-            Stream {
-                refs,
-                _stream: stream,
-            },
-        );
+        self.streams
+            .insert(root.to_owned(), Stream { refs, stream });
         Ok(())
     }
 

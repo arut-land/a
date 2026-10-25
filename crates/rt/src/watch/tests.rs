@@ -83,7 +83,6 @@ fn a_directory_made_after_the_walk_reports_its_files() {
     until(&events, "the deep file", |event| {
         let paths = match event {
             Event::Changed(paths) => paths.clone(),
-            Event::Created(path) | Event::Rescan(Rescan::Path(path)) => vec![path.clone()],
             _ => Vec::new(),
         };
         for path in paths {
@@ -189,7 +188,8 @@ fn only_entered_directories_are_reported() {
     until(&events, "the entered directory's file", |event| {
         if let Event::Changed(paths) = event {
             assert!(
-                paths.iter().all(|p| !p.starts_with(dir.path("ignored/"))),
+                // The directory itself is one of the root's entries.
+                (paths.iter()).all(|p| p.parent() != Some(&dir.path("ignored"))),
                 "{paths:?}"
             );
         }
@@ -206,17 +206,13 @@ fn a_root_made_replaced_and_removed_is_followed() {
     let hub = hub();
     let (_sub, events) = subscribe(&hub, Watch::tree(&root));
     fs::create_dir_all(root.join("nested")).unwrap();
-    until(&events, "its arrival", |e| {
-        matches!(e, Event::Rescan(Rescan::Root))
-    });
+    until(&events, "its arrival", |e| matches!(e, Event::Rescan));
     let first = dir.write("missing/tree/nested/first");
     until(&events, "a change in it", changed(&first));
 
     fs::rename(&root, dir.path("retired")).unwrap();
     fs::create_dir_all(root.join("nested")).unwrap();
-    until(&events, "its replacement", |e| {
-        matches!(e, Event::Rescan(Rescan::Root))
-    });
+    until(&events, "its replacement", |e| matches!(e, Event::Rescan));
     let again = dir.write("missing/tree/nested/again");
     until(&events, "a change in the replacement", changed(&again));
 
@@ -281,7 +277,7 @@ fn an_exhausted_watch_limit_does_not_rewalk_on_a_timer() {
         fs::remove_dir(dir.path("tree").join(name)).unwrap();
     }
     until(&events, "the walk once watches were freed", |e| {
-        matches!(e, Event::Rescan(Rescan::Root))
+        matches!(e, Event::Rescan)
     });
     let file = dir.write("tree/d/file");
     until(&events, "a change in the last directory", changed(&file));
@@ -319,4 +315,74 @@ fn a_busy_sink_hears_what_changed_meanwhile_in_its_next_batch() {
         }
     }
     drop(release);
+}
+
+#[test]
+fn a_directory_removed_and_made_again_is_watched_again() {
+    let dir = Dir::new();
+    fs::create_dir(dir.path("entered")).unwrap();
+    let hub = hub();
+    let (sub, events) = subscribe(&hub, Watch::entered(&dir.base));
+    sub.enter(&dir.path("entered"));
+    let first = dir.write("entered/first");
+    until(&events, "a change in it", changed(&first));
+    fs::remove_dir_all(dir.path("entered")).unwrap();
+    until(&events, "its removal", changed(&dir.path("entered")));
+    // Its watch is gone once the OS says so; the subscriber hears of it
+    // made again and enters it, as the index does.
+    std::thread::sleep(Duration::from_millis(200));
+    fs::create_dir(dir.path("entered")).unwrap();
+    until(&events, "its return", changed(&dir.path("entered")));
+    sub.enter(&dir.path("entered"));
+    let again = dir.write("entered/again");
+    until(&events, "a change in it made again", changed(&again));
+}
+
+#[test]
+fn a_missing_root_inside_another_tree_outlives_it() {
+    let dir = Dir::new();
+    fs::create_dir(dir.path("outer")).unwrap();
+    let hub = hub();
+    let outer = subscribe(&hub, Watch::tree(dir.path("outer")));
+    let (_inner, inner) = subscribe(&hub, Watch::tree(dir.path("outer/missing/tree")));
+    drop(outer);
+    fs::create_dir_all(dir.path("outer/missing/tree")).unwrap();
+    until(&inner, "its arrival", |e| matches!(e, Event::Rescan));
+    let file = dir.write("outer/missing/tree/file");
+    until(&inner, "a change in it", changed(&file));
+}
+
+#[test]
+fn a_tree_hears_directories_moved_in_and_not_those_moved_out() {
+    let dir = Dir::new();
+    fs::create_dir(dir.path("tree")).unwrap();
+    fs::create_dir(dir.path("outside")).unwrap();
+    dir.write("staged/inner/file");
+    let hub = hub();
+    let (_sub, events) = subscribe(&hub, Watch::tree(dir.path("tree")));
+    fs::rename(dir.path("staged"), dir.path("tree/moved")).unwrap();
+    until(
+        &events,
+        "the directory moved in",
+        changed(&dir.path("tree/moved")),
+    );
+    let inside = dir.write("tree/moved/inner/later");
+    until(&events, "a change in what moved in", changed(&inside));
+    fs::rename(dir.path("tree/moved"), dir.path("outside/moved")).unwrap();
+    until(
+        &events,
+        "the directory moved out",
+        changed(&dir.path("tree/moved")),
+    );
+    dir.write("outside/moved/inner/after");
+    let own = dir.write("tree/own");
+    until(&events, "a change still in the tree", |event| {
+        if let Event::Changed(paths) = event {
+            assert!(
+                paths.iter().all(|p| p.starts_with(dir.path("tree"))),
+                "{paths:?}"
+            );
+        }
+        changed(&own)(event)
+    });
 }
