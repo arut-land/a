@@ -2,20 +2,20 @@
   "runs": {
     "smoke": 40235381866,
     "sessions-mimalloc": 40235406289,
-    "sessions-jemalloc-snmalloc": 40236725744,
     "sessions-rpmalloc-segment": 40235412374,
     "ci-merged": 40235443703,
-    "smoke-snmalloc-release": 40236722742,
-    "paired-aa": 40239039600,
-    "paired-mimalloc": 40239042223,
-    "paired-jemalloc": 40239044759,
-    "paired-rpmalloc": 40239047529,
-    "paired-segment-windows-latest": 40239050065,
-    "paired-segment-windows-11-arm": 40239052776,
-    "paired-snmalloc": 40239055604,
-    "paired-rest": 40239058225,
-    "sessions-frames": 40239060651,
-    "sessions-segment-arm": 40239063356
+    "paired-aa": 40241525439,
+    "paired-mimalloc": 40241528406,
+    "paired-jemalloc": 40241531006,
+    "paired-rpmalloc": 40241533786,
+    "paired-segment-windows-latest": 40241536281,
+    "paired-segment-windows-11-arm": 40241538698,
+    "paired-snmalloc": 40241541308,
+    "paired-rest": 40241543773,
+    "sessions-frames": 40241546207,
+    "sessions-segment-arm": 40241548413,
+    "smoke-snmalloc-release": 40241550744,
+    "sessions-jemalloc-snmalloc": 40241553286
   },
   "superseded_before_measurement": {
     "reason": "abbreviated pinned revisions were interpreted as branch names by checkout",
@@ -30,6 +30,23 @@
       "paired-snmalloc": 40236750111,
       "paired-rest": 40237064821,
       "sessions-segment-arm": 40238426221
+    }
+  },
+  "superseded_selector_jobs": {
+    "reason": "queued behind an Ubuntu-only matrix selector; replaced by direct native runner matrices, without changing measured sources or protocol",
+    "runs": {
+      "paired-aa": 40239039600,
+      "paired-mimalloc": 40239042223,
+      "paired-jemalloc": 40239044759,
+      "paired-rpmalloc": 40239047529,
+      "paired-segment-windows-latest": 40239050065,
+      "paired-segment-windows-11-arm": 40239052776,
+      "paired-snmalloc": 40239055604,
+      "paired-rest": 40239058225,
+      "sessions-frames": 40239060651,
+      "sessions-segment-arm": 40239063356,
+      "smoke-snmalloc-release": 40236722742,
+      "sessions-jemalloc-snmalloc": 40236725744
     }
   }
 }
