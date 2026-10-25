@@ -64,15 +64,15 @@ Hosted sessions are split to stay within the 150-minute measurement step:
 | mimalloc, 1/128 sessions | [40235406289](https://github.com/arut-land/a/actions/runs/40235406289) |
 | jemalloc and snmalloc, 1/128 sessions | [40236725744](https://github.com/arut-land/a/actions/runs/40236725744) |
 | rpmalloc and Windows segment heap, 1/128 sessions | [40235412374](https://github.com/arut-land/a/actions/runs/40235412374) |
-| Paired system/system A/A | [40235415430](https://github.com/arut-land/a/actions/runs/40235415430) |
-| Paired mimalloc | [40235417870](https://github.com/arut-land/a/actions/runs/40235417870) |
-| Paired jemalloc | [40235420434](https://github.com/arut-land/a/actions/runs/40235420434) |
-| Paired snmalloc | [40236750111](https://github.com/arut-land/a/actions/runs/40236750111) |
-| Paired rpmalloc | [40235425211](https://github.com/arut-land/a/actions/runs/40235425211) |
-| Paired segment heap, Windows x64 | [40235428021](https://github.com/arut-land/a/actions/runs/40235428021) |
-| Paired segment heap, Windows ARM64 | [40235430640](https://github.com/arut-land/a/actions/runs/40235430640) |
+| Paired system/system A/A | [40239039600](https://github.com/arut-land/a/actions/runs/40239039600) |
+| Paired mimalloc | [40239042223](https://github.com/arut-land/a/actions/runs/40239042223) |
+| Paired jemalloc | [40239044759](https://github.com/arut-land/a/actions/runs/40239044759) |
+| Paired snmalloc | [40239055604](https://github.com/arut-land/a/actions/runs/40239055604) |
+| Paired rpmalloc | [40239047529](https://github.com/arut-land/a/actions/runs/40239047529) |
+| Paired segment heap, Windows x64 | [40239050065](https://github.com/arut-land/a/actions/runs/40239050065) |
+| Paired segment heap, Windows ARM64 | [40239052776](https://github.com/arut-land/a/actions/runs/40239052776) |
 | snmalloc release-mode smoke | [40236722742](https://github.com/arut-land/a/actions/runs/40236722742) |
-| Read scratch, 1/128 sessions | [40236295274](https://github.com/arut-land/a/actions/runs/40236295274) |
+| Read scratch, 1/128 sessions | [40239060651](https://github.com/arut-land/a/actions/runs/40239060651) |
 
 The earlier smoke run
 [40234108961](https://github.com/arut-land/a/actions/runs/40234108961)
@@ -89,8 +89,9 @@ debug information as a request for C++ debug mode. Its replacement campaigns
 use `c249a084`, with that dependency's debug information disabled and
 upstream's CMake/WaitOnAddress defaults on Windows. The original snmalloc
 campaigns 40235408975 and 40235422691 were cancelled before measurement.
-Run 40236728631 was superseded by the same comparison with both source
-references pinned to `c249a084`.
+The first pinned-revision dispatches used abbreviated commit IDs, which
+checkout interpreted as branch names. They were cancelled before measurement
+and replaced with full-hash inputs. The table lists the replacements.
 
 ## Support and dependencies
 
@@ -99,6 +100,13 @@ rpmalloc 0.2.2. Only one replacement can be selected in a build. jemalloc
 has no MSVC implementation: its feature selects the system allocator there,
 and the sessions campaign skips that comparison. It must not be reported as
 a Windows jemalloc result.
+
+rpmalloc fails to link on Windows ARM64: its native object references the
+x86 `_mm_pause` intrinsic (`LNK2019`, `_rpmalloc_global_cache_extract_spans`).
+This is an unsupported target for the measured crate, rather than a runtime
+sample. The shared rpmalloc/segment sessions job failed before it could
+measure either; a separate segment-only ARM64 campaign preserves that
+comparison.
 
 The segment-heap executable variant embeds the Windows SegmentHeap manifest.
 The sessions probe instead sets an Image File Execution Options key on its

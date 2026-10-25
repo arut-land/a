@@ -1,0 +1,35 @@
+{
+  "runs": {
+    "smoke": 40235381866,
+    "sessions-mimalloc": 40235406289,
+    "sessions-jemalloc-snmalloc": 40236725744,
+    "sessions-rpmalloc-segment": 40235412374,
+    "ci-merged": 40235443703,
+    "smoke-snmalloc-release": 40236722742,
+    "paired-aa": 40239039600,
+    "paired-mimalloc": 40239042223,
+    "paired-jemalloc": 40239044759,
+    "paired-rpmalloc": 40239047529,
+    "paired-segment-windows-latest": 40239050065,
+    "paired-segment-windows-11-arm": 40239052776,
+    "paired-snmalloc": 40239055604,
+    "paired-rest": 40239058225,
+    "sessions-frames": 40239060651,
+    "sessions-segment-arm": 40239063356
+  },
+  "superseded_before_measurement": {
+    "reason": "abbreviated pinned revisions were interpreted as branch names by checkout",
+    "runs": {
+      "paired-aa": 40235415430,
+      "paired-mimalloc": 40235417870,
+      "paired-jemalloc": 40235420434,
+      "paired-rpmalloc": 40235425211,
+      "paired-segment-windows-latest": 40235428021,
+      "paired-segment-windows-11-arm": 40235430640,
+      "sessions-frames": 40236295274,
+      "paired-snmalloc": 40236750111,
+      "paired-rest": 40237064821,
+      "sessions-segment-arm": 40238426221
+    }
+  }
+}

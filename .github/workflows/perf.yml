@@ -18,7 +18,8 @@ on:
       runner:
         description: 'Runner label, or all'
         default: all
-        type: string
+        type: choice
+        options: [all, ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
       source_ref:
         description: 'Source revision (empty uses this workflow revision); main bootstraps a baseline'
         default: ''
@@ -71,28 +72,8 @@ env:
   CARGO_BUILD_JOBS: 4
 
 jobs:
-  matrix:
-    if: github.event_name != 'schedule' && !inputs.autostart
-    runs-on: ubuntu-latest
-    outputs:
-      runners: ${{ steps.select.outputs.runners }}
-    steps:
-      - uses: actions/checkout@v7
-      - id: select
-        env:
-          SELECTED: ${{ inputs.runner || 'all' }}
-        run: |
-          python3 - <<'PY'
-          import json, os
-          runners = ['ubuntu-latest', 'ubuntu-24.04-arm', 'windows-latest', 'windows-11-arm', 'macos-latest', 'macos-15-intel']
-          selected = os.environ['SELECTED']
-          assert selected == 'all' or selected in runners, selected
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write('runners=' + json.dumps(runners if selected == 'all' else [selected]) + '\n')
-          PY
-
   measure:
-    needs: matrix
+    if: github.event_name != 'schedule' && !inputs.autostart
     name: perf (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     # Twenty-round ablations and the session layouts need longer than the standard paired suite.
@@ -100,7 +81,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(needs.matrix.outputs.runners) }}
+        runner: ${{ fromJSON(inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
     env:
       PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
       PERF_ABLATION: ${{ inputs.ablation || false }}
