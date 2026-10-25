@@ -76,6 +76,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support TCP keep-alive options")]
     fn keep_alive_turns_probing_on() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
