@@ -312,7 +312,17 @@ impl Runtime for Threads {
                 let handle = thread::Builder::new()
                     .name(format!("rt-worker-{n}"))
                     .spawn(move || {
-                        crate::block_on(tasks.run(stopped.wait()));
+                        let run = tasks.run(stopped.wait());
+                        // TEMPORARY (B1 measurement): the reference layout parks as main does.
+                        if std::env::var_os("A_RT_PARK").is_some_and(|v| v == "thread") {
+                            crate::block_on(run);
+                        } else {
+                            // A parked worker waits in the reactor itself, so
+                            // an event wakes the thread that runs its task;
+                            // async-io's thread waits only while every
+                            // worker is busy.
+                            async_io::block_on(crate::counted(run));
+                        }
                         drop(tasks);
                         drop(worker);
                     })
