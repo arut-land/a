@@ -20,6 +20,8 @@ mod home;
 #[cfg(feature = "web")]
 #[cfg(unix)]
 mod hygiene;
+#[cfg(feature = "index")]
+mod index;
 #[cfg(feature = "lua")]
 #[cfg(unix)]
 mod lua;

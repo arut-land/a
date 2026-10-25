@@ -53,7 +53,7 @@ pub use endpoint::{Endpoint, EndpointRetirement, Listener, OwnedConnection, Stre
 pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
 pub use machine::machine_id;
-pub use memory::small_footprint;
+pub use memory::{ZeroedWords, small_footprint};
 /// The resolved locations belonging to one daemon.
 pub use paths::Paths as Home;
 pub use paths::{InstallLayout, Paths, RemoteLayout};
@@ -68,7 +68,7 @@ pub use runtime::{Runtime, Staged, VERSION};
 pub use signals::{Signals, reraise};
 #[cfg(windows)]
 pub use windows::CompletionSource;
-pub use workspace::{GitEnv, workspace_in, workspace_of};
+pub use workspace::{GitEnv, work_tree_in, workspace_in, workspace_of};
 
 /// What [`ProcessLease::signal`] send, and [`Signals`]
 /// catches. On Windows, console control events stand for the ones a

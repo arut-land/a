@@ -65,6 +65,14 @@ impl<S> QueryCx<S> {
             .service::<T>()
             .or_else(|| self.services.get::<T>())
     }
+
+    /// Service `T` as an owned handle, for work the query hands off.
+    pub fn service_arc<T: ?Sized + 'static>(&self) -> Option<Arc<T>> {
+        self.registry
+            .service_arc::<T>()
+            .or_else(|| self.services.get_arc::<T>())
+            .cloned()
+    }
 }
 
 /// What a query may be asked about: [`Daemon`], [`Workspace`] or

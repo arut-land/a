@@ -133,6 +133,41 @@ fn final_path(file: &File) -> io::Result<std::path::PathBuf> {
     }
 }
 
+/// What names a file or directory on its volume, whatever its path: one
+/// replaced at the same path (removed and made again, renamed over) has
+/// another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileIdentity {
+    volume: u64,
+    id: [u8; 16],
+}
+
+/// The identity of what is at `path` now, links followed.
+pub fn identity(path: &Path) -> io::Result<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(path)?;
+        let mut id = [0; 16];
+        id[..8].copy_from_slice(&meta.ino().to_le_bytes());
+        Ok(FileIdentity {
+            volume: meta.dev(),
+            id,
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // A directory opens only with backup semantics; nothing is read.
+        let file = OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+            .open(path)?;
+        let (volume, id) = edit::file_id(&file)?;
+        Ok(FileIdentity { volume, id })
+    }
+}
+
 /// Trims a log without changing its append-only handle or its read cursor.
 pub fn truncate(file: &File, len: u64) -> io::Result<()> {
     #[cfg(unix)]
@@ -1310,6 +1345,24 @@ fn windows_lock(file: &File, nonblocking: bool) -> io::Result<()> {
     crate::windows::ok(unsafe {
         LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &raw mut operation)
     })
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn a_directory_made_again_at_its_path_has_another_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let first = identity(&root).unwrap();
+        assert_eq!(identity(&root).unwrap(), first);
+        // The old one kept, so its id cannot be reused for the new one.
+        fs::rename(&root, dir.path().join("old")).unwrap();
+        fs::create_dir(&root).unwrap();
+        assert_ne!(identity(&root).unwrap(), first);
+    }
 }
 
 #[cfg(test)]
