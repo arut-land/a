@@ -91,8 +91,9 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   with pending submitted mutations: input awaiting publication or an ack
   can be interrupted even while the local view is idle. Intents become
   numbered `ClientMsg`s, kept until the daemon's ack or until the log
-  shows an entry they authored (the ack is queued at commit, behind what
-  the session already published, so it can trail the turn it started); a message sent while
+  shows an entry this client authored with that number or a later one
+  (the ack is queued at commit, behind what the session already
+  published, so it can trail the turn it started); a message sent while
   reconnecting goes out once the connection is up again. `offer()` refuses
   with a typed `Notice` unless attached. Each intent (`input`, `steer`,
   `force_steer`, `withdraw(seq)` of the user's queued input,
