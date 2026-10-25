@@ -11,7 +11,8 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    ACL, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation, PSID, SECURITY_ATTRIBUTES,
+    TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken,
@@ -72,8 +73,48 @@ pub fn user_sid(pid: Option<u32>) -> io::Result<String> {
             owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })
         })
         .transpose()?;
+    let user = token_information(process.as_ref(), TokenUser)?;
+    // SAFETY: a successful TokenUser query filled this aligned buffer, SID included.
+    sid_string(unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid })
+}
+
+/// The SIDs this process's new objects are attributed to: its user, and
+/// the token's default owner, which is the Administrators group when elevated.
+pub struct Identity {
+    user: Vec<usize>,
+    owner: Vec<usize>,
+}
+
+impl Identity {
+    pub fn current() -> io::Result<Self> {
+        Ok(Self {
+            user: token_information(None, TokenUser)?,
+            owner: token_information(None, TokenOwner)?,
+        })
+    }
+
+    pub fn user(&self) -> PSID {
+        // SAFETY: the buffer holds a successful TokenUser query.
+        unsafe { (*self.user.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+    }
+
+    /// Whether `sid` is one this process assigns its own objects to.
+    pub fn owns(&self, sid: PSID) -> bool {
+        // SAFETY: the buffer holds a successful TokenOwner query.
+        let owner = unsafe { (*self.owner.as_ptr().cast::<TOKEN_OWNER>()).Owner };
+        // SAFETY: all three SIDs are valid and outlive the comparisons.
+        !sid.is_null() && unsafe { EqualSid(sid, self.user()) != 0 || EqualSid(sid, owner) != 0 }
+    }
+}
+
+/// One token information class for `process`, or this process when `None`.
+/// usize storage keeps the structure and the SIDs embedded in it aligned.
+fn token_information(
+    process: Option<&OwnedHandle>,
+    class: TOKEN_INFORMATION_CLASS,
+) -> io::Result<Vec<usize>> {
     // SAFETY: the pseudo-handle needs no close; an opened process lives through this call.
-    let process = process.as_ref().map_or_else(
+    let process = process.map_or_else(
         || unsafe { GetCurrentProcess() },
         AsRawHandle::as_raw_handle,
     );
@@ -83,32 +124,25 @@ pub fn user_sid(pid: Option<u32>) -> io::Result<String> {
     let token = owned(token)?;
     let mut size = 0;
     // SAFETY: a null buffer queries the required byte count.
-    unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            TokenUser,
-            null_mut(),
-            0,
-            &raw mut size,
-        )
-    };
-    // usize storage keeps TOKEN_USER and its embedded SID suitably aligned.
+    unsafe { GetTokenInformation(token.as_raw_handle(), class, null_mut(), 0, &raw mut size) };
     let mut buffer = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
     // SAFETY: the allocated buffer is at least `size` bytes and aligned.
     ok(unsafe {
         GetTokenInformation(
             token.as_raw_handle(),
-            TokenUser,
+            class,
             buffer.as_mut_ptr().cast(),
             size,
             &raw mut size,
         )
     })?;
-    // SAFETY: successful TokenUser filled this aligned buffer, including the SID.
-    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    Ok(buffer)
+}
+
+fn sid_string(sid: PSID) -> io::Result<String> {
     let mut text = null_mut();
-    // SAFETY: the SID remains alive in buffer; the output is a LocalAlloc string.
-    ok(unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut text) })?;
+    // SAFETY: the caller's SID is valid; the output is a LocalAlloc string.
+    ok(unsafe { ConvertSidToStringSidW(sid, &raw mut text) })?;
     let mut len = 0;
     // SAFETY: the successful conversion returned a NUL-terminated string.
     while unsafe { *text.add(len) } != 0 {
@@ -126,8 +160,25 @@ pub fn user_sid(pid: Option<u32>) -> io::Result<String> {
 pub struct Security(*mut std::ffi::c_void);
 
 impl Security {
+    /// The user alone, inherited by nothing: pipes, jobs and single files.
     pub fn user_only() -> io::Result<Self> {
-        let sddl = wide(OsStr::new(&format!("D:P(A;;GA;;;{})", user_sid(None)?)));
+        Self::from_sddl(&format!("D:P(A;;GA;;;{})", user_sid(None)?))
+    }
+
+    /// A directory whose every descendant inherits the user's sole access,
+    /// whatever its own parent grants. File rights are spelled out (`FA`):
+    /// an inherited generic right splits into a mapped and an inherit-only ACE.
+    pub fn private_directory() -> io::Result<Self> {
+        Self::from_sddl(&format!("D:P(A;OICI;FA;;;{})", user_sid(None)?))
+    }
+
+    /// A file the user alone may open, whatever its directory grants.
+    pub fn private_file() -> io::Result<Self> {
+        Self::from_sddl(&format!("D:P(A;;FA;;;{})", user_sid(None)?))
+    }
+
+    pub(crate) fn from_sddl(sddl: &str) -> io::Result<Self> {
+        let sddl = wide(OsStr::new(sddl));
         let mut descriptor = null_mut();
         // SAFETY: NUL-terminated SDDL and writable output; revision 1.
         ok(unsafe {
@@ -139,6 +190,16 @@ impl Security {
             )
         })?;
         Ok(Self(descriptor))
+    }
+
+    /// The descriptor's DACL, borrowed for as long as `self` lives.
+    pub fn dacl(&self) -> io::Result<*const ACL> {
+        let (mut present, mut dacl, mut defaulted) = (0, null_mut(), 0);
+        // SAFETY: the descriptor is live and every output is writable.
+        ok(unsafe {
+            GetSecurityDescriptorDacl(self.0, &raw mut present, &raw mut dacl, &raw mut defaulted)
+        })?;
+        Ok(dacl)
     }
 
     pub fn descriptor(&self) -> *mut std::ffi::c_void {

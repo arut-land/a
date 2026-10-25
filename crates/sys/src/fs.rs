@@ -7,6 +7,9 @@ use std::io::{self, Write as _};
 use std::path::Path;
 
 mod edit;
+#[cfg(windows)]
+#[path = "fs/private_windows.rs"]
+mod private;
 mod staging;
 pub use edit::{
     Durability, EditConflict, EditError, EditReceipt, EditTransaction, PublicationLimitations,
@@ -503,19 +506,9 @@ fn move_file(from: &Path, to: &Path, replacing: bool, durable: bool) -> io::Resu
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
-    // Canonical parents supply extended-length paths without following the
-    // final component: a rename moves a link itself, never its target.
-    let absolute = |path: &Path| -> io::Result<std::path::PathBuf> {
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        Ok(parent
-            .canonicalize()?
-            .join(path.file_name().ok_or(io::ErrorKind::InvalidInput)?))
-    };
-    let from = crate::windows::wide(absolute(from)?.as_os_str());
-    let to = crate::windows::wide(absolute(to)?.as_os_str());
+    // A rename moves a link itself, never its target.
+    let from = crate::windows::wide(private::extended(from)?.as_os_str());
+    let to = crate::windows::wide(private::extended(to)?.as_os_str());
     // WRITE_THROUGH waits for the move on disk; COPY_ALLOWED is deliberately
     // absent so publication cannot degrade to a cross-volume copy/delete.
     // Microsoft does not document FlushFileBuffers as a directory barrier.
@@ -739,28 +732,54 @@ pub fn open_log(path: &Path, header: Option<&[u8]>) -> io::Result<(File, Publica
     ))
 }
 
-/// Options that create a new file only its owner can read and write
-/// (mode 0600), never opening one that exists. Windows homes are private
-/// by their profile's ACL.
-pub fn private_file() -> OpenOptions {
-    let mut open = OpenOptions::new();
-    open.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
-    open
+/// Creates a new file only its owner can read and write, never opening one
+/// that exists: mode 0600 on Unix, and on Windows a protected owner-only DACL
+/// given to the create call, whatever the directory grants.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PrivateFile {
+    read: bool,
 }
 
-/// Creates `dir` and its parents, entered only by their owner (mode 0700),
-/// and makes an existing `dir` so. The final component is opened without
-/// following links, so a planted link or another user's directory is
-/// refused rather than adopted.
+pub fn private_file() -> PrivateFile {
+    PrivateFile::default()
+}
+
+impl PrivateFile {
+    pub fn read(&mut self, read: bool) -> &mut Self {
+        self.read = read;
+        self
+    }
+
+    pub fn open(&self, path: impl AsRef<Path>) -> io::Result<File> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .read(self.read)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+        }
+        #[cfg(windows)]
+        private::file(path.as_ref(), self.read)
+    }
+}
+
+/// Creates `dir` and its parents, entered only by their owner, and makes an
+/// existing `dir` so: mode 0700 on Unix; on Windows a protected DACL that
+/// every descendant inherits, given to the create call so the parent's access
+/// never applies, and replacing (with its inheriting contents) any other on an
+/// existing `dir`. The final component is opened without following links, so
+/// a planted link or another user's directory is refused rather than adopted.
 pub fn private_dir(dir: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-        builder.mode(0o700).create(dir)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
         let handle = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -775,37 +794,7 @@ pub fn private_dir(dir: &Path) -> io::Result<()> {
         Ok(())
     }
     #[cfg(windows)]
-    {
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Security::{
-            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity,
-        };
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, WRITE_DAC,
-        };
-        builder.create(dir)?;
-        let handle = OpenOptions::new()
-            .access_mode(FILE_GENERIC_READ | WRITE_DAC)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(dir)?;
-        let attributes = handle.metadata()?.file_attributes();
-        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0
-            || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        {
-            return Err(not_private(dir));
-        }
-        let security = crate::windows::Security::user_only()?;
-        // SAFETY: the handle and security descriptor remain valid during the call.
-        crate::windows::ok(unsafe {
-            SetKernelObjectSecurity(
-                handle.as_raw_handle(),
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                security.descriptor(),
-            )
-        })
-    }
+    private::dir(dir)
 }
 
 fn not_private(dir: &Path) -> io::Error {

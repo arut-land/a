@@ -65,6 +65,13 @@ impl Home {
     /// Listens at [`Home::endpoint`], replacing a stale socket, and points
     /// [`Home::socket_link`] at it.
     pub fn bind(&self) -> io::Result<Listener> {
+        // Windows objects created without a policy of their own inherit
+        // their parent's ACEs, so an isolated root decides everything the
+        // daemon creates beneath it. Unix modes are not inherited.
+        #[cfg(windows)]
+        if let crate::InstallLayout::Isolated(root) = self.layout() {
+            crate::fs::private_dir(root)?;
+        }
         let endpoint = self.endpoint();
         imp::bind(&endpoint.0, &self.socket_link(), &endpoint.1).map(Listener)
     }
