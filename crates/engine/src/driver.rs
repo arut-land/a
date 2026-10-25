@@ -1162,9 +1162,8 @@ impl Actor {
     fn handable(&self) -> Result<(), String> {
         let session = &self.live.session;
         let tools = self.registry.tools();
-        let at_work = || format!("session {} is at work", self.live.id.short());
         if !self.core.at_rest_but_background() {
-            return Err(at_work());
+            return Err(format!("session {} is at work", self.live.id.short()));
         }
         let resumable = lock(&session.resumable);
         for detached in self.core.ledger().detached() {
@@ -1173,7 +1172,7 @@ impl Actor {
                     .iter()
                     .any(|resumed| resumed.call == detached.call);
             if !resumes {
-                return Err(at_work());
+                return Err(format!("call {} goes on in no other build", detached.call));
             }
         }
         let jobs = lock(&session.jobs);
