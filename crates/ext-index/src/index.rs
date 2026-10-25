@@ -75,6 +75,24 @@ struct Store {
 }
 
 impl Store {
+    fn release_watches(&self) -> bool {
+        let subscriptions: Vec<_> = lock(&self.resting)
+            .values()
+            .filter_map(|index| {
+                let mut state = index.state();
+                if state.files.is_some() {
+                    return None;
+                }
+                state.stored = Stored::Unseen;
+                state.pending.rescan = true;
+                state.watching.take()
+            })
+            .collect();
+        let released = !subscriptions.is_empty();
+        drop(subscriptions);
+        released
+    }
+
     fn retire(&self, now: Instant) {
         let retired: Vec<_> = {
             let mut resting = lock(&self.resting);
@@ -824,6 +842,7 @@ impl WorkspaceIndex {
 
     fn changed_on_disk(&self, events: Vec<Event>) {
         let mut release = None;
+        let mut limited = false;
         {
             let mut state = self.state();
             for event in events {
@@ -834,6 +853,7 @@ impl WorkspaceIndex {
                         continue;
                     }
                     Event::Unavailable(Unavailable::Limit) => {
+                        limited = true;
                         state.watch_limited = true;
                         if state.files.is_none() {
                             state.pending.rescan = true;
@@ -865,6 +885,14 @@ impl WorkspaceIndex {
             }
         }
         drop(release);
+        if limited
+            && let Some(store) = self.store.as_ref().and_then(|(store, _)| store.upgrade())
+            && store.release_watches()
+        {
+            // Retry only after freeing capacity; a permanently exhausted hub
+            // must not turn a failed watch into a loop of verification walks.
+            self.state().pending.rescan = true;
+        }
         self.apply();
     }
 
@@ -1805,6 +1833,42 @@ mod tests {
             Duration::from_secs(10),
             || {
                 index
+                    .state()
+                    .files
+                    .as_ref()
+                    .is_some_and(|files| files.find("after.txt").is_some())
+            },
+        );
+    }
+
+    #[test]
+    fn watch_pressure_in_one_workspace_releases_other_resting_subscriptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("resting");
+        let active = dir.path().canonicalize().unwrap().join("active");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&active).unwrap();
+        std::fs::write(root.join("before.txt"), "hello").unwrap();
+        let rt: Rt = Arc::new(rt::Threads::new(2));
+        let hub = Arc::new(Hub::new(Arc::clone(&rt)));
+        let indexes = Indexes::new(Limits::default()).kept_in(dir.path().join("cache"));
+        let resting = indexes.open(&root, Arc::clone(&rt), Arc::clone(&hub));
+        rt::block_on(resting.content()).unwrap();
+        eventually("the first workspace rests", Duration::from_secs(10), || {
+            rt::block_on(resting.rest())
+        });
+        assert!(resting.state().watching.is_some());
+        let index = indexes.open(&active, rt, hub);
+        rt::block_on(index.content()).unwrap();
+        index.changed_on_disk(vec![Event::Unavailable(Unavailable::Limit)]);
+        assert!(resting.state().watching.is_none());
+        std::fs::write(root.join("after.txt"), "hello").unwrap();
+        rt::block_on(resting.files()).unwrap();
+        eventually(
+            "the released workspace verifies on reload",
+            Duration::from_secs(10),
+            || {
+                resting
                     .state()
                     .files
                     .as_ref()

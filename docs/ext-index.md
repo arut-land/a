@@ -101,9 +101,10 @@ Without a configured store (`Indexes::new` alone), expiry drops the index.
 
 A resting index retains its ignore rules and watch subscriptions, and
 collects pending changed paths. More than 4,096 pending paths collapse to
-a rescan request. On watch-hub `Unavailable::Limit`, resting indexes
-release their subscriptions and require verification on reload; an active
-index does so when it next rests. Neither active quiet indexes nor resting
+a rescan request. On watch-hub `Unavailable::Limit` in any workspace, the
+store releases all resting subscriptions and requires verification on
+reload. The affected active workspace retries its walk only when that
+release freed capacity; it also releases its own subscriptions at rest. Neither active quiet indexes nor resting
 ones have periodic tasks or idle wake-ups. The daemon's empty, unused
 workspace does not start an index merely by starting the daemon.
 
