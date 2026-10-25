@@ -231,24 +231,23 @@ impl<D: crate::dialect::Dialect> ext::Resumable for ShellTool<D> {
         &self,
         _input: &Command,
         state: Detached,
-        handed: Json,
+        claimed: ext::Native,
         cx: &Cx,
     ) -> impl shape::Output<Ran, Streams<String>> {
         ext::stream(|output| async move {
-            resume(state, handed, cx, output)
+            resume::<D>(state, claimed, cx, output)
                 .await
                 .map_err(|e| e.to_string())
         })
     }
 
-    async fn rehold(&self, handed: Json, cx: &Cx) -> Result<(), String> {
+    async fn rehold(&self, claimed: ext::Native, cx: &Cx) -> Result<ext::ProcessLease, String> {
         let rehold = async {
             let Stream { file, open: log } = cx.blobs.reopen(cx.call, OUTPUT_CAP)?;
-            let process = adopt(cx, handed, file).await?;
+            let process = adopt(cx, claimed, file).await?;
             let output = Written(Some(log));
             let call = cx.call;
-            cx.reown(process.process.holding(move || output.seal(call)));
-            io::Result::Ok(())
+            io::Result::Ok(process.process.holding(move || output.seal(call)))
         };
         rehold.await.map_err(|e| e.to_string())
     }
@@ -409,7 +408,7 @@ async fn execute<D: crate::dialect::Dialect>(
         limit: Duration::from_secs(limit),
         detached: &detached,
     };
-    let done = supervise(child, output, supervised, cx, &progress).await?;
+    let done = supervise::<D>(child, output, supervised, cx, &progress).await?;
     let ran = finish(cx, done, log, report, dir, limit).await?;
     Ok(Ran {
         duration_ms: duration_ms(started),
@@ -420,23 +419,23 @@ async fn execute<D: crate::dialect::Dialect>(
 /// Goes on with a command an earlier build ran and handed over, gone on in
 /// the background there: its group adopted, its stream followed from the
 /// start, as only what comes after the handover is new progress.
-async fn resume(
+async fn resume<D: crate::dialect::Dialect>(
     detached: Detached,
-    handed: Json,
+    claimed: ext::Native,
     cx: &Cx,
     progress: Partials<String>,
 ) -> io::Result<Ran> {
     let Stream { file, open: log } = cx.blobs.reopen(cx.call, OUTPUT_CAP)?;
     let report = log.path().with_extension("cwd");
     let written = rt::Async::for_reading(&runtime(cx)?.reactor(), sys::write_watch(log.path())?)?;
-    let child = adopt(cx, handed, file).await?;
+    let child = adopt(cx, claimed, file).await?;
     // Handed over again, should another upgrade come before it ends.
-    cx.resumable(&child, &detached);
+    cx.resumable::<ShellTool<D>>(&child, &detached);
     let output = Followed {
         log: log.path(),
         written,
     };
-    let done = supervise(child, output, Supervised::Resumed, cx, &progress).await?;
+    let done = supervise::<D>(child, output, Supervised::Resumed, cx, &progress).await?;
     let ran = finish(cx, done, log, report, detached.dir, 0).await?;
     Ok(Ran {
         duration_ms: now_ms().saturating_sub(detached.started),
@@ -583,7 +582,10 @@ fn leave(cx: &Cx, process: OwnedProcess, output: Option<Open>) {
     };
     let output = Written(Some(output));
     let call = cx.call;
-    cx.own(process.process.holding(move || output.seal(call)));
+    cx.own(
+        process.process.holding(move || output.seal(call)),
+        ext::Role::Work,
+    );
 }
 
 /// A stream nothing but a group the session owns writes: sealed once the
@@ -628,10 +630,10 @@ impl Drop for Written {
 
 /// The group `handed`, from the build before, owned again and writing
 /// `file`, its stream.
-async fn adopt(cx: &Cx, handed: Json, file: File) -> io::Result<OwnedProcess> {
+async fn adopt(cx: &Cx, claimed: ext::Native, file: File) -> io::Result<OwnedProcess> {
     cx.service::<dyn Processes>()
         .ok_or_else(|| io::Error::other("no process provider"))?
-        .adopt(cx, handed, file)
+        .adopt(cx, claimed, file)
         .await
 }
 
@@ -866,7 +868,7 @@ struct Followed<'a> {
 /// runs. Once the shell has exited, the output has ended when nothing of
 /// its group is left to write, or it has paused [`IDLE`], or after
 /// [`LINGER`].
-async fn supervise(
+async fn supervise<D: crate::dialect::Dialect>(
     child: OwnedProcess,
     Followed { log, written }: Followed<'_>,
     supervised: Supervised<'_>,
@@ -929,7 +931,7 @@ async fn supervise(
             detach.set();
             run = Run::Running { deadline: None };
             if let Some(detached) = detached {
-                cx.resumable(&child, detached);
+                cx.resumable::<ShellTool<D>>(&child, detached);
             }
         }
         let seen = Seen {

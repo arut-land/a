@@ -60,7 +60,7 @@ pub use agent::{
     Action, Actions, Agent, AgentKind, Inheritance, Input, ModelOnly, actions_from_json,
 };
 pub use assemble::{Need, Provides};
-pub use ext::{DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier, Tooled};
+pub use ext::{DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
 pub use flag::{Cancel, Flag};
 pub use llm::Json;
 pub use r#loop::{Defaults, LOOP, Loop, LoopPoints, Resume, StepLimit};
@@ -73,9 +73,9 @@ pub use query::{Query, QueryCx};
 pub use queue::{Boundary, QueueView, Take};
 pub use schema::Schema;
 pub use service::{
-    Budget, CwdOf, Handed, Holds, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec,
-    OwnedProcess, ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes, Recipients,
-    Record, Route, RunningProcess, SideProvider, SideRetry, SpawnError, Topology,
+    Budget, CwdOf, Holds, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec, Native,
+    OwnedProcess, Parting, ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes,
+    Recipients, Record, Role, Route, RunningProcess, SideProvider, SideRetry, SpawnError, Topology,
 };
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};

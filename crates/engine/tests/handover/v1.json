@@ -1,0 +1,35 @@
+{
+  "groups": [
+    {
+      "group": {
+        "output": 7,
+        "pid": 4242
+      },
+      "owner": {
+        "call": 3,
+        "kind": {
+          "Call": {
+            "state": {
+              "dir": "/w",
+              "started": 1
+            }
+          }
+        },
+        "session": "00000000-0000-0000-0000-000000000000",
+        "tool": "bash"
+      }
+    },
+    {
+      "group": {
+        "output": 7,
+        "pid": 4242
+      },
+      "owner": {
+        "call": 5,
+        "kind": "Job",
+        "session": "00000000-0000-0000-0000-000000000000",
+        "tool": "bash"
+      }
+    }
+  ]
+}

@@ -60,8 +60,9 @@ Work left running only in the background (detached calls, the process groups
 sessions own) is handed to the staged build live rather than waited out,
 when every piece can go on there: on Unix the daemon execs that build in its
 own process, children and listener kept; on Windows it starts it inheriting
-the groups' jobs and pipes ([agents](agents.md), `sys::handover`). Otherwise
-the drain waits for all of it.
+the groups' jobs and pipes ([agents](agents.md), `sys::handover`). Until it
+can, the upgrade is pending: the older build serves on, telling the newer
+build's clients what holds it.
 A typed crash breaker distinguishes repeated young deaths from a reboot.
 Diagnosis and restart verify the recorded process identity before signaling.
 

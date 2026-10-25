@@ -7,23 +7,27 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Threading::GetProcessId;
 
-use super::{Given, Group};
+use super::{Claimed, Given, Group, Handover, Parked};
 use crate::windows::ok;
-use crate::{Child, ContainedChild, OutputCapture, ProcessLease, ProcessPipe, RecordedIdentity};
+use crate::{Child, ProcessLease, ProcessPipe, RecordedIdentity};
 
-pub fn give(child: &Child, lease: ProcessLease, output: Option<ProcessPipe>) -> io::Result<Given> {
-    let process = inheritable(child.process().try_clone()?)?;
-    let job = inheritable(lease.into_job())?;
-    let (pipe, unread) = match output {
-        Some(output) => {
-            let (pipe, unread) = output.surrender()?;
-            (Some(inheritable(pipe)?), unread)
-        }
-        None => (None, Vec::new()),
-    };
-    Ok(Given {
+pub fn park(pipe: ProcessPipe) -> io::Result<(Parked, Vec<u8>)> {
+    let (pipe, unread) = pipe.surrender()?;
+    Ok((Parked(File::from(pipe)), unread))
+}
+
+pub fn unpark(pipe: File) -> io::Result<ProcessPipe> {
+    crate::Stream::from_pipe(pipe)
+}
+
+pub fn give(child: Child, lease: ProcessLease, output: Option<Parked>) -> Given {
+    let pid = child.id();
+    let process = File::from(child.into_process());
+    let job = File::from(lease.into_job());
+    let pipe = output.map(|Parked(pipe)| pipe);
+    Given {
         group: Group {
-            pid: child.id(),
+            pid,
             output: pipe.as_ref().map(number),
             job: number(&job),
             process: number(&process),
@@ -32,11 +36,10 @@ pub fn give(child: &Child, lease: ProcessLease, output: Option<ProcessPipe>) -> 
             .into_iter()
             .flatten()
             .collect(),
-        unread,
-    })
+    }
 }
 
-pub fn adopt(group: &Group, file: File) -> io::Result<ContainedChild> {
+pub fn claim(group: &Group) -> io::Result<Claimed> {
     let process = own(group.process)?;
     let job = own(group.job)?;
     let pipe = group.output.map(own).transpose()?;
@@ -64,24 +67,17 @@ pub fn adopt(group: &Group, file: File) -> io::Result<ContainedChild> {
             "the handed handles are not one group's",
         ));
     }
-    let child = Child::handed(OwnedHandle::from(process), group.pid);
-    Ok(ContainedChild {
-        child,
-        group: ProcessLease::handed(RecordedIdentity(group.pid), OwnedHandle::from(job)),
-        capture: pipe
-            .map(|pipe| {
-                Ok::<_, io::Error>(OutputCapture {
-                    reader: crate::Stream::from_pipe(pipe)?,
-                    file,
-                })
-            })
-            .transpose()?,
+    Ok(Claimed {
+        child: Child::handed(OwnedHandle::from(process), group.pid),
+        lease: ProcessLease::handed(RecordedIdentity(group.pid), OwnedHandle::from(job)),
+        output: pipe.map(crate::Stream::from_pipe).transpose()?,
     })
 }
 
 /// A pipe holding `bytes`, written on a thread of its own as the next
-/// build reads it.
-pub fn record(_home: &crate::Home, bytes: &[u8]) -> io::Result<File> {
+/// build reads it: one per attempt, so a successor that did not start
+/// leaves the next one a full record.
+fn record(bytes: &[u8]) -> io::Result<File> {
     let (reader, mut writer) = io::pipe()?;
     let bytes = bytes.to_vec();
     std::thread::Builder::new()
@@ -89,34 +85,39 @@ pub fn record(_home: &crate::Home, bytes: &[u8]) -> io::Result<File> {
         .spawn(move || {
             let _ = writer.write_all(&bytes);
         })?;
-    inheritable(File::from(OwnedHandle::from(reader)))
+    Ok(File::from(OwnedHandle::from(reader)))
 }
 
-pub fn replace(successor: super::Successor<'_>, home: &crate::Home) -> io::Error {
-    let super::Successor {
-        mut cmd,
-        keep,
-        lock,
-        ..
-    } = successor;
+pub fn replace(handover: &mut Handover<'_>, mut cmd: std::process::Command) -> io::Error {
     let started = (|| {
         // A starting client waits on the start lock until the successor
-        // listens, rather than starting a daemon of its own meanwhile.
-        let starting = File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(home.run_dir().join("start.lock"))?;
-        crate::fs::lock(&starting)?;
+        // listens, rather than starting a daemon of its own meanwhile; it
+        // is taken before the endpoint goes, and kept until this exits.
+        if handover.starting.is_none() {
+            let starting = File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(handover.home.run_dir().join("start.lock"))?;
+            crate::fs::lock(&starting)?;
+            handover.starting = Some(starting);
+        }
+        // The successor claims the endpoint anew.
+        if let Some(retirement) = handover.retirement.take() {
+            retirement.retire()?;
+        }
+        let record = record(&handover.record)?;
+        let keep: Vec<&File> = std::iter::once(&record).chain(&handover.handles).collect();
+        inherit(&keep, true)?;
+        cmd.arg("--handover-fd").arg(number(&record).to_string());
         // Byte locks belong to processes: the successor takes the daemon
         // lock as this one lets it go.
-        if let Some(lock) = lock {
-            crate::fs::unlock(lock)?;
-        }
-        let started = crate::proc::spawn_acknowledged(&mut cmd, home, &keep);
-        if let (Err(_), Some(lock)) = (&started, lock) {
-            crate::fs::lock(lock)?;
+        crate::fs::unlock(&handover.lock)?;
+        let started = crate::proc::spawn_acknowledged(&mut cmd, handover.home, &keep);
+        if started.is_err() {
+            inherit(&keep, false)?;
+            crate::fs::lock(&handover.lock)?;
         }
         started
     })();
@@ -146,16 +147,13 @@ pub fn own(number: i32) -> io::Result<File> {
     Ok(File::from(unsafe { OwnedHandle::from_raw_handle(handle) }))
 }
 
-/// `handle`, inheritable by the child whose handle list names it.
-fn inheritable(handle: impl Into<OwnedHandle>) -> io::Result<File> {
-    let handle = handle.into();
-    // SAFETY: the handle is owned and open.
-    ok(unsafe {
-        SetHandleInformation(
-            handle.as_raw_handle(),
-            HANDLE_FLAG_INHERIT,
-            HANDLE_FLAG_INHERIT,
-        )
-    })?;
-    Ok(File::from(handle))
+/// Makes each of `handles` inheritable (`true`) by the child whose handle
+/// list names it, or no longer.
+fn inherit(handles: &[&File], inherit: bool) -> io::Result<()> {
+    let flags = if inherit { HANDLE_FLAG_INHERIT } else { 0 };
+    for handle in handles {
+        // SAFETY: the handle is owned and open.
+        ok(unsafe { SetHandleInformation(handle.as_raw_handle(), HANDLE_FLAG_INHERIT, flags) })?;
+    }
+    Ok(())
 }

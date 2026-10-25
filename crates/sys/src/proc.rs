@@ -542,11 +542,6 @@ mod imp {
     }
 
     pub fn detach_session() -> io::Result<()> {
-        // A daemon exec'd in place by the build before already leads its
-        // own session.
-        if process::getsid(None).is_ok_and(|session| session == process::getpid()) {
-            return Ok(());
-        }
         process::setsid()?;
         Ok(())
     }

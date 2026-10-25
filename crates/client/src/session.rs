@@ -970,7 +970,7 @@ mod tests {
     #[test]
     fn a_reattach_after_drain_never_resends_the_environment() {
         let (mut client, session) = attached(Env::Origin);
-        client.step(msg(1, DaemonMsg::Draining));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
         assert!(matches!(client.link(), Link::Draining));
         let out = client.step(closed(1));
         let [(conn, attach, restart)] = connects(&out)[..] else {
@@ -1034,7 +1034,7 @@ mod tests {
                 ..
             }]
         ));
-        client.step(msg(1, DaemonMsg::Draining));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
         assert!(client.run(Cmd::Input("two".into())).is_empty());
         client.step(closed(1));
         let out = client.step(live(2, Caps::ALL));
@@ -1106,7 +1106,7 @@ mod tests {
         for disconnected in [false, true] {
             let (mut client, _) = attached(Env::Keep);
             if disconnected {
-                client.step(msg(1, DaemonMsg::Draining));
+                client.step(msg(1, DaemonMsg::Draining { held: None }));
                 client.step(closed(1));
             }
             for n in 0..UNANSWERED {
@@ -1118,7 +1118,7 @@ mod tests {
             assert!(sends(&out).is_empty(), "{out:?}");
             assert_eq!(notices(&out), vec![&Notice::Backpressure], "{out:?}");
             if !disconnected {
-                client.step(msg(1, DaemonMsg::Draining));
+                client.step(msg(1, DaemonMsg::Draining { held: None }));
                 client.step(closed(1));
             }
             let out = client.step(live(2, Caps::ALL));
@@ -1233,7 +1233,7 @@ mod tests {
     fn pending_input_never_crosses_an_explicit_session_change() {
         let (mut client, _) = attached(Env::Keep);
         client.run(Cmd::Input("unanswered".into()));
-        client.step(msg(1, DaemonMsg::Draining));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
         client.run(Cmd::Input("queued".into()));
         client.open(Target::New);
         let out = client.step(live(2, Caps::ALL));
@@ -1244,7 +1244,7 @@ mod tests {
     fn pending_input_survives_a_restart_of_the_same_session() {
         let (mut client, _) = attached(Env::Keep);
         client.run(Cmd::Input("unanswered".into()));
-        client.step(msg(1, DaemonMsg::Draining));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
         client.run(Cmd::Input("queued".into()));
         client.restart();
         let out = client.step(live(2, Caps::ALL));
@@ -1265,7 +1265,7 @@ mod tests {
             },
         ));
         assert!(refused.is_empty(), "no error shown: {refused:?}");
-        client.step(msg(1, DaemonMsg::Draining));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
         client.step(closed(1));
         let out = client.step(live(2, Caps::ALL));
         assert_eq!(sends(&out).len(), 1, "{out:?}");
@@ -1274,7 +1274,7 @@ mod tests {
         assert_eq!(client.submission(id), Some(crate::SubmissionState::Queued));
         // Taken this time: a second drain does not send it again.
         client.step(msg(2, DaemonMsg::Ack { client_seq: 1 }));
-        client.step(msg(2, DaemonMsg::Draining));
+        client.step(msg(2, DaemonMsg::Draining { held: None }));
         client.step(closed(2));
         assert!(sends(&client.step(live(3, Caps::ALL))).is_empty());
     }
@@ -1343,7 +1343,7 @@ mod tests {
         ));
         // Attached but reconnecting: offered, and queued until the
         // connection is up.
-        client.step(msg(1, DaemonMsg::Draining));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
         client.step(closed(1));
         assert!(client.offer().unwrap().steer("go").unwrap().is_empty());
         let out = client.step(live(2, Caps::ALL));

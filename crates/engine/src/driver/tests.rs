@@ -23,6 +23,7 @@ mod admission;
 mod background;
 mod bench;
 mod durable;
+mod handover;
 mod interrupt;
 mod invocation;
 mod later;
@@ -622,7 +623,8 @@ fn pressure_retains_cached_projections_while_a_process_is_owned() {
     lock(&session.session.jobs).push(Job {
         call: CallId::new(1).unwrap(),
         tool: None,
-        process: Arc::clone(&process),
+        role: ext::Role::Work,
+        lease: Arc::new(ext::ProcessLease::from(Arc::clone(&process))),
     });
     assert!(session.has_jobs());
     assert!(!session.has_work());
@@ -631,7 +633,7 @@ fn pressure_retains_cached_projections_while_a_process_is_owned() {
     session.reclaim();
     assert_eq!(session.projection_cache(false), [true; 3]);
     assert!(Arc::ptr_eq(
-        &lock(&session.session.jobs)[0].process,
+        &*lock(&session.session.jobs)[0].lease,
         &process
     ));
     lock(&session.session.jobs).clear();

@@ -372,7 +372,7 @@ impl Daemon {
     #[cfg(test)]
     fn load(home: &Home, config: &Config) -> io::Result<Owner> {
         let runtime = Arc::new(rt::Threads::default());
-        let mut owner = Self::load_on(home, config, &runtime, handover::Record::default())?;
+        let mut owner = Self::load_on(home, config, &runtime, Vec::new())?;
         owner.1 = Some(runtime);
         Ok(owner)
     }
@@ -383,7 +383,7 @@ impl Daemon {
         home: &Home,
         config: &Config,
         runtime: &Arc<impl rt::Runtime>,
-        handed: handover::Record,
+        handed: Vec<handover::Handed>,
     ) -> io::Result<Owner> {
         let machine = Machine::read(home, &**runtime);
         // Extensions publish these facts as they register.
@@ -401,7 +401,7 @@ impl Daemon {
         catalog.start(Arc::clone(runtime) as Arc<dyn rt::Runtime>);
         let records = catalog.records();
         let busy: Vec<bool> = (records.iter())
-            .map(|r| r.busy || handed.groups.iter().any(|g| g.session == r.header.id))
+            .map(|r| r.busy || (handed.iter()).any(|h| h.owner.session == r.header.id))
             .collect();
         let slots: Vec<_> = (records.into_iter())
             .map(|record| {
@@ -476,6 +476,16 @@ impl Daemon {
                 }
             }
         });
+        // Handed to a session that is not there, or did not load: no one
+        // goes on with it, and it is killed as its claim drops.
+        let unclaimed = std::mem::take(&mut *lock(&daemon.shared.handed));
+        for handed in unclaimed {
+            fact(Fact::Fault {
+                session: Some(handed.owner.session),
+                operation: Operation::Handover,
+                kind: Fault(io::ErrorKind::NotFound),
+            });
+        }
         Ok(Owner(daemon, None))
     }
 
@@ -1095,25 +1105,25 @@ impl Daemon {
             if let Some(reason) = stopping {
                 exit.now(self, reason).await;
             }
-            let draining = life.draining();
-            let busy = draining.is_some() || self.has_work();
+            let busy = life.draining().is_some() || self.has_work();
             if busy != awake.is_some() {
                 awake = busy.then(|| sys::Awake::hold("a: an agent is at work"));
             }
             let mut next = self.next_hibernation(config.hibernate, now);
-            if draining.is_some() {
-                let jobs = self.loaded().iter().any(|s| s.has_jobs());
-                if !self.has_work() && !jobs {
+            if life.wanted().is_some() {
+                if !self.at_work() {
+                    life.drain();
                     exit.now(self, Stop::Upgrade).await;
                 }
-                if let (Some(command), Some(successor)) = (successor, self.successor(&exit.home))
-                    && let Ok((record, handles)) = self.hand_over().await
+                if let (Some(command), Some(successor)) =
+                    (successor, self.successor(&exit.home.runtime()))
+                    && let Ok(given) = self.hand_over().await
                 {
-                    // Whatever holds off sleep for this build (a process
-                    // of its own on Linux) must not outlive it.
+                    life.drain();
+                    // Whatever holds off sleep for this build must not
+                    // outlive it.
                     awake.take();
-                    exit.hand_over(self, record, handles, successor, command)
-                        .await;
+                    exit.hand_over(self, given, successor, command).await;
                 }
             } else if self.idle() {
                 match idling.next(*since.get_or_insert(now), config.idle, now) {
@@ -1286,9 +1296,9 @@ pub struct Start {
     /// How a drain starts the next build to hand work over to; without it,
     /// a drain waits for all work to end.
     pub successor: Option<Successor>,
-    /// What the daemon of an earlier build handed this one, as it read it
-    /// ([`handover::Record`]).
-    pub handed: Option<Vec<u8>>,
+    /// What the daemon of an earlier build handed this one: each group,
+    /// claimed as the record was read, with what the record says of it.
+    pub handed: Option<Vec<(sys::handover::Claimed, serde_json::Value)>>,
 }
 
 /// How long a new daemon serves before asking [`Start::resident`].
@@ -1439,10 +1449,7 @@ fn run(
         sys::Signal::Interrupt,
         sys::Signal::Hangup,
     ])?;
-    let handed = start
-        .handed
-        .as_deref()
-        .map_or_default(handover::Record::read);
+    let handed = start.handed.map_or_default(handover::handed);
     let daemon = Daemon::load_on(home, &config, runtime, handed)?;
     let signals = rt::Async::for_reading(&daemon.shared.rt.reactor(), signals)?;
     let signalled = async {

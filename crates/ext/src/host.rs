@@ -42,11 +42,7 @@ pub trait Host: Send + Sync {
     ) -> BoxFuture<'static, Called>;
     /// See [`Cx::spawned`].
     fn spawned(&self, pgid: u32, background: bool);
-    fn own(&self, process: crate::ProcessLease);
-    /// See [`Cx::reown`].
-    fn reown(&self, process: crate::ProcessLease) {
-        self.own(process);
-    }
+    fn own(&self, process: crate::ProcessLease, role: crate::Role);
     /// See [`Cx::resumable`].
     fn resumable(&self, _process: Arc<dyn crate::RunningProcess>, _state: Json) {}
     /// See [`Cx::progress`].
@@ -168,7 +164,7 @@ impl Toolset {
         name: &str,
         input: &Json,
         state: Json,
-        handed: Json,
+        claimed: crate::Native,
         cx: &'a Cx,
     ) -> BoxFuture<'a, Called> {
         let Some(tool) = self.get(name) else {
@@ -180,7 +176,7 @@ impl Toolset {
             Err(error) => return Box::pin(std::future::ready(Called::failed(error))),
         };
         Box::pin(async move {
-            let called = tool.resume(input, state, handed, cx).await;
+            let called = tool.resume(input, state, claimed, cx).await;
             match cx.service::<dyn crate::Record>() {
                 Some(record) => record.record(tool, called, cx).await,
                 None => called,

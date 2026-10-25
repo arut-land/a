@@ -23,8 +23,8 @@ impl Host for PausedRecord {
     fn spawned(&self, pgid: u32, background: bool) {
         self.rig.spawned(pgid, background);
     }
-    fn own(&self, process: ext::ProcessLease) {
-        self.rig.own(process);
+    fn own(&self, process: ext::ProcessLease, role: ext::Role) {
+        self.rig.own(process, role);
     }
     fn progress(&self, text: &str) {
         self.rig.progress(text);

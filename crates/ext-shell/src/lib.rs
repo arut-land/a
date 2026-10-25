@@ -17,7 +17,8 @@
 //! process group the session owns (a background job, or what a command left
 //! running) writes an open blob stream, sealed as the group ends into the blob
 //! the end's queued notice holds. Both go on in the daemon's next build
-//! after an upgrade ([`ext::Resumable`]): the group is handed over live and
+//! after an upgrade ([`ext::Resumable`], offered with
+//! `resumable_tool`): the group is handed over live and
 //! its stream followed on from where it is.
 //!
 //! PowerShell takes one bounded Unicode `-Command` payload, preserving normal
@@ -91,13 +92,13 @@ impl Extension for Shell {
 fn contribute(r: &mut Registrar, facts: &'static sys::shell::ExecutionFacts, timeout: u64) {
     match facts.dialect {
         sys::shell::Dialect::Bash => {
-            r.tool(Bash::new(facts, timeout)).resumable();
+            r.resumable_tool(Bash::new(facts, timeout));
         }
         sys::shell::Dialect::PowerShell => {
-            r.tool(PowerShell::new(facts, timeout)).resumable();
+            r.resumable_tool(PowerShell::new(facts, timeout));
         }
         sys::shell::Dialect::WindowsPowerShell => {
-            r.tool(WindowsPowerShell::new(facts, timeout)).resumable();
+            r.resumable_tool(WindowsPowerShell::new(facts, timeout));
         }
     }
     r.fold::<state::Cwd>()

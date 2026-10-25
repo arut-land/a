@@ -63,11 +63,15 @@ impl Verdict {
     }
 }
 
-/// This daemon's build and the state of its drain.
+/// This daemon's build and the state of its upgrade.
 pub struct Lifecycle {
     pub build: String,
     runtime: Runtime,
-    /// When the drain began.
+    /// When a client of the newer build first came: the upgrade waits from
+    /// then on, this build serving meanwhile, until nothing holds it.
+    wanted: OnceLock<Instant>,
+    /// When the daemon began to make way: from then on it takes up no
+    /// client's request and exits as soon as it can.
     draining: OnceLock<Instant>,
     /// Every open connection's outbox, told when a drain begins.
     conns: Mutex<Vec<(u64, Outbox)>>,
@@ -79,6 +83,7 @@ impl Lifecycle {
         Self {
             build,
             runtime,
+            wanted: OnceLock::new(),
             draining: OnceLock::new(),
             conns: Mutex::new(Vec::new()),
             next: AtomicU64::new(0),
@@ -100,13 +105,21 @@ impl Lifecycle {
         )
     }
 
+    pub const fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    pub fn wanted(&self) -> Option<Instant> {
+        self.wanted.get().copied()
+    }
+
     pub fn draining(&self) -> Option<Instant> {
         self.draining.get().copied()
     }
 
-    /// Starts the drain once, telling every open connection.
-    pub fn drain(&self) {
-        if self.draining.set(Instant::now()).is_ok() {
+    /// The upgrade is wanted, once: the daemon makes way as soon as it can.
+    pub fn want(&self) {
+        if self.wanted.set(Instant::now()).is_ok() {
             ext_logging::emit(ext_logging::Fact::Upgrade {
                 to: self
                     .runtime
@@ -114,10 +127,17 @@ impl Lifecycle {
                     .as_deref()
                     .map(ext_logging::Build::of),
             });
-            if let Ok(draining) = Frame::new(&DaemonMsg::Draining) {
-                for (_, tx) in &*lock(&self.conns) {
-                    let _ = tx.send(draining.clone());
-                }
+        }
+    }
+
+    /// Starts the drain once, telling every open connection.
+    pub fn drain(&self) {
+        self.want();
+        if self.draining.set(Instant::now()).is_ok()
+            && let Ok(draining) = Frame::new(&DaemonMsg::Draining { held: None })
+        {
+            for (_, tx) in &*lock(&self.conns) {
+                let _ = tx.send(draining.clone());
             }
         }
     }

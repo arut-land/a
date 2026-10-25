@@ -633,6 +633,7 @@ mod tests {
                     machine: protocol::MachineId([0; 16]),
                     commands: Vec::new(),
                     queries: Vec::new(),
+                    upgrade: None,
                 },
             )
             .unwrap();
@@ -1000,6 +1001,7 @@ mod tests {
                 machine: protocol::MachineId([0; 16]),
                 commands: Vec::new(),
                 queries: Vec::new(),
+                upgrade: None,
             },
         )
         .unwrap();
@@ -1076,6 +1078,7 @@ mod tests {
                 machine: protocol::MachineId([0; 16]),
                 commands: Vec::new(),
                 queries: Vec::new(),
+                upgrade: None,
             },
         )
         .unwrap();

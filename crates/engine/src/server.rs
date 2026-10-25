@@ -220,6 +220,29 @@ pub(crate) async fn handle(
 }
 
 /// [`handle`], with the connection's role as `role` decides it.
+/// A client of the newer build: the daemon makes way for it as soon as
+/// nothing holds the upgrade, and serves it meanwhile, if it can, saying
+/// what does.
+async fn upgrading(
+    daemon: &Daemon,
+    life: &Lifecycle,
+    verdict: Verdict,
+    theirs: Versions,
+) -> (Verdict, Option<String>) {
+    if verdict != Verdict::Drain || life.draining().is_some() {
+        return (verdict, None);
+    }
+    life.want();
+    daemon.pulse.notify();
+    let held = daemon.upgrade_held(life.runtime()).await;
+    let verdict = if held.is_some() && Versions::OURS.common(theirs).is_some() {
+        Verdict::Welcome
+    } else {
+        verdict
+    };
+    (verdict, held)
+}
+
 pub(crate) async fn handle_as(
     daemon: &Arc<Daemon>,
     life: &Lifecycle,
@@ -243,6 +266,7 @@ pub(crate) async fn handle_as(
         }
         _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE, None, None),
     };
+    let (verdict, held) = upgrading(daemon, life, verdict, theirs).await;
     let outbox = Outbox::new();
     let writer = write_out(
         Arc::clone(&io),
@@ -280,6 +304,7 @@ pub(crate) async fn handle_as(
                             machine: ours,
                             commands: driver::commands(&registry),
                             queries: crate::query::advertised(&registry),
+                            upgrade: held,
                         });
                         conn.serve(&mut frames).await
                     }
@@ -290,11 +315,14 @@ pub(crate) async fn handle_as(
                     }
                 },
                 (Verdict::Drain, _) => {
-                    life.drain();
-                    daemon.pulse.notify();
-                    reply(&outbox, &DaemonMsg::Draining);
-                    // Held open until we exit: the client's cue to reconnect.
-                    frames.drain().await;
+                    let refused = held.is_some();
+                    reply(&outbox, &DaemonMsg::Draining { held });
+                    if refused {
+                        within(&daemon.shared.rt.reactor(), REFUSED_GRACE, frames.drain()).await;
+                    } else {
+                        // Held open until we exit: the client's cue to reconnect.
+                        frames.drain().await;
+                    }
                     Ok(())
                 }
                 _ => {

@@ -190,14 +190,10 @@ impl Host for CallPorts {
         });
     }
 
-    fn own(&self, process: ext::ProcessLease) {
+    fn own(&self, process: ext::ProcessLease, role: ext::Role) {
         self.spawned(process.id(), true);
-        self.reown(process);
-    }
-
-    fn reown(&self, process: ext::ProcessLease) {
         self.origin
-            .send(&self.session, ContextRequest::Own { process });
+            .send(&self.session, ContextRequest::Own { process, role });
     }
 
     fn resumable(&self, process: Arc<dyn ext::RunningProcess>, state: Json) {

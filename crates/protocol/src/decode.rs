@@ -548,6 +548,8 @@ pub(crate) struct MsgFields {
     pub(crate) body: Option<Json>,
     pub(crate) outcome: Option<Outcome>,
     pub(crate) queries: Option<Vec<crate::QueryInfo>>,
+    pub(crate) upgrade: Option<String>,
+    pub(crate) held: Option<String>,
 }
 
 /// An [`Item`] of a snapshot.

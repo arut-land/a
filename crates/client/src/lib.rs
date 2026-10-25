@@ -181,6 +181,9 @@ pub struct Connection {
     pub commands: Vec<CommandInfo>,
     /// The queries it answers.
     pub queries: Vec<QueryInfo>,
+    /// What holds the upgrade to a newer build the daemon waits for, if
+    /// it waits: it serves this client meanwhile.
+    pub upgrade: Option<String>,
 }
 
 /// What the daemon's welcome settled for a connection.
@@ -457,8 +460,8 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for a draining daemon before calling it wedged. A
-/// drain hands background work over at once, but one that cannot waits for
-/// that work to end, and a client gives up on it after this.
+/// daemon drains only once it is making way, which takes no longer than
+/// its shutdown; an upgrade that must wait serves the client meanwhile.
 pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// What a client can tell about the daemon without talking to it.
@@ -602,7 +605,7 @@ async fn reach(home: &Home, build: &str) -> Result<Connection, Error> {
     )
     .await?;
     match greeting {
-        (Greeting::Welcome(theirs), welcome, commands, queries) => Ok(Connection {
+        (Greeting::Welcome(theirs, upgrade), welcome, commands, queries) => Ok(Connection {
             stream,
             buffered,
             remote,
@@ -610,6 +613,7 @@ async fn reach(home: &Home, build: &str) -> Result<Connection, Error> {
             welcome,
             commands,
             queries,
+            upgrade,
         }),
         _ => Err(Error::Refused("the daemon cannot be asked".to_owned())),
     }
@@ -1050,6 +1054,7 @@ mod tests {
                             machine: MachineId([0; 16]),
                             commands: Vec::new(),
                             queries: Vec::new(),
+                            upgrade: None,
                         },
                     )
                     .unwrap();

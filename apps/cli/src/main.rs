@@ -199,7 +199,11 @@ fn here<'a>(home: &'a Home, host: Option<&Host>) -> io::Result<&'a Home> {
 /// restart itself.
 fn connect(daemon: &client::Daemon) -> io::Result<client::Connection> {
     let on_drain = || eprintln!("[waiting for the previous daemon to finish its work]");
-    daemon.connect(&on_drain).map_err(|e| wedged(daemon, e))
+    let connection = daemon.connect(&on_drain).map_err(|e| wedged(daemon, e))?;
+    if let Some(held) = &connection.upgrade {
+        eprintln!("[the upgrade to this build waits: {held}; `a daemon stop` ends what holds it]");
+    }
+    Ok(connection)
 }
 
 /// `e` as reported: a daemon that does not answer is diagnosed where its
@@ -723,8 +727,15 @@ fn serve(
             return client::spawn_at_login(home);
         }
     }
+    // What the daemon of the build before handed this one is claimed
+    // first, every handle owned and closed on exec from here on.
+    let handed = handover_fd
+        .map(|fd| sys::handover::read_record(sys::InheritedNumber::from(fd)))
+        .transpose()?;
     sys::crash::install(home.crash_dir(), sys::crash::Build::of(&staged.id));
-    if detached || listen_fd.is_some() {
+    // A daemon exec'd in place by the build before is where that one was:
+    // its session and its stderr (a journal, a terminal) are its own.
+    if handed.is_none() && (detached || listen_fd.is_some()) {
         sys::detach_session()?;
         sys::log::discard_stderr()?;
     }
@@ -748,9 +759,6 @@ fn serve(
         };
         (lock, listener)
     };
-    let handed = handover_fd
-        .map(|fd| sys::handover::read_record(sys::InheritedNumber::from(fd)))
-        .transpose()?;
     let start = engine::Start {
         lock,
         reset_breaker,

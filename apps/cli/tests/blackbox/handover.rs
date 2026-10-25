@@ -169,10 +169,10 @@ fn an_upgrade_hands_running_work_to_the_newer_build_live() {
 }
 
 /// A newer build that declares another handover takes nothing over: the
-/// drain waits for the job to end, however long, and only then does the
-/// newer build's daemon start.
+/// upgrade waits, the older build serving the newer one's clients meanwhile
+/// and telling them what holds it, until the job ends; then it makes way.
 #[test]
-fn a_build_that_cannot_take_the_work_over_waits_for_it_to_end() {
+fn an_upgrade_the_newer_build_cannot_take_over_waits_serving_meanwhile() {
     let env = Env::new("handover-refused");
     let old = env.older_build();
     let out = env.cmd_as(&old, &["ls"]).output().unwrap();
@@ -190,11 +190,54 @@ fn a_build_that_cannot_take_the_work_over_waits_for_it_to_end() {
     let newer = env.home.runtime().stage(&env.exe).unwrap();
     fs::write(newer.exe.with_file_name("handover"), "0").unwrap();
 
-    let listed = env.run(&["ls"]);
+    let out = env.cmd(&["ls"]).output().unwrap();
+    let (listed, told) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
     assert!(listed.starts_with(&id.short().to_string()), "{listed}");
-    assert_ne!(env.pid(), Some(pid), "the older daemon handed over");
+    assert!(told.contains("the upgrade to this build waits"), "{told}");
+    assert!(told.contains("`a daemon stop`"), "{told}");
+    assert_eq!(env.pid(), Some(pid), "the older daemon made way at once");
+    wait_within(
+        "the older daemon to make way",
+        std::time::Duration::from_secs(30),
+        || env.pid() != Some(pid),
+    );
+    env.run(&["ls"]);
+    assert_ne!(env.pid(), Some(pid));
     assert!(job_ended_holding_a_blob(&env.log(id)));
     assert!(blob_holds(&env, "now\nlate\n"));
     let log = fs::read_to_string(env.home.daemon_log()).unwrap();
     assert!(!log.contains("\"handed_over\""), "{log}");
+}
+
+/// A daemon started by hand, at a terminal and leading its own process
+/// group, hands over where it runs: the newer build stays in its session
+/// with its stderr, rather than leaving them as a daemon a client starts
+/// does.
+#[test]
+fn a_daemon_started_by_hand_hands_over_where_it_runs() {
+    use std::os::unix::process::CommandExt;
+    let env = Env::new("handover-by-hand");
+    let old = env.older_build();
+    let mut started = env.cmd_as(&old, &["__daemon"]);
+    started
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut daemon = started.spawn().unwrap();
+    let mut conn = Conn::open_when_listening(&env.home);
+    assert!(matches!(conn.hello(), protocol::DaemonMsg::Welcome { .. }));
+    conn.attach(Target::New, &env.ws);
+    conn.input("$ sleep 30 & echo job");
+    conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
+    drop(conn);
+
+    env.run(&["ls"]);
+    assert_eq!(env.pid(), Some(daemon.id()), "the daemon left its process");
+    assert!(daemon.try_wait().unwrap().is_none(), "the daemon ended");
+    env.cmd(&["daemon", "stop"]).status().unwrap();
+    assert!(daemon.wait().unwrap().success());
 }

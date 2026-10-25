@@ -521,7 +521,7 @@ mod tests {
     #[test]
     fn after_an_upgrade_the_transcript_shows_whole_again() {
         let mut page = synced();
-        page.fold(&[DaemonMsg::Draining]);
+        page.fold(&[DaemonMsg::Draining { held: None }]);
         assert_eq!(events(&mut page), NONE);
         let session = page.client.view().session.unwrap();
         page.event(closed(1));

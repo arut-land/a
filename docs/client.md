@@ -35,7 +35,11 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   need the person at the terminal (`needs_terminal`), what can be told of
   a daemon that never answered (`unanswered`), and which side to update
   on a mismatch. The hello, its timeout, the drain wait and the retries
-  are written once, in `link::connect`, over any link; the blocking API
+  are written once, in `link::connect`, over any link. A daemon whose
+  upgrade to a newer build must wait welcomes that build's client anyway,
+  saying what holds it (`Connection::upgrade`); one that cannot serve it
+  meanwhile says so in its `Draining` (`held`), which is an error, never a
+  wait; the blocking API
   (`Daemon::connect`, `status`, `stop`) runs the same code on its caller's
   thread. A new transport is a new type, never an arm in an enum:
   - `LocalLink(Home)`: this machine's daemon over its socket, spawned

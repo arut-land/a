@@ -394,7 +394,7 @@ fn a_reconnect_replay_from_any_seq_seen_is_idempotent() {
         let cut = rng.below(watched.len() as u64 + 1) as usize;
         let resume = cut + rng.below((watched.len() - cut) as u64 + 1) as usize;
         let mut view = folded(&watched[..cut]);
-        fold(&mut view, &[DaemonMsg::Draining]);
+        fold(&mut view, &[DaemonMsg::Draining { held: None }]);
         let since = rng.below(view.seq + 1);
         let upto = watched[..resume]
             .iter()
@@ -954,7 +954,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(1, input("one")),
                 entry(2, Body::Assistant { text: "one".into() }),
                 msg(DaemonMsg::Synced { seq: 2 }),
-                msg(DaemonMsg::Draining),
+                msg(DaemonMsg::Draining { held: None }),
                 attached(),
                 entry(2, Body::Assistant { text: "one".into() }),
                 entry(3, input("two")),

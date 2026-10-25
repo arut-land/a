@@ -594,6 +594,7 @@ fn stale_request<'a>(
                 session,
                 ContextRequest::Own {
                     process: (Arc::new(StaleProcess) as Arc<dyn ext::RunningProcess>).into(),
+                    role: ext::Role::Work,
                 },
             );
         })

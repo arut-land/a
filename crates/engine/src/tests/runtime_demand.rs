@@ -47,9 +47,7 @@ fn concurrent_session_sizing() {
                     config.storage.workers = workers;
                 }
                 let runtime = Arc::new(rt::Threads::configured(config));
-                let daemon =
-                    Daemon::load_on(&home, &echo(), &runtime, crate::handover::Record::default())
-                        .unwrap();
+                let daemon = Daemon::load_on(&home, &echo(), &runtime, Vec::new()).unwrap();
                 let mut held = Vec::new();
                 if lane == "cpu" {
                     // Resolve without attaching a client: the actor is loaded,

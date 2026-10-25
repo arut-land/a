@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -21,6 +21,18 @@ fn rerun() -> Command {
     command
 }
 
+/// `group`'s leader and pipe as one image hands them to the next.
+fn given(cmd: &mut Command, file: File) -> Given {
+    let ContainedChild {
+        child,
+        group,
+        capture,
+    } = crate::spawn_group_captured(cmd, file).unwrap();
+    let (pipe, unread) = park(capture.unwrap().reader).unwrap();
+    assert_eq!(unread, Vec::<u8>::new());
+    give(child, group, Some(pipe))
+}
+
 /// The process execs into a new image, and the group it started, with
 /// what it wrote but nobody read yet, is the new image's: its exit status
 /// is still there to wait for, and its pipe still holds its output.
@@ -31,18 +43,20 @@ fn an_exec_keeps_a_group_waitable_and_its_unread_output() {
     match std::env::var(STAGE).ok().as_deref() {
         Some("give") => {
             let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
-            let home = crate::Paths::from(root.clone());
             let file = File::create(root.join("output")).unwrap();
             let mut cmd = Command::new("/bin/sh");
             cmd.args(["-c", "echo before; sleep 1; echo after; exit 7"]);
-            let ContainedChild {
-                child,
-                group,
-                capture,
-            } = crate::spawn_group_captured(&mut cmd, file).unwrap();
-            let capture = capture.unwrap();
-            let given = give(&child, group, Some(capture.reader)).unwrap();
-            let record = record(&home, &serde_json::to_vec(&given.group).unwrap()).unwrap();
+            let given = given(&mut cmd, file);
+            let owner = serde_json::json!({"call": 4});
+            let path = root.join("record");
+            let mut record = File::options()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            fs::remove_file(path).unwrap();
+            record.write_all(&encode([(&given.group, &owner)])).unwrap();
             let mut next = rerun();
             next.env(STAGE, "adopt")
                 .env(RECORD, record.as_raw_fd().to_string())
@@ -50,15 +64,16 @@ fn an_exec_keeps_a_group_waitable_and_its_unread_output() {
             let error = Successor::new(next)
                 .handles(std::slice::from_ref(&record))
                 .handles(&given.handles)
-                .replace(&home);
+                .exec();
             panic!("exec failed: {error}");
         }
         Some("adopt") => {
             assert_eq!(std::env::var(PID).unwrap(), std::process::id().to_string());
             let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
             let number: i32 = std::env::var(RECORD).unwrap().parse().unwrap();
-            let bytes = read_record(crate::InheritedNumber::from(number)).unwrap();
-            let group: Group = serde_json::from_slice(&bytes).unwrap();
+            let mut claimed = read_record(crate::InheritedNumber::from(number)).unwrap();
+            let (claimed, owner) = claimed.pop().unwrap();
+            assert_eq!(owner, serde_json::json!({"call": 4}));
             let file = File::options()
                 .append(true)
                 .open(root.join("output"))
@@ -67,8 +82,8 @@ fn an_exec_keeps_a_group_waitable_and_its_unread_output() {
                 mut child,
                 group: lease,
                 capture,
-            } = adopt(&group, file).unwrap();
-            let crate::OutputCapture {
+            } = claimed.adopt(file);
+            let OutputCapture {
                 mut reader,
                 mut file,
             } = capture.unwrap();
@@ -102,20 +117,36 @@ fn an_exec_keeps_a_group_waitable_and_its_unread_output() {
 #[cfg_attr(miri, ignore)]
 fn a_handed_number_that_is_not_this_processs_child_is_refused() {
     let (reader, _writer) = io::pipe().unwrap();
-    let number = std::os::fd::OwnedFd::from(reader);
     let group: Group = serde_json::from_value(serde_json::json!({
         "pid": 1,
-        "output": std::os::fd::IntoRawFd::into_raw_fd(number),
+        "output": std::os::fd::OwnedFd::from(reader).into_raw_fd(),
     }))
     .unwrap();
-    let file = tempfile_in_temp();
-    let error = adopt(&group, file).err().unwrap();
+    let error = imp::claim(&group).err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
 }
 
-fn tempfile_in_temp() -> File {
-    let path = std::env::temp_dir().join(format!("a-handover-refused-{}", std::process::id()));
-    let file = File::create(&path).unwrap();
+/// A group the next image claims but no one adopts (its session is gone,
+/// its tool is not there) does not outlive the claim: it is killed and
+/// reaped as the claim drops.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_claimed_group_no_one_adopts_is_killed_and_reaped() {
+    let path = std::env::temp_dir().join(format!("a-unadopted-{}", std::process::id()));
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "sleep 30"]);
+    let given = given(&mut cmd, File::create(&path).unwrap());
     fs::remove_file(path).unwrap();
-    file
+    let pid = given.group.pid;
+    // As an exec passes them on: owned by nothing until claimed.
+    for handle in given.handles {
+        let _ = handle.into_raw_fd();
+    }
+    let claimed = imp::claim(&given.group).unwrap();
+    assert!(crate::process_started(pid).is_some());
+    drop(claimed);
+    assert!(
+        crate::process_started(pid).is_none(),
+        "the group outlived its claim"
+    );
 }

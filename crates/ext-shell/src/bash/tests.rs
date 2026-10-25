@@ -820,7 +820,7 @@ fn continuous_output_yields_to_other_sessions() {
                 limit: Duration::from_secs(5),
                 detached: &detached,
             };
-            supervise(
+            supervise::<crate::dialect::Bash>(
                 process,
                 Followed { log, written },
                 supervised,

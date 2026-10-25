@@ -32,8 +32,9 @@ impl Child {
         Self { process, id }
     }
 
-    pub(crate) const fn process(&self) -> &OwnedHandle {
-        &self.process
+    /// Its process handle, for the build it is handed to.
+    pub(crate) fn into_process(self) -> OwnedHandle {
+        self.process
     }
 
     pub fn id(&self) -> u32 {

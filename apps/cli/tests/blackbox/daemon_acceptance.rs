@@ -158,14 +158,20 @@ fn two_installs_upgrade_once_and_the_older_client_never_downgrades() {
     assert_eq!(env.pid(), new_pid);
 }
 
-/// The older build's daemon owns a job when the newer build's first client
-/// drains it: the job goes to the newer build live (in the same process on
-/// Unix, a successor on Windows), which reports its end, its output kept.
+/// The older build's daemon owns a job and runs a call gone on in the
+/// background when the newer build's first client comes: both go to the
+/// newer build live (in the same process on Unix, a successor on Windows,
+/// a read in flight on the call's pipe cancelled and its bytes kept), which
+/// reports the call's outcome and the job's end, their output whole.
 #[test]
-fn an_upgrade_hands_a_running_job_to_the_newer_build() {
+fn an_upgrade_hands_running_work_to_the_newer_build() {
     let env = Isolated::new("handover-job");
+    let config = env.home.config_file();
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("\n[ext.shell]\ntimeout = 1\n");
+    fs::write(&config, text).unwrap();
     let older = older_build(&env);
-    let job = "$ (sleep 8; echo late) & echo now";
+    let job = "$ (sleep 10; echo late) & echo now";
     let ran = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", job]))
         .collect(deadline())
         .unwrap();
@@ -174,6 +180,21 @@ fn an_upgrade_hands_a_running_job_to_the_newer_build() {
         "{}",
         String::from_utf8_lossy(&ran.stderr)
     );
+    // Its client waits for the call's outcome, through the upgrade.
+    let call = "$ echo start; sleep 6; echo end; exit 7";
+    let waiting = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", call]));
+    let detached = Instant::now() + Duration::from_secs(30);
+    while !env
+        .logs()
+        .values()
+        .any(|log| String::from_utf8_lossy(log).contains(r#""kind":"detached""#))
+    {
+        assert!(
+            Instant::now() < detached,
+            "the call never went on in the background"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let older_pid = env.pid();
     env.run(&["ls"]);
     assert_eq!(
@@ -188,15 +209,20 @@ fn an_upgrade_hands_a_running_job_to_the_newer_build() {
         assert!(Instant::now() < ended, "{}", log());
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(log().contains(r#""handed_over":{"groups":1}"#), "{}", log());
-    while !env
-        .logs()
-        .values()
-        .any(|log| String::from_utf8_lossy(log).contains(r#""purpose":"job""#))
-    {
-        assert!(Instant::now() < ended, "the job's end never came");
+    assert!(log().contains(r#""handed_over":{"groups":2}"#), "{}", log());
+    let logged = |text: &str| {
+        env.logs()
+            .values()
+            .any(|log| String::from_utf8_lossy(log).contains(text))
+    };
+    while !(logged(r#""purpose":"job""#) && logged(r#""purpose":"detached""#)) {
+        assert!(Instant::now() < ended, "the work's ends never came");
         std::thread::sleep(Duration::from_millis(100));
     }
+    let waited = waiting.collect(deadline()).unwrap();
+    let said = String::from_utf8_lossy(&waited.stdout);
+    assert!(said.contains("start") && said.contains("end"), "{said}");
+    assert!(said.contains("exit"), "{said}");
     let blobs = fs::read_dir(env.home.blobs_dir()).unwrap();
     let kept = (blobs.flatten())
         .filter(|fan| fan.file_name() != "open")
