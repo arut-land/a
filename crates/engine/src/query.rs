@@ -11,6 +11,7 @@ use ext::host::{Registry, SessionServices};
 use ext::query::{Asked, At};
 use protocol::{DaemonMsg, Json, Outcome, QueryInfo, Role, Scope};
 
+use crate::driver::contain;
 use crate::outbox::{Outbox, QueuePermit};
 use crate::server::{reply, workspace_of};
 use crate::{Daemon, lock};
@@ -76,7 +77,8 @@ impl Queries {
         daemon.shared.rt.spawn(Box::pin(async move {
             let _permit = permit;
             let update = |body| reply(&outbox, &DaemonMsg::Update { id, body });
-            let answer = query.answer(&body, &at, asked, &update);
+            // A query that panics fails, as a tool's call does.
+            let answer = contain(query.answer(&body, &at, asked, &update));
             let outcome = match cancel.until(answer).await {
                 Some(Ok(output)) => Outcome::Done { output },
                 Some(Err(error)) => Outcome::Failed { error },
