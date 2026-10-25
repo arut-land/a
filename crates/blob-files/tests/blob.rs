@@ -253,18 +253,19 @@ fn concurrent_ensures_of_one_blob_each_see_a_complete_file() {
     writer.write_all(&bytes).unwrap();
     let blob = writer.finish("text/plain", BlobOrigin::Paste).unwrap();
     let at = TreePath::by_id(&blob.id);
+    // One cache per directory, as the daemon holds it.
+    let tree = home.tree();
     let start = std::sync::Barrier::new(4);
     std::thread::scope(|scope| {
         for _ in 0..4 {
             scope.spawn(|| {
-                let tree = home.tree();
                 start.wait();
                 tree.ensure(&at, &blob).unwrap();
                 assert!(fs::read(tree.path(&at)).unwrap() == bytes);
             });
         }
     });
-    let dir = home.tree().path(&at);
+    let dir = tree.path(&at);
     assert_eq!(
         names(dir.parent().unwrap()),
         [blob.id.to_string()],
