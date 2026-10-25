@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
 use blob::{
-    BlobId, BlobOrigin, BlobRef, BlobStore, BlobWriter, Open, OutputStream, Sealer, Stream,
-    stream_path,
+    BlobId, BlobOrigin, BlobRead, BlobRef, BlobStore, BlobWriter, Open, OutputStream, Sealer,
+    Stream, stream_path,
 };
 
 const STAGING: &str = "staging";
@@ -119,7 +119,7 @@ impl BlobStore for Files {
         }
     }
 
-    fn open(&self, id: &BlobId) -> io::Result<Box<dyn Read + Send>> {
+    fn open(&self, id: &BlobId) -> io::Result<Box<dyn BlobRead>> {
         Ok(Box::new(File::open(self.0.path(id))?))
     }
 

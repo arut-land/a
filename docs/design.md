@@ -297,11 +297,10 @@ never inside a character) around `<truncated bytes=… path=…/>`; the
 transcript names every reference in `held` itself. The cut is a function of
 the blob's text and settings alone, so every projection shows the same bytes
 and a provider's prompt cache holds; where the blob cannot be named, the
-tag names no path. Clients never read the bytes: a result held as a blob
-with no card is shown as what it is and its reference (`Shown::Held`).
-Known gap: no client can fetch a blob's bytes yet, so a client shows such a
-result as that summary alone. Its settings are in
-[agents.md](agents.md).
+tag names no path. A result held as a blob with no card is shown as what
+it is and its reference (`Shown::Held`); a client that wants the bytes
+fetches them by that reference (below, the wire). The apps do not fetch
+yet. Its settings are in [agents.md](agents.md).
 
 ### Kernel and driver
 
@@ -532,15 +531,26 @@ Messages and Gemini with recorded-cassette parity; it runs HTTP via `rt`'s
 blocking pool and leaves retry policy to extensions.
 
 The daemon wire is framed over the local endpoint or bridge stdio: a
-little-endian u32 length, a `FrameKind` byte, then the body. Only JSON frames
-exist; a reader refuses a kind it does not know, so binary frames (blob
-chunks, without base64) can be added. `protocol::PROTO` defines the current version. Typed ids and message classes distinguish durable entries,
+little-endian u32 length, a `FrameKind` byte, then the body, JSON or a
+`Chunk`: a blob's id, a little-endian u64 offset and the bytes, never
+base64. A reader refuses a kind it does not know, and one that wants a
+message refuses a chunk. `protocol::PROTO` defines the current version. Typed ids and message classes distinguish durable entries,
 ephemeral traffic and control. Hello negotiates a supported version; attach
 replays from a seq or supplies a view snapshot, ends replay with `Synced`,
 then follows live entries. `Query { id, service, scope, body }` is
 answered by `Update`s, if it streams, then exactly one `Reply { id,
 outcome }`, on any connection, attached or not; `Cancel { id }` makes the
-reply interrupted. A wire encoding change requires a new version
+reply interrupted. `Fetch { id, session, blob, offset, len }` shares the
+query ids: the daemon sends the blob's bytes from `offset` (`len` of them,
+or to its end, clamped) as chunk frames in order, each read straight into
+its frame and queued only within a window of four chunks
+(`Outbox::send_within`), then one `Reply` whose output is the count sent.
+A blob is served only through a session whose log references it, checked
+where the fetch enters (`FrameLog::references`, folded lazily from where
+the last fetch left off, so a session nothing fetches from pays nothing):
+a hash alone opens nothing, and a fetch refused ends with `NotHeld { id }`
+in place of its reply. A chunk names its blob and offset,
+not the request, so the same frame will carry an upload. A wire encoding change requires a new version
 and a generated corpus; there is no older-format fallback.
 
 `protocol::view` is the shared reducer; `Item::present()` supplies common

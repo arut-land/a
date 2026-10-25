@@ -3,6 +3,7 @@
 mod catalog;
 pub mod config;
 mod driver;
+mod fetch;
 mod handover;
 mod model;
 mod outbox;

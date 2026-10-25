@@ -19,8 +19,8 @@ use sys::{Home, Staged};
 
 use crate::feed::{Feed, lock};
 use crate::{
-    AppAction, ChangeBatch, CliStatus, ClientError, CommandHelp, OpenTarget, QueryAnswer, Resync,
-    SessionInfo, SessionListUpdate, SessionSnapshot, Settings, TurnInfo,
+    AppAction, BlobPiece, ChangeBatch, CliStatus, ClientError, CommandHelp, OpenTarget,
+    QueryAnswer, Resync, SessionInfo, SessionListUpdate, SessionSnapshot, Settings, TurnInfo,
 };
 
 fn runtime() -> &'static Arc<Threads> {
@@ -352,6 +352,128 @@ impl QueryStream {
 }
 
 impl Drop for QueryStream {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// One blob's bytes, as the daemon streams them over a connection of its
+/// own: `start` it, then take each piece with `next`, in order. The daemon
+/// sends no faster than they are taken. Dropping it cancels the fetch.
+pub struct BlobFetch {
+    asked: Mutex<Option<Fetching>>,
+    pieces: rt::channel::Receiver<BlobPiece>,
+    cancel: Arc<Cancel>,
+}
+
+/// A fetch not yet asked, and where its pieces go.
+struct Fetching {
+    daemon: Daemon,
+    session: SessionId,
+    blob: protocol::BlobId,
+    offset: u64,
+    len: Option<u64>,
+    pieces: rt::channel::BlockingSender<BlobPiece>,
+}
+
+#[export]
+impl BlobFetch {
+    /// Blob `blob` (its id, as a `BlobRef` names it), as session `session`
+    /// references it: `len` bytes from `offset`, or all to its end without
+    /// `len`; clamped to the blob's end.
+    pub fn new(
+        client: &Client,
+        session: &str,
+        blob: &str,
+        offset: u64,
+        len: Option<u64>,
+    ) -> Result<Self, ClientError> {
+        let invalid = |message: String| ClientError::InvalidArgument { message };
+        let session = session
+            .parse()
+            .map(SessionId)
+            .map_err(|e| invalid(format!("session: {e}")))?;
+        let blob = blob.parse().map_err(|e| invalid(format!("blob: {e}")))?;
+        let (sender, pieces) = rt::channel::bounded(16);
+        Ok(Self {
+            asked: Mutex::new(Some(Fetching {
+                daemon: client.daemon().clone(),
+                session,
+                blob,
+                offset,
+                len,
+                pieces: sender,
+            })),
+            pieces,
+            cancel: Arc::default(),
+        })
+    }
+
+    /// Asks for it, starting the daemon if needed. Starts once.
+    pub fn start(&self) {
+        let Some(Fetching {
+            daemon,
+            session,
+            blob,
+            offset,
+            len,
+            pieces,
+        }) = lock(&self.asked).take()
+        else {
+            return;
+        };
+        let cancel = Arc::clone(&self.cancel);
+        let range = (
+            std::ops::Bound::Included(offset),
+            len.map_or(std::ops::Bound::Unbounded, |len| {
+                std::ops::Bound::Excluded(offset.saturating_add(len))
+            }),
+        );
+        // Detached, as a query's is: it ends with the last piece, its
+        // connection, or this fetch.
+        std::thread::spawn(move || {
+            let ended = match daemon.fetch(session, blob, range) {
+                Ok(mut fetched) => {
+                    cancel.connected(fetched.canceller());
+                    let mut buf = vec![0; 256 << 10];
+                    loop {
+                        match std::io::Read::read(&mut fetched, &mut buf) {
+                            Ok(0) => {
+                                let _ = pieces.send(BlobPiece::Done);
+                                return;
+                            }
+                            Ok(n) => {
+                                let bytes = buf[..n].to_vec();
+                                if pieces.send(BlobPiece::Bytes { bytes }).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => break BlobPiece::from(&e),
+                        }
+                    }
+                }
+                Err(e) => BlobPiece::Failed {
+                    error: e.to_string(),
+                },
+            };
+            let _ = pieces.send(ended);
+        });
+    }
+
+    /// The next piece, once there is one; none after the last, which is
+    /// never bytes.
+    pub async fn next(&self) -> Option<BlobPiece> {
+        self.pieces.recv().await
+    }
+
+    /// Stops it: its last piece then says it was cancelled, unless it
+    /// ended first.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+}
+
+impl Drop for BlobFetch {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
@@ -752,6 +874,117 @@ mod tests {
         drop(listener);
         home.endpoint().remove();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_fetch_hands_the_app_each_chunk_in_order_then_done() {
+        let (client, home, root, listener, _owner) = client_fixture();
+        let (session, blob) = (SessionId::new(), protocol::BlobId([3; 32]));
+        let fetch =
+            BlobFetch::new(&client, &session.to_string(), &blob.to_string(), 2, Some(5)).unwrap();
+        fetch.start();
+        let mut peer = listener.accept().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        write_frame(&mut peer, &welcome()).unwrap();
+        let asked = read_frame::<ClientMsg>(&mut peer).unwrap();
+        let Some(ClientMsg::Fetch {
+            id,
+            session: of,
+            blob: wanted,
+            offset: 2,
+            len: Some(5),
+        }) = asked
+        else {
+            panic!("{asked:?}");
+        };
+        assert_eq!((of, wanted), (session, blob));
+        for (offset, bytes) in [(2, &b"abc"[..]), (5, b"de")] {
+            let chunk = protocol::Chunk {
+                blob,
+                offset,
+                bytes,
+            };
+            let frame = protocol::Frame::chunk(chunk).unwrap();
+            std::io::Write::write_all(&mut peer, frame.as_bytes()).unwrap();
+        }
+        let output = protocol::Json::encode(&5).unwrap();
+        let outcome = protocol::Outcome::Done { output };
+        write_frame(&mut peer, &DaemonMsg::Reply { id, outcome }).unwrap();
+        let got: Vec<_> = (0..4).map(|_| rt::block_on(fetch.next())).collect();
+        let bytes = |b: &[u8]| Some(BlobPiece::Bytes { bytes: b.to_vec() });
+        assert_eq!(
+            got,
+            [bytes(b"abc"), bytes(b"de"), Some(BlobPiece::Done), None]
+        );
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_fetch_takes_no_byte_past_what_it_asked_for() {
+        let (client, home, root, listener, _owner) = client_fixture();
+        let (session, blob) = (SessionId::new(), protocol::BlobId([3; 32]));
+        let fetch =
+            BlobFetch::new(&client, &session.to_string(), &blob.to_string(), 0, Some(2)).unwrap();
+        fetch.start();
+        let mut peer = listener.accept().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        write_frame(&mut peer, &welcome()).unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        let chunk = protocol::Chunk {
+            blob,
+            offset: 0,
+            bytes: b"abc",
+        };
+        let frame = protocol::Frame::chunk(chunk).unwrap();
+        std::io::Write::write_all(&mut peer, frame.as_bytes()).unwrap();
+        let Some(BlobPiece::Failed { error }) = rt::block_on(fetch.next()) else {
+            panic!("bytes past the asked length were taken");
+        };
+        assert!(error.contains("3 bytes at 0"), "{error}");
+        assert_eq!(rt::block_on(fetch.next()), None);
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refused_fetch_reads_as_not_held() {
+        let (client, home, root, listener, _owner) = client_fixture();
+        let fetch = BlobFetch::new(
+            &client,
+            &SessionId::new().to_string(),
+            &protocol::BlobId([3; 32]).to_string(),
+            0,
+            None,
+        )
+        .unwrap();
+        fetch.start();
+        let mut peer = listener.accept().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        write_frame(&mut peer, &welcome()).unwrap();
+        let Some(ClientMsg::Fetch { id, .. }) = read_frame::<ClientMsg>(&mut peer).unwrap() else {
+            panic!("no fetch");
+        };
+        write_frame(&mut peer, &DaemonMsg::NotHeld { id }).unwrap();
+        assert_eq!(rt::block_on(fetch.next()), Some(BlobPiece::NotHeld));
+        assert_eq!(rt::block_on(fetch.next()), None);
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn welcome() -> DaemonMsg {
+        DaemonMsg::Welcome {
+            proto: protocol::PROTO,
+            build: "test".into(),
+            caps: Caps::ALL,
+            machine: protocol::MachineId([0; 16]),
+            commands: Vec::new(),
+            queries: Vec::new(),
+            upgrade: None,
+        }
     }
 
     fn paused_input(
