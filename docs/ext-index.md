@@ -106,10 +106,10 @@ that is the top of a git working tree is a project (a checkout a
 container or VM mounts) and is walked; `/` and a drive's root never are.
 
 **Unwatched.** On a filesystem whose change notifications miss what other
-machines or processes do, no watcher is armed: a search walks the root
-again once its files are two seconds old, so an @-mention completing is
-answered from one walk and the next search after a pause from another;
-and no content index is built (an edited file's bigrams would go stale
+machines or processes do, no watcher is armed: a search of files two
+seconds old or more is answered from them at once and starts another walk
+in the background (only the first walk is waited for), so the next search
+sees what changed; and no content index is built (an edited file's bigrams would go stale
 unseen), so grep reads every file. Which filesystems, by each OS's own
 account:
 
@@ -136,7 +136,12 @@ account:
 
 **Cloud placeholders** are listed, never opened: grep and the content
 index skip them, and the walk does not enter a placeholder directory,
-whose listing would be fetched to be read. On macOS, a dataless file or
+whose listing would be fetched to be read. On macOS the threads that
+read for the index also turn materializing off while they do
+(`setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+IOPOL_SCOPE_THREAD, IOPOL_MATERIALIZE_DATALESS_FILES_OFF)`, Apple's
+opt-out for indexers and backup tools): a file evicted after it was looked
+at fails to read rather than being fetched. On macOS, a dataless file or
 directory (`SF_DATALESS` in `st_flags`, from `lstat`: iCloud Drive and
 File Provider), which reading materializes; on Windows,
 `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`, `FILE_ATTRIBUTE_RECALL_ON_OPEN`

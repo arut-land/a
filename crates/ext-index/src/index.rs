@@ -11,8 +11,8 @@
 //! What the root is decides how it is kept ([`sys::fs::Tree`], asked as
 //! the first walk begins): a volume, a home or a system tree is never
 //! walked, and a root whose filesystem's notifications cannot be trusted
-//! has no watcher: a search walks it again once its files are
-//! [`REVALIDATE`] old, and grep reads every file.
+//! has no watcher: a search of files [`REVALIDATE`] old is answered from
+//! them as another walk starts, and grep reads every file.
 
 use std::collections::BTreeSet;
 use std::io::{self, Read as _};
@@ -218,9 +218,8 @@ const WINDOW: usize = 4;
 /// Files one content-index job reads: a multiple of 64, so chunks merge
 /// by whole bitset words.
 const BUILD_CHUNK: usize = 4096;
-/// How old the files of an unwatched root may be before a search walks it
-/// again: an @-mention completing is answered from one walk, the next
-/// search after a pause from another.
+/// How old the files of an unwatched root may be before a search starts
+/// another walk of it: an @-mention completing starts one at most.
 const REVALIDATE: Duration = Duration::from_secs(2);
 
 impl WorkspaceIndex {
@@ -262,9 +261,9 @@ impl WorkspaceIndex {
     }
 
     /// The files as the last walk and the changes since left them, after
-    /// the first walk if it has not finished, or after another if the root
-    /// is unwatched and they are [`REVALIDATE`] old. An error says why the
-    /// root is never walked.
+    /// the first walk if it has not finished. Those of an unwatched root
+    /// [`REVALIDATE`] old are answered from while another walk starts. An
+    /// error says why the root is never walked.
     async fn files(&self) -> Result<Arc<Files>, String> {
         self.used();
         let now = self.rt.now();
@@ -280,6 +279,7 @@ impl WorkspaceIndex {
             {
                 return Ok(Arc::clone(files));
             }
+            let walked = state.files.clone();
             let walk = match state.busy {
                 Busy::Idle => {
                     state.busy = Busy::Walking;
@@ -291,6 +291,13 @@ impl WorkspaceIndex {
                     false
                 }
             };
+            if let Some(files) = walked {
+                drop(state);
+                if walk {
+                    self.walk();
+                }
+                return Ok(files);
+            }
             (state.epoch, walk)
         };
         if walk {
@@ -890,6 +897,7 @@ fn grep_chunk(
     chunk: &[usize],
     stop: &AtomicBool,
 ) -> (usize, Vec<Grepped>) {
+    let _never = sys::fs::NeverFetch::new();
     let mut buf = Vec::new();
     let mut found = Vec::new();
     let mut searched = 0;
@@ -996,6 +1004,7 @@ fn build_chunk(
     len: usize,
     closed: &AtomicBool,
 ) -> Option<Chunk> {
+    let _never = sys::fs::NeverFetch::new();
     let mut consec = BigramIndexBuilder::new(len);
     let mut skip = BigramIndexBuilder::new(len);
     let mut binary = vec![0u64; len.div_ceil(64)];
@@ -1050,6 +1059,7 @@ enum Read {
 /// What `paths` (absolute) are now: files the walk would find, the
 /// directories they are in, or gone.
 fn look(rules: &Rules, paths: &BTreeSet<PathBuf>, read_content: bool) -> Vec<Change> {
+    let _never = sys::fs::NeverFetch::new();
     let mut buf = Vec::new();
     let mut content = |found: Found| {
         let read = read_content.then(|| {
@@ -1170,8 +1180,17 @@ mod tests {
         assert!(index.state().watcher.is_none());
 
         std::fs::write(root.join("beta.txt"), "needle").unwrap();
+        assert_eq!(found("beta"), Vec::<String>::new());
         std::thread::sleep(REVALIDATE);
-        assert_eq!(found("beta"), ["beta.txt"]);
+        // Answered from the old walk at once, as another starts.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while found("beta").is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the walk again finds the new file"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(index.state().watcher.is_none());
 
         // An edit would go unseen by a content index: grep reads every file.

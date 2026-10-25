@@ -18,7 +18,7 @@ pub use edit::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use tree::mark_placeholder;
-pub use tree::{Filesystem, PLACEHOLDERS, Refusal, Tree, is_placeholder};
+pub use tree::{Filesystem, NeverFetch, PLACEHOLDERS, Refusal, Tree, is_placeholder};
 
 /// Why discovery skipped a candidate instead of opening arbitrary filesystem objects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -99,6 +99,45 @@ pub(crate) fn placeholder_at(path: &Path) -> io::Result<bool> {
     native::placeholder_at(path)
 }
 
+/// While held, a placeholder this thread reads fails to read instead of
+/// being fetched: on macOS, Apple's own opt-out for indexers
+/// (`setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+/// IOPOL_SCOPE_THREAD, OFF)`), which covers a file evicted after
+/// [`is_placeholder`] said it was not one. Dropping it restores the
+/// thread's policy. Elsewhere the attributes checked before opening are
+/// the guard, and this does nothing.
+pub struct NeverFetch {
+    #[cfg(target_os = "macos")]
+    previous: Option<std::ffi::c_int>,
+    /// The policy is the thread's: the guard stays on it.
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl NeverFetch {
+    pub fn new() -> Self {
+        Self {
+            #[cfg(target_os = "macos")]
+            previous: native::never_fetch(),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Default for NeverFetch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for NeverFetch {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(previous) = self.previous {
+            native::restore_fetch(previous);
+        }
+    }
+}
+
 /// The directories never walked whole, as this platform names them.
 struct Places {
     home: Option<PathBuf>,
@@ -173,6 +212,7 @@ mod unix {
 
 #[cfg(target_os = "macos")]
 mod native {
+    use std::ffi::c_int;
     use std::fs::Metadata;
     use std::io;
     use std::os::macos::fs::MetadataExt;
@@ -237,6 +277,45 @@ mod native {
         meta.st_flags() & SF_DATALESS != 0
     }
 
+    // `<sys/resource.h>`.
+    const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: c_int = 3;
+    const IOPOL_SCOPE_THREAD: c_int = 1;
+    const IOPOL_MATERIALIZE_DATALESS_FILES_OFF: c_int = 1;
+
+    unsafe extern "C" {
+        fn getiopolicy_np(iotype: c_int, scope: c_int) -> c_int;
+        fn setiopolicy_np(iotype: c_int, scope: c_int, policy: c_int) -> c_int;
+    }
+
+    /// Turns materializing off for this thread: the policy it had, or
+    /// `None` if it could not be changed.
+    pub(super) fn never_fetch() -> Option<c_int> {
+        let kind = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES;
+        // SAFETY: both calls take plain integers and touch only this
+        // thread's I/O policy.
+        unsafe {
+            let previous = getiopolicy_np(kind, IOPOL_SCOPE_THREAD);
+            (previous >= 0
+                && setiopolicy_np(
+                    kind,
+                    IOPOL_SCOPE_THREAD,
+                    IOPOL_MATERIALIZE_DATALESS_FILES_OFF,
+                ) == 0)
+                .then_some(previous)
+        }
+    }
+
+    pub(super) fn restore_fetch(previous: c_int) {
+        // SAFETY: as in `never_fetch`.
+        unsafe {
+            setiopolicy_np(
+                IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+                IOPOL_SCOPE_THREAD,
+                previous,
+            );
+        }
+    }
+
     pub(super) fn placeholder_at(path: &Path) -> io::Result<bool> {
         // `lstat` reads the inode, never the data: it materializes nothing.
         Ok(placeholder(&std::fs::symlink_metadata(path)?))
@@ -295,8 +374,10 @@ mod native {
         false
     }
 
-    // The other platforms' lookup can fail; this one asks nothing.
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the other platforms' lookup can fail; this one asks nothing"
+    )]
     pub(super) fn placeholder_at(_: &Path) -> io::Result<bool> {
         Ok(false)
     }
@@ -560,6 +641,24 @@ mod tests {
         assert_eq!(
             Tree::of(Path::new(r"\\localhost\C$\Windows\Temp")),
             Tree::Unwatched(Filesystem::Network)
+        );
+    }
+
+    #[test]
+    fn never_fetching_leaves_resident_files_readable_and_the_thread_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("local.txt");
+        fs::write(&file, "text").unwrap();
+        #[cfg(target_os = "macos")]
+        let before = native::never_fetch().inspect(|&p| native::restore_fetch(p));
+        {
+            let _never = NeverFetch::new();
+            assert_eq!(fs::read_to_string(&file).unwrap(), "text");
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            native::never_fetch().inspect(|&p| native::restore_fetch(p)),
+            before
         );
     }
 
