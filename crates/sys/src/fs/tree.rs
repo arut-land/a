@@ -62,16 +62,18 @@ impl Tree {
     /// the volume's drive type): a network one may take a while to answer,
     /// so this belongs off any latency-sensitive path.
     ///
-    /// A mount root that is the top of a git working tree is a project
-    /// (a checkout a container or VM mounts) and is walked; `/` and a
-    /// drive's root never are.
+    /// The root of a whole filesystem is a volume; a mount of a directory
+    /// within one (a bind mount, a container's `-v $PWD:/app`) is not. A
+    /// volume that is the top of a git working tree is a project and is
+    /// walked; `/` and a drive's root never are.
     pub fn of(dir: &Path) -> Self {
         let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
-        if let Some(refusal) = Places::native().refusal(&dir) {
+        let named = native::named(&dir);
+        if let Some(refusal) = Places::native().refusal(&named) {
             return Self::Refused(refusal);
         }
-        if dir.parent().is_none()
-            || (native::is_mount_root(&dir) && !crate::workspace::is_repository_root(&dir))
+        if named.parent().is_none()
+            || (native::is_volume_root(&dir) && !crate::workspace::is_repository_root(&dir))
         {
             return Self::Refused(Refusal::Volume);
         }
@@ -146,6 +148,9 @@ struct Places {
     system: Vec<PathBuf>,
     /// Refused with everything under them.
     sealed: Vec<PathBuf>,
+    /// Another system's directories of homes, as seen from this one (WSL's
+    /// `/mnt/c/Users`): refused, and each home in them.
+    foreign_homes: Vec<PathBuf>,
 }
 
 impl Places {
@@ -160,14 +165,24 @@ impl Places {
             homes,
             system: places.system.into_iter().map(canonical).collect(),
             sealed: places.sealed.into_iter().map(canonical).collect(),
+            foreign_homes: places.foreign_homes,
         }
     }
 
     fn refusal(&self, dir: &Path) -> Option<Refusal> {
         if self.home.as_deref() == Some(dir) {
             Some(Refusal::Home)
-        } else if self.homes.iter().any(|homes| homes == dir) {
+        } else if self
+            .homes
+            .iter()
+            .chain(&self.foreign_homes)
+            .any(|homes| homes == dir)
+        {
             Some(Refusal::Homes)
+        } else if (dir.parent())
+            .is_some_and(|parent| self.foreign_homes.iter().any(|f| f == parent))
+        {
+            Some(Refusal::Home)
         } else if self.system.iter().any(|system| system == dir)
             || self.sealed.iter().any(|sealed| dir.starts_with(sealed))
         {
@@ -180,14 +195,18 @@ impl Places {
 
 #[cfg(unix)]
 mod unix {
-    use std::os::unix::fs::MetadataExt;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use super::Places;
 
     /// The Filesystem Hierarchy Standard's top-level directories, and the
     /// user's home as `HOME` or the password database names it.
-    pub(super) fn places(homes: &str, more: &[&str], sealed: &[&str]) -> Places {
+    pub(super) fn places(
+        homes: &str,
+        more: &[&str],
+        sealed: &[&str],
+        foreign_homes: Vec<PathBuf>,
+    ) -> Places {
         const FHS: [&str; 19] = [
             "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32", "/media",
             "/mnt", "/opt", "/proc", "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr", "/var",
@@ -195,18 +214,12 @@ mod unix {
         Places {
             home: std::env::home_dir(),
             homes: vec![PathBuf::from(homes)],
-            system: FHS.iter().chain(more).map(PathBuf::from).collect(),
+            system: (FHS.iter().chain(&["/nix", "/nix/store"]).chain(more))
+                .map(PathBuf::from)
+                .collect(),
             sealed: sealed.iter().map(PathBuf::from).collect(),
+            foreign_homes,
         }
-    }
-
-    /// Another filesystem is mounted at `dir`: it is on another device
-    /// than its parent.
-    pub(super) fn is_mount_root(dir: &Path) -> bool {
-        let device = |path: &Path| std::fs::metadata(path).map(|meta| meta.dev()).ok();
-        let here = device(dir);
-        dir.parent()
-            .is_some_and(|parent| here.is_some() && here != device(parent))
     }
 }
 
@@ -216,9 +229,9 @@ mod native {
     use std::fs::Metadata;
     use std::io;
     use std::os::macos::fs::MetadataExt;
-    use std::path::Path;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
 
-    pub(super) use super::unix::is_mount_root;
     use super::{Filesystem, Places, Refusal, Tree};
 
     /// `<sys/stat.h>`: the file's data (or a directory's listing) is not
@@ -238,7 +251,31 @@ mod native {
                 "/private",
             ],
             &["/System"],
+            Vec::new(),
         )
+    }
+
+    /// The Data volume's firmlinked trees under the names they have:
+    /// `/System/Volumes/Data/Users/me` is `/Users/me`, and the volume's
+    /// own root is `/`'s other half.
+    pub(super) fn named(dir: &Path) -> PathBuf {
+        match dir.strip_prefix("/System/Volumes/Data") {
+            Ok(rest) => Path::new("/").join(rest),
+            Err(_) => dir.to_owned(),
+        }
+    }
+
+    /// A volume is mounted at `dir`: `statfs` names it as the mount's
+    /// point. A firmlink (`/Users`) is on the Data volume, mounted
+    /// elsewhere.
+    pub(super) fn is_volume_root(dir: &Path) -> bool {
+        rustix::fs::statfs(dir).is_ok_and(|stat| {
+            let point: Vec<u8> = (stat.f_mntonname.iter())
+                .take_while(|&&c| c != 0)
+                .map(|&c| c.to_ne_bytes()[0])
+                .collect();
+            Path::new(std::ffi::OsStr::from_bytes(&point)) == dir
+        })
     }
 
     /// What `statfs` says: `MNT_LOCAL` unset for a network volume, the
@@ -251,8 +288,7 @@ mod native {
             .take_while(|&&c| c != 0)
             .map(|&c| c.to_ne_bytes()[0])
             .collect();
-        #[allow(clippy::cast_sign_loss)]
-        let local = stat.f_flags & libc::MNT_LOCAL as u32 != 0;
+        let local = stat.f_flags & libc::MNT_LOCAL.cast_unsigned() != 0;
         kind(&name, local)
     }
 
@@ -282,38 +318,33 @@ mod native {
     const IOPOL_SCOPE_THREAD: c_int = 1;
     const IOPOL_MATERIALIZE_DATALESS_FILES_OFF: c_int = 1;
 
+    // SAFETY: both take plain integers and touch only the I/O policy of
+    // the calling thread (or process): any arguments are sound.
     unsafe extern "C" {
-        fn getiopolicy_np(iotype: c_int, scope: c_int) -> c_int;
-        fn setiopolicy_np(iotype: c_int, scope: c_int, policy: c_int) -> c_int;
+        safe fn getiopolicy_np(iotype: c_int, scope: c_int) -> c_int;
+        safe fn setiopolicy_np(iotype: c_int, scope: c_int, policy: c_int) -> c_int;
     }
 
     /// Turns materializing off for this thread: the policy it had, or
     /// `None` if it could not be changed.
     pub(super) fn never_fetch() -> Option<c_int> {
         let kind = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES;
-        // SAFETY: both calls take plain integers and touch only this
-        // thread's I/O policy.
-        unsafe {
-            let previous = getiopolicy_np(kind, IOPOL_SCOPE_THREAD);
-            (previous >= 0
-                && setiopolicy_np(
-                    kind,
-                    IOPOL_SCOPE_THREAD,
-                    IOPOL_MATERIALIZE_DATALESS_FILES_OFF,
-                ) == 0)
-                .then_some(previous)
-        }
+        let previous = getiopolicy_np(kind, IOPOL_SCOPE_THREAD);
+        (previous >= 0
+            && setiopolicy_np(
+                kind,
+                IOPOL_SCOPE_THREAD,
+                IOPOL_MATERIALIZE_DATALESS_FILES_OFF,
+            ) == 0)
+            .then_some(previous)
     }
 
     pub(super) fn restore_fetch(previous: c_int) {
-        // SAFETY: as in `never_fetch`.
-        unsafe {
-            setiopolicy_np(
-                IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
-                IOPOL_SCOPE_THREAD,
-                previous,
-            );
-        }
+        setiopolicy_np(
+            IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+            IOPOL_SCOPE_THREAD,
+            previous,
+        );
     }
 
     pub(super) fn placeholder_at(path: &Path) -> io::Result<bool> {
@@ -326,13 +357,80 @@ mod native {
 mod native {
     use std::fs::Metadata;
     use std::io;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    pub(super) use super::unix::is_mount_root;
+    use std::os::unix::fs::MetadataExt;
+
+    use rustix::fs::{AtFlags, CWD, StatxAttributes, StatxFlags};
+
     use super::{Filesystem, Places, Refusal, Tree};
 
     pub(super) fn places() -> Places {
-        super::unix::places("/home", &["/root", "/snap"], &[])
+        super::unix::places("/home", &["/root", "/snap"], &[], windows_homes())
+    }
+
+    /// The `Users` directory of each Windows drive WSL mounts (`/mnt/c`):
+    /// the Windows homes, seen from Linux.
+    fn windows_homes() -> Vec<PathBuf> {
+        let Ok(mounts) = std::fs::read_dir("/mnt") else {
+            return Vec::new();
+        };
+        mounts
+            .flatten()
+            .filter(|drive| {
+                let name = drive.file_name();
+                name.len() == 1 && name.as_encoded_bytes()[0].is_ascii_alphabetic()
+            })
+            .map(|drive| drive.path().join("Users"))
+            .collect()
+    }
+
+    pub(super) fn named(dir: &Path) -> PathBuf {
+        dir.to_owned()
+    }
+
+    /// A whole filesystem is mounted at `dir`: `statx` says a mount is
+    /// rooted there, and `/proc/self/mountinfo` says it mounts its
+    /// filesystem's root, not a directory within it as a bind mount (a
+    /// container's `-v $PWD:/app`) or a btrfs subvolume does. Before Linux
+    /// 5.8, a change of device is all there is to go by.
+    pub(super) fn is_volume_root(dir: &Path) -> bool {
+        let asked = StatxFlags::MNT_ID;
+        let Ok(stat) = rustix::fs::statx(CWD, dir, AtFlags::NO_AUTOMOUNT, asked) else {
+            return is_mount_root(dir);
+        };
+        if !stat
+            .stx_attributes_mask
+            .contains(StatxAttributes::MOUNT_ROOT)
+            || !StatxFlags::from_bits_retain(stat.stx_mask).contains(asked)
+        {
+            return is_mount_root(dir);
+        }
+        stat.stx_attributes.contains(StatxAttributes::MOUNT_ROOT)
+            && std::fs::read_to_string("/proc/self/mountinfo")
+                .map_or(true, |mounts| mounts_whole(&mounts, stat.stx_mnt_id))
+    }
+
+    /// Another filesystem is mounted at `dir`: it is on another device
+    /// than its parent. Where nothing better says so: a bind mount and a
+    /// btrfs subvolume look the same.
+    fn is_mount_root(dir: &Path) -> bool {
+        let device = |path: &Path| std::fs::metadata(path).map(|meta| meta.dev()).ok();
+        let here = device(dir);
+        dir.parent()
+            .is_some_and(|parent| here.is_some() && here != device(parent))
+    }
+
+    /// Whether mount `id` of `mountinfo` (proc(5)) mounts its filesystem's
+    /// root: its fourth field is `/`.
+    pub(super) fn mounts_whole(mountinfo: &str, id: u64) -> bool {
+        let id = id.to_string();
+        mountinfo
+            .lines()
+            .map(|line| line.split(' '))
+            .find_map(|mut fields| (fields.next() == Some(&id)).then(|| fields.nth(2)))
+            .flatten()
+            .is_none_or(|root| root == "/")
     }
 
     /// What `statfs`'s `f_type` says, by the kernel's magic numbers
@@ -355,9 +453,11 @@ mod native {
             | 0x6B41_4653 | 0x7375_7245 | 0x0116_1970 | 0x0BD0_0BD0 => {
                 Tree::Unwatched(Filesystem::Network)
             }
-            // FUSE (virtiofs too), 9p (WSL's Windows drives), VirtualBox's
-            // shared folders.
-            0x6573_5546 | 0x0102_1997 | 0x786F_4256 => Tree::Unwatched(Filesystem::Virtual),
+            // FUSE (virtiofs too), 9p (WSL 2's Windows drives), WSL 1's
+            // drvfs, VirtualBox's shared folders.
+            0x6573_5546 | 0x0102_1997 | 0x5346_4846 | 0x786F_4256 => {
+                Tree::Unwatched(Filesystem::Virtual)
+            }
             // proc, sysfs, cgroup, cgroup2, debugfs, tracefs, securityfs,
             // pstore, bpf, configfs, devpts, efivarfs.
             0x9FA0 | 0x6265_6572 | 0x0027_E0EB | 0x6367_7270 | 0x6462_6720 | 0x7472_6163
@@ -387,7 +487,7 @@ mod native {
 mod native {
     use std::fs::Metadata;
     use std::io;
-    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::MetadataExt;
     use std::path::{Component, Path, PathBuf, Prefix};
 
@@ -430,12 +530,17 @@ mod native {
             .filter_map(folder)
             .collect(),
             sealed: folder(&FOLDERID_Windows).into_iter().collect(),
+            foreign_homes: Vec::new(),
         }
+    }
+
+    pub(super) fn named(dir: &Path) -> PathBuf {
+        dir.to_owned()
     }
 
     /// A volume is mounted at `dir`: it is its own volume path, as a drive
     /// letter's root or a mounted folder is.
-    pub(super) fn is_mount_root(dir: &Path) -> bool {
+    pub(super) fn is_volume_root(dir: &Path) -> bool {
         volume_path(dir).is_some_and(|volume| volume == dunce::simplified(dir))
     }
 
@@ -512,7 +617,7 @@ mod native {
     }
 
     pub(super) fn placeholder_at(path: &Path) -> io::Result<bool> {
-        let path = wide(path.as_os_str());
+        let path = wide(verbatim(path)?.as_os_str());
         // SAFETY: path is NUL-terminated. Attributes come from the
         // directory entry: no handle is opened, nothing is recalled.
         let attributes = unsafe { GetFileAttributesW(path.as_ptr()) };
@@ -522,13 +627,32 @@ mod native {
         Ok(attributes & PLACEHOLDER != 0)
     }
 
+    /// `path` made absolute (`GetFullPathNameW`, which opens nothing) and
+    /// verbatim, so a path past `MAX_PATH` is asked about as it is.
+    fn verbatim(path: &Path) -> io::Result<PathBuf> {
+        let absolute = std::path::absolute(path)?;
+        let Some(Component::Prefix(prefix)) = absolute.components().next() else {
+            return Ok(absolute);
+        };
+        // A UNC path drops one of its two leading backslashes.
+        let (head, skip) = match prefix.kind() {
+            Prefix::Disk(_) => (r"\\?\", 0),
+            Prefix::UNC(..) => (r"\\?\UNC", 1),
+            _ => return Ok(absolute),
+        };
+        let mut verbatim = std::ffi::OsString::from(head);
+        let rest = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+        verbatim.push(std::ffi::OsString::from_wide(&rest[skip..]));
+        Ok(PathBuf::from(verbatim))
+    }
+
     /// Marks `path` offline, as Remote Storage would: the one placeholder
     /// attribute a program may set.
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn mark_placeholder(path: &Path) -> io::Result<bool> {
         use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
         let attributes = std::fs::metadata(path)?.file_attributes();
-        let path = wide(path.as_os_str());
+        let path = wide(verbatim(path)?.as_os_str());
         // SAFETY: path is NUL-terminated.
         if unsafe { SetFileAttributesW(path.as_ptr(), attributes | FILE_ATTRIBUTE_OFFLINE) } == 0 {
             return Err(io::Error::last_os_error());
@@ -588,6 +712,7 @@ mod tests {
             homes: vec![PathBuf::from("/h")],
             system: vec![PathBuf::from("/usr")],
             sealed: vec![PathBuf::from("/System")],
+            foreign_homes: vec![PathBuf::from("/mnt/c/Users")],
         };
         let refusal = |dir: &str| places.refusal(Path::new(dir));
         assert_eq!(refusal("/h/me"), Some(Refusal::Home));
@@ -596,6 +721,43 @@ mod tests {
         assert_eq!(refusal("/usr"), Some(Refusal::System));
         assert_eq!(refusal("/usr/src/linux"), None);
         assert_eq!(refusal("/System/Library"), Some(Refusal::System));
+        assert_eq!(refusal("/mnt/c/Users"), Some(Refusal::Homes));
+        assert_eq!(refusal("/mnt/c/Users/me"), Some(Refusal::Home));
+        assert_eq!(refusal("/mnt/c/Users/me/project"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_home_through_the_data_volume_is_the_home_on_macos() {
+        let home = fs::canonicalize(std::env::home_dir().unwrap()).unwrap();
+        let data = Path::new("/System/Volumes/Data").join(home.strip_prefix("/").unwrap());
+        assert_eq!(Tree::of(&data), Tree::Refused(Refusal::Home));
+        // Named, never made: a test leaves the home as it found it.
+        let through_data = data.join("no-such-project-of-a-test");
+        assert_eq!(Tree::of(&through_data), Tree::Watched);
+        assert_eq!(
+            Tree::of(Path::new("/System/Volumes/Data")),
+            Tree::Refused(Refusal::Volume)
+        );
+        // A firmlink is not a volume of its own.
+        assert!(!native::is_volume_root(Path::new("/Users")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bind_mount_is_a_directory_and_a_whole_filesystem_a_volume() {
+        let mountinfo = "\
+22 1 8:1 / / rw - ext4 /dev/sda1 rw
+40 22 8:1 /home/me/project /app rw - ext4 /dev/sda1 rw
+41 22 8:17 / /data rw - xfs /dev/sdb1 rw
+42 22 0:30 /@home /home rw - btrfs /dev/sdc rw
+";
+        assert!(native::mounts_whole(mountinfo, 22));
+        assert!(!native::mounts_whole(mountinfo, 40));
+        assert!(native::mounts_whole(mountinfo, 41));
+        assert!(!native::mounts_whole(mountinfo, 42));
+        assert!(native::is_volume_root(Path::new("/proc")));
+        assert!(!native::is_volume_root(Path::new("/proc/self")));
     }
 
     #[cfg(target_os = "macos")]
@@ -624,6 +786,7 @@ mod tests {
         assert_eq!(kind(0xFE53_4D42), Tree::Unwatched(Filesystem::Network));
         assert_eq!(kind(0x6573_5546), Tree::Unwatched(Filesystem::Virtual));
         assert_eq!(kind(0x0102_1997), Tree::Unwatched(Filesystem::Virtual));
+        assert_eq!(kind(0x5346_4846), Tree::Unwatched(Filesystem::Virtual));
         assert_eq!(kind(0x9FA0), Tree::Refused(Refusal::System));
         assert_eq!(
             Tree::of(Path::new("/proc/self")),
@@ -660,6 +823,22 @@ mod tests {
             native::never_fetch().inspect(|&p| native::restore_fetch(p)),
             before
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_placeholder_is_found_past_max_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = (0..30).fold(dir.path().to_owned(), |path, i| {
+            path.join(format!("deep{i:02}"))
+        });
+        fs::create_dir_all(&deep).unwrap();
+        let file = deep.join("cloud.txt");
+        fs::write(&file, "text").unwrap();
+        assert!(file.as_os_str().len() > 260);
+        assert!(!placeholder_at(&file).unwrap());
+        assert!(mark_placeholder(&file).unwrap());
+        assert!(placeholder_at(&file).unwrap());
     }
 
     #[test]

@@ -2490,7 +2490,7 @@ fn busy_session_recovery_admits_independent_loads_concurrently() {
     );
 }
 
-mod runtime_demand;
+pub(crate) mod runtime_demand;
 
 /// A task placed on another machine, which this engine cannot run.
 struct Elsewhere;

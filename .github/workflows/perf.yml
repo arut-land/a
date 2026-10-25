@@ -51,13 +51,17 @@ on:
         description: 'Optional bootstrap baseline run ID; otherwise latest successful main lane'
         default: ''
         type: string
+      sessions:
+        description: 'Run only the concurrently active sessions layouts (docs/perf/runtime-demand.md)'
+        default: false
+        type: boolean
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: perf-${{ github.ref }}-${{ inputs.autostart && 'autostart' || 'measure' }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.variant || '{}' }}
+  group: perf-${{ github.ref }}-${{ inputs.autostart && 'autostart' || 'measure' }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.sessions }}-${{ inputs.variant || '{}' }}
   cancel-in-progress: false
 
 env:
@@ -91,8 +95,8 @@ jobs:
     needs: matrix
     name: perf (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    # Twenty-round ablations need longer than the standard paired suite.
-    timeout-minutes: ${{ inputs.ablation && 180 || 90 }}
+    # Twenty-round ablations and the session layouts need longer than the standard paired suite.
+    timeout-minutes: ${{ (inputs.ablation || inputs.sessions) && 180 || 90 }}
     strategy:
       fail-fast: false
       matrix:
@@ -104,6 +108,7 @@ jobs:
       PERF_REFERENCE: ${{ inputs.paired_ref }}
       PERF_BUILD_ONLY: ${{ inputs.build_only }}
       PERF_BLOAT: ${{ inputs.bloat }}
+      PERF_SESSIONS: ${{ inputs.sessions || false }}
     defaults:
       run:
         shell: bash
@@ -183,6 +188,7 @@ jobs:
           PY
       - name: Build release binaries and saved benchmarks
         id: build
+        if: env.PERF_SESSIONS != 'true'
         run: |
           extra=()
           if [[ "$PERF_BUILD_ONLY" == true ]]; then extra+=(--build-only); fi
@@ -194,7 +200,7 @@ jobs:
           fi
       - name: Measure startup workloads and benches
         timeout-minutes: 20
-        if: env.PERF_BUILD_ONLY != 'true' && env.PERF_ABLATION != 'true'
+        if: env.PERF_BUILD_ONLY != 'true' && env.PERF_ABLATION != 'true' && env.PERF_SESSIONS != 'true'
         run: |
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
             python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
@@ -209,6 +215,15 @@ jobs:
             PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase paired --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
           else
             mise exec -- python scripts/perf/hosted.py --phase paired --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
+          fi
+      - name: Measure concurrently active sessions
+        if: env.PERF_SESSIONS == 'true'
+        timeout-minutes: 150
+        run: |
+          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
+            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase sessions --source ../measured --runner '${{ matrix.runner }}'
+          else
+            mise exec -- python scripts/perf/hosted.py --phase sessions --source ../measured --runner '${{ matrix.runner }}'
           fi
       - name: Compare with main
         if: always()
