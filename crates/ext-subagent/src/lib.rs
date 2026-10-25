@@ -136,13 +136,13 @@ impl ext::Route for Subagent {
     fn resolve(
         &self,
         from: ext::Topology<'_>,
-        to: &ext::Address,
+        to: &ext::Recipient,
     ) -> Result<ext::Recipients, protocol::InboxRefusal> {
         let to = match to {
-            ext::Address::Parent => from.parent,
-            ext::Address::Conversation(handle) => Some(handle.session)
+            ext::Recipient::Parent => from.parent,
+            ext::Recipient::Conversation(handle) => Some(handle.session)
                 .filter(|s| from.parent == Some(*s) || from.children.contains(s)),
-            ext::Address::Named(_) => None,
+            ext::Recipient::Named(_) => None,
         };
         to.map(|to| ext::Recipients::from_elem(to, 1))
             .ok_or(protocol::InboxRefusal::Unauthorized)

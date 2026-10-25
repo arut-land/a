@@ -495,7 +495,7 @@ enum ContextRequest {
     },
     Send {
         id: protocol::EnvelopeId,
-        to: ext::Address,
+        to: ext::Recipient,
         payload: String,
         reply: oneshot::Sender<Result<(), protocol::InboxRefusal>>,
     },

@@ -43,9 +43,9 @@ mod queue;
 pub mod schema;
 mod service;
 pub use conversation::{
-    Address, Background, Context, ContextPolicy, Conversation, ConversationHandle, Conversations,
-    DepthBudget, Ephemeral, ModelTurn, OwnerScope, Persisted, Placement, Runner, SendMessage,
-    SideIdentity, Spawn, SpawnRefusal, Storage, Task, ThreadKey, Turn, TurnKey,
+    Background, Context, ContextPolicy, Conversation, ConversationHandle, Conversations,
+    DepthBudget, Ephemeral, ModelTurn, OwnerScope, Persisted, Placement, Recipient, Runner,
+    SendMessage, SideIdentity, Spawn, SpawnRefusal, Storage, Task, ThreadKey, Turn, TurnKey,
 };
 mod settings;
 pub mod shape;

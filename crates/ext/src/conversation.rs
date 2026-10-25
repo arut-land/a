@@ -437,14 +437,14 @@ impl ConversationHandle {
         purpose: &str,
         payload: String,
     ) -> Result<(), protocol::InboxRefusal> {
-        Address::from(self).send::<E>(cx, purpose, payload).await
+        Recipient::from(self).send::<E>(cx, purpose, payload).await
     }
 }
 
 /// Who a message is for, as its sender names it: the session's
 /// [`Route`](crate::Route) resolves it to the sessions that receive it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Address {
+pub enum Recipient {
     Conversation(ConversationHandle),
     /// The session that owns the sender.
     Parent,
@@ -452,13 +452,13 @@ pub enum Address {
     Named(crate::Name),
 }
 
-impl From<ConversationHandle> for Address {
+impl From<ConversationHandle> for Recipient {
     fn from(handle: ConversationHandle) -> Self {
         Self::Conversation(handle)
     }
 }
 
-impl Address {
+impl Recipient {
     /// Sends `payload` to whoever the route resolves this to, as `E`'s
     /// `purpose`, which with the call keeps the message's identity across
     /// retries.
@@ -808,7 +808,7 @@ impl ModelTurn {
 pub struct SendMessage {
     owner: &'static str,
     purpose: String,
-    to: Address,
+    to: Recipient,
     payload: String,
 }
 
@@ -819,7 +819,7 @@ impl SendMessage {
         self,
         sender: SessionId,
         call: CallId,
-    ) -> (protocol::EnvelopeId, Address, String) {
+    ) -> (protocol::EnvelopeId, Recipient, String) {
         let id = protocol::EnvelopeId {
             sender,
             call,

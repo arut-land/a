@@ -313,8 +313,8 @@ timeout = 120  # seconds a command is waited for before it moves to the backgrou
 ### Routing and transport
 
 Messaging uses an envelope with a durable id `(sender, call, purpose)`, sender,
-destination and payload. A sender names an `Address`: a conversation, its
-parent, or a name its route gives meaning (a channel, a group); `Address::send`
+destination and payload. A sender names a `Recipient`: a conversation, its
+parent, or a name its route gives meaning (a channel, a group); `Recipient::send`
 sends to one, and `ConversationHandle::send` to a conversation. Exactly one
 extension provides `Route`, which resolves the address against the sender's
 `Topology` (its id, parent and children) to the recipients, or a typed
@@ -568,7 +568,7 @@ crates choose modes and policy.
 | Parent sends while child works | `ConversationHandle::send` |
 | Child asks parent | Tool composition: question and correlated reply fold in an `ext-*` crate |
 | Sibling chat | Policy and tool composition over durable inboxes addressed by conversation id |
-| Named channels | A `Route` provider resolving `Address::Named`, with membership as ordered facts of its own; recipients are recorded on each `outbox` |
+| Named channels | A `Route` provider resolving `Recipient::Named`, with membership as ordered facts of its own; recipients are recorded on each `outbox` |
 | Different agent/model | `.kind(name)` and `.role(role)`; a turn or a task |
 | Recursive same agent | Tool composition: inherit task registration; depth budget descends |
 | Root-only extension | Rust declaration or Lua `a.inherit(false)` excludes the whole generation |
