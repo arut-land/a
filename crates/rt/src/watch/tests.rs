@@ -428,7 +428,15 @@ fn a_new_outer_subscriber_hears_nothing_from_before_it_subscribed() {
     until(&inner, "the inner root's change", changed(&own));
     std::thread::sleep(Duration::from_millis(500));
     let (_outer, outer) = subscribe(&hub, Watch::tree(dir.path("outer")));
-    quiet(&outer);
+    // Windows may report the taken-over root itself as its handle closes;
+    // nothing written before is told again.
+    let before = |path: &PathBuf| path.starts_with(dir.path("outer/sibling")) || *path == own;
+    while let Ok(event) = outer.recv_timeout(Duration::from_millis(500)) {
+        let Event::Changed(paths) = &event else {
+            panic!("unexpected {event:?}");
+        };
+        assert!(!paths.iter().any(before), "{paths:?}");
+    }
     let after = dir.write("outer/sibling/after");
     until(&outer, "a change after subscribing", changed(&after));
     let later = dir.write("outer/inner/later");
