@@ -877,6 +877,13 @@ impl Live {
         (lock(&self.session.jobs).iter()).any(|job| job.role == ext::Role::Work)
     }
 
+    /// The process groups the session owns.
+    pub(crate) fn jobs(&self) -> Vec<Arc<ext::ProcessLease>> {
+        (lock(&self.session.jobs).iter())
+            .map(|job| Arc::clone(&job.lease))
+            .collect()
+    }
+
     /// Whether the session's work can go to the daemon's next build, and
     /// if not why: see [`crate::handover`]. A session that takes no
     /// messages runs nothing to hand.

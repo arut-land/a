@@ -147,7 +147,19 @@ impl Exit {
         successor: std::path::PathBuf,
         command: crate::Successor,
     ) -> ! {
+        let owned: Vec<_> = (daemon.loaded().iter())
+            .flat_map(|live| live.jobs())
+            .collect();
         daemon.shutdown().await;
+        // What was not handed over (a helper) is stopped with the session;
+        // it is reaped before the exec, or it would outlive this build as
+        // a child no build knows.
+        let reaped = async {
+            for lease in &owned {
+                lease.ended().await;
+            }
+        };
+        rt::or(reaped, daemon.shared.rt.sleep(crate::STOP_GRACE)).await;
         if let Err(e) = sys::crash::exited(&self.home, &self.pid) {
             fault(&e);
         }
