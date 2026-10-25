@@ -310,6 +310,7 @@ impl Ledger {
         self.publications.apply(e);
         let (seq, body) = (e.seq, &e.body);
         self.seq = seq.get();
+        self.author(body.origin());
         match body {
             Body::Outbox {
                 envelope_id,
@@ -379,10 +380,8 @@ impl Ledger {
                 segments,
                 mode,
                 taken,
-                origin,
                 ..
             } => {
-                self.author(*origin);
                 if *taken {
                     self.turn = seq.get();
                 } else {
@@ -402,8 +401,7 @@ impl Ledger {
                     self.turn = seq.get();
                 }
             }
-            Body::Withdraw { input, origin } => {
-                self.author(*origin);
+            Body::Withdraw { input, .. } => {
                 self.untaken.retain(|q| q.seq != *input);
             }
             Body::Detached { call } => {
@@ -432,8 +430,7 @@ impl Ledger {
             | Body::Fired { .. }
             | Body::Answer { .. } => self.track(CallId(seq), body),
             // What runs in the background ends with the interrupt.
-            Body::Interrupt { origin } => {
-                self.author(*origin);
+            Body::Interrupt { .. } => {
                 self.detached.clear();
                 self.result = Some(ToolOutcome::Interrupted { output: None });
             }
@@ -530,14 +527,7 @@ impl Ledger {
                 ..
             } => self.decide(*call, d),
             Body::Wait { call, on } => self.wait(*call, on),
-            Body::Answer {
-                call,
-                value,
-                origin,
-            } => {
-                self.author(*origin);
-                self.answer(*call, value);
-            }
+            Body::Answer { call, value, .. } => self.answer(*call, value),
             Body::Watch { child } => {
                 self.armed.insert(here.0, *child);
                 if let Err(at) = self.watched.binary_search(&child.0.as_u128()) {
