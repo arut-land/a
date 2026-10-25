@@ -295,6 +295,8 @@ mod native {
         false
     }
 
+    // The other platforms' lookup can fail; this one asks nothing.
+    #[allow(clippy::unnecessary_wraps)]
     pub(super) fn placeholder_at(_: &Path) -> io::Result<bool> {
         Ok(false)
     }
