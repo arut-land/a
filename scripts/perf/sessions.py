@@ -28,10 +28,13 @@ def percentile(values, q):
 
 
 def memory_layouts(binaries):
-    labels = [("A", "workers=4", None), ("A2", "workers=4", None)]
-    labels += [(label, "workers=4", label) for label in binaries]
+    # Allocators compare by what they retain, with nothing released at rest;
+    # `rest` is the system allocator with the daemon's release at rest.
+    plain = "workers=4,rest=none"
+    labels = [("A", plain, None), ("A2", plain, None), ("rest", "workers=4", None)]
+    labels += [(label, plain, label) for label in binaries]
     if sys.platform == "linux":
-        labels.append(("arenas", "workers=4,arenas=default", None))
+        labels.append(("arenas", plain + ",arenas=default", None))
     return labels
 
 

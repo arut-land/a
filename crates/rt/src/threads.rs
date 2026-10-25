@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle};
@@ -32,6 +33,10 @@ pub struct Config {
     /// quality of service on macOS). The daemon asks for it; a client
     /// inherits its caller's.
     pub foreground: bool,
+    /// Runs on the last blocking worker to retire, once every class has
+    /// been idle for its timeout: the end of a burst, with no timer of its
+    /// own. The daemon hands memory back to the OS there.
+    pub at_rest: fn(),
 }
 
 impl Config {
@@ -54,6 +59,7 @@ impl Config {
                 bytes: 64 << 20,
             },
             foreground: false,
+            at_rest: || {},
         }
     }
 
@@ -63,6 +69,7 @@ impl Config {
     pub fn daemon() -> Self {
         Self {
             foreground: true,
+            at_rest: sys::release,
             ..Self::for_cores(sys::resources::effective_parallelism())
         }
     }
@@ -130,6 +137,8 @@ fn guarded_task(
 struct Lifecycle {
     running: Mutex<usize>,
     ended: Condvar,
+    /// Blocking workers alive in every class.
+    blocking: std::sync::atomic::AtomicUsize,
 }
 
 struct Worker(Arc<Lifecycle>);
@@ -166,6 +175,7 @@ impl Drop for Worker {
 struct Blocking {
     limits: PoolLimits,
     foreground: bool,
+    at_rest: fn(),
     lifecycle: Arc<Lifecycle>,
     #[cfg(test)]
     start_gate: Mutex<Option<Arc<Gate>>>,
@@ -219,6 +229,7 @@ impl Threads {
                 Arc::new(Blocking {
                     limits,
                     foreground: config.foreground,
+                    at_rest: config.at_rest,
                     lifecycle: Arc::clone(&lifecycle),
                     #[cfg(test)]
                     start_gate: Mutex::default(),
@@ -393,6 +404,8 @@ impl Future for Admission {
             // Count the thread before releasing the queue lock: bursts must
             // not mistake workers still starting for missing capacity.
             let worker = this.pool.lifecycle.worker();
+            let lifecycle = &this.pool.lifecycle;
+            lifecycle.blocking.fetch_add(1, Ordering::SeqCst);
             match thread::Builder::new()
                 .name("rt-blocking".into())
                 .spawn(move || {
@@ -406,6 +419,7 @@ impl Future for Admission {
                     threads.push(worker);
                 }
                 Err(error) => {
+                    lifecycle.blocking.fetch_sub(1, Ordering::SeqCst);
                     state.starting -= 1;
                     let (bytes, _) = state.queue.pop_back().expect("just submitted");
                     state.bytes -= bytes;
@@ -456,6 +470,7 @@ impl Blocking {
                 wake(&mut state);
             } else if state.closed {
                 state.workers -= 1;
+                self.lifecycle.blocking.fetch_sub(1, Ordering::SeqCst);
                 return;
             } else {
                 state.idle += 1;
@@ -467,6 +482,10 @@ impl Blocking {
                 state.idle -= 1;
                 if timeout.timed_out() && state.queue.is_empty() {
                     state.workers -= 1;
+                    drop(state);
+                    if self.lifecycle.blocking.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        (self.at_rest)();
+                    }
                     return;
                 }
             }
@@ -495,6 +514,27 @@ impl Gate {
 mod tests {
     use super::*;
     use crate::{block_on, oneshot, spawn};
+
+    #[test]
+    fn a_burst_comes_to_rest_once_its_last_blocking_worker_retires() {
+        static RESTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let rt = Threads::configured(Config {
+            at_rest: || {
+                RESTED.fetch_add(1, Ordering::SeqCst);
+            },
+            ..Config::for_cores(2)
+        });
+        block_on(crate::unblock(&rt, || ()));
+        thread::sleep(Duration::from_secs(2));
+        // A second class starts later and so retires later: rest waits for it.
+        block_on(crate::unblock_with(&rt, BlockingClass::Cpu, 1, || ()));
+        thread::sleep(Duration::from_secs(9));
+        assert_eq!(RESTED.load(Ordering::SeqCst), 0, "a class was still idling");
+        thread::sleep(Duration::from_secs(3));
+        assert_eq!(RESTED.load(Ordering::SeqCst), 1);
+        rt.shutdown();
+        assert_eq!(RESTED.load(Ordering::SeqCst), 1, "shutdown is not rest");
+    }
 
     #[test]
     fn task_wakes_can_race_executor_drop() {
