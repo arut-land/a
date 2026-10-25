@@ -118,7 +118,9 @@ impl<T: Send> AsyncSender<T> {
                 return Poll::Ready(Err(item.take().expect("send completes once")));
             }
             if state.items.len() == self.0.capacity {
-                state.sender = Some(cx.waker().clone());
+                let previous = state.sender.replace(cx.waker().clone());
+                drop(state);
+                drop(previous);
                 return Poll::Pending;
             }
             state
@@ -281,6 +283,41 @@ mod tests {
         assert!(tx.send(Observe(Arc::clone(&tx.0))).is_ok());
         drop(rx);
         drop(tx);
+    }
+
+    #[test]
+    fn replacing_a_producer_waker_drops_it_outside_the_queue_lock() {
+        struct Observe(Arc<Shared<u8>>);
+        impl std::task::Wake for Observe {
+            fn wake(self: Arc<Self>) {
+                assert!(self.0.state.try_lock().is_ok());
+            }
+        }
+        impl Drop for Observe {
+            fn drop(&mut self) {
+                assert!(self.0.state.try_lock().is_ok());
+            }
+        }
+        let (mut tx, _rx) = bounded_async(1);
+        crate::block_on(tx.send(1)).unwrap();
+        let waker = Waker::from(Arc::new(Observe(Arc::clone(&tx.0))));
+        {
+            let send = tx.send(2);
+            let mut send = std::pin::pin!(send);
+            assert!(
+                send.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+        }
+        drop(waker);
+        let send = tx.send(3);
+        let mut send = std::pin::pin!(send);
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
     }
 
     #[test]
