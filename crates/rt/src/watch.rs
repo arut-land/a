@@ -140,12 +140,18 @@ struct Shared {
     rt: Rt,
     state: Mutex<State>,
     /// What native threads report, routed by a task on the runtime.
-    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "android")),
+        expect(dead_code)
+    )]
     inbox: Mutex<Inbox>,
 }
 
 #[derive(Default)]
-#[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "android")),
+    expect(dead_code)
+)]
 struct Inbox {
     raws: Vec<Raw>,
     draining: bool,
@@ -331,7 +337,10 @@ impl Shared {
     }
 
     /// Routes `raws` from a native thread, on a task of the runtime.
-    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "android")),
+        expect(dead_code)
+    )]
     fn post(self: &Arc<Self>, raws: Vec<Raw>) {
         let mut inbox = lock(&self.inbox);
         inbox.raws.extend(raws);
