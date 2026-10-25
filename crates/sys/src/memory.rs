@@ -12,6 +12,165 @@ pub fn small_footprint() {
     }
 }
 
+#[cfg(any(
+    all(
+        feature = "mimalloc",
+        any(feature = "jemalloc", feature = "snmalloc", feature = "rpmalloc")
+    ),
+    all(feature = "jemalloc", any(feature = "snmalloc", feature = "rpmalloc")),
+    all(feature = "snmalloc", feature = "rpmalloc"),
+))]
+compile_error!("select at most one allocator feature");
+
+#[cfg(feature = "mimalloc")]
+const INNER: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+const INNER: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+#[cfg(feature = "snmalloc")]
+const INNER: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+#[cfg(feature = "rpmalloc")]
+const INNER: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
+#[cfg(not(any(
+    feature = "mimalloc",
+    all(feature = "jemalloc", not(target_env = "msvc")),
+    feature = "snmalloc",
+    feature = "rpmalloc"
+)))]
+const INNER: std::alloc::System = std::alloc::System;
+
+/// The process's global allocator: the system's, unless a build feature
+/// selects another to measure against it (docs/perf/allocators.md).
+pub struct Global;
+
+impl Global {
+    /// Which allocator this build serves memory from.
+    pub const NAME: &str = if cfg!(feature = "mimalloc") {
+        "mimalloc"
+    } else if cfg!(all(feature = "jemalloc", not(target_env = "msvc"))) {
+        "jemalloc"
+    } else if cfg!(feature = "snmalloc") {
+        "snmalloc"
+    } else if cfg!(feature = "rpmalloc") {
+        "rpmalloc"
+    } else {
+        "system"
+    };
+}
+
+// SAFETY: every call forwards to one allocator with the caller's contract.
+unsafe impl std::alloc::GlobalAlloc for Global {
+    #[inline]
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller upholds `alloc`'s contract.
+        unsafe { std::alloc::GlobalAlloc::alloc(&INNER, layout) }
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller upholds `alloc_zeroed`'s contract.
+        unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&INNER, layout) }
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: the caller upholds `dealloc`'s contract.
+        unsafe { std::alloc::GlobalAlloc::dealloc(&INNER, ptr, layout) }
+    }
+
+    #[inline]
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        // SAFETY: the caller upholds `realloc`'s contract.
+        unsafe { std::alloc::GlobalAlloc::realloc(&INNER, ptr, layout, size) }
+    }
+}
+
+/// Hands memory the allocator holds free back to the OS, once the process
+/// has come to rest after a burst; it costs a walk of the allocator's
+/// free lists, nothing while it is not called.
+pub fn release() {
+    #[cfg(feature = "mimalloc")]
+    {
+        // SAFETY: collection takes no pointers; forcing it also frees
+        // abandoned segments of threads that have exited.
+        unsafe { libmimalloc_sys::mi_collect(true) };
+    }
+    #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+    {
+        // `MALLCTL_ARENAS_ALL`: purge every arena's unused dirty pages.
+        let name = c"arena.4096.purge";
+        // SAFETY: a void control with no old or new value.
+        unsafe {
+            tikv_jemalloc_sys::mallctl(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+    }
+    #[cfg(not(any(
+        feature = "mimalloc",
+        all(feature = "jemalloc", not(target_env = "msvc")),
+        feature = "snmalloc",
+        feature = "rpmalloc"
+    )))]
+    system::release();
+}
+
+/// The system allocator's own way of returning what it holds free.
+#[cfg(not(any(
+    feature = "mimalloc",
+    all(feature = "jemalloc", not(target_env = "msvc")),
+    feature = "snmalloc",
+    feature = "rpmalloc"
+)))]
+mod system {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub fn release() {
+        // SAFETY: trimming takes no pointers and keeps every live block.
+        unsafe { libc::malloc_trim(0) };
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn release() {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone with no goal relieves every zone as far as it can.
+        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    }
+
+    #[cfg(windows)]
+    pub fn release() {
+        use windows_sys::Win32::System::Memory::{
+            HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION, HEAP_OPTIMIZE_RESOURCES_INFORMATION,
+            HeapOptimizeResources, HeapSetInformation,
+        };
+        let info = HEAP_OPTIMIZE_RESOURCES_INFORMATION {
+            Version: HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION,
+            Flags: 0,
+        };
+        // SAFETY: a null heap applies to every heap; `info` outlives the call.
+        unsafe {
+            HeapSetInformation(
+                std::ptr::null_mut(),
+                HeapOptimizeResources,
+                (&raw const info).cast(),
+                size_of_val(&info),
+            )
+        };
+    }
+
+    // musl returns freed memory as it goes.
+    #[cfg(not(any(
+        all(target_os = "linux", target_env = "gnu"),
+        target_os = "macos",
+        windows
+    )))]
+    pub fn release() {}
+}
+
 /// Zeroed words mapped straight from the OS: a page takes memory once it
 /// is first written, and dropping the mapping gives every page back at
 /// once. The allocator would keep a freed block this large for reuse (on

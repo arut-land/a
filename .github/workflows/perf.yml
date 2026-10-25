@@ -221,9 +221,9 @@ jobs:
         timeout-minutes: 150
         run: |
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
-            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase sessions --source ../measured --runner '${{ matrix.runner }}'
+            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase sessions --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
           else
-            mise exec -- python scripts/perf/hosted.py --phase sessions --source ../measured --runner '${{ matrix.runner }}'
+            mise exec -- python scripts/perf/hosted.py --phase sessions --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
           fi
       - name: Compare with main
         if: always()

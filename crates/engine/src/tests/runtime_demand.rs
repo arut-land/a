@@ -436,8 +436,28 @@ fn concurrent_active_sessions() {
     let settled = usage();
     std::thread::sleep(Duration::from_secs(5));
     let idle = usage();
+    // What the allocator could hand back at rest, then once every client
+    // has gone.
+    let releasing = Instant::now();
+    sys::release();
+    let release_ms = releasing.elapsed().as_secs_f64() * 1000.0;
+    let released = usage();
+    drop(release);
+    for client in clients {
+        client.join().unwrap();
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let detached = usage();
+    sys::release();
+    let detached_released = usage();
     let cpu = |a: &serde_json::Value, b: &serde_json::Value| {
         (b["cpu_seconds"].as_f64().unwrap() - a["cpu_seconds"].as_f64().unwrap()) * 1000.0
+    };
+    // Lifetime peaks: the resident set (Linux, Windows) or footprint (macOS).
+    let peak = |v: &serde_json::Value| {
+        v.get("peak_rss_kib")
+            .or(v.get("peak_footprint_kib"))
+            .cloned()
     };
     println!(
         "{}",
@@ -459,13 +479,18 @@ fn concurrent_active_sessions() {
             "idle_rss_kib": settled["rss_kib"],
             "idle_threads": settled["thread_count"],
             "idle_cpu_ms": cpu(&settled, &idle),
+            "allocator": sys::Global::NAME,
+            "peak_kib": peak(&settled),
+            "idle_footprint_kib": settled.get("footprint_kib"),
+            "release_ms": release_ms,
+            "released_rss_kib": released["rss_kib"],
+            "released_footprint_kib": released.get("footprint_kib"),
+            "detached_rss_kib": detached["rss_kib"],
+            "detached_released_rss_kib": detached_released["rss_kib"],
+            "detached_released_footprint_kib": detached_released.get("footprint_kib"),
         })
     );
     eprintln!("bench: measured");
-    drop(release);
-    for client in clients {
-        client.join().unwrap();
-    }
     drop(daemon);
     runtime.shutdown();
     let _ = std::fs::remove_dir_all(root);
@@ -520,6 +545,7 @@ fn serve(home: &Home, port: u16, variant: &str) -> (crate::Owner, Arc<rt::Thread
     };
     let mut threads = rt::Config::daemon();
     let mut split = false;
+    let mut arenas = true;
     for part in variant.split(',') {
         match part.split_once('=') {
             Some(("workers", n)) => threads.workers = n.parse().unwrap(),
@@ -532,12 +558,18 @@ fn serve(home: &Home, port: u16, variant: &str) -> (crate::Owner, Arc<rt::Thread
                     bytes: threads.network.bytes.max(n << 20),
                 };
             }
+            // glibc's own arena policy, without the daemon's cap.
+            Some(("arenas", "default")) => arenas = false,
             None if part == "threads" => {
                 ACTORS.set(on_own_thread).unwrap();
                 split = true;
             }
             _ => panic!("A_BENCH_RUNTIME part {part:?}"),
         }
+    }
+    if arenas {
+        // As `a` does before it starts a worker.
+        sys::small_footprint();
     }
     let runtime = Arc::new(rt::Threads::configured(threads));
     let daemon = if split {

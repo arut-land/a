@@ -8,6 +8,12 @@ publish.workspace = true
 # Terminal fixtures, and shell facts for tests that register tools
 # without starting a daemon.
 test-support = []
+# One replacement global allocator, measured against the system's
+# (docs/perf/allocators.md).
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
+snmalloc = ["dep:snmalloc-rs"]
+rpmalloc = ["dep:rpmalloc"]
 
 [dependencies]
 # The machine key: X25519 alone, no signatures; its id hashes with the
@@ -19,6 +25,15 @@ serde_json.workspace = true
 sha2 = { version = "0.11", default-features = false }
 # config.toml, edited in place so a hand-edited file keeps its comments.
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
+mimalloc = { version = "0.1.52", default-features = false, optional = true }
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"], optional = true }
+snmalloc-rs = { version = "0.7.6", default-features = false, features = ["build_cc"], optional = true }
+rpmalloc = { version = "0.2.2", default-features = false, optional = true }
+
+# jemalloc has no MSVC port.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.7", default-features = false, optional = true }
+tikv-jemalloc-sys = { version = "0.7", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["stdio", "pipe", "event", "net", "termios"] }
