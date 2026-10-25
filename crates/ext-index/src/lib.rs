@@ -40,7 +40,7 @@ mod index;
 
 pub use fff::grep::{Casing, GrepMatch, GrepMode, GrepOptions};
 pub use index::{
-    GrepQuery, GrepSummary, Grepped, Indexes, Limits, Pattern, Searched, SearchedFile,
+    GrepQuery, GrepSummary, Grepped, Indexes, Limits, Pattern, Searched, SearchedFile, Stopped,
     WorkspaceIndex,
 };
 
@@ -214,6 +214,10 @@ pub struct GrepReply {
     pub matches: usize,
     /// It stopped at its limit with files left to read.
     pub truncated: bool,
+    /// It was cancelled before it read every file: what it found is not
+    /// all there is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
     /// Why the regex asked for was searched as literal text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regex_error: Option<String>,
@@ -225,7 +229,8 @@ impl From<GrepSummary> for GrepReply {
             searched: summary.searched,
             files: summary.matched_files,
             matches: summary.matches,
-            truncated: summary.truncated,
+            truncated: summary.stopped == Some(Stopped::AtLimit),
+            cancelled: summary.stopped == Some(Stopped::Cancelled),
             regex_error: summary.regex_error,
         }
     }

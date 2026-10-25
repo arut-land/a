@@ -189,6 +189,15 @@ fn grep_text(out: &GrepOut) -> String {
             }
         }
     }
+    // A grep stopped by its cancel reports it, as a cancelled command does:
+    // the call may still be recorded as done, and must not read complete.
+    if out.reply.cancelled {
+        let _ = writeln!(
+            text,
+            "[cancelled after {} files: the search did not finish]",
+            out.reply.searched
+        );
+    }
     if out.reply.truncated {
         let _ = writeln!(
             text,
@@ -200,4 +209,27 @@ fn grep_text(out: &GrepOut) -> String {
         text.push_str("No matches.");
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cancelled_grep_never_reads_as_complete() {
+        let out = GrepOut {
+            files: Vec::new(),
+            reply: GrepReply {
+                searched: 256,
+                files: 0,
+                matches: 0,
+                truncated: false,
+                cancelled: true,
+                regex_error: None,
+            },
+        };
+        let text = grep_text(&out);
+        assert!(text.contains("did not finish"), "{text}");
+        assert!(!text.contains("No matches."), "{text}");
+    }
 }

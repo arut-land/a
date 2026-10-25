@@ -56,8 +56,11 @@ pub fn open_regular(path: &Path) -> io::Result<RegularFile> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        // Open a replaced link itself, never its device target.
-        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+        // Open a replaced link itself, never its device target; and ask, as
+        // Microsoft documents FILE_FLAG_OPEN_NO_RECALL, that the file's data
+        // stay in remote storage rather than be brought back to local
+        // storage, for a file that became a placeholder since the check.
+        options.custom_flags(0x0020_0000 | 0x0010_0000);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
