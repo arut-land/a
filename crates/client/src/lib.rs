@@ -389,19 +389,45 @@ impl Daemon {
         on_drain: &(dyn Fn() + Sync),
         first: &(dyn Fn(Option<&Environment>) -> io::Result<Vec<ClientMsg>> + Sync),
     ) -> Result<Connection, Error> {
-        rt::block_on(link::connect(
-            &link::BLOCKING,
-            self,
-            client,
-            start,
-            first,
-            on_drain,
-        ))
-        .inspect_err(|e| {
-            if *e == Error::NotResponding {
-                self.link.unanswered();
-            }
-        })
+        rt::block_on(self.open_async(&link::BLOCKING, client, start, on_drain, first))
+    }
+
+    /// Connects on the supplied runtime, yielding while the daemon answers.
+    pub async fn connect_async(
+        &self,
+        rt: &rt::Rt,
+        on_drain: &(dyn Fn() + Sync),
+    ) -> Result<Connection, Error> {
+        self.connect_as_async(rt, None, on_drain, &|_| Ok(Vec::new()))
+            .await
+    }
+
+    /// [`Daemon::connect_as`] without blocking the calling task.
+    pub async fn connect_as_async(
+        &self,
+        rt: &rt::Rt,
+        client: Option<ClientId>,
+        on_drain: &(dyn Fn() + Sync),
+        first: &(dyn Fn(Option<&Environment>) -> io::Result<Vec<ClientMsg>> + Sync),
+    ) -> Result<Connection, Error> {
+        self.open_async(rt, client, Start::Reuse, on_drain, first)
+            .await
+    }
+
+    async fn open_async(
+        &self,
+        rt: &rt::Rt,
+        client: Option<ClientId>,
+        start: Start,
+        on_drain: &(dyn Fn() + Sync),
+        first: &(dyn Fn(Option<&Environment>) -> io::Result<Vec<ClientMsg>> + Sync),
+    ) -> Result<Connection, Error> {
+        let result = link::connect(rt, self, client, start, first, on_drain).await;
+        if matches!(result, Err(Error::NotResponding)) {
+            let link = self.link.clone();
+            rt::unblock(&**rt, move || link.unanswered()).await;
+        }
+        result
     }
 
     /// The daemon's sessions, newest first.
@@ -537,19 +563,25 @@ pub(crate) fn live_daemon(home: &Home) -> Option<Record> {
 /// goes only to the process the daemon recorded, checked by its start time
 /// as well as its pid. Returns whether a daemon was running.
 pub fn stop(home: &Home) -> io::Result<bool> {
+    rt::block_on(stop_async(&link::BLOCKING, home))
+}
+
+pub(crate) async fn stop_async(rt: &rt::Rt, home: &Home) -> io::Result<bool> {
     let Some(daemon) = live_daemon(home) else {
         return Ok(false);
     };
-    if ask_to_stop(home, &daemon.build).is_ok() && wait_exited(home, Some(HELLO_TIMEOUT)) {
+    if ask_to_stop(home, &daemon.build).await.is_ok()
+        && wait_exited_async(rt, home, Some(HELLO_TIMEOUT)).await
+    {
         return Ok(true);
     }
     let process = sys::RecordedProcess::open(&daemon)?;
     ext_logging::witness(home, &daemon, ext_logging::Observation::Terminate);
     process.signal(Signal::Terminate)?;
-    if !wait_exited(home, Some(HELLO_TIMEOUT)) {
+    if !wait_exited_async(rt, home, Some(HELLO_TIMEOUT)).await {
         ext_logging::witness(home, &daemon, ext_logging::Observation::Kill);
         process.signal(Signal::Kill)?;
-        wait_exited(home, None);
+        wait_exited_async(rt, home, None).await;
     }
     home.endpoint().remove();
     // Stopped on purpose: the record it left is not a crash.
@@ -565,29 +597,33 @@ pub fn stop(home: &Home) -> io::Result<bool> {
 /// `within` (or ever): the lock is waited on, not polled. What a test or a
 /// supervisor waits on in place of polling the pid.
 pub fn wait_exited(home: &Home, within: Option<Duration>) -> bool {
+    rt::block_on(wait_exited_async(&link::BLOCKING, home, within))
+}
+
+async fn wait_exited_async(rt: &rt::Rt, home: &Home, within: Option<Duration>) -> bool {
     let Ok(file) = File::open(home.daemon_pid_file()) else {
         return true;
     };
-    locked(file, within).is_some()
+    locked(rt, file, within).await.is_some()
 }
 
-/// Takes the lock on `file` once it is free, waiting no longer than
-/// `within`: on a helper thread, since a file lock has no timed wait. A
-/// lock taken after the wait is given up is let go at once.
-fn locked(file: File, within: Option<Duration>) -> Option<File> {
+/// Waits for a file lock on the Storage pool, racing the caller's deadline.
+async fn locked(rt: &rt::Rt, file: File, within: Option<Duration>) -> Option<File> {
     if sys::fs::try_lock(&file).is_ok() {
         return Some(file);
     }
-    let (tx, rx) = inbox(QueueBudget::default(), |_| size_of::<File>());
-    thread::spawn(move || {
-        if sys::fs::lock(&file).is_ok() {
-            // Dropped, and so unlocked, when no one waits any more.
-            let _ = tx.send(file);
-        }
+    let lock = rt::unblock_with(&**rt, rt::BlockingClass::Storage, 0, move || {
+        sys::fs::lock(&file).ok().map(|()| file)
     });
     match within {
-        Some(within) => rx.recv_timeout(within),
-        None => rx.recv(),
+        Some(within) => {
+            rt::or(lock, async {
+                rt.sleep(within).await;
+                None
+            })
+            .await
+        }
+        None => lock.await,
     }
 }
 
@@ -636,12 +672,10 @@ async fn answered<T>(
 
 /// Asks the daemon to stop, and waits for it to close the connection as
 /// it exits.
-fn ask_to_stop(home: &Home, build: &str) -> Result<(), Error> {
-    rt::block_on(async {
-        let mut conn = reach(home, build).await?;
-        conn.stream.send(&ClientMsg::Shutdown).await?;
-        answered(DRAIN_TIMEOUT, conn.stream.drained(&mut conn.buffered)).await
-    })
+async fn ask_to_stop(home: &Home, build: &str) -> Result<(), Error> {
+    let mut conn = reach(home, build).await?;
+    conn.stream.send(&ClientMsg::Shutdown).await?;
+    answered(DRAIN_TIMEOUT, conn.stream.drained(&mut conn.buffered)).await
 }
 
 /// What the running daemon says of itself, if one runs and answers; never
@@ -721,7 +755,7 @@ pub fn restart(
 /// side closes: the daemon may keep a connection open after its client is
 /// done.
 pub fn bridge(home: &Home, token: &str) -> io::Result<()> {
-    let (stream, _) = connect_or_spawn(home, false)?;
+    let (stream, _) = rt::block_on(connect_or_spawn(&link::BLOCKING, home, false))?;
     let env = ClientMsg::Environment(capture()?);
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "{} {token} env", remote::SYNC)?;
@@ -785,12 +819,14 @@ fn wedged(what: &str) -> io::Error {
 }
 
 /// `start.lock`: one starter at a time, whether a client or the OS at login.
-fn starting(home: &Home) -> io::Result<File> {
+async fn starting(rt: &rt::Rt, home: &Home) -> io::Result<File> {
     sys::fs::private_dir(&home.run_dir())?;
     locked(
+        rt,
         open(&home.run_dir().join("start.lock"))?,
         Some(HELLO_TIMEOUT),
     )
+    .await
     .ok_or_else(|| wedged("another client"))
 }
 
@@ -799,13 +835,21 @@ fn starting(home: &Home) -> io::Result<File> {
 /// `start.lock`, so the two never race. `None` when a daemon already serves:
 /// once this is bound, clients connect into its backlog.
 pub fn bind_at_login(home: &Home) -> io::Result<Option<(sys::DaemonLock, sys::Listener)>> {
-    let _starting = starting(home)?;
+    rt::block_on(bind_at_login_async(&link::BLOCKING, home))
+}
+
+async fn bind_at_login_async(
+    rt: &rt::Rt,
+    home: &Home,
+) -> io::Result<Option<(sys::DaemonLock, sys::Listener)>> {
+    let _starting = starting(rt, home).await?;
     if home.endpoint().connect().is_ok() {
         return Ok(None);
     }
     // A daemon draining or stopping still holds the record and its endpoint;
     // binding before it lets go would replace the discovery it withdraws.
-    let lock = locked(open(&home.daemon_pid_file())?, Some(HELLO_TIMEOUT))
+    let lock = locked(rt, open(&home.daemon_pid_file())?, Some(HELLO_TIMEOUT))
+        .await
         .ok_or_else(|| wedged("the daemon"))?;
     let listener = home.bind()?;
     Ok(Some((sys::adopt_lock(lock, home)?, listener)))
@@ -814,7 +858,7 @@ pub fn bind_at_login(home: &Home) -> io::Result<Option<(sys::DaemonLock, sys::Li
 /// A login entry whose host does not outlive it: start a detached daemon
 /// as any client does, unless one serves.
 pub fn spawn_at_login(home: &Home) -> io::Result<()> {
-    connect_or_spawn(home, false).map(drop)
+    rt::block_on(connect_or_spawn(&link::BLOCKING, home, false)).map(drop)
 }
 
 /// Zero-lag start: when no daemon is listening, take the daemon lock, bind
@@ -830,7 +874,11 @@ pub fn spawn_at_login(home: &Home) -> io::Result<()> {
 /// that lock, then find the socket. A daemon lock held while no socket
 /// listens is then an exiting daemon's (let go as it ends) or a wedged
 /// one's, and is waited on for as long as a hello may take.
-pub(crate) fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(OwnedConnection, bool)> {
+pub(crate) async fn connect_or_spawn(
+    rt: &rt::Rt,
+    home: &Home,
+    reset: bool,
+) -> io::Result<(OwnedConnection, bool)> {
     use std::process::{Command, Stdio};
 
     let endpoint = home.endpoint();
@@ -840,13 +888,14 @@ pub(crate) fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(OwnedCon
         Err(_) => {}
     }
 
-    let _starting = starting(home)?;
+    let _starting = starting(rt, home).await?;
     match endpoint.connect() {
         Ok(stream) => return Ok((stream, false)),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(error),
         Err(_) => {}
     }
-    let lock = locked(open(&home.daemon_pid_file())?, Some(HELLO_TIMEOUT))
+    let lock = locked(rt, open(&home.daemon_pid_file())?, Some(HELLO_TIMEOUT))
+        .await
         .ok_or_else(|| wedged("the daemon"))?;
 
     // The daemon leaves this process's session (`setsid`) as it starts, so
@@ -865,8 +914,12 @@ pub(crate) fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(OwnedCon
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     home.daemon_env(&mut cmd);
-    let mut daemon = sys::spawn_daemon(&mut cmd, home, lock)?;
-    thread::spawn(move || daemon.wait());
+    let home = home.clone();
+    let daemon = rt::unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
+        sys::spawn_daemon(&mut cmd, &home, lock)
+    })
+    .await?;
+    rt::reap(&**rt, daemon);
     Ok((endpoint.connect()?, true))
 }
 
@@ -1014,11 +1067,22 @@ mod tests {
         sys::fs::lock(&held).unwrap();
         // Held throughout the wait: nothing is taken.
         let waited = File::open(&path).unwrap();
-        assert!(locked(waited, Some(Duration::from_millis(50))).is_none());
+        assert!(
+            rt::block_on(locked(
+                &link::BLOCKING,
+                waited,
+                Some(Duration::from_millis(50))
+            ))
+            .is_none()
+        );
         // Let go afterwards: the helper that was still waiting takes it and
         // drops it, so the next taker is not kept out.
         drop(held);
-        let taken = locked(File::open(&path).unwrap(), Some(Duration::from_millis(500)));
+        let taken = rt::block_on(locked(
+            &link::BLOCKING,
+            File::open(&path).unwrap(),
+            Some(Duration::from_millis(500)),
+        ));
         assert!(taken.is_some());
         drop(taken);
         fs::remove_dir_all(&root).unwrap();

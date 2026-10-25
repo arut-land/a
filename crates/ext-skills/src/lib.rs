@@ -1,5 +1,7 @@
 //! Skills: immutable workspace generations, with only an index offered
 //! until a typed tool or user command publishes instructions to the log.
+//! Source changes settle through the host's async delay seam before
+//! generation preparation is admitted to its blocking pool.
 
 mod loader;
 mod parse;

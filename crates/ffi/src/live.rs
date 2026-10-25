@@ -13,7 +13,7 @@ use std::time::Duration;
 use boltffi::{EventSubscription, StreamProducer, export};
 use client::{Attach, Cmd, Daemon, Daemons, Driver, Effect, Env, Member, Notice, SessionClient};
 use protocol::{Environment, HomeSettings, HostPath, SessionId, SettingsChange, Target};
-use rt::Threads;
+use rt::{Runtime, Threads};
 use sys::install::CliLink;
 use sys::{Home, Staged};
 
@@ -36,7 +36,7 @@ async fn blocking<T: Send + 'static>(
 }
 
 fn diagnosis(
-    rt: &dyn rt::Runtime,
+    rt: &dyn Runtime,
     home: Home,
 ) -> impl Future<Output = client::Diagnosis> + Send + 'static {
     rt::unblock(rt, move || client::diagnose(&home))
@@ -255,7 +255,7 @@ pub struct QueryStream {
 struct Asked {
     daemon: Daemon,
     query: (String, protocol::Scope, protocol::Json),
-    answers: rt::channel::BlockingSender<QueryAnswer>,
+    answers: rt::channel::AsyncSender<QueryAnswer>,
 }
 
 /// A query's cancel, which may come before it is connected.
@@ -267,14 +267,20 @@ impl Cancel {
         let mut cancel = lock(&self.0);
         cancel.0 = true;
         if let Some(canceller) = &cancel.1 {
-            let _ = canceller.cancel();
+            let canceller = canceller.clone();
+            runtime().spawn(Box::pin(async move {
+                let _ = canceller.cancel_async().await;
+            }));
         }
     }
 
     fn connected(&self, canceller: client::Canceller) {
         let mut cancel = lock(&self.0);
         if cancel.0 {
-            let _ = canceller.cancel();
+            let canceller = canceller.clone();
+            runtime().spawn(Box::pin(async move {
+                let _ = canceller.cancel_async().await;
+            }));
         }
         cancel.1 = Some(canceller);
     }
@@ -297,7 +303,7 @@ impl QueryStream {
         let body = protocol::Json::encode(&query["body"]).map_err(|e| invalid(e.to_string()))?;
         // A few answers ahead of the app; past them the socket, then the
         // daemon's query, waits.
-        let (sender, answers) = rt::channel::bounded(16);
+        let (sender, answers) = rt::channel::bounded_async(16);
         Ok(Self {
             asked: Mutex::new(Some(Asked {
                 daemon: client.daemon().clone(),
@@ -314,28 +320,32 @@ impl QueryStream {
         let Some(Asked {
             daemon,
             query: (service, scope, body),
-            answers,
+            mut answers,
         }) = lock(&self.asked).take()
         else {
             return;
         };
         let cancel = Arc::clone(&self.cancel);
-        // Detached, as the client SDK's connection threads are: it ends
-        // with the query's reply, its connection, or this stream.
-        std::thread::spawn(move || match daemon.query(&service, scope, body) {
-            Ok(read) => {
-                cancel.connected(read.canceller());
-                for answer in read {
-                    if answers.send(answer.into()).is_err() {
-                        break;
+        let rt: rt::Rt = runtime().clone();
+        runtime().spawn(Box::pin(async move {
+            match daemon.query_async(&rt, &service, scope, body).await {
+                Ok(mut read) => {
+                    cancel.connected(read.canceller());
+                    while let Some(answer) = read.next_async().await {
+                        if answers.send(answer.into()).await.is_err() {
+                            break;
+                        }
                     }
                 }
+                Err(error) => {
+                    let _ = answers
+                        .send(QueryAnswer::Failed {
+                            error: error.to_string(),
+                        })
+                        .await;
+                }
             }
-            Err(error) => {
-                let error = error.to_string();
-                let _ = answers.send(QueryAnswer::Failed { error });
-            }
-        });
+        }));
     }
 
     /// The next answer, once there is one; none after the last, which is
@@ -373,7 +383,7 @@ struct Fetching {
     blob: protocol::BlobId,
     offset: u64,
     len: Option<u64>,
-    pieces: rt::channel::BlockingSender<BlobPiece>,
+    pieces: rt::channel::AsyncSender<BlobPiece>,
 }
 
 #[export]
@@ -394,7 +404,7 @@ impl BlobFetch {
             .map(SessionId)
             .map_err(|e| invalid(format!("session: {e}")))?;
         let blob = blob.parse().map_err(|e| invalid(format!("blob: {e}")))?;
-        let (sender, pieces) = rt::channel::bounded(16);
+        let (sender, pieces) = rt::channel::bounded_async(16);
         Ok(Self {
             asked: Mutex::new(Some(Fetching {
                 daemon: client.daemon().clone(),
@@ -417,7 +427,7 @@ impl BlobFetch {
             blob,
             offset,
             len,
-            pieces,
+            mut pieces,
         }) = lock(&self.asked).take()
         else {
             return;
@@ -429,22 +439,21 @@ impl BlobFetch {
                 std::ops::Bound::Excluded(offset.saturating_add(len))
             }),
         );
-        // Detached, as a query's is: it ends with the last piece, its
-        // connection, or this fetch.
-        std::thread::spawn(move || {
-            let ended = match daemon.fetch(session, blob, range) {
+        let rt: rt::Rt = runtime().clone();
+        runtime().spawn(Box::pin(async move {
+            let ended = match daemon.fetch_async(&rt, session, blob, range).await {
                 Ok(mut fetched) => {
                     cancel.connected(fetched.canceller());
                     let mut buf = vec![0; 256 << 10];
                     loop {
-                        match std::io::Read::read(&mut fetched, &mut buf) {
+                        match fetched.read_async(&mut buf).await {
                             Ok(0) => {
-                                let _ = pieces.send(BlobPiece::Done);
+                                let _ = pieces.send(BlobPiece::Done).await;
                                 return;
                             }
                             Ok(n) => {
                                 let bytes = buf[..n].to_vec();
-                                if pieces.send(BlobPiece::Bytes { bytes }).is_err() {
+                                if pieces.send(BlobPiece::Bytes { bytes }).await.is_err() {
                                     return;
                                 }
                             }
@@ -456,8 +465,8 @@ impl BlobFetch {
                     error: e.to_string(),
                 },
             };
-            let _ = pieces.send(ended);
-        });
+            let _ = pieces.send(ended).await;
+        }));
     }
 
     /// The next piece, once there is one; none after the last, which is

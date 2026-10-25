@@ -1,7 +1,6 @@
 //! A channel from any producer to an async consumer. The receiver is a
-//! stream; which sender a channel has says what sending costs: an
-//! unbounded channel's never waits, a bounded channel's parks its thread
-//! while the channel is full, so an async task cannot hold one.
+//! stream. Unbounded senders never wait; bounded senders either park a
+//! blocking producer or yield an async producer until space is available.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -17,6 +16,7 @@ struct State<T> {
     receiver_gone: bool,
     waker: Option<Waker>,
     waiting: usize,
+    sender: Option<Waker>,
 }
 
 struct Shared<T> {
@@ -74,6 +74,9 @@ pub struct Sender<T>(Arc<Shared<T>>);
 /// is full, so only a blocking thread may hold one.
 pub struct BlockingSender<T>(Arc<Shared<T>>);
 
+/// A bounded sender that yields its task while the channel is full.
+pub struct AsyncSender<T>(Arc<Shared<T>>);
+
 pub struct Receiver<T>(Arc<Shared<T>>);
 
 fn channel<T>(capacity: usize) -> (Arc<Shared<T>>, Receiver<T>) {
@@ -84,6 +87,7 @@ fn channel<T>(capacity: usize) -> (Arc<Shared<T>>, Receiver<T>) {
             receiver_gone: false,
             waker: None,
             waiting: 0,
+            sender: None,
         }),
         space: Condvar::new(),
         capacity,
@@ -96,6 +100,45 @@ fn channel<T>(capacity: usize) -> (Arc<Shared<T>>, Receiver<T>) {
 pub fn bounded<T>(capacity: usize) -> (BlockingSender<T>, Receiver<T>) {
     let (shared, rx) = channel(capacity.max(1));
     (BlockingSender(shared), rx)
+}
+
+/// A bounded channel whose producer waits asynchronously for space.
+pub fn bounded_async<T>(capacity: usize) -> (AsyncSender<T>, Receiver<T>) {
+    let (shared, rx) = channel(capacity.max(1));
+    (AsyncSender(shared), rx)
+}
+
+impl<T: Send> AsyncSender<T> {
+    /// Sends once there is room; returns the item if the receiver is gone.
+    pub async fn send(&mut self, item: T) -> Result<(), T> {
+        let mut item = Some(item);
+        std::future::poll_fn(|cx| {
+            let mut state = self.0.state();
+            if state.receiver_gone {
+                return Poll::Ready(Err(item.take().expect("send completes once")));
+            }
+            if state.items.len() == self.0.capacity {
+                state.sender = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            state
+                .items
+                .push_back(item.take().expect("send completes once"));
+            let waker = state.waker.take();
+            drop(state);
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+            Poll::Ready(Ok(()))
+        })
+        .await
+    }
+}
+
+impl<T> Drop for AsyncSender<T> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
@@ -138,6 +181,11 @@ impl<T> Receiver<T> {
             if state.waiting > 0 {
                 self.0.space.notify_one();
             }
+            let sender = state.sender.take();
+            drop(state);
+            if let Some(sender) = sender {
+                sender.wake();
+            }
             return Poll::Ready(Some(item));
         }
         if state.closed {
@@ -159,6 +207,11 @@ impl<T> Receiver<T> {
         if state.waiting > 0 {
             self.0.space.notify_one();
         }
+        let sender = state.sender.take();
+        drop(state);
+        if let Some(sender) = sender {
+            sender.wake();
+        }
         Some(item)
     }
 
@@ -175,7 +228,11 @@ impl<T> Drop for Receiver<T> {
         let waiting = state.waiting > 0;
         let items = std::mem::take(&mut state.items);
         let waker = state.waker.take();
+        let sender = state.sender.take();
         drop(state);
+        if let Some(sender) = sender {
+            sender.wake();
+        }
         if waiting {
             self.0.space.notify_all();
         }
@@ -224,6 +281,26 @@ mod tests {
         assert!(tx.send(Observe(Arc::clone(&tx.0))).is_ok());
         drop(rx);
         drop(tx);
+    }
+
+    #[test]
+    fn async_backpressure_wakes_for_space_and_receiver_drop() {
+        let (mut tx, rx) = bounded_async(1);
+        crate::block_on(tx.send(1)).unwrap();
+        {
+            let send = tx.send(2);
+            let mut send = std::pin::pin!(send);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(send.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(rx.try_recv(), Some(1));
+            assert_eq!(crate::block_on(send), Ok(()));
+        }
+        let mut cx = Context::from_waker(Waker::noop());
+        let send = tx.send(3);
+        let mut send = std::pin::pin!(send);
+        assert!(send.as_mut().poll(&mut cx).is_pending());
+        drop(rx);
+        assert_eq!(crate::block_on(send), Err(3));
     }
 
     #[test]

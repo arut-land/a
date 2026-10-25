@@ -40,13 +40,26 @@ impl Daemon {
     /// Asks query `service` about `scope`, over a connection of its own:
     /// sent right behind the hello.
     pub fn query(&self, service: &str, scope: Scope, body: Json) -> Result<Answers, Error> {
+        rt::block_on(self.query_async(&crate::link::BLOCKING, service, scope, body))
+    }
+
+    /// Asks a query using the supplied runtime without blocking its worker.
+    pub async fn query_async(
+        &self,
+        rt: &rt::Rt,
+        service: &str,
+        scope: Scope,
+        body: Json,
+    ) -> Result<Answers, Error> {
         let query = ClientMsg::Query {
             id: ID,
             service: service.to_owned(),
             scope,
             body,
         };
-        let conn = self.connect_as(None, &|| {}, &|_| Ok(vec![query.clone()]))?;
+        let conn = self
+            .connect_as_async(rt, None, &|| {}, &|_| Ok(vec![query.clone()]))
+            .await?;
         Ok(Answers::of(conn))
     }
 }
@@ -83,27 +96,34 @@ impl Canceller {
     /// Asks the daemon to stop the query: its reply then says it was
     /// interrupted, unless it was on its way already.
     pub fn cancel(&self) -> io::Result<()> {
-        rt::block_on(self.0.send(&ClientMsg::Cancel { id: ID }))
+        rt::block_on(self.cancel_async())
+    }
+    /// Requests cancellation without blocking the calling task.
+    pub async fn cancel_async(&self) -> io::Result<()> {
+        self.0.send(&ClientMsg::Cancel { id: ID }).await
+    }
+}
+
+impl Answers {
+    /// The next streamed answer, yielding while the daemon works.
+    pub async fn next_async(&mut self) -> Option<io::Result<Answer>> {
+        if self.done {
+            return None;
+        }
+        let answer = crate::until(&*self.stream, &mut self.buffered, &mut |msg| match msg {
+            DaemonMsg::Update { id: ID, body } => Some(Answer::Update(body)),
+            DaemonMsg::Reply { id: ID, outcome } => Some(Answer::Reply(outcome)),
+            _ => None,
+        })
+        .await;
+        self.done = !matches!(answer, Ok(Answer::Update(_)));
+        Some(answer)
     }
 }
 
 impl Iterator for Answers {
     type Item = io::Result<Answer>;
-
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        let answer = rt::block_on(crate::until(
-            &*self.stream,
-            &mut self.buffered,
-            &mut |msg| match msg {
-                DaemonMsg::Update { id: ID, body } => Some(Answer::Update(body)),
-                DaemonMsg::Reply { id: ID, outcome } => Some(Answer::Reply(outcome)),
-                _ => None,
-            },
-        ));
-        self.done = !matches!(answer, Ok(Answer::Update(_)));
-        Some(answer)
+        rt::block_on(self.next_async())
     }
 }

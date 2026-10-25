@@ -80,6 +80,8 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
         input,
         post: tx,
         shown: false,
+        runtime,
+        ticks: Ticks::default(),
     };
     // The first frame goes out before the daemon is even reached, or the
     // git root walked up to.
@@ -112,6 +114,27 @@ enum Exit {
 /// How often the working indicator turns.
 const TICK: Duration = Duration::from_millis(125);
 
+/// At most one indicator wake is outstanding; idle frames arm none.
+#[derive(Default)]
+struct Ticks {
+    armed: bool,
+}
+
+impl Ticks {
+    fn arm(&mut self, working: bool, rt: &rt::Rt, post: &client::Post<Event>) {
+        if !working || self.armed {
+            return;
+        }
+        self.armed = true;
+        let post = post.clone();
+        let runtime = rt.clone();
+        rt.spawn(Box::pin(async move {
+            runtime.sleep(TICK).await;
+            let _ = post.send(Event::Tick);
+        }));
+    }
+}
+
 /// Ctrl-L: the next frame is drawn whole.
 struct Redraw;
 
@@ -123,6 +146,8 @@ struct Client {
     input: term::Control,
     post: client::Post<Event>,
     shown: bool,
+    runtime: rt::Rt,
+    ticks: Ticks,
 }
 
 impl Drop for Client {
@@ -141,14 +166,10 @@ impl Client {
             if let Some(exit) = exit {
                 return Ok(exit);
             }
+            self.ticks
+                .arm(self.app.working(), &self.runtime, &self.post);
             let first = if whole {
                 Event::Control
-            } else if self.app.working() {
-                match rx.recv_timeout(TICK) {
-                    Some(event) => event,
-                    None if rx.closed() => break,
-                    None => Event::Tick,
-                }
             } else if let Some(event) = rx.recv() {
                 event
             } else {
@@ -172,7 +193,10 @@ impl Client {
                             effects.extend(self.app.input(input));
                         }
                     }
-                    Event::Tick => self.app.tick(),
+                    Event::Tick => {
+                        self.ticks.armed = false;
+                        self.app.tick();
+                    }
                     Event::Client(event) => {
                         let stepped = self.app.client.step(event);
                         self.driver.pump(&mut self.app, stepped);
@@ -275,5 +299,29 @@ impl Client {
                 result => return result,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_arms_no_ticks_and_working_arms_only_one() {
+        let rt: rt::Rt = std::sync::Arc::new(rt::Threads::new(1));
+        let (post, inbox) = client::inbox(client::QueueBudget::default(), |_| size_of::<Event>());
+        let mut ticks = Ticks::default();
+        ticks.arm(false, &rt, &post);
+        assert!(inbox.recv_timeout(TICK * 2).is_none());
+        ticks.arm(true, &rt, &post);
+        ticks.arm(true, &rt, &post);
+        assert!(matches!(
+            inbox.recv_timeout(Duration::from_secs(5)),
+            Some(Event::Tick)
+        ));
+        assert!(inbox.recv_timeout(TICK * 2).is_none());
+        ticks.armed = false;
+        ticks.arm(false, &rt, &post);
+        assert!(inbox.recv_timeout(TICK * 2).is_none());
     }
 }

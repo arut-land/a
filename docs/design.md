@@ -556,10 +556,13 @@ and a generated corpus; there is no older-format fallback.
 `protocol::view` is the shared reducer; `Item::present()` supplies common
 presentation. Rust, FFI and Swift use shared view vectors. `client` owns the
 link/reconnect state machine, mutation numbering, offers, slash commands
-and renderer pump. Its transport driver still uses connection/read threads
-and a shared writer. Apps retain screen state and render SDK effects:
+and renderer pump. Its transport driver uses async connection, read and
+write tasks over the host's runtime. Apps retain screen state and render SDK effects:
 [CLI](cli.md), [TUI](tui.md), [web](web.md), and SwiftUI through BoltFFI.
-Moving the client driver onto the reactor remains deferred.
+Child reaping uses `rt::reap` and native exit watches. Workspace generation
+sources receive `ext::host::Delay`; the coordinator coalesces source events
+with a 100 ms async settle timer before admitting blocking preparation.
+Features neither choose a reactor nor sleep a worker through settling.
 
 ## Crate map
 

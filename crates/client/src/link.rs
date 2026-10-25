@@ -7,13 +7,12 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, LazyLock};
-use std::task::{Context, Waker};
 use std::time::Duration;
 
 use protocol::{
     Caps, ClientId, ClientMsg, DaemonMsg, Decode, Environment, MachineId, PROTO, Versions,
 };
-use rt::{BoxFuture, Rt, Runtime};
+use rt::{BoxFuture, Rt};
 use sys::{Home, Staged};
 
 use crate::{Connection, Daemon, Diagnosis, Error, Welcome};
@@ -248,14 +247,11 @@ impl Link for LocalLink {
     ) -> BoxFuture<'a, Result<Opened, Error>> {
         let home = self.0.clone();
         Box::pin(async move {
+            if start == Start::Replace {
+                crate::stop_async(rt, &home).await?;
+            }
             let (stream, started) =
-                rt::unblock_with(&**rt, rt::BlockingClass::Network, 64 << 10, move || {
-                    if start == Start::Replace {
-                        crate::stop(&home)?;
-                    }
-                    crate::connect_or_spawn(&home, start != Start::Reuse)
-                })
-                .await?;
+                crate::connect_or_spawn(rt, &home, start != Start::Reuse).await?;
             Ok(Opened {
                 within: if started {
                     crate::START_TIMEOUT
@@ -478,39 +474,5 @@ pub(crate) async fn hello(
     }
 }
 
-/// The runtime the blocking API drives a link on: its caller's thread is
-/// already one that may block, so blocking work runs right there.
-pub(crate) static BLOCKING: LazyLock<Rt> = LazyLock::new(|| Arc::new(Inline));
-
-struct Inline;
-
-impl Runtime for Inline {
-    fn spawn(&self, mut task: BoxFuture<'static, ()>) {
-        // Most finish at once (a reaped child); the rest get a thread.
-        if task
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending()
-        {
-            std::thread::spawn(move || rt::block_on(task));
-        }
-    }
-
-    fn spawn_blocking(
-        &self,
-        _: rt::BlockingClass,
-        _: usize,
-        work: Box<dyn FnOnce() + Send>,
-    ) -> BoxFuture<'static, io::Result<()>> {
-        work();
-        Box::pin(std::future::ready(Ok(())))
-    }
-
-    fn spawn_flush(&self, work: Box<dyn FnOnce() + Send>) -> BoxFuture<'static, io::Result<()>> {
-        self.spawn_blocking(rt::BlockingClass::Storage, 0, work)
-    }
-
-    fn reactor(&self) -> rt::Reactor {
-        rt::Reactor::AsyncIo
-    }
-}
+/// The shared runtime behind the blocking SDK entry points.
+pub(crate) static BLOCKING: LazyLock<Rt> = LazyLock::new(|| Arc::new(rt::Threads::new(1)));

@@ -16,8 +16,8 @@ SessionClient (session.rs)         no I/O: Link FSM, SessionView (protocol::view
   │ Effect::Io(Connect | Send | SendEnvironment | Hangup)   Event { conn, kind: Connected | Msg | … }
   │ Effect::Show(View | Link | Sessions | Notice)
   ▼
-Driver (drive.rs)                  pump: the one fixpoint loop; threads: connect + read per
-  │                                connection, one writer
+Driver (drive.rs)                  pump: the one fixpoint loop; async transport tasks
+  │                                on the supplied runtime
   ▼
 transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: connect, connect_as,
            remote.rs, query.rs,    sessions, new_session, query, fetch; the one hello over any
@@ -112,8 +112,8 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   which the daemon reads (its own slash commands included). `help(daemon)`
   lists both tables for the app's help screen.
 - **`Driver` and `pump`.** Carries out the `Io` effects: `Connect` opens
-  connection `conn` on a new thread (replacing the daemon first when
-  `restart`), reads it there and posts each message to the sink as an
+  connection `conn` on a runtime task (replacing the daemon first when
+  `restart`), reads it asynchronously and posts each message to the sink as an
   `Event`; `Send` writes on the newest connection (the session client
   numbered it); `SendEnvironment` captures this process's environment
   again (or asks the `origin` given) and sends it; `Hangup` drops the
@@ -122,7 +122,7 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   for goes round again; a send that failed is shown as a notice. Cheap to
   clone; one per session client.
 - **`Inbox`.** The one queue the app's thread sleeps on, posted to by the
-  driver's and the input threads: a lock around a `VecDeque` rather than
+  driver's tasks and the input thread: a lock around a `VecDeque` rather than
   `mpsc`, which instantiates all three channel flavours per type (7–15 KiB
   each).
 - **`Daemons`.** The daemons a client holds, one per machine, each a
@@ -233,15 +233,15 @@ Other rules the apps keep, by convention:
 - The view is `SessionView`, folded by the SDK; an app re-derives nothing
   from the transcript. What it keeps is screen state: scroll anchor, folded
   cards, the input, overlays, the tab's page.
-- Threads are detached. The driver's reader threads, the input thread and
-  the reaper of a spawned daemon are never joined: process exit ends them,
-  and the terminal is restored by `Terminal`'s drop before that. Nothing
-  slow runs in a destructor; do not add a join.
+- Transport and child reaping run as runtime tasks. Blocking SDK methods
+  drive async operations over a shared one-worker runtime; file lock waits
+  and process creation use its Storage pool. The terminal input thread is
+  detached, and `Terminal` restores the terminal before process exit.
 - A client never sleeps on a timer (`crates/client/tests/no_polling.rs`,
   and the strace acceptance test on Linux): the inbox, the socket and the
   daemon lock are waited on.
 - The first frame goes out before the daemon is reached; connecting (and
-  spawning the daemon) happens on the driver's thread.
+  spawning the daemon) happens on the driver's runtime.
 
 ## Tests
 
@@ -267,3 +267,8 @@ Other rules the apps keep, by convention:
   drive `a` against a daemon in an isolated `A_HOME` (`mise run
   acceptance` runs the first); `remote.rs`'s fake `ssh` refuses anything
   but plain words, as a non-POSIX login shell would.
+
+Query and blob consumers can use `Daemon::query_async`,
+`Daemon::fetch_async`, `Answers::next_async` and `Fetched::read_async` on
+an existing runtime. The FFI uses these with bounded async channels, so a
+slow renderer yields the producer without blocking an executor worker.

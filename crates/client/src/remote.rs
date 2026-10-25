@@ -92,7 +92,7 @@ impl Link for SshLink {
                 }
             }
             let (link, installing) = (self.clone(), build.clone());
-            rt::unblock_with(&**rt, rt::BlockingClass::Network, 64 << 10, move || {
+            rt::unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
                 link.install(&installing)
             })
             .await?;
@@ -191,7 +191,7 @@ impl SshLink {
         }
         let prompt = self.prompt;
         let (child, stdin, stdout, stderr) =
-            rt::unblock_with(&**rt, rt::BlockingClass::Network, 64 << 10, move || {
+            rt::unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
                 sys::spawn_ssh(&mut cmd, prompt)
             })
             .await?;
@@ -454,15 +454,19 @@ impl Drop for Reaper {
         if let Some(mut child) = self.child.take() {
             // Revocation cannot wait behind network admission or process exit.
             let _ = child.kill();
-            let admitted = self.rt.spawn_blocking(
-                rt::BlockingClass::Network,
-                0,
-                Box::new(move || {
-                    let _ = child.wait();
-                }),
-            );
+            let rt = self.rt.clone();
             self.rt.spawn(Box::pin(async move {
-                let _ = admitted.await;
+                if let Ok(watch) = child
+                    .exit_watch()
+                    .and_then(|watch| rt::Async::for_reading(&rt.reactor(), watch))
+                {
+                    watch.readable().await;
+                    let _ = child.wait();
+                } else {
+                    let _ =
+                        rt::unblock_with(&*rt, rt::BlockingClass::Storage, 0, move || child.wait())
+                            .await;
+                }
             }));
         }
     }

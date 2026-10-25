@@ -4,6 +4,7 @@
 //! [`Threads`] owns the workers; [`Async`] descriptors and timers share
 //! its [`Reactor`], so a host never runs two.
 //! [`block_on`] drives a future to completion on the calling thread.
+//! [`reap`] waits for a detached child through its native exit watch.
 //! [`EventSink`] is the observability seam, free when off.
 
 pub mod channel;

@@ -11,7 +11,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 BANNED = re.compile(r"\bthread::(spawn|sleep|Builder)\b|\.recv_timeout\(")
 OWNERS = ("crates/rt/", "crates/sys/")
 # path: why it cannot be a task.
-ALLOWED = {}
+ALLOWED = {
+    "apps/cli/src/main.rs": "The line REPL reads blocking platform stdin until process exit.",
+    "apps/cli/src/once.rs": "Pipeline stdin may be a terminal or file and has no portable async registration.",
+    "apps/tui/src/term.rs": "Native terminal input multiplexes signals; terminal restoration has a bounded give-back before reraising.",
+    "crates/client/src/lib.rs": "The ssh bridge copies portable blocking stdin and exits when either direction closes.",
+}
 
 
 def is_test(path):

@@ -76,13 +76,24 @@ pub fn run(
     // Ctrl-C interrupts the turn; where signals are not caught it ends `a`
     // as it would anything else.
     if let Ok(signals) = Signals::catch(&[Signal::Interrupt]) {
-        thread::spawn(move || {
-            while !signals.wait().is_empty() {
+        let signals = rt::Async::for_reading(&runtime.reactor(), signals)?;
+        runtime.spawn(Box::pin(async move {
+            while signals
+                .read_with(|signals| {
+                    if signals.take().is_empty() {
+                        Err(io::ErrorKind::WouldBlock.into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await
+                .is_ok()
+            {
                 if tx.send(Input::Interrupt).is_err() {
-                    return;
+                    break;
                 }
             }
-        });
+        }));
     }
     let mut once = Once {
         client: SessionClient::new(Env::Origin),

@@ -81,8 +81,8 @@ pub fn claim(group: &Group) -> io::Result<Claimed> {
 /// leaves the next one a full record.
 fn record(home: &crate::Home, bytes: &[u8]) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Foundation::{DELETE, GENERIC_READ, GENERIC_WRITE};
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_DELETE_ON_CLOSE;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_DELETE_ON_CLOSE};
     static ATTEMPT: AtomicU32 = AtomicU32::new(0);
     let dir = home.run_dir();
     crate::fs::private_dir(&dir)?;

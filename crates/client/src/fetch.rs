@@ -83,9 +83,22 @@ impl Daemon {
         blob: BlobId,
         range: impl RangeBounds<u64>,
     ) -> Result<Fetched, Error> {
+        rt::block_on(self.fetch_async(&crate::link::BLOCKING, session, blob, range))
+    }
+
+    /// Fetches bytes using the supplied runtime without blocking its worker.
+    pub async fn fetch_async(
+        &self,
+        rt: &rt::Rt,
+        session: SessionId,
+        blob: BlobId,
+        range: impl RangeBounds<u64>,
+    ) -> Result<Fetched, Error> {
         let (offset, len) = bounds(&range);
         let fetch = message(session, blob, offset, len);
-        let conn = self.connect_as(None, &|| {}, &|_| Ok(vec![fetch.clone()]))?;
+        let conn = self
+            .connect_as_async(rt, None, &|| {}, &|_| Ok(vec![fetch.clone()]))
+            .await?;
         Ok(Fetched::of(conn, blob, offset, len))
     }
 }
@@ -146,6 +159,17 @@ impl Fetched {
 
     pub fn canceller(&self) -> Canceller {
         Canceller(Arc::clone(&self.stream))
+    }
+
+    /// Reads the next bytes, yielding while the daemon sends them.
+    pub async fn read_async(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.at == self.chunk.len() && (self.done || out.is_empty() || !self.more().await?) {
+            return Ok(0);
+        }
+        let n = out.len().min(self.chunk.len() - self.at);
+        out[..n].copy_from_slice(&self.chunk[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
     }
 
     /// Takes frames up to the next chunk, into `chunk`, or the reply that
@@ -220,20 +244,12 @@ impl Fetched {
     }
 }
 
-impl Read for Fetched {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.at == self.chunk.len()
-            && (self.done || out.is_empty() || !rt::block_on(self.more())?)
-        {
-            return Ok(0);
-        }
-        let n = out.len().min(self.chunk.len() - self.at);
-        out[..n].copy_from_slice(&self.chunk[self.at..self.at + n]);
-        self.at += n;
-        Ok(n)
-    }
-}
-
 fn invalid(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+impl Read for Fetched {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        rt::block_on(self.read_async(out))
+    }
 }
