@@ -1,42 +1,90 @@
 # Source watching and preparation
 
-Linux uses notify's inotify backend. macOS uses FSEvents for existing
-source trees and kqueue vnode subscriptions for their parents. Windows
-uses overlapped ReadDirectoryChangesW requests awaited through the runtime's
-waitable-event reactor. Each request owns a DWORD-aligned 16 KiB buffer and
-an OVERLAPPED allocation until completion or asynchronous cancellation. There is
-no notification thread or periodic wait on Windows. This avoids notify 8.2's
-100 ms idle wait and also surfaces zero-byte overflow and terminal read errors.
-Windows retains changes between ReadDirectoryChangesW requests in the
-directory handle's kernel buffer; each completion is rearmed before callback
-delivery. A one-shot native threadpool wait, allocated before the first request
-and armed only for pending cancellation, retains the handle, event, OVERLAPPED
-and buffer until completion. Drop never waits on a redirector. There is no
-cleanup timer or occupied blocking worker. See Microsoft's
-[buffer contract](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw)
-and [one-shot wait contract](https://learn.microsoft.com/en-us/windows/win32/api/threadpoolapiset/nf-threadpoolapiset-setthreadpoolwait).
-The pending storage is shared through Arc and UnsafeCell: Rust never creates
-an exclusive borrow of a live request or freezes memory the kernel can write.
-Only a completed buffer is borrowed for parsing.
+## One watcher: `rt::watch::Hub`
 
-WatchEvent carries changes, overflow, rescan requests and unavailable
-subscriptions. Uncertainty invalidates all roots, including events without
-paths; refresh rearms subscriptions before source inventory is captured.
-Root parents remain watched so creation and replacement stay observable.
-Events retain canonical paths alongside configured alias spellings so
-overlapping canonical and aliased roots all invalidate.
-Unavailable subscriptions and failed rearms schedule rescan callbacks with
-exponential backoff from 100 ms to five seconds, independently of further
-filesystem events. A successful refresh cancels recovery; dropping the
-watcher cancels pending recovery and native requests. Healthy watches have
-no timer.
+The daemon owns one `Hub` (engine `Shared::hub`, offered to calls and
+queries as a service); a client process makes its own. A feature
+subscribes a root with a scope, `Watch::tree(root)` or
+`Watch::entered(root)`, and paths under it that never wake it
+(`.excluding(".git")`), and gets a `Subscription`; dropping it
+unsubscribes, and the last subscriber of a native watch closes it. An
+entered subscription hears of the root's entries and of each directory
+it `enter`s, as the index enters what its walk does not ignore.
 
-Watches are armed before the first capture and replacement subscriptions are
-armed before old ones close. Linux directory creation/removal and rename
-events force rearming before capture: notify can deliver a new-directory event
-before installing its descendant watches. macOS streams cover descendants
-continuously; coalesced or dropped batches require a full rescan. Native queues
-are drained independently of preparation. No callback debounce suppresses an
+| OS | Native watch | Shared how | Above the root |
+| --- | --- | --- | --- |
+| Linux | one inotify descriptor per hub, read by a task on the runtime's reactor; one watch per directory | counted per directory across subscriptions (inotify gives one inode one watch) | the nearest existing parent, for its entries coming and going |
+| macOS | FSEvents streams (`FileEvents`, `WatchRoot`, `NoDefer`, latency 0) on one serial dispatch queue in `sys` | one stream per outermost root; a nested root rides it, filtered by prefix; a stream opened for an outer root takes over the nested ones before they close | nothing: a stream follows its path, and `WatchRoot` reports the root going and coming back |
+| Windows | overlapped `ReadDirectoryChangesW` (`sys::DirectoryWatch`) awaited through the reactor | one recursive handle per outermost root, as on macOS | a non-recursive handle on the nearest existing parent, unless a tree covers it; a handle follows its directory, so a root replaced at its path is opened again |
+
+The router runs under the hub's lock, on a runtime task (macOS hands
+its dispatch-queue batches to one), and decides everything before a
+subscriber is woken: an event outside its root, excluded, in a directory
+an entered subscription has not entered, or naming a sibling of the root
+in a watched parent wakes nothing. An event at the root or above it
+compares the root's identity (device and inode, volume and file id)
+with what it was: unchanged is nothing; replaced is rearmed and told
+`Rescan::Root`; missing is told `Unavailable::Gone` and followed from
+its nearest existing parent until it is back (`Rescan::Root`). A change
+under a root believed gone counts as its return, so a coalesced creation
+is not missed. Paths come in the filesystem's spelling (links resolved,
+letter case as on disk, which is how FSEvents and Windows report them)
+and are told in the subscriber's, so a differently cased root on APFS or
+NTFS hears its changes.
+
+On Linux a directory that appears in a tree is watched, with everything
+in it, before `Created` is told: a subscriber that looks at it then sees
+what was made before the watch, and hears of the rest. A directory moved
+out drops its watches, which would name paths it no longer has. A queue
+overflow rearms every subscription and tells `Rescan::Root`.
+
+Sinks run on runtime tasks, never on a native thread, one batch at a
+time: a busy sink's next batch holds what came meanwhile (consecutive
+changes merged). There is no debounce in the hub. Only an I/O failure
+retries, rearming after 100 ms doubling to five seconds until it holds;
+running out of watches (`ENOSPC`, or `EMFILE` on the descriptor) is told
+once as `Unavailable::Limit` and waits for a watch to be freed (inotify
+dropping one of its own accord: a directory removed) or for a new
+subscription. Permission denied is `Unsupported`, as is a filesystem
+without notifications; neither has a timer. A healthy hub schedules
+nothing: `an_idle_subscription_never_wakes_the_runtime`.
+
+Subscribers never refresh a watch. The generation layers (skills, Lua)
+name their roots (`GenerationLayer::roots`) and the coordinator
+subscribes each as a tree through the engine's `Watch` seam before the
+first capture; the index subscribes its root entered (and
+`.git/info`, for `exclude`), entering each directory as its walk does,
+and each rescan walks into a new subscription that replaces the old once
+installed, so ignore rules that changed leave no stale watches; the
+client's machine list watches the directories of its two files entered.
+
+### Before and after
+
+`watchbench` (old: `rt::Watcher` over notify 8.2 on main 7b6f16c5; new:
+the hub) on one tree of 4,400 directories, 400 of them kept and 4,000
+under an ignored `target/`; the entered rows enter the 400 and their
+parents only, as the index does. Arm is subscribing (and entering);
+latency is a write to the sink seeing it, 200 writes; threads and RSS
+are the whole process after arming, a two-worker runtime included.
+Median of five alternating rounds.
+
+MEASUREMENTS
+
+Release `a` size: SIZE
+
+The hand-rolled backends replace notify (and mio, inotify, kqueue,
+fsevent-sys, walkdir and notify's own windows-sys 0.60 with them) because
+notify cannot share a watch between subscriptions, keeps a thread (Linux,
+macOS) or a timed wait (Windows) of its own, watches every directory of a
+recursive root on Linux, and reports through callbacks on its threads,
+which the old watcher had to bounce back to the runtime.
+
+## Preparation
+
+The generation coordinator arms its watches before the first capture.
+macOS and Windows cover descendants continuously and Linux watches a new
+directory before reporting it; coalesced or dropped batches are a full
+rescan. No callback debounce suppresses an
 event because preparation is running: it marks another capture pending,
 including when that attempt rejects or retries. Events arriving after an
 attempt finishes schedule new work under the same coordinator lock.

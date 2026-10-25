@@ -149,8 +149,9 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   file mean what ssh says, and a second alias of one route is left out.
   `resolve()` runs one `ssh -G` per machine, all at once, and only when
   asked: no command's start reads either file unless a target names a
-  machine. `watch(rt, sink)` tells the list again whenever either file
-  changes (`rt::Watcher` on their directories, the latest change's answer
+  machine. `watch(hub, sink)` tells the list again whenever either file
+  changes (an `rt::watch::Hub` subscription on each directory, entered only
+  at its top, which follows a directory made later; the latest change's answer
   only; an included file outside `~/.ssh` is read again with them, but its
   own change is not watched). DNS-SD browsing is a later source beside
   these.
