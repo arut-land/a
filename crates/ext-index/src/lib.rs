@@ -9,20 +9,29 @@
 //! It provides its [`Indexes`] as a service: `ext-search`'s `glob` and
 //! `grep` tools search the same ones.
 //!
-//! The index of a workspace ([`WorkspaceIndex`]) opens with the first query
-//! or call that asks about it and closes once none has for [`Limits::linger`]: a
-//! daemon nobody searches holds none.
+//! The index of a workspace ([`WorkspaceIndex`]) is got ready as soon as
+//! the workspace is in use, without waiting on it: when a session there is
+//! loaded (a client attaches, or its work resumes) and after each reply of
+//! its model, a new session's first among them, so the cold path never
+//! shares the blocking pool with a walk. A query or call that comes first
+//! opens it too. Once none has used it for [`Limits::linger`] it is
+//! written to the daemon's cache and its memory let go, and loaded from
+//! there by the next use: a daemon nobody searches holds none.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use ext::point::{Observe, PointCx, SessionStart, Started};
 use ext::query::Workspace;
 use ext::{
-    Configured, Extension, Partials, Provides, Query, QueryCx, Refused, Registrar, Streamed, Table,
-    stream,
+    Configured, Extension, Partials, Provides, Query, QueryCx, Reaction, Refused, Registrar,
+    Streamed, Table, stream,
 };
+use protocol::Body;
 use serde::{Deserialize, Serialize};
 
+mod disk;
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -46,7 +55,19 @@ pub use index::{
 
 /// The `index` extension: its queries and tools share one [`Indexes`].
 pub struct Index {
+    limits: Limits,
     indexes: Arc<Indexes>,
+}
+
+impl Index {
+    /// Kept in `dir` between uses: see [`Indexes::kept_in`].
+    #[must_use]
+    pub fn kept_in(self, dir: impl Into<PathBuf>) -> Self {
+        Self {
+            indexes: Arc::new(Indexes::new(self.limits).kept_in(dir)),
+            ..self
+        }
+    }
 }
 
 impl Configured for Index {
@@ -60,6 +81,7 @@ impl Configured for Index {
             limits.memory = bytes;
         }
         Ok(Self {
+            limits,
             indexes: Arc::new(Indexes::new(limits)),
         })
     }
@@ -75,9 +97,33 @@ impl Extension for Index {
 
     fn contribute(&self, r: &mut Registrar) {
         let indexes = &self.indexes;
+        let (loaded, replied) = (Arc::clone(indexes), Arc::clone(indexes));
         r.query(FileSearch(Arc::clone(indexes)))
             .query(FileGrep(Arc::clone(indexes)))
-            .provide::<Indexes>(Arc::clone(indexes));
+            .provide::<Indexes>(Arc::clone(indexes))
+            .on::<SessionStart>(move |cx, started| {
+                // A new session's first reply gets it ready: a walk would
+                // share the blocking pool with the cold path.
+                if started == Started::Loaded {
+                    warm(&loaded, cx);
+                }
+            })
+            .on::<Observe>(move |cx, entry| {
+                if matches!(entry.body, Body::ModelResult { r#for: None, .. }) {
+                    warm(&replied, cx);
+                }
+                Reaction::NONE
+            });
+    }
+}
+
+/// Gets the index of the session's workspace ready, as its use draws near.
+fn warm(indexes: &Indexes, cx: &PointCx<'_>) {
+    if let (Some(rt), Some(hub)) = (
+        cx.service_arc::<dyn rt::Runtime>(),
+        cx.service_arc::<rt::watch::Hub>(),
+    ) {
+        indexes.warm(cx.workspace, rt, hub);
     }
 }
 

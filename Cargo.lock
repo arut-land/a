@@ -708,11 +708,13 @@ version = "0.0.0"
 dependencies = [
  "aho-corasick",
  "bstr",
+ "crc",
  "ext",
  "globset",
  "ignore",
  "memchr",
  "neo_frizbee",
+ "protocol",
  "regex",
  "regex-syntax",
  "rt",

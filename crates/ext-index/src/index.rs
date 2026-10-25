@@ -17,18 +17,19 @@
 //! [`REVALIDATE`] old is answered from them as another walk starts, and
 //! grep reads every file.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ext::{Cancel, WorkspaceShared};
 use rt::watch::{Event, Hub, Subscription, Unavailable, Watch};
 use rt::{BlockingClass, Rt};
 use sys::fs::Tree;
 
+use crate::disk;
 use crate::fff::grep::{self, Grep, GrepMatch, GrepOptions, Known, Prefilter};
 use crate::fff::index::{
     BigramFilter, BigramIndexBuilder, BigramOverlay, SKIP_INDEX_MIN_DENSITY_PCT, build_bytes,
@@ -64,6 +65,15 @@ impl Default for Limits {
 pub struct Indexes {
     open: WorkspaceShared<WorkspaceIndex>,
     limits: Limits,
+    store: Option<Arc<Store>>,
+}
+
+/// Where indexes are kept between uses, and those at rest there: each
+/// keeps its subscription, so what changes meanwhile is known when it is
+/// loaded again.
+struct Store {
+    dir: PathBuf,
+    resting: Mutex<BTreeMap<PathBuf, Arc<WorkspaceIndex>>>,
 }
 
 impl Indexes {
@@ -71,7 +81,22 @@ impl Indexes {
         Self {
             open: WorkspaceShared::default(),
             limits,
+            store: None,
         }
+    }
+
+    /// Indexes kept in `dir` (the daemon's cache) between uses: one that
+    /// nothing has used for [`Limits::linger`] is written there and its
+    /// memory let go, and loaded again by the next use, with only what
+    /// changed since looked at again. Without one, it is dropped, and
+    /// walked and built again.
+    #[must_use]
+    pub fn kept_in(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.store = Some(Arc::new(Store {
+            dir: dir.into(),
+            resting: Mutex::default(),
+        }));
+        self
     }
 
     /// The index of the workspace at `root`, opened now if no one has it
@@ -82,13 +107,36 @@ impl Indexes {
             rt,
             hub,
             limits: self.limits,
-            state: Mutex::default(),
+            store: (self.store.as_ref())
+                .map(|store| (Arc::clone(store), disk::Place::new(&store.dir, root))),
+            state: Mutex::new(State {
+                stored: if self.store.is_some() {
+                    Stored::Unseen
+                } else {
+                    Stored::None
+                },
+                ..State::default()
+            }),
             changed: rt::Notify::new(),
             closed: Arc::default(),
             own: own.clone(),
         });
         index.used();
         index
+    }
+
+    /// Opens the index of the workspace at `root` and gets it ready, file
+    /// list and content index, without waiting for either: a workspace is
+    /// in use, and its first search or grep should find them there. All of
+    /// it runs on the blocking pool; a search meanwhile waits for the file
+    /// list, a grep for the content index.
+    pub fn warm(&self, root: &Path, rt: Rt, hub: Arc<Hub>) {
+        let index = self.open(root, rt, hub);
+        let rt = Arc::clone(&index.rt);
+        rt.spawn(Box::pin(async move {
+            // A refused root has nothing to get ready.
+            let _ = index.content().await;
+        }));
     }
 }
 
@@ -98,6 +146,7 @@ pub struct WorkspaceIndex {
     rt: Rt,
     hub: Arc<Hub>,
     limits: Limits,
+    store: Option<(Arc<Store>, disk::Place)>,
     state: Mutex<State>,
     /// Notified as a walk or a content index is installed.
     changed: rt::Notify,
@@ -132,6 +181,26 @@ struct State {
     /// root are. From its end, so a walk longer than [`REVALIDATE`] is not
     /// stale as it lands.
     walked_at: Option<Instant>,
+    /// What of it is on disk while the file list is not in memory.
+    stored: Stored,
+    /// The files or content index changed since they were last written.
+    dirty: bool,
+    /// The build of the content index the bigrams file holds.
+    bigrams_on_disk: Option<u64>,
+}
+
+/// What a closed index has on disk, and what changed since it was written.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum Stored {
+    /// Nothing: the first use walks.
+    #[default]
+    None,
+    /// Whatever the last daemon wrote, if anything: loaded, then checked
+    /// against a walk, only the files that differ looked at again.
+    Unseen,
+    /// Written as the index came to rest, its subscription kept: what
+    /// changed since is in [`State::pending`].
+    Watched,
 }
 
 /// The index's subscriptions: the tree, entered as it is walked, and the
@@ -146,9 +215,13 @@ struct Watching {
 enum Busy {
     #[default]
     Idle,
+    /// Walking, or loading what is on disk.
     Walking,
     /// Applying a batch of changes.
     Applying,
+    /// Writing the index to disk: changes wait, so what is written is all
+    /// the index knows.
+    Persisting,
 }
 
 #[derive(Default)]
@@ -169,6 +242,8 @@ enum Content {
 /// The content prefilter of a walk, and what changed since.
 #[derive(Clone)]
 pub(crate) struct ContentIndex {
+    /// Which build it is: the bigrams file names the one it holds.
+    id: u64,
     filter: Arc<BigramFilter>,
     overlay: BigramOverlay,
     /// One bit per walked file: binary, never searched.
@@ -243,10 +318,25 @@ const BUILD_CHUNK: usize = 4096;
 /// How old the files of an unwatched root may be before a search starts
 /// another walk of it: an @-mention completing starts one at most.
 const REVALIDATE: Duration = Duration::from_secs(2);
+/// Changed paths an index at rest keeps, at most, before it lets them go
+/// for a walk that checks every file once it is loaded.
+const RESTING_PATHS: usize = 4096;
+
+/// What a walk is for.
+#[derive(Clone, Copy)]
+enum Walk {
+    /// The files found replace those the index has.
+    Replace,
+    /// Load what the store has instead, if it is there.
+    Load,
+    /// Check the files loaded from the store, written at `taken`
+    /// (seconds since the epoch), against those found.
+    Verify { taken: u64 },
+}
 
 impl WorkspaceIndex {
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     fn me(&self) -> Option<Arc<Self>> {
@@ -254,7 +344,8 @@ impl WorkspaceIndex {
     }
 
     /// Keeps the index open for [`Limits::linger`] from now: one task
-    /// holds it, sleeping until the last use is that old.
+    /// holds it, sleeping until the last use is that old, then lets it
+    /// close, or, kept in a store, come to rest there.
     fn used(&self) {
         let mut state = self.state();
         state.last_used = Some(self.rt.now());
@@ -270,16 +361,127 @@ impl WorkspaceIndex {
                 let due = {
                     let mut state = me.state();
                     let due = state.last_used.map_or(now, |used| used + me.limits.linger);
-                    if due <= now {
+                    if due <= now && (me.store.is_none() || state.files.is_none()) {
                         state.keeper = false;
                         break;
                     }
                     due
                 };
-                me.rt.sleep(due - now).await;
+                if due > now {
+                    me.rt.sleep(due - now).await;
+                } else if me.rest().await {
+                    me.state().keeper = false;
+                    break;
+                }
             }
             drop(me);
         }));
+    }
+
+    /// Writes the index to its store, unless nothing changed since it
+    /// last was, and lets go of the file list and content index, keeping
+    /// the subscription that tells what changes until it is loaded again.
+    /// It stays open instead (`false`), for another linger, if it is busy
+    /// or used meanwhile; it closes, as with no store, if it cannot be
+    /// written.
+    async fn rest(&self) -> bool {
+        let Some((store, place)) = &self.store else {
+            return true;
+        };
+        let (files, content, used, write_bigrams) = {
+            let mut state = self.state();
+            if state.busy != Busy::Idle || matches!(state.content, Content::Building { .. }) {
+                state.last_used = Some(self.rt.now());
+                return false;
+            }
+            let Some(files) = state.files.clone() else {
+                return true;
+            };
+            let content = match &state.content {
+                Content::Ready(content) => Some(Arc::clone(content)),
+                Content::Absent | Content::Refused | Content::Building { .. } => None,
+            };
+            let write_bigrams = content
+                .as_ref()
+                .is_some_and(|content| state.bigrams_on_disk != Some(content.id));
+            if state.dirty {
+                state.busy = Busy::Persisting;
+            }
+            (
+                state.dirty.then_some(files),
+                content,
+                state.last_used,
+                write_bigrams,
+            )
+        };
+        let written = match files {
+            None => Ok(()),
+            Some(files) => {
+                let (root, dir, place) = (Arc::clone(&self.root), store.dir.clone(), place.clone());
+                let content = content.clone();
+                rt::unblock_with(&*self.rt, BlockingClass::Storage, 0, move || {
+                    sys::fs::private_dir(&dir)?;
+                    let content = content.as_ref().map(|content| disk::Content {
+                        id: content.id,
+                        filter: write_bigrams.then_some(&*content.filter),
+                        overlay: &content.overlay,
+                        binary: &content.binary,
+                    });
+                    disk::write(
+                        &place,
+                        &root,
+                        seconds(SystemTime::now()),
+                        &files,
+                        content.as_ref(),
+                    )
+                })
+                .await
+            }
+        };
+        let mut state = self.state();
+        if state.busy == Busy::Persisting {
+            state.busy = Busy::Idle;
+        }
+        if written.is_err() {
+            state.stored = Stored::None;
+            state.files = None;
+            state.content = Content::Absent;
+            return true;
+        }
+        state.dirty = false;
+        if let Some(content) = &content {
+            state.bigrams_on_disk = Some(content.id);
+        }
+        if state.last_used != used || matches!(state.content, Content::Building { .. }) {
+            state.last_used = Some(self.rt.now());
+            drop(state);
+            self.apply();
+            return false;
+        }
+        state.files = None;
+        state.content = Content::Absent;
+        state.walked_at = None;
+        state.stored = Stored::Watched;
+        drop(state);
+        if let Some(me) = self.me() {
+            lock(&store.resting).insert(self.root.to_path_buf(), me);
+        }
+        true
+    }
+
+    /// What the file list and content index take in memory now.
+    pub fn resident(&self) -> usize {
+        let state = self.state();
+        let files = state.files.as_ref().map_or(0, |files| files.heap_bytes());
+        let content = match &state.content {
+            Content::Ready(content) => {
+                content.filter.heap_bytes()
+                    + content.overlay.heap_bytes()
+                    + content.binary.len() * size_of::<u64>()
+            }
+            Content::Absent | Content::Refused | Content::Building { .. } => 0,
+        };
+        files + content
     }
 
     /// The files as the last walk and the changes since left them, after
@@ -305,25 +507,29 @@ impl WorkspaceIndex {
             let walk = match state.busy {
                 Busy::Idle => {
                     state.busy = Busy::Walking;
-                    true
+                    Some(if walked.is_none() && state.stored != Stored::None {
+                        Walk::Load
+                    } else {
+                        Walk::Replace
+                    })
                 }
-                Busy::Walking => false,
-                Busy::Applying => {
+                Busy::Walking => None,
+                Busy::Applying | Busy::Persisting => {
                     state.pending.rescan = true;
-                    false
+                    None
                 }
             };
             if let Some(files) = walked {
                 drop(state);
-                if walk {
-                    self.walk();
+                if let Some(walk) = walk {
+                    self.walk(walk);
                 }
                 return Ok(files);
             }
             (state.epoch, walk)
         };
-        if walk {
-            self.walk();
+        if let Some(walk) = walk {
+            self.walk(walk);
         }
         let mut walked = None;
         self.changed
@@ -344,9 +550,10 @@ impl WorkspaceIndex {
     /// found what the root is: a refused one is never walked nor watched,
     /// a watched one is walked into a new subscription, each directory
     /// entered as the walk goes; the old one is kept until the walk is
-    /// installed, so nothing that changes meanwhile is missed. The caller
+    /// installed, so nothing that changes meanwhile is missed. Or loads
+    /// what the store has of it, which a walk may then check. The caller
     /// set [`Busy::Walking`].
-    fn walk(&self) {
+    fn walk(&self, walk: Walk) {
         let weak = Weak::clone(&self.own);
         let (rt, root, closed) = (
             Arc::clone(&self.rt),
@@ -364,19 +571,25 @@ impl WorkspaceIndex {
             let watching = {
                 let Some(index) = weak.upgrade() else { return };
                 index.state().tree = Some(tree);
-                match tree {
-                    Tree::Refused(_) => {
-                        index.state().busy = Busy::Idle;
-                        index.changed.notify();
-                        return;
-                    }
-                    // On a network or virtual root the watcher sees what is
-                    // done here (the agent's own edits); walks see the rest.
-                    Tree::Watched | Tree::Unwatched(_) => Arc::new(index.watch()),
+                if let Tree::Refused(_) = tree {
+                    index.state().busy = Busy::Idle;
+                    index.changed.notify();
+                    return;
                 }
+                if let Walk::Load = walk {
+                    index.load().await;
+                    return;
+                }
+                // On a network or virtual root the watcher sees what is
+                // done here (the agent's own edits); walks see the rest.
+                Arc::new(index.watch())
             };
-            let (rules, files) = walk(&rt, root, closed, Arc::clone(&watching)).await;
+            let (rules, files) = walk_tree(&rt, root, closed, Arc::clone(&watching)).await;
             let Some(index) = weak.upgrade() else { return };
+            if let Walk::Verify { taken } = walk {
+                index.verify(rules, watching, files, taken).await;
+                return;
+            }
             {
                 let mut state = index.state();
                 state.files = Some(Arc::new(files));
@@ -385,12 +598,93 @@ impl WorkspaceIndex {
                 state.walked_at = Some(index.rt.now());
                 state.epoch += 1;
                 state.busy = Busy::Idle;
+                state.dirty = true;
                 // Its bit positions were the old walk's.
                 state.content = Content::Absent;
             }
             index.changed.notify();
             index.apply();
         }));
+    }
+
+    /// Loads what the store has of the index and installs it, searches
+    /// answered from it at once; then applies what the subscription it
+    /// kept saw since, or, with none kept (another daemon wrote it) or
+    /// changes lost, has a walk check it, looking again only at the files
+    /// that differ. With nothing whole there, it walks.
+    async fn load(&self) {
+        let root = Arc::clone(&self.root);
+        let place = self.store.as_ref().map(|(_, place)| place.clone());
+        let loaded = rt::unblock_with(&*self.rt, BlockingClass::Storage, 0, move || {
+            disk::read(&place?, &root)
+        })
+        .await;
+        let Some(loaded) = loaded else {
+            self.state().stored = Stored::None;
+            self.walk(Walk::Replace);
+            return;
+        };
+        let verify = {
+            let mut state = self.state();
+            state.bigrams_on_disk = loaded.content.as_ref().map(|content| content.id);
+            state.files = Some(Arc::new(loaded.files));
+            state.content = loaded.content.map_or(Content::Absent, |content| {
+                Content::Ready(Arc::new(ContentIndex {
+                    id: content.id,
+                    filter: Arc::new(content.filter),
+                    overlay: content.overlay,
+                    binary: Arc::new(content.binary),
+                }))
+            });
+            state.epoch += 1;
+            state.walked_at = Some(self.rt.now());
+            state.dirty = false;
+            // Unwatched, what the subscription saw is not all that changed.
+            let verify = state.stored != Stored::Watched
+                || state.pending.rescan
+                || state.rules.is_none()
+                || matches!(state.tree, Some(Tree::Unwatched(_)));
+            if verify {
+                state.pending = Pending::default();
+            } else {
+                state.busy = Busy::Idle;
+            }
+            verify
+        };
+        self.changed.notify();
+        if verify {
+            self.walk(Walk::Verify {
+                taken: loaded.taken,
+            });
+        } else {
+            self.apply();
+        }
+    }
+
+    /// Installs what a walk found that the files loaded from the store
+    /// do not say: those new, changed or gone since. The caller is
+    /// walking, so nothing else changes the files meanwhile.
+    async fn verify(&self, rules: Arc<Rules>, watching: Arc<Watching>, walked: Files, taken: u64) {
+        let (files, read) = {
+            let state = self.state();
+            let read = matches!(state.content, Content::Ready(_) | Content::Building { .. });
+            (state.files.clone().expect("loaded"), read)
+        };
+        let checking = Arc::clone(&rules);
+        let changes = rt::unblock_with(&*self.rt, BlockingClass::Storage, 0, move || {
+            differences(&checking, &files, &walked, taken, read)
+        })
+        .await;
+        {
+            let mut state = self.state();
+            state.rules = Some(rules);
+            state.watching = Some(watching);
+            state.walked_at = Some(self.rt.now());
+        }
+        self.install(changes);
+        self.state().busy = Busy::Idle;
+        self.changed.notify();
+        self.apply();
     }
 
     fn watch(&self) -> Watching {
@@ -433,6 +727,12 @@ impl WorkspaceIndex {
                     }
                 }
             }
+            // At rest, a flood (a build, a checkout) is not kept path by
+            // path: a walk checks the files once they are loaded.
+            if state.files.is_none() && state.pending.paths.len() > RESTING_PATHS {
+                state.pending.paths.clear();
+                state.pending.rescan = true;
+            }
         }
         self.apply();
     }
@@ -448,7 +748,7 @@ impl WorkspaceIndex {
             state.pending = Pending::default();
             state.busy = Busy::Walking;
             drop(state);
-            self.walk();
+            self.walk(Walk::Replace);
             return;
         }
         if state.pending.paths.is_empty() {
@@ -487,9 +787,14 @@ impl WorkspaceIndex {
             files,
             content,
             pending,
+            dirty,
             ..
         } = &mut *state;
         let Some(files) = files else { return };
+        if changes.is_empty() {
+            return;
+        }
+        *dirty = true;
         let files = Arc::make_mut(files);
         let walked = files.walked_count();
         let mut ready = match content {
@@ -617,6 +922,7 @@ impl WorkspaceIndex {
                     unreachable!("matched above");
                 };
                 state.content = built.map_or(Content::Refused, |c| Content::Ready(Arc::new(c)));
+                state.dirty = true;
                 touched
             };
             index.changed.notify();
@@ -919,7 +1225,7 @@ fn grep_chunk(
 
 /// Every file under the root, from one blocking job, with the rules it
 /// was walked by; each directory it enters is entered in `watching`.
-async fn walk(
+async fn walk_tree(
     rt: &Rt,
     root: Arc<Path>,
     closed: Arc<AtomicBool>,
@@ -986,6 +1292,7 @@ async fn build(
     })
     .await;
     Some(ContentIndex {
+        id: build_id(),
         filter: Arc::new(filter),
         overlay: BigramOverlay::new(walked),
         binary: Arc::new(binary),
@@ -1065,21 +1372,12 @@ fn look(
     let _never = sys::fs::NeverFetch::new();
     let mut buf = Vec::new();
     let mut content = |found: Found| {
-        let read = read_content.then(|| {
-            match read(
-                &rules.root().join(&found.path),
-                MAX_INDEXABLE_FILE_SIZE as u64,
-                &mut buf,
-            ) {
-                Ok(()) if memchr::memchr(0, &buf).is_none() => Read::Text(extract_bigrams(&buf)),
-                _ => Read::Binary,
-            }
-        });
+        let read = read_content.then(|| content_of(rules.root(), &found.path, &mut buf));
         (found, read)
     };
     let mut changes = Vec::new();
-    let mut files = std::collections::BTreeMap::<String, Vec<String>>::default();
-    let mut entered = std::collections::HashMap::new();
+    let mut files = BTreeMap::<String, Vec<String>>::default();
+    let mut entered = HashMap::new();
     for path in paths {
         let Some(relative) = rules.relative(path) else {
             continue;
@@ -1127,6 +1425,86 @@ fn look(
         }
     }
     changes
+}
+
+/// What the content index wants of the file at `path`: its bigrams.
+fn content_of(root: &Path, path: &str, buf: &mut Vec<u8>) -> Read {
+    match read(&root.join(path), MAX_INDEXABLE_FILE_SIZE as u64, buf) {
+        Ok(()) if memchr::memchr(0, buf).is_none() => Read::Text(extract_bigrams(buf)),
+        _ => Read::Binary,
+    }
+}
+
+/// What a walk found that `stored` (the files as the store had them)
+/// does not say: each file new, of another size or time, or modified in
+/// the second `stored` was taken or later (it may have changed again
+/// within that second), read again if `read`; each file gone.
+fn differences(
+    rules: &Rules,
+    stored: &Files,
+    walked: &Files,
+    taken: u64,
+    read: bool,
+) -> Vec<Change> {
+    let _never = sys::fs::NeverFetch::new();
+    let created: HashMap<&str, usize> = (stored.walked_count()..stored.items().len())
+        .filter(|&slot| !stored.items()[slot].is_deleted())
+        .map(|slot| (stored.path(&stored.items()[slot]), slot))
+        .collect();
+    let find = |path: &str| {
+        let items = stored.items();
+        (items[..stored.walked_count()].binary_search_by(|f| stored.path(f).cmp(path)))
+            .ok()
+            .filter(|&slot| !items[slot].is_deleted())
+            .or_else(|| created.get(path).copied())
+    };
+    let mut buf = Vec::new();
+    let mut changes = Vec::new();
+    for file in walked.items() {
+        let path = walked.path(file);
+        let same = find(path).is_some_and(|slot| {
+            let known = &stored.items()[slot];
+            known.size == file.size && known.modified == file.modified && known.modified < taken
+        });
+        if !same {
+            let found = Found {
+                path: path.to_owned(),
+                size: file.size,
+                modified: file.modified,
+            };
+            let content = read.then(|| content_of(rules.root(), path, &mut buf));
+            changes.push(Change::File(found, content));
+        }
+    }
+    for file in stored.items() {
+        let path = stored.path(file);
+        if !file.is_deleted() && walked.find(path).is_none() {
+            changes.push(Change::Gone(path.to_owned()));
+        }
+    }
+    changes
+}
+
+/// A content index's build: unique to the daemon's life and, by its
+/// time, to any other daemon's that wrote one.
+fn build_id() -> u64 {
+    static BUILDS: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            (since.as_secs().wrapping_mul(1_000_000_000))
+                .wrapping_add(u64::from(since.subsec_nanos()))
+        });
+    nanos ^ BUILDS.fetch_add(1, Ordering::Relaxed).rotate_right(16)
+}
+
+fn seconds(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// What a search of a refused root replies.

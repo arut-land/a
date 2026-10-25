@@ -385,3 +385,185 @@ fn a_placeholder_is_listed_but_its_content_never_read() {
     assert_eq!(grep(&index, "needle").0, ["local.txt"]);
     assert_eq!(grep(&index, "needle").0, ["local.txt"]);
 }
+
+/// Indexes kept in `store` that come to rest `linger` after their last use.
+fn kept(store: &Path, linger: Duration) -> Indexes {
+    Indexes::new(Limits {
+        linger,
+        ..Limits::default()
+    })
+    .kept_in(store)
+}
+
+fn rested(index: &WorkspaceIndex) {
+    eventually("the index comes to rest", || index.resident() == 0);
+}
+
+#[test]
+fn an_index_reopened_after_edits_made_while_it_rested_sees_them() {
+    let tree = Tree::new();
+    let store = tempfile::tempdir().unwrap();
+    tree.write("src/kept.rs", "fn kept() {}\n");
+    tree.write("src/edited.rs", "fn before() {}\n");
+    tree.write("src/gone.rs", "fn gone() { unicorn }\n");
+    let rt = runtime();
+    let hub = Arc::new(rt::watch::Hub::new(Arc::clone(&rt)));
+    let indexes = kept(store.path(), Duration::from_millis(200));
+    let index = indexes.open(tree.root(), Arc::clone(&rt), Arc::clone(&hub));
+    assert_eq!(grep(&index, "unicorn").0, ["src/gone.rs"]);
+    rested(&index);
+
+    // The same length, so only its time (or the second it was taken in)
+    // tells the edit.
+    tree.write("src/edited.rs", "fn unicorn() {}\n");
+    tree.write("src/fresh/new.rs", "unicorn\n");
+    std::fs::remove_file(tree.root().join("src/gone.rs")).unwrap();
+    let index = indexes.open(tree.root(), rt, hub);
+    eventually("what changed at rest is seen", || {
+        grep(&index, "unicorn").0 == ["src/edited.rs", "src/fresh/new.rs"]
+    });
+    assert!(grep(&index, "unicorn").1.prefiltered);
+    assert!(!search(&index, "").contains(&"src/gone.rs".to_owned()));
+    assert!(search(&index, "").contains(&"src/kept.rs".to_owned()));
+}
+
+#[test]
+fn an_index_another_daemon_kept_is_checked_against_the_tree_before_it_is_trusted() {
+    let tree = Tree::new();
+    let store = tempfile::tempdir().unwrap();
+    for i in 0..200 {
+        tree.write(&format!("src/f{i}.rs"), &format!("fn f{i}() {{}}\n"));
+    }
+    tree.write("src/edited.rs", "fn before() {}\n");
+    tree.write("src/gone.rs", "unicorn\n");
+    {
+        let indexes = kept(store.path(), Duration::from_millis(200));
+        let index = open(&indexes, tree.root(), runtime());
+        assert_eq!(grep(&index, "unicorn").0, ["src/gone.rs"]);
+        rested(&index);
+    }
+    // While no daemon runs: nothing watches.
+    tree.write("src/edited.rs", "fn unicorn() {}\n");
+    tree.write("src/new.rs", "unicorn\n");
+    std::fs::remove_file(tree.root().join("src/gone.rs")).unwrap();
+    tree.write(".gitignore", "src/f1*.rs\n");
+
+    let indexes = kept(store.path(), Duration::from_secs(60));
+    let index = open(&indexes, tree.root(), runtime());
+    eventually("what changed meanwhile is seen", || {
+        grep(&index, "unicorn").0 == ["src/edited.rs", "src/new.rs"]
+    });
+    let (_, summary) = grep(&index, "unicorn");
+    assert!(summary.prefiltered);
+    // The content index came from disk: only what changed is read.
+    assert!(summary.searched <= 3, "{summary:?}");
+    let listed = search(&index, "");
+    assert!(
+        !listed.iter().any(|p| p.starts_with("src/f1")),
+        "{listed:?}"
+    );
+    assert!(listed.contains(&"src/f2.rs".to_owned()));
+}
+
+#[test]
+fn a_damaged_or_older_index_on_disk_is_rebuilt_never_trusted() {
+    let tree = Tree::new();
+    let store = tempfile::tempdir().unwrap();
+    tree.write("alpha.rs", "needle\n");
+    tree.write("beta.rs", "other\n");
+    {
+        let indexes = kept(store.path(), Duration::from_millis(200));
+        let index = open(&indexes, tree.root(), runtime());
+        assert_eq!(grep(&index, "needle").0, ["alpha.rs"]);
+        rested(&index);
+    }
+    let kept_files: Vec<PathBuf> = std::fs::read_dir(store.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(kept_files.len(), 2, "{kept_files:?}");
+    let damages: [(&str, fn(&mut Vec<u8>)); 4] = [
+        // A path that is not there, with its checksum as it was.
+        ("a renamed path", |bytes| {
+            let at = bytes.windows(5).position(|w| w == b"alpha").unwrap();
+            bytes[at..at + 5].copy_from_slice(b"ghost");
+        }),
+        ("a torn write", |bytes| bytes.truncate(bytes.len() / 2)),
+        ("another format", |bytes| {
+            bytes[8] = bytes[8].wrapping_add(1)
+        }),
+        ("noise", |bytes| {
+            bytes.iter_mut().for_each(|b| *b = b.wrapping_mul(31))
+        }),
+    ];
+    for (damage, apply) in damages {
+        for path in &kept_files {
+            let mut bytes = std::fs::read(path).unwrap();
+            if path.extension().is_some_and(|e| e == "files") || damage != "a renamed path" {
+                apply(&mut bytes);
+            }
+            std::fs::write(path, bytes).unwrap();
+        }
+        tree.write("gamma.rs", "needle\n");
+        let indexes = kept(store.path(), Duration::from_millis(200));
+        let index = open(&indexes, tree.root(), runtime());
+        assert_eq!(search(&index, "ghost"), Vec::<String>::new(), "{damage}");
+        assert_eq!(
+            grep(&index, "needle").0,
+            ["alpha.rs", "gamma.rs"],
+            "{damage}"
+        );
+        std::fs::remove_file(tree.root().join("gamma.rs")).unwrap();
+        // Written again whole, for the next damage.
+        rested(&index);
+    }
+}
+
+#[test]
+fn idle_memory_drops_once_the_index_is_kept_on_disk() {
+    let tree = Tree::new();
+    let store = tempfile::tempdir().unwrap();
+    for i in 0..500 {
+        tree.write(&format!("src/f{i}.rs"), &format!("fn f{i}() {{}}\n"));
+    }
+    let indexes = kept(store.path(), Duration::from_millis(300));
+    let index = open(&indexes, tree.root(), runtime());
+    assert_eq!(grep(&index, "fn f42()").0, ["src/f42.rs"]);
+    assert!(index.resident() > 0);
+    rested(&index);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(store.path()), 0o700);
+        for entry in std::fs::read_dir(store.path()).unwrap() {
+            assert_eq!(mode(&entry.unwrap().path()), 0o600);
+        }
+    }
+    // At rest, it costs no wake-ups either.
+    std::thread::sleep(Duration::from_millis(500));
+    let before = rt::wakes();
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(rt::wakes() - before, 0);
+    // Used again, it is back.
+    assert_eq!(grep(&index, "fn f7()").0, ["src/f7.rs"]);
+    assert!(index.resident() > 0);
+}
+
+#[test]
+fn a_query_while_the_index_is_got_ready_waits_for_it_and_is_answered() {
+    let tree = Tree::new();
+    for i in 0..3000 {
+        tree.write(&format!("d{}/{i}.txt", i % 30), "filler\n");
+    }
+    tree.write("d7/target.txt", "unicorn\n");
+    let rt = runtime();
+    let hub = Arc::new(rt::watch::Hub::new(Arc::clone(&rt)));
+    let indexes = Indexes::new(Limits::default());
+    indexes.warm(tree.root(), Arc::clone(&rt), Arc::clone(&hub));
+    let index = indexes.open(tree.root(), rt, hub);
+    assert_eq!(search(&index, "target")[0], "d7/target.txt");
+    let (found, summary) = grep(&index, "unicorn");
+    assert_eq!(found, ["d7/target.txt"]);
+    assert!(summary.prefiltered);
+}

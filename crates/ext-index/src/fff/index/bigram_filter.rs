@@ -8,6 +8,9 @@
 //! into the whole by bit position.
 
 use std::collections::HashMap;
+use std::io::{self, Read, Write};
+
+use crate::disk::{In, Out, invalid};
 
 /// Maximum number of distinct bigrams tracked in the inverted index.
 /// 95 printable ASCII chars (32..=126) after lowercasing → ~70 distinct → 4900 possible.
@@ -756,6 +759,172 @@ impl BigramOverlay {
     /// we can't extract precise bigrams, e.g. regex patterns).
     pub(crate) fn modified_indices(&self) -> Vec<usize> {
         self.modified.keys().copied().collect()
+    }
+}
+
+impl BigramFilter {
+    /// How many files it covers: the walked files it was built from.
+    pub(crate) fn file_count(&self) -> usize {
+        self.file_count
+    }
+
+    /// What its columns take, the skip-1 index's included.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.lookup.capacity() * size_of::<u16>()
+            + (self.rare_keys.capacity() + self.dense.capacity()) * size_of::<u64>()
+            + self.sparse_offsets.capacity() * size_of::<u32>()
+            + self.sparse_data.capacity()
+            + self.skip_index.as_ref().map_or(0, |skip| skip.heap_bytes())
+    }
+
+    pub(crate) fn encode(&self, out: &mut Out<impl Write>) -> io::Result<()> {
+        out.len(self.file_count)?;
+        out.len(self.populated)?;
+        out.len(self.dense_count)?;
+        out.halves(&self.lookup)?;
+        out.words(&self.rare_keys)?;
+        out.words(&self.dense)?;
+        out.u32s(&self.sparse_offsets)?;
+        out.bytes(&self.sparse_data)?;
+        match &self.skip_index {
+            None => out.u8(0),
+            Some(skip) => {
+                out.u8(1)?;
+                skip.encode(out)
+            }
+        }
+    }
+
+    /// The filter [`BigramFilter::encode`] wrote, if every column it
+    /// names is there and every gap list decodes to positions of its
+    /// files: no query of it can read past what it holds.
+    pub(crate) fn decode(input: &mut In<impl Read>) -> io::Result<Self> {
+        let file_count = input.usize()?;
+        let populated = input.usize()?;
+        let dense_count = input.usize()?;
+        let lookup = input.halves()?;
+        let rare_keys = input.words()?;
+        let dense = input.words()?;
+        let sparse_offsets = input.u32s()?;
+        let sparse_data = input.bytes()?;
+        let skip_index = match input.u8()? {
+            0 => None,
+            1 => Some(Box::new(Self::decode(input)?)),
+            _ => return Err(invalid()),
+        };
+        let words = file_count.div_ceil(64);
+        let columns = dense_count + sparse_offsets.len().saturating_sub(1);
+        let whole = populated <= file_count
+            && lookup.len() == BIGRAM_KEY_SLOTS
+            && rare_keys.len() == BIGRAM_KEY_SLOTS.div_ceil(64)
+            && Some(dense.len()) == dense_count.checked_mul(words)
+            && columns < NO_COLUMN as usize
+            && lookup
+                .iter()
+                .all(|&col| col == NO_COLUMN || (col as usize) < columns)
+            && sparse_offsets.first() == Some(&0)
+            && sparse_offsets.last().map(|&end| end as usize) == Some(sparse_data.len())
+            && sparse_offsets.windows(2).all(|pair| {
+                pair[0] <= pair[1]
+                    && gaps_within(&sparse_data[pair[0] as usize..pair[1] as usize], file_count)
+            })
+            && skip_index
+                .as_ref()
+                .is_none_or(|skip| skip.file_count == file_count);
+        if !whole {
+            return Err(invalid());
+        }
+        Ok(Self {
+            lookup,
+            rare_keys,
+            dense,
+            dense_count,
+            sparse_offsets,
+            sparse_data,
+            words,
+            file_count,
+            populated,
+            skip_index,
+        })
+    }
+}
+
+/// Whether `data` is a gap list of increasing positions below `files`, as
+/// `encode_sparse_column` writes one.
+fn gaps_within(data: &[u8], files: usize) -> bool {
+    let mut pos = 0usize;
+    let mut first = true;
+    let mut i = 0;
+    while i < data.len() {
+        let mut gap = 0usize;
+        let mut shift = 0;
+        loop {
+            let Some(&b) = data.get(i) else { return false };
+            i += 1;
+            if shift > 56 {
+                return false;
+            }
+            gap |= ((b & 0x7F) as usize) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        if gap == 0 && !first {
+            return false;
+        }
+        first = false;
+        pos = match pos.checked_add(gap) {
+            Some(pos) if pos < files => pos,
+            _ => return false,
+        };
+    }
+    true
+}
+
+impl BigramOverlay {
+    /// Whether it is of `walked` files: every file it names one of them.
+    pub(crate) fn fits(&self, walked: usize) -> bool {
+        self.base_file_count == walked
+            && self.tombstones.len() == walked.div_ceil(64)
+            && self.modified.keys().all(|&slot| slot < walked)
+    }
+
+    /// What its files' own bigrams take.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.tombstones.capacity() * size_of::<u64>()
+            + (self.modified.values())
+                .map(|bigrams| {
+                    bigrams.capacity() * size_of::<u16>() + size_of::<(usize, Vec<u16>)>()
+                })
+                .sum::<usize>()
+    }
+
+    pub(crate) fn encode(&self, out: &mut Out<impl Write>) -> io::Result<()> {
+        out.len(self.base_file_count)?;
+        out.words(&self.tombstones)?;
+        out.len(self.modified.len())?;
+        for (&slot, bigrams) in &self.modified {
+            out.len(slot)?;
+            out.halves(bigrams)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn decode(input: &mut In<impl Read>) -> io::Result<Self> {
+        let base_file_count = input.usize()?;
+        let tombstones = input.words()?;
+        let count = input.len(16)?;
+        let mut modified = HashMap::with_capacity(count);
+        for _ in 0..count {
+            let slot = input.usize()?;
+            modified.insert(slot, input.halves()?);
+        }
+        Ok(Self {
+            modified,
+            tombstones,
+            base_file_count,
+        })
     }
 }
 

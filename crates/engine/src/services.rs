@@ -103,6 +103,10 @@ impl View for Viewed {
         let origin = self.session.origin(call, self.fence)?;
         Some(self.session.cx(origin, &self.registry))
     }
+
+    fn services(&self) -> Option<&ext::host::SessionServices> {
+        Some(&self.session.services)
+    }
 }
 
 /// `registry` bound to `session`: what the kernel drives.

@@ -745,7 +745,11 @@ impl Live {
             session: Arc::clone(&session),
         });
         if !session.model_only() {
-            registry.hooks().session_start(&bound.point());
+            let started = match open {
+                Open::Create => ext::point::Started::Created,
+                Open::Load => ext::point::Started::Loaded,
+            };
+            registry.hooks().session_start(&bound.point(), started);
         }
         let actor = Actor {
             live: Arc::clone(&live),

@@ -61,6 +61,7 @@ use protocol::{BlobRef, CallId, Entry, Held, Json, Segments, SessionId, ToolOutc
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::host::SessionServices;
 use crate::{Actions, Cx, Fold, Name, States};
 
 /// How a point merges its handlers' answers, in registration order.
@@ -569,6 +570,19 @@ pub trait View: Sync {
     fn cx(&self, _call: CallId) -> Option<Cx> {
         None
     }
+    /// The services the engine gives the session's calls.
+    fn services(&self) -> Option<&SessionServices> {
+        None
+    }
+}
+
+/// How a session's actor came to start, as [`SessionStart`] tells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Started {
+    /// Made now: nothing has happened in it yet.
+    Created,
+    /// Loaded from its log: a client attaches, or its work resumes.
+    Loaded,
 }
 
 impl<'a> PointCx<'a> {
@@ -616,6 +630,12 @@ impl<'a> PointCx<'a> {
     /// Reads state `S`, or its default when no extension registered it.
     pub fn state<S: Fold, R>(&self, read: impl FnOnce(&S) -> R) -> R {
         crate::state::read(|f| self.view.states(f), read)
+    }
+
+    /// Service `T` of those the engine gives the session's calls (its
+    /// runtime, its file watcher), for work a handler starts of its own.
+    pub fn service_arc<T: ?Sized + 'static>(&self) -> Option<Arc<T>> {
+        self.view.services()?.get_arc::<T>().cloned()
     }
 
     pub fn state_erased(&self, ext: &str, name: &str) -> Option<Json> {
@@ -937,7 +957,7 @@ points! {
         PointCx<'c>, &'a Entry, &'a Entry, Reaction;
     /// The session's actor started: it was created, or loaded again.
     SessionStart(session_start) = "session_start", -, FailOpen,
-        PointCx<'c>, (), (), ();
+        PointCx<'c>, Started, Started, ();
     /// The session's actor stopped: it hibernated, or the daemon drained.
     SessionEnd(session_end) = "session_end", -, FailOpen,
         PointCx<'c>, (), (), ();
@@ -1339,8 +1359,8 @@ impl Hooks {
         self.run::<Spawn>(cx, (), spawn, &mut |_, _, _| {})
     }
 
-    pub fn session_start(&self, cx: &PointCx<'_>) {
-        self.ask::<SessionStart>(cx, ());
+    pub fn session_start(&self, cx: &PointCx<'_>, started: Started) {
+        self.ask::<SessionStart>(cx, started);
     }
 
     pub fn session_end(&self, cx: &PointCx<'_>) {

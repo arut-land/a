@@ -6,10 +6,13 @@ publish.workspace = true
 
 [dependencies]
 ext.workspace = true
+protocol.workspace = true
 sys.workspace = true
 rt = { workspace = true, features = ["watch"] }
 serde.workspace = true
 memchr.workspace = true
+# The checksum of the index kept on disk; already built for the client.
+crc = { version = "3.2", default-features = false }
 # What FFF's copied code is built on (src/fff): the fuzzy scorer, the
 # gitignore-aware walk and its globs, and grep's matchers.
 neo_frizbee = { version = "0.13.3", default-features = false, features = ["std", "match_end_col"] }
