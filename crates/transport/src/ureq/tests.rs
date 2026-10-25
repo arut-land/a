@@ -262,3 +262,23 @@ fn credentials_never_cross_transport_scopes() {
     }
     server.join().unwrap();
 }
+
+/// A reply's body can be dropped (its request cancelled) after the pool
+/// took its connection back and handed it on: the cancel must never shut
+/// that connection under the next request.
+#[test]
+fn cancelling_a_finished_request_never_closes_its_pooled_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (_peer, _) = listener.accept().unwrap();
+    let mut socket = Socket::new(stream, LazyBuffers::new(64, 64));
+    let abort = Arc::new(Abort::default());
+    CURRENT.set(Some(Arc::clone(&abort)));
+    // The request reads its reply over the connection, then the pool,
+    // probing it, takes it back.
+    socket.register();
+    assert!(socket.is_open());
+    CURRENT.set(None);
+    abort.abandon();
+    assert!(socket.is_open(), "the pooled connection was shut");
+}

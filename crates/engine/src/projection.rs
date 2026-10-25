@@ -240,6 +240,7 @@ impl Actor {
                 .flatten();
             self.live.frames.push(e.seq.get(), frame);
         }
+        self.live.shown();
         lock(&self.live.followers).retain(|c| c.wake().is_ok());
     }
 

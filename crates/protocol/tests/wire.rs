@@ -309,6 +309,26 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             },
         ),
         sample("cancel", ClientMsg::Cancel { id: 2 }),
+        sample(
+            "fetch",
+            ClientMsg::Fetch {
+                id: 4,
+                session: SESSION,
+                blob: protocol::BlobId([0x0f; 32]),
+                offset: 0,
+                len: None,
+            },
+        ),
+        sample(
+            "fetch_range",
+            ClientMsg::Fetch {
+                id: 5,
+                session: SESSION,
+                blob: protocol::BlobId([0x0f; 32]),
+                offset: 4096,
+                len: Some(512),
+            },
+        ),
         sample("shutdown", ClientMsg::Shutdown),
         sample(
             "settings_change",
@@ -688,6 +708,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         ),
     ];
     vec![
+        sample("not_held", DaemonMsg::NotHeld { id: 4 }),
         sample(
             "entry_side_retry",
             entry(
@@ -1241,6 +1262,37 @@ fn files(dir: &str) -> Vec<(String, Vec<u8>)> {
 fn every_message_this_build_sends_is_in_the_corpus() {
     check("client", &client_samples());
     check("daemon", &daemon_samples());
+}
+
+/// Binary frames, whole, as a daemon sends them: a chunk's header and
+/// bytes are fixed by the protocol as a message's JSON is. Written and
+/// kept as [`check`] keeps messages.
+#[test]
+fn every_binary_frame_this_build_sends_is_in_the_corpus() {
+    let bytes: Vec<u8> = (0..=255).collect();
+    let chunk = protocol::Chunk {
+        blob: protocol::BlobId([0x0f; 32]),
+        offset: 4096,
+        bytes: &bytes,
+    };
+    let frame = protocol::Frame::chunk(chunk).unwrap();
+    let path = corpus().join("frames").join("chunk.bin");
+    if !path.exists() && std::env::var_os("UPDATE_WIRE").is_some() {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, frame.as_bytes()).unwrap();
+    }
+    let stored = fs::read(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}; UPDATE_WIRE=1 adds it", path.display()));
+    assert_eq!(
+        stored,
+        frame.as_bytes(),
+        "{} frames differently from the corpus",
+        path.display()
+    );
+    assert_eq!(
+        protocol::frame_in(&stored).unwrap(),
+        Some((stored.len(), protocol::Framed::Chunk(chunk)))
+    );
 }
 
 /// Whatever a build of this protocol sent, this one reads.

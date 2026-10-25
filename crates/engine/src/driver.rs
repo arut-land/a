@@ -378,6 +378,10 @@ pub struct Live {
     /// The committed entries, encoded once for every client.
     frames: Arc<FrameLog>,
     followers: Mutex<Vec<Outbox>>,
+    /// Live text of calls whose `model_call` entry is not shown yet, with
+    /// the fence it was streamed under: a stream can start before its call
+    /// is durable, and its deltas follow the call once it is shown.
+    early: Mutex<Vec<(CallId, u64, Frame)>>,
     busy: AtomicBool,
     /// Whether the log holds any input: a child's first comes from its
     /// parent, once.
@@ -628,6 +632,12 @@ impl Live {
         self.frames.read_entries(&*self.session.shared.rt).await
     }
 
+    /// Whether the session's log references blob `blob`.
+    pub(crate) async fn references(&self, blob: protocol::BlobId) -> io::Result<bool> {
+        let frames = Arc::clone(&self.frames);
+        rt::unblock(&*self.session.shared.rt, move || frames.references(&blob)).await
+    }
+
     /// Opens session `header`'s log, folds it into a kernel and starts the
     /// actor, which resumes it: the only way a session recovers. It blocks
     /// on the store, so it runs on a thread that may.
@@ -722,6 +732,7 @@ impl Live {
             parent: header.parent,
             frames: Arc::new(FrameLog::new(loaded.lines, loaded.seq)),
             followers: Mutex::default(),
+            early: Mutex::default(),
             busy: AtomicBool::new(busy && read_only.is_none()),
             has_input: AtomicBool::new(has_input),
             attached: AtomicUsize::new(0),
@@ -2990,7 +3001,7 @@ impl Live {
 
 impl Live {
     fn delta(&self, call: CallId, attempt: u16, text: &str, fence: u64) {
-        if self.frames.seq() < call.get() || self.session.fence.load(Ordering::SeqCst) != fence {
+        if self.session.fence.load(Ordering::SeqCst) != fence {
             return;
         }
         let delta = DaemonMsg::Delta {
@@ -2998,10 +3009,35 @@ impl Live {
             text: text.to_owned(),
             attempt,
         };
-        if let Ok(frame) = Frame::new(&delta) {
-            let after = self.frames.seq();
-            lock(&self.followers).retain(|c| c.send_after(after, frame.clone()).is_ok());
+        let Ok(frame) = Frame::new(&delta) else {
+            return;
+        };
+        // Held while sending, so a call's deltas reach followers in order
+        // whether they waited for it to be shown or not.
+        let mut early = lock(&self.early);
+        if self.frames.seq() < call.get() || early.iter().any(|(waiting, ..)| *waiting == call) {
+            early.push((call, fence, frame));
+            return;
         }
+        self.send_live(&frame);
+    }
+
+    /// Sends the live text that waited for its call, now shown, unless the
+    /// session has moved past the fence it was streamed under.
+    pub(super) fn shown(&self) {
+        let seq = self.frames.seq();
+        let fence = self.session.fence.load(Ordering::SeqCst);
+        let mut early = lock(&self.early);
+        for (_, streamed, frame) in early.extract_if(.., |(call, ..)| call.get() <= seq) {
+            if streamed == fence {
+                self.send_live(&frame);
+            }
+        }
+    }
+
+    fn send_live(&self, frame: &Frame) {
+        let after = self.frames.seq();
+        lock(&self.followers).retain(|c| c.send_after(after, frame.clone()).is_ok());
     }
 }
 

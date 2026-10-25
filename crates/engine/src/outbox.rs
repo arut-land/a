@@ -5,13 +5,13 @@
 //! frame for the entries before it; ephemeral frames are dropped once too
 //! many wait.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::store::Lines;
-use protocol::{Class, Decode, Entry, Frame};
+use protocol::{BlobId, Class, Decode, Entry, Frame, Held};
 
 use crate::lock;
 
@@ -76,6 +76,16 @@ pub struct FrameLog {
     /// they commit under, after the log holds them.
     seq: AtomicU64,
     tail: Mutex<Tail>,
+    /// The blobs the entries reference, folded only as far as a client
+    /// last asked about one: a session nobody fetches from pays nothing.
+    held: Mutex<Referenced>,
+}
+
+#[derive(Default)]
+struct Referenced {
+    /// The seq of the last entry folded.
+    through: u64,
+    blobs: HashSet<BlobId>,
 }
 
 /// The frames of the newest entries, contiguous up to the last shown.
@@ -92,7 +102,34 @@ impl FrameLog {
             lines: Mutex::new(lines),
             seq: AtomicU64::new(seq),
             tail: Mutex::default(),
+            held: Mutex::default(),
         }
+    }
+
+    /// Whether an entry committed so far references blob `blob`: what a
+    /// client may fetch through the session. Blocks: reads the entries
+    /// not folded yet.
+    pub fn references(&self, blob: &BlobId) -> io::Result<bool> {
+        let mut folded = lock(&self.held);
+        if folded.blobs.contains(blob) {
+            return Ok(true);
+        }
+        for batch in self.batches_after(folded.through) {
+            for entry in batch? {
+                folded.through = entry.seq.get();
+                folded.blobs.extend(
+                    entry
+                        .body
+                        .blobs()
+                        .into_iter()
+                        .filter_map(|held| match held {
+                            Held::Blob(blob) => Some(blob.id),
+                            Held::Stream(_) => None,
+                        }),
+                );
+            }
+        }
+        Ok(folded.blobs.contains(blob))
     }
 
     /// A reload replaces the reader after taking a new writer lease.
@@ -314,6 +351,13 @@ impl Outbox {
     /// query's streamed answer) never overruns a slow client, and leaves
     /// room for the control frames that cannot wait.
     pub async fn send_paced(&self, frame: Frame) -> Result<(), Closed> {
+        self.send_within(frame, BUDGET.bytes / 2).await
+    }
+
+    /// [`Outbox::send_paced`], once what waits fits in `window` bytes with
+    /// `frame`: a producer of bulk (a blob's chunks) keeps no more of
+    /// itself queued than that.
+    pub async fn send_within(&self, frame: Frame, window: usize) -> Result<(), Closed> {
         let len = frame.as_bytes().len();
         loop {
             let mut seen = self.shared.room.count();
@@ -324,7 +368,7 @@ impl Outbox {
                 if q.closed
                     || q.frames.is_empty()
                     || (q.frames.len() < BUDGET.requests / 2
-                        && q.bytes.saturating_add(len) <= BUDGET.bytes / 2)
+                        && q.bytes.saturating_add(len) <= window)
                 {
                     let after = q.follow.as_ref().map_or(0, |f| f.log.seq());
                     return self.push(&mut q, after, frame);
@@ -750,6 +794,31 @@ mod tests {
             assert!(q.frames.len() <= BUDGET.requests / 2);
         }
         assert!(written > 0, "the sender never waited");
+    }
+
+    #[test]
+    fn a_windowed_sender_never_queues_more_than_its_window() {
+        use std::future::Future;
+        let outbox = Outbox::new();
+        let bytes = [7; 1000];
+        let chunk = protocol::Chunk {
+            blob: BlobId([1; 32]),
+            offset: 0,
+            bytes: &bytes,
+        };
+        let frame = Frame::chunk(chunk).unwrap();
+        let window = 4 * frame.as_bytes().len();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut written = 0;
+        for _ in 0..64 {
+            let mut send = std::pin::pin!(outbox.send_within(frame.clone(), window));
+            while send.as_mut().poll(&mut cx).is_pending() {
+                assert!(outbox.try_next().is_some());
+                written += 1;
+            }
+            assert!(outbox.queue().bytes <= window);
+        }
+        assert!(written >= 64 - 4, "the sender queued past its window");
     }
 
     fn delta() -> Frame {

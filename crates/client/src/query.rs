@@ -12,7 +12,7 @@ use crate::link::Stream;
 use crate::{Connection, Daemon, Error};
 
 /// The one query a connection of its own asks.
-const ID: u64 = 1;
+pub(crate) const ID: u64 = 1;
 
 /// One of a query's answers, as the daemon sends them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,9 +31,10 @@ pub struct Answers {
     done: bool,
 }
 
-/// Cancels a query from another thread than the one reading its answers.
+/// Cancels a query, or a fetch, from another thread than the one reading
+/// its answers.
 #[derive(Clone)]
-pub struct Canceller(Arc<dyn Stream>);
+pub struct Canceller(pub(crate) Arc<dyn Stream>);
 
 impl Daemon {
     /// Asks query `service` about `scope`, over a connection of its own:
