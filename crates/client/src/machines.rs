@@ -147,17 +147,25 @@ impl Sources {
     /// route already listed (two `Host` aliases of one host) is left out.
     /// Runs `ssh -G` once per machine, all at once. Blocking.
     pub fn resolve(&self) -> io::Result<Vec<Known>> {
-        let machines = self.machines()?;
-        let routes: Vec<_> = std::thread::scope(|scope| {
-            let resolving: Vec<_> = machines
-                .iter()
-                .map(|machine| scope.spawn(|| self.route(&machine.ssh)))
-                .collect();
-            resolving
-                .into_iter()
-                .map(|thread| thread.join().ok().flatten())
-                .collect()
-        });
+        rt::block_on(self.resolve_async(&crate::link::BLOCKING))
+    }
+
+    /// Resolves routes concurrently on the supplied runtime's Storage pool.
+    pub async fn resolve_async(&self, rt: &Rt) -> io::Result<Vec<Known>> {
+        let sources = self.clone();
+        let machines = rt::unblock(&**rt, move || sources.machines()).await?;
+        let resolving: Vec<_> = machines
+            .iter()
+            .map(|machine| {
+                let sources = self.clone();
+                let host = machine.ssh.clone();
+                rt::spawn(&**rt, rt::unblock(&**rt, move || sources.route(&host)))
+            })
+            .collect();
+        let mut routes = Vec::with_capacity(resolving.len());
+        for route in resolving {
+            routes.push(route.await);
+        }
         let mut known: Vec<Known> = Vec::new();
         for (machine, route) in machines.into_iter().zip(routes) {
             if route.is_none() || known.iter().all(|k| k.route != route) {
@@ -268,14 +276,7 @@ impl Watched {
             let Some(shared) = watched.upgrade() else {
                 return;
             };
-            let resolving = Arc::clone(&shared);
-            let found = rt::unblock_with(
-                &*shared.rt,
-                rt::BlockingClass::Network,
-                64 << 10,
-                move || resolving.sources.resolve(),
-            )
-            .await;
+            let found = shared.sources.resolve_async(&shared.rt).await;
             if shared.generation.load(Ordering::Acquire) == generation {
                 (shared.sink)(found);
             }

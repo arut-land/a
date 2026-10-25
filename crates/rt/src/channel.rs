@@ -285,21 +285,34 @@ mod tests {
 
     #[test]
     fn async_backpressure_wakes_for_space_and_receiver_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Wake;
+
+        #[derive(Default)]
+        struct Wakes(AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let counter = Arc::new(Wakes::default());
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
         let (mut tx, rx) = bounded_async(1);
         crate::block_on(tx.send(1)).unwrap();
         {
             let send = tx.send(2);
             let mut send = std::pin::pin!(send);
-            let mut cx = Context::from_waker(Waker::noop());
             assert!(send.as_mut().poll(&mut cx).is_pending());
             assert_eq!(rx.try_recv(), Some(1));
+            assert_eq!(counter.0.load(Ordering::Relaxed), 1);
             assert_eq!(crate::block_on(send), Ok(()));
         }
-        let mut cx = Context::from_waker(Waker::noop());
         let send = tx.send(3);
         let mut send = std::pin::pin!(send);
         assert!(send.as_mut().poll(&mut cx).is_pending());
         drop(rx);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 2);
         assert_eq!(crate::block_on(send), Err(3));
     }
 

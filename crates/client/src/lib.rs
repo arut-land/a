@@ -253,10 +253,18 @@ impl Connection {
     }
 
     /// The daemon's sessions, newest first.
-    pub fn sessions(mut self) -> io::Result<Vec<SessionSummary>> {
-        self.send(&ClientMsg::List)?;
+    pub fn sessions(self) -> io::Result<Vec<SessionSummary>> {
+        rt::block_on(self.sessions_async())
+    }
+
+    /// Lists sessions without blocking the calling task.
+    pub async fn sessions_async(mut self) -> io::Result<Vec<SessionSummary>> {
+        self.stream.send(&ClientMsg::List).await?;
         let mut list = SessionList::default();
-        self.until(|msg| list.fold(&msg).then(|| std::mem::take(&mut list.sessions)))
+        until(&*self.stream, &mut self.buffered, &mut |msg| {
+            list.fold(&msg).then(|| std::mem::take(&mut list.sessions))
+        })
+        .await
     }
 }
 
@@ -424,8 +432,7 @@ impl Daemon {
     ) -> Result<Connection, Error> {
         let result = link::connect(rt, self, client, start, first, on_drain).await;
         if matches!(result, Err(Error::NotResponding)) {
-            let link = self.link.clone();
-            rt::unblock(&**rt, move || link.unanswered()).await;
+            self.link.unanswered();
         }
         result
     }

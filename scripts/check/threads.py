@@ -8,7 +8,7 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-BANNED = re.compile(r"\bthread::(spawn|sleep|Builder)\b|\.recv_timeout\(")
+BANNED = re.compile(r"\bthread::(spawn|scope|sleep|Builder)\b|\.recv_timeout\(")
 OWNERS = ("crates/rt/", "crates/sys/")
 # path: why it cannot be a task.
 ALLOWED = {

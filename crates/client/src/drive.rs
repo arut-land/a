@@ -387,7 +387,7 @@ impl Driver {
                         let origin = self.origin.clone();
                         match rt::unblock_with(
                             &**rt,
-                            rt::BlockingClass::Network,
+                            rt::BlockingClass::Storage,
                             64 << 10,
                             move || origin(),
                         )

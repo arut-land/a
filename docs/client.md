@@ -268,7 +268,12 @@ Other rules the apps keep, by convention:
   acceptance` runs the first); `remote.rs`'s fake `ssh` refuses anything
   but plain words, as a non-POSIX login shell would.
 
-Query and blob consumers can use `Daemon::query_async`,
+Async consumers can use `Daemon::connect_async`, `Daemon::query_async`,
 `Daemon::fetch_async`, `Answers::next_async` and `Fetched::read_async` on
 an existing runtime. The FFI uses these with bounded async channels, so a
 slow renderer yields the producer without blocking an executor worker.
+
+Machine route resolution and multi-daemon session listing also use the
+shared runtime. `Sources::resolve_async` runs `ssh -G` jobs on Storage;
+`Daemons::sessions_async` opens and reads each member concurrently as tasks.
+Their blocking entry points drive the same futures.

@@ -191,3 +191,8 @@ A generation inherits into children by default. Declare `a.inherit(false)` once
 during registration to exclude the entire generation (tools, hooks, texts, folds
 and agents). The declaration is persisted in its image and checked against the
 source when restored.
+
+Workspace source notifications coalesce through the coordinator's 100 ms
+settle timer. `Sources::open` receives the host's `Delay` callback, so the
+wait yields an async task before `Prepare` admits blocking generation work;
+the loader chooses no reactor and sleeps no worker.
