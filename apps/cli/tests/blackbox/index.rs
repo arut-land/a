@@ -36,11 +36,20 @@ fn started(name: &str) -> (Isolated, Daemon, PathBuf) {
     (env, daemon, tree)
 }
 
-fn ask(daemon: &Daemon, service: &str, tree: &Path, body: &Value) -> Vec<Answer> {
+fn ask(env: &Isolated, daemon: &Daemon, service: &str, tree: &Path, body: &Value) -> Vec<Answer> {
     let scope = Scope::Workspace(tree.to_path_buf().try_into().unwrap());
     let body = Json::encode(body).unwrap();
-    let answers = daemon.query(service, scope, body).unwrap();
-    answers.map(Result::unwrap).collect()
+    // A daemon that went away says why in its log.
+    let failed = |error: &dyn std::fmt::Display| -> ! {
+        let log = fs::read_to_string(env.home.daemon_log()).unwrap_or_default();
+        panic!("{service}: {error}\ndaemon log:\n{log}")
+    };
+    let answers = daemon
+        .query(service, scope, body)
+        .unwrap_or_else(|e| failed(&e));
+    answers
+        .map(|answer| answer.unwrap_or_else(|e| failed(&e)))
+        .collect()
 }
 
 fn value(json: &Json) -> Value {
@@ -56,8 +65,9 @@ fn reply(answers: &[Answer]) -> Value {
 
 #[test]
 fn an_at_mention_search_answers_from_the_workspace_index() {
-    let (_env, daemon, tree) = started("index-search");
+    let (env, daemon, tree) = started("index-search");
     let found = reply(&ask(
+        &env,
         &daemon,
         "files.search",
         &tree,
@@ -74,6 +84,7 @@ fn an_at_mention_search_answers_from_the_workspace_index() {
     let until = deadline();
     loop {
         let found = reply(&ask(
+            &env,
             &daemon,
             "files.search",
             &tree,
@@ -89,8 +100,14 @@ fn an_at_mention_search_answers_from_the_workspace_index() {
 
 #[test]
 fn a_grep_streams_each_files_matches_then_its_summary() {
-    let (_env, daemon, tree) = started("index-grep");
-    let answers = ask(&daemon, "files.grep", &tree, &json!({ "query": "serve" }));
+    let (env, daemon, tree) = started("index-grep");
+    let answers = ask(
+        &env,
+        &daemon,
+        "files.grep",
+        &tree,
+        &json!({ "query": "serve" }),
+    );
     let mut files: Vec<String> = (answers.iter())
         .filter_map(|answer| match answer {
             Answer::Update(update) => Some(value(update)["path"].as_str().unwrap().to_owned()),
