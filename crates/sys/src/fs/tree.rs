@@ -732,9 +732,8 @@ mod tests {
         let home = fs::canonicalize(std::env::home_dir().unwrap()).unwrap();
         let data = Path::new("/System/Volumes/Data").join(home.strip_prefix("/").unwrap());
         assert_eq!(Tree::of(&data), Tree::Refused(Refusal::Home));
-        let project = tempfile::tempdir_in(&home).unwrap();
-        let through_data =
-            Path::new("/System/Volumes/Data").join(project.path().strip_prefix("/").unwrap());
+        // Named, never made: a test leaves the home as it found it.
+        let through_data = data.join("no-such-project-of-a-test");
         assert_eq!(Tree::of(&through_data), Tree::Watched);
         assert_eq!(
             Tree::of(Path::new("/System/Volumes/Data")),

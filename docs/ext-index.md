@@ -94,7 +94,9 @@ pool (`sys::fs::Tree::of`): nothing at daemon start pays for it.
 **Refused.** The root of a whole filesystem (`/`, `C:\`, `/Volumes/X`, a
 disk mounted at its own root, a volume mounted in a folder), the home
 directory and the directory of every home (`/Users`, `/home`, `C:\Users`,
-the home's parent, and from WSL the Windows homes in `/mnt/c/Users`), the
+the home's parent, and from WSL the Windows homes in `/mnt/c/Users`, at
+WSL's default mount point only: a custom `automount.root` in `wsl.conf`
+is not recognised), the
 system's own trees (the FHS top-level directories and `/nix`;
 `/Applications`, `/Library`, `/private` and everything under `/System` on
 macOS; Program Files, ProgramData and everything under the Windows
@@ -130,7 +132,9 @@ account:
 
 - Linux, by `statfs`'s `f_type`: NFS, SMB/CIFS, Ceph, AFS, Coda, GFS2 and
   Lustre (network); FUSE (virtiofs included), 9p (WSL 2's Windows
-  drives), WSL 1's drvfs and VirtualBox's shared folders (virtual).
+  drives), WSL 1's drvfs (`0x53464846`, which coreutils names `wslfs`;
+  it may be WSL 1's own root too, which makes a WSL 1 project unwatched:
+  slower, still correct) and VirtualBox's shared folders (virtual).
   inotify(7): "Inotify reports only events that a user-space program
   triggers through the filesystem API. As a result, it does not catch
   remote events that occur on network filesystems. (Applications must
