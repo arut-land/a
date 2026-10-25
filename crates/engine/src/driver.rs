@@ -54,6 +54,8 @@ use journal::Journal;
 use projection::{Invocations, Projection};
 #[path = "work.rs"]
 mod work;
+
+mod handing;
 use work::{WorkHandle, WorkId, WorkSet};
 #[path = "services.rs"]
 mod services;
@@ -78,6 +80,9 @@ pub struct Shared {
     /// How those blobs appear as files.
     pub tree: Arc<dyn ext::blob::Materialize>,
     pub(crate) loaded: Mutex<std::collections::HashSet<SessionId>>,
+    /// What the daemon's previous build handed over and no session has
+    /// taken up yet: each takes its own as it loads.
+    pub(crate) handed: Mutex<Vec<crate::handover::Handed>>,
     pub(crate) daemon: Weak<Daemon>,
 }
 
@@ -318,7 +323,16 @@ struct Session {
     env: Mutex<Option<Arc<Environment>>>,
     pending_env: Mutex<Option<Arc<Environment>>>,
     /// Background process groups the session owns, until each ends.
-    jobs: Mutex<Vec<Arc<dyn ext::RunningProcess>>>,
+    jobs: Mutex<Vec<Job>>,
+    /// Calls gone on in the background whose groups can go on in the
+    /// daemon's next build ([`ext::Cx::resumable`]).
+    resumable: Mutex<Vec<Resumed>>,
+    /// Calls whose groups went to the daemon's next build: what they would
+    /// still report here is that build's to report.
+    handed: Mutex<Vec<CallId>>,
+    /// What the daemon's previous build handed this session, until taken
+    /// up; what is left once the session runs is killed as it drops.
+    adopting: Mutex<Vec<crate::handover::Handed>>,
     work: Mutex<WorkSet>,
     /// Notified as the session changes: a commit, work beginning or
     /// ending, a job ending, the actor ending. What waits on the session
@@ -328,6 +342,24 @@ struct Session {
 }
 
 type Mail = Arc<channel::Sender<Msg>>;
+
+/// A process group a session owns, left to it by call `call` of `tool`,
+/// and what it is to the session.
+struct Job {
+    call: CallId,
+    /// `None` for a call the log no longer names.
+    tool: Option<String>,
+    role: ext::Role,
+    lease: Arc<ext::ProcessLease>,
+}
+
+/// A call gone on in the background, running `process`, that goes on in
+/// the daemon's next build from `state`.
+struct Resumed {
+    call: CallId,
+    process: Arc<dyn ext::RunningProcess>,
+    state: Json,
+}
 
 pub struct Live {
     session: Arc<Session>,
@@ -448,6 +480,23 @@ enum Msg {
     ProjectionCache(bool, oneshot::Sender<[bool; 3]>),
     Reclaim,
     Stop,
+    /// Whether the session's work can go to the daemon's next build: see
+    /// [`Live::handable`].
+    Handable(oneshot::Sender<Result<(), String>>),
+    /// Stop the session's groups for a handover, and the session with them:
+    /// see [`Live::freeze`].
+    Freeze(oneshot::Sender<Result<(), String>>),
+    /// Call the handover off: see [`Live::thaw`].
+    Thaw,
+    /// Give the stopped groups up for good: see [`Live::commit`].
+    Commit(oneshot::Sender<Vec<(sys::handover::Given, crate::handover::Owner)>>),
+    /// A group the previous build handed over, owned again by `tool`.
+    Reheld {
+        call: CallId,
+        tool: String,
+        lease: ext::ProcessLease,
+        admission: Admission,
+    },
     /// Make what was only written durable, and show it: sent to itself
     /// [`SYNC_LAG`] after a write that was not synced.
     Sync,
@@ -515,10 +564,20 @@ enum ContextRequest {
     },
     Own {
         process: ext::ProcessLease,
+        role: ext::Role,
     },
 }
 
 impl Msg {
+    /// Whether a session frozen for a handover takes it up: what ends the
+    /// handover, or the session, or answers about it; the rest waits.
+    const fn passes_freeze(&self) -> bool {
+        matches!(
+            self,
+            Self::Handable(_) | Self::Freeze(_) | Self::Thaw | Self::Commit(_) | Self::Stop
+        )
+    }
+
     fn reads_the_log(&self) -> bool {
         if matches!(self, Self::Flushed { .. }) {
             return true;
@@ -627,6 +686,12 @@ impl Live {
         } else {
             Vec::new()
         };
+        let handed = crate::handover::take(&shared.handed, header.id);
+        let adopted: Vec<CallId> = (handed.iter())
+            .filter(|handed| matches!(handed.owner.kind, crate::handover::Kind::Call { .. }))
+            .map(|handed| handed.owner.call)
+            .collect();
+        *lock(&session.adopting) = handed;
         let load = Load {
             session: Some(header.id),
             abandoned: &abandoned,
@@ -635,6 +700,7 @@ impl Live {
             owner,
             busy,
             created: matches!(open, Open::Create),
+            adopted: &adopted,
         };
         // A log kept as it is is shown, never resumed or stepped: nothing
         // would commit.
@@ -680,6 +746,9 @@ impl Live {
             listed,
             admissions: Vec::new(),
             resuming: false,
+            frozen: None,
+            deferred: std::collections::VecDeque::new(),
+            rested: true,
             journal: Journal {
                 writer: Some(loaded.writer),
                 fold_snapshot,
@@ -777,8 +846,8 @@ impl Live {
 
     pub(crate) fn stop(&self) {
         self.send(Msg::Stop);
-        for process in lock(&self.session.jobs).iter() {
-            let _ = process.signal(ext::ProcessSignal::Kill);
+        for job in lock(&self.session.jobs).iter() {
+            let _ = job.lease.signal(ext::ProcessSignal::Kill);
         }
     }
 
@@ -803,8 +872,50 @@ impl Live {
         self.busy.load(Ordering::SeqCst)
     }
 
+    /// Whether it owns process groups of the user's work: helpers it
+    /// starts again when needed do not count.
     pub fn has_jobs(&self) -> bool {
-        !lock(&self.session.jobs).is_empty()
+        (lock(&self.session.jobs).iter()).any(|job| job.role == ext::Role::Work)
+    }
+
+    /// The process groups the session owns.
+    pub(crate) fn jobs(&self) -> Vec<Arc<ext::ProcessLease>> {
+        (lock(&self.session.jobs).iter())
+            .map(|job| Arc::clone(&job.lease))
+            .collect()
+    }
+
+    /// Whether the session's work can go to the daemon's next build, and
+    /// if not why: see [`crate::handover`]. A session that takes no
+    /// messages runs nothing to hand.
+    pub(crate) async fn handable(&self) -> Result<(), String> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Msg::Handable(reply));
+        answer.await.unwrap_or(Ok(()))
+    }
+
+    /// Stops every group the session's work runs, for a handover, and the
+    /// session with them: it takes nothing more up until it is thawed
+    /// ([`Live::thaw`]) or commits ([`Live::commit`]). Refused, and nothing
+    /// stopped, while the session is at work or runs work no other build
+    /// takes up, or as a group ends meanwhile.
+    pub(crate) async fn freeze(&self) -> Result<(), String> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Msg::Freeze(reply));
+        answer.await.unwrap_or(Ok(()))
+    }
+
+    /// Calls a handover off: every group stopped is supervised again, and
+    /// the session takes up what came meanwhile.
+    pub(crate) fn thaw(&self) {
+        self.send(Msg::Thaw);
+    }
+
+    /// Gives every group stopped up for good, each with whose it is.
+    pub(crate) async fn commit(&self) -> Vec<(sys::handover::Given, crate::handover::Owner)> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Msg::Commit(reply));
+        answer.await.unwrap_or_default()
     }
 
     /// How long the session has had no attachments, no work and no jobs.
@@ -996,6 +1107,12 @@ struct Actor {
     /// Carrying out what a resume asked for: a commit that fails now does
     /// not resume again, the session stops.
     resuming: bool,
+    /// Frozen for a handover: what it stopped, and what came meanwhile.
+    frozen: Option<handing::Frozen>,
+    /// Messages a thaw lets through, before any newer.
+    deferred: std::collections::VecDeque<Msg>,
+    /// At rest but for what runs in the background, as of the last burst.
+    rested: bool,
 
     journal: Journal,
     projection: Projection,
@@ -1204,9 +1321,10 @@ impl Actor {
     #[allow(clippy::too_many_lines)]
     async fn run(mut self, mail: channel::Receiver<Msg>, first: StepPlan) {
         let _ = self.carry(first).await;
+        self.adopt_jobs();
         let mut next = None;
         while !(self.phase == Phase::Draining && self.reporting() == 0)
-            && let Some(msg) = match next.take() {
+            && let Some(msg) = match next.take().or_else(|| self.thawed()) {
                 Some(msg) => Some(msg),
                 None => mail.recv().await,
             }
@@ -1230,7 +1348,7 @@ impl Actor {
             // burst of its own, once what came before it is carried out.
             let mut burst = vec![msg];
             while burst.len() < BURST
-                && let Some(msg) = mail.try_recv()
+                && let Some(msg) = self.thawed().or_else(|| mail.try_recv())
             {
                 if msg.reads_the_log() {
                     next = Some(msg);
@@ -1253,6 +1371,11 @@ impl Actor {
                 }
                 if let Msg::Sync = msg {
                     sync = true;
+                    continue;
+                }
+                // Frozen for a handover, the session takes nothing up.
+                if self.frozen.is_some() && !msg.passes_freeze() {
+                    self.hold(msg);
                     continue;
                 }
                 // Kept as it is, its catalog listing and all.
@@ -1283,6 +1406,13 @@ impl Actor {
             self.mark().await;
             self.publish();
             self.live.session.changed.notify();
+            // Come to rest but for what runs in the background, the session
+            // may be handed over: an upgrade waiting on it hears so.
+            let rested = self.core.at_rest_but_background();
+            if rested && !self.rested && self.live.has_work() {
+                self.live.touch();
+            }
+            self.rested = rested;
             if self.journal.since_snapshot >= SNAPSHOT_EVERY {
                 self.keep_snapshot().await;
             }
@@ -1323,6 +1453,11 @@ impl Actor {
             Msg::Flushed { .. } => unreachable!("mailbox admission"),
             Msg::Completed { fence, completion } => {
                 if fence != self.live.session.fence.load(Ordering::SeqCst) {
+                    return None;
+                }
+                if let Completion::Tool { call, .. } = &completion
+                    && lock(&self.live.session.handed).contains(call)
+                {
                     return None;
                 }
                 match completion {
@@ -1463,6 +1598,31 @@ impl Actor {
                 self.live.session.cancel_all();
                 return None;
             }
+            Msg::Handable(reply) => {
+                reply.send(self.handable());
+                return None;
+            }
+            Msg::Freeze(reply) => {
+                reply.send(self.freeze_handover().await);
+                return None;
+            }
+            Msg::Thaw => {
+                self.thaw_handover();
+                return None;
+            }
+            Msg::Commit(reply) => {
+                reply.send(self.commit_handover());
+                return None;
+            }
+            Msg::Reheld {
+                call,
+                tool,
+                lease,
+                admission,
+            } => {
+                self.own_job(call, Some(tool), ext::Role::Work, lease, admission);
+                return None;
+            }
         };
         // What was in flight reported, or was answered.
         if let Event::ToolDone { call, .. }
@@ -1471,6 +1631,7 @@ impl Actor {
         | Event::Woke { call } = &event
         {
             self.inflight.remove(call);
+            lock(&self.live.session.resumable).retain(|resumed| resumed.call != *call);
         }
         Some((event, None))
     }
@@ -1580,46 +1741,73 @@ impl Actor {
                 .open_side(origin.clone(), registry, side, reply)
                 .await
                 .map(|event| (event, None)),
-            ContextRequest::Own { process } => {
-                lock(&session.jobs).push(Arc::clone(&process));
-                let fence = session.fence.load(Ordering::SeqCst);
-                self.live.session.spawn_work(
-                    WorkId::Job(Arc::as_ptr(&process).cast::<()>() as usize),
-                    origin.admission,
-                    |cancel| {
-                        Box::pin(async move {
-                            let mut ended = pin!(process.ended());
-                            let stopped = unless(&cancel, &mut ended).await.is_none();
-                            if stopped {
-                                let _ = process.signal(ext::ProcessSignal::Kill);
-                                ended.await;
-                            }
-                            // An end of its own reaches the agent, on the
-                            // queue, holding what the group left (its
-                            // output, sealed now that nothing writes it);
-                            // one the session stopped is its own doing. The
-                            // job holds the session until its end is sent,
-                            // so no unload or drain comes between.
-                            if !stopped {
-                                let text = job_ended(&**process);
-                                let held = match process.holds() {
-                                    Some(holds) => rt::unblock(&*session.shared.rt, holds).await,
-                                    None => Vec::new(),
-                                };
-                                let ended = Event::JobEnded { call, text, held };
-                                session.emit(fence, Completion::Event(ended));
-                            }
-                            lock(&session.jobs).retain(|p| !Arc::ptr_eq(p, &process));
-                            session.changed.notify();
-                            if let Some(daemon) = session.shared.daemon.upgrade() {
-                                daemon.jobs.notify();
-                            }
-                        })
-                    },
-                );
+            ContextRequest::Own { process, role } => {
+                let ledger = self.core.ledger();
+                let tool = match ledger.call(call).map(|open| &open.call) {
+                    Some(protocol::ledger::Call::Tool { tool, .. }) => Some(tool.clone()),
+                    _ => (ledger.detached().iter())
+                        .find(|d| d.call == call)
+                        .map(|d| d.tool.clone()),
+                };
+                self.own_job(call, tool, role, process, origin.admission);
                 None
             }
         }
+    }
+
+    /// Owns `process`, left by call `call` of `tool`, until its group ends.
+    fn own_job(
+        &mut self,
+        call: CallId,
+        tool: Option<String>,
+        role: ext::Role,
+        process: ext::ProcessLease,
+        admission: Admission,
+    ) {
+        let session = Arc::clone(&self.live.session);
+        let process = Arc::new(process);
+        lock(&session.jobs).push(Job {
+            call,
+            tool,
+            role,
+            lease: Arc::clone(&process),
+        });
+        let fence = session.fence.load(Ordering::SeqCst);
+        self.live.session.spawn_work(
+            WorkId::Job(Arc::as_ptr(&process).cast::<()>() as usize),
+            admission,
+            |cancel| {
+                Box::pin(async move {
+                    let mut ended = pin!(process.ended());
+                    let stopped = unless(&cancel, &mut ended).await.is_none();
+                    if stopped {
+                        let _ = process.signal(ext::ProcessSignal::Kill);
+                        ended.await;
+                    }
+                    // An end of its own reaches the agent, on the queue,
+                    // holding what the group left (its output, sealed now
+                    // that nothing writes it); one the session stopped is
+                    // its own doing, and one handed to the next build ends
+                    // there. The job holds the session until its end is
+                    // sent, so no unload or drain comes between.
+                    let handed = lock(&session.handed).contains(&call);
+                    if !stopped && !handed {
+                        let text = job_ended(&***process);
+                        let held = match process.holds() {
+                            Some(holds) => rt::unblock(&*session.shared.rt, holds).await,
+                            None => Vec::new(),
+                        };
+                        let ended = Event::JobEnded { call, text, held };
+                        session.emit(fence, Completion::Event(ended));
+                    }
+                    lock(&session.jobs).retain(|job| !Arc::ptr_eq(&job.lease, &process));
+                    session.changed.notify();
+                    if let Some(daemon) = session.shared.daemon.upgrade() {
+                        daemon.jobs.notify();
+                    }
+                })
+            },
+        );
     }
 
     async fn refuse(&mut self, msg: Msg, why: ReadOnly) {
@@ -2249,6 +2437,7 @@ impl Actor {
             Effect::RunTool { call, tool, input } => {
                 self.run_tool(call, tool, input, Child::None);
             }
+            Effect::Adopt { call, tool, input } => self.adopt_tool(call, tool, input),
             Effect::Resume {
                 call,
                 tool,
@@ -2802,6 +2991,9 @@ impl Session {
             env: Mutex::default(),
             pending_env: Mutex::default(),
             jobs: Mutex::default(),
+            resumable: Mutex::default(),
+            handed: Mutex::default(),
+            adopting: Mutex::default(),
             work: Mutex::default(),
             changed: rt::Notify::new(),
             shared: Arc::clone(shared),

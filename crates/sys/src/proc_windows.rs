@@ -46,6 +46,16 @@ pub fn spawn_daemon(cmd: &mut Command, home: &crate::Home, lock: File) -> io::Re
     // Windows byte locks belong to processes. The start lock remains held
     // by the client until binding is acknowledged, serializing re-listen.
     drop(lock);
+    spawn_acknowledged(cmd, home, &[])
+}
+
+/// Starts a detached daemon inheriting exactly `inherited`, already made
+/// inheritable, and waits for it to acknowledge binding.
+pub(crate) fn spawn_acknowledged(
+    cmd: &mut Command,
+    home: &crate::Home,
+    inherited: &[&File],
+) -> io::Result<Child> {
     cmd.arg("--detached")
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     daemon_environment(cmd, home);
@@ -55,6 +65,7 @@ pub fn spawn_daemon(cmd: &mut Command, home: &crate::Home, lock: File) -> io::Re
     let mut child = spawn::SpawnPlan {
         command: cmd,
         io: [&input, &writer, &error],
+        inherited,
         job: None,
         flags: DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
         environment: super::SpawnEnvironment::Exact,
@@ -202,6 +213,7 @@ fn spawn_job_role(
     let child = spawn::SpawnPlan {
         command: cmd,
         io,
+        inherited: &[],
         job: Some(&job),
         flags: CREATE_NEW_PROCESS_GROUP | if terminal { 0 } else { CREATE_NO_WINDOW },
         environment,

@@ -128,9 +128,18 @@ fn the_daemon_parses_what_a_client_spawns_it_with() {
         detached: false,
         lock_fd: Some(4),
         reset_breaker: true,
+        handover_fd: None,
     };
     let args = parse("__daemon --listen-fd 3 --lock-fd 4 --reset-breaker");
     assert_eq!(args.cmd, Some(serve));
+    let args = parse("__daemon --listen-fd 3 --lock-fd 4 --handover-fd 6");
+    assert!(matches!(
+        args.cmd,
+        Some(Cmd::Serve {
+            handover_fd: Some(6),
+            ..
+        })
+    ));
 }
 
 /// The variable is the process's, so the test asks a child of this test

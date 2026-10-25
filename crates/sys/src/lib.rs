@@ -23,6 +23,7 @@ mod directory_watch;
 pub use directory_watch::DirectoryWatch;
 mod endpoint;
 pub mod fs;
+pub mod handover;
 pub mod install;
 pub mod log;
 mod login;

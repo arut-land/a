@@ -42,6 +42,8 @@ pub enum Origin {
     Foreground,
     /// The OS at login, through `a daemon autostart`.
     Login,
+    /// The daemon of an earlier build, handing over to this one.
+    Handover,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -79,6 +81,9 @@ pub enum Operation {
     Connection,
     Startup,
     Shutdown,
+    /// Handing process groups to the next build, or adopting them from the
+    /// one before.
+    Handover,
 }
 
 /// `io::ErrorKind` carries no error message, path or source error.
@@ -137,6 +142,10 @@ pub enum Fact {
     },
     Upgrade {
         to: Option<Build>,
+    },
+    /// The daemon handed its sessions' process groups to the next build.
+    HandedOver {
+        groups: usize,
     },
     Recovery {
         session: SessionId,

@@ -213,6 +213,17 @@ impl Registrar {
         self.dyn_tool(Arc::new(Erased(tool, PhantomData)))
     }
 
+    /// Offers `tool` as [`tool`](Registrar::tool) does, its calls gone on
+    /// in the background, and the groups they leave, going on in the
+    /// daemon's next build after an upgrade ([`crate::Resumable`]).
+    pub fn resumable_tool<T: crate::Resumable, M: 'static>(&mut self, tool: T) -> &mut Self
+    where
+        T::call(..): Output<T::Out, M>,
+        T::resume(..): Output<T::Out, M>,
+    {
+        self.dyn_tool(Arc::new(crate::tool::Resuming(Erased(tool, PhantomData))))
+    }
+
     /// Offers a tool named at run time.
     pub fn dyn_tool(&mut self, tool: Arc<dyn DynTool>) -> &mut Self {
         let names = self.tools.iter().map(|t| t.name());

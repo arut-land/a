@@ -320,6 +320,19 @@ impl Stream {
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(self.clone())
     }
+
+    /// The overlapped pipe end `file`, as a process pipe.
+    pub(crate) fn from_pipe(file: File) -> io::Result<Self> {
+        Self::new(Arc::new(file))
+    }
+
+    /// Gives the pipe up to another process: a read in flight is cancelled
+    /// first, and what it, or one before it, read but nobody took yet comes
+    /// back with the pipe's handle, so nothing written is lost.
+    pub(crate) fn surrender(self) -> io::Result<(OwnedHandle, Vec<u8>)> {
+        let unread = (lock(&self.0.read).take()).map_or_else(Vec::new, |mut op| op.cancel());
+        Ok((duplicate(&*self.0.file)?, unread))
+    }
 }
 
 impl CompletionSource for Stream {
@@ -514,32 +527,53 @@ impl Operation {
     }
 }
 
+impl Operation {
+    /// Cancels it if it is in flight, and returns what it read that was not
+    /// taken yet.
+    fn cancel(&mut self) -> Vec<u8> {
+        if self.pending {
+            self.length = self.join().unwrap_or(0);
+        }
+        self.buffer[self.taken.min(self.length)..self.length].to_vec()
+    }
+
+    /// Cancels the operation in flight and waits until the kernel lets go
+    /// of its buffer: its length, if it completed first.
+    fn join(&mut self) -> Option<usize> {
+        self.pending = false;
+        let mut length = 0;
+        // SAFETY: cancellation alone does not release the kernel's borrow;
+        // the wait joins it before raw and buffer can be freed.
+        unsafe {
+            CancelIoEx(self.file.as_raw_handle(), self.raw.as_ref());
+            loop {
+                if GetOverlappedResult(
+                    self.file.as_raw_handle(),
+                    self.raw.as_mut(),
+                    &raw mut length,
+                    1,
+                ) != 0
+                {
+                    return Some(length as usize);
+                }
+                if io::Error::last_os_error().raw_os_error()
+                    != Some(ERROR_IO_INCOMPLETE.cast_signed())
+                {
+                    return None;
+                }
+                // Shutdown may have signalled the event before kernel
+                // completion. Recheck the operation after resetting it;
+                // GetOverlappedResult checks completion before waiting.
+                ResetEvent(self.raw.hEvent);
+            }
+        }
+    }
+}
+
 impl Drop for Operation {
     fn drop(&mut self) {
         if self.pending {
-            // SAFETY: cancellation alone does not release the kernel's borrow;
-            // the wait joins it before raw and buffer are freed.
-            unsafe {
-                CancelIoEx(self.file.as_raw_handle(), self.raw.as_ref());
-                let mut length = 0;
-                loop {
-                    if GetOverlappedResult(
-                        self.file.as_raw_handle(),
-                        self.raw.as_mut(),
-                        &raw mut length,
-                        1,
-                    ) != 0
-                        || io::Error::last_os_error().raw_os_error()
-                            != Some(ERROR_IO_INCOMPLETE.cast_signed())
-                    {
-                        break;
-                    }
-                    // Shutdown may have signalled the event before kernel
-                    // completion. Recheck the operation after resetting it;
-                    // GetOverlappedResult checks completion before waiting.
-                    ResetEvent(self.raw.hEvent);
-                }
-            }
+            self.join();
         }
     }
 }

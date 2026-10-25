@@ -713,6 +713,19 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 machine: MACHINE,
                 commands: Vec::new(),
                 queries: Vec::new(),
+                upgrade: None,
+            },
+        ),
+        sample(
+            "welcome_upgrade",
+            DaemonMsg::Welcome {
+                proto: PROTO,
+                build: "0.0.0+0123456789abcdef".into(),
+                caps: Caps::NONE,
+                machine: MACHINE,
+                commands: Vec::new(),
+                queries: Vec::new(),
+                upgrade: Some("session 89abcdef is at work".into()),
             },
         ),
         sample(
@@ -727,6 +740,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                     description: "show or set the model".into(),
                 }],
                 queries: Vec::new(),
+                upgrade: None,
             },
         ),
         sample(
@@ -742,6 +756,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                     description: "the workspace's files that match".into(),
                     scope: protocol::ScopeKind::Workspace,
                 }],
+                upgrade: None,
             },
         ),
         sample(
@@ -790,7 +805,13 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 min: Some(PROTO),
             },
         ),
-        sample("draining", DaemonMsg::Draining),
+        sample("draining", DaemonMsg::Draining { held: None }),
+        sample(
+            "draining_held",
+            DaemonMsg::Draining {
+                held: Some("job 4242 goes on in no other build".into()),
+            },
+        ),
         sample(
             "attached",
             DaemonMsg::Attached {

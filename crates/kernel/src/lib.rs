@@ -360,6 +360,13 @@ pub enum Work {
         tool: String,
         input: Json,
     },
+    /// Go on with tool call `call`, gone on in the background, whose group
+    /// the daemon's previous build handed over ([`Load::adopted`]).
+    Adopt {
+        call: CallId,
+        tool: String,
+        input: Json,
+    },
     /// Hand tool call `call` the answer to what it waited on.
     Resume {
         call: CallId,
@@ -424,6 +431,7 @@ impl Work {
             Self::Prepare { call, .. }
             | Self::Send { call }
             | Self::RunTool { call, .. }
+            | Self::Adopt { call, .. }
             | Self::Resume { call, .. }
             | Self::Await { call, .. }
             | Self::Recover { call, .. }
@@ -560,4 +568,7 @@ pub struct Load<'a> {
     /// The log was just created: its first entry records the extensions
     /// the session runs with, as a later one does when they change.
     pub created: bool,
+    /// Calls gone on in the background that the daemon's previous build
+    /// handed over, their groups live: they go on, never recovered.
+    pub adopted: &'a [CallId],
 }

@@ -96,6 +96,8 @@ impl Client {
                     }
                 }
             }),
+            // Started again on the next call that needs it.
+            ext::Role::Helper,
         );
         Ok(Self {
             child,

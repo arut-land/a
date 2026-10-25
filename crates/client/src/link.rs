@@ -307,8 +307,8 @@ pub(crate) fn socket(rt: &Rt, stream: sys::OwnedConnection) -> io::Result<Opened
 }
 
 pub(crate) enum Greeting {
-    /// The daemon's machine.
-    Welcome(MachineId),
+    /// The daemon's machine, and what holds an upgrade it waits for.
+    Welcome(MachineId, Option<String>),
     Draining,
     /// The daemon's versions.
     Mismatch(Versions),
@@ -356,7 +356,7 @@ pub(crate) async fn connect(
         )
         .await;
         match greeting {
-            Ok((Greeting::Welcome(theirs), welcome, commands, queries)) => {
+            Ok((Greeting::Welcome(theirs, upgrade), welcome, commands, queries)) => {
                 if let Some(pinned) = daemon.pinned.filter(|&pinned| pinned != theirs) {
                     return Err(Error::OtherMachine {
                         pinned,
@@ -376,6 +376,7 @@ pub(crate) async fn connect(
                     welcome,
                     commands,
                     queries,
+                    upgrade,
                 });
             }
             Ok((Greeting::Mismatch(theirs), ..)) => {
@@ -442,13 +443,24 @@ pub(crate) async fn hello(
             machine,
             commands,
             queries,
+            upgrade,
             ..
         }) => {
             sent?;
             let welcome = Welcome { proto, caps };
-            Ok((Greeting::Welcome(machine), welcome, commands, queries))
+            Ok((
+                Greeting::Welcome(machine, upgrade),
+                welcome,
+                commands,
+                queries,
+            ))
         }
-        Some(DaemonMsg::Draining) => Ok((
+        // The upgrade cannot happen yet, and this client cannot be served
+        // by the build that holds it.
+        Some(DaemonMsg::Draining { held: Some(held) }) => Err(Error::Refused(format!(
+            "the daemon waits to upgrade: {held}; `a daemon stop` ends what holds it"
+        ))),
+        Some(DaemonMsg::Draining { held: None }) => Ok((
             Greeting::Draining,
             Welcome::default(),
             Vec::new(),

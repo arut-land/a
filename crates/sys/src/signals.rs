@@ -3,6 +3,8 @@
 //! Windows console control events wake a permanently owned manual-reset event.
 
 pub(crate) use imp::Wake;
+#[cfg(unix)]
+pub(crate) use imp::shutdown_set;
 pub use imp::{Signals, reraise};
 
 #[cfg(windows)]
@@ -332,6 +334,20 @@ mod imp {
                 let _ = install(signal, libc::SIG_DFL);
             }
             self.source.active.store(false, Ordering::Release);
+        }
+    }
+
+    /// TERM, INT and HUP: what ends a daemon. Async-signal-safe.
+    pub(crate) fn shutdown_set() -> libc::sigset_t {
+        // SAFETY: a zeroed set is valid storage, initialized by sigemptyset
+        // before any signal is added.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut set);
+            for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+                libc::sigaddset(&raw mut set, signal);
+            }
+            set
         }
     }
 

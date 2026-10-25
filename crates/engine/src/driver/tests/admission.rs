@@ -594,6 +594,7 @@ fn stale_request<'a>(
                 session,
                 ContextRequest::Own {
                     process: (Arc::new(StaleProcess) as Arc<dyn ext::RunningProcess>).into(),
+                    role: ext::Role::Work,
                 },
             );
         })
@@ -794,6 +795,7 @@ fn submitted_input_is_cancelled_while_its_publication_flush_is_held() {
             remote: false,
             commands: Vec::new(),
             machine: protocol::MachineId([0; 16]),
+            upgrade: None,
         },
     );
     feed(

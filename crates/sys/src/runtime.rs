@@ -97,6 +97,32 @@ impl Runtime {
         Ok(Staged { id, exe })
     }
 
+    /// Declares, as build `id` itself runs, the handover format it speaks
+    /// ([`crate::handover::VERSION`]), in `runtime/<id>/handover`; a
+    /// declaration already there is left as it is.
+    pub fn declare_handover(&self, id: &str) -> io::Result<()> {
+        let dir = self.dir.join(id);
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        match File::create_new(dir.join("handover")) {
+            Ok(mut file) => {
+                io::Write::write_all(&mut file, crate::handover::VERSION.to_string().as_bytes())
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The handover format build `id` declared, if it did.
+    pub fn handover(&self, id: &str) -> Option<u32> {
+        fs::read_to_string(self.dir.join(id).join("handover"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
     /// The id of an exe that already is `runtime/<id>/a`.
     fn id_in_runtime(&self, exe: &Path) -> Option<String> {
         let dir = exe.parent()?;

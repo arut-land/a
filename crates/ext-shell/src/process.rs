@@ -1,12 +1,20 @@
 //! Process ownership precedes every fallible readiness registration.
+//!
+//! A captured group can be handed to the daemon's next build
+//! ([`RunningProcess::hand_over`]): its supervision stops between two
+//! chunks of output, leaving its leader, lease and pipe parked. Committed,
+//! they go to `sys`, which passes them on live, and the next build adopts
+//! the group ([`Processes::adopt`]) and supervises it from there; called
+//! off, supervision goes on here as before.
 
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::process::ExitStatus;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use ext::{
-    BoxFuture, Cx, Flag, LaunchSpec, OwnedProcess, ProcessOutput, ProcessSignal, Processes,
-    RunningProcess, SpawnError,
+    BoxFuture, Cx, Flag, LaunchSpec, OwnedProcess, Parting, ProcessOutput, ProcessSignal,
+    Processes, RunningProcess, SpawnError,
 };
 
 pub(crate) struct Provider;
@@ -44,6 +52,92 @@ struct Live {
     captured: Mutex<Option<io::Result<()>>>,
     ended: Flag,
     permit: Mutex<Option<Permit>>,
+    runtime: rt::Rt,
+    /// The supervision running now, which a handover stops.
+    watch: Mutex<Watch>,
+    /// What supervision leaves of a group it stopped for a handover.
+    parted: Mutex<Parted>,
+    this: Weak<Self>,
+}
+
+/// One supervision of a group: `handing` stops it between two chunks of
+/// output, and `parked` says it stopped.
+#[derive(Clone, Default)]
+struct Watch {
+    handing: Flag,
+    parked: Flag,
+}
+
+#[derive(Default)]
+struct Parted {
+    child: Option<sys::Child>,
+    lease: Option<sys::ProcessLease>,
+    /// The pipe, unless nothing of the group writes it any more, and the
+    /// stream its output goes to.
+    output: Option<(sys::ProcessPipe, File)>,
+}
+
+impl Live {
+    fn new(
+        child: &sys::Child,
+        group: sys::ProcessLease,
+        permit: Permit,
+        runtime: rt::Rt,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|this| Self {
+            id: child.id(),
+            group: Mutex::new(Some(group)),
+            status: Mutex::default(),
+            exited: Flag::default(),
+            copied: Flag::default(),
+            captured: Mutex::default(),
+            ended: Flag::default(),
+            permit: Mutex::new(Some(permit)),
+            runtime,
+            watch: Mutex::default(),
+            parted: Mutex::default(),
+            this: this.clone(),
+        })
+    }
+
+    /// What a handover stopped, for it to give up or call off.
+    async fn stopped(&self) -> io::Result<Stopped> {
+        let watch = lock(&self.watch).clone();
+        watch.handing.set();
+        let parked = rt::or(
+            async {
+                watch.parked.wait().await;
+                true
+            },
+            async {
+                self.ended.wait().await;
+                false
+            },
+        )
+        .await;
+        let live = self
+            .this
+            .upgrade()
+            .filter(|_| parked)
+            .ok_or_else(|| io::Error::other("the group ended before it was handed over"))?;
+        let Parted {
+            child,
+            lease,
+            output,
+        } = std::mem::take(&mut *lock(&self.parted));
+        let mut stopped = Stopped {
+            live,
+            child,
+            lease,
+            output: None,
+        };
+        if let Some((pipe, mut file)) = output {
+            let (pipe, unread) = sys::handover::park(pipe)?;
+            stopped.output = Some((pipe, file.try_clone()?));
+            file.write_all(&unread)?;
+        }
+        Ok(stopped)
+    }
 }
 
 impl RunningProcess for Live {
@@ -92,28 +186,106 @@ impl RunningProcess for Live {
     fn ended(&self) -> BoxFuture<'_, ()> {
         Box::pin(self.ended.wait())
     }
+    fn hand_over(&self) -> BoxFuture<'_, io::Result<Box<dyn Parting>>> {
+        Box::pin(async { Ok(Box::new(self.stopped().await?) as Box<dyn Parting>) })
+    }
 }
 
-struct Reap(Option<sys::Child>, Arc<Live>);
+/// A group whose supervision a handover stopped: given up as it commits,
+/// supervised again from where it was as it drops.
+struct Stopped {
+    live: Arc<Live>,
+    child: Option<sys::Child>,
+    lease: Option<sys::ProcessLease>,
+    output: Option<(sys::handover::Parked, File)>,
+}
+
+impl Parting for Stopped {
+    fn commit(mut self: Box<Self>) -> ext::Given {
+        let (Some(child), Some(lease)) = (self.child.take(), self.lease.take()) else {
+            unreachable!("a stopped group has its leader and lease")
+        };
+        let given = sys::handover::give(child, lease, self.output.take().map(|(pipe, _)| pipe));
+        // It ends here: what waits on it here waits for good.
+        let live = &self.live;
+        lock(&live.captured).get_or_insert(Ok(()));
+        live.copied.set();
+        lock(&live.permit).take();
+        live.ended.set();
+        ext::Given {
+            group: ext::Json::encode(&given.group).unwrap_or_default(),
+            handles: given.handles,
+        }
+    }
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        let (Some(child), Some(lease)) = (self.child.take(), self.lease.take()) else {
+            return;
+        };
+        let live = Arc::clone(&self.live);
+        *lock(&live.group) = Some(lease);
+        *lock(&live.watch) = Watch::default();
+        let capture = self.output.take().and_then(|(pipe, file)| {
+            let reader = pipe.unpark().ok()?;
+            Some(sys::OutputCapture { reader, file })
+        });
+        let runtime = Arc::clone(&live.runtime);
+        runtime.spawn(Box::pin(async move {
+            let rt = Arc::clone(&live.runtime);
+            let _ = watch_over(&rt, Reap::new(child, live), capture, |child| {
+                child.exit_watch()
+            })
+            .await;
+        }));
+    }
+}
+
+struct Reap {
+    child: Option<sys::Child>,
+    live: Arc<Live>,
+    watch: Watch,
+    /// Stopped for a handover: nothing of the group is finished.
+    parked: bool,
+}
 
 impl Reap {
+    fn new(child: sys::Child, live: Arc<Live>) -> Self {
+        let watch = lock(&live.watch).clone();
+        Self {
+            child: Some(child),
+            live,
+            watch,
+            parked: false,
+        }
+    }
+
+    /// Waits for the leader's status, once; the child is kept, as a
+    /// handover gives it up with the group even once its leader exited.
     fn complete(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            *lock(&self.1.status) = Some(child.wait());
-            self.1.exited.set();
+        if let Some(child) = self.child.as_mut()
+            && !self.live.exited.is_set()
+        {
+            *lock(&self.live.status) = Some(child.wait());
+            self.live.exited.set();
         }
     }
 }
 
 impl Drop for Reap {
     fn drop(&mut self) {
+        if self.parked {
+            self.watch.parked.set();
+            return;
+        }
         // Also covers failed registration and a runtime dropping its task.
-        lock(&self.1.group).take();
+        lock(&self.live.group).take();
         self.complete();
-        lock(&self.1.captured).get_or_insert_with(|| Err(io::ErrorKind::Interrupted.into()));
-        self.1.copied.set();
-        lock(&self.1.permit).take();
-        self.1.ended.set();
+        lock(&self.live.captured).get_or_insert_with(|| Err(io::ErrorKind::Interrupted.into()));
+        self.live.copied.set();
+        lock(&self.live.permit).take();
+        self.live.ended.set();
     }
 }
 
@@ -129,6 +301,36 @@ impl Processes for Provider {
             |child| child.exit_watch(),
             |reactor, input, _| rt::Async::new(reactor, input),
         ))
+    }
+
+    fn adopt<'a>(
+        &'a self,
+        cx: &'a Cx,
+        claimed: ext::Native,
+        output: File,
+    ) -> BoxFuture<'a, Result<OwnedProcess, SpawnError>> {
+        Box::pin(async move {
+            let claimed: sys::handover::Claimed = claimed
+                .take()
+                .ok_or_else(|| io::Error::other("not a group this build claimed"))?;
+            let permit = Permit::acquire()?;
+            let rt = cx
+                .service_arc::<dyn rt::Runtime>()
+                .ok_or_else(|| io::Error::other("no runtime"))?;
+            let sys::ContainedChild {
+                child,
+                group,
+                capture,
+            } = claimed.adopt(output);
+            let live = Live::new(&child, group, permit, Arc::clone(&rt));
+            supervise(
+                &rt,
+                (Reap::new(child, live), None, capture),
+                |child| child.exit_watch(),
+                |reactor, input, _| rt::Async::new(reactor, input),
+            )
+            .await
+        })
     }
 }
 
@@ -164,7 +366,7 @@ async fn launch_admitted(
 ) -> io::Result<OwnedProcess> {
     let (permit, mut launch) = admitted?;
     let rt = cx
-        .service::<dyn rt::Runtime>()
+        .service_arc::<dyn rt::Runtime>()
         .ok_or_else(|| io::Error::other("no runtime"))?;
     if cx.cancel.is_set() {
         return Err(io::ErrorKind::Interrupted.into());
@@ -176,6 +378,7 @@ async fn launch_admitted(
     }
     let cancel = cx.cancel.clone();
     let (sent, received) = rt::oneshot::channel();
+    let runtime = Arc::clone(&rt);
     rt.spawn_blocking(
         rt::BlockingClass::Storage,
         0,
@@ -201,42 +404,38 @@ async fn launch_admitted(
                     group,
                     capture,
                 } = contained;
-                let live = Arc::new(Live {
-                    id: child.id(),
-                    group: Mutex::new(Some(group)),
-                    status: Mutex::default(),
-                    exited: Flag::default(),
-                    copied: Flag::default(),
-                    captured: Mutex::default(),
-                    ended: Flag::default(),
-                    permit: Mutex::new(Some(permit)),
-                });
-                Ok::<_, io::Error>((Reap(Some(child), live), pipes, capture))
+                let live = Live::new(&child, group, permit, runtime);
+                Ok::<_, io::Error>((Reap::new(child, live), pipes, capture))
             })());
         }),
     )
     .await?;
-    let (mut owned, pipes, capture) = received
+    let launched = received
         .await
         .ok_or_else(|| io::Error::other("process launch stopped"))??;
-    let live = Arc::clone(&owned.1);
     if cx.cancel.is_set() {
         return Err(io::ErrorKind::Interrupted.into());
     }
+    supervise(&rt, launched, watch, register).await
+}
+
+/// The pipes of a process with stdio of its own.
+type Stdio = Option<(sys::ProcessPipe, sys::ProcessPipe)>;
+
+/// Watches a contained process, launched or adopted, to its end, copying
+/// what it captures into its stream.
+async fn supervise(
+    rt: &rt::Rt,
+    (owned, pipes, capture): (Reap, Stdio, Option<sys::OutputCapture>),
+    watch: impl FnOnce(&mut sys::Child) -> io::Result<sys::ExitWatch>,
+    register: impl FnOnce(
+        &rt::Reactor,
+        sys::ProcessPipe,
+        u32,
+    ) -> io::Result<rt::Async<sys::ProcessPipe>>,
+) -> io::Result<OwnedProcess> {
+    let live = Arc::clone(&owned.live);
     let reactor = rt.reactor();
-    let watch = match watch(owned.0.as_mut().expect("owned child")) {
-        Ok(watch) => Some(rt::Async::for_reading(&reactor, watch)?),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            // Exit observation can precede waitable status; reaping must not block the reactor.
-            owned = rt::unblock_with(rt, rt::BlockingClass::Storage, 0, move || {
-                owned.complete();
-                owned
-            })
-            .await;
-            None
-        }
-        Err(e) => return Err(e),
-    };
     let (input, output) = if let Some((input, output)) = pipes {
         (
             Some(Box::new(Pipe(register(&reactor, input, live.id)?)) as Box<dyn ext::ProcessPipe>),
@@ -246,14 +445,40 @@ async fn launch_admitted(
     } else {
         (None, None)
     };
+    watch_over(rt, owned, capture, watch).await?;
+    Ok(OwnedProcess::new(live, input, output))
+}
+
+/// Starts the task that watches `owned` to its end: launched, adopted, or
+/// stopped for a handover that was called off.
+async fn watch_over(
+    rt: &rt::Rt,
+    mut owned: Reap,
+    capture: Option<sys::OutputCapture>,
+    watch: impl FnOnce(&mut sys::Child) -> io::Result<sys::ExitWatch>,
+) -> io::Result<()> {
+    let reactor = rt.reactor();
+    let watch = match watch(owned.child.as_mut().expect("owned child")) {
+        Ok(watch) => Some(rt::Async::for_reading(&reactor, watch)?),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Exit observation can precede waitable status; reaping must not block the reactor.
+            owned = rt::unblock_with(&**rt, rt::BlockingClass::Storage, 0, move || {
+                owned.complete();
+                owned
+            })
+            .await;
+            None
+        }
+        Err(e) => return Err(e),
+    };
     rt.spawn(Box::pin(reap_output(
         owned,
         watch,
         reactor,
         capture,
-        cx.service_arc::<dyn rt::Runtime>().expect("runtime"),
+        Arc::clone(rt),
     )));
-    Ok(OwnedProcess::new(live, input, output))
+    Ok(())
 }
 
 async fn reap_output(
@@ -265,7 +490,8 @@ async fn reap_output(
 ) {
     let scope_done = Flag::default();
     let capture_done = scope_done.clone();
-    let capturing = Arc::clone(&owned.1);
+    let capturing = Arc::clone(&owned.live);
+    let handing = owned.watch.handing.clone();
     let copy_reactor = reactor.clone();
     let copy_runtime = Arc::clone(&runtime);
     let copying = async move {
@@ -277,31 +503,61 @@ async fn reap_output(
                     input,
                     capture.file,
                     &capturing,
-                    &capture_done,
+                    (&capture_done, &handing),
                 )
                 .await
             }
             .await;
-            if result.is_err() {
-                lock(&capturing.group).take();
+            match result {
+                Ok(Captured::Handing(pipe, file)) => {
+                    // Not finished: the handover takes it on, or this
+                    // build again.
+                    lock(&capturing.parted).output = Some((pipe, file));
+                    return;
+                }
+                Ok(Captured::Ended) => Ok(()),
+                Err(error) => {
+                    lock(&capturing.group).take();
+                    Err(error)
+                }
             }
-            result
         } else {
             Ok(())
         };
         *lock(&capturing.captured) = Some(result);
         capturing.copied.set();
     };
+    let handing = owned.watch.handing.clone();
     let reaping = async {
-        let result = async {
-            if let Some(watch) = watch {
-                watch.readable_result().await?;
-            }
-            owned.complete();
-            descendants(&reactor, &owned.1, &*runtime).await
-        }
+        let ended = rt::or(
+            async {
+                let result = async {
+                    if let Some(watch) = watch {
+                        watch.readable_result().await?;
+                    }
+                    owned.complete();
+                    descendants(&reactor, &owned.live, &*runtime).await
+                }
+                .await;
+                Some(result)
+            },
+            async {
+                handing.wait().await;
+                None
+            },
+        )
         .await;
-        lock(&owned.1.group).take();
+        let Some(result) = ended else {
+            // Left for a handover, which gives it up or supervises it again.
+            let mut parted = lock(&owned.live.parted);
+            parted.child = owned.child.take();
+            parted.lease = lock(&owned.live.group).take();
+            owned.parked = true;
+            return Ok(());
+        };
+        lock(&owned.live.group).take();
+        // Nothing of the group is left to hand over: the last owner reaps it.
+        owned.child.take();
         scope_done.set();
         result
     };
@@ -310,28 +566,42 @@ async fn reap_output(
     let _ = rt::zip(copying, reaping).await;
 }
 
+/// How capture ended.
+enum Captured {
+    /// Nothing more is kept: nothing of the group writes the pipe any
+    /// more, the group ended, or it wrote past the cap.
+    Ended,
+    /// Stopped between two chunks for a handover: the pipe, and the stream.
+    Handing(sys::ProcessPipe, File),
+}
+
 // One bounded chunk is admitted to disk at a time; a slow disk stops pipe reads.
 async fn capture_output(
     runtime: &dyn rt::Runtime,
     input: rt::Async<sys::ProcessPipe>,
-    mut file: std::fs::File,
+    mut file: File,
     live: &Live,
-    scope_done: &Flag,
-) -> io::Result<()> {
+    (scope_done, handing): (&Flag, &Flag),
+) -> io::Result<Captured> {
     let mut buffer = vec![0; 64 << 10];
-    let mut retained = 0u64;
+    // An adopted group's stream holds what the build before kept of it.
+    let mut retained = file.metadata().map_or(0, |meta| meta.len());
     let mut drain_left = 1 << 20;
     let mut drain_until = None;
     loop {
+        if retained >= crate::output::OUTPUT_CAP {
+            live.signal(ProcessSignal::Kill)?;
+            return Ok(Captured::Ended);
+        }
         let read = if scope_done.is_set() {
             if drain_left == 0 {
-                return Ok(());
+                return Ok(Captured::Ended);
             }
             let deadline = *drain_until
                 .get_or_insert_with(|| runtime.now() + std::time::Duration::from_millis(100));
             let remaining = deadline.saturating_duration_since(runtime.now());
             if remaining.is_zero() {
-                return Ok(());
+                return Ok(Captured::Ended);
             }
             let size = buffer.len().min(drain_left);
             match rt::or(
@@ -352,32 +622,40 @@ async fn capture_output(
                     drain_left -= read;
                     read
                 }
-                None => return Ok(()),
+                None => return Ok(Captured::Ended),
             }
         } else {
             match rt::or(
                 async {
                     scope_done.wait().await;
-                    Ok(None)
+                    Ok(Next::Ended)
                 },
-                async {
-                    input
-                        .read_with(|mut input| input.read(&mut buffer))
-                        .await
-                        .map(Some)
-                },
+                rt::or(
+                    async {
+                        handing.wait().await;
+                        Ok(Next::Handing)
+                    },
+                    async {
+                        input
+                            .read_with(|mut input| input.read(&mut buffer))
+                            .await
+                            .map(Next::Read)
+                    },
+                ),
             )
             .await?
             {
-                Some(read) => read,
-                None => continue,
+                Next::Read(read) => read,
+                Next::Ended => continue,
+                Next::Handing => return Ok(Captured::Handing(input.into_inner()?, file)),
             }
         };
         if read == 0 {
-            return Ok(());
+            return Ok(Captured::Ended);
         }
         let keep = read.min(
-            usize::try_from(crate::output::OUTPUT_CAP - retained).expect("capture cap fits usize"),
+            usize::try_from(crate::output::OUTPUT_CAP.saturating_sub(retained))
+                .expect("capture cap fits usize"),
         );
         let (state, result) = rt::unblock_with(
             runtime,
@@ -394,11 +672,14 @@ async fn capture_output(
         (file, buffer) = state;
         result?;
         retained += keep as u64;
-        if retained == crate::output::OUTPUT_CAP {
-            live.signal(ProcessSignal::Kill)?;
-            return Ok(());
-        }
     }
+}
+
+/// What woke capture.
+enum Next {
+    Read(usize),
+    Ended,
+    Handing,
 }
 
 // A leader can exit first. Failed descendant watches must revoke containment.
@@ -856,5 +1137,85 @@ int main(int argc, char **argv) {
         );
         assert!(lock(&runtime.tasks).is_empty());
         assert!(sys::process_started(pid.unwrap()).is_none());
+    }
+
+    /// What `given` names, claimed as the next image of this process
+    /// claims it from the record it reads.
+    #[cfg(unix)]
+    fn claimed(given: ext::Given) -> ext::Native {
+        use std::os::fd::IntoRawFd;
+        let given = sys::handover::Given {
+            group: given.group.parse().unwrap(),
+            handles: given.handles,
+        };
+        // As an exec passes them on: owned by nothing until claimed.
+        for handle in given.handles {
+            let _ = handle.into_raw_fd();
+        }
+        let owner = serde_json::Value::Null;
+        let bytes = sys::handover::encode([(&given.group, &owner)]);
+        let path = std::env::temp_dir().join(format!("a-claim-{}", given.group.pid));
+        std::fs::write(&path, bytes).unwrap();
+        let record = File::open(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let number = sys::InheritedNumber::from(record.into_raw_fd());
+        let claimed = sys::handover::read_record(number).unwrap().pop().unwrap().0;
+        ext::Native::new(claimed.unwrap())
+    }
+
+    /// Handed over, a group runs on: the owner it leaves neither signals
+    /// nor reaps it, and the owner that adopts it (here the same process,
+    /// as the next image of one is) gets its exit status and what it writes
+    /// after, its stream whole.
+    #[test]
+    #[cfg(unix)]
+    fn a_group_handed_over_runs_on_unsignalled_and_is_adopted_whole() {
+        let rig = Rig::new(
+            "handed-group",
+            Registry::default().with(&crate::Shell::default()).unwrap(),
+        );
+        let cx = rig.cx();
+        let path = rig.dir.join("stream");
+        let file = File::create(&path).unwrap();
+        rt::block_on(async {
+            let launch = LaunchSpec {
+                output: ProcessOutput::File(file),
+                ..spec(&cx, "echo before; sleep 1; echo after; exit 7")
+            };
+            let process = Provider.spawn(&cx, launch).await.unwrap();
+            let given = process.hand_over().await.unwrap().commit();
+            drop(process);
+            let output = File::options().append(true).open(&path).unwrap();
+            let adopted = Provider.adopt(&cx, claimed(given), output).await.unwrap();
+            assert_eq!(adopted.wait().await.unwrap().code(), Some(7));
+            adopted.output_drained().await.unwrap();
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\nafter\n");
+    }
+
+    /// A handover called off leaves the group as it was: supervised here,
+    /// its status and its whole output still to come.
+    #[test]
+    fn a_handover_called_off_leaves_the_group_supervised() {
+        let rig = Rig::new(
+            "called-off",
+            Registry::default().with(&crate::Shell::default()).unwrap(),
+        );
+        let cx = rig.cx();
+        let path = rig.dir.join("stream");
+        let file = File::create(&path).unwrap();
+        rt::block_on(async {
+            let launch = LaunchSpec {
+                output: ProcessOutput::File(file),
+                ..spec(&cx, "echo before; sleep 1; echo after; exit 7")
+            };
+            let process = Provider.spawn(&cx, launch).await.unwrap();
+            drop(process.hand_over().await.unwrap());
+            assert_eq!(process.wait().await.unwrap().code(), Some(7));
+            process.output_drained().await.unwrap();
+            process.ended().await;
+        });
+        let output = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(output.replace('\r', ""), "before\nafter\n");
     }
 }

@@ -253,11 +253,14 @@ impl Tool for Leaves {
     fn call(&self, _: &Nothing, cx: &Cx) -> Result<String, String> {
         let (sealing, release) = (Arc::clone(&self.sealing), Arc::clone(&self.release));
         let lease = ext::ProcessLease::from(Arc::new(Gone) as Arc<dyn ext::RunningProcess>);
-        cx.own(lease.holding(move || {
-            sealing.set();
-            rt::block_on(release.wait());
-            Vec::new()
-        }));
+        cx.own(
+            lease.holding(move || {
+                sealing.set();
+                rt::block_on(release.wait());
+                Vec::new()
+            }),
+            ext::Role::Work,
+        );
         Ok("left".into())
     }
 }

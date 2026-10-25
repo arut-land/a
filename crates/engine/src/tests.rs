@@ -973,18 +973,21 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
         Mutex::new(Vec::new()),
         Instant::now(),
     ));
-    let daemon = Daemon::load_on(&home, &config, &runtime).unwrap();
+    let daemon = Daemon::load_on(&home, &config, &runtime, Vec::new()).unwrap();
+    let listener = home.bind().unwrap();
     let exit = Exit {
         home: home.clone(),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
-        endpoint: home.bind().unwrap().retirement().unwrap(),
+        endpoint: listener.retirement().unwrap(),
+        listener: sys::handover::Endpoint::of(&listener),
     };
+    drop(listener);
     let life = Lifecycle::new("test".into(), home.runtime());
     {
         // Owning the polls distinguishes queued news from unsolicited wakes,
         // regardless of how long a worker would take to consume that news.
         let idling = super::Idling::new(super::Idling::TRANSIENT);
-        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling));
+        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling, None));
         let mut cx = Context::from_waker(Waker::noop());
         let before = EVENTS.count("wake");
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
@@ -1007,14 +1010,17 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     {
         // Neither a daemon the OS starts at login nor one still asking
         // whether it is has an idle deadline to wake for.
+        let listener = home.bind().unwrap();
         let exit = Exit {
             home: home.clone(),
             pid: std::fs::File::create(root.join("resident-pid")).unwrap(),
-            endpoint: home.bind().unwrap().retirement().unwrap(),
+            endpoint: listener.retirement().unwrap(),
+            listener: sys::handover::Endpoint::of(&listener),
         };
+        drop(listener);
         super::lock(&runtime.1).clear();
         let idling = super::Idling::new(super::Idling::ASKING);
-        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling));
+        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling, None));
         let mut cx = Context::from_waker(Waker::noop());
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
         idling.answer(true);
@@ -1089,11 +1095,14 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
         ..echo()
     };
     let daemon = Daemon::load(&home, &config).unwrap();
+    let listener = home.bind().unwrap();
     let exit = Exit {
         home: home.clone(),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
-        endpoint: home.bind().unwrap().retirement().unwrap(),
+        endpoint: listener.retirement().unwrap(),
+        listener: sys::handover::Endpoint::of(&listener),
     };
+    drop(listener);
     let life = Lifecycle::new("test".into(), home.runtime());
     let supervisor = std::sync::Arc::clone(&daemon);
     let (stop, done) = (ext::Flag::default(), ext::Flag::default());
@@ -1101,7 +1110,7 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     daemon.shared.rt.spawn(Box::pin(async move {
         let idling = super::Idling::new(super::Idling::TRANSIENT);
         rt::or(
-            supervisor.supervise(&life, &config, exit, &idling),
+            supervisor.supervise(&life, &config, exit, &idling, None),
             stopping.wait(),
         )
         .await;
@@ -2469,7 +2478,7 @@ fn busy_session_recovery_admits_independent_loads_concurrently() {
         ..Config::default()
     };
     let runtime = Arc::new(rt::Threads::configured(rt::Config::for_cores(4)));
-    let daemon = Daemon::load_on(&home, &config, &runtime).unwrap();
+    let daemon = Daemon::load_on(&home, &config, &runtime, Vec::new()).unwrap();
     drop(daemon);
     runtime.shutdown();
     std::fs::remove_dir_all(root).unwrap();
@@ -2534,5 +2543,56 @@ fn a_task_placed_on_another_machine_is_refused_and_starts_no_child() {
     assert_eq!(daemon.shared.store.headers().unwrap().len(), 1);
     drop(parent);
     drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A group the previous build handed to a session that is not here is
+/// no one's to go on with: the daemon kills it as it loads, rather than
+/// leave it running unowned.
+#[cfg(unix)]
+#[test]
+fn a_handed_group_no_session_takes_up_is_killed_as_the_daemon_loads() {
+    use std::os::fd::IntoRawFd;
+    let (root, home) = home("unadopted");
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.args(["-c", "sleep 30"]);
+    let stream = std::fs::File::create(root.join("stream")).unwrap();
+    let sys::ContainedChild {
+        child,
+        group,
+        capture,
+    } = sys::spawn_group_captured(&mut cmd, stream).unwrap();
+    let pid = child.id();
+    let (pipe, _) = sys::handover::park(capture.unwrap().reader).unwrap();
+    let given = sys::handover::give(child, group, Some(pipe));
+    // As an exec passes them on: owned by nothing until claimed.
+    for handle in given.handles {
+        let _ = handle.into_raw_fd();
+    }
+    let owner = serde_json::to_value(super::handover::Owner {
+        session: SessionId::new(),
+        call: CallId::new(3).unwrap(),
+        tool: "bash".into(),
+        kind: super::handover::Kind::Job,
+    })
+    .unwrap();
+    std::fs::write(
+        root.join("record"),
+        sys::handover::encode([(&given.group, &owner)]),
+    )
+    .unwrap();
+    let record = std::fs::File::open(root.join("record")).unwrap();
+    let number = sys::InheritedNumber::from(record.into_raw_fd());
+    let claimed = sys::handover::read_record(number).unwrap();
+    assert!(sys::process_started(pid).is_some());
+    let runtime = std::sync::Arc::new(rt::Threads::default());
+    let daemon =
+        Daemon::load_on(&home, &echo(), &runtime, super::handover::handed(claimed)).unwrap();
+    assert!(
+        sys::process_started(pid).is_none(),
+        "the group outlived the load"
+    );
+    drop(daemon);
+    runtime.shutdown();
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -73,9 +73,9 @@ pub use query::{Query, QueryCx};
 pub use queue::{Boundary, QueueView, Take};
 pub use schema::Schema;
 pub use service::{
-    Budget, CwdOf, Holds, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec, OwnedProcess,
-    ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes, Recipients, Record, Route,
-    RunningProcess, SideProvider, SideRetry, SpawnError, Topology,
+    Budget, CwdOf, Given, Holds, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec, Native,
+    OwnedProcess, Parting, ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes,
+    Recipients, Record, Role, Route, RunningProcess, SideProvider, SideRetry, SpawnError, Topology,
 };
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};
@@ -83,7 +83,7 @@ pub use shared::WorkspaceShared;
 pub use state::{Checkpoint, DynFold, Fold, Image, PreparedPublication, Publication, States};
 pub use tool::{
     Args, Callable, Called, Concurrency, Cx, Detach, DynTool, MutationError, MutationResult,
-    Parsed, Replay, SpawnSpec, Tool,
+    Parsed, Replay, Resumable, SpawnSpec, Tool,
 };
 
 /// A runtime name: of an extension, a tool, an agent. Typed Rust items

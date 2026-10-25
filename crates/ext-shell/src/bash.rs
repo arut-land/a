@@ -211,6 +211,48 @@ impl<D: crate::dialect::Dialect> Tool for ShellTool<D> {
     }
 }
 
+/// What a command gone on in the background needs, beyond its input, its
+/// stream and its group, to go on in the daemon's next build.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Detached {
+    /// Where it started.
+    dir: PathBuf,
+    /// When, in milliseconds since the Unix epoch.
+    started: u64,
+}
+
+/// A command gone on in the background goes on in the next build where it
+/// is: its output followed from where its stream is, its result the one it
+/// would have had. A group it left to the session is the session's there.
+impl<D: crate::dialect::Dialect> ext::Resumable for ShellTool<D> {
+    type State = Detached;
+
+    fn resume(
+        &self,
+        _input: &Command,
+        state: Detached,
+        claimed: ext::Native,
+        cx: &Cx,
+    ) -> impl shape::Output<Ran, Streams<String>> {
+        ext::stream(|output| async move {
+            resume::<D>(state, claimed, cx, output)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    async fn rehold(&self, claimed: ext::Native, cx: &Cx) -> Result<ext::ProcessLease, String> {
+        let rehold = async {
+            let Stream { file, open: log } = cx.blobs.reopen(cx.call, OUTPUT_CAP)?;
+            let process = adopt(cx, claimed, file).await?;
+            let output = Written(Some(log));
+            let call = cx.call;
+            io::Result::Ok(process.process.holding(move || output.seal(call)))
+        };
+        rehold.await.map_err(|e| e.to_string())
+    }
+}
+
 fn title(input: &Command, prompt: &str) -> String {
     let mut lines = input.command.trim().lines();
     let mut title = format!("{prompt}{}", lines.next().unwrap_or_default());
@@ -352,17 +394,68 @@ async fn execute<D: crate::dialect::Dialect>(
     // raises no edge, and would be read only once the command exits.
     let written = rt::Async::for_reading(&runtime(cx)?.reactor(), sys::write_watch(log.path())?)?;
     let child = launch(cx, spawn, file).await?;
-    let pgid = child.id();
-    cx.spawned(pgid, false);
+    cx.spawned(child.id(), false);
     let limit = input.timeout.unwrap_or(timeout).clamp(1, MAX_TIMEOUT);
     let output = Followed {
         log: log.path(),
         written,
     };
-    let done = supervise(child, output, Duration::from_secs(limit), cx, &progress).await?;
-    let (Rendered { text, truncated }, kept) = keep(cx, log, done.output, done.lingering).await?;
+    let detached = Detached {
+        dir: dir.clone(),
+        started: now_ms(),
+    };
+    let supervised = Supervised::Launched {
+        limit: Duration::from_secs(limit),
+        detached: &detached,
+    };
+    let done = supervise::<D>(child, output, supervised, cx, &progress).await?;
+    let ran = finish(cx, done, log, report, dir, limit).await?;
+    Ok(Ran {
+        duration_ms: duration_ms(started),
+        ..ran
+    })
+}
 
-    let old_dir = dir.clone();
+/// Goes on with a command an earlier build ran and handed over, gone on in
+/// the background there: its group adopted, its stream followed from the
+/// start, as only what comes after the handover is new progress.
+async fn resume<D: crate::dialect::Dialect>(
+    detached: Detached,
+    claimed: ext::Native,
+    cx: &Cx,
+    progress: Partials<String>,
+) -> io::Result<Ran> {
+    let Stream { file, open: log } = cx.blobs.reopen(cx.call, OUTPUT_CAP)?;
+    let report = log.path().with_extension("cwd");
+    let written = rt::Async::for_reading(&runtime(cx)?.reactor(), sys::write_watch(log.path())?)?;
+    let child = adopt(cx, claimed, file).await?;
+    // Handed over again, should another upgrade come before it ends.
+    cx.resumable::<ShellTool<D>>(&child, &detached);
+    let output = Followed {
+        log: log.path(),
+        written,
+    };
+    let done = supervise::<D>(child, output, Supervised::Resumed, cx, &progress).await?;
+    let ran = finish(cx, done, log, report, detached.dir, 0).await?;
+    Ok(Ran {
+        duration_ms: now_ms().saturating_sub(detached.started),
+        ..ran
+    })
+}
+
+/// What a command that ended shows and keeps, and the directory it left
+/// the session in; `limit` is the timeout it had.
+async fn finish(
+    cx: &Cx,
+    done: Finished,
+    log: Open,
+    report: PathBuf,
+    dir: PathBuf,
+    limit: u64,
+) -> io::Result<Ran> {
+    let pgid = done.process.id();
+    let (Rendered { text, truncated }, kept) = keep(cx, log, done.output, done.lingering).await?;
+    let old_dir = dir;
     let (cwd, moved) = rt::unblock(runtime(cx)?, move || {
         let ended = std::fs::read_to_string(&report).ok();
         let _ = std::fs::remove_file(&report);
@@ -389,7 +482,7 @@ async fn execute<D: crate::dialect::Dialect>(
         aborted: done.stopped == Some(Stop::Aborted),
         flooded: (done.stopped == Some(Stop::Flooded)).then_some(OUTPUT_CAP),
         cwd,
-        duration_ms: duration_ms(started),
+        duration_ms: 0,
         output: text,
         truncated,
         full: kept.blob,
@@ -404,6 +497,15 @@ async fn execute<D: crate::dialect::Dialect>(
             .map_err(io::Error::other),
         None => Ok(ran),
     }
+}
+
+/// Milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Where the whole output is kept, when the model saw less of it.
@@ -480,7 +582,10 @@ fn leave(cx: &Cx, process: OwnedProcess, output: Option<Open>) {
     };
     let output = Written(Some(output));
     let call = cx.call;
-    cx.own(process.process.holding(move || output.seal(call)));
+    cx.own(
+        process.process.holding(move || output.seal(call)),
+        ext::Role::Work,
+    );
 }
 
 /// A stream nothing but a group the session owns writes: sealed once the
@@ -521,6 +626,15 @@ impl Drop for Written {
             let _ = open.discard();
         }
     }
+}
+
+/// The group `handed`, from the build before, owned again and writing
+/// `file`, its stream.
+async fn adopt(cx: &Cx, claimed: ext::Native, file: File) -> io::Result<OwnedProcess> {
+    cx.service::<dyn Processes>()
+        .ok_or_else(|| io::Error::other("no process provider"))?
+        .adopt(cx, claimed, file)
+        .await
 }
 
 async fn launch(cx: &Cx, process: Spawn, file: File) -> io::Result<OwnedProcess> {
@@ -691,6 +805,55 @@ struct Finished {
     process: OwnedProcess,
 }
 
+/// Whose command the supervisor follows.
+enum Supervised<'a> {
+    /// One this build launched, waited for until `limit`, and how it goes
+    /// on in the next build should it go on in the background.
+    Launched {
+        limit: Duration,
+        detached: &'a Detached,
+    },
+    /// One an earlier build launched, gone on in the background there.
+    Resumed,
+}
+
+impl<'a> Supervised<'a> {
+    /// The stream opened for following, with what of it is followed
+    /// already, and how the run starts at `start`.
+    async fn begin(
+        self,
+        rt: &dyn rt::Runtime,
+        log: &Path,
+        start: Instant,
+    ) -> io::Result<(File, Vec<u8>, Output, Run, Option<&'a Detached>)> {
+        let path = log.to_owned();
+        let mut file =
+            rt::unblock_with(rt, rt::BlockingClass::Storage, 0, move || File::open(path)).await?;
+        let mut buf = vec![0; 64 * 1024];
+        let mut output = Output::default();
+        match self {
+            Self::Launched { limit, detached } => {
+                let run = Run::Running {
+                    deadline: Some(start + limit),
+                };
+                Ok((file, buf, output, run, Some(detached)))
+            }
+            Self::Resumed => {
+                // What the build before followed was reported there.
+                loop {
+                    let read;
+                    (file, buf, output, _, read) =
+                        follow_chunk(rt, file, buf, output, Live::default()).await?;
+                    if read < READ {
+                        break;
+                    }
+                }
+                Ok((file, buf, output, Run::Running { deadline: None }, None))
+            }
+        }
+    }
+}
+
 /// Installed before launch so the first write cannot lose its wakeup.
 struct Followed<'a> {
     log: &'a Path,
@@ -705,23 +868,18 @@ struct Followed<'a> {
 /// runs. Once the shell has exited, the output has ended when nothing of
 /// its group is left to write, or it has paused [`IDLE`], or after
 /// [`LINGER`].
-async fn supervise(
+async fn supervise<D: crate::dialect::Dialect>(
     child: OwnedProcess,
     Followed { log, written }: Followed<'_>,
-    limit: Duration,
+    supervised: Supervised<'_>,
     cx: &Cx,
     progress: &Partials<String>,
 ) -> io::Result<Finished> {
     let rt = runtime(cx)?;
-    let path = log.to_owned();
-    let mut file =
-        rt::unblock_with(rt, rt::BlockingClass::Storage, 0, move || File::open(path)).await?;
-    let mut buf = vec![0; 64 * 1024];
-    let (mut output, mut live) = (Output::default(), Live::default());
     let start = rt.now();
-    let mut run = Run::Running {
-        deadline: Some(start + limit),
-    };
+    let (mut file, mut buf, mut output, mut run, detached) =
+        supervised.begin(rt, log, start).await?;
+    let mut live = Live::default();
     let (mut heard, mut reported) = (start, start);
     let (mut unreported, mut behind) = (false, false);
     loop {
@@ -772,6 +930,9 @@ async fn supervise(
         {
             detach.set();
             run = Run::Running { deadline: None };
+            if let Some(detached) = detached {
+                cx.resumable::<ShellTool<D>>(&child, detached);
+            }
         }
         let seen = Seen {
             exited: if exited { None } else { child.try_wait()? },

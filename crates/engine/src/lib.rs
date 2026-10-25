@@ -3,6 +3,7 @@
 mod catalog;
 pub mod config;
 mod driver;
+mod handover;
 mod model;
 mod outbox;
 mod query;
@@ -43,9 +44,6 @@ pub struct Config {
     pub idle: Duration,
     /// Unload a session after this long unused.
     pub hibernate: Duration,
-    /// How long an upgrade waits for background process groups; running
-    /// sessions, and calls gone on in the background, it waits out.
-    pub drain: Duration,
     /// The agent sessions run, by name: overrides the config files'
     /// `agent`.
     pub agent: Option<String>,
@@ -74,7 +72,6 @@ impl Default for Config {
         Self {
             idle: Duration::from_secs(600),
             hibernate: Duration::from_secs(300),
-            drain: Duration::from_secs(60),
             agent: None,
             crash_limit: sys::crash::LIMIT,
             barriers: kernel::Barriers::default(),
@@ -144,7 +141,6 @@ impl From<sys::config::Daemon> for Config {
         Self {
             idle: secs(file.idle_secs, defaults.idle),
             hibernate: secs(file.hibernate_secs, defaults.hibernate),
-            drain: secs(file.drain_secs, defaults.drain),
             agent: file.agent,
             crash_limit: file.crash_limit.map_or(defaults.crash_limit, |n| {
                 u32::try_from(n).unwrap_or(u32::MAX)
@@ -376,12 +372,19 @@ impl Daemon {
     #[cfg(test)]
     fn load(home: &Home, config: &Config) -> io::Result<Owner> {
         let runtime = Arc::new(rt::Threads::default());
-        let mut owner = Self::load_on(home, config, &runtime)?;
+        let mut owner = Self::load_on(home, config, &runtime, Vec::new())?;
         owner.1 = Some(runtime);
         Ok(owner)
     }
 
-    fn load_on(home: &Home, config: &Config, runtime: &Arc<impl rt::Runtime>) -> io::Result<Owner> {
+    /// `handed` is what the previous build handed over: the sessions it
+    /// names load at once, too, to take their groups up.
+    fn load_on(
+        home: &Home,
+        config: &Config,
+        runtime: &Arc<impl rt::Runtime>,
+        handed: Vec<handover::Handed>,
+    ) -> io::Result<Owner> {
         let machine = Machine::read(home, &**runtime);
         // Extensions publish these facts as they register.
         sys::shell::ExecutionFacts::initialize(home)?;
@@ -397,7 +400,9 @@ impl Daemon {
         let catalog = Catalog::open_on(home.catalog_file(), store.clone(), &**runtime)?;
         catalog.start(Arc::clone(runtime) as Arc<dyn rt::Runtime>);
         let records = catalog.records();
-        let busy: Vec<bool> = records.iter().map(|r| r.busy).collect();
+        let busy: Vec<bool> = (records.iter())
+            .map(|r| r.busy || (handed.iter()).any(|h| h.owner.session == r.header.id))
+            .collect();
         let slots: Vec<_> = (records.into_iter())
             .map(|record| {
                 let last = record.summary();
@@ -425,6 +430,7 @@ impl Daemon {
                 blobs,
                 tree,
                 loaded: Mutex::default(),
+                handed: Mutex::new(handed),
                 daemon: daemon.clone(),
             }),
             slots: Mutex::new(slots.clone()),
@@ -470,6 +476,16 @@ impl Daemon {
                 }
             }
         });
+        // Handed to a session that is not there, or did not load: no one
+        // goes on with it, and it is killed as its claim drops.
+        let unclaimed = std::mem::take(&mut *lock(&daemon.shared.handed));
+        for handed in unclaimed {
+            fact(Fact::Fault {
+                session: Some(handed.owner.session),
+                operation: Operation::Handover,
+                kind: Fault(io::ErrorKind::NotFound),
+            });
+        }
         Ok(Owner(daemon, None))
     }
 
@@ -1041,17 +1057,25 @@ impl Daemon {
 
     /// Hibernates idle sessions, and exits once the whole daemon has been
     /// idle for `config.idle`, or once a drain has no work left. Running
-    /// sessions and calls detached into the background hold a drain for as
-    /// long as they run, so an upgrade never cuts them off; background
-    /// process groups only for its grace, since a drain refuses input
-    /// meanwhile and a server left running would hold it forever. Every
-    /// entry is durable when written, so exiting is all a drain needs.
+    /// sessions, calls detached into the background and the process groups
+    /// sessions own hold a drain for as long as they run, so an upgrade
+    /// never cuts them off; once only calls in the background and groups
+    /// remain, they are handed to the next build instead, if it can take
+    /// them all ([`handover`]), started as `successor` says. Every entry
+    /// is durable when written, so exiting is all a drain needs.
     ///
     /// It sleeps until the next deadline or until [`Daemon::pulse`] says
     /// something changed (a client came or went, a session's work began or
     /// ended), so an idle daemon does not wake at all. While work runs it
     /// holds off system sleep.
-    async fn supervise(&self, life: &Lifecycle, config: &Config, exit: Exit, idling: &Idling) {
+    async fn supervise(
+        &self,
+        life: &Lifecycle,
+        config: &Config,
+        exit: Exit,
+        idling: &Idling,
+        successor: Option<Successor>,
+    ) {
         // When the daemon last became idle.
         let mut since: Option<Instant> = None;
         let mut awake: Option<Option<sys::Awake>> = None;
@@ -1081,20 +1105,24 @@ impl Daemon {
             if let Some(reason) = stopping {
                 exit.now(self, reason).await;
             }
-            let draining = life.draining();
-            let busy = draining.is_some() || self.has_work();
+            let busy = life.draining().is_some() || self.has_work();
             if busy != awake.is_some() {
                 awake = busy.then(|| sys::Awake::hold("a: an agent is at work"));
             }
             let mut next = self.next_hibernation(config.hibernate, now);
-            if let Some(began) = draining {
-                let jobs = self.loaded().iter().any(|s| s.has_jobs());
-                let graced = now >= began + config.drain;
-                if !self.has_work() && (!jobs || graced) {
+            if life.wanted().is_some() {
+                if !self.at_work() {
+                    life.drain();
                     exit.now(self, Stop::Upgrade).await;
                 }
-                if !graced {
-                    next = Some(earliest(next, began + config.drain));
+                if let (Some(command), Some(successor)) =
+                    (successor, self.successor(&exit.home.runtime()))
+                    && let Ok(given) = self.hand_over(life).await
+                {
+                    // Whatever holds off sleep for this build must not
+                    // outlive it.
+                    awake.take();
+                    exit.hand_over(self, given, successor, command).await;
                 }
             } else if self.idle() {
                 match idling.next(*since.get_or_insert(now), config.idle, now) {
@@ -1199,7 +1227,13 @@ struct Exit {
     /// The locked pid file; see [`claim`].
     pid: File,
     endpoint: sys::EndpointRetirement,
+    /// The listener, as the next build takes it on a handover.
+    listener: sys::handover::Endpoint,
 }
+
+/// How this binary starts the daemon of the build at a path, should a
+/// drain hand over to it ([`handover`]).
+pub type Successor = fn(&std::path::Path) -> std::process::Command;
 
 impl Exit {
     /// Retains the endpoint claim through discovery withdrawal and session
@@ -1258,6 +1292,12 @@ pub struct Start {
     /// off every reply's path: whether the OS starts this daemon at login,
     /// so it stays up instead of exiting when idle.
     pub resident: Option<fn(&Home) -> bool>,
+    /// How a drain starts the next build to hand work over to; without it,
+    /// a drain waits for all work to end.
+    pub successor: Option<Successor>,
+    /// What the daemon of an earlier build handed this one: each group,
+    /// claimed as the record was read, with what the record says of it.
+    pub handed: Option<Vec<(io::Result<sys::handover::Claimed>, serde_json::Value)>>,
 }
 
 /// How long a new daemon serves before asking [`Start::resident`].
@@ -1358,7 +1398,9 @@ fn run(
     start: Start,
     runtime: &Arc<rt::Threads>,
 ) -> io::Result<()> {
-    let origin = if start.login {
+    let origin = if start.handed.is_some() {
+        ext_logging::Origin::Handover
+    } else if start.login {
         ext_logging::Origin::Login
     } else if start.logs || start.lock.is_some() {
         ext_logging::Origin::Client
@@ -1406,7 +1448,11 @@ fn run(
         sys::Signal::Interrupt,
         sys::Signal::Hangup,
     ])?;
-    let daemon = Daemon::load_on(home, &config, runtime)?;
+    if start.handed.is_some() {
+        sys::handover::shutdown_signals_caught()?;
+    }
+    let handed = start.handed.map_or_default(handover::handed);
+    let daemon = Daemon::load_on(home, &config, runtime, handed)?;
     let signals = rt::Async::for_reading(&daemon.shared.rt.reactor(), signals)?;
     let signalled = async {
         let signal = signals
@@ -1440,11 +1486,15 @@ fn run(
         home: home.clone(),
         pid,
         endpoint: listener.retirement()?,
+        listener: sys::handover::Endpoint::of(listener),
     };
     let idling = idling(&daemon, home, start.resident);
     let answered = Arc::clone(&idling);
+    let successor = start.successor;
     daemon.shared.rt.spawn(Box::pin(async move {
-        monitor.supervise(&watch, &config, exit, &answered).await;
+        monitor
+            .supervise(&watch, &config, exit, &answered, successor)
+            .await;
     }));
     let listener = rt::Async::new(&daemon.shared.rt.reactor(), listener)?;
     // The signal lease is scoped to serving, including non-signal shutdown.

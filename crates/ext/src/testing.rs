@@ -266,7 +266,7 @@ impl Host for Recorder {
         lock(&self.spawned).push((pgid, background));
     }
 
-    fn own(&self, process: crate::ProcessLease) {
+    fn own(&self, process: crate::ProcessLease, _: crate::Role) {
         self.spawned(process.id(), true);
         let released = crate::Flag::default();
         lock(&self.processes).push((Arc::clone(&process), released.clone()));

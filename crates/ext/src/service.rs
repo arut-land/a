@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::BoxFuture;
-use protocol::{Environment, Held};
+use protocol::{Environment, Held, Json};
 
 use crate::{Called, Cx, DynTool, SpawnSpec, States};
 
@@ -44,6 +44,69 @@ pub trait Processes: Send + Sync {
         cx: &'a Cx,
         launch: LaunchSpec,
     ) -> BoxFuture<'a, Result<OwnedProcess, SpawnError>>;
+
+    /// `claimed`, a group the daemon's previous build handed over, owned
+    /// again, its output going on into `output`.
+    fn adopt<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _claimed: Native,
+        _output: std::fs::File,
+    ) -> BoxFuture<'a, Result<OwnedProcess, SpawnError>> {
+        Box::pin(std::future::ready(Err(
+            std::io::ErrorKind::Unsupported.into()
+        )))
+    }
+}
+
+/// A group stopped for a handover ([`RunningProcess::hand_over`]):
+/// committed, it is given up whole, for good; dropped instead, its
+/// supervision goes on here as if nothing happened.
+pub trait Parting: Send {
+    fn commit(self: Box<Self>) -> Given;
+}
+
+/// A group given up for the daemon's next build: where it finds it, as its
+/// provider records it, and the handles it finds it by, open here until
+/// the handover passes them on.
+pub struct Given {
+    pub group: Json,
+    pub handles: Vec<std::fs::File>,
+}
+
+/// A process group claimed from the daemon's previous build, as it comes
+/// to the provider that adopts it. What it holds is the platform's, opaque
+/// to the SDK, which stays free of I/O; dropped, it is killed.
+pub struct Native(Box<dyn std::any::Any + Send>);
+
+impl Native {
+    pub fn new(native: impl std::any::Any + Send) -> Self {
+        Self(Box::new(native))
+    }
+
+    /// What it holds, if it is a `T`.
+    pub fn take<T: std::any::Any>(self) -> Option<T> {
+        self.0.downcast().ok().map(|native| *native)
+    }
+}
+
+impl std::fmt::Debug for Native {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Native")
+    }
+}
+
+/// What a process group the session owns is to it, as it says when it
+/// takes the group ([`Cx::own`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The user's work: the session is at work while it runs, and an
+    /// upgrade hands it over or waits for it to end.
+    Work,
+    /// A helper its extension starts again when next needed, such as an
+    /// MCP server: it holds no session at work and no upgrade, which stops
+    /// it.
+    Helper,
 }
 
 pub type SpawnError = std::io::Error;
@@ -74,6 +137,14 @@ pub trait RunningProcess: Send + Sync {
     /// Captured stdout has reached its output file, independently of process reaping.
     fn output_drained(&self) -> BoxFuture<'_, std::io::Result<()>>;
     fn ended(&self) -> BoxFuture<'_, ()>;
+    /// Stops the group's supervision for a handover to the daemon's next
+    /// build, its output so far kept: see [`Parting`]. A group that ends
+    /// meanwhile is not stopped, and the handover is refused.
+    fn hand_over(&self) -> BoxFuture<'_, std::io::Result<Box<dyn Parting>>> {
+        Box::pin(std::future::ready(Err(
+            std::io::ErrorKind::Unsupported.into()
+        )))
+    }
 }
 
 pub trait ProcessPipe: Send + Sync {
@@ -105,7 +176,7 @@ impl OwnedProcess {
 
     /// Transfer cancellation to the session while retaining native ownership.
     pub fn detach(self, cx: &Cx) {
-        cx.own(self.process);
+        cx.own(self.process, Role::Work);
     }
 }
 
@@ -145,6 +216,18 @@ impl ProcessLease {
         self
     }
 
+    /// [`RunningProcess::hand_over`], for a group the session owns. Once
+    /// committed, what its end holds is made by the next build, so here it
+    /// is neither made nor dropped (dropping it would discard the stream
+    /// the group still writes).
+    pub fn hand_over(self: &Arc<Self>) -> BoxFuture<'static, std::io::Result<Box<dyn Parting>>> {
+        let lease = Arc::clone(self);
+        Box::pin(async move {
+            let parting = lease.process.hand_over().await?;
+            Ok(Box::new(Leased { lease, parting }) as Box<dyn Parting>)
+        })
+    }
+
     /// For the session that owns the group, as it ends: what
     /// [`ProcessLease::holding`] gave, once.
     pub fn holds(&self) -> Option<Holds> {
@@ -152,6 +235,21 @@ impl ProcessLease {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+    }
+}
+
+/// A group the session owns, stopped for a handover.
+struct Leased {
+    lease: Arc<ProcessLease>,
+    parting: Box<dyn Parting>,
+}
+
+impl Parting for Leased {
+    fn commit(self: Box<Self>) -> Given {
+        if let Some(holds) = self.lease.holds() {
+            std::mem::forget(holds);
+        }
+        self.parting.commit()
     }
 }
 

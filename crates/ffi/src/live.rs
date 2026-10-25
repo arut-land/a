@@ -715,6 +715,7 @@ mod tests {
             machine: protocol::MachineId([0; 16]),
             commands: Vec::new(),
             queries: Vec::new(),
+            upgrade: None,
         };
         write_frame(&mut peer, &welcome).unwrap();
         let Some(ClientMsg::Query {
@@ -782,6 +783,7 @@ mod tests {
             machine: protocol::MachineId([0; 16]),
             commands: Vec::new(),
             queries: Vec::new(),
+            upgrade: None,
         };
         read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
         read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
@@ -833,7 +835,7 @@ mod tests {
                 Some(seq)
             );
         }
-        write_frame(&mut peer, &DaemonMsg::Draining).unwrap();
+        write_frame(&mut peer, &DaemonMsg::Draining { held: None }).unwrap();
         drop(peer);
         let mut peer = listener.accept().unwrap();
         read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
@@ -885,6 +887,7 @@ mod tests {
             machine: protocol::MachineId([0; 16]),
             commands: Vec::new(),
             queries: Vec::new(),
+            upgrade: None,
         };
         session.send("unanswered".into()).unwrap();
         write_frame(&mut peer, &welcome).unwrap();
@@ -903,7 +906,7 @@ mod tests {
             },
         )
         .unwrap();
-        write_frame(&mut peer, &DaemonMsg::Draining).unwrap();
+        write_frame(&mut peer, &DaemonMsg::Draining { held: None }).unwrap();
         drop(peer);
         let mut peer = listener.accept().unwrap();
         read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();

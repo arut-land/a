@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 34;
+pub const PROTO: u32 = 35;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 34;
+pub const PROTO_MIN: u32 = 35;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -1810,15 +1810,20 @@ kinds! {
             machine: MachineId,
             commands: Vec<CommandInfo> = default,
             queries: Vec<QueryInfo> = default,
+            /// A newer build waits to take over, which `upgrade` holds:
+            /// this build serves meanwhile. `a daemon stop` ends it.
+            upgrade: Option<String> = default,
         } = Control;
         /// The daemon speaks protocols `min..=supported` (just `supported`
         /// without `min`), none of the client's.
         Mismatch "mismatch" { supported: u32, min: Option<u32> = default } = Control;
-        /// A newer build was staged: the daemon finishes in-flight work, exits,
-        /// and closes every connection. Clients then reconnect, which starts the
-        /// new build, and re-attach to replay what they missed. Sent as the reply
+        /// A newer build was staged: the daemon makes way for it, closing
+        /// every connection. Clients then reconnect, which reaches the new
+        /// build, and re-attach to replay what they missed. Sent as the reply
         /// to a hello, or to connections already open when the drain began.
-        Draining "draining" = Control;
+        /// `held` says what holds the upgrade when it cannot happen yet and
+        /// the client cannot be served meanwhile: `a daemon stop` ends it.
+        Draining "draining" { held: Option<String> = default } = Control;
         Attached "attached" { session: SessionId, workspace: HostPath } = Durable;
         Entry "entry" (Entry) = (entry_class), read decode::entry_msg;
         /// Live text of an unfinished model call, of its `attempt`th try: a
@@ -2546,7 +2551,7 @@ mod tests {
     #[test]
     fn draining_is_a_bare_tag() {
         assert_eq!(
-            serde_json::to_string(&DaemonMsg::Draining).unwrap(),
+            serde_json::to_string(&DaemonMsg::Draining { held: None }).unwrap(),
             r#"{"t":"draining"}"#
         );
     }

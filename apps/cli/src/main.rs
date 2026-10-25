@@ -89,11 +89,15 @@ fn main() -> ExitCode {
                     detached,
                     lock_fd,
                     reset_breaker,
+                    handover_fd,
                 }) => serve(
                     here(&home, args.host.as_ref())?,
                     &daemon.staged,
-                    listen_fd,
-                    lock_fd,
+                    Handoff {
+                        listen: listen_fd,
+                        lock: lock_fd,
+                        handover: handover_fd,
+                    },
                     reset_breaker,
                     detached,
                     login,
@@ -149,6 +153,9 @@ fn write(mut output: impl Write + IsTerminal, stream: usize, args: fmt::Argument
 fn daemon_of(host: Option<&Host>, cmd: Option<&Cmd>) -> io::Result<(Home, Daemons)> {
     let home = Home::from_env()?;
     let staged = home.runtime().stage(&std::env::current_exe()?)?;
+    // What a daemon of this build can be handed, said where the daemon it
+    // replaces looks: a failure only costs that daemon's waiting it out.
+    let _ = home.runtime().declare_handover(&staged.id);
     let prompt = match cmd {
         Some(Cmd::Web { .. }) => sys::Prompt::Never,
         _ => sys::Prompt::Terminal,
@@ -192,7 +199,11 @@ fn here<'a>(home: &'a Home, host: Option<&Host>) -> io::Result<&'a Home> {
 /// restart itself.
 fn connect(daemon: &client::Daemon) -> io::Result<client::Connection> {
     let on_drain = || eprintln!("[waiting for the previous daemon to finish its work]");
-    daemon.connect(&on_drain).map_err(|e| wedged(daemon, e))
+    let connection = daemon.connect(&on_drain).map_err(|e| wedged(daemon, e))?;
+    if let Some(held) = &connection.upgrade {
+        eprintln!("[the upgrade to this build waits: {held}; `a daemon stop` ends what holds it]");
+    }
+    Ok(connection)
 }
 
 /// `e` as reported: a daemon that does not answer is diagnosed where its
@@ -679,6 +690,15 @@ fn web(_daemons: Daemons, _open: bool) -> io::Result<()> {
     Err(io::Error::other("this build of a has no web UI"))
 }
 
+/// What whoever started the daemon handed it, by descriptor or handle
+/// number: a client its listener and lock, a daemon of the build before
+/// those and the record of its work ([`sys::handover`]).
+struct Handoff {
+    listen: Option<i32>,
+    lock: Option<i32>,
+    handover: Option<i32>,
+}
+
 /// The daemon. Started by a client (`listen_fd`), it leaves the client's
 /// session and discards untyped stderr; by hand, it stays at the terminal;
 /// by the OS at login (`login`), it stays in the foreground the service
@@ -686,8 +706,11 @@ fn web(_daemons: Daemons, _open: bool) -> io::Result<()> {
 fn serve(
     home: &Home,
     staged: &Staged,
-    listen_fd: Option<i32>,
-    lock_fd: Option<i32>,
+    Handoff {
+        listen: listen_fd,
+        lock: lock_fd,
+        handover: handover_fd,
+    }: Handoff,
     reset_breaker: bool,
     detached: bool,
     login: bool,
@@ -704,8 +727,15 @@ fn serve(
             return client::spawn_at_login(home);
         }
     }
+    // What the daemon of the build before handed this one is claimed
+    // first, every handle owned and closed on exec from here on.
+    let handed = handover_fd
+        .map(|fd| sys::handover::read_record(sys::InheritedNumber::from(fd)))
+        .transpose()?;
     sys::crash::install(home.crash_dir(), sys::crash::Build::of(&staged.id));
-    if detached || listen_fd.is_some() {
+    // A daemon exec'd in place by the build before is where that one was:
+    // its session and its stderr (a journal, a terminal) are its own.
+    if handed.is_none() && (detached || listen_fd.is_some()) {
         sys::detach_session()?;
         sys::log::discard_stderr()?;
     }
@@ -737,6 +767,14 @@ fn serve(
         // Only a home that can register asks, so an isolated daemon has no
         // question pending and nothing to wake for.
         resident: sys::autostart::applies(home).then_some(sys::autostart::refresh),
+        // The next build runs with this daemon's environment, which is
+        // what its first client gave it.
+        successor: Some(|exe| {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("__daemon").envs(std::env::vars_os());
+            cmd
+        }),
+        handed,
     };
     engine::serve(
         &listener,

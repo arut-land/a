@@ -137,6 +137,9 @@ pub enum EventKind {
         commands: Vec<CommandInfo>,
         /// The daemon's machine, as its welcome named it.
         machine: protocol::MachineId,
+        /// What holds the upgrade to a newer build the daemon waits for,
+        /// serving meanwhile.
+        upgrade: Option<String>,
     },
     Msg(DaemonMsg),
     /// A daemon draining for a newer build is waited out before the
@@ -205,6 +208,9 @@ pub enum Notice {
     /// The driver could not send a message.
     NotSent(Error),
     ForkRejected(protocol::ForkError),
+    /// The daemon waits to upgrade to a newer build, held by this, and
+    /// serves this client meanwhile.
+    UpgradeWaits(String),
 }
 
 impl fmt::Display for Notice {
@@ -221,6 +227,10 @@ impl fmt::Display for Notice {
                 "the host's environment is captured when `a` connects; reattach to refresh it",
             ),
             Self::ForkRejected(reason) => reason.fmt(f),
+            Self::UpgradeWaits(held) => write!(
+                f,
+                "the upgrade to a newer build waits: {held}; `a daemon stop` ends what holds it"
+            ),
             Self::NotSent(e) => write!(f, "not sent: {e}"),
         }
     }
@@ -494,8 +504,12 @@ impl SessionClient {
                 welcome,
                 remote,
                 commands,
+                upgrade,
                 ..
             } => {
+                if let Some(held) = upgrade {
+                    out.push(Effect::Show(Show::Notice(Notice::UpgradeWaits(held))));
+                }
                 self.commands = commands;
                 // Neither answered nor refused on the last connection: sent
                 // again, and the daemon, which logs who sent what, does each
@@ -786,6 +800,7 @@ mod tests {
                 remote: false,
                 commands: Vec::new(),
                 machine: protocol::MachineId([0; 16]),
+                upgrade: None,
             },
         }
     }
@@ -802,6 +817,20 @@ mod tests {
             conn: ConnId(conn),
             kind: EventKind::Closed(Error::Closed),
         }
+    }
+
+    /// Served while an upgrade waits, every client says what holds it.
+    #[test]
+    fn a_welcome_while_an_upgrade_waits_tells_what_holds_it() {
+        let mut client = SessionClient::new(Env::Keep);
+        client.open(Target::New);
+        let mut connected = live(1, Caps::ALL);
+        if let EventKind::Connected { upgrade, .. } = &mut connected.kind {
+            *upgrade = Some("session 89abcdef is at work".into());
+        }
+        let out = client.step(connected);
+        assert!(out.iter().any(|effect| matches!(effect,
+            Effect::Show(Show::Notice(Notice::UpgradeWaits(held))) if held.contains("at work"))));
     }
 
     #[test]
@@ -970,7 +999,7 @@ mod tests {
     #[test]
     fn a_reattach_after_drain_never_resends_the_environment() {
         let (mut client, session) = attached(Env::Origin);
-        client.step(msg(1, DaemonMsg::Draining));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
         assert!(matches!(client.link(), Link::Draining));
         let out = client.step(closed(1));
         let [(conn, attach, restart)] = connects(&out)[..] else {
@@ -1034,7 +1063,7 @@ mod tests {
                 ..
             }]
         ));
-        client.step(msg(1, DaemonMsg::Draining));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
         assert!(client.run(Cmd::Input("two".into())).is_empty());
         client.step(closed(1));
         let out = client.step(live(2, Caps::ALL));
@@ -1106,7 +1135,7 @@ mod tests {
         for disconnected in [false, true] {
             let (mut client, _) = attached(Env::Keep);
             if disconnected {
-                client.step(msg(1, DaemonMsg::Draining));
+                client.step(msg(1, DaemonMsg::Draining { held: None }));
                 client.step(closed(1));
             }
             for n in 0..UNANSWERED {
@@ -1118,7 +1147,7 @@ mod tests {
             assert!(sends(&out).is_empty(), "{out:?}");
             assert_eq!(notices(&out), vec![&Notice::Backpressure], "{out:?}");
             if !disconnected {
-                client.step(msg(1, DaemonMsg::Draining));
+                client.step(msg(1, DaemonMsg::Draining { held: None }));
                 client.step(closed(1));
             }
             let out = client.step(live(2, Caps::ALL));
@@ -1233,7 +1262,7 @@ mod tests {
     fn pending_input_never_crosses_an_explicit_session_change() {
         let (mut client, _) = attached(Env::Keep);
         client.run(Cmd::Input("unanswered".into()));
-        client.step(msg(1, DaemonMsg::Draining));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
         client.run(Cmd::Input("queued".into()));
         client.open(Target::New);
         let out = client.step(live(2, Caps::ALL));
@@ -1244,7 +1273,7 @@ mod tests {
     fn pending_input_survives_a_restart_of_the_same_session() {
         let (mut client, _) = attached(Env::Keep);
         client.run(Cmd::Input("unanswered".into()));
-        client.step(msg(1, DaemonMsg::Draining));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
         client.run(Cmd::Input("queued".into()));
         client.restart();
         let out = client.step(live(2, Caps::ALL));
@@ -1265,7 +1294,7 @@ mod tests {
             },
         ));
         assert!(refused.is_empty(), "no error shown: {refused:?}");
-        client.step(msg(1, DaemonMsg::Draining));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
         client.step(closed(1));
         let out = client.step(live(2, Caps::ALL));
         assert_eq!(sends(&out).len(), 1, "{out:?}");
@@ -1274,7 +1303,7 @@ mod tests {
         assert_eq!(client.submission(id), Some(crate::SubmissionState::Queued));
         // Taken this time: a second drain does not send it again.
         client.step(msg(2, DaemonMsg::Ack { client_seq: 1 }));
-        client.step(msg(2, DaemonMsg::Draining));
+        client.step(msg(2, DaemonMsg::Draining { held: None }));
         client.step(closed(2));
         assert!(sends(&client.step(live(3, Caps::ALL))).is_empty());
     }
@@ -1343,7 +1372,7 @@ mod tests {
         ));
         // Attached but reconnecting: offered, and queued until the
         // connection is up.
-        client.step(msg(1, DaemonMsg::Draining));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
         client.step(closed(1));
         assert!(client.offer().unwrap().steer("go").unwrap().is_empty());
         let out = client.step(live(2, Caps::ALL));

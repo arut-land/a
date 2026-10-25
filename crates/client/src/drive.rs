@@ -320,6 +320,7 @@ impl Driver {
             remote,
             commands,
             machine,
+            upgrade,
             ..
         } = match made {
             Ok(connection) => connection,
@@ -338,6 +339,7 @@ impl Driver {
                 remote: remote.is_some(),
                 commands,
                 machine,
+                upgrade,
             },
         ) {
             return None;
@@ -521,6 +523,7 @@ mod tests {
                 remote: false,
                 commands: Vec::new(),
                 machine: protocol::MachineId([0; 16]),
+                upgrade: None,
             },
         });
         let effects = client.offer().unwrap().input("x".repeat(8 << 20)).unwrap();
@@ -633,6 +636,7 @@ mod tests {
                     machine: protocol::MachineId([0; 16]),
                     commands: Vec::new(),
                     queries: Vec::new(),
+                    upgrade: None,
                 },
             )
             .unwrap();
@@ -1000,6 +1004,7 @@ mod tests {
                 machine: protocol::MachineId([0; 16]),
                 commands: Vec::new(),
                 queries: Vec::new(),
+                upgrade: None,
             },
         )
         .unwrap();
@@ -1076,6 +1081,7 @@ mod tests {
                 machine: protocol::MachineId([0; 16]),
                 commands: Vec::new(),
                 queries: Vec::new(),
+                upgrade: None,
             },
         )
         .unwrap();

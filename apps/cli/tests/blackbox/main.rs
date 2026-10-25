@@ -14,6 +14,8 @@ mod budgets;
 #[cfg(unix)]
 mod crash;
 #[cfg(unix)]
+mod handover;
+#[cfg(unix)]
 mod home;
 #[cfg(feature = "web")]
 #[cfg(unix)]

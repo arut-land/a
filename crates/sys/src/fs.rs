@@ -1268,6 +1268,26 @@ pub fn try_lock(file: &File) -> io::Result<()> {
     return windows_lock(file, true);
 }
 
+/// Lets go of what [`lock`] took, the file kept open.
+pub fn unlock(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    return file.unlock();
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+        // SAFETY: as in `windows_lock`, for the byte it locks.
+        let mut operation: OVERLAPPED = unsafe { std::mem::zeroed() };
+        operation.Anonymous.Anonymous.Offset = u32::MAX - 1;
+        operation.Anonymous.Anonymous.OffsetHigh = 0x7fff_ffff;
+        // SAFETY: UnlockFileEx completes before returning on this handle.
+        crate::windows::ok(unsafe {
+            UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &raw mut operation)
+        })
+    }
+}
+
 #[cfg(windows)]
 fn windows_lock(file: &File, nonblocking: bool) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;

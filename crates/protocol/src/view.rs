@@ -672,7 +672,7 @@ impl SessionView {
                 self.recap = self.recap_since(self.since);
                 Some(Change::Synced)
             }
-            DaemonMsg::Draining => Some(Change::Draining),
+            DaemonMsg::Draining { .. } => Some(Change::Draining),
             DaemonMsg::Mismatch { supported, .. } => Some(Change::Mismatch {
                 supported: *supported,
             }),

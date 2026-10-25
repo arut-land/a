@@ -567,6 +567,8 @@ pub(crate) struct MsgFields {
     // A reply's; read as a tool's, so an entry frame's reads too.
     pub(crate) outcome: Option<ToolOutcome>,
     pub(crate) queries: Option<Vec<crate::QueryInfo>>,
+    pub(crate) upgrade: Option<String>,
+    pub(crate) held: Option<String>,
 }
 
 /// An [`Item`] of a snapshot.

@@ -246,3 +246,46 @@ fn daemon_stop_and_cancellation_kill_server_descendants() {
         assert!(!sys::RecordedIdentity(server).members().contains(&child));
     }
 }
+
+/// An MCP server is a helper, not the user's work: it holds no upgrade.
+/// The session's job goes to the newer build live, the server is stopped
+/// with the older one, and the newer build starts it again on the next
+/// call that needs it.
+#[test]
+fn an_mcp_server_never_holds_an_upgrade_and_starts_again_after_it() {
+    let env = configured("mcp-upgrade");
+    let old = env.older_build();
+    assert!(env.cmd_as(&old, &["ls"]).status().unwrap().success());
+    let pid = env.pid().unwrap();
+    let mut conn = env.connect();
+    let (session, _) = conn.attach(Target::New, &env.ws);
+    call(&mut conn, "echo");
+    conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
+    let server = self::pid(&env);
+    conn.input("$ sleep 30 & echo job");
+    conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
+    drop(conn);
+
+    env.run(&["ls"]);
+    assert_eq!(env.pid(), Some(pid), "the job was not handed over");
+    wait_for("the older build's MCP server to stop", || {
+        !sys::RecordedIdentity(server).alive()
+    });
+    let mut conn = env.connect();
+    conn.attach(Target::Id(session), &env.ws);
+    call(&mut conn, "echo");
+    let entries = conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
+    assert!(entries.iter().any(|e| matches!(
+        &e.body,
+        Body::ToolResult {
+            outcome: Outcome::Done { .. },
+            ..
+        }
+    )));
+    let starts = fs::read_to_string(env.root.join("effects")).unwrap();
+    assert_eq!(
+        starts.lines().filter(|l| l.starts_with("start ")).count(),
+        2,
+        "{starts}"
+    );
+}

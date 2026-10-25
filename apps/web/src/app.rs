@@ -333,6 +333,7 @@ mod tests {
                 remote: false,
                 commands: Vec::new(),
                 machine: protocol::MachineId([0; 16]),
+                upgrade: None,
             },
             client::EventKind::Msg(protocol::DaemonMsg::Synced { seq: 0 }),
         ] {

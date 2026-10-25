@@ -24,7 +24,9 @@ started without autostart, or before it was turned on, keeps the idle exit;
 turning it off leaves a running daemon until it stops. `a daemon stop` and
 an upgrade drain still end a resident daemon; the next client self-spawns a
 successor, which becomes resident the same way, and the OS does not
-restart it.
+restart it. A drain that hands its work over instead (see
+[agents](agents.md)) execs the newer build in the same process on Linux and
+macOS, so the service manager tracks the same daemon, still resident.
 
 The login entry is `a __daemon --login`, and the daemon log records its
 start with the `login` origin. It takes `start.lock` like a self-spawning

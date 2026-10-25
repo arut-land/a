@@ -1,6 +1,7 @@
 //! Drain-and-restart upgrades: once a newer build is staged, the first client
 //! of another build makes this daemon finish its work and exit, so the next
-//! connection starts `runtime/current`.
+//! connection starts `runtime/current`; work left only in the background is
+//! handed to that build live instead ([`crate::handover`]).
 //!
 //! Several builds share one home (the app's bundled `a`, a CLI from brew or
 //! cargo), and the rules keep them from fighting:
@@ -22,7 +23,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use protocol::{DaemonMsg, Frame, Versions};
@@ -30,6 +31,9 @@ use sys::Runtime;
 
 use crate::lock;
 use crate::outbox::Outbox;
+
+/// Why a request is refused once the daemon makes way for a newer build.
+pub const DRAINING: &str = "the daemon is restarting for an upgrade; send that again in a moment";
 
 /// How the daemon answers a hello.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,12 +66,17 @@ impl Verdict {
     }
 }
 
-/// This daemon's build and the state of its drain.
+/// This daemon's build and the state of its upgrade.
 pub struct Lifecycle {
     pub build: String,
     runtime: Runtime,
-    /// When the drain began.
-    draining: OnceLock<Instant>,
+    /// When a client of the newer build first came: the upgrade waits from
+    /// then on, this build serving meanwhile, until nothing holds it.
+    wanted: OnceLock<Instant>,
+    /// When the daemon began to make way: from then on it takes up no
+    /// client's request and exits as soon as it can. Shared with the
+    /// answers to requests already sent, which it turns into refusals.
+    draining: Arc<OnceLock<Instant>>,
     /// Every open connection's outbox, told when a drain begins.
     conns: Mutex<Vec<(u64, Outbox)>>,
     next: AtomicU64,
@@ -78,7 +87,8 @@ impl Lifecycle {
         Self {
             build,
             runtime,
-            draining: OnceLock::new(),
+            wanted: OnceLock::new(),
+            draining: Arc::default(),
             conns: Mutex::new(Vec::new()),
             next: AtomicU64::new(0),
         }
@@ -99,13 +109,26 @@ impl Lifecycle {
         )
     }
 
+    pub const fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    pub fn wanted(&self) -> Option<Instant> {
+        self.wanted.get().copied()
+    }
+
     pub fn draining(&self) -> Option<Instant> {
         self.draining.get().copied()
     }
 
-    /// Starts the drain once, telling every open connection.
-    pub fn drain(&self) {
-        if self.draining.set(Instant::now()).is_ok() {
+    /// When the drain began, as an answer still to come reads it.
+    pub fn drain_cell(&self) -> Arc<OnceLock<Instant>> {
+        Arc::clone(&self.draining)
+    }
+
+    /// The upgrade is wanted, once: the daemon makes way as soon as it can.
+    pub fn want(&self) {
+        if self.wanted.set(Instant::now()).is_ok() {
             ext_logging::emit(ext_logging::Fact::Upgrade {
                 to: self
                     .runtime
@@ -113,10 +136,17 @@ impl Lifecycle {
                     .as_deref()
                     .map(ext_logging::Build::of),
             });
-            if let Ok(draining) = Frame::new(&DaemonMsg::Draining) {
-                for (_, tx) in &*lock(&self.conns) {
-                    let _ = tx.send(draining.clone());
-                }
+        }
+    }
+
+    /// Starts the drain once, telling every open connection.
+    pub fn drain(&self) {
+        self.want();
+        if self.draining.set(Instant::now()).is_ok()
+            && let Ok(draining) = Frame::new(&DaemonMsg::Draining { held: None })
+        {
+            for (_, tx) in &*lock(&self.conns) {
+                let _ = tx.send(draining.clone());
             }
         }
     }

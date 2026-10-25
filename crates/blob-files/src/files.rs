@@ -95,6 +95,19 @@ impl BlobStore for Files {
         })
     }
 
+    fn reopen(&self, of: OutputStream, cap: u64) -> io::Result<Stream> {
+        let path = stream_path(&self.0.streams, of);
+        let file = fs::OpenOptions::new().append(true).open(&path)?;
+        let sealer = Sealing {
+            store: Arc::clone(&self.0),
+            cap,
+        };
+        Ok(Stream {
+            file,
+            open: Open::new(path, Box::new(sealer)),
+        })
+    }
+
     fn streams(&self) -> &Path {
         &self.0.streams
     }

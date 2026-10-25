@@ -27,6 +27,16 @@ pub struct Child {
 }
 
 impl Child {
+    /// The process `process` is, `id`, as the build before handed it over.
+    pub(crate) const fn handed(process: OwnedHandle, id: u32) -> Self {
+        Self { process, id }
+    }
+
+    /// Its process handle, for the build it is handed to.
+    pub(crate) fn into_process(self) -> OwnedHandle {
+        self.process
+    }
+
     pub fn id(&self) -> u32 {
         self.id
     }
@@ -82,6 +92,9 @@ fn inheritable(source: &dyn AsHandle) -> io::Result<OwnedHandle> {
 pub(super) struct SpawnPlan<'a> {
     pub command: &'a Command,
     pub io: [&'a dyn AsHandle; 3],
+    /// Handles beyond stdio, already inheritable: the child finds each
+    /// under the value it has here.
+    pub inherited: &'a [&'a std::fs::File],
     pub job: Option<&'a OwnedHandle>,
     pub flags: u32,
     pub environment: SpawnEnvironment,
@@ -92,6 +105,7 @@ impl SpawnPlan<'_> {
         let Self {
             command: cmd,
             io,
+            inherited,
             job,
             flags,
             environment: policy,
@@ -115,19 +129,12 @@ impl SpawnPlan<'_> {
             inheritable(io[1])?,
             inheritable(io[2])?,
         ];
-        let allowed = handles.each_ref().map(AsRawHandle::as_raw_handle);
+        let stdio = handles.each_ref().map(AsRawHandle::as_raw_handle);
+        let allowed: Vec<_> = (stdio.iter().copied())
+            .chain(inherited.iter().map(|file| file.as_raw_handle()))
+            .collect();
         let jobs = job.map(|job| [job.as_raw_handle()]);
-        // Redirecting stdio does not restrict inheritance. HANDLE_LIST is the
-        // documented boundary even when bInheritHandles is TRUE:
-        // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute
-        let builder = ProcThreadAttributeList::build()
-            .attribute(PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, &allowed);
-        let builder = if let Some(jobs) = &jobs {
-            builder.attribute(PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, jobs)
-        } else {
-            builder
-        };
-        let attributes = builder.finish()?;
+        let attributes = attributes(&allowed, jobs.as_ref())?;
         // SAFETY: zero initializes the reserved fields; required fields follow.
         let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
         startup.StartupInfo.cb = u32::try_from(size_of_val(&startup)).unwrap();
@@ -136,7 +143,7 @@ impl SpawnPlan<'_> {
             startup.StartupInfo.hStdInput,
             startup.StartupInfo.hStdOutput,
             startup.StartupInfo.hStdError,
-        ] = allowed;
+        ] = stdio;
         startup.lpAttributeList = attributes.as_ptr().cast_mut().cast();
         // SAFETY: PROCESS_INFORMATION is an output struct of scalar fields.
         let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -194,6 +201,29 @@ impl SpawnPlan<'_> {
         }
         Ok(child)
     }
+}
+
+/// Redirecting stdio does not restrict inheritance. `HANDLE_LIST` is the
+/// documented boundary even when `bInheritHandles` is TRUE:
+/// <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute>
+fn attributes<'a>(
+    allowed: &'a [std::os::windows::io::RawHandle],
+    jobs: Option<&'a [std::os::windows::io::RawHandle; 1]>,
+) -> io::Result<ProcThreadAttributeList<'a>> {
+    // SAFETY: `allowed` outlives the attribute list built over it, and the
+    // size is its length in bytes.
+    let builder = unsafe {
+        ProcThreadAttributeList::build().raw_attribute(
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            allowed.as_ptr().cast::<std::ffi::c_void>(),
+            size_of_val(allowed),
+        )
+    };
+    match jobs {
+        Some(jobs) => builder.attribute(PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, jobs),
+        None => builder,
+    }
+    .finish()
 }
 
 fn resolve(
@@ -397,6 +427,7 @@ mod tests {
         let result = SpawnPlan {
             command: &command,
             io: [&null, &null, &null],
+            inherited: &[],
             job: None,
             flags: windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
             environment: SpawnEnvironment::Exact,
