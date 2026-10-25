@@ -86,6 +86,72 @@ sleeping task, then closes with its watcher. A daemon nobody searches
 holds no index: it is never in the idle RSS scenario. An open index that
 nothing changes or asks costs no wake-ups.
 
+## Roots it never walks, and filesystems it cannot watch
+
+What the root is is asked once, as the first walk begins, on the blocking
+pool (`sys::fs::Tree::of`): nothing at daemon start pays for it.
+
+**Refused.** A volume's root (`/`, `C:\`, `/Volumes/X`, a mount root, a
+mounted folder), the home directory and the directory of every home
+(`/Users`, `/home`, `C:\Users`, and the home's parent), and the system's
+own trees (the FHS top-level directories, `/Applications`, `/Library`,
+`/private` and everything under `/System` on macOS; Program Files,
+ProgramData and everything under the Windows directory, as the shell's
+known folders name them), and a kernel filesystem (procfs, sysfs, devfs,
+…) are never walked nor watched: `files.search`, `files.grep`, `glob` and
+`grep` reply with an error saying so. A session started in one has search
+without a whole-disk walk, and on macOS without the privacy prompts a walk
+of the home's Desktop, Documents and Downloads would raise. A mount root
+that is the top of a git working tree is a project (a checkout a
+container or VM mounts) and is walked; `/` and a drive's root never are.
+
+**Unwatched.** On a filesystem whose change notifications miss what other
+machines or processes do, no watcher is armed: a search of files two
+seconds old or more is answered from them at once and starts another walk
+in the background (only the first walk is waited for), so the next search
+sees what changed; and no content index is built (an edited file's bigrams would go stale
+unseen), so grep reads every file. Which filesystems, by each OS's own
+account:
+
+- Linux, by `statfs`'s `f_type`: NFS, SMB/CIFS, Ceph, AFS, Coda, GFS2 and
+  Lustre (network); FUSE (virtiofs included), 9p (WSL's Windows drives)
+  and VirtualBox's shared folders (virtual). inotify(7): "Inotify reports
+  only events that a user-space program triggers through the filesystem
+  API. As a result, it does not catch remote events that occur on network
+  filesystems. (Applications must fall back to polling the filesystem to
+  catch such events.) Furthermore, various pseudo-filesystems such as
+  /proc, /sys, and /dev/pts are not monitorable with inotify." overlayfs
+  is watched: a container's changes go through it.
+- macOS, by `statfs`: `MNT_LOCAL` unset, or `f_fstypename` one of nfs,
+  smbfs, afpfs, webdav, cifs, ftp (network) or macfuse/osxfuse/fuse*
+  (virtual). FSEvents reports what this Mac's kernel does to a volume;
+  what another client does to a network volume reaches it only if the
+  filesystem's client passes it on, which none of these promise.
+- Windows: a UNC path (`\\server\share`, `\\wsl$\…`) or a drive whose
+  `GetDriveTypeW` is `DRIVE_REMOTE` (network); a volume whose filesystem
+  (`GetVolumeInformationW`) is none Windows ships, NTFS, ReFS, FAT, exFAT,
+  CDFS or UDF, is a driver's (WinFsp, Dokan) and virtual.
+  `ReadDirectoryChangesW` on a share reports what the server's redirector
+  passes on, and fails outright for a buffer over 64 KB.
+
+**Cloud placeholders** are listed, never opened: grep and the content
+index skip them, and the walk does not enter a placeholder directory,
+whose listing would be fetched to be read. On macOS the threads that
+read for the index also turn materializing off while they do
+(`setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+IOPOL_SCOPE_THREAD, IOPOL_MATERIALIZE_DATALESS_FILES_OFF)`, Apple's
+opt-out for indexers and backup tools): a file evicted after it was looked
+at fails to read rather than being fetched. On macOS, a dataless file or
+directory (`SF_DATALESS` in `st_flags`, from `lstat`: iCloud Drive and
+File Provider), which reading materializes; on Windows,
+`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`, `FILE_ATTRIBUTE_RECALL_ON_OPEN`
+(Cloud Files: OneDrive and other sync engines) or `FILE_ATTRIBUTE_OFFLINE`,
+read with `GetFileAttributesW`, which opens no handle. Microsoft's
+attribute reference: reading such a file or enumerating such a directory
+"will cause at least some of the file/directory content to be fetched from
+a remote store".
+Linux has no placeholders; FUSE-backed cloud drives are unwatched above.
+
 ## The content index and its memory
 
 The first grep builds the content index: for every walked file, the

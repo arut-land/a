@@ -136,7 +136,7 @@ impl Query for FileSearch {
         let root = Arc::clone(&cx.scope.path);
         async move {
             let index = indexes.open(&root, rt?);
-            let found = index.search(request.query, request.limit).await;
+            let found = index.search(request.query, request.limit).await?;
             Ok(SearchReply {
                 files: (found.files.into_iter())
                     .map(|f| FoundFile {
