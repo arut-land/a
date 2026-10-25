@@ -13,7 +13,7 @@ def snapshot(pid, threads=False):
               "user_seconds": cpu.user, "kernel_seconds": cpu.system,
               "thread_count": process.num_threads()}
     try:
-        result.update(memory_peaks(process))
+        result.update(memory_peaks(pid, process))
     except (OSError, AttributeError):
         pass
     # Windows idle diagnosis needs thread counters; macOS requires a debug task port.
@@ -23,11 +23,11 @@ def snapshot(pid, threads=False):
     return result
 
 
-def memory_peaks(process):
+def memory_peaks(pid, process):
     """The lifetime peak resident set, and on macOS the footprint the OS
     itself charges the process (freed-but-reusable pages leave it at once)."""
     if sys.platform == "linux":
-        with open(f"/proc/{process.pid}/status") as status:
+        with open(f"/proc/{pid}/status") as status:
             for line in status:
                 if line.startswith("VmHWM:"):
                     return {"peak_rss_kib": int(line.split()[1])}
@@ -39,7 +39,7 @@ def memory_peaks(process):
         import struct
         buffer = ctypes.create_string_buffer(16 + 8 * 40)
         # proc_pid_rusage with RUSAGE_INFO_V4: a UUID, then 64-bit counters.
-        if ctypes.CDLL("/usr/lib/libproc.dylib").proc_pid_rusage(process.pid, 4, buffer) != 0:
+        if ctypes.CDLL("/usr/lib/libproc.dylib").proc_pid_rusage(int(pid), 4, buffer) != 0:
             return {}
         fields = struct.unpack_from("<40Q", buffer, 16)
         return {"footprint_kib": fields[7] / 1024, "peak_footprint_kib": fields[28] / 1024}
