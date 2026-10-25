@@ -12,7 +12,10 @@ def snapshot(pid, threads=False):
               "cpu_seconds": cpu.user + cpu.system,
               "user_seconds": cpu.user, "kernel_seconds": cpu.system,
               "thread_count": process.num_threads()}
-    result.update(memory_peaks(process))
+    try:
+        result.update(memory_peaks(process))
+    except (OSError, AttributeError):
+        pass
     # Windows idle diagnosis needs thread counters; macOS requires a debug task port.
     if threads and sys.platform == "win32":
         result["threads"] = [dict(id=t.id, user_seconds=t.user_time, kernel_seconds=t.system_time)

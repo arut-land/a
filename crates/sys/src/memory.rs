@@ -143,9 +143,9 @@ mod system {
 
     #[cfg(windows)]
     pub fn release() {
-        use windows_sys::Win32::System::Memory::{
+        use windows_sys::Win32::System::Memory::{HeapOptimizeResources, HeapSetInformation};
+        use windows_sys::Win32::System::SystemServices::{
             HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION, HEAP_OPTIMIZE_RESOURCES_INFORMATION,
-            HeapOptimizeResources, HeapSetInformation,
         };
         let info = HEAP_OPTIMIZE_RESOURCES_INFORMATION {
             Version: HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION,

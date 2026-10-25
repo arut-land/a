@@ -436,32 +436,11 @@ fn concurrent_active_sessions() {
     let settled = usage();
     std::thread::sleep(Duration::from_secs(5));
     let idle = usage();
-    // What the allocator could hand back at rest, then once every client
-    // has gone.
-    let releasing = Instant::now();
-    sys::release();
-    let release_ms = releasing.elapsed().as_secs_f64() * 1000.0;
-    let released = usage();
-    drop(release);
-    for client in clients {
-        client.join().unwrap();
-    }
-    std::thread::sleep(Duration::from_secs(2));
-    let detached = usage();
-    sys::release();
-    let detached_released = usage();
+    let rest = at_rest(release, clients);
     let cpu = |a: &serde_json::Value, b: &serde_json::Value| {
         (b["cpu_seconds"].as_f64().unwrap() - a["cpu_seconds"].as_f64().unwrap()) * 1000.0
     };
-    // Lifetime peaks: the resident set (Linux, Windows) or footprint (macOS).
-    let peak = |v: &serde_json::Value| {
-        v.get("peak_rss_kib")
-            .or(v.get("peak_footprint_kib"))
-            .cloned()
-    };
-    println!(
-        "{}",
-        json!({
+    let mut record = json!({
             "runtime": variant,
             "sessions": load.sessions,
             "turns": load.turns,
@@ -479,21 +458,48 @@ fn concurrent_active_sessions() {
             "idle_rss_kib": settled["rss_kib"],
             "idle_threads": settled["thread_count"],
             "idle_cpu_ms": cpu(&settled, &idle),
-            "allocator": sys::Global::NAME,
-            "peak_kib": peak(&settled),
+            // Lifetime peaks: the resident set (Linux, Windows) or footprint (macOS).
+            "peak_kib": settled.get("peak_rss_kib").or(settled.get("peak_footprint_kib")),
             "idle_footprint_kib": settled.get("footprint_kib"),
-            "release_ms": release_ms,
-            "released_rss_kib": released["rss_kib"],
-            "released_footprint_kib": released.get("footprint_kib"),
-            "detached_rss_kib": detached["rss_kib"],
-            "detached_released_rss_kib": detached_released["rss_kib"],
-            "detached_released_footprint_kib": detached_released.get("footprint_kib"),
-        })
-    );
+    });
+    record.as_object_mut().unwrap().extend(rest);
+    println!("{record}");
     eprintln!("bench: measured");
     drop(daemon);
     runtime.shutdown();
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// What the allocator hands back at rest, then once every client has
+/// detached (`release` lets them go).
+fn at_rest(
+    release: std::sync::mpsc::Sender<()>,
+    clients: Vec<std::thread::JoinHandle<()>>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let releasing = Instant::now();
+    sys::release();
+    let release_ms = releasing.elapsed().as_secs_f64() * 1000.0;
+    let released = usage();
+    drop(release);
+    for client in clients {
+        client.join().unwrap();
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let detached = usage();
+    sys::release();
+    let detached_released = usage();
+    let serde_json::Value::Object(rest) = json!({
+        "allocator": sys::Global::NAME,
+        "release_ms": release_ms,
+        "released_rss_kib": released["rss_kib"],
+        "released_footprint_kib": released.get("footprint_kib"),
+        "detached_rss_kib": detached["rss_kib"],
+        "detached_released_rss_kib": detached_released["rss_kib"],
+        "detached_released_footprint_kib": detached_released.get("footprint_kib"),
+    }) else {
+        unreachable!("an object literal")
+    };
+    rest
 }
 
 /// Each delta's latency, provider write to client read, in milliseconds;
