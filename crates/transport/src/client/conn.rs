@@ -2,22 +2,20 @@
 //! under TLS for https. Every operation waits for readiness on the reactor
 //! instead of holding a thread, and dropping a connection closes it.
 
-#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-use std::io::Write as _;
+use std::future::Future;
 use std::io::{self, Read as _};
 use std::net::{SocketAddr, TcpStream};
-#[cfg(feature = "tls-rustls")]
-use std::sync::Arc;
-#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-use std::sync::OnceLock;
+use std::pin::Pin;
+use std::task::Poll;
 use std::time::Duration;
 
-use super::proxy::Proxy;
+use super::proxy::Proxies;
+use super::tls;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[cfg(all(feature = "tls-native", feature = "tls-rustls"))]
-compile_error!("one TLS provider: tls-native or tls-rustls");
+/// How long an attempt runs alone before the next address is tried beside
+/// it (RFC 8305's recommended connection attempt delay).
+const STAGGER: Duration = Duration::from_millis(250);
 
 /// Where a request goes: a pool key, and what a new connection dials.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,15 +30,16 @@ impl TryFrom<&http::Uri> for Target {
     type Error = io::Error;
 
     fn try_from(uri: &http::Uri) -> io::Result<Self> {
+        let invalid = |what| io::Error::new(io::ErrorKind::InvalidInput, format!("{what}: {uri}"));
         let https = match uri.scheme_str() {
             Some("https") => true,
             Some("http") => false,
-            _ => return Err(invalid(format!("not an http(s) URL: {uri}"))),
+            _ => return Err(invalid("not an http(s) URL")),
         };
         let host = uri
             .host()
             .filter(|host| !host.is_empty())
-            .ok_or_else(|| invalid(format!("no host in {uri}")))?;
+            .ok_or_else(|| invalid("no host"))?;
         Ok(Self {
             https,
             host: host.to_owned(),
@@ -51,33 +50,35 @@ impl TryFrom<&http::Uri> for Target {
 
 pub(super) enum Conn {
     Plain(rt::Async<TcpStream>),
-    #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-    Tls(Box<Secure>),
+    Tls(tls::Stream),
 }
 
 impl Conn {
-    /// Dials `target`, through `proxy` unless it is bypassed, within the
+    /// Dials `target`, through its proxy unless it is bypassed, within the
     /// connect timeout.
     pub async fn open(
         rt: &rt::Rt,
         target: &Target,
-        proxy: Option<&Proxy>,
-        tls: &Tls,
+        proxies: &Proxies,
+        tls: &tls::Config,
     ) -> io::Result<Self> {
         let opening = async {
-            let proxy = proxy.filter(|proxy| proxy.applies_to(&target.host));
+            let proxy = proxies.route(target)?;
             let (host, port) = proxy.map_or((target.host.as_str(), target.port), |proxy| {
                 (proxy.host.as_str(), proxy.port)
             });
             let addrs = rt::resolve(&**rt, host, port).await?;
-            let socket = dial(rt, &addrs).await?;
+            let socket = dial(rt, interleaved(addrs)).await?;
+            socket.get_ref().set_nodelay(true)?;
+            sys::net::keep_alive(socket.get_ref())?;
             if let Some(proxy) = proxy {
                 proxy.tunnel(&socket, target).await?;
             }
-            if target.https {
-                return tls.wrap(&target.host, socket).await;
-            }
-            Ok(Self::Plain(socket))
+            Ok(if target.https {
+                Self::Tls(tls.connect(&target.host, socket).await?)
+            } else {
+                Self::Plain(socket)
+            })
         };
         rt::or(opening, async {
             rt.sleep(CONNECT_TIMEOUT).await;
@@ -92,25 +93,14 @@ impl Conn {
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Plain(socket) => socket.read_with(|mut socket| socket.read(buf)).await,
-            #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-            Self::Tls(tls) => retry(tls, |tls| tls.read(buf)).await,
+            Self::Tls(tls) => tls.read(buf).await,
         }
     }
 
     pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         match self {
             Self::Plain(socket) => socket.write_all(bytes).await,
-            #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-            Self::Tls(tls) => {
-                let mut bytes = bytes;
-                while !bytes.is_empty() {
-                    match retry(tls, |tls| tls.write(bytes)).await? {
-                        0 => return Err(io::ErrorKind::WriteZero.into()),
-                        n => bytes = &bytes[n..],
-                    }
-                }
-                retry(tls, io::Write::flush).await
-            }
+            Self::Tls(tls) => tls.write_all(bytes).await,
         }
     }
 
@@ -119,217 +109,119 @@ impl Conn {
     pub fn is_reusable(&self) -> bool {
         let socket = match self {
             Self::Plain(socket) => socket.get_ref(),
-            #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-            Self::Tls(tls) => tls.io().socket.get_ref(),
+            Self::Tls(tls) => tls.socket(),
         };
         matches!(socket.peek(&mut [0]), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
     }
 }
 
-/// The first address that answers, each given an equal share of the
-/// budget so one that never does leaves time for the next.
-async fn dial(rt: &rt::Rt, addrs: &[SocketAddr]) -> io::Result<rt::Async<TcpStream>> {
-    let reactor = rt.reactor();
-    let each = CONNECT_TIMEOUT / u32::try_from(addrs.len()).unwrap_or(u32::MAX).max(1);
-    let mut last = io::Error::from(io::ErrorKind::ConnectionRefused);
-    for &addr in addrs {
-        let attempt = rt::or(rt::Async::<TcpStream>::connect(&reactor, addr), async {
-            rt.sleep(each).await;
-            Err(io::ErrorKind::TimedOut.into())
-        });
-        match attempt.await {
-            Ok(socket) => {
-                socket.get_ref().set_nodelay(true)?;
-                return Ok(socket);
-            }
-            Err(error) => last = error,
-        }
-    }
-    Err(last)
-}
-
-pub(super) fn invalid(message: String) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
-}
-
-/// How TLS reaches the socket: the TLS library's blocking-style calls over
-/// a non-blocking socket, which report would-block in the direction the
-/// socket refused, so the call waits for that readiness and is retried.
-#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-pub(super) struct Io {
-    socket: rt::Async<TcpStream>,
-    wants: Direction,
-}
-
-#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-#[derive(Clone, Copy)]
-enum Direction {
-    Read,
-    Write,
-}
-
-#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-impl Io {
-    fn new(socket: rt::Async<TcpStream>) -> Self {
-        Self {
-            socket,
-            wants: Direction::Read,
-        }
-    }
-
-    async fn ready(&self) {
-        match self.wants {
-            Direction::Read => self.socket.readable().await,
-            Direction::Write => self.socket.writable().await,
-        }
-    }
-
-    fn note<T>(&mut self, wants: Direction, result: io::Result<T>) -> io::Result<T> {
-        if matches!(&result, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
-            self.wants = wants;
-        }
-        result
-    }
-}
-
-#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-impl io::Read for Io {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let result = self.socket.get_ref().read(buf);
-        self.note(Direction::Read, result)
-    }
-}
-
-#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-impl io::Write for Io {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let result = self.socket.get_ref().write(buf);
-        self.note(Direction::Write, result)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-async fn retry<R>(
-    tls: &mut Secure,
-    mut op: impl FnMut(&mut Secure) -> io::Result<R>,
-) -> io::Result<R> {
+/// The resolver's order with the address families alternating from its
+/// first choice on (RFC 8305 §4), so an unreachable family costs one
+/// stagger rather than all its addresses.
+fn interleaved(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let Some(first) = addrs.first().map(SocketAddr::is_ipv6) else {
+        return addrs;
+    };
+    let (mut preferred, mut other): (Vec<_>, Vec<_>) =
+        addrs.into_iter().partition(|addr| addr.is_ipv6() == first);
+    let (mut preferred, mut other) = (preferred.drain(..), other.drain(..));
+    let mut order = Vec::with_capacity(preferred.len() + other.len());
     loop {
-        match op(tls) {
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => tls.io().ready().await,
-            result => return result,
+        match (preferred.next(), other.next()) {
+            (None, None) => return order,
+            (a, b) => order.extend(a.into_iter().chain(b)),
         }
     }
 }
 
-#[cfg(feature = "tls-native")]
-pub(super) type Secure = native_tls::TlsStream<Io>;
+type Attempt = Pin<Box<dyn Future<Output = io::Result<rt::Async<TcpStream>>> + Send>>;
 
-#[cfg(feature = "tls-rustls")]
-pub(super) type Secure = rustls::StreamOwned<rustls::ClientConnection, Io>;
-
-#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-trait Socket {
-    fn io(&self) -> &Io;
-}
-
-#[cfg(feature = "tls-native")]
-impl Socket for Secure {
-    fn io(&self) -> &Io {
-        self.get_ref()
-    }
-}
-
-#[cfg(feature = "tls-rustls")]
-impl Socket for Secure {
-    fn io(&self) -> &Io {
-        &self.sock
-    }
-}
-
-/// The TLS configuration, built on the first https connection: loading
-/// trust settings costs memory a plain-http process never needs.
-#[derive(Default)]
-pub(super) struct Tls {
-    #[cfg(feature = "tls-native")]
-    config: OnceLock<native_tls::TlsConnector>,
-    #[cfg(feature = "tls-rustls")]
-    config: OnceLock<Arc<rustls::ClientConfig>>,
-}
-
-impl Tls {
-    #[cfg(not(any(feature = "tls-native", feature = "tls-rustls")))]
-    #[expect(
-        clippy::unused_self,
-        reason = "the TLS variants keep their configuration"
-    )]
-    fn wrap(
-        &self,
-        _: &str,
-        _: rt::Async<TcpStream>,
-    ) -> impl Future<Output = io::Result<Conn>> + use<> {
-        std::future::ready(Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "https needs a TLS feature (tls-native or tls-rustls)",
-        )))
-    }
-
-    #[cfg(feature = "tls-native")]
-    async fn wrap(&self, host: &str, socket: rt::Async<TcpStream>) -> io::Result<Conn> {
-        let connector = if let Some(connector) = self.config.get() {
-            connector
-        } else {
-            let connector = native_tls::TlsConnector::new().map_err(io::Error::other)?;
-            self.config.get_or_init(|| connector)
-        };
-        let mut handshake = connector.connect(unbracketed(host), Io::new(socket));
+/// Happy Eyeballs (RFC 8305 §5): one attempt at a time in `addrs` order,
+/// each next one started when the last fails or after [`STAGGER`],
+/// whichever is first; the first to connect wins and the rest are dropped.
+async fn dial(rt: &rt::Rt, addrs: Vec<SocketAddr>) -> io::Result<rt::Async<TcpStream>> {
+    let reactor = rt.reactor();
+    let mut addrs = addrs.into_iter();
+    let mut running: Vec<Attempt> = Vec::new();
+    let mut stagger: Option<rt::BoxFuture<'static, ()>> = None;
+    let mut last = io::Error::from(io::ErrorKind::ConnectionRefused);
+    // Start the next attempt at once: at first, and when one fails.
+    let mut now = true;
+    std::future::poll_fn(|cx| {
         loop {
-            match handshake {
-                Ok(tls) => return Ok(Conn::Tls(Box::new(tls))),
-                Err(native_tls::HandshakeError::WouldBlock(mid)) => {
-                    mid.get_ref().ready().await;
-                    handshake = mid.handshake();
-                }
-                Err(native_tls::HandshakeError::Failure(error)) => {
-                    return Err(io::Error::other(error));
+            let due = std::mem::take(&mut now)
+                || stagger
+                    .as_mut()
+                    .is_some_and(|stagger| stagger.as_mut().poll(cx).is_ready());
+            if due {
+                stagger = None;
+                match addrs.next() {
+                    Some(addr) => {
+                        let reactor = reactor.clone();
+                        running.push(Box::pin(async move {
+                            rt::Async::<TcpStream>::connect(&reactor, addr).await
+                        }));
+                        stagger = Some(rt.sleep(STAGGER));
+                    }
+                    None if running.is_empty() => {
+                        let refused = io::ErrorKind::ConnectionRefused.into();
+                        return Poll::Ready(Err(std::mem::replace(&mut last, refused)));
+                    }
+                    None => {}
                 }
             }
-        }
-    }
-
-    #[cfg(feature = "tls-rustls")]
-    async fn wrap(&self, host: &str, socket: rt::Async<TcpStream>) -> io::Result<Conn> {
-        let config = if let Some(config) = self.config.get() {
-            config
-        } else {
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let config = rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .and_then(rustls_platform_verifier::BuilderVerifierExt::with_platform_verifier)
-                .map_err(io::Error::other)?
-                .with_no_client_auth();
-            self.config.get_or_init(|| Arc::new(config))
-        };
-        let name = rustls::pki_types::ServerName::try_from(unbracketed(host).to_owned())
-            .map_err(|error| invalid(format!("{host}: {error}")))?;
-        let session =
-            rustls::ClientConnection::new(Arc::clone(config), name).map_err(io::Error::other)?;
-        let mut tls = rustls::StreamOwned::new(session, Io::new(socket));
-        while tls.conn.is_handshaking() {
-            match tls.conn.complete_io(&mut tls.sock) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => tls.sock.ready().await,
-                Err(e) => return Err(e),
+            let mut at = 0;
+            while at < running.len() {
+                match running[at].as_mut().poll(cx) {
+                    Poll::Ready(Ok(socket)) => return Poll::Ready(Ok(socket)),
+                    Poll::Ready(Err(error)) => {
+                        last = error;
+                        drop(running.swap_remove(at));
+                        now = true;
+                    }
+                    Poll::Pending => at += 1,
+                }
+            }
+            // A new stagger is polled once to arm it before waiting.
+            if !now && !due {
+                return Poll::Pending;
             }
         }
-        Ok(Conn::Tls(Box::new(tls)))
-    }
+    })
+    .await
 }
 
-#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-fn unbracketed(host: &str) -> &str {
-    host.trim_start_matches('[').trim_end_matches(']')
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_families_alternate_from_the_resolver_s_first() {
+        let v6 = |n: u16| SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, n], 443));
+        let v4 = |n: u8| SocketAddr::from(([10, 0, 0, n], 443));
+        assert_eq!(
+            interleaved(vec![v6(1), v6(2), v6(3), v4(1)]),
+            [v6(1), v4(1), v6(2), v6(3)]
+        );
+        assert_eq!(
+            interleaved(vec![v4(1), v4(2), v6(1), v6(2)]),
+            [v4(1), v6(1), v4(2), v6(2)]
+        );
+    }
+
+    /// An address that never answers holds a connection back by one
+    /// stagger, not the connect timeout.
+    #[test]
+    fn an_unanswering_address_delays_the_next_by_one_stagger() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let reachable = listener.local_addr().unwrap();
+        // TEST-NET-1 (RFC 5737): nothing answers; a host without a route
+        // fails it at once, which is the same as far as the order goes.
+        let silent = SocketAddr::from(([192, 0, 2, 1], 9));
+        let rt: rt::Rt = std::sync::Arc::new(rt::Threads::new(1));
+        let started = std::time::Instant::now();
+        let socket = rt::block_on(dial(&rt, vec![silent, reachable])).unwrap();
+        assert_eq!(socket.get_ref().peer_addr().unwrap(), reachable);
+        assert!(started.elapsed() < STAGGER * 4, "{:?}", started.elapsed());
+    }
 }

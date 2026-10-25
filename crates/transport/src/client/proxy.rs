@@ -1,6 +1,9 @@
-//! An HTTP CONNECT proxy from the environment, as ureq read it:
-//! `ALL_PROXY`, then `HTTPS_PROXY`, then `HTTP_PROXY` (either case) for
-//! every request, minus the hosts `NO_PROXY` names.
+//! The HTTP CONNECT proxies the environment names, read as curl reads
+//! them: `https_proxy` (or `HTTPS_PROXY`) for https and `http_proxy` for
+//! http, each falling back to `all_proxy` (or `ALL_PROXY`); `NO_PROXY`
+//! (or `no_proxy`) names the hosts that go direct. Upper-case
+//! `HTTP_PROXY` is ignored, as curl ignores it: a CGI server sets it from
+//! a request's `Proxy:` header.
 
 use std::fmt::Write as _;
 use std::io::{self, Read as _};
@@ -8,24 +11,26 @@ use std::net::TcpStream;
 
 use base64::Engine as _;
 
-use super::conn::{Target, invalid};
+use super::conn::Target;
 
-const VARS: [&str; 6] = [
-    "ALL_PROXY",
-    "all_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "HTTP_PROXY",
-    "http_proxy",
-];
+#[derive(Debug, Default)]
+pub(super) struct Proxies {
+    http: Option<Setting>,
+    https: Option<Setting>,
+    bypass: Vec<Bypass>,
+}
 
-#[derive(Debug)]
+/// A proxy the environment names: one this client cannot speak (https or
+/// SOCKS) fails each request that would go through it, never a silent
+/// bypass.
+type Setting = Result<Proxy, (io::ErrorKind, String)>;
+
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct Proxy {
     pub host: String,
     pub port: u16,
     /// A `Proxy-Authorization` value, from the URL's user and password.
     authorization: Option<String>,
-    bypass: Vec<Bypass>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,56 +43,73 @@ enum Bypass {
     Prefix(String),
 }
 
-impl Proxy {
-    /// The proxy the environment names. One it names but this client
-    /// cannot speak (https or SOCKS) is an error, never a silent bypass.
-    pub fn from_env() -> io::Result<Option<Self>> {
-        let Some(url) = VARS.iter().find_map(|var| std::env::var(var).ok()) else {
-            return Ok(None);
-        };
-        let bypass = ["NO_PROXY", "no_proxy"]
-            .iter()
-            .find_map(|var| std::env::var(var).ok())
-            .map_or_else(Vec::new, |list| {
-                list.split(',').filter_map(Bypass::parse).collect()
-            });
-        Self::parse(&url, bypass).map(Some)
+impl Proxies {
+    pub fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
     }
 
-    fn parse(url: &str, bypass: Vec<Bypass>) -> io::Result<Self> {
+    fn from_lookup(var: impl Fn(&str) -> Option<String>) -> Self {
+        let first = |names: &[&str]| names.iter().find_map(|name| var(name));
+        let all = first(&["all_proxy", "ALL_PROXY"]);
+        let setting = |url: Option<String>| {
+            url.or_else(|| all.clone())
+                .map(|url| Proxy::parse(&url).map_err(|e| (e.kind(), e.to_string())))
+        };
+        Self {
+            http: setting(first(&["http_proxy"])),
+            https: setting(first(&["https_proxy", "HTTPS_PROXY"])),
+            bypass: first(&["NO_PROXY", "no_proxy"]).map_or_else(Vec::new, |list| {
+                list.split(',').filter_map(Bypass::parse).collect()
+            }),
+        }
+    }
+
+    /// The proxy a request to `target` goes through, if any.
+    pub fn route(&self, target: &Target) -> io::Result<Option<&Proxy>> {
+        let setting = if target.https { &self.https } else { &self.http };
+        let Some(setting) = setting else {
+            return Ok(None);
+        };
+        let host = target.host.to_ascii_lowercase();
+        if self.bypass.iter().any(|bypass| bypass.matches(&host)) {
+            return Ok(None);
+        }
+        setting
+            .as_ref()
+            .map(Some)
+            .map_err(|(kind, message)| io::Error::new(*kind, message.clone()))
+    }
+}
+
+impl Proxy {
+    fn parse(url: &str) -> io::Result<Self> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidInput, format!("proxy URL {url}"));
         let url = if url.contains("://") {
             url.to_owned()
         } else {
             format!("http://{url}")
         };
-        let uri: http::Uri = url
-            .parse()
-            .map_err(|_| invalid(format!("proxy URL {url}")))?;
+        let uri: http::Uri = url.parse().map_err(|_| invalid())?;
         if uri.scheme_str() != Some("http") {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("only http:// proxies are supported: {url}"),
             ));
         }
-        let authority = uri
-            .authority()
-            .ok_or_else(|| invalid(format!("proxy URL {url}")))?;
-        let authorization = authority.as_str().rsplit_once('@').map(|(credentials, _)| {
-            let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
-            let token = base64::prelude::BASE64_STANDARD.encode(format!("{user}:{password}"));
-            format!("Basic {token}")
-        });
+        let authority = uri.authority().ok_or_else(invalid)?;
+        let authorization = authority
+            .as_str()
+            .rsplit_once('@')
+            .map(|(credentials, _)| {
+                let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
+                let token = base64::prelude::BASE64_STANDARD.encode(format!("{user}:{password}"));
+                format!("Basic {token}")
+            });
         Ok(Self {
             host: authority.host().to_owned(),
             port: authority.port_u16().unwrap_or(80),
             authorization,
-            bypass,
         })
-    }
-
-    pub fn applies_to(&self, host: &str) -> bool {
-        let host = host.to_ascii_lowercase();
-        !self.bypass.iter().any(|bypass| bypass.matches(&host))
     }
 
     /// Asks the proxy for a tunnel to `target`; the socket then speaks to
@@ -157,36 +179,77 @@ impl Bypass {
 mod tests {
     use super::*;
 
+    fn proxies(vars: &[(&str, &str)]) -> Proxies {
+        Proxies::from_lookup(|name| {
+            vars.iter()
+                .find(|(var, _)| *var == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+    }
+
+    fn target(https: bool, host: &str) -> Target {
+        Target {
+            https,
+            host: host.to_owned(),
+            port: if https { 443 } else { 80 },
+        }
+    }
+
+    fn via(proxies: &Proxies, https: bool, host: &str) -> Option<String> {
+        proxies
+            .route(&target(https, host))
+            .unwrap()
+            .map(|proxy| format!("{}:{}", proxy.host, proxy.port))
+    }
+
     #[test]
     fn no_proxy_entries_bypass_what_they_name() {
-        let proxy = Proxy::parse(
-            "user:secret@proxy.test:3128",
-            "localhost,*.internal.test,.corp.test,10.*"
-                .split(',')
-                .filter_map(Bypass::parse)
-                .collect(),
-        )
-        .unwrap();
-        assert_eq!((proxy.host.as_str(), proxy.port), ("proxy.test", 3128));
+        let proxies = proxies(&[
+            ("all_proxy", "user:secret@proxy.test:3128"),
+            ("NO_PROXY", "localhost,*.internal.test,.corp.test,10.*"),
+        ]);
         assert_eq!(
-            proxy.authorization.as_deref(),
-            Some("Basic dXNlcjpzZWNyZXQ=")
+            proxies.route(&target(true, "api.openai.com")).unwrap(),
+            Some(&Proxy {
+                host: "proxy.test".to_owned(),
+                port: 3128,
+                authorization: Some("Basic dXNlcjpzZWNyZXQ=".to_owned()),
+            })
         );
         for host in ["LOCALHOST", "a.internal.test", "b.corp.test", "10.1.2.3"] {
-            assert!(!proxy.applies_to(host), "{host}");
+            assert_eq!(via(&proxies, true, host), None, "{host}");
         }
-        for host in ["api.openai.com", "corp.test.evil", "110.1.2.3"] {
-            assert!(proxy.applies_to(host), "{host}");
+        for host in ["corp.test.evil", "110.1.2.3"] {
+            assert!(via(&proxies, true, host).is_some(), "{host}");
         }
     }
 
     #[test]
-    fn a_proxy_this_client_cannot_speak_is_refused() {
+    fn the_scheme_s_own_proxy_wins_over_all_proxy() {
+        let proxies = proxies(&[
+            ("ALL_PROXY", "all.test:1"),
+            ("HTTPS_PROXY", "secure.test:2"),
+            ("HTTP_PROXY", "cgi-header.test:3"),
+        ]);
+        assert_eq!(via(&proxies, true, "a.test").as_deref(), Some("secure.test:2"));
+        // Upper-case HTTP_PROXY is ignored, as curl ignores it.
+        assert_eq!(via(&proxies, false, "a.test").as_deref(), Some("all.test:1"));
+        assert_eq!(
+            via(&self::proxies(&[("http_proxy", "plain.test:4")]), false, "a.test").as_deref(),
+            Some("plain.test:4")
+        );
+        assert_eq!(via(&self::proxies(&[("http_proxy", "plain.test:4")]), true, "a.test"), None);
+    }
+
+    #[test]
+    fn an_unusable_proxy_fails_only_what_would_go_through_it() {
         for url in ["https://proxy.test", "socks5://proxy.test:1080"] {
+            let proxies = proxies(&[("ALL_PROXY", url), ("NO_PROXY", "localhost")]);
             assert_eq!(
-                Proxy::parse(url, Vec::new()).unwrap_err().kind(),
+                proxies.route(&target(true, "api.openai.com")).unwrap_err().kind(),
                 io::ErrorKind::Unsupported
             );
+            assert_eq!(via(&proxies, true, "localhost"), None);
         }
     }
 }

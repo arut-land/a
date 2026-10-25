@@ -5,39 +5,50 @@
 //! as the caller pulls it, so a slow reader holds the peer back rather than
 //! buffering it. Dropping the reply, before its head or during its body,
 //! closes its connection at once: the provider sees the request go away
-//! rather than generating on. A body read to its end returns the
+//! rather than generating on. The chunk that completes a body returns the
 //! connection to the pool.
 
 mod conn;
 mod pool;
 mod proxy;
+mod tls;
 
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::HeaderValue;
-use http::header::{ACCEPT, CONTENT_LENGTH, USER_AGENT};
+use http::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, COOKIE, HeaderName, LOCATION, PROXY_AUTHORIZATION,
+    USER_AGENT,
+};
+use http::{HeaderValue, Method, StatusCode};
 use ureq_proto::BodyMode;
-use ureq_proto::client::state::{Prepare, RecvBody, RecvResponse, Redirect, SendRequest};
+use ureq_proto::client::state::{RecvBody, RecvResponse, SendRequest};
 use ureq_proto::client::{
-    Await100Result, Call, RecvBodyResult, RecvResponseResult, RedirectAuthHeaders,
-    SendRequestResult,
+    Await100Result, Call, RecvBodyResult, RecvResponseResult, SendRequestResult,
 };
 
 use crate::{BoxFuture, Http, HttpClients, Payload, RedirectPolicy, Response};
-use conn::{Conn, Target, Tls};
+use conn::{Conn, Target};
 use pool::Pool;
-use proxy::Proxy;
+use proxy::Proxies;
 
-/// How long to wait for a reply's head: a reasoning model may think for
-/// minutes before its first byte.
-const HEAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long the peer may go silent: before a reply's head (a reasoning
+/// model may think for minutes before its first byte), between a body's
+/// chunks, and while it accepts none of a request. Tests wait seconds.
+const IDLE: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(300)
+};
 const MAX_REDIRECTS: usize = 10;
-/// Reads and decoded chunks are at most this; a reply head may grow the
-/// read buffer to [`MAX_HEAD`].
+/// The read buffer an exchange starts with; a reply head may grow it to
+/// [`MAX_HEAD`].
 const CHUNK: usize = 16 << 10;
 const MAX_HEAD: usize = 64 << 10;
+/// Credentials the provider codecs send, which a redirect to another host
+/// must not carry (`Authorization` never follows a redirect).
+const KEY_HEADERS: [&str; 3] = ["x-api-key", "x-goog-api-key", "api-key"];
 
 #[derive(Clone)]
 pub struct Client(Arc<Shared>);
@@ -50,18 +61,17 @@ struct Shared {
 }
 
 /// What every client of a process shares: read or built once.
+#[derive(Default)]
 struct Setup {
-    /// A proxy the environment names but this client cannot use fails
-    /// every request rather than being bypassed.
-    proxy: Result<Option<Proxy>, (io::ErrorKind, String)>,
-    tls: Tls,
+    proxies: Proxies,
+    tls: tls::Config,
 }
 
 impl Setup {
     fn from_env() -> Arc<Self> {
         Arc::new(Self {
-            proxy: Proxy::from_env().map_err(|error| (error.kind(), error.to_string())),
-            tls: Tls::default(),
+            proxies: Proxies::from_env(),
+            tls: tls::Config::default(),
         })
     }
 }
@@ -90,13 +100,15 @@ impl Http for Client {
 
 enum Exchange {
     Reply(Response),
-    Redirect(Box<Call<Redirect>>),
+    Redirect {
+        status: StatusCode,
+        location: HeaderValue,
+    },
 }
 
 impl Shared {
     async fn send(self: &Arc<Self>, request: http::Request<Payload>) -> io::Result<Response> {
         let (mut parts, mut payload) = request.into_parts();
-        parts.headers.insert(CONTENT_LENGTH, payload.len().into());
         parts
             .headers
             .entry(USER_AGENT)
@@ -108,67 +120,58 @@ impl Shared {
             .headers
             .entry(ACCEPT)
             .or_insert(HeaderValue::from_static("*/*"));
-        let mut call = Call::new(http::Request::from_parts(parts, ())).map_err(protocol)?;
-        // Only the first request carries a body: a redirect that would
-        // resend one is refused by the protocol.
-        let mut redirects = 0;
-        loop {
-            let mut redirect = match self.exchange(call, std::mem::take(&mut payload)).await? {
+        for _ in 0..=MAX_REDIRECTS {
+            // Only the first request carries a body: a redirect that would
+            // resend one is refused.
+            parts = match self.exchange(&parts, std::mem::take(&mut payload)).await? {
                 Exchange::Reply(reply) => return Ok(reply),
-                Exchange::Redirect(redirect) => redirect,
+                Exchange::Redirect { status, location } => redirected(parts, status, &location)?,
             };
-            redirects += 1;
-            if redirects > MAX_REDIRECTS {
-                return Err(io::Error::other("too many redirects"));
-            }
-            call = redirect
-                .as_new_call(RedirectAuthHeaders::Never)
-                .map_err(protocol)?
-                .ok_or_else(|| {
-                    io::Error::other(format!(
-                        "a {} redirect would resend the request body",
-                        redirect.status()
-                    ))
-                })?;
         }
+        Err(io::Error::other("too many redirects"))
     }
 
     async fn exchange(
         self: &Arc<Self>,
-        call: Call<Prepare>,
+        parts: &http::request::Parts,
         payload: Payload,
     ) -> io::Result<Exchange> {
         let follow = matches!(self.redirects, RedirectPolicy::Follow);
-        let target = Target::try_from(call.uri())?;
+        let mut parts = parts.clone();
+        parts
+            .headers
+            .insert(CONTENT_LENGTH, payload.len().into());
+        let target = Target::try_from(&parts.uri)?;
+        let call = Call::new(http::Request::from_parts(parts, ())).map_err(protocol)?;
         let conn = if let Some(conn) = self.pool.take(&target, self.rt.now()) {
             conn
         } else {
-            let proxy = self
-                .setup
-                .proxy
-                .as_ref()
-                .map_err(|(kind, message)| io::Error::new(*kind, message.clone()))?;
-            Conn::open(&self.rt, &target, proxy.as_ref(), &self.setup.tls).await?
+            Conn::open(&self.rt, &target, &self.setup.proxies, &self.setup.tls).await?
         };
-        let mut wire = Wire::new(conn);
+        let mut wire = Wire::new(conn, Arc::clone(&self.rt));
         let call = wire.send(call.proceed(), &payload).await?;
-        let (head, next) = rt::or(wire.head(call, follow), async {
-            self.rt.sleep(HEAD_TIMEOUT).await;
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timed out waiting for a reply",
-            ))
-        })
-        .await?;
+        let (head, next) = wire.head(call, follow).await?;
+        let redirect = |head: &http::response::Parts| {
+            let location = head.headers.get(LOCATION).cloned().ok_or_else(|| {
+                io::Error::other(format!("a {} redirect without a location", head.status))
+            })?;
+            Ok(Exchange::Redirect {
+                status: head.status,
+                location,
+            })
+        };
         let call = match next {
             RecvResponseResult::RecvBody(call) => call,
             RecvResponseResult::Redirect(call) => {
                 self.release(target, wire, call.must_close_connection());
-                return Ok(if follow {
-                    Exchange::Redirect(Box::new(call))
+                return if follow {
+                    redirect(&head)
                 } else {
-                    Exchange::Reply(http::Response::from_parts(head, crate::body([])))
-                });
+                    Ok(Exchange::Reply(http::Response::from_parts(
+                        head,
+                        crate::body([]),
+                    )))
+                };
             }
             RecvResponseResult::Cleanup(call) => {
                 self.release(target, wire, call.must_close_connection());
@@ -179,18 +182,14 @@ impl Shared {
             }
         };
         let mut reader = Reader {
-            call: Some(call),
-            wire: Some(wire),
+            body: Some((call, wire)),
             closed: false,
-            redirect: None,
             target,
             shared: Arc::clone(self),
         };
-        if follow && head.status.is_redirection() {
+        if follow && head.status.is_redirection() && head.status != StatusCode::NOT_MODIFIED {
             while reader.next().await?.is_some() {}
-            if let Some(redirect) = reader.redirect.take() {
-                return Ok(Exchange::Redirect(Box::new(redirect)));
-            }
+            return redirect(&head);
         }
         Ok(Exchange::Reply(http::Response::from_parts(
             head,
@@ -206,22 +205,87 @@ impl Shared {
     }
 }
 
-/// A connection with its read buffer, for one exchange: an idle pooled
-/// connection holds no buffer.
+/// The request a redirect asks for, by curl's rules: 307 and 308 keep the
+/// method but never resend a body, the others become GET (HEAD stays).
+/// Credentials stay behind: `Authorization` and cookies always, the
+/// providers' key headers when the host changes.
+fn redirected(
+    mut parts: http::request::Parts,
+    status: StatusCode,
+    location: &HeaderValue,
+) -> io::Result<http::request::Parts> {
+    let location = location
+        .to_str()
+        .map_err(|_| io::Error::other("a redirect to a location that is not text"))?;
+    let uri = resolve(&parts.uri, location)?;
+    parts.method = match status {
+        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT => {
+            if matches!(
+                parts.method,
+                Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+            ) {
+                return Err(io::Error::other(format!(
+                    "a {status} redirect would resend the request body"
+                )));
+            }
+            parts.method
+        }
+        _ if parts.method == Method::HEAD => Method::HEAD,
+        _ => Method::GET,
+    };
+    for name in [AUTHORIZATION, PROXY_AUTHORIZATION, COOKIE, CONTENT_LENGTH] {
+        parts.headers.remove(name);
+    }
+    if uri.host() != parts.uri.host() {
+        for name in KEY_HEADERS {
+            parts.headers.remove(HeaderName::from_static(name));
+        }
+    }
+    parts.uri = uri;
+    Ok(parts)
+}
+
+/// `location` against the URI that answered with it.
+fn resolve(base: &http::Uri, location: &str) -> io::Result<http::Uri> {
+    let scheme = base.scheme_str().unwrap_or("https");
+    let authority = base.authority().map_or("", http::uri::Authority::as_str);
+    let absolute = if location.contains("://") {
+        location.to_owned()
+    } else if let Some(rest) = location.strip_prefix("//") {
+        format!("{scheme}://{rest}")
+    } else if location.starts_with('/') {
+        format!("{scheme}://{authority}{location}")
+    } else {
+        let path = base.path();
+        let directory = &path[..path.rfind('/').map_or(0, |at| at + 1)];
+        format!("{scheme}://{authority}{directory}{location}")
+    };
+    absolute
+        .parse()
+        .map_err(|_| io::Error::other(format!("a redirect to {location}, not a URL")))
+}
+
+/// A connection with its buffers, for one exchange: an idle pooled
+/// connection holds none.
 struct Wire {
     conn: Conn,
+    rt: rt::Rt,
     buf: Vec<u8>,
     start: usize,
     end: usize,
+    /// Where a body decodes to before its chunk is copied out at size.
+    out: Vec<u8>,
 }
 
 impl Wire {
-    fn new(conn: Conn) -> Self {
+    fn new(conn: Conn, rt: rt::Rt) -> Self {
         Self {
             conn,
+            rt,
             buf: vec![0; CHUNK],
             start: 0,
             end: 0,
+            out: Vec::new(),
         }
     }
 
@@ -247,11 +311,14 @@ impl Wire {
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "the reply head is too large",
+                    "a reply head or chunk line longer than 64 KiB",
                 ));
             }
         }
-        let n = self.conn.read(&mut self.buf[self.end..]).await?;
+        let Self {
+            conn, rt, buf, end, ..
+        } = self;
+        let n = within(rt, conn.read(&mut buf[*end..]), "waiting for the reply").await?;
         self.end += n;
         Ok(n)
     }
@@ -265,9 +332,10 @@ impl Wire {
         // holds the head on its way out.
         while !call.can_proceed() {
             let n = call.write(&mut self.buf).map_err(protocol)?;
-            self.conn.write_all(&self.buf[..n]).await?;
+            let head = self.conn.write_all(&self.buf[..n]);
+            within(&self.rt, head, "sending the request").await?;
         }
-        let call = match call
+        let mut call = match call
             .proceed()
             .map_err(protocol)?
             .expect("the head is written")
@@ -279,12 +347,11 @@ impl Wire {
             SendRequestResult::SendBody(call) => call,
             SendRequestResult::RecvResponse(call) => return Ok(call),
         };
-        let mut call = call;
         // The body has a length, so its pieces go to the socket as they
         // are, never copied into one buffer.
         for piece in payload.pieces() {
             call.consume_direct_write(piece.len()).map_err(protocol)?;
-            self.conn.write_all(piece).await?;
+            within(&self.rt, self.conn.write_all(piece), "sending the request").await?;
         }
         call.proceed()
             .ok_or_else(|| io::Error::other("the request body is shorter than its length"))
@@ -304,6 +371,10 @@ impl Wire {
                 let next = call.proceed().expect("a parsed reply proceeds");
                 return Ok((reply.into_parts().0, next));
             }
+            // What a 1xx left buffered may already hold the reply.
+            if used > 0 {
+                continue;
+            }
             if self.fill().await? == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -312,17 +383,51 @@ impl Wire {
             }
         }
     }
+
+    /// Decodes what is buffered: the input it used, and the body bytes.
+    fn decode(&mut self, call: &mut Call<RecvBody>) -> io::Result<(usize, Vec<u8>)> {
+        let Self {
+            buf,
+            start,
+            end,
+            out,
+            ..
+        } = self;
+        let input = &buf[*start..*end];
+        // Decoding never lengthens its input, so this much room takes all
+        // of it at once, a body's end included.
+        if out.len() < input.len() {
+            out.resize(input.len(), 0);
+        }
+        let (used, n) = call.read(input, out).map_err(protocol)?;
+        let chunk = out[..n].to_vec();
+        self.consume(used);
+        Ok((used, chunk))
+    }
+}
+
+/// `operation`, unless the peer goes silent for [`IDLE`] first.
+async fn within<T>(
+    rt: &rt::Rt,
+    operation: impl Future<Output = io::Result<T>>,
+    what: &str,
+) -> io::Result<T> {
+    rt::or(operation, async {
+        rt.sleep(IDLE).await;
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("timed out {what}"),
+        ))
+    })
+    .await
 }
 
 /// A reply body, decoded as the caller pulls it.
 struct Reader {
     /// Until the body ends or fails.
-    call: Option<Call<RecvBody>>,
-    wire: Option<Wire>,
+    body: Option<(Call<RecvBody>, Wire)>,
     /// The peer closed its end.
     closed: bool,
-    /// Where a redirect's body, read to its end, points.
-    redirect: Option<Call<Redirect>>,
     target: Target,
     shared: Arc<Shared>,
 }
@@ -330,26 +435,21 @@ struct Reader {
 impl Reader {
     async fn next(&mut self) -> io::Result<Option<Vec<u8>>> {
         loop {
-            let (Some(call), Some(wire)) = (self.call.as_mut(), self.wire.as_mut()) else {
+            let Some((call, wire)) = self.body.as_mut() else {
                 return Ok(None);
             };
-            let complete = match call.body_mode() {
-                BodyMode::NoBody => true,
-                BodyMode::LengthDelimited(_) | BodyMode::Chunked => call.can_proceed(),
-                BodyMode::CloseDelimited => false,
-            };
-            if complete {
+            if complete(call) {
                 self.finish()?;
                 return Ok(None);
             }
             if !wire.input().is_empty() {
-                // Decoding never lengthens what it reads, so a chunk sized
-                // to its input holds no more than a few bytes of framing.
-                let mut chunk = vec![0; wire.input().len()];
-                let (used, n) = call.read(wire.input(), &mut chunk).map_err(protocol)?;
-                wire.consume(used);
-                if n > 0 {
-                    chunk.truncate(n);
+                let (used, chunk) = wire.decode(call)?;
+                if !chunk.is_empty() {
+                    // A caller that stops at the last event, as a model
+                    // stream does, still leaves the connection for the next.
+                    if complete(call) {
+                        self.finish()?;
+                    }
                     return Ok(Some(chunk));
                 }
                 if used > 0 {
@@ -379,8 +479,7 @@ impl Reader {
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        let call = self.call.take().expect("a body being read");
-        let wire = self.wire.take().expect("a body being read");
+        let (call, wire) = self.body.take().expect("a body being read");
         if !call.can_proceed() {
             // `0\r\n` then the peer's close: the whole body arrived, but
             // the connection is done.
@@ -393,11 +492,7 @@ impl Reader {
             ));
         }
         let close = match call.proceed().expect("a complete body proceeds") {
-            RecvBodyResult::Redirect(redirect) => {
-                let close = redirect.must_close_connection();
-                self.redirect = Some(redirect);
-                close
-            }
+            RecvBodyResult::Redirect(redirect) => redirect.must_close_connection(),
             RecvBodyResult::Cleanup(cleanup) => cleanup.must_close_connection(),
         };
         self.shared
@@ -406,20 +501,27 @@ impl Reader {
     }
 
     fn into_body(self) -> crate::Body {
-        Box::pin(futures_lite::stream::unfold(
-            self,
-            |mut reader| async move {
-                match reader.next().await {
-                    Ok(Some(chunk)) => Some((Ok(chunk), reader)),
-                    Ok(None) => None,
-                    Err(error) => {
-                        // A failed body ends here, and its connection with it.
-                        (reader.call, reader.wire) = (None, None);
-                        Some((Err(error), reader))
-                    }
+        Box::pin(futures_lite::stream::unfold(self, |mut reader| async move {
+            match reader.next().await {
+                Ok(Some(chunk)) => Some((Ok(chunk), reader)),
+                Ok(None) => None,
+                Err(error) => {
+                    // A failed body ends here, and its connection with it.
+                    reader.body = None;
+                    Some((Err(error), reader))
                 }
-            },
-        ))
+            }
+        }))
+    }
+}
+
+/// Whether the body has all arrived: a close-delimited one never has
+/// until the peer closes.
+fn complete(call: &Call<RecvBody>) -> bool {
+    match call.body_mode() {
+        BodyMode::NoBody => true,
+        BodyMode::LengthDelimited(_) | BodyMode::Chunked => call.can_proceed(),
+        BodyMode::CloseDelimited => false,
     }
 }
 

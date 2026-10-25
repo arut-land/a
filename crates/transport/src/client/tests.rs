@@ -58,7 +58,7 @@ fn request(port: u16) -> http::Request<Payload> {
 }
 
 /// Reads one request's head and body off `reader`.
-fn read_request(reader: &mut BufReader<TcpStream>) -> String {
+fn read_request(reader: &mut impl BufRead) -> String {
     let mut headers = String::new();
     let mut length = 0;
     loop {
@@ -379,4 +379,209 @@ fn credentials_never_cross_transport_scopes() {
         assert!(next_chunk(&mut body).is_none());
     }
     server.join().unwrap();
+}
+
+/// A body read in one call to its last chunk, then dropped, as a model
+/// stream drops its reply at the last event: the connection still carries
+/// the next request.
+#[test]
+fn a_reply_left_at_its_last_chunk_leaves_its_connection_to_the_next() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        for _ in 0..2 {
+            read_request(&mut reader);
+            (&stream)
+                .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+                .unwrap();
+        }
+    });
+    let http = client();
+    for _ in 0..2 {
+        let reply = rt::block_on(http.send(request(port))).unwrap();
+        let mut body = reply.into_body();
+        assert_eq!(&next_chunk(&mut body).unwrap().unwrap()[..], b"hello");
+    }
+    server.join().unwrap();
+}
+
+#[test]
+fn a_reply_after_an_informational_one_in_the_same_read_is_not_waited_for() {
+    let (port, _, _) = server(
+        b"HTTP/1.1 103 Early Hints\r\nlink: </style.css>\r\n\r\n\
+          HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+    );
+    let started = Instant::now();
+    let reply = rt::block_on(client().send(request(port))).unwrap();
+    assert_eq!(reply.status(), 200);
+    assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
+    let mut body = reply.into_body();
+    assert_eq!(&next_chunk(&mut body).unwrap().unwrap()[..], b"ok");
+}
+
+#[test]
+fn a_reply_gone_silent_between_chunks_times_out() {
+    let (port, _, _) = server(
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
+    );
+    let reply = rt::block_on(client().send(request(port))).unwrap();
+    let mut body = reply.into_body();
+    assert_eq!(&next_chunk(&mut body).unwrap().unwrap()[..], b"hello");
+    let started = Instant::now();
+    let error = next_chunk(&mut body).unwrap().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(started.elapsed() >= IDLE);
+}
+
+/// Provider keys follow a redirect within the host and stay behind when it
+/// leaves; `Authorization` never follows.
+#[test]
+fn a_redirect_to_another_host_drops_the_provider_key() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let headers = read_request(&mut reader);
+            let reply = if headers.starts_with("get /same") {
+                format!("HTTP/1.1 302 Found\r\nlocation: http://localhost:{port}/other\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            } else if headers.starts_with("get /other") {
+                "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+            } else {
+                "HTTP/1.1 303 See Other\r\nlocation: /same\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+            };
+            (&stream).write_all(reply.as_bytes()).unwrap();
+            seen.push(headers);
+        }
+        seen
+    });
+    // `localhost` is a name, looked up on the network lane.
+    let http = Client::new(Arc::new(rt::Threads::new(1)), RedirectPolicy::Follow);
+    let mut request = request(port);
+    for (name, value) in [("x-api-key", "key"), ("authorization", "Bearer key")] {
+        request
+            .headers_mut()
+            .insert(name, value.parse().unwrap());
+    }
+    let reply = rt::block_on(http.send(request)).unwrap();
+    assert_eq!(reply.status(), 200);
+    let seen = server.join().unwrap();
+    assert!(seen[0].contains("x-api-key: key") && seen[0].contains("authorization"));
+    assert!(seen[1].contains("x-api-key: key"), "{}", seen[1]);
+    assert!(!seen[1].contains("authorization"), "{}", seen[1]);
+    assert!(!seen[2].contains("x-api-key"), "{}", seen[2]);
+}
+
+#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
+mod tls_data {
+    use super::*;
+
+    const CERT: &[u8] = include_bytes!("testdata/localhost.pem");
+    const KEY: &[u8] = include_bytes!("testdata/localhost.key");
+
+    trait Duplex: Read + Write {}
+    impl<T: Read + Write> Duplex for T {}
+
+    #[cfg(feature = "tls-native")]
+    fn accept(tcp: TcpStream) -> Box<dyn Duplex> {
+        let identity = native_tls::Identity::from_pkcs8(CERT, KEY).unwrap();
+        Box::new(
+            native_tls::TlsAcceptor::new(identity)
+                .unwrap()
+                .accept(tcp)
+                .unwrap(),
+        )
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    fn accept(tcp: TcpStream) -> Box<dyn Duplex> {
+        use rustls::pki_types::pem::PemObject as _;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let chain = CertificateDer::pem_slice_iter(CERT)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(KEY).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+        let session = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+        Box::new(rustls::StreamOwned::new(session, tcp))
+    }
+
+    fn trusting() -> Client {
+        let mut tls = tls::Config::default();
+        tls.trusted = Some(CERT.to_vec());
+        let setup = Setup {
+            proxies: Proxies::default(),
+            tls,
+        };
+        Client::with(
+            Arc::new(Unblocked(rt::Threads::new(1))),
+            RedirectPolicy::Follow,
+            Arc::new(setup),
+        )
+    }
+
+    /// A peer reading slower than the client writes refuses writes for a
+    /// while; every byte still reaches it, and the reply comes back.
+    #[test]
+    fn a_large_body_reaches_a_slow_reading_tls_peer_whole() {
+        const BODY: usize = 8 << 20;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut tls = BufReader::new(accept(tcp));
+            let mut line = String::new();
+            while line != "\r\n" {
+                line.clear();
+                tls.read_line(&mut line).unwrap();
+            }
+            let mut received = 0;
+            let mut buf = vec![0; 64 << 10];
+            while received < BODY {
+                let n = tls.read(&mut buf).unwrap();
+                assert!(n > 0, "the client stopped after {received} bytes");
+                received += n;
+                thread::sleep(Duration::from_millis(1));
+            }
+            let text = received.to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{text}",
+                text.len()
+            );
+            let mut tls = tls.into_inner();
+            tls.write_all(reply.as_bytes()).unwrap();
+            tls.flush().unwrap();
+            // Until the client has read the reply.
+            let _ = tls.read(&mut buf);
+        });
+        let request = http::Request::post(format!("https://localhost:{port}/v1/responses"))
+            .body(vec![b'x'; BODY].into())
+            .unwrap();
+        // `localhost` would be looked up on the blocking lane: dial the
+        // literal the certificate also names.
+        let request = {
+            let (mut parts, body) = request.into_parts();
+            parts.uri = format!("https://127.0.0.1:{port}/v1/responses").parse().unwrap();
+            http::Request::from_parts(parts, body)
+        };
+        let reply = rt::block_on(trusting().send(request)).unwrap();
+        assert_eq!(reply.status(), 200);
+        let mut body = reply.into_body();
+        assert_eq!(
+            next_chunk(&mut body).unwrap().unwrap(),
+            BODY.to_string().into_bytes()
+        );
+        server.join().unwrap();
+    }
 }

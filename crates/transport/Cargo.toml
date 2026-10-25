@@ -7,7 +7,7 @@ publish.workspace = true
 [features]
 # The HTTP/1.1 client, async over the `rt` reactor; with neither TLS feature
 # it speaks plain http only.
-client = ["dep:rt", "dep:ureq-proto", "dep:base64", "dep:futures-lite"]
+client = ["dep:rt", "dep:sys", "dep:ureq-proto", "dep:base64", "dep:futures-lite"]
 # Binaries select TLS features; this library makes no platform choice.
 # Host crypto and trust (Security.framework, SChannel, OpenSSL), without a
 # bundled crypto implementation or certificate bundle.
@@ -26,6 +26,8 @@ native-tls = { version = "0.2.14", default-features = false, optional = true }
 rt = { workspace = true, optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }
 rustls-platform-verifier = { version = "0.7", default-features = false, optional = true }
+# TCP keep-alive.
+sys = { workspace = true, optional = true }
 # HTTP/1.1 as a sans-IO state machine: the protocol ureq runs, driven here
 # over non-blocking sockets.
 ureq-proto = { version = "0.6.5", default-features = false, features = ["client"], optional = true }
