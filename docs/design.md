@@ -405,7 +405,7 @@ meanwhile. Queries come from the daemon's linked registry, not a
 workspace's generation layers.
 `WorkspaceShared<T>` keeps one value per workspace, made on first use and
 dropped with its last user; the generation `Coordinator` holds its
-workspaces in one, and a workspace index will be another.
+workspaces in one, and [`ext-index`](ext-index.md) its workspace indexes.
 
 `Built<L>` checks typed Rust needs and provides at compile time;
 `Configured` lets each extension read its own settings table. Dynamic
@@ -434,6 +434,7 @@ The linked extensions own:
 | `ext-subagent` | `task` over owned child sessions |
 | `ext-title` | Titles from a side model call |
 | `ext-spill` | Long tool results shown as their ends and where the whole is |
+| `ext-index` | One file index per workspace: `files.search`, `files.grep`, `glob`, `grep` |
 | `ext-lua` | Optional runtime mods through the erased SDK |
 | `ext-fixtures` | Test-only echo agent and sleep tool |
 

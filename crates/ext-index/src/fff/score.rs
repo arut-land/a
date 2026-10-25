@@ -46,44 +46,58 @@ pub(crate) fn max_typos(query: &FFFQuery<'_>) -> u16 {
     (effective.len() as u16 / 4).clamp(2, 6)
 }
 
-/// The best `limit` of `files` for `query`, best first. A query of
-/// constraints alone lists the files that pass them, most recently
-/// modified first.
-pub(crate) fn search(files: &Files, query: &FFFQuery<'_>, limit: usize) -> Searched {
+/// The live files `query`'s constraints let through.
+pub(crate) fn working(files: &Files, query: &FFFQuery<'_>) -> Vec<usize> {
     let items = files.items();
     let live = (0..items.len()).filter(|&slot| !items[slot].is_deleted());
-    let working = apply_constraints(files, live.clone(), &query.constraints)
-        .unwrap_or_else(|| live.collect());
-    let Some(fuzzy_parts) = fuzzy_parts(query) else {
-        let mut working = working;
-        let total_matched = working.len();
-        let recent = |a: &usize, b: &usize| recent_first(files, &items[*a], &items[*b]);
-        if limit < working.len() {
-            working.select_nth_unstable_by(limit, recent);
-            working.truncate(limit);
-        }
-        working.sort_unstable_by(recent);
-        let items = working
-            .into_iter()
-            .map(|slot| {
-                let score = Score {
-                    match_type: "recent",
-                    ..Score::default()
-                };
-                (slot, score)
-            })
-            .collect();
-        return Searched {
-            items,
-            total_matched,
-        };
-    };
-    let paths: Vec<&str> = working
-        .iter()
-        .map(|&slot| files.path(&items[slot]))
+    apply_constraints(files, live.clone(), &query.constraints).unwrap_or_else(|| live.collect())
+}
+
+/// `slots` scored for `query`'s fuzzy text, the ones it matches; `None`
+/// when it has none. Each slot is scored on its own, so a list may be
+/// scored in parts.
+pub(crate) fn score(
+    files: &Files,
+    slots: &[usize],
+    query: &FFFQuery<'_>,
+) -> Option<Vec<(usize, Score)>> {
+    let fuzzy_parts = fuzzy_parts(query)?;
+    let items = files.items();
+    let paths: Vec<&str> = slots.iter().map(|&slot| files.path(&items[slot])).collect();
+    Some(score_matches(
+        files,
+        slots,
+        &paths,
+        fuzzy_parts,
+        max_typos(query),
+    ))
+}
+
+/// The `limit` most recently modified of `working`: what a query of
+/// constraints alone lists.
+pub(crate) fn recent(files: &Files, mut working: Vec<usize>, limit: usize) -> Searched {
+    let items = files.items();
+    let total_matched = working.len();
+    let recent = |a: &usize, b: &usize| recent_first(files, &items[*a], &items[*b]);
+    if limit < working.len() {
+        working.select_nth_unstable_by(limit, recent);
+        working.truncate(limit);
+    }
+    working.sort_unstable_by(recent);
+    let items = working
+        .into_iter()
+        .map(|slot| {
+            let score = Score {
+                match_type: "recent",
+                ..Score::default()
+            };
+            (slot, score)
+        })
         .collect();
-    let results = score_matches(files, &working, &paths, fuzzy_parts, max_typos(query));
-    sort_and_take(files, results, limit)
+    Searched {
+        items,
+        total_matched,
+    }
 }
 
 fn fuzzy_parts<'q>(query: &'q FFFQuery<'q>) -> Option<&'q [&'q str]> {
@@ -364,7 +378,11 @@ fn is_special_entry_point_file(filename: &str) -> bool {
 
 /// The best `limit` by total, ties to the more recently modified and
 /// then by path, so a page is the same however often it is asked.
-fn sort_and_take(files: &Files, mut results: Vec<(usize, Score)>, limit: usize) -> Searched {
+pub(crate) fn sort_and_take(
+    files: &Files,
+    mut results: Vec<(usize, Score)>,
+    limit: usize,
+) -> Searched {
     let total_matched = results.len();
     let items = files.items();
     let compare = |a: &(usize, Score), b: &(usize, Score)| {
@@ -453,6 +471,39 @@ fn merge_byte_offsets(mut ranges: SmallVec<[(u32, u32); 4]>) -> SmallVec<[(u32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The best `limit` of `files` for `query`, best first, scored whole.
+    fn search(files: &Files, query: &FFFQuery<'_>, limit: usize) -> Searched {
+        let working = working(files, query);
+        match score(files, &working, query) {
+            Some(results) => sort_and_take(files, results, limit),
+            None => recent(files, working, limit),
+        }
+    }
+
+    #[test]
+    fn scored_in_parts_a_search_ranks_as_scored_whole() {
+        let paths: Vec<String> = (0..700)
+            .map(|i| format!("src/m{}/controller_{i}.rs", i % 9))
+            .collect();
+        let files = make_files(&paths.iter().map(String::as_str).collect::<Vec<_>>());
+        let parsed = QueryParser::default().parse("ctrl m3");
+        let working = working(&files, &parsed);
+        let whole = sort_and_take(&files, score(&files, &working, &parsed).unwrap(), 30);
+        let parts = working
+            .chunks(97)
+            .flat_map(|part| score(&files, part, &parsed).unwrap())
+            .collect();
+        let parted = sort_and_take(&files, parts, 30);
+        let slots = |s: &Searched| {
+            s.items
+                .iter()
+                .map(|(slot, s)| (*slot, s.total))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(slots(&parted), slots(&whole));
+        assert_eq!(parted.total_matched, whole.total_matched);
+    }
     use crate::fff::query::QueryParser;
     use crate::fff::types::Found;
 

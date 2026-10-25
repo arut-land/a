@@ -199,7 +199,9 @@ pub struct GrepSummary {
 const GREP_CHUNK: usize = 256;
 /// What a grep job holds at most: the largest file it reads, twice.
 const GREP_JOB_BYTES: usize = 20 << 20;
-/// Grep and build jobs in flight at once.
+/// Paths a search scores in one part, at least.
+const SEARCH_PART: usize = 16 << 10;
+/// Grep and build jobs in flight at once, and parts of a search.
 const WINDOW: usize = 4;
 /// Files one content-index job reads: a multiple of 64, so chunks merge
 /// by whole bitset words.
@@ -272,9 +274,9 @@ impl WorkspaceIndex {
     }
 
     /// Walks the root again on the blocking pool, the watcher armed first
-    /// so nothing that changes during the walk is missed.
-    /// What the caller set [`Busy::Walking`] for, under the lock it then let go:
-    /// the watcher may call back into the index as it arms.
+    /// so nothing that changes during the walk is missed. The caller set
+    /// [`Busy::Walking`] and let the lock go: the watcher may call back
+    /// into the index as it arms.
     fn walk(&self) {
         let watcher = match self.state().watcher.take() {
             Some(mut watcher) => {
@@ -554,9 +556,41 @@ impl WorkspaceIndex {
     /// The best `limit` files for `query`, as an @-mention completes.
     pub async fn search(&self, query: String, limit: usize) -> Searched {
         let files = self.files().await;
+        let query = Arc::<str>::from(query);
+        let (on, asked) = (Arc::clone(&files), Arc::clone(&query));
+        let working = rt::unblock_with(&*self.rt, BlockingClass::Cpu, 0, move || {
+            Arc::new(score::working(&on, &QueryParser::default().parse(&asked)))
+        })
+        .await;
+        // Scored in parts on the CPU pool: one thread takes several
+        // milliseconds over a hundred thousand paths.
+        let parts = working.len().div_ceil(SEARCH_PART).clamp(1, WINDOW);
+        let size = working.len().div_ceil(parts).max(1);
+        let jobs: Vec<_> = (0..parts)
+            .map(|part| {
+                let (files, query, working) =
+                    (Arc::clone(&files), Arc::clone(&query), Arc::clone(&working));
+                let job = rt::unblock_with(&*self.rt, BlockingClass::Cpu, 0, move || {
+                    let slots = &working
+                        [(part * size).min(working.len())..((part + 1) * size).min(working.len())];
+                    score::score(&files, slots, &QueryParser::default().parse(&query))
+                });
+                rt::spawn(&*self.rt, job)
+            })
+            .collect();
+        let mut scored = Some(Vec::new());
+        for job in jobs {
+            match (job.await, &mut scored) {
+                (Some(part), Some(all)) => all.extend(part),
+                _ => scored = None,
+            }
+        }
         rt::unblock_with(&*self.rt, BlockingClass::Cpu, 0, move || {
             let parsed = QueryParser::default().parse(&query);
-            let found = score::search(&files, &parsed, limit);
+            let found = match scored {
+                Some(scored) => score::sort_and_take(&files, scored, limit),
+                None => score::recent(&files, Arc::unwrap_or_clone(working), limit),
+            };
             let paths: Vec<&str> = (found.items.iter())
                 .map(|(slot, _)| files.path(&files.items()[*slot]))
                 .collect();
