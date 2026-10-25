@@ -197,3 +197,33 @@ fn a_request_failing_after_an_interrupt_is_not_retried() {
         Some(Outcome::Failed { error }) if error.contains("unreachable")
     ));
 }
+
+/// A connection that closes while the request is still being sent settles
+/// the call, as failed: the turn never waits on a request that is gone.
+#[test]
+fn a_connection_closed_mid_request_settles_its_call() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        while line != "\r\n" {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+        }
+        reader.read_exact(&mut [0; 64]).unwrap();
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+    });
+    let (fixture, home) = over_ureq(port);
+    let session = fixture.start(&[]);
+    session.submit("hi").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    std::fs::remove_file(home).unwrap();
+    assert!(
+        matches!(model_result(&log), Some(Outcome::Failed { .. })),
+        "{log:#?}"
+    );
+}

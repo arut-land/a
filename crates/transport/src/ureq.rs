@@ -234,6 +234,18 @@ impl Abort {
         self.line().socket = None;
     }
 
+    /// Lets go of `socket` only: the pool is taking it back.
+    fn release_socket(&self, socket: &Arc<TcpStream>) {
+        let mut line = self.line();
+        if line
+            .socket
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, socket))
+        {
+            line.socket = None;
+        }
+    }
+
     fn abandon(&self) {
         let mut line = self.line();
         line.abandoned = true;
@@ -370,7 +382,15 @@ impl Transport for Socket {
         Ok(read > 0)
     }
 
+    /// Probed as the pool takes the connection back, on the thread of the
+    /// request that used it: from then on, cancelling that request must
+    /// not shut a connection the pool may already have handed to the next.
     fn is_open(&mut self) -> bool {
+        CURRENT.with_borrow(|abort| {
+            if let Some(abort) = abort {
+                abort.release_socket(&self.stream);
+            }
+        });
         let probe = || -> io::Result<bool> {
             self.stream.set_nonblocking(true)?;
             let open = matches!(
