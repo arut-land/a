@@ -30,6 +30,11 @@ opt-level = 1
 [profile.dev.package.memchr]
 opt-level = 1
 
+# neo_frizbee's x86 SIMD scorer is generic: it is instantiated here, and
+# Cranelift has no lowering for intrinsics it uses (sse4.1 phminposuw).
+[profile.dev.package.ext-index]
+codegen-backend = "llvm"
+
 # panic stays unwind so a panicking session actor cannot take the daemon down.
 #
 # The same size profile on every target. Linux measurements and the native
