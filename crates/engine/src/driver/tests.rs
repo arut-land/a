@@ -2573,6 +2573,7 @@ impl ext::host::Sources for MemorySource {
         &self,
         _: &Path,
         _: ext::host::Spawn,
+        _: ext::host::Delay,
         _: ext::host::Prepare,
         _: ext::host::Watch,
     ) -> Result<Arc<dyn ext::host::Generations>, ext::Refused> {

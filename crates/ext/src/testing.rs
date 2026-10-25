@@ -42,6 +42,11 @@ pub fn watch() -> crate::host::Watch {
     })
 }
 
+/// The coordinator's timers, on the tests' runtime.
+pub fn delay() -> crate::host::Delay {
+    Arc::new(|duration| RT.sleep(duration))
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

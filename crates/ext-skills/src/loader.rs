@@ -16,12 +16,6 @@ struct Files {
     duplicates: Vec<String>,
 }
 
-impl Files {
-    fn is_empty(&self) -> bool {
-        self.sources.is_empty() && self.invalid.is_empty() && self.duplicates.is_empty()
-    }
-}
-
 #[derive(PartialEq)]
 struct Inputs {
     files: BTreeMap<String, (PathBuf, sys::source::Source)>,
@@ -73,11 +67,6 @@ impl GenerationLayer for Loader {
     ) -> Result<PreparedLayer, PrepareError> {
         ext::source::prepare(
             || self.capture(workspace),
-            |files: &Files| {
-                if !files.is_empty() {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            },
             |files| {
                 let catalog = catalog(files)?;
                 for name in catalog.keys() {
@@ -113,10 +102,6 @@ impl GenerationLayer for Loader {
                 })
             },
         )
-    }
-
-    fn delay(&self, duration: std::time::Duration) -> ext::BoxFuture<'static, ()> {
-        rt::Reactor::AsyncIo.sleep(duration)
     }
 
     fn validate(&self, workspace: &Path, prepared: &PreparedLayer) -> Result<bool, PrepareError> {
@@ -347,7 +332,6 @@ mod tests {
                     captures += 1;
                     loader.capture(&rig.workspace())
                 },
-                |_| {},
                 catalog,
             );
             assert!(matches!(invalid, Err(PrepareError::Rejected(_))));
@@ -355,23 +339,23 @@ mod tests {
                 captures, 3,
                 "stable content is rejected only after re-observation"
             );
-            let mut reobserved = false;
+            let mut captures = 0;
             let attempt = ext::source::prepare(
-                || loader.capture(&rig.workspace()),
-                |_| {
-                    reobserved = true;
-                    fs::write(
-                        &path,
-                        "---\nname: review\ndescription: Review\n---\nsettled",
-                    )
-                    .unwrap();
+                || {
+                    let seen = loader.capture(&rig.workspace());
+                    captures += 1;
+                    if captures == 1 {
+                        fs::write(
+                            &path,
+                            "---\nname: review\ndescription: Review\n---\nsettled",
+                        )
+                        .unwrap();
+                    }
+                    seen
                 },
                 catalog,
             );
-            assert!(
-                reobserved,
-                "discovery must reach the debounce before rejection"
-            );
+            assert_eq!(captures, 2, "a change is seen before rejection");
             assert!(matches!(attempt, Err(PrepareError::Retry(_))));
             // The retry is driven by the result, with no filesystem callback.
             let prepared = loader
@@ -445,7 +429,6 @@ mod tests {
                 .unwrap();
                 loader.capture(&rig.workspace())
             },
-            |_| {},
             catalog,
         )
         .unwrap();
@@ -522,6 +505,10 @@ mod tests {
                 std::thread::yield_now();
             }
         });
+        // Preparation no longer waits, so it runs only once the writer does.
+        while writes.load(Ordering::Relaxed) == 0 {
+            std::thread::yield_now();
+        }
         let result = loader.prepare(
             &rig.workspace(),
             &Registry::default(),
@@ -562,7 +549,6 @@ mod tests {
                 fs::rename(root.join("b/save.tmp"), &b).unwrap();
                 loader.capture(&rig.workspace())
             },
-            |_| {},
             catalog,
         )
         .unwrap();
@@ -592,6 +578,7 @@ mod tests {
             .open(
                 &rig.workspace(),
                 Arc::new(move |task| rt.spawn(task)),
+                ext::testing::delay(),
                 Arc::new(|_| {}),
                 ext::testing::watch(),
             )

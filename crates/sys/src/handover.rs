@@ -143,7 +143,6 @@ pub fn read_record(
     use std::io::Read;
     let mut file = imp::own(number.raw())?;
     let mut bytes = Vec::new();
-    #[cfg(unix)]
     io::Seek::rewind(&mut file)?;
     file.read_to_end(&mut bytes)?;
     let record: Record = serde_json::from_slice(&bytes).map_err(io::Error::other)?;

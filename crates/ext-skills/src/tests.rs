@@ -187,6 +187,7 @@ fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
         .open(
             &workspace,
             spawn.clone(),
+            ext::testing::delay(),
             Arc::new(|_| {}),
             ext::testing::watch(),
         )
@@ -197,6 +198,7 @@ fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
         .open(
             &workspace,
             spawn.clone(),
+            ext::testing::delay(),
             Arc::new(|_| {}),
             ext::testing::watch(),
         )
@@ -230,6 +232,7 @@ fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
             .open(
                 &workspace,
                 spawn.clone(),
+                ext::testing::delay(),
                 Arc::new(|_| {}),
                 ext::testing::watch()
             )

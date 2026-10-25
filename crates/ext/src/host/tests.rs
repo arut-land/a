@@ -541,6 +541,15 @@ impl DynExtension for ImageExtension {
     fn contribute(&self, _: &mut Registrar) {}
 }
 
+/// A task run at once, as the coordinator's timers resolve.
+fn inline() -> Spawn {
+    Arc::new(rt::block_on::<BoxFuture<'static, ()>>)
+}
+
+fn now() -> Delay {
+    Arc::new(|_| Box::pin(std::future::ready(())))
+}
+
 /// Hands each layer the `changed` its watched root is given, as the
 /// engine's watcher would call it.
 fn watching(layers: Vec<Arc<TestLayer>>) -> Watch {
@@ -599,9 +608,6 @@ impl GenerationLayer for TestLayer {
                 }),
             )],
         })
-    }
-    fn delay(&self, duration: Duration) -> BoxFuture<'static, ()> {
-        rt::Reactor::AsyncIo.sleep(duration)
     }
     fn restore(&self, own_image: &[Installed]) -> Result<Registrations, Refused> {
         let [image] = own_image else {
@@ -685,6 +691,7 @@ fn a_layer_never_decodes_another_layers_image() {
         .open(
             Path::new("/layers"),
             Arc::new(|_| {}),
+            now(),
             Arc::new(|_| {}),
             watching(vec![one.clone(), two.clone()]),
         )
@@ -711,7 +718,8 @@ fn event_bursts_schedule_one_pending_rebuild() {
     let workspace = coordinator
         .open(
             Path::new("/events"),
-            Arc::new(|_| {}),
+            inline(),
+            now(),
             Arc::new(move |work| queued.lock().unwrap().push(work)),
             watching(vec![layer.clone()]),
         )
@@ -748,6 +756,7 @@ fn event_bursts_schedule_one_pending_rebuild() {
         .open(
             Path::new("/events"),
             Arc::new(|_| {}),
+            now(),
             Arc::new(|_| panic!("duplicate subscription")),
             watching(vec![layer.clone()]),
         )
@@ -775,7 +784,8 @@ fn resumed_writes_queue_a_capture_during_or_after_preparation() {
             let workspace = Coordinator::new(Registry::default(), vec![layer.clone()])
                 .open(
                     Path::new("/resumed"),
-                    Arc::new(|_| {}),
+                    inline(),
+                    now(),
                     Arc::new(move |work| queued.lock().unwrap().push(work)),
                     watching(vec![layer.clone()]),
                 )
@@ -785,14 +795,11 @@ fn resumed_writes_queue_a_capture_during_or_after_preparation() {
             let partial = layer.clone();
             let event = changed.clone();
             *layer.during.lock().unwrap() = Some(Box::new(move || {
-                // The writer stays paused across the entire injected quiet
-                // window and all captures; even valid partial content can pass.
-                let captured = crate::source::prepare(
-                    || Ok(partial.value.load(SeqCst)),
-                    |_| {},
-                    |value| Ok(*value),
-                )
-                .unwrap();
+                // The writer stays paused across all captures; even valid
+                // partial content can pass.
+                let captured =
+                    crate::source::prepare(|| Ok(partial.value.load(SeqCst)), |value| Ok(*value))
+                        .unwrap();
                 assert_eq!(captured, 1);
                 partial.fail.store(outcome == "rejected", SeqCst);
                 partial.busy.store(outcome == "retry", SeqCst);
@@ -840,7 +847,11 @@ fn transient_reads_recover_without_another_callback_and_stop_when_healthy_or_dro
     let workspace = coordinator
         .open(
             Path::new("/recover"),
-            Arc::new(move |task| runtime.spawn(task)),
+            {
+                let runtime = Arc::clone(&runtime);
+                Arc::new(move |task| runtime.spawn(task))
+            },
+            Arc::new(move |duration| runtime.sleep(duration)),
             Arc::new(move |work| {
                 let _ = send.send(work);
             }),
@@ -957,6 +968,7 @@ fn opening_a_workspace_never_holds_the_global_reservation_map() {
                 .open(
                     Path::new("/first"),
                     Arc::new(|_| {}),
+                    now(),
                     Arc::new(|_| {}),
                     Arc::new(|_, _| Box::new(())),
                 )
@@ -969,6 +981,7 @@ fn opening_a_workspace_never_holds_the_global_reservation_map() {
             let other = coordinator.open(
                 Path::new("/other"),
                 Arc::new(|_| {}),
+                now(),
                 Arc::new(|_| {}),
                 Arc::new(|_, _| Box::new(())),
             );
@@ -984,6 +997,7 @@ fn opening_a_workspace_never_holds_the_global_reservation_map() {
             .open(
                 Path::new("/first"),
                 Arc::new(|_| {}),
+                now(),
                 Arc::new(|_| {}),
                 Arc::new(|_, _| Box::new(())),
             )
@@ -1006,7 +1020,8 @@ fn queued_preparation_does_not_retain_a_closed_workspace() {
     let workspace = coordinator
         .open(
             Path::new("/queued"),
-            Arc::new(|_| {}),
+            inline(),
+            now(),
             Arc::new(move |work| queued.lock().unwrap().push(work)),
             watching(vec![layer.clone()]),
         )

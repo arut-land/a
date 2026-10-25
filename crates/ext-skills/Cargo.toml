@@ -10,7 +10,6 @@ ext.workspace = true
 llm.workspace = true
 protocol.workspace = true
 sys.workspace = true
-rt = { workspace = true, features = ["watch"] }
 serde.workspace = true
 serde_json.workspace = true
 yaml-rust2 = { version = "0.13", default-features = false }
@@ -18,6 +17,7 @@ yaml-rust2 = { version = "0.13", default-features = false }
 [dev-dependencies]
 bolero = "0.13"
 kernel.workspace = true
+rt.workspace = true
 ext = { workspace = true, features = ["testing"] }
 
 [lints]

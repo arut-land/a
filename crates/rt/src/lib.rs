@@ -170,6 +170,25 @@ where
     async move { rx.await.expect("spawned task panicked") }
 }
 
+/// Reaps `child` once it exits, on a task waiting on its exit watch: a
+/// child nothing else waits for leaves no zombie, and no thread waits for it.
+pub fn reap(rt: &dyn Runtime, mut child: sys::Child) {
+    let Ok(watch) = (child.exit_watch()).and_then(|watch| Async::for_reading(&rt.reactor(), watch))
+    else {
+        let admitted = rt.spawn_blocking(
+            BlockingClass::Storage,
+            0,
+            Box::new(move || drop(child.wait())),
+        );
+        rt.spawn(Box::pin(async move { drop(admitted.await) }));
+        return;
+    };
+    rt.spawn(Box::pin(async move {
+        watch.readable().await;
+        let _ = child.wait();
+    }));
+}
+
 // Every lock here guards plain queues that a panicking holder cannot leave
 // half-updated, so poisoning is ignored.
 

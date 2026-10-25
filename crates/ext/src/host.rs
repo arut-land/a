@@ -792,8 +792,6 @@ pub trait GenerationLayer: Send + Sync {
         previous: Option<&PreparedLayer>,
         initial: bool,
     ) -> Result<PreparedLayer, PrepareError>;
-    /// Injects the runtime timer; the coordinator cancels it on events or drop.
-    fn delay(&self, duration: Duration) -> BoxFuture<'static, ()>;
     fn validate(&self, _workspace: &Path, _prepared: &PreparedLayer) -> Result<bool, PrepareError> {
         Ok(true)
     }
@@ -825,6 +823,7 @@ struct Workspace {
     preparing: Mutex<Vec<PreparedLayer>>,
     pending: Mutex<Preparation>,
     spawn: Spawn,
+    delay: Delay,
     watch: Watch,
     watches: Mutex<Vec<Box<dyn Any + Send + Sync>>>,
     changed: Arc<Changed>,
@@ -863,6 +862,7 @@ impl Sources for Coordinator {
         &self,
         path: &Path,
         spawn: Spawn,
+        delay: Delay,
         prepare: Prepare,
         watch: Watch,
     ) -> Result<Arc<dyn Generations>, Refused> {
@@ -878,6 +878,7 @@ impl Sources for Coordinator {
                 preparing: Mutex::default(),
                 pending: Mutex::default(),
                 spawn,
+                delay,
                 watch,
                 watches: Mutex::default(),
                 updates: Updates::default(),
@@ -1006,7 +1007,7 @@ impl Workspace {
         let cancel = Cancel::default();
         pending.retry = Some(cancel.clone());
         drop(pending);
-        let wait = self.layers[0].delay(delay);
+        let wait = (self.delay)(delay);
         let weak = Arc::downgrade(self);
         (self.spawn)(Box::pin(async move {
             if cancel.until(wait).await.is_some()
@@ -1028,27 +1029,42 @@ impl Workspace {
         }
         pending.running = true;
         drop(pending);
+        self.settle(Arc::clone(prepare));
+    }
+
+    /// Prepares the next generation once its sources have been quiet for
+    /// [`SETTLE`], which coalesces an editor's writes: a timer on the host's
+    /// runtime, so no worker sleeps through it. What changes while it is
+    /// prepared is prepared again at once.
+    fn settle(self: &Arc<Self>, prepare: Prepare) {
+        let wait = (self.delay)(SETTLE);
         let weak = Arc::downgrade(self);
-        prepare(Box::new(move || {
-            while let Some(workspace) = weak.upgrade() {
-                lock(&workspace.pending).dirty = false;
-                let result = workspace.rebuild(false);
-                let mut pending = lock(&workspace.pending);
-                if result.is_ok() {
-                    pending.attempts = 0;
-                }
-                if !pending.dirty {
-                    pending.running = false;
-                    drop(pending);
-                    if let Err(error) = result {
-                        match error {
-                            PrepareError::Retry(_) => workspace.retry(),
-                            PrepareError::Rejected(error) => eprintln!("warning: {error}"),
-                        }
-                    }
-                    break;
-                }
+        (self.spawn)(Box::pin(async move {
+            wait.await;
+            if weak.strong_count() == 0 {
+                return;
             }
+            prepare(Box::new(move || {
+                while let Some(workspace) = weak.upgrade() {
+                    lock(&workspace.pending).dirty = false;
+                    let result = workspace.rebuild(false);
+                    let mut pending = lock(&workspace.pending);
+                    if result.is_ok() {
+                        pending.attempts = 0;
+                    }
+                    if !pending.dirty {
+                        pending.running = false;
+                        drop(pending);
+                        if let Err(error) = result {
+                            match error {
+                                PrepareError::Retry(_) => workspace.retry(),
+                                PrepareError::Rejected(error) => eprintln!("warning: {error}"),
+                            }
+                        }
+                        break;
+                    }
+                }
+            }));
         }));
     }
 }
@@ -1130,6 +1146,13 @@ pub type Prepare = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 /// Schedules owned asynchronous subscription work on the host runtime.
 pub type Spawn = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>;
 
+/// A timer on the host runtime, resolving after the duration.
+pub type Delay = Arc<dyn Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// How long a workspace's sources stay quiet before a change to them is
+/// prepared.
+const SETTLE: Duration = Duration::from_millis(100);
+
 /// Watches the tree at a path, calling `changed` on anything that happens
 /// in it, until what it returns is dropped: the engine's file watcher.
 pub type Watch = Arc<dyn Fn(&Path, Arc<Changed>) -> Box<dyn Any + Send + Sync> + Send + Sync>;
@@ -1139,6 +1162,7 @@ pub trait Sources: Send + Sync {
         &self,
         workspace: &Path,
         spawn: Spawn,
+        delay: Delay,
         prepare: Prepare,
         watch: Watch,
     ) -> Result<Arc<dyn Generations>, Refused>;

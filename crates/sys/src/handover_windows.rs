@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
@@ -74,18 +75,26 @@ pub fn claim(group: &Group) -> io::Result<Claimed> {
     })
 }
 
-/// A pipe holding `bytes`, written on a thread of its own as the next
-/// build reads it: one per attempt, so a successor that did not start
+/// A private file holding `bytes`, as on Unix: deleted as its last handle
+/// closes, so nothing but the handle reaches it and a crash leaves nothing
+/// to read by mistake. One per attempt, so a successor that did not start
 /// leaves the next one a full record.
-fn record(bytes: &[u8]) -> io::Result<File> {
-    let (reader, mut writer) = io::pipe()?;
-    let bytes = bytes.to_vec();
-    std::thread::Builder::new()
-        .name("a-handover".into())
-        .spawn(move || {
-            let _ = writer.write_all(&bytes);
-        })?;
-    Ok(File::from(OwnedHandle::from(reader)))
+fn record(home: &crate::Home, bytes: &[u8]) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::{DELETE, GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_DELETE_ON_CLOSE;
+    static ATTEMPT: AtomicU32 = AtomicU32::new(0);
+    let dir = home.run_dir();
+    crate::fs::private_dir(&dir)?;
+    let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let mut file = File::options()
+        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+        .share_mode(0)
+        .create_new(true)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .open(dir.join(format!("handover.{}.{attempt}", std::process::id())))?;
+    file.write_all(bytes)?;
+    Ok(file)
 }
 
 pub fn replace(handover: &mut Handover<'_>, mut cmd: std::process::Command) -> io::Error {
@@ -107,7 +116,7 @@ pub fn replace(handover: &mut Handover<'_>, mut cmd: std::process::Command) -> i
         if let Some(retirement) = handover.retirement.take() {
             retirement.retire()?;
         }
-        let record = record(&handover.record)?;
+        let record = record(handover.home, &handover.record)?;
         let keep: Vec<&File> = std::iter::once(&record).chain(&handover.handles).collect();
         inherit(&keep, true)?;
         cmd.arg("--handover-fd").arg(number(&record).to_string());
