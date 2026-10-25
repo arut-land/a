@@ -287,11 +287,16 @@ impl Core {
     /// background: the ledger alone says where the session stands, so a
     /// snapshot of it restores the session ([`Core::restore`]).
     pub fn at_rest(&self) -> bool {
+        self.at_rest_but_background() && self.fold.ledger.detached().is_empty()
+    }
+
+    /// At rest but for calls gone on in the background: what runs, if
+    /// anything, runs there, and nothing else is to happen until it ends.
+    pub fn at_rest_but_background(&self) -> bool {
         self.turn == Turn::Idle
             && self.failed.is_none()
             && self.fold.at_rest()
             && self.fold.ledger.untaken().iter().all(Queued::notice)
-            && self.fold.ledger.detached().is_empty()
             && self.fold.ledger.open_calls().next().is_none()
             && self.fold.ledger.pending_outbox().next().is_none()
     }
@@ -335,6 +340,7 @@ impl Core {
                 | Work::Sleep { .. }
                 | Work::Await { .. }
                 | Work::Recover { .. }
+                | Work::Adopt { .. }
                 | Work::Kill { .. } => Some(Requirement::Ordered),
                 Work::Invocation { .. }
                 | Work::Reply { .. }
@@ -1820,7 +1826,7 @@ impl Core {
         self.relink(fx);
         self.queue_children(fx);
         self.placeholders(fx);
-        self.recover_detached(fx);
+        self.recover_detached(load.adopted, fx);
         // A command cut off is not run again.
         let commands: SmallVec<[CallId; 1]> = self.fold.ledger.open_commands().collect();
         for call in commands {
@@ -1912,9 +1918,18 @@ impl Core {
     /// Calls a restart cut off in the background go on as each tool's
     /// replay says: one safe to run again runs again, still detached; any
     /// other's outcome is that it was cut off and may not have completed,
-    /// holding the stream its output so far went to.
-    fn recover_detached(&mut self, fx: &mut StepPlan) {
+    /// holding the stream its output so far went to. One whose group was
+    /// handed over, `adopted`, was never cut off: it goes on.
+    fn recover_detached(&mut self, adopted: &[CallId], fx: &mut StepPlan) {
         for d in self.fold.ledger.detached().to_vec() {
+            if adopted.contains(&d.call) {
+                fx.immediate.push(Work::Adopt {
+                    call: d.call,
+                    tool: d.tool,
+                    input: d.input,
+                });
+                continue;
+            }
             let safe = (self.registry.callable(&d.tool)).is_some_and(|c| c.replay == Replay::Safe);
             if safe {
                 fx.immediate.push(Work::RunTool {

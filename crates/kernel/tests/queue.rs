@@ -283,6 +283,34 @@ fn a_restart_runs_a_safe_detached_call_again_and_reports_an_unsafe_one_cut_off()
     assert_eq!(envelope.held, [Held::Stream(stream)], "its output so far");
 }
 
+/// A call whose group the previous build handed over was never cut off:
+/// it goes on, still detached, its outcome still to come.
+#[test]
+fn an_adopted_detached_call_goes_on_and_is_never_settled_as_interrupted() {
+    let log = log([
+        input("$ make"),
+        bash("make"),
+        Body::Detached { call: id(2) },
+        placeholder(2),
+    ]);
+    let load = Load {
+        adopted: &[id(2)],
+        ..Load::default()
+    };
+    let (s, fx) = Session::resume(Reg::echo().arc(), log, &load);
+    assert!(
+        work(&fx).any(
+            |w| matches!(w, Work::Adopt { call, tool, .. } if *call == id(2) && tool == "bash")
+        )
+    );
+    assert!(
+        !fx.appends
+            .iter()
+            .any(|e| matches!(e.body, Body::Enqueue { .. }))
+    );
+    assert_ne!(s.core.ledger().detached(), []);
+}
+
 #[test]
 fn a_detached_calls_outcome_holds_what_its_result_would_have() {
     let mut s = sleeping();

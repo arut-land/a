@@ -812,10 +812,18 @@ fn continuous_output_yields_to_other_sessions() {
         let cx = &cx;
         let log = &log;
         let mut work = ext::stream(|progress| async move {
+            let detached = Detached {
+                dir: cx.dir(),
+                started: 0,
+            };
+            let supervised = Supervised::Launched {
+                limit: Duration::from_secs(5),
+                detached: &detached,
+            };
             supervise(
                 process,
                 Followed { log, written },
-                Duration::from_secs(5),
+                supervised,
                 cx,
                 &progress,
             )

@@ -43,6 +43,12 @@ pub trait Host: Send + Sync {
     /// See [`Cx::spawned`].
     fn spawned(&self, pgid: u32, background: bool);
     fn own(&self, process: crate::ProcessLease);
+    /// See [`Cx::reown`].
+    fn reown(&self, process: crate::ProcessLease) {
+        self.own(process);
+    }
+    /// See [`Cx::resumable`].
+    fn resumable(&self, _process: Arc<dyn crate::RunningProcess>, _state: Json) {}
     /// See [`Cx::progress`].
     fn progress(&self, text: &str);
     /// Commits `data` as a change to extension `ext`'s state `state`:
@@ -152,6 +158,40 @@ impl Toolset {
                 None => called,
             }
         })
+    }
+
+    /// Goes on with a call gone on in the background in the daemon's
+    /// previous build: see [`crate::Resumable::resume`]. It is recorded as
+    /// [`Toolset::run`] records a call.
+    pub fn resume<'a>(
+        &'a self,
+        name: &str,
+        input: &Json,
+        state: Json,
+        handed: Json,
+        cx: &'a Cx,
+    ) -> BoxFuture<'a, Called> {
+        let Some(tool) = self.get(name) else {
+            let error = format!("unknown tool {name}");
+            return Box::pin(std::future::ready(Called::failed(error)));
+        };
+        let input = match tool.parse(input) {
+            Ok(input) => input,
+            Err(error) => return Box::pin(std::future::ready(Called::failed(error))),
+        };
+        Box::pin(async move {
+            let called = tool.resume(input, state, handed, cx).await;
+            match cx.service::<dyn crate::Record>() {
+                Some(record) => record.record(tool, called, cx).await,
+                None => called,
+            }
+        })
+    }
+
+    /// Whether tool `name`'s calls and groups go on in the daemon's next
+    /// build.
+    pub fn resumable(&self, name: &str) -> bool {
+        self.get(name).is_some_and(DynTool::resumable)
     }
 
     /// What the model sees of a call's outcome.

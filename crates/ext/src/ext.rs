@@ -171,6 +171,38 @@ impl Text {
     }
 }
 
+/// A tool just offered ([`Registrar::tool`]): the registrar goes on from
+/// it, and a [`Resumable`](crate::Resumable) tool is offered as one.
+pub struct Tooled<'r, T: Tool, M> {
+    registrar: &'r mut Registrar,
+    tool: Arc<Erased<T, M>>,
+}
+
+impl<'r, T: crate::Resumable, M> Tooled<'r, T, M> {
+    /// Its calls gone on in the background, and the groups they leave, go
+    /// on in the daemon's next build after an upgrade.
+    pub fn resumable(self) -> &'r mut Registrar
+    where
+        T::resume(..): Output<T::Out, M>,
+    {
+        let _ = self.tool.2.set(crate::tool::Resumer::of::<M>());
+        self.registrar
+    }
+}
+
+impl<T: Tool, M> std::ops::Deref for Tooled<'_, T, M> {
+    type Target = Registrar;
+    fn deref(&self) -> &Registrar {
+        self.registrar
+    }
+}
+
+impl<T: Tool, M> std::ops::DerefMut for Tooled<'_, T, M> {
+    fn deref_mut(&mut self) -> &mut Registrar {
+        self.registrar
+    }
+}
+
 /// Makes an agent for a session.
 type MakeAgent = dyn Fn() -> Box<dyn Agent> + Send + Sync;
 
@@ -206,11 +238,16 @@ pub struct Registrar {
 
 impl Registrar {
     /// Offers `tool`, whose calls are shaped `M` as what it returns.
-    pub fn tool<T: Tool, M: 'static>(&mut self, tool: T) -> &mut Self
+    pub fn tool<T: Tool, M: 'static>(&mut self, tool: T) -> Tooled<'_, T, M>
     where
         T::call(..): Output<T::Out, M>,
     {
-        self.dyn_tool(Arc::new(Erased(tool, PhantomData)))
+        let tool = Arc::new(Erased(tool, PhantomData, std::sync::OnceLock::new()));
+        self.dyn_tool(Arc::clone(&tool) as Arc<dyn DynTool>);
+        Tooled {
+            registrar: self,
+            tool,
+        }
     }
 
     /// Offers a tool named at run time.

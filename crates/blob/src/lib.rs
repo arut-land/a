@@ -114,6 +114,10 @@ pub trait BlobStore: Send + Sync {
     /// again starts its stream over.
     fn stream(&self, of: OutputStream, cap: u64) -> io::Result<Stream>;
 
+    /// `of`'s stream as it is, written on from its end: one the daemon's
+    /// next build goes on with after a handover.
+    fn reopen(&self, of: OutputStream, cap: u64) -> io::Result<Stream>;
+
     /// The directory streams grow in, each where [`stream_path`] puts it.
     fn streams(&self) -> &Path;
 
@@ -242,6 +246,15 @@ impl Blobs {
             call,
         };
         self.store.stream(of, cap)
+    }
+
+    /// Call `call`'s output stream as it is: see [`BlobStore::reopen`].
+    pub fn reopen(&self, call: CallId, cap: u64) -> io::Result<Stream> {
+        let of = OutputStream {
+            session: self.session,
+            call,
+        };
+        self.store.reopen(of, cap)
     }
 
     pub fn open(&self, id: &BlobId) -> io::Result<Box<dyn Read + Send>> {

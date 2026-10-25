@@ -277,10 +277,22 @@ Either way the call is recovered once. A detached call's outcome taken up
 as a turn ends reaches the agent as `Input::Detached`, as a child's does as
 `Input::ChildDone`.
 
-An upgrade drain waits for running turns and detached calls for as long as
-they run; only an interrupt or `a daemon stop` ends them sooner. Background
-process groups hold it only for `[daemon] drain_secs`, since a drain refuses
-input meanwhile and a server left running would hold it forever.
+An upgrade drain waits for running turns. What then runs only in the
+background (detached calls, and the process groups sessions own) is handed
+to the newer build live when it can go on there: every such call's tool and
+every group's is `ext::Resumable` (the shell is, `r.tool(x).resumable()`),
+and the newer build declares the handover format this one speaks
+(`runtime/<id>/handover`, `sys::handover::VERSION`). On Unix the daemon then
+execs the newer build in its own process (the same pid, its listener, lock
+and children kept); on Windows it starts the newer build inheriting each
+group's job, leader and output pipe through an explicit handle list, and
+exits once that build serves. The newer build adopts each group through the
+tool that started it: a call goes on from where its stream is, as
+`Work::Adopt` (never recovered as cut off), its outcome still to come, and a
+job's end is still reported, holding its output. Nothing of a handover is
+logged in a session. When the work cannot be handed over, the drain waits for
+it all, calls and groups alike, however long they run; only an interrupt or
+`a daemon stop` ends them sooner. See `crates/engine/src/handover.rs`.
 
 `Input { force }` on a steer brings the turn's next boundary on now: the
 model call streaming is cut short (its partial reply is dropped, and the

@@ -442,7 +442,9 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 /// second on an idle machine and seconds on a busy one.
 pub(crate) const START_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long to wait for a draining daemon: its grace plus a margin.
+/// How long to wait for a draining daemon before calling it wedged. A
+/// drain hands background work over at once, but one that cannot waits for
+/// that work to end, and a client gives up on it after this.
 pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// What a client can tell about the daemon without talking to it.

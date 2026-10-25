@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::BoxFuture;
-use protocol::{Environment, Held};
+use protocol::{Environment, Held, Json};
 
 use crate::{Called, Cx, DynTool, SpawnSpec, States};
 
@@ -43,6 +43,28 @@ pub trait Processes: Send + Sync {
         cx: &'a Cx,
         launch: LaunchSpec,
     ) -> BoxFuture<'a, Result<OwnedProcess, SpawnError>>;
+
+    /// The group the daemon's previous build gave up as `handed`
+    /// ([`RunningProcess::hand_over`]), owned again, its output going on
+    /// into `output`.
+    fn adopt<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _handed: Json,
+        _output: std::fs::File,
+    ) -> BoxFuture<'a, Result<OwnedProcess, SpawnError>> {
+        Box::pin(std::future::ready(Err(
+            std::io::ErrorKind::Unsupported.into()
+        )))
+    }
+}
+
+/// A process group given up for the daemon's next build: how its provider
+/// finds it there, and the native handles it finds it by, open here until
+/// the handover passes them on.
+pub struct Handed {
+    pub state: Json,
+    pub handles: Vec<std::fs::File>,
 }
 
 pub type SpawnError = std::io::Error;
@@ -73,6 +95,14 @@ pub trait RunningProcess: Send + Sync {
     /// Captured stdout has reached its output file, independently of process reaping.
     fn output_drained(&self) -> BoxFuture<'_, std::io::Result<()>>;
     fn ended(&self) -> BoxFuture<'_, ()>;
+    /// Gives the group up for the daemon's next build, once its output so
+    /// far is kept: from then on nothing here signals or reaps it, and it
+    /// ends here as if it had ended, though it runs on.
+    fn hand_over(&self) -> BoxFuture<'_, std::io::Result<Handed>> {
+        Box::pin(std::future::ready(Err(
+            std::io::ErrorKind::Unsupported.into()
+        )))
+    }
 }
 
 pub trait ProcessPipe: Send + Sync {
@@ -142,6 +172,15 @@ impl ProcessLease {
     pub fn holding(self, holds: impl FnOnce() -> Vec<Held> + Send + 'static) -> Self {
         *self.holds.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(holds));
         self
+    }
+
+    /// For a group handed to the daemon's next build: what its end holds
+    /// is made there, so here it is neither made nor dropped (dropping it
+    /// would discard the stream the group still writes).
+    pub fn part(&self) {
+        if let Some(holds) = self.holds() {
+            std::mem::forget(holds);
+        }
     }
 
     /// For the session that owns the group, as it ends: what

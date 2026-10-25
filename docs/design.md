@@ -56,6 +56,12 @@ it when none is running.
 The daemon serves connections and session actors on `rt`. Idle sessions
 hibernate; the daemon exits when no clients or work pin it. Upgrades drain
 work and restart the staged build; clients reconnect from their last seq.
+Work left running only in the background (detached calls, the process groups
+sessions own) is handed to the staged build live rather than waited out,
+when every piece can go on there: on Unix the daemon execs that build in its
+own process, children and listener kept; on Windows it starts it inheriting
+the groups' jobs and pipes ([agents](agents.md), `sys::handover`). Otherwise
+the drain waits for all of it.
 A typed crash breaker distinguishes repeated young deaths from a reboot.
 Diagnosis and restart verify the recorded process identity before signaling.
 

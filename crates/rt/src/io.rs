@@ -163,6 +163,20 @@ impl Async<sys::ProcessPipe> {
 }
 
 impl<T: Source> Async<T> {
+    /// Deregisters it, giving back what was registered: for one going to
+    /// another process.
+    pub fn into_inner(self) -> io::Result<T> {
+        match self.0 {
+            Inner::AsyncIo(io) => io.into_inner(),
+            #[cfg(test)]
+            Inner::FakeCompletion { io, .. } => Ok(io),
+            #[cfg(windows)]
+            Inner::Signal(handle) => handle.into_inner(),
+            #[cfg(windows)]
+            Inner::Completion { io, .. } => Ok(io),
+        }
+    }
+
     pub fn get_ref(&self) -> &T {
         match &self.0 {
             Inner::AsyncIo(io) => io.get_ref(),

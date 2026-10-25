@@ -970,18 +970,22 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
         Mutex::new(Vec::new()),
         Instant::now(),
     ));
-    let daemon = Daemon::load_on(&home, &config, &runtime).unwrap();
+    let daemon =
+        Daemon::load_on(&home, &config, &runtime, super::handover::Record::default()).unwrap();
+    let listener = home.bind().unwrap();
     let exit = Exit {
         home: home.clone(),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
-        endpoint: home.bind().unwrap().retirement().unwrap(),
+        endpoint: listener.retirement().unwrap(),
+        listener: sys::handover::Endpoint::of(&listener),
     };
+    drop(listener);
     let life = Lifecycle::new("test".into(), home.runtime());
     {
         // Owning the polls distinguishes queued news from unsolicited wakes,
         // regardless of how long a worker would take to consume that news.
         let idling = super::Idling::new(super::Idling::TRANSIENT);
-        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling));
+        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling, None));
         let mut cx = Context::from_waker(Waker::noop());
         let before = EVENTS.count("wake");
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
@@ -1004,14 +1008,17 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     {
         // Neither a daemon the OS starts at login nor one still asking
         // whether it is has an idle deadline to wake for.
+        let listener = home.bind().unwrap();
         let exit = Exit {
             home: home.clone(),
             pid: std::fs::File::create(root.join("resident-pid")).unwrap(),
-            endpoint: home.bind().unwrap().retirement().unwrap(),
+            endpoint: listener.retirement().unwrap(),
+            listener: sys::handover::Endpoint::of(&listener),
         };
+        drop(listener);
         super::lock(&runtime.1).clear();
         let idling = super::Idling::new(super::Idling::ASKING);
-        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling));
+        let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling, None));
         let mut cx = Context::from_waker(Waker::noop());
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
         idling.answer(true);
@@ -1086,11 +1093,14 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
         ..echo()
     };
     let daemon = Daemon::load(&home, &config).unwrap();
+    let listener = home.bind().unwrap();
     let exit = Exit {
         home: home.clone(),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
-        endpoint: home.bind().unwrap().retirement().unwrap(),
+        endpoint: listener.retirement().unwrap(),
+        listener: sys::handover::Endpoint::of(&listener),
     };
+    drop(listener);
     let life = Lifecycle::new("test".into(), home.runtime());
     let supervisor = std::sync::Arc::clone(&daemon);
     let (stop, done) = (ext::Flag::default(), ext::Flag::default());
@@ -1098,7 +1108,7 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     daemon.shared.rt.spawn(Box::pin(async move {
         let idling = super::Idling::new(super::Idling::TRANSIENT);
         rt::or(
-            supervisor.supervise(&life, &config, exit, &idling),
+            supervisor.supervise(&life, &config, exit, &idling, None),
             stopping.wait(),
         )
         .await;
@@ -2464,7 +2474,8 @@ fn busy_session_recovery_admits_independent_loads_concurrently() {
         ..Config::default()
     };
     let runtime = Arc::new(rt::Threads::configured(rt::Config::for_cores(4)));
-    let daemon = Daemon::load_on(&home, &config, &runtime).unwrap();
+    let daemon =
+        Daemon::load_on(&home, &config, &runtime, super::handover::Record::default()).unwrap();
     drop(daemon);
     runtime.shutdown();
     std::fs::remove_dir_all(root).unwrap();

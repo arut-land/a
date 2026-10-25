@@ -16,7 +16,9 @@
 //! forced steer would send it, and its result comes back on the queue. A
 //! process group the session owns (a background job, or what a command left
 //! running) writes an open blob stream, sealed as the group ends into the blob
-//! the end's queued notice holds.
+//! the end's queued notice holds. Both go on in the daemon's next build
+//! after an upgrade ([`ext::Resumable`]): the group is handed over live and
+//! its stream followed on from where it is.
 //!
 //! PowerShell takes one bounded Unicode `-Command` payload, preserving normal
 //! error semantics and explicit exits without changing execution policy. Its
@@ -89,13 +91,13 @@ impl Extension for Shell {
 fn contribute(r: &mut Registrar, facts: &'static sys::shell::ExecutionFacts, timeout: u64) {
     match facts.dialect {
         sys::shell::Dialect::Bash => {
-            r.tool(Bash::new(facts, timeout));
+            r.tool(Bash::new(facts, timeout)).resumable();
         }
         sys::shell::Dialect::PowerShell => {
-            r.tool(PowerShell::new(facts, timeout));
+            r.tool(PowerShell::new(facts, timeout)).resumable();
         }
         sys::shell::Dialect::WindowsPowerShell => {
-            r.tool(WindowsPowerShell::new(facts, timeout));
+            r.tool(WindowsPowerShell::new(facts, timeout)).resumable();
         }
     }
     r.fold::<state::Cwd>()

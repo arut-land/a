@@ -78,6 +78,9 @@ pub struct Shared {
     /// How those blobs appear as files.
     pub tree: Arc<dyn ext::blob::Materialize>,
     pub(crate) loaded: Mutex<std::collections::HashSet<SessionId>>,
+    /// What the daemon's previous build handed over and no session has
+    /// taken up yet: each takes its own as it loads.
+    pub(crate) handed: Mutex<crate::handover::Record>,
     pub(crate) daemon: Weak<Daemon>,
 }
 
@@ -318,7 +321,18 @@ struct Session {
     env: Mutex<Option<Arc<Environment>>>,
     pending_env: Mutex<Option<Arc<Environment>>>,
     /// Background process groups the session owns, until each ends.
-    jobs: Mutex<Vec<Arc<dyn ext::RunningProcess>>>,
+    jobs: Mutex<Vec<Job>>,
+    /// Calls gone on in the background whose groups can go on in the
+    /// daemon's next build ([`ext::Cx::resumable`]).
+    resumable: Mutex<Vec<Resumed>>,
+    /// Calls whose groups went to the daemon's next build: what they would
+    /// still report here is that build's to report.
+    handed: Mutex<Vec<CallId>>,
+    /// What the daemon's previous build handed this session, until taken
+    /// up, and the tools of the groups being owned again meanwhile, whose
+    /// calls the log no longer names.
+    adopting: Mutex<Vec<crate::handover::Group>>,
+    reheld: Mutex<Vec<(CallId, String)>>,
     work: Mutex<WorkSet>,
     /// Notified as the session changes: a commit, work beginning or
     /// ending, a job ending, the actor ending. What waits on the session
@@ -328,6 +342,22 @@ struct Session {
 }
 
 type Mail = Arc<channel::Sender<Msg>>;
+
+/// A process group a session owns, left to it by call `call` of `tool`.
+struct Job {
+    call: CallId,
+    /// `None` for a call the log no longer names.
+    tool: Option<String>,
+    process: Arc<dyn ext::RunningProcess>,
+}
+
+/// A call gone on in the background, running `process`, that goes on in
+/// the daemon's next build from `state`.
+struct Resumed {
+    call: CallId,
+    process: Arc<dyn ext::RunningProcess>,
+    state: Json,
+}
 
 pub struct Live {
     session: Arc<Session>,
@@ -448,6 +478,11 @@ enum Msg {
     ProjectionCache(bool, oneshot::Sender<[bool; 3]>),
     Reclaim,
     Stop,
+    /// Whether each group the session runs can go to the daemon's next
+    /// build: see [`Live::handable`].
+    Handable(oneshot::Sender<Result<(), String>>),
+    /// Give them up: see [`Live::hand_over`].
+    HandOver(oneshot::Sender<Vec<(crate::handover::Group, Vec<std::fs::File>)>>),
     /// Make what was only written durable, and show it: sent to itself
     /// [`SYNC_LAG`] after a write that was not synced.
     Sync,
@@ -627,6 +662,12 @@ impl Live {
         } else {
             Vec::new()
         };
+        let handed = crate::handover::take(&shared.handed, header.id);
+        let adopted: Vec<CallId> = (handed.iter())
+            .filter(|group| matches!(group.kind, crate::handover::Kind::Call { .. }))
+            .map(|group| group.call)
+            .collect();
+        *lock(&session.adopting) = handed;
         let load = Load {
             session: Some(header.id),
             abandoned: &abandoned,
@@ -635,6 +676,7 @@ impl Live {
             owner,
             busy,
             created: matches!(open, Open::Create),
+            adopted: &adopted,
         };
         // A log kept as it is is shown, never resumed or stepped: nothing
         // would commit.
@@ -777,8 +819,8 @@ impl Live {
 
     pub(crate) fn stop(&self) {
         self.send(Msg::Stop);
-        for process in lock(&self.session.jobs).iter() {
-            let _ = process.signal(ext::ProcessSignal::Kill);
+        for job in lock(&self.session.jobs).iter() {
+            let _ = job.process.signal(ext::ProcessSignal::Kill);
         }
     }
 
@@ -805,6 +847,23 @@ impl Live {
 
     pub fn has_jobs(&self) -> bool {
         !lock(&self.session.jobs).is_empty()
+    }
+
+    /// Whether the session's work can go to the daemon's next build, and
+    /// if not why: see [`crate::handover`]. A session that takes no
+    /// messages runs nothing to hand.
+    pub(crate) async fn handable(&self) -> Result<(), String> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Msg::Handable(reply));
+        answer.await.unwrap_or(Ok(()))
+    }
+
+    /// Gives the session's groups up for the daemon's next build, with the
+    /// handles each is found by there.
+    pub(crate) async fn hand_over(&self) -> Vec<(crate::handover::Group, Vec<std::fs::File>)> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Msg::HandOver(reply));
+        answer.await.unwrap_or_default()
     }
 
     /// How long the session has had no attachments, no work and no jobs.
@@ -1063,6 +1122,31 @@ enum Child {
     Waiting(oneshot::Sender<Json>),
 }
 
+/// A group that could not be handed over: it goes on, or ends, here.
+fn handover_fault(session: SessionId, e: &io::Error) {
+    ext_logging::emit(ext_logging::Fact::Fault {
+        session: Some(session),
+        operation: ext_logging::Operation::Handover,
+        kind: ext_logging::Fault(e.kind()),
+    });
+}
+
+fn group(
+    session: SessionId,
+    call: CallId,
+    tool: String,
+    handed: Json,
+    kind: crate::handover::Kind,
+) -> crate::handover::Group {
+    crate::handover::Group {
+        session,
+        call,
+        tool,
+        handed,
+        kind,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Serving,
@@ -1072,6 +1156,128 @@ enum Phase {
 }
 
 impl Actor {
+    /// Whether the session's work can go on in the daemon's next build: it
+    /// is at rest but for calls gone on in the background, each of which,
+    /// like every group the session owns, a tool takes up again there.
+    fn handable(&self) -> Result<(), String> {
+        let session = &self.live.session;
+        let tools = self.registry.tools();
+        let at_work = || format!("session {} is at work", self.live.id.short());
+        if !self.core.at_rest_but_background() {
+            return Err(at_work());
+        }
+        let resumable = lock(&session.resumable);
+        for detached in self.core.ledger().detached() {
+            let resumes = tools.resumable(&detached.tool)
+                && resumable
+                    .iter()
+                    .any(|resumed| resumed.call == detached.call);
+            if !resumes {
+                return Err(at_work());
+            }
+        }
+        let jobs = lock(&session.jobs);
+        if let Some(job) =
+            (jobs.iter()).find(|job| !job.tool.as_deref().is_some_and(|t| tools.resumable(t)))
+        {
+            return Err(format!(
+                "job {} goes on in no other build",
+                job.process.id()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Gives every group of the session up for the daemon's next build,
+    /// as it says whose each is ([`crate::handover::Group`]): calls gone on
+    /// in the background, then the groups the session owns. One that ends
+    /// meanwhile is left to end here.
+    async fn hand_over(&mut self) -> Vec<(crate::handover::Group, Vec<std::fs::File>)> {
+        let session = Arc::clone(&self.live.session);
+        let mut given = Vec::new();
+        let resumable = std::mem::take(&mut *lock(&session.resumable));
+        for Resumed {
+            call,
+            process,
+            state,
+        } in resumable
+        {
+            let ledger = self.core.ledger();
+            let Some(tool) = (ledger.detached().iter())
+                .find(|d| d.call == call)
+                .map(|d| d.tool.clone())
+            else {
+                continue;
+            };
+            lock(&session.handed).push(call);
+            match process.hand_over().await {
+                Ok(handed) => {
+                    self.inflight.remove(&call);
+                    let kind = crate::handover::Kind::Call { state };
+                    given.push((
+                        group(session.id, call, tool, handed.state, kind),
+                        handed.handles,
+                    ));
+                }
+                Err(e) => {
+                    handover_fault(session.id, &e);
+                    lock(&session.handed).retain(|handed| *handed != call);
+                }
+            }
+        }
+        let jobs: Vec<_> = (lock(&session.jobs).iter())
+            .filter_map(|job| Some((job.call, job.tool.clone()?, Arc::clone(&job.process))))
+            .collect();
+        for (call, tool, process) in jobs {
+            lock(&session.handed).push(call);
+            match process.hand_over().await {
+                Ok(handed) => {
+                    let kind = crate::handover::Kind::Job;
+                    given.push((
+                        group(session.id, call, tool, handed.state, kind),
+                        handed.handles,
+                    ));
+                }
+                Err(e) => {
+                    handover_fault(session.id, &e);
+                    lock(&session.handed).retain(|handed| *handed != call);
+                }
+            }
+        }
+        given
+    }
+
+    /// Takes up what the daemon's previous build handed this session that
+    /// is not a call the log goes on with ([`Effect::Adopt`]): the groups
+    /// calls left to it, owned again through the tools that started them.
+    fn adopt_jobs(&self) {
+        let jobs: Vec<_> = lock(&self.live.session.adopting)
+            .extract_if(.., |group| matches!(group.kind, crate::handover::Kind::Job))
+            .collect();
+        let fence = self.live.session.fence.load(Ordering::SeqCst);
+        for group in jobs {
+            let Some(origin) = self.live.session.origin(group.call, fence) else {
+                continue;
+            };
+            let cx = self.live.session.cx(origin, &self.registry);
+            (lock(&self.live.session.reheld)).push((group.call, group.tool.clone()));
+            let registry = Arc::clone(&self.registry);
+            let id = self.live.id;
+            self.live.session.shared.rt.spawn(Box::pin(async move {
+                let Some(tool) = registry.tools().get(&group.tool) else {
+                    return;
+                };
+                if tool.rehold(group.handed, &cx).await.is_err() {
+                    ext_logging::emit(ext_logging::Fact::Fault {
+                        session: Some(id),
+                        operation: ext_logging::Operation::Handover,
+                        kind: ext_logging::Fault(io::ErrorKind::Other),
+                    });
+                }
+            }));
+        }
+    }
+
     /// Tool and model calls in flight, each of which reports once.
     fn reporting(&self) -> usize {
         (self.inflight.values())
@@ -1204,6 +1410,7 @@ impl Actor {
     #[allow(clippy::too_many_lines)]
     async fn run(mut self, mail: channel::Receiver<Msg>, first: StepPlan) {
         let _ = self.carry(first).await;
+        self.adopt_jobs();
         let mut next = None;
         while !(self.phase == Phase::Draining && self.reporting() == 0)
             && let Some(msg) = match next.take() {
@@ -1323,6 +1530,11 @@ impl Actor {
             Msg::Flushed { .. } => unreachable!("mailbox admission"),
             Msg::Completed { fence, completion } => {
                 if fence != self.live.session.fence.load(Ordering::SeqCst) {
+                    return None;
+                }
+                if let Completion::Tool { call, .. } = &completion
+                    && lock(&self.live.session.handed).contains(call)
+                {
                     return None;
                 }
                 match completion {
@@ -1463,6 +1675,14 @@ impl Actor {
                 self.live.session.cancel_all();
                 return None;
             }
+            Msg::Handable(reply) => {
+                reply.send(self.handable());
+                return None;
+            }
+            Msg::HandOver(reply) => {
+                reply.send(self.hand_over().await);
+                return None;
+            }
         };
         // What was in flight reported, or was answered.
         if let Event::ToolDone { call, .. }
@@ -1581,7 +1801,23 @@ impl Actor {
                 .await
                 .map(|event| (event, None)),
             ContextRequest::Own { process } => {
-                lock(&session.jobs).push(Arc::clone(&process));
+                let ledger = self.core.ledger();
+                let tool = match ledger.call(call).map(|open| &open.call) {
+                    Some(protocol::ledger::Call::Tool { tool, .. }) => Some(tool.clone()),
+                    _ => (ledger.detached().iter())
+                        .find(|d| d.call == call)
+                        .map(|d| d.tool.clone())
+                        .or_else(|| {
+                            let mut reheld = lock(&session.reheld);
+                            let at = reheld.iter().position(|(c, _)| *c == call)?;
+                            Some(reheld.swap_remove(at).1)
+                        }),
+                };
+                lock(&session.jobs).push(Job {
+                    call,
+                    tool,
+                    process: Arc::clone(&process),
+                });
                 let fence = session.fence.load(Ordering::SeqCst);
                 self.live.session.spawn_work(
                     WorkId::Job(Arc::as_ptr(&process).cast::<()>() as usize),
@@ -1600,7 +1836,10 @@ impl Actor {
                             // one the session stopped is its own doing. The
                             // job holds the session until its end is sent,
                             // so no unload or drain comes between.
-                            if !stopped {
+                            // A group handed to the next build ends there.
+                            if lock(&session.handed).contains(&call) {
+                                process.part();
+                            } else if !stopped {
                                 let text = job_ended(&**process);
                                 let held = match process.holds() {
                                     Some(holds) => rt::unblock(&*session.shared.rt, holds).await,
@@ -1609,7 +1848,7 @@ impl Actor {
                                 let ended = Event::JobEnded { call, text, held };
                                 session.emit(fence, Completion::Event(ended));
                             }
-                            lock(&session.jobs).retain(|p| !Arc::ptr_eq(p, &process));
+                            lock(&session.jobs).retain(|job| !Arc::ptr_eq(&job.process, &process));
                             session.changed.notify();
                             if let Some(daemon) = session.shared.daemon.upgrade() {
                                 daemon.jobs.notify();
@@ -2249,6 +2488,7 @@ impl Actor {
             Effect::RunTool { call, tool, input } => {
                 self.run_tool(call, tool, input, Child::None);
             }
+            Effect::Adopt { call, tool, input } => self.adopt_tool(call, tool, input),
             Effect::Resume {
                 call,
                 tool,
@@ -2680,6 +2920,39 @@ impl Actor {
             session.emit(fence, Completion::Tool { call, called });
         });
     }
+
+    /// Goes on with call `call`, gone on in the background, whose group
+    /// the daemon's previous build handed over: its outcome is reported as
+    /// the call's would have been there.
+    fn adopt_tool(&mut self, call: CallId, tool: String, input: Json) {
+        let taken = lock(&self.live.session.adopting)
+            .extract_if(.., |group| {
+                group.call == call && matches!(group.kind, crate::handover::Kind::Call { .. })
+            })
+            .find_map(|group| match group.kind {
+                crate::handover::Kind::Call { state } => Some((state, group.handed)),
+                crate::handover::Kind::Job => None,
+            });
+        let Some((state, handed)) = taken else {
+            return;
+        };
+        self.inflight.insert(call, InFlight::Tool(Child::None));
+        let registry = Arc::clone(&self.registry);
+        let fence = self.live.session.fence.load(Ordering::SeqCst);
+        let origin = (self.live.session)
+            .origin(call, fence)
+            .expect("actor generation");
+        origin.detach.set();
+        let cx = (self.live.session)
+            .cx(origin.clone(), &registry)
+            .detachable(origin.detach.clone());
+        let session = Arc::clone(&self.live.session);
+        origin.spawn(&*self.live.session.shared.rt, async move {
+            let resumed = registry.tools().resume(&tool, &input, state, handed, &cx);
+            let called = contain(resumed).await;
+            session.emit(fence, Completion::Tool { call, called });
+        });
+    }
 }
 
 /// Whether the catalog is to hear of `now`: it lists what it waits on and
@@ -2795,6 +3068,10 @@ impl Session {
             env: Mutex::default(),
             pending_env: Mutex::default(),
             jobs: Mutex::default(),
+            resumable: Mutex::default(),
+            handed: Mutex::default(),
+            adopting: Mutex::default(),
+            reheld: Mutex::default(),
             work: Mutex::default(),
             changed: rt::Notify::new(),
             shared: Arc::clone(shared),

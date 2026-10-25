@@ -12,8 +12,6 @@
 //! [daemon]                      # read when the daemon starts
 //! idle_secs = 600               # exit after this long unused
 //! hibernate_secs = 300          # unload a session after this long unused
-//! drain_secs = 60               # how long an upgrade waits for background jobs;
-//!                               # running turns and detached calls it waits out
 //! agent = "echo"                # every session's agent, over both files
 //! crash_limit = 3               # young deaths in a row before refusing
 //! durability = "step"           # fsync every step, or "effects": only before one
@@ -148,7 +146,6 @@ impl Table {
 pub struct Daemon {
     pub idle_secs: Option<u64>,
     pub hibernate_secs: Option<u64>,
-    pub drain_secs: Option<u64>,
     /// `loop` or `echo` (which needs no model, and offers the test
     /// fixtures).
     pub agent: Option<String>,
@@ -345,7 +342,6 @@ impl FromStr for Config {
             config.daemon = Daemon {
                 idle_secs: whole("idle_secs")?,
                 hibernate_secs: whole("hibernate_secs")?,
-                drain_secs: whole("drain_secs")?,
                 agent: string(t, "agent", "daemon.")?,
                 crash_limit: whole("crash_limit")?,
                 durability: string(t, "durability", "daemon.")?,

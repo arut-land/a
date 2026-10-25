@@ -320,6 +320,19 @@ impl Stream {
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(self.clone())
     }
+
+    /// The overlapped pipe end `file`, as a process pipe.
+    pub(crate) fn from_pipe(file: File) -> io::Result<Self> {
+        Self::new(Arc::new(file))
+    }
+
+    /// Gives the pipe up to another process: a read in flight is cancelled
+    /// first, and what it, or one before it, read but nobody took yet comes
+    /// back with the pipe's handle, so nothing written is lost.
+    pub(crate) fn surrender(self) -> io::Result<(OwnedHandle, Vec<u8>)> {
+        let unread = (lock(&self.0.read).take()).map_or_else(Vec::new, |mut op| op.cancel());
+        Ok((duplicate(&*self.0.file)?, unread))
+    }
 }
 
 impl CompletionSource for Stream {
@@ -511,6 +524,30 @@ impl Operation {
         self.pending = false;
         self.length = length as usize;
         Ok(self.length)
+    }
+}
+
+impl Operation {
+    /// Cancels it if it is in flight, and returns what it read that was not
+    /// taken yet.
+    fn cancel(&mut self) -> Vec<u8> {
+        if self.pending {
+            let mut length = 0;
+            // SAFETY: the operation and its file are owned; cancellation is
+            // joined by the waiting GetOverlappedResult before either is freed.
+            let completed = unsafe {
+                CancelIoEx(self.file.as_raw_handle(), self.raw.as_ref());
+                GetOverlappedResult(
+                    self.file.as_raw_handle(),
+                    self.raw.as_mut(),
+                    &raw mut length,
+                    1,
+                ) != 0
+            };
+            self.pending = false;
+            self.length = if completed { length as usize } else { 0 };
+        }
+        self.buffer[self.taken.min(self.length)..self.length].to_vec()
     }
 }
 

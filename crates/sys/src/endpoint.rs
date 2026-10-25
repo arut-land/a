@@ -230,6 +230,17 @@ impl Stream {
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         imp::stream_nonblocking(&self.0, nonblocking)
     }
+
+    #[cfg(windows)]
+    pub(crate) fn from_pipe(file: std::fs::File) -> io::Result<Self> {
+        imp::Stream::from_pipe(file).map(Self)
+    }
+
+    /// See the Windows stream's own `surrender`.
+    #[cfg(windows)]
+    pub(crate) fn surrender(self) -> io::Result<(std::os::windows::io::OwnedHandle, Vec<u8>)> {
+        self.0.surrender()
+    }
 }
 
 /// What the reactor registers: a stream or listener is waited on, never

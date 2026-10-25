@@ -127,10 +127,10 @@ fn an_unclean_exit_releases_the_endpoint_and_recovers_committed_sessions() {
     assert_ne!(env.pid(), pid);
 }
 
-#[test]
-fn two_installs_upgrade_once_and_the_older_client_never_downgrades() {
+/// A build of `a` other than the one under test, and older: the same
+/// program with a byte more, built an hour earlier.
+fn older_build(env: &Isolated) -> std::path::PathBuf {
     use std::io::Write;
-    let env = Isolated::new("upgrade");
     let source = std::path::Path::new(env!("CARGO_BIN_EXE_a"));
     let older = env.home.root().join("older.exe");
     fs::copy(source, &older).unwrap();
@@ -140,7 +140,13 @@ fn two_installs_upgrade_once_and_the_older_client_never_downgrades() {
         fs::metadata(source).unwrap().modified().unwrap() - Duration::from_secs(3600),
     )
     .unwrap();
-    drop(file);
+    older
+}
+
+#[test]
+fn two_installs_upgrade_once_and_the_older_client_never_downgrades() {
+    let env = Isolated::new("upgrade");
+    let older = older_build(&env);
     assert!(env.command_at(&older, &["ls"]).status().unwrap().success());
     let old_pid = env.pid();
     let old_build = env.home.runtime().current().unwrap();
@@ -150,6 +156,51 @@ fn two_installs_upgrade_once_and_the_older_client_never_downgrades() {
     assert_ne!(env.home.runtime().current().unwrap(), old_build);
     assert!(env.command_at(&older, &["ls"]).status().unwrap().success());
     assert_eq!(env.pid(), new_pid);
+}
+
+/// The older build's daemon owns a job when the newer build's first client
+/// drains it: the job goes to the newer build live (in the same process on
+/// Unix, a successor on Windows), which reports its end, its output kept.
+#[test]
+fn an_upgrade_hands_a_running_job_to_the_newer_build() {
+    let env = Isolated::new("handover-job");
+    let older = older_build(&env);
+    let job = "$ (sleep 8; echo late) & echo now";
+    let ran = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", job]))
+        .collect(deadline())
+        .unwrap();
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    let older_pid = env.pid();
+    env.run(&["ls"]);
+    assert_eq!(
+        env.pid() == older_pid,
+        cfg!(unix),
+        "where the newer build serves"
+    );
+    let log = fs::read_to_string(env.home.daemon_log()).unwrap();
+    assert!(log.contains(r#""handed_over":{"groups":1}"#), "{log}");
+    assert!(log.contains(r#""origin":"handover""#), "{log}");
+    let ended = Instant::now() + Duration::from_secs(30);
+    while !env
+        .logs()
+        .values()
+        .any(|log| String::from_utf8_lossy(log).contains(r#""purpose":"job""#))
+    {
+        assert!(Instant::now() < ended, "the job's end never came");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let blobs = fs::read_dir(env.home.blobs_dir()).unwrap();
+    let kept = (blobs.flatten())
+        .filter(|fan| fan.file_name() != "open")
+        .filter_map(|fan| fs::read_dir(fan.path()).ok())
+        .flatten()
+        .flatten()
+        .any(|blob| fs::read(blob.path()).is_ok_and(|bytes| bytes == b"now\nlate\n"));
+    assert!(kept, "the job's output was not kept");
 }
 
 #[test]

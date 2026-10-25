@@ -1,6 +1,7 @@
 //! Drain-and-restart upgrades: once a newer build is staged, the first client
 //! of another build makes this daemon finish its work and exit, so the next
-//! connection starts `runtime/current`.
+//! connection starts `runtime/current`; work left only in the background is
+//! handed to that build live instead ([`crate::handover`]).
 //!
 //! Several builds share one home (the app's bundled `a`, a CLI from brew or
 //! cargo), and the rules keep them from fighting:

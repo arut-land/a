@@ -84,6 +84,9 @@ pub enum Cmd {
         /// Serve even after a crash loop
         #[usage(long)]
         reset_breaker: bool,
+        /// What the daemon of the build before handed this one
+        #[usage(long)]
+        handover_fd: Option<i32>,
     },
 }
 

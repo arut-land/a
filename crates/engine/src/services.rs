@@ -192,8 +192,23 @@ impl Host for CallPorts {
 
     fn own(&self, process: ext::ProcessLease) {
         self.spawned(process.id(), true);
+        self.reown(process);
+    }
+
+    fn reown(&self, process: ext::ProcessLease) {
         self.origin
             .send(&self.session, ContextRequest::Own { process });
+    }
+
+    fn resumable(&self, process: Arc<dyn ext::RunningProcess>, state: Json) {
+        let call = self.origin.id;
+        let mut resumable = lock(&self.session.resumable);
+        resumable.retain(|resumed| resumed.call != call);
+        resumable.push(super::Resumed {
+            call,
+            process,
+            state,
+        });
     }
 
     fn progress(&self, text: &str) {

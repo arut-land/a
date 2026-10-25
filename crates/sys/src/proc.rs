@@ -12,6 +12,8 @@ use crate::Signal;
 pub(crate) use imp::passed;
 #[cfg(unix)]
 pub(crate) use imp::raw;
+#[cfg(windows)]
+pub(crate) use imp::spawn_acknowledged;
 pub use imp::{Child, ExitWatch};
 
 #[derive(Clone, Copy)]
@@ -64,6 +66,24 @@ impl ProcessLease {
             id: RecordedIdentity(child.id()),
             child: child.clone(),
         }
+    }
+
+    /// The job the build before handed over, its leader `id`.
+    #[cfg(windows)]
+    pub(crate) const fn handed(
+        id: RecordedIdentity,
+        handle: std::os::windows::io::OwnedHandle,
+    ) -> Self {
+        Self { id, handle }
+    }
+
+    /// The job, no longer stopped as the lease drops: for the next build.
+    #[cfg(windows)]
+    pub(crate) fn into_job(self) -> std::os::windows::io::OwnedHandle {
+        let lease = std::mem::ManuallyDrop::new(self);
+        // SAFETY: the lease is never dropped, so the handle read out of it
+        // has this one owner.
+        unsafe { std::ptr::read(&raw const lease.handle) }
     }
 
     pub const fn id(&self) -> RecordedIdentity {
@@ -171,6 +191,10 @@ pub struct Passed(pub(crate) i32);
 pub struct InheritedNumber(i32);
 
 impl InheritedNumber {
+    pub(crate) const fn raw(self) -> i32 {
+        self.0
+    }
+
     /// Duplicates through the OS before constructing an owner. The original
     /// number may belong to another Rust owner and is never closed here.
     /// Both descriptors are close-on-exec so tools cannot retain daemon locks.
@@ -518,6 +542,11 @@ mod imp {
     }
 
     pub fn detach_session() -> io::Result<()> {
+        // A daemon exec'd in place by the build before already leads its
+        // own session.
+        if process::getsid(None).is_ok_and(|session| session == process::getpid()) {
+            return Ok(());
+        }
         process::setsid()?;
         Ok(())
     }

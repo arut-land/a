@@ -19,6 +19,7 @@ const BUSY_LOAD: Load<'static> = Load {
     busy: true,
     created: false,
     session: None,
+    adopted: &[],
 };
 
 fn resume(

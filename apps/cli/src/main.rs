@@ -87,11 +87,15 @@ fn main() -> ExitCode {
                     detached,
                     lock_fd,
                     reset_breaker,
+                    handover_fd,
                 }) => serve(
                     here(&home, args.host.as_ref())?,
                     &daemon.staged,
-                    listen_fd,
-                    lock_fd,
+                    Handoff {
+                        listen: listen_fd,
+                        lock: lock_fd,
+                        handover: handover_fd,
+                    },
                     reset_breaker,
                     detached,
                     login,
@@ -146,6 +150,9 @@ fn write(mut output: impl Write + IsTerminal, stream: usize, args: fmt::Argument
 fn daemon_of(host: Option<&Host>, cmd: Option<&Cmd>) -> io::Result<(Home, client::Daemon)> {
     let home = Home::from_env()?;
     let staged = home.runtime().stage(&std::env::current_exe()?)?;
+    // What a daemon of this build can be handed, said where the daemon it
+    // replaces looks: a failure only costs that daemon's waiting it out.
+    let _ = home.runtime().declare_handover(&staged.id);
     let prompt = match cmd {
         Some(Cmd::Web { .. }) => sys::Prompt::Never,
         _ => sys::Prompt::Terminal,
@@ -649,6 +656,15 @@ fn web(_daemon: client::Daemon, _open: bool) -> io::Result<()> {
     Err(io::Error::other("this build of a has no web UI"))
 }
 
+/// What whoever started the daemon handed it, by descriptor or handle
+/// number: a client its listener and lock, a daemon of the build before
+/// those and the record of its work ([`sys::handover`]).
+struct Handoff {
+    listen: Option<i32>,
+    lock: Option<i32>,
+    handover: Option<i32>,
+}
+
 /// The daemon. Started by a client (`listen_fd`), it leaves the client's
 /// session and discards untyped stderr; by hand, it stays at the terminal;
 /// by the OS at login (`login`), it stays in the foreground the service
@@ -656,8 +672,11 @@ fn web(_daemon: client::Daemon, _open: bool) -> io::Result<()> {
 fn serve(
     home: &Home,
     staged: &Staged,
-    listen_fd: Option<i32>,
-    lock_fd: Option<i32>,
+    Handoff {
+        listen: listen_fd,
+        lock: lock_fd,
+        handover: handover_fd,
+    }: Handoff,
     reset_breaker: bool,
     detached: bool,
     login: bool,
@@ -699,6 +718,9 @@ fn serve(
         };
         (lock, listener)
     };
+    let handed = handover_fd
+        .map(|fd| sys::handover::read_record(sys::InheritedNumber::from(fd)))
+        .transpose()?;
     let start = engine::Start {
         lock,
         reset_breaker,
@@ -707,6 +729,12 @@ fn serve(
         // Only a home that can register asks, so an isolated daemon has no
         // question pending and nothing to wake for.
         resident: sys::autostart::applies(home).then_some(sys::autostart::refresh),
+        successor: Some(|exe| {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("__daemon");
+            cmd
+        }),
+        handed,
     };
     engine::serve(
         &listener,

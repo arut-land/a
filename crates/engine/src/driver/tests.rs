@@ -361,6 +361,7 @@ impl Fixture {
                 blobs,
                 tree,
                 loaded: Mutex::default(),
+                handed: Mutex::default(),
                 daemon: daemon.clone(),
             }),
             slots: Mutex::default(),
@@ -618,14 +619,21 @@ fn pressure_retains_cached_projections_while_a_process_is_owned() {
     let fixture = Fixture::new(ext::LOOP, Registry::default(), openai(&Script::new(&[])));
     let session = fixture.start(&[entry(1, echo("cached message"))]);
     let process: Arc<dyn ext::RunningProcess> = Arc::new(admission::StaleProcess);
-    lock(&session.session.jobs).push(Arc::clone(&process));
+    lock(&session.session.jobs).push(Job {
+        call: CallId::new(1).unwrap(),
+        tool: None,
+        process: Arc::clone(&process),
+    });
     assert!(session.has_jobs());
     assert!(!session.has_work());
     assert_eq!(session.summary().activity, Activity::Idle);
     assert_eq!(session.projection_cache(true), [true; 3]);
     session.reclaim();
     assert_eq!(session.projection_cache(false), [true; 3]);
-    assert!(Arc::ptr_eq(&lock(&session.session.jobs)[0], &process));
+    assert!(Arc::ptr_eq(
+        &lock(&session.session.jobs)[0].process,
+        &process
+    ));
     lock(&session.session.jobs).clear();
     session.reclaim();
     assert_eq!(session.projection_cache(false), [false; 3]);

@@ -7,6 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::{Passed, SpawnEnvironment};
@@ -20,6 +21,9 @@ struct OwnedChild {
     watch: Option<OwnedFd>,
     group: bool,
     waiter: Mutex<Option<Waiter>>,
+    /// Handed to the next build: this process's image no longer signals or
+    /// reaps it, the one it execs into does.
+    released: AtomicBool,
 }
 
 struct Waiter {
@@ -57,7 +61,65 @@ impl Child {
         self.0.observe(nonblocking)
     }
 
+    /// Gives the child up to the image this process execs into: from
+    /// now on nothing here signals, waits on or reaps it. It stays this
+    /// process's child, so the next image adopts it ([`Child::adopt`]).
+    pub(crate) fn release(&self) -> u32 {
+        self.0.released.store(true, Ordering::SeqCst);
+        self.0.pid
+    }
+
+    /// The group led by `pid`, a child an earlier image of this process
+    /// started and released. Only the kernel's word that it is this
+    /// process's child, unreaped, makes it one: a number that names
+    /// anything else is refused.
+    pub(crate) fn adopt(pid: u32) -> io::Result<Self> {
+        let id = libc::id_t::from(pid);
+        match observe(libc::P_PID, id, true) {
+            Ok(_) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the handed process is not this process's child",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        let leader =
+            rustix::process::Pid::from_raw(pid.cast_signed()).ok_or(io::ErrorKind::InvalidInput)?;
+        match rustix::process::getpgid(Some(leader)) {
+            Ok(group) if group == leader => {}
+            // A leader already exited answers for no group, as its status
+            // still pins the id.
+            Err(rustix::io::Errno::SRCH) => {}
+            Ok(_) | Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the handed process leads no group",
+                ));
+            }
+        }
+        let mut child = Self(Arc::new(OwnedChild {
+            pid,
+            watch: None,
+            group: true,
+            waiter: Mutex::new(None),
+            released: AtomicBool::new(false),
+        }));
+        match super::imp::exit_watch(pid) {
+            Ok(watch) => Arc::get_mut(&mut child.0).unwrap().watch = Some(watch),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ENOSYS) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(child)
+    }
+
     pub(super) fn signal_group(&self, signal: Signal) -> io::Result<()> {
+        if self.0.released.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         if self.0.group {
             // The unreaped leader pins this PGID until all leases are dropped.
             if self.observe(true)?.is_some()
@@ -74,6 +136,9 @@ impl Child {
     }
 
     fn signal(&self, signal: Signal) -> io::Result<()> {
+        if self.0.released.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         #[cfg(target_os = "linux")]
         if let Some(fd) = &self.0.watch {
             return match rustix::process::pidfd_send_signal(fd, super::raw(signal)) {
@@ -195,6 +260,10 @@ impl OwnedChild {
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
+        // A waiter still blocked on it ends with this image.
+        if *self.released.get_mut() {
+            return;
+        }
         let owned = self.observe(true).is_ok();
         if self.group && owned {
             let _ = super::imp::signal_group(self.pid, Signal::Kill);
@@ -385,6 +454,7 @@ impl<'a> SpawnPlan<'a> {
             watch: None,
             group: self.group,
             waiter: Mutex::new(None),
+            released: AtomicBool::new(false),
         }));
         match super::imp::exit_watch(child.id()) {
             Ok(watch) => Arc::get_mut(&mut child.0).unwrap().watch = Some(watch),

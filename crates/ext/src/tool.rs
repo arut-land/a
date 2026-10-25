@@ -309,6 +309,21 @@ impl Cx {
         self.host.own(process);
     }
 
+    /// Owns again, as [`Cx::own`] does, a group the daemon's previous
+    /// build handed over: its process is on the log already.
+    pub fn reown(&self, process: crate::ProcessLease) {
+        self.host.reown(process);
+    }
+
+    /// The call, gone on in the background, runs `process` and can go on
+    /// in the daemon's next build from `state` ([`Resumable`]): an upgrade
+    /// hands the two over rather than waiting for the call to end.
+    pub fn resumable(&self, process: &crate::OwnedProcess, state: &impl Serialize) {
+        if let Ok(state) = Json::encode(state) {
+            self.host.resumable(Arc::clone(&process.process), state);
+        }
+    }
+
     /// Logs `text` as more of the call's output, for clients to show as
     /// it runs and for the call's outcome should it be interrupted.
     pub fn progress(&self, text: &str) {
@@ -449,6 +464,55 @@ pub trait Tool: Send + Sync + 'static {
     }
 }
 
+/// A tool whose calls gone on in the background, and the process groups
+/// they leave to the session, go on in the daemon's next build: an upgrade
+/// hands each group over, live, rather than waiting for it to end. Offered
+/// with [`Tooled::resumable`](crate::Tooled::resumable).
+pub trait Resumable: Tool {
+    /// What a call's run knows that its input, its output stream and its
+    /// process do not, given to [`Cx::resumable`] as it goes on in the
+    /// background.
+    type State: Serialize + DeserializeOwned + Send + Sync + 'static;
+
+    /// Goes on with a call gone on in the background in an earlier build:
+    /// `handed` is its group, for the [`Processes`](crate::Processes)
+    /// provider to adopt. It ends as [`Tool::call`] would have, of the
+    /// same shape.
+    fn resume(&self, input: &Self::In, state: Self::State, handed: Json, cx: &Cx) -> impl Send;
+
+    /// Owns again, as the session's ([`Cx::own`]), `handed`, a group a
+    /// call left to the session in an earlier build.
+    fn rehold(&self, handed: Json, cx: &Cx) -> impl Future<Output = Result<(), String>> + Send;
+}
+
+/// A resumable tool's entry points, set as it is offered as one.
+pub(crate) struct Resumer<T: Tool> {
+    resume: for<'a> fn(&'a T, T::In, Json, Json, &'a Cx) -> BoxFuture<'a, Called>,
+    rehold: for<'a> fn(&'a T, Json, &'a Cx) -> BoxFuture<'a, Result<(), String>>,
+}
+
+impl<T: Resumable> Resumer<T> {
+    pub(crate) fn of<M>() -> Self
+    where
+        T::resume(..): Output<T::Out, M>,
+    {
+        Self {
+            resume: |tool, input, state, handed, cx| {
+                Box::pin(async move {
+                    let state = match state.parse::<T::State>() {
+                        Ok(state) => state,
+                        Err(e) => return Called::failed(format!("unreadable handover: {e}")),
+                    };
+                    let progress = |text: &str| cx.progress(text);
+                    let output = tool.resume(&input, state, handed, cx).run(&progress).await;
+                    called::<T>(&input, output)
+                })
+            },
+            rehold: |tool, handed, cx| Box::pin(tool.rehold(handed, cx)),
+        }
+    }
+}
+
 /// A call's input, read into its tool's own type: what its card is made
 /// of and its run is given, so it is read once.
 pub struct Parsed(Box<dyn Any + Send + Sync>);
@@ -512,13 +576,38 @@ pub trait DynTool: Send + Sync {
     /// What the model sees of a stored output.
     fn to_model(&self, output: &Json) -> llm::Output;
     fn present(&self, input: &Parsed) -> Option<Card>;
+    /// Whether its calls and their groups go on in the daemon's next
+    /// build ([`Resumable`]).
+    fn resumable(&self) -> bool {
+        false
+    }
+    /// See [`Resumable::resume`]; a tool that is not resumable fails it.
+    fn resume<'a>(
+        &'a self,
+        _input: Parsed,
+        _state: Json,
+        _handed: Json,
+        _cx: &'a Cx,
+    ) -> BoxFuture<'a, Called> {
+        let error = format!("{} calls do not go on in another build", self.name());
+        Box::pin(std::future::ready(Called::failed(error)))
+    }
+    /// See [`Resumable::rehold`]; a tool that is not resumable refuses it.
+    fn rehold<'a>(&'a self, _handed: Json, _cx: &'a Cx) -> BoxFuture<'a, Result<(), String>> {
+        let error = format!("{} groups do not go on in another build", self.name());
+        Box::pin(std::future::ready(Err(error)))
+    }
 }
 
 /// A typed tool as a [`DynTool`], the shape `M` of its calls found from
-/// what its `call` returns.
-pub(crate) struct Erased<T, M>(pub T, pub PhantomData<fn() -> M>);
+/// what its `call` returns, and its [`Resumer`] once offered as resumable.
+pub(crate) struct Erased<T: Tool, M>(
+    pub T,
+    pub PhantomData<fn() -> M>,
+    pub std::sync::OnceLock<Resumer<T>>,
+);
 
-impl<T, M> DynTool for Erased<T, M>
+impl<T: Tool, M> DynTool for Erased<T, M>
 where
     T: Tool,
     T::call(..): Output<T::Out, M>,
@@ -570,19 +659,37 @@ where
         };
         Box::pin(async move {
             let progress = |text: &str| cx.progress(text);
-            let output = match self.0.call(&input, cx).run(&progress).await {
-                Ok(output) => output,
-                Err(error) => return Called::failed(error),
-            };
-            match Json::encode(&output) {
-                Ok(json) => Called {
-                    card: T::present_result(&input, &output),
-                    held: T::held(&output),
-                    outcome: Outcome::Done { output: json },
-                },
-                Err(e) => Called::failed(e.to_string()),
-            }
+            let output = self.0.call(&input, cx).run(&progress).await;
+            called::<T>(&input, output)
         })
+    }
+
+    fn resumable(&self) -> bool {
+        self.2.get().is_some()
+    }
+
+    fn resume<'a>(
+        &'a self,
+        input: Parsed,
+        state: Json,
+        handed: Json,
+        cx: &'a Cx,
+    ) -> BoxFuture<'a, Called> {
+        let (Some(resumer), Some(input)) = (self.2.get(), input.take::<T::In>()) else {
+            let error = format!("{} calls do not go on in another build", T::NAME);
+            return Box::pin(std::future::ready(Called::failed(error)));
+        };
+        (resumer.resume)(&self.0, input, state, handed, cx)
+    }
+
+    fn rehold<'a>(&'a self, handed: Json, cx: &'a Cx) -> BoxFuture<'a, Result<(), String>> {
+        match self.2.get() {
+            Some(resumer) => (resumer.rehold)(&self.0, handed, cx),
+            None => Box::pin(std::future::ready(Err(format!(
+                "{} groups do not go on in another build",
+                T::NAME
+            )))),
+        }
     }
 
     fn to_model(&self, output: &Json) -> llm::Output {
@@ -591,5 +698,21 @@ where
 
     fn present(&self, input: &Parsed) -> Option<Card> {
         T::present(input.get()?)
+    }
+}
+
+/// How a call of `T` on `input` ended, from what it returned.
+fn called<T: Tool>(input: &T::In, output: Result<T::Out, String>) -> Called {
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => return Called::failed(error),
+    };
+    match Json::encode(&output) {
+        Ok(json) => Called {
+            card: T::present_result(input, &output),
+            held: T::held(&output),
+            outcome: Outcome::Done { output: json },
+        },
+        Err(e) => Called::failed(e.to_string()),
     }
 }
