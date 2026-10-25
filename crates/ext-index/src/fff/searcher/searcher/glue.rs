@@ -32,8 +32,7 @@ impl<'s, M: Matcher, S: Sink> SliceByLine<'s, M, S> {
                 && self.core.match_by_line(self.slice)?
             {}
         }
-        let byte_count = self.slice.len() as u64;
-        self.core.finish(byte_count)
+        Ok(())
     }
 }
 
@@ -72,17 +71,13 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
                 self.sink_matched(&last_match)?;
             }
         }
-        let byte_count = self.slice.len() as u64;
-        self.core.finish(byte_count)
+        Ok(())
     }
 
     fn sink(&mut self) -> Result<bool, S::Error> {
-        let mat = match self.find()? {
-            Some(range) => range,
-            None => {
-                self.core.set_pos(self.slice.len());
-                return Ok(true);
-            }
+        let Some(mat) = self.find()? else {
+            self.core.set_pos(self.slice.len());
+            return Ok(true);
         };
         self.advance(&mat);
 

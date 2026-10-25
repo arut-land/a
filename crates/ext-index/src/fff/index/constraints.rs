@@ -215,7 +215,7 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
                 return self.evaluate(path, name, inner, glob_idx, !negate);
             }
             // Pass-throughs — handled at higher levels.
-            Constraint::Parts(_) | Constraint::Exclude(_) | Constraint::FileType(_) => true,
+            Constraint::FileType(_) => true,
         };
         if negate { !raw } else { raw }
     }
@@ -486,7 +486,7 @@ mod tests {
         let exact = [Constraint::FilePath("유니코드_파일_테스트.csv")];
         assert_eq!(passing(&paths, &exact).len(), 1);
         let mismatch = [Constraint::FilePath("트.c")];
-        assert!(passing(&paths, &mismatch).is_empty());
+        assert_eq!(passing(&paths, &mismatch), [""; 0]);
     }
 
     #[test]

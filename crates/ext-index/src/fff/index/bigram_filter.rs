@@ -21,7 +21,7 @@ const NO_COLUMN: u16 = u16::MAX;
 pub const BIGRAM_KEY_SLOTS: usize = 95 * 95;
 
 // Slot in the compact lookup for a printable bigram key (`hi << 8 | lo`).
-#[inline(always)]
+#[inline]
 fn key_slot(key: u16) -> usize {
     let hi = (key >> 8) as usize;
     let lo = (key & 0xFF) as usize;
@@ -275,11 +275,8 @@ impl BigramIndexBuilder {
         self.populated += chunk.populated;
     }
 
-    pub fn is_ready(&self) -> bool {
-        self.populated > 0
-    }
-
-    pub fn columns_used(&self) -> u16 {
+    #[cfg(test)]
+    fn columns_used(&self) -> u16 {
         self.columns as u16
     }
 
@@ -446,6 +443,7 @@ fn and_sparse_column(result: &mut [u64], data: &[u8]) {
 }
 
 /// One bigram column: a stride-`words` dense bitset or a varint gap list.
+#[derive(Clone, Copy)]
 pub(crate) enum ColumnRef<'a> {
     Dense(&'a [u64]),
     Sparse(&'a [u8]),
@@ -608,13 +606,14 @@ impl BigramFilter {
         self.skip_index = Some(Box::new(skip));
     }
 
-    #[inline]
+    #[cfg(test)]
     pub fn is_candidate(candidates: &[u64], file_idx: usize) -> bool {
         let word = file_idx / 64;
         let bit = file_idx % 64;
         word < candidates.len() && candidates[word] & (1u64 << bit) != 0
     }
 
+    #[cfg(test)]
     pub fn count_candidates(candidates: &[u64]) -> usize {
         candidates.iter().map(|w| w.count_ones() as usize).sum()
     }
@@ -623,33 +622,27 @@ impl BigramFilter {
         self.populated > 0
     }
 
-    pub fn file_count(&self) -> usize {
-        self.file_count
-    }
-
-    pub fn columns_used(&self) -> usize {
-        self.dense_count + self.sparse_count()
-    }
-
     /// Number of columns stored as varint gap lists.
-    pub fn sparse_count(&self) -> usize {
+    #[cfg(test)]
+    fn sparse_count(&self) -> usize {
         self.sparse_offsets.len().saturating_sub(1)
     }
 
     /// Bytes held by the sparse (gap-encoded) columns.
     pub fn sparse_bytes(&self) -> usize {
-        self.sparse_data.len() + self.sparse_offsets.len() * std::mem::size_of::<u32>()
+        self.sparse_data.len() + self.sparse_offsets.len() * size_of::<u32>()
     }
 
     /// Total heap bytes used by this index (lookup + dense + sparse + skip).
     pub fn heap_bytes(&self) -> usize {
-        let lookup_bytes = self.lookup.len() * std::mem::size_of::<u16>();
+        let lookup_bytes = self.lookup.len() * size_of::<u16>();
         let dense_bytes = self.dense.capacity() * size_of::<u64>();
         let skip_bytes = self.skip_index.as_ref().map_or(0, |s| s.heap_bytes());
         lookup_bytes + self.rare_keys.len() * 8 + dense_bytes + self.sparse_bytes() + skip_bytes
     }
 
     /// Check whether a bigram key is present in this index.
+    #[cfg(test)]
     pub fn has_key(&self, key: u16) -> bool {
         self.column(key) != NO_COLUMN
     }
@@ -678,7 +671,7 @@ impl BigramFilter {
 
 /// Single-byte normalize: 0 for non-printable, lowercased byte otherwise.
 /// 0 is a safe sentinel: lowered printable bytes are 32..=126.
-#[inline(always)]
+#[inline]
 fn normalize_byte_scalar(b: u8) -> u8 {
     let printable = b.wrapping_sub(32) <= 94;
     let lower = b | ((b.wrapping_sub(b'A') < 26) as u8 * 0x20);
@@ -765,11 +758,6 @@ impl BigramOverlay {
                     .then_some(file_idx)
             })
             .collect()
-    }
-
-    /// Number of base files this overlay was created for.
-    pub(crate) fn base_file_count(&self) -> usize {
-        self.base_file_count
     }
 
     /// Get the tombstone bitset for clearing base candidates.
@@ -897,8 +885,8 @@ mod tests {
     /// Return the sorted list of (consec, skip) bigram keys that should appear
     /// for `content`. Used as the reference implementation.
     fn expected_bigrams(content: &[u8]) -> (Vec<u16>, Vec<u16>) {
-        let mut consec: std::collections::BTreeSet<u16> = Default::default();
-        let mut skip: std::collections::BTreeSet<u16> = Default::default();
+        let mut consec = std::collections::BTreeSet::<u16>::default();
+        let mut skip = std::collections::BTreeSet::<u16>::default();
         let printable = |b: u8| (32..=126).contains(&b);
         for i in 1..content.len() {
             let a = content[i - 1];

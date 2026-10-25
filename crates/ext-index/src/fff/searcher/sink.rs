@@ -8,21 +8,11 @@ pub trait SinkError: Sized {
     /// A constructor for converting any value that satisfies the
     /// `std::fmt::Display` trait into an error.
     fn error_message<T: std::fmt::Display>(message: T) -> Self;
-
-    /// A constructor for converting I/O errors that occur while searching into
-    /// an error of this type.
-    fn error_io(err: io::Error) -> Self {
-        Self::error_message(err)
-    }
 }
 
 impl SinkError for io::Error {
     fn error_message<T: std::fmt::Display>(message: T) -> io::Error {
         io::Error::other(message.to_string())
-    }
-
-    fn error_io(err: io::Error) -> io::Error {
-        err
     }
 }
 
@@ -37,7 +27,7 @@ pub trait Sink {
     /// This method is called whenever a match is found.
     ///
     /// If this returns `true`, then searching continues. If this returns
-    /// `false`, then searching is stopped immediately and `finish` is called.
+    /// `false`, then searching is stopped immediately.
     fn matched(&mut self, _searcher: &Searcher, _mat: &SinkMatch<'_>) -> Result<bool, Self::Error>;
 
     /// This method is called when a search has begun, before any search is
@@ -45,13 +35,6 @@ pub trait Sink {
     #[inline]
     fn begin(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
         Ok(true)
-    }
-
-    /// This method is called when a search has completed. By default, this
-    /// does nothing.
-    #[inline]
-    fn finish(&mut self, _searcher: &Searcher, _: &SinkFinish) -> Result<(), Self::Error> {
-        Ok(())
     }
 }
 
@@ -66,25 +49,6 @@ impl<S: Sink> Sink for &mut S {
     #[inline]
     fn begin(&mut self, searcher: &Searcher) -> Result<bool, S::Error> {
         (**self).begin(searcher)
-    }
-
-    #[inline]
-    fn finish(&mut self, searcher: &Searcher, sink_finish: &SinkFinish) -> Result<(), S::Error> {
-        (**self).finish(searcher, sink_finish)
-    }
-}
-
-/// Summary data reported at the end of a search.
-#[derive(Clone, Debug)]
-pub struct SinkFinish {
-    pub(crate) byte_count: u64,
-}
-
-impl SinkFinish {
-    /// Return the total number of bytes searched.
-    #[inline]
-    pub fn byte_count(&self) -> u64 {
-        self.byte_count
     }
 }
 

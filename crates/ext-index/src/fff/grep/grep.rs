@@ -8,13 +8,13 @@ use super::sink::{SinkState, debug_assert_newline_terminator};
 use super::types::{GrepMatch, GrepMode, GrepOptions};
 use crate::fff::query::{FFFQuery, FuzzyQuery, GrepConfig, QueryParser};
 use crate::fff::searcher::{
-    LineTerminator, Searcher, SearcherBuilder, Sink, SinkFinish, SinkMatch,
+    LineTerminator, Searcher, SearcherBuilder, Sink, SinkMatch,
     matcher::{Match, Matcher, NoError},
 };
 
 /// A literal needle, found with or without ASCII case.
 pub(super) enum NeedleFinder {
-    CaseSensitive(Finder<'static>),
+    CaseSensitive(Box<Finder<'static>>),
     /// The lowered needle, and an ASCII-case-insensitive searcher for it.
     CaseInsensitive(AhoCorasick, Vec<u8>),
 }
@@ -22,7 +22,7 @@ pub(super) enum NeedleFinder {
 impl NeedleFinder {
     fn new(needle: &[u8], case_insensitive: bool) -> Self {
         if !case_insensitive {
-            return Self::CaseSensitive(Finder::new(needle).into_owned());
+            return Self::CaseSensitive(Box::new(Finder::new(needle).into_owned()));
         }
         let lowered = needle.to_ascii_lowercase();
         let searcher = AhoCorasick::builder()
@@ -155,10 +155,6 @@ impl Sink for PlainTextSink<'_> {
             context_after,
         ))
     }
-
-    fn finish(&mut self, _: &Searcher, _: &SinkFinish) -> Result<(), Self::Error> {
-        Ok(())
-    }
 }
 
 enum Pattern {
@@ -167,7 +163,7 @@ enum Pattern {
         multiline_segment_len: Option<usize>,
     },
     Regex(regex::bytes::Regex),
-    Fuzzy(FuzzyGrep),
+    Fuzzy(Box<FuzzyGrep>),
 }
 
 /// What the content index is asked for a grep's candidates.
@@ -201,11 +197,11 @@ impl Grep {
 
         if options.mode == GrepMode::Fuzzy {
             return Some(Self {
-                pattern: Pattern::Fuzzy(FuzzyGrep::new(
+                pattern: Pattern::Fuzzy(Box::new(FuzzyGrep::new(
                     &grep_text,
                     case_insensitive,
                     options.max_matches_per_file,
-                )),
+                ))),
                 text: grep_text,
                 searcher: Searcher::new(),
                 options,
@@ -448,13 +444,13 @@ mod tests {
         // First needle segment highlighted as the line suffix
         assert_eq!(found[0].ranges.as_slice(), [(6, 13)]);
         assert_eq!(found[0].col, 6);
-        assert!(plain.file(winpath).is_empty());
+        assert_eq!(plain.file(winpath), []);
 
         // PlainText + `\\n`: literal backslash + n, must NOT be mangled to newline
         let escaped = grep("\\\\nvim-data", options);
         let found = escaped.file(winpath);
         assert!(found[0].text.contains("\\\\nvim-data"));
-        assert!(found[0].after.is_empty());
+        assert_eq!(found[0].after, [""; 0]);
 
         // Regex + `\n`: goes through the MultiLine searcher strategy
         let regex = grep(

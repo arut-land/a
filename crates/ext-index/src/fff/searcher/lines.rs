@@ -4,7 +4,7 @@ A collection of routines for performing operations on lines.
 
 use bstr::ByteSlice;
 
-use crate::fff::searcher::matcher::{LineTerminator, Match};
+use crate::fff::searcher::matcher::Match;
 
 /// An explicit iterator over lines in a particular slice of bytes.
 ///
@@ -32,12 +32,12 @@ impl LineStep {
     }
 
     /// Like next, but returns a `Match` instead of a tuple.
-    #[inline(always)]
+    #[inline]
     pub fn next_match(&mut self, bytes: &[u8]) -> Option<Match> {
         self.next_impl(bytes).map(|(s, e)| Match::new(s, e))
     }
 
-    #[inline(always)]
+    #[inline]
     fn next_impl(&mut self, mut bytes: &[u8]) -> Option<(usize, usize)> {
         bytes = &bytes[..self.end];
         match bytes[self.pos..].find_byte(self.line_term) {
@@ -68,22 +68,11 @@ pub fn count(bytes: &[u8], line_term: u8) -> u64 {
     memchr::memchr_iter(line_term, bytes).count() as u64
 }
 
-/// Given a line that possibly ends with a terminator, return that line without the terminator.
-#[inline(always)]
-pub fn without_terminator(bytes: &[u8], line_term: LineTerminator) -> &[u8] {
-    let line_term = line_term.as_bytes();
-    let start = bytes.len().saturating_sub(line_term.len());
-    if bytes.get(start..) == Some(line_term) {
-        return &bytes[..bytes.len() - line_term.len()];
-    }
-    bytes
-}
-
 /// Return the start and end offsets of the lines containing the given range
 /// of bytes.
 ///
 /// Line terminators are considered part of the line they terminate.
-#[inline(always)]
+#[inline]
 pub fn locate(bytes: &[u8], line_term: u8, range: Match) -> Match {
     let line_start = bytes[..range.start()]
         .rfind_byte(line_term)

@@ -129,7 +129,7 @@ impl ParserConfig for GrepConfig {
             && open < close
         {
             let inner = &bytes[open + 1..close];
-            if inner.contains(&b',') && inner.iter().any(|b| b.is_ascii_alphabetic()) {
+            if inner.contains(&b',') && inner.iter().any(u8::is_ascii_alphabetic) {
                 return true;
             }
         }

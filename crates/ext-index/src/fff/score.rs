@@ -20,11 +20,11 @@ use crate::fff::types::{Files, recent_first};
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Score {
     pub(crate) total: i32,
-    pub(crate) base_score: i32,
+    /// What landing in the file's name added, and where it landed: why a
+    /// file ranked where it did, which the tests check.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) filename_bonus: i32,
-    pub(crate) special_filename_bonus: i32,
-    pub(crate) path_alignment_bonus: i32,
-    pub(crate) exact_match: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) match_type: &'static str,
 }
 
@@ -270,7 +270,6 @@ fn score_matches(
                     && main_needle_len as usize == fname_len
                     && main_needle.eq_ignore_ascii_case(name.as_bytes()));
 
-            let mut has_special_filename_bonus = false;
             let filename_bonus = if is_exact_filename {
                 base_score / 5 * 2 // 40% bonus for exact filename match
             } else if is_filename_match {
@@ -290,7 +289,6 @@ fn score_matches(
             } else if (5..=11).contains(&fname_len) && is_special_entry_point_file(name) {
                 // 5% bonus for special file but not as much as file name to avoid situations
                 // when you have /user_service/server.rs and /user_service/server/mod.rs
-                has_special_filename_bonus = true;
                 base_score * 5 / 100
             } else {
                 0
@@ -316,15 +314,7 @@ fn score_matches(
 
             let score = Score {
                 total,
-                base_score,
                 filename_bonus,
-                special_filename_bonus: if has_special_filename_bonus {
-                    filename_bonus
-                } else {
-                    0
-                },
-                path_alignment_bonus,
-                exact_match: is_exact_filename || path_match.exact,
                 match_type: if is_exact_filename {
                     "exact_filename"
                 } else if is_filename_match {
@@ -521,7 +511,7 @@ mod tests {
                         let b = second.iter().find(|b| b.index == a.index)?;
                         Some((
                             a.index,
-                            ((u32::from(a.score) + u32::from(b.score)) / 2) as u16,
+                            u32::midpoint(u32::from(a.score), u32::from(b.score)) as u16,
                             a.end_col,
                             a.exact && b.exact,
                         ))
@@ -555,7 +545,7 @@ mod tests {
     #[test]
     fn a_query_of_constraints_alone_lists_recent_files_first() {
         let mut files = make_files(&["a.rs", "b.rs", "c.txt"]);
-        files.upsert(Found {
+        files.upsert(&Found {
             path: "b.rs".into(),
             size: 1,
             modified: 10,

@@ -51,14 +51,14 @@ impl Files {
             items: Vec::with_capacity(found.len()),
             walked: 0,
         };
-        for file in found {
+        for file in &found {
             files.push(file);
         }
         files.walked = files.items.len();
         files
     }
 
-    fn push(&mut self, found: Found) -> Option<usize> {
+    fn push(&mut self, found: &Found) -> Option<usize> {
         let len = u16::try_from(found.path.len()).ok()?;
         let start = u32::try_from(self.arena.len()).ok()?;
         let name = found.path.rfind('/').map_or(0, |slash| slash + 1) as u16;
@@ -99,11 +99,6 @@ impl Files {
         &self.path(file)[file.name as usize..]
     }
 
-    /// Its directory, with the trailing `/`; empty at the root.
-    pub(crate) fn dir<'a>(&'a self, file: &FileItem) -> &'a str {
-        &self.path(file)[..file.name as usize]
-    }
-
     /// The slot of the live file at `path`.
     pub(crate) fn find(&self, path: &str) -> Option<usize> {
         let walked = &self.items[..self.walked];
@@ -118,7 +113,7 @@ impl Files {
 
     /// Records `found`, as new or changed: the slot it is in, and whether
     /// it is new.
-    pub(crate) fn upsert(&mut self, found: Found) -> Option<(usize, bool)> {
+    pub(crate) fn upsert(&mut self, found: &Found) -> Option<(usize, bool)> {
         if let Some(slot) = self.find(&found.path) {
             let file = &mut self.items[slot];
             file.size = found.size;
@@ -163,10 +158,6 @@ impl FileItem {
         self.deleted
     }
 
-    pub(crate) fn path_len(&self) -> usize {
-        self.len as usize
-    }
-
     pub(crate) fn name_offset(&self) -> usize {
         self.name as usize
     }
@@ -197,15 +188,14 @@ mod tests {
         let mut files = Files::walked(vec![found("src/b.rs"), found("a.rs"), found("src/a.rs")]);
         assert_eq!(files.find("src/a.rs"), Some(1));
         assert_eq!(files.name(&files.items()[1]), "a.rs");
-        assert_eq!(files.dir(&files.items()[1]), "src/");
-        assert_eq!(files.upsert(found("new.rs")), Some((3, true)));
-        assert_eq!(files.upsert(found("a.rs")), Some((0, false)));
+        assert_eq!(files.upsert(&found("new.rs")), Some((3, true)));
+        assert_eq!(files.upsert(&found("a.rs")), Some((0, false)));
         assert_eq!(files.find("new.rs"), Some(3));
         assert_eq!(files.under("src"), [1, 2]);
         assert_eq!(files.remove("src/a.rs"), Some(1));
         assert_eq!(files.find("src/a.rs"), None);
         assert_eq!(files.live_count(), 3);
         // Back after a removal: a new slot, the old one stays a tombstone.
-        assert_eq!(files.upsert(found("src/a.rs")), Some((4, true)));
+        assert_eq!(files.upsert(&found("src/a.rs")), Some((4, true)));
     }
 }

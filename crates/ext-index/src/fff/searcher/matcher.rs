@@ -103,14 +103,8 @@ impl LineTerminator {
 
     /// Return the terminator byte.
     #[inline]
-    pub fn as_byte(&self) -> u8 {
+    pub fn as_byte(self) -> u8 {
         self.0
-    }
-
-    /// Return the terminator as a single-element byte slice.
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        std::slice::from_ref(&self.0)
     }
 }
 

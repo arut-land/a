@@ -91,7 +91,7 @@ mod tests {
                 })
                 .collect(),
         );
-        files.upsert(Found {
+        files.upsert(&Found {
             path: "new.rs".into(),
             size: 1,
             modified: 0,

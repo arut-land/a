@@ -23,15 +23,6 @@ pub struct FFFQuery<'a> {
     pub location: Option<Location>,
 }
 
-impl<'a> FFFQuery<'a> {
-    /// Parse query and execute, perfectly paired with configuration presets
-    pub fn parse(query: &'a str, config: impl ParserConfig) -> Self {
-        let query_parser = QueryParser::new(config);
-
-        query_parser.parse(query.as_ref())
-    }
-}
-
 /// Main query parser - zero-cost wrapper around configuration
 #[derive(Debug)]
 pub struct QueryParser<C: ParserConfig> {
@@ -44,6 +35,7 @@ impl<C: ParserConfig> QueryParser<C> {
     }
 
     /// Parse a field containing only constraints.
+    #[cfg(test)]
     pub fn parse_constraints<'a>(&self, query: &'a str) -> ConstraintVec<'a> {
         query
             .split_whitespace()
@@ -382,7 +374,7 @@ fn parse_negation<'a, C: ParserConfig>(token: &'a str, config: &C) -> Option<Con
 
     // Negated text (!test) requires ≥3 inner chars with at least one alphanumeric,
     // so operators like `!=`, `!==`, `!!` stay literal search text.
-    if inner_token.len() < 3 || !inner_token.chars().any(|c| c.is_alphanumeric()) {
+    if inner_token.len() < 3 || !inner_token.chars().any(char::is_alphanumeric) {
         return None;
     }
     Some(Constraint::Not(Box::new(Constraint::Text(inner_token))))
@@ -456,10 +448,10 @@ fn parse_token_without_negation<'a, C: ParserConfig>(
 fn parse_path_segment(token: &str) -> Option<Constraint<'_>> {
     if token.len() > 1 && token.starts_with('/') {
         let segment = token.trim_start_matches('/').trim_end_matches('/');
-        if !segment.is_empty() {
-            Some(Constraint::PathSegment(segment))
-        } else {
+        if segment.is_empty() {
             None
+        } else {
+            Some(Constraint::PathSegment(segment))
         }
     } else {
         None
@@ -472,10 +464,10 @@ fn parse_path_segment(token: &str) -> Option<Constraint<'_>> {
 fn parse_path_segment_trailing(token: &str) -> Option<Constraint<'_>> {
     if token.len() > 1 && token.ends_with('/') {
         let segment = token.trim_end_matches('/');
-        if !segment.is_empty() {
-            Some(Constraint::PathSegment(segment))
-        } else {
+        if segment.is_empty() {
             None
+        } else {
+            Some(Constraint::PathSegment(segment))
         }
     } else {
         None
@@ -610,7 +602,7 @@ mod tests {
         let parser = QueryParser::new(FileSearchConfig);
         // Inner text < 3 chars is not a Not constraint
         let result = parser.parse("!ab foo");
-        assert!(result.constraints.is_empty());
+        assert_eq!(result.constraints, []);
         // Inner text >= 3 chars still is
         let result = parser.parse("!abc foo");
         assert_eq!(result.constraints.len(), 1);
@@ -753,7 +745,7 @@ mod tests {
     fn test_grep_question_mark_is_text() {
         let parser = QueryParser::new(GrepConfig);
         let result = parser.parse("foo?");
-        assert!(result.constraints.is_empty());
+        assert_eq!(result.constraints, []);
         assert_eq!(result.fuzzy_query, FuzzyQuery::Text("foo?"));
     }
 
@@ -809,7 +801,7 @@ mod tests {
 
         // Single-token regex like "fn\\s+\\w+" returns FFFQuery with Text fuzzy query
         let result = QueryParser::new(GrepConfig).parse("fn\\s+\\w+");
-        assert!(result.constraints.is_empty());
+        assert_eq!(result.constraints, []);
         assert_eq!(result.fuzzy_query, FuzzyQuery::Text("fn\\s+\\w+"));
 
         // But the escaped constraint forms SHOULD still be stripped:
@@ -849,11 +841,10 @@ mod tests {
             Constraint::Not(inner) => {
                 assert!(
                     matches!(**inner, Constraint::Text("test")),
-                    "Expected Not(Text(\"test\")), got Not({:?})",
-                    inner
+                    "Expected Not(Text(\"test\")), got Not({inner:?})"
                 );
             }
-            other => panic!("Expected Not constraint, got {:?}", other),
+            other => panic!("Expected Not constraint, got {other:?}"),
         }
     }
 
@@ -866,11 +857,10 @@ mod tests {
             Constraint::Not(inner) => {
                 assert!(
                     matches!(**inner, Constraint::PathSegment("src")),
-                    "Expected Not(PathSegment(\"src\")), got Not({:?})",
-                    inner
+                    "Expected Not(PathSegment(\"src\")), got Not({inner:?})"
                 );
             }
-            other => panic!("Expected Not constraint, got {:?}", other),
+            other => panic!("Expected Not constraint, got {other:?}"),
         }
     }
 
@@ -883,11 +873,10 @@ mod tests {
             Constraint::Not(inner) => {
                 assert!(
                     matches!(**inner, Constraint::Extension("rs")),
-                    "Expected Not(Extension(\"rs\")), got Not({:?})",
-                    inner
+                    "Expected Not(Extension(\"rs\")), got Not({inner:?})"
                 );
             }
-            other => panic!("Expected Not constraint, got {:?}", other),
+            other => panic!("Expected Not constraint, got {other:?}"),
         }
     }
 
@@ -897,7 +886,7 @@ mod tests {
         assert_eq!(directory.as_slice(), &[Constraint::PathSegment("scope-a")]);
 
         let file = QueryParser::new(GrepConfig).parse_constraints("scope-a/one.txt");
-        assert!(file.is_empty());
+        assert_eq!(file, []);
     }
 
     #[test]
@@ -938,7 +927,7 @@ mod tests {
         let parser = QueryParser::new(GrepConfig);
         // localhost:8080 should NOT be parsed as location -- it's a search pattern
         let result = parser.parse("localhost:8080");
-        assert!(result.constraints.is_empty());
+        assert_eq!(result.constraints, []);
         assert_eq!(result.fuzzy_query, FuzzyQuery::Text("localhost:8080"));
     }
 
@@ -1032,7 +1021,7 @@ mod tests {
         // Single-token filename should NOT become a constraint -- it should
         // return FFFQuery with Text fuzzy query so the caller uses it for fuzzy matching.
         let result = parser.parse("score.rs");
-        assert!(result.constraints.is_empty());
+        assert_eq!(result.constraints, []);
         assert_eq!(result.fuzzy_query, FuzzyQuery::Text("score.rs"));
     }
 

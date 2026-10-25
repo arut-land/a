@@ -164,7 +164,7 @@ pub(super) fn split_multiline_blob(display_bytes: &[u8]) -> (&[u8], Vec<String>)
     match memchr::memchr(b'\n', display_bytes) {
         None => (display_bytes, Vec::new()),
         Some(pos) => {
-            let first = strip_line_terminators(&display_bytes[..pos + 1]);
+            let first = strip_line_terminators(&display_bytes[..=pos]);
             let extra = display_bytes[pos + 1..]
                 .split(|&b| b == b'\n')
                 .map(|l| String::from_utf8_lossy(strip_line_terminators(l)).into_owned())

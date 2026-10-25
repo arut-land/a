@@ -7,7 +7,6 @@ publish.workspace = true
 [dependencies]
 ext.workspace = true
 llm.workspace = true
-protocol.workspace = true
 sys.workspace = true
 rt = { workspace = true, features = ["watch"] }
 serde.workspace = true
@@ -17,15 +16,15 @@ memchr.workspace = true
 neo_frizbee = { version = "0.13.3", default-features = false, features = ["std", "match_end_col"] }
 ignore = "0.4.25"
 globset = { version = "0.4.18", default-features = false }
-regex = { version = "1.12", default-features = false, features = ["std", "perf", "unicode"] }
-regex-syntax = { version = "0.8.10", default-features = false, features = ["std", "unicode"] }
+# Patterns are matched as bytes with ASCII classes (`unicode(false)`):
+# no Unicode tables.
+regex = { version = "1.12", default-features = false, features = ["std", "perf"] }
+regex-syntax = { version = "0.8.10", default-features = false, features = ["std"] }
 aho-corasick = { version = "1.1.4", default-features = false, features = ["std", "perf-literal"] }
 bstr = { version = "1.12", default-features = false, features = ["std"] }
 smallvec = { version = "1.15", features = ["const_generics", "union", "serde"] }
 
 [dev-dependencies]
-ext = { workspace = true, features = ["testing"] }
-serde_json.workspace = true
 tempfile = { version = "3", default-features = false }
 
 [lints]

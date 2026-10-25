@@ -11,6 +11,7 @@
 //! that asks about it and closes once none has for [`Limits::linger`]: a
 //! daemon nobody searches holds none.
 
+use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -315,10 +316,8 @@ impl Tool for Glob {
             |globbed| {
                 let mut text = globbed.files.join("\n");
                 if let Some(more) = globbed.more {
-                    text.push_str(&format!(
-                        "\n[{} of {more} files listed]",
-                        globbed.files.len()
-                    ));
+                    let listed = globbed.files.len();
+                    let _ = write!(text, "\n[{listed} of {more} files listed]");
                 }
                 if text.is_empty() {
                     text.push_str("No files matched.");
@@ -412,7 +411,6 @@ impl Tool for GrepTool {
 }
 
 fn grep_text(out: &GrepOut) -> String {
-    use std::fmt::Write as _;
     let mut text = String::new();
     if let Some(error) = &out.reply.regex_error {
         let _ = writeln!(text, "[not a regex ({error}): searched as plain text]");

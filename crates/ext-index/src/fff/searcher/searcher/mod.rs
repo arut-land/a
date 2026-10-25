@@ -35,8 +35,7 @@ impl std::fmt::Display for ConfigError {
                 write!(
                     f,
                     "grep config error: mismatched line terminators, \
-                     matcher has {:?} but searcher has {:?}",
-                    matcher, searcher
+                     matcher has {matcher:?} but searcher has {searcher:?}"
                 )
             }
         }
@@ -136,9 +135,8 @@ impl Searcher {
 
     /// Check that the searcher's configuration and the matcher are consistent.
     fn check_config<M: Matcher>(&self, matcher: M) -> Result<(), ConfigError> {
-        let matcher_line_term = match matcher.line_terminator() {
-            None => return Ok(()),
-            Some(line_term) => line_term,
+        let Some(matcher_line_term) = matcher.line_terminator() else {
+            return Ok(());
         };
         if matcher_line_term != self.config.line_term {
             return Err(ConfigError::MismatchedLineTerminators {
@@ -162,13 +160,6 @@ impl Searcher {
     #[inline]
     pub fn line_terminator(&self) -> LineTerminator {
         self.config.line_term
-    }
-
-    /// Returns true if and only if this searcher is configured to count line
-    /// numbers.
-    #[inline]
-    pub fn line_number(&self) -> bool {
-        self.config.line_number
     }
 
     /// Returns true if and only if this searcher is configured to perform

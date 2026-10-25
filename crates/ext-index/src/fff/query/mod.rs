@@ -11,9 +11,8 @@ pub mod glob_detect;
 pub mod location;
 mod parser;
 
-pub use config::{FileSearchConfig, GrepConfig, ParserConfig};
+pub use config::{FileSearchConfig, GrepConfig};
 pub use constraints::Constraint;
-pub use location::Location;
 pub use parser::{FFFQuery, FuzzyQuery, QueryParser};
 
 pub type ConstraintVec<'a> = Vec<Constraint<'a>>;
@@ -26,7 +25,7 @@ mod tests {
     fn test_empty_query() {
         let parser = QueryParser::default();
         let result = parser.parse("");
-        assert!(result.constraints.is_empty());
+        assert_eq!(result.constraints, []);
         assert_eq!(result.fuzzy_query, FuzzyQuery::Empty);
     }
 
@@ -34,7 +33,7 @@ mod tests {
     fn test_whitespace_only() {
         let parser = QueryParser::default();
         let result = parser.parse("   ");
-        assert!(result.constraints.is_empty());
+        assert_eq!(result.constraints, []);
         assert_eq!(result.fuzzy_query, FuzzyQuery::Empty);
     }
 
@@ -42,7 +41,7 @@ mod tests {
     fn test_single_token() {
         let parser = QueryParser::default();
         let result = parser.parse("hello");
-        assert!(result.constraints.is_empty());
+        assert_eq!(result.constraints, []);
         assert_eq!(result.fuzzy_query, FuzzyQuery::Text("hello"));
     }
 
@@ -81,7 +80,7 @@ mod tests {
         // Glob patterns with ** are treated as globs, not extensions
         match &result.constraints[0] {
             Constraint::Glob(pattern) => assert_eq!(*pattern, "**/*.rs"),
-            other => panic!("Expected Glob constraint, got {:?}", other),
+            other => panic!("Expected Glob constraint, got {other:?}"),
         }
     }
 

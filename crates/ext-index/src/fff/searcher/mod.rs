@@ -2,9 +2,9 @@
 //! matching: FFF's simplification of ripgrep's `grep-searcher`, which
 //! only searches slices (no readers, files or memory maps).
 
-pub use self::matcher::{LineTerminator, Match, Matcher, NoError};
+pub use self::matcher::LineTerminator;
 pub use self::searcher::{Searcher, SearcherBuilder};
-pub use self::sink::{Sink, SinkError, SinkFinish, SinkMatch};
+pub use self::sink::{Sink, SinkMatch};
 
 pub mod lines;
 pub mod matcher;

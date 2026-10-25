@@ -18,24 +18,27 @@ fn runtime() -> rt::Rt {
 /// resolves one. It is a directory of its own temporary one: the watcher
 /// watches the root's parent too, which other tests' temporary
 /// directories would keep changing.
-struct Tree(tempfile::TempDir, PathBuf);
+struct Tree {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+}
 
 impl Tree {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap().join("ws");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        Self(dir, root)
+        Self { _dir: dir, root }
     }
 
     fn write(&self, path: &str, content: &str) {
-        let path = self.1.join(path);
+        let path = self.root.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
     }
 
     fn root(&self) -> &Path {
-        &self.1
+        &self.root
     }
 }
 
@@ -106,9 +109,9 @@ fn gitignored_files_never_appear() {
     let listed = search(&index, "");
     assert!(listed.contains(&"kept.rs".to_owned()), "{listed:?}");
     assert!(
-        !listed
-            .iter()
-            .any(|p| p.starts_with("build/") || p.ends_with(".log"))
+        !listed.iter().any(
+            |p| p.starts_with("build/") || Path::new(p).extension().is_some_and(|e| e == "log")
+        )
     );
     assert!(!listed.iter().any(|p| p.starts_with(".git/")));
     assert_eq!(grep(&index, "needle").0, ["kept.rs"]);
@@ -122,9 +125,9 @@ fn gitignored_files_never_appear() {
     });
     let listed = search(&index, "");
     assert!(
-        !listed
-            .iter()
-            .any(|p| p.starts_with("build/") || p.ends_with(".log")),
+        !listed.iter().any(
+            |p| p.starts_with("build/") || Path::new(p).extension().is_some_and(|e| e == "log")
+        ),
         "{listed:?}"
     );
     assert_eq!(grep(&index, "needle").0, ["kept.rs", "later.rs"]);

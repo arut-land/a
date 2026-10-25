@@ -2,7 +2,7 @@ use crate::fff::searcher::{
     lines,
     matcher::Matcher,
     searcher::{Config, Range, Searcher},
-    sink::{Sink, SinkError, SinkFinish, SinkMatch},
+    sink::{Sink, SinkError, SinkMatch},
 };
 
 #[derive(Debug)]
@@ -58,10 +58,6 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         self.sink.begin(self.searcher)
     }
 
-    pub(crate) fn finish(&mut self, byte_count: u64) -> Result<(), S::Error> {
-        self.sink.finish(self.searcher, &SinkFinish { byte_count })
-    }
-
     pub(crate) fn match_by_line(&mut self, buf: &[u8]) -> Result<bool, S::Error> {
         while !buf[self.pos()..].is_empty() {
             if let Some(line) = self.find_by_line(buf)? {
@@ -77,17 +73,16 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         Ok(true)
     }
 
-    #[inline(always)]
+    #[inline]
     fn find_by_line(&mut self, buf: &[u8]) -> Result<Option<Range>, S::Error> {
         let mut pos = self.pos();
         while !buf[pos..].is_empty() {
-            let mat = match self
+            let Some(mat) = self
                 .matcher
                 .find(&buf[pos..])
                 .map_err(S::Error::error_message)?
-            {
-                None => return Ok(None),
-                Some(m) => m,
+            else {
+                return Ok(None);
             };
             let line = lines::locate(
                 buf,
@@ -103,7 +98,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         Ok(None)
     }
 
-    #[inline(always)]
+    #[inline]
     fn sink_matched(&mut self, buf: &[u8], range: &Range) -> Result<bool, S::Error> {
         self.count_lines(buf, range.start());
         let offset = self.absolute_byte_offset + range.start() as u64;

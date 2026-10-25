@@ -250,9 +250,8 @@ pub(crate) fn regex_to_bigram_query(pattern: &str) -> BigramQuery {
         .utf8(false)
         .build();
 
-    let hir = match parser.parse(pattern) {
-        Ok(h) => h,
-        Err(_) => return BigramQuery::Any,
+    let Ok(hir) = parser.parse(pattern) else {
+        return BigramQuery::Any;
     };
 
     decompose(&hir).query
@@ -262,7 +261,7 @@ fn decompose(hir: &Hir) -> HirInfo {
     let can_be_empty = hir.properties().minimum_len().is_none_or(|n| n == 0);
 
     match hir.kind() {
-        HirKind::Empty => HirInfo::empty(),
+        HirKind::Empty | HirKind::Look(_) => HirInfo::empty(),
 
         HirKind::Literal(lit) => decompose_literal(lit.0.as_ref()),
 
@@ -283,8 +282,6 @@ fn decompose(hir: &Hir) -> HirInfo {
                 },
             }
         }
-
-        HirKind::Look(_) => HirInfo::empty(),
 
         HirKind::Repetition(rep) => {
             let inner = decompose(&rep.sub);
@@ -328,7 +325,7 @@ fn decompose_literal(bytes: &[u8]) -> HirInfo {
         return HirInfo::empty();
     }
 
-    let lower: SmallVec<[u8; 64]> = bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
+    let lower: SmallVec<[u8; 64]> = bytes.iter().map(u8::to_ascii_lowercase).collect();
 
     if lower.len() == 1 {
         let b = lower[0];
@@ -632,7 +629,7 @@ fn simplify_and(children: Vec<BigramQuery>) -> BigramQuery {
 }
 
 fn simplify_or(children: Vec<BigramQuery>) -> BigramQuery {
-    if children.iter().any(|c| c.is_any()) {
+    if children.iter().any(BigramQuery::is_any) {
         return BigramQuery::Any;
     }
     let mut flat: Vec<BigramQuery> = Vec::new();

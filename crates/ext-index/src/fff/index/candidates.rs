@@ -19,13 +19,6 @@ fn clear_tombstones(candidates: &mut [u64], overlay: &BigramOverlay) {
     }
 }
 
-/// Number of base files covered by the bigram bitset; files past this
-/// boundary (overflow, max 1024) are always scanned.
-#[inline]
-pub(crate) fn bigram_boundary(overlay: Option<&BigramOverlay>, files_len: usize) -> usize {
-    overlay.map(|o| o.base_file_count()).unwrap_or(files_len)
-}
-
 /// Candidate bitset for literal patterns, OR-ed across all of them: a file is
 /// a candidate when it contains the bigrams of ANY pattern. Overlay-modified
 /// files are re-checked against each pattern's bigrams.
