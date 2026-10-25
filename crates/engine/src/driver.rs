@@ -748,7 +748,7 @@ impl Live {
             resuming: false,
             frozen: None,
             deferred: std::collections::VecDeque::new(),
-            rested: false,
+            rested: true,
             journal: Journal {
                 writer: Some(loaded.writer),
                 fold_snapshot,
@@ -1409,7 +1409,7 @@ impl Actor {
             // Come to rest but for what runs in the background, the session
             // may be handed over: an upgrade waiting on it hears so.
             let rested = self.core.at_rest_but_background();
-            if rested && !self.rested {
+            if rested && !self.rested && self.live.has_work() {
                 self.live.touch();
             }
             self.rested = rested;
