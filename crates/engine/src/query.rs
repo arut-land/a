@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use ext::host::Registry;
 use ext::query::{Asked, At, Sink};
 use ext::{BoxFuture, Cancel};
-use protocol::{DaemonMsg, Frame, Json, Outcome, QueryInfo, Role, Scope};
+use protocol::{ClientMsg, DaemonMsg, Frame, Json, Outcome, QueryInfo, Role, Scope};
 
 use crate::driver::contain;
 use crate::outbox::{Outbox, QueuePermit};
@@ -22,24 +22,42 @@ use crate::{Daemon, lock};
 pub(crate) struct Queries(Arc<Mutex<BTreeMap<u64, Cancel>>>);
 
 impl Queries {
-    /// Answers query `id` on its own task, if it is admitted; `bytes` is
-    /// what its frame weighed.
-    pub(crate) fn ask(
+    /// Takes a query, answered on its own task if it is admitted, or its
+    /// cancel; hands back any other message. `bytes` is what its frame
+    /// weighed.
+    pub(crate) fn take(
         &self,
         daemon: &Daemon,
         outbox: &Outbox,
         role: Role,
-        (id, service, scope, body): (u64, String, Scope, Json),
+        msg: ClientMsg,
         bytes: usize,
-    ) {
+    ) -> Option<ClientMsg> {
+        let (id, service, scope, body) = match msg {
+            ClientMsg::Query {
+                id,
+                service,
+                scope,
+                body,
+            } => (id, service, scope, body),
+            ClientMsg::Cancel { id } => {
+                if let Some(cancel) = lock(&self.0).get(&id) {
+                    cancel.set();
+                }
+                return None;
+            }
+            msg => return Some(msg),
+        };
         // Not a reply: that would read as the running query's.
         if lock(&self.0).contains_key(&id) {
             let message = format!("query {id} is running already");
-            return reply(outbox, &DaemonMsg::Error { message });
+            reply(outbox, &DaemonMsg::Error { message });
+            return None;
         }
         let failed = |error: String| {
             let outcome = Outcome::Failed { error };
             reply(outbox, &DaemonMsg::Reply { id, outcome });
+            None
         };
         let Some(permit) = QueuePermit::query(bytes) else {
             return failed("daemon admission is full".into());
@@ -81,13 +99,7 @@ impl Queries {
             lock(&running).remove(&id);
             reply(&outbox, &DaemonMsg::Reply { id, outcome });
         }));
-    }
-
-    /// Stops query `id`, if it runs: its reply says it was cancelled.
-    pub(crate) fn cancel(&self, id: u64) {
-        if let Some(cancel) = lock(&self.0).get(&id) {
-            cancel.set();
-        }
+        None
     }
 }
 

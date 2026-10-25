@@ -315,15 +315,23 @@ impl Outbox {
     /// room for the control frames that cannot wait.
     pub async fn send_paced(&self, frame: Frame) -> Result<(), Closed> {
         let len = frame.as_bytes().len();
-        let room = || {
-            let q = self.queue();
-            q.closed
-                || q.frames.is_empty()
-                || (q.frames.len() < BUDGET.requests / 2
-                    && q.bytes.saturating_add(len) <= BUDGET.bytes / 2)
-        };
-        self.shared.room.until(room).await;
-        self.send(frame)
+        loop {
+            let mut seen = self.shared.room.count();
+            {
+                // Checked and pushed under one lock, so senders that wait
+                // together never overshoot together.
+                let mut q = self.queue();
+                if q.closed
+                    || q.frames.is_empty()
+                    || (q.frames.len() < BUDGET.requests / 2
+                        && q.bytes.saturating_add(len) <= BUDGET.bytes / 2)
+                {
+                    let after = q.follow.as_ref().map_or(0, |f| f.log.seq());
+                    return self.push(&mut q, after, frame);
+                }
+            }
+            self.shared.room.changed(&mut seen).await;
+        }
     }
 
     /// Queues `frame` behind entry `after`. Callers pass the seq of the

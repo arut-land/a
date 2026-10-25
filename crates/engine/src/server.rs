@@ -328,7 +328,7 @@ impl Conn<'_> {
     /// are read: an interrupt behind an input does not wait for its fsync.
     /// Queries and their cancels read no log, so neither waits either.
     /// Anything else waits until what was asked before it is answered.
-    #[allow(clippy::too_many_lines, reason = "one match over what a client sends")]
+    #[expect(clippy::too_many_lines, reason = "one match over what a client sends")]
     async fn serve(&mut self, frames: &mut Frames) -> io::Result<()> {
         let mut pending: VecDeque<(Option<u64>, BoxFuture<'static, Answer>)> = VecDeque::new();
         let result = loop {
@@ -369,7 +369,9 @@ impl Conn<'_> {
                 }
                 continue;
             }
-            let Some(msg) = self.query(msg, frames.bytes) else {
+            let role = self.decl.role;
+            let taken = (self.queries).take(self.daemon, self.outbox, role, msg, frames.bytes);
+            let Some(msg) = taken else {
                 continue;
             };
             while let Some((client_seq, answer)) = pending.pop_front() {
@@ -431,27 +433,6 @@ impl Conn<'_> {
         }
         self.outbox.unfollow();
         result
-    }
-
-    /// Asks or cancels a query, or hands back any other message.
-    fn query(&self, msg: ClientMsg, bytes: usize) -> Option<ClientMsg> {
-        match msg {
-            ClientMsg::Query {
-                id,
-                service,
-                scope,
-                body,
-            } => {
-                let asked = (id, service, scope, body);
-                (self.queries).ask(self.daemon, self.outbox, self.decl.role, asked, bytes);
-                None
-            }
-            ClientMsg::Cancel { id } => {
-                self.queries.cancel(id);
-                None
-            }
-            msg => Some(msg),
-        }
     }
 
     async fn attach(
