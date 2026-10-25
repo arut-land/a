@@ -219,10 +219,9 @@ fn text_of(output: llm::Output) -> String {
 }
 
 impl Transcript {
-    /// The transcript of `entries`, on `registry`, that `system` prompts,
-    /// as their edits leave it: the entries an `edit` covers stand as its
-    /// text, a user's message, or are left out; the latest edit of an
-    /// entry is what stands.
+    /// As [`Transcript::placed`], with no store, as tests project: a
+    /// payload a blob holds is not read.
+    #[cfg(test)]
     pub fn of(
         entries: impl IntoIterator<Item = impl Borrow<Entry>>,
         registry: Arc<Registry>,
@@ -231,7 +230,11 @@ impl Transcript {
         Self::placed(entries, registry, system, &Places::default())
     }
 
-    /// As [`Transcript::of`], naming references where `places` shows them.
+    /// The transcript of `entries`, on `registry`, that `system` prompts,
+    /// as their edits leave it: the entries an `edit` covers stand as its
+    /// text, a user's message, or are left out; the latest edit of an
+    /// entry is what stands. References are named, and payloads held as
+    /// blobs read, through `places`.
     pub fn placed(
         entries: impl IntoIterator<Item = impl Borrow<Entry>>,
         registry: Arc<Registry>,
