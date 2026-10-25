@@ -40,3 +40,27 @@ fn a_turn_never_starts_while_a_session_is_frozen_for_a_handover() {
     assert!(refused.is_err_and(|why| why.contains("at work")));
     session.halt();
 }
+
+/// What comes while a session is frozen is refused as it commits, never
+/// swallowed: the client is told to send it again, to the newer build.
+#[test]
+fn input_held_back_by_a_handover_is_refused_as_it_commits() {
+    let fixture = Fixture::new(
+        ext_fixtures::ECHO,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let session = Arc::new(fixture.start(&[]));
+    rt::block_on(session.freeze()).unwrap();
+    let submitting = Arc::clone(&session);
+    let submitted = thread::spawn(move || submitting.submit("while frozen"));
+    thread::sleep(Duration::from_millis(200));
+    assert!(rt::block_on(session.commit()).is_empty());
+    let refused = submitted.join().unwrap();
+    assert_eq!(refused, Err(crate::upgrade::DRAINING.to_owned()));
+    assert_eq!(
+        session.submit("after the commit"),
+        Err(crate::upgrade::DRAINING.to_owned())
+    );
+    session.halt();
+}

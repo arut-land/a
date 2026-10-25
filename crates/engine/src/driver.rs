@@ -1375,7 +1375,7 @@ impl Actor {
                 }
                 // Frozen for a handover, the session takes nothing up.
                 if self.frozen.is_some() && !msg.passes_freeze() {
-                    self.deferred.push_back(msg);
+                    self.hold(msg);
                     continue;
                 }
                 // Kept as it is, its catalog listing and all.

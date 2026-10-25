@@ -144,13 +144,28 @@ impl Actor {
             if matches!(owner.kind, Kind::Call { .. }) {
                 self.inflight.remove(&owner.call);
             }
-            // A provider gives up what its platform hands over; nothing else
-            // is one.
-            if let Some(native) = parting.commit().take::<sys::handover::Given>() {
-                given.push((native, owner));
+            let ext::Given { group, handles } = parting.commit();
+            match group.parse() {
+                Ok(group) => given.push((sys::handover::Given { group, handles }, owner)),
+                // Released, its handles closed: as a crash leaves it.
+                Err(_) => unclaimed(self.live.id),
             }
         }
+        for msg in std::mem::take(&mut self.deferred) {
+            refused(msg);
+        }
         given
+    }
+
+    /// Holds `msg` back while the session is frozen; once it committed,
+    /// nothing is taken up any more, and a request is refused so its
+    /// client sends it again to the newer build.
+    pub(super) fn hold(&mut self, msg: Msg) {
+        if self.frozen.as_ref().is_some_and(|frozen| frozen.committed) {
+            refused(msg);
+        } else {
+            self.deferred.push_back(msg);
+        }
     }
 
     /// Takes up what the daemon's previous build handed this session that
@@ -224,6 +239,23 @@ impl Actor {
             let called = contain(resumed).await;
             session.emit(fence, Completion::Tool { call, called });
         });
+    }
+}
+
+/// Refuses what a client, a session or a call asked of a session that
+/// handed its work over: each is answered, never dropped.
+fn refused(msg: Msg) {
+    match msg {
+        Msg::Request { reply, .. } => reply.send(Err(crate::upgrade::DRAINING.to_owned())),
+        Msg::Enqueue { reply, .. } => reply.send(Err(protocol::InboxRefusal::Interrupted)),
+        Msg::Context {
+            request:
+                super::ContextRequest::Note {
+                    done: Some(done), ..
+                },
+            ..
+        } => done.send(Err(ext::MutationError::Revoked)),
+        _ => {}
     }
 }
 

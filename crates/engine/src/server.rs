@@ -668,10 +668,7 @@ impl Conn<'_> {
         let (request, rejection) = match msg {
             ClientMsg::Interrupt { .. } => (Request::Interrupt, Rejection::Other),
             _ if self.life.draining().is_some() => {
-                return refused(Err((
-                    Rejection::Draining,
-                    "the daemon is restarting for an upgrade; send that again in a moment".into(),
-                )));
+                return refused(Err((Rejection::Draining, crate::upgrade::DRAINING.into())));
             }
             ClientMsg::Input {
                 segments,
@@ -696,7 +693,18 @@ impl Conn<'_> {
             _ => return refused(Err((Rejection::Other, "not a mutation".into()))),
         };
         let answer = session.ask(request, origin);
-        Box::pin(async move { answer.await.map_err(|message| (rejection, message)) })
+        // One a handover refuses as it commits is to be sent again.
+        let draining = self.life.drain_cell();
+        Box::pin(async move {
+            answer.await.map_err(|message| {
+                let rejection = if draining.get().is_some() {
+                    Rejection::Draining
+                } else {
+                    rejection
+                };
+                (rejection, message)
+            })
+        })
     }
 
     /// Tells the client the answer to its mutation `client_seq`: an ack or

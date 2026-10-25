@@ -201,7 +201,7 @@ struct Stopped {
 }
 
 impl Parting for Stopped {
-    fn commit(mut self: Box<Self>) -> ext::Native {
+    fn commit(mut self: Box<Self>) -> ext::Given {
         let (Some(child), Some(lease)) = (self.child.take(), self.lease.take()) else {
             unreachable!("a stopped group has its leader and lease")
         };
@@ -212,7 +212,10 @@ impl Parting for Stopped {
         live.copied.set();
         lock(&live.permit).take();
         live.ended.set();
-        ext::Native::new(given)
+        ext::Given {
+            group: ext::Json::encode(&given.group).unwrap_or_default(),
+            handles: given.handles,
+        }
     }
 }
 
@@ -1139,9 +1142,12 @@ int main(int argc, char **argv) {
     /// What `given` names, claimed as the next image of this process
     /// claims it from the record it reads.
     #[cfg(unix)]
-    fn claimed(given: ext::Native) -> ext::Native {
+    fn claimed(given: ext::Given) -> ext::Native {
         use std::os::fd::IntoRawFd;
-        let given: sys::handover::Given = given.take().unwrap();
+        let given = sys::handover::Given {
+            group: given.group.parse().unwrap(),
+            handles: given.handles,
+        };
         // As an exec passes them on: owned by nothing until claimed.
         for handle in given.handles {
             let _ = handle.into_raw_fd();
@@ -1153,7 +1159,8 @@ int main(int argc, char **argv) {
         let record = File::open(&path).unwrap();
         std::fs::remove_file(path).unwrap();
         let number = sys::InheritedNumber::from(record.into_raw_fd());
-        ext::Native::new(sys::handover::read_record(number).unwrap().pop().unwrap().0)
+        let claimed = sys::handover::read_record(number).unwrap().pop().unwrap().0;
+        ext::Native::new(claimed.unwrap())
     }
 
     /// Handed over, a group runs on: the owner it leaves neither signals

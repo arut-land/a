@@ -282,17 +282,6 @@ mod imp {
                 )?;
                 this.0.caught.push(signal);
             }
-            // A daemon exec'd in place by the build before starts with the
-            // shutdown signals blocked, so none came between the images
-            // unhandled: they are delivered now.
-            let set = shutdown_set();
-            // SAFETY: the set is initialized; the old mask is not asked for.
-            if unsafe {
-                libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut())
-            } != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
             Ok(this)
         }
 

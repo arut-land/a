@@ -73,7 +73,7 @@ pub use query::{Query, QueryCx};
 pub use queue::{Boundary, QueueView, Take};
 pub use schema::Schema;
 pub use service::{
-    Budget, CwdOf, Holds, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec, Native,
+    Budget, CwdOf, Given, Holds, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec, Native,
     OwnedProcess, Parting, ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes,
     Recipients, Record, Role, Route, RunningProcess, SideProvider, SideRetry, SpawnError, Topology,
 };

@@ -60,14 +60,26 @@ pub struct Handed {
 }
 
 /// What the previous build handed over, read: each group with an owner
-/// this build can read; any other is killed as its claim drops.
-pub fn handed(record: Vec<(sys::handover::Claimed, serde_json::Value)>) -> Vec<Handed> {
+/// this build can read. One that could not be claimed, or whose owner this
+/// build cannot read, is logged and goes on with no one: killed as its
+/// claim drops, or, unclaimed, left as a crash leaves it.
+pub fn handed(
+    record: Vec<(std::io::Result<sys::handover::Claimed>, serde_json::Value)>,
+) -> Vec<Handed> {
     (record.into_iter())
-        .filter_map(|(claimed, owner)| match serde_json::from_value(owner) {
-            Ok(owner) => Some(Handed { claimed, owner }),
-            Err(e) => {
-                fault(&e.into());
-                None
+        .filter_map(|(claimed, owner)| {
+            let owner = serde_json::from_value::<Owner>(owner);
+            let session = owner.as_ref().ok().map(|owner| owner.session);
+            match (claimed, owner) {
+                (Ok(claimed), Ok(owner)) => Some(Handed { claimed, owner }),
+                (Err(e), _) => {
+                    fault_in(session, &e);
+                    None
+                }
+                (Ok(_), Err(e)) => {
+                    fault_in(None, &e.into());
+                    None
+                }
             }
         })
         .collect()
@@ -111,21 +123,31 @@ impl Daemon {
     /// Freezes every loaded session, then commits them all: the groups
     /// given up, each with whose it is. Any session's refusal thaws those
     /// frozen, and nothing is given up.
-    pub(crate) async fn hand_over(&self) -> Result<Vec<(sys::handover::Given, Owner)>, String> {
-        let loaded = self.loaded();
+    pub(crate) async fn hand_over(
+        &self,
+        life: &crate::upgrade::Lifecycle,
+    ) -> Result<Vec<(sys::handover::Given, Owner)>, String> {
         // Asked first, so a session that would refuse stops nothing of
         // the others' to start again.
-        for live in &loaded {
+        for live in &self.loaded() {
             live.handable().await?;
         }
+        // No session loads, wakes or is made while the others freeze: the
+        // commit covers every session there is.
+        *lock(&self.admission) = false;
+        let loaded = self.loaded();
         for (at, live) in loaded.iter().enumerate() {
             if let Err(why) = live.freeze().await {
                 for frozen in &loaded[..at] {
                     frozen.thaw();
                 }
+                *lock(&self.admission) = true;
                 return Err(why);
             }
         }
+        // Requests that came meanwhile are refused as each session
+        // commits, to be sent again to the newer build.
+        life.drain();
         let mut given = Vec::new();
         for live in &loaded {
             given.extend(live.commit().await);
@@ -199,8 +221,12 @@ impl Exit {
 }
 
 fn fault(e: &std::io::Error) {
+    fault_in(None, e);
+}
+
+fn fault_in(session: Option<SessionId>, e: &std::io::Error) {
     fact(Fact::Fault {
-        session: None,
+        session,
         operation: Operation::Handover,
         kind: Fault(e.kind()),
     });

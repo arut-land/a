@@ -302,12 +302,15 @@ build declares the handover format this one speaks (`runtime/<id>/handover`,
 owned as `Role::Helper` (an MCP server), hold no upgrade and no session at
 work: they are stopped, and started again on the next call that needs them.
 
-A handover is one commit across every session. Each session freezes first:
-its groups' supervision stops between two chunks of output, and the session
-takes nothing more up, so no call can end and no turn start meanwhile. A
-session that refuses, or a group that ends meanwhile, thaws them all, and a
-later pulse tries again; only once every session froze does each give its
-groups up for good. On Unix the daemon then execs the newer build in its
+A handover is one commit across every session. No session loads, wakes or
+is made while it runs. Each session freezes first: its groups' supervision
+stops between two chunks of output, and the session takes nothing more up,
+so no call can end and no turn start meanwhile. A session that refuses, or
+a group that ends meanwhile, thaws them all, and a later pulse tries again;
+only once every session froze does each give its groups up for good, and
+what its clients asked meanwhile is refused (`Rejection::Draining`), to be
+sent again to the newer build. Every client says why an upgrade waits
+(`Notice::UpgradeWaits`). On Unix the daemon then execs the newer build in its
 own process (the same pid, session and stderr, its listener, lock and
 children kept, the shutdown signals blocked across the exec); on Windows it
 starts the newer build inheriting each group's job, leader and output pipe

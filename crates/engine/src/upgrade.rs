@@ -23,7 +23,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use protocol::{DaemonMsg, Frame, Versions};
@@ -31,6 +31,9 @@ use sys::Runtime;
 
 use crate::lock;
 use crate::outbox::Outbox;
+
+/// Why a request is refused once the daemon makes way for a newer build.
+pub const DRAINING: &str = "the daemon is restarting for an upgrade; send that again in a moment";
 
 /// How the daemon answers a hello.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,8 +74,9 @@ pub struct Lifecycle {
     /// then on, this build serving meanwhile, until nothing holds it.
     wanted: OnceLock<Instant>,
     /// When the daemon began to make way: from then on it takes up no
-    /// client's request and exits as soon as it can.
-    draining: OnceLock<Instant>,
+    /// client's request and exits as soon as it can. Shared with the
+    /// answers to requests already sent, which it turns into refusals.
+    draining: Arc<OnceLock<Instant>>,
     /// Every open connection's outbox, told when a drain begins.
     conns: Mutex<Vec<(u64, Outbox)>>,
     next: AtomicU64,
@@ -84,7 +88,7 @@ impl Lifecycle {
             build,
             runtime,
             wanted: OnceLock::new(),
-            draining: OnceLock::new(),
+            draining: Arc::default(),
             conns: Mutex::new(Vec::new()),
             next: AtomicU64::new(0),
         }
@@ -115,6 +119,11 @@ impl Lifecycle {
 
     pub fn draining(&self) -> Option<Instant> {
         self.draining.get().copied()
+    }
+
+    /// When the drain began, as an answer still to come reads it.
+    pub fn drain_cell(&self) -> Arc<OnceLock<Instant>> {
+        Arc::clone(&self.draining)
     }
 
     /// The upgrade is wanted, once: the daemon makes way as soon as it can.

@@ -137,6 +137,9 @@ pub enum EventKind {
         commands: Vec<CommandInfo>,
         /// The daemon's machine, as its welcome named it.
         machine: protocol::MachineId,
+        /// What holds the upgrade to a newer build the daemon waits for,
+        /// serving meanwhile.
+        upgrade: Option<String>,
     },
     Msg(DaemonMsg),
     /// A daemon draining for a newer build is waited out before the
@@ -205,6 +208,9 @@ pub enum Notice {
     /// The driver could not send a message.
     NotSent(Error),
     ForkRejected(protocol::ForkError),
+    /// The daemon waits to upgrade to a newer build, held by this, and
+    /// serves this client meanwhile.
+    UpgradeWaits(String),
 }
 
 impl fmt::Display for Notice {
@@ -221,6 +227,10 @@ impl fmt::Display for Notice {
                 "the host's environment is captured when `a` connects; reattach to refresh it",
             ),
             Self::ForkRejected(reason) => reason.fmt(f),
+            Self::UpgradeWaits(held) => write!(
+                f,
+                "the upgrade to a newer build waits: {held}; `a daemon stop` ends what holds it"
+            ),
             Self::NotSent(e) => write!(f, "not sent: {e}"),
         }
     }
@@ -494,8 +504,12 @@ impl SessionClient {
                 welcome,
                 remote,
                 commands,
+                upgrade,
                 ..
             } => {
+                if let Some(held) = upgrade {
+                    out.push(Effect::Show(Show::Notice(Notice::UpgradeWaits(held))));
+                }
                 self.commands = commands;
                 // Neither answered nor refused on the last connection: sent
                 // again, and the daemon, which logs who sent what, does each
@@ -786,6 +800,7 @@ mod tests {
                 remote: false,
                 commands: Vec::new(),
                 machine: protocol::MachineId([0; 16]),
+                upgrade: None,
             },
         }
     }
@@ -802,6 +817,20 @@ mod tests {
             conn: ConnId(conn),
             kind: EventKind::Closed(Error::Closed),
         }
+    }
+
+    /// Served while an upgrade waits, every client says what holds it.
+    #[test]
+    fn a_welcome_while_an_upgrade_waits_tells_what_holds_it() {
+        let mut client = SessionClient::new(Env::Keep);
+        client.open(Target::New);
+        let mut connected = live(1, Caps::ALL);
+        if let EventKind::Connected { upgrade, .. } = &mut connected.kind {
+            *upgrade = Some("session 89abcdef is at work".into());
+        }
+        let out = client.step(connected);
+        assert!(out.iter().any(|effect| matches!(effect,
+            Effect::Show(Show::Notice(Notice::UpgradeWaits(held))) if held.contains("at work"))));
     }
 
     #[test]

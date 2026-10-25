@@ -63,6 +63,7 @@ fn connect(app: &mut App, remote: bool) {
             remote,
             commands: Vec::new(),
             machine: protocol::MachineId([0; 16]),
+            upgrade: None,
         },
     });
     client::pump(|_| Ok(()), app, connected);

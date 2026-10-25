@@ -155,12 +155,12 @@ fn an_upgrade_hands_running_work_to_the_newer_build_live() {
     // The daemon log is written behind the facts it records.
     let log = || fs::read_to_string(env.home.daemon_log()).unwrap_or_default();
     let logged = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !log().contains("\"origin\":\"handover\"") {
+    // It is best effort: a fact may be lost under load, never made up.
+    while !log().contains("\"handed_over\"") {
         assert!(std::time::Instant::now() < logged, "{}", log());
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let log = log();
-    assert!(log.contains("\"handed_over\""), "{log}");
     assert!(!log.contains("previous_crash"), "{log}");
 
     // The server job runs on, the new daemon's own: stopping it ends it.

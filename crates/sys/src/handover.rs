@@ -135,11 +135,11 @@ pub fn encode<'a>(groups: impl IntoIterator<Item = (&'a Group, &'a serde_json::V
 }
 
 /// Reads the record crossing under `number` and claims every group it
-/// names, each with what its owner said of it. A group that cannot be
-/// claimed is left out, its handles closed.
+/// names, each with what its owner said of it, or why it could not be
+/// claimed (its handles then closed).
 pub fn read_record(
     number: crate::InheritedNumber,
-) -> io::Result<Vec<(Claimed, serde_json::Value)>> {
+) -> io::Result<Vec<(io::Result<Claimed>, serde_json::Value)>> {
     use std::io::Read;
     let mut file = imp::own(number.raw())?;
     let mut bytes = Vec::new();
@@ -148,8 +148,26 @@ pub fn read_record(
     file.read_to_end(&mut bytes)?;
     let record: Record = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     Ok((record.groups.into_iter())
-        .filter_map(|Entry { group, owner }| Some((imp::claim(&group).ok()?, owner)))
+        .map(|Entry { group, owner }| (imp::claim(&group), owner))
         .collect())
+}
+
+/// Lets TERM, INT and HUP through again in an image the build before
+/// exec'd into, which blocked them across the exec so none came between
+/// the images unhandled: called once the daemon catches them.
+pub fn shutdown_signals_caught() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let set = crate::signals::shutdown_set();
+        // SAFETY: the set is initialized; the old mask is not asked for.
+        let error = unsafe {
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut())
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error));
+        }
+    }
+    Ok(())
 }
 
 /// The daemon's listener as the next build takes it: on Unix its socket
@@ -291,7 +309,8 @@ impl<'a> Successor<'a> {
     /// Replaces this process's image with the successor's; returns only if
     /// that fails, everything as it was. TERM, INT and HUP stay blocked
     /// across the exec, so none comes between the images unhandled; the
-    /// next image's [`crate::Signals::catch`] unblocks them.
+    /// next image lets them through once it catches them
+    /// ([`shutdown_signals_caught`]).
     pub(crate) fn exec(self) -> io::Error {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;

@@ -1117,9 +1117,8 @@ impl Daemon {
                 }
                 if let (Some(command), Some(successor)) =
                     (successor, self.successor(&exit.home.runtime()))
-                    && let Ok(given) = self.hand_over().await
+                    && let Ok(given) = self.hand_over(life).await
                 {
-                    life.drain();
                     // Whatever holds off sleep for this build must not
                     // outlive it.
                     awake.take();
@@ -1298,7 +1297,7 @@ pub struct Start {
     pub successor: Option<Successor>,
     /// What the daemon of an earlier build handed this one: each group,
     /// claimed as the record was read, with what the record says of it.
-    pub handed: Option<Vec<(sys::handover::Claimed, serde_json::Value)>>,
+    pub handed: Option<Vec<(io::Result<sys::handover::Claimed>, serde_json::Value)>>,
 }
 
 /// How long a new daemon serves before asking [`Start::resident`].
@@ -1449,6 +1448,9 @@ fn run(
         sys::Signal::Interrupt,
         sys::Signal::Hangup,
     ])?;
+    if start.handed.is_some() {
+        sys::handover::shutdown_signals_caught()?;
+    }
     let handed = start.handed.map_or_default(handover::handed);
     let daemon = Daemon::load_on(home, &config, runtime, handed)?;
     let signals = rt::Async::for_reading(&daemon.shared.rt.reactor(), signals)?;

@@ -693,6 +693,7 @@ mod display_tests {
                 remote: false,
                 commands: Vec::new(),
                 machine: protocol::MachineId([0; 16]),
+                upgrade: None,
             },
         });
         app.fold(&DaemonMsg::Attached {

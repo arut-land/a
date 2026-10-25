@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::BoxFuture;
-use protocol::{Environment, Held};
+use protocol::{Environment, Held, Json};
 
 use crate::{Called, Cx, DynTool, SpawnSpec, States};
 
@@ -63,13 +63,20 @@ pub trait Processes: Send + Sync {
 /// committed, it is given up whole, for good; dropped instead, its
 /// supervision goes on here as if nothing happened.
 pub trait Parting: Send {
-    fn commit(self: Box<Self>) -> Native;
+    fn commit(self: Box<Self>) -> Given;
 }
 
-/// A process group's native handles as they cross between builds of the
-/// daemon: given up by its provider for the next build, or claimed by this
-/// one from the build before. What it holds is the platform's, opaque to
-/// the SDK, which stays free of I/O; dropped, it is killed.
+/// A group given up for the daemon's next build: where it finds it, as its
+/// provider records it, and the handles it finds it by, open here until
+/// the handover passes them on.
+pub struct Given {
+    pub group: Json,
+    pub handles: Vec<std::fs::File>,
+}
+
+/// A process group claimed from the daemon's previous build, as it comes
+/// to the provider that adopts it. What it holds is the platform's, opaque
+/// to the SDK, which stays free of I/O; dropped, it is killed.
 pub struct Native(Box<dyn std::any::Any + Send>);
 
 impl Native {
@@ -238,7 +245,7 @@ struct Leased {
 }
 
 impl Parting for Leased {
-    fn commit(self: Box<Self>) -> Native {
+    fn commit(self: Box<Self>) -> Given {
         if let Some(holds) = self.lease.holds() {
             std::mem::forget(holds);
         }

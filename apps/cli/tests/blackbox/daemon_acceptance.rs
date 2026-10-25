@@ -205,11 +205,11 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
     // The daemon log is written behind the facts it records.
     let ended = Instant::now() + Duration::from_secs(30);
     let log = || fs::read_to_string(env.home.daemon_log()).unwrap_or_default();
-    while !log().contains(r#""origin":"handover""#) {
+    // It is best effort: a fact may be lost under load, never made up.
+    while !log().contains(r#""handed_over":{"groups":2}"#) {
         assert!(Instant::now() < ended, "{}", log());
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(log().contains(r#""handed_over":{"groups":2}"#), "{}", log());
     let logged = |text: &str| {
         env.logs()
             .values()

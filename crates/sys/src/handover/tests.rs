@@ -73,6 +73,7 @@ fn an_exec_keeps_a_group_waitable_and_its_unread_output() {
             let number: i32 = std::env::var(RECORD).unwrap().parse().unwrap();
             let mut claimed = read_record(crate::InheritedNumber::from(number)).unwrap();
             let (claimed, owner) = claimed.pop().unwrap();
+            let claimed = claimed.unwrap();
             assert_eq!(owner, serde_json::json!({"call": 4}));
             let file = File::options()
                 .append(true)
