@@ -225,7 +225,8 @@ cover every layout and session count.
   cost is delta p99 rising to about 6.5 ms and idle RSS doubling to 68 MiB
   (allocator retention after 128 concurrent streams). Windows is the
   exception: its turns are bound by PowerShell start-up, and the wider lane
-  changes nothing there.
+  changes nothing there. Since then HTTP no longer runs on the lane: the
+  transport is async on the reactor ([transport.md](transport.md)).
 - **Under load, live deltas are dropped at the start of a reply.** With 128
   concurrent streams, macos-15-intel lost 9384 of 17280 deltas
   (54%). macos-latest lost 57, and the default layouts lost none.
