@@ -16,25 +16,31 @@ use protocol::{CallId, SessionId};
 struct Home {
     dir: tempfile::TempDir,
     files: Arc<Files>,
+    /// One cache per directory, as the daemon holds it.
+    tree: Arc<CacheDir>,
 }
 
 impl Home {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let files = Arc::new(Files::open(dir.path().join("blobs"), dir.path()).unwrap());
-        Self { dir, files }
+        let tree = Arc::new(CacheDir::new(
+            dir.path().join("cache"),
+            Arc::clone(&files) as _,
+        ));
+        Self { dir, files, tree }
     }
 
     fn blobs(&self) -> PathBuf {
         self.dir.path().join("blobs")
     }
 
-    fn tree(&self) -> CacheDir {
-        CacheDir::new(self.dir.path().join("cache"), Arc::clone(&self.files) as _)
+    fn tree(&self) -> Arc<CacheDir> {
+        Arc::clone(&self.tree)
     }
 
     fn session(&self, session: SessionId) -> Blobs {
-        Blobs::new(Arc::clone(&self.files) as _, Arc::new(self.tree()), session)
+        Blobs::new(Arc::clone(&self.files) as _, self.tree(), session)
     }
 
     fn put(&self, bytes: &[u8]) -> BlobRef {
@@ -253,7 +259,6 @@ fn concurrent_ensures_of_one_blob_each_see_a_complete_file() {
     writer.write_all(&bytes).unwrap();
     let blob = writer.finish("text/plain", BlobOrigin::Paste).unwrap();
     let at = TreePath::by_id(&blob.id);
-    // One cache per directory, as the daemon holds it.
     let tree = home.tree();
     let start = std::sync::Barrier::new(4);
     std::thread::scope(|scope| {

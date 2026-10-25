@@ -579,7 +579,10 @@ pub fn publish_ordered(from: &Path, to: &Path) -> io::Result<()> {
 /// outside the directory that holds `to`, and only then given its name, so
 /// `to`'s directory never holds a partial copy.
 pub fn clone_file(from: &Path, staging: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(unix)]
     let name = to.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+    #[cfg(windows)]
+    to.file_name().ok_or(io::ErrorKind::InvalidInput)?;
     #[cfg(target_vendor = "apple")]
     {
         use std::ffi::CString;
@@ -629,10 +632,7 @@ pub fn clone_file(from: &Path, staging: &Path, to: &Path) -> io::Result<()> {
             )
         }
         #[cfg(windows)]
-        {
-            let _ = name;
-            move_file(&temporary, to, false, false)
-        }
+        move_file(&temporary, to, false, false)
     })();
     // Gone once renamed; still ours after a failure or a link fallback.
     let _ = fs::remove_file(&temporary);
@@ -646,9 +646,9 @@ fn copy_new(from: &Path, to: &Path) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         COPY_FILE_FAIL_IF_EXISTS, COPYFILE2_EXTENDED_PARAMETERS, CopyFile2,
     };
-    #[expect(clippy::cast_possible_truncation, reason = "a struct of a few words")]
     let parameters = COPYFILE2_EXTENDED_PARAMETERS {
-        dwSize: size_of::<COPYFILE2_EXTENDED_PARAMETERS>() as u32,
+        dwSize: u32::try_from(size_of::<COPYFILE2_EXTENDED_PARAMETERS>())
+            .expect("fixed structure size"),
         dwCopyFlags: COPY_FILE_FAIL_IF_EXISTS,
         ..Default::default()
     };
