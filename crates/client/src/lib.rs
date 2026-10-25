@@ -577,7 +577,7 @@ pub(crate) async fn stop_async(rt: &rt::Rt, home: &Home) -> io::Result<bool> {
     let Some(daemon) = live_daemon(home) else {
         return Ok(false);
     };
-    if ask_to_stop(home, &daemon.build).await.is_ok()
+    if ask_to_stop(rt, home, &daemon.build).await.is_ok()
         && wait_exited_async(rt, home, Some(HELLO_TIMEOUT)).await
     {
         return Ok(true);
@@ -636,15 +636,16 @@ async fn locked(rt: &rt::Rt, file: File, within: Option<Duration>) -> Option<Fil
 
 /// Connects to the running daemon, as its own build `build` so as not to
 /// set off a drain, without starting one.
-async fn reach(home: &Home, build: &str) -> Result<Connection, Error> {
+async fn reach(rt: &rt::Rt, home: &Home, build: &str) -> Result<Connection, Error> {
     let link::Opened {
         stream,
         machine,
         mut buffered,
         remote,
         within,
-    } = link::socket(&link::BLOCKING, home.endpoint().connect()?)?;
+    } = link::socket(rt, home.endpoint().connect()?)?;
     let greeting = answered(
+        rt,
         within,
         link::hello(&*stream, &mut buffered, build, None, machine, &[]),
     )
@@ -667,11 +668,12 @@ async fn reach(home: &Home, build: &str) -> Result<Connection, Error> {
 /// `future`, unless `within` passes first: a daemon that took the
 /// connection but does not answer.
 async fn answered<T>(
+    rt: &rt::Rt,
     within: Duration,
     future: impl Future<Output = Result<T, Error>>,
 ) -> Result<T, Error> {
     rt::or(future, async {
-        link::BLOCKING.sleep(within).await;
+        rt.sleep(within).await;
         Err(Error::NotResponding)
     })
     .await
@@ -679,10 +681,10 @@ async fn answered<T>(
 
 /// Asks the daemon to stop, and waits for it to close the connection as
 /// it exits.
-async fn ask_to_stop(home: &Home, build: &str) -> Result<(), Error> {
-    let mut conn = reach(home, build).await?;
+async fn ask_to_stop(rt: &rt::Rt, home: &Home, build: &str) -> Result<(), Error> {
+    let mut conn = reach(rt, home, build).await?;
     conn.stream.send(&ClientMsg::Shutdown).await?;
-    answered(DRAIN_TIMEOUT, conn.stream.drained(&mut conn.buffered)).await
+    answered(rt, DRAIN_TIMEOUT, conn.stream.drained(&mut conn.buffered)).await
 }
 
 /// What the running daemon says of itself, if one runs and answers; never
@@ -704,7 +706,7 @@ pub(crate) fn note_timeout(home: &Home, daemon: &Record, error: &Error) {
 
 fn status_of(home: &Home, daemon: &Record) -> Result<Status, Error> {
     rt::block_on(async {
-        let mut conn = reach(home, &daemon.build).await?;
+        let mut conn = reach(&link::BLOCKING, home, &daemon.build).await?;
         conn.stream.send(&ClientMsg::Status).await?;
         let mut pick = |msg| match msg {
             DaemonMsg::Status {
@@ -722,7 +724,7 @@ fn status_of(home: &Home, daemon: &Record) -> Result<Status, Error> {
             }),
             _ => None,
         };
-        answered(HELLO_TIMEOUT, async {
+        answered(&link::BLOCKING, HELLO_TIMEOUT, async {
             Ok(until(&*conn.stream, &mut conn.buffered, &mut pick).await?)
         })
         .await
