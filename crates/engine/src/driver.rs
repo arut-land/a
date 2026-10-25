@@ -2503,6 +2503,14 @@ impl Actor {
             // A replayed process number carries no live OS ownership.
             Effect::Kill { .. } => {}
             Effect::EndStream { stream, cut } => self.end_stream(stream, cut),
+            Effect::DiscardStream { stream } => {
+                let store = Arc::clone(&shared.blobs);
+                // Left behind, it is only a stream no one names.
+                let discarded = rt::unblock(&*shared.rt, move || store.discard(stream));
+                shared
+                    .rt
+                    .spawn(Box::pin(async move { drop(discarded.await) }));
+            }
             Effect::MarkBusy(busy) => {
                 self.live.busy.store(busy, Ordering::SeqCst);
                 let how = if busy { "busy" } else { "settled" };
@@ -2512,8 +2520,8 @@ impl Actor {
         }
     }
 
-    /// Ends stream `stream`, cut off, on a storage worker; the kernel hears
-    /// what became of it.
+    /// Copies stream `stream`, cut off, on a storage worker; the kernel
+    /// hears what it held.
     fn end_stream(&self, stream: protocol::OutputStream, cut: kernel::CutOff) {
         let session = Arc::clone(&self.live.session);
         let fence = session.fence.load(Ordering::SeqCst);
@@ -3234,35 +3242,26 @@ fn job_ended(process: &dyn ext::RunningProcess) -> String {
     format!("[background job {} ended: {how}]", process.id())
 }
 
-/// Ends stream `of`, which a restart cut off: its bytes so far are copied
-/// into a blob, and it is removed. Copied, never sealed in place: a group
-/// the crash left behind may write it still, and would change a blob named
-/// by what it holds.
+/// What stream `of`, which a restart cut off, holds so far, copied into a
+/// blob and cut at [`STREAM_CAP`](ext::blob::STREAM_CAP). Copied, never
+/// sealed in place: a group the crash left behind may write it still, and
+/// would change a blob named by what it holds.
 fn end_cut_off(store: &dyn ext::blob::BlobStore, of: protocol::OutputStream) -> kernel::StreamEnd {
-    let open = match store.reopen(of, u64::MAX) {
-        Ok(stream) => stream.open,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return kernel::StreamEnd::Missing,
-        Err(_) => return kernel::StreamEnd::Kept,
-    };
-    match copied(store, open.path(), of.call) {
-        Ok(blob) => {
-            // Left behind, it is only a stream no one names.
-            let _ = open.discard();
-            blob.map_or(kernel::StreamEnd::Discarded, kernel::StreamEnd::Sealed)
-        }
-        Err(_) => kernel::StreamEnd::Kept,
+    match copied(store, of) {
+        Ok(Some(blob)) => kernel::StreamEnd::Copied(blob),
+        Ok(None) => kernel::StreamEnd::Empty,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => kernel::StreamEnd::Missing,
+        Err(_) => kernel::StreamEnd::Unreadable,
     }
 }
 
-/// The bytes at `path`, as they are now, in a new blob of call `call`'s
-/// output; none if there are none.
 fn copied(
     store: &dyn ext::blob::BlobStore,
-    path: &Path,
-    call: CallId,
+    of: protocol::OutputStream,
 ) -> io::Result<Option<protocol::BlobRef>> {
-    let file = std::fs::File::open(path)?;
-    let mut bytes = (&file).take(file.metadata()?.len());
+    let file = std::fs::File::open(ext::blob::stream_path(store.streams(), of))?;
+    let size = file.metadata()?.len().min(ext::blob::STREAM_CAP);
+    let mut bytes = (&file).take(size);
     let mut head = Vec::with_capacity(ext::blob::SNIFFED);
     (&mut bytes)
         .take(ext::blob::SNIFFED as u64)
@@ -3270,10 +3269,10 @@ fn copied(
     if head.is_empty() {
         return Ok(None);
     }
-    let mut blob = store.writer(u64::MAX)?;
+    let mut blob = store.writer(size)?;
     blob.write_all(&head)?;
     io::copy(&mut bytes, &mut blob)?;
-    let origin = protocol::BlobOrigin::ToolOutput(call);
+    let origin = protocol::BlobOrigin::ToolOutput(of.call);
     blob.finish(ext::blob::media_type(&head), origin).map(Some)
 }
 

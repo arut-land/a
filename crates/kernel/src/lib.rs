@@ -411,10 +411,13 @@ pub enum Work {
     Report { outcome: protocol::ToolOutcome },
     /// Kill process group `pgid`, left over from a run cut off.
     Kill { pgid: u32 },
-    /// End stream `stream`, which a restart cut off, nothing owning what
-    /// writes it any more: its bytes so far go to a blob and the stream
-    /// is removed ([`Event::StreamEnded`]).
+    /// Copy stream `stream`, which a restart cut off, nothing owning what
+    /// writes it any more, into a blob, leaving it as it is
+    /// ([`Event::StreamEnded`]): a blob named by its bytes, so copying
+    /// again after another restart makes the same one.
     EndStream { stream: OutputStream, cut: CutOff },
+    /// Remove stream `stream`: what it held is logged, or was not wanted.
+    DiscardStream { stream: OutputStream },
     /// Whether the session has work in flight, which a restart recovers.
     MarkBusy(bool),
     Deliver {
@@ -570,17 +573,18 @@ pub enum CutOff {
     Job { pgid: u32 },
 }
 
-/// What became of a stream ended at recovery.
+/// What a stream a restart cut off held ([`Work::EndStream`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamEnd {
-    /// Its bytes are this blob's; it is gone.
-    Sealed(protocol::BlobRef),
-    /// It was empty, and is gone.
-    Discarded,
+    /// Its bytes so far, up to [`blob::STREAM_CAP`](ext::blob::STREAM_CAP),
+    /// copied into this blob.
+    Copied(protocol::BlobRef),
+    /// Nothing.
+    Empty,
     /// It was not there: nothing made it, or what wrote it ended it first.
     Missing,
-    /// It could not be read, and is left as it is.
-    Kept,
+    /// It could not be read.
+    Unreadable,
 }
 
 /// How a session's log is resumed.

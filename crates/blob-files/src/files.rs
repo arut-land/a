@@ -112,6 +112,13 @@ impl BlobStore for Files {
         &self.0.streams
     }
 
+    fn discard(&self, of: OutputStream) -> io::Result<()> {
+        match fs::remove_file(stream_path(&self.0.streams, of)) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            removed => removed,
+        }
+    }
+
     fn open(&self, id: &BlobId) -> io::Result<Box<dyn Read + Send>> {
         Ok(Box::new(File::open(self.0.path(id))?))
     }

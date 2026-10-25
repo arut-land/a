@@ -320,12 +320,7 @@ fn leftover_processes_of_this_boot_are_killed() {
         &fx,
         (
             vec![entry(6, tool_result(2, INTERRUPTED))],
-            vec![
-                IDLE,
-                Work::Kill { pgid: 7 },
-                Work::Kill { pgid: 8 },
-                end_job(8),
-            ],
+            vec![IDLE, Work::Kill { pgid: 7 }, Work::Kill { pgid: 8 }],
         ),
     );
     // A background group outlives its call, until the session ends.
@@ -336,10 +331,8 @@ fn leftover_processes_of_this_boot_are_killed() {
         tool_result(2, done(json!(0))),
     ];
     let (_, fx) = resume(Reg::echo(), ended.clone(), &BUSY_LOAD);
-    assert_plan(
-        &fx,
-        (vec![], vec![IDLE, Work::Kill { pgid: 8 }, end_job(8)]),
-    );
+    // Busy still, until what it wrote is back.
+    assert_plan(&fx, (vec![], vec![Work::Kill { pgid: 8 }, end_job(8)]));
     let again = Load {
         fresh: false,
         ..BUSY_LOAD

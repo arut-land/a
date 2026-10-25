@@ -56,6 +56,9 @@ pub struct Core {
     /// Detached calls an interrupt cancelled before its entry, which ends
     /// them, is logged: what they report meanwhile is dropped.
     dropped: SmallVec<[CallId; 1]>,
+    /// Calls whose streams a restart cut off are being copied: the
+    /// session's work in the background until each is back.
+    ending: SmallVec<[CallId; 1]>,
     barriers: Barriers,
 }
 
@@ -110,6 +113,7 @@ impl Core {
             reported: 0,
             failed: None,
             dropped: SmallVec::new(),
+            ending: SmallVec::new(),
             barriers: Barriers::default(),
         }
     }
@@ -288,7 +292,9 @@ impl Core {
     /// background: the ledger alone says where the session stands, so a
     /// snapshot of it restores the session ([`Core::restore`]).
     pub fn at_rest(&self) -> bool {
-        self.at_rest_but_background() && self.fold.ledger.detached().is_empty()
+        self.at_rest_but_background()
+            && self.fold.ledger.detached().is_empty()
+            && self.ending.is_empty()
     }
 
     /// At rest but for calls gone on in the background: what runs, if
@@ -351,7 +357,8 @@ impl Core {
                 | Work::Side { .. }
                 | Work::StartChild { .. }
                 | Work::Interrupt { .. }
-                | Work::Report { .. } => Some(Requirement::Durable),
+                | Work::Report { .. }
+                | Work::DiscardStream { .. } => Some(Requirement::Durable),
                 Work::Cancel { .. } | Work::Detach { .. } | Work::MarkBusy(_) => None,
             };
             match requirement {
@@ -1763,7 +1770,7 @@ impl Core {
             Turn::Model { .. } | Turn::Stopping { .. } => true,
         };
         let outgoing = ledger.pending_outbox().next().is_some();
-        let background = !ledger.detached().is_empty();
+        let background = !ledger.detached().is_empty() || !self.ending.is_empty();
         let busy = working || queued || armed || outgoing || background;
         if busy != self.busy {
             self.busy = busy;
@@ -1868,11 +1875,10 @@ impl Core {
     }
 
     fn cancel_recovered(&mut self, fx: &mut StepPlan) {
-        // Their outcomes are dropped with them; their streams are ended.
+        // Their outcomes are dropped with them, and their streams.
         for d in self.fold.ledger.detached() {
             let stream = self.stream(d.call);
-            let cut = CutOff::Detached;
-            fx.immediate.push(Work::EndStream { stream, cut });
+            fx.immediate.push(Work::DiscardStream { stream });
         }
         let background = self.drop_detached(fx);
         let children: Vec<_> = self.fold.ledger.armed().map(|(_, child)| child).collect();
@@ -1944,18 +1950,17 @@ impl Core {
                 });
                 continue;
             }
-            let stream = self.stream(d.call);
-            let cut = CutOff::Detached;
-            fx.immediate.push(Work::EndStream { stream, cut });
+            self.end_stream(d.call, CutOff::Detached, fx);
         }
     }
 
     /// Ends the stream of each group left to the session that a restart cut
     /// off: neither ended (its end queued) nor handed over, `reheld`, to go
-    /// on. A detached call's stream is ended with its call.
-    fn end_jobs(&self, reheld: &[CallId], fx: &mut StepPlan) {
+    /// on. The stream of a call still open, or detached, is its call's,
+    /// which a call run again starts over.
+    fn end_jobs(&mut self, reheld: &[CallId], fx: &mut StepPlan) {
         let ledger = &self.fold.ledger;
-        let mut ended: SmallVec<[CallId; 2]> = SmallVec::new();
+        let mut ended: SmallVec<[(CallId, u32); 2]> = SmallVec::new();
         for job in ledger.background() {
             let news = EnvelopeId {
                 sender: self.session,
@@ -1963,24 +1968,37 @@ impl Core {
                 purpose: EnvelopeId::JOB.to_owned(),
             };
             let detached = ledger.detached().iter().any(|d| d.call == job.call);
-            if ended.contains(&job.call)
+            if ended.iter().any(|&(call, _)| call == job.call)
                 || reheld.contains(&job.call)
                 || detached
+                || ledger.call(job.call).is_some()
                 || ledger.received(&news)
             {
                 continue;
             }
-            ended.push(job.call);
-            let stream = self.stream(job.call);
-            let cut = CutOff::Job { pgid: job.pgid };
-            fx.immediate.push(Work::EndStream { stream, cut });
+            ended.push((job.call, job.pgid));
+        }
+        for (call, pgid) in ended {
+            self.end_stream(call, CutOff::Job { pgid }, fx);
         }
     }
 
-    /// Stream `stream`, cut off, ended as `end` says: what it held reaches
-    /// the session as its owner's end would have. A detached call's
-    /// outcome is that it was cut off, unless an interrupt dropped the call
-    /// first; a group's end is news that it was, unless it left no stream.
+    /// Has call `call`'s stream copied, the session waiting on it
+    /// meanwhile ([`Core::stream_ended`]).
+    fn end_stream(&mut self, call: CallId, cut: CutOff, fx: &mut StepPlan) {
+        if !self.ending.contains(&call) {
+            self.ending.push(call);
+        }
+        let stream = self.stream(call);
+        fx.immediate.push(Work::EndStream { stream, cut });
+    }
+
+    /// Stream `stream`, cut off, copied as `end` says: what it held reaches
+    /// the session as its owner's end would have, and only once that is
+    /// logged is the stream removed, so a restart in between copies it
+    /// again. A detached call's outcome is that it was cut off, unless an
+    /// interrupt dropped the call first; a group's end is news that it
+    /// was, a logged fact even when it left no stream.
     fn stream_ended(
         &mut self,
         stream: OutputStream,
@@ -1989,40 +2007,43 @@ impl Core {
         fx: &mut StepPlan,
     ) {
         let call = stream.call;
-        let missing = end == StreamEnd::Missing;
+        let Some(at) = self.ending.iter().position(|&c| c == call) else {
+            return;
+        };
+        self.ending.remove(at);
+        let discard = matches!(end, StreamEnd::Copied(_) | StreamEnd::Empty);
         let held = match end {
-            StreamEnd::Sealed(blob) => vec![Held::Blob(blob)],
-            StreamEnd::Kept => vec![Held::Stream(stream)],
-            StreamEnd::Discarded | StreamEnd::Missing => Vec::new(),
+            StreamEnd::Copied(blob) => vec![Held::Blob(blob)],
+            StreamEnd::Unreadable => vec![Held::Stream(stream)],
+            StreamEnd::Empty | StreamEnd::Missing => Vec::new(),
         };
         match cut {
             CutOff::Detached => {
                 let detached = self.fold.ledger.detached().iter().any(|d| d.call == call);
-                if !detached || self.dropped.contains(&call) {
-                    return;
+                if detached && !self.dropped.contains(&call) {
+                    let output = if held.is_empty() {
+                        "[the daemon stopped while this call ran in the background: it may not \
+                         have completed; it wrote no output]"
+                    } else {
+                        "[the daemon stopped while this call ran in the background: it may not \
+                         have completed; its output so far is kept]"
+                    };
+                    let outcome = ToolOutcome::Interrupted {
+                        output: Some(output.to_owned()),
+                    };
+                    self.own(call, Carried::Detached(outcome), held, fx);
                 }
-                let output = if held.is_empty() {
-                    "[the daemon stopped while this call ran in the background: it may not have \
-                     completed; it wrote no output]"
-                } else {
-                    "[the daemon stopped while this call ran in the background: it may not have \
-                     completed; its output so far is kept]"
-                };
-                let outcome = ToolOutcome::Interrupted {
-                    output: Some(output.to_owned()),
-                };
-                self.own(call, Carried::Detached(outcome), held, fx);
             }
             CutOff::Job { pgid } => {
-                if missing {
-                    return;
-                }
                 let text = format!(
                     "[background job {pgid} cut off: the daemon stopped while it ran, and no \
                      longer owns it]"
                 );
                 self.own(call, Carried::Job(text), held, fx);
             }
+        }
+        if discard {
+            fx.immediate.push(Work::DiscardStream { stream });
         }
     }
 
