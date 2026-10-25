@@ -151,7 +151,10 @@ fn run(tool: &str, input: u64) -> (Outcome, String) {
         blobs: {
             let unused = std::env::temp_dir();
             let store = Arc::new(blob_files::Files::open(unused.join("unused"), &unused).unwrap());
-            let tree = Arc::new(blob_files::CacheDir::new(unused, Arc::clone(&store) as _));
+            let tree = Arc::new(blob_files::CacheDir::new(
+                unused.join("cache"),
+                Arc::clone(&store) as _,
+            ));
             blob::Blobs::new(store, tree, SessionId::new())
         },
         cancel: Cancel::default(),

@@ -572,10 +572,17 @@ pub fn publish_ordered(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// Makes `to` a read-only copy of `from`, sharing its storage where the
-/// file system can (an APFS clone, a reflink) but never its file: a write
-/// through `to` cannot reach `from`. `to` appears whole or not at all and
-/// is never replaced; one that exists is `AlreadyExists`.
-pub fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
+/// file system can (an APFS clone, a reflink, a `ReFS` block clone) but never
+/// its file: a write through `to` cannot reach `from`. `to` appears whole or
+/// not at all and is never replaced; one that exists is `AlreadyExists`. A
+/// copy is made in `staging`, an existing directory on `to`'s file system
+/// outside the directory that holds `to`, and only then given its name, so
+/// `to`'s directory never holds a partial copy.
+pub fn clone_file(from: &Path, staging: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    let name = to.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+    #[cfg(windows)]
+    to.file_name().ok_or(io::ErrorKind::InvalidInput)?;
     #[cfg(target_vendor = "apple")]
     {
         use std::ffi::CString;
@@ -595,51 +602,91 @@ pub fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
             return Err(error);
         }
     }
-    let dir = to
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut source = File::open(from)?;
-    // A copy is written under a name of its own and only then given `to`,
-    // so a concurrent maker never sees it part written.
-    let (temporary, mut copy) = loop {
-        let temporary = edit::temporary_name();
-        match private_file().open(dir.join(&temporary)) {
-            Ok(file) => break (temporary, file),
+    let temporary = loop {
+        let temporary = staging.join(edit::temporary_name());
+        match copy_new(from, &temporary) {
+            Ok(()) => break temporary,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
-        }
-    };
-    let copied = (|| {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            use std::os::fd::AsRawFd;
-            // SAFETY: both descriptors stay open for the call; FICLONE takes
-            // the source descriptor as its argument.
-            let shared =
-                unsafe { libc::ioctl(copy.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } != -1;
-            if !shared {
-                io::copy(&mut source, &mut copy)?;
+            Err(e) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(e);
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        io::copy(&mut source, &mut copy)?;
-        let mut read_only = copy.metadata()?.permissions();
+    };
+    let published = (|| {
+        let mut read_only = fs::metadata(&temporary)?.permissions();
         read_only.set_readonly(true);
-        copy.set_permissions(read_only)?;
-        drop(copy);
+        fs::set_permissions(&temporary, read_only)?;
         #[cfg(unix)]
         {
-            let name = to.file_name().ok_or(io::ErrorKind::InvalidInput)?;
-            let parent = File::open(dir)?;
-            staging::no_replace(&parent, &temporary, &parent, name)
+            let parent = to
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let temporary_name = temporary.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+            staging::no_replace(
+                &edit::open_parent(staging)?,
+                temporary_name,
+                &edit::open_parent(parent)?,
+                name,
+            )
         }
         #[cfg(windows)]
-        move_file(&dir.join(&temporary), to, false, false)
+        move_file(&temporary, to, false, false)
     })();
     // Gone once renamed; still ours after a failure or a link fallback.
-    let _ = fs::remove_file(dir.join(&temporary));
-    copied
+    let _ = fs::remove_file(&temporary);
+    published
+}
+
+/// Copies `from` to `to`, a new name, as the platform copies a file:
+/// `CopyFile2` block-clones on `ReFS` and Dev Drive, as Explorer does.
+#[cfg(windows)]
+fn copy_new(from: &Path, to: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        COPY_FILE_FAIL_IF_EXISTS, COPYFILE2_EXTENDED_PARAMETERS, CopyFile2,
+    };
+    let parameters = COPYFILE2_EXTENDED_PARAMETERS {
+        dwSize: u32::try_from(size_of::<COPYFILE2_EXTENDED_PARAMETERS>())
+            .expect("fixed structure size"),
+        dwCopyFlags: COPY_FILE_FAIL_IF_EXISTS,
+        ..Default::default()
+    };
+    let (from, to) = (
+        crate::windows::wide(from.as_os_str()),
+        crate::windows::wide(to.as_os_str()),
+    );
+    // SAFETY: both NUL-terminated paths and the parameters outlive the call.
+    let result = unsafe { CopyFile2(from.as_ptr(), to.as_ptr(), &raw const parameters) };
+    match result {
+        0 => Ok(()),
+        // HRESULT_FROM_WIN32 carries the Win32 code, and with it the error kind.
+        failed if failed.cast_unsigned() >> 16 == 0x8007 => {
+            Err(io::Error::from_raw_os_error(failed & 0xFFFF))
+        }
+        failed => Err(io::Error::other(format!(
+            "CopyFile2 failed: {:#010x}",
+            failed.cast_unsigned()
+        ))),
+    }
+}
+
+/// Copies `from` to `to`, a new name, sharing its storage where the file
+/// system can.
+#[cfg(not(windows))]
+fn copy_new(from: &Path, to: &Path) -> io::Result<()> {
+    let mut source = File::open(from)?;
+    let mut copy = private_file().open(to)?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: both descriptors stay open for the call; FICLONE takes
+        // the source descriptor as its argument.
+        if unsafe { libc::ioctl(copy.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } != -1 {
+            return Ok(());
+        }
+    }
+    io::copy(&mut source, &mut copy).map(drop)
 }
 
 /// A name whose publication must precede the log's first durable promise.
@@ -992,9 +1039,9 @@ mod tests {
         let taken = publish_ordered(&staged, &blob).unwrap_err();
         assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read_to_string(&blob).unwrap(), "bytes");
-        clone_file(&blob, &copy).unwrap();
+        clone_file(&blob, dir.path(), &copy).unwrap();
         assert_eq!(fs::read_to_string(&copy).unwrap(), "bytes");
-        let taken = clone_file(&staged, &copy).unwrap_err();
+        let taken = clone_file(&staged, dir.path(), &copy).unwrap_err();
         assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read_to_string(&copy).unwrap(), "bytes");
         let mut names: Vec<_> = fs::read_dir(dir.path())

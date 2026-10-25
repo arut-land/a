@@ -343,7 +343,7 @@ impl Fixture {
             blob_files::Files::open(scratch.path().join("blobs"), scratch.path()).unwrap(),
         );
         let tree = Arc::new(blob_files::CacheDir::new(
-            scratch.path().join("tree"),
+            scratch.path().join("cache"),
             Arc::clone(&blobs),
         ));
         let daemon = Arc::new_cyclic(|daemon| Daemon {

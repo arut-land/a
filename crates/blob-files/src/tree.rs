@@ -2,33 +2,52 @@
 //! every OS has. A file shares the store's storage where the file system
 //! can (an APFS clone, a reflink) and is copied where it cannot; either
 //! way it is a read-only file of its own, appears whole, and everything
-//! here can be deleted and made again from the store.
+//! here can be deleted and made again from the store. Copies are made in a
+//! staging directory beside the tree, so the tree holds only whole files.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::SystemTime;
 
 use blob::{BlobRef, BlobStore, Materialize, TreePath};
 
 pub struct CacheDir {
-    root: PathBuf,
+    tree: PathBuf,
+    staging: PathBuf,
+    swept: Once,
     store: Arc<dyn BlobStore>,
 }
 
 impl CacheDir {
-    pub fn new(root: impl Into<PathBuf>, store: Arc<dyn BlobStore>) -> Self {
+    /// The cache in `dir`: the tree in `dir/tree`, copies being made in
+    /// `dir/staging`, both on one file system. One `CacheDir` owns `dir`.
+    pub fn new(dir: impl AsRef<Path>, store: Arc<dyn BlobStore>) -> Self {
+        let dir = dir.as_ref();
         Self {
-            root: root.into(),
+            tree: dir.join("tree"),
+            staging: dir.join("staging"),
+            swept: Once::new(),
             store,
         }
+    }
+
+    /// Emptied before this owner's first copy, when none of its own can be
+    /// in flight: what staging holds then a crash left. A leftover that
+    /// cannot be removed is outside the tree, and the next owner tries again.
+    fn staging(&self) -> io::Result<&Path> {
+        self.swept.call_once(|| {
+            let _ = fs::remove_dir_all(&self.staging);
+        });
+        sys::fs::private_dir(&self.staging)?;
+        Ok(&self.staging)
     }
 }
 
 impl Materialize for CacheDir {
     fn root(&self) -> &Path {
-        &self.root
+        &self.tree
     }
 
     fn ensure(&self, at: &TreePath, blob: &BlobRef) -> io::Result<()> {
@@ -43,7 +62,7 @@ impl Materialize for CacheDir {
         let dir = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
         sys::fs::private_dir(dir)?;
         let from = self.store.materialize(&blob.id)?;
-        match sys::fs::clone_file(&from, &path) {
+        match sys::fs::clone_file(&from, self.staging()?, &path) {
             // Another call made it first, from the same blob.
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
             made => made,
@@ -52,7 +71,7 @@ impl Materialize for CacheDir {
 
     fn evict(&self, budget: u64) -> io::Result<u64> {
         let mut files: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
-        let mut pending = vec![self.root.clone()];
+        let mut pending = vec![self.tree.clone()];
         while let Some(dir) = pending.pop() {
             let items = match fs::read_dir(&dir) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,

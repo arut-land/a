@@ -156,9 +156,12 @@ their log, and environment redaction does not apply to them.
 
 `Materialize`'s only backend is `blob_files::CacheDir`:
 `cache/tree/by-id/<id>`, cloned (APFS `clonefile`, Linux `FICLONE`), else
-copied under a temporary name and renamed into place without replacing,
-read-only, evicted least recently used first and rebuilt on demand. Never a
-hard link: a write through the cache never reaches the blob. Virtual backends (Windows Cloud
+copied (Windows `CopyFile2`, which block-clones on ReFS and Dev Drive) into
+`cache/staging` and renamed into the tree without replacing, read-only,
+evicted least recently used first and rebuilt on demand. The tree holds only
+whole files: eviction walks it alone, and what a crash leaves in staging is
+removed before the next owner's first copy. Never a hard link: a write
+through the cache never reaches the blob. Virtual backends (Windows Cloud
 Files, macOS File Provider, Linux FUSE) would plug in behind the same trait,
 answering from `Namespace` and hydrating via `BlobStore::open`.
 
