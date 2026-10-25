@@ -92,6 +92,9 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
         packages = ("engine", "llm")
     env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
                CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
+    if os.name == "nt":
+        # snmalloc checks Git Bash's MSYSTEM before the MSVC target.
+        env.pop("MSYSTEM", None)
     release = Path(env["CARGO_TARGET_DIR"]) / "release"
     # Features select an allocator or heap for `a` and the engine's benches
     # alone (docs/perf/allocators.md); the other benches keep their own.
@@ -386,6 +389,9 @@ def sessions(source, output, variant):
     executable's image options) instead of the runtime layouts."""
     env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
                CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
+    if os.name == "nt":
+        # snmalloc checks Git Bash's MSYSTEM before the MSVC target.
+        env.pop("MSYSTEM", None)
 
     def engine(name, features=()):
         result = run(["cargo", "test", "--release", *STD, "-p", "engine", "--lib", "--no-run",
