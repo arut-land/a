@@ -227,17 +227,37 @@ cover every layout and session count.
   exception: its turns are bound by PowerShell start-up, and the wider lane
   changes nothing there. Since then HTTP no longer runs on the lane: the
   transport is async on the reactor ([transport.md](transport.md)).
-- **Under load, live deltas are dropped at the start of a reply.** With 128
-  concurrent streams, macos-15-intel lost 9384 of 17280 deltas
-  (54%). macos-latest lost 57, and the default layouts lost none.
-  Drops cluster on a reply's first delta. This fits `Live::delta` discarding
-  deltas until the frame log holds the call's `model_call` entry. The final
-  text is unaffected (`model_result` is the fact).
-- **Three of about 400 samples stalled** (`failures.jsonl` in the run's
-  artifacts): `threads`/32 on macos-15-intel, `A2`/32 on ubuntu-24.04-arm and
-  `network`/128 on ubuntu-latest. In the first two, the transport closed a
-  provider connection mid-request-body. In all three, a session's turn then
-  made no progress for 120 s. The sampler records the stall and moves on.
+- **Under load, live deltas were dropped at the start of a reply (fixed).**
+  With 128 concurrent streams, macos-15-intel lost 9384 of 17280 deltas
+  (54%). A model call's request starts as soon as its `model_call` entry is
+  ordered, before it is durable. `Live::delta` discarded every delta that
+  arrived before the frame log showed that entry, and a flush lane shared
+  by 128 sessions makes that window long. Such deltas now wait in
+  `Live::early` and follow the call once it is shown, in order and never
+  before it (`no_delta_is_lost_when_a_stream_outruns_its_calls_flush`). In
+  run [40210776111](https://github.com/arut-land/a/actions/runs/40210776111),
+  no runner lost a delta. The deltas that used to be dropped now arrive
+  late, after their call's flush: with 128 network workers, delta p99 is
+  280 ms on macos-15-intel and 17 ms on macos-latest. The default lane is
+  unchanged (p99 1.3 and 1.9 ms).
+- **Rare stalls were spurious request failures (fixed).** Three of about
+  400 samples in the first run stalled (`threads`/32 on macos-15-intel,
+  `A2`/32 on ubuntu-24.04-arm, `network`/128 on ubuntu-latest). The
+  provider saw a connection close in the middle of a request. The engine
+  settles such a call as failed
+  (`a_connection_closed_mid_request_settles_its_call`); the stall was the
+  sampler waiting for a second model result that never came. The cut came
+  from the transport. Once a reply's body ends, ureq hands its connection
+  back to the pool before the request's blocking job lets go of the
+  socket. A reply dropped in that window "cancelled" the request by
+  shutting the socket down, under whichever request had taken it from the
+  pool. The pool's probe now releases the socket from the finished request
+  (`cancelling_a_finished_request_never_closes_its_pooled_connection`), and
+  the sampler ends a turn on a failed call and counts it (`failed_calls`).
+  The rerun had no stalls and no failed calls on any runner. The async
+  transport that replaced ureq has no such window: a connection belongs to
+  the reply reading it until the pool takes it, and nothing else can close
+  it.
 
 ## Acceptance and integration
 
