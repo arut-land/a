@@ -130,15 +130,25 @@ is equal or lower (ubuntu-latest 8.2 → 7.7 MiB at one session).
   workers. It stays under a frame interval except on macos-15-intel,
   where this run also predates the fix for deltas dropped under load
   (the dropped counts it shows are that bug).
-- **CPU** falls by two thirds on macos-latest and is flat on Linux arm,
-  but rises by 22–34% on ubuntu-latest and on Windows at 32 and 128.
-  What the readiness model costs per event: a read that would block, a
-  re-arm of the one-shot registration (`epoll_ctl`, or AFD on Windows) and
-  the reactor thread's wake, where a blocked `read` had none of them.
-  That is the reactor's cost, below the client: a persistent
-  edge-triggered registration or a completion backend (io_uring, IOCP)
-  removes it without changing the client (see "What the client needs
-  from rt").
+- **CPU** in this run fell by two thirds on macos-latest, was flat on
+  Linux arm and rose by 22–34% on ubuntu-latest and Windows at 32 and 128.
+  A second run on the branch merged with main
+  ([40220709639](https://github.com/arut-land/a/actions/runs/40220709639),
+  which also has main's late-delta fix) puts ubuntu-latest at 3010 ms and
+  ubuntu-24.04-arm at 2980 ms for 128 sessions (ureq: 3730 and 3820), turn
+  p50 520 and 483 ms, no failed calls; Windows stays PowerShell-bound
+  (windows-latest turn p50 10652 ms, CPU 5500 ms, against 10888 and
+  5172). Runner draws vary by a fifth between runs. What the readiness
+  model does cost per event is a read that would block, a re-arm of the
+  one-shot registration (`epoll_ctl`, or AFD on Windows) and the reactor
+  thread's wake, where a blocked `read` had none of them. That is below
+  the client: a persistent edge-triggered registration or a completion
+  backend (io_uring, IOCP) removes it without changing the client (see
+  "What the client needs from rt").
+- **macos-15-intel's delta p99 at 128** is 715 ms in the second run (no
+  dropped deltas): the deltas main used to drop now wait for their call's
+  flush, which 128 sessions share; main measured the same with 128 network
+  workers (280 ms). It is the flush lane, not the transport.
 - **Idle RSS after 128 sessions** is 1–3 MiB higher on Linux (128
   replies' buffers, retained by the allocator) and 7.5 MiB on
   macos-latest, against 30–37 MiB more for 128 network workers.
