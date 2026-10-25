@@ -680,7 +680,8 @@ mod tests {
         use std::io::Read;
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "ps -o pgid= -p $$"]);
-        let (mut child, input, mut output) = super::super::spawn_ssh(&mut command).unwrap();
+        let (mut child, input, mut output, _) =
+            super::super::spawn_ssh(&mut command, super::super::Prompt::Terminal).unwrap();
         drop(input);
         let mut text = String::new();
         output.read_to_string(&mut text).unwrap();
@@ -689,6 +690,27 @@ mod tests {
         assert_eq!(text.trim().parse::<i32>().unwrap(), unsafe {
             libc::getpgrp()
         });
+    }
+
+    #[test]
+    fn ssh_that_may_not_prompt_has_no_terminal_and_reports_on_its_own_pipe() {
+        use std::io::Read;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", r#"echo "$HOME" >&2; ps -o pgid= -p $$"#]);
+        let (mut child, input, mut output, error) =
+            super::super::spawn_ssh(&mut command, super::super::Prompt::Never).unwrap();
+        drop(input);
+        let mut text = String::new();
+        output.read_to_string(&mut text).unwrap();
+        let mut reported = String::new();
+        error.unwrap().read_to_string(&mut reported).unwrap();
+        assert!(child.wait().unwrap().success());
+        // SAFETY: getpgrp has no inputs or ownership effects.
+        assert_ne!(text.trim().parse::<i32>().unwrap(), unsafe {
+            libc::getpgrp()
+        });
+        // ssh finds its keys and agent through the caller's environment.
+        assert_eq!(reported.trim(), std::env::var("HOME").unwrap());
     }
 
     #[test]

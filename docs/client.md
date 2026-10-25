@@ -19,30 +19,54 @@ SessionClient (session.rs)         no I/O: Link FSM, SessionView (protocol::view
 Driver (drive.rs)                  pump: the one fixpoint loop; threads: connect + read per
   │                                connection, one writer
   ▼
-transport (lib.rs, remote.rs)      Daemon { endpoint: Local(Home) | Ssh(host), staged }: connect,
-                                   connect_as, sessions, new_session; hello, Error, Connection,
-                                   stop/status/restart/diagnose, bridge
+transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: connect, connect_as,
+           remote.rs)              sessions, new_session; the one hello over any Link; Error,
+                                   Connection, stop/status/restart/diagnose, bridge
 ```
 
-- **Transport.** `Daemon { endpoint, staged }` is the daemon as a client
-  reaches it: this machine's over its Unix socket (spawned with zero lag:
-  the client takes the daemon lock, binds the socket, hands both to a
-  detached `a __daemon` and connects into its backlog; one client starts
-  it at a time, under `start.lock`, and the others wait on that lock, not
-  on a timer) or another machine's through `ssh <host> a bridge`, whose
-  stdio carries the same frames. [Autostart](autostart.md) only starts the
-  daemon earlier, at login; it never changes this path. `connect` completes the hello: a
+- **Transport.** `Daemon { link, staged }` is the daemon as a client
+  reaches it. A `Link` (`link.rs`) opens a byte stream to one daemon,
+  ready for the hello, and says what only it knows: whether opening may
+  need the person at the terminal (`needs_terminal`), what can be told of
+  a daemon that never answered (`unanswered`), and which side to update
+  on a mismatch. The hello, its timeout, the drain wait and the retries
+  are written once, in `link::connect`, over any link; the blocking API
+  (`Daemon::connect`, `status`, `stop`) runs the same code on its caller's
+  thread. A new transport is a new type, never an arm in an enum:
+  - `LocalLink(Home)`: this machine's daemon over its socket, spawned
+    with zero lag (the client takes the daemon lock, binds the socket,
+    hands both to a detached `a __daemon` and connects into its backlog;
+    one client starts it at a time, under `start.lock`, and the others
+    wait on that lock, not on a timer). [Autostart](autostart.md) only
+    starts the daemon earlier, at login; it never changes this path.
+  - `SshLink { host, prompt }` (`remote.rs`): another machine's, through
+    the system `ssh` to `a bridge`, whose stdio carries the same frames
+    after a sync line and the host's environment. The remote login shell
+    is given only plain words, so sh, csh, fish, cmd and PowerShell run
+    them alike: `sh -s` with a discovery script on stdin (the `a` on
+    `PATH`, else the one its runtime directory holds, as the host's
+    `A_HOME` or native layout says), `a bridge <token>` where there is no
+    POSIX shell, and `uname -sm` before installing this build where
+    neither finds `a`. A script is grouped, so `sh` reads it whole before
+    running any of it; the upload follows only once the script says
+    `ready`, since a shell such as dash reads ahead. `Prompt::Never`
+    (`a web`) runs ssh with `BatchMode=yes` and no terminal, and reads
+    what it says, so a host that needs a password or a host key confirmed
+    is `LinkError::NeedsInteractiveAuth`, not a prompt nobody sees.
+
+  `connect` completes the hello: a
   `Welcome` (protocol and capabilities taken up, the slash commands the
   daemon advertises), a `Draining` daemon waited out and tried again, a
   mismatch as `Error::Mismatch { theirs, newer, host }`, whose `Display`
   is the one sentence that says which side to update. `connect_as` sends
   the attach right behind the hello, saving a round trip. `Error` is the
   typed reason a daemon could not be reached or stopped serving
-  (`Mismatch`, `NotResponding`, `Refused`, `Closed`, `Io`); it converts
-  to `io::Error` for the commands that report that way. `stop`, `status`,
-  `restart` and `diagnose` are what `a daemon …` runs; none starts a
-  daemon but `restart`. The daemon lists sessions newest first; no client
-  sorts, and `SessionSummary` prints the `a ls` line.
+  (`Mismatch`, `NotResponding`, `Refused`, `Closed`, `Link(LinkError)`,
+  `Io`); it converts to `io::Error` for the commands that report that
+  way. `stop`, `status`, `restart` and `diagnose` are what `a daemon …`
+  runs; none starts a daemon but `restart`. The daemon lists sessions
+  newest first; no client sorts, and `SessionSummary` prints the `a ls`
+  line.
 - **`SessionClient`.** One session as a client follows it, without I/O.
   `Link` is the connection's state machine: `Connecting` → `Replaying` →
   `Live` → `Draining` → `Reconnecting {since}` → `Replaying`, or
@@ -156,6 +180,9 @@ Other rules the apps keep, by convention:
   it, a wedged daemon ends nothing until restarted.
 - `crates/client/src/drive.rs`: the pump runs until the renderer asks for
   nothing more.
+- `crates/client/src/remote.rs`, `tests/ssh.rs`: a shell reading ahead
+  leaves the bridge nothing of the script; a link that may not prompt
+  says a person must authenticate instead of asking.
 - `crates/client/src/lib.rs`: the mismatch sentence, `stop` signalling
   only the process that recorded itself, a lock let go after the wait is
   not kept.
@@ -163,4 +190,5 @@ Other rules the apps keep, by convention:
   the rules above.
 - Black-box: `apps/cli/tests/blackbox/{acceptance,crash,home,remote}.rs`
   drive `a` against a daemon in an isolated `A_HOME` (`mise run
-  acceptance` runs the first).
+  acceptance` runs the first); `remote.rs`'s fake `ssh` refuses anything
+  but plain words, as a non-POSIX login shell would.

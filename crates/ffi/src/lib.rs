@@ -119,9 +119,10 @@ impl From<client::Error> for ClientError {
             client::Error::NotResponding => Self::NotResponding { message },
             client::Error::Closed => Self::Closed,
             client::Error::Busy => Self::Busy { message },
-            client::Error::Fork(_) | client::Error::Refused(_) | client::Error::Io(..) => {
-                Self::Unavailable { message }
-            }
+            client::Error::Fork(_)
+            | client::Error::Refused(_)
+            | client::Error::Link(_)
+            | client::Error::Io(..) => Self::Unavailable { message },
         }
     }
 }

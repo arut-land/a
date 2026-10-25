@@ -1,7 +1,7 @@
-//! The client SDK every app is a renderer over. Below, the transport:
-//! reach a daemon and complete the hello (this machine's over its Unix
-//! socket, spawned if needed; another machine's through `ssh <host> a
-//! bridge`, whose stdio carries the same frames). Above it, without I/O, a
+//! The client SDK every app is a renderer over. Below, the transport: a
+//! [`link::Link`] reaches a daemon (this machine's over its socket, spawned
+//! if needed; another machine's through `ssh <host> a bridge`, whose stdio
+//! carries the same frames) and one hello runs over any of them. Above it, without I/O, a
 //! session's link, view and intents ([`SessionClient`]) and the one slash
 //! command table ([`COMMANDS`]); a [`Driver`] owns transport on the supplied runtime.
 
@@ -9,6 +9,7 @@ mod approval;
 mod command;
 mod drive;
 mod inbox;
+pub mod link;
 #[cfg(test)]
 mod one_rule;
 mod remote;
@@ -23,6 +24,8 @@ pub use approval::{ApprovalPart, approval_parts, approval_text};
 pub use command::{COMMANDS, Cmd, Command, help, parse, parse_input};
 pub use drive::{ClientHandle, Driver, Renderer, pump};
 pub use inbox::{Inbox, PUMP_BATCH, Post, QueueBudget, inbox};
+pub use link::{LinkError, LocalLink, Start};
+pub use remote::SshLink;
 pub use session::{
     Attach, ConnId, Effect, End, Env, Event, EventKind, Io, Link, Notice, Offer, SessionClient,
     Show, TurnView,
@@ -31,18 +34,21 @@ pub use watch::SessionWatch;
 
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, BufReader, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use protocol::view::SessionList;
 use protocol::{
     Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings,
-    PROTO, SessionId, SessionSummary, SettingsChange, Versions, read_frame, write_frame,
+    SessionId, SessionSummary, SettingsChange, Versions, write_frame,
 };
 use sys::crash::{Crashes, Record};
-use sys::{Home, OwnedConnection as Stream, Signal, Staged};
+use sys::{Home, OwnedConnection, Signal, Staged};
+
+use link::Greeting;
 
 /// Why a daemon could not be reached, or stopped serving this client.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +72,8 @@ pub enum Error {
     Busy,
     /// The daemon closed the connection.
     Closed,
+    /// The link to the daemon could not be opened, as it says.
+    Link(LinkError),
     /// The socket, `ssh` or the spawn failed.
     Io(io::ErrorKind, String),
 }
@@ -98,6 +106,7 @@ impl fmt::Display for Error {
                 )
             }
             Self::Fork(reason) => reason.fmt(f),
+            Self::Link(why) => why.fmt(f),
             Self::NotResponding => f.write_str("the daemon is not responding"),
             Self::Refused(why) | Self::Io(_, why) => f.write_str(why),
             Self::Busy => f.write_str("the client transport is busy; try again"),
@@ -128,70 +137,20 @@ impl From<Error> for io::Error {
             Error::NotResponding => io::ErrorKind::TimedOut,
             Error::Refused(_) | Error::Fork(_) => io::ErrorKind::Other,
             Error::Busy => io::ErrorKind::WouldBlock,
+            Error::Link(LinkError::NeedsInteractiveAuth(_)) => io::ErrorKind::PermissionDenied,
+            Error::Link(LinkError::Unreachable(_)) => io::ErrorKind::HostUnreachable,
             Error::Closed => io::ErrorKind::UnexpectedEof,
-            Error::Io(kind, _) => *kind,
+            Error::Link(LinkError::Io(kind, _)) | Error::Io(kind, _) => *kind,
         };
         Self::new(kind, e.to_string())
     }
 }
 
-/// The read half of a connection.
-pub struct Reader(BufReader<Transport>);
-
-/// The write half owns cancellation of its peer reader.
-pub struct Writer {
-    io: Option<Transport>,
-    child: Option<sys::ContainedChild>,
-}
-
-enum Transport<L = Stream, P = sys::ProcessPipe> {
-    Local(L),
-    Pipe(P),
-}
-
-// Pipe and socket types coincide on some targets.
-#[allow(clippy::match_same_arms)]
-impl<L: Read, P: Read> Read for Transport<L, P> {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Local(io) => io.read(bytes),
-            Self::Pipe(io) => io.read(bytes),
-        }
-    }
-}
-
-#[allow(clippy::match_same_arms)]
-impl<L: Write, P: Write> Write for Transport<L, P> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Local(io) => io.write(bytes),
-            Self::Pipe(io) => io.write(bytes),
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Local(io) => io.flush(),
-            Self::Pipe(io) => io.flush(),
-        }
-    }
-}
-
-impl Drop for Writer {
-    fn drop(&mut self) {
-        if let Some(Transport::Local(stream)) = &self.io {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
-        if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-/// A daemon connection, split so reading and writing can make progress independently.
+/// A daemon connection, for a client that waits on each answer in turn;
+/// [`Driver`] reads and writes one at once.
 pub struct Connection {
-    pub reader: Reader,
-    pub writer: Writer,
+    stream: Box<dyn link::Stream>,
+    buffered: Vec<u8>,
     /// The far host's environment, as its bridge captured it; `None` for
     /// this machine's daemon.
     pub remote: Option<Environment>,
@@ -214,10 +173,7 @@ impl Connection {
     /// commands with: this process's, or a remote daemon's bridge's, never
     /// this machine's paths on another.
     pub fn origin(&self) -> io::Result<Environment> {
-        match &self.remote {
-            Some(env) => Ok(env.clone()),
-            None => capture(),
-        }
+        origin(self.remote.as_ref())
     }
 
     /// The message making `attach`. The daemon finds the workspace from
@@ -227,17 +183,32 @@ impl Connection {
         attaching(attach, || self.origin())
     }
 
+    /// Sends `msg` as it is: a mutation is numbered by the session client
+    /// that made it, which keeps it for the daemon's answer.
+    pub fn send(&mut self, msg: &ClientMsg) -> io::Result<()> {
+        rt::block_on(self.stream.send(msg))
+    }
+
     /// Sends each of `msgs`.
     pub fn send_all(&mut self, msgs: &[ClientMsg]) -> io::Result<()> {
-        msgs.iter().try_for_each(|msg| self.writer.send(msg))
+        msgs.iter().try_for_each(|msg| self.send(msg))
+    }
+
+    pub fn recv(&mut self) -> io::Result<Option<DaemonMsg>> {
+        rt::block_on(self.stream.recv(&mut self.buffered))
+    }
+
+    /// The first message `pick` accepts; the rest are skipped.
+    pub fn until<T>(&mut self, mut pick: impl FnMut(DaemonMsg) -> Option<T>) -> io::Result<T> {
+        rt::block_on(until(&*self.stream, &mut self.buffered, &mut pick))
     }
 
     /// The home settings, after making `change` to them. The daemon is
     /// their one writer; a change it refuses (a bad variable name, a file
     /// it cannot parse) is `InvalidInput`, saying why.
     pub fn settings(mut self, change: Option<SettingsChange>) -> io::Result<HomeSettings> {
-        self.writer.send(&ClientMsg::Settings { change })?;
-        let (settings, error) = self.reader.until(|msg| match msg {
+        self.send(&ClientMsg::Settings { change })?;
+        let (settings, error) = self.until(|msg| match msg {
             DaemonMsg::Settings { settings, error } => Some((settings, error)),
             _ => None,
         })?;
@@ -250,16 +221,38 @@ impl Connection {
     /// Asks for the session list now and on every change, as
     /// [`DaemonMsg::Sessions`].
     pub fn watch_sessions(&mut self) -> io::Result<()> {
-        self.writer.send(&ClientMsg::WatchSessions)
+        self.send(&ClientMsg::WatchSessions)
     }
 
     /// The daemon's sessions, newest first.
     pub fn sessions(mut self) -> io::Result<Vec<SessionSummary>> {
-        self.writer.send(&ClientMsg::List)?;
+        self.send(&ClientMsg::List)?;
         let mut list = SessionList::default();
-        self.reader
-            .until(|msg| list.fold(&msg).then(|| std::mem::take(&mut list.sessions)))
+        self.until(|msg| list.fold(&msg).then(|| std::mem::take(&mut list.sessions)))
     }
+}
+
+/// The first message `pick` accepts; the rest are skipped.
+async fn until<T>(
+    stream: &dyn link::Stream,
+    buffered: &mut Vec<u8>,
+    pick: &mut impl FnMut(DaemonMsg) -> Option<T>,
+) -> io::Result<T> {
+    while let Some(msg) = stream.recv(buffered).await? {
+        if let Some(found) = pick(msg) {
+            return Ok(found);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        Error::Closed.to_string(),
+    ))
+}
+
+/// Where a session's commands run: the far host's environment, as its
+/// bridge captured it, else this process's.
+fn origin(remote: Option<&Environment>) -> io::Result<Environment> {
+    remote.map_or_else(capture, |env| Ok(env.clone()))
 }
 
 fn attaching(
@@ -319,162 +312,69 @@ pub fn capture() -> io::Result<Environment> {
     ))
 }
 
-impl Reader {
-    pub fn recv(&mut self) -> io::Result<Option<DaemonMsg>> {
-        read_frame(&mut self.0)
-    }
-
-    /// The first message `pick` accepts; the rest are skipped.
-    pub fn until<T>(&mut self, mut pick: impl FnMut(DaemonMsg) -> Option<T>) -> io::Result<T> {
-        while let Some(msg) = self.recv()? {
-            if let Some(found) = pick(msg) {
-                return Ok(found);
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            Error::Closed.to_string(),
-        ))
-    }
-
-    /// Waits for a draining daemon to close the connection as it exits.
-    fn drained(&mut self) -> io::Result<()> {
-        loop {
-            match self.recv() {
-                Ok(Some(_)) => {}
-                Ok(None) => return Ok(()),
-                // It exited with what we sent behind the hello unread.
-                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
-                Err(e) => return Err(e),
-            }
-        }
-    }
-}
-
-impl Writer {
-    /// Sends `msg` as it is: a mutation is numbered by the session client
-    /// that made it, which keeps it for the daemon's answer.
-    pub fn send(&mut self, msg: &ClientMsg) -> io::Result<()> {
-        msg.write_frame(self.io.as_mut().expect("owned writer"))
-    }
-}
-
-/// Where a daemon is.
-#[derive(Clone, Debug)]
-pub enum Endpoint {
-    /// This machine's, over its Unix socket.
-    Local(Home),
-    /// Another machine's, through `ssh <host> a bridge`.
-    Ssh(String),
-}
-
-/// A daemon as a client reaches it: where it is, and this build (which a
-/// connection may start, or install on a host that lacks `a`).
+/// A daemon as a client reaches it: the link to it, and this build (which
+/// a connection may start, or install on a host that lacks `a`).
 #[derive(Clone, Debug)]
 pub struct Daemon {
-    pub endpoint: Endpoint,
+    pub link: Arc<dyn link::Link>,
     pub staged: Staged,
 }
 
 impl Daemon {
-    pub const fn local(home: Home, staged: Staged) -> Self {
+    pub fn new(link: impl link::Link, staged: Staged) -> Self {
         Self {
-            endpoint: Endpoint::Local(home),
+            link: Arc::new(link),
             staged,
         }
     }
 
-    pub const fn ssh(host: String, staged: Staged) -> Self {
-        Self {
-            endpoint: Endpoint::Ssh(host),
-            staged,
-        }
-    }
-
-    /// The home, for what acts on this machine's daemon only.
-    pub fn home(&self) -> io::Result<&Home> {
-        match &self.endpoint {
-            Endpoint::Local(home) => Ok(home),
-            Endpoint::Ssh(host) => Err(io::Error::other(format!(
-                "this command acts on this machine; run it on {host} instead"
-            ))),
-        }
+    /// This machine's daemon.
+    pub fn local(home: Home, staged: Staged) -> Self {
+        Self::new(LocalLink::new(home), staged)
     }
 
     /// Connects and completes the hello. A daemon draining for a newer
     /// build is waited out (`on_drain` says so first), then the next
     /// attempt starts the new build.
-    pub fn connect(&self, on_drain: &dyn Fn()) -> Result<Connection, Error> {
+    pub fn connect(&self, on_drain: &(dyn Fn() + Sync)) -> Result<Connection, Error> {
         self.connect_as(None, on_drain, &|_| Ok(Vec::new()))
     }
 
     /// [`Daemon::connect`] as `client`, which names the client across its
     /// connections so a mutation it sends again is done once, sending the
-    /// messages `first` makes for the connection (an attach, say) right
-    /// behind the hello rather than after the welcome, which saves a round
-    /// trip. A daemon that does not welcome the client acts on none of
-    /// them, so each retry sends them again.
+    /// messages `first` makes for the connection (given the far host's
+    /// environment, if any) right behind the hello rather than after the
+    /// welcome, which saves a round trip.
     pub fn connect_as(
         &self,
         client: Option<ClientId>,
-        on_drain: &dyn Fn(),
-        first: &dyn Fn(&Connection) -> io::Result<Vec<ClientMsg>>,
+        on_drain: &(dyn Fn() + Sync),
+        first: &(dyn Fn(Option<&Environment>) -> io::Result<Vec<ClientMsg>> + Sync),
     ) -> Result<Connection, Error> {
-        self.connect_inner(client, on_drain, first)
-            .inspect_err(|e| {
-                if matches!(e, Error::NotResponding)
-                    && let Endpoint::Local(home) = &self.endpoint
-                    && let Some(daemon) = live_daemon(home)
-                {
-                    note_timeout(home, &daemon, e);
-                }
-            })
+        self.open(client, Start::Reuse, on_drain, first)
     }
 
-    fn connect_inner(
+    fn open(
         &self,
         client: Option<ClientId>,
-        on_drain: &dyn Fn(),
-        first: &dyn Fn(&Connection) -> io::Result<Vec<ClientMsg>>,
+        start: Start,
+        on_drain: &(dyn Fn() + Sync),
+        first: &(dyn Fn(Option<&Environment>) -> io::Result<Vec<ClientMsg>> + Sync),
     ) -> Result<Connection, Error> {
-        // A daemon exiting (idle) as we connect, or draining, gets one more
-        // try each.
-        for _ in 0..3 {
-            let (stream, mut conn) = match &self.endpoint {
-                Endpoint::Local(home) => {
-                    let (stream, started) = connect_or_spawn(home, false)?;
-                    let timeout = if started {
-                        START_TIMEOUT
-                    } else {
-                        HELLO_TIMEOUT
-                    };
-                    stream.set_read_timeout(Some(timeout))?;
-                    let conn = split(&stream)?;
-                    (Some(stream), conn)
-                }
-                Endpoint::Ssh(host) => (None, remote::open(host, &self.staged)?),
-            };
-            let first = first(&conn)?;
-            match hello(&mut conn, &self.staged.id, client, &first) {
-                Ok(Greeting::Mismatch(theirs)) => return Err(self.mismatch(theirs)),
-                Ok(Greeting::Welcome) => {
-                    if let Some(stream) = &stream {
-                        stream.set_read_timeout(None)?;
-                    }
-                    return Ok(conn);
-                }
-                Ok(Greeting::Draining) => {
-                    on_drain();
-                    if let Some(stream) = &stream {
-                        stream.set_read_timeout(Some(DRAIN_TIMEOUT))?;
-                    }
-                    conn.reader.drained()?;
-                }
-                Err(Error::Closed) => {}
-                Err(e) => return Err(e),
+        rt::block_on(link::connect(
+            &link::BLOCKING,
+            &self.link,
+            &self.staged,
+            client,
+            start,
+            first,
+            on_drain,
+        ))
+        .inspect_err(|e| {
+            if *e == Error::NotResponding {
+                self.link.unanswered();
             }
-        }
-        Err(Error::Closed)
+        })
     }
 
     /// The daemon's sessions, newest first.
@@ -486,12 +386,14 @@ impl Daemon {
     /// environment, as `a new` does, and leaves it running.
     pub fn new_session(&self) -> Result<SessionId, Error> {
         let new = Attach::new(protocol::Target::New, Env::Origin);
-        let mut conn = self.connect_as(None, &|| {}, &|conn| Ok(vec![conn.attach(&new)?]))?;
-        let session = conn.reader.until(|msg| match msg {
+        let mut conn = self.connect_as(None, &|| {}, &|remote| {
+            Ok(vec![attaching(&new, || origin(remote))?])
+        })?;
+        let session = conn.until(|msg| match msg {
             DaemonMsg::Attached { session, .. } => Some(session),
             _ => None,
         })?;
-        conn.writer.send(&ClientMsg::Detach)?;
+        conn.send(&ClientMsg::Detach)?;
         Ok(session)
     }
 
@@ -504,40 +406,23 @@ impl Daemon {
         seq: Option<protocol::Seq>,
     ) -> Result<SessionId, Error> {
         let attach = Attach::new(protocol::Target::Fork { session, seq }, Env::Keep);
-        let mut conn = self.connect_as(None, &|| {}, &|conn| Ok(vec![conn.attach(&attach)?]))?;
-        let session = conn.reader.until(|msg| match msg {
+        let mut conn = self.connect_as(None, &|| {}, &|remote| {
+            Ok(vec![attaching(&attach, || origin(remote))?])
+        })?;
+        let session = conn.until(|msg| match msg {
             DaemonMsg::Attached { session, .. } => Some(Ok(session)),
             DaemonMsg::ForkRejected { reason } => Some(Err(Error::Fork(reason))),
             DaemonMsg::Error { message } => Some(Err(Error::Refused(message))),
             _ => None,
         })??;
-        conn.writer.send(&ClientMsg::Detach)?;
+        conn.send(&ClientMsg::Detach)?;
         Ok(session)
     }
 
-    /// Stops any running local daemon and connects to a fresh one, which
-    /// serves even after the crash-loop breaker stopped the last ones.
+    /// Stops any running daemon and connects to a fresh one, which serves
+    /// even after the crash-loop breaker stopped the last ones.
     pub fn restart(&self) -> Result<Connection, Error> {
-        restart(self.home()?, &self.staged, None)
-    }
-
-    /// Why a daemon speaking `theirs` cannot serve this client.
-    fn mismatch(&self, theirs: Versions) -> Error {
-        let (newer, host) = match &self.endpoint {
-            Endpoint::Local(home) => (
-                home.runtime()
-                    .current()
-                    .filter(|current| *current != self.staged.id)
-                    .map(|_| home.runtime().current_exe()),
-                None,
-            ),
-            Endpoint::Ssh(host) => (None, Some(host.clone())),
-        };
-        Error::Mismatch {
-            theirs,
-            newer,
-            host,
-        }
+        self.open(None, Start::Replace, &|| {}, &|_| Ok(Vec::new()))
     }
 }
 
@@ -547,69 +432,10 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 /// [`HELLO_TIMEOUT`] for a daemon this client just started: the first run
 /// of a newly staged build is scanned by macOS first, which takes half a
 /// second on an idle machine and seconds on a busy one.
-const START_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for a draining daemon: its grace plus a margin.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
-
-fn split(stream: &Stream) -> io::Result<Connection> {
-    Ok(Connection {
-        reader: Reader(BufReader::new(Transport::Local(stream.try_clone()?))),
-        writer: Writer {
-            io: Some(Transport::Local(stream.try_clone()?)),
-            child: None,
-        },
-        remote: None,
-        welcome: Welcome::default(),
-        commands: Vec::new(),
-    })
-}
-
-enum Greeting {
-    Welcome,
-    Draining,
-    /// The daemon's versions.
-    Mismatch(Versions),
-}
-
-/// Sends the hello and `first` back to back, then reads the answer.
-fn hello(
-    conn: &mut Connection,
-    build: &str,
-    client: Option<ClientId>,
-    first: &[ClientMsg],
-) -> Result<Greeting, Error> {
-    conn.writer.send(&ClientMsg::Hello {
-        proto: PROTO,
-        build: build.to_owned(),
-        min: Versions::OURS.min_field(),
-        caps: Caps::ALL,
-        client,
-    })?;
-    // A daemon that refuses the hello may hang up before reading these, so
-    // failing to send them matters only once welcomed.
-    let sent = conn.send_all(first);
-    match conn.reader.recv()? {
-        Some(DaemonMsg::Welcome {
-            proto,
-            caps,
-            commands,
-            ..
-        }) => {
-            sent?;
-            conn.welcome = Welcome { proto, caps };
-            conn.commands = commands;
-            Ok(Greeting::Welcome)
-        }
-        Some(DaemonMsg::Draining) => Ok(Greeting::Draining),
-        Some(DaemonMsg::Mismatch { supported, min }) => {
-            Ok(Greeting::Mismatch(Versions::new(min, supported)))
-        }
-        // A daemon refusing to serve at all, after a crash loop.
-        Some(DaemonMsg::Error { message }) => Err(Error::Refused(message)),
-        _ => Err(Error::Closed),
-    }
-}
+pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// What a client can tell about the daemon without talking to it.
 #[derive(Clone, Debug, Default)]
@@ -665,7 +491,7 @@ pub fn diagnose(home: &Home) -> Diagnosis {
 /// The running daemon's record. Only trusted while the daemon holds its
 /// lock: if we can take the lock, the daemon is gone and the pid may be
 /// reused.
-fn live_daemon(home: &Home) -> Option<Record> {
+pub(crate) fn live_daemon(home: &Home) -> Option<Record> {
     let file = File::open(home.daemon_pid_file()).ok()?;
     if sys::fs::try_lock(&file).is_ok() {
         return None;
@@ -738,23 +564,51 @@ fn locked(file: File, within: Option<Duration>) -> Option<File> {
 
 /// Connects to the running daemon, as its own build `build` so as not to
 /// set off a drain, without starting one.
-fn reach(home: &Home, build: &str) -> Result<(Stream, Connection), Error> {
-    let stream = home.endpoint().connect()?;
-    stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
-    let mut conn = split(&stream)?;
-    match hello(&mut conn, build, None, &[])? {
-        Greeting::Welcome => Ok((stream, conn)),
+async fn reach(home: &Home, build: &str) -> Result<Connection, Error> {
+    let link::Opened {
+        stream,
+        mut buffered,
+        remote,
+        within,
+    } = link::socket(&link::BLOCKING, home.endpoint().connect()?)?;
+    let greeting = answered(
+        within,
+        link::hello(&*stream, &mut buffered, build, None, &[]),
+    )
+    .await?;
+    match greeting {
+        (Greeting::Welcome, welcome, commands) => Ok(Connection {
+            stream,
+            buffered,
+            remote,
+            welcome,
+            commands,
+        }),
         _ => Err(Error::Refused("the daemon cannot be asked".to_owned())),
     }
+}
+
+/// `future`, unless `within` passes first: a daemon that took the
+/// connection but does not answer.
+async fn answered<T>(
+    within: Duration,
+    future: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    rt::or(future, async {
+        link::BLOCKING.sleep(within).await;
+        Err(Error::NotResponding)
+    })
+    .await
 }
 
 /// Asks the daemon to stop, and waits for it to close the connection as
 /// it exits.
 fn ask_to_stop(home: &Home, build: &str) -> Result<(), Error> {
-    let (stream, mut conn) = reach(home, build)?;
-    conn.writer.send(&ClientMsg::Shutdown)?;
-    stream.set_read_timeout(Some(DRAIN_TIMEOUT))?;
-    Ok(conn.reader.drained()?)
+    rt::block_on(async {
+        let mut conn = reach(home, build).await?;
+        conn.stream.send(&ClientMsg::Shutdown).await?;
+        answered(DRAIN_TIMEOUT, conn.stream.drained(&mut conn.buffered)).await
+    })
 }
 
 /// What the running daemon says of itself, if one runs and answers; never
@@ -768,32 +622,37 @@ pub fn status(home: &Home) -> Result<Option<Status>, Error> {
         .inspect_err(|e| note_timeout(home, &daemon, e))
 }
 
-fn note_timeout(home: &Home, daemon: &Record, error: &Error) {
+pub(crate) fn note_timeout(home: &Home, daemon: &Record, error: &Error) {
     if matches!(error, Error::NotResponding) {
         ext_logging::witness(home, daemon, ext_logging::Observation::Unresponsive);
     }
 }
 
 fn status_of(home: &Home, daemon: &Record) -> Result<Status, Error> {
-    let (_, mut conn) = reach(home, &daemon.build)?;
-    conn.writer.send(&ClientMsg::Status)?;
-    let status = conn.reader.until(|msg| match msg {
-        DaemonMsg::Status {
-            pid,
-            build,
-            started,
-            clients,
-            known,
-        } => Some(Status {
-            pid,
-            build,
-            started,
-            clients,
-            sessions: known,
-        }),
-        _ => None,
-    })?;
-    Ok(status)
+    rt::block_on(async {
+        let mut conn = reach(home, &daemon.build).await?;
+        conn.stream.send(&ClientMsg::Status).await?;
+        let mut pick = |msg| match msg {
+            DaemonMsg::Status {
+                pid,
+                build,
+                started,
+                clients,
+                known,
+            } => Some(Status {
+                pid,
+                build,
+                started,
+                clients,
+                sessions: known,
+            }),
+            _ => None,
+        };
+        answered(HELLO_TIMEOUT, async {
+            Ok(until(&*conn.stream, &mut conn.buffered, &mut pick).await?)
+        })
+        .await
+    })
 }
 
 /// What a daemon says of itself; see [`status`].
@@ -816,9 +675,8 @@ pub fn restart(
     staged: &Staged,
     client: Option<ClientId>,
 ) -> Result<Connection, Error> {
-    stop(home)?;
-    drop(connect_or_spawn(home, true)?);
-    Daemon::local(home.clone(), staged.clone()).connect_as(client, &|| {}, &|_| Ok(Vec::new()))
+    Daemon::local(home.clone(), staged.clone())
+        .open(client, Start::Replace, &|| {}, &|_| Ok(Vec::new()))
 }
 
 /// Serves `ssh <host> a bridge`: connects to this machine's daemon, prints
@@ -939,7 +797,7 @@ pub fn spawn_at_login(home: &Home) -> io::Result<()> {
 /// that lock, then find the socket. A daemon lock held while no socket
 /// listens is then an exiting daemon's (let go as it ends) or a wedged
 /// one's, and is waited on for as long as a hello may take.
-fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
+pub(crate) fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(OwnedConnection, bool)> {
     use std::process::{Command, Stdio};
 
     let endpoint = home.endpoint();
@@ -1003,6 +861,9 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::Link as _;
+    use protocol::{PROTO, read_frame};
+    use std::io::BufReader;
 
     #[cfg(unix)]
     #[test]
@@ -1053,7 +914,7 @@ mod tests {
         let new = build("new", 2);
 
         let theirs = Versions::from(PROTO + 1);
-        let told = Daemon::local(home.clone(), old).mismatch(theirs);
+        let told = LocalLink::new(home.clone()).mismatch(&old, theirs);
         let current = home.runtime().current_exe();
         assert_eq!(
             told,
@@ -1068,8 +929,8 @@ mod tests {
             told.contains(&*current.to_string_lossy()) && !told.contains("restart"),
             "{told}"
         );
-        let told = Daemon::local(home.clone(), new)
-            .mismatch(theirs)
+        let told = LocalLink::new(home.clone())
+            .mismatch(&new, theirs)
             .to_string();
         assert!(told.contains("restart the daemon"), "{told}");
         fs::remove_dir_all(&root).unwrap();
@@ -1182,58 +1043,6 @@ mod tests {
             assert_eq!(observed["pid"], daemon.pid);
             assert_eq!(observed["started"], daemon.started);
             assert_eq!(observed["reason"], "unresponsive");
-        }
-    }
-}
-
-#[cfg(test)]
-mod transport_tests {
-    use super::*;
-
-    #[derive(Default)]
-    struct Pending {
-        accepted: Vec<u8>,
-        delivered: Vec<u8>,
-        stalled: bool,
-    }
-    impl Write for Pending {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.accepted.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            if self.stalled {
-                return Err(io::ErrorKind::WouldBlock.into());
-            }
-            self.delivered.append(&mut self.accepted);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn transport_flush_delivers_accepted_bytes_and_preserves_flush_errors() {
-        for mut transport in [
-            Transport::Local(Pending {
-                stalled: true,
-                ..Pending::default()
-            }),
-            Transport::Pipe(Pending {
-                stalled: true,
-                ..Pending::default()
-            }),
-        ] {
-            transport.write_all(b"frame").unwrap();
-            assert_eq!(
-                transport.flush().unwrap_err().kind(),
-                io::ErrorKind::WouldBlock
-            );
-            let (Transport::Local(io) | Transport::Pipe(io)) = &mut transport;
-            assert_eq!(io.delivered, b"");
-            io.stalled = false;
-            transport.flush().unwrap();
-            let (Transport::Local(io) | Transport::Pipe(io)) = &transport;
-            assert_eq!(io.delivered, b"frame");
-            assert_eq!(io.accepted, b"");
         }
     }
 }

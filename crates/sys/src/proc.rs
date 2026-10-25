@@ -1009,18 +1009,49 @@ pub type ProcessPipe = crate::Stream;
 
 /// Starts a contained child with only its explicit stdio inherited.
 pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(ContainedChild, ProcessPipe, ProcessPipe)> {
-    spawn_stdio_role(cmd, false)
+    let (child, input, output, _) = spawn_stdio_role(cmd, Role::Contained)?;
+    Ok((child, input, output))
 }
 
-/// SSH uses the caller's terminal for authentication and visible diagnostics.
-pub fn spawn_ssh(cmd: &mut Command) -> io::Result<(ContainedChild, ProcessPipe, ProcessPipe)> {
-    spawn_stdio_role(cmd, true)
+/// Whether ssh may ask the person at this process's terminal: for a
+/// password, a passphrase, or a host key to confirm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prompt {
+    /// It shares the caller's terminal and stderr.
+    Terminal,
+    /// It has no terminal to ask at; what it reports comes back on a pipe.
+    Never,
+}
+
+/// SSH with the caller's environment, and its terminal as `prompt` says;
+/// the last pipe is its stderr, when that is not the caller's.
+pub fn spawn_ssh(
+    cmd: &mut Command,
+    prompt: Prompt,
+) -> io::Result<(
+    ContainedChild,
+    ProcessPipe,
+    ProcessPipe,
+    Option<ProcessPipe>,
+)> {
+    spawn_stdio_role(cmd, Role::Ssh(prompt))
+}
+
+#[derive(Clone, Copy)]
+enum Role {
+    Contained,
+    Ssh(Prompt),
 }
 
 fn spawn_stdio_role(
     cmd: &mut Command,
-    terminal: bool,
-) -> io::Result<(ContainedChild, ProcessPipe, ProcessPipe)> {
+    role: Role,
+) -> io::Result<(
+    ContainedChild,
+    ProcessPipe,
+    ProcessPipe,
+    Option<ProcessPipe>,
+)> {
     #[cfg(unix)]
     {
         use std::os::fd::OwnedFd;
@@ -1028,16 +1059,26 @@ fn spawn_stdio_role(
         let (output, child_output) = io::pipe()?;
         let child_input = File::from(OwnedFd::from(child_input));
         let child_output = File::from(OwnedFd::from(child_output));
-        let error = if terminal {
-            File::from(std::os::fd::AsFd::as_fd(&io::stderr()).try_clone_to_owned()?)
-        } else {
-            File::options().write(true).open("/dev/null")?
+        let (error, child_error) = match role {
+            Role::Contained => (None, File::options().write(true).open("/dev/null")?),
+            Role::Ssh(Prompt::Terminal) => (
+                None,
+                File::from(std::os::fd::AsFd::as_fd(&io::stderr()).try_clone_to_owned()?),
+            ),
+            Role::Ssh(Prompt::Never) => {
+                let (error, child_error) = io::pipe()?;
+                (
+                    Some(File::from(OwnedFd::from(error))),
+                    File::from(OwnedFd::from(child_error)),
+                )
+            }
         };
-        let plan = unix::SpawnPlan::new(cmd, [&child_input, &child_output, &error]);
-        let plan = if terminal {
-            plan.terminal().inherit_snapshot()
-        } else {
-            plan
+        let plan = unix::SpawnPlan::new(cmd, [&child_input, &child_output, &child_error]);
+        let plan = match role {
+            Role::Contained => plan,
+            Role::Ssh(Prompt::Terminal) => plan.terminal().inherit_snapshot(),
+            // Its own session: no controlling terminal to open for a prompt.
+            Role::Ssh(Prompt::Never) => plan.inherit_snapshot(),
         };
         let child = plan.spawn()?;
         let input = File::from(OwnedFd::from(input));
@@ -1051,10 +1092,17 @@ fn spawn_stdio_role(
             },
             input,
             output,
+            error,
         ))
     }
     #[cfg(windows)]
-    imp::spawn_stdio_role(cmd, terminal)
+    imp::spawn_stdio_role(
+        cmd,
+        match role {
+            Role::Contained => None,
+            Role::Ssh(prompt) => Some(prompt),
+        },
+    )
 }
 
 #[cfg(unix)]

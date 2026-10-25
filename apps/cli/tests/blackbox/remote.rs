@@ -64,7 +64,9 @@ fn bridge_speaks_the_protocol_over_stdio() {
 /// Fake `ssh`: the remote has a literal path containing shell metacharacters,
 /// its own `HOME`
 /// and no `a` on its `PATH`, so the first connection installs this build.
-/// Returns `a --host box` for the test's own (local) home, and the host's.
+/// Its login shell, like csh or fish, runs only plain words: anything to
+/// quote is refused. Returns `a --host box` for the test's own (local)
+/// home, and the host's.
 fn fake_remote(env: &mut Env, uname: &str) -> (Command, Home) {
     let remote = env.root.join("remote space 'quote' $(touch injected)");
     let host = env.other_home(remote.join(".a"));
@@ -75,11 +77,13 @@ fn fake_remote(env: &mut Env, uname: &str) -> (Command, Home) {
         &format!(
             r#"shift
 printf '%s\n' "$*" >> {log}
+case "$*" in *[!A-Za-z0-9\ ._+-]*) echo "the login shell cannot parse: $*" >&2; exit 1;; esac
 [ "$*" = "uname -sm" ] && [ -n '{uname}' ] && {{ echo '{uname}'; exit; }}
 cd {remote} || exit
-# A connection cut mid-upload: the remote sees a clean EOF.
-case "${{A_TEST_CUT:-}} $*" in [0-9]*"cat > "*)
-    head -c "$A_TEST_CUT" | env A_HOME={home} HOME={remote} PATH=/usr/bin:/bin sh -c "$*"; exit;;
+# A connection cut mid-upload: the remote sees a clean EOF. `dd bs=1`
+# passes the script on as it comes, where `head -c` would wait to fill.
+case "${{A_TEST_CUT:-}} $*" in [0-9]*" sh -s "[0-9]*)
+    dd bs=1 count="$A_TEST_CUT" 2>/dev/null | env A_HOME={home} HOME={remote} PATH=/usr/bin:/bin sh -c "$*"; exit;;
 esac
 exec env A_HOME={home} HOME={remote} PATH=/usr/bin:/bin sh -c "$*"
 "#,
@@ -150,12 +154,29 @@ fn a_host_reuses_its_installed_identity_when_discovery_is_lost() {
     fs::remove_file(host.runtime().dir().join("current")).unwrap();
     let (mut ls, _) = fake_remote(&mut env, "");
     assert!(ok(&ls.arg("ls").output().unwrap()).starts_with(session.trim()));
-    let log = fs::read_to_string(env.root.join("ssh.log")).unwrap();
-    assert_eq!(log.matches("cat > ").count(), 1, "{log}");
     assert_eq!(
         fs::metadata(installed).unwrap().modified().unwrap(),
         modified
     );
+}
+
+#[test]
+fn the_remote_login_shell_is_only_given_plain_words() {
+    let mut env = Env::new("plain-words");
+    let (mut new, _) = fake_remote(&mut env, "");
+    ok(&new.arg("new").output().unwrap());
+    let log = fs::read_to_string(env.root.join("ssh.log")).unwrap();
+    for command in log.lines() {
+        assert!(
+            command
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b" ._+-".contains(&b)),
+            "{command:?}"
+        );
+    }
+    // Found, installed and run: each through `sh -s` or plain words.
+    assert!(log.contains("uname -sm"), "{log}");
+    assert!(log.lines().any(|c| c == "sh -s"), "{log}");
 }
 
 #[test]

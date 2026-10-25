@@ -57,7 +57,7 @@ pub use paths::{InstallLayout, Paths, RemoteLayout};
 pub use platform::{Arch, Os, Platform};
 pub use proc::{
     AdoptLockError, Child, ContainedChild, DaemonLock, ExitWatch, InheritedNumber, OutputCapture,
-    Pass, Passed, ProcessLease, ProcessPipe, RecordedIdentity, RecordedProcess, adopt_lock,
+    Pass, Passed, ProcessLease, ProcessPipe, Prompt, RecordedIdentity, RecordedProcess, adopt_lock,
     boot_id, daemon_ready, detach_session, exit_signal, find_bash, process_started, spawn_daemon,
     spawn_group, spawn_group_captured, spawn_ssh, spawn_stdio,
 };
