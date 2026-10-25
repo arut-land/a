@@ -113,6 +113,11 @@ impl Daemon {
     /// frozen, and nothing is given up.
     pub(crate) async fn hand_over(&self) -> Result<Vec<(sys::handover::Given, Owner)>, String> {
         let loaded = self.loaded();
+        // Asked first, so a session that would refuse stops nothing of
+        // the others' to start again.
+        for live in &loaded {
+            live.handable().await?;
+        }
         for (at, live) in loaded.iter().enumerate() {
             if let Err(why) = live.freeze().await {
                 for frozen in &loaded[..at] {
