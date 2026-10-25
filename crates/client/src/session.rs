@@ -17,8 +17,8 @@ use std::fmt;
 
 use protocol::view::{Change, SessionList, SessionView, Update};
 use protocol::{
-    Activity, CallId, ClientMsg, CommandInfo, DaemonMsg, Environment, Mode, Rejection, Segments,
-    SessionSummary, Target,
+    Activity, Author, Body, CallId, ClientMsg, CommandInfo, DaemonMsg, Environment, Mode,
+    Rejection, Segments, SessionSummary, Target,
 };
 
 use crate::{Cmd, Diagnosis, Error, Welcome};
@@ -459,7 +459,7 @@ impl SessionClient {
     /// Tracks one submitted input by its durable mutation origin.
     pub fn submit(&mut self, text: String) -> Result<(crate::SubmissionId, Vec<Effect>), Notice> {
         let effects = self.offer()?.input(text)?;
-        let id = protocol::Author {
+        let id = Author {
             client: self.opened.client,
             seq: protocol::ClientSeq::new(self.seq).unwrap(),
         };
@@ -555,6 +555,17 @@ impl SessionClient {
             DaemonMsg::Attached { session, .. } => {
                 self.opened.target = Target::Id(*session);
                 self.view_current = true;
+            }
+            // Logged is done: the ack is queued once the mutation commits,
+            // behind whatever the session has published by then, so the
+            // turn it started can be seen to end before it arrives.
+            DaemonMsg::Entry(entry) => {
+                if let Some(author) = origin(&entry.body)
+                    && author.client == self.opened.client
+                {
+                    self.unanswered
+                        .retain(|m| m.client_seq() != Some(author.seq.get()));
+                }
             }
             DaemonMsg::Sessions { .. } => {
                 self.sessions.fold(msg);
@@ -782,10 +793,48 @@ pub(crate) const fn is_mutation(msg: &ClientMsg) -> bool {
     )
 }
 
+/// The client mutation that logged `body`, if one did.
+const fn origin(body: &Body) -> Option<Author> {
+    match body {
+        Body::Input { origin, .. }
+        | Body::Withdraw { origin, .. }
+        | Body::Answer { origin, .. }
+        | Body::Interrupt { origin } => *origin,
+        Body::Take { .. }
+        | Body::Assistant { .. }
+        | Body::Context { .. }
+        | Body::ModelCall { .. }
+        | Body::ModelResult { .. }
+        | Body::ToolCall { .. }
+        | Body::ToolProcess { .. }
+        | Body::Fact { .. }
+        | Body::Progress { .. }
+        | Body::Detached { .. }
+        | Body::ToolResult { .. }
+        | Body::Decision { .. }
+        | Body::Wait { .. }
+        | Body::Link { .. }
+        | Body::Outbox { .. }
+        | Body::Enqueue { .. }
+        | Body::Ack { .. }
+        | Body::Spawned { .. }
+        | Body::Watch { .. }
+        | Body::Fired { .. }
+        | Body::Environment { .. }
+        | Body::Extensions { .. }
+        | Body::Ext { .. }
+        | Body::Edit { .. }
+        | Body::Unknown { .. } => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
-    use protocol::{Audience, Body, Caps, Entry, Epoch, Json, Permission, Seq, SessionId, Verdict};
+    use protocol::{
+        Audience, Caps, ClientId, ClientSeq, Entry, Epoch, Json, Permission, Seq, SessionId,
+        Verdict,
+    };
 
     use super::*;
 
@@ -1116,6 +1165,40 @@ mod tests {
             assert!(client.turn().can_interrupt);
             assert!(client.offer().unwrap().interrupt().is_ok());
         }
+    }
+
+    #[test]
+    fn a_turn_seen_to_end_is_not_interruptible_while_its_ack_lags() {
+        let (mut client, _) = attached(Env::Keep);
+        client.run(Cmd::Input("hello".into()));
+        let logged = |client: ClientId, seq: u64| {
+            DaemonMsg::Entry(Entry::new(
+                Seq::new(seq + 1).unwrap(),
+                Epoch(1),
+                Body::Input {
+                    segments: "hello".into(),
+                    mode: Mode::Queue,
+                    taken: true,
+                    origin: Some(Author {
+                        client,
+                        seq: ClientSeq::new(1).unwrap(),
+                    }),
+                    force: false,
+                },
+            ))
+        };
+        let idle = |seq| DaemonMsg::Activity {
+            seq,
+            activity: Activity::Idle,
+        };
+        // Another client's mutation numbered the same is not this one's.
+        client.step(msg(1, logged(ClientId::new(), 1)));
+        client.step(msg(1, idle(2)));
+        assert!(client.turn().can_interrupt);
+        client.step(msg(1, logged(client.opened.client, 2)));
+        client.step(msg(1, idle(3)));
+        assert!(!client.turn().can_interrupt, "{:?}", client.turn());
+        assert!(client.offer().unwrap().interrupt().is_err());
     }
 
     #[test]

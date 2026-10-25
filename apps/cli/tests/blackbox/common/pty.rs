@@ -237,7 +237,10 @@ impl Pty {
         });
         let (_, status) = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("a did not exit")
+            .unwrap_or_else(|_| {
+                let screen = Screen::parse(&self.bytes(), self.cols, self.rows);
+                panic!("a did not exit, showing\n{}", screen.text())
+            })
             .unwrap()
             .expect("the child was reaped by someone else");
         self.reaped = true;
