@@ -221,9 +221,10 @@ by its id as any envelope is: `child`, under the watch, for the result of a
 child no call waits on (its `fired` fact closes the watch first, and a load
 queues a fired result whose envelope a crash cut off); `detached`, under the
 call, for a detached call's outcome; `job`, under the call, for the end of
-a process group the call left to the session. A payload of the first two is
-the `Outcome`; the model reads the child's result, or the call's output as
-its tool presents it.
+a process group the call left to the session, holding (`Envelope.held`) the
+group's output stream, sealed into a blob as the group ended. A payload of
+the first two is the `Outcome`; the model reads the child's result, or the
+call's output as its tool presents it.
 
 `Withdraw { input }` takes the user's queued input back before it is taken
 up; editing it is a withdrawal, then the new input. Whichever of `withdraw`
@@ -243,7 +244,9 @@ point answers a `Take` (`None`, `One`, `All`, `These`, or `IntoResult`, the
 one answer that takes anything at `ToolDone`). With no handler,
 `Take::default_at` answers as the kernel always has: nothing into results;
 before a model call, steers, children's results, and the hidden items not
-behind the user's queued input; at a turn's end, the first item. A policy
+behind the user's queued input; at a turn's end, the first item, but never
+a job's end (`Queued::notice`): that is news for the next model call, which
+starts no turn, keeps no session busy and leaves one at rest. A policy
 (all at once, one at a time, into each result) is a handler; a model-only
 runner answers one input per turn, so only the user's input may join it
 before its end. Owner cancellation drains the queue; it is not a policy.
@@ -252,13 +255,16 @@ before its end. Owner cancellation drains the queue; it is not a policy.
 
 `Cx::detach` is a flag beside `cancel`: the session stops waiting on the
 call. A tool declares `DETACH = Detach::Background` when it can go on in
-the background; the engine then stops awaiting it, and the kernel logs
+the background, and its calls get the flag (`Some`), but for one another
+call invoked, which that call waits on however long it runs. The flag is
+set by a forced steer, or by the call itself: the shell sets it as its
+timeout passes, so a timeout and a forced steer are one path. The engine
+then stops awaiting the call, and the kernel logs
 `detached { call }` and answers the call at once with a placeholder result
 naming its output stream (`OutputStream { call }`; the blob store names the
 stream's growing blob once it exists). The reply's calls stay paired with
 their results, and the turn goes on. The call's real outcome arrives later
-as its `detached` envelope. A tool that cannot go on in the background
-ignores the flag, or hands its own work off.
+as its `detached` envelope.
 
 A detached call is the session's work: the session stays busy, so the
 daemon neither idle-exits nor finishes an upgrade drain while one runs. An

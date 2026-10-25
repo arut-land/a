@@ -112,7 +112,7 @@ entry references outside the log lives in one typed field and nowhere else:
 `ToolResult.held: Vec<Held>` (`Held::Blob` or `Held::Stream`), filled from the
 tool's `Tool::held(&Out)` (the one hook a tool adds; the output keeps at most a
 marker, such as `truncated` or `{"detached": true}`), and `Envelope.held` on a
-detached call's outcome. A sweep's reference index folds those fields, never
+detached call's outcome or a job's end. A sweep's reference index folds those fields, never
 tool output JSON.
 
 The seam is the `blob` crate (re-exported as `ext::blob`), which does no I/O:
@@ -127,8 +127,11 @@ detached call's placeholder names, a background shell job's log, and the
 output of a command whose leftover processes still write it) grows at
 `blobs/open/<session>/<call>.log`, named by the session whose log holds the
 call. It is sealed into a blob only once nothing writes it: a command that
-leaves processes behind keeps its whole output as a growing stream. Sealing a
-growing stream once its writers are gone is deferred to the queue (seam Q).
+leaves processes behind keeps its whole output as a growing stream, and a
+process group the session owns (a background job, or what a command left
+running) has its stream sealed as the group ends, into the blob its `job`
+envelope holds (`ProcessLease::holding`). A group the session stops leaves
+its stream discarded.
 
 References are named for the model by the engine when it reads them, not by
 the tool and not when they are logged: the transcript adds a line for each
@@ -281,7 +284,14 @@ blob stream, with storage back-pressure and a hard 64 MiB retention limit for
 foreground and background jobs. A foreground command whose output the model saw
 cut is sealed into a blob its result holds, unless processes it left running
 still write it: then the result holds the stream. Otherwise the stream is
-discarded. A background job's result holds its stream, open while it runs. Group observation is capped at 4096
+discarded. A background job's result holds its stream, open while it runs;
+a group the session owns has its stream sealed as it ends, held by its end's
+queued notice, which waits for the next model call rather than starting a
+turn. A command's `timeout` (`[ext.shell] timeout`, 120 s by default, at
+most 600 per call) is how long the session waits on it: past it the command
+goes on in the background, as a forced steer sends it (`Cx::detach`), its
+result coming back on the queue; only a call another call invoked, which
+must be waited on, is stopped at it. Group observation is capped at 4096
 members; exceeding it revokes the live lease. Following streams and enumerating groups use admitted
 storage workers, leaving reactor workers available for other sessions. Once
 owned-scope cleanup ends, capture finishes accepted writes and drains at most

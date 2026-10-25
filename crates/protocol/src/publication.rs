@@ -59,8 +59,9 @@ pub enum ContextValue {
     /// A queued outcome of a call that went on in the background, and
     /// what it holds outside the log.
     Background(CallId, Outcome, Vec<crate::Held>),
-    /// A queued end of a process group call `call` left to the session.
-    Job(CallId, String),
+    /// A queued end of a process group call `call` left to the session,
+    /// and what it holds outside the log: the group's output, sealed.
+    Job(CallId, String, Vec<crate::Held>),
     Reply(Json),
     ToolCall(String, String),
     /// A result, and what it holds outside the log: how its references

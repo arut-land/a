@@ -71,14 +71,13 @@ pub enum Concurrency {
     Exclusive,
 }
 
-/// Whether a running call may be detached, as a forced steer or a
-/// client asks: answered at once with a placeholder naming its output
-/// stream, while it goes on in the background, its outcome reaching the
-/// agent later on the session's queue.
+/// Whether a running call may be detached, as a forced steer or the call
+/// itself asks ([`Cx::detach`]): answered at once with a placeholder
+/// naming its output stream, while it goes on in the background, its
+/// outcome reaching the agent later on the session's queue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Detach {
-    /// It is waited for; [`Cx::detach`] tells it it may stop being, if it
-    /// can hand its work off itself.
+    /// It is waited for, however long it runs.
     #[default]
     Never,
     /// It goes on in the background: the engine stops waiting on it.
@@ -138,10 +137,13 @@ pub struct Cx {
     /// blobs, which a result references by id.
     pub blobs: blob::Blobs,
     pub cancel: Cancel,
-    /// Set when the session stops waiting on the call (a forced steer):
-    /// a call that can hand its work to the background may, and one whose
-    /// tool is [`Detach::Background`] is no longer waited for.
-    pub detach: Flag,
+    /// Set when the session stops waiting on the call, as a forced steer
+    /// does, or when the call sets it itself (the shell, as its timeout
+    /// passes): it goes on in the background, its outcome reaching the
+    /// agent on the queue. `None` for a call the session waits on however
+    /// long it runs: its tool is [`Detach::Never`], or another call
+    /// invoked it.
+    pub detach: Option<Flag>,
     services: Arc<SessionServices>,
     host: Arc<dyn Host>,
     invocation: crate::point::InvocationContext,
@@ -157,7 +159,6 @@ impl Cx {
             model,
             blobs,
             cancel,
-            detach,
             services,
         } = call;
         Self {
@@ -168,11 +169,19 @@ impl Cx {
             model,
             blobs,
             cancel,
-            detach,
+            detach: None,
             services,
             host,
             invocation: crate::point::InvocationContext::default(),
         }
+    }
+
+    /// The call may go on in the background, once `detach` is set: for
+    /// the engine, as it runs a call of a [`Detach::Background`] tool.
+    #[must_use]
+    pub fn detachable(mut self, detach: Flag) -> Self {
+        self.detach = Some(detach);
+        self
     }
 
     /// State shared only by this owned invocation chain.

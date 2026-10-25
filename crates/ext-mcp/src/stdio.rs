@@ -216,7 +216,12 @@ mod tests {
             env: BTreeMap::new(),
         };
         let mcp = crate::Mcp::new(vec![server.clone()], Duration::from_secs(5)).unwrap();
-        let rig = Rig::new(name, Registry::default().with(&ext_shell::Shell).unwrap());
+        let rig = Rig::new(
+            name,
+            Registry::default()
+                .with(&ext_shell::Shell::default())
+                .unwrap(),
+        );
         (mcp, rig, server)
     }
 
@@ -277,7 +282,9 @@ mod tests {
         }
         let rig = Rig::new(
             "temporary-env",
-            Registry::default().with(&ext_shell::Shell).unwrap(),
+            Registry::default()
+                .with(&ext_shell::Shell::default())
+                .unwrap(),
         );
         let env = environment_of(&rig, BTreeMap::new());
         let temp = sys::shell::ExecutionFacts::current().temp.to_str().unwrap();

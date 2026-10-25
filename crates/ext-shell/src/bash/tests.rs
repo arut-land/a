@@ -1,4 +1,5 @@
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -53,7 +54,10 @@ unsafe impl GlobalAlloc for Counting {
 }
 
 fn rig(name: &str) -> Rig {
-    Rig::new(name, Registry::default().with(&crate::Shell).unwrap())
+    Rig::new(
+        name,
+        Registry::default().with(&crate::Shell::default()).unwrap(),
+    )
 }
 
 fn bash(rig: &Rig, input: &Value) -> Ran {
@@ -188,8 +192,9 @@ fn a_background_child_holding_the_pipe_does_not_hold_the_call() {
 }
 
 #[test]
-fn output_a_lingering_process_still_writes_is_never_sealed() {
+fn a_lingering_groups_stream_is_sealed_as_the_group_ends_and_not_before() {
     let rig = rig("lingering-cut");
+    let mut seen = rig.ends.count();
     let (ran, held) = kept(
         &rig,
         &json!({ "command": "(sleep 1; seq 1 50000) & seq 1 200000" }),
@@ -198,24 +203,75 @@ fn output_a_lingering_process_still_writes_is_never_sealed() {
     assert_eq!(
         held,
         [Held::Stream(stream(&rig, 1))],
-        "the stream, never a blob"
+        "the stream, never a blob under a writer"
     );
-    let log = rig.stream(1);
-    let before = std::fs::metadata(&log).unwrap().len();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while std::fs::metadata(&log).unwrap().len() == before {
-        assert!(
-            Instant::now() < deadline,
-            "the lingering writer never wrote"
-        );
-        std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(stored(&rig), ["open"], "nothing sealed while it is written");
+    rt::block_on(rig.ends.changed(&mut seen));
+    let held = rig.held.lock().unwrap().clone();
+    let blob = blob(&held);
+    assert_eq!(blob.origin, BlobOrigin::ToolOutput(stream(&rig, 1).call));
+    assert_eq!(read(&rig, blob), seq(1..=200_000) + &seq(1..=50_000));
+    assert_open_is_empty(&rig);
+}
+
+#[test]
+fn a_background_jobs_stream_is_sealed_into_exactly_what_it_wrote() {
+    let rig = rig("job-sealed");
+    for (command, wrote) in [
+        ("seq 1 3000; printf end", seq(1..=3000) + "end"),
+        ("true", String::new()),
+    ] {
+        let mut seen = rig.ends.count();
+        bash(&rig, &json!({ "command": command, "background": true }));
+        rt::block_on(rig.ends.changed(&mut seen));
+        let held = std::mem::take(&mut *rig.held.lock().unwrap());
+        if wrote.is_empty() {
+            assert_eq!(held, [], "an empty stream is dropped, not kept");
+        } else {
+            let blob = blob(&held);
+            assert_eq!(blob.media_type, "text/plain; charset=utf-8");
+            assert_eq!(read(&rig, blob), wrote);
+        }
+        assert_open_is_empty(&rig);
     }
+}
+
+/// `seq`'s output over `numbers`.
+fn seq(numbers: std::ops::RangeInclusive<u32>) -> String {
+    numbers.fold(String::new(), |mut text, n| {
+        let _ = writeln!(text, "{n}");
+        text
+    })
+}
+
+fn read(rig: &Rig, blob: &BlobRef) -> String {
+    let mut text = String::new();
+    rig.blobs
+        .open(&blob.id)
+        .unwrap()
+        .read_to_string(&mut text)
+        .unwrap();
+    text
+}
+
+/// What the rig's blob store holds at its top.
+fn stored(rig: &Rig) -> Vec<String> {
     let mut stored: Vec<_> = std::fs::read_dir(rig.dir.join("blobs"))
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     stored.sort();
-    assert_eq!(stored, ["open"], "no blob was sealed");
+    stored
+}
+
+/// No stream is left growing once every group has ended.
+fn assert_open_is_empty(rig: &Rig) {
+    let open = rig.blobs.streams().join(rig.session.to_string());
+    let left: Vec<_> = std::fs::read_dir(&open)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
 }
 
 #[test]
@@ -467,7 +523,7 @@ fn cancellation_during_launch_is_aborted_for_foreground_and_background_calls() {
     for background in [false, true] {
         let cancel = ext::Cancel::default();
         let registry = Registry::default()
-            .with(&crate::Shell)
+            .with(&crate::Shell::default())
             .and_then(|r| r.with(&CancelSpawn(cancel.clone())))
             .unwrap();
         let mut rig = Rig::new("cancel-during-launch", registry);
@@ -548,7 +604,7 @@ impl Extension for Wrapper {
 #[test]
 fn every_process_goes_through_the_spawn_hooks() {
     let registry = Registry::default()
-        .with(&crate::Shell)
+        .with(&crate::Shell::default())
         .and_then(|r| r.with(&Wrapper))
         .unwrap();
     let rig = Rig::new("spawn-hook", registry);
@@ -628,7 +684,9 @@ fn the_supervisor_moves_only_as_its_states_allow() {
     let t = Instant::now();
     let later = t + Duration::from_secs(1);
     let status = ExitStatus::from_raw(0);
-    let running = Run::Running { deadline: later };
+    let running = Run::Running {
+        deadline: Some(later),
+    };
     let term = |why| Run::Stopping {
         why,
         kill: KillPhase::Term { at: t },

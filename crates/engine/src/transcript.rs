@@ -129,7 +129,9 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
                 Source::Job(call) if envelope.id.purpose == EnvelopeId::DETACHED => {
                     ContextValue::Background(call, outcome()?, envelope.held.clone())
                 }
-                Source::Job(call) => ContextValue::Job(call, envelope.payload.clone()),
+                Source::Job(call) => {
+                    ContextValue::Job(call, envelope.payload.clone(), envelope.held.clone())
+                }
                 _ => ContextValue::Inbox(envelope.clone()),
             }
         }
@@ -424,7 +426,11 @@ impl Transcript {
             }
             ContextValue::Child(outcome) => ext::child_result(&outcome),
             ContextValue::Background(call, outcome, held) => self.background(call, &outcome, &held),
-            ContextValue::Job(call, text) => self.ended(call, None, &text),
+            ContextValue::Job(call, text, held) => {
+                // Its stream, sealed as the group ended, is read as a blob.
+                let log = (self.name_held(&held).into_iter()).find_map(|placed| placed.at);
+                self.ended(call, None, &text, log)
+            }
             _ => return,
         };
         self.waiting.insert(seq, Waiting::Own(text));
@@ -438,7 +444,7 @@ impl Transcript {
         let held = self.name_held(held);
         let ext::Presented { output, .. } = self.registry.present_result(&tool, outcome, &held);
         let output = with_held(output, &held);
-        self.ended(call, Some(&text_of(output)), "")
+        self.ended(call, Some(&text_of(output)), "", None)
     }
 
     /// What a result holds, each reference named through the session's
@@ -462,10 +468,11 @@ impl Transcript {
     }
 
     /// A call that went on in the background ended, as the model reads it:
-    /// with its output, or with `note` about its end.
-    fn ended(&self, call: CallId, output: Option<&str>, note: &str) -> String {
+    /// with its output, or with `note` about its end; its whole output at
+    /// `log`, else where it streamed.
+    fn ended(&self, call: CallId, output: Option<&str>, note: &str, log: Option<String>) -> String {
         let command = self.tools.get(&call).map_or("", String::as_str);
-        let stream = self.stream(call);
+        let stream = log.or_else(|| self.stream(call));
         let id = call.to_string();
         Tag::from(tag::BackgroundResult {
             call: &id,

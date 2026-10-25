@@ -26,8 +26,9 @@
 //! kept as they were written: environment redaction never applies to them.
 //!
 //! A path is named only once it exists: [`Places`] ensures a blob as it
-//! names it. Sealing a growing stream once its writers are gone is
-//! deferred to the queue (seam Q).
+//! names it. A stream whose writers are gone is sealed by whoever owned
+//! them: the shell, as a process group the session owns ends, into the
+//! blob that end's queued notice holds.
 
 use std::fs::File;
 use std::future::Future;

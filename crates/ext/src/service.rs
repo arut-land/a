@@ -6,11 +6,11 @@
 //! [`Layers`], to every call.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::BoxFuture;
-use protocol::Environment;
+use protocol::{Environment, Held};
 
 use crate::{Called, Cx, DynTool, SpawnSpec, States};
 
@@ -119,7 +119,12 @@ impl std::ops::Deref for OwnedProcess {
 pub struct ProcessLease {
     process: Arc<dyn RunningProcess>,
     released: Option<Box<dyn FnOnce() + Send + Sync>>,
+    holds: Mutex<Option<Holds>>,
 }
+
+/// What a group's end holds outside the log, made once the group has
+/// ended: see [`ProcessLease::holding`].
+pub type Holds = Box<dyn FnOnce() -> Vec<Held> + Send>;
 
 impl ProcessLease {
     /// Completion and rejected adoption must both release dependent resources.
@@ -128,6 +133,25 @@ impl ProcessLease {
         self.released = Some(Box::new(released));
         self
     }
+
+    /// What the end of the group, once the session owns it, holds: made
+    /// on a storage worker once nothing of the group is left and its
+    /// output is drained (an output stream sealed now that nothing writes
+    /// it), and dropped unmade if the session stops the group.
+    #[must_use]
+    pub fn holding(self, holds: impl FnOnce() -> Vec<Held> + Send + 'static) -> Self {
+        *self.holds.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(holds));
+        self
+    }
+
+    /// For the session that owns the group, as it ends: what
+    /// [`ProcessLease::holding`] gave, once.
+    pub fn holds(&self) -> Option<Holds> {
+        self.holds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
 }
 
 impl From<Arc<dyn RunningProcess>> for ProcessLease {
@@ -135,6 +159,7 @@ impl From<Arc<dyn RunningProcess>> for ProcessLease {
         Self {
             process,
             released: None,
+            holds: Mutex::new(None),
         }
     }
 }

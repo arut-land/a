@@ -146,6 +146,51 @@ fn a_running_quiet_command_costs_no_threads() {
     env.cmd(&["daemon", "stop"]).status().unwrap();
 }
 
+/// A command past its timeout goes on in the background with no timer of
+/// its own: while it runs quietly, the daemon never wakes.
+#[test]
+fn a_command_backgrounded_at_its_timeout_never_wakes_the_daemon() {
+    let env = Env::new("timeout-idle");
+    let pid = env.start();
+    let mut conn = env.connect();
+    conn.attach(Target::New, &env.ws);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let command = format!(
+        "exec 3<>/dev/tcp/127.0.0.1/{port}; printf ready >&3; read -r reply <&3; echo released"
+    );
+    let input = serde_json::json!({ "command": command, "timeout": 1 });
+    conn.input(&format!("call bash {input}"));
+    conn.until(|e| matches!(e.body, Body::Detached { .. }));
+    let mut accepted = None;
+    wait_for("the command to connect", || {
+        accepted = listener.accept().ok();
+        accepted.is_some()
+    });
+    let (mut release, _) = accepted.unwrap();
+    release.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let mut ready = [0; 5];
+    release.read_exact(&mut ready).unwrap();
+    assert_eq!(&ready, b"ready");
+    blocking_threads_retired(pid);
+    parked(pid);
+    let (_, before) = threads_and_switches(pid);
+    // The measurement window, the command running in the background.
+    std::thread::sleep(Duration::from_secs(3));
+    let (_, after) = threads_and_switches(pid);
+    eprintln!(
+        "{} wakes in 3 s while a backgrounded command runs",
+        after - before
+    );
+    assert_eq!(after - before, 0, "a backgrounded command woke the daemon");
+    release.write_all(b"done\n").unwrap();
+    conn.until(
+        |e| matches!(&e.body, Body::Assistant { text } if text.contains("ended in the background")),
+    );
+    env.cmd(&["daemon", "stop"]).status().unwrap();
+}
+
 #[test]
 fn the_last_job_holds_the_daemon_until_it_ends() {
     let env = Env::new("job-exit");

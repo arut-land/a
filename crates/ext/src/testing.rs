@@ -55,6 +55,9 @@ pub struct Recorder {
     pub progress: Mutex<String>,
     /// Notified each time a group the session owns ends.
     pub ends: Arc<rt::Notify>,
+    /// What the ends of the groups the session owned held, as the engine
+    /// has them made ([`crate::ProcessLease::holding`]).
+    pub held: Arc<Mutex<Vec<protocol::Held>>>,
 }
 
 impl Deref for Rig {
@@ -92,6 +95,7 @@ impl Rig {
                 processes: Mutex::default(),
                 progress: Mutex::default(),
                 ends: Arc::default(),
+                held: Arc::default(),
             }),
             calls: AtomicU64::new(0),
             _directory: directory,
@@ -123,7 +127,6 @@ impl Rig {
             blobs: self.blobs.clone(),
             cancel: self.cancel.clone(),
             services: Arc::clone(&SERVICES),
-            detach: crate::Flag::default(),
         }
         .cx(Arc::clone(&self.host) as _)
     }
@@ -212,7 +215,6 @@ impl Host for Recorder {
                 blobs: cx.blobs,
                 cancel: cx.cancel,
                 services: Arc::clone(&SERVICES),
-                detach: crate::Flag::default(),
             }
             .cx(self.clone())
             .with_invocation(context);
@@ -264,9 +266,13 @@ impl Host for Recorder {
         self.spawned(process.id(), true);
         let released = crate::Flag::default();
         lock(&self.processes).push((Arc::clone(&process), released.clone()));
-        let ends = Arc::clone(&self.ends);
+        let (ends, held) = (Arc::clone(&self.ends), Arc::clone(&self.held));
         RT.spawn(Box::pin(async move {
             process.ended().await;
+            if let Some(holds) = process.holds() {
+                let made = rt::unblock(&**RT, holds).await;
+                lock(&held).extend(made);
+            }
             drop(process);
             released.set();
             ends.notify();

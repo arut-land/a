@@ -69,7 +69,7 @@ use crate::state::Cwd;
 
 #[test]
 fn an_extension_cannot_hold_session_state_across_an_await() {
-    let rig = Rig::new("hold", Registry::default().with(&Shell).unwrap());
+    let rig = Rig::new("hold", Registry::default().with(&Shell::default()).unwrap());
     let (reader, writer) = (rig.cx(), rig.cx());
     let ws = rig.workspace();
     let sub = ws.join("sub");
@@ -99,7 +99,7 @@ fn an_extension_cannot_hold_session_state_across_an_await() {
 fn revoking_a_pending_cwd_record_preserves_the_shell_result() {
     let rig = Arc::new(Rig::new(
         "revoked-cwd",
-        Registry::default().with(&Shell).unwrap(),
+        Registry::default().with(&Shell::default()).unwrap(),
     ));
     std::fs::create_dir(rig.workspace().join("sub")).unwrap();
     let (ready, waiting) = oneshot::channel();
@@ -116,7 +116,6 @@ fn revoking_a_pending_cwd_record_preserves_the_shell_result() {
         services: Arc::new(
             SessionServices::default().with::<dyn rt::Runtime>(Arc::new(rt::Threads::default())),
         ),
-        detach: ext::Flag::default(),
     }
     .cx(Arc::new(PausedRecord {
         rig: Arc::clone(&rig),
@@ -153,7 +152,7 @@ fn revoking_a_pending_cwd_record_preserves_the_shell_result() {
 #[test]
 fn published_description_matches_the_selected_executable() {
     let facts = sys::shell::ExecutionFacts::current();
-    let registry = Registry::default().with(&Shell).unwrap();
+    let registry = Registry::default().with(&Shell::default()).unwrap();
     let specs = registry.tools().specs();
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].name, facts.tool());
@@ -170,7 +169,7 @@ impl ext::Extension for Selected {
     const NAME: &'static str = "shell";
     const VERSION: u32 = 1;
     fn contribute(&self, r: &mut ext::Registrar) {
-        super::contribute(r, self.0);
+        super::contribute(r, self.0, crate::bash::TIMEOUT);
     }
 }
 

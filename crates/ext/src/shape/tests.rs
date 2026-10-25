@@ -159,7 +159,6 @@ fn run(tool: &str, input: u64) -> (Outcome, String) {
         },
         cancel: Cancel::default(),
         services: Arc::default(),
-        detach: crate::Flag::default(),
     }
     .cx(Arc::clone(&host) as _);
     let input = Json::encode(&input).unwrap();

@@ -332,6 +332,7 @@ fn only_the_users_queued_input_can_be_withdrawn_and_an_earlier_take_wins() {
     s.step(Event::JobEnded {
         call: id(2),
         text: "job 7 ended".into(),
+        held: Vec::new(),
     });
     let job = s.log.last().unwrap().seq;
     let fx = s.step(withdraw(job, 3));
@@ -341,30 +342,52 @@ fn only_the_users_queued_input_can_be_withdrawn_and_an_earlier_take_wins() {
     s.step(user("again"));
     let again = s.log.last().unwrap().seq;
     s.step(tool_done(2, done(json!("held"))));
-    assert!(takes(&s).contains(&(job.get(), None)));
     assert!(takes(&s).contains(&(again.get(), None)));
     let fx = s.step(withdraw(again, 4));
     assert!(work(&fx).any(|w| matches!(w, Work::Reply { result: Err(_), .. })));
 }
 
 #[test]
-fn a_background_jobs_end_reaches_an_idle_agent_once() {
-    let mut s = echo();
-    s.step(user("hi"));
+fn a_background_jobs_end_starts_no_turn_and_is_read_with_the_next_model_call() {
+    let mut s = modeled();
+    s.step(user("work"));
+    s.step(prepared(2));
+    s.step(model_done(2, &[]));
+    assert!(s.core.at_rest());
+    let blob = Held::Blob(BlobRef {
+        id: BlobId([7; 32]),
+        size: 3,
+        media_type: "text/plain".into(),
+        origin: BlobOrigin::ToolOutput(id(1)),
+    });
     let ended = || Event::JobEnded {
         call: id(1),
         text: "job 7 ended: exit 0".into(),
+        held: vec![blob.clone()],
     };
     s.step(ended());
     s.step(ended());
     let queued: Vec<_> = (s.log.iter())
         .filter_map(|e| match &e.body {
-            Body::Enqueue { envelope } => Some(envelope.source()),
+            Body::Enqueue { envelope } => Some((envelope.source(), envelope.held.clone())),
             _ => None,
         })
         .collect();
-    assert_eq!(queued, [Source::Job(id(1))]);
-    assert_eq!(s.log.last().unwrap().body, said("job 7 ended: exit 0"));
+    assert_eq!(queued, [(Source::Job(id(1)), vec![blob.clone()])]);
+    let job = last(&s, |b| matches!(b, Body::Enqueue { .. }));
+    assert_eq!(takes(&s), [], "no turn of its own");
+    assert!(s.core.at_rest(), "news waiting is no work");
+    assert_eq!(s.core.ledger().activity(), protocol::Activity::Idle);
+
+    s.step(user("next"));
+    let next = job + 1;
+    assert_eq!(
+        takes(&s),
+        [(next, None), (job, None)],
+        "the user's input starts the turn; the end is read before the model is asked"
+    );
+    let taken = last(&s, |b| matches!(b, Body::Take { .. }));
+    assert!(last(&s, |b| matches!(b, Body::ModelCall { .. })) > taken);
 }
 
 /// Delivers what is queued into each tool's result, and nothing elsewhere:

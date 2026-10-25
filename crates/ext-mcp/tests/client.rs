@@ -24,7 +24,7 @@ fn rig(name: &str, timeout: Duration) -> Rig {
     Rig::new(
         &format!("mcp-{name}"),
         Registry::default()
-            .with(&ext_shell::Shell)
+            .with(&ext_shell::Shell::default())
             .unwrap()
             .with(&mcp)
             .unwrap(),

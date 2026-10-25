@@ -688,7 +688,7 @@ mod tests {
 
     fn registry() -> Registry {
         Registry::default()
-            .with(&ext_shell::Shell)
+            .with(&ext_shell::Shell::default())
             .and_then(|r| r.with(&crate::Edit))
             .unwrap()
     }

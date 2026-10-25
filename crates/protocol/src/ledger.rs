@@ -193,6 +193,15 @@ pub struct Queued {
     pub typed: bool,
 }
 
+impl Queued {
+    /// News of a process group the session owned ending: read with the
+    /// next model call, it starts no turn and is no work of its own, so a
+    /// session holding only these is at rest.
+    pub const fn notice(&self) -> bool {
+        matches!(self.source, Source::Job(_)) && !self.outcome
+    }
+}
+
 /// A call that went on in the background, and what it runs: what a
 /// restart runs again, if it may.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -727,7 +736,7 @@ impl Ledger {
             .open
             .iter()
             .any(|(_, open)| !matches!(open.call, Call::Side { .. }))
-            || !self.untaken.is_empty()
+            || self.untaken.iter().any(|q| !q.notice())
             || !self.armed.is_empty()
             || !self.detached.is_empty()
             || self.pending_outbox().next().is_some()

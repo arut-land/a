@@ -160,8 +160,12 @@ pub enum Event {
     /// on in the background ([`Work::Detach`]).
     Detached { call: CallId },
     /// A process group call `call` left to the session ended; `text` says
-    /// how, for the agent.
-    JobEnded { call: CallId, text: String },
+    /// how, for the agent, and `held` is what it left outside the log.
+    JobEnded {
+        call: CallId,
+        text: String,
+        held: Vec<protocol::Held>,
+    },
     /// Tool call `call`, running, reports something to log.
     Note { call: CallId, note: Note },
     /// Tool call `call`, running, waits on a dialog or a client.
