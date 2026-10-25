@@ -47,4 +47,5 @@ ext-retry.workspace = true
 ext-settings.workspace = true
 ext-shell = { workspace = true, features = ["testing"] }
 ext-skills.workspace = true
+ext-spill.workspace = true
 ext-subagent.workspace = true

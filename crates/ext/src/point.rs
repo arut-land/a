@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
-use protocol::{CallId, Entry, Json, Outcome, Segments, SessionId, Verdict};
+use protocol::{CallId, Entry, Held, Json, Outcome, Segments, SessionId, Verdict};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -690,6 +690,17 @@ fn post_tool<'a, 'b: 'a>(call: ToolUse<'b>, outcome: &'a Outcome) -> Finished<'a
 pub struct Ended<'a> {
     pub tool: &'a str,
     pub outcome: &'a Outcome,
+    /// What the result holds outside the log, named.
+    pub held: &'a [Placed],
+}
+
+/// A reference a result holds, and where the model reads it: named before
+/// the presentation is asked, so its handlers do no I/O.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub held: Held,
+    /// `None` when it cannot be read now.
+    pub at: Option<String>,
 }
 
 /// What the model is shown of a call's outcome.
@@ -707,6 +718,7 @@ pub struct Presenting<'a> {
     /// What the model is shown, as the handlers before left it: first,
     /// the tool's own [`to_model`](crate::Tool::to_model).
     pub presented: &'a Presented,
+    pub held: &'a [Placed],
 }
 
 fn presenting<'a, 'b: 'a>(ended: Ended<'b>, presented: &'a Presented) -> Presenting<'a> {
@@ -714,6 +726,7 @@ fn presenting<'a, 'b: 'a>(ended: Ended<'b>, presented: &'a Presented) -> Present
         tool: ended.tool,
         outcome: ended.outcome,
         presented,
+        held: ended.held,
     }
 }
 

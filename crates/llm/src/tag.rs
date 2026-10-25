@@ -204,6 +204,22 @@ impl<'a> From<BackgroundResult<'a>> for Tag<'a> {
     }
 }
 
+/// Where text was cut from what the model reads, and where the whole is.
+#[derive(Clone, Copy, Debug)]
+pub struct Truncated<'a> {
+    /// The bytes left out here.
+    pub bytes: u64,
+    pub at: &'a str,
+}
+
+impl<'a> From<Truncated<'a>> for Tag<'a> {
+    fn from(cut: Truncated<'a>) -> Self {
+        Tag::new("truncated")
+            .attr("bytes", cut.bytes.to_string())
+            .attr("path", cut.at)
+    }
+}
+
 /// Reasoning another model showed, as the model that continues reads it:
 /// named for its source, so it is not taken for its own. Which kind a part
 /// is, its producer's protocol says (`foreign` in each protocol module);

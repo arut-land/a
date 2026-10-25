@@ -30,6 +30,7 @@ mod parsed;
 mod retry;
 mod scenarios;
 mod side;
+mod spill;
 
 fn entry(seq: u64, body: Body) -> Entry {
     Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)

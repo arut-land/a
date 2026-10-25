@@ -65,8 +65,8 @@ pub use flag::{Cancel, Flag};
 pub use llm::Json;
 pub use r#loop::{Defaults, LOOP, Loop, LoopPoints, Resume, StepLimit};
 pub use point::{
-    Answer, Asked, Chained, Gate, Gated, Gating, Later, PointCx, Presented, Reaction, Recover,
-    Requirement, Rewrite,
+    Answer, Asked, Chained, Gate, Gated, Gating, Later, Placed, PointCx, Presented, Reaction,
+    Recover, Requirement, Rewrite,
 };
 pub use protocol::{Annotation, AnnotationLifetime, ExtensionFact};
 pub use query::{Query, QueryCx};
@@ -74,7 +74,7 @@ pub use queue::{Boundary, QueueView, Take};
 pub use schema::Schema;
 pub use service::{
     Budget, CwdOf, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec, OwnedProcess,
-    ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes, Recipients, Route,
+    ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes, Recipients, Record, Route,
     RunningProcess, SideProvider, SideRetry, SpawnError, Topology,
 };
 pub use settings::{Configured, Empty, Table};

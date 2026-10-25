@@ -22,6 +22,7 @@ dependencies = [
  "ext-settings",
  "ext-shell",
  "ext-skills",
+ "ext-spill",
  "ext-subagent",
  "ext-title",
  "libc",
@@ -551,6 +552,7 @@ dependencies = [
  "ext-settings",
  "ext-shell",
  "ext-skills",
+ "ext-spill",
  "ext-subagent",
  "ext-title",
  "futures-core",
@@ -794,6 +796,18 @@ dependencies = [
  "sys",
  "uuid",
  "yaml-rust2",
+]
+
+[[package]]
+name = "ext-spill"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "llm",
+ "protocol",
+ "rt",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
