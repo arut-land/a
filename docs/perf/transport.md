@@ -98,8 +98,58 @@ eight, with ranges overlapping.
   `tls-rustls` feature) was checked against OpenAI and Gemini the same way.
 - **Binary**: the probe is 675 KiB against 760 KiB with ureq.
 
-Hosted results (sessions suite, idle RSS, size) are in the sections
-below.
+## Hosted
+
+**Daemon under load.** The sessions suite (`gh workflow run perf -f
+sessions=true`, [runtime-demand.md](runtime-demand.md)), run
+[40216350510](https://github.com/arut-land/a/actions/runs/40216350510)
+against the ureq run 40201401042, default layout `A`, five rounds:
+
+| Runner | Sessions | Turn p50 (ms) | Turn p99 (ms) | Delta p99 (ms) | Active CPU (ms) | Idle RSS (MiB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ubuntu-latest | 32 | 1046 → 348 | 1742 → 444 | 0.11 → 0.92 | 860 → 1150 | 16.3 → 15.2 |
+| ubuntu-latest | 128 | 3945 → 612 | 4997 → 754 | 0.32 → 7.2 | 3730 → 4550 | 31.0 → 33.6 |
+| ubuntu-24.04-arm | 32 | 1046 → 331 | 1370 → 392 | 0.14 → 0.35 | 800 → 890 | 14.6 → 14.3 |
+| ubuntu-24.04-arm | 128 | 4079 → 578 | 4724 → 719 | 0.29 → 4.6 | 3820 → 3660 | 30.1 → 32.3 |
+| macos-latest | 32 | 5024 → 1376 | 6723 → 1694 | 1.47 → 1.99 | 1578 → 911 | 19.0 → 19.3 |
+| macos-latest | 128 | 19413 → 1360 | 27770 → 1878 | 1.73 → 6.4 | 6940 → 2518 | 35.2 → 42.7 |
+| macos-15-intel | 128 | 13561 → 4300 | 21135 → 6689 | 1.96 → 17.1 | 11348 → 11521 | 28.0 → 28.8 |
+| windows-latest | 128 | 10888 → 8394 | 17670 → 12529 | 0.15 → 0.26 | 5172 → 7531 | 41.0 → 38.3 |
+| windows-11-arm | 128 | 7263 → 8330 | 11226 → 12447 | 0.80 → 0.62 | 6766 → 8891 | 37.2 → 36.4 |
+
+At 1 and 8 sessions every runner is within noise of before, and idle RSS
+is equal or lower (ubuntu-latest 8.2 → 7.7 MiB at one session).
+
+- **Turns no longer queue.** Linux turn p50 at 128 sessions is 578–612
+  ms, against 3945–4079 ms on eight workers and 497–532 ms on 128; macOS
+  drops from 19 s to 1.4 s. On Windows a turn is bound by PowerShell
+  start-up for the shell call, as before: 128 concurrent starts now
+  overlap, which moves turn latency by ±25% and CPU up.
+- **Delta p99 at 128** rises to 5–17 ms, as it did with 128 network
+  workers (6.5 ms): 128 replies now stream at once over four async
+  workers. It stays under a frame interval except on macos-15-intel,
+  where this run also predates the fix for deltas dropped under load
+  (the dropped counts it shows are that bug).
+- **CPU** falls by two thirds on macos-latest and is flat on Linux arm,
+  but rises by 22–34% on ubuntu-latest and on Windows at 32 and 128.
+  What the readiness model costs per event: a read that would block, a
+  re-arm of the one-shot registration (`epoll_ctl`, or AFD on Windows) and
+  the reactor thread's wake, where a blocked `read` had none of them.
+  That is the reactor's cost, below the client: a persistent
+  edge-triggered registration or a completion backend (io_uring, IOCP)
+  removes it without changing the client (see "What the client needs
+  from rt").
+- **Idle RSS after 128 sessions** is 1–3 MiB higher on Linux (128
+  replies' buffers, retained by the allocator) and 7.5 MiB on
+  macos-latest, against 30–37 MiB more for 128 network workers.
+
+**Idle, start-up and size**, paired against main on the same runners
+(run [40216532258](https://github.com/arut-land/a/actions/runs/40216532258),
+five interleaved rounds): idle RSS, cold reply and attach are within
+noise on every runner (idle RSS ubuntu-latest 8616 KiB, +0.9%; macos-latest
+9424 KiB, −0.5%), and idle CPU stays zero. The release binary is 82–103
+KiB smaller everywhere (ubuntu-latest 9826 → 9733 KiB, macos-latest 5090
+→ 5008 KiB, windows-latest 11656 → 11553 KiB).
 
 ## HTTP/2 and HTTP/3
 
