@@ -450,9 +450,15 @@ impl State {
         let now = identity(&sub.root);
         match (sub.status, now) {
             (Status::Live(Some(was)), Some(now)) if was == now => {}
-            // What is missing above it may have moved: follow it closer.
+            // What is missing above it may have moved: follow it closer,
+            // and look again once that is armed, for what was made before.
             (Status::Gone, None) => {
-                self.rearm(id);
+                if self.rearm(id) == Armed::Gone
+                    && identity(&self.subs[&id].root).is_some()
+                    && self.rearm(id) == Armed::Live
+                {
+                    self.tell(id, Event::Rescan);
+                }
             }
             // Back already, by the time it is rearmed.
             (_, None) => match self.rearm(id) {
