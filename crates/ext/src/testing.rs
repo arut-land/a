@@ -77,7 +77,7 @@ impl Rig {
         let dir = std::fs::canonicalize(dir).unwrap();
         let session = SessionId::new();
         let store = Arc::new(Files::open(dir.join("blobs"), &dir).expect("the rig's store"));
-        let tree = Arc::new(CacheDir::new(dir.join("tree"), Arc::clone(&store) as _));
+        let tree = Arc::new(CacheDir::new(dir.join("cache"), Arc::clone(&store) as _));
         Self {
             blobs: Blobs::new(store, tree, session),
             dir,

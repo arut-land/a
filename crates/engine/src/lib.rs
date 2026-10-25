@@ -360,7 +360,7 @@ impl Daemon {
             &home.sessions_dir(),
         )?);
         let tree = Arc::new(blob_files::CacheDir::new(
-            home.cache_dir().join("tree"),
+            home.cache_dir(),
             Arc::clone(&blobs),
         ));
         let catalog = Catalog::open_on(home.catalog_file(), store.clone(), &**runtime)?;
