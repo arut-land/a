@@ -175,12 +175,15 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   `Connection::fetch`) reads a blob a session's log references, as its
   `BlobRef` names it, over a connection of its own: `range` is any
   `RangeBounds<u64>` (`..`, `..4096` for a head), clamped to the blob's
-  end. `Fetched` is an `io::Read` of the bytes in order; the read that
-  ends them fails if the daemon refused or stopped the fetch, or if a
-  chunk came out of place or the count sent differs from what arrived.
-  Its `canceller()` is a query's. The FFI's `BlobFetch` hands the pieces
-  to the app with an async `next()` (`Bytes`, then `Done` or `Failed`),
-  paced as a query's answers are.
+  end. `Fetched` is an `io::Read` of the bytes in order. Each chunk is
+  matched by its (blob, offset) to the next byte due, and none may reach
+  past the range asked for. The read that ends them fails with an
+  `Unfetched` (`NotHeld`, `Cancelled`; `Unfetched::of(&error)`) if the
+  daemon refused or stopped the fetch, and with `InvalidData` if a chunk
+  came out of place or the count sent differs from what arrived. Its
+  `canceller()` is a query's. The FFI's `BlobFetch` hands the pieces to
+  the app with an async `next()` (`Bytes`, then `Done`, `NotHeld`,
+  `Cancelled` or `Failed`), paced as a query's answers are.
 
 ## How an app drives it
 

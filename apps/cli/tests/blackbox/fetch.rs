@@ -6,7 +6,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::time::Duration;
 
-use client::Daemon;
+use client::{Daemon, Unfetched};
 use protocol::{BlobId, Decode, Entry, Held, SessionId};
 
 use crate::support::Isolated;
@@ -89,10 +89,7 @@ fn a_blob_no_reachable_session_references_is_refused() {
         .id;
     let refused = |session, blob| {
         let error = read_all(daemon.fetch(session, blob, ..).unwrap()).unwrap_err();
-        assert!(
-            error.to_string().contains("no blob") || error.to_string().contains("no session"),
-            "{error}"
-        );
+        assert_eq!(Unfetched::of(&error), Some(Unfetched::NotHeld), "{error}");
     };
     // Held by a session, but not this one: the hash alone opens nothing.
     refused(other, blob);
@@ -118,4 +115,18 @@ fn a_slow_client_paces_the_stream_without_disconnect() {
     let mut bytes = first.to_vec();
     fetched.read_to_end(&mut bytes).unwrap();
     assert!(bytes == stored, "the paced stream differs from the stored");
+}
+
+#[test]
+fn a_cancelled_fetch_ends_cancelled_short_of_its_bytes() {
+    let (_env, daemon, session, blob, stored) = kept("fetch-cancel", 2_000_000);
+    let mut fetched = daemon.fetch(session, blob, ..).unwrap();
+    let mut first = [0; 1];
+    fetched.read_exact(&mut first).unwrap();
+    fetched.canceller().cancel().unwrap();
+    let mut bytes = first.to_vec();
+    let error = fetched.read_to_end(&mut bytes).unwrap_err();
+    assert_eq!(Unfetched::of(&error), Some(Unfetched::Cancelled), "{error}");
+    assert!(bytes.len() < stored.len(), "every byte came");
+    assert!(stored.starts_with(&bytes));
 }

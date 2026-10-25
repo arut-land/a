@@ -520,11 +520,25 @@ pub enum BlobPiece {
     },
     /// Every byte asked for came.
     Done,
-    /// Why not: refused (no session it can be fetched through references
-    /// it), cancelled, or the connection's failure.
+    /// Refused: no session it was fetched through references the blob.
+    NotHeld,
+    Cancelled,
+    /// Why not: the store's, or the connection's, failure.
     Failed {
         error: String,
     },
+}
+
+impl From<&io::Error> for BlobPiece {
+    fn from(error: &io::Error) -> Self {
+        match client::Unfetched::of(error) {
+            Some(client::Unfetched::NotHeld) => Self::NotHeld,
+            Some(client::Unfetched::Cancelled) => Self::Cancelled,
+            None => Self::Failed {
+                error: error.to_string(),
+            },
+        }
+    }
 }
 
 /// Ordered approval content from the client SDK.

@@ -1,7 +1,8 @@
 //! Queries a connection asks the extensions, and the blobs it fetches,
 //! each answered on a task of its own and never logged: the session's log
 //! is not touched, and the connection goes on reading while one runs.
-//! Every one admitted ends with one [`DaemonMsg::Reply`].
+//! Every one admitted ends with one [`DaemonMsg::Reply`], or a fetch
+//! refused with [`DaemonMsg::NotHeld`].
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -11,8 +12,7 @@ use ext::query::{Asked, At, Sink};
 use ext::{BoxFuture, Cancel};
 use protocol::{ClientMsg, DaemonMsg, Frame, Json, MachineId, Outcome, QueryInfo, Role, Scope};
 
-use crate::driver::contain;
-use crate::fetch::Fetch;
+use crate::driver::{Failure, contain};
 use crate::outbox::{Outbox, QueuePermit};
 use crate::server::{reply, workspace_of};
 use crate::{Daemon, lock};
@@ -35,56 +35,17 @@ impl Queries {
         msg: ClientMsg,
         bytes: usize,
     ) -> Option<ClientMsg> {
-        let (id, ask) = match msg {
+        match msg {
             ClientMsg::Query {
                 id,
                 service,
                 scope,
                 body,
-            } => (id, Ask::Query(service, scope, body)),
-            ClientMsg::Fetch {
-                id,
-                session,
-                blob,
-                offset,
-                len,
-            } => (
-                id,
-                Ask::Fetch(Fetch {
-                    session,
-                    blob,
-                    offset,
-                    len,
-                }),
-            ),
-            ClientMsg::Cancel { id } => {
-                if let Some(cancel) = lock(&self.0).get(&id) {
-                    cancel.set();
-                }
-                return None;
-            }
-            msg => return Some(msg),
-        };
-        // Not a reply: that would read as the running query's.
-        if lock(&self.0).contains_key(&id) {
-            let message = format!("query {id} is running already");
-            reply(outbox, &DaemonMsg::Error { message });
-            return None;
-        }
-        let failed = |error: String| {
-            let outcome = Outcome::Failed { error };
-            reply(outbox, &DaemonMsg::Reply { id, outcome });
-            None
-        };
-        let Some(permit) = QueuePermit::query(bytes) else {
-            return failed("daemon admission is full".into());
-        };
-        let cancel = Cancel::default();
-        let answer: BoxFuture<'static, Result<Json, String>> = match ask {
-            Ask::Query(service, scope, body) => {
+            } => {
+                let permit = self.admit(outbox, id, bytes)?;
                 let registry = daemon.shared.registry.get();
                 let Some(query) = registry.query(&service) else {
-                    return failed(format!("no query named {service}"));
+                    return failed(outbox, id, format!("no query named {service}"));
                 };
                 let at = match scope {
                     Scope::Daemon => At::Daemon,
@@ -95,9 +56,10 @@ impl Queries {
                         Some(slot) => {
                             At::Session(session, Arc::from(slot.header.workspace.as_path()))
                         }
-                        None => return failed(format!("no session {session}")),
+                        None => return failed(outbox, id, format!("no session {session}")),
                     },
                 };
+                let cancel = Cancel::default();
                 let asked = Asked {
                     machine,
                     role,
@@ -105,21 +67,75 @@ impl Queries {
                     services: Arc::clone(&daemon.queried),
                     registry,
                 };
-                let outbox = outbox.clone();
-                Box::pin(async move {
-                    let updates = Paced {
-                        outbox: &outbox,
-                        id,
-                    };
-                    query.answer(&body, &at, asked, &updates).await
-                })
+                let paced = outbox.clone();
+                let answer = Box::pin(async move {
+                    let updates = Paced { outbox: &paced, id };
+                    let answer = query.answer(&body, &at, asked, &updates).await;
+                    answer.map_err(Ended::Failed)
+                });
+                self.run(daemon, outbox, id, permit, cancel, answer);
             }
-            Ask::Fetch(fetch) => Box::pin(crate::fetch::answer(
-                Arc::clone(daemon),
-                outbox.clone(),
-                fetch,
-            )),
-        };
+            ClientMsg::Fetch {
+                id,
+                session,
+                blob,
+                offset,
+                len,
+            } => {
+                let permit = self.admit(outbox, id, bytes)?;
+                let fetch = crate::fetch::answer(
+                    Arc::clone(daemon),
+                    outbox.clone(),
+                    session,
+                    blob,
+                    offset,
+                    len,
+                );
+                self.run(
+                    daemon,
+                    outbox,
+                    id,
+                    permit,
+                    Cancel::default(),
+                    Box::pin(fetch),
+                );
+            }
+            ClientMsg::Cancel { id } => {
+                if let Some(cancel) = lock(&self.0).get(&id) {
+                    cancel.set();
+                }
+            }
+            msg => return Some(msg),
+        }
+        None
+    }
+
+    /// Admission for one more to run as `id`, which no running one has;
+    /// `None` once refused, its answer sent.
+    fn admit(&self, outbox: &Outbox, id: u64, bytes: usize) -> Option<QueuePermit> {
+        // Not a reply: that would read as the running one's.
+        if lock(&self.0).contains_key(&id) {
+            let message = format!("query {id} is running already");
+            reply(outbox, &DaemonMsg::Error { message });
+            return None;
+        }
+        match QueuePermit::query(bytes) {
+            Some(permit) => Some(permit),
+            None => failed(outbox, id, "daemon admission is full".into()),
+        }
+    }
+
+    /// Runs `answer` as `id` on a task of its own, until it ends or
+    /// `cancel` is set, then sends how it ended.
+    fn run(
+        &self,
+        daemon: &Daemon,
+        outbox: &Outbox,
+        id: u64,
+        permit: QueuePermit,
+        cancel: Cancel,
+        answer: BoxFuture<'static, Result<Json, Ended>>,
+    ) {
         lock(&self.0).insert(id, cancel.clone());
         let (running, outbox) = (Arc::clone(&self.0), outbox.clone());
         daemon.shared.rt.spawn(Box::pin(async move {
@@ -131,20 +147,38 @@ impl Queries {
             // the cancel lands: it was interrupted all the same.
             let outcome = match cancel.until(answer).await {
                 Some(Ok(output)) if !cancel.is_set() => Outcome::Done { output },
-                Some(Err(error)) => Outcome::Failed { error },
+                Some(Err(Ended::Failed(error))) => Outcome::Failed { error },
+                Some(Err(Ended::NotHeld)) => {
+                    lock(&running).remove(&id);
+                    reply(&outbox, &DaemonMsg::NotHeld { id });
+                    return;
+                }
                 Some(Ok(_)) | None => Outcome::Interrupted { output: None },
             };
             lock(&running).remove(&id);
             reply(&outbox, &DaemonMsg::Reply { id, outcome });
         }));
-        None
     }
 }
 
-/// What a client asks that runs beside its connection.
-enum Ask {
-    Query(String, Scope, Json),
-    Fetch(Fetch),
+/// Answers `id` with `error`; `None`, as nothing more is taken of it.
+fn failed<T>(outbox: &Outbox, id: u64, error: String) -> Option<T> {
+    let outcome = Outcome::Failed { error };
+    reply(outbox, &DaemonMsg::Reply { id, outcome });
+    None
+}
+
+/// How one ended without its answer, other than by its cancel.
+pub(crate) enum Ended {
+    Failed(String),
+    /// A fetch of a blob no session it names references.
+    NotHeld,
+}
+
+impl Failure for Result<Json, Ended> {
+    fn failed(error: String) -> Self {
+        Err(Ended::Failed(error))
+    }
 }
 
 impl Drop for Queries {

@@ -541,12 +541,14 @@ answered by `Update`s, if it streams, then exactly one `Reply { id,
 outcome }`, on any connection, attached or not; `Cancel { id }` makes the
 reply interrupted. `Fetch { id, session, blob, offset, len }` shares the
 query ids: the daemon sends the blob's bytes from `offset` (`len` of them,
-or to its end, clamped) as chunk frames in order, each once the client has
-room for it (`Outbox::send_paced`), then one `Reply` whose output is the
-count sent. A blob is served only through a session whose log references
-it, checked where the fetch enters (`FrameLog::references`, folded lazily
-from where the last fetch left off, so a session nothing fetches from pays
-nothing): a hash alone opens nothing. A chunk names its blob and offset,
+or to its end, clamped) as chunk frames in order, each read straight into
+its frame and queued only within a window of four chunks
+(`Outbox::send_within`), then one `Reply` whose output is the count sent.
+A blob is served only through a session whose log references it, checked
+where the fetch enters (`FrameLog::references`, folded lazily from where
+the last fetch left off, so a session nothing fetches from pays nothing):
+a hash alone opens nothing, and a fetch refused ends with `NotHeld { id }`
+in place of its reply. A chunk names its blob and offset,
 not the request, so the same frame will carry an upload. A wire encoding change requires a new version
 and a generated corpus; there is no older-format fallback.
 

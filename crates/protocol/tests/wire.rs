@@ -708,6 +708,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         ),
     ];
     vec![
+        sample("not_held", DaemonMsg::NotHeld { id: 4 }),
         sample(
             "entry_side_retry",
             entry(

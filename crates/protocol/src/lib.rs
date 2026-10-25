@@ -1789,7 +1789,8 @@ kinds! {
         /// to its end, as session `session`'s log references it: answered
         /// by their [`Chunk`] frames in order, then one
         /// [`DaemonMsg::Reply`] naming `id`, whose output is how many bytes
-        /// were sent. `id` is a query's, cancelled as one is.
+        /// were sent, or [`DaemonMsg::NotHeld`]. `id` is a query's,
+        /// cancelled as one is.
         Fetch "fetch" { id: u64, session: SessionId, blob: BlobId, offset: u64 = default, len: Option<u64> = default };
     }
     else Err(serde_json::Error::custom("unknown client message"))
@@ -1971,6 +1972,10 @@ kinds! {
         /// How query `id` ended: its answer, why not, or that it was
         /// cancelled. Nothing about `id` follows.
         Reply "reply" { id: u64, outcome: Outcome } = Control;
+        /// Fetch `id` is refused: no session it may be fetched through
+        /// references the blob. In place of its reply; nothing about `id`
+        /// follows.
+        NotHeld "not_held" { id: u64 } = Control;
     }
     /// A message, or an entry, of a kind this build does not know: a newer
     /// daemon's. Never sent; decoding yields it so a client skips what it
@@ -2042,10 +2047,11 @@ pub enum Replaceable {
 }
 
 /// A frame encoded once, length prefix included, for any number of peers:
-/// cloning it shares the bytes.
+/// cloning it shares the bytes. Held as the buffer it was written into, so
+/// a chunk read straight into its frame is never copied again.
 #[derive(Clone, Debug)]
 pub struct Frame {
-    bytes: Arc<[u8]>,
+    bytes: Arc<Vec<u8>>,
     /// The entry's seq, for an entry.
     pub seq: Option<u64>,
     pub class: Class,
@@ -2093,8 +2099,11 @@ impl Frame {
 
     fn finish(mut bytes: Vec<u8>, seq: Option<u64>, class: Class) -> io::Result<Self> {
         prefix(&mut bytes)?;
+        // A frame may wait in a queue or a log's tail: it keeps no more
+        // than its bytes.
+        bytes.shrink_to_fit();
         Ok(Self {
-            bytes: Arc::from(bytes),
+            bytes: Arc::new(bytes),
             seq,
             class,
             replaceable: None,
@@ -2113,11 +2122,27 @@ impl Frame {
     /// The frame of `chunk`: about the connection, as the request it
     /// answers is.
     pub fn chunk(chunk: Chunk<'_>) -> io::Result<Self> {
-        let mut bytes = Vec::with_capacity(HEADER + CHUNK_HEADER + chunk.bytes.len());
+        let mut bytes = chunk.bytes;
+        Self::read_chunk(chunk.blob, chunk.offset, chunk.bytes.len(), &mut bytes)
+    }
+
+    /// The frame of the next `len` bytes `from` reads, which are blob
+    /// `blob`'s from `offset`: read into the frame's own buffer, behind
+    /// its header, with nothing zeroed or copied first.
+    pub fn read_chunk(
+        blob: BlobId,
+        offset: u64,
+        len: usize,
+        from: &mut impl Read,
+    ) -> io::Result<Self> {
+        let mut bytes = Vec::with_capacity(HEADER + CHUNK_HEADER + len);
         bytes.extend_from_slice(&[0, 0, 0, 0, FrameKind::Chunk as u8]);
-        bytes.extend_from_slice(&chunk.blob.0);
-        bytes.extend_from_slice(&chunk.offset.to_le_bytes());
-        bytes.extend_from_slice(chunk.bytes);
+        bytes.extend_from_slice(&blob.0);
+        bytes.extend_from_slice(&offset.to_le_bytes());
+        from.take(len as u64).read_to_end(&mut bytes)?;
+        if bytes.len() < HEADER + CHUNK_HEADER + len {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
         Self::finish(bytes, None, Class::Control)
     }
 

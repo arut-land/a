@@ -68,7 +68,87 @@ fn bridge_speaks_the_protocol_over_stdio() {
 #[test]
 fn a_blob_fetched_over_a_bridge_arrives_byte_identical() {
     let env = Env::new("bridge-fetch");
-    env.run(&["--mode", "auto", "-p", "$ seq 1 100000"]);
+    let (session, blob, stored) = kept_output(&env, 100_000);
+    let (mut child, mut stdin, mut stdout) = bridged(&env);
+    let fetch = ClientMsg::Fetch {
+        id: 1,
+        session,
+        blob,
+        offset: 0,
+        len: None,
+    };
+    write_frame(&mut stdin, &fetch).unwrap();
+    let mut fetched = Vec::new();
+    let sent = loop {
+        match raw_frame(&mut stdout) {
+            Raw::Chunk {
+                blob: of,
+                offset,
+                bytes,
+            } => {
+                assert_eq!((of, offset), (blob, fetched.len() as u64));
+                fetched.extend_from_slice(&bytes);
+            }
+            Raw::Msg(DaemonMsg::Reply {
+                id: 1,
+                outcome: protocol::Outcome::Done { output },
+            }) => break output.parse::<u64>().unwrap(),
+            Raw::Msg(other) => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(sent, stored.len() as u64);
+    assert!(fetched == stored, "the bytes differ from the stored");
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}
+
+/// A fetch cancelled mid-stream replies interrupted, and no chunk follows
+/// the reply.
+#[test]
+fn a_fetch_cancelled_mid_stream_sends_no_chunk_after_its_reply() {
+    let env = Env::new("bridge-cancel");
+    let (session, blob, stored) = kept_output(&env, 2_000_000);
+    let (mut child, mut stdin, mut stdout) = bridged(&env);
+    let fetch = ClientMsg::Fetch {
+        id: 1,
+        session,
+        blob,
+        offset: 0,
+        len: None,
+    };
+    write_frame(&mut stdin, &fetch).unwrap();
+    let mut chunks = 0;
+    let mut cancelled = false;
+    loop {
+        match raw_frame(&mut stdout) {
+            Raw::Chunk { .. } if !cancelled => {
+                chunks += 1;
+                write_frame(&mut stdin, &ClientMsg::Cancel { id: 1 }).unwrap();
+                cancelled = true;
+            }
+            Raw::Chunk { .. } => chunks += 1,
+            Raw::Msg(DaemonMsg::Reply {
+                id: 1,
+                outcome: protocol::Outcome::Interrupted { .. },
+            }) => break,
+            Raw::Msg(other) => panic!("{other:?}"),
+        }
+    }
+    assert!(chunks * (256 << 10) < stored.len(), "every chunk came");
+    // What the daemon sends after the reply is all here before the
+    // bridge ends.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    drop(stdin);
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty(), "{} bytes followed the reply", rest.len());
+    assert!(child.wait().unwrap().success());
+}
+
+/// A session of `env` whose shell call kept `lines` lines of output whole:
+/// the session, the blob and its bytes as the store holds them.
+fn kept_output(env: &Env, lines: u64) -> (SessionId, protocol::BlobId, Vec<u8>) {
+    env.run(&["--mode", "auto", "-p", &format!("$ seq 1 {lines}")]);
     let dir = fs::read_dir(env.home.sessions_dir())
         .unwrap()
         .next()
@@ -83,7 +163,17 @@ fn a_blob_fetched_over_a_bridge_arrives_byte_identical() {
         })
         .expect("the shell kept its output whole");
     let stored = fs::read(env.home.blobs_dir().join(blob.fan()).join(blob.to_string())).unwrap();
+    (session, blob, stored)
+}
 
+/// `a bridge` in `env`, welcomed: its child, stdin and stdout.
+fn bridged(
+    env: &Env,
+) -> (
+    std::process::Child,
+    std::process::ChildStdin,
+    BufReader<std::process::ChildStdout>,
+) {
     let mut child = env
         .cmd(&["bridge", "tok"])
         .stdin(Stdio::piped())
@@ -95,43 +185,37 @@ fn a_blob_fetched_over_a_bridge_arrives_byte_identical() {
     stdout.read_line(&mut String::new()).unwrap();
     read_frame::<ClientMsg>(&mut stdout).unwrap().unwrap();
     write_frame(&mut stdin, &hello()).unwrap();
-    let fetch = ClientMsg::Fetch {
-        id: 1,
-        session,
-        blob,
-        offset: 0,
-        len: None,
-    };
-    write_frame(&mut stdin, &fetch).unwrap();
     assert!(matches!(
         read_frame::<DaemonMsg>(&mut stdout).unwrap(),
         Some(DaemonMsg::Welcome { .. })
     ));
-    let mut fetched = Vec::new();
-    let sent = loop {
-        let mut frame = vec![0; 4];
-        stdout.read_exact(&mut frame).unwrap();
-        let len = u32::from_le_bytes(frame[..4].try_into().unwrap());
-        frame.resize(4 + len as usize, 0);
-        stdout.read_exact(&mut frame[4..]).unwrap();
-        match protocol::frame_in(&frame).unwrap().unwrap().1 {
-            protocol::Framed::Chunk(chunk) => {
-                assert_eq!((chunk.blob, chunk.offset), (blob, fetched.len() as u64));
-                fetched.extend_from_slice(chunk.bytes);
-            }
-            protocol::Framed::Json(json) => match DaemonMsg::from_json(json).unwrap() {
-                DaemonMsg::Reply {
-                    id: 1,
-                    outcome: protocol::Outcome::Done { output },
-                } => break output.parse::<u64>().unwrap(),
-                other => panic!("{other:?}"),
-            },
-        }
-    };
-    assert_eq!(sent, stored.len() as u64);
-    assert!(fetched == stored, "the bytes differ from the stored");
-    drop(stdin);
-    assert!(child.wait().unwrap().success());
+    (child, stdin, stdout)
+}
+
+enum Raw {
+    Chunk {
+        blob: protocol::BlobId,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    Msg(DaemonMsg),
+}
+
+/// The next frame, a chunk's bytes kept.
+fn raw_frame(stdout: &mut impl Read) -> Raw {
+    let mut frame = vec![0; 4];
+    stdout.read_exact(&mut frame).unwrap();
+    let len = u32::from_le_bytes(frame[..4].try_into().unwrap());
+    frame.resize(4 + len as usize, 0);
+    stdout.read_exact(&mut frame[4..]).unwrap();
+    match protocol::frame_in(&frame).unwrap().unwrap().1 {
+        protocol::Framed::Chunk(chunk) => Raw::Chunk {
+            blob: chunk.blob,
+            offset: chunk.offset,
+            bytes: chunk.bytes.to_vec(),
+        },
+        protocol::Framed::Json(json) => Raw::Msg(DaemonMsg::from_json(json).unwrap()),
+    }
 }
 
 /// Fake `ssh`: the remote has a literal path containing shell metacharacters,

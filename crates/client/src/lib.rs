@@ -29,7 +29,7 @@ pub use approval::{ApprovalPart, approval_parts, approval_text};
 pub use command::{COMMANDS, Cmd, Command, help, parse, parse_input};
 pub use daemons::{Daemons, Listed, Member};
 pub use drive::{ClientHandle, Driver, Renderer, pump};
-pub use fetch::Fetched;
+pub use fetch::{Fetched, Unfetched};
 pub use host::Host;
 pub use inbox::{Inbox, PUMP_BATCH, Post, QueueBudget, inbox};
 pub use link::{LinkError, LocalLink, Start};

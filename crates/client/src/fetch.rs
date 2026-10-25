@@ -4,6 +4,7 @@
 //! own, at the pace they are read: the daemon sends no faster than the
 //! reader takes them, and hanging up cancels the fetch.
 
+use std::fmt;
 use std::io::{self, Read};
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
@@ -15,8 +16,8 @@ use crate::query::{Canceller, ID};
 use crate::{Connection, Daemon, Error};
 
 /// A blob's bytes as they arrive, read in order. The read that ends them
-/// fails if the daemon refused or stopped the fetch, or if what came is
-/// not exactly what it says it sent.
+/// fails if the daemon refused or stopped the fetch ([`Unfetched`]), or if
+/// what came is not exactly what was asked for and it says it sent.
 pub struct Fetched {
     stream: Arc<dyn Stream>,
     buffered: Vec<u8>,
@@ -24,10 +25,51 @@ pub struct Fetched {
     /// The offset of the next byte due.
     next: u64,
     start: u64,
+    /// Where the bytes asked for end, if the ask said.
+    end: Option<u64>,
     /// The chunk being read, and how far.
     chunk: Vec<u8>,
     at: usize,
     done: bool,
+}
+
+/// Why a fetch ended short of its bytes: the inner error of the
+/// [`io::Error`] the read that ends them returns ([`Unfetched::of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unfetched {
+    /// No session it was fetched through references the blob
+    /// ([`io::ErrorKind::NotFound`]).
+    NotHeld,
+    /// Its [`Canceller`] stopped it.
+    Cancelled,
+}
+
+impl Unfetched {
+    /// Why `error` ended a fetch, if a fetch's end it is.
+    pub fn of(error: &io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref().copied()
+    }
+}
+
+impl fmt::Display for Unfetched {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotHeld => "no session it was fetched through references the blob",
+            Self::Cancelled => "the fetch was cancelled",
+        })
+    }
+}
+
+impl std::error::Error for Unfetched {}
+
+impl From<Unfetched> for io::Error {
+    fn from(why: Unfetched) -> Self {
+        let kind = match why {
+            Unfetched::NotHeld => io::ErrorKind::NotFound,
+            Unfetched::Cancelled => io::ErrorKind::Other,
+        };
+        Self::new(kind, why)
+    }
 }
 
 impl Daemon {
@@ -41,9 +83,10 @@ impl Daemon {
         blob: BlobId,
         range: impl RangeBounds<u64>,
     ) -> Result<Fetched, Error> {
-        let fetch = fetching(session, blob, &range);
+        let (offset, len) = bounds(&range);
+        let fetch = message(session, blob, offset, len);
         let conn = self.connect_as(None, &|| {}, &|_| Ok(vec![fetch.clone()]))?;
-        Ok(Fetched::of(conn, blob, &range))
+        Ok(Fetched::of(conn, blob, offset, len))
     }
 }
 
@@ -55,18 +98,28 @@ impl Connection {
         blob: BlobId,
         range: impl RangeBounds<u64>,
     ) -> io::Result<Fetched> {
-        self.send(&fetching(session, blob, &range))?;
-        Ok(Fetched::of(self, blob, &range))
+        let (offset, len) = bounds(&range);
+        self.send(&message(session, blob, offset, len))?;
+        Ok(Fetched::of(self, blob, offset, len))
     }
 }
 
-fn fetching(session: SessionId, blob: BlobId, range: &impl RangeBounds<u64>) -> ClientMsg {
-    let offset = start(range);
+/// Where `range` starts, and how many bytes it holds if it ends.
+fn bounds(range: &impl RangeBounds<u64>) -> (u64, Option<u64>) {
+    let offset = match range.start_bound() {
+        Bound::Included(&first) => first,
+        Bound::Excluded(&before) => before.saturating_add(1),
+        Bound::Unbounded => 0,
+    };
     let len = match range.end_bound() {
         Bound::Included(&last) => Some(last.saturating_add(1).saturating_sub(offset)),
         Bound::Excluded(&end) => Some(end.saturating_sub(offset)),
         Bound::Unbounded => None,
     };
+    (offset, len)
+}
+
+const fn message(session: SessionId, blob: BlobId, offset: u64, len: Option<u64>) -> ClientMsg {
     ClientMsg::Fetch {
         id: ID,
         session,
@@ -76,22 +129,15 @@ fn fetching(session: SessionId, blob: BlobId, range: &impl RangeBounds<u64>) -> 
     }
 }
 
-fn start(range: &impl RangeBounds<u64>) -> u64 {
-    match range.start_bound() {
-        Bound::Included(&first) => first,
-        Bound::Excluded(&before) => before.saturating_add(1),
-        Bound::Unbounded => 0,
-    }
-}
-
 impl Fetched {
-    fn of(conn: Connection, blob: BlobId, range: &impl RangeBounds<u64>) -> Self {
+    fn of(conn: Connection, blob: BlobId, offset: u64, len: Option<u64>) -> Self {
         Self {
             stream: Arc::from(conn.stream),
             buffered: conn.buffered,
             blob,
-            next: start(range),
-            start: start(range),
+            next: offset,
+            start: offset,
+            end: len.map(|len| offset.saturating_add(len)),
             chunk: Vec::new(),
             at: 0,
             done: false,
@@ -116,7 +162,15 @@ impl Fetched {
                 continue;
             };
             let ended = match framed {
-                Framed::Chunk(chunk) if chunk.blob == self.blob && chunk.offset == self.next => {
+                // Matched by blob and offset: the next bytes due, and no
+                // more than were asked for.
+                Framed::Chunk(chunk)
+                    if chunk.blob == self.blob
+                        && chunk.offset == self.next
+                        && self.end.is_none_or(|end| {
+                            self.next.saturating_add(chunk.bytes.len() as u64) <= end
+                        }) =>
+                {
                     self.chunk.clear();
                     self.chunk.extend_from_slice(chunk.bytes);
                     self.at = 0;
@@ -125,16 +179,21 @@ impl Fetched {
                     return Ok(true);
                 }
                 Framed::Chunk(chunk) => Err(invalid(format!(
-                    "bytes {} of blob {} where {} of {} were due",
-                    chunk.offset, chunk.blob, self.next, self.blob
+                    "{} bytes at {} of blob {} where {} of {} were due",
+                    chunk.bytes.len(),
+                    chunk.offset,
+                    chunk.blob,
+                    self.next,
+                    self.blob
                 ))),
-                Framed::Json(json) => {
-                    let DaemonMsg::Reply { id: ID, outcome } = DaemonMsg::from_json(json)? else {
+                Framed::Json(json) => match DaemonMsg::from_json(json)? {
+                    DaemonMsg::Reply { id: ID, outcome } => self.ended(outcome),
+                    DaemonMsg::NotHeld { id: ID } => Err(Unfetched::NotHeld.into()),
+                    _ => {
                         self.buffered.drain(..len);
                         continue;
-                    };
-                    self.ended(outcome)
-                }
+                    }
+                },
             };
             self.buffered.drain(..len);
             self.done = true;
@@ -156,7 +215,7 @@ impl Fetched {
                 }
             }
             Outcome::Failed { error } => Err(io::Error::other(error)),
-            Outcome::Interrupted { .. } => Err(io::Error::other("the fetch was cancelled")),
+            Outcome::Interrupted { .. } => Err(Unfetched::Cancelled.into()),
         }
     }
 }
