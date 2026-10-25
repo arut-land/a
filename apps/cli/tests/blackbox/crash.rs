@@ -179,14 +179,11 @@ fn a_crash_leaves_no_stream_open_and_what_it_cut_off_holds_what_it_wrote() {
         .collect();
     jobs.sort();
     assert_eq!(jobs, [vec![], vec![b"job\n".to_vec()]], "{queued:#?}");
-    let left: Vec<_> = (fs::read_dir(&open).unwrap())
-        .map(|e| e.unwrap().path())
-        .collect();
-    assert_eq!(
-        left,
-        Vec::<std::path::PathBuf>::new(),
-        "nothing is left open"
-    );
+    // The log file shows the news as it is written; each stream is removed
+    // only once that news is durable, so it is waited on, not assumed.
+    wait_for("nothing left open", || {
+        fs::read_dir(&open).unwrap().next().is_none()
+    });
 }
 
 /// What a sealed blob holds.
