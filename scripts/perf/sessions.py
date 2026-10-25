@@ -68,10 +68,17 @@ PAIRED = {
 }
 
 
-def paired(records, reference="A", resamples=2000):
-    """Each layout minus the reference over rounds where both completed: the
-    median paired difference and its bootstrap 95% interval (fixed seed)."""
+def bootstrap(diffs, reference, seed, resamples=2000):
+    """The median paired difference and its bootstrap 95% interval (fixed seed)."""
     import random
+    rng = random.Random(seed)
+    medians = sorted(statistics.median(rng.choices(diffs, k=len(diffs))) for _ in range(resamples))
+    return dict(median=statistics.median(diffs), reference=reference,
+                low=medians[int(resamples * 0.025)], high=medians[int(resamples * 0.975) - 1])
+
+
+def paired(records, reference="A"):
+    """Each layout minus the reference over rounds where both completed."""
     runs = {(r["label"], r["sessions"], r["round"]): r for r in records}
     out = {}
     for label in sorted({r["label"] for r in records} - {reference}):
@@ -85,11 +92,7 @@ def paired(records, reference="A", resamples=2000):
                 diffs = [metric(runs[(label, sessions, n)]) - metric(runs[(reference, sessions, n)])
                          for n in rounds]
                 base = statistics.median(metric(runs[(reference, sessions, n)]) for n in rounds)
-                rng = random.Random(f"{label}/{sessions}/{name}")
-                medians = sorted(statistics.median(rng.choices(diffs, k=len(diffs)))
-                                 for _ in range(resamples))
-                row[name] = dict(median=statistics.median(diffs), reference=base,
-                                 low=medians[int(resamples * 0.025)], high=medians[int(resamples * 0.975) - 1])
+                row[name] = bootstrap(diffs, base, f"{label}/{sessions}/{name}")
             out[f"{label}/{sessions}"] = row
     return out
 
@@ -101,6 +104,33 @@ def paired_table(rows):
     for row in rows.values():
         cells = ["{median:+.3g} [{low:+.3g}, {high:+.3g}]".format(**row[name]) for name in names]
         lines.append(f"| {row['label']} | {row['sessions']} | {row['pairs']} | " + " | ".join(cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
+TRIP = ["p50_us", "p90_us", "p99_us", "cpu_ms", "switches"]
+
+
+def paired_trips(trips, reference="A"):
+    """rt's round trip, each layout minus the reference in the same round."""
+    runs = {(t["label"], t["round"]): t for t in trips}
+    out = {}
+    for label in sorted({t["label"] for t in trips} - {reference}):
+        rounds = sorted(n for (l, n) in runs if l == label and (reference, n) in runs)
+        if rounds:
+            out[label] = dict(label=label, pairs=len(rounds), **{
+                name: bootstrap([runs[(label, n)][name] - runs[(reference, n)][name] for n in rounds],
+                                statistics.median(runs[(reference, n)][name] for n in rounds),
+                                f"trip/{label}/{name}")
+                for name in TRIP})
+    return out
+
+
+def trips_table(rows):
+    lines = ["| round trip − A | pairs | A median: " + " | ".join(TRIP) + " |",
+             "| --- | ---: | " + " | ".join("---:" for _ in TRIP) + " |"]
+    for row in rows.values():
+        cells = ["{reference:.4g}: {median:+.3g} [{low:+.3g}, {high:+.3g}]".format(**row[name]) for name in TRIP]
+        lines.append(f"| {row['label']} | {row['pairs']} | " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"
 
 
@@ -119,6 +149,7 @@ def table(summary):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path, help="the engine's release lib test executable")
+    parser.add_argument("--round-trip", type=Path, help="rt's round_trip test executable, run per layout and round")
     parser.add_argument("--output", type=Path, default=Path("target/perf-sessions"))
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--sessions", default="1,8,32,128")
@@ -130,9 +161,22 @@ def main():
     labels = layouts(cores)
     counts = [int(n) for n in args.sessions.split(",")]
     raw = args.output / "sessions.jsonl"
-    records, failures = [], []
+    records, failures, trips = [], [], []
     for round in range(args.rounds):
         order = labels if round % 2 == 0 else list(reversed(labels))
+        for label, _, extra in order if args.round_trip else []:
+            result = subprocess.run(
+                [str(args.round_trip), "reactor_round_trip", "--exact", "--ignored", "--nocapture",
+                 "--test-threads=1"], env=dict(os.environ, **extra), capture_output=True, text=True, timeout=300)
+            if result.returncode:
+                print(label, "round trip", round, result.stderr[-2000:], sep="\n", flush=True)
+                continue
+            line = next(line for line in result.stdout.splitlines() if '{"' in line)
+            trip = dict(json.loads(line[line.index('{"'):]), label=label, round=round)
+            trips.append(trip)
+            with (args.output / "round-trip.jsonl").open("a") as stream:
+                stream.write(json.dumps(trip) + "\n")
+            print(label, "round trip", round, f"p50={trip['p50_us']}us p99={trip['p99_us']}us", flush=True)
         for sessions in counts:
             for label, runtime, extra in order:
                 env = dict(os.environ, **extra, A_BENCH_RUNTIME=runtime, A_BENCH_SESSIONS=str(sessions),
@@ -167,10 +211,11 @@ def main():
                       f"p99={percentile(record['delta_ms'], 0.99):.3f}ms rss={record['idle_rss_kib']:.0f}KiB",
                       flush=True)
     summary, pairs = summarize(records), paired(records)
+    trip_pairs = paired_trips(trips)
     stalled = [(f["label"], f["sessions"], f["round"], f["failed"]) for f in failures]
     (args.output / "sessions.json").write_text(
-        json.dumps(dict(cores=cores, summary=summary, paired=pairs, failures=stalled), indent=2) + "\n")
-    report = table(summary) + "\n" + paired_table(pairs)
+        json.dumps(dict(cores=cores, summary=summary, paired=pairs, round_trip=trip_pairs, failures=stalled), indent=2) + "\n")
+    report = table(summary) + "\n" + paired_table(pairs) + "\n" + trips_table(trip_pairs)
     (args.output / "sessions.md").write_text(report)
     print(report)
     print("failed samples:", stalled)
