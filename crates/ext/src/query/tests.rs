@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::sync::Mutex;
 
-use protocol::{MachineId, Via};
+use protocol::MachineId;
 use serde::Deserialize;
 
 use super::*;
@@ -76,10 +76,7 @@ fn ask(name: &str, body: &str, at: &At) -> (Vec<String>, Result<Json, String>) {
     let query = registry.query(name).unwrap();
     let updates = Kept::default();
     let asked = Asked {
-        peer: Peer {
-            machine: MachineId([0; 16]),
-            via: Via::Local,
-        },
+        machine: MachineId([0; 16]),
         role: Role::Viewer,
         cancel: Cancel::default(),
         services: Arc::default(),

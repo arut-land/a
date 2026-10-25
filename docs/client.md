@@ -56,13 +56,12 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
     (`a web`) runs ssh with `BatchMode=yes` and no terminal, and reads
     what it says, so a host that needs a password or a host key confirmed
     is `LinkError::NeedsInteractiveAuth`, not a prompt nobody sees.
-    `host` is a `protocol::Host`, never an ssh option; `home` is this
+    `host` is a `client::Host`, never an ssh option; `home` is this
     machine's, whose machine id the hello names to the far daemon.
 
   `connect` completes the hello: a
   `Welcome` (protocol and capabilities taken up, the slash commands the
-  daemon advertises) and the `Connection`'s `peer`, the daemon's machine
-  and how the link reached it (`Opened::via`), a `Draining` daemon waited out and tried again, a
+  daemon advertises) and the `Connection`'s `machine`, the daemon's, a `Draining` daemon waited out and tried again, a
   mismatch as `Error::Mismatch { theirs, newer, host }`, whose `Display`
   is the one sentence that says which side to update. `connect_as` sends
   the attach right behind the hello, saving a round trip. `Error` is the

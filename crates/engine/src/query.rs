@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use ext::host::Registry;
 use ext::query::{Asked, At, Sink};
 use ext::{BoxFuture, Cancel};
-use protocol::{ClientMsg, DaemonMsg, Frame, Json, Outcome, Peer, QueryInfo, Role, Scope};
+use protocol::{ClientMsg, DaemonMsg, Frame, Json, MachineId, Outcome, QueryInfo, Role, Scope};
 
 use crate::driver::contain;
 use crate::outbox::{Outbox, QueuePermit};
@@ -29,7 +29,7 @@ impl Queries {
         &self,
         daemon: &Daemon,
         outbox: &Outbox,
-        peer: &Peer,
+        machine: MachineId,
         role: Role,
         msg: ClientMsg,
         bytes: usize,
@@ -78,7 +78,7 @@ impl Queries {
         let cancel = Cancel::default();
         lock(&self.0).insert(id, cancel.clone());
         let asked = Asked {
-            peer: peer.clone(),
+            machine,
             role,
             cancel: cancel.clone(),
             services: Arc::clone(&daemon.queried),

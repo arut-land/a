@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use protocol::{
     Author, Caps, ClientDecl, ClientId, ClientMsg, ClientSeq, DaemonMsg, Decode, Environment,
-    Frame, HomeSettings, PROTO, Peer, Rejection, Role, SettingsChange, Versions, Via,
+    Frame, HomeSettings, MachineId, PROTO, Rejection, Role, SettingsChange, Versions,
 };
 use rt::{Async, BoxFuture, Reactor};
 use sys::{Listener, OwnedConnection as Stream};
@@ -192,18 +192,25 @@ async fn write_out(io: Arc<Async<Stream>>, outbox: Outbox, rt: rt::Rt) {
     let _ = io.get_ref().shutdown(std::net::Shutdown::Both);
 }
 
-/// The trust rule: this user, on a transport that authenticated this
-/// user, owns the daemon. Every [`Via`] is one such transport today; one
-/// that is not (another person's pinned key) decides here.
-const fn role_of(peer: &Peer) -> Role {
-    match peer.via {
-        Via::Local | Via::Ssh { .. } => Role::Owner,
+/// How a connection reached the daemon: its endpoint, the one way in, which
+/// the OS opens to this user alone (a socket's peer credentials, a pipe's
+/// per-user access list). A client bridged over ssh comes through it too,
+/// ssh having authenticated this user on this machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Way {
+    Endpoint,
+}
+
+/// The trust rule, and the one place a role is decided: this user, on a
+/// way in that authenticated this user, owns the daemon. A way that does
+/// not (another person's pinned key) is a new [`Way`], decided here.
+const fn role_of(way: Way) -> Role {
+    match way {
+        Way::Endpoint => Role::Owner,
     }
 }
 
-/// Serves connection `stream` until the client hangs up. The daemon's
-/// endpoint lets only this user connect, so every connection comes
-/// [`Via::Local`], a bridged one included.
+/// Serves connection `stream` until the client hangs up.
 pub(crate) async fn handle(
     daemon: &Arc<Daemon>,
     life: &Lifecycle,
@@ -217,7 +224,7 @@ pub(crate) async fn handle_as(
     daemon: &Arc<Daemon>,
     life: &Lifecycle,
     stream: Stream,
-    role: fn(&Peer) -> Role,
+    role: fn(Way) -> Role,
 ) -> io::Result<()> {
     let io = Arc::new(Async::new(&daemon.shared.rt.reactor(), stream)?);
     let mut frames = Frames::new(Arc::clone(&io));
@@ -251,11 +258,6 @@ pub(crate) async fn handle_as(
                 (Verdict::Welcome, Some(proto)) => match daemon.machine.id().await {
                     Ok(ours) => {
                         let _registered = life.register(outbox.clone());
-                        // One that names no machine is on the daemon's.
-                        let peer = Peer {
-                            machine: machine.unwrap_or(ours),
-                            via: Via::Local,
-                        };
                         let mut conn = Conn {
                             daemon,
                             life,
@@ -263,8 +265,9 @@ pub(crate) async fn handle_as(
                             // One that does not name itself is one client for as
                             // long as its connection lasts.
                             client: client.unwrap_or_default(),
-                            role: role(&peer),
-                            peer,
+                            // One that names no machine is on the daemon's.
+                            machine: machine.unwrap_or(ours),
+                            role: role(Way::Endpoint),
                             attached: None,
                             decl: ClientDecl::default(),
                             queries: Queries::default(),
@@ -346,7 +349,10 @@ struct Conn<'a> {
     /// that the log holds already is a resend, answered as the first was,
     /// across reconnects and daemon restarts.
     client: ClientId,
-    peer: Peer,
+    /// The machine the client is on, as its hello claims: unauthenticated,
+    /// since any process of this user may claim any machine, which the
+    /// trust rule allows. For attribution, never for a decision.
+    machine: MachineId,
     role: Role,
     attached: Option<Attachment>,
     decl: ClientDecl,
@@ -385,9 +391,25 @@ impl Conn<'_> {
                 })
                 .await
             };
-            let mut msg = match next {
+            let msg = match next {
                 Ok(Some(msg)) => msg,
                 ended => break ended.map(|_| ()),
+            };
+            let mut msg = match self.admit(msg) {
+                Admission::Admitted(msg) => msg,
+                Admission::Refused(mut refused) => {
+                    // In turn with the mutations before it, as one taken would be.
+                    if let Some(&mut client_seq) = refused.client_seq_mut() {
+                        let answer = Err((Rejection::ReadOnly, VIEWER.into()));
+                        pending.push_back((client_seq, Box::pin(std::future::ready(answer))));
+                    } else {
+                        while let Some((client_seq, answer)) = pending.pop_front() {
+                            self.answered(client_seq, answer.await);
+                        }
+                        self.refuse(refused).await;
+                    }
+                    continue;
+                }
             };
             if let Some(&mut client_seq) = msg.client_seq_mut() {
                 let control = matches!(msg, ClientMsg::Interrupt { .. });
@@ -411,7 +433,7 @@ impl Conn<'_> {
             let taken = (self.queries).take(
                 self.daemon,
                 self.outbox,
-                &self.peer,
+                self.machine,
                 self.role,
                 msg,
                 frames.bytes,
@@ -456,9 +478,6 @@ impl Conn<'_> {
                         .unwrap_or(u32::MAX),
                     known: u32::try_from(lock(&self.daemon.slots).len()).unwrap_or(u32::MAX),
                 }),
-                ClientMsg::Shutdown if self.role == Role::Viewer => {
-                    self.error("this client is a viewer".into());
-                }
                 ClientMsg::Shutdown => {
                     lock(&self.daemon.stopping).get_or_insert(ext_logging::Stop::Requested);
                     self.daemon.pulse.notify();
@@ -488,12 +507,6 @@ impl Conn<'_> {
         env: Option<Environment>,
         decl: ClientDecl,
     ) {
-        if matches!(target, protocol::Target::Fork { .. }) && self.role == Role::Viewer {
-            self.reply(&DaemonMsg::ForkRejected {
-                reason: protocol::ForkError::Viewer,
-            });
-            return;
-        }
         let env = if matches!(target, protocol::Target::Fork { .. }) {
             None
         } else {
@@ -525,7 +538,7 @@ impl Conn<'_> {
                 }
                 s.session().attach(self.outbox.clone(), since).await;
                 session_event("attach", s.session().id, || {
-                    format!("since {since} from {}", self.peer.machine)
+                    format!("since {since} from {}", self.machine)
                 });
                 self.attached = Some(s);
             }
@@ -533,18 +546,66 @@ impl Conn<'_> {
         }
     }
 
-    /// The home settings, after `change` if this client may make it: the
-    /// daemon is the file's one writer, writing it off the async workers.
+    /// What this connection may ask, checked once here for every message
+    /// before anything acts on it, so that no request skips it: a viewer's
+    /// that would write (a log, the home's settings, the daemon's life) is
+    /// handed back, refused, and its attach keeps the session's
+    /// environment.
+    fn admit(&self, msg: ClientMsg) -> Admission {
+        match self.role {
+            Role::Owner => Admission::Admitted(msg),
+            Role::Viewer => match msg {
+                msg if writes(&msg) => Admission::Refused(msg),
+                ClientMsg::Attach {
+                    target,
+                    workspace,
+                    since,
+                    decl,
+                    env: _,
+                } => Admission::Admitted(ClientMsg::Attach {
+                    target,
+                    workspace,
+                    since,
+                    env: None,
+                    decl,
+                }),
+                msg => Admission::Admitted(msg),
+            },
+        }
+    }
+
+    /// Answers a request [`Conn::admit`] refused, as its kind is answered.
+    async fn refuse(&self, msg: ClientMsg) {
+        match msg {
+            ClientMsg::Attach {
+                target: protocol::Target::Fork { .. },
+                ..
+            } => self.reply(&DaemonMsg::ForkRejected {
+                reason: protocol::ForkError::Viewer,
+            }),
+            ClientMsg::Settings { .. } => {
+                let DaemonMsg::Settings { settings, .. } = self.settings(None).await else {
+                    unreachable!("settings answers with settings");
+                };
+                self.reply(&DaemonMsg::Settings {
+                    settings,
+                    error: Some(VIEWER.into()),
+                });
+            }
+            _ => self.error(VIEWER.into()),
+        }
+    }
+
+    /// The home settings, after `change`: the daemon is the file's one
+    /// writer, writing it off the async workers.
     async fn settings(&self, change: Option<SettingsChange>) -> DaemonMsg {
         let shared = Arc::clone(&self.daemon.shared);
-        let viewer = self.role == Role::Viewer;
         let rt = Arc::clone(&shared.rt);
         let (file, refused) = rt::unblock(&*rt, move || {
             let home = &shared.models.settings.home;
             home.refresh();
             match change {
                 None => (home.get(), None),
-                Some(_) if viewer => (home.get(), Some("this client is a viewer".to_owned())),
                 Some(change) => home
                     .change(&change)
                     .map_or_else(|e| (home.get(), Some(e)), |file| (file, None)),
@@ -558,8 +619,7 @@ impl Conn<'_> {
         DaemonMsg::Settings { settings, error }
     }
 
-    /// Sends mutation `msg`, from `origin`, on if this client may: the
-    /// future is its answer.
+    /// Sends mutation `msg`, from `origin`, on: the future is its answer.
     fn mutate(&self, msg: ClientMsg) -> BoxFuture<'static, Answer> {
         let origin = msg.client_seq().and_then(ClientSeq::new).map(|seq| Author {
             client: self.client,
@@ -568,9 +628,6 @@ impl Conn<'_> {
         let refused =
             |answer: Answer| -> BoxFuture<'static, Answer> { Box::pin(std::future::ready(answer)) };
         let session = match &self.attached {
-            _ if self.role == Role::Viewer => {
-                return refused(Err((Rejection::ReadOnly, "this client is a viewer".into())));
-            }
             Some(s) => s.session(),
             None => return refused(Err((Rejection::NotAttached, "not attached".into()))),
         };
@@ -625,6 +682,48 @@ impl Conn<'_> {
             (_, Err((_, message))) => self.error(message),
             (_, Ok(())) => {}
         }
+    }
+}
+
+/// A request as [`Conn::admit`] takes it: to act on, or to refuse.
+enum Admission {
+    Admitted(ClientMsg),
+    Refused(ClientMsg),
+}
+
+/// Why a viewer's request is refused.
+const VIEWER: &str = "this client is a viewer";
+
+/// Whether `msg` would write: a session's log (a mutation, an environment,
+/// a new or forked session), the home's settings, or the daemon's life.
+/// An attach's environment is not counted: a viewer's is dropped instead.
+const fn writes(msg: &ClientMsg) -> bool {
+    use protocol::Target;
+    match msg {
+        ClientMsg::Input { .. }
+        | ClientMsg::Withdraw { .. }
+        | ClientMsg::Approve { .. }
+        | ClientMsg::Interrupt { .. }
+        | ClientMsg::Environment(_)
+        | ClientMsg::Shutdown
+        | ClientMsg::Settings { change: Some(_) }
+        | ClientMsg::Attach {
+            target: Target::New | Target::Fork { .. },
+            ..
+        } => true,
+        ClientMsg::Hello { .. }
+        | ClientMsg::Attach {
+            target: Target::Latest { .. } | Target::Id(_) | Target::Prefix(_),
+            ..
+        }
+        | ClientMsg::Declare(_)
+        | ClientMsg::List
+        | ClientMsg::Detach
+        | ClientMsg::WatchSessions
+        | ClientMsg::Status
+        | ClientMsg::Settings { change: None }
+        | ClientMsg::Query { .. }
+        | ClientMsg::Cancel { .. } => false,
     }
 }
 

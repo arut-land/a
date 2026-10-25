@@ -4,7 +4,7 @@
 use std::ffi::{OsStr, OsString};
 use std::process::Command;
 
-use protocol::Host;
+use client::Host;
 use usage_rs::embedded::{Exit, Outcome};
 
 use super::generate::commands;

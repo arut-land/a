@@ -17,8 +17,8 @@ use protocol::{
 use sys::Home;
 
 use super::outbox::Outbox;
-use super::server::{handle, handle_as};
-use super::{Config, Daemon, Lifecycle, Owner};
+use super::server::{Way, handle, handle_as};
+use super::{Config, Daemon, Lifecycle, Owner, lock};
 
 struct Fixture {
     root: PathBuf,
@@ -72,7 +72,7 @@ impl Fixture {
         self.served(Some(|_| Role::Viewer))
     }
 
-    fn served(&self, role: Option<fn(&protocol::Peer) -> Role>) -> Peer<'_> {
+    fn served(&self, role: Option<fn(Way) -> Role>) -> Peer<'_> {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let (daemon, life) = (Arc::clone(&self.daemon), Arc::clone(&self.life));
         let rt = Arc::clone(&daemon.shared.rt);
@@ -407,18 +407,41 @@ fn a_repeated_mutation_is_answered_again_but_not_done_again() {
     assert_eq!(inputs, 1);
 }
 
-/// A role is the daemon's to give: whatever a viewer declares, it stays one.
+/// A role is the daemon's to give, and checked once for everything a
+/// client sends: a viewer writes nothing by any request (a mutation, an
+/// environment, a new or forked session, the settings, a shutdown), even
+/// after it declares itself again, and attaches without its environment.
 #[test]
-fn a_viewer_cannot_change_the_session_whatever_it_declares() {
+fn a_viewer_writes_nothing_by_any_request() {
     let fixture = Fixture::new("viewer");
+    let session = {
+        let mut owner = fixture.connect();
+        owner.send(&hello(Caps::ALL));
+        owner.send(&attach(Target::New, 0, ClientDecl::default()));
+        assert!(matches!(owner.answer(), DaemonMsg::Welcome { .. }));
+        let DaemonMsg::Attached { session, .. } = owner.answer() else {
+            panic!("not attached");
+        };
+        session
+    };
+    fixture.settle();
+    let logged = || fixture.daemon.shared.store.entries(session).unwrap().len();
+    let before = logged();
+    let env = Environment::new("/w".into(), [("VIEWER".into(), "1".into())], false);
     let mut peer = fixture.connect_viewer();
     peer.send(&hello(Caps::ALL));
-    peer.send(&attach(Target::New, 0, ClientDecl::default()));
+    peer.send(&ClientMsg::Attach {
+        target: Target::Id(session),
+        workspace: "/w".into(),
+        since: 0,
+        env: Some(env.clone()),
+        decl: ClientDecl::default(),
+    });
+    assert!(matches!(peer.answer(), DaemonMsg::Welcome { .. }));
+    assert!(matches!(peer.answer(), DaemonMsg::Attached { .. }));
     peer.send(&input("hi", 1));
     peer.send(&ClientMsg::Declare(ClientDecl::default()));
     peer.send(&input("hi", 2));
-    assert!(matches!(peer.answer(), DaemonMsg::Welcome { .. }));
-    assert!(matches!(peer.answer(), DaemonMsg::Attached { .. }));
     for _ in 0..2 {
         assert!(matches!(
             peer.answer(),
@@ -428,9 +451,13 @@ fn a_viewer_cannot_change_the_session_whatever_it_declares() {
             }
         ));
     }
+    peer.send(&ClientMsg::Environment(env));
+    assert!(matches!(peer.answer(), DaemonMsg::Error { .. }));
+    peer.send(&attach(Target::New, 0, ClientDecl::default()));
+    assert!(matches!(peer.answer(), DaemonMsg::Error { .. }));
     peer.send(&attach(
         Target::Fork {
-            session: "any".into(),
+            session: session.to_string(),
             seq: None,
         },
         0,
@@ -442,6 +469,24 @@ fn a_viewer_cannot_change_the_session_whatever_it_declares() {
             reason: protocol::ForkError::Viewer
         }
     ));
+    peer.send(&ClientMsg::Settings {
+        change: Some(SettingsChange {
+            model: Some("a:b".into()),
+            ..SettingsChange::default()
+        }),
+    });
+    assert!(matches!(
+        peer.answer(),
+        DaemonMsg::Settings { error: Some(_), .. }
+    ));
+    peer.send(&ClientMsg::Shutdown);
+    assert!(matches!(peer.answer(), DaemonMsg::Error { .. }));
+    drop(peer);
+    fixture.settle();
+    assert_eq!(logged(), before);
+    assert_eq!(fixture.daemon.shared.store.headers().unwrap().len(), 1);
+    assert!(!fixture.root.join("config.toml").exists());
+    assert!(lock(&fixture.daemon.stopping).is_none());
 }
 
 /// A client asks its home for the machine id the daemon names itself by:

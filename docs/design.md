@@ -82,18 +82,23 @@ makes the first time the home needs one and keeps in the state directory
 [the measurements](perf/machine-key.md)). The daemon reads it on the
 blocking pool while it loads, and its welcome names it. A client of this
 machine's daemon names no machine in its hello; one over another link names
-its own home's, so the daemon knows whether a client shares its files. Each
-side ends with a `protocol::Peer { machine, via }`: the client's
-`Connection::peer` is the daemon as its link reached it, and the daemon's
-is the client, always `Via::Local`, since a bridge connects locally. The
-daemon decides what a connection may do (`server::Role`) from its peer,
-never from the client: trust is this user on a transport that authenticated
-this user, which the endpoint's peer check and `ssh` both are, so every peer
-owns the daemon today. A transport that does not prove that (another
-person's pinned key, later) decides there. No key is exchanged yet. The
-peer is not logged: it decides nothing a replay must reproduce, and the log
-names a mutation's client already. `--host` is a `protocol::Host`, which is
-never something ssh would read as an option.
+its own home's, so the daemon knows whether a client shares its files. That
+claim is unauthenticated (any process of this user may claim any machine),
+which the trust rule allows: it attributes, it never decides. The client's
+`Connection::machine` is the daemon's. What a connection may do
+(`protocol::Role`) the daemon decides in one place, `server::role_of`, from
+how the connection came, never from the client: trust is this user on a way
+in that authenticated this user. The daemon's one way in is its endpoint,
+which the OS opens to this user alone, and a client bridged over ssh comes
+through it too, so every connection owns the daemon today; a way that does
+not prove that (another person's pinned key, later) is a new `server::Way`
+decided there. Every request is admitted once, by `Conn::admit`, before
+anything acts on it: a viewer's that would write (a mutation, an
+environment, a new or forked session, the settings, a shutdown) is refused,
+and its attach keeps the session's environment. No key is exchanged yet.
+The client's machine is not logged: it decides nothing a replay must
+reproduce, and the log names a mutation's client already. `--host` is a
+`client::Host`, which is never something ssh would read as an option.
 
 See [the client SDK](client.md) and [CLI](cli.md), and the staging and
 endpoint types in `crates/sys`. The daemon targets macOS, Linux and Windows.
@@ -323,8 +328,9 @@ like a tool, its answer's shape (at once, a future, or streamed updates
 before the reply) is the type `answer` returns, and its `Scope` type
 (`Daemon`, `Workspace`, `Session`) is what its `QueryCx` holds. A query
 is asked about its scope or a narrower one that implies it, and its
-`QueryCx` names who asks (`peer`, so a query can tell a client on the
-daemon's machine from one elsewhere) and the `role` the daemon gave it.
+`QueryCx` names who asks (`machine`, the client's claimed machine, so a
+query can tell a client on the daemon's machine from one elsewhere) and the
+`role` the daemon gave it.
 `QueryCx` has no way to append, publish or change state, so a query can never
 write a log. Welcome advertises the queries; each is ephemeral,
 correlated by the client's id, cancelled by `Cancel` or a hangup, and

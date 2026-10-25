@@ -13,12 +13,12 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use protocol::{ClientMsg, Host, MachineId, Versions, Via};
+use protocol::{ClientMsg, MachineId, Versions};
 use rt::{BoxFuture, Rt};
 use sys::{Home, Platform, Prompt, Staged};
 
-use crate::Error;
 use crate::link::{Link, LinkError, Opened, Pipe, Start, Stream};
+use crate::{Error, Host};
 
 /// What the bridge prints, with its token, once it is connected.
 pub const SYNC: &str = "A-BRIDGE";
@@ -224,9 +224,6 @@ impl SshLink {
                 };
                 return Ok(Bridge::Ready(Opened {
                     stream: Box::new(pipe),
-                    via: Via::Ssh {
-                        host: self.host.clone(),
-                    },
                     machine: None,
                     buffered,
                     remote: Some(env),

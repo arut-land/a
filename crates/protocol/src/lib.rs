@@ -105,7 +105,7 @@ pub mod view;
 
 pub use blob::{BlobId, BlobOrigin, BlobRef, Held, Payload};
 pub use json::Json;
-pub use peer::{Host, MachineId, Peer, Role, Via};
+pub use peer::{MachineId, Role};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

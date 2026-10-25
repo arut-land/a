@@ -30,11 +30,12 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 use std::thread;
 
+use client::Host;
 use client::{Driver, End, Env, Event, Link, Renderer, SessionClient, Show};
+use protocol::Target;
 use protocol::view::{
     Change, Item, Kind, Part, Presented, SessionView, Shown, answer_line, mismatch_line, recap_line,
 };
-use protocol::{Host, Target};
 use sys::{Home, Staged};
 
 use crate::args::{Args, Autostart, Cmd, Daemon};

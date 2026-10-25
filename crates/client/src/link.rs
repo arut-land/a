@@ -11,8 +11,7 @@ use std::task::{Context, Waker};
 use std::time::Duration;
 
 use protocol::{
-    Caps, ClientId, ClientMsg, DaemonMsg, Decode, Environment, MachineId, PROTO, Peer, Versions,
-    Via,
+    Caps, ClientId, ClientMsg, DaemonMsg, Decode, Environment, MachineId, PROTO, Versions,
 };
 use rt::{BoxFuture, Rt, Runtime};
 use sys::{Home, Staged};
@@ -85,8 +84,6 @@ impl Start {
 /// A byte stream a [`Link`] opened.
 pub struct Opened {
     pub stream: Box<dyn Stream>,
-    /// How it reaches the daemon.
-    pub via: Via,
     /// This machine, as the hello names it to a daemon on another; `None`
     /// to this machine's own.
     pub machine: Option<MachineId>,
@@ -302,7 +299,6 @@ pub(crate) fn socket(rt: &Rt, stream: sys::OwnedConnection) -> io::Result<Opened
             rt::Async::new(&reactor, stream)?,
             (),
         )),
-        via: Via::Local,
         machine: None,
         buffered: Vec::new(),
         remote: None,
@@ -337,7 +333,6 @@ pub(crate) async fn connect(
     for _ in 0..3 {
         let Opened {
             stream,
-            via,
             machine,
             mut buffered,
             remote,
@@ -354,12 +349,12 @@ pub(crate) async fn connect(
         )
         .await;
         match greeting {
-            Ok((Greeting::Welcome(machine), welcome, commands, queries)) => {
+            Ok((Greeting::Welcome(theirs), welcome, commands, queries)) => {
                 return Ok(Connection {
                     stream,
                     buffered,
                     remote,
-                    peer: Peer { machine, via },
+                    machine: theirs,
                     welcome,
                     commands,
                     queries,

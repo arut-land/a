@@ -1,7 +1,6 @@
-//! Who is on the other side of a connection: the machine, and the
-//! transport that vouched for the person on it.
+//! Who is on the other side of a connection: the machine it is on, and
+//! what the daemon lets it do.
 
-use std::ffi::OsStr;
 use std::fmt;
 use std::str::FromStr;
 
@@ -76,73 +75,13 @@ impl<'de> Deserialize<'de> for MachineId {
     }
 }
 
-/// A host as `ssh` takes one: a `Host` alias from its configuration,
-/// `[user@]name` or an `ssh://` URI. Never one that `ssh` would read as
-/// an option, as `-oProxyCommand=…` would be.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Host(String);
-
-impl Host {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for Host {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.as_bytes().first() {
-            None => Err("a host is not empty".to_owned()),
-            Some(b'-') => Err(format!(
-                "{s:?} is not a host: ssh would take it as an option"
-            )),
-            Some(_) => Ok(Self(s.to_owned())),
-        }
-    }
-}
-
-impl fmt::Display for Host {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl AsRef<OsStr> for Host {
-    fn as_ref(&self) -> &OsStr {
-        self.0.as_ref()
-    }
-}
-
-/// How a connection reached the daemon, which says who is on it. Trust is
-/// "this user, on a transport that authenticated this user": each way in
-/// is one that does, and a new one decides what it proves where the
-/// daemon matches on it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Via {
-    /// This machine's endpoint, where the OS proved the peer is this user
-    /// (a socket's peer credentials, a pipe's per-user access list). A
-    /// bridge `ssh` runs is local to the daemon it serves.
-    Local,
-    /// `ssh` to `host`, which authenticated this user there.
-    Ssh { host: Host },
-}
-
-/// What a connection may do. The daemon decides it from the connection's
-/// [`Peer`]; a client never says.
+/// What a connection may do. The daemon decides it from how the connection
+/// came; a client never says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Owner,
     /// Read-only: its mutations are rejected.
     Viewer,
-}
-
-/// Who is on the other side of a connection: the machine it runs on, and
-/// how it came.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Peer {
-    pub machine: MachineId,
-    pub via: Via,
 }
 
 #[cfg(test)]
@@ -161,16 +100,6 @@ mod tests {
         // Spare bits set, an upper-case digit, a short one.
         for wrong in ["7".repeat(26), "A".repeat(26), "aaaa".into()] {
             assert!(wrong.parse::<MachineId>().is_err(), "{wrong}");
-        }
-    }
-
-    #[test]
-    fn a_host_is_never_an_ssh_option() {
-        for host in ["box", "me@box", "ssh://me@box:22", "box-2"] {
-            assert_eq!(host.parse::<Host>().unwrap().as_str(), host);
-        }
-        for option in ["-oProxyCommand=touch /tmp/x", "-", ""] {
-            assert!(option.parse::<Host>().is_err(), "{option:?}");
         }
     }
 }

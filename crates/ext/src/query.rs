@@ -15,7 +15,7 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 
-use protocol::{Json, Peer, Role, ScopeKind, SessionId};
+use protocol::{Json, MachineId, Role, ScopeKind, SessionId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -45,9 +45,10 @@ pub trait Query: Send + Sync + 'static {
 pub struct QueryCx<S> {
     /// What it is asked about.
     pub scope: S,
-    /// Who asks: the client's machine (the daemon's own when it named
-    /// none) and how it came.
-    pub peer: Peer,
+    /// The asking client's machine, as its hello claimed (the daemon's own
+    /// when it named none). Unauthenticated: tell a client on the daemon's
+    /// machine from one elsewhere with it, never decide what it may do.
+    pub machine: MachineId,
     /// What the asking client may do.
     pub role: Role,
     /// Set once the client cancels it or hangs up: the engine stops
@@ -137,7 +138,7 @@ pub enum At {
 
 /// What the engine gives every query besides its scope.
 pub struct Asked {
-    pub peer: Peer,
+    pub machine: MachineId,
     pub role: Role,
     pub cancel: Cancel,
     pub services: Arc<SessionServices>,
@@ -262,7 +263,7 @@ where
         };
         let cx = QueryCx {
             scope,
-            peer: asked.peer,
+            machine: asked.machine,
             role: asked.role,
             cancel: asked.cancel,
             services: asked.services,

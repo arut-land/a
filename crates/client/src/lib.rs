@@ -8,6 +8,7 @@
 mod approval;
 mod command;
 mod drive;
+mod host;
 mod inbox;
 pub mod link;
 #[cfg(test)]
@@ -24,6 +25,7 @@ mod watch;
 pub use approval::{ApprovalPart, approval_parts, approval_text};
 pub use command::{COMMANDS, Cmd, Command, help, parse, parse_input};
 pub use drive::{ClientHandle, Driver, Renderer, pump};
+pub use host::Host;
 pub use inbox::{Inbox, PUMP_BATCH, Post, QueueBudget, inbox};
 pub use link::{LinkError, LocalLink, Start};
 pub use query::{Answer, Answers, Canceller};
@@ -44,8 +46,8 @@ use std::time::Duration;
 
 use protocol::view::SessionList;
 use protocol::{
-    Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings, Host,
-    Peer, QueryInfo, SessionId, SessionSummary, SettingsChange, Versions, write_frame,
+    Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings,
+    MachineId, QueryInfo, SessionId, SessionSummary, SettingsChange, Versions, write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, OwnedConnection, Signal, Staged};
@@ -156,8 +158,8 @@ pub struct Connection {
     /// The far host's environment, as its bridge captured it; `None` for
     /// this machine's daemon.
     pub remote: Option<Environment>,
-    /// The daemon, as the link and its welcome named it.
-    pub peer: Peer,
+    /// The daemon's machine, as its welcome named it.
+    pub machine: MachineId,
     /// What the hello settled.
     pub welcome: Welcome,
     /// The slash commands the daemon advertised.
@@ -573,7 +575,6 @@ fn locked(file: File, within: Option<Duration>) -> Option<File> {
 async fn reach(home: &Home, build: &str) -> Result<Connection, Error> {
     let link::Opened {
         stream,
-        via,
         machine,
         mut buffered,
         remote,
@@ -585,11 +586,11 @@ async fn reach(home: &Home, build: &str) -> Result<Connection, Error> {
     )
     .await?;
     match greeting {
-        (Greeting::Welcome(machine), welcome, commands, queries) => Ok(Connection {
+        (Greeting::Welcome(theirs), welcome, commands, queries) => Ok(Connection {
             stream,
             buffered,
             remote,
-            peer: Peer { machine, via },
+            machine: theirs,
             welcome,
             commands,
             queries,
@@ -1030,7 +1031,7 @@ mod tests {
                             proto: PROTO,
                             build: "1.2.3+0123456789abcdef".into(),
                             caps: Caps::ALL,
-                            machine: protocol::MachineId([0; 16]),
+                            machine: MachineId([0; 16]),
                             commands: Vec::new(),
                             queries: Vec::new(),
                         },
