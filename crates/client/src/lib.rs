@@ -38,7 +38,7 @@ pub use session::{
     Attach, ConnId, Effect, End, Env, Event, EventKind, Io, Link, Notice, Offer, SessionClient,
     Show, TurnView,
 };
-pub use watch::SessionWatch;
+pub use watch::{Problem, SessionWatch};
 
 use std::fmt;
 use std::fs::{self, File};
@@ -287,10 +287,7 @@ fn attaching(
         Env::Origin => Some(origin()?),
         Env::Given(env) => Some(env.clone()),
     };
-    let workspace = attach
-        .workspace
-        .clone()
-        .unwrap_or_else(|| env.as_ref().map_or_default(|env| env.cwd.clone()));
+    let workspace = (attach.workspace.clone()).or_else(|| env.as_ref().map(|env| env.cwd.clone()));
     Ok(ClientMsg::Attach {
         target: attach.target.clone(),
         workspace,

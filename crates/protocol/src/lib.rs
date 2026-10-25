@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 32;
+pub const PROTO: u32 = 33;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 32;
+pub const PROTO_MIN: u32 = 33;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -1494,10 +1494,11 @@ kinds! {
         /// `env` is the client's, for the commands the session runs; without
         /// one the session keeps the environment it had. `workspace` is the
         /// directory the client is in: the daemon takes the git working tree it
-        /// is in (with `env`'s git variables) as the workspace.
+        /// is in (with `env`'s git variables) as the workspace; none where
+        /// the target needs none (a fork's source names its own).
         Attach "attach" {
             target: Target,
-            workspace: HostPath,
+            workspace: Option<HostPath> = default,
             since: u64,
             env: Option<Environment> = default,
             decl: ClientDecl = default,

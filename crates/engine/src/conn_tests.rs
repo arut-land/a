@@ -237,7 +237,7 @@ fn a_resend_after_restart_runs_once() {
 fn attach(target: Target, since: u64, decl: ClientDecl) -> ClientMsg {
     ClientMsg::Attach {
         target,
-        workspace: "/w".into(),
+        workspace: Some("/w".into()),
         since,
         env: None,
         decl,
@@ -432,7 +432,7 @@ fn a_viewer_writes_nothing_by_any_request() {
     peer.send(&hello(Caps::ALL));
     peer.send(&ClientMsg::Attach {
         target: Target::Id(session),
-        workspace: "/w".into(),
+        workspace: Some("/w".into()),
         since: 0,
         env: Some(env.clone()),
         decl: ClientDecl::default(),
@@ -703,7 +703,7 @@ fn the_daemon_finds_the_workspace_from_the_clients_directory_and_git_variables()
         peer.send(&hello(Caps::NONE));
         peer.send(&ClientMsg::Attach {
             target: Target::New,
-            workspace: repo.join("src/deep").try_into().unwrap(),
+            workspace: Some(repo.join("src/deep").try_into().unwrap()),
             since: 0,
             env,
             decl: ClientDecl::default(),

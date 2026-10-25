@@ -16,7 +16,6 @@
 pub mod md;
 mod present;
 
-use crate::HostPath;
 use std::borrow::{Borrow, Cow};
 use std::collections::VecDeque;
 use std::io;
@@ -26,8 +25,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ledger::{Keyed, OutcomeKind, Phase};
 use crate::{
-    Activity, ApprovalReason, Audience, Body, CallId, Card, DaemonMsg, Entry, Json, Outcome,
-    Permission, Seq, SessionId, SessionSummary, Verdict, WaitOn,
+    Activity, ApprovalReason, Audience, Body, CallId, Card, DaemonMsg, Entry, HostPath, Json,
+    Outcome, Permission, Seq, SessionId, SessionSummary, Verdict, WaitOn,
 };
 
 pub use present::{

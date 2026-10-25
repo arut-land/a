@@ -431,7 +431,7 @@ impl SessionClient {
                                 session: session.to_string(),
                                 seq,
                             },
-                            workspace: protocol::HostPath::default(),
+                            workspace: None,
                             since: 0,
                             env: None,
                             decl: protocol::ClientDecl::default(),

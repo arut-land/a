@@ -30,7 +30,7 @@ fn attach(home: &sys::Home, target: Target) -> (protocol::SessionId, Vec<Entry>,
         &mut stream,
         &ClientMsg::Attach {
             target,
-            workspace: std::env::current_dir().unwrap().try_into().unwrap(),
+            workspace: Some(std::env::current_dir().unwrap().try_into().unwrap()),
             since: 0,
             env: None,
             decl: protocol::ClientDecl::default(),

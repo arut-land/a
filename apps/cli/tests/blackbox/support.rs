@@ -270,6 +270,9 @@ impl Isolated {
             .args(args)
             .env("A_HOME", self.home.root())
             .env_remove("A_HOST")
+            // Nothing under the developer's home (`~/.ssh/config`, say).
+            .env("HOME", self.home.root().join("user"))
+            .env("USERPROFILE", self.home.root().join("user"))
             .current_dir(self.home.root())
             .stdin(Stdio::null());
         command

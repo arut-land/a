@@ -32,7 +32,7 @@ fn bridge_speaks_the_protocol_over_stdio() {
     send(&hello());
     send(&ClientMsg::Attach {
         target: Target::New,
-        workspace: "/w".into(),
+        workspace: Some("/w".into()),
         since: 0,
         env: None,
         decl: protocol::ClientDecl::default(),

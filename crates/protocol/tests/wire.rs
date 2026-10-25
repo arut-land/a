@@ -162,7 +162,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             "attach",
             ClientMsg::Attach {
                 target: Target::New,
-                workspace: "/w".into(),
+                workspace: Some("/w".into()),
                 since: 0,
                 env: None,
                 decl: ClientDecl::default(),
@@ -175,7 +175,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                     session: SESSION.to_string(),
                     seq: Seq::new(7),
                 },
-                workspace: "/ignored".into(),
+                workspace: None,
                 since: 0,
                 env: None,
                 decl: ClientDecl::default(),
@@ -187,7 +187,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 target: Target::Latest {
                     any_workspace: true,
                 },
-                workspace: "/w".into(),
+                workspace: Some("/w".into()),
                 since: 0,
                 env: None,
                 decl: ClientDecl::default(),
@@ -197,7 +197,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             "attach_id_env_decl",
             ClientMsg::Attach {
                 target: Target::Id(SESSION),
-                workspace: "/w".into(),
+                workspace: Some("/w".into()),
                 since: 7,
                 env: Some(env.clone()),
                 decl: decl.clone(),
@@ -274,7 +274,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             "attach_prefix",
             ClientMsg::Attach {
                 target: Target::Prefix("0190a".into()),
-                workspace: "/w".into(),
+                workspace: Some("/w".into()),
                 since: 0,
                 env: None,
                 decl: ClientDecl::default(),
