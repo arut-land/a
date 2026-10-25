@@ -3,7 +3,6 @@
 //! on the queue.
 
 use std::fmt::Write as _;
-use std::io::Read as _;
 
 use protocol::{BlobRef, EnvelopeId, Held, OutputStream};
 
@@ -299,4 +298,46 @@ fn a_job_holds_its_session_until_its_end_is_queued() {
     });
     session.wait("the job ended", PATIENCE, || !session.has_jobs());
     session.halt();
+}
+
+/// A stream a restart cut off is copied, never moved: it stays in place
+/// until the kernel has its blob logged, a copy made again after another
+/// restart is the same blob, and one past the cap is cut at it as a live
+/// seal cuts it.
+#[test]
+fn a_cut_off_stream_is_copied_in_place_the_same_each_time_and_cut_at_the_cap() {
+    use ext::blob::BlobStore as _;
+    let home = tempfile::tempdir().unwrap();
+    let store = blob_files::Files::open(home.path().join("blobs"), home.path()).unwrap();
+    let of = OutputStream {
+        session: SessionId::new(),
+        call: CallId::new(2).unwrap(),
+    };
+    let ext::blob::Stream { mut file, .. } = store.stream(of, 0).unwrap();
+    file.write_all(b"so far\n").unwrap();
+    let kernel::StreamEnd::Copied(first) = end_cut_off(&store, of) else {
+        panic!("not copied");
+    };
+    let path = ext::blob::stream_path(store.streams(), of);
+    assert!(path.exists(), "removed before it was logged");
+    let kernel::StreamEnd::Copied(again) = end_cut_off(&store, of) else {
+        panic!("not copied");
+    };
+    assert_eq!(first, again);
+    let mut copied = Vec::new();
+    store
+        .open(&first.id)
+        .unwrap()
+        .read_to_end(&mut copied)
+        .unwrap();
+    assert_eq!(copied, b"so far\n");
+
+    file.set_len(ext::blob::STREAM_CAP + 1).unwrap();
+    let kernel::StreamEnd::Copied(cut) = end_cut_off(&store, of) else {
+        panic!("not copied");
+    };
+    assert_eq!(cut.size, ext::blob::STREAM_CAP);
+
+    store.discard(of).unwrap();
+    assert_eq!(end_cut_off(&store, of), kernel::StreamEnd::Missing);
 }

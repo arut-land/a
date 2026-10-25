@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::output::OUTPUT_CAP;
 use crate::output::{Ended, Live, Output, Rendered};
 use crate::state::Cwd;
-use ext::blob::{BlobOrigin, BlobRef, Held, Open, OutputStream, Stream};
+use ext::blob::{self, BlobOrigin, BlobRef, Held, Open, OutputStream, Stream};
 use ext::shape::{self, Streams};
 use ext::{Cx, Json, Partials, Schema, SpawnSpec as Spawn, Tool};
 
@@ -602,18 +602,15 @@ impl Written {
         let Ok(file) = File::open(open.path()) else {
             return Vec::new();
         };
-        let mut head = Vec::with_capacity(crate::output::HEAD);
-        let Ok(1..) = file.take(crate::output::HEAD as u64).read_to_end(&mut head) else {
+        let mut head = Vec::with_capacity(blob::SNIFFED);
+        let Ok(1..) = file.take(blob::SNIFFED as u64).read_to_end(&mut head) else {
             // Dropped unsealed, an empty stream is discarded.
             return Vec::new();
         };
         let Some(open) = self.0.take() else {
             return Vec::new();
         };
-        let mut sniffed = Output::default();
-        sniffed.push(&head);
-        let media_type = sniffed.finish().media_type();
-        (open.seal(media_type, BlobOrigin::ToolOutput(call)))
+        (open.seal(blob::media_type(&head), BlobOrigin::ToolOutput(call)))
             .map(Held::Blob)
             .into_iter()
             .collect()

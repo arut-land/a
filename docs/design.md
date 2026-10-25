@@ -196,7 +196,22 @@ leaves processes behind keeps its whole output as a growing stream, and a
 process group the session owns (a background job, or what a command left
 running) has its stream sealed as the group ends, into the blob its `job`
 envelope holds (`ProcessLease::holding`). A group the session stops leaves
-its stream discarded.
+its stream discarded. A restart that cuts streams off ends them: a detached
+call's that is not run again or handed over, and, on the first load after
+the daemon starts, each group's left to the session whose end is not queued,
+whose call is not open, and that was not handed over. The kernel asks
+(`Work::EndStream`); the engine copies the bytes so far, cut at
+`blob::STREAM_CAP`, into a blob on a storage worker, leaving the stream; the
+kernel queues the call's interrupted outcome or news of the group's end
+holding that blob (`Event::StreamEnded`; a group's news is logged even with
+no stream, so it is ended once), and only once that is durable removes the
+stream (`Work::DiscardStream`). A restart in between copies it again into
+the same blob. The session counts a copy in flight as background work, so
+it is not unloaded, and the daemon neither idle-exits nor drains, before it
+is back. Copied, never sealed in place: a group a crash left running may
+write the stream still. Calls an orphan drops have their streams removed
+without a copy. Of what a recovered session's restart cut off, only a
+stream that could not be read stays under `open/`.
 
 References are named for the model by the engine when it reads them, not by
 the tool and not when they are logged: the transcript adds a line for each

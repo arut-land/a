@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use kernel::{Boundary, Event, Load, Replied, Take, Ticket};
+use kernel::{Boundary, CutOff, Event, Load, Replied, StepPlan, StreamEnd, Take, Ticket};
 use protocol::{
     BlobId, BlobOrigin, BlobRef, Body, CallId, EnvelopeId, Held, Outcome, OutputStream, SessionId,
     Source,
@@ -198,11 +198,19 @@ fn a_crash_between_detached_and_its_placeholder_recovers_the_call_once() {
         let reruns = work(&fx)
             .filter(|w| matches!(w, Work::RunTool { .. }))
             .count();
-        let reported = (fx.appends.iter())
-            .filter(|e| matches!(&e.body, Body::Enqueue { envelope } if envelope.id.purpose == EnvelopeId::DETACHED))
+        let ended = work(&fx)
+            .filter(|w| {
+                matches!(
+                    w,
+                    Work::EndStream {
+                        cut: CutOff::Detached,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(
-            (reruns, reported),
+            (reruns, ended),
             if safe { (1, 0) } else { (0, 1) },
             "{command}"
         );
@@ -235,6 +243,26 @@ fn a_childs_result_never_jumps_ahead_of_the_users_queued_input() {
     assert_eq!(said, ["next", "child: \"ok\""]);
 }
 
+/// A blob, as an ended stream's bytes are sealed into.
+fn sealed(call: u64) -> BlobRef {
+    BlobRef {
+        id: BlobId([7; 32]),
+        size: 6,
+        media_type: "text/plain; charset=utf-8".into(),
+        origin: BlobOrigin::ToolOutput(id(call)),
+    }
+}
+
+/// Each envelope the session queued itself: what it carries, and holds.
+fn queued(s: &Session) -> Vec<(protocol::Carried, Vec<Held>)> {
+    (s.bodies().into_iter())
+        .filter_map(|b| match b {
+            Body::Enqueue { envelope } => Some((envelope.payload.clone(), envelope.held.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn a_restart_runs_a_safe_detached_call_again_and_reports_an_unsafe_one_cut_off() {
     let detached = |command: &str, call: Body| {
@@ -253,33 +281,259 @@ fn a_restart_runs_a_safe_detached_call_again_and_reports_an_unsafe_one_cut_off()
     assert!(work(&fx).any(|w| *w == run_tool(2, "sleep", json!({ "seconds": 9 }))));
     assert_ne!(s.core.ledger().detached(), []);
 
-    let (s, fx) = Session::resume(
+    let (mut s, fx) = Session::resume(
         Reg::echo().arc(),
         detached("$ make", bash("make")),
         &Load::default(),
     );
     assert!(!work(&fx).any(|w| matches!(w, Work::RunTool { .. })));
+    let cut = CutOff::Detached;
+    assert!(work(&fx).any(|w| *w
+        == Work::EndStream {
+            stream: STREAM,
+            cut
+        }));
+    assert_eq!(queued(&s), [], "its outcome waits for what it wrote");
+    let fx = s.step(Event::StreamEnded {
+        stream: STREAM,
+        cut,
+        end: StreamEnd::Copied(sealed(2)),
+    });
     assert_eq!(s.core.ledger().detached(), []);
-    let envelope = fx
-        .appends
-        .iter()
-        .find_map(|e| match &e.body {
-            Body::Enqueue { envelope } => Some(envelope),
-            _ => None,
-        })
-        .unwrap();
-    let protocol::Carried::Detached(Outcome::Interrupted {
-        output: Some(output),
-    }) = &envelope.payload
+    let [
+        (
+            protocol::Carried::Detached(Outcome::Interrupted {
+                output: Some(output),
+            }),
+            held,
+        ),
+    ] = &queued(&s)[..]
     else {
-        panic!("{:?}", envelope.payload);
+        panic!("{:?}", queued(&s));
     };
     assert!(output.contains("may not have completed"), "{output}");
-    let stream = OutputStream {
-        session: SessionId::NIL,
-        call: id(2),
+    assert_eq!(*held, [Held::Blob(sealed(2))], "its output so far");
+    assert_eq!(discarded_once_logged(&fx), [STREAM]);
+}
+
+/// Call 2's stream, as a session with no id names it.
+const STREAM: OutputStream = OutputStream {
+    session: SessionId::NIL,
+    call: CallId::new(2).unwrap(),
+};
+
+/// The streams `fx` removes, each only once what it held is durable.
+fn discarded_once_logged(fx: &StepPlan) -> Vec<OutputStream> {
+    assert!(
+        !fx.immediate
+            .iter()
+            .any(|w| matches!(w, Work::DiscardStream { .. })),
+        "{fx:?}"
+    );
+    (fx.admitted.iter())
+        .filter_map(|guarded| match guarded.work {
+            Work::DiscardStream { stream } => {
+                assert_eq!(guarded.admission.requirement, ext::Requirement::Durable);
+                Some(stream)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A stream copied at recovery is held as what it held: its blob, or, if
+/// it could not be read, the stream as it is, left in place; one empty or
+/// gone is held by nothing.
+#[test]
+fn a_cut_off_calls_outcome_holds_its_stream_as_it_was_copied() {
+    for (end, held, discarded) in [
+        (StreamEnd::Unreadable, vec![Held::Stream(STREAM)], vec![]),
+        (StreamEnd::Empty, vec![], vec![STREAM]),
+        (StreamEnd::Missing, vec![], vec![]),
+    ] {
+        let (mut s, _) = Session::resume(Reg::echo().arc(), cut_off(), &Load::default());
+        let cut = CutOff::Detached;
+        let fx = s.step(Event::StreamEnded {
+            stream: STREAM,
+            cut,
+            end,
+        });
+        let [(protocol::Carried::Detached(_), queued)] = &queued(&s)[..] else {
+            panic!("{:?}", queued(&s));
+        };
+        assert_eq!(*queued, held);
+        assert_eq!(discarded_once_logged(&fx), discarded);
+    }
+}
+
+/// A log a crash cut off with call 2 gone on in the background.
+fn cut_off() -> Vec<protocol::Entry> {
+    log([
+        input("$ make"),
+        bash("make"),
+        Body::Detached { call: id(2) },
+        placeholder(2),
+    ])
+}
+
+/// While a cut-off stream is being copied, the session is at work in the
+/// background: nothing may unload it, or drain or idle-exit the daemon,
+/// before what it held is logged.
+#[test]
+fn a_stream_being_copied_holds_its_session() {
+    let fresh = Load {
+        fresh: true,
+        ..Load::default()
     };
-    assert_eq!(envelope.held, [Held::Stream(stream)], "its output so far");
+    let (mut s, fx) = Session::resume(Reg::echo().arc(), job(2, 8), &fresh);
+    assert!(work(&fx).any(|w| *w == Work::MarkBusy(true)));
+    assert!(!s.core.at_rest());
+    let fx = s.step(Event::StreamEnded {
+        stream: STREAM,
+        cut: CutOff::Job { pgid: 8 },
+        end: StreamEnd::Copied(sealed(2)),
+    });
+    assert!(work(&fx).any(|w| *w == Work::MarkBusy(false)));
+    assert!(s.core.at_rest());
+}
+
+/// An interrupt that drops a cut-off call before its stream is copied
+/// leaves nothing to report: the copy that comes back queues nothing, and
+/// the stream is removed.
+#[test]
+fn a_cut_off_call_an_interrupt_dropped_reports_nothing_when_its_stream_is_copied() {
+    let (mut s, _) = Session::resume(Reg::echo().arc(), cut_off(), &Load::default());
+    s.step(interrupt());
+    let fx = s.step(Event::StreamEnded {
+        stream: STREAM,
+        cut: CutOff::Detached,
+        end: StreamEnd::Copied(sealed(2)),
+    });
+    assert_eq!(queued(&s), []);
+    assert_eq!(discarded_once_logged(&fx), [STREAM]);
+}
+
+/// An orphan drops what it ran in the background as it resumes, and
+/// removes those calls' streams with them, copying nothing.
+#[test]
+fn an_orphan_removes_the_streams_of_the_calls_it_drops() {
+    let load = Load {
+        owner: kernel::Owner::Gone,
+        ..Load::default()
+    };
+    let (s, fx) = Session::resume(Reg::echo().arc(), cut_off(), &load);
+    assert!(!work(&fx).any(|w| matches!(w, Work::EndStream { .. })));
+    assert_eq!(discarded_once_logged(&fx), [STREAM]);
+    assert_eq!(s.core.ledger().detached(), []);
+}
+
+/// Call `call`, which left group `pgid` to the session.
+fn left(call: u64, pgid: u32) -> [Body; 4] {
+    [
+        input("$ serve &"),
+        bash("serve &"),
+        Body::ToolProcess {
+            call: id(call),
+            pgid,
+            boot: "boot-1".into(),
+            background: true,
+        },
+        tool_result(call, done(json!(0))),
+    ]
+}
+
+/// A log whose call `call` left group `pgid` to the session.
+fn job(call: u64, pgid: u32) -> Vec<protocol::Entry> {
+    log(left(call, pgid))
+}
+
+/// A group left to the session that a crash cut off has its stream copied
+/// on the first load after, and its end queued holding what it wrote, or,
+/// with no stream, holding nothing, which ends it all the same. One whose
+/// end was queued, one handed over to go on, and one whose call is still
+/// open, which its call's run again starts over, are left alone.
+#[test]
+fn a_job_a_crash_cut_off_has_its_end_queued_holding_what_it_wrote() {
+    let ended = Body::Enqueue {
+        envelope: protocol::Envelope::own(
+            SessionId::NIL,
+            id(6),
+            protocol::Carried::Job("ended".into()),
+        ),
+    };
+    let bodies = || {
+        log(left(2, 8)
+            .into_iter()
+            .chain(left(6, 9))
+            .chain([ended.clone()]))
+    };
+    let fresh = Load {
+        fresh: true,
+        ..Load::default()
+    };
+    let (mut s, fx) = Session::resume(Reg::echo().arc(), bodies(), &fresh);
+    let cut = CutOff::Job { pgid: 8 };
+    let ends: Vec<_> = work(&fx)
+        .filter(|w| matches!(w, Work::EndStream { .. }))
+        .collect();
+    assert_eq!(
+        ends,
+        [&Work::EndStream {
+            stream: STREAM,
+            cut
+        }]
+    );
+    let fx = s.step(Event::StreamEnded {
+        stream: STREAM,
+        cut,
+        end: StreamEnd::Copied(sealed(2)),
+    });
+    assert_eq!(discarded_once_logged(&fx), [STREAM]);
+    let jobs = |s: &Session| -> Vec<_> {
+        (s.log.iter())
+            .filter_map(|e| match &e.body {
+                Body::Enqueue { envelope } => Some((envelope.source(), envelope.held.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        jobs(&s),
+        [
+            (Source::Job(id(6)), vec![]),
+            (Source::Job(id(2)), vec![Held::Blob(sealed(2))]),
+        ]
+    );
+
+    let (mut s, _) = Session::resume(Reg::echo().arc(), bodies(), &fresh);
+    s.step(Event::StreamEnded {
+        stream: STREAM,
+        cut,
+        end: StreamEnd::Missing,
+    });
+    assert_eq!(
+        jobs(&s)[1],
+        (Source::Job(id(2)), vec![]),
+        "logged all the same"
+    );
+    let (_, fx) = Session::resume(Reg::echo().arc(), s.log.clone(), &fresh);
+    assert!(
+        !work(&fx).any(|w| matches!(w, Work::EndStream { .. })),
+        "once ended, never again"
+    );
+
+    let handed = Load {
+        reheld: &[id(2)],
+        ..fresh
+    };
+    let (_, fx) = Session::resume(Reg::echo().arc(), bodies(), &handed);
+    assert!(!work(&fx).any(|w| matches!(w, Work::EndStream { .. })));
+    let open = log(left(2, 8).into_iter().take(3));
+    let (_, fx) = Session::resume(Reg::echo().arc(), open, &fresh);
+    assert!(!work(&fx).any(|w| matches!(w, Work::EndStream { .. })));
+    // Within one daemon, the session's groups are its own still.
+    let (_, fx) = Session::resume(Reg::echo().arc(), bodies(), &Load::default());
+    assert!(!work(&fx).any(|w| matches!(w, Work::EndStream { .. })));
 }
 
 /// A call whose group the previous build handed over was never cut off:

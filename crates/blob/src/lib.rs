@@ -29,7 +29,9 @@
 //! A blob's path is named only once it exists: [`Places`] ensures a blob
 //! as it names it. A stream's is named from its reference alone. A stream whose writers are gone is sealed by whoever owned
 //! them: the shell, as a process group the session owns ends, into the
-//! blob that end's queued notice holds.
+//! blob that end's queued notice holds. One a restart cut off is copied
+//! into a blob by the engine, as what wrote it may still, and removed once
+//! the blob is logged.
 
 use std::fs::File;
 use std::future::Future;
@@ -121,6 +123,9 @@ pub trait BlobStore: Send + Sync {
 
     /// The directory streams grow in, each where [`stream_path`] puts it.
     fn streams(&self) -> &Path;
+
+    /// Removes `of`'s stream, if it is there.
+    fn discard(&self, of: OutputStream) -> io::Result<()>;
 
     fn open(&self, id: &BlobId) -> io::Result<Box<dyn Read + Send>>;
 
@@ -323,6 +328,23 @@ impl Places {
             return stream.to_string();
         };
         stream_path(store.streams(), stream).display().to_string()
+    }
+}
+
+/// The most of a stream that is kept: what writing past stops a writer,
+/// and where a stream is cut as it becomes a blob.
+pub const STREAM_CAP: u64 = 64 << 20;
+
+/// How much of a stream's start [`media_type`] reads.
+pub const SNIFFED: usize = 8 * 1024;
+
+/// The media type of output that starts with `head`, its first
+/// [`SNIFFED`] bytes: binary if they hold a NUL, text otherwise.
+pub fn media_type(head: &[u8]) -> &'static str {
+    if head[..head.len().min(SNIFFED)].contains(&0) {
+        "application/octet-stream"
+    } else {
+        "text/plain; charset=utf-8"
     }
 }
 

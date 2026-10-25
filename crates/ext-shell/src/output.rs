@@ -13,7 +13,7 @@ pub const TAIL: usize = 24 * 1024;
 /// The most lines the model sees, split between start and end.
 pub const LINES: usize = 2000;
 /// The most output retained per command; reaching it stops the process.
-pub const OUTPUT_CAP: u64 = 64 << 20;
+pub const OUTPUT_CAP: u64 = ext::blob::STREAM_CAP;
 
 /// A line longer than this is passed on in pieces, so one without a newline
 /// cannot grow without bound.

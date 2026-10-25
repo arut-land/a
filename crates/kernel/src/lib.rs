@@ -34,8 +34,8 @@ pub use ext::{
 #[cfg(doc)]
 use protocol::ledger::Ledger;
 use protocol::{
-    Author, CallId, Card, Entry, Environment, Json, Mode, Outcome, Seq, SessionId, ToolChoice,
-    WaitOn,
+    Author, CallId, Card, Entry, Environment, Json, Mode, Outcome, OutputStream, Seq, SessionId,
+    ToolChoice, WaitOn,
 };
 use smallvec::SmallVec;
 
@@ -165,6 +165,12 @@ pub enum Event {
         call: CallId,
         text: String,
         held: Vec<protocol::Held>,
+    },
+    /// Stream `stream`, which a restart cut off, ended ([`Work::EndStream`]).
+    StreamEnded {
+        stream: OutputStream,
+        cut: CutOff,
+        end: StreamEnd,
     },
     /// Tool call `call`, running, reports something to log.
     Note { call: CallId, note: Note },
@@ -405,6 +411,13 @@ pub enum Work {
     Report { outcome: protocol::ToolOutcome },
     /// Kill process group `pgid`, left over from a run cut off.
     Kill { pgid: u32 },
+    /// Copy stream `stream`, which a restart cut off, nothing owning what
+    /// writes it any more, into a blob, leaving it as it is
+    /// ([`Event::StreamEnded`]): a blob named by its bytes, so copying
+    /// again after another restart makes the same one.
+    EndStream { stream: OutputStream, cut: CutOff },
+    /// Remove stream `stream`: what it held is logged, or was not wanted.
+    DiscardStream { stream: OutputStream },
     /// Whether the session has work in flight, which a restart recovers.
     MarkBusy(bool),
     Deliver {
@@ -549,6 +562,31 @@ impl CancelledInput {
     }
 }
 
+/// Whose output a stream a restart cut off is, so what its end reaches the
+/// session as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutOff {
+    /// A call's gone on in the background: its outcome, interrupted.
+    Detached,
+    /// Process group `pgid`'s, which a call left to the session: news of
+    /// its end.
+    Job { pgid: u32 },
+}
+
+/// What a stream a restart cut off held ([`Work::EndStream`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// Its bytes so far, up to [`blob::STREAM_CAP`](ext::blob::STREAM_CAP),
+    /// copied into this blob.
+    Copied(protocol::BlobRef),
+    /// Nothing.
+    Empty,
+    /// It was not there: nothing made it, or what wrote it ended it first.
+    Missing,
+    /// It could not be read.
+    Unreadable,
+}
+
 /// How a session's log is resumed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Load<'a> {
@@ -571,4 +609,7 @@ pub struct Load<'a> {
     /// Calls gone on in the background that the daemon's previous build
     /// handed over, their groups live: they go on, never recovered.
     pub adopted: &'a [CallId],
+    /// Calls whose groups left to the session the previous build handed
+    /// over, live: owned again, their streams go on.
+    pub reheld: &'a [CallId],
 }
