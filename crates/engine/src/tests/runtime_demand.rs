@@ -355,6 +355,8 @@ fn usage() -> serde_json::Value {
 struct Seen {
     deltas: Vec<Delta>,
     turns: Vec<Duration>,
+    /// Model calls that failed: each ends its turn early.
+    failed: usize,
 }
 
 /// One measured sample's shape, from `A_BENCH_*`.
@@ -448,6 +450,7 @@ fn concurrent_active_sessions() {
             "cores": sys::resources::effective_parallelism(),
             "delta_ms": deltas,
             "dropped_deltas": dropped_at.values().sum::<usize>(),
+            "failed_calls": seen.iter().map(|(_, seen)| seen.failed).sum::<usize>(),
             "dropped_at": dropped_at,
             "turn_ms": turns,
             "active_wall_ms": wall.as_secs_f64() * 1000.0,
@@ -609,6 +612,7 @@ impl Client {
         let mut seen = Seen {
             deltas: Vec::new(),
             turns: Vec::new(),
+            failed: 0,
         };
         for turn in 0..load.turns {
             let asked = Instant::now();
@@ -618,7 +622,7 @@ impl Client {
                 force: false,
                 client_seq: Some(turn as u64 + 1),
             });
-            let mut results = 0;
+            let (mut results, mut failed) = (0, false);
             loop {
                 match self.recv() {
                     protocol::DaemonMsg::Delta { text, .. } => {
@@ -626,10 +630,13 @@ impl Client {
                         seen.deltas.push(Delta { turn, text, at });
                     }
                     protocol::DaemonMsg::Entry(entry) => {
-                        results += usize::from(matches!(entry.body, Body::ModelResult { .. }));
+                        if let Body::ModelResult { outcome, .. } = entry.body {
+                            results += 1;
+                            failed |= matches!(outcome, Outcome::Failed { .. });
+                        }
                     }
                     protocol::DaemonMsg::Activity { activity, .. } => match activity {
-                        Activity::Idle if results == 2 => break,
+                        Activity::Idle if results == 2 || failed => break,
                         Activity::Idle | Activity::Running => {}
                         other => panic!("session {n} turn {turn}: {other:?}"),
                     },
@@ -637,6 +644,7 @@ impl Client {
                 }
             }
             seen.turns.push(asked.elapsed());
+            seen.failed += usize::from(failed);
         }
         seen
     }
