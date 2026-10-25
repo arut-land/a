@@ -462,7 +462,7 @@ fn failed_epochs_fence_speculative_reports_before_sequences_are_reused() {
         completion: Completion::Event(Event::ToolDone {
             call: old.call,
             outcome: Outcome::Done {
-                output: Json::encode(&"stale result").unwrap(),
+                output: Json::encode(&"stale result").unwrap().into(),
             },
             card: None,
             held: Vec::new(),
@@ -1179,7 +1179,7 @@ fn delegated_results_wait_for_their_own_durable_prefix() {
     assert_eq!(
         first.outcome,
         Outcome::Done {
-            output: Json::encode(&true).unwrap()
+            output: Json::encode(&true).unwrap().into()
         }
     );
     assert_eq!(rt::block_on(accepted), Some(Ok(())));

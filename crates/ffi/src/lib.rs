@@ -493,13 +493,20 @@ pub enum QueryAnswer {
 impl From<io::Result<client::Answer>> for QueryAnswer {
     fn from(answer: io::Result<client::Answer>) -> Self {
         use client::Answer;
-        use protocol::Outcome;
+        use protocol::{Outcome, Payload};
         match answer {
             Ok(Answer::Update(body)) => Self::Update {
                 body: body.to_string(),
             },
-            Ok(Answer::Reply(Outcome::Done { output })) => Self::Done {
+            Ok(Answer::Reply(Outcome::Done {
+                output: Payload::Inline(output),
+            })) => Self::Done {
                 body: output.to_string(),
+            },
+            Ok(Answer::Reply(Outcome::Done {
+                output: Payload::Blob(blob),
+            })) => Self::Failed {
+                error: format!("the answer is held as blob {}", blob.id),
             },
             Ok(Answer::Reply(Outcome::Failed { error })) => Self::Failed { error },
             Ok(Answer::Reply(Outcome::Interrupted { .. })) => Self::Cancelled,
@@ -565,7 +572,7 @@ impl From<&Presented<'_>> for Presentation {
                     Shown::Diff(_) => BodyKind::Diff,
                     Shown::Json(_) => BodyKind::Json,
                     Shown::Markdown(_) => BodyKind::Markdown,
-                    Shown::None | Shown::Text(_) => BodyKind::Text,
+                    Shown::None | Shown::Text(_) | Shown::Held(_) => BodyKind::Text,
                 },
                 text: body.text().into_owned(),
             }),

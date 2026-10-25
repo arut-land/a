@@ -49,7 +49,9 @@ fn update(text: &str) -> Answer {
 
 fn echoed(text: &str, workspace: &protocol::HostPath) -> Answer {
     let output = Json::encode(&json!({ "text": text, "workspace": workspace })).unwrap();
-    Answer::Reply(Outcome::Done { output })
+    Answer::Reply(Outcome::Done {
+        output: output.into(),
+    })
 }
 
 #[test]

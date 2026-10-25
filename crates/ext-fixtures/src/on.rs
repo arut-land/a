@@ -258,7 +258,7 @@ mod tests {
         let done = Input::ChildDone {
             watch: protocol::Seq::new(3).unwrap(),
             outcome: Outcome::Done {
-                output: Json::encode("hi").unwrap(),
+                output: Json::encode("hi").unwrap().into(),
             },
         };
         assert_eq!(

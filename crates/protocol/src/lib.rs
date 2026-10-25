@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 33;
+pub const PROTO: u32 = 34;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 33;
+pub const PROTO_MIN: u32 = 34;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -948,7 +948,8 @@ impl Permission {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Outcome {
     Done {
-        output: Json,
+        #[serde(flatten)]
+        output: Payload,
     },
     Failed {
         error: String,
@@ -2098,7 +2099,9 @@ impl Outcome {
             detached: bool,
         }
         Self::Done {
-            output: Json::encode(&Placeholder { detached: true }).unwrap_or_default(),
+            output: Json::encode(&Placeholder { detached: true })
+                .unwrap_or_default()
+                .into(),
         }
     }
 }

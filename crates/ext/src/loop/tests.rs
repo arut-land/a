@@ -38,7 +38,7 @@ fn reply(calls: &[(&str, Option<&str>)]) -> Input {
     Input::ModelDone {
         call: call(),
         outcome: Outcome::Done {
-            output: Json::encode(&response).unwrap(),
+            output: Json::encode(&response).unwrap().into(),
         },
     }
 }
@@ -78,7 +78,7 @@ fn the_loop_hears_a_childs_result() {
     let done = |output: &str| Input::ChildDone {
         watch: Seq::new(3).unwrap(),
         outcome: Outcome::Done {
-            output: Json::encode(output).unwrap(),
+            output: Json::encode(output).unwrap().into(),
         },
     };
     let mut agent = Loop::default();

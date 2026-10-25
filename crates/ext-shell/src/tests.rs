@@ -139,7 +139,10 @@ fn revoking_a_pending_cwd_record_preserves_the_shell_result() {
         reply.send(Err(MutationError::Revoked));
         work.await
     });
-    let Outcome::Done { output } = called.outcome else {
+    let Outcome::Done {
+        output: protocol::Payload::Inline(output),
+    } = called.outcome
+    else {
         panic!("{:?}", called.outcome)
     };
     let ran: crate::bash::Ran = output.parse().unwrap();

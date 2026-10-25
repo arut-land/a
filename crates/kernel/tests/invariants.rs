@@ -67,7 +67,10 @@ fn conversation(log: &[Entry]) -> Vec<String> {
             Body::ToolCall { tool, input, .. } => Some(format!("call {tool} {input}")),
             Body::ToolResult { outcome, .. } => Some(format!("result {outcome:?}")),
             Body::ModelResult {
-                outcome: Outcome::Done { output },
+                outcome:
+                    Outcome::Done {
+                        output: protocol::Payload::Inline(output),
+                    },
                 ..
             } => Some(format!("reply {output}")),
             _ => None,

@@ -94,7 +94,9 @@ impl Queries {
             // A query that panics fails, as a tool's call does.
             let answer = contain(query.answer(&body, &at, asked, &updates));
             let outcome = match cancel.until(answer).await {
-                Some(Ok(output)) => Outcome::Done { output },
+                Some(Ok(output)) => Outcome::Done {
+                    output: output.into(),
+                },
                 Some(Err(error)) => Outcome::Failed { error },
                 None => Outcome::Interrupted { output: None },
             };

@@ -23,10 +23,11 @@ pub trait CwdOf: Send + Sync {
 }
 
 /// What a call's result is recorded as, asked once as the call ends and
-/// before the engine logs it, with the call's context: the one moment a
-/// result may be changed with I/O (output sealed into a blob the result
-/// then holds), so what is logged is the fact, and every projection of it
-/// stays pure. A call run again is recorded again.
+/// before the engine logs it, and before the kernel's `post_tool` chain,
+/// with the call's context: the one moment a result may be changed with
+/// I/O (its payload moved into a blob it is then logged as), so what is
+/// logged is the fact, and every projection of it stays pure. A call run
+/// again is recorded again; a call another invoked is not recorded.
 pub trait Record: Send + Sync {
     fn record<'a>(
         &'a self,

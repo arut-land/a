@@ -517,7 +517,10 @@ impl Conn {
         let entries = self.until(|e| matches!(e.body, Body::ToolResult { .. }));
         match &entries.last().unwrap().body {
             Body::ToolResult {
-                outcome: Outcome::Done { output },
+                outcome:
+                    Outcome::Done {
+                        output: protocol::Payload::Inline(output),
+                    },
                 ..
             } => output.parse::<serde_json::Value>().unwrap(),
             other => panic!("{command} did not run: {other:?}"),

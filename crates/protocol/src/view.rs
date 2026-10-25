@@ -1090,7 +1090,9 @@ impl SessionView {
         };
         *status = match outcome {
             Outcome::Done { output } => {
-                let reply = output.parse::<Reply>().unwrap_or_default();
+                let reply = (output.inline())
+                    .and_then(|output| output.parse::<Reply>().ok())
+                    .unwrap_or_default();
                 *usage = reply.usage.and_then(ReplyUsage::counts);
                 *text = reply.message.content.0;
                 Status::Done

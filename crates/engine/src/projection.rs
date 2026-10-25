@@ -507,7 +507,7 @@ mod tests {
         ));
         for outcome in [
             Outcome::Done {
-                output: Json::encode(&"result").unwrap(),
+                output: Json::encode(&"result").unwrap().into(),
             },
             Outcome::Failed {
                 error: "failed".into(),

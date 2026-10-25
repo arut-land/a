@@ -2014,7 +2014,7 @@ impl Core {
             Phase::Settled(kind) => {
                 let outcome = match kind {
                     OutcomeKind::Done => Outcome::Done {
-                        output: Json::null(),
+                        output: Json::null().into(),
                     },
                     OutcomeKind::Failed => Outcome::Failed {
                         error: "the call was refused".to_owned(),
@@ -2187,7 +2187,9 @@ fn reply(fx: &mut StepPlan, ticket: Option<Ticket>, result: Result<(), String>) 
 /// A model call's outcome, but a failure, which is first offered to retry.
 fn outcome(replied: Replied) -> Outcome {
     match replied {
-        Replied::Done(output) => Outcome::Done { output },
+        Replied::Done(output) => Outcome::Done {
+            output: output.into(),
+        },
         Replied::Failed(error) => Outcome::Failed {
             error: error.to_string(),
         },

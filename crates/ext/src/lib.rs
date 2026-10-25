@@ -26,7 +26,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use protocol::Outcome;
+use protocol::{Outcome, Payload};
 
 mod agent;
 mod assemble;
@@ -66,7 +66,7 @@ pub use llm::Json;
 pub use r#loop::{Defaults, LOOP, Loop, LoopPoints, Resume, StepLimit};
 pub use point::{
     Answer, Asked, Chained, Gate, Gated, Gating, Later, Placed, PointCx, Presented, Reaction,
-    Recover, Requirement, Rewrite,
+    Recover, Requirement, Rewrite, Stored,
 };
 pub use protocol::{Annotation, AnnotationLifetime, ExtensionFact};
 pub use query::{Query, QueryCx};
@@ -103,10 +103,18 @@ pub const CHILD_RESULT_LIMIT: usize = 32 * 1024;
 /// [`CHILD_RESULT_LIMIT`].
 pub fn child_result(outcome: &Outcome) -> String {
     let text = match outcome {
-        Outcome::Done { output } => match output.parse::<String>() {
+        Outcome::Done {
+            output: Payload::Inline(output),
+        } => match output.parse::<String>() {
             Ok(text) => format!("The child session finished:\n{text}"),
             Err(_) => format!("The child session finished:\n{output}"),
         },
+        Outcome::Done {
+            output: Payload::Blob(blob),
+        } => format!(
+            "The child session finished; its {} bytes of result are held as blob {}.",
+            blob.size, blob.id
+        ),
         Outcome::Failed { error } => format!("The child session failed: {error}"),
         Outcome::Interrupted { .. } => "The child session was interrupted.".to_owned(),
     };
@@ -151,7 +159,7 @@ mod tests {
     fn a_childs_result_is_cut_for_the_model() {
         let long = "é".repeat(CHILD_RESULT_LIMIT);
         let text = child_result(&Outcome::Done {
-            output: Json::encode(&long).unwrap(),
+            output: Json::encode(&long).unwrap().into(),
         });
         let (shown, note) = text.rsplit_once('\n').unwrap();
         assert!(shown.len() <= CHILD_RESULT_LIMIT);

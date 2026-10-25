@@ -19,7 +19,9 @@ fn command(conn: &mut Conn, text: &str) -> (Value, Vec<Entry>) {
     conn.input(text);
     let entries = conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
     let Body::ToolResult {
-        outcome: Outcome::Done { output },
+        outcome: Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        },
         ..
     } = &entries.last().unwrap().body
     else {

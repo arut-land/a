@@ -27,10 +27,10 @@ use crate::ledger::Phase;
 use crate::publication;
 use crate::view::{Item, Status, Usage, ViewSnapshot, ViewState};
 use crate::{
-    Activity, Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
+    Activity, Audience, Author, BlobRef, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
     CommandInfo, DaemonMsg, Decode, Entry, Environment, Epoch, ForkError, HomeSettings, Installed,
-    Json, Mode, Outcome, Permission, Rejection, Seq, SessionId, SessionSummary, SettingsChange,
-    Target, ToolChoice, Verdict, WaitOn,
+    Json, Mode, Outcome, Payload, Permission, Rejection, Seq, SessionId, SessionSummary,
+    SettingsChange, Target, ToolChoice, Verdict, WaitOn,
 };
 
 /// Declares a tagged union of the wire, one line per kind:
@@ -867,6 +867,7 @@ struct OutcomeFields {
     status: Ending,
     #[serde(default, deserialize_with = "present")]
     output: Option<Json>,
+    blob: Option<BlobRef>,
     error: Option<String>,
 }
 
@@ -874,7 +875,10 @@ impl OutcomeFields {
     fn outcome(&mut self) -> Result<Outcome> {
         Ok(match self.status {
             Ending::Done => Outcome::Done {
-                output: req(self.output.take(), "output")?,
+                output: match self.blob.take() {
+                    Some(blob) => Payload::Blob(Box::new(blob)),
+                    None => Payload::Inline(req(self.output.take(), "output")?),
+                },
             },
             Ending::Failed => Outcome::Failed {
                 error: req(self.error.take(), "error")?,

@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use protocol::{
-    Audience, CallId, Card, Environment, Installed, Json, Outcome, Segments, Seq, SessionId,
+    Audience, CallId, Card, Environment, Installed, Json, Outcome, Payload, Segments, Seq,
+    SessionId,
 };
 
 use crate::ext::RegisteredAgent;
@@ -110,6 +111,13 @@ impl Parts {
     }
 }
 
+/// Whether a call's result goes through [`Record`](crate::Record).
+#[derive(Clone, Copy)]
+enum Recorded {
+    Yes,
+    No,
+}
+
 /// The tools an agent may call, by name, as a [`Registry`] resolves them.
 #[derive(Default)]
 pub struct Toolset(Vec<Arc<dyn DynTool>>);
@@ -129,13 +137,36 @@ impl Toolset {
 
     /// Runs a call of tool `name` on `input`, read now unless `parsed`
     /// holds it read already, and records it as the [`Record`](crate::Record)
-    /// service says.
+    /// service says: what the model reads, a result its tool gave.
     pub fn run<'a>(
         &'a self,
         name: &str,
         input: &Json,
         parsed: Option<Parsed>,
         cx: &'a Cx,
+    ) -> BoxFuture<'a, Called> {
+        self.start(name, input, parsed, cx, Recorded::Yes)
+    }
+
+    /// As [`Toolset::run`], unrecorded: the result of a call another
+    /// invoked, which its invoker reads as the tool gave it.
+    pub fn call<'a>(
+        &'a self,
+        name: &str,
+        input: &Json,
+        parsed: Option<Parsed>,
+        cx: &'a Cx,
+    ) -> BoxFuture<'a, Called> {
+        self.start(name, input, parsed, cx, Recorded::No)
+    }
+
+    fn start<'a>(
+        &'a self,
+        name: &str,
+        input: &Json,
+        parsed: Option<Parsed>,
+        cx: &'a Cx,
+        recorded: Recorded,
     ) -> BoxFuture<'a, Called> {
         let Some(tool) = self.get(name) else {
             let error = format!("unknown tool {name}");
@@ -147,19 +178,41 @@ impl Toolset {
         };
         Box::pin(async move {
             let called = tool.call(input, cx).await;
-            match cx.service::<dyn crate::Record>() {
-                Some(record) => record.record(tool, called, cx).await,
-                None => called,
+            match (recorded, cx.service::<dyn crate::Record>()) {
+                (Recorded::Yes, Some(record)) => record.record(tool, called, cx).await,
+                _ => called,
             }
         })
     }
 
-    /// What the model sees of a call's outcome.
-    pub fn to_model(&self, name: &str, outcome: &Outcome) -> (llm::Output, bool) {
+    /// What the model sees of a call's outcome, its payload's `text` read
+    /// back when a blob holds it.
+    pub fn to_model(
+        &self,
+        name: &str,
+        outcome: &Outcome,
+        text: Option<String>,
+    ) -> (llm::Output, bool) {
         match outcome {
-            Outcome::Done { output } => (
+            Outcome::Done {
+                output: Payload::Inline(output),
+            } => (
                 self.get(name)
                     .map_or_else(|| llm::Output::Json(output.clone()), |t| t.to_model(output)),
+                false,
+            ),
+            Outcome::Done {
+                output: Payload::Blob(blob),
+            } => (
+                text.map_or_else(
+                    || {
+                        llm::Output::Text(format!(
+                            "[{} bytes of output, held as blob {}, unreadable now]",
+                            blob.size, blob.id
+                        ))
+                    },
+                    |text| crate::point::Stored::decode(blob, text),
+                ),
                 false,
             ),
             Outcome::Failed { error } => (llm::Output::Text(error.clone()), true),
@@ -445,12 +498,15 @@ impl Registry {
         tool: &str,
         outcome: &Outcome,
         held: &[crate::point::Placed],
+        stored: Option<crate::point::Stored>,
     ) -> crate::point::Presented {
-        let (output, error) = self.tools.to_model(tool, outcome);
+        let crate::point::Stored { at, text } = stored.unwrap_or_default();
+        let (output, error) = self.tools.to_model(tool, outcome, text);
         let ended = crate::point::Ended {
             tool,
             outcome,
             held,
+            stored: at.as_deref(),
         };
         (self.hooks).present_result(ended, crate::point::Presented { output, error })
     }

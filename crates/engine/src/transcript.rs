@@ -10,8 +10,8 @@ use ext::host::Registry;
 use llm::{Assistant, Message, Messages, Tag, ToolMessage, ToolResult, tag};
 use protocol::publication::{ContextImage, ContextInput, ContextLayer, ContextValue, RunnerKind};
 use protocol::{
-    BlobOrigin, Body, CallId, Entry, Envelope, EnvelopeId, Held, Mode, Outcome, OutputStream,
-    Segment, Segments, Seq, Source, Verdict,
+    Body, CallId, Entry, Envelope, EnvelopeId, Held, Mode, Outcome, OutputStream, Payload, Segment,
+    Segments, Seq, Source, Verdict,
 };
 
 /// Provider replies remain intact; live updates and recovery share projection rules.
@@ -148,7 +148,10 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
         }
         Body::ModelResult {
             r#for: None,
-            outcome: Outcome::Done { output },
+            outcome:
+                Outcome::Done {
+                    output: Payload::Inline(output),
+                },
             ..
         } => ContextValue::Reply(output.clone()),
         Body::ToolCall {
@@ -176,14 +179,12 @@ impl Waiting {
 }
 
 /// `output`, telling the model where it reads what the result holds: each
-/// reference left out when it cannot be read, and a spill, which the
-/// presentation that cut the result names.
+/// reference left out when it cannot be read.
 fn with_held(output: llm::Output, held: &[ext::Placed]) -> llm::Output {
     let lines: Vec<String> = (held.iter())
         .filter_map(|placed| {
             let at = placed.at.as_deref()?;
             match &placed.held {
-                Held::Blob(blob) if matches!(blob.origin, BlobOrigin::Spilled(_)) => None,
                 Held::Blob(_) => Some(format!("[full output: {at}]")),
                 Held::Stream(_) => Some(format!("[output, as it grows: {at}]")),
             }
@@ -380,17 +381,15 @@ impl Transcript {
                 self.streams.insert(call, *stream);
             }
         }
-        let held = self.name_held(held);
         let ext::Presented { output, error } = if self.detached.contains(&call) {
             let text = "[it goes on in the background; its result follows once it ends]";
             ext::Presented {
-                output: llm::Output::Text(text.to_owned()),
+                output: with_held(llm::Output::Text(text.to_owned()), &self.name_held(held)),
                 error: false,
             }
         } else {
-            self.registry.present_result(&tool, outcome, &held)
+            self.present(&tool, outcome, held)
         };
-        let output = with_held(output, &held);
         let result = ToolResult {
             id: id.into(),
             name: tool.into(),
@@ -441,10 +440,29 @@ impl Transcript {
     fn background(&mut self, call: CallId, outcome: &Outcome, held: &[Held]) -> String {
         self.detached.remove(&call);
         let tool = self.tools.get(&call).cloned().unwrap_or_default();
-        let held = self.name_held(held);
-        let ext::Presented { output, .. } = self.registry.present_result(&tool, outcome, &held);
-        let output = with_held(output, &held);
+        let ext::Presented { output, .. } = self.present(&tool, outcome, held);
         self.ended(call, Some(&text_of(output)), "", None)
+    }
+
+    /// What the model is shown of a call of `tool` that ended in
+    /// `outcome`, holding `held`: each reference named, and a payload a
+    /// blob holds read back, before the presentation is asked.
+    fn present(&self, tool: &str, outcome: &Outcome, held: &[Held]) -> ext::Presented {
+        let held = self.name_held(held);
+        let stored = match outcome {
+            Outcome::Done {
+                output: Payload::Blob(blob),
+            } => Some(ext::Stored {
+                at: self.places.blob(blob),
+                text: self.places.read(blob),
+            }),
+            _ => None,
+        };
+        let presented = self.registry.present_result(tool, outcome, &held, stored);
+        ext::Presented {
+            output: with_held(presented.output, &held),
+            ..presented
+        }
     }
 
     /// What a result holds, each reference named through the session's
@@ -692,7 +710,7 @@ mod tests {
     use super::*;
     use ext::point::{PresentResult, Presenting};
     use ext::{Extension, Presented, Registrar, Rewrite};
-    use protocol::{BlobId, BlobRef, EnvelopeId, Epoch, Json, SessionId};
+    use protocol::{BlobId, BlobOrigin, BlobRef, EnvelopeId, Epoch, Json, SessionId};
 
     fn entry(seq: u64, body: Body) -> Entry {
         Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)
@@ -870,7 +888,7 @@ mod tests {
                 Body::ToolResult {
                     call: CallId::new(1).unwrap(),
                     outcome: Outcome::Done {
-                        output: Json::encode("ok").unwrap(),
+                        output: Json::encode("ok").unwrap().into(),
                     },
                     card: None,
                     held: Vec::new(),
@@ -885,54 +903,5 @@ mod tests {
         assert_eq!(plain, llm::Output::Json(Json::encode("ok").unwrap()));
         let shown = output(Registry::default().with(&Shown).unwrap());
         assert_eq!(shown, llm::Output::Text(format!("t said {plain:?}")));
-    }
-
-    /// A spill is named by the presentation that cut the result; the
-    /// whole output a tool kept, by the transcript.
-    #[test]
-    fn a_spill_is_never_named_twice() {
-        let blob = |byte, origin| {
-            Held::Blob(BlobRef {
-                id: BlobId([byte; 32]),
-                size: 9000,
-                media_type: "text/plain".into(),
-                origin,
-            })
-        };
-        let call = CallId::new(1).unwrap();
-        let entries = [
-            entry(
-                1,
-                Body::ToolCall {
-                    invoke: None,
-                    tool: "t".into(),
-                    input: Json::null(),
-                    id: Some("c1".into()),
-                    card: None,
-                    by: protocol::Audience::Model,
-                },
-            ),
-            entry(
-                2,
-                Body::ToolResult {
-                    call,
-                    outcome: Outcome::Done {
-                        output: Json::encode("ok").unwrap(),
-                    },
-                    card: None,
-                    held: vec![
-                        blob(0x01, BlobOrigin::Spilled(call)),
-                        blob(0x02, BlobOrigin::ToolOutput(call)),
-                    ],
-                },
-            ),
-        ];
-        let Some(Message::Tool(tool)) = seen(&entries, Registry::default()).pop() else {
-            panic!("a tool message");
-        };
-        assert_eq!(
-            tool.results[0].output,
-            llm::Output::Text(format!("\"ok\"\n[full output: by-id/{}]", "02".repeat(32)))
-        );
     }
 }

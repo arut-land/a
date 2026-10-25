@@ -154,7 +154,7 @@ fn pending_exchanges_never_become_child_work() {
             Body::ToolResult {
                 call: CallId::new(2).unwrap(),
                 outcome: Outcome::Done {
-                    output: Json::encode("answer").unwrap(),
+                    output: Json::encode("answer").unwrap().into(),
                 },
                 card: None,
                 held: Vec::new(),
@@ -437,7 +437,7 @@ fn response_entry(seq: u64, response: &llm::Response) -> Entry {
         Body::ModelResult {
             call: CallId::new(seq).unwrap(),
             outcome: Outcome::Done {
-                output: Json::encode(response).unwrap(),
+                output: Json::encode(response).unwrap().into(),
             },
             r#for: None,
             failure: None,
@@ -489,7 +489,7 @@ fn identical_local_sequences_and_provider_ids_remain_in_their_scopes() {
                 Body::ToolResult {
                     call: CallId::new(3).unwrap(),
                     outcome: Outcome::Done {
-                        output: Json::encode(text).unwrap(),
+                        output: Json::encode(text).unwrap().into(),
                     },
                     card: None,
                     held: Vec::new(),

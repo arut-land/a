@@ -719,9 +719,9 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
                 Body::ModelCall { .. },
                 Body::ModelResult { r#for: None, failure: None, call: a, outcome: Outcome::Done { .. } },
                 Body::ToolCall { tool, id: Some(id), .. },
-                Body::ToolResult { call: b, outcome: Outcome::Done { output }, card: None, .. },
+                Body::ToolResult { call: b, outcome: Outcome::Done { output: protocol::Payload::Inline(output) }, card: None, .. },
                 Body::ModelCall { .. },
-                Body::ModelResult { r#for: None, failure: None, call: c, outcome: Outcome::Done { output: answer } },
+                Body::ModelResult { r#for: None, failure: None, call: c, outcome: Outcome::Done { output: protocol::Payload::Inline(answer) } },
             ] if (a.get(), b.get(), c.get()) == (2, 4, 6) && tool == "lookup_harbor_label" && id == call_id && output.parse::<Value>().unwrap() == "crimson-harbor"
                 && answer.parse::<Value>().unwrap()["message"]["content"][1]["text"] == "The harbor label is crimson-harbor."
         ),
@@ -881,7 +881,7 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
     assert!(
         log.iter().any(|e| matches!(
             &e.body,
-            Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.parse::<Value>().unwrap() == "crimson-harbor"
+            Body::ToolResult { outcome: Outcome::Done { output: protocol::Payload::Inline(output) }, .. } if output.parse::<Value>().unwrap() == "crimson-harbor"
         )),
         "{log:#?}"
     );
@@ -896,7 +896,7 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
     let script = Script::new(&replies[1..]);
     let session = fixture(&script).load(&[entry(1, Body::Watch { child })]);
     let found = Outcome::Done {
-        output: Json::encode("found it").unwrap(),
+        output: Json::encode("found it").unwrap().into(),
     };
     session.settled(child, found.clone());
     settle(&session);
@@ -1090,7 +1090,7 @@ fn results_are_logged_in_call_order() {
     let result = |call: u64| Body::ToolResult {
         call: CallId::new(call).unwrap(),
         outcome: Outcome::Done {
-            output: Json::encode(&json!({ "slept": call })).unwrap(),
+            output: Json::encode(&json!({ "slept": call })).unwrap().into(),
         },
         card: None,
         held: Vec::new(),
@@ -1257,7 +1257,7 @@ fn an_interrupt_in_the_burst_that_approves_a_call_stops_it() {
     });
     // Aborted before it ran, or killed as it started: never run through.
     assert!(
-        !matches!(outcome, Some(Outcome::Done { output }) if output.parse::<Value>().unwrap()["exit"] == 0),
+        !matches!(outcome, Some(Outcome::Done { output: protocol::Payload::Inline(output) }) if output.parse::<Value>().unwrap()["exit"] == 0),
         "{log:#?}"
     );
 }
@@ -1317,7 +1317,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
                 Body::ToolProcess { call: ran, .. },
                 Body::ToolResult {
                     call: done,
-                    outcome: Outcome::Done { output },
+                    outcome: Outcome::Done { output: protocol::Payload::Inline(output) },
                     card: Some(card), ..
                 },
             ] if [call, ran, done].iter().all(|c| c.get() == 2) && value.raw() == "true"
@@ -1395,7 +1395,7 @@ fn slash_commands_are_callables_and_input_hooks_rewrite_or_refuse() {
     let ran = Body::ToolResult {
         call: CallId::new(2).unwrap(),
         outcome: Outcome::Done {
-            output: Json::encode("all of them in 2").unwrap(),
+            output: Json::encode("all of them in 2").unwrap().into(),
         },
         card: None,
         held: Vec::new(),
@@ -1516,7 +1516,9 @@ fn the_shell_directory_survives_a_restart_and_an_interrupt_stops_a_call() {
     again.submit("$ pwd").unwrap();
     let ran = finished(&again, log.len() as u64 + 2);
     let Some(Body::ToolResult {
-        outcome: Outcome::Done { output },
+        outcome: Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        },
         ..
     }) = ran.last().map(|e| &e.body)
     else {
@@ -1544,7 +1546,10 @@ fn the_shell_directory_survives_a_restart_and_an_interrupt_stops_a_call() {
     let _ = std::fs::remove_dir(std::env::temp_dir().join(&dir));
     let result = log.iter().rev().find_map(|e| match &e.body {
         Body::ToolResult {
-            outcome: Outcome::Done { output },
+            outcome:
+                Outcome::Done {
+                    output: protocol::Payload::Inline(output),
+                },
             ..
         } => Some(output),
         _ => None,
@@ -1802,7 +1807,7 @@ fn a_forced_steer_detaches_a_running_call_whose_outcome_comes_back_on_the_queue(
     assert_eq!(
         back,
         Outcome::Done {
-            output: Json::encode("released").unwrap()
+            output: Json::encode("released").unwrap().into()
         }
     );
     let results = (log.iter())
@@ -1950,6 +1955,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
         &Outcome::Interrupted {
             output: Some("one\n".into()),
         },
+        None,
     );
     assert!(error);
     assert_eq!(
@@ -1980,7 +1986,10 @@ fn the_model_is_set_per_session_and_says_where_it_comes_from() {
         .iter()
         .filter_map(|e| match &e.body {
             Body::ToolResult {
-                outcome: Outcome::Done { output },
+                outcome:
+                    Outcome::Done {
+                        output: protocol::Payload::Inline(output),
+                    },
                 ..
             } => Some(output.parse::<Value>().unwrap()),
             _ => None,
@@ -2184,7 +2193,10 @@ fn state_is_visible_only_after_commit() {
         .iter()
         .filter_map(|e| match &e.body {
             Body::ToolResult {
-                outcome: Outcome::Done { output },
+                outcome:
+                    Outcome::Done {
+                        output: protocol::Payload::Inline(output),
+                    },
                 ..
             } => output.parse().ok(),
             _ => None,

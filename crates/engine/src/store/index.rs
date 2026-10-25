@@ -227,7 +227,7 @@ mod tests {
                 call: owner,
                 r#for: Some(owner),
                 outcome: Outcome::Done {
-                    output: Json::encode(&"x".repeat(32768)).unwrap(),
+                    output: Json::encode(&"x".repeat(32768)).unwrap().into(),
                 },
                 failure: None,
             },
@@ -259,7 +259,7 @@ mod tests {
                 call: CallId::new(20 + n).unwrap(),
                 r#for: Some(owner),
                 outcome: Outcome::Done {
-                    output: Json::encode(&"y".repeat(32768)).unwrap(),
+                    output: Json::encode(&"y".repeat(32768)).unwrap().into(),
                 },
                 failure: None,
             });

@@ -169,7 +169,7 @@ fn run(tool: &str, input: u64) -> (Outcome, String) {
 
 fn done(n: u64) -> Outcome {
     Outcome::Done {
-        output: Json::encode(&n).unwrap(),
+        output: Json::encode(&n).unwrap().into(),
     }
 }
 

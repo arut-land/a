@@ -82,7 +82,7 @@ fn a_users_bash_replaces_the_shells_in_place() {
     let log = finished(&session, 2);
     session.halt();
     assert!(log.iter().any(|e| matches!(&e.body,
-        Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.raw().contains("sandboxed: echo hi"))));
+        Body::ToolResult { outcome: Outcome::Done { output: protocol::Payload::Inline(output) }, .. } if output.raw().contains("sandboxed: echo hi"))));
 }
 
 /// The model a rate-limited call falls back to, until the turn ends.

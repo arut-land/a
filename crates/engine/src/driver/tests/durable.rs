@@ -569,7 +569,7 @@ fn pending_fold_changes_survive_reload_exactly_once() {
     harness.session.send(Msg::Step(Event::ToolDone {
         call: harness.call,
         outcome: Outcome::Done {
-            output: Json::default(),
+            output: Json::default().into(),
         },
         card: None,
         held: Vec::new(),
@@ -641,7 +641,7 @@ impl ManualSession {
         self.session.send(Msg::Step(Event::ToolDone {
             call: self.call,
             outcome: Outcome::Done {
-                output: Json::default(),
+                output: Json::default().into(),
             },
             card: None,
             held: Vec::new(),
@@ -802,7 +802,7 @@ fn reattached_fold_matches_restart(multiplier: u64, absent_event: bool) {
         h.session.send(Msg::Step(Event::ToolDone {
             call: CallId(call),
             outcome: Outcome::Done {
-                output: Json::default(),
+                output: Json::default().into(),
             },
             card: None,
             held: Vec::new(),
@@ -1483,7 +1483,9 @@ fn interrupt_revokes_bookkeeping_but_settles_the_completed_effect_once() {
     assert!(cx.cancel.is_set());
     let output = rt::block_on(recording).unwrap();
     assert_eq!(cx.state(|s: &Updates| s.0), 0);
-    let outcome = Outcome::Done { output };
+    let outcome = Outcome::Done {
+        output: output.into(),
+    };
     h.session.session.emit(
         fence,
         Completion::Tool {

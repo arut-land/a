@@ -2,7 +2,7 @@
 //! nothing withdrawn, and calls detached into the background.
 
 use super::*;
-use protocol::{Audience, Envelope, Epoch, Json, Mode, SessionId};
+use protocol::{Audience, BlobOrigin, Envelope, Epoch, Json, Mode, SessionId};
 
 const SESSION: SessionId = SessionId::NIL;
 
@@ -58,7 +58,7 @@ fn called() -> Vec<Body> {
             call: call(2),
             r#for: None,
             outcome: Outcome::Done {
-                output: Json::encode(&reply).unwrap(),
+                output: Json::encode(&reply).unwrap().into(),
             },
             failure: None,
         },
@@ -93,7 +93,7 @@ fn what_is_taken_into_a_result_is_read_with_it_and_never_between_a_call_and_its_
         Body::ToolResult {
             call: call(3),
             outcome: Outcome::Done {
-                output: Json::encode("slept").unwrap(),
+                output: Json::encode("slept").unwrap().into(),
             },
             card: None,
             held: Vec::new(),
@@ -134,7 +134,7 @@ fn a_withdrawn_input_is_never_read() {
 fn a_detached_call_answers_with_its_stream_and_its_outcome_is_read_once_taken() {
     let mut bodies = called();
     let outcome = Outcome::Done {
-        output: Json::encode("slept").unwrap(),
+        output: Json::encode("slept").unwrap().into(),
     };
     bodies.extend([
         Body::Detached { call: call(3) },
@@ -234,7 +234,7 @@ fn a_held_blob_is_named_only_once_it_can_be_read() {
         bodies.push(Body::ToolResult {
             call: call(3),
             outcome: Outcome::Done {
-                output: Json::encode("cut").unwrap(),
+                output: Json::encode("cut").unwrap().into(),
             },
             card: None,
             held: vec![Held::Blob(blob.clone())],

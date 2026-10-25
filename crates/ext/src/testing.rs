@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
-use protocol::{Body, CallId, Entry, Environment, Epoch, Json, Outcome, Seq, SessionId};
+use protocol::{Body, CallId, Entry, Environment, Epoch, Json, Outcome, Payload, Seq, SessionId};
 use serde_json::Value;
 
 use crate::host::{Host, Parts, Registry, SessionServices};
@@ -147,7 +147,9 @@ impl Rig {
     /// The output of a call that must succeed.
     pub fn done(&self, tool: &str, input: &Value) -> Value {
         match self.call(tool, input) {
-            Outcome::Done { output } => output.parse().expect("a JSON output"),
+            Outcome::Done {
+                output: Payload::Inline(output),
+            } => output.parse().expect("a JSON output"),
             other => panic!("{tool} {input}: {other:?}"),
         }
     }

@@ -492,8 +492,9 @@ tests under the new `protocol::PROTO`, without compatibility adapters.
 
 `ext-spill` shows a tool result whose model text is over `limit` bytes as
 its first `head` and last `tail` bytes around `<truncated bytes=… path=…/>`,
-the path a file holding the whole text (design.md, "Blobs"). A result that
-holds its output already, as the shell's does, is left as its tool shows it.
+the path a file holding the whole text (design.md, "Blobs"). The log holds
+such a result as that blob alone. A result that holds its output already,
+as the shell's does, is left as its tool shows it.
 
 ```toml
 [ext.spill]

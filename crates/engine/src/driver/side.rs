@@ -5,6 +5,7 @@ use super::{
     Event, Json, Model, Msg, Opened, Outcome, PendingSide, Phase, Replied, Session, SideAdmitted,
     SideFact, Ticket, contain, first, lock, oneshot, replied, reply,
 };
+use protocol::Payload;
 
 impl Actor {
     // Successful settlement revokes mutation authority, but a background
@@ -522,7 +523,12 @@ async fn ephemeral_turn(
         ));
     }
     Ok(match replied {
-        Replied::Done(output) => (Outcome::Done { output }, None),
+        Replied::Done(output) => (
+            Outcome::Done {
+                output: output.into(),
+            },
+            None,
+        ),
         Replied::Failed(error) => failed(&error),
         Replied::Interrupted(_) => (Outcome::Interrupted { output: None }, None),
     })
@@ -543,8 +549,16 @@ fn side_answer(outcome: Outcome, failure: Option<Json>) -> Result<llm::Response,
             .unwrap_or_else(|e| llm::Error::new(llm::Kind::Decode, e.to_string())));
     }
     match outcome {
-        Outcome::Done { output } => llm::Response::from_json(output.raw())
+        Outcome::Done {
+            output: Payload::Inline(output),
+        } => llm::Response::from_json(output.raw())
             .map_err(|e| llm::Error::new(llm::Kind::Decode, e.to_string())),
+        Outcome::Done {
+            output: Payload::Blob(blob),
+        } => Err(llm::Error::new(
+            llm::Kind::Decode,
+            format!("a reply held as blob {}", blob.id),
+        )),
         Outcome::Failed { error } => Err(llm::Error::new(llm::Kind::Other, error)),
         Outcome::Interrupted { .. } => Err(llm::Error::incomplete()),
     }

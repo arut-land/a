@@ -578,7 +578,9 @@ where
                 Ok(json) => Called {
                     card: T::present_result(&input, &output),
                     held: T::held(&output),
-                    outcome: Outcome::Done { output: json },
+                    outcome: Outcome::Done {
+                        output: json.into(),
+                    },
                 },
                 Err(e) => Called::failed(e.to_string()),
             }

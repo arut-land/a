@@ -411,7 +411,7 @@ impl Ledger {
             }),
             Body::Assistant { text } => {
                 self.result = Some(Outcome::Done {
-                    output: Json::encode(text.as_str()).unwrap_or_default(),
+                    output: Json::encode(text.as_str()).unwrap_or_default().into(),
                 });
             }
             Body::Environment(env) => self.env = Some(env.clone()),
@@ -924,7 +924,7 @@ mod durable_tests {
             by: Audience::Model,
         };
         let outcome = Outcome::Done {
-            output: Json::null(),
+            output: Json::null().into(),
         };
         let detached = [
             queued(),

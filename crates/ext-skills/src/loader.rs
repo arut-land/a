@@ -654,7 +654,7 @@ mod tests {
         core.step(Event::ToolDone {
             call,
             outcome: Outcome::Done {
-                output: Json::encode(&true).unwrap(),
+                output: Json::encode(&true).unwrap().into(),
             },
             card: None,
             held: Vec::new(),

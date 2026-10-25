@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
-use protocol::{CallId, Entry, Held, Json, Outcome, Segments, SessionId, Verdict};
+use protocol::{BlobRef, CallId, Entry, Held, Json, Outcome, Segments, SessionId, Verdict};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -692,6 +692,9 @@ pub struct Ended<'a> {
     pub outcome: &'a Outcome,
     /// What the result holds outside the log, named.
     pub held: &'a [Placed],
+    /// Where the model reads the outcome's payload, when it is held as a
+    /// blob ([`Payload::Blob`](protocol::Payload::Blob)) and can be read.
+    pub stored: Option<&'a str>,
 }
 
 /// A reference a result holds, and where the model reads it: named before
@@ -702,6 +705,42 @@ pub struct Placed {
     /// `None` when it cannot be read now.
     pub at: Option<String>,
 }
+
+/// An outcome's payload held as a blob, read back before the presentation
+/// is asked, so its handlers do no I/O.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stored {
+    /// Where the model reads it; `None` when it cannot be read now.
+    pub at: Option<String>,
+    /// What it holds, as text; `None` when that cannot be read now.
+    pub text: Option<String>,
+}
+
+impl Stored {
+    /// What a blob holds of `output`, the model's view of a result, and
+    /// its media type: the bytes its ends are cut from, and the file the
+    /// model greps. `None` for content (images), which no text holds.
+    pub fn encode(output: llm::Output) -> Option<(String, &'static str)> {
+        match output {
+            llm::Output::Text(text) => Some((text, "text/plain")),
+            llm::Output::Json(json) => Some((json.raw().to_owned(), JSON)),
+            llm::Output::Content(_) => None,
+        }
+    }
+
+    /// `text`, read back from `blob`, as [`Stored::encode`] had it.
+    pub fn decode(blob: &BlobRef, text: String) -> llm::Output {
+        if blob.media_type != JSON {
+            return llm::Output::Text(text);
+        }
+        match serde_json::from_str::<Box<serde_json::value::RawValue>>(&text) {
+            Ok(raw) => llm::Output::Json(Json::from(raw)),
+            Err(_) => llm::Output::Text(text),
+        }
+    }
+}
+
+const JSON: &str = "application/json";
 
 /// What the model is shown of a call's outcome.
 #[derive(Clone, Debug, PartialEq)]
@@ -719,6 +758,8 @@ pub struct Presenting<'a> {
     /// the tool's own [`to_model`](crate::Tool::to_model).
     pub presented: &'a Presented,
     pub held: &'a [Placed],
+    /// As [`Ended::stored`].
+    pub stored: Option<&'a str>,
 }
 
 fn presenting<'a, 'b: 'a>(ended: Ended<'b>, presented: &'a Presented) -> Presenting<'a> {
@@ -727,6 +768,7 @@ fn presenting<'a, 'b: 'a>(ended: Ended<'b>, presented: &'a Presented) -> Present
         outcome: ended.outcome,
         presented,
         held: ended.held,
+        stored: ended.stored,
     }
 }
 

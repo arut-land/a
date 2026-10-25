@@ -60,7 +60,10 @@ fn backgrounded(fixture: &Fixture, session: &Live, log: &[Entry], call: CallId) 
             _ => None,
         })
         .unwrap();
-    let Some(Outcome::Done { output }) = Outcome::from_payload(&back.payload) else {
+    let Some(Outcome::Done {
+        output: protocol::Payload::Inline(output),
+    }) = Outcome::from_payload(&back.payload)
+    else {
         panic!("{back:?}")
     };
     let ran: ext_shell::bash::Ran = output.parse().unwrap();
@@ -194,7 +197,10 @@ fn a_command_another_call_invoked_is_still_stopped_at_its_timeout() {
     let inner = (log.iter())
         .find_map(|e| match &e.body {
             Body::ToolResult {
-                outcome: Outcome::Done { output },
+                outcome:
+                    Outcome::Done {
+                        output: protocol::Payload::Inline(output),
+                    },
                 ..
             } => output.parse::<ext_shell::bash::Ran>().ok(),
             _ => None,

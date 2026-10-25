@@ -177,7 +177,7 @@ fn a_transient_error_is_retried_then_succeeds() {
     assert_eq!(http.sent(), 3);
     assert_eq!(retries(&log), [(2, 1), (2, 2)]);
     assert!(
-        matches!(model_result(&log), Some(Outcome::Done { output })
+        matches!(model_result(&log), Some(Outcome::Done { output: protocol::Payload::Inline(output) })
             if output.parse::<Value>().unwrap()["message"]["content"][1]["text"] == "The harbor label is crimson-harbor."),
         "{log:#?}"
     );

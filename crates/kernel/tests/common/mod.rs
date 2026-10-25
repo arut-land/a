@@ -571,7 +571,10 @@ impl Agent for Modeled {
                 }])
             }
             Input::ModelDone {
-                outcome: Outcome::Done { output },
+                outcome:
+                    Outcome::Done {
+                        output: protocol::Payload::Inline(output),
+                    },
                 ..
             } => {
                 let calls: Vec<Value> = output.parse::<Value>().unwrap()["calls"]
@@ -605,7 +608,12 @@ impl Agent for Modeled {
 /// What an outcome says, for the echo agent.
 fn told(outcome: &Outcome) -> String {
     match outcome {
-        Outcome::Done { output } => output.to_string(),
+        Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        } => output.to_string(),
+        Outcome::Done {
+            output: protocol::Payload::Blob(blob),
+        } => format!("blob {}", blob.id),
         Outcome::Failed { error } => format!("failed: {error}"),
         Outcome::Interrupted { .. } => "interrupted".to_owned(),
     }
@@ -1018,7 +1026,7 @@ pub fn permission(call: u64, permission: Permission) -> Body {
 
 pub fn done(output: Value) -> Outcome {
     Outcome::Done {
-        output: Json::encode(&output).unwrap(),
+        output: Json::encode(&output).unwrap().into(),
     }
 }
 

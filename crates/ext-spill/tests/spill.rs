@@ -6,9 +6,9 @@ use std::io::{Read as _, Write as _};
 
 use ext::host::Registry;
 use ext::testing::Rig;
-use ext::{Called, Cx, Extension, Placed, Registrar, Schema, Tool};
+use ext::{Called, Cx, Extension, Placed, Registrar, Schema, Stored, Tool};
 use ext_spill::Spill;
-use protocol::{BlobOrigin, BlobRef, Held, Json, Outcome};
+use protocol::{BlobOrigin, BlobRef, Held, Json, Outcome, Payload};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -122,7 +122,8 @@ fn registry() -> Registry {
 /// projection's (the engine's `transcript` tests), the cut is spill's.
 const AT: &str = "tree/by-id/spilled";
 
-/// What the model is shown of `called`.
+/// What the model is shown of `called`: its payload read back from the
+/// rig's store when a blob holds it.
 fn shown(rig: &Rig, tool: &str, called: &Called) -> String {
     let held: Vec<Placed> = (called.held.iter())
         .map(|held| Placed {
@@ -130,9 +131,18 @@ fn shown(rig: &Rig, tool: &str, called: &Called) -> String {
             at: Some(AT.to_owned()),
         })
         .collect();
+    let stored = match &called.outcome {
+        Outcome::Done {
+            output: Payload::Blob(blob),
+        } => Some(Stored {
+            at: Some(AT.to_owned()),
+            text: Some(read(rig, blob)),
+        }),
+        _ => None,
+    };
     match rig
         .registry
-        .present_result(tool, &called.outcome, &held)
+        .present_result(tool, &called.outcome, &held, stored)
         .output
     {
         llm::Output::Text(text) => text,
@@ -141,9 +151,15 @@ fn shown(rig: &Rig, tool: &str, called: &Called) -> String {
     }
 }
 
+/// The blob `called` is logged as, holding nothing else.
 fn spill(called: &Called) -> &BlobRef {
-    match &called.held[..] {
-        [Held::Blob(blob)] if matches!(blob.origin, BlobOrigin::Spilled(_)) => blob,
+    match (&called.outcome, &called.held[..]) {
+        (
+            Outcome::Done {
+                output: Payload::Blob(blob),
+            },
+            [],
+        ) => blob,
         other => panic!("one spill: {other:?}"),
     }
 }
@@ -181,10 +197,8 @@ fn a_result_over_the_limit_is_shown_as_its_ends_and_where_the_whole_is() {
 fn a_json_result_is_spilled_as_the_json_the_model_reads() {
     let rig = Rig::new("spill-json", registry());
     let called = rig.called("dump", &json!({ "count": 1000 }));
-    let Outcome::Done { output } = &called.outcome else {
-        panic!("{:?}", called.outcome);
-    };
     let blob = spill(&called);
+    let output = Json::encode(&lines(1000)).unwrap();
     assert_eq!(read(&rig, blob), output.raw());
     assert_eq!(blob.media_type, "application/json");
     let text = shown(&rig, "dump", &called);
@@ -198,6 +212,12 @@ fn a_result_within_the_limit_is_shown_as_the_tool_shows_it() {
     // 372 lines: 4092 bytes.
     let called = rig.called("print", &json!({ "count": 372 }));
     assert_eq!(called.held, []);
+    assert!(matches!(
+        called.outcome,
+        Outcome::Done {
+            output: Payload::Inline(_)
+        }
+    ));
     let plain = Rig::new("spill-plain", Registry::default().with(&Tools).unwrap());
     let alone = plain.called("print", &json!({ "count": 372 }));
     assert_eq!(called.outcome, alone.outcome);
@@ -222,8 +242,14 @@ fn a_call_run_again_records_the_same_spill() {
 fn a_result_that_holds_its_output_already_is_never_spilled_again() {
     let rig = Rig::new("spill-held", registry());
     let called = rig.called("keep", &json!({ "count": 1000 }));
-    let [Held::Blob(full)] = &called.held[..] else {
-        panic!("{:?}", called.held);
+    let (
+        Outcome::Done {
+            output: Payload::Inline(_),
+        },
+        [Held::Blob(full)],
+    ) = (&called.outcome, &called.held[..])
+    else {
+        panic!("{called:?}");
     };
     assert_eq!(
         full.origin,

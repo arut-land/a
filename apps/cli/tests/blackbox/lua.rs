@@ -20,7 +20,9 @@ fn command(conn: &mut crate::common::Conn, text: &str) -> Outcome {
 
 fn done(conn: &mut crate::common::Conn, text: &str) -> Value {
     match command(conn, text) {
-        Outcome::Done { output } => output.parse().unwrap(),
+        Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        } => output.parse().unwrap(),
         other => panic!("{text}: {other:?}"),
     }
 }
