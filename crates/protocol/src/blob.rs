@@ -89,6 +89,9 @@ pub enum BlobOrigin {
     },
     /// The whole output of a call that showed less.
     ToolOutput(CallId),
+    /// Everything the model would be shown of a call's result, which it
+    /// is shown the ends of: what a presentation cut, kept whole.
+    Spilled(CallId),
     /// The output of a call's background job.
     JobLog(CallId),
 }

@@ -176,11 +176,28 @@ Input is logged as segments: typed text, pastes, and pastes and attachments
 kept by reference, so a client shows a paste as a placeholder and the model
 reads it tagged. Whatever a model reads that no person typed is an
 `llm::Tag`, made by one renderer: `<pasted-content>`, `<steer from=…>`,
-`<message from=… channel=…>`, `<background-result call=… command=…>`, and
+`<message from=… channel=…>`, `<background-result call=… command=…>`,
+`<truncated bytes=… path=…/>`, and
 another model's `<reasoning-summary source=…>` or `<reasoning source=…>`
 ([llm.md](llm.md)). What the model is shown of a call's outcome is a pure
 point, `present_result`, which defaults to the tool's own `to_model`; the log
-keeps the outcome whole.
+keeps the outcome whole. Its handlers are given what the result holds,
+already named (`ext::Placed`), so they do no I/O.
+
+A result too long to show whole is spilled, for any tool, by `ext-spill` in
+two steps. The `ext::Record` service is asked once as a call ends, with its
+`Cx`, before the result is logged: the one place a result may be changed with
+I/O. `spill` writes a result whose model text is over `limit` (4 KiB) whole to
+a blob the result then holds (`BlobOrigin::Spilled`), so the reference is
+durable with the entry and swept with it; a result that holds something
+already (the shell's own cut output) is left as its tool made it. Its
+`present_result` handler shows a result holding its spill as the first
+`head` and last `tail` bytes (2 KiB each, cut at a near line end, never
+inside a character) around `<truncated bytes=… path=…/>`; the transcript
+names every other reference itself. The cut is a function of the logged text
+and settings alone, so every projection shows the same bytes and a
+provider's prompt cache holds. The log keeps the outcome too, so a spilled
+output's bytes are stored twice until outcomes themselves move to blobs.
 
 ### Kernel and driver
 
@@ -323,6 +340,7 @@ The linked extensions own:
 | `ext-retry`, `ext-compact` | Retryable failures; overflow recovery and transcript edits |
 | `ext-subagent` | `task` over owned child sessions |
 | `ext-title` | Titles from a side model call |
+| `ext-spill` | Long tool results shown as their ends and where the whole is |
 | `ext-lua` | Optional runtime mods through the erased SDK |
 | `ext-fixtures` | Test-only echo agent and sleep tool |
 

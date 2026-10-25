@@ -24,6 +24,7 @@ ext-retry = { workspace = true, optional = true }
 ext-settings = { workspace = true, optional = true }
 ext-skills = { workspace = true, optional = true }
 ext-shell = { workspace = true, optional = true }
+ext-spill = { workspace = true, optional = true }
 ext-subagent = { workspace = true, optional = true }
 ext-title = { workspace = true, optional = true }
 protocol.workspace = true
@@ -34,7 +35,7 @@ usage-rs.workspace = true
 web = { workspace = true, optional = true }
 
 [features]
-default = ["mcp", "fork", "web", "policy", "prompt", "shell", "edit", "compact", "retry", "settings", "subagent", "title", "skills"]
+default = ["mcp", "fork", "web", "policy", "prompt", "shell", "edit", "compact", "retry", "settings", "spill", "subagent", "title", "skills"]
 # User mods; opt-in until quiet-machine startup has been verified.
 lua = ["dep:ext-lua"]
 fork = ["dep:ext-fork"]
@@ -54,6 +55,8 @@ edit = ["shell", "dep:ext-edit"]
 compact = ["dep:ext-compact"]
 # Model requests that failed for a reason that may pass are sent again.
 retry = ["dep:ext-retry"]
+# A long tool result is shown as its ends and where the whole is.
+spill = ["dep:ext-spill"]
 # `/model`, which shows and sets the session's model.
 settings = ["dep:ext-settings"]
 # Lazily published skill instructions and /name commands.

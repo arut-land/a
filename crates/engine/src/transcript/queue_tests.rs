@@ -225,7 +225,7 @@ fn a_held_blob_is_named_only_once_it_can_be_read() {
     let mut writer = ext::blob::BlobStore::writer(&*store, 1 << 20).unwrap();
     std::io::Write::write_all(&mut writer, b"whole").unwrap();
     let kept = writer
-        .finish("text/plain", ext::blob::BlobOrigin::ToolOutput(call(3)))
+        .finish("text/plain", BlobOrigin::ToolOutput(call(3)))
         .unwrap();
     let mut gone = kept.clone();
     gone.id = ext::blob::BlobId([9; 32]);

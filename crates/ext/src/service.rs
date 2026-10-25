@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::BoxFuture;
 use protocol::Environment;
 
-use crate::{Cx, SpawnSpec, States};
+use crate::{Called, Cx, DynTool, SpawnSpec, States};
 
 /// Where a session's commands run. The shell provides it; what works
 /// where they do (`edit`, the context the model is first given) asks it.
@@ -20,6 +20,20 @@ pub trait CwdOf: Send + Sync {
     /// The directory, for a session in `workspace` whose client's
     /// environment is `env`, with its extensions' `states`.
     fn dir(&self, workspace: &Path, env: Option<&Environment>, states: &States) -> PathBuf;
+}
+
+/// What a call's result is recorded as, asked once as the call ends and
+/// before the engine logs it, with the call's context: the one moment a
+/// result may be changed with I/O (output sealed into a blob the result
+/// then holds), so what is logged is the fact, and every projection of it
+/// stays pure. A call run again is recorded again.
+pub trait Record: Send + Sync {
+    fn record<'a>(
+        &'a self,
+        tool: &'a dyn DynTool,
+        called: Called,
+        cx: &'a Cx,
+    ) -> BoxFuture<'a, Called>;
 }
 
 /// Launch and live ownership are one operation; numeric ids are recovery facts.

@@ -129,7 +129,8 @@ impl Toolset {
     }
 
     /// Runs a call of tool `name` on `input`, read now unless `parsed`
-    /// holds it read already.
+    /// holds it read already, and records it as the [`Record`](crate::Record)
+    /// service says.
     pub fn run<'a>(
         &'a self,
         name: &str,
@@ -141,10 +142,17 @@ impl Toolset {
             let error = format!("unknown tool {name}");
             return Box::pin(std::future::ready(Called::failed(error)));
         };
-        match parsed.map_or_else(|| tool.parse(input), Ok) {
-            Ok(input) => tool.call(input, cx),
-            Err(error) => Box::pin(std::future::ready(Called::failed(error))),
-        }
+        let input = match parsed.map_or_else(|| tool.parse(input), Ok) {
+            Ok(input) => input,
+            Err(error) => return Box::pin(std::future::ready(Called::failed(error))),
+        };
+        Box::pin(async move {
+            let called = tool.call(input, cx).await;
+            match cx.service::<dyn crate::Record>() {
+                Some(record) => record.record(tool, called, cx).await,
+                None => called,
+            }
+        })
     }
 
     /// What the model sees of a call's outcome.
@@ -430,11 +438,21 @@ impl Registry {
         &self.hooks
     }
 
-    /// What the model is shown of a call's outcome: its tool's own
-    /// presentation, as the `present_result` handlers leave it.
-    pub fn present_result(&self, tool: &str, outcome: &Outcome) -> crate::point::Presented {
+    /// What the model is shown of a call's outcome, which holds `held`:
+    /// its tool's own presentation, as the `present_result` handlers leave
+    /// it.
+    pub fn present_result(
+        &self,
+        tool: &str,
+        outcome: &Outcome,
+        held: &[crate::point::Placed],
+    ) -> crate::point::Presented {
         let (output, error) = self.tools.to_model(tool, outcome);
-        let ended = crate::point::Ended { tool, outcome };
+        let ended = crate::point::Ended {
+            tool,
+            outcome,
+            held,
+        };
         (self.hooks).present_result(ended, crate::point::Presented { output, error })
     }
 
