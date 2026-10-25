@@ -51,3 +51,16 @@ an unsigned command-line program cannot have. Either keychain is also one
 per user, not per home, so tests with an isolated `A_HOME` would share it.
 Signed app builds (`apps/apple`) can take the key into the keychain later,
 behind the same function.
+
+## Measured on the hosted runners
+
+`perf` on this change (run 40158080189, Windows x64 again in 40159891959),
+against the latest main lane. The paired harness cannot pair across it:
+it builds the reference with this tree's `perf-attach`, whose hello has a
+field the reference lacks. Shipped size grows 15-25 KiB (+0.4-0.5 %) on
+every target, the X25519 code and the peer and host types with it. Cold
+reply, attach and idle RSS are within each lane's noise: macOS arm64
+19.8 ms cold reply, Linux x64 5.6 ms, Linux arm64 7.0 ms, Windows x64
+22.1 ms (+0.9 ms, within noise; the first run's +9.5 ms did not repeat),
+Windows arm64 54.1 ms; idle RSS moved by at most +240 KiB (Windows arm64)
+and +24-80 KiB elsewhere.
