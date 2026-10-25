@@ -45,12 +45,12 @@ fn reactor_round_trip() {
         .collect();
     let after = usage();
     trips.sort_by(f64::total_cmp);
-    let at = |q: f64| trips[((trips.len() as f64 * q) as usize).min(trips.len() - 1)];
+    let at = |percent: usize| trips[(TRIPS * percent / 100).min(TRIPS - 1)];
     println!(
         "{{\"trips\":{TRIPS},\"p50_us\":{:.2},\"p90_us\":{:.2},\"p99_us\":{:.2},\"wakes\":{},\"cpu_ms\":{:.1},\"switches\":{}}}",
-        at(0.5),
-        at(0.9),
-        at(0.99),
+        at(50),
+        at(90),
+        at(99),
         rt::wakes(),
         (after.0 - before.0) * 1000.0,
         after.1 - before.1
