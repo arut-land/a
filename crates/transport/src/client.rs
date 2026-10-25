@@ -95,7 +95,7 @@ enum Exchange {
 
 impl Shared {
     async fn send(self: &Arc<Self>, request: http::Request<Payload>) -> io::Result<Response> {
-        let (mut parts, payload) = request.into_parts();
+        let (mut parts, mut payload) = request.into_parts();
         parts.headers.insert(CONTENT_LENGTH, payload.len().into());
         parts
             .headers
@@ -111,7 +111,6 @@ impl Shared {
         let mut call = Call::new(http::Request::from_parts(parts, ())).map_err(protocol)?;
         // Only the first request carries a body: a redirect that would
         // resend one is refused by the protocol.
-        let mut payload = payload;
         let mut redirects = 0;
         loop {
             let mut redirect = match self.exchange(call, std::mem::take(&mut payload)).await? {
