@@ -13,12 +13,13 @@ pub struct SessionWatch {
 
 impl SessionWatch {
     /// Calls `sink` with every member's sessions, the first member's first,
-    /// whenever one's list changes. A member that fails is told as the
-    /// error, and lists nothing until it is reached again.
+    /// and why each member that cannot list cannot, whenever either
+    /// changes. A member that fails lists nothing until it is reached
+    /// again; the others' lists stay.
     pub fn start(
         rt: &rt::Rt,
         daemons: &Daemons,
-        sink: impl Fn(Result<&[Listed], &Error>) + Send + Sync + 'static,
+        sink: impl Fn(&[Listed], &[Problem]) + Send + Sync + 'static,
     ) -> Self {
         let lists = Arc::new(Lists {
             members: Mutex::new(daemons.iter().map(|_| Listing::default()).collect()),
@@ -34,8 +35,8 @@ impl SessionWatch {
                     EventKind::Msg(protocol::DaemonMsg::Sessions { sessions }) => {
                         lists.listed(at, &on, sessions);
                     }
-                    EventKind::Failed(error) => lists.failed(at, &error),
-                    EventKind::Wedged(_) => lists.failed(at, &Error::NotResponding),
+                    EventKind::Failed(error) => lists.failed(at, &on, error),
+                    EventKind::Wedged(_) => lists.failed(at, &on, Error::NotResponding),
                     _ => {}
                 });
                 driver.watch = true;
@@ -52,18 +53,28 @@ impl SessionWatch {
     }
 }
 
-type Sink = dyn Fn(Result<&[Listed], &Error>) + Send + Sync;
+/// Why a member lists nothing now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Problem {
+    /// The member's name.
+    pub on: String,
+    pub error: Error,
+}
+
+type Sink = dyn Fn(&[Listed], &[Problem]) + Send + Sync;
 
 struct Lists {
     members: Mutex<Vec<Listing>>,
     sink: Box<Sink>,
 }
 
-/// One member's latest list, and the machine its connection reached.
+/// One member's latest list, the machine its connection reached, and why
+/// it cannot list, while it cannot.
 #[derive(Default)]
 struct Listing {
     machine: Option<MachineId>,
     sessions: Vec<Listed>,
+    problem: Option<Problem>,
 }
 
 impl Lists {
@@ -76,6 +87,7 @@ impl Lists {
         let Some(machine) = members[at].machine else {
             return;
         };
+        members[at].problem = None;
         members[at].sessions = sessions
             .into_iter()
             .map(|summary| Listed {
@@ -84,17 +96,29 @@ impl Lists {
                 summary,
             })
             .collect();
-        let merged: Vec<Listed> = members
+        self.tell(&members);
+    }
+
+    fn failed(&self, at: usize, on: &str, error: Error) {
+        let mut members = self.lock();
+        members[at] = Listing {
+            problem: Some(Problem {
+                on: on.to_owned(),
+                error,
+            }),
+            ..Listing::default()
+        };
+        self.tell(&members);
+    }
+
+    /// Calls the sink under the lock, so that what it is told stays in order.
+    fn tell(&self, members: &[Listing]) {
+        let listed: Vec<Listed> = members
             .iter()
             .flat_map(|m| m.sessions.iter().cloned())
             .collect();
-        (self.sink)(Ok(&merged));
-    }
-
-    fn failed(&self, at: usize, error: &Error) {
-        let mut members = self.lock();
-        members[at] = Listing::default();
-        (self.sink)(Err(error));
+        let problems: Vec<Problem> = members.iter().filter_map(|m| m.problem.clone()).collect();
+        (self.sink)(&listed, &problems);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Listing>> {

@@ -340,8 +340,15 @@ pub(crate) async fn connect(
         } = link.open(rt, build, start).await?;
         start = start.again();
         let first = first(remote.as_ref())?;
+        // To a pinned machine, nothing (an environment, say) goes out
+        // before its welcome says it is that machine.
+        let behind = if daemon.pinned.is_some() {
+            &[][..]
+        } else {
+            &first
+        };
         let greeting = rt::or(
-            hello(&*stream, &mut buffered, &build.id, client, machine, &first),
+            hello(&*stream, &mut buffered, &build.id, client, machine, behind),
             async {
                 rt.sleep(within).await;
                 Err(Error::NotResponding)
@@ -355,6 +362,11 @@ pub(crate) async fn connect(
                         pinned,
                         found: theirs,
                     });
+                }
+                if daemon.pinned.is_some() {
+                    for msg in &first {
+                        stream.send(msg).await?;
+                    }
                 }
                 return Ok(Connection {
                     stream,

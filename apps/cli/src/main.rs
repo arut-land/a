@@ -72,7 +72,7 @@ fn main() -> ExitCode {
                     eprintln!("a: -p runs a turn: it takes no command but `resume` or `attach`");
                     return Ok(ExitCode::from(2));
                 }
-                Some(Cmd::Ls) => ls(&daemons),
+                Some(Cmd::Ls) => ls(daemon),
                 Some(Cmd::New) => new(daemon),
                 Some(Cmd::Fork { session }) => fork(&home, &daemons, &session),
                 Some(Cmd::Bridge { token }) => client::bridge(
@@ -627,19 +627,9 @@ fn outcome(p: &Presented<'_>) -> Vec<String> {
     lines
 }
 
-/// Each machine's sessions; a machine is named only beside others.
-fn ls(daemons: &Daemons) -> io::Result<()> {
-    if !daemons.several() {
-        for s in connect(&daemons.first().daemon)?.sessions()? {
-            sayln!("{s}");
-        }
-        return Ok(());
-    }
-    for (member, listed) in daemons.sessions() {
-        match listed {
-            Ok(listed) => listed.iter().for_each(|l| sayln!("{l}")),
-            Err(e) => errln!("a: {}: {}", member.name, client::sanitize(&e.to_string())),
-        }
+fn ls(daemon: &client::Daemon) -> io::Result<()> {
+    for s in connect(daemon)?.sessions()? {
+        sayln!("{s}");
     }
     Ok(())
 }

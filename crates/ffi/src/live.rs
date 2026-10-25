@@ -231,16 +231,10 @@ impl SessionWatch {
         *watch = Some(client::SessionWatch::start(
             &rt,
             &self.daemons,
-            move |list| {
-                producer.push(match list {
-                    Ok(sessions) => SessionListUpdate {
-                        sessions: sessions.iter().map(|l| (&l.summary).into()).collect(),
-                        problem: None,
-                    },
-                    Err(problem) => SessionListUpdate {
-                        sessions: Vec::new(),
-                        problem: Some(problem.to_string()),
-                    },
+            move |sessions, problems| {
+                producer.push(SessionListUpdate {
+                    sessions: sessions.iter().map(|l| (&l.summary).into()).collect(),
+                    problem: problems.first().map(|p| p.error.to_string()),
                 });
             },
         ));

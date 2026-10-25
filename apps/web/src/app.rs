@@ -15,7 +15,7 @@ use client::{Cmd, Daemons, Driver, Event};
 use client::{Inbox, Post};
 use http::header::HOST;
 use http::{Method, Request, StatusCode};
-use protocol::{SessionId, SessionSummary};
+use protocol::SessionId;
 use rt::Rt;
 use serde::Deserialize;
 
@@ -47,25 +47,6 @@ pub struct App {
 // Nothing behind these locks is left half-updated by a panic.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Every member's sessions, side by side; an error only when no member
-/// could list.
-fn listed(daemons: &Daemons) -> Result<Vec<SessionSummary>, String> {
-    let (found, failed): (Vec<_>, Vec<_>) = daemons
-        .sessions()
-        .into_iter()
-        .map(|(_, listing)| listing)
-        .partition(Result::is_ok);
-    match failed.into_iter().next() {
-        Some(Err(e)) if found.is_empty() => Err(e.to_string()),
-        _ => Ok(found
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|l| l.summary)
-            .collect()),
-    }
 }
 
 /// What a tab's calls carry: Datastar sends the page's signals.
@@ -122,7 +103,10 @@ impl App {
         });
         let response = match (&parts.method, path, session) {
             (&Method::GET, "/", _) => {
-                let listed = self.blocking(listed).await;
+                let listed = self
+                    .blocking(|daemons| daemons.first().daemon.sessions())
+                    .await
+                    .map_err(|e| e.to_string());
                 page(view::sessions_page(&listed))
             }
             (&Method::POST, "/new", _) => match self

@@ -25,7 +25,7 @@ impl Member {
     pub const LOCAL: &str = "local";
 
     /// `machine`'s daemon, over ssh from `home`.
-    pub fn ssh(machine: Machine, prompt: Prompt, home: &Home, staged: &Staged) -> Self {
+    fn ssh(machine: Machine, prompt: Prompt, home: &Home, staged: &Staged) -> Self {
         let daemon = Daemon::new(
             SshLink::new(machine.ssh, prompt, home.clone()),
             staged.clone(),
@@ -114,7 +114,7 @@ impl Daemons {
     }
 
     /// Whether it holds more than one: a set is never empty.
-    pub fn several(&self) -> bool {
+    fn several(&self) -> bool {
         self.0.len() > 1
     }
 
@@ -180,12 +180,23 @@ impl Daemons {
     /// The one session across the members whose id starts with `prefix`.
     fn find(&self, prefix: &str) -> Result<(&Member, Target), Error> {
         let mut listed = Vec::new();
+        let mut unreached = Vec::new();
         for (member, sessions) in self.sessions() {
-            // A machine that cannot be reached holds none of them.
-            listed.extend(sessions.into_iter().flatten().map(|l| (member, l)));
+            match sessions {
+                Ok(sessions) => listed.extend(sessions.into_iter().map(|l| (member, l))),
+                Err(e) => unreached.push(format!("{} ({e})", member.name)),
+            }
         }
         match crate::matching(&listed, |(_, l)| Some(l.summary.id), prefix) {
             Ok((member, l)) => Ok((*member, Target::Id(l.summary.id))),
+            // It may be on a machine that did not answer.
+            Err(NoMatch::None) if !unreached.is_empty() => Err(Error::Io(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no session matches {prefix} on the machines reached; not reached: {}",
+                    unreached.join(", ")
+                ),
+            )),
             Err(NoMatch::None) => Err(Error::Io(
                 io::ErrorKind::NotFound,
                 format!("no session matches {prefix}"),

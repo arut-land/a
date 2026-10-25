@@ -85,43 +85,61 @@ impl Sources {
     /// name holds a `:`, which separates a machine from a session, is not
     /// one to name.
     pub fn machines(&self) -> io::Result<Vec<Machine>> {
-        let mut machines = Vec::new();
-        let text = read(&self.machines)?;
-        for machine in sys::config::machines(&text).map_err(|e| invalid(&self.machines, &e))? {
-            let ssh = machine.ssh.as_deref().unwrap_or(&machine.name);
-            let ssh = ssh
-                .parse()
-                .map_err(|e: String| invalid(&self.machines, &e))?;
-            let pinned = machine
-                .id
-                .map(|id| id.parse())
-                .transpose()
-                .map_err(|e: &str| invalid(&self.machines, &e))?;
-            machines.push(Machine {
-                name: machine.name,
-                ssh,
-                pinned,
-            });
-        }
-        if let Some(config) = &self.ssh {
-            for name in hosts(&read(config.path())?) {
-                if machines.iter().all(|m| m.name != name)
-                    && let Ok(ssh) = name.parse()
-                {
-                    machines.push(Machine {
-                        name,
-                        ssh,
-                        pinned: None,
-                    });
-                }
+        let mut machines = self.listed()?;
+        for name in self.hosts()? {
+            if machines.iter().all(|m| m.name != name)
+                && let Some(machine) = Machine::host(name)
+            {
+                machines.push(machine);
             }
         }
         Ok(machines)
     }
 
-    /// The machine called `name`, if one is.
+    /// The machine called `name`, if one is: the ssh configuration is read
+    /// only when `machines.toml` names none.
     pub fn named(&self, name: &str) -> io::Result<Option<Machine>> {
-        Ok(self.machines()?.into_iter().find(|m| m.name == name))
+        if let Some(machine) = self.listed()?.into_iter().find(|m| m.name == name) {
+            return Ok(Some(machine));
+        }
+        Ok(self
+            .hosts()?
+            .into_iter()
+            .find(|host| host == name)
+            .and_then(Machine::host))
+    }
+
+    /// The machines `machines.toml` names, in its order.
+    fn listed(&self) -> io::Result<Vec<Machine>> {
+        let text = read(&self.machines)?;
+        let invalid = |e: &dyn std::fmt::Display| invalid(&self.machines, e);
+        sys::config::machines(&text)
+            .map_err(|e| invalid(&e))?
+            .into_iter()
+            .map(|machine| {
+                let ssh = machine.ssh.as_deref().unwrap_or(&machine.name);
+                Ok(Machine {
+                    ssh: ssh.parse().map_err(|e: String| invalid(&e))?,
+                    pinned: (machine.id.map(|id| id.parse()).transpose())
+                        .map_err(|e: &str| invalid(&e))?,
+                    name: machine.name,
+                })
+            })
+            .collect()
+    }
+
+    /// The names the ssh configuration's `Host` lines give, in order, its
+    /// `Include`s followed where they stand.
+    fn hosts(&self) -> io::Result<Vec<String>> {
+        let Some(config) = &self.ssh else {
+            return Ok(Vec::new());
+        };
+        let path = config.path();
+        let mut names = Vec::new();
+        // Relative includes are in the directory of the user's
+        // configuration, `~/.ssh`.
+        hosts(path, path.parent().unwrap_or(Path::new(".")), 0, &mut names)?;
+        Ok(names)
     }
 
     /// Every machine with its route, one per route: a second name for a
@@ -215,6 +233,17 @@ impl Sources {
     }
 }
 
+impl Machine {
+    /// A host of the ssh configuration, called by its name.
+    fn host(name: String) -> Option<Self> {
+        Some(Self {
+            ssh: name.parse().ok()?,
+            name,
+            pinned: None,
+        })
+    }
+}
+
 /// The machines as they change; dropping it stops watching.
 pub struct MachineWatch {
     _watched: Arc<Watched>,
@@ -259,27 +288,61 @@ impl Watched {
     }
 }
 
-/// The names `Host` lines give, in order: each word of each line, the
-/// patterns and negations left out.
-fn hosts(config: &str) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    for line in config.lines() {
-        let line = line.trim_start();
-        // `Host a b`, `Host=a`, or `host a`, keywords being any case.
-        let Some((keyword, rest)) = line.split_once(|c: char| c.is_whitespace() || c == '=') else {
-            continue;
-        };
-        if !keyword.eq_ignore_ascii_case("host") {
-            continue;
-        }
-        let rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '=');
-        for word in words(rest) {
-            if !word.contains(['*', '?', '!', ':']) && !names.contains(&word) {
-                names.push(word);
+/// How deep `Include`s nest before ssh gives up, as `READCONF_MAX_DEPTH`.
+const INCLUDE_DEPTH: u8 = 16;
+
+/// Adds the names the `Host` lines of the file at `path` give to `names`,
+/// each once, the patterns and negations left out, and those of each file
+/// an `Include` there names (`~` the user's home, a relative path in
+/// `base`, a glob its matches in order). A missing file names nothing.
+fn hosts(path: &Path, base: &Path, depth: u8, names: &mut Vec<String>) -> io::Result<()> {
+    if depth > INCLUDE_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: includes nest too deep", path.display()),
+        ));
+    }
+    for (keyword, words) in read(path)?.lines().filter_map(directive) {
+        if keyword.eq_ignore_ascii_case("host") {
+            for word in words {
+                if !word.contains(['*', '?', '!', ':']) && !names.contains(&word) {
+                    names.push(word);
+                }
+            }
+        } else if keyword.eq_ignore_ascii_case("include") {
+            for pattern in words {
+                for file in included(&pattern, base) {
+                    hosts(&file, base, depth + 1, names)?;
+                }
             }
         }
     }
-    names
+    Ok(())
+}
+
+/// A line's keyword and its words: `Host a b`, `Host=a`, `host a`, the
+/// keyword being any case.
+fn directive(line: &str) -> Option<(&str, Vec<String>)> {
+    let (keyword, rest) = line
+        .trim_start()
+        .split_once(|c: char| c.is_whitespace() || c == '=')?;
+    let rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+    Some((keyword, words(rest)))
+}
+
+/// The files an `Include` of `pattern` names, sorted as glob(3) sorts.
+fn included(pattern: &str, base: &Path) -> Vec<PathBuf> {
+    let path = match pattern.strip_prefix("~/") {
+        Some(rest) => match std::env::home_dir() {
+            Some(home) => home.join(rest),
+            None => return Vec::new(),
+        },
+        None => base.join(pattern),
+    };
+    let Some(pattern) = path.to_str() else {
+        return Vec::new();
+    };
+    glob::glob(pattern).map_or_else(|_| Vec::new(), |found| found.flatten().collect())
 }
 
 /// A line's words as ssh splits them: on whitespace, a double-quoted word
@@ -323,6 +386,19 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    fn names(config: &str, files: &[(&str, &str)]) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in files {
+            let path = dir.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        fs::write(dir.path().join("config"), config).unwrap();
+        let mut names = Vec::new();
+        hosts(&dir.path().join("config"), dir.path(), 0, &mut names).unwrap();
+        names
+    }
+
     #[test]
     fn only_a_host_line_names_a_machine_and_never_a_pattern() {
         let config = "\
@@ -337,8 +413,31 @@ HostName notahost
 Host mac2
 ";
         assert_eq!(
-            hosts(config),
+            names(config, &[]),
             ["mac2", "mac2-alias", "quoted name", "lower"]
         );
+    }
+
+    #[test]
+    fn an_include_names_its_files_hosts_where_it_stands() {
+        let config = "Host first\nInclude config.d/* missing\nHost last\n";
+        let files = [
+            ("config.d/b", "Host from-b\n"),
+            ("config.d/a", "Host from-a\nInclude nested\n"),
+            ("nested", "Host deeper\n"),
+        ];
+        assert_eq!(
+            names(config, &files),
+            ["first", "from-a", "deeper", "from-b", "last"]
+        );
+    }
+
+    #[test]
+    fn an_include_of_itself_is_refused_not_followed_forever() {
+        let mut found = Vec::new();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config"), "Include config\n").unwrap();
+        let error = hosts(&dir.path().join("config"), dir.path(), 0, &mut found).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

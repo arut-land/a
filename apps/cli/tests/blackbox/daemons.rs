@@ -60,6 +60,45 @@ fn a_session_is_found_on_the_machine_that_holds_it() {
     assert_eq!(daemons.resolve(Target::New).unwrap().0.name, "one");
 }
 
+/// A machine that cannot be reached, as only a test can make one.
+#[derive(Debug)]
+struct Down;
+
+impl client::link::Link for Down {
+    fn open<'a>(
+        &'a self,
+        _: &'a rt::Rt,
+        _: &'a sys::Staged,
+        _: client::Start,
+    ) -> rt::BoxFuture<'a, Result<client::link::Opened, Error>> {
+        Box::pin(std::future::ready(Err(Error::Link(
+            client::LinkError::Unreachable("it is down".into()),
+        ))))
+    }
+}
+
+#[test]
+fn a_session_not_found_names_the_machines_that_did_not_answer() {
+    let ((one, _), (_two, b), daemons) = pair("daemons-down");
+    let staged = (one.home.runtime())
+        .stage(Path::new(env!("CARGO_BIN_EXE_a")))
+        .unwrap();
+    let daemons = daemons.with(Member {
+        name: "three".into(),
+        daemon: Daemon::new(Down, staged),
+    });
+    // What the machines reached hold is still found.
+    let (member, _) = daemons
+        .resolve(Target::Prefix(b.short().to_string()))
+        .unwrap();
+    assert_eq!(member.name, "two");
+    let missing = daemons.resolve(Target::Prefix("zzzz".into()));
+    assert!(
+        matches!(&missing, Err(Error::Io(_, why)) if why.contains("not reached: three (it is down)")),
+        "{missing:?}"
+    );
+}
+
 #[test]
 fn each_machine_lists_its_own_sessions_under_its_own_id() {
     let ((one, a), (two, b), daemons) = pair("daemons-list");
@@ -92,10 +131,9 @@ fn a_watch_merges_every_machines_list_in_the_sets_order() {
     let seen: Arc<Mutex<Vec<SessionId>>> = Arc::default();
     let into = Arc::clone(&seen);
     let rt: rt::Rt = Arc::new(rt::Threads::default());
-    let _watch = SessionWatch::start(&rt, &daemons, move |list| {
-        if let Ok(list) = list {
-            *into.lock().unwrap() = list.iter().map(|l| l.summary.id).collect();
-        }
+    let _watch = SessionWatch::start(&rt, &daemons, move |list, problems| {
+        assert_eq!(problems, []);
+        *into.lock().unwrap() = list.iter().map(|l| l.summary.id).collect();
     });
     let until = deadline();
     while *seen.lock().unwrap() != [a, b] {
@@ -104,8 +142,10 @@ fn a_watch_merges_every_machines_list_in_the_sets_order() {
     }
 }
 
+/// Refused before anything sent behind the hello is acted on: the new
+/// session asked for there is never made.
 #[test]
-fn a_daemon_that_is_not_the_pinned_machine_is_refused() {
+fn a_daemon_that_is_not_the_pinned_machine_is_refused_before_it_acts() {
     let (env, daemon, _) = started("daemons-pin");
     let other = MachineId([7; 16]);
     let pinned = Daemon {
@@ -113,15 +153,17 @@ fn a_daemon_that_is_not_the_pinned_machine_is_refused() {
         ..daemon.clone()
     };
     assert_eq!(
-        pinned.connect(&|| {}).err(),
+        pinned.new_session().err(),
         Some(Error::OtherMachine {
             pinned: other,
             found: machine(&env),
         })
     );
+    assert_eq!(daemon.sessions().unwrap().len(), 1);
     let right = Daemon {
         pinned: Some(machine(&env)),
-        ..daemon
+        ..daemon.clone()
     };
-    assert!(right.connect(&|| {}).is_ok());
+    let made = right.new_session().unwrap();
+    assert!(daemon.sessions().unwrap().iter().any(|s| s.id == made));
 }
