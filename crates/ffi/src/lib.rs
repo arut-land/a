@@ -25,7 +25,7 @@ use protocol::view::{
 use protocol::{CommandInfo, SessionSummary};
 
 pub use feed::Reducer;
-pub use live::{Client, QueryStream, Session, SessionWatch, find_session};
+pub use live::{BlobFetch, Client, QueryStream, Session, SessionWatch, find_session};
 
 /// The purpose of the side request that titles a session, as the app
 /// reads its reply from the view.
@@ -504,6 +504,37 @@ impl From<io::Result<client::Answer>> for QueryAnswer {
             Ok(Answer::Reply(Outcome::Failed { error })) => Self::Failed { error },
             Ok(Answer::Reply(Outcome::Interrupted { .. })) => Self::Cancelled,
             Err(error) => Self::Failed {
+                error: error.to_string(),
+            },
+        }
+    }
+}
+
+/// A piece of a blob as it arrives, in order; nothing follows any but
+/// bytes.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlobPiece {
+    Bytes {
+        bytes: Vec<u8>,
+    },
+    /// Every byte asked for came.
+    Done,
+    /// Refused: no session it was fetched through references the blob.
+    NotHeld,
+    Cancelled,
+    /// Why not: the store's, or the connection's, failure.
+    Failed {
+        error: String,
+    },
+}
+
+impl From<&io::Error> for BlobPiece {
+    fn from(error: &io::Error) -> Self {
+        match client::Unfetched::of(error) {
+            Some(client::Unfetched::NotHeld) => Self::NotHeld,
+            Some(client::Unfetched::Cancelled) => Self::Cancelled,
+            None => Self::Failed {
                 error: error.to_string(),
             },
         }

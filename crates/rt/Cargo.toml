@@ -9,7 +9,8 @@ default = ["threads"]
 # The built-in runtime: async-executor's workers and a blocking pool of
 # our own (the `blocking` crate's polls every 500 ms while idle).
 threads = ["dep:async-executor"]
-watch = ["dep:notify"]
+# The process-wide file watcher, over each OS's own notifications.
+watch = []
 
 [dependencies]
 # Already linked by async-io; producer wake never waits on registration.
@@ -25,8 +26,10 @@ futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-lite = { version = "2", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
-notify = { version = "8", optional = true }
 rustix.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = { version = "3", default-features = false }

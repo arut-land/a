@@ -35,7 +35,7 @@
 
 use std::fs::File;
 use std::future::Future;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -106,6 +106,11 @@ impl Open {
     }
 }
 
+/// A blob's bytes as a backend reads them.
+pub trait BlobRead: Read + Seek + Send {}
+
+impl<T: Read + Seek + Send> BlobRead for T {}
+
 /// Where blobs live: beside the logs that reference them, each backend
 /// its own way (hash-named files, a table). Calls block: run them on a
 /// storage worker.
@@ -127,7 +132,9 @@ pub trait BlobStore: Send + Sync {
     /// Removes `of`'s stream, if it is there.
     fn discard(&self, of: OutputStream) -> io::Result<()>;
 
-    fn open(&self, id: &BlobId) -> io::Result<Box<dyn Read + Send>>;
+    /// The blob's bytes, from where its reader seeks: a client's range
+    /// reads only what it asked for.
+    fn open(&self, id: &BlobId) -> io::Result<Box<dyn BlobRead>>;
 
     /// The blob as a read-only file a [`Materialize`] backend can clone
     /// rather than copy.
@@ -263,7 +270,7 @@ impl Blobs {
         self.store.reopen(of, cap)
     }
 
-    pub fn open(&self, id: &BlobId) -> io::Result<Box<dyn Read + Send>> {
+    pub fn open(&self, id: &BlobId) -> io::Result<Box<dyn BlobRead>> {
         self.store.open(id)
     }
 

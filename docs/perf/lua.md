@@ -74,7 +74,8 @@ The SDK's added seams are generic: owned workspace subscriptions with a blocking
 preparation callback, fallible erased fold restoration/application, and binding
 activation. The SDK remains I/O-free. There are no Lua knobs in the kernel.
 
-notify 8.2 (CC0-1.0) supplies directory creation, replacement and removal events across
+(Since replaced: the watcher is `rt::watch::Hub` over each OS's own
+notifications, see [watchers](watchers.md).) notify 8.2 (CC0-1.0) supplied directory creation, replacement and removal events across
 supported platforms. The existing sys watcher only follows writes to one file
 and has no Windows backend. The generation/watcher changes added 68,608 bytes
 before tuning, including notify and the SDK/engine changes; this does not isolate

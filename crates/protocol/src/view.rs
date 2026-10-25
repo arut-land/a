@@ -706,6 +706,7 @@ impl SessionView {
             | DaemonMsg::Ack { .. }
             | DaemonMsg::Update { .. }
             | DaemonMsg::Reply { .. }
+            | DaemonMsg::NotHeld { .. }
             | DaemonMsg::Unknown { .. } => None,
         }
     }

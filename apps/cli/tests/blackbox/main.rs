@@ -43,6 +43,7 @@ mod web;
 
 mod daemon_acceptance;
 mod daemons;
+mod fetch;
 mod query;
 
 mod support;

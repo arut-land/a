@@ -143,7 +143,7 @@ impl Frames {
             }
             if let Some((len, body)) = protocol::frame_in(&self.buf)? {
                 self.batch += len.max(WRITE_BATCH / 64);
-                let msg = T::from_json(body)?;
+                let msg = T::from_json(body.json()?)?;
                 self.bytes = len;
                 self.buf.drain(..len);
                 return Ok(Some(msg));
@@ -399,7 +399,8 @@ impl Conn<'_> {
     /// Takes the client's frames as they come. Mutations are sent on at
     /// once and answered in order as they commit, while the next frames
     /// are read: an interrupt behind an input does not wait for its fsync.
-    /// Queries and their cancels read no log, so neither waits either.
+    /// Queries, fetches and their cancels write no log, so none waits
+    /// either.
     /// Anything else waits until what was asked before it is answered.
     #[expect(clippy::too_many_lines, reason = "one match over what a client sends")]
     async fn serve(&mut self, frames: &mut Frames) -> io::Result<()> {
@@ -517,7 +518,8 @@ impl Conn<'_> {
                 | ClientMsg::Approve { .. }
                 | ClientMsg::Interrupt { .. }
                 | ClientMsg::Query { .. }
-                | ClientMsg::Cancel { .. } => {}
+                | ClientMsg::Cancel { .. }
+                | ClientMsg::Fetch { .. } => {}
             }
         };
         while let Some((client_seq, answer)) = pending.pop_front() {
@@ -765,7 +767,8 @@ const fn writes(msg: &ClientMsg) -> bool {
         | ClientMsg::Status
         | ClientMsg::Settings { change: None }
         | ClientMsg::Query { .. }
-        | ClientMsg::Cancel { .. } => false,
+        | ClientMsg::Cancel { .. }
+        | ClientMsg::Fetch { .. } => false,
     }
 }
 

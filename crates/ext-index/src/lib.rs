@@ -86,6 +86,11 @@ pub fn runtime(service: Option<Arc<dyn rt::Runtime>>) -> Result<rt::Rt, String> 
     service.ok_or_else(|| "the engine provides no runtime".to_owned())
 }
 
+/// The file watcher the engine keeps the indexes current with.
+pub fn watcher(service: Option<Arc<rt::watch::Hub>>) -> Result<Arc<rt::watch::Hub>, String> {
+    service.ok_or_else(|| "the engine provides no file watcher".to_owned())
+}
+
 /// `files.search`: the best files of a workspace for `query`.
 pub struct FileSearch(Arc<Indexes>);
 
@@ -132,10 +137,11 @@ impl Query for FileSearch {
         cx: &QueryCx<Workspace>,
     ) -> impl Future<Output = Result<SearchReply, String>> + Send {
         let rt = runtime(cx.service_arc::<dyn rt::Runtime>());
+        let hub = watcher(cx.service_arc::<rt::watch::Hub>());
         let indexes = Arc::clone(&self.0);
         let root = Arc::clone(&cx.scope.path);
         async move {
-            let index = indexes.open(&root, rt?);
+            let index = indexes.open(&root, rt?, hub?);
             let found = index.search(request.query, request.limit).await?;
             Ok(SearchReply {
                 files: (found.files.into_iter())
@@ -250,11 +256,12 @@ impl Query for FileGrep {
         cx: &QueryCx<Workspace>,
     ) -> Streamed<GrepFile, impl Future<Output = Result<GrepReply, String>> + Send, GrepReply> {
         let rt = runtime(cx.service_arc::<dyn rt::Runtime>());
+        let hub = watcher(cx.service_arc::<rt::watch::Hub>());
         let indexes = Arc::clone(&self.0);
         let root = Arc::clone(&cx.scope.path);
         let cancel = cx.cancel.clone();
         stream(move |updates: Partials<GrepFile>| async move {
-            let index = indexes.open(&root, rt?);
+            let index = indexes.open(&root, rt?, hub?);
             let query = GrepQuery {
                 pattern: Pattern::Typed(request.query),
                 options: GrepOptions {

@@ -57,6 +57,7 @@ def summarize(records):
             idle_cpu_ms=statistics.median(run["idle_cpu_ms"] for run in runs),
             idle_switches=statistics.median(run["idle_switches"] for run in runs),
             dropped_deltas=sum(run["dropped_deltas"] for run in runs),
+            failed_calls=sum(run.get("failed_calls", 0) for run in runs),
         )
     return summary
 
@@ -142,13 +143,13 @@ def trips_table(rows):
 
 def table(summary):
     lines = ["| layout | sessions | delta p50 ms | delta p99 ms | run p99 ms | turn p50 ms | turn p99 ms "
-             "| active CPU ms | active switches | idle RSS KiB | idle threads | idle switches | dropped deltas |",
-             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+             "| active CPU ms | active switches | idle RSS KiB | idle threads | idle switches | dropped deltas | failed calls |",
+             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for row in summary.values():
         lines.append("| {label} ({runtime}) | {sessions} | {delta_p50_ms:.3f} | {delta_p99_ms:.3f} "
                      "| {run_delta_p99_ms:.3f} | {turn_p50_ms:.0f} | {turn_p99_ms:.0f} | {active_cpu_ms:.0f} "
                      "| {active_switches:.0f} | {idle_rss_kib:.0f} | {idle_threads:.0f} | {idle_switches:.0f} "
-                     "| {dropped_deltas} |".format(**row))
+                     "| {dropped_deltas} | {failed_calls} |".format(**row))
     return "\n".join(lines) + "\n"
 
 

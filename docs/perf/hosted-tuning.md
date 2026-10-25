@@ -84,4 +84,4 @@ it happens to pass.
 
 ## Open issues
 
-- [notify 8.2 `windows.rs`](https://docs.rs/crate/notify/8.2.0/source/src/windows.rs) uses a 100 ms timed wait; Windows idle daemon CPU can increment by 15.625 ms. The OS watcher work will address this upstream or behind the rt/sys seam.
+- Resolved: notify is gone. The watcher is `rt::watch::Hub` over each OS's own notifications, with no timed wait anywhere ([watchers](watchers.md)).

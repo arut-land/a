@@ -352,6 +352,7 @@ impl Fixture {
         let daemon = Arc::new_cyclic(|daemon| Daemon {
             shared: Arc::new(Shared {
                 http_clients: std::sync::OnceLock::new(),
+                hub: Arc::new(rt::watch::Hub::new(Arc::clone(&rt))),
                 rt,
                 store,
                 catalog: crate::catalog::Catalog::memory(),
@@ -2573,6 +2574,7 @@ impl ext::host::Sources for MemorySource {
         _: &Path,
         _: ext::host::Spawn,
         _: ext::host::Prepare,
+        _: ext::host::Watch,
     ) -> Result<Arc<dyn ext::host::Generations>, ext::Refused> {
         Ok(self.0.clone())
     }
@@ -3014,6 +3016,7 @@ fn environment_bursts_retain_one_payload_and_one_mailbox_marker() {
         parent: None,
         frames: Arc::new(FrameLog::new(loaded.lines, 0)),
         followers: Mutex::default(),
+        early: Mutex::default(),
         busy: AtomicBool::new(false),
         has_input: AtomicBool::new(false),
         attached: AtomicUsize::new(0),

@@ -70,7 +70,12 @@ impl Rules {
     /// (docs/perf/index.md). As many as the daemon's storage lane has
     /// workers, which follows the CPUs the process may use (CPU sets and
     /// job limits on Windows, affinity and quotas on Linux).
-    pub(crate) fn walk(&self, stop: &(dyn Fn() -> bool + Sync)) -> Vec<Found> {
+    /// Each directory it descends into is given to `enter` first.
+    pub(crate) fn walk(
+        &self,
+        stop: &(dyn Fn() -> bool + Sync),
+        enter: &(dyn Fn(&Path) + Sync),
+    ) -> Vec<Found> {
         let threads = rt::Config::daemon().storage.workers;
         let found = Mutex::new(Vec::new());
         self.builder(&self.root)
@@ -83,9 +88,13 @@ impl Rules {
                     if batch.0.len() % 256 == 0 && stop() {
                         return WalkState::Quit;
                     }
-                    if let Some(file) = entry.ok().and_then(|entry| self.found(&entry)) {
-                        batch.0.push(file);
+                    let Ok(entry) = entry else {
+                        return WalkState::Continue;
+                    };
+                    if entry.depth() > 0 && entry.file_type().is_some_and(|t| t.is_dir()) {
+                        enter(entry.path());
                     }
+                    batch.0.extend(self.found(&entry));
                     WalkState::Continue
                 })
             });
@@ -93,21 +102,29 @@ impl Rules {
     }
 
     /// Every file under `dir` (relative to the root): what a directory
-    /// that appeared brings.
-    pub(crate) fn walk_dir(&self, dir: &str) -> Vec<Found> {
-        self.walk_dir_until(dir, &|| false)
+    /// that appeared brings. It and each directory under it are given to
+    /// `enter` before they are read.
+    pub(crate) fn walk_dir(&self, dir: &str, enter: &dyn Fn(&Path)) -> Vec<Found> {
+        self.walk_dir_until(dir, &|| false, enter)
     }
 
     /// [`Rules::walk_dir`], unless `stop` says to give up first.
-    pub(crate) fn walk_dir_until(&self, dir: &str, stop: &dyn Fn() -> bool) -> Vec<Found> {
-        self.files_under(&self.root.join(dir), None, stop)
+    pub(crate) fn walk_dir_until(
+        &self,
+        dir: &str,
+        stop: &dyn Fn() -> bool,
+        enter: &dyn Fn(&Path),
+    ) -> Vec<Found> {
+        let dir = self.root.join(dir);
+        enter(&dir);
+        self.files_under(&dir, None, stop, enter)
     }
 
     /// The files among `names` (relative paths, all in directory `dir`)
     /// that a walk would find, and what it would find of each: a path
     /// not returned is ignored, or gone, or not a file.
     pub(crate) fn files_in(&self, dir: &str, names: &[&str]) -> Vec<Found> {
-        let mut found = self.files_under(&self.root.join(dir), Some(1), &|| false);
+        let mut found = self.files_under(&self.root.join(dir), Some(1), &|| false, &|_| {});
         found.retain(|f| names.contains(&f.path.as_str()));
         found
     }
@@ -140,13 +157,22 @@ impl Rules {
         *memo.entry(dir.to_owned()).or_insert(false)
     }
 
-    fn files_under(&self, dir: &Path, depth: Option<usize>, stop: &dyn Fn() -> bool) -> Vec<Found> {
+    fn files_under(
+        &self,
+        dir: &Path,
+        depth: Option<usize>,
+        stop: &dyn Fn() -> bool,
+        enter: &dyn Fn(&Path),
+    ) -> Vec<Found> {
         let mut found = Vec::new();
-        for entry in self.builder(dir).max_depth(depth).build() {
+        for entry in self.builder(dir).max_depth(depth).build().flatten() {
             if found.len() % 256 == 0 && stop() {
                 break;
             }
-            found.extend(entry.ok().and_then(|entry| self.found(&entry)));
+            if entry.depth() > 0 && entry.file_type().is_some_and(|t| t.is_dir()) {
+                enter(entry.path());
+            }
+            found.extend(self.found(&entry));
         }
         found
     }

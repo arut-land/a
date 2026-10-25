@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use ext::host::{Changed, GenerationLayer, PreparedLayer, Rebuild, Registrations, Registry, Spawn};
+use ext::host::{GenerationLayer, PreparedLayer, Rebuild, Registrations, Registry};
 use ext::source::Error as PrepareError;
 use ext::{Extension, Refused, Registrar, Tier};
 
@@ -64,27 +64,8 @@ impl GenerationLayer for Loader {
     fn name(&self) -> &'static str {
         "lua"
     }
-    fn watch(
-        &self,
-        workspace: &Path,
-        spawn: Spawn,
-        changed: Arc<Changed>,
-    ) -> Result<Box<ext::host::Refresh>, Refused> {
-        let home = self.home.join("ext");
-        let local = workspace.join(".a/ext");
-        let roots = [home, local];
-        let mut watcher = rt::Watcher::new(spawn, roots.clone(), move |event| {
-            if event.affects(&roots) {
-                changed();
-            }
-        })
-        .map_err(|e| Refused(e.to_string()))?;
-        Ok(Box::new(move || {
-            // Failure is a typed watch event; the watcher owns recovery even
-            // when the current source inventory can already be prepared.
-            let _ = watcher.refresh();
-            Ok(())
-        }))
+    fn roots(&self, workspace: &Path) -> Vec<PathBuf> {
+        vec![self.home.join("ext"), workspace.join(".a/ext")]
     }
     fn prepare(
         &self,
@@ -299,7 +280,7 @@ mod tests {
     use super::*;
     use ext::host::{Coordinator, Sources};
 
-    fn spawn() -> Spawn {
+    fn spawn() -> ext::host::Spawn {
         let rt: rt::Rt = Arc::new(rt::Threads::default());
         Arc::new(move |task| rt.spawn(task))
     }
@@ -497,7 +478,7 @@ mod tests {
         .unwrap();
         let loader = Loader::new(&root, sys::config::Exts::default()).unwrap();
         let source = Coordinator::new(Registry::default(), vec![Arc::new(loader)])
-            .open(&root, spawn(), Arc::new(|_| {}))
+            .open(&root, spawn(), Arc::new(|_| {}), ext::testing::watch())
             .unwrap();
         let installed = source.snapshot().registry.installed();
         fs::remove_file(file).unwrap();
@@ -517,7 +498,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let loader = Loader::new(&root, sys::config::Exts::default()).unwrap();
         let workspace = Coordinator::new(Registry::default(), vec![Arc::new(loader)])
-            .open(&root, spawn(), Arc::new(|_| {}))
+            .open(&root, spawn(), Arc::new(|_| {}), ext::testing::watch())
             .unwrap();
         let registry = workspace.snapshot().registry;
         let weak = Arc::downgrade(&registry);
@@ -540,6 +521,7 @@ mod tests {
                 Arc::new(move |work| {
                     send.send(work).unwrap();
                 }),
+                ext::testing::watch(),
             )
             .unwrap();
         fs::write(

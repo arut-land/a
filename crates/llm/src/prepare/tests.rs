@@ -332,11 +332,11 @@ fn a_models_reasoning_reads_as_the_same_kind_over_every_wire_it_came_by() {
         );
         assert_eq!(
             kind(ProtocolKey::OpenaiChat, model),
-            Some("reasoning-summary")
+            Some(crate::tag::Name::ReasoningSummary)
         );
     }
     assert_eq!(
         kind(ProtocolKey::OpenaiChat, "deepseek-reasoner"),
-        Some("reasoning")
+        Some(crate::tag::Name::Reasoning)
     );
 }

@@ -184,12 +184,22 @@ fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
     let source = registry
         .service::<dyn Sources>()
         .unwrap()
-        .open(&workspace, spawn.clone(), Arc::new(|_| {}))
+        .open(
+            &workspace,
+            spawn.clone(),
+            Arc::new(|_| {}),
+            ext::testing::watch(),
+        )
         .unwrap();
     let another = registry
         .service::<dyn Sources>()
         .unwrap()
-        .open(&workspace, spawn.clone(), Arc::new(|_| {}))
+        .open(
+            &workspace,
+            spawn.clone(),
+            Arc::new(|_| {}),
+            ext::testing::watch(),
+        )
         .unwrap();
     assert!(Arc::ptr_eq(&source, &another));
     drop(another);
@@ -217,7 +227,12 @@ fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
         reserved
             .service::<dyn Sources>()
             .unwrap()
-            .open(&workspace, spawn.clone(), Arc::new(|_| {}))
+            .open(
+                &workspace,
+                spawn.clone(),
+                Arc::new(|_| {}),
+                ext::testing::watch()
+            )
             .is_err()
     );
     drop(source);
