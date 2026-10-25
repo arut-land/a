@@ -1,8 +1,8 @@
 //! Blobs as ordinary files in a cache directory, the materialize backend
 //! every OS has. A file shares the store's storage where the file system
-//! can (an APFS clone, a reflink, else a hard link, which is the store's
-//! own file) and is copied where it cannot; either way it is read-only,
-//! and everything here can be deleted and made again from the store.
+//! can (an APFS clone, a reflink) and is copied where it cannot; either
+//! way it is a read-only file of its own, appears whole, and everything
+//! here can be deleted and made again from the store.
 
 use std::fs;
 use std::io;
@@ -35,7 +35,7 @@ impl Materialize for CacheDir {
         let path = self.path(at);
         match fs::metadata(&path) {
             Ok(file) if file.is_file() && file.len() == blob.size => return Ok(()),
-            // Torn or not this blob: made again.
+            // Another blob at this place: made again.
             Ok(_) => fs::remove_file(&path)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),

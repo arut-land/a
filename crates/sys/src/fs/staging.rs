@@ -230,7 +230,7 @@ impl<'a> Staged<'a> {
 }
 
 #[cfg(unix)]
-fn no_replace(source: &File, from: &OsStr, target: &File, to: &OsStr) -> io::Result<()> {
+pub(super) fn no_replace(source: &File, from: &OsStr, target: &File, to: &OsStr) -> io::Result<()> {
     use rustix::fs::{AtFlags, RenameFlags, linkat, renameat_with};
     match renameat_with(source, from, target, to, RenameFlags::NOREPLACE) {
         Ok(()) => Ok(()),

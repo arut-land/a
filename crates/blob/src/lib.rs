@@ -118,8 +118,8 @@ pub trait BlobStore: Send + Sync {
 
     fn open(&self, id: &BlobId) -> io::Result<Box<dyn Read + Send>>;
 
-    /// The blob as a read-only file a [`Materialize`] backend can share
-    /// (clone or link) rather than copy.
+    /// The blob as a read-only file a [`Materialize`] backend can clone
+    /// rather than copy.
     fn materialize(&self, id: &BlobId) -> io::Result<PathBuf>;
 
     /// Removes, at rest, every sealed blob `live` does not hold, and what a
@@ -164,10 +164,9 @@ impl TreePath {
     }
 }
 
-/// How the tree appears to the OS. Read-only to the store on every backend
-/// a blob is copied or cloned into; where the cache falls back to a hard
-/// link, the file is the store's own, and a write that clears its
-/// read-only bit reaches the blob.
+/// How the tree appears to the OS. Read-only to the store: a file here is
+/// never the store's own, so a write that clears its read-only bit changes
+/// only the copy.
 pub trait Materialize: Send + Sync {
     fn root(&self) -> &Path;
 
