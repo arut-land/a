@@ -11,6 +11,7 @@ mod drive;
 mod inbox;
 #[cfg(test)]
 mod one_rule;
+mod query;
 mod remote;
 mod session;
 mod stream;
@@ -23,6 +24,7 @@ pub use approval::{ApprovalPart, approval_parts, approval_text};
 pub use command::{COMMANDS, Cmd, Command, help, parse, parse_input};
 pub use drive::{ClientHandle, Driver, Renderer, pump};
 pub use inbox::{Inbox, PUMP_BATCH, Post, QueueBudget, inbox};
+pub use query::{Answer, Answers, Canceller};
 pub use session::{
     Attach, ConnId, Effect, End, Env, Event, EventKind, Io, Link, Notice, Offer, SessionClient,
     Show, TurnView,
@@ -39,7 +41,7 @@ use std::time::Duration;
 use protocol::view::SessionList;
 use protocol::{
     Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings,
-    PROTO, SessionId, SessionSummary, SettingsChange, Versions, read_frame, write_frame,
+    PROTO, QueryInfo, SessionId, SessionSummary, SettingsChange, Versions, read_frame, write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, OwnedConnection as Stream, Signal, Staged};
@@ -199,6 +201,8 @@ pub struct Connection {
     pub welcome: Welcome,
     /// The slash commands the daemon advertised.
     pub commands: Vec<CommandInfo>,
+    /// The queries it answers.
+    pub queries: Vec<QueryInfo>,
 }
 
 /// What the daemon's welcome settled for a connection.
@@ -562,6 +566,7 @@ fn split(stream: &Stream) -> io::Result<Connection> {
         remote: None,
         welcome: Welcome::default(),
         commands: Vec::new(),
+        queries: Vec::new(),
     })
 }
 
@@ -594,11 +599,13 @@ fn hello(
             proto,
             caps,
             commands,
+            queries,
             ..
         }) => {
             sent?;
             conn.welcome = Welcome { proto, caps };
             conn.commands = commands;
+            conn.queries = queries;
             Ok(Greeting::Welcome)
         }
         Some(DaemonMsg::Draining) => Ok(Greeting::Draining),
@@ -1160,6 +1167,7 @@ mod tests {
                             build: "1.2.3+0123456789abcdef".into(),
                             caps: Caps::ALL,
                             commands: Vec::new(),
+                            queries: Vec::new(),
                         },
                     )
                     .unwrap();

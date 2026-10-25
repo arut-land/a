@@ -5,6 +5,7 @@ pub mod config;
 mod driver;
 mod model;
 mod outbox;
+mod query;
 mod server;
 mod store;
 mod transcript;

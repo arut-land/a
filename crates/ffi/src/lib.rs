@@ -25,7 +25,7 @@ use protocol::view::{
 use protocol::{CommandInfo, SessionSummary};
 
 pub use feed::Reducer;
-pub use live::{Client, Session, SessionWatch, find_session};
+pub use live::{Client, QueryStream, Session, SessionWatch, find_session};
 
 /// The purpose of the side request that titles a session, as the app
 /// reads its reply from the view.
@@ -467,6 +467,45 @@ pub struct Presentation {
     pub body: Option<ShownBody>,
     /// A reply's token counts, once it has them.
     pub usage: Option<TokenUsage>,
+}
+
+/// One of a query's answers, its JSON as text; nothing follows any but an
+/// update.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryAnswer {
+    /// A streamed partial answer.
+    Update {
+        body: String,
+    },
+    Done {
+        body: String,
+    },
+    /// Why not, the connection's failure included.
+    Failed {
+        error: String,
+    },
+    Cancelled,
+}
+
+impl From<io::Result<client::Answer>> for QueryAnswer {
+    fn from(answer: io::Result<client::Answer>) -> Self {
+        use client::Answer;
+        use protocol::Outcome;
+        match answer {
+            Ok(Answer::Update(body)) => Self::Update {
+                body: body.to_string(),
+            },
+            Ok(Answer::Reply(Outcome::Done { output })) => Self::Done {
+                body: output.to_string(),
+            },
+            Ok(Answer::Reply(Outcome::Failed { error })) => Self::Failed { error },
+            Ok(Answer::Reply(Outcome::Interrupted { .. })) => Self::Cancelled,
+            Err(error) => Self::Failed {
+                error: error.to_string(),
+            },
+        }
+    }
 }
 
 /// Ordered approval content from the client SDK.

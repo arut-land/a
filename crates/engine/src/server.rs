@@ -23,6 +23,7 @@ use sys::{Listener, OwnedConnection as Stream};
 
 use crate::driver::{self, Attachment, Request};
 use crate::outbox::{BUDGET, Outbox};
+use crate::query::{Ask, Queries};
 use crate::upgrade::{Lifecycle, Verdict};
 use crate::{Daemon, config, lock, session_event};
 
@@ -236,12 +237,14 @@ pub(crate) async fn handle(
                         client: client.unwrap_or_default(),
                         attached: None,
                         decl: ClientDecl::default(),
+                        queries: Queries::default(),
                     };
                     conn.reply(&DaemonMsg::Welcome {
                         proto,
                         build: life.build.clone(),
                         caps,
                         commands: driver::commands(&daemon.shared.registry.get()),
+                        queries: crate::query::advertised(&daemon.shared.registry.get()),
                     });
                     conn.serve(&mut frames).await
                 }
@@ -281,7 +284,7 @@ pub(crate) async fn handle(
 /// The workspace a client in `dir` works in: the git working tree `dir` is
 /// in, found with the client's git variables (`GIT_DIR`, ceilings), not the
 /// daemon's, so every client, local or bridged, gets the same rule.
-fn workspace_of(dir: &Path, env: Option<&Environment>) -> PathBuf {
+pub(crate) fn workspace_of(dir: &Path, env: Option<&Environment>) -> PathBuf {
     let var = |name: &str| env?.vars.get(name).map(Into::into);
     sys::workspace_in(dir, &sys::GitEnv::from_vars(var))
 }
@@ -307,6 +310,7 @@ struct Conn<'a> {
     client: ClientId,
     attached: Option<Attachment>,
     decl: ClientDecl,
+    queries: Queries,
 }
 
 impl Conn<'_> {
@@ -321,6 +325,7 @@ impl Conn<'_> {
     /// Takes the client's frames as they come. Mutations are sent on at
     /// once and answered in order as they commit, while the next frames
     /// are read: an interrupt behind an input does not wait for its fsync.
+    /// Queries and their cancels read no log, so neither waits either.
     /// Anything else waits until what was asked before it is answered.
     async fn serve(&mut self, frames: &mut Frames) -> io::Result<()> {
         let mut pending: VecDeque<(Option<u64>, BoxFuture<'static, Answer>)> = VecDeque::new();
@@ -362,6 +367,9 @@ impl Conn<'_> {
                 }
                 continue;
             }
+            let Some(msg) = self.query(msg, frames.bytes) else {
+                continue;
+            };
             while let Some((client_seq, answer)) = pending.pop_front() {
                 self.answered(client_seq, answer.await);
             }
@@ -391,14 +399,7 @@ impl Conn<'_> {
                     self.reply(&settings);
                 }
                 ClientMsg::WatchSessions => self.daemon.watch_list(self.outbox),
-                ClientMsg::Status => self.reply(&DaemonMsg::Status {
-                    pid: std::process::id(),
-                    build: self.life.build.clone(),
-                    started: self.daemon.started,
-                    clients: u32::try_from(self.daemon.clients.load(Ordering::SeqCst))
-                        .unwrap_or(u32::MAX),
-                    known: u32::try_from(lock(&self.daemon.slots).len()).unwrap_or(u32::MAX),
-                }),
+                ClientMsg::Status => self.reply(&self.status()),
                 ClientMsg::Shutdown if self.decl.role == Role::Viewer => {
                     self.error("this client is a viewer".into());
                 }
@@ -411,7 +412,9 @@ impl Conn<'_> {
                 | ClientMsg::Input { .. }
                 | ClientMsg::Withdraw { .. }
                 | ClientMsg::Approve { .. }
-                | ClientMsg::Interrupt { .. } => {}
+                | ClientMsg::Interrupt { .. }
+                | ClientMsg::Query { .. }
+                | ClientMsg::Cancel { .. } => {}
             }
         };
         while let Some((client_seq, answer)) = pending.pop_front() {
@@ -419,6 +422,45 @@ impl Conn<'_> {
         }
         self.outbox.unfollow();
         result
+    }
+
+    /// The answer to [`ClientMsg::Status`].
+    fn status(&self) -> DaemonMsg {
+        DaemonMsg::Status {
+            pid: std::process::id(),
+            build: self.life.build.clone(),
+            started: self.daemon.started,
+            clients: u32::try_from(self.daemon.clients.load(Ordering::SeqCst)).unwrap_or(u32::MAX),
+            known: u32::try_from(lock(&self.daemon.slots).len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Asks or cancels a query, or hands back any other message.
+    fn query(&self, msg: ClientMsg, bytes: usize) -> Option<ClientMsg> {
+        match msg {
+            ClientMsg::Query {
+                id,
+                service,
+                scope,
+                body,
+            } => {
+                let ask = Ask {
+                    id,
+                    service,
+                    scope,
+                    body,
+                    bytes,
+                };
+                self.queries
+                    .ask(self.daemon, self.outbox, self.decl.role, ask);
+                None
+            }
+            ClientMsg::Cancel { id } => {
+                self.queries.cancel(id);
+                None
+            }
+            msg => Some(msg),
+        }
     }
 
     async fn attach(

@@ -2,9 +2,10 @@
 //! feature, compiled in or loaded, is made of.
 //!
 //! An extension contributes through one [`Registrar`]: tools and commands,
-//! handlers at the engine's decision [`point`]s, text the model reads,
-//! durable [`Fold`], typed services other extensions build on, and the
-//! agents a session can run. The engine itself offers the model nothing.
+//! [`query`]s clients ask, handlers at the engine's decision [`point`]s,
+//! text the model reads, durable [`Fold`], typed services other extensions
+//! build on, and the agents a session can run. The engine itself offers
+//! the model nothing.
 //!
 //! Extensions talk to each other through four channels and no fifth: the
 //! log (the [`point::Observe`] point), typed state, services, and points.
@@ -37,6 +38,7 @@ mod history;
 pub mod host;
 mod r#loop;
 pub mod point;
+pub mod query;
 mod queue;
 pub mod schema;
 mod service;
@@ -47,6 +49,7 @@ pub use conversation::{
 };
 mod settings;
 pub mod shape;
+mod shared;
 pub mod source;
 mod state;
 #[cfg(feature = "testing")]
@@ -66,6 +69,7 @@ pub use point::{
     Requirement, Rewrite,
 };
 pub use protocol::{Annotation, AnnotationLifetime, ExtensionFact};
+pub use query::{Query, QueryCx};
 pub use queue::{Boundary, QueueView, Take};
 pub use schema::Schema;
 pub use service::{
@@ -75,6 +79,7 @@ pub use service::{
 };
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};
+pub use shared::WorkspaceShared;
 pub use state::{Checkpoint, DynFold, Fold, Image, PreparedPublication, Publication, States};
 pub use tool::{
     Args, Callable, Called, Concurrency, Cx, Detach, DynTool, MutationError, MutationResult,

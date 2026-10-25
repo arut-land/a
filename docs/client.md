@@ -20,8 +20,8 @@ Driver (drive.rs)                  pump: the one fixpoint loop; threads: connect
   │                                connection, one writer
   ▼
 transport (lib.rs, remote.rs)      Daemon { endpoint: Local(Home) | Ssh(host), staged }: connect,
-                                   connect_as, sessions, new_session; hello, Error, Connection,
-                                   stop/status/restart/diagnose, bridge
+                                   connect_as, sessions, new_session, query; hello, Error,
+                                   Connection, stop/status/restart/diagnose, bridge
 ```
 
 - **Transport.** `Daemon { endpoint, staged }` is the daemon as a client
@@ -86,6 +86,13 @@ transport (lib.rs, remote.rs)      Daemon { endpoint: Local(Home) | Ssh(host), s
   each).
 - **`SessionWatch`.** The daemon's session list as it changes, over a
   connection of its own that is made again when the daemon goes.
+- **Queries.** `Daemon::query(service, scope, body)` (or
+  `Connection::query`) asks one of the queries the welcome advertised
+  (`Connection::queries`) over a connection of its own, so its answers
+  never wait behind a session's replay. `Answers` iterates its `Update`s,
+  then its `Reply(Outcome)`; a `Canceller` stops it from another thread,
+  and dropping both hangs up, which cancels it too. The FFI's
+  `QueryStream` is this, as a stream of `QueryAnswer`s.
 
 ## How an app drives it
 

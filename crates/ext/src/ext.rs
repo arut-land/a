@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::assemble::Needs;
 use crate::point::{ERASED, ErasedHandler, Handler, Hooked, Point};
+use crate::query::{self, Answered, DynQuery, Query};
 use crate::shape::Output;
 use crate::state::Decl;
 use crate::tool::Erased;
@@ -193,6 +194,7 @@ pub(crate) struct Provided {
 #[derive(Default)]
 pub struct Registrar {
     pub(crate) tools: Vec<Arc<dyn DynTool>>,
+    pub(crate) queries: Vec<Arc<dyn DynQuery>>,
     pub(crate) hooks: Vec<Hooked>,
     pub(crate) texts: Vec<Text>,
     pub(crate) states: Vec<Decl>,
@@ -216,6 +218,23 @@ impl Registrar {
         let names = self.tools.iter().map(|t| t.name());
         self.errors.extend(twice("tool", tool.name(), names));
         self.tools.push(tool);
+        self
+    }
+
+    /// Answers query `Q` for clients, its answers shaped `M` as what its
+    /// `answer` returns.
+    pub fn query<Q: Query, M: 'static>(&mut self, query: Q) -> &mut Self
+    where
+        Q::answer(..): Answered<Q::Reply, M>,
+    {
+        self.dyn_query(Arc::new(query::Erased(query, PhantomData)))
+    }
+
+    /// Answers a query named at run time.
+    pub fn dyn_query(&mut self, query: Arc<dyn DynQuery>) -> &mut Self {
+        let names = self.queries.iter().map(|q| q.name());
+        self.errors.extend(twice("query", query.name(), names));
+        self.queries.push(query);
         self
     }
 

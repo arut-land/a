@@ -96,6 +96,7 @@ pub(crate) fn launch(host: &str, script: &str) -> io::Result<Connection> {
         remote: None,
         welcome: Welcome::default(),
         commands: Vec::new(),
+        queries: Vec::new(),
     })
 }
 

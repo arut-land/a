@@ -913,6 +913,7 @@ mod tests {
                     build: "test".into(),
                     caps: Caps::ALL,
                     commands: Vec::new(),
+                    queries: Vec::new(),
                 },
             )
             .unwrap();
@@ -1280,6 +1281,7 @@ mod tests {
                 build: "test".into(),
                 caps: Caps::ALL,
                 commands: Vec::new(),
+                queries: Vec::new(),
             },
         )
         .unwrap();
@@ -1354,6 +1356,7 @@ mod tests {
                 build: "test".into(),
                 caps: Caps::ALL,
                 commands: Vec::new(),
+                queries: Vec::new(),
             },
         )
         .unwrap();

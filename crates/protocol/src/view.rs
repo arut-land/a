@@ -701,6 +701,8 @@ impl SessionView {
             | DaemonMsg::Settings { .. }
             | DaemonMsg::Status { .. }
             | DaemonMsg::Ack { .. }
+            | DaemonMsg::Update { .. }
+            | DaemonMsg::Reply { .. }
             | DaemonMsg::Unknown { .. } => None,
         }
     }

@@ -1,5 +1,5 @@
-//! For tests: the `echo` agent, which needs no model, and `sleep`, a safe
-//! call to interrupt and recover.
+//! For tests: the `echo` agent, which needs no model, `sleep`, a safe call
+//! to interrupt and recover, and the `echo` query.
 //!
 //! The crate is empty unless its `on` feature is: a binary turns that on
 //! for its tests (through a dev-dependency, as cargo unifies features) and
@@ -12,7 +12,7 @@ pub const ECHO: &str = "echo";
 mod on;
 
 #[cfg(any(test, feature = "on"))]
-pub use on::{Echo, Fixtures, Seconds, Sleep, Slept};
+pub use on::{Echo, Echoed, Fixtures, Said, Say, Seconds, Sleep, Slept};
 
 /// The fixtures, in a build that has them.
 pub fn extension() -> Option<Box<dyn ext::DynExtension>> {
