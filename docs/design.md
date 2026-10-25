@@ -62,9 +62,18 @@ Diagnosis and restart verify the recorded process identity before signaling.
 An attach supplies the client's environment and working directory. Tools
 use the session's environment rather than the shell that started the daemon.
 The log records its redacted form; live secret values stay out of that log.
-Environment refresh is an explicit client command. Remote clients use
-system SSH and `a bridge`; missing installations may receive this build
-only when `sys::Platform` recognizes the host as matching it.
+Environment refresh is an explicit client command. A client reaches a
+daemon through a `client::link::Link`, over which one hello runs: this
+machine's over its socket (`LocalLink`), another's through the system
+`ssh` to `a bridge` there (`SshLink`), whose stdio carries the same frames
+into a local connection, so the daemon side is unchanged. The remote login
+shell is given only plain words: `sh -s` with a discovery script on stdin
+on a POSIX host (any login shell), `a bridge <token>` where there is no
+`sh`, honouring the host's `A_HOME` or native layout. A POSIX host that
+lacks `a` receives this build only when `sys::Platform` recognizes it as
+matching. A client with no one at its terminal (`a web`) runs ssh in batch
+mode, and a host that would ask for a password is a typed error. Later
+transports are further `Link` types.
 
 See [the client SDK](client.md) and [CLI](cli.md), and the staging and
 endpoint types in `crates/sys`. The daemon targets macOS, Linux and Windows.

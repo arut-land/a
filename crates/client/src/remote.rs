@@ -1,188 +1,364 @@
-//! `ssh <host> a bridge` with the system `ssh` (`A_SSH` overrides it).
-//! Installs this build on a host that lacks `a`, streaming its bytes over SSH.
+//! Another machine's daemon, through the system `ssh` (`A_SSH` overrides
+//! it) to `a bridge` there, whose stdio carries the frames. The remote
+//! login shell is given only plain words, which any shell parses alike: a
+//! POSIX host (whatever its login shell, csh and fish included) runs
+//! `sh -s` with the script on stdin; one without `sh` (cmd or PowerShell
+//! on Windows) is asked for `a bridge <token>`, which serves where its `a`
+//! is on PATH. Installs this build on a POSIX host that lacks `a`,
+//! streaming its bytes over SSH.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use protocol::{ClientMsg, read_frame};
-use sys::{Platform, Staged};
+use protocol::{ClientMsg, Versions};
+use rt::{BoxFuture, Rt};
+use sys::{Platform, Prompt, Staged};
 
-use crate::{Connection, Reader, Transport, Welcome, Writer};
+use crate::Error;
+use crate::link::{Link, LinkError, Opened, Pipe, Start, Stream};
 
 /// What the bridge prints, with its token, once it is connected.
 pub const SYNC: &str = "A-BRIDGE";
 
+/// What a script says first, with its token: a POSIX shell runs it.
+const SHELL: &str = "A-SH";
+
 /// Ends a sync line followed by the host's environment, as a frame.
 pub const WITH_ENV: &[u8] = b" env";
 
-/// The exit status a POSIX shell gives a command it cannot find.
+/// The exit status a POSIX shell gives a command it cannot find, and the
+/// discovery script gives when it finds no `a`.
 const NOT_FOUND: i32 = 127;
 
-/// Opens a bridge to `host`'s daemon: the `a` on its `PATH`, else the one a
-/// previous install staged, else this build after installing it there.
-pub fn open(host: &str, staged: &Staged) -> io::Result<Connection> {
-    let token = token();
-    let found = find_script(&token);
-    if let Some(conn) = bridge(host, &found, &token)? {
-        return Ok(conn);
+/// The exit status of `ssh` itself failing: it could not connect or
+/// authenticate.
+const SSH_FAILED: i32 = 255;
+
+/// Another machine's daemon over `ssh <host>`: the `a` on its `PATH`, else
+/// the one a previous install staged, else this build after installing it
+/// there.
+#[derive(Clone, Debug)]
+pub struct SshLink {
+    host: String,
+    prompt: Prompt,
+}
+
+impl SshLink {
+    pub fn new(host: impl Into<String>, prompt: Prompt) -> Self {
+        Self {
+            host: host.into(),
+            prompt,
+        }
     }
-    install(host, staged)?;
-    let installed = installed_script(&staged.id, &token);
-    bridge(host, &installed, &token)?
-        .ok_or_else(|| io::Error::other(format!("the `a` installed on {host} does not run")))
+}
+
+impl Link for SshLink {
+    fn open<'a>(
+        &'a self,
+        rt: &'a Rt,
+        build: &'a Staged,
+        start: Start,
+    ) -> BoxFuture<'a, Result<Opened, Error>> {
+        Box::pin(async move {
+            if start == Start::Replace {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "this command acts on this machine; run it on {} instead",
+                        self.host
+                    ),
+                )
+                .into());
+            }
+            let token = token();
+            match self.bridge(rt, Bootstrap::Find, &token).await? {
+                Bridge::Ready(opened) => return Ok(opened),
+                Bridge::Ended(ended) if ended.shell && ended.code == Some(NOT_FOUND) => {}
+                Bridge::Ended(ended) if ended.shell => return Err(self.ended(&ended)),
+                // No POSIX shell ran discovery (a Windows host, say): only an
+                // `a` its login shell finds can serve.
+                Bridge::Ended(_) => {
+                    return match self.bridge(rt, Bootstrap::Direct, &token).await? {
+                        Bridge::Ready(opened) => Ok(opened),
+                        Bridge::Ended(ended) => Err(self.ended(&ended)),
+                    };
+                }
+            }
+            let (link, installing) = (self.clone(), build.clone());
+            rt::unblock_with(&**rt, rt::BlockingClass::Network, 64 << 10, move || {
+                link.install(&installing)
+            })
+            .await?;
+            match self
+                .bridge(rt, Bootstrap::Installed(&build.id), &token)
+                .await?
+            {
+                Bridge::Ready(opened) => Ok(opened),
+                Bridge::Ended(_) => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("the `a` installed on {} does not run", self.host),
+                )
+                .into()),
+            }
+        })
+    }
+
+    fn needs_terminal(&self) -> bool {
+        self.prompt == Prompt::Terminal
+    }
+
+    fn mismatch(&self, _: &Staged, theirs: Versions) -> Error {
+        Error::Mismatch {
+            theirs,
+            newer: None,
+            host: Some(self.host.clone()),
+        }
+    }
+}
+
+/// How a bridge is started on the host.
+#[derive(Clone, Copy)]
+enum Bootstrap<'a> {
+    /// The `a` on its PATH, else the one its runtime directory holds.
+    Find,
+    /// The `a` its login shell finds, with no POSIX shell to help.
+    Direct,
+    /// The build installed under this id.
+    Installed(&'a str),
+}
+
+enum Bridge {
+    Ready(Opened),
+    Ended(Ended),
+}
+
+/// A bridge that ended before it was ready.
+struct Ended {
+    /// Whether a POSIX shell ran the script: it says so first.
+    shell: bool,
+    code: Option<i32>,
+    /// What it said on stderr, where that is not the person's terminal.
+    said: String,
+}
+
+impl SshLink {
+    fn ssh(&self) -> Command {
+        let mut cmd =
+            Command::new(std::env::var_os("A_SSH").unwrap_or_else(|| OsString::from("ssh")));
+        if self.prompt == Prompt::Never {
+            cmd.args(["-o", "BatchMode=yes"]);
+        }
+        cmd.arg(&self.host);
+        cmd
+    }
+
+    /// Why the bridge `ended`, as the error to report.
+    fn ended(&self, ended: &Ended) -> Error {
+        let status = ended
+            .code
+            .map_or_else(|| "a signal".to_owned(), |code| format!("status {code}"));
+        let said = if ended.said.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", ended.said)
+        };
+        io::Error::other(format!(
+            "ssh {}: the bridge ended with {status} before it was ready{said}",
+            self.host
+        ))
+        .into()
+    }
+
+    /// Starts the bridge as `how` says and waits for its sync line.
+    async fn bridge(&self, rt: &Rt, how: Bootstrap<'_>, token: &str) -> Result<Bridge, Error> {
+        let mut cmd = self.ssh();
+        let script = match how {
+            Bootstrap::Find => Some(find_script(token)),
+            Bootstrap::Installed(id) => Some(installed_script(id, token)),
+            Bootstrap::Direct => None,
+        };
+        if script.is_some() {
+            cmd.args(["sh", "-s"]);
+        } else {
+            cmd.args(["a", "bridge", token]);
+        }
+        let prompt = self.prompt;
+        let (child, stdin, stdout, stderr) =
+            rt::unblock_with(&**rt, rt::BlockingClass::Network, 64 << 10, move || {
+                sys::spawn_ssh(&mut cmd, prompt)
+            })
+            .await?;
+        let report = stderr.map(|stderr| Report::drain(rt, stderr)).transpose()?;
+        let reactor = rt.reactor();
+        let mut pipe = Pipe::new(
+            rt::Async::new(&reactor, stdout)?,
+            rt::Async::new(&reactor, stdin)?,
+            Reaper {
+                child: Some(child),
+                rt: rt.clone(),
+            },
+        );
+        let stream: &dyn Stream = &pipe;
+        // A host that cannot run the script may hang up on it; its status says so.
+        if let Some(script) = script {
+            let _ = stream.write_all(script.as_bytes()).await;
+        }
+        let sync = format!("{SYNC} {token}");
+        let ran = format!("{SHELL} {token}");
+        let mut shell = false;
+        let mut buffered = Vec::new();
+        while let Some(line) = stream.line(&mut buffered).await? {
+            shell |= line.trim_ascii_end() == ran.as_bytes();
+            if line.trim_ascii_end().strip_prefix(sync.as_bytes()) == Some(WITH_ENV) {
+                let Some(ClientMsg::Environment(env)) = stream.recv(&mut buffered).await? else {
+                    return Err(
+                        io::Error::other(format!("ssh {}: no environment", self.host)).into(),
+                    );
+                };
+                return Ok(Bridge::Ready(Opened {
+                    stream: Box::new(pipe),
+                    buffered,
+                    remote: Some(env),
+                    // It may have just started the daemon there.
+                    within: crate::START_TIMEOUT,
+                }));
+            }
+        }
+        let code = pipe.guard_mut().exited().await?;
+        let said = match report {
+            Some(report) => report.said().await,
+            None => String::new(),
+        };
+        if code != Some(SSH_FAILED) {
+            return Ok(Bridge::Ended(Ended { shell, code, said }));
+        }
+        Err(Error::Link(if needs_person(&said) {
+            LinkError::NeedsInteractiveAuth(format!(
+                "ssh {} needs a password or a host key confirmed, which this client cannot ask for; run `ssh {}` at a terminal once",
+                self.host, self.host
+            ))
+        } else if said.is_empty() {
+            LinkError::Unreachable(format!("ssh {} failed", self.host))
+        } else {
+            LinkError::Unreachable(format!("ssh {}: {said}", self.host))
+        }))
+    }
+
+    /// Copies this build to the host layout's `runtime/<id>/a`; a host of
+    /// another OS or architecture is refused. Blocking.
+    fn install(&self, staged: &Staged) -> io::Result<()> {
+        let quiet = || match self.prompt {
+            Prompt::Terminal => Stdio::inherit(),
+            Prompt::Never => Stdio::null(),
+        };
+        let uname = self
+            .ssh()
+            .args(["uname", "-sm"])
+            .stdin(Stdio::null())
+            .stderr(quiet())
+            .output()?;
+        let uname = String::from_utf8_lossy(&uname.stdout);
+        let uname = uname.trim();
+        let here = Platform::CURRENT;
+        if Platform::from_uname(uname) != Some(here) {
+            return Err(io::Error::other(format!(
+                "`a` is not installed on {}, and this build is for {here}, not {uname:?}; install `a` there and retry",
+                self.host
+            )));
+        }
+        let (crc, size) = cksum(std::fs::File::open(&staged.exe)?)?;
+        // The image's checksum goes as words; the script on stdin.
+        let mut child = self
+            .ssh()
+            .args(["sh", "-s", &crc.to_string(), &size.to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(quiet())
+            .spawn()?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        stdin.write_all(install_script(&staged.id).as_bytes())?;
+        stdin.flush()?;
+        let mut said = String::new();
+        stdout.read_line(&mut said)?;
+        // The image follows only once the shell has read all of its
+        // script: a shell may read ahead of the command it runs. A cut
+        // upload shows in the status, which only a verified image passes.
+        if said.trim_end() == "ready" {
+            let _ = io::copy(&mut std::fs::File::open(&staged.exe)?, &mut stdin);
+        }
+        drop(stdin);
+        let status = child.wait()?;
+        match said.trim_end() {
+            "installed" | "ready" if status.success() => Ok(()),
+            "ready" => Err(io::Error::other(format!(
+                "ssh {}: upload failed: {status}",
+                self.host
+            ))),
+            _ => Err(io::Error::other(format!(
+                "ssh {}: cannot prepare runtime directory: {status}",
+                self.host
+            ))),
+        }
+    }
+}
+
+/// Whether what ssh said is that a person must authenticate.
+fn needs_person(said: &str) -> bool {
+    said.contains("Permission denied") || said.contains("Host key verification failed")
+}
+
+/// One script for `sh -s`, read whole before any of it runs, so nothing
+/// after it on stdin is taken for script or left for the bridge.
+fn grouped(body: &str) -> String {
+    format!("{{\n{body}\n}}\n")
 }
 
 pub(crate) fn find_script(token: &str) -> String {
-    format!(
-        r#"if command -v a >/dev/null 2>&1; then exec a bridge {token}; fi
+    grouped(&format!(
+        r#"echo {SHELL} {token}
+if command -v a >/dev/null 2>&1; then exec a bridge {token}; fi
 {}
 if [ -x "$a_runtime/current/a" ]; then exec "$a_runtime/current/a" bridge {token}; else exit {NOT_FOUND}; fi"#,
         sys::RemoteLayout::discovery_script()
-    )
+    ))
 }
 
 pub(crate) fn installed_script(id: &str, token: &str) -> String {
-    format!(
-        "{}\nexec \"$a_runtime/{id}/a\" bridge {token}",
+    grouped(&format!(
+        "echo {SHELL} {token}\n{}\nexec \"$a_runtime/{id}/a\" bridge {token}",
         sys::RemoteLayout::for_platform(Platform::CURRENT).runtime_script()
-    )
+    ))
 }
 
-/// Runs `script` on `host` and waits for the sync line; `None` if the shell
-/// found no `a` to run.
-fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection>> {
-    let mut connection = launch(host, script)?;
-    let out = &mut connection.reader.0;
-    let sync = format!("{SYNC} {token}");
-    let mut line = Vec::new();
-    let remote = loop {
-        line.clear();
-        if out.read_until(b'\n', &mut line)? == 0 {
-            return match connection
-                .writer
-                .child
-                .as_mut()
-                .expect("bridge child")
-                .wait()?
-                .code()
-            {
-                Some(NOT_FOUND) => Ok(None),
-                _ => Err(io::Error::other(format!(
-                    "ssh {host}: the bridge ended before it was ready"
-                ))),
-            };
-        }
-        if line.trim_ascii_end().strip_prefix(sync.as_bytes()) == Some(WITH_ENV) {
-            match read_frame(out)? {
-                Some(ClientMsg::Environment(env)) => break env,
-                _ => return Err(io::Error::other(format!("ssh {host}: no environment"))),
-            }
-        }
-    };
-    connection.remote = Some(remote);
-    Ok(Some(connection))
-}
-
-pub(crate) fn launch(host: &str, script: &str) -> io::Result<Connection> {
-    let (child, stdin, stdout) = sys::spawn_ssh(command("A_SSH", "ssh").arg(host).arg(sh(script)))?;
-    Ok(Connection {
-        reader: Reader(BufReader::new(Transport::Pipe(stdout))),
-        writer: Writer {
-            io: Some(Transport::Pipe(stdin)),
-            child: Some(child),
-        },
-        remote: None,
-        welcome: Welcome::default(),
-        commands: Vec::new(),
-        queries: Vec::new(),
-    })
-}
-
-/// Copies this build to the host layout's `runtime/<id>/a`; a host of another
-/// OS or architecture is refused.
-pub(crate) fn install(host: &str, staged: &Staged) -> io::Result<()> {
-    let uname = command("A_SSH", "ssh")
-        .args([host, "uname -sm"])
-        .stdin(Stdio::null())
-        .output()?;
-    let uname = String::from_utf8_lossy(&uname.stdout);
-    let uname = uname.trim();
-    let here = Platform::CURRENT;
-    if Platform::from_uname(uname) != Some(here) {
-        return Err(io::Error::other(format!(
-            "`a` is not installed on {host}, and this build is for {here}, not {uname:?}; install `a` there and retry"
-        )));
-    }
-    let (crc, size) = cksum(std::fs::File::open(&staged.exe)?)?;
-    // An image that does not match is a crash leftover from an interrupted
-    // upload, never a build to run.
-    let verify = format!(
-        r#"crc={crc} size={size}
-verify() {{ [ -x "$1" ] && set -- $(cksum < "$1") && [ "$1 $2" = "$crc $size" ]; }}"#
-    );
-    let prepare = format!(
-        r#"{}
-{verify}
-if verify "$a_runtime/{id}/a"; then exit 0; fi
-umask 077
-mkdir -p "$a_runtime/{id}" && mktemp -d "$a_runtime/{id}/.install.XXXXXXXXXX""#,
-        sys::RemoteLayout::for_platform(here).runtime_script(),
-        id = staged.id,
-    );
-    let prepared = command("A_SSH", "ssh")
-        .arg(host)
-        .arg(sh(&prepare))
-        .stdin(Stdio::null())
-        .output()?;
-    if !prepared.status.success() {
-        return Err(io::Error::other(format!(
-            "ssh {host}: cannot prepare runtime directory: {}",
-            String::from_utf8_lossy(&prepared.stderr).trim_end()
-        )));
-    }
-    if prepared.stdout.is_empty() {
-        return Ok(());
-    }
-    let dir = String::from_utf8(prepared.stdout)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let dir = dir.strip_suffix('\n').ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "ssh: missing runtime directory")
-    })?;
+/// Says `installed` when the image `$1 $2` (its `cksum`) is in place, else
+/// `ready`, then takes the image on stdin. An image that does not match is
+/// a crash leftover from an interrupted upload, never a build to run.
+fn install_script(id: &str) -> String {
     // A cut connection ends `cat` with a clean EOF, so only the checksum
     // proves the upload whole. It is flushed before its name exists, and a
     // concurrent installer may win, but a verified image is never replaced.
-    let upload = format!(
-        "{} -- '{}'",
-        sh(&format!(
-            r#"set -u
+    grouped(&format!(
+        r#"crc=$1 size=$2
+verify() {{ [ -x "$1" ] && set -- $(cksum < "$1") && [ "$1 $2" = "$crc $size" ]; }}
+{}
+if verify "$a_runtime/{id}/a"; then echo installed; exit 0; fi
 umask 077
-upload=$1
-{verify}
+mkdir -p "$a_runtime/{id}" && upload=$(mktemp -d "$a_runtime/{id}/.install.XXXXXXXXXX") || exit 1
 trap 'rm -f "$upload/a"; rmdir "$upload"' 0
 trap 'exit 1' HUP INT TERM
+echo ready
 cat > "$upload/a" && chmod 700 "$upload/a" && verify "$upload/a" && sync || exit 1
-ln "$upload/a" "$upload/../a" 2>/dev/null || verify "$upload/../a" || mv -f "$upload/a" "$upload/../a""#
-        )),
-        dir.replace('\'', r"'\''")
-    );
-    let status = command("A_SSH", "ssh")
-        .arg(host)
-        .arg(upload)
-        .stdin(std::fs::File::open(&staged.exe)?)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "ssh {host}: upload failed: {status}"
-        )))
-    }
+ln "$upload/a" "$upload/../a" 2>/dev/null || verify "$upload/../a" || mv -f "$upload/a" "$upload/../a""#,
+        sys::RemoteLayout::for_platform(Platform::CURRENT).runtime_script(),
+    ))
 }
 
 /// POSIX `cksum` of a file: its CRC and its length.
-fn cksum(mut file: impl io::Read) -> io::Result<(u32, u64)> {
+fn cksum(mut file: impl Read) -> io::Result<(u32, u64)> {
     const CKSUM: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
     let mut digest = CKSUM.digest();
     let mut buf = vec![0; 64 * 1024];
@@ -203,16 +379,6 @@ fn cksum(mut file: impl io::Read) -> io::Result<(u32, u64)> {
     Ok((digest.finalize(), size))
 }
 
-fn command(var: &str, default: &str) -> Command {
-    Command::new(std::env::var_os(var).unwrap_or_else(|| OsString::from(default)))
-}
-
-/// One argument for the remote login shell, which may not be POSIX: it only
-/// has to start `sh` with a single-quoted script.
-fn sh(script: &str) -> String {
-    format!("sh -c '{}'", script.replace('\'', r"'\''"))
-}
-
 /// Distinguishes our sync line from anything a login shell could print.
 pub(crate) fn token() -> String {
     let nanos = SystemTime::now()
@@ -221,11 +387,86 @@ pub(crate) fn token() -> String {
     format!("{:x}{:x}", nanos, std::process::id())
 }
 
-#[cfg(test)]
+/// The end of what ssh says on stderr, read as it says it so that it never
+/// blocks on a full pipe.
+struct Report {
+    tail: Arc<Mutex<Vec<u8>>>,
+    done: rt::oneshot::Receiver<()>,
+}
+
+impl Report {
+    const KEPT: usize = 4 << 10;
+
+    fn drain(rt: &Rt, stderr: sys::ProcessPipe) -> io::Result<Self> {
+        let pipe = rt::Async::read_pipe(&rt.reactor(), stderr)?;
+        let tail = Arc::new(Mutex::new(Vec::new()));
+        let (finished, done) = rt::oneshot::channel();
+        let kept = tail.clone();
+        rt.spawn(Box::pin(async move {
+            let mut bytes = [0; 4096];
+            while let Ok(read @ 1..) = pipe.read_with(|mut io| io.read(&mut bytes)).await {
+                let mut tail = kept.lock().unwrap_or_else(PoisonError::into_inner);
+                tail.extend_from_slice(&bytes[..read]);
+                let over = tail.len().saturating_sub(Self::KEPT);
+                tail.drain(..over);
+            }
+            finished.send(());
+        }));
+        Ok(Self { tail, done })
+    }
+
+    /// All it said, once ssh has exited.
+    async fn said(self) -> String {
+        self.done.await;
+        let tail = self.tail.lock().unwrap_or_else(PoisonError::into_inner);
+        crate::sanitize(String::from_utf8_lossy(&tail).trim()).into_owned()
+    }
+}
+
+/// Kills and reaps the ssh child with its connection.
+struct Reaper {
+    child: Option<sys::ContainedChild>,
+    rt: Rt,
+}
+
+impl Reaper {
+    /// Its exit status, once it has exited.
+    async fn exited(&mut self) -> io::Result<Option<i32>> {
+        let child = self.child.as_mut().expect("bridge child");
+        if child.try_wait()?.is_none()
+            && let Ok(watch) = child.exit_watch()
+        {
+            rt::Async::for_reading(&self.rt.reactor(), watch)?
+                .readable()
+                .await;
+        }
+        Ok(child.try_wait()?.and_then(|status| status.code()))
+    }
+}
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // Revocation cannot wait behind network admission or process exit.
+            let _ = child.kill();
+            let admitted = self.rt.spawn_blocking(
+                rt::BlockingClass::Network,
+                0,
+                Box::new(move || {
+                    let _ = child.wait();
+                }),
+            );
+            self.rt.spawn(Box::pin(async move {
+                let _ = admitted.await;
+            }));
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn upload_checksums_match_the_hosts_cksum() {
         for len in [0, 1, 255, 256, 65_537, 200_003] {
@@ -235,7 +476,7 @@ mod tests {
                 .stdout(Stdio::piped())
                 .spawn()
                 .unwrap();
-            io::Write::write_all(&mut child.stdin.take().unwrap(), &bytes).unwrap();
+            child.stdin.take().unwrap().write_all(&bytes).unwrap();
             let out = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
             let (crc, size) = cksum(&bytes[..]).unwrap();
             assert_eq!(
@@ -245,8 +486,34 @@ mod tests {
         }
     }
 
+    /// dash reads its script from a pipe in blocks, so what follows the
+    /// script on stdin is safe only once the script is read whole.
     #[test]
-    fn quotes_scripts_for_the_login_shell() {
-        assert_eq!(sh("echo 'hi'"), r"sh -c 'echo '\''hi'\'''");
+    fn a_shell_reading_ahead_leaves_the_bridge_nothing_of_the_script() {
+        for shell in ["/bin/sh", "/bin/dash", "/bin/bash"] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            let mut child = Command::new(shell)
+                .arg("-s")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            stdin
+                .write_all(grouped("echo ready\nexec head -c 5").as_bytes())
+                .unwrap();
+            let mut stdout = BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            assert_eq!(line, "ready\n", "{shell}");
+            stdin.write_all(b"frame").unwrap();
+            drop(stdin);
+            let mut rest = String::new();
+            stdout.read_to_string(&mut rest).unwrap();
+            assert_eq!(rest, "frame", "{shell}");
+            child.wait().unwrap();
+        }
     }
 }

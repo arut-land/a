@@ -30,12 +30,12 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 use std::thread;
 
-use client::{Driver, End, Endpoint, Env, Event, Link, Renderer, SessionClient, Show};
+use client::{Driver, End, Env, Event, Link, Renderer, SessionClient, Show};
 use protocol::Target;
 use protocol::view::{
     Change, Item, Kind, Part, Presented, SessionView, Shown, answer_line, mismatch_line, recap_line,
 };
-use sys::Home;
+use sys::{Home, Staged};
 
 use crate::args::{Args, Autostart, Cmd, Daemon};
 
@@ -54,9 +54,9 @@ fn main() -> ExitCode {
     let (prompt, mode) = (args.prompt, args.mode);
     let result = match args.cmd {
         Some(Cmd::Daemon { action }) if prompt.is_none() => {
-            daemon_cmd(args.host, action).map(|()| ExitCode::SUCCESS)
+            daemon_cmd(args.host.as_deref(), action).map(|()| ExitCode::SUCCESS)
         }
-        cmd => daemon_of(args.host).and_then(|daemon| {
+        cmd => daemon_of(args.host.as_deref(), cmd.as_ref()).and_then(|(home, daemon)| {
             let done = match cmd {
                 None => return session(&daemon, Target::New, prompt, mode),
                 Some(Cmd::Resume { id: None, any }) => {
@@ -73,7 +73,7 @@ fn main() -> ExitCode {
                 Some(Cmd::New) => new(&daemon),
                 Some(Cmd::Fork { session }) => fork(&daemon, &session),
                 Some(Cmd::Bridge { token }) => client::bridge(
-                    daemon.home()?,
+                    here(&home, args.host.as_deref())?,
                     token.as_deref().unwrap_or(&daemon.staged.id),
                 ),
                 Some(Cmd::Web { no_open }) => web(daemon, !no_open),
@@ -86,7 +86,15 @@ fn main() -> ExitCode {
                     detached,
                     lock_fd,
                     reset_breaker,
-                }) => serve(&daemon, listen_fd, lock_fd, reset_breaker, detached, login),
+                }) => serve(
+                    here(&home, args.host.as_deref())?,
+                    &daemon.staged,
+                    listen_fd,
+                    lock_fd,
+                    reset_breaker,
+                    detached,
+                    login,
+                ),
             };
             done.map(|()| ExitCode::SUCCESS)
         }),
@@ -132,14 +140,30 @@ fn write(mut output: impl Write + IsTerminal, stream: usize, args: fmt::Argument
 }
 
 /// Entry points that attach resolve their installed image first, so a daemon
-/// they may spawn runs the newest installed build.
-fn daemon_of(host: Option<String>) -> io::Result<client::Daemon> {
+/// they may spawn runs the newest installed build. `a web` serves pages, not
+/// a person at its terminal, so ssh may not ask there.
+fn daemon_of(host: Option<&str>, cmd: Option<&Cmd>) -> io::Result<(Home, client::Daemon)> {
     let home = Home::from_env()?;
     let staged = home.runtime().stage(&std::env::current_exe()?)?;
-    Ok(match host {
-        Some(host) => client::Daemon::ssh(host, staged),
-        None => client::Daemon::local(home, staged),
-    })
+    let prompt = match cmd {
+        Some(Cmd::Web { .. }) => sys::Prompt::Never,
+        _ => sys::Prompt::Terminal,
+    };
+    let daemon = match host {
+        Some(host) => client::Daemon::new(client::SshLink::new(host, prompt), staged),
+        None => client::Daemon::local(home.clone(), staged),
+    };
+    Ok((home, daemon))
+}
+
+/// This machine's home, for a command that acts on this machine only.
+fn here<'a>(home: &'a Home, host: Option<&str>) -> io::Result<&'a Home> {
+    match host {
+        None => Ok(home),
+        Some(host) => Err(io::Error::other(format!(
+            "this command acts on this machine; run it on {host} instead"
+        ))),
+    }
 }
 
 /// Connects to the daemon. A wedged local daemon is diagnosed, and
@@ -150,26 +174,23 @@ fn connect(daemon: &client::Daemon) -> io::Result<client::Connection> {
     daemon.connect(&on_drain).map_err(|e| wedged(daemon, e))
 }
 
-/// `e` as reported: a local daemon that does not answer is diagnosed.
+/// `e` as reported: a daemon that does not answer is diagnosed where its
+/// link can.
 fn wedged(daemon: &client::Daemon, e: client::Error) -> io::Error {
-    match (&daemon.endpoint, &e) {
-        (Endpoint::Local(home), client::Error::NotResponding) => {
-            report(&client::diagnose(home));
-            io::Error::new(io::ErrorKind::TimedOut, RESTART)
-        }
-        _ => e.into(),
+    if e == client::Error::NotResponding
+        && let Some(diagnosis) = daemon.link.diagnose()
+    {
+        report(&diagnosis);
+        return io::Error::new(io::ErrorKind::TimedOut, RESTART);
     }
+    e.into()
 }
 
 const RESTART: &str = "run `a daemon restart` to replace it";
 
-fn daemon_cmd(host: Option<String>, action: Daemon) -> io::Result<()> {
-    if let Some(host) = host {
-        return Err(io::Error::other(format!(
-            "this command acts on this machine; run it on {host} instead"
-        )));
-    }
+fn daemon_cmd(host: Option<&str>, action: Daemon) -> io::Result<()> {
     let home = Home::from_env()?;
+    let home = here(&home, host)?.clone();
     match action {
         Daemon::Autostart {
             state: Autostart::On,
@@ -629,14 +650,14 @@ fn web(_daemon: client::Daemon, _open: bool) -> io::Result<()> {
 /// by the OS at login (`login`), it stays in the foreground the service
 /// manager tracks. The engine owns the typed diagnostic log in every case.
 fn serve(
-    daemon: &client::Daemon,
+    home: &Home,
+    staged: &Staged,
     listen_fd: Option<i32>,
     lock_fd: Option<i32>,
     reset_breaker: bool,
     detached: bool,
     login: bool,
 ) -> io::Result<()> {
-    let home = daemon.home()?;
     if login && (listen_fd.is_some() || lock_fd.is_some() || detached) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -644,12 +665,12 @@ fn serve(
         ));
     }
     if login {
-        sys::autostart::enter(home, &daemon.staged.id)?;
+        sys::autostart::enter(home, &staged.id)?;
         if sys::autostart::LOGIN == sys::autostart::Login::Spawn {
             return client::spawn_at_login(home);
         }
     }
-    sys::crash::install(home.crash_dir(), sys::crash::Build::of(&daemon.staged.id));
+    sys::crash::install(home.crash_dir(), sys::crash::Build::of(&staged.id));
     if detached || listen_fd.is_some() {
         sys::detach_session()?;
         sys::log::discard_stderr()?;
@@ -690,7 +711,7 @@ fn serve(
             extensions: exts::registry,
             ..engine::Config::load(home)
         },
-        &daemon.staged.id,
+        &staged.id,
         start,
     )
 }

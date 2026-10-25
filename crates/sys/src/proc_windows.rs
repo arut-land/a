@@ -132,32 +132,56 @@ pub fn spawn_group_captured(cmd: &mut Command, output: File) -> io::Result<Conta
     Ok(child)
 }
 
+/// `ssh` is `None` for a contained child, else whether ssh may prompt.
 pub fn spawn_stdio_role(
     cmd: &mut Command,
-    terminal: bool,
-) -> io::Result<(ContainedChild, crate::Stream, crate::Stream)> {
+    ssh: Option<super::Prompt>,
+) -> io::Result<(
+    ContainedChild,
+    crate::Stream,
+    crate::Stream,
+    Option<crate::Stream>,
+)> {
     let (input, child_input) = crate::endpoint::imp::process_pipe()?;
     let (output, child_output) = crate::endpoint::imp::process_pipe()?;
-    let error = if terminal {
-        File::from(std::os::windows::io::AsHandle::as_handle(&io::stderr()).try_clone_to_owned()?)
-    } else {
-        File::options().write(true).open("NUL")?
+    let (error, child_error) = match ssh {
+        None => (None, File::options().write(true).open("NUL")?),
+        Some(super::Prompt::Terminal) => (
+            None,
+            File::from(
+                std::os::windows::io::AsHandle::as_handle(&io::stderr()).try_clone_to_owned()?,
+            ),
+        ),
+        Some(super::Prompt::Never) => {
+            let (error, child_error) = crate::endpoint::imp::process_pipe()?;
+            (Some(error), child_error)
+        }
     };
-    let child = spawn_job_role(cmd, [&child_input, &child_output, &error], terminal)?;
-    Ok((child, input, output))
+    let child = spawn_job_role(
+        cmd,
+        [&child_input, &child_output, &child_error],
+        ssh == Some(super::Prompt::Terminal),
+        if ssh.is_some() {
+            super::SpawnEnvironment::InheritSnapshot
+        } else {
+            super::SpawnEnvironment::Exact
+        },
+    )?;
+    Ok((child, input, output, error))
 }
 
 fn spawn_job(
     cmd: &Command,
     io: [&dyn std::os::windows::io::AsHandle; 3],
 ) -> io::Result<ContainedChild> {
-    spawn_job_role(cmd, io, false)
+    spawn_job_role(cmd, io, false, super::SpawnEnvironment::Exact)
 }
 
 fn spawn_job_role(
     cmd: &Command,
     io: [&dyn std::os::windows::io::AsHandle; 3],
     terminal: bool,
+    environment: super::SpawnEnvironment,
 ) -> io::Result<ContainedChild> {
     let security = Security::user_only()?;
     let attributes = security.attributes();
@@ -180,11 +204,7 @@ fn spawn_job_role(
         io,
         job: Some(&job),
         flags: CREATE_NEW_PROCESS_GROUP | if terminal { 0 } else { CREATE_NO_WINDOW },
-        environment: if terminal {
-            super::SpawnEnvironment::InheritSnapshot
-        } else {
-            super::SpawnEnvironment::Exact
-        },
+        environment,
     }
     .spawn()?;
     let group = ProcessLease {

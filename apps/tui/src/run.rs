@@ -4,7 +4,7 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-use client::{Cmd, Daemon, Driver, End, Endpoint, Inbox, Io, Link};
+use client::{Cmd, Daemon, Driver, End, Inbox, Io, Link};
 use protocol::Target;
 use sys::Signals;
 
@@ -36,8 +36,8 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
         .start(runtime.clone(), daemon.clone());
     let mut app = App::new(viewport, &target);
     let mut first = app.client.open(target);
-    // SSH may need the terminal for authentication before raw mode starts.
-    if matches!(daemon.endpoint, Endpoint::Ssh(_)) {
+    // The link may need the terminal (an ssh password) before raw mode starts.
+    if daemon.link.needs_terminal() {
         let connecting = first
             .iter()
             .position(|effect| matches!(effect, client::Effect::Io(Io::Connect { .. })))

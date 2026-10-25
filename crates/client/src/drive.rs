@@ -1,17 +1,17 @@
 //! Ordered client I/O owned by one cancellable runtime task.
 
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use protocol::{ClientId, ClientMsg, DaemonMsg, Decode, Environment};
-use rt::{Rt, Runtime};
+use protocol::{ClientId, ClientMsg, Environment};
+use rt::Rt;
 
+use crate::link::Start;
 use crate::{
-    Attach, ConnId, Connection, Daemon, Effect, Endpoint, Error, Event, EventKind, Io, Notice,
-    Show, Transport,
+    Attach, ConnId, Connection, Daemon, Effect, Error, Event, EventKind, Io, Notice, Show,
 };
 
 type Sink = dyn Fn(&ClientHandle, Event) + Send + Sync;
@@ -313,12 +313,13 @@ impl Driver {
                 rt, daemon, client, conn, &attach, restart, generation, handle,
             )
             .await;
-        let Connected {
-            io,
+        let Connection {
+            stream,
             mut buffered,
             welcome,
             remote,
             commands,
+            ..
         } = match made {
             Ok(connection) => connection,
             Err(error) => {
@@ -333,7 +334,7 @@ impl Driver {
             generation,
             EventKind::Connected {
                 welcome,
-                remote,
+                remote: remote.is_some(),
                 commands,
             },
         ) {
@@ -347,7 +348,7 @@ impl Driver {
                     batch = 0;
                     rt::yield_now().await;
                 }
-                match io.recv(&mut buffered).await {
+                match stream.recv(&mut buffered).await {
                     Ok(Some(msg)) => {
                         if !self.emit(handle, conn, generation, EventKind::Msg(msg)) {
                             return (Error::Closed, None);
@@ -377,7 +378,7 @@ impl Driver {
                     Request::Io(command) => command,
                 };
                 let result = match *command {
-                    Io::Send(msg) => io.send(&msg).await,
+                    Io::Send(msg) => stream.send(&msg).await,
                     Io::SendEnvironment => {
                         let origin = self.origin.clone();
                         match rt::unblock_with(
@@ -388,7 +389,7 @@ impl Driver {
                         )
                         .await
                         {
-                            Ok(env) => io.send(&ClientMsg::Environment(env)).await,
+                            Ok(env) => stream.send(&ClientMsg::Environment(env)).await,
                             Err(error) => Err(error),
                         }
                     }
@@ -419,88 +420,32 @@ impl Driver {
         restart: bool,
         generation: u64,
         handle: &Weak<Handle>,
-    ) -> Result<Connected, Error> {
-        for attempt in 0..3 {
-            let (io, mut buffered, remote, timeout) = match &daemon.endpoint {
-                Endpoint::Local(home) => {
-                    let home = home.clone();
-                    let (opened, started) =
-                        rt::unblock_with(&**rt, rt::BlockingClass::Network, 64 << 10, move || {
-                            if restart && attempt == 0 {
-                                crate::stop(&home)?;
-                            }
-                            let (stream, started) = crate::connect_or_spawn(&home, restart)?;
-                            Ok::<_, Error>((crate::split(&stream)?, started))
-                        })
-                        .await?;
-                    let (io, buffered) = AsyncConnection::new(rt.clone(), opened)?;
-                    (
-                        io,
-                        buffered,
-                        None,
-                        if started {
-                            crate::START_TIMEOUT
-                        } else {
-                            crate::HELLO_TIMEOUT
-                        },
-                    )
-                }
-                Endpoint::Ssh(host) => {
-                    let (io, buffered, env) = open_remote(rt, host, &daemon.staged).await?;
-                    (io, buffered, Some(env), crate::HELLO_TIMEOUT)
-                }
-            };
-            let first = if self.watch {
+    ) -> Result<Connection, Error> {
+        let first = |remote: Option<&Environment>| {
+            Ok(vec![if self.watch {
                 ClientMsg::WatchSessions
             } else {
-                crate::attaching(attach, || remote.clone().map_or_else(crate::capture, Ok))?
-            };
-            let greeting = io.hello(&mut buffered, &daemon.staged.id, client, &first);
-            let deadline = async {
-                rt.sleep(timeout).await;
-                Err(io::Error::new(io::ErrorKind::TimedOut, "daemon hello"))
-            };
-            match rt::or(greeting, deadline).await? {
-                Some(DaemonMsg::Welcome {
-                    proto,
-                    caps,
-                    commands,
-                    ..
-                }) => {
-                    return Ok(Connected {
-                        io,
-                        buffered,
-                        welcome: crate::Welcome { proto, caps },
-                        remote: remote.is_some(),
-                        commands,
-                    });
-                }
-                Some(DaemonMsg::Mismatch { supported, min }) => {
-                    let daemon = daemon.clone();
-                    return Err(rt::unblock(&**rt, move || {
-                        daemon.mismatch(protocol::Versions::new(min, supported))
-                    })
-                    .await);
-                }
-                Some(DaemonMsg::Draining) => {
-                    self.emit(handle, conn, generation, EventKind::Waiting);
-                    rt::or(
-                        async {
-                            while io.recv::<DaemonMsg>(&mut buffered).await?.is_some() {}
-                            Ok::<_, io::Error>(())
-                        },
-                        async {
-                            rt.sleep(crate::DRAIN_TIMEOUT).await;
-                            Ok(())
-                        },
-                    )
-                    .await?;
-                }
-                Some(DaemonMsg::Error { message }) => return Err(Error::Refused(message)),
-                _ => {}
-            }
-        }
-        Err(Error::Closed)
+                crate::attaching(attach, || crate::origin(remote))?
+            }])
+        };
+        let on_drain = || {
+            self.emit(handle, conn, generation, EventKind::Waiting);
+        };
+        let start = if restart {
+            Start::Replace
+        } else {
+            Start::Reuse
+        };
+        crate::link::connect(
+            rt,
+            &daemon.link,
+            &daemon.staged,
+            Some(client),
+            start,
+            &first,
+            &on_drain,
+        )
+        .await
     }
 }
 
@@ -532,251 +477,30 @@ impl ClientHandle {
     }
 }
 
+/// A daemon that took the connection and never answered is wedged, when
+/// its link can say why.
 async fn failure(rt: &Rt, daemon: &Daemon, error: Error) -> EventKind {
-    if error == Error::NotResponding {
-        match &daemon.endpoint {
-            Endpoint::Local(home) => {
-                let home = home.clone();
-                EventKind::Wedged(
-                    rt::unblock(&**rt, move || {
-                        if let Some(daemon) = crate::live_daemon(&home) {
-                            crate::note_timeout(&home, &daemon, &Error::NotResponding);
-                        }
-                        crate::diagnose(&home)
-                    })
-                    .await,
-                )
-            }
-            Endpoint::Ssh(_) => EventKind::Failed(error),
-        }
-    } else {
-        EventKind::Failed(error)
+    if error != Error::NotResponding {
+        return EventKind::Failed(error);
     }
-}
-
-struct Connected {
-    io: AsyncConnection,
-    buffered: Vec<u8>,
-    welcome: crate::Welcome,
-    remote: bool,
-    commands: Vec<protocol::CommandInfo>,
-}
-
-async fn open_remote(
-    rt: &Rt,
-    host: &str,
-    staged: &sys::Staged,
-) -> io::Result<(AsyncConnection, Vec<u8>, Environment)> {
-    let token = crate::remote::token();
-    for installed in [false, true] {
-        let script = if installed {
-            let host = host.to_owned();
-            let installing = staged.clone();
-            rt::unblock_with(&**rt, rt::BlockingClass::Network, 64 << 10, move || {
-                crate::remote::install(&host, &installing)
-            })
-            .await?;
-            crate::remote::installed_script(&staged.id, &token)
-        } else {
-            crate::remote::find_script(&token)
-        };
-        let host = host.to_owned();
-        let opened = rt::unblock_with(&**rt, rt::BlockingClass::Network, 64 << 10, move || {
-            crate::remote::launch(&host, &script)
-        })
-        .await?;
-        let (mut io, mut buffered) = AsyncConnection::new(rt.clone(), opened)?;
-        let sync = format!("{} {token}", crate::remote::SYNC);
-        loop {
-            let Some(line) = io.line(&mut buffered).await? else {
-                let child = io.bridge.child.as_mut().expect("bridge child");
-                if child.try_wait()?.is_none()
-                    && let Ok(watch) = child.exit_watch()
-                {
-                    rt::Async::for_reading(&rt.reactor(), watch)?
-                        .readable()
-                        .await;
-                }
-                if !installed && child.try_wait()?.and_then(|status| status.code()) == Some(127) {
-                    break;
-                }
-                return Err(io::Error::other(
-                    "ssh: the bridge ended before it was ready",
-                ));
-            };
-            if line.trim_ascii_end().strip_prefix(sync.as_bytes()) == Some(crate::remote::WITH_ENV)
-            {
-                return match io.recv(&mut buffered).await? {
-                    Some(ClientMsg::Environment(env)) => Ok((io, buffered, env)),
-                    _ => Err(io::Error::other("ssh: no environment")),
-                };
-            }
-        }
-    }
-    Err(io::Error::other("ssh: the installed bridge did not start"))
-}
-
-enum AsyncTransport {
-    Local(rt::Async<sys::OwnedConnection>),
-    Pipe(rt::Async<sys::ProcessPipe>),
-}
-
-impl AsyncTransport {
-    fn new(rt: &dyn Runtime, io: Transport) -> io::Result<Self> {
-        Ok(match io {
-            Transport::Local(io) => Self::Local(rt::Async::new(&rt.reactor(), io)?),
-            Transport::Pipe(io) => Self::Pipe(rt::Async::new(&rt.reactor(), io)?),
-        })
-    }
-    async fn read(&self, bytes: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Local(io) => io.read_with(|mut io| io.read(bytes)).await,
-            Self::Pipe(io) => io.read_with(|mut io| io.read(bytes)).await,
-        }
-    }
-    async fn write(&self, bytes: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Local(io) => io.write_with(|mut io| io.write(bytes)).await,
-            Self::Pipe(io) => io.write_with(|mut io| io.write(bytes)).await,
-        }
-    }
-    #[allow(clippy::match_same_arms)]
-    async fn flush(&self) -> io::Result<()> {
-        match self {
-            Self::Local(io) => io.flush().await,
-            Self::Pipe(io) => io.flush().await,
-        }
-    }
-}
-
-struct AsyncConnection {
-    reader: AsyncTransport,
-    writer: AsyncTransport,
-    bridge: Reaper,
-}
-
-struct Reaper {
-    child: Option<sys::ContainedChild>,
-    rt: Rt,
-}
-
-impl AsyncConnection {
-    fn new(rt: Rt, mut connection: Connection) -> io::Result<(Self, Vec<u8>)> {
-        let bridge = Reaper {
-            child: connection.writer.child.take(),
-            rt,
-        };
-        let buffered = connection.reader.0.buffer().to_vec();
-        let reader = AsyncTransport::new(&*bridge.rt, connection.reader.0.into_inner())?;
-        let writer = AsyncTransport::new(
-            &*bridge.rt,
-            connection.writer.io.take().expect("owned writer"),
-        )?;
-        Ok((
-            Self {
-                reader,
-                writer,
-                bridge,
-            },
-            buffered,
-        ))
-    }
-
-    async fn hello(
-        &self,
-        buffered: &mut Vec<u8>,
-        build: &str,
-        client: ClientId,
-        first: &ClientMsg,
-    ) -> io::Result<Option<DaemonMsg>> {
-        self.send(&ClientMsg::Hello {
-            proto: protocol::PROTO,
-            build: build.to_owned(),
-            min: protocol::Versions::OURS.min_field(),
-            caps: protocol::Caps::ALL,
-            client: Some(client),
-        })
-        .await?;
-        let sent = self.send(first).await;
-        let reply = self.recv(buffered).await?;
-        if matches!(reply, Some(DaemonMsg::Welcome { .. })) {
-            sent?;
-        }
-        Ok(reply)
-    }
-
-    async fn send(&self, msg: &ClientMsg) -> io::Result<()> {
-        let mut bytes = Vec::new();
-        msg.write_frame(&mut bytes)?;
-        let mut remaining = bytes.as_slice();
-        while !remaining.is_empty() {
-            let written = self.writer.write(remaining).await?;
-            if written == 0 {
-                return Err(io::ErrorKind::WriteZero.into());
-            }
-            remaining = &remaining[written..];
-        }
-        self.writer.flush().await
-    }
-
-    async fn line(&self, buffered: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
-        loop {
-            if let Some(end) = buffered.iter().position(|&byte| byte == b'\n') {
-                return Ok(Some(buffered.drain(..=end).collect()));
-            }
-            if buffered.len() > 64 << 10 {
-                return Err(io::Error::other("ssh: oversized preamble line"));
-            }
-            let mut bytes = [0; 8192];
-            let read = self.reader.read(&mut bytes).await?;
-            if read == 0 {
-                return Ok(None);
-            }
-            buffered.extend_from_slice(&bytes[..read]);
-        }
-    }
-
-    async fn recv<T: Decode>(&self, buffered: &mut Vec<u8>) -> io::Result<Option<T>> {
-        loop {
-            if let Some((len, body)) = protocol::frame_in(buffered)? {
-                let msg = T::from_json(body)?;
-                buffered.drain(..len);
-                return Ok(Some(msg));
-            }
-            let mut bytes = [0; 8192];
-            let read = self.reader.read(&mut bytes).await?;
-            if read == 0 {
-                return Ok(None);
-            }
-            buffered.extend_from_slice(&bytes[..read]);
-        }
-    }
-}
-
-impl Drop for Reaper {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            // Revocation cannot wait behind network admission or process exit.
-            let _ = child.kill();
-            let admitted = self.rt.spawn_blocking(
-                rt::BlockingClass::Network,
-                0,
-                Box::new(move || {
-                    let _ = child.wait();
-                }),
-            );
-            self.rt.spawn(Box::pin(async move {
-                let _ = admitted.await;
-            }));
-        }
+    let link = daemon.link.clone();
+    let diagnosis = rt::unblock(&**rt, move || {
+        link.unanswered();
+        link.diagnose()
+    });
+    match diagnosis.await {
+        Some(diagnosis) => EventKind::Wedged(diagnosis),
+        None => EventKind::Failed(error),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{Caps, Target, read_frame, write_frame};
+    use protocol::{Caps, DaemonMsg, Target, read_frame, write_frame};
+    use rt::Runtime;
     use std::future::{Future, poll_fn};
+    use std::io::{Read, Write};
     use std::pin::pin;
     use std::sync::mpsc;
     use std::task::Poll;
@@ -955,9 +679,7 @@ mod tests {
                 Err(error) => panic!("{error}"),
             }
         }
-        let (io, _) =
-            AsyncConnection::new(runtime.clone(), crate::split(&stream).unwrap()).unwrap();
-        drop(stream);
+        let io = crate::link::socket(&runtime, stream).unwrap().stream;
         let stop = Arc::new(rt::Notify::new());
         let cancel = stop.clone();
         let (stalled, pending) = mpsc::channel();

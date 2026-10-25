@@ -141,10 +141,10 @@ fn hold_open(env: &Isolated, daemon: &Daemon, n: u64) -> Connection {
             scope: here(env),
             body: hold("open"),
         };
-        conn.writer.send(&query).unwrap();
+        conn.send(&query).unwrap();
     }
     for _ in 0..n {
-        let msg = conn.reader.recv().unwrap().unwrap();
+        let msg = conn.recv().unwrap().unwrap();
         assert!(matches!(msg, DaemonMsg::Update { .. }), "{msg:?}");
     }
     conn
