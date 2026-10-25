@@ -292,6 +292,7 @@ mod tests {
                 },
                 remote: false,
                 commands: Vec::new(),
+                machine: protocol::MachineId([0; 16]),
             },
         }
     }

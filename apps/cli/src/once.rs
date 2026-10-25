@@ -489,6 +489,7 @@ mod tests {
                 },
                 remote: false,
                 commands: Vec::new(),
+                machine: protocol::MachineId([0; 16]),
             },
             EventKind::Msg(DaemonMsg::Attached {
                 session: SessionId::new(),

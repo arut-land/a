@@ -122,6 +122,7 @@ impl From<client::Error> for ClientError {
             client::Error::Fork(_)
             | client::Error::Refused(_)
             | client::Error::Link(_)
+            | client::Error::OtherMachine { .. }
             | client::Error::Io(..) => Self::Unavailable { message },
         }
     }

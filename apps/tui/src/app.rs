@@ -692,6 +692,7 @@ mod display_tests {
                 },
                 remote: false,
                 commands: Vec::new(),
+                machine: protocol::MachineId([0; 16]),
             },
         });
         app.fold(&DaemonMsg::Attached {

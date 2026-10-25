@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use boltffi::{EventSubscription, StreamProducer, export};
-use client::{Attach, Cmd, Daemon, Driver, Effect, Env, Notice, SessionClient};
+use client::{Attach, Cmd, Daemon, Daemons, Driver, Effect, Env, Member, Notice, SessionClient};
 use protocol::{Environment, HomeSettings, HostPath, SessionId, SettingsChange, Target};
 use rt::Threads;
 use sys::install::CliLink;
@@ -79,8 +79,15 @@ fn session_path() -> OsString {
 /// The per-user daemon, as the CLI reaches it: the native layout or explicit `$A_HOME`.
 pub struct Client {
     home: Home,
-    daemon: Daemon,
+    /// This machine's daemon alone, for now.
+    daemons: Daemons,
     vars: Vec<(OsString, OsString)>,
+}
+
+impl Client {
+    fn daemon(&self) -> &Daemon {
+        &self.daemons.first().daemon
+    }
 }
 
 #[export]
@@ -91,7 +98,7 @@ impl Client {
         let home = Home::from_env()?;
         let staged: Staged = home.runtime().stage(Path::new(helper))?;
         Ok(Self {
-            daemon: Daemon::local(home.clone(), staged),
+            daemons: Daemons::one(Member::LOCAL, Daemon::local(home.clone(), staged)),
             home,
             vars: session_vars(),
         })
@@ -99,7 +106,7 @@ impl Client {
 
     /// The staged build's id, `<version>+<hash>`.
     pub fn build(&self) -> String {
-        self.daemon.staged.id.clone()
+        self.daemon().staged.id.clone()
     }
 
     pub fn daemon_log(&self) -> String {
@@ -119,7 +126,7 @@ impl Client {
     /// The model and provider variables sessions fall back on, as the
     /// daemon has them.
     pub async fn settings(&self) -> Result<Settings, ClientError> {
-        let daemon = self.daemon.clone();
+        let daemon = self.daemon().clone();
         blocking(move || Ok(daemon.connect(&|| {})?.settings(None)?.into())).await
     }
 
@@ -132,7 +139,7 @@ impl Client {
         to: Settings,
     ) -> Result<Settings, ClientError> {
         let change = SettingsChange::between(&HomeSettings::from(from), &HomeSettings::from(to));
-        let daemon = self.daemon.clone();
+        let daemon = self.daemon().clone();
         blocking(move || Ok(daemon.connect(&|| {})?.settings(Some(change))?.into())).await
     }
 
@@ -171,7 +178,7 @@ impl Client {
 
     /// Replaces a daemon that stopped answering (`not_responding`).
     pub async fn restart_daemon(&self) -> Result<(), ClientError> {
-        let daemon = self.daemon.clone();
+        let daemon = self.daemon().clone();
         blocking(move || {
             daemon.restart()?;
             Ok(())
@@ -189,7 +196,7 @@ impl Client {
 /// The daemon's session list as it changes, pushed by the daemon over one
 /// connection: subscribe to `updates`, then `start`.
 pub struct SessionWatch {
-    daemon: Daemon,
+    daemons: Daemons,
     producer: Arc<StreamProducer<SessionListUpdate>>,
     /// Watches until dropped.
     watch: Mutex<Option<client::SessionWatch>>,
@@ -199,7 +206,7 @@ pub struct SessionWatch {
 impl SessionWatch {
     pub fn new(client: &Client) -> Self {
         Self {
-            daemon: client.daemon.clone(),
+            daemons: client.daemons.clone(),
             producer: Arc::new(StreamProducer::new(64)),
             watch: Mutex::new(None),
         }
@@ -220,13 +227,14 @@ impl SessionWatch {
             return;
         }
         let producer = Arc::clone(&self.producer);
+        let rt: rt::Rt = runtime().clone();
         *watch = Some(client::SessionWatch::start(
-            runtime().clone(),
-            self.daemon.clone(),
+            &rt,
+            &self.daemons,
             move |list| {
                 producer.push(match list {
                     Ok(sessions) => SessionListUpdate {
-                        sessions: sessions.iter().map(Into::into).collect(),
+                        sessions: sessions.iter().map(|l| (&l.summary).into()).collect(),
                         problem: None,
                     },
                     Err(problem) => SessionListUpdate {
@@ -298,7 +306,7 @@ impl QueryStream {
         let (sender, answers) = rt::channel::bounded(16);
         Ok(Self {
             asked: Mutex::new(Some(Asked {
-                daemon: client.daemon.clone(),
+                daemon: client.daemon().clone(),
                 query: (service, scope, body),
                 answers: sender,
             })),
@@ -412,7 +420,7 @@ impl Session {
                 driver.pump(&mut *feed, effects);
             },
         )
-        .start(runtime().clone(), client.daemon.clone());
+        .start(runtime().clone(), client.daemon().clone());
         Self {
             feed,
             driver,
@@ -685,7 +693,7 @@ mod tests {
         .unwrap();
         let listener = home.bind().unwrap();
         let client = Client {
-            daemon: Daemon::local(home.clone(), staged),
+            daemons: Daemons::one(Member::LOCAL, Daemon::local(home.clone(), staged)),
             home: home.clone(),
             vars: Vec::new(),
         };

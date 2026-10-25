@@ -30,7 +30,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 use std::thread;
 
-use client::Host;
+use client::{Daemons, Host, Member};
 use client::{Driver, End, Env, Event, Link, Renderer, SessionClient, Show};
 use protocol::Target;
 use protocol::view::{
@@ -57,27 +57,29 @@ fn main() -> ExitCode {
         Some(Cmd::Daemon { action }) if prompt.is_none() => {
             daemon_cmd(args.host.as_ref(), action).map(|()| ExitCode::SUCCESS)
         }
-        cmd => daemon_of(args.host.as_ref(), cmd.as_ref()).and_then(|(home, daemon)| {
+        cmd => daemon_of(args.host.as_ref(), cmd.as_ref()).and_then(|(home, daemons)| {
+            let daemon = &daemons.first().daemon;
             let done = match cmd {
-                None => return session(&daemon, Target::New, prompt, mode),
+                None => return session(&home, &daemons, Target::New, prompt, mode),
                 Some(Cmd::Resume { id: None, any }) => {
-                    return session(&daemon, Target::Latest { any_workspace: any }, prompt, mode);
+                    let latest = Target::Latest { any_workspace: any };
+                    return session(&home, &daemons, latest, prompt, mode);
                 }
                 Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
-                    return session(&daemon, Target::Prefix(id), prompt, mode);
+                    return session(&home, &daemons, Target::Prefix(id), prompt, mode);
                 }
                 Some(_) if prompt.is_some() => {
                     eprintln!("a: -p runs a turn: it takes no command but `resume` or `attach`");
                     return Ok(ExitCode::from(2));
                 }
-                Some(Cmd::Ls) => ls(&daemon),
-                Some(Cmd::New) => new(&daemon),
-                Some(Cmd::Fork { session }) => fork(&daemon, &session),
+                Some(Cmd::Ls) => ls(&daemons),
+                Some(Cmd::New) => new(daemon),
+                Some(Cmd::Fork { session }) => fork(&home, &daemons, &session),
                 Some(Cmd::Bridge { token }) => client::bridge(
                     here(&home, args.host.as_ref())?,
                     token.as_deref().unwrap_or(&daemon.staged.id),
                 ),
-                Some(Cmd::Web { no_open }) => web(daemon, !no_open),
+                Some(Cmd::Web { no_open }) => web(daemons.clone(), !no_open),
                 Some(Cmd::Daemon { .. }) => {
                     unreachable!("daemon commands are handled before installation")
                 }
@@ -142,22 +144,37 @@ fn write(mut output: impl Write + IsTerminal, stream: usize, args: fmt::Argument
 
 /// Entry points that attach resolve their installed image first, so a daemon
 /// they may spawn runs the newest installed build. `a web` serves pages, not
-/// a person at its terminal, so ssh may not ask there.
-fn daemon_of(host: Option<&Host>, cmd: Option<&Cmd>) -> io::Result<(Home, client::Daemon)> {
+/// a person at its terminal, so ssh may not ask there. The set holds the
+/// one daemon `--host` names, else this machine's.
+fn daemon_of(host: Option<&Host>, cmd: Option<&Cmd>) -> io::Result<(Home, Daemons)> {
     let home = Home::from_env()?;
     let staged = home.runtime().stage(&std::env::current_exe()?)?;
     let prompt = match cmd {
         Some(Cmd::Web { .. }) => sys::Prompt::Never,
         _ => sys::Prompt::Terminal,
     };
-    let daemon = match host {
-        Some(host) => client::Daemon::new(
-            client::SshLink::new(host.clone(), prompt, home.clone()),
-            staged,
+    let daemons = match host {
+        Some(host) => Daemons::one(
+            host.as_str(),
+            client::Daemon::new(
+                client::SshLink::new(host.clone(), prompt, home.clone()),
+                staged,
+            ),
         ),
-        None => client::Daemon::local(home.clone(), staged),
+        None => Daemons::one(Member::LOCAL, client::Daemon::local(home.clone(), staged)),
     };
-    Ok((home, daemon))
+    Ok((home, daemons))
+}
+
+/// The set with the machine `target` names (`a attach mac2:3f9a`), from
+/// `machines.toml` or the ssh configuration, where the set lacks it.
+fn reaching(home: &Home, daemons: &Daemons, target: &Target) -> io::Result<Daemons> {
+    daemons.clone().naming(
+        target,
+        &client::Sources::of(home),
+        sys::Prompt::Terminal,
+        home,
+    )
 }
 
 /// This machine's home, for a command that acts on this machine only.
@@ -249,11 +266,15 @@ fn daemon_cmd(host: Option<&Host>, action: Daemon) -> io::Result<()> {
 /// client at a terminal, the line REPL anywhere else, which leave `mode` to
 /// `/mode`.
 fn session(
-    daemon: &client::Daemon,
+    home: &Home,
+    daemons: &Daemons,
     target: Target,
     prompt: Option<String>,
     mode: Option<String>,
 ) -> io::Result<ExitCode> {
+    let daemons = reaching(home, daemons, &target)?;
+    let (member, target) = daemons.resolve(target)?;
+    let daemon = &member.daemon;
     if prompt.is_some() || (!io::stdin().is_terminal() && !tui::plain()) {
         return once::run(daemon, target, prompt, mode);
     }
@@ -606,9 +627,19 @@ fn outcome(p: &Presented<'_>) -> Vec<String> {
     lines
 }
 
-fn ls(daemon: &client::Daemon) -> io::Result<()> {
-    for s in connect(daemon)?.sessions()? {
-        sayln!("{s}");
+/// Each machine's sessions; a machine is named only beside others.
+fn ls(daemons: &Daemons) -> io::Result<()> {
+    if !daemons.several() {
+        for s in connect(&daemons.first().daemon)?.sessions()? {
+            sayln!("{s}");
+        }
+        return Ok(());
+    }
+    for (member, listed) in daemons.sessions() {
+        match listed {
+            Ok(listed) => listed.iter().for_each(|l| sayln!("{l}")),
+            Err(e) => errln!("a: {}: {}", member.name, client::sanitize(&e.to_string())),
+        }
     }
     Ok(())
 }
@@ -619,7 +650,7 @@ fn new(daemon: &client::Daemon) -> io::Result<()> {
     Ok(())
 }
 
-fn fork(daemon: &client::Daemon, source: &str) -> io::Result<()> {
+fn fork(home: &Home, daemons: &Daemons, source: &str) -> io::Result<()> {
     let (source, seq) = match source.rsplit_once('@') {
         Some((source, seq)) => (
             source,
@@ -632,20 +663,29 @@ fn fork(daemon: &client::Daemon, source: &str) -> io::Result<()> {
         ),
         None => (source, None),
     };
+    let target = Target::Fork {
+        session: source.to_owned(),
+        seq,
+    };
+    let daemons = reaching(home, daemons, &target)?;
+    let (member, Target::Fork { session, seq }) = daemons.resolve(target)? else {
+        unreachable!("a fork resolves to a fork")
+    };
+    let daemon = &member.daemon;
     let session = daemon
-        .fork_session(source.to_owned(), seq)
+        .fork_session(session, seq)
         .map_err(|e| wedged(daemon, e))?;
     sayln!("{}", session.short());
     Ok(())
 }
 
 #[cfg(feature = "web")]
-fn web(daemon: client::Daemon, open: bool) -> io::Result<()> {
-    web::run(daemon, open)
+fn web(daemons: Daemons, open: bool) -> io::Result<()> {
+    web::run(daemons, open)
 }
 
 #[cfg(not(feature = "web"))]
-fn web(_daemon: client::Daemon, _open: bool) -> io::Result<()> {
+fn web(_daemons: Daemons, _open: bool) -> io::Result<()> {
     Err(io::Error::other("this build of a has no web UI"))
 }
 

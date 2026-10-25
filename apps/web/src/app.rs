@@ -11,11 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
-use client::{Cmd, Daemon, Driver, Event};
+use client::{Cmd, Daemons, Driver, Event};
 use client::{Inbox, Post};
 use http::header::HOST;
 use http::{Method, Request, StatusCode};
-use protocol::SessionId;
+use protocol::{SessionId, SessionSummary};
 use rt::Rt;
 use serde::Deserialize;
 
@@ -36,7 +36,8 @@ enum TabIn {
 }
 
 pub struct App {
-    daemon: Daemon,
+    /// Its chats are the first member's.
+    daemons: Daemons,
     rt: Rt,
     pub gate: Gate,
     tabs: Arc<Tabs>,
@@ -48,6 +49,25 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Every member's sessions, side by side; an error only when no member
+/// could list.
+fn listed(daemons: &Daemons) -> Result<Vec<SessionSummary>, String> {
+    let (found, failed): (Vec<_>, Vec<_>) = daemons
+        .sessions()
+        .into_iter()
+        .map(|(_, listing)| listing)
+        .partition(Result::is_ok);
+    match failed.into_iter().next() {
+        Some(Err(e)) if found.is_empty() => Err(e.to_string()),
+        _ => Ok(found
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|l| l.summary)
+            .collect()),
+    }
+}
+
 /// What a tab's calls carry: Datastar sends the page's signals.
 #[derive(Deserialize)]
 struct Signals {
@@ -57,9 +77,9 @@ struct Signals {
 }
 
 impl App {
-    pub fn new(daemon: Daemon, rt: Rt, gate: Gate) -> Self {
+    pub fn new(daemons: Daemons, rt: Rt, gate: Gate) -> Self {
         Self {
-            daemon,
+            daemons,
             rt,
             gate,
             tabs: Arc::default(),
@@ -71,10 +91,10 @@ impl App {
     fn blocking<T, F>(&self, work: F) -> impl Future<Output = T>
     where
         T: Send + 'static,
-        F: FnOnce(&Daemon) -> T + Send + 'static,
+        F: FnOnce(&Daemons) -> T + Send + 'static,
     {
-        let daemon = self.daemon.clone();
-        rt::unblock(&*self.rt, move || work(&daemon))
+        let daemons = self.daemons.clone();
+        rt::unblock(&*self.rt, move || work(&daemons))
     }
 
     /// Hands `what` to tab `tab`'s client; `false` if it has none.
@@ -102,13 +122,13 @@ impl App {
         });
         let response = match (&parts.method, path, session) {
             (&Method::GET, "/", _) => {
-                let listed = self
-                    .blocking(Daemon::sessions)
-                    .await
-                    .map_err(|e| e.to_string());
+                let listed = self.blocking(listed).await;
                 page(view::sessions_page(&listed))
             }
-            (&Method::POST, "/new", _) => match self.blocking(Daemon::new_session).await {
+            (&Method::POST, "/new", _) => match self
+                .blocking(|daemons| daemons.first().daemon.new_session())
+                .await
+            {
                 Ok(session) => see_other(&format!("/s/{session}"), None),
                 Err(e) => text(
                     StatusCode::BAD_GATEWAY,
@@ -231,7 +251,7 @@ impl Live {
         let tx = Arc::new(tx);
         let events = Arc::clone(&tx);
         let driver = Driver::new(move |driver, event| events.event(driver, event, TabIn::Client))
-            .start(app.rt.clone(), app.daemon.clone());
+            .start(app.rt.clone(), app.daemons.first().daemon.clone());
         let stream = app.streams.fetch_add(1, Ordering::Relaxed);
         lock(&app.tabs).insert(id.to_owned(), (stream, tx));
         let (page, open) = Page::new(session);
@@ -328,6 +348,7 @@ mod tests {
                 },
                 remote: false,
                 commands: Vec::new(),
+                machine: protocol::MachineId([0; 16]),
             },
             client::EventKind::Msg(protocol::DaemonMsg::Synced { seq: 0 }),
         ] {

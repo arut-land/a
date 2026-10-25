@@ -135,6 +135,8 @@ pub enum EventKind {
         welcome: Welcome,
         remote: bool,
         commands: Vec<CommandInfo>,
+        /// The daemon's machine, as its welcome named it.
+        machine: protocol::MachineId,
     },
     Msg(DaemonMsg),
     /// A daemon draining for a newer build is waited out before the
@@ -492,6 +494,7 @@ impl SessionClient {
                 welcome,
                 remote,
                 commands,
+                ..
             } => {
                 self.commands = commands;
                 // Neither answered nor refused on the last connection: sent
@@ -782,6 +785,7 @@ mod tests {
                 },
                 remote: false,
                 commands: Vec::new(),
+                machine: protocol::MachineId([0; 16]),
             },
         }
     }

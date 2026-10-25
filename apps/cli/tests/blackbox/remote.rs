@@ -397,3 +397,32 @@ fn a_host_of_another_platform_is_refused() {
     assert!(stderr.contains("not installed on box"), "{stderr}");
     assert!(!host.root().join("runtime").exists());
 }
+
+/// `a attach mac2:<id>` reaches the machine `machines.toml` calls mac2,
+/// and only the one it pins.
+#[test]
+fn a_session_on_a_named_machine_is_attached_by_the_machines_name() {
+    let mut env = Env::new("machines");
+    let (mut new, host) = fake_remote(&mut env, "");
+    let session = ok(&new.arg("new").output().unwrap());
+    let attach = |machines: &str| {
+        fs::write(env.home.machines_file(), machines).unwrap();
+        env.cmd(&["-p", "hi", "attach", &format!("mac2:{}", session.trim())])
+            .env("A_SSH", env.root.join("ssh"))
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap()
+    };
+    let other = protocol::MachineId([7; 16]);
+    let refused = attach(&format!(
+        "[machine.mac2]\nssh = \"box\"\nid = \"{other}\"\n"
+    ));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success());
+    assert!(stderr.contains("as machines.toml pins"), "{stderr}");
+
+    ok(&attach("[machine.mac2]\nssh = \"box\"\n"));
+    let text = only_log(&host);
+    assert!(text.contains(r#""segments":[{"text":"hi""#), "{text}");
+    assert!(!env.home.sessions_dir().exists(), "a session at home");
+}

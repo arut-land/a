@@ -16,7 +16,7 @@ use protocol::{
 use rt::{BoxFuture, Rt, Runtime};
 use sys::{Home, Staged};
 
-use crate::{Connection, Diagnosis, Error, Welcome};
+use crate::{Connection, Daemon, Diagnosis, Error, Welcome};
 
 /// A way to one daemon.
 pub trait Link: fmt::Debug + Send + Sync + 'static {
@@ -322,13 +322,13 @@ pub(crate) enum Greeting {
 /// on none of `first`, so each try sends it again.
 pub(crate) async fn connect(
     rt: &Rt,
-    link: &Arc<dyn Link>,
-    build: &Staged,
+    daemon: &Daemon,
     client: Option<ClientId>,
     start: Start,
     first: &(dyn Fn(Option<&Environment>) -> io::Result<Vec<ClientMsg>> + Sync),
     on_drain: &(dyn Fn() + Sync),
 ) -> Result<Connection, Error> {
+    let (link, build) = (&daemon.link, &daemon.staged);
     let mut start = start;
     for _ in 0..3 {
         let Opened {
@@ -350,6 +350,12 @@ pub(crate) async fn connect(
         .await;
         match greeting {
             Ok((Greeting::Welcome(theirs), welcome, commands, queries)) => {
+                if let Some(pinned) = daemon.pinned.filter(|&pinned| pinned != theirs) {
+                    return Err(Error::OtherMachine {
+                        pinned,
+                        found: theirs,
+                    });
+                }
                 return Ok(Connection {
                     stream,
                     buffered,

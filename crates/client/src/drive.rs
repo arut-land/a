@@ -295,7 +295,7 @@ impl Driver {
         false
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn connection(
         &self,
         rt: &Rt,
@@ -319,6 +319,7 @@ impl Driver {
             welcome,
             remote,
             commands,
+            machine,
             ..
         } = match made {
             Ok(connection) => connection,
@@ -336,6 +337,7 @@ impl Driver {
                 welcome,
                 remote: remote.is_some(),
                 commands,
+                machine,
             },
         ) {
             return None;
@@ -436,16 +438,7 @@ impl Driver {
         } else {
             Start::Reuse
         };
-        crate::link::connect(
-            rt,
-            &daemon.link,
-            &daemon.staged,
-            Some(client),
-            start,
-            &first,
-            &on_drain,
-        )
-        .await
+        crate::link::connect(rt, daemon, Some(client), start, &first, &on_drain).await
     }
 }
 
@@ -527,6 +520,7 @@ mod tests {
                 },
                 remote: false,
                 commands: Vec::new(),
+                machine: protocol::MachineId([0; 16]),
             },
         });
         let effects = client.offer().unwrap().input("x".repeat(8 << 20)).unwrap();

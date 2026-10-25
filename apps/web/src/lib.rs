@@ -19,19 +19,19 @@ use std::io::{self, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 
-use client::Daemon;
+use client::Daemons;
 use rt::Rt;
 
 /// Serves the UI on a random port of 127.0.0.1 until the process is
 /// stopped. The printed link carries a one-time token; `open` also opens it
 /// in the default browser.
-pub fn run(daemon: Daemon, open: bool) -> io::Result<()> {
+pub fn run(daemons: Daemons, open: bool) -> io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let gate = http::Gate::new(port);
     let link = gate.link();
     let rt: Rt = Arc::new(rt::Threads::default());
-    let app = Arc::new(app::App::new(daemon, Arc::clone(&rt), gate));
+    let app = Arc::new(app::App::new(daemons, Arc::clone(&rt), gate));
 
     // Whoever reads the link may stop reading (`a web | head -1`): the
     // server keeps going without its stdout.
