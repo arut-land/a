@@ -634,6 +634,12 @@ async fn locked(rt: &rt::Rt, file: File, within: Option<Duration>) -> Option<Fil
     }
 }
 
+/// Local endpoint verification and named-pipe opening may block in the OS.
+async fn local_connect(rt: &rt::Rt, home: &Home) -> io::Result<OwnedConnection> {
+    let endpoint = home.endpoint();
+    rt::unblock(&**rt, move || endpoint.connect()).await
+}
+
 /// Connects to the running daemon, as its own build `build` so as not to
 /// set off a drain, without starting one.
 async fn reach(rt: &rt::Rt, home: &Home, build: &str) -> Result<Connection, Error> {
@@ -643,7 +649,7 @@ async fn reach(rt: &rt::Rt, home: &Home, build: &str) -> Result<Connection, Erro
         mut buffered,
         remote,
         within,
-    } = link::socket(rt, home.endpoint().connect()?)?;
+    } = link::socket(rt, local_connect(rt, home).await?)?;
     let greeting = answered(
         rt,
         within,
@@ -852,7 +858,7 @@ async fn bind_at_login_async(
     home: &Home,
 ) -> io::Result<Option<(sys::DaemonLock, sys::Listener)>> {
     let _starting = starting(rt, home).await?;
-    if home.endpoint().connect().is_ok() {
+    if local_connect(rt, home).await.is_ok() {
         return Ok(None);
     }
     // A daemon draining or stopping still holds the record and its endpoint;
@@ -890,15 +896,14 @@ pub(crate) async fn connect_or_spawn(
 ) -> io::Result<(OwnedConnection, bool)> {
     use std::process::{Command, Stdio};
 
-    let endpoint = home.endpoint();
-    match endpoint.connect() {
+    match local_connect(rt, home).await {
         Ok(stream) => return Ok((stream, false)),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(error),
         Err(_) => {}
     }
 
     let _starting = starting(rt, home).await?;
-    match endpoint.connect() {
+    match local_connect(rt, home).await {
         Ok(stream) => return Ok((stream, false)),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(error),
         Err(_) => {}
@@ -923,13 +928,13 @@ pub(crate) async fn connect_or_spawn(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     home.daemon_env(&mut cmd);
-    let home = home.clone();
+    let spawning = home.clone();
     let daemon = rt::unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
-        sys::spawn_daemon(&mut cmd, &home, lock)
+        sys::spawn_daemon(&mut cmd, &spawning, lock)
     })
     .await?;
     rt::reap(&**rt, daemon);
-    Ok((endpoint.connect()?, true))
+    Ok((local_connect(rt, home).await?, true))
 }
 
 impl Event {
