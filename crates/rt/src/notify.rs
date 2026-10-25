@@ -3,8 +3,8 @@
 //! for as a condition, checked before it sleeps and after every wake, so
 //! a notify between its check and its sleep is never lost.
 
-use std::future::{Future, poll_fn};
-use std::sync::Mutex;
+use std::future::poll_fn;
+use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 
 use crate::lock;
@@ -15,7 +15,7 @@ pub struct Notify(Mutex<State>);
 #[derive(Debug, Default)]
 struct State {
     count: u64,
-    waiters: Vec<Waker>,
+    waiters: Vec<(Arc<()>, Waker)>,
 }
 
 impl Notify {
@@ -31,7 +31,9 @@ impl Notify {
         state.count += 1;
         let waiters = std::mem::take(&mut state.waiters);
         drop(state);
-        waiters.into_iter().for_each(Waker::wake);
+        for (_, waker) in waiters {
+            waker.wake();
+        }
     }
 
     /// How many times it was notified.
@@ -41,19 +43,30 @@ impl Notify {
 
     /// Resolves once `ready` holds; it is checked now and after each
     /// notify.
-    pub fn until<'a>(
-        &'a self,
-        mut ready: impl FnMut() -> bool + Send + 'a,
-    ) -> impl Future<Output = ()> + Send + 'a {
-        poll_fn(move |cx| {
+    pub async fn until(&self, mut ready: impl FnMut() -> bool + Send) {
+        let waiter = Waiter {
+            notify: self,
+            token: Arc::new(()),
+        };
+        poll_fn(|cx| {
             if ready() {
                 return Poll::Ready(());
             }
             let mut state = lock(&self.0);
-            if !state.waiters.iter().any(|w| w.will_wake(cx.waker())) {
-                state.waiters.push(cx.waker().clone());
-            }
+            let previous = if let Some((_, waker)) = state
+                .waiters
+                .iter_mut()
+                .find(|(token, _)| Arc::ptr_eq(token, &waiter.token))
+            {
+                Some(std::mem::replace(waker, cx.waker().clone()))
+            } else {
+                state
+                    .waiters
+                    .push((Arc::clone(&waiter.token), cx.waker().clone()));
+                None
+            };
             drop(state);
+            drop(previous);
             // A notify between the check and the registration may have
             // missed this waker.
             if ready() {
@@ -62,6 +75,7 @@ impl Notify {
                 Poll::Pending
             }
         })
+        .await;
     }
 
     /// Resolves once notified since `seen` was taken from
@@ -74,10 +88,30 @@ impl Notify {
     }
 }
 
+struct Waiter<'a> {
+    notify: &'a Notify,
+    token: Arc<()>,
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        let removed = {
+            let mut state = lock(&self.notify.0);
+            state
+                .waiters
+                .iter()
+                .position(|(token, _)| Arc::ptr_eq(token, &self.token))
+                .map(|index| state.waiters.swap_remove(index))
+        };
+        drop(removed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::block_on;
+    use std::future::Future;
     use std::pin::pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -89,6 +123,50 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn cancelled_and_completed_waiters_release_their_wakers() {
+        let notify = Notify::new();
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&count));
+        let mut cx = Context::from_waker(&waker);
+        let mut cancelled = Box::pin(notify.until(|| false));
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        drop(cancelled);
+        assert_eq!(Arc::strong_count(&count), 2);
+
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let mut completed = pin!(notify.until(|| ready.load(Ordering::SeqCst)));
+        assert!(completed.as_mut().poll(&mut cx).is_pending());
+        ready.store(true, Ordering::SeqCst);
+        assert!(completed.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(Arc::strong_count(&count), 2);
+
+        let mut checks = 0;
+        let mut during_registration = pin!(notify.until(|| {
+            checks += 1;
+            checks == 2
+        }));
+        assert!(during_registration.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(Arc::strong_count(&count), 2);
+        notify.notify();
+        assert_eq!(count.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancelling_one_waiter_preserves_another_with_the_same_waker() {
+        let notify = Notify::new();
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&count));
+        let mut cx = Context::from_waker(&waker);
+        let mut first = Box::pin(notify.until(|| false));
+        let mut second = pin!(notify.until(|| false));
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        drop(first);
+        notify.notify();
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -86,7 +86,11 @@ impl Native {
             handle.refs += 1;
             held.tree = Some((key, handle.serial));
         } else if let Some(parent) = parent {
-            if !self.parents.contains_key(parent) {
+            if !self
+                .parents
+                .get(parent)
+                .is_some_and(|h| h.identity == identity(parent))
+            {
                 let handle = self.open(parent, Depth::Entries)?;
                 self.parents.insert(parent.to_owned(), handle);
             }
