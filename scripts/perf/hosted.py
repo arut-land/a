@@ -381,7 +381,7 @@ def paired(output, source, reference):
             checkpoint()
 
 
-def sessions(source, output, variant):
+def sessions(source, output, variant, reference=""):
     """Build only the engine's measurements, then run the concurrent-session layouts.
 
     A variant naming `allocators` builds the measurement once per allocator
@@ -393,10 +393,11 @@ def sessions(source, output, variant):
         # snmalloc checks Git Bash's MSYSTEM before the MSVC target.
         env.pop("MSYSTEM", None)
 
-    def engine(name, features=()):
+    def engine(name, features=(), checkout=source):
+        build_env = dict(env, CARGO_TARGET_DIR=str(checkout / "target/perf-build"))
         result = run(["cargo", "test", "--release", *STD, "-p", "engine", "--lib", "--no-run",
                       *(["--features", ",".join(features)] if features else []),
-                      "--message-format=json"], cwd=source, env=env, stdout=subprocess.PIPE, text=True)
+                      "--message-format=json"], cwd=checkout, env=build_env, stdout=subprocess.PIPE, text=True)
         executables = [record["executable"] for line in result.stdout.splitlines()
                        if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
         assert len(executables) == 1, executables
@@ -406,6 +407,13 @@ def sessions(source, output, variant):
 
     binary = engine("engine-bench")
     extra = []
+    if reference:
+        reference_source = source.parent / "reference"
+        run(["git", "fetch", "--no-tags", "--depth=1", "origin", reference], cwd=source)
+        reference = subprocess.check_output(["git", "rev-parse", "FETCH_HEAD"], cwd=source, text=True).strip()
+        run(["git", "worktree", "add", "--detach", reference_source, reference], cwd=source)
+        extra.append(f"candidate={binary}")
+        binary = engine("engine-bench-reference", checkout=reference_source)
     for allocator in variant.get("allocators", []):
         if allocator == "segment":
             if os.name != "nt":
@@ -421,7 +429,7 @@ def sessions(source, output, variant):
         else:
             extra.append(f"{allocator}={engine('engine-bench-' + allocator, ['sys/' + allocator])}")
     layouts = ["--layouts", "memory", *(arg for entry in extra for arg in ("--binary", entry))] \
-        if "allocators" in variant else []
+        if "allocators" in variant or reference else []
     os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
     run([sys.executable, ROOT / "scripts/perf/sessions.py", binary, "--output", output / "sessions",
          "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5"),
@@ -429,6 +437,7 @@ def sessions(source, output, variant):
     (output / "sessions" / "host.json").write_text(json.dumps(dict(
         platform=platform.platform(), machine=platform.machine(), hardware=hardware(),
         revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
+        reference_revision=reference or None,
     ), indent=2) + "\n")
 
 
@@ -449,7 +458,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     variant = json.loads(args.variant or "{}")
     if args.phase == "sessions":
-        sessions(source, output, variant)
+        sessions(source, output, variant, args.paired_ref)
         return
     if args.phase in ["all", "build"]:
         build(source, output, variant, benchmarks=not args.build_only)

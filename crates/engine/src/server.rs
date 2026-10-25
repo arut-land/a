@@ -149,11 +149,18 @@ impl Frames {
                 return Ok(Some(msg));
             }
             let at = self.buf.len();
-            self.buf.resize(at + (16 << 10), 0);
-            let read = &mut self.buf[at..];
-            let n = self.io.read_with(|mut s| s.read(read)).await;
-            self.buf.truncate(at + n.as_ref().map_or(0, |n| *n));
-            match n? {
+            let n = self
+                .io
+                .read_with(|mut s| {
+                    // Scratch lives only while polling: an idle connection
+                    // retains received bytes, not a full read buffer.
+                    let mut read = [0; 16 << 10];
+                    let n = s.read(&mut read)?;
+                    self.buf.extend_from_slice(&read[..n]);
+                    Ok(n)
+                })
+                .await?;
+            match n {
                 0 if at == 0 => return Ok(None),
                 0 => return Err(io::ErrorKind::UnexpectedEof.into()),
                 _ => {}
@@ -779,7 +786,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn ready_incoming_frames_yield_before_reading_another_batch() {
+    fn incoming_frames_keep_only_received_bytes_and_yield_between_batches() {
         let root =
             std::env::temp_dir().join(format!("a-server-overload-{}", protocol::SessionId::new()));
         std::fs::create_dir_all(&root).unwrap();
@@ -802,6 +809,34 @@ mod tests {
         let stream = listener.accept().unwrap();
         let runtime = rt::Threads::new(1);
         let mut frames = Frames::new(Arc::new(Async::new(&runtime.reactor(), stream).unwrap()));
+        ClientMsg::Detach.write_frame(&mut &peer).unwrap();
+        assert!(matches!(
+            rt::block_on(frames.next::<ClientMsg>()).unwrap(),
+            Some(ClientMsg::Detach)
+        ));
+        assert!(
+            frames.buf.capacity() < 16 << 10,
+            "read scratch was retained"
+        );
+        let writer = std::thread::spawn(move || {
+            ClientMsg::Hello {
+                proto: PROTO,
+                build: "x".repeat(64 << 10),
+                min: None,
+                caps: Caps::NONE,
+                client: None,
+                machine: None,
+            }
+            .write_frame(&mut &peer)
+            .unwrap();
+            peer
+        });
+        assert!(matches!(
+            rt::block_on(frames.next::<ClientMsg>()).unwrap(),
+            Some(ClientMsg::Hello { build, .. }) if build.len() == 64 << 10
+        ));
+        let peer = writer.join().unwrap();
+        frames.batch = 0;
         for _ in 0..65 {
             ClientMsg::Detach.write_frame(&mut frames.buf).unwrap();
         }
