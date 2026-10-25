@@ -151,9 +151,13 @@ fn an_upgrade_hands_running_work_to_the_newer_build_live() {
         "the job's output was not kept"
     );
 
-    let log = fs::read_to_string(env.home.daemon_log()).unwrap();
+    // The daemon log is written behind the facts it records.
+    let log = || fs::read_to_string(env.home.daemon_log()).unwrap_or_default();
+    wait_for("the handover in the daemon log", || {
+        log().contains("\"origin\":\"handover\"")
+    });
+    let log = log();
     assert!(log.contains("\"handed_over\""), "{log}");
-    assert!(log.contains("\"origin\":\"handover\""), "{log}");
     assert!(!log.contains("previous_crash"), "{log}");
 
     // The server job runs on, the new daemon's own: stopping it ends it.

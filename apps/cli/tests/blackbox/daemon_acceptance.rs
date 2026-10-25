@@ -181,10 +181,14 @@ fn an_upgrade_hands_a_running_job_to_the_newer_build() {
         cfg!(unix),
         "where the newer build serves"
     );
-    let log = fs::read_to_string(env.home.daemon_log()).unwrap();
-    assert!(log.contains(r#""handed_over":{"groups":1}"#), "{log}");
-    assert!(log.contains(r#""origin":"handover""#), "{log}");
+    // The daemon log is written behind the facts it records.
     let ended = Instant::now() + Duration::from_secs(30);
+    let log = || fs::read_to_string(env.home.daemon_log()).unwrap_or_default();
+    while !log().contains(r#""origin":"handover""#) {
+        assert!(Instant::now() < ended, "{}", log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(log().contains(r#""handed_over":{"groups":1}"#), "{}", log());
     while !env
         .logs()
         .values()
