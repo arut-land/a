@@ -150,8 +150,10 @@ is equal or lower (ubuntu-latest 8.2 → 7.7 MiB at one session).
   flush, which 128 sessions share; main measured the same with 128 network
   workers (280 ms). It is the flush lane, not the transport.
 - **Idle RSS after 128 sessions** is 1–3 MiB higher on Linux (128
-  replies' buffers, retained by the allocator) and 7.5 MiB on
-  macos-latest, against 30–37 MiB more for 128 network workers.
+  replies' buffers, retained by the allocator) and 7.5–9.7 MiB on
+  macos-latest (second run: 44.9 MiB, turn p50 1689 ms, CPU 3828 ms),
+  against 30–43 MiB more for 128 network workers (macos-latest 79.5 MiB).
+  From 1 to 32 sessions it is equal or lower.
 
 **Idle, start-up and size**, paired against main on the same runners
 (run [40216532258](https://github.com/arut-land/a/actions/runs/40216532258),
