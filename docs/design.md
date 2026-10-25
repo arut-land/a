@@ -147,9 +147,9 @@ their log, and environment redaction does not apply to them.
 
 `Materialize`'s only backend is `blob_files::CacheDir`:
 `cache/tree/by-id/<id>`, cloned (APFS `clonefile`, Linux `FICLONE`), else
-hard-linked, else copied, read-only, evicted least recently used first and
-rebuilt on demand. A hard-linked file is the store's own, so a write that
-clears its read-only bit reaches the blob. Virtual backends (Windows Cloud
+copied under a temporary name and renamed into place without replacing,
+read-only, evicted least recently used first and rebuilt on demand. Never a
+hard link: a write through the cache never reaches the blob. Virtual backends (Windows Cloud
 Files, macOS File Provider, Linux FUSE) would plug in behind the same trait,
 answering from `Namespace` and hydrating via `BlobStore::open`.
 
