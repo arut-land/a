@@ -344,7 +344,6 @@ impl Transcript {
         })?;
         let edits = Edits::new(edits);
         let mut transcript = Self::empty(registry, system, places);
-        transcript.jobs = jobs;
         entries(&mut |entry| {
             transcript.through = entry.seq.get();
             match edits.at(entry.seq) {
@@ -359,6 +358,9 @@ impl Transcript {
                         && background.contains(&CallId(entry.seq))
                     {
                         transcript.tools.insert(CallId(entry.seq), tool.clone());
+                        if jobs.contains(&CallId(entry.seq)) {
+                            transcript.jobs.insert(CallId(entry.seq));
+                        }
                     }
                     transcript.apply(entry, None);
                 }
@@ -873,7 +875,7 @@ fn project(
             places,
         );
         transcript.model_only = runner == RunnerKind::ModelOnly;
-        transcript.jobs = inputs
+        let jobs: HashSet<_> = inputs
             .iter()
             .filter_map(|ContextInput(_, value)| match value {
                 ContextValue::Job(call, ..) => Some(*call),
@@ -892,6 +894,9 @@ fn project(
                 && completions.contains(&CallId(seq))
             {
                 transcript.tools.insert(CallId(seq), tool.clone());
+                if jobs.contains(&CallId(seq)) {
+                    transcript.jobs.insert(CallId(seq));
+                }
             }
             if let ContextValue::Inherited(child) = value {
                 transcript.inherit(
