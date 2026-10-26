@@ -12,6 +12,7 @@ use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 use crate::error::Error;
+use crate::json::encoded_bytes;
 use crate::prepare::Prepare;
 use crate::protocol::Target;
 use crate::spec::{Message, SmolStr};
@@ -190,6 +191,164 @@ impl ContextPolicy {
             .chain(context)
             .chain(current.iter().cloned())
             .collect())
+    }
+}
+
+impl ContextPolicy {
+    /// Covers every exchange in order, repeating `current` on each input.
+    /// Large exchanges become consecutive serialized text fragments; media
+    /// stays native and indivisible, even when it exceeds the byte target.
+    pub fn cover<'a>(
+        self,
+        prefix: &'a [Message],
+        current: &'a Messages,
+    ) -> impl Iterator<Item = Result<Messages, String>> + 'a {
+        let mut exchanges = exchanges(prefix).peekable();
+        let mut fragment: Option<(crate::Json, usize)> = None;
+        let mut media = Vec::new().into_iter();
+        std::iter::from_fn(move || {
+            let result: Result<Option<Messages>, String> = (|| {
+                let mandatory =
+                    encoded_bytes(current, self.bytes as usize).map_err(|e| e.to_string())?;
+                let room = (self.bytes as usize)
+                    .checked_sub(mandatory)
+                    .ok_or("summary instructions leave no room for context")?;
+                if fragment.is_none() && media.len() == 0 {
+                    let Some(exchange) = exchanges.next() else {
+                        return Ok(None);
+                    };
+                    if let Ok(bytes) = encoded_bytes(&exchange, room) {
+                        let mut messages = exchange.to_vec();
+                        let mut used = bytes;
+                        for _ in 1..self.exchanges {
+                            let Some(next) = exchanges.peek() else { break };
+                            let Ok(bytes) = encoded_bytes(next, room - used) else {
+                                break;
+                            };
+                            used += bytes;
+                            messages.extend_from_slice(exchanges.next().expect("peeked exchange"));
+                        }
+                        return Ok(Some(
+                            messages
+                                .into_iter()
+                                .chain(current.iter().cloned())
+                                .collect(),
+                        ));
+                    }
+                    let mut parts = Vec::new();
+                    let mut exchange = exchange.to_vec();
+                    for message in &mut exchange {
+                        readable_exchange(message, &mut parts);
+                    }
+                    fragment = Some((
+                        crate::Json::encode(&exchange).map_err(|e| e.to_string())?,
+                        0,
+                    ));
+                    media = parts.into_iter();
+                }
+                if let Some(part) = media.next() {
+                    return Ok(Some(
+                        std::iter::once(Message::User(crate::User {
+                            content: vec![part],
+                        }))
+                        .chain(current.iter().cloned())
+                        .collect(),
+                    ));
+                }
+                let Some((json, offset)) = &mut fragment else {
+                    return Ok(None);
+                };
+                let text = json.raw();
+                let mut messages: Messages = [
+                    Message::system("The next message is a consecutive fragment of a serialized conversation exchange. Summarise its facts, including incomplete text."),
+                    Message::user(""),
+                ].into_iter().chain(current.iter().cloned()).collect();
+                let framing =
+                    encoded_bytes(&messages, self.bytes as usize).map_err(|e| e.to_string())?;
+                let mut remaining = (self.bytes as usize).saturating_sub(framing);
+                let start = *offset;
+                for ch in text[start..].chars() {
+                    let bytes = match ch {
+                        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+                        '\0'..='\u{1f}' => 6,
+                        _ => ch.len_utf8(),
+                    };
+                    if bytes > remaining {
+                        break;
+                    }
+                    remaining -= bytes;
+                    *offset += ch.len_utf8();
+                }
+                if start == *offset {
+                    return Err("summary instructions leave no room for a text fragment".into());
+                }
+                *messages.get_mut(1).expect("fragment message") =
+                    Message::user(&text[start..*offset]);
+                if *offset == text.len() {
+                    fragment = None;
+                }
+                Ok(Some(messages))
+            })();
+            result.transpose()
+        })
+    }
+}
+
+// A text fragment must not expose provider-private replay metadata (signatures,
+// encrypted reasoning, native ids). Native requests still carry it unchanged.
+fn readable_exchange(message: &mut Message, media: &mut Vec<crate::UserPart>) {
+    fn user_parts(parts: &mut [crate::UserPart], media: &mut Vec<crate::UserPart>) {
+        for part in parts {
+            if let crate::UserPart::Text(text) = part {
+                text.meta.clear();
+            }
+            if matches!(part, crate::UserPart::Media(_)) {
+                media.push(std::mem::replace(
+                    part,
+                    crate::UserPart::Text(crate::Text::new("[media supplied separately]")),
+                ));
+            }
+        }
+    }
+    match message {
+        Message::System(system) => {
+            for text in &mut system.content {
+                text.meta.clear();
+            }
+        }
+        Message::User(user) => user_parts(&mut user.content, media),
+        Message::Assistant(reply) => {
+            reply.origin = None;
+            for part in &mut reply.content {
+                part.meta_mut().clear();
+                match part {
+                    crate::AssistantPart::Media(image) => {
+                        media.push(crate::UserPart::Media(image.clone()));
+                        *part = crate::AssistantPart::Text(crate::Text::new(
+                            "[media supplied separately]",
+                        ));
+                    }
+                    crate::AssistantPart::ToolResult(result) => {
+                        result.meta.clear();
+                        if let crate::Output::Content(parts) = &mut result.output {
+                            user_parts(parts, media);
+                        }
+                    }
+                    crate::AssistantPart::Text(_)
+                    | crate::AssistantPart::Reasoning(_)
+                    | crate::AssistantPart::ToolCall(_)
+                    | crate::AssistantPart::Opaque(_) => {}
+                }
+            }
+        }
+        Message::Tool(tool) => {
+            for result in &mut tool.results {
+                result.meta.clear();
+                if let crate::Output::Content(parts) = &mut result.output {
+                    user_parts(parts, media);
+                }
+            }
+        }
     }
 }
 

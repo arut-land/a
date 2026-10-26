@@ -12,6 +12,7 @@ protocol.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+ext-logging = { workspace = true, features = ["testing"] }
 ext = { workspace = true, features = ["testing"] }
 ext-retry.workspace = true
 rt.workspace = true

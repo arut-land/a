@@ -962,7 +962,11 @@ fn shutdown_never_admits_a_background_side_call_waiting_for_its_flush() {
     );
     let session = harness.create();
     settle(&session);
-    let flush = faulty.hold_next_flush();
+    let flush = faulty.hold_flush_containing(session.id, |entry| {
+        matches!(&entry.body,
+            Body::ModelCall { r#for: Some(_), purpose: Some(purpose), .. } if purpose == "probe"
+        )
+    });
     let (reply, ack) = oneshot::channel();
     session.send(Msg::Request {
         request: Request::Input {
@@ -975,9 +979,9 @@ fn shutdown_never_admits_a_background_side_call_waiting_for_its_flush() {
     });
     flush.started();
     session.wait(
-        "background intent ordered after owner finished",
+        "owner finished before background admission",
         PATIENCE,
-        || !session.has_work() && !sides(&faulty.pending(session.id)).is_empty(),
+        || !session.has_work(),
     );
     assert_eq!(http.sent(), 0);
     session.stop();
@@ -2278,4 +2282,191 @@ fn metrics_queries_read_owned_attempts_from_committed_prefixes() {
     ))
     .unwrap();
     assert!(suffixes.iter().all(|p| p.entries.is_empty() && !p.reset));
+}
+
+#[test]
+fn compaction_covers_the_full_edited_prefix_across_exchange_and_byte_windows() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::default()
+        .with(&ext_compact::Compact::default())
+        .unwrap()
+        .with(&TitleHistory(Arc::clone(&captured)))
+        .unwrap();
+    let http = Flaky::new([]);
+    let mut entries = Vec::new();
+    for n in 0..20 {
+        entries.push(entry(
+            entries.len() as u64 + 1,
+            user(&format!("request-{n}")),
+        ));
+        entries.push(entry(
+            entries.len() as u64 + 1,
+            echo(&format!("answer-{n}")),
+        ));
+    }
+    entries.push(entry(
+        entries.len() as u64 + 1,
+        user(&format!(
+            "newest-head {} newest-tail",
+            "🦀 large newest ".repeat(10_000)
+        )),
+    ));
+    entries.push(entry(entries.len() as u64 + 1, echo("newest-answer")));
+    let session = fixture(registry, &http).start(&entries);
+    session.submit("/compact keep every request").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    let chunks = lock(&captured);
+    assert!(chunks.len() > 3, "large prefix must span summary inputs");
+    let text = format!("{chunks:?}");
+    for n in 0..20 {
+        assert!(
+            text.contains(&format!("request-{n}")),
+            "missing request {n}"
+        );
+        assert!(text.contains(&format!("answer-{n}")), "missing answer {n}");
+    }
+    assert!(text.contains("newest-head"));
+    assert!(text.contains("newest-tail"));
+    let edited = log
+        .iter()
+        .find_map(|e| match &e.body {
+            Body::Edit { target, upto, .. } => Some((target.get(), upto.unwrap().get())),
+            _ => None,
+        })
+        .expect("summary edit committed");
+    assert_eq!(edited.0, 1);
+    assert!(edited.1 >= entries.len() as u64);
+    let summary = transcript(&log, log.len() as u64 + 1, Arc::new(Registry::default()));
+    assert!(format!("{summary:?}").contains("fixture compact"));
+    assert_eq!(http.sent(), 0);
+}
+
+#[derive(Clone, Copy)]
+enum MissingSummary {
+    Empty,
+    Failed,
+}
+
+struct IncompleteSummary(MissingSummary, Arc<AtomicUsize>);
+
+impl ext::SideProvider for IncompleteSummary {
+    fn reply<'a>(
+        &'a self,
+        turn: &'a ext::ModelTurn,
+        messages: &'a llm::Messages,
+    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        Box::pin(async move {
+            let n = self.1.fetch_add(1, Ordering::SeqCst);
+            let mut reply =
+                ext::SideProvider::reply(&ext_fixtures::Fixtures, turn, messages).await?;
+            if n == 1 {
+                match self.0 {
+                    MissingSummary::Empty => reply.message.content.clear(),
+                    MissingSummary::Failed => {
+                        return Err(llm::Error::new(llm::Kind::Other, "summary failed"));
+                    }
+                }
+            }
+            Ok(reply)
+        })
+    }
+}
+
+impl Extension for IncompleteSummary {
+    const NAME: &'static str = "incomplete-summary";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn ext::SideProvider>(Arc::new(Self(self.0, Arc::clone(&self.1))));
+    }
+}
+
+#[test]
+fn an_empty_or_failed_chunk_leaves_the_entire_prefix_intact() {
+    for missing in [MissingSummary::Empty, MissingSummary::Failed] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = Registry::default()
+            .with(&ext_compact::Compact::default())
+            .unwrap()
+            .with(&IncompleteSummary(missing, Arc::clone(&calls)))
+            .unwrap();
+        let http = Flaky::new([]);
+        let entries: Vec<_> = (0..20)
+            .flat_map(|n| {
+                [
+                    entry(n * 2 + 1, user(&format!("keep request-{n}"))),
+                    entry(n * 2 + 2, echo(&format!("keep answer-{n}"))),
+                ]
+            })
+            .collect();
+        let session = fixture(registry, &http).start(&entries);
+        session.submit("/compact").unwrap();
+        settle(&session);
+        let log = log_of(&session);
+        session.halt();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!log.iter().any(|e| matches!(e.body, Body::Edit { .. })));
+        let messages = transcript(&log, u64::MAX, Arc::new(Registry::default()));
+        for n in 0..20 {
+            assert!(messages.contains(&llm::Message::user(format!("keep request-{n}"))));
+            assert!(messages.contains(&llm::Message::assistant(format!("keep answer-{n}"))));
+        }
+    }
+}
+
+#[test]
+fn compaction_summarises_inherited_context_with_local_edit_precedence() {
+    let inherited = [
+        entry(1, user("inherited original")),
+        entry(2, echo("inherited answer")),
+    ];
+    let mut intent = spawn::SpawnIntent::from_json(&crate::tests::spawn_intent(1, "")).unwrap();
+    intent.image = crate::transcript::context_image(&inherited);
+    intent.settings = ext::Checkpoint::default();
+    let entries = [
+        entry(
+            1,
+            Body::Spawned {
+                intent: intent.into_json().unwrap(),
+            },
+        ),
+        entry(2, user("local original")),
+        entry(3, echo("local answer")),
+        entry(
+            4,
+            Body::Edit {
+                target: Seq::new(2).unwrap(),
+                upto: Seq::new(3),
+                replace: Some(Json::encode("effective local summary").unwrap()),
+            },
+        ),
+    ];
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::default()
+        .with(&ext_compact::Compact::default())
+        .unwrap()
+        .with(&TitleHistory(Arc::clone(&captured)))
+        .unwrap();
+    let http = Flaky::new([]);
+    let session = fixture(registry, &http).start(&entries);
+    session.submit("/compact").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    let captured = lock(&captured);
+    let summary_inputs = format!("{captured:?}");
+    assert!(summary_inputs.contains("inherited original"));
+    assert!(summary_inputs.contains("inherited answer"));
+    assert!(summary_inputs.contains("effective local summary"));
+    assert!(!summary_inputs.contains("local original"));
+    assert!(!summary_inputs.contains("local answer"));
+    assert_eq!(
+        log.iter()
+            .filter(|e| matches!(e.body, Body::Edit { .. }))
+            .count(),
+        2
+    );
+    let messages = transcript(&log, u64::MAX, Arc::new(Registry::default()));
+    assert!(!format!("{messages:?}").contains("local original"));
 }

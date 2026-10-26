@@ -105,7 +105,7 @@ impl Actor {
             return None;
         }
         let prefix = match side.context {
-            ext::Context::Owner => Some(of.0),
+            ext::Context::Owner | ext::Context::OwnerPrefix => Some(of.0),
             ext::Context::Fresh => None,
         };
         let turn = side.intent(prefix).ok()?;
@@ -291,6 +291,7 @@ async fn side_call(
 /// Where a model-only request's attempts are settled: the call they are
 /// recorded under, what cancels them, the generation they belong to, and,
 /// for an ephemeral turn, where the actor can read what each started.
+#[derive(Clone, Copy)]
 pub(super) struct Attempt<'a> {
     pub id: CallId,
     pub cancel: &'a Cancel,
@@ -304,8 +305,79 @@ pub(super) struct Attempt<'a> {
 #[derive(Default)]
 pub(super) struct Started(pub(super) std::sync::Mutex<Option<(std::time::Instant, u16, String)>>);
 
-#[allow(clippy::too_many_lines)]
 pub(super) async fn run_side(
+    session: &Arc<Session>,
+    cx: &Cx,
+    side: &ext::ModelTurn,
+    messages: llm::Messages,
+    model: &Result<Model, llm::Error>,
+    at: Attempt<'_>,
+    observed: &mut super::Observation,
+) -> Replied {
+    if side.context != ext::Context::OwnerPrefix {
+        return run_side_once(session, cx, side, messages, model, at, observed).await;
+    }
+    let prefix = &messages[..messages.len() - side.messages.len()];
+    let mut summaries = String::new();
+    let mut usage = llm::Usage::default();
+    let mut last = None;
+    for chunk in side.bounds().cover(prefix, &side.messages) {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return Replied::Failed(llm::Error::new(llm::Kind::InvalidRequest, error));
+            }
+        };
+        let result = run_side_once(session, cx, side, chunk, model, at, observed).await;
+        if let Some(counts) = observed
+            .usage
+            .as_ref()
+            .and_then(|json| llm::Usage::decode_counts(json).ok())
+        {
+            for (count, value) in llm::Count::ALL.into_iter().zip(counts) {
+                let total = usage.count(count);
+                if let Some(value) = value {
+                    *total = Some(total.unwrap_or(0).saturating_add(value));
+                }
+            }
+        }
+        observed.usage = llm::Usage::encode_counts(&usage.counts()).ok();
+        let Replied::Done(output) = result else {
+            return result;
+        };
+        let response = match llm::Response::from_json(output.raw()) {
+            Ok(response) => response,
+            Err(error) => {
+                return Replied::Failed(llm::Error::new(llm::Kind::Decode, error.to_string()));
+            }
+        };
+        let text = response.message.text();
+        if text.trim().is_empty() {
+            return Replied::Failed(llm::Error::new(
+                llm::Kind::Other,
+                "the model wrote no summary",
+            ));
+        }
+        if !summaries.is_empty() {
+            summaries.push_str("\n\n");
+        }
+        summaries.push_str(&text);
+        last = Some(response);
+    }
+    let Some(mut response) = last else {
+        return Replied::Failed(llm::Error::new(llm::Kind::Other, "nothing to compact"));
+    };
+    response.message = llm::Assistant {
+        content: vec![llm::AssistantPart::Text(llm::Text::new(summaries))],
+        origin: None,
+    };
+    response.usage = usage;
+    observed.usage = llm::Usage::encode_counts(&usage.counts()).ok();
+    replied(Ok(response)).0
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_side_once(
     session: &Arc<Session>,
     cx: &Cx,
     side: &ext::ModelTurn,
@@ -449,7 +521,7 @@ async fn ephemeral_turn(
             .select(ext::Inheritance::All, Some(authority.extensions.as_slice()))
             .map_err(|e| invalid(e.to_string()))?;
         let context = match side.context {
-            ext::Context::Owner => {
+            ext::Context::Owner | ext::Context::OwnerPrefix => {
                 let (shared, owner, through) =
                     (Arc::clone(&session.shared), session.id, origin.id.get() - 1);
                 rt::unblock(&*session.shared.rt, move || {
@@ -461,15 +533,22 @@ async fn ephemeral_turn(
             ext::Context::Fresh => llm::Messages::default(),
         };
         let system = child.system_prompt();
-        let current = (!system.is_empty())
+        let current: llm::Messages = (!system.is_empty())
             .then(|| llm::Message::system(system))
             .into_iter()
             .chain(side.messages.iter().cloned())
             .collect();
-        let messages = side
-            .bounds()
-            .assemble(&[], &context, &current)
-            .map_err(invalid)?;
+        let messages = match side.context {
+            ext::Context::OwnerPrefix => context
+                .iter()
+                .chain(side.messages.iter())
+                .cloned()
+                .collect(),
+            ext::Context::Fresh | ext::Context::Owner => side
+                .bounds()
+                .assemble(&[], &context, &current)
+                .map_err(invalid)?,
+        };
         let model = authority.routing.and_then(|route| {
             session
                 .shared
@@ -665,10 +744,13 @@ impl Actor {
                 Some((ext::ModelTurn::typed(&spawn.request, call, text)?, None))
             })
             .ok_or("model-only turn has no admitted authority")?;
-        let history = self
-            .conversation(CallId(seq))
-            .await
-            .map_err(|e| e.to_string())?;
+        let history = match turn.context {
+            ext::Context::OwnerPrefix => llm::Messages::default(),
+            ext::Context::Fresh | ext::Context::Owner => self
+                .conversation(CallId(seq))
+                .await
+                .map_err(|e| e.to_string())?,
+        };
         let context = if let Some(seq) = prefix {
             let parent = self.live.parent.ok_or("model-only context has no owner")?;
             let shared = Arc::clone(&self.live.session.shared);
@@ -685,12 +767,21 @@ impl Actor {
             .and_then(|spawn| spawn.request.runner.context_policy())
             .ok_or("model-only context policy is missing")?;
         let system = self.registry.system_prompt();
-        let current = (!system.is_empty())
+        let current: llm::Messages = (!system.is_empty())
             .then(|| llm::Message::system(system))
             .into_iter()
             .chain(turn.messages.iter().cloned())
             .collect();
-        let messages = policy.assemble(&history, &context, &current)?;
+        let messages = match turn.context {
+            ext::Context::OwnerPrefix => context
+                .iter()
+                .chain(turn.messages.iter())
+                .cloned()
+                .collect(),
+            ext::Context::Fresh | ext::Context::Owner => {
+                policy.assemble(&history, &context, &current)?
+            }
+        };
         let model = self
             .live
             .session

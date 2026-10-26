@@ -104,6 +104,10 @@ pub enum Context {
     /// The owner's effective conversation before the owning call, as an
     /// immutable image: a task's prefix, a turn's per-input context.
     Owner,
+    /// Every effective message before the owning call. Oversized prefixes
+    /// are covered by multiple responses, whose summaries are joined.
+    /// Unlike recent owner context, no thread history is included.
+    OwnerPrefix,
 }
 
 /// Where the conversation runs. Each daemon stores its own sessions, so a
@@ -204,6 +208,13 @@ impl Turn {
 }
 
 impl<S: Storage> Conversation<Turn, S> {
+    /// Summarises the complete effective prefix before the owning call.
+    /// Each chunk is answered before the next; any failure fails the turn.
+    pub fn owner_prefix(mut self) -> Self {
+        self.context = Context::OwnerPrefix;
+        self
+    }
+
     /// System instructions ahead of the prompt.
     pub fn instructions(mut self, system: &str) -> Self {
         self.runner.messages = std::iter::once(llm::Message::system(system))
@@ -900,6 +911,24 @@ mod tests {
         assert!(dropped.is_ephemeral());
         let (restored, _) = ModelTurn::from_intent(dropped.intent(None).unwrap().raw()).unwrap();
         assert!(restored.is_ephemeral());
+    }
+
+    #[test]
+    fn complete_prefix_coverage_survives_admission_without_changing_recent_defaults() {
+        let call = CallId::new(3).unwrap();
+        let complete = Conversation::turn::<Owner>("compact", "summary")
+            .owner_prefix()
+            .request(call);
+        let (restored, prefix) =
+            ModelTurn::from_intent(complete.intent(Some(call.0)).unwrap().raw()).unwrap();
+        assert_eq!(restored.context, Context::OwnerPrefix);
+        assert_eq!(prefix, Some(call.0));
+        let recent = Conversation::turn::<Owner>("title", "name")
+            .owner_context()
+            .request(call);
+        assert_eq!(recent.context, Context::Owner);
+        assert_eq!(recent.bounds().exchanges, 8);
+        assert_eq!(recent.bounds().bytes, 65536);
     }
 
     #[test]

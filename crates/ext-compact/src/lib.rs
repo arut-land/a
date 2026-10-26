@@ -13,8 +13,11 @@
 //! when its provider says so. `/compact` compacts now, and
 //! `/compact <instructions>` says what the summary should keep.
 //!
-//! What it summarises is the conversation the call's model sees, sent as
-//! it is, so the provider's cache of it serves the summary.
+//! It summarises the complete effective prefix it replaces. Exchanges
+//! that fit are sent as they are, so the provider's cache serves the
+//! summary; oversized exchanges are covered by consecutive fragments.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ext::point::{RequestError, Step};
 use ext::{
@@ -55,14 +58,19 @@ impl Percent {
 
 /// The calls compacted, which are not compacted again.
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct Compacted(pub Vec<u64>);
+#[serde(transparent)]
+pub struct Compacted {
+    calls: Vec<u64>,
+    #[serde(skip)]
+    unmeasured: AtomicBool,
+}
 
 impl Fold for Compacted {
     const NAME: &'static str = "compacted";
     type Change = u64;
 
     fn apply(&mut self, call: &u64) {
-        self.0.push(*call);
+        self.calls.push(*call);
     }
 }
 
@@ -71,7 +79,7 @@ impl Compact {
     /// compacted yet.
     fn owns(cx: &PointCx<'_>, error: &llm::Error) -> Option<CallId> {
         let call = cx.call?;
-        let done = cx.state(|c: &Compacted| c.0.contains(&call.get()));
+        let done = cx.state(|c: &Compacted| c.calls.contains(&call.get()));
         (error.kind == llm::Kind::ContextOverflow && !done).then_some(call)
     }
 }
@@ -116,13 +124,18 @@ impl Extension for Compact {
             })
             .on::<Step>(move |cx, request| match threshold.zip(window(request)) {
                 None if threshold.is_some() => {
-                    unmeasured(cx.session);
+                    if cx.state(|state: &Compacted| !state.unmeasured.swap(true, Ordering::Relaxed))
+                    {
+                        ext_logging::emit(ext_logging::Fact::ThresholdUnmeasured {
+                            session: cx.session,
+                        });
+                    }
                     Rewrite::Pass
                 }
                 Some((share, window))
                     if estimate(request) > share.of(window)
                         && cx.call.is_some_and(|call| {
-                            !cx.state(|c: &Compacted| c.0.contains(&call.get()))
+                            !cx.state(|c: &Compacted| c.calls.contains(&call.get()))
                         }) =>
                 {
                     let error = format!(
@@ -134,19 +147,6 @@ impl Extension for Compact {
                 }
                 _ => Rewrite::Pass,
             });
-    }
-}
-
-/// Says once per session, in the daemon log, that its threshold measures
-/// nothing: the model has no known window.
-fn unmeasured(session: protocol::SessionId) {
-    static NOTED: std::sync::Mutex<Vec<protocol::SessionId>> = std::sync::Mutex::new(Vec::new());
-    let mut noted = NOTED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !noted.contains(&session) {
-        noted.push(session);
-        ext_logging::emit(ext_logging::Fact::ThresholdUnmeasured { session });
     }
 }
 
@@ -188,12 +188,15 @@ fn estimate(request: &llm::Request) -> u64 {
 /// user's `instructions` ask for, and has the model see the summary in its
 /// place from now on.
 async fn compact(cx: &Cx, call: CallId, instructions: &str) -> Result<String, String> {
+    let (Some(first), Some(last)) = (Seq::new(1), Seq::new(call.get() - 1)) else {
+        return Err("nothing to compact".into());
+    };
     let ask = match instructions.trim() {
         "" => SUMMARY.to_owned(),
         said => format!("{SUMMARY}\nThe user's instructions for this summary: {said}"),
     };
     let reply = Conversation::turn::<Compact>("compact", ask)
-        .owner_context()
+        .owner_prefix()
         .ask(cx)
         .await
         .map_err(|e| e.to_string())?;
@@ -201,10 +204,6 @@ async fn compact(cx: &Cx, call: CallId, instructions: &str) -> Result<String, St
     if summary.trim().is_empty() {
         return Err("the model wrote no summary".into());
     }
-    let (first, last) = (Seq::new(1), Seq::new(call.get() - 1));
-    let (Some(first), Some(last)) = (first, last) else {
-        return Err("nothing to compact".into());
-    };
     let text = format!("<summary of the conversation so far>\n{summary}\n</summary>");
     cx.edit(first, Some(last), Some(&text));
     // A crash may repeat an edit; it must never retain only its completion mark.

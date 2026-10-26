@@ -195,3 +195,159 @@ fn tools_are_spliced_as_the_bodys_field_and_an_escape_hatch_replaces_them() {
         assert_eq!(sent(&overlay)["tools"], json!([{"type": "hosted"}]));
     }
 }
+
+#[test]
+fn complete_coverage_never_drops_an_exchange_or_an_oversized_newest_message() {
+    let current = vec![Message::user("summarise all supplied context")].into();
+    let policy = ContextPolicy {
+        exchanges: 8,
+        bytes: 65536,
+    };
+    let mut prefix = Vec::new();
+    for n in 0..20 {
+        prefix.push(Message::user(format!("request {n}")));
+        prefix.push(Message::assistant(format!("answer {n}")));
+    }
+    let large = Message::user("newest 🦀\\\"\n".repeat(20_000));
+    prefix.push(large.clone());
+    let mut covered = Vec::new();
+    let mut fragments = String::new();
+    let mut inputs = 0;
+    let mut bytes = 0;
+    for chunk in policy.cover(&prefix, &current) {
+        let chunk = chunk.unwrap();
+        inputs += 1;
+        let encoded = crate::Json::encode(&chunk).unwrap();
+        bytes += encoded.raw().len();
+        assert!(encoded.raw().len() <= policy.bytes as usize);
+        assert_eq!(chunk.last(), current.last());
+        if matches!(chunk.first(), Some(Message::System(system)) if system.text().starts_with("The next message is a consecutive fragment"))
+        {
+            let Message::User(user) = &chunk[1] else {
+                panic!("fragment text")
+            };
+            let crate::UserPart::Text(text) = &user.content[0] else {
+                panic!("fragment text")
+            };
+            fragments.push_str(&text.text);
+        } else {
+            covered.extend_from_slice(&chunk[..chunk.len() - 1]);
+        }
+    }
+    assert_eq!(covered, prefix[..prefix.len() - 1]);
+    assert_eq!(fragments, crate::Json::encode(&[large]).unwrap().raw());
+    assert!(inputs > 3);
+    eprintln!(
+        "complete prefix: {} source bytes, {inputs} summary inputs, {bytes} total input bytes",
+        crate::Json::encode(&prefix).unwrap().raw().len()
+    );
+}
+
+#[test]
+fn oversized_exchanges_keep_native_media_and_all_tool_data() {
+    let media = crate::Media {
+        media_type: "image/png".into(),
+        source: crate::Source::Bytes {
+            data: Arc::from([1, 2, 3]),
+        },
+        meta: crate::Meta::new(),
+    };
+    let messages = [Message::Tool(ToolMessage {
+        results: vec![ToolResult {
+            id: "call".into(),
+            name: "read".into(),
+            output: Output::Content(vec![
+                crate::UserPart::Text(Text::new("large output".repeat(20_000))),
+                crate::UserPart::Media(media.clone()),
+            ]),
+            error: false,
+            meta: crate::Meta::new(),
+        }],
+    })];
+    let current = vec![Message::user("summary")].into();
+    let chunks: Vec<_> = ContextPolicy {
+        exchanges: 8,
+        bytes: 65536,
+    }
+    .cover(&messages, &current)
+    .collect::<Result<_, _>>()
+    .unwrap();
+    assert!(chunks.iter().any(|chunk| chunk.iter().any(|m| matches!(m,
+        Message::User(user) if user.content.contains(&crate::UserPart::Media(media.clone()))))));
+    let text: String = chunks
+        .iter()
+        .filter_map(|chunk| match chunk.first() {
+            Some(Message::System(_)) => match &chunk[1] {
+                Message::User(user) => match &user.content[0] {
+                    crate::UserPart::Text(text) => Some(text.text.as_str()),
+                    crate::UserPart::Media(_) => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let restored = Messages::from_json(&text).unwrap();
+    let Message::Tool(tool) = &restored[0] else {
+        panic!("tool result preserved")
+    };
+    assert_eq!(tool.results[0].id, "call");
+    let Output::Content(content) = &tool.results[0].output else {
+        panic!("tool content preserved")
+    };
+    assert_eq!(
+        content[0],
+        crate::UserPart::Text(Text::new("large output".repeat(20_000)))
+    );
+    assert_eq!(
+        content[1],
+        crate::UserPart::Text(Text::new("[media supplied separately]"))
+    );
+}
+
+#[test]
+fn serialized_summary_fragments_never_expose_private_provider_replay_data() {
+    let mut meta = crate::Meta::new();
+    meta.insert(
+        "responses",
+        &json!({"encrypted_content": "private-ciphertext"}),
+    );
+    let prefix = [Message::Assistant(Assistant {
+        content: vec![AssistantPart::Reasoning(crate::Reasoning {
+            text: "visible reasoning ".repeat(10_000),
+            redacted: false,
+            meta,
+        })],
+        origin: None,
+    })];
+    let current = vec![Message::user("summary")].into();
+    let mut fragments = String::new();
+    for chunk in (ContextPolicy {
+        exchanges: 8,
+        bytes: 65536,
+    })
+    .cover(&prefix, &current)
+    {
+        let chunk = chunk.unwrap();
+        let Message::User(user) = &chunk[1] else {
+            panic!("serialized fragment")
+        };
+        let crate::UserPart::Text(text) = &user.content[0] else {
+            panic!("serialized text")
+        };
+        fragments.push_str(&text.text);
+    }
+    assert!(!fragments.contains("private-ciphertext"));
+    let restored = Messages::from_json(&fragments).unwrap();
+    let Message::Assistant(reply) = &restored[0] else {
+        panic!("assistant context")
+    };
+    let AssistantPart::Reasoning(reasoning) = &reply.content[0] else {
+        panic!("visible reasoning")
+    };
+    assert_eq!(reasoning.text, "visible reasoning ".repeat(10_000));
+    let Message::Assistant(original) = &prefix[0] else {
+        panic!("original assistant")
+    };
+    assert!(original.content[0].meta().get("responses").is_some());
+}

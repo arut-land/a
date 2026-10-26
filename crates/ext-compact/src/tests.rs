@@ -159,3 +159,47 @@ fn compact_instructions_reach_the_summary_prompt() {
     assert!(asked[1].contains("Leave out nothing a continuation needs"));
     assert!(!asked[1].contains("instructions for this summary"));
 }
+
+#[test]
+fn warning_deduplication_belongs_to_the_loaded_session_and_is_never_checkpointed() {
+    let registry = Registry::default()
+        .with(&Compact {
+            threshold: Percent::new(50),
+        })
+        .unwrap();
+    let rig = Rig::new("warning-lifetime", registry);
+    let session = rig.session;
+    let cx = rig.cx();
+    let mut request = llm::Request {
+        model: "unknown-model".into(),
+        ..llm::Request::default()
+    };
+    let warnings = || {
+        ext_logging::testing::pending()
+            .iter()
+            .filter(|fact| {
+                matches!(fact,
+        ext_logging::Fact::ThresholdUnmeasured { session: id } if *id == session)
+            })
+            .count()
+    };
+    rig.registry.hooks().step(&cx.point(), &mut request);
+    rt::block_on(cx.update::<Compacted>(&cx.call.get())).unwrap();
+    rig.registry.hooks().step(&cx.point(), &mut request);
+    assert_eq!(warnings(), 1);
+    let image = cx.state(|state: &Compacted| llm::Json::encode(state).unwrap());
+    let restored: Compacted = image.parse().unwrap();
+    assert_eq!(restored.calls, vec![cx.call.get()]);
+    assert!(!restored.unmeasured.load(Ordering::Relaxed));
+    drop(cx);
+    drop(rig);
+    let registry = Registry::default()
+        .with(&Compact {
+            threshold: Percent::new(50),
+        })
+        .unwrap();
+    let mut rig = Rig::new("warning-reloaded", registry);
+    rig.session = session;
+    rig.registry.hooks().step(&rig.cx().point(), &mut request);
+    assert_eq!(warnings(), 2, "the same id warns again when loaded anew");
+}
