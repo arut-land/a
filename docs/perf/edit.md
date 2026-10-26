@@ -74,9 +74,9 @@ publication still uses rustix/libc and windows-sys; all unsafe code stays in sys
 
 The edit tool imposes no file-size or matching-work ceiling. Capture, hashing,
 UTF-8 validation, exact matching, content comparison and publication stream
-through fixed buffers. The matcher retains a prefix table proportional to the
-supplied `old`, including overlapping occurrences. Worker reservations account for
-replacement arguments and the matcher table rather than the file's size. The
+through fixed buffers. The matcher uses `memchr` with an overlap window
+proportional to the supplied `old`, including overlapping occurrences. Worker reservations account for
+replacement arguments and the overlap window rather than the file's size. The
 detailed formatter retains at most 256 KiB of source text under its existing work
 budget; larger sources retain line counts with the bounded `[diff cut]` display.
 Output size does not determine whether a diff is formatted. The filesystem

@@ -12,7 +12,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # A JPEG decoded at a DCT scale, an eighth of the work and memory or less.
 jpeg-decoder = { version = "0.3", default-features = false }
 llm.workspace = true
-# Count line breaks while validating bounded chunks.
+# Stream exact matches and count line breaks in bounded chunks.
 memchr.workspace = true
 protocol.workspace = true
 rt.workspace = true

@@ -232,7 +232,6 @@ impl Transaction<'_> {
         limits: Limits,
     ) -> Result<(Edited, u64), EditError> {
         let captured = edits.iter().map(|edit| edit.old.len()).max().unwrap_or(0)
-            * size_of::<usize>()
             + size_of_val(edits.as_ref())
             + edits
                 .iter()
@@ -295,10 +294,11 @@ impl Transaction<'_> {
     }
 }
 
-// Fixed file buffers, plus the caller-owned replacement strings and matcher table.
+// Fixed file buffers, plus replacement strings and the matcher's overlap window.
 const STREAM_BYTES: usize = 1 << 20;
 const CHUNK: usize = 64 << 10;
 
+/// FNV-1a is stable across builds, so hashes in durable logs still compare.
 fn hash_file(mut file: &File) -> io::Result<u64> {
     file.rewind()?;
     let mut buffer = vec![0; CHUNK];
@@ -342,43 +342,31 @@ fn text_lines(mut file: &File) -> Result<usize, EditError> {
 }
 
 fn unique_match(mut file: &File, old: &str, n: usize) -> Result<u64, EditError> {
-    let old = old.as_bytes();
-    let mut prefix = vec![0; old.len()];
-    let mut matched = 0;
-    for at in 1..old.len() {
-        while matched > 0 && old[at] != old[matched] {
-            matched = prefix[matched - 1];
-        }
-        if old[at] == old[matched] {
-            matched += 1;
-        }
-        prefix[at] = matched;
-    }
+    let finder = memchr::memmem::Finder::new(old.as_bytes());
+    let mut buffer = Vec::with_capacity(old.len() + CHUNK);
+    let mut chunk = vec![0; CHUNK];
+    let (mut offset, mut found) = (0u64, None);
     file.rewind()?;
-    let (mut matched, mut offset, mut found) = (0, 0u64, None);
-    let mut buffer = vec![0; CHUNK];
     loop {
-        let count = file.read(&mut buffer)?;
+        let count = file.read(&mut chunk)?;
         if count == 0 {
             break;
         }
-        for &byte in &buffer[..count] {
-            while matched > 0 && byte != old[matched] {
-                matched = prefix[matched - 1];
+        buffer.extend_from_slice(&chunk[..count]);
+        if let Some(at) = finder.find(&buffer) {
+            if found.is_some() || finder.find(&buffer[at + 1..]).is_some() {
+                return Err(EditError::Failed(format!(
+                    "edit {n}: `old` appears more than once; include more of the text around it"
+                )));
             }
-            if byte == old[matched] {
-                matched += 1;
-            }
-            offset += 1;
-            if matched == old.len() {
-                if found.replace(offset - old.len() as u64).is_some() {
-                    return Err(EditError::Failed(format!(
-                        "edit {n}: `old` appears more than once; include more of the text around it"
-                    )));
-                }
-                matched = prefix[matched - 1];
-            }
+            found = Some(offset + at as u64);
         }
+        // A full match cannot fit in the retained suffix, so it is never counted
+        // twice. Any match crossing the next buffer boundary remains searchable.
+        let consumed = buffer.len().saturating_sub(old.len() - 1);
+        buffer.copy_within(consumed.., 0);
+        buffer.truncate(buffer.len() - consumed);
+        offset += consumed as u64;
     }
     found.ok_or_else(|| EditError::Failed(format!("edit {n}: `old` is not in the file")))
 }
@@ -582,14 +570,6 @@ impl Diff {
     }
 }
 
-/// FNV-1a: stable across builds, so hashes in old logs still compare.
-#[cfg(test)]
-fn hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +655,31 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, EditError::Failed(message) if message.contains("admission")));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
+    }
+
+    #[test]
+    fn large_replacement_patterns_do_not_exhaust_worker_admission() {
+        let rig = Rig::new("edit-large-pattern", registry());
+        let path = rig.workspace().join("target");
+        let old = "x".repeat((8 << 20) - 128);
+        std::fs::write(&path, &old).unwrap();
+        let runtime = rt::Threads::new(1);
+        let (edited, current) = rt::block_on(
+            Transaction {
+                rt: &runtime,
+                cancel: &ext::Cancel::default(),
+            }
+            .edit(
+                path.clone(),
+                edits(&[(&old, "after\n")]).into(),
+                None,
+                LIMITS,
+            ),
+        )
+        .unwrap();
+        assert!(edited.publication.visible);
+        assert_eq!(std::fs::read(&path).unwrap(), b"after\n");
+        assert_eq!(current, hash_file(&File::open(path).unwrap()).unwrap());
     }
 
     #[test]
@@ -887,7 +892,8 @@ mod tests {
                 assert!(!file.exists());
             } else {
                 let (edited, current) = result.unwrap();
-                assert_eq!(current, hash(&vec![b'x'; 2 << 20]));
+                assert_eq!(std::fs::read(&file).unwrap(), vec![b'x'; 2 << 20]);
+                assert_eq!(current, hash_file(&File::open(file).unwrap()).unwrap());
                 assert!(edited.diff.len() <= DIFF_LIMIT);
             }
         }
