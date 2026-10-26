@@ -35,6 +35,8 @@ pub struct FsEvent {
 
 type Callback = Box<dyn Fn(Vec<FsEvent>) + Send + Sync>;
 
+const BATCH_EVENTS: usize = 256;
+
 /// A started stream over one path and everything under it; dropping it
 /// stops the stream on its queue, after any callback in progress.
 pub struct FsEventStream(Stream);
@@ -164,20 +166,22 @@ extern "C" fn callback(
             std::slice::from_raw_parts(flags, count),
         )
     };
-    let events = paths
-        .iter()
-        .zip(flags)
-        .map(|(&path, &flags)| FsEvent {
-            // SAFETY: each path is NUL-terminated.
-            path: PathBuf::from(std::ffi::OsString::from_vec(
-                unsafe { std::ffi::CStr::from_ptr(path) }
-                    .to_bytes()
-                    .to_vec(),
-            )),
-            kind: kind(flags),
-        })
-        .collect();
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(events)));
+    for (paths, flags) in paths.chunks(BATCH_EVENTS).zip(flags.chunks(BATCH_EVENTS)) {
+        let events = paths
+            .iter()
+            .zip(flags)
+            .map(|(&path, &flags)| FsEvent {
+                // SAFETY: each path is NUL-terminated.
+                path: PathBuf::from(std::ffi::OsString::from_vec(
+                    unsafe { std::ffi::CStr::from_ptr(path) }
+                        .to_bytes()
+                        .to_vec(),
+                )),
+                kind: kind(flags),
+            })
+            .collect();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(events)));
+    }
 }
 
 extern "C" fn release(info: *const c_void) {
@@ -264,4 +268,43 @@ unsafe extern "C" {
     fn FSEventStreamInvalidate(stream: *mut c_void);
     fn FSEventStreamRelease(stream: *mut c_void);
     fn FSEventStreamFlushSync(stream: *mut c_void);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    #[test]
+    fn a_native_burst_is_delivered_in_finite_owned_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (send, events) = channel();
+        let stream = FsEventStream::new(&root, move |batch| {
+            let _ = send.send(batch.len());
+        })
+        .unwrap();
+        let (release, released) = channel();
+        queue().exec_async(move || {
+            let _ = released.recv();
+        });
+        for i in 0..3000 {
+            std::fs::write(root.join(i.to_string()), "").unwrap();
+        }
+        release.send(()).unwrap();
+        stream.flush();
+        let mut total = 0;
+        while let Ok(count) = events.recv_timeout(Duration::from_millis(100)) {
+            assert!(
+                count <= 256,
+                "native callback copied {count} records at once"
+            );
+            total += count;
+        }
+        assert!(
+            total > 256,
+            "native burst did not exercise more than one owned batch: {total}"
+        );
+    }
 }

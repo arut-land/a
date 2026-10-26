@@ -5,8 +5,10 @@
 //! subscriptions, and closes it with its last subscriber.
 //!
 //! Sinks run on the runtime's tasks, never on a native thread, one batch
-//! at a time. Nothing is debounced here. The hub follows its roots itself:
-//! a root that appears, is replaced or goes away is rearmed by the hub
+//! at a time. Pending paths are deduplicated; excess detail becomes a
+//! rescan, preserving availability transitions. Nothing is debounced here.
+//! The hub follows its roots itself: a root that appears, is replaced or
+//! goes away is rearmed by the hub
 //! before the subscriber hears [`Event::Rescan`] or [`Unavailable::Gone`],
 //! so subscribers never refresh a watch. Only an I/O failure retries on a
 //! timer; a watch limit or an unsupported filesystem waits for something
@@ -18,7 +20,7 @@
 //! walked and armed under the hub's lock (Linux), which suits the small
 //! trees subscribed whole; a large one is entered as it is walked.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -154,6 +156,8 @@ struct Shared {
 )]
 struct Inbox {
     raws: Vec<Raw>,
+    detail_bytes: usize,
+    rescanning: bool,
     draining: bool,
 }
 
@@ -343,7 +347,9 @@ impl Shared {
     )]
     fn post(self: &Arc<Self>, raws: Vec<Raw>) {
         let mut inbox = lock(&self.inbox);
-        inbox.raws.extend(raws);
+        for raw in raws {
+            inbox.push(raw);
+        }
         if std::mem::replace(&mut inbox.draining, true) {
             return;
         }
@@ -356,9 +362,12 @@ impl Shared {
                         inbox.draining = false;
                         return;
                     }
+                    inbox.detail_bytes = 0;
+                    inbox.rescanning = false;
                     std::mem::take(&mut inbox.raws)
                 };
                 shared.handle(|_| raws);
+                crate::yield_now().await;
             }
         }));
     }
@@ -374,8 +383,13 @@ impl State {
                 Raw::Created(path) => self.changed(&path, true, &mut roots),
                 Raw::Rescan(None) => {
                     for id in self.ids() {
-                        if self.rearm(id) == Armed::Live {
-                            self.tell(id, Event::Rescan);
+                        let was = self.subs[&id].status;
+                        match self.rearm(id) {
+                            Armed::Live => self.tell(id, Event::Rescan),
+                            Armed::Gone if was != Status::Gone => {
+                                self.tell(id, Event::Unavailable(Unavailable::Gone));
+                            }
+                            Armed::Gone | Armed::Failed => {}
                         }
                     }
                 }
@@ -655,9 +669,114 @@ struct Delivery {
 
 #[derive(Default)]
 struct Queue {
-    events: Vec<Event>,
+    events: Vec<Pending>,
     running: bool,
     closed: bool,
+}
+
+// Only disposable path detail is capped. Availability transitions delimit
+// invalidation epochs and must remain observable even for a stalled sink.
+const DETAIL_BYTES: usize = 64 << 10;
+const DETAIL_PATHS: usize = 1024;
+
+enum Pending {
+    Changes {
+        paths: BTreeSet<PathBuf>,
+        bytes: usize,
+    },
+    Rescan,
+    Unavailable(Unavailable),
+}
+
+impl From<Pending> for Event {
+    fn from(pending: Pending) -> Self {
+        match pending {
+            Pending::Changes { paths, .. } => Self::Changed(paths.into_iter().collect()),
+            Pending::Rescan => Self::Rescan,
+            Pending::Unavailable(error) => Self::Unavailable(error),
+        }
+    }
+}
+
+impl Queue {
+    fn push(&mut self, event: Event) {
+        match event {
+            Event::Changed(more) => {
+                if matches!(self.events.last(), Some(Pending::Rescan)) {
+                    return;
+                }
+                if !matches!(self.events.last(), Some(Pending::Changes { .. })) {
+                    self.events.push(Pending::Changes {
+                        paths: BTreeSet::new(),
+                        bytes: 0,
+                    });
+                }
+                let Some(Pending::Changes { paths, bytes }) = self.events.last_mut() else {
+                    unreachable!()
+                };
+                for path in more {
+                    if paths.contains(&path) {
+                        continue;
+                    }
+                    *bytes += path.as_os_str().len();
+                    if *bytes > DETAIL_BYTES || paths.len() == DETAIL_PATHS {
+                        *self.events.last_mut().expect("pending changes") = Pending::Rescan;
+                        break;
+                    }
+                    paths.insert(path);
+                }
+            }
+            Event::Rescan => match self.events.last_mut() {
+                Some(last @ Pending::Changes { .. }) => *last = Pending::Rescan,
+                Some(Pending::Rescan) => {}
+                _ => self.events.push(Pending::Rescan),
+            },
+            Event::Unavailable(error) => self.events.push(Pending::Unavailable(error)),
+        }
+    }
+}
+
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "android")),
+    expect(dead_code)
+)]
+impl Inbox {
+    fn push(&mut self, raw: Raw) {
+        let bytes = match &raw {
+            Raw::Changed(path) | Raw::Created(path) | Raw::Rescan(Some(path)) => {
+                path.as_os_str().len()
+            }
+            Raw::Rescan(None) => DETAIL_BYTES + 1,
+            Raw::Freed => {
+                if !self.raws.iter().any(|raw| matches!(raw, Raw::Freed)) {
+                    self.raws.push(raw);
+                }
+                return;
+            }
+            Raw::Unwatched(_) | Raw::Failed(_, _) => {
+                self.detail_bytes = 0;
+                self.rescanning = false;
+                self.raws.push(raw);
+                return;
+            }
+        };
+        if self.rescanning {
+            return;
+        }
+        self.detail_bytes += bytes;
+        if self.detail_bytes > DETAIL_BYTES || self.raws.len() >= DETAIL_PATHS {
+            while matches!(
+                self.raws.last(),
+                Some(Raw::Changed(_) | Raw::Created(_) | Raw::Rescan(_))
+            ) {
+                self.raws.pop();
+            }
+            self.raws.push(Raw::Rescan(None));
+            self.rescanning = true;
+        } else {
+            self.raws.push(raw);
+        }
+    }
 }
 
 impl Delivery {
@@ -666,10 +785,7 @@ impl Delivery {
         if queue.closed {
             return;
         }
-        match (queue.events.last_mut(), event) {
-            (Some(Event::Changed(paths)), Event::Changed(more)) => paths.extend(more),
-            (_, event) => queue.events.push(event),
-        }
+        queue.push(event);
         if std::mem::replace(&mut queue.running, true) {
             return;
         }
@@ -683,8 +799,12 @@ impl Delivery {
                         return;
                     }
                     std::mem::take(&mut queue.events)
+                        .into_iter()
+                        .map(Event::from)
+                        .collect()
                 };
                 (lock(&delivery.sink))(batch);
+                crate::yield_now().await;
             }
         }));
     }
