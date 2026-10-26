@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use protocol::Card;
-use rt::BlockingClass::{Cpu, Storage};
+use rt::BlockingClass::Storage;
 use serde::{Deserialize, Serialize};
 
 use ext::{Cx, Fold, Json, Schema, Tool};
@@ -244,7 +244,7 @@ impl Transaction<'_> {
             })
             .await?;
         let (transaction, content, edited, hash) = self
-            .run(Cpu, STREAM_BYTES + captured, move || {
+            .run(Storage, STREAM_BYTES + captured, move || {
                 let original = transaction.original();
                 if let Some(bytes) = original {
                     let current = hash_file(bytes)?;
@@ -827,6 +827,10 @@ mod tests {
                 bytes: usize,
                 work: Box<dyn FnOnce() + Send>,
             ) -> rt::BoxFuture<'static, io::Result<()>> {
+                assert!(
+                    matches!(class, Storage),
+                    "file work belongs on storage workers"
+                );
                 let stage = self
                     .stage
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
