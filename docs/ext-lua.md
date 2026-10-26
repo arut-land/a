@@ -76,9 +76,26 @@ separate VM without effects. On every application, live or replayed, the host
 re-evaluates the source in a fresh environment and resets the private VM's PRNG
 with seed zero. Durable code may reseed it with
 `math.randomseed(seed[, second])`: an integer seed is required, and the second
-seed defaults to zero. `next` and `pairs` are unavailable in the reducer VM
-because hash traversal order varies between VMs. Use `ipairs` for arrays or
-access explicitly ordered keys.
+seed defaults to zero. Durable `pairs` and `next` traverse keys in a stable
+order: integers ascending, strings by their bytes, non-integral numbers ascending,
+booleans (`false` before `true`), the null marker, then table keys. Table keys
+are ordered by a canonical structural encoding: scalar types have distinct tags,
+strings preserve their bytes, and nested tables encode their entries in sorted
+order with lengths framing each part. This includes both keys and values;
+shared acyclic subtrees encode by contents. Cycles raise
+`durable iteration cannot order cyclic table keys reproducibly`. Distinct table
+keys with identical encodings raise
+`durable iteration cannot order structurally identical table keys reproducibly`:
+structure alone cannot distinguish their identities. Function, userdata and thread
+keys, including such values inside table keys, raise
+`durable iteration cannot order <type> keys or table-key contents reproducibly`
+because those values have no reproducible structural identity. `a.null` remains
+an allowed scalar marker. Non-durable calls retain native `pairs` and `next`.
+Iterator keys are captured at the start of a traversal; value updates remain visible and deleted keys are
+skipped. Restart `next` with a nil key to capture additions. `pairs` iterators
+keep independent snapshots, including when nested on the same table. Snapshots
+use Lua-managed memory. Ordering work spends fuel based on key count and the
+bytes processed by structural encoding.
 Closure upvalues and global mutations cannot survive an application; only the
 JSON state passed in and returned carries session data. Another session's
 reductions therefore cannot change replay. Reducers spend instruction fuel only;
