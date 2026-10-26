@@ -126,6 +126,37 @@ The longer-window retries measure only 128 sessions; there is no pairing
 across runners. The first mimalloc retry, 40252160653, was cancelled while
 queued to avoid repeating its completed one-session measurements.
 
+The final collection contains 69 comparison blocks and 4,148 metric
+comparisons. [Primary tables](allocator-effects.md) report every hosted and
+local comparison at 128 sessions and the separate daemon suite, including
+binary-size differences. The [complete CSV](allocator-effects.csv) adds
+one-session, peak, footprint, post-release, idle CPU and remaining latency
+metrics. [Observations](allocator-observations.json) preserve raw matched
+pairs, ordering estimates, host/build metadata and input hashes;
+[run provenance](allocator-runs.json) records all dispatches and source pins.
+Unsupported builds have no substituted samples.
+
+All supported allocator daemon comparisons complete 20 pairs. The Windows
+ARM64 separate-executable A/A retry completes only 18 before a daemon
+availability failure, so it cannot qualify another result against a complete
+A/A band. Its in-process sessions A/A comparisons do complete 20 pairs.
+The original Apple Silicon 19-pair blocks remain separate from successful
+20-pair 128-session retries. The Intel rpmalloc daemon retry
+[40261595054](https://github.com/arut-land/a/actions/runs/40261595054)
+completes 20 pairs after the first attempt failed before its first pair.
+
+The original read-scratch and jemalloc/snmalloc matrix runs were cancelled
+only after their supported non-Mac jobs and artifacts completed; their Mac
+jobs were still queued. The replacement Mac measurements split session counts:
+
+| Runner | Read scratch: 1 / 128 sessions | jemalloc/snmalloc: 1 / 128 sessions |
+| --- | --- | --- |
+| macOS Intel | [40267241765](https://github.com/arut-land/a/actions/runs/40267241765) / [40267244835](https://github.com/arut-land/a/actions/runs/40267244835) | [40268855546](https://github.com/arut-land/a/actions/runs/40268855546) / [40268858444](https://github.com/arut-land/a/actions/runs/40268858444) |
+| macOS ARM64 | [40267247697](https://github.com/arut-land/a/actions/runs/40267247697) / [40267250565](https://github.com/arut-land/a/actions/runs/40267250565) | [40268861305](https://github.com/arut-land/a/actions/runs/40268861305) / [40268864173](https://github.com/arut-land/a/actions/runs/40268864173) |
+
+All eight replacement jobs succeed with 20 rounds. There are no remaining
+queued Mac measurements in this collection.
+
 ## Allocator decision
 
 Keep the native system allocator. The replacement allocators trade memory for
@@ -146,7 +177,7 @@ The Windows segment-heap manifest is also rejected: idle RSS changes by
 −92 KiB [−112, −52] on x64, overlapping its A/A band of ±80 KiB, and
 +8 KiB [−4, 28] on ARM64. These are 20 matched daemon pairs. Its experimental
 feature and manifest rewrite have been removed. The retirement callback is
-a separate decision.
+rejected separately below.
 
 The release-mode snmalloc smoke completed on Linux ARM64 and Windows x64;
 its remaining queued jobs were cancelled because the same-source full paired
@@ -283,3 +314,45 @@ pressure relief reported zero bytes returned after dropping large caches.
 The retirement callback and per-sample explicit release measure that question
 again on the sessions workload. Retained allocations and allocator-held free
 memory must be distinguished; a release call cannot discard live caches.
+
+## Read-scratch qualification
+
+At 128 attached sessions, all six hosted comparisons and the local M3
+complete 20 alternating rounds. RSS changes are KiB; CPU and turn p99 changes
+are percent, with 95% bootstrap intervals:
+
+| Runner | Idle RSS | Active CPU | Turn p99 |
+| --- | ---: | ---: | ---: |
+| Linux x64 | −1978 [−2114, −1778] | −1.654 [−3.102, 1.791] | −1.574 [−3.876, 2.383] |
+| Linux ARM64 | −2062 [−2262, −1832] | −0.963 [−1.781, −0.135] | 0.625 [−1.117, 2.369] |
+| Windows x64 | −1996 [−2476, −1470] | −0.538 [−8.421, 2.620] | 0.262 [−2.526, 2.327] |
+| Windows ARM64 | −2114 [−2192, −2044] | −2.359 [−6.577, 2.845] | −2.062 [−5.088, 3.205] |
+| macOS Intel | −2016 [−2036, −1978] | 2.04 [−2.95, 6.88] | 1.72 [−0.45, 3.34] |
+| macOS ARM64 | −2256 [−2384, −2056] | 0.98 [−1.36, 4.18] | −0.66 [−1.82, 1.15] |
+| Local M3 | −2256 [−2440, −1952] | 0.452 [−2.861, 2.869] | −0.900 [−1.974, 0.774] |
+
+Every RSS interval clears its own complete A/A band. There is no clear
+CPU or turn-latency regression; some upper timing bounds extend beyond A/A,
+particularly Intel macOS, so these measurements do not prove strict timing
+non-inferiority on every host. Keep the structural retention fix and retain
+that uncertainty in the tables. It adds no per-extension boilerplate or
+runtime policy knob.
+
+## Validation and remaining scope
+
+CI [40266082518](https://github.com/arut-land/a/actions/runs/40266082518)
+passes all twelve jobs: Linux, macOS, both Windows architectures, both hosted
+budgets, Apple builds/tests, deny, Miri, no-tokio, machete and fuzz. This validates
+the cleaned native allocator implementation before the final main merge.
+Local validation after merging main includes the real frame-buffer invariant,
+formatting, and the performance harness tests (14 tests, two Windows-only skips).
+The native-build size above belongs to its recorded source revision, not the
+subsequent main merge.
+
+Deferred: a full 20-pair separate-executable Windows ARM64 A/A retry after
+addressing the observed daemon availability failure; unsupported Windows ARM64
+snmalloc/rpmalloc toolchains; measurements on the owner's physical Windows and
+Linux machines; musl and additional glibc trim-threshold experiments. No default
+change depends on those missing observations. Projection-cache lifetime changes
+remain unimplemented: profiling identified a removable read buffer without
+adding cache rebuild work or a memory cap. No speculative hardening was added.

@@ -834,7 +834,6 @@ mod tests {
             ClientMsg::Hello {
                 proto: PROTO,
                 build: "x".repeat(64 << 10),
-                min: None,
                 caps: Caps::NONE,
                 client: None,
                 machine: None,

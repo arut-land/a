@@ -15,7 +15,24 @@
     "sessions-frames": 40241546207,
     "sessions-segment-arm": 40241548413,
     "smoke-snmalloc-release": 40241550744,
-    "sessions-jemalloc-snmalloc": 40241553286
+    "sessions-jemalloc-snmalloc": 40241553286,
+    "paired-aa-arm-retry": 40249311731,
+    "ci-allocator-cleanup": 40252158167,
+    "sessions-mimalloc-mac-retry": 40252160653,
+    "paired-rest-arm-retry": 40253490613,
+    "sessions-mimalloc-mac-128": 40258918237,
+    "sessions-rpmalloc-mac-128": 40258921054,
+    "paired-rpmalloc-intel-retry": 40261595054,
+    "ci-native-cleanup": 40264611706,
+    "ci-native-validated": 40266082518,
+    "sessions-frames-mac-intel-1": 40267241765,
+    "sessions-frames-mac-intel-128": 40267244835,
+    "sessions-frames-mac-arm-1": 40267247697,
+    "sessions-frames-mac-arm-128": 40267250565,
+    "sessions-jemalloc-snmalloc-mac-intel-1": 40268855546,
+    "sessions-jemalloc-snmalloc-mac-intel-128": 40268858444,
+    "sessions-jemalloc-snmalloc-mac-arm-1": 40268861305,
+    "sessions-jemalloc-snmalloc-mac-arm-128": 40268864173
   },
   "superseded_before_measurement": {
     "reason": "abbreviated pinned revisions were interpreted as branch names by checkout",
@@ -48,5 +65,121 @@
       "smoke-snmalloc-release": 40236722742,
       "sessions-jemalloc-snmalloc": 40236725744
     }
+  },
+  "dispatches": {
+    "sessions-frames-mac-intel-1": {
+      "run": 40267241765,
+      "workflow_revision": "7b405f4c682b86b48bfa3a773b8b496056c9cf28",
+      "harness_ref": "b41ea27b71f0cb4af2a392a5b1b3daef1efcdc36",
+      "source_ref": "1190974fe404f46a78d4b84e7dab11937c7a2aa3",
+      "paired_ref": "48b9c3a0fc3e9180065ee6620c941757cf426cf9",
+      "runner": "macos-15-intel",
+      "variant": {
+        "sessions": "1"
+      },
+      "rounds": 20
+    },
+    "sessions-frames-mac-intel-128": {
+      "run": 40267244835,
+      "workflow_revision": "7b405f4c682b86b48bfa3a773b8b496056c9cf28",
+      "harness_ref": "b41ea27b71f0cb4af2a392a5b1b3daef1efcdc36",
+      "source_ref": "1190974fe404f46a78d4b84e7dab11937c7a2aa3",
+      "paired_ref": "48b9c3a0fc3e9180065ee6620c941757cf426cf9",
+      "runner": "macos-15-intel",
+      "variant": {
+        "sessions": "128"
+      },
+      "rounds": 20
+    },
+    "sessions-frames-mac-arm-1": {
+      "run": 40267247697,
+      "workflow_revision": "7b405f4c682b86b48bfa3a773b8b496056c9cf28",
+      "harness_ref": "b41ea27b71f0cb4af2a392a5b1b3daef1efcdc36",
+      "source_ref": "1190974fe404f46a78d4b84e7dab11937c7a2aa3",
+      "paired_ref": "48b9c3a0fc3e9180065ee6620c941757cf426cf9",
+      "runner": "macos-latest",
+      "variant": {
+        "sessions": "1"
+      },
+      "rounds": 20
+    },
+    "sessions-frames-mac-arm-128": {
+      "run": 40267250565,
+      "workflow_revision": "7b405f4c682b86b48bfa3a773b8b496056c9cf28",
+      "harness_ref": "b41ea27b71f0cb4af2a392a5b1b3daef1efcdc36",
+      "source_ref": "1190974fe404f46a78d4b84e7dab11937c7a2aa3",
+      "paired_ref": "48b9c3a0fc3e9180065ee6620c941757cf426cf9",
+      "runner": "macos-latest",
+      "variant": {
+        "sessions": "128"
+      },
+      "rounds": 20
+    },
+    "sessions-jemalloc-snmalloc-mac-intel-1": {
+      "run": 40268855546,
+      "workflow_revision": "7b405f4c682b86b48bfa3a773b8b496056c9cf28",
+      "harness_ref": "b41ea27b71f0cb4af2a392a5b1b3daef1efcdc36",
+      "source_ref": "c249a084371eb92afed2aed31e9e82153b55fb27",
+      "runner": "macos-15-intel",
+      "variant": {
+        "allocators": [
+          "jemalloc",
+          "snmalloc"
+        ],
+        "sessions": "1"
+      },
+      "rounds": 20
+    },
+    "sessions-jemalloc-snmalloc-mac-intel-128": {
+      "run": 40268858444,
+      "workflow_revision": "7b405f4c682b86b48bfa3a773b8b496056c9cf28",
+      "harness_ref": "b41ea27b71f0cb4af2a392a5b1b3daef1efcdc36",
+      "source_ref": "c249a084371eb92afed2aed31e9e82153b55fb27",
+      "runner": "macos-15-intel",
+      "variant": {
+        "allocators": [
+          "jemalloc",
+          "snmalloc"
+        ],
+        "sessions": "128"
+      },
+      "rounds": 20
+    },
+    "sessions-jemalloc-snmalloc-mac-arm-1": {
+      "run": 40268861305,
+      "workflow_revision": "7b405f4c682b86b48bfa3a773b8b496056c9cf28",
+      "harness_ref": "b41ea27b71f0cb4af2a392a5b1b3daef1efcdc36",
+      "source_ref": "c249a084371eb92afed2aed31e9e82153b55fb27",
+      "runner": "macos-latest",
+      "variant": {
+        "allocators": [
+          "jemalloc",
+          "snmalloc"
+        ],
+        "sessions": "1"
+      },
+      "rounds": 20
+    },
+    "sessions-jemalloc-snmalloc-mac-arm-128": {
+      "run": 40268864173,
+      "workflow_revision": "7b405f4c682b86b48bfa3a773b8b496056c9cf28",
+      "harness_ref": "b41ea27b71f0cb4af2a392a5b1b3daef1efcdc36",
+      "source_ref": "c249a084371eb92afed2aed31e9e82153b55fb27",
+      "runner": "macos-latest",
+      "variant": {
+        "allocators": [
+          "jemalloc",
+          "snmalloc"
+        ],
+        "sessions": "128"
+      },
+      "rounds": 20
+    }
+  },
+  "decisions": {
+    "default_allocator": "system",
+    "retirement_callback": "rejected",
+    "segment_heap": "rejected",
+    "read_scratch": "polling stack"
   }
 }
