@@ -60,39 +60,93 @@ fn contents(home: &Home) -> io::Result<String> {
     ))
 }
 
+/// The existing registration owns controls, regardless of which client asks.
+fn owner(
+    home: &Home,
+    mut registered: impl FnMut(&str) -> io::Result<bool>,
+) -> io::Result<Option<String>> {
+    if plist(home)?.try_exists()? {
+        return Ok(Some(label(home)));
+    }
+    // Overrides survive unregistration; only an existing service owns controls.
+    Ok(registered(APP_LABEL)?.then(|| APP_LABEL.to_owned()))
+}
+
+fn registered(label: &str) -> io::Result<bool> {
+    let output = Command::new("launchctl")
+        .arg("print")
+        .arg(format!("{}/{label}", domain()))
+        .output()?;
+    Ok(output.status.success())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Switch {
+    Enable,
+    Disable,
+}
+
+fn switch(
+    label: &str,
+    action: Switch,
+    mut run: impl FnMut(&mut Command) -> io::Result<()>,
+) -> io::Result<()> {
+    // enable/disable only changes future launches. bootout and SMAppService's
+    // unregister also terminate the current process, which is a separate action.
+    run(Command::new("launchctl")
+        .arg(match action {
+            Switch::Enable => "enable",
+            Switch::Disable => "disable",
+        })
+        .arg(format!("{}/{label}", domain())))
+}
+
 pub(super) fn enable(home: &Home) -> io::Result<()> {
-    // Written, not bootstrapped: loading it now would start a second daemon
-    // only for it to find this home's daemon serving.
-    update(&plist(home)?, contents(home)?.as_bytes()).map(drop)
+    let owner = if let Some(owner) = owner(home, registered)? {
+        owner
+    } else {
+        update(&plist(home)?, contents(home)?.as_bytes())?;
+        label(home)
+    };
+    switch(&owner, Switch::Enable, run)
+}
+
+pub(super) fn enable_bundled() -> io::Result<()> {
+    switch(APP_LABEL, Switch::Enable, run)
 }
 
 pub(super) fn disable(home: &Home) -> io::Result<()> {
-    let path = plist(home)?;
-    if !path.exists() {
-        return Ok(());
+    if let Some(owner) = owner(home, registered)? {
+        switch(&owner, Switch::Disable, run)?;
     }
-    // Loaded since the last login, unless this login enabled it.
-    let _ =
-        run(Command::new("launchctl")
-            .arg("bootout")
-            .arg(format!("{}/{}", domain(), label(home))));
-    std::fs::remove_file(path)
+    Ok(())
+}
+
+pub(super) fn registration(home: &Home) -> io::Result<super::Registration> {
+    registration_with(home, &disabled()?, registered)
+}
+
+fn registration_with(
+    home: &Home,
+    disabled: &str,
+    registered: impl FnMut(&str) -> io::Result<bool>,
+) -> io::Result<super::Registration> {
+    let Some(owner) = owner(home, registered)? else {
+        return Ok(super::Registration::Unregistered);
+    };
+    Ok(if switched_off(disabled, &owner) {
+        super::Registration::Disabled
+    } else {
+        super::Registration::Enabled
+    })
 }
 
 pub(super) fn refresh(home: &Home) -> io::Result<bool> {
     let path = plist(home)?;
-    let disabled = disabled()?;
-    if path.exists() {
+    if path.try_exists()? {
         update(&path, contents(home)?.as_bytes())?;
-        return Ok(!switched_off(&disabled, &label(home)));
     }
-    // The app's agent names its helper inside the bundle, so it never needs
-    // rewriting; it is on while launchd has it loaded.
-    Ok(!switched_off(&disabled, APP_LABEL)
-        && run(Command::new("launchctl")
-            .arg("print")
-            .arg(format!("{}/{APP_LABEL}", domain())))
-        .is_ok())
+    Ok(registration(home)? == super::Registration::Enabled)
 }
 
 /// launchd's override list for this user's domain, which the Login Items
@@ -103,24 +157,89 @@ fn disabled() -> io::Result<String> {
         .arg(domain())
         .stdin(std::process::Stdio::null())
         .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Whether `label` is listed off: `"label" => disabled` (or `=> true` from
 /// releases that print booleans).
 fn switched_off(listing: &str, label: &str) -> bool {
+    override_state(listing, label).unwrap_or(false)
+}
+
+fn override_state(listing: &str, label: &str) -> Option<bool> {
     let quoted = format!("\"{label}\"");
-    listing.lines().any(|line| {
-        let line = line.trim();
-        line.strip_prefix(quoted.as_str())
-            .and_then(|rest| rest.trim_start().strip_prefix("=>"))
-            .is_some_and(|state| matches!(state.trim(), "disabled" | "true"))
+    listing.lines().find_map(|line| {
+        match line
+            .trim()
+            .strip_prefix(quoted.as_str())?
+            .trim_start()
+            .strip_prefix("=>")?
+            .trim()
+        {
+            "disabled" | "true" => Some(true),
+            "enabled" | "false" => Some(false),
+            _ => None,
+        }
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_switches_never_unload_the_running_daemon() {
+        let mut actions = Vec::new();
+        for action in [Switch::Disable, Switch::Enable] {
+            switch(APP_LABEL, action, |command| {
+                actions.push(
+                    command
+                        .get_args()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>(),
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            actions,
+            [
+                vec!["disable".to_owned(), format!("{}/{APP_LABEL}", domain())],
+                vec!["enable".to_owned(), format!("{}/{APP_LABEL}", domain())]
+            ]
+        );
+    }
+
+    #[test]
+    fn overrides_cannot_create_a_bundled_registration() {
+        let home = Home::from(std::env::temp_dir().join("a-autostart-bundle-owner"));
+        for listing in [
+            "\"dev.a.daemon\" => disabled",
+            "\"dev.a.daemon\" => enabled",
+        ] {
+            assert_eq!(
+                registration_with(&home, listing, |_| Ok(false)).unwrap(),
+                super::super::Registration::Unregistered,
+            );
+        }
+        assert_eq!(
+            registration_with(&home, "\"dev.a.daemon\" => disabled", |label| {
+                Ok(label == APP_LABEL)
+            })
+            .unwrap(),
+            super::super::Registration::Disabled,
+        );
+        assert_eq!(
+            registration_with(&home, "", |label| Ok(label == APP_LABEL)).unwrap(),
+            super::super::Registration::Enabled,
+        );
+    }
 
     #[test]
     fn registration_names_cannot_cross_state_homes() {

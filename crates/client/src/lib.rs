@@ -645,7 +645,13 @@ async fn locked(rt: &rt::Rt, file: File, within: Option<Duration>) -> Option<Fil
 /// Local endpoint verification and named-pipe opening may block in the OS.
 async fn local_connect(rt: &rt::Rt, home: &Home) -> io::Result<OwnedConnection> {
     let endpoint = home.endpoint();
-    rt::unblock(&**rt, move || endpoint.connect()).await
+    rt::try_unblock_with(
+        &**rt,
+        rt::BlockingClass::Storage,
+        rt::STORAGE_BYTES,
+        move || endpoint.connect(),
+    )
+    .await?
 }
 
 /// Connects to the running daemon, as its own build `build` so as not to
@@ -778,7 +784,7 @@ pub fn restart(
 /// side closes: the daemon may keep a connection open after its client is
 /// done.
 pub fn bridge(home: &Home, token: &str) -> io::Result<()> {
-    let (stream, _) = rt::block_on(connect_or_spawn(&link::BLOCKING, home, false))?;
+    let (stream, _) = rt::block_on(connect_or_spawn(&link::BLOCKING, home, Start::Reuse))?;
     let env = ClientMsg::Environment(capture()?);
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "{} {token} env", remote::SYNC)?;
@@ -882,11 +888,12 @@ async fn bind_at_login_async(
 /// A login entry whose host does not outlive it: start a detached daemon
 /// as any client does, unless one serves.
 pub fn spawn_at_login(home: &Home) -> io::Result<()> {
-    rt::block_on(connect_or_spawn(&link::BLOCKING, home, false)).map(drop)
+    rt::block_on(connect_or_spawn(&link::BLOCKING, home, Start::Reuse)).map(drop)
 }
 
-/// Zero-lag start: when no daemon is listening, take the daemon lock, bind
-/// the socket here, hand both to a detached daemon running
+/// Connects to the daemon or asks its native launch owner to start it.
+/// A managed start waits for endpoint readiness. Direct starts take the
+/// daemon lock, bind the socket here, hand both to a detached daemon running
 /// `runtime/current`, and connect straight into its backlog. The lock goes
 /// with the fd, so it is held from here until the daemon exits, and only
 /// that daemon reaps a dead predecessor or refuses to serve after a crash
@@ -901,7 +908,7 @@ pub fn spawn_at_login(home: &Home) -> io::Result<()> {
 pub(crate) async fn connect_or_spawn(
     rt: &rt::Rt,
     home: &Home,
-    reset: bool,
+    start: Start,
 ) -> io::Result<(OwnedConnection, bool)> {
     use std::process::{Command, Stdio};
 
@@ -909,6 +916,24 @@ pub(crate) async fn connect_or_spawn(
         Ok(stream) => return Ok((stream, false)),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(error),
         Err(_) => {}
+    }
+
+    if sys::autostart::MANAGED_START && sys::autostart::applies(home) {
+        let managed = home.clone();
+        if rt::try_unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
+            sys::autostart::start(
+                &managed,
+                match start {
+                    Start::Reuse => sys::autostart::Launch::Start,
+                    Start::Reset => sys::autostart::Launch::Reset,
+                    Start::Replace => sys::autostart::Launch::Replace,
+                },
+            )
+        })
+        .await??
+        {
+            return Ok((local_connect(rt, home).await?, true));
+        }
     }
 
     let _starting = starting(rt, home).await?;
@@ -930,7 +955,7 @@ pub(crate) async fn connect_or_spawn(
         .filter_map(|&name| Some((name, std::env::var_os(name)?)));
     let mut cmd = Command::new(home.runtime().current_exe());
     cmd.arg("__daemon")
-        .args(reset.then_some("--reset-breaker"))
+        .args((start != Start::Reuse).then_some("--reset-breaker"))
         .env_clear()
         .envs(inherited)
         .stdin(Stdio::null())
@@ -938,10 +963,10 @@ pub(crate) async fn connect_or_spawn(
         .stderr(Stdio::null());
     home.daemon_env(&mut cmd);
     let spawning = home.clone();
-    let daemon = rt::unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
+    let daemon = rt::try_unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
         sys::spawn_daemon(&mut cmd, &spawning, lock)
     })
-    .await?;
+    .await??;
     rt::reap(&**rt, daemon);
     Ok((local_connect(rt, home).await?, true))
 }

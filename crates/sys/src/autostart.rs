@@ -1,6 +1,4 @@
-//! Optional start at login. The per-user OS registration is the only state:
-//! present means on. A client's self-spawn never reads it, so turning it on or
-//! off cannot change how fast a first connect starts a daemon.
+//! Native registration and managed launch ownership for the per-user daemon.
 
 use std::io;
 #[cfg(unix)]
@@ -30,6 +28,9 @@ pub enum Login {
 
 pub const LOGIN: Login = native::LOGIN;
 
+/// Whether this platform's native manager also owns client-initiated starts.
+pub const MANAGED_START: bool = cfg!(target_os = "linux");
+
 fn native_home(home: &Home) -> io::Result<()> {
     if home.layout() != &InstallLayout::Native {
         return Err(io::Error::new(
@@ -46,6 +47,59 @@ pub fn applies(home: &Home) -> bool {
     native_home(home).is_ok()
 }
 
+/// The OS registration, independently of whether a daemon is running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Registration {
+    Unregistered,
+    Disabled,
+    Enabled,
+}
+
+/// Reads login registration without rewriting it or starting a daemon.
+pub fn registration(home: &Home) -> io::Result<Registration> {
+    if !applies(home) {
+        return Ok(Registration::Unregistered);
+    }
+    native::registration(home)
+}
+
+/// A native launch request, including explicit crash recovery or replacement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Launch {
+    Start,
+    Reset,
+    Replace,
+}
+
+/// Starts through the native manager when it owns this installation.
+/// Returns false for direct starts. Called without either startup lock held:
+/// the managed daemon takes those locks before binding its endpoint.
+pub fn start(home: &Home, launch: Launch) -> io::Result<bool> {
+    if !applies(home) {
+        return Ok(false);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        native::start(home, launch)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = launch;
+        Ok(false)
+    }
+}
+
+/// Announces a managed daemon's bound endpoint to its launch owner.
+pub fn ready(home: &Home) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if applies(home) {
+        native::ready()?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = home;
+    Ok(())
+}
+
 /// Registers the daemon to start when this user logs in.
 pub fn enable(home: &Home) -> io::Result<()> {
     native_home(home)?;
@@ -54,7 +108,24 @@ pub fn enable(home: &Home) -> io::Result<()> {
     native::enable(home)
 }
 
-/// Removes the registration; the running daemon is left alone.
+/// Completes a bundled agent's `SMAppService` registration with its enabled
+/// override, without waiting for launchd to load it or creating another entry.
+pub fn enable_bundled(home: &Home) -> io::Result<()> {
+    native_home(home)?;
+    #[cfg(target_os = "macos")]
+    {
+        native::enable_bundled()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this installation has no bundled login agent",
+        ))
+    }
+}
+
+/// Disables future login launches; the running daemon is left alone.
 pub fn disable(home: &Home) -> io::Result<()> {
     native_home(home)?;
     native::disable(home)
@@ -173,7 +244,13 @@ mod tests {
             disable(&home).unwrap_err().kind(),
             io::ErrorKind::Unsupported
         );
+        assert_eq!(
+            enable_bundled(&home).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
         assert!(!refresh(&home));
+        assert!(!start(&home, Launch::Start).unwrap());
+        assert_eq!(registration(&home).unwrap(), Registration::Unregistered);
         assert_eq!(
             enter(&home, "test").unwrap_err().kind(),
             io::ErrorKind::Unsupported

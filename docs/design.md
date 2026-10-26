@@ -50,8 +50,9 @@ holds its pid-file lock for its lifetime, excluding other writers to that
 home. `sys::Paths` resolves native configuration, state, data, cache, logs
 and runtime locations; `A_HOME` selects an isolated root. See [paths and
 install layout](paths.md). Optional [autostart](autostart.md) registers
-the daemon with the OS to start at login and stay up; clients still self-spawn
-it when none is running.
+the daemon with the OS to start at login. Registered Linux installations also
+route client startup and replacement through their systemd user unit; isolated
+and unmanaged installations start directly.
 
 The daemon serves connections and session actors on `rt`. Idle sessions
 hibernate; the daemon exits when no clients or work pin it. Upgrades drain

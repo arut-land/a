@@ -72,7 +72,13 @@ impl Link for SshLink {
                 .into());
             }
             let home = self.home.clone();
-            let machine = rt::unblock(&**rt, move || sys::machine_id(&home)).await?;
+            let machine = rt::try_unblock_with(
+                &**rt,
+                rt::BlockingClass::Storage,
+                rt::STORAGE_BYTES,
+                move || sys::machine_id(&home),
+            )
+            .await??;
             let opened = |opened: Opened| Opened {
                 machine: Some(MachineId(machine)),
                 ..opened
@@ -92,10 +98,10 @@ impl Link for SshLink {
                 }
             }
             let (link, installing) = (self.clone(), build.clone());
-            rt::unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
+            rt::try_unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
                 link.install(&installing)
             })
-            .await?;
+            .await??;
             match self
                 .bridge(rt, Bootstrap::Installed(&build.id), &token)
                 .await?
@@ -191,10 +197,10 @@ impl SshLink {
         }
         let prompt = self.prompt;
         let (child, stdin, stdout, stderr) =
-            rt::unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
+            rt::try_unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
                 sys::spawn_ssh(&mut cmd, prompt)
             })
-            .await?;
+            .await??;
         let report = stderr.map(|stderr| Report::drain(rt, stderr)).transpose()?;
         let reactor = rt.reactor();
         let mut pipe = Pipe::new(
@@ -344,8 +350,8 @@ pub(crate) fn installed_script(id: &str, token: &str) -> String {
 /// a crash leftover from an interrupted upload, never a build to run.
 fn install_script(id: &str) -> String {
     // A cut connection ends `cat` with a clean EOF, so only the checksum
-    // proves the upload whole. It is flushed before its name exists, and a
-    // concurrent installer may win, but a verified image is never replaced.
+    // proves the upload whole. Staging is reconstructible; publication needs
+    // checksum verification, not a machine-wide filesystem flush.
     grouped(&format!(
         r#"crc=$1 size=$2
 verify() {{ [ -x "$1" ] && set -- $(cksum < "$1") && [ "$1 $2" = "$crc $size" ]; }}
@@ -356,7 +362,7 @@ mkdir -p "$a_runtime/{id}" && upload=$(mktemp -d "$a_runtime/{id}/.install.XXXXX
 trap 'rm -f "$upload/a"; rmdir "$upload"' 0
 trap 'exit 1' HUP INT TERM
 echo ready
-cat > "$upload/a" && chmod 700 "$upload/a" && verify "$upload/a" && sync || exit 1
+cat > "$upload/a" && chmod 700 "$upload/a" && verify "$upload/a" || exit 1
 ln "$upload/a" "$upload/../a" 2>/dev/null || verify "$upload/../a" || mv -f "$upload/a" "$upload/../a""#,
         sys::RemoteLayout::for_platform(Platform::CURRENT).runtime_script(),
     ))
@@ -463,9 +469,10 @@ impl Drop for Reaper {
                     watch.readable().await;
                     let _ = child.wait();
                 } else {
-                    let _ =
-                        rt::unblock_with(&*rt, rt::BlockingClass::Storage, 0, move || child.wait())
-                            .await;
+                    let _ = rt::try_unblock_with(&*rt, rt::BlockingClass::Storage, 0, move || {
+                        child.wait()
+                    })
+                    .await;
                 }
             }));
         }
@@ -475,6 +482,55 @@ impl Drop for Reaper {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_verified_executable_uploads_are_published_without_global_sync() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let sync = bin.join("sync");
+        std::fs::write(&sync, "#!/bin/sh\necho global-sync >&2; exit 99\n").unwrap();
+        std::fs::set_permissions(&sync, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bytes = b"#!/bin/sh\nexit 0\n";
+        let (crc, size) = cksum(&bytes[..]).unwrap();
+        for (id, checksum) in [("valid", crc), ("invalid", crc ^ 1)] {
+            let home = root.path().join(id);
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    &install_script(id),
+                    "upload",
+                    &checksum.to_string(),
+                    &size.to_string(),
+                ])
+                .env("A_HOME", &home)
+                .env(
+                    "PATH",
+                    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            child.stdin.take().unwrap().write_all(bytes).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(output.status.success(), id == "valid", "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let published = home.join("runtime").join(id).join("a");
+            if id == "valid" {
+                assert_eq!(std::fs::read(&published).unwrap(), bytes);
+                assert_eq!(
+                    std::fs::metadata(published).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            } else {
+                assert!(!published.exists());
+            }
+        }
+    }
 
     #[test]
     fn upload_checksums_match_the_hosts_cksum() {

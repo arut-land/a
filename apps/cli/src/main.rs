@@ -44,6 +44,20 @@ fn run(startup: sys::handover::Startup) -> ExitCode {
     {
         sys::console::attach_when_launched_without_one();
     }
+    // The app queries the same owner as CLI login controls, without staging
+    // an image or connecting to the daemon.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "__autostart")
+    {
+        return match autostart_control() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                errln!("a: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // Help, the version, completion requests and usage errors (status 2)
     // end the process here.
     let args = Args::parse();
@@ -226,6 +240,32 @@ fn wedged(daemon: &client::Daemon, e: client::Error) -> io::Error {
 
 const RESTART: &str = "run `a daemon restart` to replace it";
 
+/// The app's registration controls never start or stop a daemon.
+fn autostart_control() -> io::Result<()> {
+    let home = Home::from_env()?;
+    if let Some(action) = std::env::args_os().nth(2) {
+        return if action == "bundle-on" {
+            sys::autostart::enable_bundled(&home)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown registration action",
+            ))
+        };
+    }
+    let status = if sys::autostart::applies(&home) {
+        match sys::autostart::registration(&home)? {
+            sys::autostart::Registration::Unregistered => "unregistered",
+            sys::autostart::Registration::Disabled => "off",
+            sys::autostart::Registration::Enabled => "on",
+        }
+    } else {
+        "unavailable"
+    };
+    sayln!("{status}");
+    Ok(())
+}
+
 fn daemon_cmd(host: Option<&Host>, action: Daemon) -> io::Result<()> {
     let home = Home::from_env()?;
     let home = here(&home, host)?.clone();
@@ -240,7 +280,9 @@ fn daemon_cmd(host: Option<&Host>, action: Daemon) -> io::Result<()> {
             state: Autostart::Off,
         } => {
             sys::autostart::disable(&home)?;
-            sayln!("autostart off: the daemon starts on first use and exits when idle");
+            sayln!(
+                "autostart off: future login launches disabled; the running daemon is left alone"
+            );
         }
         Daemon::Log => match std::fs::read_to_string(home.daemon_log()) {
             Ok(text) => out(format_args!("{text}")),
@@ -770,6 +812,9 @@ fn serve(
         };
         (lock, listener)
     };
+    if login {
+        sys::autostart::ready(home)?;
+    }
     let start = engine::Start {
         lock,
         reset_breaker,

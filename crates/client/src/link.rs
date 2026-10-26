@@ -248,8 +248,7 @@ impl Link for LocalLink {
             if start == Start::Replace {
                 crate::stop_async(rt, &home).await?;
             }
-            let (stream, started) =
-                crate::connect_or_spawn(rt, &home, start != Start::Reuse).await?;
+            let (stream, started) = crate::connect_or_spawn(rt, &home, start).await?;
             Ok(Opened {
                 within: if started {
                     crate::START_TIMEOUT
@@ -375,7 +374,13 @@ pub(crate) async fn connect<F: Future<Output = ()> + Send>(
             }
             Ok((Greeting::Mismatch(theirs), ..)) => {
                 let (link, build) = (link.clone(), build.clone());
-                return Err(rt::unblock(&**rt, move || link.mismatch(&build, theirs)).await);
+                return Err(rt::try_unblock_with(
+                    &**rt,
+                    rt::BlockingClass::Storage,
+                    rt::STORAGE_BYTES,
+                    move || link.mismatch(&build, theirs),
+                )
+                .await?);
             }
             Ok((Greeting::Draining, ..)) => {
                 on_drain().await;
