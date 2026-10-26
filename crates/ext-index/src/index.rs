@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ext::{Cancel, WorkspaceShared};
@@ -61,8 +61,13 @@ impl Default for Limits {
 
 /// The open indexes, one per workspace.
 pub struct Indexes {
-    open: WorkspaceShared<WorkspaceIndex>,
     limits: Limits,
+    dir: Option<PathBuf>,
+    opened: OnceLock<Box<Opened>>,
+}
+
+struct Opened {
+    open: WorkspaceShared<WorkspaceIndex>,
     store: Option<Arc<Store>>,
 }
 
@@ -120,9 +125,9 @@ impl Store {
 impl Indexes {
     pub fn new(limits: Limits) -> Self {
         Self {
-            open: WorkspaceShared::default(),
             limits,
-            store: None,
+            dir: None,
+            opened: OnceLock::new(),
         }
     }
 
@@ -133,25 +138,35 @@ impl Indexes {
     /// walked and built again.
     #[must_use]
     pub fn kept_in(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.store = Some(Arc::new(Store {
-            dir: dir.into(),
-            resting: Mutex::default(),
-        }));
+        self.dir = Some(dir.into());
         self
     }
 
     /// The index of the workspace at `root`, opened now if no one has it
     /// open, and kept open for [`Limits::linger`] from now.
     pub fn open(&self, root: &Path, rt: Rt, hub: Arc<Hub>) -> Arc<WorkspaceIndex> {
-        let index = self.open.get_or_make(root, |own| WorkspaceIndex {
+        let opened = self.opened.get_or_init(|| {
+            Box::new(Opened {
+                open: WorkspaceShared::default(),
+                store: self.dir.as_ref().map(|dir| {
+                    Arc::new(Store {
+                        dir: dir.clone(),
+                        resting: Mutex::default(),
+                    })
+                }),
+            })
+        });
+        let index = opened.open.get_or_make(root, |own| WorkspaceIndex {
             root: Arc::from(root),
             rt,
             hub,
             limits: self.limits,
-            store: (self.store.as_ref())
+            store: opened
+                .store
+                .as_ref()
                 .map(|store| (Arc::downgrade(store), disk::Place::new(&store.dir, root))),
             state: Mutex::new(State {
-                stored: if self.store.is_some() {
+                stored: if opened.store.is_some() {
                     Stored::Unseen
                 } else {
                     Stored::None
@@ -1849,6 +1864,31 @@ fn is_binary(content: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unused_index_configuration_holds_no_open_or_resting_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("ws");
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "needle").unwrap();
+        let indexes = Indexes::new(Limits::default()).kept_in(&cache);
+        assert!(indexes.opened.get().is_none());
+        assert!(!cache.exists());
+        let rt: Rt = Arc::new(rt::Threads::new(2));
+        let index = indexes.open(&root, Arc::clone(&rt), Arc::new(Hub::new(Arc::clone(&rt))));
+        let opened = indexes.opened.get().expect("first use opens shared state");
+        assert!(opened.store.is_some());
+        assert_eq!(
+            rt::block_on(index.search("a".into(), 10)).unwrap().files[0].path,
+            "a.txt"
+        );
+        let again = indexes.open(&root, Arc::clone(&rt), Arc::new(Hub::new(rt)));
+        assert!(
+            Arc::ptr_eq(&index, &again),
+            "first use still shares one workspace index"
+        );
+    }
 
     #[test]
     fn an_unwatched_root_sees_local_changes_at_once_and_remote_ones_by_walking_again() {

@@ -62,6 +62,10 @@ are not UTF-8 are left out.
 
 ## Lifetime
 
+Registration retains configuration only. The workspace map and resting store
+are created on first use; the checksum table is created on first cache I/O.
+An unused index has no workspace state, cache store, or checksum table.
+
 A loaded session starts warming its workspace index through
 `SessionStart(Started::Loaded)`. A created session waits for its first
 top-level `ModelResult`; subsequent replies refresh the linger deadline.

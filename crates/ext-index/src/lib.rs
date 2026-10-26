@@ -50,11 +50,14 @@ pub struct Index {
 impl Index {
     /// Kept in `dir` between uses: see [`Indexes::kept_in`].
     #[must_use]
-    pub fn kept_in(self, dir: impl Into<PathBuf>) -> Self {
-        Self {
-            indexes: Arc::new(Indexes::new(self.limits).kept_in(dir)),
-            ..self
+    pub fn kept_in(mut self, dir: impl Into<PathBuf>) -> Self {
+        let configured = Indexes::new(self.limits).kept_in(dir);
+        if let Some(indexes) = Arc::get_mut(&mut self.indexes) {
+            *indexes = configured;
+        } else {
+            self.indexes = Arc::new(configured);
         }
+        self
     }
 }
 

@@ -194,3 +194,46 @@ while releasing its large structures ten times sooner. A session's
 subsequent model replies renew the deadline. No periodic cleanup or idle
 polling was added: the retained regression tests observe zero runtime
 wake-ups for both quiet active and resting indexes.
+
+## Unused index state on macOS
+
+The idle budget opens a new session without sending a model message. The
+`Created` hook returns without warming it; the process-wide watch hub was
+already present on main. The branch nevertheless added a 16 KiB slicing-by-16
+CRC table in a relocatable static. In the release executable that table
+increased `__DATA_CONST` from 224 to 240 KiB. `vmmap` showed the entire region
+resident and dirty in the unused daemon, before any cache I/O.
+
+The table now lives in a boxed `OnceLock`, constructed on the first cache
+read or write. The fixed executable's `__DATA_CONST` is back to 224 KiB,
+including its dirty resident size. This keeps the same CRC algorithm and
+16-lane implementation; no cache-format or checksum-throughput tradeoff is
+needed. The workspace map and resting store are also boxed behind first
+use. Configuration before registration reuses its unpublished service
+allocation instead of constructing and discarding another one.
+
+Measured on the M3, macOS 27.0.1, with the size-optimized fixtures build and
+the real idle budget test, fresh isolated homes and a real terminal client.
+Main was `4ddd838c`; the candidate includes that main, including its removal
+of retained connection-read scratch. Five rounds alternated main/candidate
+order. RSS was sampled after the test's three-second idle window; `vmmap`
+and `heap` ran afterward, outside the measurement window.
+
+| Build | Daemon RSS samples, KiB | Median, KiB |
+| --- | --- | ---: |
+| main | 10512, 10512, 10496, 10480, 10432 | 10496 |
+| lazy index state and checksum table | 10400, 10464, 10384, 10400, 10464 | 10400 |
+
+The median paired difference is -80 KiB; the difference between medians is
+-96 KiB. Allocator residency and code-page placement vary, so the stable
+attribution is the removed 16 KiB of dirty static storage, not an assertion
+that every byte of the RSS difference was the table. All samples measured
+zero terminal-client CPU in the idle window. A store-only experiment left
+`__DATA_CONST` at 240 KiB and did not show a clear total-RSS improvement.
+
+`mise run budgets` was also run directly on main and the branch. On this
+machine both exceeded the unchanged 10 MiB absolute RSS threshold (initial
+main 10688 KiB, fixed branch 10656 KiB). These local failures are retained,
+not hidden by a new threshold or allocator policy. Hosted macOS budgets
+remain a required check for this change. Raw samples, full-suite outputs,
+and native memory maps are under `/private/tmp/index-idle`.

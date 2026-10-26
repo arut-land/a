@@ -15,6 +15,7 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use crc::{CRC_32_ISCSI, CRC_64_XZ, Crc, NoTable, Table};
@@ -30,7 +31,13 @@ pub(crate) const MAX_AGE: Duration = Duration::from_hours(720);
 const FILES: [u8; 8] = *b"a-files\0";
 const BIGRAMS: [u8; 8] = *b"a-bigrm\0";
 
-static CHECK: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&CRC_32_ISCSI);
+// A table with relocations in static storage dirties pages during image loading,
+// even if no workspace ever uses the index.
+static CHECK: OnceLock<Box<Crc<u32, Table<16>>>> = OnceLock::new();
+
+fn checksum() -> &'static Crc<u32, Table<16>> {
+    CHECK.get_or_init(|| Box::new(Crc::<u32, Table<16>>::new(&CRC_32_ISCSI)))
+}
 
 /// Where the index of the workspace at `root` is kept in `dir`.
 #[derive(Clone)]
@@ -190,7 +197,7 @@ fn save(
     sys::fs::write_private_with(path, |file| {
         let mut out = Out {
             inner: BufWriter::with_capacity(64 << 10, file),
-            check: CHECK.digest(),
+            check: checksum().digest(),
         };
         out.put(&magic)?;
         out.u32(FORMAT)?;
@@ -210,7 +217,7 @@ fn load<T>(
     let len = file.metadata()?.len();
     let mut input = In {
         inner: BufReader::with_capacity(64 << 10, file),
-        check: CHECK.digest(),
+        check: checksum().digest(),
         left: len.checked_sub(4).ok_or_else(invalid)?,
         budget: usize::MAX,
     };
@@ -446,7 +453,7 @@ pub(crate) fn prune(dir: &Path, current: &Place) {
 pub(crate) fn encoded(write: impl FnOnce(&mut Out<Vec<u8>>) -> io::Result<()>) -> Vec<u8> {
     let mut out = Out {
         inner: Vec::new(),
-        check: CHECK.digest(),
+        check: checksum().digest(),
     };
     write(&mut out).unwrap();
     out.inner
@@ -460,7 +467,7 @@ pub(crate) fn decoded<'a, T>(
     let mut input = In {
         inner: bytes,
         left: bytes.len() as u64,
-        check: CHECK.digest(),
+        check: checksum().digest(),
         budget: usize::MAX,
     };
     read(&mut input)
