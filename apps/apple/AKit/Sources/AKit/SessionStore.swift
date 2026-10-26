@@ -43,12 +43,15 @@ public final class SessionStore {
     }
 
     public fileprivate(set) var cacheState: CacheState = .detached
-    fileprivate var retainedBytes: UInt64 { session?.retainedBytes() ?? 0 }
+    fileprivate var retainedBytes: UInt64 = 0
     @ObservationIgnored fileprivate var viewChanged: (() -> Void)?
 
     @ObservationIgnored private var source: (any ViewSource)?
     @ObservationIgnored private var session: Session?
     @ObservationIgnored fileprivate var attachmentChanged: ((SessionStore) -> Void)?
+    @ObservationIgnored private(set) var recovery: Task<Void, Never>?
+    @ObservationIgnored private var recoveryGeneration: UInt64 = 0
+    @ObservationIgnored private var latestRevision: UInt64 = 0
     @ObservationIgnored private var listening: Task<Void, Never>?
 
     /// A store for `session`; `open` attaches it.
@@ -137,6 +140,10 @@ public final class SessionStore {
 
     fileprivate func releaseAttachment() {
         cacheState = .detached
+        recoveryGeneration += 1
+        recovery?.cancel()
+        recovery = nil
+        retainedBytes = 0
         listening?.cancel()
         listening = nil
         session = nil
@@ -157,28 +164,39 @@ public final class SessionStore {
     /// Applies `update`: once, in order, catching up first on a gap.
     public func apply(_ update: ChangeBatch) {
         if update.revision <= rev { return }
-        defer { viewChanged?() }
-        if update.revision != rev + 1 {
+        latestRevision = max(latestRevision, update.revision)
+        if update.revision == rev + 1 {
+            fold(update)
+            viewChanged?()
+        } else {
             catchUp()
-            if update.revision <= rev { return }
         }
-        fold(update)
     }
 
     private func catchUp() {
-        guard let source else { return }
+        guard recovery == nil, let source else { return }
         resyncs += 1
-        switch source.resync(from: rev) {
-        case .updates(let updates):
-            for update in updates where update.revision == rev + 1 {
-                fold(update)
+        let from = rev
+        let generation = recoveryGeneration
+        recovery = Task { [weak self] in
+            let result = await Task.detached { source.resync(from: from) }.value
+            guard let self, !Task.isCancelled, generation == self.recoveryGeneration else { return }
+            self.recovery = nil
+            switch result {
+            case .updates(let updates):
+                for update in updates where update.revision == self.rev + 1 {
+                    self.fold(update)
+                }
+            case .snapshot(let snapshot):
+                if snapshot.rev >= self.rev { self.adopt(snapshot) }
             }
-        case .snapshot(let snapshot):
-            adopt(snapshot)
+            self.viewChanged?()
+            if self.rev < self.latestRevision { self.catchUp() }
         }
     }
 
     private func adopt(_ s: SessionSnapshot) {
+        retainedBytes = s.retainedBytes
         (rev, seq, sessionId, workspace, title) = (s.rev, s.seq, s.session, s.workspace, s.title)
         (items, link, recap, streaming, turn) = (s.items, s.link, s.recap, s.streaming, s.turn)
         if let id = s.session { attachment = .attached(id: id) }
@@ -203,6 +221,7 @@ public final class SessionStore {
                 break
             }
         }
+        retainedBytes = update.retainedBytes
         (rev, seq, turn, title) = (update.revision, update.seq, update.turn, update.title)
         if streaming?.call != update.streaming?.call || streaming?.attempt != update.streaming?.attempt {
             streaming = update.streaming.map { StreamingText(call: $0.call, attempt: $0.attempt, text: "") }

@@ -305,6 +305,8 @@ pub enum OpenTarget {
 pub struct ChangeBatch {
     /// One more than the previous batch; a gap requires resynchronization.
     pub revision: u64,
+    /// Cached byte charge for the current view and replay cache.
+    pub retained_bytes: u64,
     /// The last log entry folded, after this update.
     pub seq: u64,
     pub changes: Vec<ViewChange>,
@@ -734,6 +736,7 @@ pub struct StreamingText {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSnapshot {
     pub rev: u64,
+    pub retained_bytes: u64,
     pub seq: u64,
     pub session: Option<String>,
     pub workspace: String,
@@ -870,10 +873,11 @@ impl From<&Recap> for RecapInfo {
 }
 
 impl SessionSnapshot {
-    fn of(client: &SessionClient, rev: u64) -> Self {
+    fn of(client: &SessionClient, rev: u64, retained_bytes: u64) -> Self {
         let view = client.view();
         Self {
             rev,
+            retained_bytes,
             seq: view.seq,
             session: view.session.map(|s| s.to_string()),
             workspace: view.workspace.to_string(),

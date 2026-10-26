@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import Synchronization
 
 @testable import AKit
 
@@ -82,19 +83,20 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     }
 }
 
-@Test func aStoreCatchesUpOnDroppedUpdates() throws {
+@Test func aStoreCatchesUpOnDroppedUpdates() async throws {
     for vector in Vector.all {
         let (reducer, updates) = try vector.fold()
         let store = SessionStore(source: reducer)
         for (i, update) in updates.enumerated() where i % 3 != 1 {
             store.apply(update)
         }
+        try await eventually("dropped updates recover") { store.rev == reducer.snapshot().rev }
         expectInStep(store, reducer, vector.name)
         #expect(updates.count < 3 || store.resyncs > 0, "\(vector.name)")
     }
 }
 
-@Test func aStoreFarBehindTakesASnapshot() throws {
+@Test func aStoreFarBehindTakesASnapshot() async throws {
     let reducer = Reducer()
     let vector = Vector.all.first { $0.name == "a far behind renderer takes a snapshot" }!
     let store = SessionStore(source: reducer)
@@ -103,6 +105,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
         last = try reducer.fold(message: message)
     }
     store.apply(last!)
+    try await eventually("far behind recovers") { store.rev == reducer.snapshot().rev }
     expectInStep(store, reducer, "far behind")
     #expect(store.items.count == 1 && store.resyncs == 1)
 }
@@ -213,7 +216,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     let item = reducer.snapshot().items[0]
     let store = SessionStore(source: Reducer())
     let batch = ChangeBatch(
-        revision: 1, seq: 99,
+        revision: 1, retainedBytes: 0, seq: 99,
         changes: [
             .added(index: 0, item: item),
             .updated(index: 10, item: item),
@@ -242,10 +245,10 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
         let store = SessionStore(source: Reducer())
         let turn = store.turn
         store.apply(ChangeBatch(
-            revision: 1, seq: 1, changes: [.added(index: 0, item: item)],
+            revision: 1, retainedBytes: 0, seq: 1, changes: [.added(index: 0, item: item)],
             turn: turn, streaming: nil, title: "original"))
         store.apply(ChangeBatch(
-            revision: 2, seq: 99, changes: [.error(message: "discarded")] + changes,
+            revision: 2, retainedBytes: 0, seq: 99, changes: [.error(message: "discarded")] + changes,
             turn: reducer.turn(), streaming: StreamId(call: 123, attempt: 0), title: "discarded"))
         #expect(store.items == [item])
         #expect(store.rev == 1 && store.seq == 1)
@@ -254,7 +257,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
         #expect(store.sessionId == nil && store.workspace.isEmpty && store.problem == nil)
 
         store.apply(ChangeBatch(
-            revision: 2, seq: 2,
+            revision: 2, retainedBytes: 0, seq: 2,
             changes: [.added(index: 1, item: next), .updated(index: 1, item: next)],
             turn: turn, streaming: nil, title: "retry"))
         #expect(store.items == [item, next])
@@ -271,4 +274,75 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
         expectInStep(store, reducer, vector.name)
     }
     #expect(store.streaming?.text == "€")
+}
+
+/// Delays a real resync result after Rust has built it, without holding its feed lock.
+nonisolated private final class DelayedRecovery: ViewSource, Sendable {
+    let reducer: Reducer
+    let release = DispatchSemaphore(value: 0)
+    let waiting = Mutex(false)
+
+    init(_ reducer: Reducer) { self.reducer = reducer }
+
+    func updates() -> AsyncStream<ChangeBatch> { reducer.updates() }
+
+    func resync(from: UInt64) -> Resync {
+        let result = reducer.resync(from: from)
+        waiting.withLock { $0 = true }
+        release.wait()
+        return result
+    }
+}
+
+@Test func anOlderAsyncSnapshotNeverReplacesSubsequentUpdates() async throws {
+    let vector = Vector.all.first { $0.name == "a far behind renderer takes a snapshot" }!
+    let (reducer, updates) = try vector.fold()
+    let source = DelayedRecovery(reducer)
+    defer { source.release.signal() }
+    let store = SessionStore(source: source)
+    store.apply(updates.last!)
+    // Reaching this condition on MainActor while resync is blocked proves it stays responsive.
+    try await eventually("snapshot built off MainActor") { source.waiting.withLock { $0 } }
+    let recovery = store.recovery
+    for update in updates { store.apply(update) }
+    let newer = try #require(try reducer.fold(message: vector.messages.last!))
+    store.apply(newer)
+    source.release.signal()
+    await recovery?.value
+    #expect(store.rev == newer.revision)
+    expectInStep(store, reducer, "snapshot racing newer updates")
+}
+
+@Test func detachingDuringAsyncRecoveryNeverResurrectsAnAttachment() async throws {
+    let vector = Vector.all.first { $0.name == "a far behind renderer takes a snapshot" }!
+    let (reducer, updates) = try vector.fold()
+    let source = DelayedRecovery(reducer)
+    defer { source.release.signal() }
+    let store = SessionStore(source: source)
+    store.apply(updates.last!)
+    try await eventually("snapshot in flight") { source.waiting.withLock { $0 } }
+    let recovery = store.recovery
+    await store.detach()
+    source.release.signal()
+    await recovery?.value
+    #expect(store.attachment == .detached)
+    #expect(store.link == .detached && store.rev == 0 && store.items.isEmpty)
+}
+
+@Test func updatesArrivingDuringRecoveryAreRecoveredWithoutAnotherNotification() async throws {
+    let vector = Vector.all.first { $0.name == "a far behind renderer takes a snapshot" }!
+    let (reducer, updates) = try vector.fold()
+    let source = DelayedRecovery(reducer)
+    defer { source.release.signal() }
+    let store = SessionStore(source: source)
+    store.apply(updates.last!)
+    try await eventually("first recovery captured") { source.waiting.withLock { $0 } }
+    let newer = try #require(try reducer.fold(message: vector.messages.last!))
+    store.apply(newer)
+    // One permit for the captured snapshot, one for the suffix requested afterwards.
+    source.release.signal()
+    source.release.signal()
+    try await eventually("latest revision recovered") { store.rev == newer.revision }
+    #expect(store.resyncs == 2)
+    expectInStep(store, reducer, "update raced snapshot")
 }
