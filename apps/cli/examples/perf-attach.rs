@@ -15,7 +15,6 @@ fn attach(home: &sys::Home, target: Target) -> (protocol::SessionId, Vec<Entry>,
         &ClientMsg::Hello {
             proto: protocol::PROTO,
             build: "perf".into(),
-            min: None,
             caps: protocol::Caps::NONE,
             client: None,
             machine: None,

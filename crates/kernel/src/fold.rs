@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 
 use protocol::ledger::{Call, Item, Ledger};
-use protocol::{Audience, Body, CallId, Entry, Json, Seq, Source, ToolOutcome, Verdict, WaitOn};
+use protocol::{Audience, Body, CallId, Entry, Seq, Source, ToolOutcome, Verdict, WaitOn};
 
 use crate::{Action, Agent, Binding, Input};
 
@@ -28,8 +28,6 @@ pub struct Fold {
     /// Whether the agent was given an input since the `on_stop` point was
     /// last asked.
     pub stepped: bool,
-    /// The inputs the `pre_tool` chain left open calls with.
-    inputs: Vec<(CallId, Json)>,
     /// The tool calls waiting on a child, by the child's link.
     owners: Vec<(Seq, CallId)>,
     /// Results of children that calls wait on, not yet handed to them.
@@ -53,7 +51,6 @@ impl Fold {
             agent,
             asked: VecDeque::new(),
             stepped: false,
-            inputs: Vec::new(),
             owners: Vec::new(),
             fired: Vec::new(),
             refused: Vec::new(),
@@ -62,11 +59,10 @@ impl Fold {
     }
 
     /// Whether the ledger is all there is: nothing asked for and not
-    /// logged, and nothing kept of a call (its rewritten input, the child
-    /// it waits on, a result fired for it, why it was refused).
+    /// logged, and nothing kept of a call (the child it waits on, a result
+    /// fired for it, why it was refused).
     pub fn at_rest(&self) -> bool {
         self.asked.is_empty()
-            && self.inputs.is_empty()
             && self.owners.is_empty()
             && self.fired.is_empty()
             && self.refused.is_empty()
@@ -108,15 +104,6 @@ impl Fold {
                 d: Verdict::OnStop { text },
                 ..
             } => Some(Input::User { text: text.clone() }),
-            Body::Decision {
-                call: Some(call),
-                d: Verdict::PreTool { input },
-                ..
-            } => {
-                self.inputs.retain(|(c, _)| c != call);
-                self.inputs.push((*call, input.clone()));
-                None
-            }
             Body::ToolCall {
                 invoke: Some(_), ..
             } => None,
@@ -139,7 +126,6 @@ impl Fold {
             Body::ToolResult { call, outcome, .. } => {
                 let call = *call;
                 let open = self.ledger.call(call)?;
-                self.inputs.retain(|(c, _)| *c != call);
                 self.fired.retain(|(c, _)| *c != call);
                 self.owners.retain(|(_, c)| *c != call);
                 self.refused.retain(|(c, _)| *c != call);
@@ -174,10 +160,10 @@ impl Fold {
                 None
             }
             Body::Enqueue { envelope }
-                if envelope.source() == Source::Child(envelope.id.call.0) =>
+                if envelope.source() == Source::Child(envelope.id().call.0) =>
             {
                 self.unqueued
-                    .retain(|(watch, _)| *watch != envelope.id.call.0);
+                    .retain(|(watch, _)| *watch != envelope.id().call.0);
                 None
             }
             // What the turn asked for and had not started is dropped.
@@ -306,13 +292,6 @@ impl Fold {
         self.owners
             .iter()
             .find_map(|&(l, call)| (l == link.seq).then_some(call))
-    }
-
-    /// The input the gate left call `call` with, if it changed it.
-    pub fn input_of(&self, call: CallId) -> Option<&Json> {
-        self.inputs
-            .iter()
-            .find_map(|(c, input)| (*c == call).then_some(input))
     }
 
     /// Why the agent refused call `call`, if it did and it is unanswered.

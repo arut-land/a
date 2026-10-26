@@ -409,8 +409,6 @@ pub enum Work {
     Interrupt { child: SessionId },
     /// Hand this child session's result to its owner.
     Report { outcome: protocol::ToolOutcome },
-    /// Kill process group `pgid`, left over from a run cut off.
-    Kill { pgid: u32 },
     /// Copy stream `stream`, which a restart cut off, nothing owning what
     /// writes it any more, into a blob, leaving it as it is
     /// ([`Event::StreamEnded`]): a blob named by its bytes, so copying
@@ -454,7 +452,7 @@ impl Work {
     }
 
     /// Whether it reaches outside the session (work started, a client or
-    /// an owner answered, a child told, a process killed): what the entries
+    /// an owner answered, a child told, a stream ended): what the entries
     /// before it must be durable ahead of.
     pub const fn external(&self) -> bool {
         !matches!(
@@ -552,9 +550,9 @@ impl CancelledInput {
                 call,
                 outcome: Outcome::Interrupted { .. },
                 ..
-            } if *call == envelope.id.call => Some(Self {
+            } if *call == envelope.id().call => Some(Self {
                 input: input.seq,
-                owner: envelope.id.sender,
+                owner: envelope.id().sender,
                 fact: fact.seq,
             }),
             _ => None,
@@ -593,11 +591,8 @@ pub struct Load<'a> {
     /// The session's id, which its own envelopes are addressed by; none
     /// for a kernel that sends itself none it keeps (a scratch fork).
     pub session: Option<SessionId>,
-    /// The boot the daemon runs in: process groups logged under another
-    /// one are gone, their ids reused.
-    pub boot: Option<&'a str>,
-    /// The first load since the daemon started: the background process
-    /// groups the session owned are left over, to kill.
+    /// The first load since the daemon started: unowned background
+    /// streams must be settled.
     pub fresh: bool,
     pub owner: Owner,
     pub abandoned: &'a [CancelledInput],

@@ -1,0 +1,1 @@
+{"t":"entry","seq":2,"epoch":0,"kind":"ack","envelope_id":{"sender":"00000000-0000-0000-0000-00000000000a","call":3,"purpose":"subagent:message"},"recipient":"00000000-0000-0000-0000-00000000000c","refusal":"Full"}

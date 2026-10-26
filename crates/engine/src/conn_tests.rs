@@ -171,7 +171,6 @@ fn hello(caps: Caps) -> ClientMsg {
     ClientMsg::Hello {
         proto: PROTO,
         build: "test".into(),
-        min: None,
         caps,
         client: None,
         machine: None,
@@ -183,7 +182,6 @@ fn hello_as(client: ClientId) -> ClientMsg {
     ClientMsg::Hello {
         proto: PROTO,
         build: "test".into(),
-        min: None,
         caps: Caps::ALL,
         client: Some(client),
         machine: None,
@@ -504,13 +502,12 @@ fn the_welcome_names_the_homes_machine() {
 }
 
 #[test]
-fn a_mismatched_hello_gets_the_range_and_nothing_behind_it_is_done() {
+fn a_mismatched_hello_gets_the_exact_version_and_nothing_behind_it_is_done() {
     let fixture = Fixture::new("mismatch");
     let mut peer = fixture.connect();
     peer.send(&ClientMsg::Hello {
         proto: PROTO + 2,
         build: "test".into(),
-        min: Some(PROTO + 1),
         caps: Caps::ALL,
         client: None,
         machine: None,
@@ -519,28 +516,10 @@ fn a_mismatched_hello_gets_the_range_and_nothing_behind_it_is_done() {
     peer.send(&input("hi", 1));
     assert!(matches!(
         peer.recv(),
-        DaemonMsg::Mismatch {
-            supported: PROTO,
-            min: None
-        }
+        DaemonMsg::Mismatch { supported: PROTO }
     ));
     drop(peer);
     assert_eq!(fixture.daemon.list(), []);
-
-    // A range that reaches back to ours is welcomed at ours.
-    let mut peer = fixture.connect();
-    peer.send(&ClientMsg::Hello {
-        proto: PROTO + 1,
-        build: "test".into(),
-        min: Some(PROTO),
-        caps: Caps::NONE,
-        client: None,
-        machine: None,
-    });
-    assert!(matches!(
-        peer.recv(),
-        DaemonMsg::Welcome { proto: PROTO, .. }
-    ));
 }
 
 /// A session longer than a snapshot is worth: a client far behind gets

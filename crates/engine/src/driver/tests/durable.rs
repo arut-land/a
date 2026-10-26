@@ -8,16 +8,17 @@ use super::*;
 fn a_failed_enqueue_releases_transport_for_retry() {
     for failure in [SyncFailure::Discard, SyncFailure::Retain] {
         let mut harness = ManualSession::new();
-        let envelope = protocol::Envelope {
-            id: protocol::EnvelopeId {
+        let envelope = protocol::Envelope::new(
+            protocol::EnvelopeId {
                 sender: SessionId::new(),
                 call: id(1),
                 purpose: "retry".into(),
             },
-            destination: harness.session.id,
-            payload: "update".into(),
-            held: Vec::new(),
-        };
+            harness.session.id,
+            "update".into(),
+            Vec::new(),
+        )
+        .unwrap();
         let (reply, mut received) = oneshot::channel();
         harness.faulty.fail_next_sync(failure);
         harness.session.send(Msg::Enqueue {
@@ -42,7 +43,9 @@ fn a_failed_enqueue_releases_transport_for_retry() {
         let kept = harness.finish();
         assert_eq!(
             kept.iter()
-                .filter(|e| matches!(&e.body, Body::Enqueue { envelope: e } if e.id == envelope.id))
+                .filter(
+                    |e| matches!(&e.body, Body::Enqueue { envelope: e } if e.id() == envelope.id())
+                )
                 .count(),
             1
         );

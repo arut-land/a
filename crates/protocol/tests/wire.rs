@@ -38,16 +38,17 @@ const fn sample<M>(name: &'static str, msg: M) -> Sample<M> {
 }
 
 fn envelope() -> protocol::Envelope {
-    protocol::Envelope {
-        id: protocol::EnvelopeId {
+    protocol::Envelope::new(
+        protocol::EnvelopeId {
             sender: SESSION,
             call: CallId::new(3).unwrap(),
             purpose: "subagent:message".into(),
         },
-        destination: SessionId(Uuid::from_u128(0xc)),
-        payload: "hello".into(),
-        held: Vec::new(),
-    }
+        SessionId(Uuid::from_u128(0xc)),
+        "hello".into(),
+        Vec::new(),
+    )
+    .unwrap()
 }
 
 /// Input of every segment kind.
@@ -80,7 +81,7 @@ fn context_image() -> protocol::publication::ContextImage {
         ContextValue::Inherited(1),
         ContextValue::User("summary at an excluded position".into()),
         ContextValue::Queued("consumed input".into(), Mode::Steer),
-        ContextValue::Inbox(envelope().id, "hello".into()),
+        ContextValue::Inbox(envelope().id().clone(), "hello".into()),
         ContextValue::Taken(Seq::new(3).unwrap()),
         ContextValue::Assistant("answer".into()),
         ContextValue::Context(
@@ -141,18 +142,16 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             ClientMsg::Hello {
                 proto: PROTO,
                 build: "0.0.0+0123456789abcdef".into(),
-                min: None,
                 caps: Caps::NONE,
                 client: None,
                 machine: None,
             },
         ),
         sample(
-            "hello_range",
+            "hello_other_version",
             ClientMsg::Hello {
                 proto: PROTO + 1,
                 build: "0.0.1+0123456789abcdef".into(),
-                min: Some(PROTO),
                 caps: Caps::NONE,
                 client: Some(CLIENT),
                 machine: Some(MACHINE),
@@ -348,7 +347,6 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             ClientMsg::Hello {
                 proto: PROTO,
                 build: "0.0.0+0123456789abcdef".into(),
-                min: None,
                 caps: Caps::NONE,
                 client: Some(CLIENT),
                 machine: None,
@@ -816,14 +814,12 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             "mismatch",
             DaemonMsg::Mismatch {
                 supported: PROTO,
-                min: None,
             },
         ),
         sample(
-            "mismatch_range",
+            "mismatch_other_version",
             DaemonMsg::Mismatch {
                 supported: PROTO + 1,
-                min: Some(PROTO),
             },
         ),
         sample("draining", DaemonMsg::Draining { held: None }),
@@ -968,12 +964,13 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
-        sample("entry_outbox", entry(1, Body::Outbox { envelope_id: envelope().id, recipients: vec![envelope().destination, SessionId(Uuid::from_u128(0xd))], payload: "hello".into() })),
+        sample("entry_outbox", entry(1, Body::Outbox { envelope_id: envelope().id().clone(), recipients: vec![envelope().destination, SessionId(Uuid::from_u128(0xd))], payload: "hello".into() })),
         sample("entry_enqueue", entry(1, Body::Enqueue { envelope: envelope() })),
         sample("entry_enqueue_detached", entry(19, Body::Enqueue { envelope: protocol::Envelope::own(SESSION, CallId::new(4).unwrap(), protocol::Carried::Detached(protocol::ToolOutcome::Interrupted { output: None })).holding(vec![protocol::Held::Blob(protocol::BlobRef { id: protocol::BlobId([0x0f; 32]), size: 9000, media_type: "text/plain".into(), origin: protocol::BlobOrigin::ToolOutput(CallId::new(4).unwrap()) })]) })),
         sample("entry_enqueue_own", entry(18, Body::Enqueue { envelope: protocol::Envelope::own(SESSION, CallId::new(16).unwrap(), protocol::Carried::Child(protocol::ToolOutcome::Interrupted { output: None })) })),
-        sample("entry_ack", entry(2, Body::Ack { envelope_id: envelope().id, recipient: envelope().destination, refusal: None })),
-        sample("entry_inbox_full", entry(2, Body::Ack { envelope_id: envelope().id, recipient: envelope().destination, refusal: Some(protocol::InboxRefusal::Full) })),
+        sample("entry_unwatch", entry(2, Body::Unwatch { watch: Seq::new(1).unwrap() })),
+        sample("entry_ack", entry(2, Body::Ack { envelope_id: envelope().id().clone(), recipient: envelope().destination, refusal: None })),
+        sample("entry_inbox_full", entry(2, Body::Ack { envelope_id: envelope().id().clone(), recipient: envelope().destination, refusal: Some(protocol::InboxRefusal::Full) })),
         sample("entry_withdraw", entry(5, Body::Withdraw { input: Seq::new(3).unwrap(), origin: None })),
         sample("entry_take_into", entry(6, Body::Take { input: Seq::new(3).unwrap(), into: CallId::new(4) })),
         sample("entry_detached", entry(7, Body::Detached { call: CallId::new(4).unwrap() })),
@@ -1338,7 +1335,6 @@ fn capabilities_and_versions_negotiate() {
     let hello = ClientMsg::Hello {
         proto: PROTO,
         build: "b".into(),
-        min: None,
         caps,
         client: None,
         machine: None,
@@ -1347,12 +1343,6 @@ fn capabilities_and_versions_negotiate() {
         serde_json::to_string(&hello).unwrap(),
         format!(r#"{{"t":"hello","proto":{PROTO},"build":"b"}}"#)
     );
-
-    let v = protocol::Versions::new;
-    assert_eq!(v(None, 1).common(v(None, 1)), Some(1));
-    assert_eq!(v(Some(1), 3).common(v(Some(2), 5)), Some(3));
-    assert_eq!(v(None, 1).common(v(Some(2), 3)), None);
-    assert_eq!(v(Some(2), 3).to_string(), "protocols 2-3");
 }
 
 #[test]

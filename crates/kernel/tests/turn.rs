@@ -1343,9 +1343,9 @@ fn a_call_waits_on_a_dialog_and_resumes_with_its_answer() {
 
 fn outgoing(envelope: &protocol::Envelope) -> protocol::Outgoing {
     protocol::Outgoing {
-        id: envelope.id.clone(),
+        id: envelope.id().clone(),
         recipients: vec![envelope.destination],
-        payload: match &envelope.payload {
+        payload: match envelope.payload() {
             protocol::Carried::Message(text) => text.clone(),
             other => panic!("{other:?}"),
         },
@@ -1354,16 +1354,17 @@ fn outgoing(envelope: &protocol::Envelope) -> protocol::Outgoing {
 
 /// An envelope from the child to this session.
 fn envelope(purpose: &str) -> protocol::Envelope {
-    protocol::Envelope {
-        id: protocol::EnvelopeId {
+    protocol::Envelope::new(
+        protocol::EnvelopeId {
             sender: child(),
             call: id(2),
             purpose: purpose.into(),
         },
-        destination: SessionId::NIL,
-        payload: purpose.into(),
-        held: Vec::new(),
-    }
+        SessionId::NIL,
+        purpose.into(),
+        Vec::new(),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -1451,8 +1452,13 @@ fn an_outbox_replays_the_original_envelope_until_its_durable_ack() {
     assert!(
         work(&fx).any(|e| matches!(e, Work::Deliver { envelope, .. } if envelope == &original))
     );
-    let mut changed = original.clone();
-    changed.payload = "different".into();
+    let changed = protocol::Envelope::new(
+        original.id().clone(),
+        original.destination,
+        "different".into(),
+        Vec::new(),
+    )
+    .unwrap();
     let fx = restored.step(Event::SendEnvelope {
         outgoing: outgoing(&changed),
         ticket: Ticket(2),
@@ -1461,7 +1467,7 @@ fn an_outbox_replays_the_original_envelope_until_its_durable_ack() {
         work(&fx).any(|e| matches!(e, Work::Deliver { envelope, .. } if envelope == &original))
     );
     restored.step(Event::Delivered {
-        id: original.id.clone(),
+        id: original.id().clone(),
         result: Ok(()),
         ticket: Some(Ticket(2)),
         recipient: SessionId::NIL,
@@ -1502,6 +1508,7 @@ fn cancel_wins_once_over_a_detached_result_even_after_reload() {
         ticket: None,
     });
     assert!(work(&fx).any(|e| matches!(e, Work::Interrupt { child: c } if *c == child())));
+    assert!(s.core.at_rest());
     s.step(Event::ChildSettled {
         child: child(),
         outcome: done(json!("late")).into(),
@@ -1512,15 +1519,21 @@ fn cancel_wins_once_over_a_detached_result_even_after_reload() {
         child: child(),
         outcome: done(json!("later")).into(),
     });
-    let results: Vec<_> = restored
-        .log
-        .iter()
-        .filter_map(|e| match &e.body {
-            Body::Fired { outcome, .. } => Some(outcome),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(results, [&Outcome::Interrupted { output: None }]);
+    assert!(restored.core.at_rest());
+    assert!(
+        !restored
+            .log
+            .iter()
+            .any(|e| matches!(e.body, Body::Fired { .. } | Body::Enqueue { .. }))
+    );
+    assert_eq!(
+        restored
+            .log
+            .iter()
+            .filter(|e| matches!(e.body, Body::Unwatch { .. }))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -1617,7 +1630,7 @@ fn an_unacknowledged_outbox_keeps_its_owner_recoverable() {
         work(&effects).any(|e| matches!(e, Work::Deliver { envelope, .. } if envelope == &message))
     );
     restored.step(Event::Delivered {
-        id: message.id,
+        id: message.id().clone(),
         result: Ok(()),
         ticket: None,
         recipient: SessionId::NIL,
@@ -1678,4 +1691,70 @@ fn child_and_inbox_recovery_keep_their_original_identity() {
     );
     assert_eq!(recovered.core.ledger().links().len(), 1);
     assert_eq!(recovered.core.ledger().links()[0].seq, link);
+}
+
+#[test]
+fn a_childs_own_interrupted_result_is_delivered_live_and_after_a_crash() {
+    let (mut session, _) = Session::resume(
+        Reg::echo().arc(),
+        log([Body::Watch { child: child() }]),
+        &Load::default(),
+    );
+    let plan = session.step(Event::ChildSettled {
+        child: child(),
+        outcome: INTERRUPTED.into(),
+    });
+    assert!(
+        plan.appends
+            .iter()
+            .any(|e| matches!(e.body, Body::Fired { .. }))
+    );
+    assert!(
+        plan.appends
+            .iter()
+            .any(|e| matches!(e.body, Body::Enqueue { .. }))
+    );
+    let through = session
+        .log
+        .iter()
+        .position(|e| matches!(e.body, Body::Fired { .. }))
+        .unwrap()
+        + 1;
+    let (recovered, plan) = Session::resume(
+        Reg::echo().arc(),
+        session.log[..through].to_vec(),
+        &Load::default(),
+    );
+    assert!(
+        plan.appends
+            .iter()
+            .any(|e| matches!(e.body, Body::Enqueue { .. }))
+    );
+    assert_eq!(session.log, recovered.log);
+}
+
+#[test]
+fn a_reserved_message_purpose_is_rejected_before_it_enters_the_outbox() {
+    let mut session = echo();
+    let plan = session.step(Event::SendEnvelope {
+        outgoing: protocol::Outgoing {
+            id: protocol::EnvelopeId {
+                sender: child(),
+                call: id(2),
+                purpose: protocol::EnvelopeId::CHILD.into(),
+            },
+            recipients: vec![SessionId::NIL],
+            payload: "hello".into(),
+        },
+        ticket: Ticket(1),
+    });
+    assert_eq!(plan.appends, [] as [protocol::Entry; 0]);
+    assert!(work(&plan).any(|w| matches!(
+        w,
+        Work::Delivery {
+            result: Err(protocol::InboxRefusal::Unauthorized),
+            ..
+        }
+    )));
+    assert!(session.core.at_rest());
 }

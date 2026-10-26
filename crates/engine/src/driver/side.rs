@@ -620,12 +620,13 @@ impl super::Daemon {
                 return Ok((Outcome::Interrupted { output: None }, None));
             }
             live.exchange(
-                protocol::Envelope {
+                protocol::Envelope::new(
                     id,
-                    destination: live.id,
-                    payload: Carried::Message(image.turn.raw().into()),
-                    held: Vec::new(),
-                },
+                    live.id,
+                    Carried::Message(image.turn.raw().into()),
+                    Vec::new(),
+                )
+                .map_err(std::io::Error::other)?,
                 cancel,
             )
             .await
@@ -637,20 +638,20 @@ impl super::Daemon {
 
 impl Actor {
     pub(super) async fn prepare_thread(&mut self, call: CallId) -> Result<super::InFlight, String> {
-        let seq = protocol::Seq::new(self.core.ledger().turn_start())
+        let seq = self
+            .core
+            .ledger()
+            .turn_start()
             .ok_or("model-only turn has no admitted input")?;
         let mut entry = self.indexed_entry(seq).await.map_err(|e| e.to_string())?;
         if let Body::Take { input, .. } = entry.body {
             entry = self.indexed_entry(input).await.map_err(|e| e.to_string())?;
         }
         let (text, keyed) = match &entry.body {
-            Body::Enqueue {
-                envelope:
-                    protocol::Envelope {
-                        payload: Carried::Message(text),
-                        ..
-                    },
-            } => (text.clone(), true),
+            Body::Enqueue { envelope } => match envelope.payload() {
+                Carried::Message(text) => (text.clone(), true),
+                _ => return Err("model-only turn has no admitted input".into()),
+            },
             Body::Input { segments, .. } => (segments.text(), false),
             _ => return Err("model-only turn has no admitted input".into()),
         };
