@@ -80,17 +80,45 @@ fn read(name: &str) -> io::Result<Option<String>> {
 }
 
 fn write(name: &str, command: &str) -> io::Result<()> {
-    let (key, value, data) = (wide(RUN), wide(name), wide(command));
-    // SAFETY: terminated strings; the data length covers its terminator.
-    status(unsafe {
-        RegSetKeyValueW(
-            HKEY_CURRENT_USER,
-            key.as_ptr(),
-            value.as_ptr(),
-            REG_SZ,
-            data.as_ptr().cast(),
-            u32::try_from(data.len() * 2).map_err(|_| io::ErrorKind::InvalidInput)?,
-        )
+    write_command(command, |data| {
+        let (key, value) = (wide(RUN), wide(name));
+        // SAFETY: terminated strings; the data length covers its terminator.
+        status(unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                value.as_ptr(),
+                REG_SZ,
+                data.as_ptr().cast(),
+                u32::try_from(data.len() * 2).map_err(|_| io::ErrorKind::InvalidInput)?,
+            )
+        })
+    })
+}
+
+fn write_command(command: &str, write: impl FnOnce(&[u16]) -> io::Result<()>) -> io::Result<()> {
+    write(&run_command(command)?)
+}
+
+/// Run commands are limited to 260 UTF-16 code units, excluding the NUL.
+/// <https://learn.microsoft.com/windows/win32/setupapi/run-and-runonce-registry-keys>
+fn run_command(command: &str) -> io::Result<Vec<u16>> {
+    let data = wide(command);
+    if data.len() - 1 > 260 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the installed daemon command exceeds the Windows Run limit of 260 UTF-16 code units; install a under a shorter user profile path",
+        ));
+    }
+    Ok(data)
+}
+
+pub(super) fn registration(home: &Home) -> io::Result<super::Registration> {
+    let name = name(home);
+    Ok(match read(&name)? {
+        None => super::Registration::Unregistered,
+        Some(_) if approved(&name) => super::Registration::Enabled,
+        Some(_) => super::Registration::Disabled,
     })
 }
 
@@ -149,6 +177,22 @@ pub(super) fn refresh(home: &Home) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_commands_are_bounded_in_utf16_before_registry_mutation() {
+        assert_eq!(run_command(&"a".repeat(260)).unwrap().len(), 261);
+        assert!(run_command(&"a".repeat(261)).is_err());
+        assert_eq!(run_command(&"🦀".repeat(130)).unwrap().len(), 261);
+        assert!(run_command(&format!("{}a", "🦀".repeat(130))).is_err());
+        assert_eq!(
+            write_command(&"🦀".repeat(131), |_| panic!(
+                "unsupported command reached the registry"
+            ))
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput,
+        );
+    }
 
     #[test]
     fn registration_names_cannot_cross_state_homes() {
