@@ -32,26 +32,58 @@ fn every_protocol_contributes_hosts() {
 }
 
 #[test]
-fn upload_compression_belongs_only_to_a_documented_endpoint() {
+fn upload_compression_stays_with_the_verified_endpoint() {
     use transport::Compression;
     for (spec, coding) in [
         ("openai:model", Some(Compression::Zstd)),
         ("openai@chat:model", None),
-        ("anthropic:model", None),
-        ("gemini:model", None),
+        ("anthropic:model", Some(Compression::Gzip)),
+        ("gemini:model", Some(Compression::Gzip)),
         ("openrouter:model", None),
         ("xai:model", None),
         ("deepseek:model", None),
+        ("groq:model", None),
+        ("mistral:model", None),
+        ("zai@messages:model", None),
+        ("minimax@messages:model", None),
+        ("moonshot@messages:model", None),
+        ("xiaomimimo@messages:model", None),
         ("ollama:model", None),
     ] {
         let (configured, _) = provider(spec, &|_| Some("key".into())).unwrap();
-        // A custom URL never inherits the documented host's capability.
+        // A custom URL never inherits the built-in host's capability.
         assert_eq!(configured.compression, None, "{spec} with a URL override");
         let (configured, _) = provider(spec, &|name| {
             name.ends_with("API_KEY").then(|| "key".into())
         })
         .unwrap();
         assert_eq!(configured.compression, coding, "{spec}");
+        let request = configured
+            .request(
+                "model",
+                &crate::Request {
+                    messages: vec![crate::Message::user("Hi")].into(),
+                    generation: crate::Generation {
+                        max_output_tokens: std::num::NonZeroU32::new(1),
+                        ..crate::Generation::default()
+                    },
+                    ..crate::Request::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            request.extensions().get::<Compression>().copied(),
+            coding,
+            "{spec} request"
+        );
+        assert_eq!(
+            configured
+                .clone()
+                .with_base_url(format!("{}/", configured.base_url))
+                .compression,
+            coding,
+            "{spec} with the same endpoint"
+        );
         assert_eq!(
             configured
                 .with_base_url("http://127.0.0.1:1234")

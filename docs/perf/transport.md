@@ -56,7 +56,7 @@ What ureq gave the daemon, and what the client does now:
 | Proxy | Environment, NO_PROXY, CONNECT | http_proxy for HTTP (uppercase HTTP_PROXY ignored); https_proxy before HTTPS_PROXY for HTTPS; scheme-specific before all_proxy / ALL_PROXY; no_proxy before NO_PROXY; empty values skipped before selection; bypass checked before reporting an unusable proxy |
 | Proxy schemes | HTTP CONNECT | HTTP CONNECT; an HTTPS or SOCKS proxy fails the requests routed through it, while bypassed requests still work |
 | Response compression | off | Advertises gzip, zstd and decodes incrementally, including SSE; removes Content-Encoding and Content-Length after decoding |
-| Request compression | off | Provider endpoint capability; gzip/zstd available, enabled only for documented OpenAI Responses zstd uploads |
+| Request compression | off | Provider endpoint capability; gzip/zstd available, OpenAI Responses zstd, Anthropic Messages and Gemini gzip uploads |
 | Cookies | off | No cookie jar |
 | Cancellation | socket shutdown from dropping task | Dropping the future or partial body closes it; at a yielded chunk boundary, a terminator-only drain returns it to the pool or closes within a separate 250 ms grace period |
 | DNS | getaddrinfo on request's thread | rt::resolve: getaddrinfo on the network lane, only for a name and a new connection |
@@ -111,32 +111,84 @@ No codec, checksum or compression format is reimplemented here. Existing
 futures-io, thiserror, memchr and the runtime are reused.
 
 Requests carry an optional `transport::Compression` extension. A host's
-capability defaults to None; only a documented endpoint sets it. Custom
+capability defaults to None; endpoint-specific evidence enables it. Custom
 base URLs clear the built-in capability. Payload pieces feed the encoder
 without concatenating the conversation; output stays in pieces with a
 known wire Content-Length. Compression yields between output pieces and
 is selected only when smaller. OpenAI documents a 128 MiB compressed and
 decoded limit and a 100:1 maximum ratio for zstd: outside that envelope the
 client selects the original payload, without imposing a new request size
-error. Gzip has no provider enabled by default.
+error. Anthropic Messages and Gemini use gzip.
 
-Provider audit, 2026-10-26: “off” means no explicit request-body coding
-guarantee was found in the cited official API documentation; it does not
-claim the server rejects compressed requests. Response negotiation is
-independent and enabled for every host.
+Provider audit, 2026-10-26: request compression is an endpoint capability,
+not a protocol capability. Anthropic-compatible gateways explicitly start
+with no compression rather than inheriting Anthropic's gzip setting.
+Custom base URLs clear the built-in capability. No automatic retry with a
+different encoding is needed. Response negotiation remains independent.
 
-| Provider / endpoint | Upload default | Official source / finding |
+| Provider / endpoint | Upload default | Evidence |
 | --- | --- | --- |
 | OpenAI Responses | zstd, level 3 | [Production best practices](https://developers.openai.com/api/docs/guides/production-best-practices), “Compress request bodies”, explicitly documents POST /v1/responses and the envelope above |
-| OpenAI Chat Completions | off | The documented guarantee above names Responses only |
-| Anthropic Messages | off | [Create a Message](https://platform.claude.com/docs/en/api/messages/create) does not document gzip/zstd uploads; Claude Code gzip reports do not establish an API contract |
-| Gemini generateContent / streamGenerateContent | off | [Generating content](https://ai.google.dev/api/generate-content) documents JSON requests, no request content coding guarantee |
-| Bedrock InvokeModel | off | [InvokeModel](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModel.html) specifies JSON content type, no request coding contract; not a built-in host in llm |
-| OpenRouter | off | [API reference](https://openrouter.ai/docs/api-reference/overview); context compression changes messages, not HTTP content coding |
-| xAI | off | [Responses API](https://docs.x.ai/developers/rest-api-reference/inference/responses), no documented gzip/zstd upload guarantee |
-| DeepSeek | off | [API introduction](https://api-docs.deepseek.com/), OpenAI JSON compatibility does not establish zstd request support |
-| Ollama | off | [Chat API](https://docs.ollama.com/api/chat), no upload coding guarantee |
-| Groq, Mistral, other compatible hosts | off | [Groq OpenAI compatibility](https://console.groq.com/docs/openai), [Mistral API](https://docs.mistral.ai/api/); compatibility alone does not opt a host into compression |
+| Anthropic Messages | gzip | [Claude Code changelog, 2.1.300](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md#21300) confirms large uploads to api.anthropic.com use gzip, including with telemetry disabled; `CLAUDE_CODE_GZIP_REQUEST_BODIES=0` disables it |
+| Gemini generateContent / streamGenerateContent | gzip | Live generateContent endpoint explicitly reports only identity/gzip are supported; zstd returns 415 (below) |
+| OpenAI Chat, OpenRouter, xAI, DeepSeek, Groq, Mistral | off, unverified | Authentication stopped the live probes before acceptance could be established; no inference from protocol compatibility |
+| Bedrock InvokeModel | off, unverified | No AWS credentials available; not a built-in llm host |
+| Ollama | off, unverified | No local listener on 127.0.0.1:11434 |
+
+### Live request-coding probes (2026-10-26)
+
+Each endpoint received one gzip and one zstd POST, with identical decoded
+JSON per endpoint, `Content-Type: application/json`, `Content-Encoding`
+set to the tested codec and `Accept-Encoding: identity`. Python 3.10.20
+stdlib gzip (mtime 0, default level 9) and zstandard 0.25.0 (level 3) created
+the bodies. Probes ran only via `mise exec --`; no retries. Brotli is not
+kept in the transport, so no br probes were needed.
+
+The environment's OpenAI and Anthropic credentials belong to a configured
+Abacus gateway, not the public provider origins; they were not sent to
+those origins. No direct provider credentials were available. These are
+**unauthenticated probes**, not successful model calls: a 401/403 cannot
+establish whether a compressed request will be decoded after authentication.
+Gemini's explicit list of supported encodings establishes gzip support,
+but a successful authenticated model call remains untested. Anthropic's
+gzip setting rests on its shipped client's documented behavior, not its
+401. Other providers remain unverified rather than labeled rejected.
+
+Minimal decoded request bodies (no streaming; one tiny completion):
+
+- Chat endpoints: `{"model":"<model>","messages":[{"role":"user","content":"Hi"}],"max_tokens":1}`.
+- Messages: `{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"Hi"}],"max_tokens":1}`, with `anthropic-version: 2023-06-01`.
+- Responses: `{"model":"gpt-4.1-nano","input":"Hi","max_output_tokens":16}`.
+- Gemini: `{"contents":[{"parts":[{"text":"Hi"}]}],"generationConfig":{"maxOutputTokens":1}}`.
+
+Exact HTTP statuses and error fields follow; request IDs and JSON
+whitespace are omitted. The OpenAI Chat message is reproduced below the
+table to keep the matrix readable.
+
+| Endpoint (model for Chat) | gzip | zstd |
+| --- | --- | --- |
+| `api.anthropic.com/v1/messages` | 401 `authentication_error`: `x-api-key header is required` | Same |
+| `api.openai.com/v1/chat/completions` (`gpt-4.1-nano`) | 401 `invalid_request_error`, message below, `param: null`, `code: null` | Same |
+| `api.openai.com/v1/responses` | 401 `invalid_request_error`: `Missing bearer or basic authentication in header`, `param: null`, `code: null` | Same |
+| `generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent` | 403 `PERMISSION_DENIED`: `Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this API.` | 415 `FAILED_PRECONDITION`: `Unsupported Content-Encoding; only identity/gzip are supported.` |
+| `openrouter.ai/api/v1/chat/completions` (`openai/gpt-4.1-nano`) | 401: `No cookie auth credentials found`, error `code: 401` | Same |
+| `api.x.ai/v1/chat/completions` (`grok-3-mini`) | 401 `unauthenticated:no-credentials`: `No credentials presented.` | Same |
+| `api.deepseek.com/chat/completions` (`deepseek-chat`) | 401, plain text: `Authentication Fails (governor)` | Same |
+| `api.groq.com/openai/v1/chat/completions` (`llama-3.1-8b-instant`) | 401 `invalid_request_error`, `code: invalid_api_key`: `Invalid API Key` | Same |
+| `api.mistral.ai/v1/chat/completions` (`mistral-small-latest`) | 401, `detail: Invalid API Key` | Same |
+
+OpenAI Chat's exact error message:
+
+```text
+You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_KEY), or as the password field (with blank username) if you're accessing the API from your browser and are prompted for a username and password. You can obtain an API key from https://platform.openai.com/account/api-keys.
+```
+
+The earlier documentation-only assessment missed Anthropic's explicit
+Claude Code evidence and Gemini's service-level gzip support. An
+authenticated per-provider acceptance matrix, including whether Anthropic
+accepts zstd, remains pending direct credentials; enabling unknown codecs
+would risk breaking model calls. No existing feature or request size is
+restricted by this change.
 
 Apple M3 upload probe, same release profile, three runs per row. Synthetic
 conversation JSON alternates user/assistant messages containing sampled

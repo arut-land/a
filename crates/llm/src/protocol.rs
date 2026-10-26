@@ -323,7 +323,7 @@ impl KeyStyle {
 /// from, with the protocol (and its quirks) that speaks to it.
 #[derive(Clone, Copy, Debug)]
 pub struct Host {
-    /// Only set when this endpoint documents accepting the content coding.
+    /// Request coding verified for this endpoint; compatible gateways opt in separately.
     pub compression: Option<transport::Compression>,
     pub id: &'static str,
     pub base_url: &'static str,
