@@ -1,0 +1,519 @@
+runner,workload,sessions,layout,pairs,metric,reference,median,low,high
+local M3,sessions,1,A2,20,run_delta_p99_ms,0.243396,0.0151665,-0.04337450000000001,0.042791499999999996
+local M3,sessions,1,A2,20,turn_p99_ms,554.6020625,2.717124999999953,-4.397707999999966,8.230604999999969
+local M3,sessions,1,A2,20,active_cpu_ms,56.77543800000001,0.5193125000000016,-5.596083500000006,7.241584500000002
+local M3,sessions,1,A2,20,active_switches,1211.5,-13.5,-25.5,15.5
+local M3,sessions,1,A2,20,idle_rss_kib,12264.0,24.0,-48.0,32.0
+local M3,sessions,1,A2,20,idle_threads,10.0,0.0,0.0,0.0
+local M3,sessions,1,A2,20,idle_cpu_ms,2.079584999999995,-0.15439600000000436,-0.4587270000000061,0.08641799999999789
+local M3,sessions,1,A2,20,idle_switches,5.0,0.0,0.0,1.0
+local M3,sessions,8,A2,20,run_delta_p99_ms,0.26339599999999996,0.04054099999999998,-0.03156250000000002,0.13172899999999998
+local M3,sessions,8,A2,20,turn_p99_ms,562.5309585,0.1217705000000251,-3.708687500000053,5.438436999999965
+local M3,sessions,8,A2,20,active_cpu_ms,291.905854,10.121234000000001,2.4386224999999513,27.98480349999997
+local M3,sessions,8,A2,20,active_switches,9310.0,-54.0,-151.0,203.5
+local M3,sessions,8,A2,20,idle_rss_kib,17512.0,256.0,-16.0,480.0
+local M3,sessions,8,A2,20,idle_threads,19.0,0.0,0.0,0.0
+local M3,sessions,8,A2,20,idle_cpu_ms,2.2678959999999915,0.07246800000000608,-0.09212399999999898,0.3428520000000046
+local M3,sessions,8,A2,20,idle_switches,5.0,0.0,0.0,1.0
+local M3,sessions,32,A2,20,run_delta_p99_ms,0.4038545,0.038916499999999965,-0.05429149999999999,0.14804199999999995
+local M3,sessions,32,A2,20,turn_p99_ms,1730.071375,38.07818799999984,-60.02372950000006,101.14493750000008
+local M3,sessions,32,A2,20,active_cpu_ms,1048.740973,2.792064000000096,-38.80386749999997,31.516677999999956
+local M3,sessions,32,A2,20,active_switches,39044.0,-210.5,-600.0,22.0
+local M3,sessions,32,A2,20,idle_rss_kib,21480.0,8.0,-128.0,112.0
+local M3,sessions,32,A2,20,idle_threads,43.0,0.0,0.0,0.0
+local M3,sessions,32,A2,20,idle_cpu_ms,2.780127999999882,0.324911999999844,-0.5361760000001103,0.8296960000000464
+local M3,sessions,32,A2,20,idle_switches,5.0,1.0,-0.5,1.0
+local M3,sessions,128,A2,20,run_delta_p99_ms,0.6613960000000001,-0.044792,-0.09472949999999997,0.03677050000000004
+local M3,sessions,128,A2,20,turn_p99_ms,6792.7060205,-44.009833499999786,-156.3835210000002,51.66933250000011
+local M3,sessions,128,A2,20,active_cpu_ms,4851.747784000001,20.299870000000737,-139.15676799999983,267.6273960000003
+local M3,sessions,128,A2,20,active_switches,167311.5,-945.5,-2628.0,-28.0
+local M3,sessions,128,A2,20,idle_rss_kib,38864.0,-112.0,-320.0,128.0
+local M3,sessions,128,A2,20,idle_threads,139.0,0.0,0.0,0.0
+local M3,sessions,128,A2,20,idle_cpu_ms,5.577792000000414,-0.8837760000006689,-1.6391360000007626,0.47456000000001275
+local M3,sessions,128,A2,20,idle_switches,6.0,-1.0,-1.5,1.0
+local M3,sessions,1,reactor,20,run_delta_p99_ms,0.243396,0.014686999999999992,-0.031583500000000014,0.0505415
+local M3,sessions,1,reactor,20,turn_p99_ms,554.6020625,-2.480000000000018,-6.882020999999952,3.275957500000004
+local M3,sessions,1,reactor,20,active_cpu_ms,56.77543800000001,5.137584499999985,-0.5550619999999995,9.679228500000004
+local M3,sessions,1,reactor,20,active_switches,1211.5,184.5,166.5,221.0
+local M3,sessions,1,reactor,20,idle_rss_kib,12264.0,-16.0,-112.0,104.0
+local M3,sessions,1,reactor,20,idle_threads,10.0,0.0,0.0,0.0
+local M3,sessions,1,reactor,20,idle_cpu_ms,2.079584999999995,-0.016625500000002402,-0.6319560000000028,0.2003940000000064
+local M3,sessions,1,reactor,20,idle_switches,5.0,0.0,0.0,0.0
+local M3,sessions,8,reactor,20,run_delta_p99_ms,0.26339599999999996,0.09672949999999997,0.023625500000000008,0.14100000000000004
+local M3,sessions,8,reactor,20,turn_p99_ms,562.5309585,-10.592020999999988,-16.20354199999997,-3.2398749999999836
+local M3,sessions,8,reactor,20,active_cpu_ms,291.905854,-1.5132670000000132,-21.13713549999997,35.60470700000003
+local M3,sessions,8,reactor,20,active_switches,9310.0,702.0,597.5,910.5
+local M3,sessions,8,reactor,20,idle_rss_kib,17512.0,48.0,-176.0,520.0
+local M3,sessions,8,reactor,20,idle_threads,19.0,0.0,0.0,0.0
+local M3,sessions,8,reactor,20,idle_cpu_ms,2.2678959999999915,-0.2975959999999833,-0.8568560000000169,0.010892000000067847
+local M3,sessions,8,reactor,20,idle_switches,5.0,0.0,0.0,0.5
+local M3,sessions,32,reactor,20,run_delta_p99_ms,0.4038545,0.05185400000000001,-0.030917,0.09543699999999997
+local M3,sessions,32,reactor,20,turn_p99_ms,1730.071375,-52.290230000000065,-88.85064649999993,-19.69718750000004
+local M3,sessions,32,reactor,20,active_cpu_ms,1048.740973,-5.712214999999901,-53.806948000000034,53.84103900000002
+local M3,sessions,32,reactor,20,active_switches,39044.0,1962.0,1210.5,2827.0
+local M3,sessions,32,reactor,20,idle_rss_kib,21480.0,72.0,-16.0,200.0
+local M3,sessions,32,reactor,20,idle_threads,43.0,0.0,0.0,0.0
+local M3,sessions,32,reactor,20,idle_cpu_ms,2.780127999999882,0.1532800000000334,-0.683808000000008,0.80422400000002
+local M3,sessions,32,reactor,20,idle_switches,5.0,0.0,-0.5,1.0
+local M3,sessions,128,reactor,20,run_delta_p99_ms,0.6613960000000001,-0.013249999999999984,-0.05341649999999998,0.053333500000000006
+local M3,sessions,128,reactor,20,turn_p99_ms,6792.7060205,-270.9472295000005,-421.6069585,-180.31270800000084
+local M3,sessions,128,reactor,20,active_cpu_ms,4851.747784000001,-98.51504199999954,-213.0738560000009,214.81719200000043
+local M3,sessions,128,reactor,20,active_switches,167311.5,10230.5,8458.0,12874.5
+local M3,sessions,128,reactor,20,idle_rss_kib,38864.0,-80.0,-304.0,176.0
+local M3,sessions,128,reactor,20,idle_threads,139.0,0.0,0.0,0.0
+local M3,sessions,128,reactor,20,idle_cpu_ms,5.577792000000414,-0.6045439999995406,-1.349632000000156,0.8678400000001751
+local M3,sessions,128,reactor,20,idle_switches,6.0,0.0,-1.0,1.5
+local M3,round_trip,0,A2,20,p50_us,91.75,1.3799999999999955,-0.8349999999999937,8.920000000000002
+local M3,round_trip,0,A2,20,p90_us,130.95999999999998,0.3499999999999943,-4.785000000000004,11.540000000000013
+local M3,round_trip,0,A2,20,p99_us,218.56,-4.314999999999998,-34.999999999999986,22.564999999999998
+local M3,round_trip,0,A2,20,cpu_ms,356.45,-0.45000000000003126,-28.44999999999999,51.75000000000003
+local M3,round_trip,0,A2,20,switches,39058.0,102.5,-195.5,234.0
+local M3,round_trip,0,reactor,20,p50_us,91.75,-10.374999999999993,-18.620000000000005,-1.3149999999999977
+local M3,round_trip,0,reactor,20,p90_us,130.95999999999998,-2.0449999999999946,-9.31000000000001,3.8349999999999937
+local M3,round_trip,0,reactor,20,p99_us,218.56,-15.5,-32.329999999999984,8.609999999999985
+local M3,round_trip,0,reactor,20,cpu_ms,356.45,-44.900000000000006,-72.9,-2.1000000000000227
+local M3,round_trip,0,reactor,20,switches,39058.0,-9565.0,-10157.5,-9133.0
+perf-macos-15-intel,sessions,1,A2,19,run_delta_p99_ms,0.350448,-0.0025450000000000195,-0.04284199999999999,0.07114500000000001
+perf-macos-15-intel,sessions,1,A2,19,turn_p99_ms,1504.670771,-11.873408000000154,-90.4979699999999,107.983475
+perf-macos-15-intel,sessions,1,A2,19,active_cpu_ms,77.441916,-0.9997490000000084,-5.615078000000011,0.6408160000000152
+perf-macos-15-intel,sessions,1,A2,19,active_switches,996,-21,-47,5
+perf-macos-15-intel,sessions,1,A2,19,idle_rss_kib,6496.0,4.0,-4.0,20.0
+perf-macos-15-intel,sessions,1,A2,19,idle_threads,10,0,0,0
+perf-macos-15-intel,sessions,1,A2,19,idle_cpu_ms,0.7513780000000109,-0.019082000000003596,-0.08975999999999429,0.08928599999999398
+perf-macos-15-intel,sessions,1,A2,19,idle_switches,3,0,0,0
+perf-macos-15-intel,sessions,8,A2,19,run_delta_p99_ms,0.6613530000000001,0.11094899999999996,0.009637999999999924,0.3651230000000002
+perf-macos-15-intel,sessions,8,A2,19,turn_p99_ms,1371.311106,28.64545299999986,-137.35225100000002,83.98864299999991
+perf-macos-15-intel,sessions,8,A2,19,active_cpu_ms,558.3125,-0.49038599999983035,-10.43185799999992,9.557156000000077
+perf-macos-15-intel,sessions,8,A2,19,active_switches,7751,-36,-174,82
+perf-macos-15-intel,sessions,8,A2,19,idle_rss_kib,10148.0,32.0,12.0,84.0
+perf-macos-15-intel,sessions,8,A2,19,idle_threads,19,0,0,0
+perf-macos-15-intel,sessions,8,A2,19,idle_cpu_ms,0.8082879999999903,0.0005760000000298859,-0.0861600000000573,0.053352000000062016
+perf-macos-15-intel,sessions,8,A2,19,idle_switches,3,0,0,0
+perf-macos-15-intel,sessions,32,A2,18,run_delta_p99_ms,1.165314,0.1265995000000001,0.0022384999999999766,0.31720799999999993
+perf-macos-15-intel,sessions,32,A2,18,turn_p99_ms,5101.5983,-20.044601000000057,-278.6428299999993,379.6416710000003
+perf-macos-15-intel,sessions,32,A2,18,active_cpu_ms,2241.86294,-26.751518000000033,-99.14576999999997,54.84418400000004
+perf-macos-15-intel,sessions,32,A2,18,active_switches,31339.0,0.0,-387.5,413.0
+perf-macos-15-intel,sessions,32,A2,18,idle_rss_kib,14012.0,24.0,-4.0,52.0
+perf-macos-15-intel,sessions,32,A2,18,idle_threads,43.0,0.0,0.0,0.0
+perf-macos-15-intel,sessions,32,A2,18,idle_cpu_ms,0.8627200000002055,0.03204800000011776,-0.036512000000099576,0.08102399999998511
+perf-macos-15-intel,sessions,32,A2,18,idle_switches,3.0,0.0,0.0,0.0
+perf-macos-15-intel,sessions,128,A2,16,run_delta_p99_ms,1.457593,-0.12259949999999997,-0.2978855,0.05583199999999999
+perf-macos-15-intel,sessions,128,A2,16,turn_p99_ms,20862.9965775,-6.94392649999827,-640.3985609999982,509.29915900000196
+perf-macos-15-intel,sessions,128,A2,16,active_cpu_ms,9567.695348000001,-179.7310639999996,-619.3723519999985,26.000496000000567
+perf-macos-15-intel,sessions,128,A2,16,active_switches,130014.0,-1381.5,-2453.0,755.0
+perf-macos-15-intel,sessions,128,A2,16,idle_rss_kib,28720.0,-8.0,-42.0,36.0
+perf-macos-15-intel,sessions,128,A2,16,idle_threads,139.0,0.0,0.0,0.0
+perf-macos-15-intel,sessions,128,A2,16,idle_cpu_ms,0.8764159999996579,0.04185600000017331,-0.003968000000575955,0.09318400000069005
+perf-macos-15-intel,sessions,128,A2,16,idle_switches,3.0,0.0,0.0,1.0
+perf-macos-15-intel,sessions,1,reactor,19,run_delta_p99_ms,0.350448,0.04582900000000001,0.0062530000000000086,0.07330600000000004
+perf-macos-15-intel,sessions,1,reactor,19,turn_p99_ms,1504.670771,-12.664715000000115,-102.99386400000003,72.28244100000006
+perf-macos-15-intel,sessions,1,reactor,19,active_cpu_ms,77.441916,6.9559619999999995,2.774922999999994,13.689915999999982
+perf-macos-15-intel,sessions,1,reactor,19,active_switches,996,152,124,170
+perf-macos-15-intel,sessions,1,reactor,19,idle_rss_kib,6496.0,12.0,-32.0,40.0
+perf-macos-15-intel,sessions,1,reactor,19,idle_threads,10,0,0,0
+perf-macos-15-intel,sessions,1,reactor,19,idle_cpu_ms,0.7513780000000109,0.000329999999992836,-0.029184000000001542,0.04773199999999478
+perf-macos-15-intel,sessions,1,reactor,19,idle_switches,3,0,0,0
+perf-macos-15-intel,sessions,8,reactor,19,run_delta_p99_ms,0.6613530000000001,0.05815499999999996,0.03324099999999991,0.09210300000000016
+perf-macos-15-intel,sessions,8,reactor,19,turn_p99_ms,1371.311106,-64.17712800000004,-153.29142000000002,-32.500898000000234
+perf-macos-15-intel,sessions,8,reactor,19,active_cpu_ms,558.3125,31.321660000000065,16.091805000000022,57.45860199999993
+perf-macos-15-intel,sessions,8,reactor,19,active_switches,7751,547,354,693
+perf-macos-15-intel,sessions,8,reactor,19,idle_rss_kib,10148.0,0.0,-44.0,56.0
+perf-macos-15-intel,sessions,8,reactor,19,idle_threads,19,0,0,0
+perf-macos-15-intel,sessions,8,reactor,19,idle_cpu_ms,0.8082879999999903,-0.011311999999930045,-0.07036799999993182,0.03212799999985361
+perf-macos-15-intel,sessions,8,reactor,19,idle_switches,3,0,0,0
+perf-macos-15-intel,sessions,32,reactor,18,run_delta_p99_ms,1.165314,0.08228300000000005,-0.07387100000000013,0.26313249999999994
+perf-macos-15-intel,sessions,32,reactor,18,turn_p99_ms,5101.5983,-173.3681335000001,-516.2581559999999,124.2192869999999
+perf-macos-15-intel,sessions,32,reactor,18,active_cpu_ms,2241.86294,229.89842999999996,156.0630839999999,351.15133600000036
+perf-macos-15-intel,sessions,32,reactor,18,active_switches,31339.0,2730.5,2284.0,3167.5
+perf-macos-15-intel,sessions,32,reactor,18,idle_rss_kib,14012.0,-16.0,-42.0,18.0
+perf-macos-15-intel,sessions,32,reactor,18,idle_threads,43.0,0.0,0.0,0.0
+perf-macos-15-intel,sessions,32,reactor,18,idle_cpu_ms,0.8627200000002055,0.02332800000015567,-0.008864000000219363,0.064384000000417
+perf-macos-15-intel,sessions,32,reactor,18,idle_switches,3.0,0.0,0.0,0.0
+perf-macos-15-intel,sessions,128,reactor,17,run_delta_p99_ms,1.457372,-0.02237800000000001,-0.22391200000000033,0.324044
+perf-macos-15-intel,sessions,128,reactor,17,turn_p99_ms,20807.205633999998,-948.4144769999984,-1118.9886640000004,-700.3443680000019
+perf-macos-15-intel,sessions,128,reactor,17,active_cpu_ms,9491.384887999999,902.0445600000021,835.8315359999979,1793.2695359999998
+perf-macos-15-intel,sessions,128,reactor,17,active_switches,129987,11852,10746,12973
+perf-macos-15-intel,sessions,128,reactor,17,idle_rss_kib,28720.0,32.0,-64.0,72.0
+perf-macos-15-intel,sessions,128,reactor,17,idle_threads,139,0,-1,0
+perf-macos-15-intel,sessions,128,reactor,17,idle_cpu_ms,0.8663040000005395,0.014079999999694337,-0.056063999998912095,0.15974399999763023
+perf-macos-15-intel,sessions,128,reactor,17,idle_switches,3,0,0,0
+perf-macos-15-intel,round_trip,0,A2,19,p50_us,335.52,-0.6899999999999977,-10.649999999999977,12.279999999999973
+perf-macos-15-intel,round_trip,0,A2,19,p90_us,417.11,-1.160000000000025,-28.810000000000002,14.379999999999995
+perf-macos-15-intel,round_trip,0,A2,19,p99_us,550.53,7.269999999999982,-10.240000000000009,58.41000000000008
+perf-macos-15-intel,round_trip,0,A2,19,cpu_ms,1791.8,-19.800000000000182,-83.29999999999995,63.299999999999955
+perf-macos-15-intel,round_trip,0,A2,19,switches,40367,33,-455,277
+perf-macos-15-intel,round_trip,0,reactor,19,p50_us,335.52,-48.39999999999998,-66.91000000000003,-40.129999999999995
+perf-macos-15-intel,round_trip,0,reactor,19,p90_us,417.11,-32.31999999999999,-74.44,-21.710000000000036
+perf-macos-15-intel,round_trip,0,reactor,19,p99_us,550.53,-58.21999999999997,-125.22999999999996,-18.519999999999982
+perf-macos-15-intel,round_trip,0,reactor,19,cpu_ms,1791.8,262.29999999999995,121.79999999999995,335.29999999999995
+perf-macos-15-intel,round_trip,0,reactor,19,switches,40367,1863,1313,2131
+perf-macos-latest,sessions,1,A2,17,run_delta_p99_ms,0.43720800000000004,-0.005292000000000019,-0.24816699999999997,0.06279099999999999
+perf-macos-latest,sessions,1,A2,17,turn_p99_ms,1594.268292,16.26462599999968,-73.47495799999979,129.09229200000004
+perf-macos-latest,sessions,1,A2,17,active_cpu_ms,64.881038,-0.8942059999999898,-6.54241600000001,7.5618729999999985
+perf-macos-latest,sessions,1,A2,17,active_switches,1015,4,-3,23
+perf-macos-latest,sessions,1,A2,17,idle_rss_kib,11328.0,-48.0,-64.0,16.0
+perf-macos-latest,sessions,1,A2,17,idle_threads,10,0,0,0
+perf-macos-latest,sessions,1,A2,17,idle_cpu_ms,1.2147920000000063,0.10458400000000467,-0.001497999999988675,0.40433200000000724
+perf-macos-latest,sessions,1,A2,17,idle_switches,3,0,-1,1
+perf-macos-latest,sessions,8,A2,17,run_delta_p99_ms,0.732083,-0.13541599999999987,-0.29891699999999993,0.03095800000000004
+perf-macos-latest,sessions,8,A2,17,turn_p99_ms,1683.2438330000002,28.402832999999873,-58.37149999999997,105.65633300000036
+perf-macos-latest,sessions,8,A2,17,active_cpu_ms,363.86132799999996,-8.334240999999963,-25.478255000000047,24.207291999999995
+perf-macos-latest,sessions,8,A2,17,active_switches,7006,70,-55,152
+perf-macos-latest,sessions,8,A2,17,idle_rss_kib,15408.0,16.0,-80.0,160.0
+perf-macos-latest,sessions,8,A2,17,idle_threads,19,0,0,0
+perf-macos-latest,sessions,8,A2,17,idle_cpu_ms,1.2110399999999966,0.03769599999997597,-0.15171200000002605,0.16524800000000672
+perf-macos-latest,sessions,8,A2,17,idle_switches,3,1,0,2
+perf-macos-latest,sessions,32,A2,17,run_delta_p99_ms,1.040792,-0.060541999999999985,-0.19587500000000002,0.4207080000000001
+perf-macos-latest,sessions,32,A2,17,turn_p99_ms,6733.8077920000005,-293.7410000000009,-500.90779099999963,-52.61070800000016
+perf-macos-latest,sessions,32,A2,17,active_cpu_ms,1451.19986,7.994459999999663,-48.343607999999904,105.44584400000008
+perf-macos-latest,sessions,32,A2,17,active_switches,29136,194,-75,406
+perf-macos-latest,sessions,32,A2,17,idle_rss_kib,19632.0,-96.0,-144.0,48.0
+perf-macos-latest,sessions,32,A2,17,idle_threads,43,0,0,0
+perf-macos-latest,sessions,32,A2,17,idle_cpu_ms,1.2481600000000537,0.1419520000003338,-0.04403199999991614,0.3977920000000079
+perf-macos-latest,sessions,32,A2,17,idle_switches,4,0,-1,0
+perf-macos-latest,sessions,128,A2,17,run_delta_p99_ms,1.345,0.010083000000000064,-0.21187599999999995,0.09108399999999994
+perf-macos-latest,sessions,128,A2,17,turn_p99_ms,27191.663792,61.489291999998386,-1331.5243750000009,934.6373740000017
+perf-macos-latest,sessions,128,A2,17,active_cpu_ms,6299.581136000001,146.00070399999822,-132.46014399999876,250.43913599999905
+perf-macos-latest,sessions,128,A2,17,active_switches,121961,7,-375,275
+perf-macos-latest,sessions,128,A2,17,idle_rss_kib,36016.0,48.0,-16.0,224.0
+perf-macos-latest,sessions,128,A2,17,idle_threads,139,0,0,0
+perf-macos-latest,sessions,128,A2,17,idle_cpu_ms,1.4141439999990624,-0.0954880000003655,-0.2693119999994664,0.13440000000120023
+perf-macos-latest,sessions,128,A2,17,idle_switches,3,0,0,1
+perf-macos-latest,sessions,1,reactor,17,run_delta_p99_ms,0.43720800000000004,-0.06604100000000007,-0.17858300000000038,0.128417
+perf-macos-latest,sessions,1,reactor,17,turn_p99_ms,1594.268292,-3.248249999999871,-73.45308299999988,103.18954199999985
+perf-macos-latest,sessions,1,reactor,17,active_cpu_ms,64.881038,4.767545999999996,-4.131829000000003,12.813413999999995
+perf-macos-latest,sessions,1,reactor,17,active_switches,1015,121,118,143
+perf-macos-latest,sessions,1,reactor,17,idle_rss_kib,11328.0,16.0,-16.0,48.0
+perf-macos-latest,sessions,1,reactor,17,idle_threads,10,0,0,0
+perf-macos-latest,sessions,1,reactor,17,idle_cpu_ms,1.2147920000000063,0.06566400000000705,-0.05654400000001947,0.3727500000000049
+perf-macos-latest,sessions,1,reactor,17,idle_switches,3,0,0,1
+perf-macos-latest,sessions,8,reactor,17,run_delta_p99_ms,0.732083,-0.014666999999999986,-0.37525000000000003,0.14308399999999988
+perf-macos-latest,sessions,8,reactor,17,turn_p99_ms,1683.2438330000002,-67.5412080000001,-88.23029100000008,48.04983299999981
+perf-macos-latest,sessions,8,reactor,17,active_cpu_ms,363.86132799999996,26.46724400000005,-18.853302000000042,46.851562
+perf-macos-latest,sessions,8,reactor,17,active_switches,7006,484,404,647
+perf-macos-latest,sessions,8,reactor,17,idle_rss_kib,15408.0,16.0,-48.0,64.0
+perf-macos-latest,sessions,8,reactor,17,idle_threads,19,0,0,0
+perf-macos-latest,sessions,8,reactor,17,idle_cpu_ms,1.2110399999999966,0.09644800000002673,-0.1364640000000028,0.3344640000001453
+perf-macos-latest,sessions,8,reactor,17,idle_switches,3,0,0,1
+perf-macos-latest,sessions,32,reactor,17,run_delta_p99_ms,1.040792,0.135208,-0.03733299999999984,0.6929989999999999
+perf-macos-latest,sessions,32,reactor,17,turn_p99_ms,6733.8077920000005,-422.21470900000077,-992.2151670000003,-313.0432919999994
+perf-macos-latest,sessions,32,reactor,17,active_cpu_ms,1451.19986,31.898212000000058,-28.094248000000107,109.47277200000008
+perf-macos-latest,sessions,32,reactor,17,active_switches,29136,1769,1514,1986
+perf-macos-latest,sessions,32,reactor,17,idle_rss_kib,19632.0,-32.0,-192.0,48.0
+perf-macos-latest,sessions,32,reactor,17,idle_threads,43,0,0,0
+perf-macos-latest,sessions,32,reactor,17,idle_cpu_ms,1.2481600000000537,-0.00992000000010762,-0.187007999999933,0.20358400000008992
+perf-macos-latest,sessions,32,reactor,17,idle_switches,4,0,-1,0
+perf-macos-latest,sessions,128,reactor,17,run_delta_p99_ms,1.345,-0.05004300000000006,-0.09112399999999976,0.0995410000000001
+perf-macos-latest,sessions,128,reactor,17,turn_p99_ms,27191.663792,-2218.4571670000005,-2719.0078329999997,-1325.388041000002
+perf-macos-latest,sessions,128,reactor,17,active_cpu_ms,6299.581136000001,390.6747599999999,-268.0706200000004,522.7250479999993
+perf-macos-latest,sessions,128,reactor,17,active_switches,121961,7550,7130,7695
+perf-macos-latest,sessions,128,reactor,17,idle_rss_kib,36016.0,64.0,-32.0,176.0
+perf-macos-latest,sessions,128,reactor,17,idle_threads,139,0,0,0
+perf-macos-latest,sessions,128,reactor,17,idle_cpu_ms,1.4141439999990624,0.046592000000345024,-0.29081600000058216,0.47744000000005116
+perf-macos-latest,sessions,128,reactor,17,idle_switches,3,0,0,0
+perf-macos-latest,round_trip,0,A2,18,p50_us,204.83499999999998,2.5400000000000205,-7.6699999999999875,16.875
+perf-macos-latest,round_trip,0,A2,18,p90_us,306.83500000000004,2.4399999999999977,-2.2299999999999898,7.689999999999998
+perf-macos-latest,round_trip,0,A2,18,p99_us,443.94,-29.189999999999998,-99.23500000000001,34.29499999999999
+perf-macos-latest,round_trip,0,A2,18,cpu_ms,1039.3000000000002,-4.649999999999977,-46.40000000000009,76.89999999999992
+perf-macos-latest,round_trip,0,A2,18,switches,39166.5,-155.0,-537.0,233.5
+perf-macos-latest,round_trip,0,reactor,18,p50_us,204.83499999999998,-37.045,-50.665000000000006,-23.0
+perf-macos-latest,round_trip,0,reactor,18,p90_us,306.83500000000004,-28.0,-39.454999999999984,-16.455000000000013
+perf-macos-latest,round_trip,0,reactor,18,p99_us,443.94,-26.275000000000006,-158.27,34.21000000000001
+perf-macos-latest,round_trip,0,reactor,18,cpu_ms,1039.3000000000002,6.9500000000000455,-95.05000000000007,57.44999999999993
+perf-macos-latest,round_trip,0,reactor,18,switches,39166.5,3325.5,2655.5,4061.0
+perf-ubuntu-24.04-arm,sessions,1,A2,20,run_delta_p99_ms,0.283368,-0.03468399999999999,-0.0953185,0.04342900000000001
+perf-ubuntu-24.04-arm,sessions,1,A2,20,turn_p99_ms,372.409111,-0.26822250000000736,-1.802857500000016,1.37383200000005
+perf-ubuntu-24.04-arm,sessions,1,A2,20,active_cpu_ms,30.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,1,A2,20,active_switches,829.0,2.5,-4.5,4.5
+perf-ubuntu-24.04-arm,sessions,1,A2,20,idle_rss_kib,7158.0,2.0,-28.0,26.0
+perf-ubuntu-24.04-arm,sessions,1,A2,20,idle_threads,10.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,1,A2,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,1,A2,20,idle_switches,4.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,8,A2,20,run_delta_p99_ms,0.1291795,0.003816,-0.036800999999999987,0.010193000000000008
+perf-ubuntu-24.04-arm,sessions,8,A2,20,turn_p99_ms,376.20536400000003,-0.21655000000004065,-2.4831020000000024,3.713661499999972
+perf-ubuntu-24.04-arm,sessions,8,A2,20,active_cpu_ms,210.0,5.000000000000014,0.0,10.000000000000043
+perf-ubuntu-24.04-arm,sessions,8,A2,20,active_switches,5072.0,75.5,-67.5,221.5
+perf-ubuntu-24.04-arm,sessions,8,A2,20,idle_rss_kib,11616.0,86.0,-106.0,318.0
+perf-ubuntu-24.04-arm,sessions,8,A2,20,idle_threads,19.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,8,A2,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,8,A2,20,idle_switches,4.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,32,A2,20,run_delta_p99_ms,0.126247,0.005773000000000021,-0.0129405,0.021828499999999987
+perf-ubuntu-24.04-arm,sessions,32,A2,20,turn_p99_ms,1313.3826985,61.721708000000035,-2.2190195000000585,115.97739899999988
+perf-ubuntu-24.04-arm,sessions,32,A2,20,active_cpu_ms,780.0,10.0,-20.0,34.99999999999994
+perf-ubuntu-24.04-arm,sessions,32,A2,20,active_switches,19006.0,529.0,-821.5,1049.5
+perf-ubuntu-24.04-arm,sessions,32,A2,20,idle_rss_kib,15102.0,12.0,-272.0,96.0
+perf-ubuntu-24.04-arm,sessions,32,A2,20,idle_threads,43.0,0.0,0.0,1.0
+perf-ubuntu-24.04-arm,sessions,32,A2,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,32,A2,20,idle_switches,5.0,0.0,-1.0,0.0
+perf-ubuntu-24.04-arm,sessions,128,A2,19,run_delta_p99_ms,0.229543,0.013902999999999999,-0.03312100000000004,0.05969599999999997
+perf-ubuntu-24.04-arm,sessions,128,A2,19,turn_p99_ms,4895.789331,12.60638900000049,-151.72018499999922,120.00222699999995
+perf-ubuntu-24.04-arm,sessions,128,A2,19,active_cpu_ms,3500.0,30.0,-4.547473508864641e-13,80.0
+perf-ubuntu-24.04-arm,sessions,128,A2,19,active_switches,91757,-7,-1345,1315
+perf-ubuntu-24.04-arm,sessions,128,A2,19,idle_rss_kib,30596.0,28.0,-188.0,180.0
+perf-ubuntu-24.04-arm,sessions,128,A2,19,idle_threads,139,0,0,0
+perf-ubuntu-24.04-arm,sessions,128,A2,19,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,128,A2,19,idle_switches,4,0,0,0
+perf-ubuntu-24.04-arm,sessions,1,reactor,20,run_delta_p99_ms,0.283368,-0.009076,-0.04130900000000004,0.08560249999999998
+perf-ubuntu-24.04-arm,sessions,1,reactor,20,turn_p99_ms,372.409111,-1.4568285000000003,-2.5344065000000455,0.7482200000000603
+perf-ubuntu-24.04-arm,sessions,1,reactor,20,active_cpu_ms,30.0,0.0,0.0,5.0
+perf-ubuntu-24.04-arm,sessions,1,reactor,20,active_switches,829.0,102.5,96.0,117.5
+perf-ubuntu-24.04-arm,sessions,1,reactor,20,idle_rss_kib,7158.0,-18.0,-30.0,22.0
+perf-ubuntu-24.04-arm,sessions,1,reactor,20,idle_threads,10.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,1,reactor,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,1,reactor,20,idle_switches,4.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,8,reactor,20,run_delta_p99_ms,0.1291795,0.0026634999999999853,-0.028102000000000002,0.0247845
+perf-ubuntu-24.04-arm,sessions,8,reactor,20,turn_p99_ms,376.20536400000003,1.705448500000017,-1.67940999999999,5.517515000000003
+perf-ubuntu-24.04-arm,sessions,8,reactor,20,active_cpu_ms,210.0,10.0,0.0,10.000000000000043
+perf-ubuntu-24.04-arm,sessions,8,reactor,20,active_switches,5072.0,246.0,70.0,444.0
+perf-ubuntu-24.04-arm,sessions,8,reactor,20,idle_rss_kib,11616.0,160.0,-240.0,352.0
+perf-ubuntu-24.04-arm,sessions,8,reactor,20,idle_threads,19.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,8,reactor,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,8,reactor,20,idle_switches,4.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,32,reactor,19,run_delta_p99_ms,0.127539,0.016721,-0.008751999999999996,0.04087400000000001
+perf-ubuntu-24.04-arm,sessions,32,reactor,19,turn_p99_ms,1311.072024,3.1311460000001716,-23.597447000000102,125.82051000000024
+perf-ubuntu-24.04-arm,sessions,32,reactor,19,active_cpu_ms,780.0,20.0,0.0,40.000000000000114
+perf-ubuntu-24.04-arm,sessions,32,reactor,19,active_switches,19017,1045,215,1320
+perf-ubuntu-24.04-arm,sessions,32,reactor,19,idle_rss_kib,15108.0,156.0,44.0,280.0
+perf-ubuntu-24.04-arm,sessions,32,reactor,19,idle_threads,43,0,0,0
+perf-ubuntu-24.04-arm,sessions,32,reactor,19,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,32,reactor,19,idle_switches,5,0,-1,0
+perf-ubuntu-24.04-arm,sessions,128,reactor,19,run_delta_p99_ms,0.229543,0.012264999999999998,-0.01975300000000002,0.03958599999999998
+perf-ubuntu-24.04-arm,sessions,128,reactor,19,turn_p99_ms,4895.789331,51.7408089999999,-83.83098999999947,111.50482000000011
+perf-ubuntu-24.04-arm,sessions,128,reactor,19,active_cpu_ms,3500.0,110.0,69.99999999999955,200.0
+perf-ubuntu-24.04-arm,sessions,128,reactor,19,active_switches,91757,3076,1018,4375
+perf-ubuntu-24.04-arm,sessions,128,reactor,19,idle_rss_kib,30596.0,-92.0,-300.0,352.0
+perf-ubuntu-24.04-arm,sessions,128,reactor,19,idle_threads,139,0,0,0
+perf-ubuntu-24.04-arm,sessions,128,reactor,19,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,sessions,128,reactor,19,idle_switches,4,0,0,0
+perf-ubuntu-24.04-arm,round_trip,0,A2,20,p50_us,59.57,0.36499999999999844,-0.23999999999999844,0.5850000000000009
+perf-ubuntu-24.04-arm,round_trip,0,A2,20,p90_us,63.89,-0.13999999999999702,-1.6999999999999993,1.8249999999999993
+perf-ubuntu-24.04-arm,round_trip,0,A2,20,p99_us,74.66,0.6650000000000063,-3.0449999999999946,2.2950000000000017
+perf-ubuntu-24.04-arm,round_trip,0,A2,20,cpu_ms,290.0,0.0,0.0,0.0
+perf-ubuntu-24.04-arm,round_trip,0,A2,20,switches,39978.0,1.5,-1.0,4.5
+perf-ubuntu-24.04-arm,round_trip,0,reactor,20,p50_us,59.57,-9.805,-10.265000000000004,-9.375
+perf-ubuntu-24.04-arm,round_trip,0,reactor,20,p90_us,63.89,-11.735,-12.43,-10.075
+perf-ubuntu-24.04-arm,round_trip,0,reactor,20,p99_us,74.66,-10.149999999999999,-12.075000000000003,-6.475000000000001
+perf-ubuntu-24.04-arm,round_trip,0,reactor,20,cpu_ms,290.0,-40.0,-50.0,-40.0
+perf-ubuntu-24.04-arm,round_trip,0,reactor,20,switches,39978.0,-9793.5,-9802.5,-9790.0
+perf-ubuntu-latest,sessions,1,A2,20,run_delta_p99_ms,0.1823995,0.007020999999999986,-0.004926000000000014,0.020687999999999984
+perf-ubuntu-latest,sessions,1,A2,20,turn_p99_ms,372.933171,-0.7620709999999917,-1.3571809999999687,-0.05522799999999961
+perf-ubuntu-latest,sessions,1,A2,20,active_cpu_ms,40.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,1,A2,20,active_switches,786.0,-0.5,-5.5,2.5
+perf-ubuntu-latest,sessions,1,A2,20,idle_rss_kib,8268.0,-8.0,-56.0,44.0
+perf-ubuntu-latest,sessions,1,A2,20,idle_threads,10.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,1,A2,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,1,A2,20,idle_switches,4.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,8,A2,20,run_delta_p99_ms,0.13457999999999998,0.0067194999999999755,-0.01010550000000001,0.024585000000000003
+perf-ubuntu-latest,sessions,8,A2,20,turn_p99_ms,379.7495255,-0.27042250000002355,-1.986314999999962,2.059490500000038
+perf-ubuntu-latest,sessions,8,A2,20,active_cpu_ms,290.0,0.0,0.0,5.0
+perf-ubuntu-latest,sessions,8,A2,20,active_switches,4913.0,6.0,-221.0,92.0
+perf-ubuntu-latest,sessions,8,A2,20,idle_rss_kib,12894.0,-40.0,-548.0,212.0
+perf-ubuntu-latest,sessions,8,A2,20,idle_threads,19.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,8,A2,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,8,A2,20,idle_switches,4.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,32,A2,20,run_delta_p99_ms,0.31795399999999996,-0.012939499999999993,-0.13961400000000002,0.224108
+perf-ubuntu-latest,sessions,32,A2,20,turn_p99_ms,1438.8592585000001,-55.10248399999989,-119.32927900000004,42.74544900000001
+perf-ubuntu-latest,sessions,32,A2,20,active_cpu_ms,1130.0,0.0,-10.000000000000114,20.0
+perf-ubuntu-latest,sessions,32,A2,20,active_switches,20039.0,-344.0,-934.0,307.5
+perf-ubuntu-latest,sessions,32,A2,20,idle_rss_kib,16224.0,-80.0,-372.0,280.0
+perf-ubuntu-latest,sessions,32,A2,20,idle_threads,43.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,32,A2,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,32,A2,20,idle_switches,4.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,128,A2,19,run_delta_p99_ms,0.23242400000000002,-0.008073999999999998,-0.03248699999999999,0.00590400000000002
+perf-ubuntu-latest,sessions,128,A2,19,turn_p99_ms,4898.679661,-148.92282699999942,-205.6319139999996,-37.49928499999987
+perf-ubuntu-latest,sessions,128,A2,19,active_cpu_ms,4569.999999999999,20.0,-19.99999999999909,30.0
+perf-ubuntu-latest,sessions,128,A2,19,active_switches,85827,384,-738,757
+perf-ubuntu-latest,sessions,128,A2,19,idle_rss_kib,31668.0,-4.0,-184.0,352.0
+perf-ubuntu-latest,sessions,128,A2,19,idle_threads,139,0,0,0
+perf-ubuntu-latest,sessions,128,A2,19,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,128,A2,19,idle_switches,4,0,0,0
+perf-ubuntu-latest,sessions,1,reactor,20,run_delta_p99_ms,0.1823995,0.0007480000000000125,-0.010168499999999997,0.0038075000000000053
+perf-ubuntu-latest,sessions,1,reactor,20,turn_p99_ms,372.933171,0.21835600000002842,-1.2415469999999402,0.8657309999999825
+perf-ubuntu-latest,sessions,1,reactor,20,active_cpu_ms,40.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,1,reactor,20,active_switches,786.0,89.5,80.5,97.0
+perf-ubuntu-latest,sessions,1,reactor,20,idle_rss_kib,8268.0,24.0,-18.0,58.0
+perf-ubuntu-latest,sessions,1,reactor,20,idle_threads,10.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,1,reactor,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,1,reactor,20,idle_switches,4.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,8,reactor,20,run_delta_p99_ms,0.13457999999999998,0.014875500000000007,0.001840499999999981,0.025620500000000004
+perf-ubuntu-latest,sessions,8,reactor,20,turn_p99_ms,379.7495255,0.5428230000000269,-1.6904659999999865,1.7545670000000086
+perf-ubuntu-latest,sessions,8,reactor,20,active_cpu_ms,290.0,0.0,0.0,10.0
+perf-ubuntu-latest,sessions,8,reactor,20,active_switches,4913.0,93.0,-125.5,220.5
+perf-ubuntu-latest,sessions,8,reactor,20,idle_rss_kib,12894.0,12.0,-236.0,154.0
+perf-ubuntu-latest,sessions,8,reactor,20,idle_threads,19.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,8,reactor,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,8,reactor,20,idle_switches,4.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,32,reactor,20,run_delta_p99_ms,0.31795399999999996,-0.030705999999999997,-0.12081050000000003,0.12691450000000004
+perf-ubuntu-latest,sessions,32,reactor,20,turn_p99_ms,1438.8592585000001,10.370953500000041,-66.16105800000003,72.48632750000013
+perf-ubuntu-latest,sessions,32,reactor,20,active_cpu_ms,1130.0,20.000000000000114,15.0,40.00000000000023
+perf-ubuntu-latest,sessions,32,reactor,20,active_switches,20039.0,659.5,51.5,909.0
+perf-ubuntu-latest,sessions,32,reactor,20,idle_rss_kib,16224.0,-130.0,-222.0,108.0
+perf-ubuntu-latest,sessions,32,reactor,20,idle_threads,43.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,32,reactor,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,32,reactor,20,idle_switches,4.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,128,reactor,19,run_delta_p99_ms,0.23242400000000002,0.014836000000000016,-0.010220000000000007,0.030465999999999993
+perf-ubuntu-latest,sessions,128,reactor,19,turn_p99_ms,4898.679661,-29.413397999999688,-103.52966399999968,147.0756250000004
+perf-ubuntu-latest,sessions,128,reactor,19,active_cpu_ms,4569.999999999999,130.0000000000009,89.99999999999909,170.0000000000009
+perf-ubuntu-latest,sessions,128,reactor,19,active_switches,85827,3093,2341,3785
+perf-ubuntu-latest,sessions,128,reactor,19,idle_rss_kib,31668.0,-52.0,-164.0,456.0
+perf-ubuntu-latest,sessions,128,reactor,19,idle_threads,139,0,0,0
+perf-ubuntu-latest,sessions,128,reactor,19,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-ubuntu-latest,sessions,128,reactor,19,idle_switches,4,0,0,0
+perf-ubuntu-latest,round_trip,0,A2,20,p50_us,112.045,0.32500000000000284,-0.07000000000000028,0.5249999999999986
+perf-ubuntu-latest,round_trip,0,A2,20,p90_us,118.375,0.3149999999999977,-0.36999999999999744,0.8800000000000097
+perf-ubuntu-latest,round_trip,0,A2,20,p99_us,124.46000000000001,1.6749999999999972,-0.3200000000000003,3.4750000000000014
+perf-ubuntu-latest,round_trip,0,A2,20,cpu_ms,700.0,0.0,0.0,10.0
+perf-ubuntu-latest,round_trip,0,A2,20,switches,39946.0,-1.5,-20.0,13.5
+perf-ubuntu-latest,round_trip,0,reactor,20,p50_us,112.045,-15.520000000000003,-15.899999999999999,-15.175000000000004
+perf-ubuntu-latest,round_trip,0,reactor,20,p90_us,118.375,-18.165,-18.29,-17.909999999999997
+perf-ubuntu-latest,round_trip,0,reactor,20,p99_us,124.46000000000001,-18.445000000000007,-20.425000000000004,-18.029999999999994
+perf-ubuntu-latest,round_trip,0,reactor,20,cpu_ms,700.0,-110.0,-110.0,-105.0
+perf-ubuntu-latest,round_trip,0,reactor,20,switches,39946.0,-9756.5,-9765.5,-9750.5
+perf-windows-11-arm,sessions,1,A2,3,run_delta_p99_ms,0.1373,0.030000000000000027,-0.0007999999999999952,0.033299999999999996
+perf-windows-11-arm,sessions,1,A2,3,turn_p99_ms,367.77959999999996,-2.5996999999999844,-3.5400999999999385,5.352599999999995
+perf-windows-11-arm,sessions,1,A2,3,active_cpu_ms,46.875,-15.625,-31.25,93.75
+perf-windows-11-arm,sessions,1,A2,3,active_switches,932,3,1,4
+perf-windows-11-arm,sessions,1,A2,3,idle_rss_kib,12992.0,-8.0,-16.0,16.0
+perf-windows-11-arm,sessions,1,A2,3,idle_threads,15,0,0,0
+perf-windows-11-arm,sessions,1,A2,3,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-windows-11-arm,sessions,1,A2,3,idle_switches,8,1,-1,3
+perf-windows-11-arm,sessions,8,A2,3,run_delta_p99_ms,0.1482,0.21170000000000003,-0.057999999999999996,0.3045
+perf-windows-11-arm,sessions,8,A2,3,turn_p99_ms,739.4833,-37.952600000000075,-89.79149999999993,15.284199999999942
+perf-windows-11-arm,sessions,8,A2,3,active_cpu_ms,328.125,31.25,-203.125,93.75
+perf-windows-11-arm,sessions,8,A2,3,active_switches,6574,32,-282,242
+perf-windows-11-arm,sessions,8,A2,3,idle_rss_kib,15372.0,60.0,-20.0,184.0
+perf-windows-11-arm,sessions,8,A2,3,idle_threads,24,1,-1,7
+perf-windows-11-arm,sessions,8,A2,3,idle_cpu_ms,0.0,0.0,-15.625,0.0
+perf-windows-11-arm,sessions,8,A2,3,idle_switches,11,-2,-3,1
+perf-windows-11-arm,sessions,32,A2,3,run_delta_p99_ms,0.3922,0.016400000000000026,-0.1926,0.21009999999999995
+perf-windows-11-arm,sessions,32,A2,3,turn_p99_ms,3335.3267,-281.15200000000004,-501.1110999999996,-190.5594000000001
+perf-windows-11-arm,sessions,32,A2,3,active_cpu_ms,1687.5,-296.875,-437.5,-62.5
+perf-windows-11-arm,sessions,32,A2,3,active_switches,27355,-1231,-1620,-138
+perf-windows-11-arm,sessions,32,A2,3,idle_rss_kib,20256.0,92.0,16.0,292.0
+perf-windows-11-arm,sessions,32,A2,3,idle_threads,48,2,-1,2
+perf-windows-11-arm,sessions,32,A2,3,idle_cpu_ms,0.0,0.0,-15.625,15.625
+perf-windows-11-arm,sessions,32,A2,3,idle_switches,9,1,0,6
+perf-windows-11-arm,sessions,128,A2,3,run_delta_p99_ms,0.7528,-0.029099999999999904,-0.2999,0.3127
+perf-windows-11-arm,sessions,128,A2,3,turn_p99_ms,11369.1885,72.80090000000018,-1115.8149999999987,1760.6841999999997
+perf-windows-11-arm,sessions,128,A2,3,active_cpu_ms,6750.0,-234.375,-1687.5,-15.625
+perf-windows-11-arm,sessions,128,A2,3,active_switches,105238,1003,-2456,3550
+perf-windows-11-arm,sessions,128,A2,3,idle_rss_kib,38304.0,-316.0,-484.0,-112.0
+perf-windows-11-arm,sessions,128,A2,3,idle_threads,144,0,0,0
+perf-windows-11-arm,sessions,128,A2,3,idle_cpu_ms,0.0,0.0,0.0,15.625
+perf-windows-11-arm,sessions,128,A2,3,idle_switches,9,-1,-2,1
+perf-windows-11-arm,sessions,1,reactor,3,run_delta_p99_ms,0.1373,-0.0005000000000000004,-0.025699999999999973,0.03830000000000003
+perf-windows-11-arm,sessions,1,reactor,3,turn_p99_ms,367.77959999999996,10.76400000000001,5.862500000000011,14.972099999999955
+perf-windows-11-arm,sessions,1,reactor,3,active_cpu_ms,46.875,15.625,15.625,31.25
+perf-windows-11-arm,sessions,1,reactor,3,active_switches,932,60,43,82
+perf-windows-11-arm,sessions,1,reactor,3,idle_rss_kib,12992.0,8.0,0.0,32.0
+perf-windows-11-arm,sessions,1,reactor,3,idle_threads,15,0,0,0
+perf-windows-11-arm,sessions,1,reactor,3,idle_cpu_ms,0.0,0.0,0.0,15.625
+perf-windows-11-arm,sessions,1,reactor,3,idle_switches,8,1,-1,1
+perf-windows-11-arm,sessions,8,reactor,3,run_delta_p99_ms,0.1482,-0.03650000000000003,-0.0493,0.11080000000000001
+perf-windows-11-arm,sessions,8,reactor,3,turn_p99_ms,739.4833,-0.28120000000001255,-174.79200000000014,227.6264
+perf-windows-11-arm,sessions,8,reactor,3,active_cpu_ms,328.125,-78.125,-156.25,156.25
+perf-windows-11-arm,sessions,8,reactor,3,active_switches,6574,610,-283,780
+perf-windows-11-arm,sessions,8,reactor,3,idle_rss_kib,15372.0,116.0,-88.0,176.0
+perf-windows-11-arm,sessions,8,reactor,3,idle_threads,24,1,-2,1
+perf-windows-11-arm,sessions,8,reactor,3,idle_cpu_ms,0.0,0.0,-15.625,0.0
+perf-windows-11-arm,sessions,8,reactor,3,idle_switches,11,0,-2,1
+perf-windows-11-arm,sessions,32,reactor,3,run_delta_p99_ms,0.3922,0.09890000000000004,0.06680000000000008,0.2622
+perf-windows-11-arm,sessions,32,reactor,3,turn_p99_ms,3335.3267,-304.5034999999998,-460.2673999999997,-239.37789999999995
+perf-windows-11-arm,sessions,32,reactor,3,active_cpu_ms,1687.5,15.625,-93.75,78.125
+perf-windows-11-arm,sessions,32,reactor,3,active_switches,27355,-581,-1243,178
+perf-windows-11-arm,sessions,32,reactor,3,idle_rss_kib,20256.0,32.0,32.0,168.0
+perf-windows-11-arm,sessions,32,reactor,3,idle_threads,48,1,0,2
+perf-windows-11-arm,sessions,32,reactor,3,idle_cpu_ms,0.0,0.0,-15.625,15.625
+perf-windows-11-arm,sessions,32,reactor,3,idle_switches,9,1,-2,1
+perf-windows-11-arm,sessions,128,reactor,3,run_delta_p99_ms,0.7528,0.09660000000000002,-0.1462,0.7035000000000001
+perf-windows-11-arm,sessions,128,reactor,3,turn_p99_ms,11369.1885,271.1832000000013,-320.8078000000005,303.7335000000003
+perf-windows-11-arm,sessions,128,reactor,3,active_cpu_ms,6750.0,-437.5,-984.375,78.125
+perf-windows-11-arm,sessions,128,reactor,3,active_switches,105238,3268,1597,3638
+perf-windows-11-arm,sessions,128,reactor,3,idle_rss_kib,38304.0,44.0,-8.0,64.0
+perf-windows-11-arm,sessions,128,reactor,3,idle_threads,144,0,-1,1
+perf-windows-11-arm,sessions,128,reactor,3,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-windows-11-arm,sessions,128,reactor,3,idle_switches,9,1,-2,3
+perf-windows-11-arm,round_trip,0,A2,3,p50_us,109.2,0.7999999999999972,-0.9000000000000057,3.299999999999997
+perf-windows-11-arm,round_trip,0,A2,3,p90_us,121.8,0.09999999999999432,-2.5,1.6000000000000085
+perf-windows-11-arm,round_trip,0,A2,3,p99_us,149.4,-3.0999999999999943,-10.100000000000023,-3.0
+perf-windows-11-arm,round_trip,0,A2,3,cpu_ms,828.1,-15.600000000000023,-62.5,171.89999999999998
+perf-windows-11-arm,round_trip,0,A2,3,switches,44978,-1,-19,16
+perf-windows-11-arm,round_trip,0,reactor,3,p50_us,109.2,-13.099999999999994,-13.600000000000009,-12.5
+perf-windows-11-arm,round_trip,0,reactor,3,p90_us,121.8,1.5,-1.3999999999999915,2.299999999999997
+perf-windows-11-arm,round_trip,0,reactor,3,p99_us,149.4,15014.6,14994.8,15023.1
+perf-windows-11-arm,round_trip,0,reactor,3,cpu_ms,828.1,-15.600000000000023,-312.5,218.70000000000005
+perf-windows-11-arm,round_trip,0,reactor,3,switches,44978,-5262,-5388,-4992
+perf-windows-latest,sessions,1,A2,20,run_delta_p99_ms,0.1429,0.002699999999999994,-0.009600000000000011,0.011849999999999986
+perf-windows-latest,sessions,1,A2,20,turn_p99_ms,405.11800000000005,-0.6962999999999795,-5.645700000000005,1.825850000000031
+perf-windows-latest,sessions,1,A2,20,active_cpu_ms,39.0625,7.8125,-15.625,23.4375
+perf-windows-latest,sessions,1,A2,20,active_switches,939.0,-4.0,-14.0,2.5
+perf-windows-latest,sessions,1,A2,20,idle_rss_kib,11770.0,-40.0,-86.0,64.0
+perf-windows-latest,sessions,1,A2,20,idle_threads,15.0,0.0,0.0,0.0
+perf-windows-latest,sessions,1,A2,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-windows-latest,sessions,1,A2,20,idle_switches,6.0,0.0,-0.5,1.0
+perf-windows-latest,sessions,8,A2,20,run_delta_p99_ms,0.1604,0.0010499999999999954,-0.010150000000000006,0.009600000000000011
+perf-windows-latest,sessions,8,A2,20,turn_p99_ms,662.17615,37.358799999999974,19.72784999999999,46.552250000000015
+perf-windows-latest,sessions,8,A2,20,active_cpu_ms,367.1875,15.625,-109.375,78.125
+perf-windows-latest,sessions,8,A2,20,active_switches,5691.0,-80.5,-144.0,23.0
+perf-windows-latest,sessions,8,A2,20,idle_rss_kib,15106.0,-8.0,-38.0,146.0
+perf-windows-latest,sessions,8,A2,20,idle_threads,25.0,0.0,0.0,0.5
+perf-windows-latest,sessions,8,A2,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-windows-latest,sessions,8,A2,20,idle_switches,5.0,0.0,0.0,0.0
+perf-windows-latest,sessions,32,A2,20,run_delta_p99_ms,0.188,-0.0020000000000000157,-0.04295,0.015949999999999992
+perf-windows-latest,sessions,32,A2,20,turn_p99_ms,3253.2719500000003,-65.65744999999993,-180.70230000000015,238.8969499999996
+perf-windows-latest,sessions,32,A2,20,active_cpu_ms,1593.75,54.6875,-476.5625,289.0625
+perf-windows-latest,sessions,32,A2,20,active_switches,22399.0,154.0,-368.0,435.5
+perf-windows-latest,sessions,32,A2,20,idle_rss_kib,20674.0,-24.0,-288.0,220.0
+perf-windows-latest,sessions,32,A2,20,idle_threads,50.0,0.0,-1.0,1.0
+perf-windows-latest,sessions,32,A2,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-windows-latest,sessions,32,A2,20,idle_switches,5.0,0.0,0.0,0.0
+perf-windows-latest,sessions,128,A2,20,run_delta_p99_ms,0.2512,0.0004500000000000337,-0.027800000000000005,0.030350000000000002
+perf-windows-latest,sessions,128,A2,20,turn_p99_ms,11604.58455,-82.59655000000112,-319.6069500000003,243.83509999999933
+perf-windows-latest,sessions,128,A2,20,active_cpu_ms,6867.1875,-671.875,-882.8125,320.3125
+perf-windows-latest,sessions,128,A2,20,active_switches,90990.0,134.0,-490.0,887.0
+perf-windows-latest,sessions,128,A2,20,idle_rss_kib,40738.0,-76.0,-908.0,314.0
+perf-windows-latest,sessions,128,A2,20,idle_threads,144.0,0.0,0.0,0.5
+perf-windows-latest,sessions,128,A2,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-windows-latest,sessions,128,A2,20,idle_switches,5.0,0.0,0.0,0.0
+perf-windows-latest,sessions,1,reactor,20,run_delta_p99_ms,0.1429,-0.0019000000000000059,-0.01125000000000001,0.010650000000000007
+perf-windows-latest,sessions,1,reactor,20,turn_p99_ms,405.11800000000005,0.6475499999999954,-1.872099999999989,5.817649999999958
+perf-windows-latest,sessions,1,reactor,20,active_cpu_ms,39.0625,15.625,-15.625,39.0625
+perf-windows-latest,sessions,1,reactor,20,active_switches,939.0,59.0,44.0,80.5
+perf-windows-latest,sessions,1,reactor,20,idle_rss_kib,11770.0,-4.0,-80.0,54.0
+perf-windows-latest,sessions,1,reactor,20,idle_threads,15.0,0.0,0.0,0.0
+perf-windows-latest,sessions,1,reactor,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-windows-latest,sessions,1,reactor,20,idle_switches,6.0,0.0,-1.0,0.0
+perf-windows-latest,sessions,8,reactor,20,run_delta_p99_ms,0.1604,0.00449999999999999,-0.00714999999999999,0.01819999999999998
+perf-windows-latest,sessions,8,reactor,20,turn_p99_ms,662.17615,46.33594999999997,-1.4072499999999195,76.39065
+perf-windows-latest,sessions,8,reactor,20,active_cpu_ms,367.1875,39.0625,-132.8125,148.4375
+perf-windows-latest,sessions,8,reactor,20,active_switches,5691.0,129.0,43.0,296.0
+perf-windows-latest,sessions,8,reactor,20,idle_rss_kib,15106.0,182.0,-158.0,266.0
+perf-windows-latest,sessions,8,reactor,20,idle_threads,25.0,0.0,0.0,0.0
+perf-windows-latest,sessions,8,reactor,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-windows-latest,sessions,8,reactor,20,idle_switches,5.0,0.0,0.0,0.0
+perf-windows-latest,sessions,32,reactor,20,run_delta_p99_ms,0.188,-0.008849999999999983,-0.04304999999999998,0.0208
+perf-windows-latest,sessions,32,reactor,20,turn_p99_ms,3253.2719500000003,102.08504999999991,-51.14505000000008,349.4850000000001
+perf-windows-latest,sessions,32,reactor,20,active_cpu_ms,1593.75,-156.25,-515.625,585.9375
+perf-windows-latest,sessions,32,reactor,20,active_switches,22399.0,380.0,262.0,773.5
+perf-windows-latest,sessions,32,reactor,20,idle_rss_kib,20674.0,-68.0,-178.0,118.0
+perf-windows-latest,sessions,32,reactor,20,idle_threads,50.0,0.0,-0.5,0.0
+perf-windows-latest,sessions,32,reactor,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-windows-latest,sessions,32,reactor,20,idle_switches,5.0,0.0,0.0,0.0
+perf-windows-latest,sessions,128,reactor,20,run_delta_p99_ms,0.2512,-0.011249999999999968,-0.04214999999999999,0.020000000000000018
+perf-windows-latest,sessions,128,reactor,20,turn_p99_ms,11604.58455,214.5593999999992,58.65530000000035,407.94334999999955
+perf-windows-latest,sessions,128,reactor,20,active_cpu_ms,6867.1875,-171.875,-843.75,78.125
+perf-windows-latest,sessions,128,reactor,20,active_switches,90990.0,1455.5,876.5,2078.5
+perf-windows-latest,sessions,128,reactor,20,idle_rss_kib,40738.0,-88.0,-758.0,458.0
+perf-windows-latest,sessions,128,reactor,20,idle_threads,144.0,0.0,-1.0,0.0
+perf-windows-latest,sessions,128,reactor,20,idle_cpu_ms,0.0,0.0,0.0,0.0
+perf-windows-latest,sessions,128,reactor,20,idle_switches,5.0,0.0,0.0,0.0
+perf-windows-latest,round_trip,0,A2,20,p50_us,136.0,-0.09999999999999432,-0.25,0.5
+perf-windows-latest,round_trip,0,A2,20,p90_us,151.55,-0.549999999999983,-1.1999999999999886,0.20000000000001705
+perf-windows-latest,round_trip,0,A2,20,p99_us,179.6,-2.8499999999999943,-10.549999999999997,-0.3499999999999943
+perf-windows-latest,round_trip,0,A2,20,cpu_ms,1078.1,-23.399999999999977,-101.5,62.450000000000045
+perf-windows-latest,round_trip,0,A2,20,switches,46622.0,-109.5,-277.0,55.0
+perf-windows-latest,round_trip,0,reactor,20,p50_us,136.0,-47.00000000000001,-51.949999999999996,-39.699999999999996
+perf-windows-latest,round_trip,0,reactor,20,p90_us,151.55,-36.79999999999999,-38.4,-35.25
+perf-windows-latest,round_trip,0,reactor,20,p99_us,179.6,1382.8,5.0,1944.6
+perf-windows-latest,round_trip,0,reactor,20,cpu_ms,1078.1,-179.65000000000003,-242.19999999999987,-78.09999999999997
+perf-windows-latest,round_trip,0,reactor,20,switches,46622.0,-12110.5,-12205.5,-11261.0
