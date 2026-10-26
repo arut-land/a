@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use boltffi::{EventSubscription, StreamProducer, export};
@@ -13,7 +14,8 @@ use client::{ConnId, Effect, Event, EventKind, Renderer, SessionClient, Show, We
 use protocol::{Caps, DaemonMsg, Decode};
 
 use crate::{
-    ChangeBatch, ClientError, Resync, SessionSnapshot, StreamingText, TITLE, TurnInfo, ViewChange,
+    ChangeBatch, ClientError, LinkState, Resync, SessionSnapshot, StreamingText, TITLE, TurnInfo,
+    ViewChange,
 };
 
 /// How many updates a stream buffers for a slow reader before it drops.
@@ -271,16 +273,21 @@ impl Feed {
 
     /// Replays retained changes, coalescing invalidations against `from`.
     /// A lost replay range or replaced view requires a snapshot.
+    #[cfg(test)]
     pub fn resync(&self, from: u64) -> Resync {
+        self.prepare(from)
+            .render(&AtomicBool::new(false), || {})
+            .unwrap()
+    }
+
+    fn prepare(&self, from: u64) -> PreparedResync {
         let kept = from == self.rev
             || self
                 .recent
                 .front()
                 .is_some_and(|u| u.revision <= from.saturating_add(1));
         if !kept {
-            return Resync::Snapshot {
-                snapshot: self.snapshot(),
-            };
+            return self.prepare_snapshot();
         }
         let updates = || self.recent.iter().filter(|update| update.revision > from);
         if !updates().any(|update| {
@@ -291,9 +298,9 @@ impl Feed {
                 )
             })
         }) {
-            return Resync::Updates {
+            return PreparedResync::Ready(Resync::Updates {
                 updates: updates().cloned().collect(),
-            };
+            });
         }
         let mut items = BTreeMap::new();
         let mut changes = Vec::new();
@@ -302,9 +309,7 @@ impl Feed {
                 ViewChange::Snapshot { .. }
                 | ViewChange::ViewInvalidated
                 | ViewChange::Attached { reset: true, .. } => {
-                    return Resync::Snapshot {
-                        snapshot: self.snapshot(),
-                    };
+                    return self.prepare_snapshot();
                 }
                 ViewChange::Added { index, .. } => {
                     items.insert(*index, true);
@@ -326,23 +331,163 @@ impl Feed {
         }
         let view = self.client.view();
         // Items only append between the view replacements rejected above.
-        for (index, added) in items {
-            let item = crate::DisplayItem::in_view(&view.items[index as usize], view);
-            changes.push(if added {
-                ViewChange::Added { index, item }
-            } else {
-                ViewChange::Updated { index, item }
-            });
-        }
-        Resync::Patch {
+        let items = items
+            .into_iter()
+            .map(|(index, added)| (index, added, view.items[index as usize].clone()))
+            .collect();
+        let mut presentation = protocol::view::SessionView::default();
+        presentation.state = view.state.clone();
+        PreparedResync::Patch {
             from,
             update: self.update(changes),
+            presentation: Box::new(presentation),
+            items,
             streaming: view.streaming.as_ref().map(|stream| StreamingText {
                 call: stream.call.get(),
                 attempt: stream.attempt,
                 text: stream.text.clone(),
             }),
         }
+    }
+
+    fn prepare_snapshot(&self) -> PreparedResync {
+        PreparedResync::Snapshot {
+            view: Box::new(self.client.view().clone()),
+            rev: self.rev,
+            retained_bytes: self.retained_bytes() as u64,
+            link: self.client.link().into(),
+            turn: self.client.turn().into(),
+        }
+    }
+}
+
+/// An owned revision, captured under the feed lock and rendered without it.
+enum PreparedResync {
+    Ready(Resync),
+    Snapshot {
+        view: Box<protocol::view::SessionView>,
+        rev: u64,
+        retained_bytes: u64,
+        link: LinkState,
+        turn: TurnInfo,
+    },
+    Patch {
+        from: u64,
+        update: ChangeBatch,
+        presentation: Box<protocol::view::SessionView>,
+        items: Vec<(u32, bool, protocol::view::Item)>,
+        streaming: Option<StreamingText>,
+    },
+}
+
+impl PreparedResync {
+    fn render(self, cancelled: &AtomicBool, mut rendered: impl FnMut()) -> Option<Resync> {
+        let result = match self {
+            Self::Ready(result) => result,
+            Self::Snapshot {
+                view,
+                rev,
+                retained_bytes,
+                link,
+                turn,
+            } => {
+                let mut items = Vec::with_capacity(view.items.len());
+                for item in &view.items {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    items.push(crate::DisplayItem::in_view(item, &view));
+                    rendered();
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    return None;
+                }
+                Resync::Snapshot {
+                    snapshot: SessionSnapshot::with_items(
+                        &view,
+                        rev,
+                        retained_bytes,
+                        link,
+                        turn,
+                        items,
+                    ),
+                }
+            }
+            Self::Patch {
+                from,
+                mut update,
+                presentation,
+                items,
+                streaming,
+            } => {
+                for (index, added, raw) in items {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    let item = crate::DisplayItem::in_view(&raw, &presentation);
+                    update.changes.push(if added {
+                        ViewChange::Added { index, item }
+                    } else {
+                        ViewChange::Updated { index, item }
+                    });
+                    rendered();
+                }
+                Resync::Patch {
+                    from,
+                    update,
+                    streaming,
+                }
+            }
+        };
+        (!cancelled.load(Ordering::Relaxed)).then_some(result)
+    }
+}
+
+/// One cancellable recovery build. Cancellation also covers a worker waiting
+/// for the feed lock; rendering owns its captured revision after that lock is released.
+pub struct Recovery {
+    feed: Arc<Mutex<Feed>>,
+    from: u64,
+    cancelled: AtomicBool,
+}
+
+impl Recovery {
+    pub(crate) fn new(feed: Arc<Mutex<Feed>>, from: u64) -> Self {
+        Self {
+            feed,
+            from,
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    fn render(&self, rendered: impl FnMut()) -> Option<Resync> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let prepared = {
+            let feed = lock(&self.feed);
+            if self.cancelled.load(Ordering::Relaxed) {
+                return None;
+            }
+            feed.prepare(self.from)
+        };
+        if self.cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        prepared.render(&self.cancelled, rendered)
+    }
+}
+
+#[export]
+impl Recovery {
+    /// Builds the captured revision off the caller's UI thread. `None` means cancelled.
+    pub fn build(&self) -> Option<Resync> {
+        self.render(|| {})
+    }
+
+    /// Stops the build at its next item, before hashing, or before returning a result.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 }
 
@@ -365,7 +510,7 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// the bindings' tests run the shared vectors through, and a way to fold a
 /// recorded session. It folds as if from a connection that is live.
 pub struct Reducer {
-    feed: Mutex<Feed>,
+    feed: Arc<Mutex<Feed>>,
 }
 
 impl Default for Reducer {
@@ -393,7 +538,7 @@ impl Reducer {
             },
         });
         Self {
-            feed: Mutex::new(Feed::new(client)),
+            feed: Arc::new(Mutex::new(Feed::new(client))),
         }
     }
 
@@ -435,7 +580,12 @@ impl Reducer {
     }
 
     pub fn resync(&self, from: u64) -> Resync {
-        lock(&self.feed).resync(from)
+        self.recovery(from).build().expect("uncancelled recovery")
+    }
+
+    /// Prepares a recovery handle without locking or rendering the feed.
+    pub fn recovery(&self, from: u64) -> Recovery {
+        Recovery::new(Arc::clone(&self.feed), from)
     }
 
     /// The log-derived state as JSON, the form the vectors' `state` is in.
@@ -452,6 +602,65 @@ impl Reducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_releases_the_feed_during_rendering_and_cancellation_stops_remaining_items() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let reducer = Reducer::new();
+        for seq in 1..=3 {
+            let message = DaemonMsg::Entry(protocol::Entry::new(
+                protocol::Seq::new(seq).unwrap(),
+                protocol::Epoch(0),
+                protocol::Body::Assistant {
+                    text: "x".repeat(1 << 20),
+                },
+            ));
+            reducer
+                .fold(&serde_json::to_string(&message).unwrap())
+                .unwrap();
+        }
+        // A lost replay range exercises the full-history rendering path.
+        lock(&reducer.feed).recent.clear();
+        let recovery = Arc::new(reducer.recovery(0));
+        let worker = Arc::clone(&recovery);
+        let (rendered, rendering) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let build = thread::spawn(move || {
+            let mut count = 0;
+            let result = worker.render(|| {
+                count += 1;
+                if count == 1 {
+                    rendered.send(()).unwrap();
+                    resumed.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+            });
+            (result, count)
+        });
+        rendering.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The first item has actually rendered and two still remain. UI commands
+        // must acquire this same lock before recovery finishes.
+        let available = reducer.feed.try_lock().is_ok();
+        recovery.cancel();
+        resume.send(()).unwrap();
+        let (result, count) = build.join().unwrap();
+        assert!(
+            available,
+            "rendering must not block commands on the feed mutex"
+        );
+        assert!(result.is_none(), "cancelled results never reach the UI");
+        assert_eq!(count, 1, "cancellation stops the remaining history render");
+        let Resync::Snapshot { snapshot } = reducer.resync(0) else {
+            panic!("snapshot required")
+        };
+        assert_eq!(
+            snapshot.items.len(),
+            3,
+            "cancellation does not discard the view"
+        );
+    }
 
     #[test]
     fn retained_payload_releases_replaced_views_and_evicted_updates() {

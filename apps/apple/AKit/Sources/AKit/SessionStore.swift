@@ -1,6 +1,33 @@
 import Foundation
 import Observation
 
+/// A view source whose recovery worker follows task cancellation.
+public protocol RecoveringViewSource: ViewSource {
+    nonisolated func recover(from: UInt64) async -> Resync?
+}
+
+extension Recovery: @retroactive @unchecked Sendable {}
+
+extension Session: RecoveringViewSource {
+    public nonisolated func recover(from: UInt64) async -> Resync? {
+        await buildRecovery(recovery(from: from))
+    }
+}
+
+extension Reducer: RecoveringViewSource {
+    public nonisolated func recover(from: UInt64) async -> Resync? {
+        await buildRecovery(recovery(from: from))
+    }
+}
+
+private nonisolated func buildRecovery(_ recovery: Recovery) async -> Resync? {
+    await withTaskCancellationHandler {
+        await Task.detached { recovery.build() }.value
+    } onCancel: {
+        recovery.cancel()
+    }
+}
+
 public enum CacheState: Equatable {
     case active, cached, detached
 }
@@ -46,7 +73,7 @@ public final class SessionStore {
     fileprivate var retainedBytes: UInt64 = 0
     @ObservationIgnored fileprivate var viewChanged: (() -> Void)?
 
-    @ObservationIgnored private var source: (any ViewSource)?
+    @ObservationIgnored private var source: (any RecoveringViewSource)?
     @ObservationIgnored private var session: Session?
     @ObservationIgnored fileprivate var attachmentChanged: ((SessionStore) -> Void)?
     @ObservationIgnored private(set) var recovery: Task<Void, Never>?
@@ -61,7 +88,7 @@ public final class SessionStore {
     }
 
     /// A store following any source, such as a reducer fed by hand.
-    public init(source: any ViewSource) {
+    public init(source: any RecoveringViewSource) {
         self.source = source
         self.session = nil
     }
@@ -185,8 +212,8 @@ public final class SessionStore {
         let from = rev
         let generation = recoveryGeneration
         recovery = Task { [weak self] in
-            let result = await Task.detached { source.resync(from: from) }.value
-            guard let self, !Task.isCancelled, generation == self.recoveryGeneration else { return }
+            let result = await source.recover(from: from)
+            guard let self, let result, !Task.isCancelled, generation == self.recoveryGeneration else { return }
             self.recovery = nil
             switch result {
             case .updates(let updates):

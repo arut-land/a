@@ -277,7 +277,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
 }
 
 /// Delays a real resync result after Rust has built it, without holding its feed lock.
-nonisolated private final class DelayedRecovery: ViewSource, Sendable {
+nonisolated private final class DelayedRecovery: RecoveringViewSource, Sendable {
     let reducer: Reducer
     let release = DispatchSemaphore(value: 0)
     let waiting = Mutex(false)
@@ -285,6 +285,10 @@ nonisolated private final class DelayedRecovery: ViewSource, Sendable {
     init(_ reducer: Reducer) { self.reducer = reducer }
 
     func updates() -> AsyncStream<ChangeBatch> { reducer.updates() }
+
+    func recover(from: UInt64) async -> Resync? {
+        await Task.detached { self.resync(from: from) }.value
+    }
 
     func resync(from: UInt64) -> Resync {
         let result = reducer.resync(from: from)
@@ -301,8 +305,7 @@ nonisolated private final class DelayedRecovery: ViewSource, Sendable {
     defer { source.release.signal() }
     let store = SessionStore(source: source)
     store.apply(updates.last!)
-    // Reaching this condition on MainActor while resync is blocked proves it stays responsive.
-    try await eventually("snapshot built off MainActor") { source.waiting.withLock { $0 } }
+    try await eventually("snapshot captured before newer updates") { source.waiting.withLock { $0 } }
     let recovery = store.recovery
     for update in updates { store.apply(update) }
     let newer = try #require(try reducer.fold(message: vector.messages.last!))
@@ -353,6 +356,17 @@ private func inputFrame(seq: UInt64, text: String) throws -> String {
     frame["seq"] = seq
     frame["segments"] = [["text": text]]
     return String(decoding: try JSONSerialization.data(withJSONObject: frame), as: UTF8.self)
+}
+
+@Test func cancellingTheRecoveryTaskCancelsItsRustWorker() async throws {
+    let reducer = Reducer()
+    _ = try reducer.fold(message: inputFrame(seq: 1, text: String(repeating: "x", count: 1 << 20)))
+    let recovery = Task { await reducer.recover(from: 0) }
+    // The task cannot begin until this MainActor turn yields. Cancellation must
+    // reach the Rust handle even when it precedes worker creation.
+    recovery.cancel()
+    #expect(await recovery.value == nil)
+    #expect(reducer.snapshot().items.count == 1)
 }
 
 @Test func largeItemsRecoverWithoutARevisionGap() async throws {

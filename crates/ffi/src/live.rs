@@ -22,7 +22,8 @@ use sys::{Home, Staged};
 use crate::feed::{Feed, lock};
 use crate::{
     AppAction, BlobPiece, ChangeBatch, CliStatus, ClientError, CommandHelp, OpenTarget,
-    QueryAnswer, Resync, SessionInfo, SessionListUpdate, SessionSnapshot, Settings, TurnInfo,
+    QueryAnswer, Recovery, Resync, SessionInfo, SessionListUpdate, SessionSnapshot, Settings,
+    TurnInfo,
 };
 
 fn runtime() -> &'static Arc<Threads> {
@@ -585,7 +586,12 @@ impl Session {
     /// What came after `from`: replay, a coalesced patch, or a snapshot.
     /// Builds display data; call off the UI thread.
     pub fn resync(&self, from: u64) -> Resync {
-        lock(&self.feed).resync(from)
+        self.recovery(from).build().expect("uncancelled recovery")
+    }
+
+    /// Prepares a recovery handle without locking or rendering the feed.
+    pub fn recovery(&self, from: u64) -> Recovery {
+        Recovery::new(Arc::clone(&self.feed), from)
     }
 
     /// What the controls offer for the turn now.
