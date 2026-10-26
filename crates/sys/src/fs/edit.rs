@@ -2134,7 +2134,20 @@ mod tests {
         let work = Workspace::new();
         fs::write(work.target(), b"original").unwrap();
         let transaction = work.capture();
+        #[cfg(unix)]
         fs::write(work.target(), b"changed").unwrap();
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                fs::write(work.target(), b"changed")
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(32)
+            );
+            let incoming = work.0.join("incoming");
+            fs::write(&incoming, b"changed").unwrap();
+            super::super::replace(&incoming, &work.target()).unwrap();
+        }
         let mut captured = Vec::new();
         transaction.original().unwrap().rewind().unwrap();
         transaction
