@@ -115,24 +115,38 @@ fn an_image_too_large_or_unread_is_converted_to_fit() {
     assert_eq!(output["image"]["converted"]["width"], 3000);
 }
 
-/// A screenshot of a 5K display decodes to 59 MB of RGBA: its rows are
-/// scaled as they are read, so it is never held whole.
 #[test]
-fn a_screen_sized_png_is_scaled_without_being_decoded_whole() {
+fn png_scaling_preserves_pixels_and_alpha() {
+    scaled_png(2400, 1200, (2000, 1000));
+}
+
+#[test]
+#[ignore = "resource test: run alone; converts a 59 MB decoded screenshot"]
+fn a_screen_sized_png_preserves_pixels_and_alpha() {
+    scaled_png(5120, 2880, (2000, 1125));
+}
+
+fn scaled_png(width: u32, height: u32, expected: (u32, u32)) {
     let rig = Rig::new("read-screen", registry());
-    let screen = RgbaImage::from_fn(5120, 2880, |x, y| {
-        Rgba([low(x / 64), low(y / 64), 40, if x < 2560 { 255 } else { 0 }])
-    });
-    screen
-        .save_with_format(rig.workspace().join("screen.png"), ImageFormat::Png)
-        .unwrap();
+    {
+        let screen = RgbaImage::from_fn(width, height, |x, y| {
+            Rgba([
+                low(x / 64),
+                low(y / 64),
+                40,
+                if x < width / 2 { 255 } else { 0 },
+            ])
+        });
+        screen
+            .save_with_format(rig.workspace().join("screen.png"), ImageFormat::Png)
+            .unwrap();
+    }
     let (output, bytes, _) = read(&rig, "screen.png");
     let sent = image::load_from_memory(&bytes).unwrap().into_rgba8();
-    assert_eq!(sent.dimensions(), (2000, 1125));
-    assert_eq!(output["image"]["converted"]["width"], 5120);
-    // Each pixel the mean of the block it covers.
+    assert_eq!(sent.dimensions(), expected);
+    assert_eq!(output["image"]["converted"]["width"], width);
     assert_eq!(sent.get_pixel(10, 10).0, [0, 0, 40, 255]);
-    assert_eq!(sent.get_pixel(1990, 10).0[3], 0);
+    assert_eq!(sent.get_pixel(expected.0 - 10, 10).0[3], 0);
 }
 
 #[test]
@@ -216,20 +230,30 @@ fn a_turned_jpeg_is_sent_upright() {
     assert_eq!(output["image"]["converted"]["width"], 40);
 }
 
-/// A 24 MP photo decodes to more than the CPU workers' whole budget, were
-/// it decoded whole: it is decoded at a DCT scale, and converted still.
 #[test]
+fn jpeg_scaling_preserves_the_aspect_ratio() {
+    scaled_jpeg(2400, 1600, (2000, 1333));
+}
+
+#[test]
+#[ignore = "resource test: run alone; converts a 24 MP photo"]
 fn a_large_photo_is_converted() {
+    scaled_jpeg(6000, 4000, (2000, 1333));
+}
+
+fn scaled_jpeg(width: u32, height: u32, expected: (u32, u32)) {
     let rig = Rig::new("read-photo", registry());
-    let photo = image::GrayImage::from_fn(6000, 4000, |x, y| image::Luma([low(x ^ y)]));
-    photo
-        .save_with_format(rig.workspace().join("photo.jpg"), ImageFormat::Jpeg)
-        .unwrap();
+    {
+        let photo = image::GrayImage::from_fn(width, height, |x, y| image::Luma([low(x ^ y)]));
+        photo
+            .save_with_format(rig.workspace().join("photo.jpg"), ImageFormat::Jpeg)
+            .unwrap();
+    }
     let (output, bytes, blob) = read(&rig, "photo.jpg");
     assert_eq!(blob.media_type, "image/jpeg");
     let sent = image::load_from_memory(&bytes).unwrap();
-    assert_eq!((sent.width(), sent.height()), (2000, 1333));
-    assert_eq!(output["image"]["converted"]["width"], 6000);
+    assert_eq!((sent.width(), sent.height()), expected);
+    assert_eq!(output["image"]["converted"]["width"], width);
 }
 
 #[test]
@@ -309,12 +333,22 @@ fn png_orientation_is_applied_before_pass_through_or_scaling() {
 }
 
 #[test]
+fn unselected_lines_can_exceed_the_text_limit() {
+    unselected_line((8 << 20) + 1);
+}
+
+#[test]
+#[ignore = "resource test: run alone; scans a 2 GiB sparse line"]
 fn unselected_lines_can_exceed_the_image_and_text_limits() {
+    unselected_line((2 << 30) + 1);
+}
+
+fn unselected_line(length: u64) {
     use std::io::{Seek as _, SeekFrom, Write as _};
     let rig = Rig::new("read-long-line", registry());
     let mut file = std::fs::File::create(rig.workspace().join("long.txt")).unwrap();
     file.write_all(b"before\n").unwrap();
-    file.seek(SeekFrom::Start((2 << 30) + 1)).unwrap();
+    file.seek(SeekFrom::Start(length)).unwrap();
     file.write_all(b"\nafter\n").unwrap();
     drop(file);
     let outcome = rig.call(
@@ -325,12 +359,22 @@ fn unselected_lines_can_exceed_the_image_and_text_limits() {
 }
 
 #[test]
+fn an_image_magic_prefix_still_allows_a_large_text_window() {
+    image_magic_text((8 << 20) + 1);
+}
+
+#[test]
+#[ignore = "resource test: run alone; crosses the 512 MiB image limit"]
 fn an_image_magic_prefix_does_not_limit_a_text_files_size() {
+    image_magic_text((512 << 20) + 1);
+}
+
+fn image_magic_text(length: u64) {
     use std::io::{Seek as _, SeekFrom, Write as _};
     let rig = Rig::new("read-large-magic", registry());
     let mut file = std::fs::File::create(rig.workspace().join("notes.txt")).unwrap();
     file.write_all(b"BMW notes\n").unwrap();
-    file.seek(SeekFrom::Start((512 << 20) + 1)).unwrap();
+    file.seek(SeekFrom::Start(length)).unwrap();
     file.write_all(b"\n").unwrap();
     drop(file);
     let outcome = rig.call("read", &json!({"path": "notes.txt", "limit": 1}));
