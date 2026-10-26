@@ -116,7 +116,9 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   `restart`), reads it asynchronously and posts each message to the sink as an
   `Event`; `Send` writes on the newest connection (the session client
   numbered it); `SendEnvironment` captures this process's environment
-  again (or asks the `origin` given) and sends it; `Hangup` drops the
+  again (or asks the `origin` given) and sends it. Initial `Env::Origin`
+  attaches ask the same callback locally and keep the bridge environment
+  remotely; `Hangup` drops the
   writer. `pump(renderer, effects)` is the fixpoint every app runs: the
   `Io` is done, the `Show`s go to the `Renderer`, and what showing asks
   for goes round again; a send that failed is shown as a notice. Cheap to
@@ -124,7 +126,13 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
 - **`Inbox`.** The one queue the app's thread sleeps on, posted to by the
   driver's tasks and the input thread: a lock around a `VecDeque` rather than
   `mpsc`, which instantiates all three channel flavours per type (7–15 KiB
-  each).
+  each). `Driver::with_inbox` awaits space before reading another daemon
+  event; the budget bounds pending delivery, never the history that can be
+  opened. One oversized event can occupy an empty data lane. Priority input
+  has its own byte and request accounting, and outgoing control writes and
+  cancellation continue while delivery waits. Session connections carry an
+  `Attach`; list watches carry only their client identity and reconnect
+  without constructing a session attach.
 - **`Daemons`.** The daemons a client holds, one per machine, each a
   `Member { name, daemon }`; the first is the default, where a new session
   starts. Every app holds one today (this machine's as `local`, or
@@ -193,8 +201,8 @@ impl Renderer for App {
     fn show(&mut self, shown: Vec<Show>) -> Vec<Effect> { /* View, Link, Sessions, Notice */ }
 }
 
-let (post, inbox) = client::inbox();
-let driver = Driver::new(daemon, move |_, event| { let _ = post.send(Input::Daemon(event)); });
+let (post, inbox) = client::inbox(client::QueueBudget::default(), |_| 4096);
+let driver = Driver::with_inbox(post.clone(), Input::Daemon).start(runtime, daemon);
 let mut app = App { session: SessionClient::new(Env::Origin), .. };
 driver.pump(&mut app, app.session.attach(Attach::new(target, Env::Origin)));
 while let Some(input) = inbox.recv() {

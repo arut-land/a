@@ -83,7 +83,7 @@ impl App {
         let Some((_, tx)) = lock(&self.tabs).get(tab).cloned() else {
             return false;
         };
-        tx.send(what).is_ok()
+        tx.send_first(what).is_ok()
     }
 
     /// Answers a request the gate let through.
@@ -134,29 +134,32 @@ impl App {
                 };
                 return Reply::Events(Box::new(Live::open(Arc::clone(self), tab, session)));
             }
-            (&Method::POST, "/api/send", _) => match signals(&body) {
-                Some(Signals { draft, .. }) if draft.trim().is_empty() => done(true),
-                Some(Signals { tab, draft }) => {
-                    let (reply, admitted) = rt::oneshot::channel();
-                    if !self.tell(&tab, TabIn::Line(draft.clone(), reply)) {
-                        done(false)
-                    } else if admitted.await == Some(true) {
-                        whole(
-                            StatusCode::OK,
-                            "application/json",
-                            serde_json::to_vec(&serde_json::json!({ "admitted": draft })).unwrap(),
-                        )
-                    } else {
-                        text(StatusCode::CONFLICT, "submission rejected; draft kept")
+            (&Method::POST, "/api/send", _) => {
+                match serde_json::from_slice::<Signals>(&body).ok() {
+                    Some(Signals { draft, .. }) if draft.trim().is_empty() => done(true),
+                    Some(Signals { tab, draft }) => {
+                        let (reply, admitted) = rt::oneshot::channel();
+                        if !self.tell(&tab, TabIn::Line(draft.clone(), reply)) {
+                            done(false)
+                        } else if admitted.await == Some(true) {
+                            whole(
+                                StatusCode::OK,
+                                "application/json",
+                                serde_json::to_vec(&serde_json::json!({ "admitted": draft }))
+                                    .unwrap(),
+                            )
+                        } else {
+                            text(StatusCode::CONFLICT, "submission rejected; draft kept")
+                        }
                     }
+                    None => done(false),
                 }
-                None => done(false),
-            },
+            }
             (&Method::POST, "/api/approve", _) => {
                 let call = param(query, "call")
                     .and_then(|c| c.parse().ok().and_then(protocol::CallId::new));
                 let approved = param(query, "ok") == Some("1");
-                match (signals(&body), call) {
+                match (serde_json::from_slice::<Signals>(&body).ok(), call) {
                     (Some(Signals { tab, .. }), Some(call)) => {
                         done(self.tell(&tab, TabIn::Cmd(Cmd::Approve { call, approved })))
                     }
@@ -165,10 +168,12 @@ impl App {
             }
             // Stops the running turn: its model or tool call, and the rest
             // of it.
-            (&Method::POST, "/api/interrupt", _) => match signals(&body) {
-                Some(Signals { tab, .. }) => done(self.tell(&tab, TabIn::Cmd(Cmd::Interrupt))),
-                None => done(false),
-            },
+            (&Method::POST, "/api/interrupt", _) => {
+                match serde_json::from_slice::<Signals>(&body).ok() {
+                    Some(Signals { tab, .. }) => done(self.tell(&tab, TabIn::Cmd(Cmd::Interrupt))),
+                    None => done(false),
+                }
+            }
             _ => text(StatusCode::NOT_FOUND, "not found"),
         };
         Reply::Whole(response)
@@ -190,10 +195,6 @@ fn done(told: bool) -> http::Response<Vec<u8>> {
     } else {
         text(StatusCode::NOT_FOUND, "this tab is not live; reload it")
     }
-}
-
-fn signals(body: &[u8]) -> Option<Signals> {
-    serde_json::from_slice(body).ok()
 }
 
 fn param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
@@ -235,8 +236,7 @@ impl Live {
                 }
         });
         let tx = Arc::new(tx);
-        let events = Arc::clone(&tx);
-        let driver = Driver::new(move |driver, event| events.event(driver, event, TabIn::Client))
+        let driver = Driver::with_inbox(tx.as_ref().clone(), TabIn::Client)
             .start(app.rt.clone(), app.daemons.first().daemon.clone());
         let stream = app.streams.fetch_add(1, Ordering::Relaxed);
         lock(&app.tabs).insert(id.to_owned(), (stream, tx));
@@ -313,6 +313,61 @@ impl Drop for Live {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_cannot_reject_composer_interrupt_or_approval_input() {
+        let runtime: Rt = Arc::new(rt::Threads::new(1));
+        let daemon = client::Daemon::local(
+            sys::Home::from(std::env::temp_dir().join("a-web-unused-priority-home")),
+            sys::Staged {
+                id: "test".into(),
+                exe: std::env::current_exe().unwrap(),
+            },
+        );
+        let app = App::new(Daemons::one("local", daemon), runtime, Gate::new(1));
+        let (post, inbox) = client::inbox(
+            client::QueueBudget {
+                bytes: 8192,
+                requests: 4,
+                control_reserve: 1,
+            },
+            |_| 1,
+        );
+        for _ in 0..3 {
+            post.send(TabIn::Client(Event {
+                conn: client::ConnId(1),
+                kind: client::EventKind::Waiting,
+            }))
+            .ok()
+            .unwrap();
+        }
+        lock(&app.tabs).insert("tab".into(), (1, Arc::new(post)));
+        let (reply, _accepted) = rt::oneshot::channel();
+        assert!(app.tell("tab", TabIn::Line("draft".into(), reply)));
+        assert!(app.tell("tab", TabIn::Cmd(Cmd::Interrupt)));
+        assert!(app.tell(
+            "tab",
+            TabIn::Cmd(Cmd::Approve {
+                call: protocol::CallId::new(1).unwrap(),
+                approved: true
+            })
+        ));
+        assert!(matches!(inbox.try_recv(), Some(TabIn::Line(text, _)) if text == "draft"));
+        assert!(matches!(inbox.try_recv(), Some(TabIn::Cmd(Cmd::Interrupt))));
+        assert!(matches!(
+            inbox.try_recv(),
+            Some(TabIn::Cmd(Cmd::Approve { approved: true, .. }))
+        ));
+        for _ in 0..3 {
+            assert!(matches!(
+                inbox.try_recv(),
+                Some(TabIn::Client(Event {
+                    kind: client::EventKind::Waiting,
+                    ..
+                }))
+            ));
+        }
+    }
 
     #[test]
     fn sustained_input_cannot_starve_rendering() {

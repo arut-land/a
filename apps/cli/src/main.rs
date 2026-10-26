@@ -72,7 +72,17 @@ fn main() -> ExitCode {
                     here(&home, args.host.as_ref())?,
                     token.as_deref().unwrap_or(&daemon.staged.id),
                 ),
-                Some(Cmd::Web { no_open }) => web(daemons.clone(), !no_open),
+                Some(Cmd::Web { no_open }) => {
+                    #[cfg(feature = "web")]
+                    {
+                        web::run(daemons.clone(), !no_open)
+                    }
+                    #[cfg(not(feature = "web"))]
+                    {
+                        let _ = no_open;
+                        Err(io::Error::other("this build of a has no web UI"))
+                    }
+                }
                 Some(Cmd::Daemon { .. }) => {
                     unreachable!("daemon commands are handled before installation")
                 }
@@ -310,10 +320,9 @@ fn repl(daemon: &client::Daemon, target: Target) -> io::Result<()> {
                 Input::Line(None) | Input::Busy => 0,
             }
     });
-    let events = tx.clone();
     let runtime: rt::Rt = std::sync::Arc::new(rt::Threads::default());
-    let driver = Driver::new(move |driver, event| events.event(driver, event, Input::Client))
-        .start(runtime.clone(), daemon.clone());
+    let driver =
+        Driver::with_inbox(tx.clone(), Input::Client).start(runtime.clone(), daemon.clone());
     let mut repl = Repl {
         client: SessionClient::new(Env::Origin),
         screen: Screen::default(),
@@ -419,17 +428,19 @@ impl Repl {
             return;
         };
         // thread-exception: repl-stdin
-        thread::spawn(move || {
-            for line in io::stdin().lock().lines() {
-                let Ok(line) = line else { break };
-                if tx.send(Input::Line(Some(line))).is_err() {
-                    tx.close_with(Input::Busy);
-                    return;
-                }
-            }
-            let _ = tx.send(Input::Line(None));
-        });
+        thread::spawn(move || read_lines(io::stdin().lock(), &tx));
     }
+}
+
+fn read_lines(input: impl BufRead, post: &client::Post<Input>) {
+    for line in input.lines() {
+        let Ok(line) = line else { break };
+        if post.send_first(Input::Line(Some(line))).is_err() {
+            post.close_with(Input::Busy);
+            return;
+        }
+    }
+    let _ = post.send_first(Input::Line(None));
 }
 
 /// Shows what the client tells; what ends the client is kept for the loop.
@@ -690,16 +701,6 @@ fn fork(home: &Home, daemons: &Daemons, source: &str) -> io::Result<()> {
         .map_err(|e| wedged(daemon, e))?;
     sayln!("{}", session.short());
     Ok(())
-}
-
-#[cfg(feature = "web")]
-fn web(daemons: Daemons, open: bool) -> io::Result<()> {
-    web::run(daemons, open)
-}
-
-#[cfg(not(feature = "web"))]
-fn web(_daemons: Daemons, _open: bool) -> io::Result<()> {
-    Err(io::Error::other("this build of a has no web UI"))
 }
 
 /// What whoever started the daemon handed it, by descriptor or handle
@@ -1099,5 +1100,45 @@ mod approval_tests {
                 assert!(text.find(marker).unwrap() < reason, "{marker}: {text}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+    use std::io::{Seek, Write};
+
+    #[test]
+    fn replay_cannot_reject_lines_or_eof_or_erase_the_backlog() {
+        let (post, inbox) = client::inbox(
+            client::QueueBudget {
+                bytes: 8192,
+                requests: 4,
+                control_reserve: 1,
+            },
+            |_| 1,
+        );
+        for conn in 1..=3 {
+            post.send(Input::Client(Event {
+                conn: client::ConnId(conn),
+                kind: client::EventKind::Waiting,
+            }))
+            .ok()
+            .unwrap();
+        }
+        let mut input = tempfile::tempfile().unwrap();
+        input.write_all(b"first\nsecond\n").unwrap();
+        input.rewind().unwrap();
+        read_lines(io::BufReader::new(input), &post);
+        for expected in ["first", "second"] {
+            assert!(matches!(inbox.try_recv(), Some(Input::Line(Some(text))) if text == expected));
+        }
+        assert!(matches!(inbox.try_recv(), Some(Input::Line(None))));
+        for expected in 1..=3 {
+            assert!(
+                matches!(inbox.try_recv(), Some(Input::Client(Event { conn: client::ConnId(conn), .. })) if conn == expected)
+            );
+        }
+        assert!(inbox.try_recv().is_none());
     }
 }

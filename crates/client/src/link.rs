@@ -314,13 +314,13 @@ pub(crate) enum Greeting {
 /// we connect, or draining for a newer build (`on_drain` says so first),
 /// gets one more try each; a daemon that does not welcome the client acts
 /// on none of `first`, so each try sends it again.
-pub(crate) async fn connect(
+pub(crate) async fn connect<F: Future<Output = ()> + Send>(
     rt: &Rt,
     daemon: &Daemon,
     client: Option<ClientId>,
     start: Start,
     first: &(dyn Fn(Option<&Environment>) -> io::Result<Vec<ClientMsg>> + Sync),
-    on_drain: &(dyn Fn() + Sync),
+    on_drain: &(dyn Fn() -> F + Sync),
 ) -> Result<Connection, Error> {
     let (link, build) = (&daemon.link, &daemon.staged);
     let mut start = start;
@@ -378,7 +378,7 @@ pub(crate) async fn connect(
                 return Err(rt::unblock(&**rt, move || link.mismatch(&build, theirs)).await);
             }
             Ok((Greeting::Draining, ..)) => {
-                on_drain();
+                on_drain().await;
                 // One still draining past its grace is wedged.
                 rt::or(stream.drained(&mut buffered), async {
                     rt.sleep(crate::DRAIN_TIMEOUT).await;

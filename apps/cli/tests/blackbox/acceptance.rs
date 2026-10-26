@@ -15,6 +15,57 @@ const ANY: Target = Target::Latest {
 };
 
 #[test]
+fn a_history_larger_than_the_pending_event_budget_opens_without_loss() {
+    let env = Env::new("replay-backpressure");
+    env.start();
+    let mut conn = env.connect();
+    let (id, _) = conn.attach(Target::New, &env.ws);
+    conn.input("history survives a slow renderer");
+    conn.until(|entry| matches!(&entry.body, Body::Assistant { text } if text == "history survives a slow renderer"));
+    let expected = env.log(id);
+    assert!(expected.len() > 2);
+
+    let (post, inbox) = client::inbox(
+        client::QueueBudget {
+            bytes: 8192,
+            requests: 2,
+            control_reserve: 1,
+        },
+        client::Event::retained_bytes,
+    );
+    let runtime: rt::Rt = std::sync::Arc::new(rt::Threads::new(1));
+    let daemon = client::Daemon::local(
+        env.home.clone(),
+        env.home.runtime().stage(&env.exe).unwrap(),
+    );
+    let driver = client::Driver::with_inbox(post, std::convert::identity).start(runtime, daemon);
+    let mut session = client::SessionClient::new(client::Env::Keep);
+    driver.pump(&mut (), session.open(Target::Id(id)));
+    // The writer must still progress with a one-event inbox before rendering.
+    driver.io(client::Io::Send(ClientMsg::List)).unwrap();
+    rt::block_on(driver.flush()).unwrap();
+    let mut replayed = Vec::new();
+    loop {
+        let event = inbox
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("replay must keep progressing");
+        let synced = matches!(
+            event.kind,
+            client::EventKind::Msg(protocol::DaemonMsg::Synced { .. })
+        );
+        if let client::EventKind::Msg(protocol::DaemonMsg::Entry(ref entry)) = event.kind {
+            replayed.push(entry.clone());
+        }
+        driver.pump(&mut (), session.step(event));
+        if synced {
+            break;
+        }
+        assert!(session.link().attached());
+    }
+    assert_eq!(replayed, expected);
+}
+
+#[test]
 fn concurrent_cold_starts_make_exactly_one_daemon() {
     let env = Env::new("one-daemon");
     let clients: Vec<_> = (0..8).map(|_| env.cmd(&["ls"]).spawn().unwrap()).collect();
