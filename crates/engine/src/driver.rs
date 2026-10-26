@@ -27,8 +27,8 @@ use ext::host::{Binding, Bound, Host, Parts, Registry, SessionServices};
 use ext::point::View;
 use ext::{BoxFuture, Called, Cancel, Cx, Flag, States};
 use kernel::{
-    Admission, Core, Durability, Event, Guarded, Load, Note, Owner, Replied, Requirement, StepPlan,
-    Ticket, Work as Effect,
+    Admission, Core, Event, Guarded, Load, Note, Owner, Replied, Requirement, StepPlan, Ticket,
+    Work as Effect,
 };
 use protocol::ledger::Ledger;
 use protocol::view::SessionView;
@@ -50,7 +50,7 @@ use kernel::SideFact;
 mod journal;
 #[path = "projection.rs"]
 mod projection;
-use journal::Journal;
+use journal::{FlushMode, Journal};
 use projection::{Invocations, Projection};
 #[path = "work.rs"]
 mod work;
@@ -2056,9 +2056,6 @@ impl Actor {
         Ok(())
     }
 
-    /// Appends a burst once, then admits each effect against the prefix
-    /// and requirement declared by the kernel. Publication and unsafe
-    /// effects share an epoch while ordered work keeps making progress.
     /// An ephemeral turn's result entry ends its attempt's watch; one an
     /// interrupt wrote first, before the turn reported, settles the attempt
     /// it cut off, sent or not.
@@ -2085,12 +2082,15 @@ impl Actor {
         }
     }
 
+    /// Appends a burst once, then admits each effect against the prefix
+    /// and requirement declared by the kernel. Publication and unsafe
+    /// effects share an epoch while ordered work keeps making progress.
     async fn carry(&mut self, plan: StepPlan) -> Result<(), ()> {
         let StepPlan {
             mut appends,
             commit,
             immediate,
-            admitted,
+            admitted: mut after,
         } = plan;
         for entry in &mut appends {
             let call = match &entry.body {
@@ -2112,7 +2112,6 @@ impl Actor {
             }
             self.settle_ephemeral(entry);
         }
-        let mut after = admitted;
         let busy = immediate.iter().rev().find_map(|work| match work {
             Effect::MarkBusy(busy) => Some(*busy),
             _ => None,
@@ -2152,8 +2151,12 @@ impl Actor {
         let written = if let Some(commit) = commit {
             self.commit(
                 &mut appends,
-                commit.durability == Durability::Barrier,
-                flush,
+                commit.durability.into(),
+                if flush {
+                    FlushMode::Immediate
+                } else {
+                    FlushMode::Deferred
+                },
                 self.listing(busy.unwrap_or_else(|| self.live.has_work())),
             )
             .await
@@ -2170,14 +2173,11 @@ impl Actor {
             .await;
             return Err(());
         }
-        self.admissions.extend(
-            after
-                .into_iter()
-                .map(|Guarded { admission, work }| Guarded {
-                    admission,
-                    work: Admitted::Effect(work),
-                }),
-        );
+        self.admissions
+            .extend(after.into_iter().map(|guarded| Guarded {
+                admission: guarded.admission,
+                work: Admitted::Effect(guarded.work),
+            }));
         self.admit().await;
         if busy == Some(false) {
             self.effect(Effect::MarkBusy(false)).await;

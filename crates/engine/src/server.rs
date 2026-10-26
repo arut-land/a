@@ -349,10 +349,18 @@ pub(crate) fn workspace_of(dir: &Path, env: Option<&Environment>) -> PathBuf {
 }
 
 pub(crate) fn reply(outbox: &Outbox, msg: &DaemonMsg) {
-    // The writer ends with the connection; a lost reply needs no handling.
-    if let Ok(frame) = Frame::new(msg) {
-        let _ = outbox.send(frame);
-    }
+    let frame = Frame::new(msg).unwrap_or_else(|error| {
+        let message = format!("framing reply: {error}");
+        let failure = match msg {
+            DaemonMsg::Reply { id, .. } => DaemonMsg::Reply {
+                id: *id,
+                outcome: protocol::Outcome::Failed { error: message },
+            },
+            _ => DaemonMsg::Error { message },
+        };
+        Frame::new(&failure).expect("framing failure fits in a frame")
+    });
+    let _ = outbox.send(frame);
 }
 
 /// The answer to a mutation: done, or refused and why.
@@ -532,13 +540,28 @@ impl Conn<'_> {
         } else {
             env
         };
-        // Only a new or the latest session asks for one; without it, none.
-        let found = || {
-            let dir = workspace
-                .as_ref()
-                .map_or(Path::new(""), protocol::HostPath::local);
-            workspace_of(dir, env.as_ref())
+        // An attach by id or prefix never needs filesystem discovery.
+        let workspace = if matches!(
+            target,
+            protocol::Target::New
+                | protocol::Target::Latest {
+                    any_workspace: false
+                }
+        ) {
+            let env = env.clone();
+            Some(
+                rt::unblock(&*self.daemon.shared.rt, move || {
+                    let dir = workspace
+                        .as_ref()
+                        .map_or(Path::new(""), protocol::HostPath::local);
+                    workspace_of(dir, env.as_ref())
+                })
+                .await,
+            )
+        } else {
+            None
         };
+        let found = || workspace.expect("target requires a workspace");
         let resolved = match &target {
             protocol::Target::Fork { session, seq } => {
                 match self.daemon.fork(session, *seq).await {

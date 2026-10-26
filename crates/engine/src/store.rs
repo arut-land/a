@@ -31,7 +31,7 @@ pub use faulty::{Faulty, SyncFailure};
 pub use jsonl::Jsonl;
 #[cfg(test)]
 pub(crate) use jsonl::{FORMAT, seal, unseal};
-pub use lease::{LeaseAuthority, Local};
+pub use lease::Local;
 #[cfg(test)]
 pub use memory::Memory;
 
@@ -110,7 +110,7 @@ impl Loaded {
     #[cfg(test)]
     pub fn append(&mut self, body: protocol::Body) -> io::Result<Entry> {
         let mut entry = [Entry::new(Seq::new(self.seq + 1).unwrap(), Epoch(0), body)];
-        self.writer.append(&mut entry, true)?;
+        self.writer.append(&mut entry, AppendMode::Order)?;
         self.writer.flush_inline()?;
         let [entry] = entry;
         self.seq = entry.seq.get();
@@ -149,6 +149,22 @@ impl Encoded {
             start = end;
             line
         })
+    }
+}
+
+/// Whether an append also establishes the log's write-order barrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendMode {
+    Write,
+    Order,
+}
+
+impl From<kernel::Durability> for AppendMode {
+    fn from(durability: kernel::Durability) -> Self {
+        match durability {
+            kernel::Durability::Lazy => Self::Write,
+            kernel::Durability::Barrier => Self::Order,
+        }
     }
 }
 
@@ -191,18 +207,17 @@ impl Writer {
     }
 
     /// Appends `entries`, each stamped with the lease's epoch, ordered if
-    /// `durable`. Before publishing or starting effects, [`Writer::flushed`]
-    /// completes that promise. Returns the lines encoded for publication.
-    pub fn append(&mut self, entries: &mut [Entry], durable: bool) -> io::Result<Encoded> {
+    /// `mode` is [`AppendMode::Order`]. Before publishing or starting effects,
+    /// [`Writer::flushed`] completes that promise. Returns the encoded lines.
+    pub fn append(&mut self, entries: &mut [Entry], mode: AppendMode) -> io::Result<Encoded> {
         self.writable()?;
         for e in &mut *entries {
             e.epoch = Epoch(self.epoch);
         }
         let lines = Encoded::of(entries)?;
-        if durable {
-            self.log.append_all(entries, &lines)?;
-        } else {
-            self.log.write_all(entries, &lines)?;
+        match mode {
+            AppendMode::Order => self.log.append_all(entries, &lines)?,
+            AppendMode::Write => self.log.write_all(entries, &lines)?,
         }
         Ok(lines)
     }

@@ -1,5 +1,7 @@
 //! Ordered writes and durable publication belong to the same session writer.
 
+use crate::store::AppendMode;
+
 use super::{
     Actor, Admission, Arc, AssertUnwindSafe, Encoded, Entry, Flag, Future, Json, Msg, Ordering,
     Poll, Record, RecoveryImage, Requirement, SYNC_LAG, Snapshot, WorkId, Writer, catch_unwind,
@@ -41,6 +43,12 @@ impl Journal {
     pub(super) fn is_durable(&self) -> bool {
         self.durable_seq >= self.ordered_seq && self.flushes.is_empty()
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FlushMode {
+    Deferred,
+    Immediate,
 }
 
 impl Actor {
@@ -197,8 +205,8 @@ impl Actor {
     pub(super) async fn commit(
         &mut self,
         batch: &mut Vec<Entry>,
-        durable: bool,
-        flush: bool,
+        mode: AppendMode,
+        flush: FlushMode,
         listing: Record,
     ) -> io::Result<()> {
         let mut writer = self
@@ -217,19 +225,19 @@ impl Actor {
                 if first && let Some(listing) = &listing {
                     shared.catalog.record(listing.clone());
                 }
-                let written =
-                    catch_unwind(AssertUnwindSafe(|| writer.append(&mut entries, durable)))
-                        .unwrap_or_else(|_| Err(io::Error::other("committing entries panicked")));
+                let written = catch_unwind(AssertUnwindSafe(|| writer.append(&mut entries, mode)))
+                    .unwrap_or_else(|_| Err(io::Error::other("committing entries panicked")));
                 if !first
                     && written.is_ok()
                     && let Some(listing) = &listing
                 {
                     shared.catalog.record(listing.clone());
                 }
-                let durable_on_order = durable && writer.durable_on_order();
-                let request = (written.is_ok() && flush && !durable_on_order)
-                    .then(|| writer.enroll())
-                    .flatten();
+                let durable_on_order = mode == AppendMode::Order && writer.durable_on_order();
+                let request =
+                    (written.is_ok() && flush == FlushMode::Immediate && !durable_on_order)
+                        .then(|| writer.enroll())
+                        .flatten();
                 let (epoch, leader) = match request {
                     Some(request) => (Some(request.epoch), request.leader),
                     None => (None, None),
@@ -248,7 +256,10 @@ impl Actor {
         let lines = written
             .inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Commit, e))?;
         crate::session_event("commit", self.live.id, || {
-            let how = if durable { "synced" } else { "written" };
+            let how = match mode {
+                AppendMode::Order => "synced",
+                AppendMode::Write => "written",
+            };
             format!("{} entries {how}", entries.len())
         });
         self.journal.ordered_seq = entries
@@ -259,7 +270,7 @@ impl Actor {
         self.journal.unsynced.push((entries, lines));
         if let Some(epoch) = epoch {
             self.track(self.journal.ordered_seq, epoch).await?;
-        } else if durable_on_order || flush {
+        } else if durable_on_order || flush == FlushMode::Immediate {
             self.durable(self.journal.ordered_seq).await;
         }
         if !self.journal.unsynced.is_empty() {
