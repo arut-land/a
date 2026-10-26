@@ -85,7 +85,7 @@ dependency tree. Candidates were checked before selecting the backend:
 | **async-compression gzip/br + mzstd** | **860 KiB** | **Pure Rust, no C SDK or second runtime; workspace Windows cross-clippy passes** |
 | ruzstd | Not built | Decode only; still needs a separate encoder for documented request compression |
 
-Isolated copies of the final transport source, with only the compression
+Isolated copies of the transport source, with only the compression
 backend changed, built the identical probe at 523,584 bytes without
 compression, 1,021,488 with libzstd and 1,404,528 with mzstd (macOS arm64,
 release, opt-level z, LTO,
@@ -163,7 +163,71 @@ openssl req -x509 -new -key crates/transport/src/client/testdata/localhost.key \
   -addext 'extendedKeyUsage=serverAuth' -addext 'basicConstraints=critical,CA:FALSE'
 ```
 
-## Measurements
+## Review verification and hosted session measurements
+
+CI [40337822668](https://github.com/arut-land/a/actions/runs/40337822668)
+on `1cb54aa5` passed all twelve jobs: Linux and macOS workspace checks,
+Windows x64/ARM, Apple tests/build, both budgets, deny, machete, no-tokio,
+fuzz and Miri. Native TLS, rustls and plain HTTP pass on all native test
+platforms. Local transport runs pass 27 tests with each TLS backend and
+25 without TLS, with clippy warnings denied for all three feature sets.
+
+Hosted sessions run
+[40333365424](https://github.com/arut-land/a/actions/runs/40333365424)
+measured `cbbf13f0`, after merging main `9771c7bb`. The only following
+code change is the proxy environment case-precedence correction in
+`1cb54aa5`; this workload does not set conflicting proxy variables.
+The mock provider sends uncompressed SSE and uses a custom base URL,
+so these are transport regression observations, separate from the upload
+compression probe above. There is no paired current-main baseline in this
+run, so differences from the initial measurements below cannot be assigned
+to compression or to an individual review fix.
+
+The table is layout A (four async workers), five rounds, three turns per
+session. Turn and delta percentiles pool the recorded events; active CPU
+and idle RSS are medians of per-run process measurements. All 500
+recorded samples from the 6 completed native runners have zero failed
+calls, dropped deltas or failed samples, with five rounds in every layout
+and session count. Linux and Windows layout-A idle CPU is zero; macOS ARM
+uses 1.3–1.8 ms and macOS Intel 0.9–1.2 ms over the five-second idle
+accounting interval.
+
+| Runner | Sessions | Turn p50 / p99 (ms) | Delta p99 (ms) | Active CPU (ms) | Idle RSS (MiB) | Failed calls / dropped deltas |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| macos-15-intel | 1 | 1331 / 1557 | 1.24 | 112 | 6.3 | 0 / 0 |
+| macos-15-intel | 8 | 1114 / 1363 | 2.02 | 727 | 8.0 | 0 / 0 |
+| macos-15-intel | 32 | 1664 / 2241 | 7.34 | 3170 | 13.2 | 0 / 0 |
+| macos-15-intel | 128 | 5365 / 7888 | 1412.53 | 14498 | 28.8 | 0 / 0 |
+| macos-latest | 1 | 1504 / 1734 | 0.78 | 74 | 11.2 | 0 / 0 |
+| macos-latest | 8 | 1343 / 1721 | 1.01 | 398 | 13.5 | 0 / 0 |
+| macos-latest | 32 | 1323 / 1682 | 1.86 | 1183 | 20.0 | 0 / 0 |
+| macos-latest | 128 | 2077 / 2899 | 16.87 | 4921 | 44.4 | 0 / 0 |
+| ubuntu-24.04-arm | 1 | 371 / 376 | 0.26 | 30 | 7.0 | 0 / 0 |
+| ubuntu-24.04-arm | 8 | 290 / 379 | 0.24 | 250 | 9.4 | 0 / 0 |
+| ubuntu-24.04-arm | 32 | 328 / 401 | 0.24 | 890 | 14.8 | 0 / 0 |
+| ubuntu-24.04-arm | 128 | 557 / 703 | 5.35 | 3630 | 32.9 | 0 / 0 |
+| ubuntu-latest | 1 | 371 / 626 | 0.21 | 40 | 8.4 | 0 / 0 |
+| ubuntu-latest | 8 | 368 / 629 | 0.15 | 240 | 10.8 | 0 / 0 |
+| ubuntu-latest | 32 | 369 / 1315 | 0.42 | 920 | 16.0 | 0 / 0 |
+| ubuntu-latest | 128 | 821 / 2615 | 5.77 | 3780 | 34.8 | 0 / 0 |
+| windows-11-arm | 1 | 392 / 456 | 0.16 | 31 | 12.7 | 0 / 0 |
+| windows-11-arm | 8 | 715 / 1072 | 0.23 | 359 | 14.3 | 0 / 0 |
+| windows-11-arm | 32 | 2878 / 4576 | 0.33 | 1766 | 19.1 | 0 / 0 |
+| windows-11-arm | 128 | 11185 / 16410 | 0.41 | 8125 | 36.6 | 0 / 0 |
+| windows-latest | 1 | 402 / 419 | 0.25 | 62 | 11.5 | 0 / 0 |
+| windows-latest | 8 | 555 / 779 | 0.27 | 469 | 14.2 | 0 / 0 |
+| windows-latest | 32 | 1977 / 3103 | 0.30 | 2172 | 19.7 | 0 / 0 |
+| windows-latest | 128 | 7921 / 11884 | 0.39 | 8516 | 39.4 | 0 / 0 |
+
+All six native jobs completed successfully. Intel macOS at 128 sessions
+has a 1.41 s delta p99 despite preserving every event; its repeated
+four-worker control (A2) measured 1.21 s. This tail remains a measurement
+for follow-up, without a causal claim from this unpaired run.
+
+## Initial transport measurements (before compression)
+
+These probes and hosted runs preceded the review and compression changes.
+Their binary-size comparison excludes the compression code measured above.
 
 Apple M3, macOS 27.0, release builds of a probe linking `transport` from
 main (`a43606cd`, ureq) and from this branch, `tls-native`, on
