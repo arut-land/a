@@ -43,7 +43,15 @@ env = { MBX_CARGO_SHIM_MODE = "1", MBX_BUILD_SCRIPT_EXECUTION = "{{ os() != 'win
 build = "cargo build --workspace"
 release = "cargo build-release --workspace"
 fmt = "cargo fmt --all"
-test = "cargo nextest run --workspace --features a/lua --no-tests=pass"
+test = { run = [
+    "cargo nextest run --workspace --features a/lua --no-tests=fail --no-fail-fast",
+    "mise run test:doc",
+    "mise run test:panic",
+    "mise run test:web-composer",
+] }
+"test:doc" = "cargo test --workspace --doc --features a/lua"
+"test:panic" = { env = { CARGO_PROFILE_DEV_CODEGEN_BACKEND = "llvm" }, run = "cargo nextest run -p engine -p ext --lib --run-ignored ignored-only -E 'test(=driver::tests::a_kernel_panic_is_a_resume) | test(=point::tests::a_failing_handler_answers_its_points_failure_policy)' --no-tests=fail" }
+"test:web-composer" = "node --test scripts/test-web-composer.mjs"
 "check:fmt" = "cargo fmt --all --check"
 "check:clippy" = "cargo clippy --workspace --all-targets --features a/lua -- -D warnings"
 # Sequential: the tests and clippy would rebuild the same target at once.
@@ -167,6 +175,7 @@ CARGO_TARGET_DIR=target/fixtures cargo nextest run --release -p ext-shell --test
 # optimized library).
 "apple:ffi" = { dir = "crates/ffi", run = "boltffi pack apple --deny-skipped" }
 "apple:gen" = { dir = "apps/apple", run = "xcodegen generate --quiet" }
+"apple:check" = { depends = ["apple:test", "apple:build"] }
 # The shared reducer vectors (A_VECTORS names them: the Swift tests hold
 # no path into the Rust tree) and the session store through the FFI, then
 # a live session on a daemon of its own (a throwaway A_HOME, the echo

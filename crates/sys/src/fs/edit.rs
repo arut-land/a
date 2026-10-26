@@ -1,7 +1,7 @@
 //! Safe-save publication. Final-component links and multiply linked files are
 //! rejected: replacing either would silently change which object is edited.
 //! Publication is one atomic native rename, never evacuation or unlink. Exchange
-//! verifies displaced identity, bytes and metadata and swaps back on conflict.
+//! verifies displaced identity, bytes and metadata and swaps back while still owned.
 //! Receipts expose the non-exchange path race and writes through old descriptors.
 
 use std::ffi::OsString;
@@ -557,9 +557,15 @@ impl EditTransaction {
             if checked.is_err() {
                 before_rollback();
                 publication_checkpoint!("before_rollback");
-                // A name replaced again since the first exchange swaps that
-                // newer file into staging: it is kept, never reclaimed.
-                if !staged.exchange(&self.name).unwrap_or(false) || !staged.holds_staged() {
+                // A later writer owns the live name: leave it in place and
+                // retain the displaced file for recovery instead of swapping.
+                let owned = self
+                    .open_source()
+                    .ok()
+                    .and_then(|current| same_object(&current, &staged.file).ok())
+                    .unwrap_or(false);
+                if !owned || !staged.exchange(&self.name).unwrap_or(false) || !staged.holds_staged()
+                {
                     return Err(EditError::Conflict(EditConflict::RollbackFailed {
                         retained: self
                             .observed_parent
@@ -1957,6 +1963,19 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[test]
+    fn object_identity_distinguishes_replacements_with_identical_bytes() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"same").unwrap();
+        let original = File::open(work.target()).unwrap();
+        assert!(same_object(&original, &File::open(work.target()).unwrap()).unwrap());
+        let incoming = work.0.join("incoming");
+        fs::write(&incoming, b"same").unwrap();
+        fs::rename(incoming, work.target()).unwrap();
+        assert!(!same_object(&original, &File::open(work.target()).unwrap()).unwrap());
+        work.only_target_remains();
+    }
+
     #[cfg(unix)]
     fn assert_changed(result: &Result<EditReceipt, EditError>) {
         assert!(
@@ -2909,7 +2928,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn writers_in_the_final_window_are_detected_and_restored() {
+    fn rollback_restores_the_displaced_writer_while_target_is_owned() {
         for replacing in [false, true] {
             let work = Workspace::new();
             fs::write(work.target(), b"original").unwrap();
@@ -2935,10 +2954,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_unrestored_swap_back_keeps_the_displaced_file() {
-        // A second replacement between the two exchanges, or a vanished name
-        // that makes the swap back fail, leaves another writer's file staged.
-        for vanished in [false, true] {
+    fn rollback_never_replaces_a_target_it_no_longer_owns() {
+        for newer in [None, Some(b"newer".as_slice()), Some(b"ours".as_slice())] {
             let work = Workspace::new();
             fs::write(work.target(), b"original").unwrap();
             let transaction = work.capture();
@@ -2957,10 +2974,10 @@ mod tests {
                 || Ok(()),
                 || {},
                 || {
-                    if vanished {
-                        fs::remove_file(work.target()).unwrap();
+                    if let Some(bytes) = newer {
+                        replace(bytes);
                     } else {
-                        replace(b"newer");
+                        fs::remove_file(work.target()).unwrap();
                     }
                 },
             );
@@ -2968,10 +2985,11 @@ mod tests {
                 panic!("{result:?}");
             };
             drop(staged);
-            let kept: &[u8] = if vanished { b"theirs" } else { b"newer" };
-            assert_eq!(fs::read(&retained).unwrap(), kept);
-            if !vanished {
-                assert_eq!(fs::read(work.target()).unwrap(), b"theirs");
+            assert_eq!(fs::read(&retained).unwrap(), b"theirs");
+            if let Some(bytes) = newer {
+                assert_eq!(fs::read(work.target()).unwrap(), bytes);
+            } else {
+                assert!(!work.target().exists());
             }
         }
     }
