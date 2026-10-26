@@ -284,7 +284,7 @@ impl Transaction<'_> {
                 edited.publication = transaction.publish_reader(
                     &mut &content,
                     content.metadata()?.len(),
-                    false,
+                    sys::fs::Persistence::Visible,
                     &|_| cancel.is_set(),
                 )?;
                 Ok((edited, hash))

@@ -16,7 +16,11 @@ fn publication_child() {
     publication_step("captured");
     let result = transaction.publish_with_sync(
         b"new",
-        cfg!(unix),
+        if cfg!(unix) {
+            Persistence::Durable
+        } else {
+            Persistence::Visible
+        },
         File::sync_all,
         &|_| false,
         exchange,
