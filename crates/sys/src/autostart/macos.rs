@@ -128,10 +128,11 @@ pub(super) fn disable(home: &Home) -> io::Result<()> {
 }
 
 pub(super) fn registration(home: &Home) -> io::Result<super::Registration> {
-    let Some(owner) = owner(home, &disabled()?, loaded)? else {
+    let disabled = disabled()?;
+    let Some(owner) = owner(home, &disabled, loaded)? else {
         return Ok(super::Registration::Unregistered);
     };
-    Ok(if switched_off(&disabled()?, &owner) {
+    Ok(if switched_off(&disabled, &owner) {
         super::Registration::Disabled
     } else {
         super::Registration::Enabled
