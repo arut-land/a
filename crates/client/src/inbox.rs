@@ -338,14 +338,14 @@ mod tests {
             use std::future::{Future, poll_fn};
             use std::pin::pin;
 
-            let mut send = pin!(post.send_async(2));
+            let mut delivery = pin!(post.send_async(2));
             poll_fn(|cx| {
-                assert!(send.as_mut().poll(cx).is_pending());
+                assert!(delivery.as_mut().poll(cx).is_pending());
                 Poll::Ready(())
             })
             .await;
             waiting.send(()).unwrap();
-            sent.send(send.await).unwrap();
+            sent.send(delivery.await).unwrap();
         }));
         pending.recv_timeout(Duration::from_secs(2)).unwrap();
         // A second task must run even while the producer awaits space.
