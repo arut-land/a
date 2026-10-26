@@ -25,8 +25,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Apple silicon and x86_64 Linux.
-        os: [macos-latest, ubuntu-latest]
+        # Apple silicon and x86_64 Linux. Branch runs skip macOS: it is
+        # verified locally on Apple silicon, and its runners are scarce.
+        os: ${{ fromJSON(github.ref == 'refs/heads/main' && '["macos-latest","ubuntu-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -43,8 +44,10 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/mbx/actions
-          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}
-          restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - &mise
         uses: jdx/mise-action@v5
         with:
@@ -73,12 +76,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-latest
-            strict: 0
-          # Latency is held to the design's budgets on one lane.
-          - os: ubuntu-latest
-            strict: 1
+        # Latency is held to the design's budgets on one lane (strict);
+        # macOS on main only, as for check.
+        include: ${{ fromJSON(github.ref == 'refs/heads/main' && '[{"os":"macos-latest","strict":0},{"os":"ubuntu-latest","strict":1}]' || '[{"os":"ubuntu-latest","strict":1}]') }}
     runs-on: ${{ matrix.os }}
     env:
       A_STRICT_BUDGETS: ${{ matrix.strict }}
@@ -145,7 +145,9 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: fuzz-crashes
-          path: crates/protocol/tests/__fuzz__/*/crashes
+          path: |
+            crates/protocol/tests/__fuzz__/*/crashes
+            crates/ext-skills/src/parse/__fuzz__/*/crashes
 
   miri:
     runs-on: ubuntu-latest
@@ -202,16 +204,16 @@ jobs:
         run: |
           $runners = @((Get-Command pwsh.exe).Source, "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
           "A_TEST_POWERSHELL=$($runners -join ';')" >> $env:GITHUB_ENV
-      - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
+      - run: mise run check:clippy
       - run: mise exec -- cargo build -p a
-      - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
+      - run: mise run test
       - *transport-features
-      - run: mise run acceptance
 
   # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
   # reducer vectors and a live session through it in Swift, then the app
   # built headless with xcodebuild.
   apple:
+    if: github.ref == 'refs/heads/main'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -220,5 +222,4 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           install_args: rust mr-boxington github:boltffi/boltffi aqua:yonaskolb/XcodeGen
-      - run: mise run apple:test
-      - run: mise run apple:build
+      - run: mise run --jobs 1 apple:check
