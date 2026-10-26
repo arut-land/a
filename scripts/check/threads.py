@@ -1,80 +1,273 @@
-"""No feature owns a thread or a timer loop: outside `rt`, `sys` and tests,
-nothing spawns a thread, sleeps one, or waits on a channel with a timeout.
-Such work is a task, a timer or a blocking job on the runtime it was given.
-The few places that cannot be are allowed below, each with its reason."""
+"""Features use runtime tasks and timers. Each native blocking exception names
+one call site, its function and its API; another call in the file is not exempt.
+"""
 
 import pathlib
 import re
 import sys
+from collections import Counter
+from typing import NamedTuple
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-BANNED = re.compile(r"\bthread::(spawn|scope|sleep|Builder)\b|\.recv_timeout\(")
 OWNERS = ("crates/rt/", "crates/sys/")
-# path: why it cannot be a task.
+APIS = {"spawn", "scope", "sleep", "Builder"}
+# id: (path, function, API, reason)
 ALLOWED = {
-    "apps/cli/src/main.rs": "The line REPL reads blocking platform stdin until process exit.",
-    "apps/cli/src/once.rs": "Pipeline stdin may be a terminal or file and has no portable async registration.",
-    "apps/tui/src/term.rs": "Native terminal input multiplexes signals; terminal restoration has a bounded give-back before reraising.",
-    "crates/client/src/lib.rs": "The ssh bridge copies portable blocking stdin and exits when either direction closes.",
+    "repl-stdin": ("apps/cli/src/main.rs", "read_stdin", "spawn",
+                   "The line REPL reads blocking platform stdin until process exit."),
+    "pipeline-stdin": ("apps/cli/src/once.rs", "run", "spawn",
+                       "Pipeline stdin has no portable async registration."),
+    "terminal-giveback": ("apps/tui/src/term.rs", "end", "spawn",
+                         "Restoration may block on an unread terminal."),
+    "terminal-deadline": ("apps/tui/src/term.rs", "end", "recv_timeout",
+                         "Reraising must not wait indefinitely for restoration."),
+    "terminal-input": ("apps/tui/src/term.rs", "spawn_input", "spawn",
+                      "Native input multiplexes terminal events and signals."),
+    "bridge-stdin": ("crates/client/src/lib.rs", "bridge", "spawn",
+                    "The bridge copies portable blocking stdin until either side closes."),
 }
 
 
+class Token(NamedTuple):
+    value: str
+    line: int
+
+
+class Finding(NamedTuple):
+    line: int
+    function: str
+    api: str
+
+
 def is_test(path):
-    parts = path.parts
-    return "tests" in parts or "benches" in parts or "examples" in parts or path.name == "tests.rs" or path.name.endswith("_tests.rs")
+    return ("tests" in path.parts or "benches" in path.parts or "examples" in path.parts
+            or path.name == "tests.rs" or path.name.endswith("_tests.rs"))
 
 
-def code(text):
-    """The text with `#[cfg(test)]` items blanked, line numbers kept."""
-    lines = text.splitlines()
-    out = []
-    skip = 0
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if re.match(r"\s*#\[cfg\((all\()?test\b", line):
-            # The item after the attribute, to its closing brace or semicolon.
-            depth = 0
-            opened = False
-            j = i + 1
-            out.append("")
-            while j < len(lines):
-                depth += lines[j].count("{") - lines[j].count("}")
-                opened |= "{" in lines[j]
-                out.append("")
-                if (opened and depth <= 0) or (not opened and lines[j].rstrip().endswith(";")):
+def tokens(source):
+    """Lex Rust punctuation and names, ignoring comments and literal contents."""
+    result = []
+    pos, line = 0, 1
+    while pos < len(source):
+        start = pos
+        if source.startswith("//", pos):
+            end = source.find("\n", pos)
+            pos = len(source) if end < 0 else end
+        elif source.startswith("/*", pos):
+            pos += 2
+            depth = 1
+            while pos < len(source) and depth:
+                if source.startswith("/*", pos):
+                    depth += 1
+                    pos += 2
+                elif source.startswith("*/", pos):
+                    depth -= 1
+                    pos += 2
+                else:
+                    pos += 1
+        elif match := re.match(r'(?:br|r)(#*)"', source[pos:]):
+            closing = '"' + match[1]
+            end = source.find(closing, pos + len(match[0]))
+            pos = len(source) if end < 0 else end + len(closing)
+        elif source[pos] == '"':
+            pos += 1
+            while pos < len(source):
+                if source[pos] == "\\":
+                    pos += 2
+                elif source[pos] == '"':
+                    pos += 1
                     break
-                j += 1
-            i = j + 1
-            continue
-        out.append(line)
-        i += 1
-    return out
+                else:
+                    pos += 1
+        elif match := re.match(r"'(?:\\u\{[0-9a-fA-F_]+\}|\\x[0-9a-fA-F]{2}|\\.|[^'\\\n])'", source[pos:]):
+            pos += len(match[0])
+        elif match := re.match(r"(?:r#)?[^\W\d]\w*|::", source[pos:]):
+            result.append(Token(match[0].removeprefix("r#"), line))
+            pos += len(match[0])
+        else:
+            if not source[pos].isspace():
+                result.append(Token(source[pos], line))
+            pos += 1
+        line += source[start:pos].count("\n")
+    return result
+
+
+def closing(items, start, left="{", right="}"):
+    depth = 1
+    for pos in range(start + 1, len(items)):
+        depth += (items[pos].value == left) - (items[pos].value == right)
+        if depth == 0:
+            return pos
+    raise ValueError(f"unclosed {left} at line {items[start].line}")
+
+
+def requires_test(expression):
+    if expression == ["test"]:
+        return True
+    if (len(expression) < 3 or expression[0] not in ("all", "any")
+            or expression[1] != "(" or expression[-1] != ")"):
+        return False
+    parts, part, depth = [], [], 0
+    for value in expression[2:-1] + [","]:
+        if value == "," and depth == 0:
+            if part:
+                parts.append(requires_test(part))
+            part = []
+        else:
+            part.append(value)
+            depth += (value == "(") - (value == ")")
+    return any(parts) if expression[0] == "all" else bool(parts) and all(parts)
+
+
+def imports(items):
+    """Expand a use tree into local names and the paths they import."""
+    values = [item.value for item in items]
+    pos = 0
+    bindings = []
+
+    def tree(prefix=()):
+        nonlocal pos
+        path = list(prefix)
+        alias = None
+        while pos < len(values) and values[pos] not in (",", "}"):
+            value = values[pos]
+            pos += 1
+            if value == "{":
+                while pos < len(values) and values[pos] != "}":
+                    tree(tuple(path))
+                    if pos < len(values) and values[pos] == ",":
+                        pos += 1
+                pos += 1
+                return
+            if value == "as":
+                alias = values[pos]
+                pos += 1
+                break
+            if value != "::":
+                path.append(value)
+        if path and path[-1] == "self":
+            path.pop()
+        if path:
+            bindings.append((alias or path[-1], tuple(path)))
+
+    tree()
+    return bindings
+
+
+def findings(source):
+    items = tokens(source)
+    found = []
+
+    def scope(start, end, inherited, function=""):
+        bindings, children, refs = [], [], []
+        pos, next_function = start, None
+        while pos < end:
+            value = items[pos].value
+            if value == "#" and pos + 1 < end and items[pos + 1].value == "[":
+                attribute_end = closing(items, pos + 1, "[", "]")
+                attribute = [t.value for t in items[pos + 2:attribute_end]]
+                if attribute[:2] == ["cfg", "("] and requires_test(attribute[2:-1]):
+                    pos = attribute_end + 1
+                    while pos < end and items[pos].value not in ("{", ";"):
+                        pos += 1
+                    if pos < end and items[pos].value == "{":
+                        pos = closing(items, pos)
+                    pos += 1
+                    continue
+                pos = attribute_end + 1
+                continue
+            if value == "use":
+                stop = pos + 1
+                while stop < end and items[stop].value != ";":
+                    stop += 1
+                bindings.extend(imports(items[pos + 1:stop]))
+                pos = stop + 1
+                continue
+            if value == "extern" and [t.value for t in items[pos:pos + 4]] == ["extern", "crate", "std", "as"]:
+                bindings.append((items[pos + 4].value, ("std",)))
+            if value == "fn" and pos + 1 < end and items[pos + 1].value.isidentifier():
+                next_function = items[pos + 1].value
+            if value == "{":
+                stop = closing(items, pos)
+                children.append((pos + 1, stop, next_function or function))
+                next_function = None
+                pos = stop + 1
+                continue
+            if value == ";":
+                next_function = None
+            refs.append(pos)
+            pos += 1
+        aliases = dict(inherited)
+        # A use may refer to an alias declared later in this scope.
+        for _ in range(len(bindings) + 1):
+            previous = dict(aliases)
+            for name, path in bindings:
+                target = aliases.get(path[0], (path[0],)) + path[1:]
+                if name == "*":
+                    if target == ("std", "thread", "*"):
+                        aliases.update((api, ("std", "thread", api)) for api in APIS)
+                else:
+                    aliases[name] = target
+            if aliases == previous:
+                break
+        consumed = -1
+        for pos in refs:
+            if pos <= consumed:
+                continue
+            value = items[pos].value
+            if value == "." and pos + 2 < end and items[pos + 1].value == "recv_timeout":
+                found.append(Finding(items[pos + 1].line, function, "recv_timeout"))
+                continue
+            path = [value]
+            stop = pos
+            while stop + 2 < end and items[stop + 1].value == "::":
+                path.append(items[stop + 2].value)
+                stop += 2
+            target = aliases.get(path[0], (path[0],)) + tuple(path[1:])
+            if target[:2] == ("std", "thread") and len(target) > 2 and target[2] in APIS:
+                found.append(Finding(items[pos].line, function, target[2]))
+            consumed = stop
+        for child_start, child_end, child_function in children:
+            scope(child_start, child_end, aliases, child_function)
+
+    scope(0, len(items), {"std": ("std",), "thread": ("std", "thread")})
+    return sorted(found)
+
+
+def exceptions(path, source, found, used):
+    unexpected = []
+    lines = source.splitlines()
+    for finding in found:
+        marker = re.fullmatch(r"\s*// thread-exception: ([\w-]+)\s*",
+                              lines[finding.line - 2] if finding.line > 1 else "")
+        name = marker[1] if marker else None
+        allowed = ALLOWED.get(name)
+        if allowed and allowed[:3] == (path, finding.function, finding.api) and not used[name]:
+            used[name] += 1
+        else:
+            unexpected.append(finding)
+    return unexpected
 
 
 def main():
-    found = []
+    used = Counter()
+    failed = False
     for path in sorted(ROOT.glob("**/*.rs")):
         rel = path.relative_to(ROOT)
-        if rel.parts[0] not in ("apps", "crates") or str(rel).startswith(OWNERS):
+        if (rel.parts[0] not in ("apps", "crates") or rel.as_posix().startswith(OWNERS)
+                or "target" in rel.parts or is_test(rel)):
             continue
-        if "target" in rel.parts or is_test(rel):
-            continue
-        for number, line in enumerate(code(path.read_text(encoding="utf-8")), 1):
-            if line.lstrip().startswith("//"):
-                continue
-            if BANNED.search(line):
-                found.append((str(rel.as_posix()), number, line.strip()))
-    unexpected = [f for f in found if f[0] not in ALLOWED]
-    for rel, number, line in unexpected:
-        print(f"{rel}:{number}: {line}")
-    stale = set(ALLOWED) - {f[0] for f in found}
-    for rel in sorted(stale):
-        print(f"{rel}: allowed but no longer needs it")
-    if unexpected or stale:
-        print("a feature owns a thread or a timer: make it a task, a timer or a blocking job on its runtime")
-        return 1
-    return 0
+        source = path.read_text(encoding="utf-8")
+        for finding in exceptions(rel.as_posix(), source, findings(source), used):
+            print(f"{rel}:{finding.line}: {finding.function}: {finding.api}")
+            failed = True
+    for name in sorted(ALLOWED.keys() - used.keys()):
+        print(f"{ALLOWED[name][0]}: unused thread exception {name}")
+        failed = True
+    if failed:
+        print("a feature owns a thread or a timer: use its runtime")
+    return int(failed)
 
 
-sys.exit(main())
+if __name__ == "__main__":
+    sys.exit(main())

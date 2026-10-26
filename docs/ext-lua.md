@@ -232,7 +232,8 @@ during registration to exclude the entire generation (tools, hooks, texts, folds
 and agents). The declaration is persisted in its image and checked against the
 source when restored.
 
-Workspace source notifications coalesce through the coordinator's 100 ms
-settle timer. `Sources::open` receives the host's `Delay` callback, so the
+Workspace source notifications reset the coordinator's 100 ms quiet
+window. Writes during preparation coalesce into one followup after quiet.
+`Sources::open` receives the host's `Delay` callback, so the
 wait yields an async task before `Prepare` admits blocking generation work;
 the loader chooses no reactor and sleeps no worker.

@@ -46,7 +46,7 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
     with zero lag (the client takes the daemon lock, binds the socket,
     hands both to a detached `a __daemon` and connects into its backlog;
     one client starts it at a time, under `start.lock`, and the others
-    wait on that lock, not on a timer). [Autostart](autostart.md) only
+    retry a contended lock with cancellable runtime timers). [Autostart](autostart.md) only
     starts the daemon earlier, at login; it never changes this path.
   - `SshLink { host, prompt, home }` (`remote.rs`): another machine's, through
     the system `ssh` to `a bridge`, whose stdio carries the same frames
@@ -226,12 +226,14 @@ Other rules the apps keep, by convention:
   from the transcript. What it keeps is screen state: scroll anchor, folded
   cards, the input, overlays, the tab's page.
 - Transport and child reaping run as runtime tasks. Blocking SDK methods
-  drive async operations over a shared one-worker runtime; file lock waits
-  and process creation use its Storage pool. The terminal input thread is
+  drive async operations over a shared one-worker runtime. Contended file
+  locks retry nonblocking native attempts every 25 ms; cancellation drops
+  the file and timer, leaving Storage workers available for lock holders
+  and shutdown. Process creation uses the Storage pool. The terminal input thread is
   detached, and `Terminal` restores the terminal before process exit.
-- A client never sleeps on a timer (`crates/client/tests/no_polling.rs`,
-  and the strace acceptance test on Linux): the inbox, the socket and the
-  daemon lock are waited on.
+- Inbox and socket waits never poll (`crates/client/tests/no_polling.rs`
+  and the strace cold-start acceptance test on Linux). Only lock contention
+  retries on a timer; an uncontended start takes no timer path.
 - The first frame goes out before the daemon is reached; connecting (and
   spawning the daemon) happens on the driver's runtime.
 

@@ -418,6 +418,7 @@ impl Repl {
         let Some(tx) = self.input.take() else {
             return;
         };
+        // thread-exception: repl-stdin
         thread::spawn(move || {
             for line in io::stdin().lock().lines() {
                 let Ok(line) = line else { break };

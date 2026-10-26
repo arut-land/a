@@ -581,7 +581,9 @@ write tasks over the host's runtime. Apps retain screen state and render SDK eff
 [CLI](cli.md), [TUI](tui.md), [web](web.md), and SwiftUI through BoltFFI.
 Child reaping uses `rt::reap` and native exit watches. Workspace generation
 sources receive `ext::host::Delay`; the coordinator coalesces source events
-with a 100 ms async settle timer before admitting blocking preparation.
+with a resettable 100 ms async quiet window before admitting blocking
+preparation. Events during preparation coalesce into one followup after
+another quiet window; events while admission is queued restart quiet too.
 Features neither choose a reactor nor sleep a worker through settling.
 
 ## Crate map

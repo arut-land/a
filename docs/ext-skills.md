@@ -160,7 +160,8 @@ and delegates the underlying recorded installation to Lua when present; neither
 layer decodes the other's images. Restored installation identity is checked
 against the recorded installation before the fork is accepted.
 
-Workspace source notifications coalesce through the coordinator's 100 ms
-settle timer. `Sources::open` receives the host's `Delay` callback, so the
+Workspace source notifications reset the coordinator's 100 ms quiet
+window. Writes during preparation coalesce into one followup after quiet.
+`Sources::open` receives the host's `Delay` callback, so the
 wait yields an async task before `Prepare` admits blocking generation work;
 the loader chooses no reactor and sleeps no worker.

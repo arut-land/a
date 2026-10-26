@@ -64,7 +64,7 @@ deny = "cargo deny check"
 # Unused dependencies.
 machete = "cargo machete"
 # Features use runtime tasks and timers; only native blocking input is exempt.
-"check:threads" = "python3 scripts/check/threads.py"
+"check:threads" = { run = ["python3 -m unittest discover -s scripts/check -p 'test_*.py'", "python3 scripts/check/threads.py"] }
 # No crate links the crate named exactly `tokio` (slab, bytes and the rest
 # of the tokio-rs org are fine): not the workspace's, nor `a` as built by
 # default, web UI included.

@@ -1313,7 +1313,15 @@ pub fn try_lock(file: &File) -> io::Result<()> {
     #[cfg(unix)]
     return file.try_lock().map_err(io::Error::from);
     #[cfg(windows)]
-    return windows_lock(file, true);
+    return windows_lock(file, true).map_err(|error| {
+        if error.raw_os_error()
+            == Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION.cast_signed())
+        {
+            io::Error::from(io::ErrorKind::WouldBlock)
+        } else {
+            error
+        }
+    });
 }
 
 /// Lets go of what [`lock`] took, the file kept open.
@@ -1392,7 +1400,10 @@ mod lock_tests {
         lock(&held).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"daemon identity");
         let other = File::options().read(true).write(true).open(&path).unwrap();
-        assert!(try_lock(&other).is_err());
+        assert_eq!(
+            try_lock(&other).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         drop(held);
         try_lock(&other).unwrap();
         drop(other);

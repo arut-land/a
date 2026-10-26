@@ -63,6 +63,7 @@ pub fn run(
     let driver = Driver::new(move |driver, event| events.event(driver, event, Input::Client))
         .start(runtime.clone(), daemon.clone());
     let stdin = tx.clone();
+    // thread-exception: pipeline-stdin
     thread::spawn(move || {
         let text = (!io::stdin().is_terminal()).then(|| {
             let mut bytes = Vec::new();

@@ -117,21 +117,49 @@ const TICK: Duration = Duration::from_millis(125);
 /// At most one indicator wake is outstanding; idle frames arm none.
 #[derive(Default)]
 struct Ticks {
-    armed: bool,
+    next: u64,
+    armed: Option<(u64, rt::oneshot::Sender<()>)>,
 }
 
 impl Ticks {
     fn arm(&mut self, working: bool, rt: &rt::Rt, post: &client::Post<Event>) {
-        if !working || self.armed {
+        if !working {
+            self.armed = None;
             return;
         }
-        self.armed = true;
+        if self.armed.is_some() {
+            return;
+        }
+        self.next += 1;
+        let tick = self.next;
+        let (cancel, cancelled) = rt::oneshot::channel::<()>();
+        self.armed = Some((tick, cancel));
         let post = post.clone();
         let runtime = rt.clone();
         rt.spawn(Box::pin(async move {
-            runtime.sleep(TICK).await;
-            let _ = post.send(Event::Tick);
+            if rt::or(
+                async {
+                    cancelled.await;
+                    false
+                },
+                async {
+                    runtime.sleep(TICK).await;
+                    true
+                },
+            )
+            .await
+            {
+                let _ = post.send(Event::Tick(tick));
+            }
         }));
+    }
+
+    fn take(&mut self, tick: u64) -> bool {
+        if self.armed.as_ref().is_some_and(|(armed, _)| *armed == tick) {
+            self.armed = None;
+            return true;
+        }
+        false
     }
 }
 
@@ -193,9 +221,10 @@ impl Client {
                             effects.extend(self.app.input(input));
                         }
                     }
-                    Event::Tick => {
-                        self.ticks.armed = false;
-                        self.app.tick();
+                    Event::Tick(tick) => {
+                        if self.ticks.take(tick) {
+                            self.app.tick();
+                        }
                     }
                     Event::Client(event) => {
                         let stepped = self.app.client.step(event);
@@ -215,6 +244,8 @@ impl Client {
             if let Some(exit) = exit {
                 return Ok(exit);
             }
+            self.ticks
+                .arm(self.app.working(), &self.runtime, &self.post);
             if whole {
                 self.screen.invalidate();
             }
@@ -307,6 +338,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn becoming_idle_cancels_the_outstanding_tick() {
+        let rt: rt::Rt = std::sync::Arc::new(rt::Threads::new(1));
+        let (post, inbox) = client::inbox(client::QueueBudget::default(), |_| size_of::<Event>());
+        let mut ticks = Ticks::default();
+        ticks.arm(true, &rt, &post);
+        ticks.arm(false, &rt, &post);
+        assert!(inbox.recv_timeout(TICK * 2).is_none());
+    }
+
+    #[test]
+    fn a_tick_queued_before_idle_cannot_disarm_new_work() {
+        let rt: rt::Rt = std::sync::Arc::new(rt::Threads::new(1));
+        let (post, inbox) = client::inbox(client::QueueBudget::default(), |_| size_of::<Event>());
+        let mut ticks = Ticks::default();
+        ticks.arm(true, &rt, &post);
+        let Some(Event::Tick(old)) = inbox.recv_timeout(Duration::from_secs(5)) else {
+            panic!("working did not tick");
+        };
+        ticks.arm(false, &rt, &post);
+        ticks.arm(true, &rt, &post);
+        assert!(!ticks.take(old));
+        let Some(Event::Tick(new)) = inbox.recv_timeout(Duration::from_secs(5)) else {
+            panic!("new work lost its tick");
+        };
+        assert!(ticks.take(new));
+    }
+
+    #[test]
     fn idle_arms_no_ticks_and_working_arms_only_one() {
         let rt: rt::Rt = std::sync::Arc::new(rt::Threads::new(1));
         let (post, inbox) = client::inbox(client::QueueBudget::default(), |_| size_of::<Event>());
@@ -317,10 +376,10 @@ mod tests {
         ticks.arm(true, &rt, &post);
         assert!(matches!(
             inbox.recv_timeout(Duration::from_secs(5)),
-            Some(Event::Tick)
+            Some(Event::Tick(_))
         ));
         assert!(inbox.recv_timeout(TICK * 2).is_none());
-        ticks.armed = false;
+        ticks.armed = None;
         ticks.arm(false, &rt, &post);
         assert!(inbox.recv_timeout(TICK * 2).is_none());
     }

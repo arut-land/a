@@ -834,9 +834,10 @@ struct Workspace {
 #[derive(Default)]
 struct Preparation {
     running: bool,
-    dirty: bool,
+    changes: u64,
     attempts: u32,
     retry: Option<Cancel>,
+    settle: Option<Cancel>,
 }
 
 impl Coordinator {
@@ -999,7 +1000,7 @@ impl Workspace {
 
     fn retry(self: &Arc<Self>) {
         let mut pending = lock(&self.pending);
-        if pending.retry.is_some() || pending.running || pending.dirty {
+        if pending.retry.is_some() || pending.running {
             return;
         }
         let delay = Duration::from_millis((100 << pending.attempts.min(6)).min(5000));
@@ -1020,58 +1021,89 @@ impl Workspace {
 
     fn changed(self: &Arc<Self>, prepare: &Prepare) {
         let mut pending = lock(&self.pending);
-        if let Some(cancel) = pending.retry.take() {
-            cancel.set();
-        }
-        pending.dirty = true;
-        if pending.running {
-            return;
-        }
+        let retry = pending.retry.take();
+        let settle = pending.settle.clone();
+        pending.changes += 1;
+        let start = !pending.running;
         pending.running = true;
         drop(pending);
-        self.settle(Arc::clone(prepare));
+        for cancel in retry.into_iter().chain(settle) {
+            cancel.set();
+        }
+        if start {
+            self.settle(Arc::clone(prepare));
+        }
     }
 
     /// Prepares the next generation once its sources have been quiet for
     /// [`SETTLE`], which coalesces an editor's writes: a timer on the host's
-    /// runtime, so no worker sleeps through it. What changes while it is
-    /// prepared is prepared again at once.
+    /// runtime, so no worker sleeps through it. Changes during preparation
+    /// coalesce into one followup after another quiet window.
     fn settle(self: &Arc<Self>, prepare: Prepare) {
-        let wait = (self.delay)(SETTLE);
         let weak = Arc::downgrade(self);
         (self.spawn)(Box::pin(async move {
-            wait.await;
-            if weak.strong_count() == 0 {
-                return;
-            }
-            prepare(Box::new(move || {
-                while let Some(workspace) = weak.upgrade() {
-                    lock(&workspace.pending).dirty = false;
+            loop {
+                let Some(workspace) = weak.upgrade() else {
+                    return;
+                };
+                let cancel = Cancel::default();
+                let (seen, previous) = {
+                    let mut pending = lock(&workspace.pending);
+                    (pending.changes, pending.settle.replace(cancel.clone()))
+                };
+                drop(previous);
+                let wait = (workspace.delay)(SETTLE);
+                drop(workspace);
+                if cancel.until(wait).await.is_none() {
+                    continue;
+                }
+                let next = Arc::clone(&prepare);
+                prepare(Box::new(move || {
+                    let Some(workspace) = weak.upgrade() else {
+                        return;
+                    };
+                    let mut pending = lock(&workspace.pending);
+                    pending.settle = None;
+                    // An event can arrive after quiet, while the job waits
+                    // for admission. It still needs its own quiet window.
+                    if pending.changes != seen {
+                        drop(pending);
+                        workspace.settle(next);
+                        return;
+                    }
+                    drop(pending);
                     let result = workspace.rebuild(false);
                     let mut pending = lock(&workspace.pending);
                     if result.is_ok() {
                         pending.attempts = 0;
                     }
-                    if !pending.dirty {
-                        pending.running = false;
+                    if pending.changes != seen {
                         drop(pending);
-                        if let Err(error) = result {
-                            match error {
-                                PrepareError::Retry(_) => workspace.retry(),
-                                PrepareError::Rejected(error) => eprintln!("warning: {error}"),
-                            }
-                        }
-                        break;
+                        workspace.settle(next);
+                        return;
                     }
-                }
-            }));
+                    pending.running = false;
+                    drop(pending);
+                    if let Err(error) = result {
+                        match error {
+                            PrepareError::Retry(_) => workspace.retry(),
+                            PrepareError::Rejected(error) => eprintln!("warning: {error}"),
+                        }
+                    }
+                }));
+                return;
+            }
         }));
     }
 }
 
 impl Drop for Workspace {
     fn drop(&mut self) {
-        if let Some(cancel) = lock(&self.pending).retry.take() {
+        let mut pending = lock(&self.pending);
+        let retry = pending.retry.take();
+        let settle = pending.settle.take();
+        drop(pending);
+        for cancel in retry.into_iter().chain(settle) {
             cancel.set();
         }
     }

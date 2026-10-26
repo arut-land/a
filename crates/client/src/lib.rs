@@ -599,8 +599,8 @@ pub(crate) async fn stop_async(rt: &rt::Rt, home: &Home) -> io::Result<bool> {
 }
 
 /// Whether the daemon let go of its lock, as it does when it exits, within
-/// `within` (or ever): the lock is waited on, not polled. What a test or a
-/// supervisor waits on in place of polling the pid.
+/// `within` (or ever). Contention retries nonblocking native lock attempts
+/// on the runtime's timer; cancelling a wait leaves no blocking job behind.
 pub fn wait_exited(home: &Home, within: Option<Duration>) -> bool {
     rt::block_on(wait_exited_async(&link::BLOCKING, home, within))
 }
@@ -612,14 +612,20 @@ async fn wait_exited_async(rt: &rt::Rt, home: &Home, within: Option<Duration>) -
     locked(rt, file, within).await.is_some()
 }
 
-/// Waits for a file lock on the Storage pool, racing the caller's deadline.
+/// Lock holders and shutdown need Storage workers themselves, so a waiter
+/// must never occupy one while it waits for them.
 async fn locked(rt: &rt::Rt, file: File, within: Option<Duration>) -> Option<File> {
-    if sys::fs::try_lock(&file).is_ok() {
-        return Some(file);
-    }
-    let lock = rt::unblock_with(&**rt, rt::BlockingClass::Storage, 0, move || {
-        sys::fs::lock(&file).ok().map(|()| file)
-    });
+    let lock = async {
+        loop {
+            match sys::fs::try_lock(&file) {
+                Ok(()) => return Some(file),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    rt.sleep(Duration::from_millis(25)).await;
+                }
+                Err(_) => return None,
+            }
+        }
+    };
     match within {
         Some(within) => {
             rt::or(lock, async {
@@ -774,6 +780,7 @@ pub fn bridge(home: &Home, token: &str) -> io::Result<()> {
     writeln!(stdout, "{} {token} env", remote::SYNC)?;
     write_frame(&mut stdout, &env)?;
     let mut up = stream.try_clone()?;
+    // thread-exception: bridge-stdin
     thread::spawn(move || {
         let _ = copy(io::stdin().lock(), &mut up);
         std::process::exit(0);
@@ -1071,6 +1078,38 @@ mod tests {
     }
 
     #[test]
+    fn timed_out_lock_waits_leave_storage_available_for_stop() {
+        let (root, home) = scratch("cancelled-locks");
+        let record = Record {
+            pid: u32::MAX,
+            ..Record::current("absent")
+        };
+        fs::write(home.daemon_pid_file(), record.to_string()).unwrap();
+        let held = File::open(home.daemon_pid_file()).unwrap();
+        sys::fs::lock(&held).unwrap();
+        let mut config = rt::Config::for_cores(1);
+        config.storage.workers = 1;
+        config.storage.queue = 1;
+        let runtime: rt::Rt = Arc::new(rt::Threads::configured(config));
+        let stopped = rt::block_on(async {
+            for _ in 0..3 {
+                assert!(!wait_exited_async(&runtime, &home, Some(Duration::from_millis(20))).await);
+            }
+            rt::or(async { Some(stop_async(&runtime, &home).await) }, async {
+                runtime.sleep(Duration::from_secs(1)).await;
+                None
+            })
+            .await
+        });
+        drop(held);
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            matches!(stopped, Some(Err(_))),
+            "stop must reach its native identity check while the record stays locked"
+        );
+    }
+
+    #[test]
     fn a_lock_let_go_after_the_wait_is_not_kept() {
         let (root, home) = scratch("lock-wait");
         let path = home.daemon_pid_file();
@@ -1087,8 +1126,7 @@ mod tests {
             ))
             .is_none()
         );
-        // Let go afterwards: the helper that was still waiting takes it and
-        // drops it, so the next taker is not kept out.
+        // A cancelled wait cannot acquire the lock after its caller leaves.
         drop(held);
         let taken = rt::block_on(locked(
             &link::BLOCKING,
