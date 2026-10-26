@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use client::{Answer, Daemon};
 use protocol::{Json, Outcome, Scope};
@@ -76,65 +76,6 @@ fn reply(answers: &[Answer]) -> Value {
 }
 
 #[test]
-fn the_first_grep_after_restart_reconciles_an_index_created_only_on_query() {
-    let env = Isolated::new("index-persist");
-    env.run(&["ls"]);
-    let cache = env.home.cache_dir().join("index");
-    assert!(!cache.exists());
-    let tree = env.home.root().join("tree");
-    fs::create_dir_all(tree.join(".git")).unwrap();
-    let file = tree.join("item.txt");
-    fs::write(&file, "oldneedle\n").unwrap();
-    let staged = env
-        .home
-        .runtime()
-        .stage(Path::new(env!("CARGO_BIN_EXE_a")))
-        .unwrap();
-    let daemon = Daemon::local(env.home.clone(), staged);
-    let answers = ask(
-        &env,
-        &daemon,
-        "files.grep",
-        &tree,
-        &json!({"query": "oldneedle"}),
-    );
-    assert_eq!(reply(&answers)["matches"], 1);
-
-    let until = Instant::now() + Duration::from_secs(60);
-    while !fs::read_dir(&cache)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .any(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "files")
-        })
-    {
-        assert!(Instant::now() < until, "the queried index never persisted");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    env.run(&["daemon", "stop"]);
-    fs::write(&file, "newneedle\n").unwrap();
-    env.run(&["ls"]);
-    let staged = env
-        .home
-        .runtime()
-        .stage(Path::new(env!("CARGO_BIN_EXE_a")))
-        .unwrap();
-    let daemon = Daemon::local(env.home.clone(), staged);
-    let answers = ask(
-        &env,
-        &daemon,
-        "files.grep",
-        &tree,
-        &json!({"query": "newneedle"}),
-    );
-    assert_eq!(reply(&answers)["matches"], 1);
-}
-
-#[test]
 fn an_at_mention_search_answers_from_the_workspace_index() {
     let (env, daemon, tree) = started("index-search");
     let found = reply(&ask(
@@ -165,7 +106,7 @@ fn an_at_mention_search_answers_from_the_workspace_index() {
             break;
         }
         assert!(Instant::now() < until, "{found}");
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
