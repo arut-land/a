@@ -223,7 +223,7 @@ fn a_held_blob_is_named_only_once_it_can_be_read() {
     ));
     let places = ext::blob::Blobs::new(store.clone(), tree, SessionId::new()).places();
     let mut writer = ext::blob::BlobStore::writer(&*store, 1 << 20).unwrap();
-    std::io::Write::write_all(&mut writer, b"whole").unwrap();
+    io::Write::write_all(&mut writer, b"whole").unwrap();
     let kept = writer
         .finish("text/plain", BlobOrigin::ToolOutput(call(3)))
         .unwrap();
@@ -276,7 +276,7 @@ fn a_childs_result_held_as_a_blob_is_read_back_for_its_parent() {
     ));
     let places = ext::blob::Blobs::new(store.clone(), tree, SessionId::new()).places();
     let mut writer = ext::blob::BlobStore::writer(&*store, 1 << 20).unwrap();
-    std::io::Write::write_all(&mut writer, b"the child's whole answer").unwrap();
+    io::Write::write_all(&mut writer, b"the child's whole answer").unwrap();
     let blob = writer
         .finish("text/plain", BlobOrigin::ToolOutput(call(3)))
         .unwrap();
@@ -308,4 +308,104 @@ fn a_childs_result_held_as_a_blob_is_read_back_for_its_parent() {
         said.contains("The child session finished:\\nthe child's whole answer"),
         "{said}"
     );
+}
+
+#[test]
+fn completion_metadata_lives_only_until_background_completion_is_formatted() {
+    for detached in [false, true] {
+        let mut transcript =
+            Transcript::empty(Arc::new(Registry::default()), "", &Places::default());
+        for (at, body) in called().into_iter().enumerate() {
+            transcript.apply(&Entry::new(seq(at as u64 + 1), Epoch(0), body), None);
+        }
+        assert!(transcript.tools.is_empty());
+        assert!(transcript.streams.is_empty());
+        let mut at = 4;
+        if detached {
+            transcript.apply(
+                &Entry::new(seq(at), Epoch(0), Body::Detached { call: call(3) }),
+                None,
+            );
+            at += 1;
+        }
+        transcript.apply(
+            &Entry::new(
+                seq(at),
+                Epoch(0),
+                Body::ToolResult {
+                    call: call(3),
+                    outcome: Outcome::detached(),
+                    card: None,
+                    held: vec![Held::Stream(OutputStream {
+                        session: SESSION,
+                        call: call(3),
+                    })],
+                },
+            ),
+            None,
+        );
+        assert_eq!(transcript.tools.len(), 1);
+        assert_eq!(transcript.streams.len(), 1);
+        let payload = if detached {
+            Carried::Detached(Outcome::Done {
+                output: Json::encode("finished").unwrap().into(),
+            })
+        } else {
+            Carried::Job("finished".into())
+        };
+        transcript.apply(
+            &Entry::new(
+                seq(at + 1),
+                Epoch(0),
+                Body::Enqueue {
+                    envelope: Envelope::own(SESSION, call(3), payload),
+                },
+            ),
+            None,
+        );
+        assert!(transcript.tools.is_empty());
+        assert!(transcript.streams.is_empty());
+        assert!(transcript.detached.is_empty());
+        transcript.apply(
+            &Entry::new(
+                seq(at + 2),
+                Epoch(0),
+                Body::Take {
+                    input: seq(at + 1),
+                    into: None,
+                },
+            ),
+            None,
+        );
+        let Message::User(user) = transcript.messages.last().unwrap() else {
+            panic!("completion must be user context")
+        };
+        let shown = format!("{user:?}");
+        assert!(shown.contains(r#"command=\"sleep\""#), "{shown}");
+        assert!(shown.contains(r#"log=\"stream:3\""#), "{shown}");
+        assert!(shown.contains("finished"), "{shown}");
+    }
+}
+
+#[test]
+fn foreground_completions_retain_no_background_metadata() {
+    let mut transcript = Transcript::empty(Arc::new(Registry::default()), "", &Places::default());
+    for (at, body) in called()
+        .into_iter()
+        .chain([Body::ToolResult {
+            call: call(3),
+            outcome: Outcome::Done {
+                output: Json::null().into(),
+            },
+            card: None,
+            held: Vec::new(),
+        }])
+        .enumerate()
+    {
+        transcript.apply(&Entry::new(seq(at as u64 + 1), Epoch(0), body), None);
+    }
+    assert!(transcript.calls.is_empty());
+    assert!(transcript.tools.is_empty());
+    assert!(transcript.streams.is_empty());
+    assert!(transcript.detached.is_empty());
 }

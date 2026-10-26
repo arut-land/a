@@ -589,3 +589,216 @@ fn model_only_inputs_keep_their_interpretation_across_agent_scopes() {
         image = context_image(std::slice::from_ref(&child));
     }
 }
+
+#[test]
+fn batch_replay_preserves_inherited_layers_and_latest_overlapping_edits() {
+    use crate::store::LogStore;
+
+    let home = tempfile::tempdir().unwrap();
+    let store = crate::store::Jsonl::open(home.path()).unwrap();
+    let mut loaded = store
+        .create(&crate::store::Header {
+            id: SessionId::new(),
+            workspace: home.path().to_path_buf(),
+            parent: None,
+        })
+        .unwrap();
+    let ancestor = context_image(&[entry(
+        1,
+        Body::Assistant {
+            text: "ancestor".into(),
+        },
+    )]);
+    let parent = context_image(&[
+        entry(
+            1,
+            Body::Spawned {
+                intent: spawn_image(ancestor),
+            },
+        ),
+        entry(
+            2,
+            Body::Assistant {
+                text: "parent".into(),
+            },
+        ),
+    ]);
+    let mut entries = vec![entry(
+        1,
+        Body::Spawned {
+            intent: spawn_image(parent),
+        },
+    )];
+    entries.extend((2..=4097).map(|seq| {
+        entry(
+            seq,
+            Body::Assistant {
+                text: "history".repeat(64),
+            },
+        )
+    }));
+    entries.push(entry(4098, Body::Interrupt { origin: None }));
+    for (from, to, replacement) in [
+        (100, 300, Some("earlier")),
+        (200, 400, Some("later")),
+        (300, 350, None),
+        (4099, 4099, None),
+    ] {
+        entries.push(entry(
+            entries.len() as u64 + 1,
+            Body::Edit {
+                target: Seq::new(from).unwrap(),
+                upto: Some(Seq::new(to).unwrap()),
+                replace: replacement.map(|text| Json::encode(text).unwrap()),
+            },
+        ));
+    }
+    loaded.writer.append_raw(&entries).unwrap();
+    let through = entries.len() as u64;
+    drop(entries);
+    let frames = crate::outbox::FrameLog::new(loaded.lines, through);
+    let mut passes = 0;
+    let transcript = Transcript::replay(
+        |each| {
+            passes += 1;
+            for batch in frames.batches_after(0) {
+                for entry in batch? {
+                    each(&entry);
+                }
+            }
+            Ok(())
+        },
+        Arc::new(Registry::default()),
+        "system",
+        &Places::default(),
+    )
+    .unwrap();
+    assert_eq!(passes, 2);
+    assert_eq!(transcript.through(), through);
+    let messages = transcript.into_messages();
+    assert_eq!(messages.len(), 3800);
+    let expected = [
+        Message::system("system"),
+        Message::assistant("ancestor"),
+        Message::assistant("parent"),
+    ];
+    assert_eq!(
+        &messages.iter().take(3).cloned().collect::<Vec<_>>(),
+        &expected
+    );
+    assert_eq!(messages.iter().nth(101), Some(&Message::user("earlier")));
+    assert_eq!(messages.iter().nth(102), Some(&Message::user("later")));
+    assert_eq!(
+        messages.last(),
+        Some(&Message::assistant("history".repeat(64)))
+    );
+}
+
+/// Runs through the hosted perf harness's long-log filter, away from shared dev hosts.
+#[test]
+#[ignore = "a measurement; run alone or on a hosted runner"]
+fn bench_loading_a_long_log_transcript_reconstruction() {
+    use crate::store::LogStore;
+    use std::time::{Duration, Instant};
+
+    let rss = || {
+        let output = std::process::Command::new(std::env::var("A_PERF_PYTHON").unwrap())
+            .args([
+                std::env::var("A_PERF_PROCESS").unwrap(),
+                std::process::id().to_string(),
+                "rss".into(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let home = tempfile::tempdir().unwrap();
+    let store = crate::store::Jsonl::open(home.path()).unwrap();
+    let mut loaded = store
+        .create(&crate::store::Header {
+            id: SessionId::new(),
+            workspace: home.path().to_path_buf(),
+            parent: None,
+        })
+        .unwrap();
+    for start in (1..=16384).step_by(256) {
+        let entries: Vec<_> = (start..start + 256)
+            .map(|seq| {
+                entry(
+                    seq,
+                    Body::Assistant {
+                        text: "history ".repeat(512),
+                    },
+                )
+            })
+            .collect();
+        loaded.writer.append_raw(&entries).unwrap();
+    }
+    loaded
+        .writer
+        .append_raw(&[entry(
+            16385,
+            Body::Edit {
+                target: Seq::new(4097).unwrap(),
+                upto: Some(Seq::new(8192).unwrap()),
+                replace: Some(Json::encode("summary").unwrap()),
+            },
+        )])
+        .unwrap();
+    let frames = crate::outbox::FrameLog::new(loaded.lines, 16385);
+    let registry = Arc::new(Registry::default());
+    for staged in [true, false] {
+        sys::memory::release();
+        let before = rss();
+        let mut sampled_peak = before;
+        let mut elapsed = Duration::ZERO;
+        let transcript = if staged {
+            let start = Instant::now();
+            let entries = frames.entries().unwrap();
+            elapsed += start.elapsed();
+            sampled_peak = sampled_peak.max(rss());
+            let start = Instant::now();
+            let image = context_image(&entries);
+            elapsed += start.elapsed();
+            sampled_peak = sampled_peak.max(rss());
+            let start = Instant::now();
+            let transcript = project(image, Arc::clone(&registry), "", &Places::default());
+            elapsed += start.elapsed();
+            sampled_peak = sampled_peak.max(rss());
+            transcript
+        } else {
+            let start = Instant::now();
+            let transcript = Transcript::replay(
+                |each| {
+                    for batch in frames.batches_after(0) {
+                        for entry in batch? {
+                            each(&entry);
+                        }
+                    }
+                    Ok(())
+                },
+                Arc::clone(&registry),
+                "",
+                &Places::default(),
+            )
+            .unwrap();
+            elapsed += start.elapsed();
+            sampled_peak = sampled_peak.max(rss());
+            transcript
+        };
+        sys::memory::release();
+        let retained = rss().saturating_sub(before);
+        let messages = transcript.into_messages();
+        assert_eq!(messages.len(), 12289);
+        assert_eq!(messages.iter().nth(4096), Some(&Message::user("summary")));
+        eprintln!(
+            "transcript staged={staged}: 16385 entries, elapsed={elapsed:?}, sampled_peak_delta_kib={}, retained_result_delta_kib={retained}",
+            sampled_peak.saturating_sub(before)
+        );
+    }
+}

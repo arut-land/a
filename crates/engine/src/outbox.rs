@@ -206,7 +206,13 @@ impl FrameLog {
 
     pub async fn read_entries(self: &Arc<Self>, rt: &dyn rt::Runtime) -> io::Result<Vec<Entry>> {
         let log = Arc::clone(self);
-        rt::unblock(rt, move || log.entries()).await
+        rt::try_unblock_with(
+            rt,
+            rt::BlockingClass::Storage,
+            rt::STORAGE_BYTES,
+            move || log.entries(),
+        )
+        .await?
     }
 
     fn batch(&self, next: u64, last: u64) -> io::Result<Vec<u8>> {
@@ -512,12 +518,18 @@ impl Outbox {
             let step = self.queue().step();
             match step {
                 Step::Read(log, cursor, follows) if cursor < log.seq() => {
-                    let ahead = rt::unblock(rt, move || {
-                        let mut ahead = VecDeque::new();
-                        log.read_after(cursor, &mut ahead);
-                        ahead
-                    })
-                    .await;
+                    let ahead = rt::try_unblock_with(
+                        rt,
+                        rt::BlockingClass::Storage,
+                        rt::STORAGE_BYTES,
+                        move || {
+                            let mut ahead = VecDeque::new();
+                            log.read_after(cursor, &mut ahead);
+                            ahead
+                        },
+                    )
+                    .await
+                    .unwrap_or_else(|error| VecDeque::from([Err(error)]));
                     self.accept_read(cursor, follows, ahead);
                     continue;
                 }
@@ -620,24 +632,16 @@ impl Queue {
     /// The next frame to write, if there is one now: the next queued if the
     /// client has the entries it waits for, else the next entry.
     fn step(&mut self) -> Step {
-        loop {
-            match self.frames.front() {
-                Some(Queued::Switch(_)) => {
-                    let Some(Queued::Switch(follow)) = self.frames.pop_front() else {
-                        unreachable!()
-                    };
-                    self.follow = follow;
-                }
-                Some(Queued::Frame(after, _))
-                    if self.follow.as_ref().is_none_or(|f| *after <= f.cursor) =>
-                {
-                    let Some(Queued::Frame(_, frame)) = self.frames.pop_front() else {
-                        unreachable!()
-                    };
+        while let Some(queued) = self.frames.pop_front_if(|queued| match queued {
+            Queued::Switch(_) => true,
+            Queued::Frame(after, _) => self.follow.as_ref().is_none_or(|f| *after <= f.cursor),
+        }) {
+            match queued {
+                Queued::Switch(follow) => self.follow = follow,
+                Queued::Frame(_, frame) => {
                     self.bytes -= frame.as_bytes().len();
                     return Step::Frame(frame);
                 }
-                _ => break,
             }
         }
         let Some(follow) = self.follow.as_mut() else {
