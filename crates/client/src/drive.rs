@@ -823,7 +823,12 @@ mod tests {
         write_frame(&mut peer, &DaemonMsg::Synced { seq: 1 }).unwrap();
         rt::block_on(handle.flush()).unwrap();
         drop(handle);
-        assert!(read_frame::<ClientMsg>(&mut peer).unwrap().is_none());
+        // Closing a stream with unread replay may reset the peer.
+        match read_frame::<ClientMsg>(&mut peer) {
+            Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("connection stayed open after dropping its handle: {other:?}"),
+        }
         assert!(matches!(
             inbox.recv_timeout(Duration::from_secs(2)).unwrap().kind,
             EventKind::Connected { .. }
