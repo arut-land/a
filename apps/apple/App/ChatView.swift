@@ -71,13 +71,17 @@ struct ChatView: View {
     private func send() {
         let text = input.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { return }
-        input = ""
+        let draft = input
         Task {
-            switch await store.submit(text) {
-            case .help?: showsHelp = true
-            case let action?: perform(action)
-            case nil: break
-            }
+            do {
+                let action = try await store.submit(text)
+                if input == draft { input = "" }
+                switch action {
+                case .help?: showsHelp = true
+                case let action?: perform(action)
+                case nil: break
+                }
+            } catch {}
         }
     }
 }

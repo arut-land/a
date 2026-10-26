@@ -674,6 +674,25 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     ]
     };
     let mut scenarios = vec![
+        ("retry replaces streamed text at every length", vec![
+            attached(),
+            entry(1, Body::ModelCall { request: None, model: "m".into(), attempt: 0, choice: protocol::ToolChoice::Auto, r#for: None, purpose: None }),
+            msg(DaemonMsg::Synced { seq: 1 }),
+            msg(DaemonMsg::Delta { call: call(1), attempt: 0, text: "a\nold".into() }),
+            msg(DaemonMsg::Delta { call: call(1), attempt: 1, text: "€new!".into() }),
+            msg(DaemonMsg::Delta { call: call(1), attempt: 2, text: "€same".into() }),
+            msg(DaemonMsg::Delta { call: call(1), attempt: 3, text: "€".into() }),
+        ]),
+        ("a far behind renderer takes a snapshot", {
+            let mut messages = vec![attached(), entry(1, input("kept"))];
+            messages.extend((0..520).map(|_| msg(DaemonMsg::Activity { seq: 1, activity: protocol::Activity::Idle })));
+            messages
+        }),
+        ("a titling reply titles the store", vec![
+            attached(),
+            entry(1, Body::ModelCall { request: None, model: "m".into(), attempt: 0, choice: protocol::ToolChoice::Auto, r#for: None, purpose: Some("title".into()) }),
+            entry(2, Body::ModelResult { call: call(1), r#for: None, failure: None, outcome: Outcome::Done { output: Json::encode(&json!({"message":{"content":[{"type":"text","text":"Fix the parser"}]}})).unwrap() } }),
+        ]),
         ("the queue folds withdrawals and keeps what it hides out of the transcript", queue_scenario()),
         ("queued submission origins survive snapshots and ownership transfer", {
             let origin = protocol::Author { client: protocol::ClientId(Uuid::from_u128(0xc)), seq: protocol::ClientSeq::new(7).unwrap() };

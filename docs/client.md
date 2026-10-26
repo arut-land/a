@@ -112,7 +112,7 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   which the daemon reads (its own slash commands included). `help(daemon)`
   lists both tables for the app's help screen.
 - **`Driver` and `pump`.** Carries out the `Io` effects: `Connect` opens
-  connection `conn` on a runtime task (replacing the daemon first when
+  connection `conn` on the supplied runtime (replacing the daemon first when
   `restart`), reads it asynchronously and posts each message to the sink as an
   `Event`; `Send` writes on the newest connection (the session client
   numbered it); `SendEnvironment` captures this process's environment
@@ -214,19 +214,11 @@ FFI feed (`crates/ffi/src/live.rs`) are `Renderer`s over this one loop;
 
 ## Renderer rules
 
-`crates/client/src/one_rule.rs` searches every app's sources (Swift
-included) for the signs of a rule copied out of the SDK and fails on any:
-
-- No app decides what waits on whom from the approvals (`Approval::
-  Pending`, a `pendingAsks` list of its own): `TurnView::asking` and
-  `asks` say so.
-- No app decides whether a turn runs (`var running`, `fn running`):
-  `TurnView::running`.
-- No app parses slash commands (`"/detach"`, `"/steer"`, …): `parse`.
-- No app decides when a reply stops streaming (`part == .outcome`): the
-  FFI's every update names the call whose reply is streaming.
-
-A Rust file's own `#[cfg(test)]` module may build any state it likes.
+Shared reducer vectors exercise the renderers' actual presentation and state
+updates. The CLI parity cases compare the TUI, web and REPL at each fold;
+Swift applies the same Rust-generated frames through the FFI and compares
+its store with the reducer after every update, including retry replacement.
+Turn controls come from `TurnView`; slash commands come from `parse`.
 
 Other rules the apps keep, by convention:
 
@@ -261,8 +253,7 @@ Other rules the apps keep, by convention:
 - `crates/client/src/lib.rs`: the mismatch sentence, `stop` signalling
   only the process that recorded itself, a lock let go after the wait is
   not kept.
-- `crates/client/src/one_rule.rs` (a test module), `tests/no_polling.rs`:
-  the rules above.
+- `tests/no_polling.rs`: clients wait for events without polling.
 - Black-box: `apps/cli/tests/blackbox/{acceptance,crash,home,remote}.rs`
   drive `a` against a daemon in an isolated `A_HOME` (`mise run
   acceptance` runs the first); `remote.rs`'s fake `ssh` refuses anything

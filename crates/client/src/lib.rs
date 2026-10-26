@@ -14,8 +14,6 @@ mod host;
 mod inbox;
 pub mod link;
 mod machines;
-#[cfg(test)]
-mod one_rule;
 mod query;
 mod remote;
 mod session;

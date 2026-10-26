@@ -12,6 +12,9 @@
 //! Where raw terminal input is unsupported, [`viewport`] picks the line REPL.
 
 mod app;
+/// The screen state, exposed for cross-renderer integration tests.
+#[doc(hidden)]
+pub use app::App;
 mod editor;
 mod keys;
 mod render;
