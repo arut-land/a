@@ -26,7 +26,8 @@ fn concurrent_cold_starts_make_exactly_one_daemon() {
 
 /// The cold client binds the socket itself and connects into the new
 /// daemon's backlog, so it never sleeps waiting for the daemon to come up.
-/// Only the client is traced: strace would otherwise wait out the daemon.
+/// Follow the client's workers, detaching the daemon on exec so strace
+/// does not wait for a process that outlives the client.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_cold_client_never_polls_for_the_daemon() {
@@ -34,6 +35,9 @@ fn a_cold_client_never_polls_for_the_daemon() {
     let trace = env.root.join("trace");
     let wrapper = [
         "strace",
+        "-f",
+        "-b",
+        "execve",
         "-e",
         "trace=connect,nanosleep,clock_nanosleep",
         "-o",
@@ -42,7 +46,7 @@ fn a_cold_client_never_polls_for_the_daemon() {
     let status = env.cmd_under(&wrapper, &["ls"]).status();
     assert!(status.expect("this test needs strace").success());
     let trace = fs::read_to_string(trace).unwrap();
-    assert!(trace.lines().any(|l| l.starts_with("connect(")), "{trace}");
+    assert!(trace.contains("connect("), "{trace}");
     assert!(!trace.contains("sleep("), "{trace}");
 }
 
