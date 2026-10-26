@@ -64,14 +64,7 @@ pub fn run(
     let stdin = tx.clone();
     // thread-exception: pipeline-stdin
     thread::spawn(move || {
-        let text = (!io::stdin().is_terminal()).then(|| {
-            let mut bytes = Vec::new();
-            let _ = io::stdin().lock().read_to_end(&mut bytes);
-            String::from_utf8_lossy(&bytes).into_owned()
-        });
-        if stdin.send(Input::Stdin(text)).is_err() {
-            stdin.close_with(Input::Busy);
-        }
+        read_stdin((!io::stdin().is_terminal()).then(io::stdin), &stdin);
     });
     // Ctrl-C interrupts the turn; where signals are not caught it ends `a`
     // as it would anything else.
@@ -89,7 +82,7 @@ pub fn run(
                 .await
                 .is_ok()
             {
-                if tx.send(Input::Interrupt).is_err() {
+                if tx.send_first(Input::Interrupt).is_err() {
                     break;
                 }
             }
@@ -130,6 +123,17 @@ pub fn run(
             }
             Input::Interrupt => once.interrupt(),
         };
+    }
+}
+
+fn read_stdin(input: Option<impl Read>, post: &client::Post<Input>) {
+    let text = input.map(|mut input| {
+        let mut bytes = Vec::new();
+        let _ = input.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    if post.send_first(Input::Stdin(text)).is_err() {
+        post.close_with(Input::Busy);
     }
 }
 
@@ -377,6 +381,41 @@ mod tests {
         Activity, Author, Body, ClientId, DaemonMsg, Entry, Epoch, Mode, Seq, SessionId,
     };
     use protocol::{Decode, view::SessionView};
+
+    #[test]
+    fn replay_cannot_reject_or_erase_piped_stdin() {
+        use std::io::{Seek, Write};
+
+        let (post, inbox) = client::inbox(
+            client::QueueBudget {
+                bytes: 8192,
+                requests: 2,
+                control_reserve: 1,
+            },
+            |_| 1,
+        );
+        post.send(Input::Client(Event {
+            conn: ConnId(1),
+            kind: EventKind::Waiting,
+        }))
+        .ok()
+        .unwrap();
+        let mut input = tempfile::tempfile().unwrap();
+        input.write_all(b"piped input").unwrap();
+        input.rewind().unwrap();
+        read_stdin(Some(input), &post);
+        assert!(
+            matches!(inbox.try_recv(), Some(Input::Stdin(Some(text))) if text == "piped input")
+        );
+        assert!(matches!(
+            inbox.try_recv(),
+            Some(Input::Client(Event {
+                kind: EventKind::Waiting,
+                ..
+            }))
+        ));
+        assert!(inbox.try_recv().is_none());
+    }
 
     fn receive(once: &mut Once, msg: DaemonMsg) {
         let effects = once.client.step(Event {

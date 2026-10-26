@@ -110,6 +110,7 @@ struct Outbox {
 #[derive(Default)]
 struct Queued {
     items: VecDeque<(u64, usize, Request)>,
+    finished: Option<u64>,
     closed: bool,
 }
 
@@ -131,6 +132,9 @@ impl Outbox {
         }
         let replace = matches!(&request, Request::Connect { .. })
             || matches!(&request, Request::Io(io) if matches!(&**io, Io::Hangup));
+        if !replace && state.finished == Some(self.epoch.load(Ordering::Acquire)) {
+            return Err(Error::Closed);
+        }
         let coalesced =
             request.environment() && state.items.iter().any(|(_, _, item)| item.environment());
         let bytes = match &request {
@@ -173,7 +177,9 @@ impl Outbox {
         }
         if replace {
             state.items.clear();
-            self.epoch.fetch_add(1, Ordering::AcqRel);
+            let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            state.finished =
+                matches!(&request, Request::Io(io) if matches!(&**io, Io::Hangup)).then_some(epoch);
         } else if coalesced {
             state.items.retain(|(_, _, item)| !item.environment());
         }
@@ -201,6 +207,19 @@ impl Outbox {
             }
             self.ready.until(|| self.ready.count() != seen).await;
         }
+    }
+
+    fn finish(&self, generation: u64) {
+        let abandoned = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.epoch.load(Ordering::Acquire) != generation {
+                return;
+            }
+            state.finished = Some(generation);
+            std::mem::take(&mut state.items)
+        };
+        // Dropping flush senders wakes their waiters, which may queue more I/O.
+        drop(abandoned);
     }
 
     fn close(&self) {
@@ -362,6 +381,13 @@ impl Driver {
         generation: u64,
         handle: &Weak<Handle>,
     ) -> Option<(u64, Request)> {
+        {
+            let mut state = rx.state.lock().unwrap_or_else(PoisonError::into_inner);
+            // A watch retries without a new Connect effect or connection generation.
+            if rx.epoch.load(Ordering::Acquire) == generation {
+                state.finished = None;
+            }
+        }
         let made = self
             .open(
                 rt, daemon, client, conn, &purpose, restart, generation, handle,
@@ -379,6 +405,7 @@ impl Driver {
         } = match made {
             Ok(connection) => connection,
             Err(error) => {
+                rx.finish(generation);
                 let kind = failure(rt, daemon, error).await;
                 self.emit(handle, conn, generation, kind).await;
                 return None;
@@ -472,6 +499,7 @@ impl Driver {
             (Error::Closed, None)
         };
         let (why, pending) = rt::or(read, write).await;
+        rx.finish(generation);
         self.emit(handle, conn, generation, EventKind::Closed(why))
             .await;
         pending
@@ -1161,6 +1189,64 @@ mod tests {
         drop(handle);
         peer.read_to_end(&mut Vec::new()).unwrap();
         assert!(refused, "a stalled transport accepted every queued refresh");
+    }
+
+    #[test]
+    fn failed_writes_resolve_flushes_before_terminal_delivery() {
+        let fixture = Fixture::new();
+        let runtime: Rt = Arc::new(rt::Threads::new(1));
+        let (post, inbox) = crate::inbox(
+            crate::QueueBudget {
+                bytes: 8192,
+                requests: 2,
+                control_reserve: 1,
+            },
+            |_| 1,
+        );
+        post.send(Event {
+            conn: ConnId(1),
+            kind: EventKind::Waiting,
+        })
+        .unwrap();
+        let handle = Driver::with_inbox(post, std::convert::identity)
+            .start(runtime.clone(), fixture.daemon.clone());
+        handle
+            .io(Io::Connect {
+                conn: ConnId(1),
+                attach: Attach::new(Target::New, crate::Env::Keep),
+                restart: false,
+            })
+            .unwrap();
+        let (mut peer, _) = fixture.welcome();
+        handle.io(Io::Send(large_input())).unwrap();
+        peer.read_exact(&mut [0; 4]).unwrap();
+        let mut flush = pin!(handle.flush());
+        rt::block_on(poll_fn(|cx| {
+            assert!(flush.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }));
+        drop(peer);
+        assert_eq!(
+            rt::block_on(rt::or(async { Some(flush.await) }, async {
+                runtime.sleep(Duration::from_secs(2)).await;
+                None
+            })),
+            Some(Err(Error::Closed)),
+            "flush must finish while terminal delivery is backpressured"
+        );
+        assert_eq!(
+            rt::block_on(rt::or(async { Some(handle.flush().await) }, async {
+                runtime.sleep(Duration::from_secs(2)).await;
+                None
+            })),
+            Some(Err(Error::Closed)),
+            "later flushes must observe the ended connection too"
+        );
+        assert!(matches!(inbox.recv().unwrap().kind, EventKind::Waiting));
+        assert!(matches!(
+            inbox.recv_timeout(Duration::from_secs(2)).unwrap().kind,
+            EventKind::Closed(_)
+        ));
     }
 
     #[test]

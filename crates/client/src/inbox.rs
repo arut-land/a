@@ -1,6 +1,16 @@
 //! The app's bounded inbox for daemon events and input.
 //! A locked queue avoids std mpsc's per-type channel implementations,
 //! which cost 7–15 KiB in the shipped clients.
+//!
+//! The budget is per lane, not a total memory limit. Priority input has the
+//! full byte and request allowances; data has `requests - control_reserve`
+//! slots and `bytes - 4096 * control_reserve` bytes (saturating at zero).
+//! Each lane accounts caller-supplied item weights, excluding queue allocation.
+//! An async sender may put one item of any weight into an empty data lane,
+//! so an oversized decoded event cannot make a history impossible to open.
+//! While waiting for space, each driver retains one additional decoded event
+//! outside the queue. Framing read buffers and socket/SSH transport buffers
+//! are also outside these allowances. Queue weights do not bound process RSS.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};

@@ -83,7 +83,7 @@ impl App {
         let Some((_, tx)) = lock(&self.tabs).get(tab).cloned() else {
             return false;
         };
-        tx.send(what).is_ok()
+        tx.send_first(what).is_ok()
     }
 
     /// Answers a request the gate let through.
@@ -313,6 +313,61 @@ impl Drop for Live {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_cannot_reject_composer_interrupt_or_approval_input() {
+        let runtime: Rt = Arc::new(rt::Threads::new(1));
+        let daemon = client::Daemon::local(
+            sys::Home::from(std::env::temp_dir().join("a-web-unused-priority-home")),
+            sys::Staged {
+                id: "test".into(),
+                exe: std::env::current_exe().unwrap(),
+            },
+        );
+        let app = App::new(Daemons::one("local", daemon), runtime, Gate::new(1));
+        let (post, inbox) = client::inbox(
+            client::QueueBudget {
+                bytes: 8192,
+                requests: 4,
+                control_reserve: 1,
+            },
+            |_| 1,
+        );
+        for _ in 0..3 {
+            post.send(TabIn::Client(Event {
+                conn: client::ConnId(1),
+                kind: client::EventKind::Waiting,
+            }))
+            .ok()
+            .unwrap();
+        }
+        lock(&app.tabs).insert("tab".into(), (1, Arc::new(post)));
+        let (reply, _accepted) = rt::oneshot::channel();
+        assert!(app.tell("tab", TabIn::Line("draft".into(), reply)));
+        assert!(app.tell("tab", TabIn::Cmd(Cmd::Interrupt)));
+        assert!(app.tell(
+            "tab",
+            TabIn::Cmd(Cmd::Approve {
+                call: protocol::CallId::new(1).unwrap(),
+                approved: true
+            })
+        ));
+        assert!(matches!(inbox.try_recv(), Some(TabIn::Line(text, _)) if text == "draft"));
+        assert!(matches!(inbox.try_recv(), Some(TabIn::Cmd(Cmd::Interrupt))));
+        assert!(matches!(
+            inbox.try_recv(),
+            Some(TabIn::Cmd(Cmd::Approve { approved: true, .. }))
+        ));
+        for _ in 0..3 {
+            assert!(matches!(
+                inbox.try_recv(),
+                Some(TabIn::Client(Event {
+                    kind: client::EventKind::Waiting,
+                    ..
+                }))
+            ));
+        }
+    }
 
     #[test]
     fn sustained_input_cannot_starve_rendering() {

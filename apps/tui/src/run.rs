@@ -148,7 +148,7 @@ impl Ticks {
             )
             .await
             {
-                let _ = post.send(Event::Tick(tick));
+                let _ = post.send_first(Event::Tick(tick));
             }
         }));
     }
