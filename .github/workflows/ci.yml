@@ -44,8 +44,10 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ${{ runner.temp }}/mbx/actions
-          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}
-          restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - &mise
         uses: jdx/mise-action@v5
         with:
@@ -143,7 +145,9 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: fuzz-crashes
-          path: crates/protocol/tests/__fuzz__/*/crashes
+          path: |
+            crates/protocol/tests/__fuzz__/*/crashes
+            crates/ext-skills/src/parse/__fuzz__/*/crashes
 
   miri:
     runs-on: ubuntu-latest
@@ -200,11 +204,10 @@ jobs:
         run: |
           $runners = @((Get-Command pwsh.exe).Source, "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
           "A_TEST_POWERSHELL=$($runners -join ';')" >> $env:GITHUB_ENV
-      - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
+      - run: mise run check:clippy
       - run: mise exec -- cargo build -p a
-      - run: mise exec -- cargo nextest run --workspace --no-tests=fail --no-fail-fast
+      - run: mise run test
       - *transport-features
-      - run: mise run acceptance
 
   # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
   # reducer vectors and a live session through it in Swift, then the app
@@ -219,5 +222,4 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           install_args: rust mr-boxington github:boltffi/boltffi aqua:yonaskolb/XcodeGen
-      - run: mise run apple:test
-      - run: mise run apple:build
+      - run: mise run --jobs 1 apple:check
