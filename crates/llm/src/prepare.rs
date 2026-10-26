@@ -144,15 +144,13 @@ impl Prepare {
             let mut kept = kept.iter();
             tool.results.retain(|_| kept.next() == Some(&true));
         }
-        if kept.contains(&true) {
-            if let Some(answers) = self.answers.take() {
-                self.send(&Message::Tool(answers), fold)?;
-            }
-            if self.pending.is_empty() {
-                self.send(&message, fold)?;
-            } else if let Message::Tool(tool) = message.into_owned() {
-                self.answers = Some(tool);
-            }
+        if kept.contains(&true)
+            && let Message::Tool(tool) = message.into_owned()
+        {
+            self.answers
+                .get_or_insert_default()
+                .results
+                .extend(tool.results);
         }
         if self.pending.is_empty() {
             if let Some(answers) = self.answers.take() {
@@ -191,12 +189,10 @@ impl Prepare {
                 let native = native(assistant, target);
                 let ids: Vec<_> = assistant
                     .tool_calls()
-                    .filter(|call| native || !call.provider_executed)
                     .map(|call| self.ids.rename(&call.id, fit))
                     .collect();
                 let unchanged = assistant
                     .tool_calls()
-                    .filter(|call| native || !call.provider_executed)
                     .zip(&ids)
                     .all(|(call, id)| call.id == *id);
                 let fits = |part: &AssistantPart| match part {
@@ -233,7 +229,9 @@ impl Prepare {
                     if !native {
                         part.meta_mut().clear();
                     }
-                    if let AssistantPart::ToolCall(call) = part {
+                    if let AssistantPart::ToolCall(call) = part
+                        && !call.provider_executed
+                    {
                         call.id = ids.next().expect("one allocated id per call");
                     }
                 }

@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 /// Per-provider deltas.
 #[derive(Debug, Clone, Copy)]
 struct Sanitize {
-    /// `OpenAI` allows no keywords beside `$ref`.
+    /// `OpenAI` allows no validation keywords beside `$ref`.
     strip_ref_siblings: bool,
     /// `OpenAI` requires `properties` on every object schema.
     inject_empty_properties: bool,
@@ -18,6 +18,29 @@ struct Sanitize {
 
 /// `OpenAI`'s strict subset.
 pub(crate) fn openai(schema: &mut Value) {
+    if schema.get("$ref").is_some() {
+        // The strict root must be an object, while nested recursive refs stay refs.
+        let root = schema.clone();
+        let mut seen = Vec::new();
+        while let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            if seen.contains(&reference.to_owned()) {
+                break;
+            }
+            let Some(resolved) = reference
+                .strip_prefix('#')
+                .and_then(|path| root.pointer(path))
+            else {
+                break;
+            };
+            seen.push(reference.to_owned());
+            *schema = resolved.clone();
+        }
+        if let Some(defs) = root.get("$defs")
+            && let Some(object) = schema.as_object_mut()
+        {
+            object.insert("$defs".into(), defs.clone());
+        }
+    }
     sanitize(
         schema,
         Sanitize {
@@ -45,7 +68,12 @@ fn sanitize(schema: &mut Value, options: Sanitize) {
         return;
     };
     if options.strip_ref_siblings && obj.contains_key("$ref") {
-        obj.retain(|key, _| key == "$ref");
+        obj.retain(|key, _| key == "$ref" || key == "$defs");
+        if let Some(Value::Object(defs)) = obj.get_mut("$defs") {
+            for child in defs.values_mut() {
+                sanitize(child, options);
+            }
+        }
         return;
     }
     let is_object =
@@ -158,4 +186,31 @@ pub(crate) fn short_hash(text: &str) -> String {
     h2 = (h2 ^ (h2 >> 16)).wrapping_mul(2_246_822_507)
         ^ (h1 ^ (h1 >> 13)).wrapping_mul(3_266_489_909);
     format!("{}{}", base36(h2), base36(h1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn root_refs_resolve_without_losing_recursive_definitions() {
+        let mut schema = json!({
+            "$ref": "#/$defs/Input",
+            "$defs": {
+                "Input": {"type": "object", "properties": {
+                    "child": {"anyOf": [{"$ref": "#/$defs/Input"}, {"type": "null"}]}
+                }}
+            }
+        });
+        openai(&mut schema);
+        assert!(schema.get("$ref").is_none());
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], json!(["child"]));
+        assert_eq!(schema["$defs"]["Input"]["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["child"]["anyOf"][0]["$ref"],
+            "#/$defs/Input"
+        );
+    }
 }

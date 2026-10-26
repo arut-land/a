@@ -7,6 +7,8 @@
 //! turning off thinking a model cannot turn off, more than 5 stop
 //! sequences, a seed beyond 32 bits, and `parallel_tool_calls: false`.
 
+use base64::Engine;
+
 use std::num::NonZeroU32;
 
 use serde::Serialize;
@@ -333,12 +335,10 @@ fn function_response(
 
 /// Whether `text` is padded standard base64.
 fn is_base64(text: &str) -> bool {
-    let body = text.trim_end_matches('=');
-    let alphabet = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/');
-    !body.is_empty()
-        && text.len().is_multiple_of(4)
-        && text.len() - body.len() <= 2
-        && body.bytes().all(alphabet)
+    !text.is_empty()
+        && base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .is_ok()
 }
 
 /// One assistant part as a Gemini part: its item while that is current,
@@ -530,4 +530,19 @@ pub(crate) fn body(
         tools,
         headers: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signatures_require_canonical_padded_standard_base64() {
+        for signature in ["Zg==", "Zm8=", "Zm9v"] {
+            assert!(is_base64(signature), "{signature}");
+        }
+        for signature in ["", "Zg", "Zh==", "Zg===", "Zg=x", "____"] {
+            assert!(!is_base64(signature), "{signature}");
+        }
+    }
 }
