@@ -82,7 +82,9 @@ dependency tree. Candidates were checked before selecting the backend:
 | **async-compression gzip/br + mzstd** | **860 KiB** | **Pure Rust, no C SDK or second runtime; workspace Windows cross-clippy passes** |
 | ruzstd | Not built | Decode only; still needs a separate encoder for documented request compression |
 
-The identical probe was 523,568 bytes without compression, 1,021,488 with
+Isolated copies of the final transport source, with only the compression
+backend changed, built the identical probe at 523,584 bytes without
+compression, 1,021,488 with
 libzstd and 1,404,528 with mzstd (macOS arm64, release, opt-level z, LTO,
 one codegen unit, stripped). These are probe deltas, not full daemon sizes.
 The selected backend adds 17 lockfile entries (16 normal/build dependency
