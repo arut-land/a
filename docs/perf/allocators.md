@@ -153,6 +153,12 @@ its remaining queued jobs were cancelled because the same-source full paired
 campaign covers the build and runtime checks on those targets.
 Windows ARM64's full paired build confirms the remaining C1001 failure.
 
+The local Apple M3 cleanup build at `40f8663b`, using the normal
+`cargo build-release -p a` profile and two build jobs, is 5,243,824 bytes
+(5,120.922 KiB). The shipped-byte fixture exclusion scan passes. This is an
+exact build observation; allocator size differences below compare matching
+sources within each paired campaign.
+
 ## Support and dependencies
 
 Candidates are mimalloc 0.1.52, tikv-jemallocator 0.7, snmalloc-rs 0.7.6 and
