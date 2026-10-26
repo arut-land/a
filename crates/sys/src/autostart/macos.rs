@@ -85,15 +85,24 @@ fn loaded(label: &str) -> io::Result<bool> {
     Ok(output.status.success())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum Switch {
+    Enable,
+    Disable,
+}
+
 fn switch(
     label: &str,
-    enabled: bool,
+    action: Switch,
     mut run: impl FnMut(&mut Command) -> io::Result<()>,
 ) -> io::Result<()> {
     // enable/disable only changes future launches. bootout and SMAppService's
     // unregister also terminate the current process, which is a separate action.
     run(Command::new("launchctl")
-        .arg(if enabled { "enable" } else { "disable" })
+        .arg(match action {
+            Switch::Enable => "enable",
+            Switch::Disable => "disable",
+        })
         .arg(format!("{}/{label}", domain())))
 }
 
@@ -104,16 +113,16 @@ pub(super) fn enable(home: &Home) -> io::Result<()> {
         update(&plist(home)?, contents(home)?.as_bytes())?;
         label(home)
     };
-    switch(&owner, true, run)
+    switch(&owner, Switch::Enable, run)
 }
 
 pub(super) fn enable_bundled() -> io::Result<()> {
-    switch(APP_LABEL, true, run)
+    switch(APP_LABEL, Switch::Enable, run)
 }
 
 pub(super) fn disable(home: &Home) -> io::Result<()> {
     if let Some(owner) = owner(home, &disabled()?, loaded)? {
-        switch(&owner, false, run)?;
+        switch(&owner, Switch::Disable, run)?;
     }
     Ok(())
 }
@@ -183,8 +192,8 @@ mod tests {
     #[test]
     fn login_switches_never_unload_the_running_daemon() {
         let mut actions = Vec::new();
-        for enabled in [false, true] {
-            switch(APP_LABEL, enabled, |command| {
+        for action in [Switch::Disable, Switch::Enable] {
+            switch(APP_LABEL, action, |command| {
                 actions.push(
                     command
                         .get_args()
