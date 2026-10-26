@@ -40,13 +40,13 @@ pub fn give(child: Child, lease: ProcessLease, output: Option<Parked>) -> Given 
     }
 }
 
-pub fn claim(group: &Group) -> io::Result<Claimed> {
-    let process = crate::InheritedNumber::from(group.process).duplicate()?;
-    let job = crate::InheritedNumber::from(group.job).duplicate()?;
-    let pipe = group
-        .output
-        .map(|number| crate::InheritedNumber::from(number).duplicate())
-        .transpose()?;
+pub fn claim(
+    group: &Group,
+    duplicate: &mut impl FnMut(i32) -> io::Result<File>,
+) -> io::Result<Claimed> {
+    let process = duplicate(group.process)?;
+    let job = duplicate(group.job)?;
+    let pipe = group.output.map(duplicate).transpose()?;
     // SAFETY: the handle is owned and open.
     if unsafe { GetProcessId(process.as_raw_handle()) } != group.pid {
         return Err(io::Error::new(
@@ -76,6 +76,34 @@ pub fn claim(group: &Group) -> io::Result<Claimed> {
         lease: ProcessLease::handed(RecordedIdentity(group.pid), OwnedHandle::from(job)),
         output: pipe.map(crate::Stream::from_pipe).transpose()?,
     })
+}
+
+/// # Safety
+/// The number must name an inherited handle with no Rust owner.
+pub unsafe fn take_inherited(number: i32) -> io::Result<File> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    let handle = number as isize as HANDLE;
+    let mut flags = 0;
+    // SAFETY: these calls validate handle values or return borrowed stdio handles.
+    let inherited = unsafe {
+        GetHandleInformation(handle, &raw mut flags) != 0
+            && flags & HANDLE_FLAG_INHERIT != 0
+            && [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+                .into_iter()
+                .all(|kind| GetStdHandle(kind) != handle)
+    };
+    if !inherited {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no inherited handle under that number",
+        ));
+    }
+    // SAFETY: the caller guarantees this inherited original has no Rust owner.
+    Ok(File::from(unsafe { OwnedHandle::from_raw_handle(handle) }))
 }
 
 /// A private file holding `bytes`, as on Unix: deleted as its last handle

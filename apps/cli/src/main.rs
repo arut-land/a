@@ -33,7 +33,9 @@ use sys::{Home, Staged};
 
 use crate::args::{Args, Autostart, Cmd, Daemon};
 
-fn main() -> ExitCode {
+sys::main!(run);
+
+fn run(startup: sys::handover::Startup) -> ExitCode {
     sys::small_footprint();
     // The daemon never wants one: whoever starts it gives it no terminal.
     if std::env::args_os()
@@ -99,7 +101,8 @@ fn main() -> ExitCode {
                     Handoff {
                         listen: listen_fd,
                         lock: lock_fd,
-                        handover: handover_fd,
+                        handover: handover_fd
+                            .map(|fd| startup.read_record(sys::InheritedNumber::from(fd))),
                     },
                     reset_breaker,
                     detached,
@@ -703,13 +706,12 @@ fn fork(home: &Home, daemons: &Daemons, source: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// What whoever started the daemon handed it, by descriptor or handle
-/// number: a client its listener and lock, a daemon of the build before
-/// those and the record of its work ([`sys::handover`]).
+/// The listener and lock numbers passed by the starting client, and the
+/// previous daemon's groups already claimed at process entry.
 struct Handoff {
     listen: Option<i32>,
     lock: Option<i32>,
-    handover: Option<i32>,
+    handover: Option<io::Result<sys::handover::Claims>>,
 }
 
 /// The daemon. Started by a client (`listen_fd`), it leaves the client's
@@ -722,7 +724,7 @@ fn serve(
     Handoff {
         listen: listen_fd,
         lock: lock_fd,
-        handover: handover_fd,
+        handover,
     }: Handoff,
     reset_breaker: bool,
     detached: bool,
@@ -740,11 +742,7 @@ fn serve(
             return client::spawn_at_login(home);
         }
     }
-    // What the daemon of the build before handed this one is claimed
-    // first, every handle owned and closed on exec from here on.
-    let handed = handover_fd
-        .map(|fd| sys::handover::read_record(sys::InheritedNumber::from(fd)))
-        .transpose()?;
+    let handed = handover.transpose()?;
     sys::crash::install(home.crash_dir(), sys::crash::Build::of(&staged.id));
     // A daemon exec'd in place by the build before is where that one was:
     // its session and its stderr (a journal, a terminal) are its own.

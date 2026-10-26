@@ -448,6 +448,155 @@ mod tests {
         assert!(crate::child::ran(&output, "bootstrap"), "{output:?}");
     }
 
+    const HANDOVER_RECORD: &str = "A_TEST_HANDOVER_RECORD";
+    const HANDOVER_HANDLES: &str = "A_TEST_HANDOVER_HANDLES";
+
+    #[test]
+    fn a_handover_receiver_releases_originals_while_still_running() {
+        use windows_sys::Win32::Foundation::GetHandleInformation;
+        if let Ok(number) = std::env::var(HANDOVER_RECORD) {
+            println!("handover ready");
+            io::stdout().flush().unwrap();
+            let mut line = String::new();
+            io::stdin().read_line(&mut line).unwrap();
+            // SAFETY: the parent passed these originals through SpawnPlan's
+            // explicit inheritance list. Nothing in this child owns them yet.
+            let claims = unsafe {
+                crate::handover::startup::read_inherited_record(crate::InheritedNumber::from(
+                    number.parse::<i32>().unwrap(),
+                ))
+            }
+            .unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(
+                claims[0].0.as_ref().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            for number in std::iter::once(number).chain(
+                std::env::var(HANDOVER_HANDLES)
+                    .unwrap()
+                    .split(',')
+                    .map(str::to_owned),
+            ) {
+                let handle = number.parse::<i32>().unwrap() as isize
+                    as windows_sys::Win32::Foundation::HANDLE;
+                let mut flags = 0;
+                assert_eq!(
+                    // SAFETY: validates the raw value without creating an owner;
+                    // flags is a writable output.
+                    unsafe { GetHandleInformation(handle, &raw mut flags) },
+                    0,
+                    "inherited original leaked: {number}"
+                );
+            }
+            println!("handover claimed");
+            io::stdout().flush().unwrap();
+            line.clear();
+            io::stdin().read_line(&mut line).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_handover_claim_releases_originals_before_the_receiver_exits() {
+        use windows_sys::Win32::Foundation::{
+            HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/D", "/C", "ping -n 60 127.0.0.1 >NUL"])
+            .envs(std::env::vars_os());
+        let ContainedChild {
+            child,
+            group,
+            capture,
+        } = spawn_group_captured(
+            &mut command,
+            File::options().write(true).open("NUL").unwrap(),
+        )
+        .unwrap();
+        let watch = child.exit_watch().unwrap();
+        let (pipe, _) = crate::handover::park(capture.unwrap().reader).unwrap();
+        let mut given = crate::handover::give(child, group, Some(pipe));
+        // The real process handle deliberately disagrees with the recorded PID.
+        given.group.pid = 0;
+        let mut record = tempfile::tempfile().unwrap();
+        record
+            .write_all(&crate::handover::encode([(
+                &given.group,
+                &serde_json::Value::Null,
+            )]))
+            .unwrap();
+        let keep: Vec<_> = std::iter::once(&record).chain(&given.handles).collect();
+        for file in &keep {
+            // SAFETY: the test owns each handle; only its inheritance bit changes.
+            ok(unsafe {
+                SetHandleInformation(
+                    file.as_raw_handle(),
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                )
+            })
+            .unwrap();
+        }
+        let mut successor = Command::new(std::env::current_exe().unwrap());
+        successor
+            .envs(std::env::vars_os())
+            .env(HANDOVER_RECORD, passed(&record).0.to_string())
+            .env(
+                HANDOVER_HANDLES,
+                given
+                    .handles
+                    .iter()
+                    .map(|file| passed(file).0.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+            .args([
+                "--exact",
+                "proc::imp::tests::a_handover_receiver_releases_originals_while_still_running",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+        let (input, mut gate) = io::pipe().unwrap();
+        let (output, ready) = io::pipe().unwrap();
+        let error = File::options().write(true).open("NUL").unwrap();
+        let mut receiver = spawn::SpawnPlan {
+            command: &successor,
+            io: [&input, &ready, &error],
+            inherited: &keep,
+            job: None,
+            flags: CREATE_NO_WINDOW,
+            environment: crate::proc::SpawnEnvironment::Exact,
+        }
+        .spawn()
+        .unwrap();
+        drop((input, ready, error, keep));
+        let mut lines = BufReader::new(output).lines();
+        assert!(lines.by_ref().any(|line| line.unwrap() == "handover ready"));
+        drop((record, given));
+        assert_eq!(
+            // SAFETY: the owned watch pins the process; no claim has run yet.
+            unsafe { WaitForSingleObject(watch.as_raw_handle(), 0) },
+            WAIT_TIMEOUT
+        );
+        gate.write_all(b"claim\n").unwrap();
+        assert!(
+            lines
+                .by_ref()
+                .any(|line| line.unwrap() == "handover claimed")
+        );
+        // SAFETY: watch owns the target process, whose last job handle should
+        // close in the receiver even though that receiver is still running.
+        let exited = unsafe { WaitForSingleObject(watch.as_raw_handle(), 5000) };
+        gate.write_all(b"exit\n").unwrap();
+        drop(gate);
+        assert!(receiver.wait().unwrap().success());
+        assert_eq!(
+            exited, WAIT_OBJECT_0,
+            "the original job kept the group alive"
+        );
+    }
+
     #[test]
     fn job_owner() {
         if std::env::var_os("A_TEST_JOB_OWNER").is_none() {
