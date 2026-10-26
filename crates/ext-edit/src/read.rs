@@ -128,7 +128,7 @@ impl Tool for Read {
             .ok_or("the engine provides no runtime")?;
         let fail = |e: io::Error| format!("{shown}: {e}");
         let file = path.clone();
-        let (size, header) = offload(rt, Storage, HEAD, move || peek(&file))
+        let (size, header) = rt::try_unblock_with(rt, Storage, HEAD, move || peek(&file))
             .await
             .and_then(|peeked| peeked)
             .map_err(fail)?;
@@ -143,7 +143,7 @@ impl Tool for Read {
             // A file past the storage workers' budget reserves all of it.
             let reserved = usize::try_from(size)
                 .map_or(rt::STORAGE_BUDGET, |size| size.min(rt::STORAGE_BUDGET));
-            let bytes = offload(rt, Storage, reserved, move || whole(&file, size))
+            let bytes = rt::try_unblock_with(rt, Storage, reserved, move || whole(&file, size))
                 .await
                 .and_then(|read| read)
                 .map_err(fail)?;
@@ -157,7 +157,7 @@ impl Tool for Read {
         }
         let reserved = usize::try_from(size.min(TEXT_LIMIT)).unwrap_or(usize::MAX);
         let named = shown.clone();
-        let read = offload(rt, Storage, reserved, move || {
+        let read = rt::try_unblock_with(rt, Storage, reserved, move || {
             File::open(&path).map(|opened| lines(BufReader::new(opened), path, window, &named))
         });
         read.await.and_then(|read| read).map_err(fail)?
@@ -274,7 +274,7 @@ async fn picture(
         .saturating_add(decoded.max(SCALED))
         .saturating_add(MAX_BYTES)
         .min(rt::CPU_BUDGET);
-    let converted = offload(rt, Cpu, work, move || {
+    let converted = rt::try_unblock_with(rt, Cpu, work, move || {
         convert(bytes, format, decode, orientation)
     })
     .await
@@ -294,7 +294,7 @@ async fn keep(
 ) -> Result<Contents, String> {
     let (blobs, call) = (cx.blobs.clone(), cx.call);
     let (media_type, width, height) = (sent.media_type, sent.width, sent.height);
-    let blob = offload(rt, Storage, sent.bytes.len(), move || {
+    let blob = rt::try_unblock_with(rt, Storage, sent.bytes.len(), move || {
         let mut writer = blobs.writer(sent.bytes.len() as u64)?;
         writer.write_all(&sent.bytes)?;
         writer.finish(media_type, BlobOrigin::ToolOutput(call))
@@ -401,21 +401,6 @@ struct Prepared {
     media_type: &'static str,
     width: u32,
     height: u32,
-}
-
-/// `work` run on a blocking worker of `class`, reserving `bytes` while it
-/// runs; `Err` when the runtime cannot admit it.
-async fn offload<T: Send + 'static>(
-    rt: &dyn rt::Runtime,
-    class: rt::BlockingClass,
-    bytes: usize,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> io::Result<T> {
-    let (tx, rx) = rt::oneshot::channel();
-    rt.spawn_blocking(class, bytes, Box::new(move || tx.send(work())))
-        .await?;
-    rx.await
-        .ok_or_else(|| io::Error::other("the worker panicked"))
 }
 
 /// What an image's header says: its size, how it is turned, and how it

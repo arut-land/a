@@ -703,12 +703,14 @@ dependencies = [
  "image",
  "jpeg-decoder",
  "llm",
+ "memchr",
  "png",
  "protocol",
  "rt",
  "serde",
  "serde_json",
  "sys",
+ "tempfile",
 ]
 
 [[package]]
