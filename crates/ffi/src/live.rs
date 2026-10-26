@@ -295,7 +295,7 @@ impl QueryStream {
     /// …}`, the body as the query reads it. An omitted body is `null`.
     pub fn new(client: &Client, query: &str) -> Result<Self, ClientError> {
         let invalid = |message: String| ClientError::InvalidArgument { message };
-        let query: BTreeMap<&str, &serde_json::value::RawValue> =
+        let query: BTreeMap<String, &serde_json::value::RawValue> =
             serde_json::from_str(query).map_err(|e| invalid(e.to_string()))?;
         let field = |name| query.get(name).map_or("null", |raw| raw.get());
         let service: String =
@@ -862,6 +862,15 @@ mod tests {
             assert_eq!(*scope, protocol::Scope::Daemon);
             assert_eq!(payload.raw(), body.unwrap_or("null"));
         }
+        let escaped = QueryStream::new(
+            &client,
+            r#"{"serv\u0069ce":"echo","scope":"daemon","b\u006fdy": { "x": 1e0 }}"#,
+        )
+        .unwrap();
+        let asked = lock(&escaped.asked);
+        let (service, _, body) = &asked.as_ref().unwrap().query;
+        assert_eq!(service, "echo");
+        assert_eq!(body.raw(), r#"{ "x": 1e0 }"#);
         assert!(QueryStream::new(&client, r#"{"service":"echo","scope":"invalid"}"#).is_err());
     }
 
