@@ -3,7 +3,9 @@
 The adoption criterion is lower memory beyond the A/A band, with no CPU or
 latency regression. RAM limits that prevent work are not candidates. Allocator
 arena counts control allocator organization, rather than how much live session
-state the daemon may own.
+state the daemon may own. Qualifying the retirement callback also requires
+upper 95% bounds for active CPU and turn/delta p99 latency within the matching
+A/A band. A wider interval leaves that target unqualified.
 
 ## Protocol
 
@@ -26,7 +28,12 @@ client threads. These are allocator comparisons on the same workload, not
 measurements of the daemon alone. Paired executable measurements separately
 cover the daemon, the line client, startup, attach, driver turns and large
 tool results. Their reference is built from the same source with an empty
-variant; no allocator feature is passed to that build.
+variant; no allocator feature is passed to that build. The A/A suite builds
+that same revision in both positions. Shipped executable hashes are recorded,
+not assumed identical: the Linux ARM64 A/A hashes match, while Apple Silicon's
+hashes differ despite identical sizes. Its source, variant and 20-round
+control remain explicit; byte identity is not claimed across all targets. The sessions records also
+report `system` for every `A`, `A2`, `rest` and `arenas` baseline checked.
 
 Memory uses KiB. macOS physical footprint and its lifetime peak differ from
 RSS: pages the allocator has marked reusable can remain resident without
@@ -44,7 +51,9 @@ within each run before pairing; individual deltas are not independent
 bootstrap samples. The script retains raw pairs, matched round IDs and
 separate estimates for the two orders. Intervals describe the measured
 host, not variation across hardware. Failed or missing rounds are not
-filled with zero. Samples with failed calls or dropped deltas cannot enter
+filled with zero. Executable size is the exact difference between two saved
+builds, not a statistically sampled interval; `n=1` for that field. Samples
+with failed calls or dropped deltas cannot enter
 the effect table.
 
 ```sh
@@ -60,7 +69,10 @@ snmalloc paired suite use `c249a084`, which includes that merge and the
 read-scratch change. Each allocator is compared with its own same-source
 system build; absolute footprints across those blocks are not interchangeable.
 The local M3 allocator binaries were saved by the preceding build campaign.
-Hosted sessions are split to stay within the 150-minute measurement step:
+The original dispatches split allocators around a 150-minute measurement
+step; Apple Silicon retries use the longer window below. To reproduce the
+experimental composition, check out harness `b41ea27b` and build the pinned
+measured source from each run. The final branch removes rejected features.
 
 | Comparison | Run |
 | --- | --- |
@@ -79,6 +91,10 @@ Hosted sessions are split to stay within the 150-minute measurement step:
 | Retirement hook, separate daemon | [40241543773](https://github.com/arut-land/a/actions/runs/40241543773) |
 | Segment heap, ARM64 sessions only | [40241548413](https://github.com/arut-land/a/actions/runs/40241548413) |
 | Read scratch, 1/128 sessions | [40241546207](https://github.com/arut-land/a/actions/runs/40241546207) |
+| System/system A/A, Windows ARM64 retry | [40249311731](https://github.com/arut-land/a/actions/runs/40249311731) |
+| Retirement hook, Windows ARM64 retry | [40253490613](https://github.com/arut-land/a/actions/runs/40253490613) |
+| mimalloc, Apple Silicon, 128-session retry | [40258918237](https://github.com/arut-land/a/actions/runs/40258918237) |
+| rpmalloc, Apple Silicon, 128-session retry | [40258921054](https://github.com/arut-land/a/actions/runs/40258921054) |
 
 The earlier smoke run
 [40234108961](https://github.com/arut-land/a/actions/runs/40234108961)
@@ -102,6 +118,13 @@ with the runner matrix computed directly, removing an Ubuntu-only selector
 job that blocked their native runner queues; their measured sources and
 paired protocol are unchanged.
 
+The original Apple Silicon mimalloc and rpmalloc sessions steps hit their
+150-minute limit with one-session samples complete, but only 19 complete
+128-session control pairs. Those incomplete pairs remain separate evidence.
+The longer-window retries measure only 128 sessions; there is no pairing
+across runners. The first mimalloc retry, 40252160653, was cancelled while
+queued to avoid repeating its completed one-session measurements.
+
 ## Allocator decision
 
 Keep the native system allocator. The replacement allocators trade memory for
@@ -123,6 +146,11 @@ The Windows segment-heap manifest is also rejected: idle RSS changes by
 +8 KiB [−4, 28] on ARM64. These are 20 matched daemon pairs. Its experimental
 feature and manifest rewrite have been removed. The retirement callback is
 a separate decision.
+
+The release-mode snmalloc smoke completed on Linux ARM64 and Windows x64;
+its remaining queued jobs were cancelled because the same-source full paired
+campaign covers the build and runtime checks on those targets.
+Windows ARM64's full paired build confirms the remaining C1001 failure.
 
 ## Support and dependencies
 
@@ -184,6 +212,29 @@ uninstrumented 20-round comparison uses `1190974f` against `48b9c3a0` on
 all six hosted targets. Large transcript, snapshot and view caches remain
 reconstructible state; dropping them indiscriminately also creates rebuild
 work. The read scratch can be removed without choosing a cache lifetime.
+
+## Retirement callback decision
+
+Do not retain the automatic callback, its runtime configuration field or its
+worker accounting. On Linux x64, the separate daemon suite changes large-JSON
+CPU by +1.314% [1.042, 1.552], entirely beyond its A/A band of ±0.572%.
+That violates the adoption criterion. These short driver/large-JSON workloads
+do not wait for worker retirement: their CPU results compare compiled runtime
+variants and bookkeeping, rather than timing `malloc_trim` itself.
+
+Memory return alone is insufficient. After the read-scratch change, the
+128-session callback returns 626 KiB [510, 796] on Linux ARM64 and 1,556 KiB
+[1,262, 2,046] on Windows x64. Their upper turn-p99 bounds (+2.894% and
++5.355%) extend beyond their respective A/A bands (±1.940% and ±3.497%).
+Those targets also fail the conservative latency qualification. The M3
+shows no memory return beyond A/A.
+
+The native `sys::release()` entry point remains an explicit diagnostic used
+by the measurement executable. Production has no automatic trim, extra
+retirement timer, callback field or worker counter. The experiment and its
+lifecycle invariant test remain available in the pinned source commits.
+The current sessions harness removes the rejected callback layout and its
+`rest=none` option; the experimental campaign uses the pinned harness above.
 
 ## Local M3 paired results
 

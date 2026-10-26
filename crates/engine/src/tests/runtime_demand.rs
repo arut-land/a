@@ -374,7 +374,7 @@ struct Load {
 /// comma-separated parts: `workers=<n>` async workers, `network=<n>`
 /// network lane workers (and queue), `threads` for each session on an
 /// executor of its own, `arenas=default` for glibc's arena policy without
-/// the daemon's cap, `rest=none` for nothing released at rest. Prints one
+/// the daemon's cap. Prints one
 /// JSON line; docs/perf/runtime-demand.md and docs/perf/allocators.md.
 #[test]
 #[ignore = "release-only sizing measurement; see docs/perf/runtime-demand.md"]
@@ -568,8 +568,6 @@ fn serve(home: &Home, port: u16, variant: &str) -> (crate::Owner, Arc<rt::Thread
             }
             // glibc's own arena policy, without the daemon's cap.
             Some(("arenas", "default")) => arenas = false,
-            // Nothing handed back when the runtime comes to rest.
-            Some(("rest", "none")) => threads.at_rest = || {},
             None if part == "threads" => {
                 ACTORS.set(on_own_thread).unwrap();
                 split = true;
