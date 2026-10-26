@@ -686,8 +686,8 @@ fn batch_replay_preserves_inherited_layers_and_latest_overlapping_edits() {
         &messages.iter().take(3).cloned().collect::<Vec<_>>(),
         &expected
     );
-    assert_eq!(messages.iter().nth(101), Some(&Message::user("earlier")));
-    assert_eq!(messages.iter().nth(102), Some(&Message::user("later")));
+    assert_eq!(messages.get(101), Some(&Message::user("earlier")));
+    assert_eq!(messages.get(102), Some(&Message::user("later")));
     assert_eq!(
         messages.last(),
         Some(&Message::assistant("history".repeat(64)))
@@ -701,22 +701,6 @@ fn bench_loading_a_long_log_transcript_reconstruction() {
     use crate::store::LogStore;
     use std::time::{Duration, Instant};
 
-    let rss = || {
-        let output = std::process::Command::new(std::env::var("A_PERF_PYTHON").unwrap())
-            .args([
-                std::env::var("A_PERF_PROCESS").unwrap(),
-                std::process::id().to_string(),
-                "rss".into(),
-            ])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .trim()
-            .parse::<u64>()
-            .unwrap()
-    };
     let home = tempfile::tempdir().unwrap();
     let store = crate::store::Jsonl::open(home.path()).unwrap();
     let mut loaded = store
@@ -753,23 +737,23 @@ fn bench_loading_a_long_log_transcript_reconstruction() {
     let frames = crate::outbox::FrameLog::new(loaded.lines, 16385);
     let registry = Arc::new(Registry::default());
     for staged in [true, false] {
-        sys::memory::release();
-        let before = rss();
+        sys::release();
+        let before = resident_kib();
         let mut sampled_peak = before;
         let mut elapsed = Duration::ZERO;
         let transcript = if staged {
             let start = Instant::now();
             let entries = frames.entries().unwrap();
             elapsed += start.elapsed();
-            sampled_peak = sampled_peak.max(rss());
+            sampled_peak = sampled_peak.max(resident_kib());
             let start = Instant::now();
             let image = context_image(&entries);
             elapsed += start.elapsed();
-            sampled_peak = sampled_peak.max(rss());
+            sampled_peak = sampled_peak.max(resident_kib());
             let start = Instant::now();
             let transcript = project(image, Arc::clone(&registry), "", &Places::default());
             elapsed += start.elapsed();
-            sampled_peak = sampled_peak.max(rss());
+            sampled_peak = sampled_peak.max(resident_kib());
             transcript
         } else {
             let start = Instant::now();
@@ -788,17 +772,34 @@ fn bench_loading_a_long_log_transcript_reconstruction() {
             )
             .unwrap();
             elapsed += start.elapsed();
-            sampled_peak = sampled_peak.max(rss());
+            sampled_peak = sampled_peak.max(resident_kib());
             transcript
         };
-        sys::memory::release();
-        let retained = rss().saturating_sub(before);
+        sys::release();
+        let retained = resident_kib().saturating_sub(before);
         let messages = transcript.into_messages();
         assert_eq!(messages.len(), 12289);
-        assert_eq!(messages.iter().nth(4096), Some(&Message::user("summary")));
+        assert_eq!(messages.get(4096), Some(&Message::user("summary")));
         eprintln!(
             "transcript staged={staged}: 16385 entries, elapsed={elapsed:?}, sampled_peak_delta_kib={}, retained_result_delta_kib={retained}",
             sampled_peak.saturating_sub(before)
         );
     }
+}
+
+fn resident_kib() -> u64 {
+    let output = std::process::Command::new(std::env::var("A_PERF_PYTHON").unwrap())
+        .args([
+            std::env::var("A_PERF_PROCESS").unwrap(),
+            std::process::id().to_string(),
+            "rss".into(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse::<u64>()
+        .unwrap()
 }

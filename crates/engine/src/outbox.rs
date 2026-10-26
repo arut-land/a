@@ -1022,6 +1022,23 @@ mod tests {
                 frames.entries().is_err(),
                 "fault {fault} cannot certify a prefix"
             );
+            let transcript = crate::transcript::Transcript::replay(
+                |each| {
+                    for batch in frames.batches_after(0) {
+                        for entry in batch? {
+                            each(&entry);
+                        }
+                    }
+                    Ok(())
+                },
+                Arc::new(ext::host::Registry::default()),
+                "",
+                &ext::blob::Places::default(),
+            );
+            assert!(
+                transcript.is_err(),
+                "fault {fault} cannot certify a transcript"
+            );
             let outbox = Outbox::new();
             let follower = outbox.follow(
                 frames,
