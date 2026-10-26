@@ -72,11 +72,13 @@ impl Link for SshLink {
                 .into());
             }
             let home = self.home.clone();
-            let machine =
-                rt::try_unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
-                    sys::machine_id(&home)
-                })
-                .await??;
+            let machine = rt::try_unblock_with(
+                &**rt,
+                rt::BlockingClass::Storage,
+                rt::STORAGE_BYTES,
+                move || sys::machine_id(&home),
+            )
+            .await??;
             let opened = |opened: Opened| Opened {
                 machine: Some(MachineId(machine)),
                 ..opened
