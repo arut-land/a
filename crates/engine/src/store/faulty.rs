@@ -47,9 +47,15 @@ pub enum SyncFailure {
 
 #[derive(Default)]
 struct Hold {
+    target: Option<HoldTarget>,
     started: ext::Flag,
     released: Mutex<bool>,
     ready: Condvar,
+}
+
+struct HoldTarget {
+    session: SessionId,
+    matches: fn(&Entry) -> bool,
 }
 
 pub struct HeldFlush(Arc<Hold>);
@@ -80,6 +86,20 @@ impl Faulty {
 
     pub fn hold_next_flush(&self) -> HeldFlush {
         let hold = Arc::new(Hold::default());
+        lock(&self.state.holds).push_back(Arc::clone(&hold));
+        HeldFlush(hold)
+    }
+
+    /// Holds the epoch that captures a matching append, leaving earlier epochs free.
+    pub fn hold_flush_containing(
+        &self,
+        session: SessionId,
+        matches: fn(&Entry) -> bool,
+    ) -> HeldFlush {
+        let hold = Arc::new(Hold {
+            target: Some(HoldTarget { session, matches }),
+            ..Hold::default()
+        });
         lock(&self.state.holds).push_back(Arc::clone(&hold));
         HeldFlush(hold)
     }
@@ -240,7 +260,20 @@ impl Log for FaultyLog {
             let generation = self.generation;
             Some(self.state.flusher.enroll_prepared(move || {
                 let pending = std::mem::take(&mut *lock(&state.unsynced));
-                let hold = lock(&state.holds).pop_front();
+                let mut holds = lock(&state.holds);
+                let hold = holds
+                    .iter()
+                    .position(|hold| {
+                        hold.target.as_ref().is_none_or(|target| {
+                            pending.get(&target.session).is_some_and(|batches| {
+                                batches
+                                    .iter()
+                                    .any(|(entries, _)| entries.iter().any(target.matches))
+                            })
+                        })
+                    })
+                    .and_then(|index| holds.remove(index));
+                drop(holds);
                 Box::new(move || {
                     if generation != state.generation.load(Ordering::SeqCst) {
                         return Err(io::Error::other("cache epoch invalidated"));
@@ -321,5 +354,70 @@ struct Off;
 impl Log for Off {
     fn append_all(&mut self, _: &[Entry], _: &Encoded) -> io::Result<()> {
         Err(io::Error::other("no log"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{AppendMode, Jsonl};
+    use protocol::{Body, Epoch, Mode, Seq};
+
+    #[test]
+    fn a_targeted_hold_covers_its_append_without_blocking_earlier_epochs() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing = Arc::new(Jsonl::open(dir.path().join("logs")).unwrap());
+        let faulty = Faulty::new(Arc::clone(&backing) as _);
+        let runtime = rt::Threads::new(1);
+        let header = Header {
+            id: SessionId::new(),
+            workspace: dir.path().to_path_buf(),
+            parent: None,
+        };
+        let mut target = faulty.create(&header).unwrap().writer;
+        let other = Header {
+            id: SessionId::new(),
+            ..header.clone()
+        };
+        let mut unrelated = faulty.create(&other).unwrap().writer;
+        let hold = faulty.hold_flush_containing(header.id, |entry| entry.seq.get() == 2);
+        for seq in 1..=2 {
+            unrelated
+                .append(&mut [entry(seq)], AppendMode::Order)
+                .unwrap();
+        }
+        unrelated.flush_inline().unwrap();
+        target.append(&mut [entry(1)], AppendMode::Order).unwrap();
+        target.flush_inline().unwrap();
+        assert!(!hold.0.started.is_set());
+        assert_eq!(backing.entries(other.id).unwrap().len(), 2);
+        assert_eq!(backing.entries(header.id).unwrap().len(), 1);
+
+        target.append(&mut [entry(2)], AppendMode::Order).unwrap();
+        let epoch = target.enroll().unwrap().dispatch(&runtime);
+        hold.started();
+        assert_eq!(backing.entries(header.id).unwrap().len(), 1);
+        assert!(faulty.pending(header.id).is_empty());
+        target.append(&mut [entry(3)], AppendMode::Order).unwrap();
+        hold.release();
+        rt::block_on(epoch).unwrap();
+        assert_eq!(backing.entries(header.id).unwrap().len(), 2);
+        assert_eq!(faulty.pending(header.id)[0].seq.get(), 3);
+        target.flush_inline().unwrap();
+        assert_eq!(backing.entries(header.id).unwrap().len(), 3);
+    }
+
+    fn entry(seq: u64) -> Entry {
+        Entry::new(
+            Seq::new(seq).unwrap(),
+            Epoch(0),
+            Body::Input {
+                segments: format!("m{seq}").into(),
+                mode: Mode::Queue,
+                taken: true,
+                origin: None,
+                force: false,
+            },
+        )
     }
 }
