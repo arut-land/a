@@ -224,6 +224,7 @@ macro_rules! gateway {
                 base_url: $base_url,
                 key_env: &[concat!($env, "_API_KEY")],
                 base_url_env: &[concat!($env, "_ANTHROPIC_API_BASE")],
+                compression: None,
                 ..ANTHROPIC.0
             },
             Quirks { $($quirk: $value,)+ ..Quirks::GATEWAY },
@@ -239,7 +240,7 @@ const ANTHROPIC: (Host, Quirks) = (
         base_url_env: &["ANTHROPIC_BASE_URL"],
         key: KeyStyle::Header("x-api-key"),
         keyless: false,
-        compression: None,
+        compression: Some(transport::Compression::Gzip),
     },
     Quirks::ANTHROPIC,
 );
