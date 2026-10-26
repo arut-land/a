@@ -2144,9 +2144,8 @@ mod tests {
                     .raw_os_error(),
                 Some(32)
             );
-            let incoming = work.0.join("incoming");
-            fs::write(&incoming, b"changed").unwrap();
-            super::super::replace(&incoming, &work.target()).unwrap();
+            fs::remove_file(work.target()).unwrap();
+            fs::write(work.target(), b"changed").unwrap();
         }
         let mut captured = Vec::new();
         transaction.original().unwrap().rewind().unwrap();
