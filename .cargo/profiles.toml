@@ -49,10 +49,6 @@ debug = "line-tables-only"
 split-debuginfo = "packed"
 strip = "symbols"
 
-# snmalloc treats Cargo's debug-information setting as its C++ debug mode.
-[profile.release.package.snmalloc-sys]
-debug = false
-
 # cargo-bolero (`mise run fuzz`): optimized, and LLVM throughout for
 # libFuzzer's coverage instrumentation.
 [profile.fuzz]

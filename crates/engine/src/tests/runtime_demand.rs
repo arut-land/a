@@ -491,7 +491,7 @@ fn at_rest(
     sys::release();
     let detached_released = usage();
     let serde_json::Value::Object(rest) = json!({
-        "allocator": sys::Global::NAME,
+        "allocator": "system",
         "release_ms": release_ms,
         "released_rss_kib": released["rss_kib"],
         "released_footprint_kib": released.get("footprint_kib"),

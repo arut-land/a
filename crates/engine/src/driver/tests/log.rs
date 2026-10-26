@@ -2,7 +2,7 @@
 //! when a client comes to them, never held in the daemon's memory nor
 //! encoded again.
 
-use std::alloc::{GlobalAlloc, Layout};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::fs;
 
@@ -11,7 +11,7 @@ use protocol::Decode;
 use super::*;
 use crate::store::{FORMAT, seal, unseal};
 
-/// The process's allocator (`sys::Global`), counting the bytes this thread holds and the most
+/// The system allocator, counting the bytes this thread holds and the most
 /// it has held.
 struct Counting;
 
@@ -27,26 +27,26 @@ fn held(change: isize) {
     });
 }
 
-// Only this test binary counts: the allocator defers to the process's.
+// Only this test binary counts: the allocator defers to the system's.
 #[allow(unsafe_code)]
-// SAFETY: every method forwards to `sys::Global`, which upholds the contract.
+// SAFETY: every method forwards to `System`, which upholds the contract.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         held(layout.size().cast_signed());
-        // SAFETY: the caller upholds `sys::Global.alloc`'s contract.
-        unsafe { sys::Global.alloc(layout) }
+        // SAFETY: the caller upholds `System.alloc`'s contract.
+        unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         held(-layout.size().cast_signed());
-        // SAFETY: the caller upholds `sys::Global.dealloc`'s contract.
-        unsafe { sys::Global.dealloc(ptr, layout) }
+        // SAFETY: the caller upholds `System.dealloc`'s contract.
+        unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         held(size.cast_signed() - layout.size().cast_signed());
-        // SAFETY: the caller upholds `sys::Global.realloc`'s contract.
-        unsafe { sys::Global.realloc(ptr, layout, size) }
+        // SAFETY: the caller upholds `System.realloc`'s contract.
+        unsafe { System.realloc(ptr, layout, size) }
     }
 }
 

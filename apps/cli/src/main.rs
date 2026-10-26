@@ -40,9 +40,6 @@ use sys::{Home, Staged};
 
 use crate::args::{Args, Autostart, Cmd, Daemon};
 
-#[global_allocator]
-static GLOBAL: sys::Global = sys::Global;
-
 fn main() -> ExitCode {
     sys::small_footprint();
     // The daemon never wants one: whoever starts it gives it no terminal.

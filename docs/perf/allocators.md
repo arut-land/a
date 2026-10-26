@@ -98,6 +98,24 @@ with the runner matrix computed directly, removing an Ubuntu-only selector
 job that blocked their native runner queues; their measured sources and
 paired protocol are unchanged.
 
+## Allocator decision
+
+Keep the native system allocator. The replacement allocators trade memory for
+throughput in the separate Linux daemon, while retaining substantially more
+memory in the sessions workload. For example, on Linux ARM64, mimalloc changes
+idle daemon RSS by +18,814 KiB [18,808, 18,820] and driver CPU by
+−20.624% [−20.696, −20.373]; jemalloc changes them by +2,110 KiB
+[2,098, 2,122] and −12.476% [−12.822, −12.032]. Corrected release-mode
+snmalloc increases both: +9,802 KiB [9,776, 9,840] and +15.073%
+[14.563, 15.325]. These are 20-pair 95% intervals, not smoke estimates.
+A CPU improvement alone does not meet this campaign's memory criterion.
+
+The four experimental allocator features, their native build dependencies and
+the forwarding global-allocator seam have been removed. Their pinned source
+commits above preserve reproducibility. The final binary uses Rust's native
+system allocator directly; measurement helpers continue to label it `system`.
+Windows segment heap and the retirement callback are separate decisions.
+
 ## Support and dependencies
 
 Candidates are mimalloc 0.1.52, tikv-jemallocator 0.7, snmalloc-rs 0.7.6 and
@@ -112,6 +130,11 @@ This is an unsupported target for the measured crate, rather than a runtime
 sample. The shared rpmalloc/segment sessions job failed before it could
 measure either; a separate segment-only ARM64 campaign preserves that
 comparison.
+
+snmalloc also fails on Windows ARM64 with upstream's CMake build in release
+mode: MSVC 14.51 reports C1001 at `freelist.h:934`. Clearing `MSYSTEM` and
+disabling C++ debug mode did not resolve that compiler failure. It is not
+qualified on this runner/toolchain; no performance result is substituted.
 
 The segment-heap executable variant embeds the Windows SegmentHeap manifest.
 The sessions probe instead sets an Image File Execution Options key on its
