@@ -645,7 +645,7 @@ async fn locked(rt: &rt::Rt, file: File, within: Option<Duration>) -> Option<Fil
 /// Local endpoint verification and named-pipe opening may block in the OS.
 async fn local_connect(rt: &rt::Rt, home: &Home) -> io::Result<OwnedConnection> {
     let endpoint = home.endpoint();
-    rt::try_unblock_with(&**rt, rt::BlockingClass::Storage, 0, move || {
+    rt::try_unblock_with(&**rt, rt::BlockingClass::Storage, 64 << 10, move || {
         endpoint.connect()
     })
     .await?

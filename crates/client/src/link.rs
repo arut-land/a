@@ -377,7 +377,7 @@ pub(crate) async fn connect<F: Future<Output = ()> + Send>(
                 return Err(rt::try_unblock_with(
                     &**rt,
                     rt::BlockingClass::Storage,
-                    0,
+                    64 << 10,
                     move || link.mismatch(&build, theirs),
                 )
                 .await?);
