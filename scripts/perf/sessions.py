@@ -7,6 +7,10 @@ between them is the noise band any other layout must clear. With `--round-trip`,
 rt's echoed-byte timing runs in each layout's environment every round too.
 Each layout is also compared with `A` round by round: median paired differences
 with bootstrap 95% intervals.
+
+`--layouts memory` compares allocators instead: each `--binary LABEL=PATH` is
+the same measurement built with another global allocator, run on the default
+runtime beside the two system-allocator controls (docs/perf/allocators.md).
 """
 import argparse
 import json
@@ -17,11 +21,22 @@ import subprocess
 import sys
 
 TEST = "tests::runtime_demand::concurrent_active_sessions"
+MEMORY = ["peak_kib", "idle_footprint_kib", "release_ms", "released_rss_kib", "released_footprint_kib",
+          "detached_rss_kib", "detached_released_rss_kib", "detached_released_footprint_kib"]
 
 
 def percentile(values, q):
     values = sorted(values)
     return values[min(len(values) - 1, int(len(values) * q))]
+
+
+def memory_layouts(binaries, arena_policy=False):
+    plain = "workers=4"
+    labels = [("A", plain, {}, None), ("A2", plain, {}, None)]
+    labels += [(label, plain, {}, label) for label in binaries]
+    if arena_policy and sys.platform == "linux":
+        labels.append(("arenas", plain + ",arenas=default", {}, None))
+    return labels
 
 
 def layouts(cores):
@@ -58,6 +73,8 @@ def summarize(records):
             idle_switches=statistics.median(run["idle_switches"] for run in runs),
             dropped_deltas=sum(run["dropped_deltas"] for run in runs),
             failed_calls=sum(run.get("failed_calls", 0) for run in runs),
+            **{name: statistics.median(run[name] for run in runs)
+               for name in MEMORY if all(run.get(name) is not None for run in runs)},
         )
     return summary
 
@@ -150,6 +167,15 @@ def table(summary):
                      "| {run_delta_p99_ms:.3f} | {turn_p50_ms:.0f} | {turn_p99_ms:.0f} | {active_cpu_ms:.0f} "
                      "| {active_switches:.0f} | {idle_rss_kib:.0f} | {idle_threads:.0f} | {idle_switches:.0f} "
                      "| {dropped_deltas} | {failed_calls} |".format(**row))
+    rows = [row for row in summary.values() if "released_rss_kib" in row]
+    if rows:
+        lines += ["", "| layout | sessions | peak KiB | idle RSS KiB | released KiB | release ms "
+                  "| detached KiB | detached released KiB |",
+                  "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+        for row in rows:
+            lines.append("| {label} | {sessions} | {peak} | {idle_rss_kib:.0f} | {released_rss_kib:.0f} "
+                         "| {release_ms:.2f} | {detached_rss_kib:.0f} | {detached_released_rss_kib:.0f} |".format(
+                             peak=f"{row['peak_kib']:.0f}" if "peak_kib" in row else "", **row))
     return "\n".join(lines) + "\n"
 
 
@@ -157,6 +183,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path, help="the engine's release lib test executable")
     parser.add_argument("--round-trip", type=Path, help="rt's round_trip test executable, run per layout and round")
+    parser.add_argument("--binary", dest="binaries", action="append", default=[],
+                        help="LABEL=PATH: the same executable built with another allocator")
+    parser.add_argument("--layouts", choices=["runtime", "memory"], default="runtime")
+    parser.add_argument("--arena-policy", action="store_true",
+                        help="compare glibc arena policies; requires a binary supporting arenas=default")
     parser.add_argument("--output", type=Path, default=Path("target/perf-sessions"))
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--sessions", default="1,8,32,128")
@@ -165,13 +196,15 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     cores = os.cpu_count()
-    labels = layouts(cores)
+    binaries = dict(entry.split("=", 1) for entry in args.binaries)
+    labels = (memory_layouts(binaries, args.arena_policy) if args.layouts == "memory"
+              else [(label, runtime, extra, None) for label, runtime, extra in layouts(cores)])
     counts = [int(n) for n in args.sessions.split(",")]
     raw = args.output / "sessions.jsonl"
     records, failures, trips = [], [], []
     for round in range(args.rounds):
         order = labels if round % 2 == 0 else list(reversed(labels))
-        for label, _, extra in order if args.round_trip else []:
+        for label, _, extra, _ in order if args.round_trip else []:
             try:
                 result = subprocess.run(
                     [str(args.round_trip), "reactor_round_trip", "--exact", "--ignored", "--nocapture",
@@ -194,12 +227,12 @@ def main():
                 stream.write(json.dumps(trip) + "\n")
             print(label, "round trip", round, f"p50={trip['p50_us']}us p99={trip['p99_us']}us", flush=True)
         for sessions in counts:
-            for label, runtime, extra in order:
+            for label, runtime, extra, built in order:
                 env = dict(os.environ, **extra, A_BENCH_RUNTIME=runtime, A_BENCH_SESSIONS=str(sessions),
                            A_BENCH_TURNS=str(args.turns), A_BENCH_PACE_MS=str(args.pace_ms))
                 try:
                     result = subprocess.run(
-                        [str(args.binary), TEST, "--exact", "--ignored", "--nocapture", "--test-threads=1"],
+                        [str(binaries[built] if built else args.binary), TEST, "--exact", "--ignored", "--nocapture", "--test-threads=1"],
                         env=env, capture_output=True, text=True, timeout=300)
                     failed = result.returncode and f"exit {result.returncode}"
                     out, err = result.stdout, result.stderr
@@ -224,8 +257,8 @@ def main():
                 with raw.open("a") as stream:
                     stream.write(json.dumps(record) + "\n")
                 print(label, runtime, sessions, round,
-                      f"p99={percentile(record['delta_ms'], 0.99):.3f}ms rss={record['idle_rss_kib']:.0f}KiB",
-                      flush=True)
+                      f"p99={percentile(record['delta_ms'], 0.99):.3f}ms rss={record['idle_rss_kib']:.0f}KiB "
+                      f"released={record.get('released_rss_kib', 0):.0f}KiB", flush=True)
     summary, pairs = summarize(records), paired(records)
     trip_pairs = paired_trips(trips)
     stalled = [(f["label"], f["sessions"], f["round"], f["failed"]) for f in failures]

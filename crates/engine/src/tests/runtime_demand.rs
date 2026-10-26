@@ -376,7 +376,9 @@ struct Load {
 /// answer streamed. `A_BENCH_RUNTIME` changes the daemon's runtime by
 /// comma-separated parts: `workers=<n>` async workers, `network=<n>`
 /// network lane workers (and queue), `threads` for each session on an
-/// executor of its own. Prints one JSON line; docs/perf/runtime-demand.md.
+/// executor of its own, `arenas=default` for glibc's arena policy without
+/// the daemon's cap. Prints one
+/// JSON line; docs/perf/runtime-demand.md and docs/perf/allocators.md.
 #[test]
 #[ignore = "release-only sizing measurement; see docs/perf/runtime-demand.md"]
 fn concurrent_active_sessions() {
@@ -439,15 +441,14 @@ fn concurrent_active_sessions() {
     let settled = usage();
     std::thread::sleep(Duration::from_secs(5));
     let idle = usage();
+    let rest = at_rest(release, clients);
     let cpu = |a: &serde_json::Value, b: &serde_json::Value| {
         (b["cpu_seconds"].as_f64().unwrap() - a["cpu_seconds"].as_f64().unwrap()) * 1000.0
     };
     let switches = |a: &serde_json::Value, b: &serde_json::Value| {
         b["ctx_switches"].as_u64().unwrap() - a["ctx_switches"].as_u64().unwrap()
     };
-    println!(
-        "{}",
-        json!({
+    let mut record = json!({
             "runtime": variant,
             "sessions": load.sessions,
             "turns": load.turns,
@@ -467,16 +468,48 @@ fn concurrent_active_sessions() {
             "idle_threads": settled["thread_count"],
             "idle_cpu_ms": cpu(&settled, &idle),
             "idle_switches": switches(&settled, &idle),
-        })
-    );
+            // Lifetime peaks: the resident set (Linux, Windows) or footprint (macOS).
+            "peak_kib": settled.get("peak_rss_kib").or(settled.get("peak_footprint_kib")),
+            "idle_footprint_kib": settled.get("footprint_kib"),
+    });
+    record.as_object_mut().unwrap().extend(rest);
+    println!("{record}");
     eprintln!("bench: measured");
+    drop(daemon);
+    runtime.shutdown();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// What the allocator hands back at rest, then once every client has
+/// detached (`release` lets them go).
+fn at_rest(
+    release: std::sync::mpsc::Sender<()>,
+    clients: Vec<std::thread::JoinHandle<()>>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let releasing = Instant::now();
+    sys::release();
+    let release_ms = releasing.elapsed().as_secs_f64() * 1000.0;
+    let released = usage();
     drop(release);
     for client in clients {
         client.join().unwrap();
     }
-    drop(daemon);
-    runtime.shutdown();
-    let _ = std::fs::remove_dir_all(root);
+    std::thread::sleep(Duration::from_secs(2));
+    let detached = usage();
+    sys::release();
+    let detached_released = usage();
+    let serde_json::Value::Object(rest) = json!({
+        "allocator": "system",
+        "release_ms": release_ms,
+        "released_rss_kib": released["rss_kib"],
+        "released_footprint_kib": released.get("footprint_kib"),
+        "detached_rss_kib": detached["rss_kib"],
+        "detached_released_rss_kib": detached_released["rss_kib"],
+        "detached_released_footprint_kib": detached_released.get("footprint_kib"),
+    }) else {
+        unreachable!("an object literal")
+    };
+    rest
 }
 
 /// Each delta's latency, provider write to client read, in milliseconds;
@@ -528,6 +561,7 @@ fn serve(home: &Home, port: u16, variant: &str) -> (crate::Owner, Arc<rt::Thread
     };
     let mut threads = rt::Config::daemon();
     let mut split = false;
+    let mut arenas = true;
     for part in variant.split(',') {
         match part.split_once('=') {
             Some(("workers", n)) => threads.workers = n.parse().unwrap(),
@@ -540,12 +574,18 @@ fn serve(home: &Home, port: u16, variant: &str) -> (crate::Owner, Arc<rt::Thread
                     bytes: threads.network.bytes.max(n << 20),
                 };
             }
+            // glibc's own arena policy, without the daemon's cap.
+            Some(("arenas", "default")) => arenas = false,
             None if part == "threads" => {
                 ACTORS.set(on_own_thread).unwrap();
                 split = true;
             }
             _ => panic!("A_BENCH_RUNTIME part {part:?}"),
         }
+    }
+    if arenas {
+        // As `a` does before it starts a worker.
+        sys::small_footprint();
     }
     let runtime = Arc::new(rt::Threads::configured(threads));
     let daemon = if split {

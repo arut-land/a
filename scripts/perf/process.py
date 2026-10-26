@@ -13,11 +13,38 @@ def snapshot(pid, threads=False):
               "user_seconds": cpu.user, "kernel_seconds": cpu.system,
               "thread_count": process.num_threads(),
               "ctx_switches": switches(process)}
+    try:
+        result.update(memory_peaks(pid, process))
+    except (OSError, AttributeError):
+        pass
     # Windows idle diagnosis needs thread counters; macOS requires a debug task port.
     if threads and sys.platform == "win32":
         result["threads"] = [dict(id=t.id, user_seconds=t.user_time, kernel_seconds=t.system_time)
                              for t in process.threads()]
     return result
+
+
+def memory_peaks(pid, process):
+    """The lifetime peak resident set, and on macOS the footprint the OS
+    itself charges the process (freed-but-reusable pages leave it at once)."""
+    if sys.platform == "linux":
+        with open(f"/proc/{pid}/status") as status:
+            for line in status:
+                if line.startswith("VmHWM:"):
+                    return {"peak_rss_kib": int(line.split()[1])}
+        return {}
+    if sys.platform == "win32":
+        return {"peak_rss_kib": process.memory_info().peak_wset / 1024}
+    if sys.platform == "darwin":
+        import ctypes
+        import struct
+        buffer = ctypes.create_string_buffer(16 + 8 * 40)
+        # proc_pid_rusage with RUSAGE_INFO_V4: a UUID, then 64-bit counters.
+        if ctypes.CDLL("/usr/lib/libproc.dylib").proc_pid_rusage(int(pid), 4, buffer) != 0:
+            return {}
+        fields = struct.unpack_from("<40Q", buffer, 16)
+        return {"footprint_kib": fields[7] / 1024, "peak_footprint_kib": fields[28] / 1024}
+    return {}
 
 
 def switches(process):
