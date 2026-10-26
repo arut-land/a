@@ -53,13 +53,16 @@ What ureq gave the daemon, and what the client does now:
 | Body timeouts | none | 300 s idle between reads and individual socket writes, reset on progress; no total request duration limit |
 | TCP keep-alive | platform defaults | Kernel probes: 60 s idle, 10 s interval, 5 probes, with native socket options on each OS |
 | Redirects | 10, auth headers dropped | 301/302/303 become GET (HEAD stays); 307/308 preserve the method but body resends are refused; Authorization, Proxy-Authorization, Cookie and body headers dropped; x-api-key, x-goog-api-key and api-key also dropped when the host changes |
-| Proxy | Environment, NO_PROXY, CONNECT | http_proxy for HTTP (uppercase HTTP_PROXY ignored); https_proxy before HTTPS_PROXY for HTTPS; scheme-specific before all_proxy / ALL_PROXY; NO_PROXY before no_proxy; bypass checked before reporting an unusable proxy |
+| Proxy | Environment, NO_PROXY, CONNECT | http_proxy for HTTP (uppercase HTTP_PROXY ignored); https_proxy before HTTPS_PROXY for HTTPS; scheme-specific before all_proxy / ALL_PROXY; no_proxy before NO_PROXY; bypass checked before reporting an unusable proxy |
 | Proxy schemes | HTTP CONNECT | HTTP CONNECT; an HTTPS or SOCKS proxy fails the requests routed through it, while bypassed requests still work |
 | Response compression | off | Advertises gzip, br, zstd and decodes incrementally, including SSE; removes Content-Encoding and Content-Length after decoding |
 | Request compression | off | Provider endpoint capability; gzip/zstd available, enabled only for documented OpenAI Responses zstd uploads |
 | Cookies | off | No cookie jar |
 | Cancellation | socket shutdown from dropping task | Dropping the future or partial body closes it; at a yielded chunk boundary, a terminator-only drain returns it to the pool or closes by IDLE |
 | DNS | getaddrinfo on request's thread | rt::resolve: getaddrinfo on the network lane, only for a name and a new connection |
+
+Environment precedence follows curl's [proxy selection](https://github.com/curl/curl/blob/master/lib/proxy.c),
+including lowercase `no_proxy` before `NO_PROXY` when both are set.
 
 The response head remains bounded at 64 KiB and the CONNECT response at
 16 KiB. Idle pool limits constrain retained connections, never active
@@ -84,8 +87,8 @@ dependency tree. Candidates were checked before selecting the backend:
 
 Isolated copies of the final transport source, with only the compression
 backend changed, built the identical probe at 523,584 bytes without
-compression, 1,021,488 with
-libzstd and 1,404,528 with mzstd (macOS arm64, release, opt-level z, LTO,
+compression, 1,021,488 with libzstd and 1,404,528 with mzstd (macOS arm64,
+release, opt-level z, LTO,
 one codegen unit, stripped). These are probe deltas, not full daemon sizes.
 The selected backend adds 17 lockfile entries (16 normal/build dependency
 entries, plus the optional zlib-rs resolution). Existing futures-io,
@@ -145,7 +148,7 @@ These are upload savings, not model inference speedups.
 Zstd saves 70–71% of upload bytes here, with 5–67 ms additional process CPU;
 gzip saves 54–55%, with 21–170 ms additional CPU. Faster links reduce the
 latency benefit; no provider/model latency is inferred from this probe.
- Tests gate the second SSE event
+Tests gate the second SSE event
 and compression footer until the first decoded event reaches the caller,
 for gzip, Brotli and zstd; truncated streams report errors. Upload tests
 round-trip every piece over a real socket and verify the wire coding and

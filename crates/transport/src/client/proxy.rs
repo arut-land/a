@@ -1,7 +1,7 @@
 //! The HTTP CONNECT proxies the environment names, read as curl reads
 //! them: `https_proxy` (or `HTTPS_PROXY`) for https and `http_proxy` for
-//! http, each falling back to `all_proxy` (or `ALL_PROXY`); `NO_PROXY`
-//! (or `no_proxy`) names the hosts that go direct. Upper-case
+//! http, each falling back to `all_proxy` (or `ALL_PROXY`); `no_proxy`
+//! (or `NO_PROXY`) names the hosts that go direct. Upper-case
 //! `HTTP_PROXY` is ignored, as curl ignores it: a CGI server sets it from
 //! a request's `Proxy:` header.
 
@@ -58,7 +58,7 @@ impl Proxies {
         Self {
             http: setting(first(&["http_proxy"])),
             https: setting(first(&["https_proxy", "HTTPS_PROXY"])),
-            bypass: first(&["NO_PROXY", "no_proxy"]).map_or_else(Vec::new, |list| {
+            bypass: first(&["no_proxy", "NO_PROXY"]).map_or_else(Vec::new, |list| {
                 list.split(',').filter_map(Bypass::parse).collect()
             }),
         }
@@ -257,6 +257,27 @@ mod tests {
                 "a.test"
             ),
             None
+        );
+    }
+
+    #[test]
+    fn lowercase_proxy_settings_win_when_both_cases_are_set() {
+        let proxies = proxies(&[
+            ("all_proxy", "all-lower.test:1"),
+            ("ALL_PROXY", "all-upper.test:2"),
+            ("https_proxy", "https-lower.test:3"),
+            ("HTTPS_PROXY", "https-upper.test:4"),
+            ("no_proxy", "lower.test"),
+            ("NO_PROXY", "upper.test"),
+        ]);
+        assert_eq!(via(&proxies, true, "lower.test"), None);
+        assert_eq!(
+            via(&proxies, true, "upper.test").as_deref(),
+            Some("https-lower.test:3")
+        );
+        assert_eq!(
+            via(&proxies, false, "upper.test").as_deref(),
+            Some("all-lower.test:1")
         );
     }
 
