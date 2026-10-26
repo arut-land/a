@@ -16,7 +16,7 @@ tls-native = ["client", "dep:native-tls"]
 tls-rustls = ["client", "dep:rustls", "dep:rustls-platform-verifier"]
 
 [dependencies]
-async-compression = { version = "0.4", default-features = false, features = ["futures-io", "gzip", "brotli"], optional = true }
+async-compression = { version = "0.4", default-features = false, features = ["futures-io", "gzip"], optional = true }
 # Proxy credentials; ureq-proto links it already.
 base64 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
@@ -35,6 +35,11 @@ sys = { workspace = true, optional = true }
 ureq-proto = { version = "0.6.5", default-features = false, features = ["client"], optional = true }
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["pem"] }
+getrandom = { version = "0.4", features = ["sys_rng"] }
+rsa = "0.10.0-rc.19"
+sha2 = { version = "0.11", default-features = false, features = ["oid"] }
+time = { version = "0.3", default-features = false, features = ["std"] }
 rt.workspace = true
 
 [lints]

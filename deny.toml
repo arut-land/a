@@ -13,6 +13,7 @@ targets = [
 [advisories]
 yanked = "deny"
 ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "transport tests generate ephemeral RSA keys and self-sign certificates locally; TLS private-key operations use native TLS/rustls, so no network-observable RSA oracle exists" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is test-only: the llm parity tests read recorded YAML cassettes" },
 ]
 

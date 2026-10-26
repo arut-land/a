@@ -13,8 +13,8 @@ protocol) driven over sockets registered with the `rt` reactor
 (`rt::Async<TcpStream>`), with native TLS or rustls run over the
 non-blocking socket. A request and its reply body are futures polled by
 the task that awaits them; no thread is held. A dropped body at a chunk
-boundary gets one background drain for its terminator, bounded by the idle
-deadline; another data byte closes it.
+boundary gets one background drain for its terminator, with a separate
+250 ms total deadline; another data byte closes it.
 
 ## Candidates
 
@@ -53,16 +53,19 @@ What ureq gave the daemon, and what the client does now:
 | Body timeouts | none | 300 s idle between reads and individual socket writes, reset on progress; no total request duration limit |
 | TCP keep-alive | platform defaults | Kernel probes: 60 s idle, 10 s interval, 5 probes, with native socket options on each OS |
 | Redirects | 10, auth headers dropped | 301/302/303 become GET (HEAD stays); 307/308 preserve the method but body resends are refused; Authorization, Proxy-Authorization, Cookie and body headers dropped; x-api-key, x-goog-api-key and api-key also dropped when the host changes |
-| Proxy | Environment, NO_PROXY, CONNECT | http_proxy for HTTP (uppercase HTTP_PROXY ignored); https_proxy before HTTPS_PROXY for HTTPS; scheme-specific before all_proxy / ALL_PROXY; no_proxy before NO_PROXY; bypass checked before reporting an unusable proxy |
+| Proxy | Environment, NO_PROXY, CONNECT | http_proxy for HTTP (uppercase HTTP_PROXY ignored); https_proxy before HTTPS_PROXY for HTTPS; scheme-specific before all_proxy / ALL_PROXY; no_proxy before NO_PROXY; empty values skipped before selection; bypass checked before reporting an unusable proxy |
 | Proxy schemes | HTTP CONNECT | HTTP CONNECT; an HTTPS or SOCKS proxy fails the requests routed through it, while bypassed requests still work |
-| Response compression | off | Advertises gzip, br, zstd and decodes incrementally, including SSE; removes Content-Encoding and Content-Length after decoding |
+| Response compression | off | Advertises gzip, zstd and decodes incrementally, including SSE; removes Content-Encoding and Content-Length after decoding |
 | Request compression | off | Provider endpoint capability; gzip/zstd available, enabled only for documented OpenAI Responses zstd uploads |
 | Cookies | off | No cookie jar |
-| Cancellation | socket shutdown from dropping task | Dropping the future or partial body closes it; at a yielded chunk boundary, a terminator-only drain returns it to the pool or closes by IDLE |
+| Cancellation | socket shutdown from dropping task | Dropping the future or partial body closes it; at a yielded chunk boundary, a terminator-only drain returns it to the pool or closes within a separate 250 ms grace period |
 | DNS | getaddrinfo on request's thread | rt::resolve: getaddrinfo on the network lane, only for a name and a new connection |
 
 Environment precedence follows curl's [proxy selection](https://github.com/curl/curl/blob/master/lib/proxy.c),
-including lowercase `no_proxy` before `NO_PROXY` when both are set.
+including lowercase `no_proxy` before `NO_PROXY` when both are nonempty.
+An empty lowercase value falls through to the uppercase value or next
+proxy setting. Content codings are normalized to ASCII lowercase before
+decoding, as required by [RFC 9110 §8.4.1](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.4.1).
 
 The response head remains bounded at 64 KiB and the CONNECT response at
 16 KiB. Idle pool limits constrain retained connections, never active
@@ -77,27 +80,35 @@ deadline in total while continuing to make progress.
 ## Compression
 
 No compression implementation was already linked in the client's normal
-dependency tree. Candidates were checked before selecting the backend:
+dependency tree. The initial comparison found async-compression with C
+libzstd smaller than the pure Rust mzstd backend, but the C build requires
+a Windows SDK during cross-clippy. mzstd preserves the SDK-free check.
+ruzstd only decodes and would need a separate upload encoder.
 
-| Candidate | Additional stripped release probe size | Build and dependency result |
-| --- | ---: | --- |
-| async-compression, gzip/br/zstd (libzstd) | 486 KiB | 16 new lockfile packages; Windows cross-clippy fails compiling C without a Windows C SDK |
-| **async-compression gzip/br + mzstd** | **860 KiB** | **Pure Rust, no C SDK or second runtime; workspace Windows cross-clippy passes** |
-| ruzstd | Not built | Decode only; still needs a separate encoder for documented request compression |
+The review compared three codec sets using isolated copies of the same
+merged transport source and an identical probe that selects a zstd upload
+and consumes the response. macOS arm64, native TLS, opt-level z, LTO, one
+codegen unit, stripped, panic abort:
 
-Isolated copies of the transport source, with only the compression
-backend changed, built the identical probe at 523,584 bytes without
-compression, 1,021,488 with libzstd and 1,404,528 with mzstd (macOS arm64,
-release, opt-level z, LTO,
-one codegen unit, stripped). These are probe deltas, not full daemon sizes.
-The selected backend adds 17 lockfile entries (16 normal/build dependency
-entries, plus the optional zlib-rs resolution). Existing futures-io,
-thiserror, memchr and the runtime are reused. The
-maintained codecs own gzip/Brotli framing and zstd sessions. The local
-zstd adapter only drives input/output progress over AsyncRead: its upstream
-async-compression adapter is currently behind an unstable cfg. No codec,
-checksum or compression format is reimplemented here. This costs more
-code than C zstd but preserves the workspace's SDK-free Windows check.
+| Codec set | Stripped probe bytes | Saving versus all codecs |
+| --- | ---: | ---: |
+| gzip/Brotli/zstd response decoding, gzip/zstd uploads | 1,404,560 | — |
+| **gzip/zstd response decoding and uploads (selected)** | **1,239,168** | **165,392 bytes (161.5 KiB, 11.8%)** |
+| gzip response decoding, zstd uploads only | 1,172,688 | 231,872 bytes (226.4 KiB, 16.5%) |
+
+These are probe sizes, not full daemon sizes. Brotli has no measured
+provider benefit here to justify its 161.5 KiB cost, so it is removed from
+the offer and dependency features; servers can choose gzip or identity.
+Keeping gzip uploads and zstd response decoding costs another 64.9 KiB
+over the minimum. This preserves the existing gzip/zstd upload capability
+and streamed zstd replies; OpenAI explicitly documents zstd uploads.
+The normal dependency tree contains no certificate generator.
+
+async-compression owns gzip framing; mzstd owns zstd framing and sessions.
+The local zstd adapter only drives input/output progress over AsyncRead:
+its upstream async-compression adapter is currently behind an unstable cfg.
+No codec, checksum or compression format is reimplemented here. Existing
+futures-io, thiserror, memchr and the runtime are reused.
 
 Requests carry an optional `transport::Compression` extension. A host's
 capability defaults to None; only a documented endpoint sets it. Custom
@@ -150,20 +161,36 @@ gzip saves 54–55%, with 21–170 ms additional CPU. Faster links reduce the
 latency benefit; no provider/model latency is inferred from this probe.
 Tests gate the second SSE event
 and compression footer until the first decoded event reaches the caller,
-for gzip, Brotli and zstd; truncated streams report errors. Upload tests
-round-trip every piece over a real socket and verify the wire coding and
-Content-Length. The TLS slow-reader test trusts a self-signed RSA certificate
-with a 397-day validity (expires 2027-11-26); macOS rejects the former
-100-year certificate. Regenerate it before expiry with the existing key:
+for gzip and zstd, including uppercase coding tokens; truncated streams
+report errors. A stacked-header test covers mixed-case gzip and identity.
+Upload tests round-trip every piece over a real socket and verify the wire
+coding and Content-Length. Cancellation tests cover both delayed terminator
+reuse and expiry of the dedicated 250 ms drain deadline, independently of
+the 300 s I/O idle deadline.
 
-```sh
-openssl req -x509 -new -key crates/transport/src/client/testdata/localhost.key \
-  -out crates/transport/src/client/testdata/localhost.pem -days 397 \
-  -subj /CN=localhost -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
-  -addext 'extendedKeyUsage=serverAuth' -addext 'basicConstraints=critical,CA:FALSE'
-```
+TLS tests generate one fresh RSA key and self-signed certificate per test
+process with OnceLock. The certificate has localhost and 127.0.0.1 SANs,
+server authentication usage, and validity from yesterday through seven
+days ahead. The generated certificate is trusted only by the test client;
+a real handshake test rejects a different hostname. No certificate or key
+is committed, and no annual renewal is needed.
+
+The dev-only generator uses rcgen's signing interface with RSA/SHA-256
+crates. RSA is required by native-tls's SChannel identity import; avoiding
+rcgen's ring backend keeps the native-TLS Windows cross-check free of a C
+SDK requirement. deny.toml records a test-only exception for RSA advisory
+RUSTSEC-2023-0071: key generation and self-signing are local, with no remote
+RSA oracle; actual TLS private-key operations use native TLS or rustls.
+These dev dependencies add no code to the shipped client.
 
 ## Review verification and hosted session measurements
+
+The follow-up review merges main `4ddd838c`. On local macOS, transport
+passes 30 tests with each TLS backend and 27 with plain HTTP; clippy denies
+warnings for all three feature sets. Regressions cover mixed-case content
+codings, empty proxy environment fallthrough, certificate hostname checks,
+and the independent cancellation drain deadline. The measurements and CI
+results below describe the earlier revisions explicitly named there.
 
 CI [40337822668](https://github.com/arut-land/a/actions/runs/40337822668)
 on `1cb54aa5` passed all twelve jobs: Linux and macOS workspace checks,

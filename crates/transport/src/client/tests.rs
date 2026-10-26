@@ -539,31 +539,100 @@ mod tls_data {
 
     use super::*;
 
-    const CERT: &[u8] = include_bytes!("testdata/localhost.pem");
-    const KEY: &[u8] = include_bytes!("testdata/localhost.key");
+    struct Identity {
+        certificate: String,
+        key: String,
+    }
+
+    struct CertificateKey {
+        key: rsa::pkcs1v15::SigningKey<sha2::Sha256>,
+        public: Vec<u8>,
+    }
+
+    impl rcgen::PublicKeyData for CertificateKey {
+        fn der_bytes(&self) -> &[u8] {
+            &self.public
+        }
+
+        fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+            &rcgen::PKCS_RSA_SHA256
+        }
+    }
+
+    impl rcgen::SigningKey for CertificateKey {
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
+            use rsa::signature::{RandomizedSigner as _, SignatureEncoding as _};
+            self.key
+                .try_sign_with_rng(&mut getrandom::SysRng, message)
+                .map(|signature| signature.to_vec())
+                .map_err(|_| rcgen::Error::RemoteKeyError)
+        }
+    }
+
+    fn identity() -> &'static Identity {
+        use rsa::pkcs1::EncodeRsaPublicKey as _;
+        use rsa::pkcs8::EncodePrivateKey as _;
+        static IDENTITY: std::sync::OnceLock<Identity> = std::sync::OnceLock::new();
+        IDENTITY.get_or_init(|| {
+            // SChannel's native-tls identity import requires an RSA key.
+            let key = rsa::RsaPrivateKey::new(
+                &mut getrandom::rand_core::UnwrapErr(getrandom::SysRng),
+                2048,
+            )
+            .unwrap();
+            let pem = key
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .unwrap()
+                .to_string();
+            let pair = CertificateKey {
+                public: key
+                    .to_public_key()
+                    .to_pkcs1_der()
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+                key: rsa::pkcs1v15::SigningKey::new(key),
+            };
+            let mut params =
+                rcgen::CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+                    .unwrap();
+            let now = time::OffsetDateTime::now_utc();
+            params.serial_number = Some(1_u64.into());
+            params.not_before = now - time::Duration::days(1);
+            params.not_after = now + time::Duration::days(7);
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+            Identity {
+                certificate: params.self_signed(&pair).unwrap().pem(),
+                key: pem,
+            }
+        })
+    }
 
     trait Duplex: Read + Write {}
     impl<T: Read + Write> Duplex for T {}
 
     #[cfg(feature = "tls-native")]
-    fn accept(tcp: TcpStream) -> Box<dyn Duplex> {
-        let identity = native_tls::Identity::from_pkcs8(CERT, KEY).unwrap();
-        Box::new(
-            native_tls::TlsAcceptor::new(identity)
-                .unwrap()
-                .accept(tcp)
-                .unwrap(),
+    fn accept(tcp: TcpStream) -> io::Result<Box<dyn Duplex>> {
+        let identity = native_tls::Identity::from_pkcs8(
+            identity().certificate.as_bytes(),
+            identity().key.as_bytes(),
         )
+        .unwrap();
+        native_tls::TlsAcceptor::new(identity)
+            .unwrap()
+            .accept(tcp)
+            .map(|stream| Box::new(stream) as Box<dyn Duplex>)
+            .map_err(io::Error::other)
     }
 
     #[cfg(feature = "tls-rustls")]
-    fn accept(tcp: TcpStream) -> Box<dyn Duplex> {
+    fn accept(tcp: TcpStream) -> io::Result<Box<dyn Duplex>> {
         use rustls::pki_types::pem::PemObject as _;
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-        let chain = CertificateDer::pem_slice_iter(CERT)
+        let chain = CertificateDer::pem_slice_iter(identity().certificate.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let key = PrivateKeyDer::from_pem_slice(KEY).unwrap();
+        let key = PrivateKeyDer::from_pem_slice(identity().key.as_bytes()).unwrap();
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -572,13 +641,15 @@ mod tls_data {
         .with_no_client_auth()
         .with_single_cert(chain, key)
         .unwrap();
-        let session = rustls::ServerConnection::new(Arc::new(config)).unwrap();
-        Box::new(rustls::StreamOwned::new(session, tcp))
+        let mut session = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+        let mut tcp = tcp;
+        session.complete_io(&mut tcp)?;
+        Ok(Box::new(rustls::StreamOwned::new(session, tcp)))
     }
 
     fn trusting() -> Client {
         let mut tls = tls::Config::default();
-        tls.trusted = Some(CERT.to_vec());
+        tls.trusted = Some(identity().certificate.as_bytes().to_vec());
         let setup = Setup {
             proxies: Proxies::default(),
             tls,
@@ -590,6 +661,24 @@ mod tls_data {
         )
     }
 
+    #[test]
+    fn trusting_the_generated_certificate_still_checks_the_hostname() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let server = thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            if let Ok(mut stream) = accept(tcp) {
+                let _ = stream.read(&mut [0]);
+            }
+        });
+        let rt: rt::Rt = Arc::new(rt::Threads::new(1));
+        let socket = rt::Async::socket(&rt.reactor(), tcp).unwrap();
+        let mut config = tls::Config::default();
+        config.trusted = Some(identity().certificate.as_bytes().to_vec());
+        assert!(rt::block_on(config.connect(&rt, "wrong.test", socket)).is_err());
+        server.join().unwrap();
+    }
+
     /// A peer reading slower than the client writes refuses writes for a
     /// while; every byte still reaches it, and the reply comes back.
     #[test]
@@ -599,7 +688,7 @@ mod tls_data {
         let port = listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
-            let mut tls = BufReader::new(accept(tcp));
+            let mut tls = BufReader::new(accept(tcp).unwrap());
             let mut line = String::new();
             while line != "\r\n" {
                 line.clear();
@@ -691,7 +780,6 @@ fn compressed_events(coding: &str) -> (Vec<u8>, Vec<u8>) {
     }
     match coding {
         "gzip" => encode!(async_compression::futures::write::GzipEncoder<Vec<u8>>),
-        "br" => encode!(async_compression::futures::write::BrotliEncoder<Vec<u8>>),
         "zstd" => {
             let mut compressor = mzstd::Compressor::new(mzstd::EncoderConfig::default()).unwrap();
             let mut output = Vec::new();
@@ -709,7 +797,7 @@ fn compressed_events(coding: &str) -> (Vec<u8>, Vec<u8>) {
 
 #[test]
 fn compressed_events_arrive_before_the_next_event_or_footer() {
-    for coding in ["gzip", "br", "zstd"] {
+    for coding in ["gzip", "zstd"] {
         let (first, all) = compressed_events(coding);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -717,10 +805,11 @@ fn compressed_events_arrive_before_the_next_event_or_footer() {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            assert!(read_request(&mut reader).contains("accept-encoding: gzip, br, zstd"));
+            assert!(read_request(&mut reader).contains("accept-encoding: gzip, zstd"));
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\ncontent-encoding: {coding}\r\ncontent-length: {}\r\n\r\n",
+                "HTTP/1.1 200 OK\r\ncontent-encoding: {}\r\ncontent-length: {}\r\n\r\n",
+                coding.to_ascii_uppercase(),
                 all.len()
             )
             .unwrap();
@@ -749,8 +838,28 @@ fn compressed_events_arrive_before_the_next_event_or_footer() {
 }
 
 #[test]
+fn content_codings_ignore_ascii_case_in_stacked_headers() {
+    let (_, all) = compressed_events("gzip");
+    let response = http::Response::builder()
+        .header(CONTENT_ENCODING, " GZip ")
+        .header(CONTENT_ENCODING, "IDENTITY")
+        .header(CONTENT_LENGTH, all.len())
+        .body(crate::body([all]))
+        .unwrap();
+    let response = compression::decode(response).unwrap();
+    assert!(!response.headers().contains_key(CONTENT_ENCODING));
+    assert!(!response.headers().contains_key(CONTENT_LENGTH));
+    let mut body = response.into_body();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = next_chunk(&mut body) {
+        bytes.extend(chunk.unwrap());
+    }
+    assert_eq!(bytes, b"data: first\n\ndata: last\n\n");
+}
+
+#[test]
 fn truncated_compression_is_an_error() {
-    for coding in ["gzip", "br", "zstd"] {
+    for coding in ["gzip", "zstd"] {
         let (first, _) = compressed_events(coding);
         let response = http::Response::builder()
             .header(CONTENT_ENCODING, coding)
@@ -826,9 +935,10 @@ fn a_dropped_boundary_without_a_terminator_is_closed_by_the_drain_deadline() {
     let started = Instant::now();
     drop(body);
     closed
-        .recv_timeout(IDLE + PROMPT)
+        .recv_timeout(DRAIN + PROMPT)
         .expect("terminator drain outlived its deadline");
-    assert!(started.elapsed() >= IDLE);
+    assert!(started.elapsed() >= DRAIN);
+    assert!(started.elapsed() < IDLE);
 }
 
 #[test]

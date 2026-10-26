@@ -43,6 +43,8 @@ const IDLE: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(300)
 };
+/// Cancellation only waits briefly for framing already in flight.
+const DRAIN: Duration = Duration::from_millis(250);
 const MAX_REDIRECTS: usize = 10;
 /// The read buffer an exchange starts with; a reply head may grow it to
 /// [`MAX_HEAD`].
@@ -125,7 +127,7 @@ impl Shared {
         parts
             .headers
             .entry(ACCEPT_ENCODING)
-            .or_insert(HeaderValue::from_static("gzip, br, zstd"));
+            .or_insert(HeaderValue::from_static("gzip, zstd"));
         if !parts.headers.contains_key(CONTENT_ENCODING)
             && let Some(coding) = parts.extensions.get::<crate::Compression>().copied()
             && (coding != crate::Compression::Zstd || payload.len() <= 128 << 20)
@@ -606,7 +608,11 @@ impl Drop for Reader {
                     }
                 }
             };
-            let _ = within(&shared.rt.clone(), drain, "draining the reply terminator").await;
+            let _ = rt::or(drain, async {
+                shared.rt.sleep(DRAIN).await;
+                Ok::<(), io::Error>(())
+            })
+            .await;
         }));
     }
 }

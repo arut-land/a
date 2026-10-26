@@ -49,7 +49,11 @@ impl Proxies {
     }
 
     fn from_lookup(var: impl Fn(&str) -> Option<String>) -> Self {
-        let first = |names: &[&str]| names.iter().find_map(|name| var(name));
+        let first = |names: &[&str]| {
+            names
+                .iter()
+                .find_map(|name| var(name).filter(|value| !value.is_empty()))
+        };
         let all = first(&["all_proxy", "ALL_PROXY"]);
         let setting = |url: Option<String>| {
             url.or_else(|| all.clone())
@@ -278,6 +282,28 @@ mod tests {
         assert_eq!(
             via(&proxies, false, "upper.test").as_deref(),
             Some("all-lower.test:1")
+        );
+    }
+
+    #[test]
+    fn empty_proxy_variables_fall_through_to_the_next_setting() {
+        let proxies = proxies(&[
+            ("https_proxy", ""),
+            ("HTTPS_PROXY", "secure.test:1"),
+            ("http_proxy", ""),
+            ("all_proxy", ""),
+            ("ALL_PROXY", "all.test:2"),
+            ("no_proxy", ""),
+            ("NO_PROXY", "localhost"),
+        ]);
+        assert_eq!(via(&proxies, true, "localhost"), None);
+        assert_eq!(
+            via(&proxies, true, "a.test").as_deref(),
+            Some("secure.test:1")
+        );
+        assert_eq!(
+            via(&proxies, false, "a.test").as_deref(),
+            Some("all.test:2")
         );
     }
 

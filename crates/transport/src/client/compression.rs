@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
-use async_compression::futures::bufread::{BrotliDecoder, GzipDecoder, GzipEncoder};
+use async_compression::futures::bufread::{GzipDecoder, GzipEncoder};
 use futures_lite::io::{AsyncBufRead, AsyncRead, AsyncReadExt as _, BufReader};
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH};
 
@@ -26,7 +26,8 @@ pub(super) fn decode(response: Response) -> io::Result<Response> {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         })
         .collect::<io::Result<Vec<_>>>()?
-        .join(",");
+        .join(",")
+        .to_ascii_lowercase();
     if codings.is_empty() {
         return Ok(http::Response::from_parts(head, body));
     }
@@ -43,7 +44,6 @@ pub(super) fn decode(response: Response) -> io::Result<Response> {
                 decoder.multiple_members(true);
                 Box::pin(decoder)
             }
-            "br" => Box::pin(BrotliDecoder::new(input)),
             "zstd" => Box::pin(Zstd {
                 input,
                 session: mzstd::Decompressor::default().into_session(),
