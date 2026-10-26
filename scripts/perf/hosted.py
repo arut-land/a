@@ -431,14 +431,15 @@ def sessions(source, output, variant, reference=""):
     layouts = ["--layouts", "memory", *(arg for entry in extra for arg in ("--binary", entry))] \
         if "allocators" in variant or reference else []
     os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
-    run([sys.executable, ROOT / "scripts/perf/sessions.py", binary, "--output", output / "sessions",
-         "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5"),
-         "--sessions", variant.get("sessions", "1,8,32,128"), *layouts], cwd=source)
+    (output / "sessions").mkdir(exist_ok=True)
     (output / "sessions" / "host.json").write_text(json.dumps(dict(
         platform=platform.platform(), machine=platform.machine(), hardware=hardware(),
         revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
         reference_revision=reference or None,
     ), indent=2) + "\n")
+    run([sys.executable, ROOT / "scripts/perf/sessions.py", binary, "--output", output / "sessions",
+         "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5"),
+         "--sessions", variant.get("sessions", "1,8,32,128"), *layouts], cwd=source)
 
 
 def main():
