@@ -18,12 +18,21 @@ import sessions
 
 
 class Sessions(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.summary = Path(directory.name) / "summary.md"
+        summary_env = mock.patch.dict(os.environ, GITHUB_STEP_SUMMARY=str(self.summary))
+        summary_env.start()
+        self.addCleanup(summary_env.stop)
+
     def test_failed_subprocesses_write_artifacts_before_returning_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run([sys.executable, str(Path(sessions.__file__)), sys.executable,
                                      "--round-trip", sys.executable, "--rounds", "1", "--sessions", "1",
                                      "--output", directory], capture_output=True, text=True, timeout=30)
             self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Concurrent sessions", self.summary.read_text())
             output = Path(directory)
             summary = json.loads((output / "sessions.json").read_text())
             failures = [json.loads(line) for line in (output / "failures.jsonl").read_text().splitlines()]
