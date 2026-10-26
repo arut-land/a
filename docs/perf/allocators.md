@@ -71,8 +71,9 @@ system build; absolute footprints across those blocks are not interchangeable.
 The local M3 allocator binaries were saved by the preceding build campaign.
 The original dispatches split allocators around a 150-minute measurement
 step; Apple Silicon retries use the longer window below. To reproduce the
-experimental composition, check out harness `b41ea27b` and build the pinned
-measured source from each run. The final branch removes rejected features.
+experimental composition, pin `harness_ref=b41ea27b71f0cb4af2a392a5b1b3daef1efcdc36`
+and build the pinned measured source from each run. The final branch removes
+rejected features. Harness and measured source are separate checkout inputs.
 
 | Comparison | Run |
 | --- | --- |
