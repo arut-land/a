@@ -159,11 +159,31 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    let result = try_unblock_with(rt, class, bytes, work);
+    async move { result.await.expect("blocking work failed") }
+}
+
+/// Runs blocking work, reporting refused admission or a lost worker as an error.
+/// `bytes` reserves captures and working buffers until completion.
+///
+/// # Errors
+/// Returns the runtime's admission error, or an error if the worker panics.
+pub fn try_unblock_with<T, F>(
+    rt: &dyn Runtime,
+    class: BlockingClass,
+    bytes: usize,
+    work: F,
+) -> impl Future<Output = std::io::Result<T>> + Send + 'static
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
     let (tx, rx) = oneshot::channel();
     let admitted = rt.spawn_blocking(class, bytes, Box::new(move || tx.send(work())));
     async move {
-        admitted.await.expect("blocking admission failed");
-        rx.await.expect("blocking work panicked")
+        admitted.await?;
+        rx.await
+            .ok_or_else(|| std::io::Error::other("blocking worker panicked"))
     }
 }
 
