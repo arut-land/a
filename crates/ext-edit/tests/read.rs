@@ -2,7 +2,10 @@
 //! result references, as its own bytes where providers read them, else
 //! converted to fit.
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Read as _;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use ext::host::Registry;
 use ext::testing::Rig;
@@ -43,7 +46,16 @@ fn shown(rig: &Rig, outcome: &protocol::ToolOutcome) -> String {
 
 /// The call's output, and the bytes of the blob it holds.
 fn read(rig: &Rig, path: &str) -> (Value, Vec<u8>, protocol::BlobRef) {
-    let called = rig.called("read", &json!({ "path": path }));
+    read_with_peak(rig, path, None)
+}
+
+fn read_with_peak(
+    rig: &Rig,
+    path: &str,
+    ceiling: Option<usize>,
+) -> (Value, Vec<u8>, protocol::BlobRef) {
+    let input = json!({ "path": path });
+    let called = within_peak(path, ceiling, || rig.called("read", &input));
     let Outcome::Done {
         output: Payload::Inline(output),
     } = called.outcome
@@ -117,16 +129,18 @@ fn an_image_too_large_or_unread_is_converted_to_fit() {
 
 #[test]
 fn png_scaling_preserves_pixels_and_alpha() {
-    scaled_png(2400, 1200, (2000, 1000));
+    scaled_png(2400, 1200, (2000, 1000), None);
 }
 
 #[test]
 #[ignore = "resource test: run alone; converts a 59 MB decoded screenshot"]
 fn a_screen_sized_png_preserves_pixels_and_alpha() {
-    scaled_png(5120, 2880, (2000, 1125));
+    let _resource = RESOURCE.lock().unwrap();
+    // Below the 59 MB required by a whole RGBA decode, above the scaled output.
+    scaled_png(5120, 2880, (2000, 1125), Some(32 << 20));
 }
 
-fn scaled_png(width: u32, height: u32, expected: (u32, u32)) {
+fn scaled_png(width: u32, height: u32, expected: (u32, u32), ceiling: Option<usize>) {
     let rig = Rig::new("read-screen", registry());
     {
         let screen = RgbaImage::from_fn(width, height, |x, y| {
@@ -141,7 +155,7 @@ fn scaled_png(width: u32, height: u32, expected: (u32, u32)) {
             .save_with_format(rig.workspace().join("screen.png"), ImageFormat::Png)
             .unwrap();
     }
-    let (output, bytes, _) = read(&rig, "screen.png");
+    let (output, bytes, _) = read_with_peak(&rig, "screen.png", ceiling);
     let sent = image::load_from_memory(&bytes).unwrap().into_rgba8();
     assert_eq!(sent.dimensions(), expected);
     assert_eq!(output["image"]["converted"]["width"], width);
@@ -232,24 +246,26 @@ fn a_turned_jpeg_is_sent_upright() {
 
 #[test]
 fn jpeg_scaling_preserves_the_aspect_ratio() {
-    scaled_jpeg(2400, 1600, (2000, 1333));
+    scaled_jpeg(2400, 1600, (2000, 1333), None);
 }
 
 #[test]
 #[ignore = "resource test: run alone; converts a 24 MP photo"]
 fn a_large_photo_is_converted() {
-    scaled_jpeg(6000, 4000, (2000, 1333));
+    let _resource = RESOURCE.lock().unwrap();
+    // RGB needs 72 MB decoded whole; the DCT-scaled decode fits below 64 MiB.
+    scaled_jpeg(6000, 4000, (2000, 1333), Some(64 << 20));
 }
 
-fn scaled_jpeg(width: u32, height: u32, expected: (u32, u32)) {
+fn scaled_jpeg(width: u32, height: u32, expected: (u32, u32), ceiling: Option<usize>) {
     let rig = Rig::new("read-photo", registry());
     {
-        let photo = image::GrayImage::from_fn(width, height, |x, y| image::Luma([low(x ^ y)]));
+        let photo = picture(width, height);
         photo
             .save_with_format(rig.workspace().join("photo.jpg"), ImageFormat::Jpeg)
             .unwrap();
     }
-    let (output, bytes, blob) = read(&rig, "photo.jpg");
+    let (output, bytes, blob) = read_with_peak(&rig, "photo.jpg", ceiling);
     assert_eq!(blob.media_type, "image/jpeg");
     let sent = image::load_from_memory(&bytes).unwrap();
     assert_eq!((sent.width(), sent.height()), expected);
@@ -334,16 +350,17 @@ fn png_orientation_is_applied_before_pass_through_or_scaling() {
 
 #[test]
 fn unselected_lines_can_exceed_the_text_limit() {
-    unselected_line((8 << 20) + 1);
+    unselected_line((8 << 20) + 1, None);
 }
 
 #[test]
 #[ignore = "resource test: run alone; scans a 2 GiB sparse line"]
 fn unselected_lines_can_exceed_the_image_and_text_limits() {
-    unselected_line((2 << 30) + 1);
+    let _resource = RESOURCE.lock().unwrap();
+    unselected_line((2 << 30) + 1, Some(8 << 20));
 }
 
-fn unselected_line(length: u64) {
+fn unselected_line(length: u64, ceiling: Option<usize>) {
     use std::io::{Seek as _, SeekFrom, Write as _};
     let rig = Rig::new("read-long-line", registry());
     let mut file = std::fs::File::create(rig.workspace().join("long.txt")).unwrap();
@@ -351,25 +368,24 @@ fn unselected_line(length: u64) {
     file.seek(SeekFrom::Start(length)).unwrap();
     file.write_all(b"\nafter\n").unwrap();
     drop(file);
-    let outcome = rig.call(
-        "read",
-        &json!({"path": "long.txt", "offset": 3, "limit": 1}),
-    );
+    let input = json!({"path": "long.txt", "offset": 3, "limit": 1});
+    let outcome = within_peak("sparse text window", ceiling, || rig.call("read", &input));
     assert_eq!(shown(&rig, &outcome), "after\n[lines 3-3 of 3]");
 }
 
 #[test]
 fn an_image_magic_prefix_still_allows_a_large_text_window() {
-    image_magic_text((8 << 20) + 1);
+    image_magic_text((8 << 20) + 1, None);
 }
 
 #[test]
 #[ignore = "resource test: run alone; crosses the 512 MiB image limit"]
 fn an_image_magic_prefix_does_not_limit_a_text_files_size() {
-    image_magic_text((512 << 20) + 1);
+    let _resource = RESOURCE.lock().unwrap();
+    image_magic_text((512 << 20) + 1, Some(8 << 20));
 }
 
-fn image_magic_text(length: u64) {
+fn image_magic_text(length: u64, ceiling: Option<usize>) {
     use std::io::{Seek as _, SeekFrom, Write as _};
     let rig = Rig::new("read-large-magic", registry());
     let mut file = std::fs::File::create(rig.workspace().join("notes.txt")).unwrap();
@@ -377,7 +393,8 @@ fn image_magic_text(length: u64) {
     file.seek(SeekFrom::Start(length)).unwrap();
     file.write_all(b"\n").unwrap();
     drop(file);
-    let outcome = rig.call("read", &json!({"path": "notes.txt", "limit": 1}));
+    let input = json!({"path": "notes.txt", "limit": 1});
+    let outcome = within_peak("magic text window", ceiling, || rig.call("read", &input));
     assert_eq!(shown(&rig, &outcome), "BMW notes\n[lines 1-1 of 2]");
     let Outcome::Failed { error } = rig.call("read", &json!({"path": "notes.txt"})) else {
         panic!("a large text file needs a window");
@@ -398,4 +415,129 @@ fn only_selected_text_is_bounded_and_utf8_can_cross_buffers() {
         panic!("the selected text is bounded");
     };
     assert!(error.contains("the lines asked for"), "{error}");
+}
+
+#[test]
+#[ignore = "resource test: run alone; measures streaming over a 128 MiB file"]
+fn large_file_reads_and_edits_keep_heap_independent_of_file_size() {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    let _resource = RESOURCE.lock().unwrap();
+    let rig = Rig::new("edit-streaming-memory", registry());
+    let path = rig.workspace().join("large.txt");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.set_len(128 << 20).unwrap();
+    file.seek(SeekFrom::End(0)).unwrap();
+    file.write_all(b"\ntarget\n").unwrap();
+    drop(file);
+
+    let input = json!({"path": "large.txt", "offset": 2, "limit": 1});
+    let outcome = within_peak("streaming read", Some(8 << 20), || rig.call("read", &input));
+    assert_eq!(shown(&rig, &outcome), "target\n[lines 2-2 of 2]");
+
+    let input = json!({"path": "large.txt", "edits": [{"old": "target", "new": "newest"}]});
+    let outcome = within_peak("streaming edit", Some(8 << 20), || rig.call("edit", &input));
+    let Outcome::Done {
+        output: Payload::Inline(output),
+    } = outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    let output: Value = output.parse().unwrap();
+    assert_eq!(output["publication"]["visible"], true);
+    assert_eq!(output["publication"]["durability"], "not_requested");
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), (128 << 20) + 8);
+    let mut file = std::fs::File::open(path).unwrap();
+    file.seek(SeekFrom::End(-8)).unwrap();
+    let mut tail = String::new();
+    file.read_to_string(&mut tail).unwrap();
+    assert_eq!(tail, "\nnewest\n");
+}
+
+#[test]
+#[ignore = "resource test: run alone; checks the allocation measurement phases"]
+fn allocation_phases_exclude_fixtures_and_reset_their_peak() {
+    let _resource = RESOURCE.lock().unwrap();
+    let fixture = vec![0u8; 1 << 20];
+    std::hint::black_box(&fixture);
+    drop(fixture);
+    let (bytes, first) = allocation_peak(|| {
+        let mut bytes = Vec::with_capacity(4 << 10);
+        bytes.resize(64 << 10, 0u8);
+        bytes
+    });
+    assert!(
+        (bytes.len()..128 << 10).contains(&first),
+        "first peak: {first}"
+    );
+    drop(bytes);
+    let (bytes, second) = allocation_peak(|| vec![0u8; 8 << 10]);
+    assert!(
+        (bytes.len()..16 << 10).contains(&second),
+        "second peak: {second}"
+    );
+}
+
+// Resource tests run alone: the counter includes all of the runtime's workers.
+static RESOURCE: Mutex<()> = Mutex::new(());
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+struct Counting;
+
+// This test binary alone counts requested live heap; production keeps System.
+#[allow(unsafe_code)]
+// SAFETY: allocation contracts, pointers and layouts pass unchanged to System.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller supplies a valid allocation layout.
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            let live = LIVE.fetch_add(layout.size(), Relaxed) + layout.size();
+            PEAK.fetch_max(live, Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(layout.size(), Relaxed);
+        // SAFETY: the caller supplies System's live pointer and its layout.
+        unsafe { System.dealloc(ptr, layout) };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        // SAFETY: the caller supplies System's live pointer, layout and a nonzero size.
+        let ptr = unsafe { System.realloc(ptr, layout, size) };
+        if !ptr.is_null() {
+            let live = if size >= layout.size() {
+                LIVE.fetch_add(size - layout.size(), Relaxed) + size - layout.size()
+            } else {
+                LIVE.fetch_sub(layout.size() - size, Relaxed) - (layout.size() - size)
+            };
+            PEAK.fetch_max(live, Relaxed);
+        }
+        ptr
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+fn allocation_peak<T>(work: impl FnOnce() -> T) -> (T, usize) {
+    let baseline = LIVE.load(Relaxed);
+    PEAK.store(baseline, Relaxed);
+    let result = work();
+    (result, PEAK.load(Relaxed).saturating_sub(baseline))
+}
+
+fn within_peak<T>(label: &str, ceiling: Option<usize>, work: impl FnOnce() -> T) -> T {
+    let Some(ceiling) = ceiling else {
+        return work();
+    };
+    let (result, peak) = allocation_peak(work);
+    eprintln!("{label}: incremental live heap peak {peak} bytes (ceiling {ceiling})");
+    assert!(
+        peak < ceiling,
+        "{label}: peak {peak} bytes exceeds {ceiling}"
+    );
+    result
 }
