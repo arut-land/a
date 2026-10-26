@@ -356,9 +356,26 @@ impl Input {
     fn results(&mut self, results: &[ToolResult], out: &mut Settled) -> Result<(), Error> {
         for result in results {
             let custom = self.custom.contains(&result.id);
+            let output = result_output(&result.output)?;
+            let output = if result.error {
+                match output {
+                    ResultOutput::Text(text) => {
+                        ResultOutput::Text(format!("[tool error]\n{text}").into())
+                    }
+                    ResultOutput::Parts(mut parts) => {
+                        parts.insert(
+                            0,
+                            json!({"type": PartType::InputText, "text": "[tool error]"}),
+                        );
+                        ResultOutput::Parts(parts)
+                    }
+                }
+            } else {
+                output
+            };
             let item = OutputItem {
                 call_id: &result.id,
-                output: result_output(&result.output)?,
+                output,
                 status: (!custom).then_some(Status::Completed),
                 kind: if custom {
                     ItemType::CustomToolCallOutput

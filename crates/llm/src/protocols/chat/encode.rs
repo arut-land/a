@@ -272,8 +272,10 @@ fn tool_message(result: &ToolResult, ctx: &Context, attached: &mut Vec<Value>) -
         .iter()
         .all(|part| !image(part) && part.str("text").is_none_or(|text| text.trim().is_empty()));
     if blank {
-        let error = if result.error { "[tool error] " } else { "" };
-        parts = vec![text_part(&format!("{error}{NO_TOOL_OUTPUT}"))];
+        parts = vec![text_part(NO_TOOL_OUTPUT)];
+    }
+    if result.error {
+        parts.insert(0, text_part("[tool error]"));
     }
     let content = if ctx.quirks.tool_result_parts || parts.iter().any(image) {
         Value::Array(parts)

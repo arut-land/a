@@ -340,3 +340,39 @@ fn a_models_reasoning_reads_as_the_same_kind_over_every_wire_it_came_by() {
         Some(crate::tag::Name::Reasoning)
     );
 }
+
+#[test]
+fn hosted_calls_do_not_consume_local_call_ids() {
+    for hosted_first in [false, true] {
+        let mut hosted = call("hosted");
+        if let AssistantPart::ToolCall(call) = &mut hosted {
+            call.provider_executed = true;
+        }
+        let mut content = vec![call("local-long"), hosted];
+        if hosted_first {
+            content.reverse();
+        }
+        let out = run(vec![Message::Assistant(Assistant {
+            content,
+            origin: Some(origin("m")),
+        })]);
+        let Message::Assistant(assistant) = &out[0] else {
+            panic!()
+        };
+        let ids: Vec<_> = assistant
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                AssistantPart::ToolCall(call) => Some((call.id.as_str(), call.provider_executed)),
+                _ => None,
+            })
+            .collect();
+        assert!(ids.contains(&("hosted", true)));
+        assert!(ids.contains(&("loca", false)));
+        let Message::Tool(tool) = &out[1] else {
+            panic!()
+        };
+        assert_eq!(tool.results.len(), 1);
+        assert_eq!(tool.results[0].id, "loca");
+    }
+}

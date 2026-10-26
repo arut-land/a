@@ -443,8 +443,7 @@ mod tests {
     }
 
     /// Only `&` and `"` (and a `<` of ours) are escaped in a value: a
-    /// shell command reads as it was run. Values used to escape `<`, `>`
-    /// and newlines as well; this pins the change.
+    /// shell command reads as it was run, including redirections and newlines.
     #[test]
     fn an_attribute_value_escapes_only_its_quotes_and_our_tags() {
         let tag = Tag::from(BackgroundResult {
