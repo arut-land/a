@@ -8,21 +8,18 @@ import json
 import os
 from pathlib import Path
 import platform
-import queue
 import shutil
 import statistics
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 
-from process import snapshot, stop_daemon, run_timed
+from process import run_timed
+from build import STD, SUFFIX, benchmark, environment, stage, variant_arguments
+from lifecycle import daemon, idle_sample
 from stats import distribution
 
 ROOT = Path(__file__).resolve().parents[2]
-STD = ["-Zbuild-std=std,panic_unwind", "-Zbuild-std-features=panic-unwind,optimize_for_size"]
-SUFFIX = ".exe" if os.name == "nt" else ""
 
 
 def run(argv, **kwargs):
@@ -33,7 +30,8 @@ def run(argv, **kwargs):
     try:
         # Bound each sample rather than the total time of a benchmark suite.
         bounded = argv[0] == "hyperfine" or "timeout" in kwargs
-        return (run_timed if bounded else subprocess.run)(argv, check=True, **kwargs)
+        kwargs.setdefault("check", True)
+        return (run_timed if bounded else subprocess.run)(argv, **kwargs)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         if error.stdout:
             print(error.stdout, flush=True)
@@ -77,24 +75,11 @@ def windows_image(binary):
     return dict(headers=headers, dependencies=dependencies)
 
 
-def variant_arguments(variant):
-    config = list(variant.get("config", []))
-    flags = variant.get("rustflags", [])
-    if flags:
-        config.append("profile.release.rustflags=" + json.dumps(["-Cllvm-args=-addrsig", *flags]))
-    overrides = [arg for value in config for arg in ("--config", value)]
-    return overrides
-
-
 def build(source, output, variant, benchmarks=True, packages=("engine", "protocol", "llm", "tui")):
     overrides = variant_arguments(variant)
     if os.environ.get("PERF_ABLATION") == "true":
         packages = ("engine", "llm")
-    env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
-               CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
-    if os.name == "nt":
-        # snmalloc checks Git Bash's MSYSTEM before the MSVC target.
-        env.pop("MSYSTEM", None)
+    env = environment(source / "target/perf-build")
     release = Path(env["CARGO_TARGET_DIR"]) / "release"
     # Features select an allocator or heap for `a` and the engine's benches
     # alone (docs/perf/allocators.md); the other benches keep their own.
@@ -104,7 +89,7 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
         run(["cargo", "build-release", "-p", "a", *(["--features", ",".join(selected)] if selected else []),
              *overrides], cwd=source, env=env)
         name = "a-fixtures" if fixture else "a"
-        shutil.copy2(release / ("a" + SUFFIX), output / (name + SUFFIX))
+        stage(release / ("a" + SUFFIX), output / (name + SUFFIX))
     (output / "build.json").write_text(json.dumps(dict(
         revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
         variant=variant,
@@ -119,20 +104,14 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
     run(["cargo", "build-release", "-p", "a", "--example", "perf-attach", *chosen, *overrides], cwd=source, env=env)
     run(["cargo", "test", "--release", *STD, "-p", "a", "--example", "perf-attach", *chosen, *overrides],
         cwd=source, env=env)
-    shutil.copy2(release / "examples" / ("perf-attach" + SUFFIX), output / ("perf-attach" + SUFFIX))
+    stage(release / "examples" / ("perf-attach" + SUFFIX), output / ("perf-attach" + SUFFIX))
     for package, target in [("engine", ["--lib"]), ("protocol", ["--test", "bench"]),
                             ("llm", ["--test", "bench"]), ("tui", ["--lib"])]:
         if package not in packages:
             continue
         allocator = [f for f in features if f.startswith("sys/")] if package == "engine" else []
-        result = run(["cargo", "test", "--release", *STD, "-p", package, *target,
-                      *(["--features", ",".join(allocator)] if allocator else []),
-                      "--no-run", "--message-format=json", *overrides], cwd=source, env=env,
-                     stdout=subprocess.PIPE, text=True)
-        executables = [record["executable"] for line in result.stdout.splitlines()
-                       if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
-        assert len(executables) == 1, executables
-        shutil.copy2(executables[0], output / (package + "-bench" + SUFFIX))
+        benchmark(source, env, ["-p", package, *target], overrides, allocator,
+                  output / (package + "-bench" + SUFFIX), run=run)
     metadata = json.loads((output / "build.json").read_text())
     metadata["executables"] = {
         p.name: dict(bytes=p.stat().st_size, sha256=hashlib.sha256(p.read_bytes()).hexdigest())
@@ -146,83 +125,45 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
 def budgets(output, binary=None, probe=None, samples=5):
     binary = str(binary or output / ("a-fixtures" + SUFFIX))
     cold, first_run, rss, cpu, client_cpu, attach_p50, attach_p99 = [], [], [], [], [], [], []
-    root = os.environ.get("RUNNER_TEMP")
     for trial in range(samples):
-        with tempfile.TemporaryDirectory(prefix="a-hosted-", dir=root) as directory:
-            home = Path(directory)
-            (home / "config.toml").write_text('[daemon]\nagent = "echo"\nidle_secs = 120\n')
-            env = dict(os.environ, A_HOME=str(home), A_TUI="plain")
-            env.pop("A_HOST", None)
-            client = None
+        with daemon(binary, output, trial, first_run=True) as active:
+            home, env, pid = active.home, active.env, active.pid
+
             def cli(*args):
                 return run([binary, *args], env=env, cwd=home, capture_output=True, timeout=60)
-            try:
-                started = time.perf_counter()
-                # Pipes wake on exit; the general timeout wrapper's file-backed
-                # capture waits with polling and quantizes short POSIX commands.
-                subprocess.run([binary, "ls"], env=env, cwd=home,
-                               capture_output=True, check=True, timeout=60)
-                first_run.append((time.perf_counter() - started) * 1000)
-                stop_daemon(binary, env, home)
-                started = time.perf_counter()
-                client = subprocess.Popen([binary], env=env, cwd=home, stdin=subprocess.PIPE,
-                                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                first = queue.Queue()
-                threading.Thread(target=lambda: first.put(client.stdout.readline()), daemon=True).start()
-                assert first.get(timeout=60).startswith(b"[session")
-                cold.append((time.perf_counter() - started) * 1000)
-                pid = int((home / "run/daemon.pid").read_text().splitlines()[0])
-                time.sleep(3)
-                rss.append(snapshot(pid)["rss_kib"])
-                # Blocking workers retire after ten idle seconds; CPU measures steady idle.
-                time.sleep(12)
-                before = [snapshot(p, threads=True) for p in (pid, client.pid)]
-                time.sleep(10)
-                after = [snapshot(p, threads=True) for p in (pid, client.pid)]
-                (output / f"idle-{trial}.json").write_text(json.dumps(dict(
-                    daemon_pid=pid, client_pid=client.pid, before=before, after=after), indent=2))
-                cpu.append((after[0]["cpu_seconds"] - before[0]["cpu_seconds"]) * 1000)
-                client_cpu.append((after[1]["cpu_seconds"] - before[1]["cpu_seconds"]) * 1000)
-                if os.environ.get("PERF_ABLATION") == "true":
-                    import psutil
-                    diagnostic = {}
-                    process = psutil.Process(pid)
-                    if sys.platform == "darwin":
-                        try:
-                            maps = subprocess.run(["vmmap", "-summary", str(pid)], capture_output=True, text=True, timeout=10)
-                            diagnostic["vmmap"] = maps.stdout + maps.stderr
-                        except subprocess.TimeoutExpired:
-                            diagnostic["maps_error"] = "vmmap exceeded 10 seconds"
-                    else:
-                        try:
-                            diagnostic["memory"] = process.memory_full_info()._asdict()
-                            diagnostic["maps"] = [m._asdict() for m in process.memory_maps(grouped=True)]
-                        except (psutil.Error, NotImplementedError, AttributeError) as error:
-                            diagnostic["maps_error"] = str(error)
-                    (output / f"memory-{trial}.json").write_text(json.dumps(diagnostic, indent=2))
-                session = cli("new").stdout.decode().strip()
-                for n in range(10):
-                    cli("-p", f"message {n}", "resume", session)
-                result = cli_probe(output, session, env, home, probe)
-                samples = sorted(result)
-                attach_p50.append(statistics.median(samples))
-                attach_p99.append(samples[495])
-                (output / f"attach-{trial}.json").write_text(json.dumps(samples))
-            except Exception:
-                # Retain the daemon's own explanation before its isolated home disappears.
-                for path in (home / "logs").glob("*"):
-                    if path.is_file():
-                        shutil.copy2(path, output / f"failed-{trial}-{path.name}")
-                raise
-            finally:
-                if client:
-                    client.stdin.close()
+
+            first_run.append(active.first_run_ms)
+            cold.append(active.cold_ms)
+            observation = idle_sample(active, 10)
+            rss.append(observation["rss"])
+            cpu.append(observation["daemon_cpu_seconds"] * 1000)
+            client_cpu.append(observation["client_cpu_seconds"] * 1000)
+            (output / f"idle-{trial}.json").write_text(json.dumps(observation, indent=2))
+            if os.environ.get("PERF_ABLATION") == "true":
+                import psutil
+                diagnostic = {}
+                process = psutil.Process(pid)
+                if sys.platform == "darwin":
                     try:
-                        client.wait(timeout=15)
+                        maps = subprocess.run(["vmmap", "-summary", str(pid)], capture_output=True, text=True, timeout=10)
+                        diagnostic["vmmap"] = maps.stdout + maps.stderr
                     except subprocess.TimeoutExpired:
-                        client.kill()
-                        client.wait()
-                stop_daemon(binary, env, home)
+                        diagnostic["maps_error"] = "vmmap exceeded 10 seconds"
+                else:
+                    try:
+                        diagnostic["memory"] = process.memory_full_info()._asdict()
+                        diagnostic["maps"] = [m._asdict() for m in process.memory_maps(grouped=True)]
+                    except (psutil.Error, NotImplementedError, AttributeError) as error:
+                        diagnostic["maps_error"] = str(error)
+                (output / f"memory-{trial}.json").write_text(json.dumps(diagnostic, indent=2))
+            session = cli("new").stdout.decode().strip()
+            for n in range(10):
+                cli("-p", f"message {n}", "resume", session)
+            result = cli_probe(output, session, env, home, probe)
+            samples = sorted(result)
+            attach_p50.append(statistics.median(samples))
+            attach_p99.append(samples[495])
+            (output / f"attach-{trial}.json").write_text(json.dumps(samples))
     metrics = {name: distribution(values) for name, values in [
         ("cold_reply_ms", cold), ("first_run_ls_ms", first_run), ("attach_p50_ms", attach_p50), ("attach_p99_ms", attach_p99),
         ("idle_rss_kib", rss), ("idle_daemon_cpu_ms", cpu), ("idle_line_client_cpu_ms", client_cpu)]}
@@ -281,8 +222,7 @@ def summarize(output, source, variant, runner):
 
 
 def bloat(source, output, variant):
-    env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
-               CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
+    env = environment(source / "target/perf-build")
     for label, extra in [("crates", ["--crates"]), ("functions", ["-n", "100"] )]:
         result = run(["cargo", "bloat", "--release", "-p", "a", *STD, *variant_arguments(variant),
                       "--config", 'profile.release.strip="none"',
@@ -387,25 +327,11 @@ def sessions(source, output, variant, reference=""):
     A variant naming `allocators` builds the measurement once per allocator
     and compares them (`segment` is Windows' segment heap, through the
     executable's image options) instead of the runtime layouts."""
-    env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
-               CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
-    if os.name == "nt":
-        # snmalloc checks Git Bash's MSYSTEM before the MSVC target.
-        env.pop("MSYSTEM", None)
+    def build_benchmark(name, target=("-p", "engine", "--lib"), features=(), checkout=source):
+        return benchmark(checkout, environment(checkout / "target/perf-build"), target,
+                         variant_arguments(variant), features, output / (name + SUFFIX), run=run)
 
-    def benchmark(name, target=("-p", "engine", "--lib"), features=(), checkout=source):
-        build_env = dict(env, CARGO_TARGET_DIR=str(checkout / "target/perf-build"))
-        result = run(["cargo", "test", "--release", *STD, *target, "--no-run",
-                      *(["--features", ",".join(features)] if features else []),
-                      "--message-format=json"], cwd=checkout, env=build_env, stdout=subprocess.PIPE, text=True)
-        executables = [record["executable"] for line in result.stdout.splitlines()
-                       if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
-        assert len(executables) == 1, executables
-        binary = output / (name + SUFFIX)
-        shutil.copy2(executables[0], binary)
-        return binary
-
-    binary = benchmark("engine-bench")
+    binary = build_benchmark("engine-bench")
     extra = []
     if reference:
         reference_source = source.parent / "reference"
@@ -413,7 +339,7 @@ def sessions(source, output, variant, reference=""):
         reference = subprocess.check_output(["git", "rev-parse", "FETCH_HEAD"], cwd=source, text=True).strip()
         run(["git", "worktree", "add", "--detach", reference_source, reference], cwd=source)
         extra.append(f"candidate={binary}")
-        binary = benchmark("engine-bench-reference", checkout=reference_source)
+        binary = build_benchmark("engine-bench-reference", checkout=reference_source)
     for allocator in variant.get("allocators", []):
         if allocator == "segment":
             if os.name != "nt":
@@ -427,12 +353,12 @@ def sessions(source, output, variant, reference=""):
         elif allocator == "jemalloc" and os.name == "nt":
             continue
         else:
-            extra.append(f"{allocator}={benchmark('engine-bench-' + allocator, features=['sys/' + allocator])}")
+            extra.append(f"{allocator}={build_benchmark('engine-bench-' + allocator, features=['sys/' + allocator])}")
     layouts = ["--layouts", "memory", *(arg for entry in extra for arg in ("--binary", entry))] \
         if "allocators" in variant or reference else []
     if "allocators" in variant and not reference:
         layouts.append("--arena-policy")
-    round_trip = [] if layouts else ["--round-trip", benchmark("rt-round-trip", ("-p", "rt", "--test", "round_trip"))]
+    round_trip = [] if layouts else ["--round-trip", build_benchmark("rt-round-trip", ("-p", "rt", "--test", "round_trip"))]
     os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
     (output / "sessions").mkdir(exist_ok=True)
     (output / "sessions" / "host.json").write_text(json.dumps(dict(
