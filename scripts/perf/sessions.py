@@ -4,7 +4,7 @@ Runs the engine's `concurrent_active_sessions` measurement in a fresh process
 per sample (idle RSS must not inherit an earlier layout's heap), alternating
 layout order each round. `workers=4` runs twice under two labels; the gap
 between them is the noise band any other layout must clear. With `--round-trip`,
-rt's echoed-byte timing runs in each layout's environment every round too.
+rt's echoed-byte timing runs once per round on its fixed Threads::new(4) runtime.
 Each layout is also compared with `A` round by round: median paired differences
 with bootstrap 95% intervals.
 
@@ -134,28 +134,25 @@ def paired_table(rows):
 TRIP = ["p50_us", "p90_us", "p99_us", "cpu_ms", "switches"]
 
 
-def paired_trips(trips, reference="A"):
-    """rt's round trip, each layout minus the reference in the same round."""
-    runs = {(t["label"], t["round"]): t for t in trips}
-    out = {}
-    for label in sorted({t["label"] for t in trips} - {reference}):
-        rounds = sorted(n for (l, n) in runs if l == label and (reference, n) in runs)
-        if rounds:
-            out[label] = dict(label=label, pairs=len(rounds), **{
-                name: bootstrap([runs[(label, n)][name] - runs[(reference, n)][name] for n in rounds],
-                                statistics.median(runs[(reference, n)][name] for n in rounds),
-                                f"trip/{label}/{name}")
-                for name in TRIP})
-    return out
-
-
-def trips_table(rows):
-    lines = ["| round trip - A | pairs | A median: " + " | ".join(TRIP) + " |",
+def trips_table(trips):
+    lines = ["| round trip runtime | runs | " + " | ".join(TRIP) + " |",
              "| --- | ---: | " + " | ".join("---:" for _ in TRIP) + " |"]
-    for row in rows.values():
-        cells = ["{reference:.4g}: {median:+.3g} [{low:+.3g}, {high:+.3g}]".format(**row[name]) for name in TRIP]
-        lines.append(f"| {row['label']} | {row['pairs']} | " + " | ".join(cells) + " |")
+    if trips:
+        cells = [f"{statistics.median(trip[name] for trip in trips):.4g}" for name in TRIP]
+        lines.append(f"| Threads::new(4) | {len(trips)} | " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"
+
+
+def execute(command, env, timeout=300):
+    try:
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=timeout)
+        return result.stdout, result.stderr, f"exit {result.returncode}" if result.returncode else None
+    except subprocess.TimeoutExpired as error:
+        out, err = (text.decode(errors="replace") if isinstance(text, bytes) else text or ""
+                    for text in (error.stdout, error.stderr))
+        return out, err, "timed out"
+    except OSError as error:
+        return "", str(error), "could not execute"
 
 
 def table(summary):
@@ -179,10 +176,10 @@ def table(summary):
     return "\n".join(lines) + "\n"
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path, help="the engine's release lib test executable")
-    parser.add_argument("--round-trip", type=Path, help="rt's round_trip test executable, run per layout and round")
+    parser.add_argument("--round-trip", type=Path, help="rt's round_trip test executable, fixed Threads::new(4) baseline, run once per round")
     parser.add_argument("--binary", dest="binaries", action="append", default=[],
                         help="LABEL=PATH: the same executable built with another allocator")
     parser.add_argument("--layouts", choices=["runtime", "memory"], default="runtime")
@@ -193,7 +190,7 @@ def main():
     parser.add_argument("--sessions", default="1,8,32,128")
     parser.add_argument("--turns", type=int, default=3)
     parser.add_argument("--pace-ms", type=int, default=10)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.output.mkdir(parents=True, exist_ok=True)
     cores = os.cpu_count()
     binaries = dict(entry.split("=", 1) for entry in args.binaries)
@@ -204,42 +201,31 @@ def main():
     records, failures, trips = [], [], []
     for round in range(args.rounds):
         order = labels if round % 2 == 0 else list(reversed(labels))
-        for label, _, extra, _ in order if args.round_trip else []:
-            try:
-                result = subprocess.run(
-                    [str(args.round_trip), "reactor_round_trip", "--exact", "--ignored", "--nocapture",
-                     "--test-threads=1"], env=dict(os.environ, **extra), capture_output=True, text=True,
-                    timeout=300)
-                failed = result.returncode and f"exit {result.returncode}"
-            except subprocess.TimeoutExpired:
-                failed, result = "timed out", None
+        if args.round_trip:
+            out, err, failed = execute(
+                [str(args.round_trip), "reactor_round_trip", "--exact", "--ignored", "--nocapture",
+                 "--test-threads=1"], env=dict(os.environ))
             if failed:
-                # A stalled echo is a finding, as a stalled session sample is.
-                failures.append(dict(label=label, runtime="round trip", sessions=0, round=round, failed=failed))
+                failure = dict(runtime="Threads::new(4)", label="round trip", sessions=0,
+                               round=round, failed=failed, stdout=out[-4000:], stderr=err[-4000:])
+                failures.append(failure)
                 with (args.output / "failures.jsonl").open("a") as stream:
-                    stream.write(json.dumps(failures[-1]) + "\n")
-                print(label, "round trip", round, failed, result and result.stderr[-2000:], sep="\n", flush=True)
-                continue
-            line = next(line for line in result.stdout.splitlines() if '{"' in line)
-            trip = dict(json.loads(line[line.index('{"'):]), label=label, round=round)
-            trips.append(trip)
-            with (args.output / "round-trip.jsonl").open("a") as stream:
-                stream.write(json.dumps(trip) + "\n")
-            print(label, "round trip", round, f"p50={trip['p50_us']}us p99={trip['p99_us']}us", flush=True)
+                    stream.write(json.dumps(failure) + "\n")
+                print("round trip", round, failed, err[-2000:], sep="\n", flush=True)
+            else:
+                line = next(line for line in out.splitlines() if '{"' in line)
+                trip = dict(json.loads(line[line.index('{"'):]), runtime="Threads::new(4)", round=round)
+                trips.append(trip)
+                with (args.output / "round-trip.jsonl").open("a") as stream:
+                    stream.write(json.dumps(trip) + "\n")
+                print("round trip", round, f"p50={trip['p50_us']}us p99={trip['p99_us']}us", flush=True)
         for sessions in counts:
             for label, runtime, extra, built in order:
                 env = dict(os.environ, **extra, A_BENCH_RUNTIME=runtime, A_BENCH_SESSIONS=str(sessions),
                            A_BENCH_TURNS=str(args.turns), A_BENCH_PACE_MS=str(args.pace_ms))
-                try:
-                    result = subprocess.run(
-                        [str(binaries[built] if built else args.binary), TEST, "--exact", "--ignored", "--nocapture", "--test-threads=1"],
-                        env=env, capture_output=True, text=True, timeout=300)
-                    failed = result.returncode and f"exit {result.returncode}"
-                    out, err = result.stdout, result.stderr
-                except subprocess.TimeoutExpired as error:
-                    failed = "timed out"
-                    out, err = (text.decode(errors="replace") if isinstance(text, bytes) else text or ""
-                                for text in (error.stdout, error.stderr))
+                out, err, failed = execute(
+                    [str(binaries[built] if built else args.binary), TEST, "--exact", "--ignored", "--nocapture", "--test-threads=1"],
+                    env=env)
                 if failed:
                     # A stalled layout is a finding, not the end of the others' samples.
                     failure = dict(label=label, runtime=runtime, sessions=sessions, round=round,
@@ -260,11 +246,10 @@ def main():
                       f"p99={percentile(record['delta_ms'], 0.99):.3f}ms rss={record['idle_rss_kib']:.0f}KiB "
                       f"released={record.get('released_rss_kib', 0):.0f}KiB", flush=True)
     summary, pairs = summarize(records), paired(records)
-    trip_pairs = paired_trips(trips)
     stalled = [(f["label"], f["sessions"], f["round"], f["failed"]) for f in failures]
     (args.output / "sessions.json").write_text(
-        json.dumps(dict(cores=cores, summary=summary, paired=pairs, round_trip=trip_pairs, failures=stalled), indent=2) + "\n")
-    report = table(summary) + "\n" + paired_table(pairs) + "\n" + trips_table(trip_pairs)
+        json.dumps(dict(cores=cores, summary=summary, paired=pairs, round_trip=trips, failures=stalled), indent=2) + "\n")
+    report = table(summary) + "\n" + paired_table(pairs) + "\n" + trips_table(trips)
     (args.output / "sessions.md").write_text(report)
     print(report)
     print("failed samples:", stalled)
@@ -272,6 +257,8 @@ def main():
         with open(summary_file, "a") as stream:
             stream.write(f"Concurrent sessions ({cores} cores)\n\n" + report)
 
+    return 1 if failures else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

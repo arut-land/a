@@ -223,7 +223,7 @@ fn a_held_blob_is_named_only_once_it_can_be_read() {
     ));
     let places = ext::blob::Blobs::new(store.clone(), tree, SessionId::new()).places();
     let mut writer = ext::blob::BlobStore::writer(&*store, 1 << 20).unwrap();
-    std::io::Write::write_all(&mut writer, b"whole").unwrap();
+    io::Write::write_all(&mut writer, b"whole").unwrap();
     let kept = writer
         .finish("text/plain", BlobOrigin::ToolOutput(call(3)))
         .unwrap();
@@ -276,7 +276,7 @@ fn a_childs_result_held_as_a_blob_is_read_back_for_its_parent() {
     ));
     let places = ext::blob::Blobs::new(store.clone(), tree, SessionId::new()).places();
     let mut writer = ext::blob::BlobStore::writer(&*store, 1 << 20).unwrap();
-    std::io::Write::write_all(&mut writer, b"the child's whole answer").unwrap();
+    io::Write::write_all(&mut writer, b"the child's whole answer").unwrap();
     let blob = writer
         .finish("text/plain", BlobOrigin::ToolOutput(call(3)))
         .unwrap();
@@ -307,5 +307,240 @@ fn a_childs_result_held_as_a_blob_is_read_back_for_its_parent() {
     assert!(
         said.contains("The child session finished:\\nthe child's whole answer"),
         "{said}"
+    );
+}
+
+#[test]
+fn completion_metadata_lives_only_until_background_completion_is_formatted() {
+    for detached in [false, true] {
+        let mut transcript =
+            Transcript::empty(Arc::new(Registry::default()), "", &Places::default());
+        for (at, body) in called().into_iter().enumerate() {
+            transcript.apply(&Entry::new(seq(at as u64 + 1), Epoch(0), body), None);
+        }
+        assert!(transcript.tools.is_empty());
+        assert!(transcript.streams.is_empty());
+        let mut at = 4;
+        if detached {
+            transcript.apply(
+                &Entry::new(seq(at), Epoch(0), Body::Detached { call: call(3) }),
+                None,
+            );
+            at += 1;
+        }
+        transcript.apply(
+            &Entry::new(
+                seq(at),
+                Epoch(0),
+                Body::ToolResult {
+                    call: call(3),
+                    outcome: Outcome::detached(),
+                    card: None,
+                    held: vec![Held::Stream(OutputStream {
+                        session: SESSION,
+                        call: call(3),
+                    })],
+                },
+            ),
+            None,
+        );
+        assert_eq!(transcript.tools.len(), 1);
+        assert_eq!(transcript.streams.len(), 1);
+        let payload = if detached {
+            Carried::Detached(Outcome::Done {
+                output: Json::encode("finished").unwrap().into(),
+            })
+        } else {
+            Carried::Job("finished".into())
+        };
+        transcript.apply(
+            &Entry::new(
+                seq(at + 1),
+                Epoch(0),
+                Body::Enqueue {
+                    envelope: Envelope::own(SESSION, call(3), payload),
+                },
+            ),
+            None,
+        );
+        assert!(transcript.tools.is_empty());
+        assert!(transcript.streams.is_empty());
+        assert!(transcript.detached.is_empty());
+        transcript.apply(
+            &Entry::new(
+                seq(at + 2),
+                Epoch(0),
+                Body::Take {
+                    input: seq(at + 1),
+                    into: None,
+                },
+            ),
+            None,
+        );
+        let Message::User(user) = transcript.messages.last().unwrap() else {
+            panic!("completion must be user context")
+        };
+        let shown = format!("{user:?}");
+        assert!(shown.contains(r#"command=\"sleep\""#), "{shown}");
+        assert!(shown.contains(r#"log=\"stream:3\""#), "{shown}");
+        assert!(shown.contains("finished"), "{shown}");
+    }
+}
+
+#[test]
+fn detached_completion_keeps_metadata_until_the_remaining_job_ends() {
+    let mut bodies = called();
+    bodies.extend([
+        Body::Detached { call: call(3) },
+        Body::ToolResult {
+            call: call(3),
+            outcome: Outcome::detached(),
+            card: None,
+            held: vec![Held::Stream(OutputStream {
+                session: SESSION,
+                call: call(3),
+            })],
+        },
+        Body::ToolProcess {
+            call: call(3),
+            pgid: 42,
+            boot: "boot".into(),
+            background: true,
+        },
+        Body::Enqueue {
+            envelope: Envelope::own(
+                SESSION,
+                call(3),
+                Carried::Detached(Outcome::Done {
+                    output: Json::encode("shell exited").unwrap().into(),
+                }),
+            ),
+        },
+        Body::Take {
+            input: seq(7),
+            into: None,
+        },
+        Body::Enqueue {
+            envelope: Envelope::own(SESSION, call(3), Carried::Job("descendants exited".into())),
+        },
+        Body::Take {
+            input: seq(9),
+            into: None,
+        },
+    ]);
+    let entries: Vec<_> = bodies
+        .into_iter()
+        .enumerate()
+        .map(|(at, body)| Entry::new(seq(at as u64 + 1), Epoch(0), body))
+        .collect();
+    let registry = Arc::new(Registry::default());
+    let mut live = Transcript::empty(Arc::clone(&registry), "", &Places::default());
+    for (at, entry) in entries.iter().enumerate() {
+        live.apply(entry, None);
+        let replay = Transcript::of(&entries[..=at], Arc::clone(&registry), "");
+        assert_eq!(replay.messages, live.messages);
+        if entry.seq == seq(8) {
+            for transcript in [&live, &replay] {
+                assert_eq!(transcript.tools.get(&call(3)).unwrap(), "sleep");
+                assert!(transcript.streams.contains_key(&call(3)));
+            }
+        }
+    }
+    assert!(live.tools.is_empty());
+    assert!(live.streams.is_empty());
+    assert!(live.jobs.is_empty());
+    let messages = live.into_messages();
+    let shown = format!("{messages:?}");
+    assert!(shown.contains("shell exited"), "{shown}");
+    assert!(shown.contains("descendants exited"), "{shown}");
+    assert_eq!(shown.matches(r#"command=\"sleep\""#).count(), 2, "{shown}");
+    assert_eq!(shown.matches(r#"log=\"stream:3\""#).count(), 2, "{shown}");
+    let replay = Transcript::of(&entries, Arc::clone(&registry), "");
+    assert!(replay.tools.is_empty());
+    assert!(replay.streams.is_empty());
+    assert!(replay.jobs.is_empty());
+    assert_eq!(
+        project(context_image(&entries), registry, "", &Places::default()).into_messages(),
+        messages
+    );
+}
+
+#[test]
+fn foreground_completions_retain_no_background_metadata() {
+    let mut transcript = Transcript::empty(Arc::new(Registry::default()), "", &Places::default());
+    for (at, body) in called()
+        .into_iter()
+        .chain([Body::ToolResult {
+            call: call(3),
+            outcome: Outcome::Done {
+                output: Json::null().into(),
+            },
+            card: None,
+            held: Vec::new(),
+        }])
+        .enumerate()
+    {
+        transcript.apply(&Entry::new(seq(at as u64 + 1), Epoch(0), body), None);
+    }
+    assert!(transcript.calls.is_empty());
+    assert!(transcript.tools.is_empty());
+    assert!(transcript.streams.is_empty());
+    assert!(transcript.detached.is_empty());
+}
+
+#[test]
+fn background_jobs_keep_their_name_without_publishing_a_stream() {
+    let mut bodies = called();
+    bodies.extend([
+        Body::ToolProcess {
+            call: call(3),
+            pgid: 42,
+            boot: "boot".into(),
+            background: true,
+        },
+        Body::ToolResult {
+            call: call(3),
+            outcome: Outcome::Done {
+                output: Json::null().into(),
+            },
+            card: None,
+            held: Vec::new(),
+        },
+        Body::Enqueue {
+            envelope: Envelope::own(SESSION, call(3), Carried::Job("finished".into())),
+        },
+        Body::Take {
+            input: seq(6),
+            into: None,
+        },
+        Body::Edit {
+            target: seq(4),
+            upto: None,
+            replace: None,
+        },
+    ]);
+    let entries: Vec<_> = bodies
+        .into_iter()
+        .enumerate()
+        .map(|(at, body)| Entry::new(seq(at as u64 + 1), Epoch(0), body))
+        .collect();
+    let registry = Arc::new(Registry::default());
+    let mut live = Transcript::empty(Arc::clone(&registry), "", &Places::default());
+    for entry in &entries {
+        live.apply(entry, None);
+    }
+    assert!(live.tools.is_empty());
+    assert!(live.streams.is_empty());
+    let messages = live.into_messages();
+    let text = format!("{:?}", messages.last().unwrap());
+    assert!(text.contains(r#"command=\"sleep\""#), "{text}");
+    assert!(text.contains("finished"), "{text}");
+    assert_eq!(
+        Transcript::of(&entries, Arc::clone(&registry), "").into_messages(),
+        messages
+    );
+    assert_eq!(
+        project(context_image(&entries), registry, "", &Places::default()).into_messages(),
+        messages
     );
 }
