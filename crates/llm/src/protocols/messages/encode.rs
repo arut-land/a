@@ -27,7 +27,7 @@ use crate::models::anthropic::{
 use crate::protocol::{Encoded, Target};
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
-    Assistant, AssistantPart, Format, Json, Media, Message, Output, Request, Source, System, Tool,
+    Assistant, AssistantPart, Carried, Format, Json, Media, Message, Output, Request, System, Tool,
     ToolChoice, ToolResult, ToolWire, UserPart,
 };
 
@@ -582,20 +582,20 @@ fn media_block(media: &Media) -> Result<Value, Error> {
     let image = kind.starts_with("image/");
     let pdf = kind == "application/pdf";
     let readable = ["image/jpeg", "image/png", "image/gif", "image/webp"].contains(&kind);
-    let source = match &media.source {
+    let source = match media.source.carried() {
         _ if kind.starts_with("audio/") || kind.starts_with("video/") => None,
-        Source::File { id } => Some(obj!({"type": "file", "file_id": id.as_str()})),
+        Carried::File(id) => Some(obj!({"type": "file", "file_id": id})),
         // Anthropic's document URL source is for PDFs and names no type, so
         // an untyped URL is one.
-        Source::Url { url } if image || pdf || kind.is_empty() => {
-            Some(obj!({"type": "url", "url": url.as_str()}))
+        Carried::Url(url) if image || pdf || kind.is_empty() => {
+            Some(obj!({"type": "url", "url": url}))
         }
-        Source::Data { data } if pdf || readable => {
-            Some(obj!({"type": "base64", "media_type": kind, "data": data.as_str()}))
+        Carried::Data(data) if pdf || readable => {
+            Some(obj!({"type": "base64", "media_type": kind, "data": &*data}))
         }
-        Source::Url { .. } => None,
-        Source::Data { .. } if image || kind.is_empty() => None,
-        Source::Data { data } => base64(data)
+        Carried::Url(_) => None,
+        Carried::Data(_) if image || kind.is_empty() => None,
+        Carried::Data(data) => base64(&data)
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .map(|text| obj!({"type": "text", "media_type": "text/plain", "data": text})),
     };

@@ -20,9 +20,10 @@ use crate::protocol::{Encoded, Target};
 use crate::protocols::schema;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
-    Assistant, AssistantPart, Format, Media, Message, Output, Request, Source, Tool, ToolCall,
+    Assistant, AssistantPart, Carried, Format, Media, Message, Output, Request, Tool, ToolCall,
     ToolChoice, ToolResult, ToolWire, UserPart,
 };
+use crate::tag::{self, Tag};
 
 /// What replaces an image for a model that reads none.
 pub(super) const USER_IMAGE_OMITTED: &str = "(image omitted: model does not support images)";
@@ -30,8 +31,6 @@ pub(super) const USER_IMAGE_OMITTED: &str = "(image omitted: model does not supp
 pub(super) const TOOL_IMAGE_OMITTED: &str = "(tool image omitted: model does not support images)";
 /// What replaces a tool-result image that moved to a user message.
 pub(super) const TOOL_IMAGE_ATTACHED: &str = "(see attached image)";
-/// The text heading the user message that carries tool-result images.
-pub(super) const TOOL_IMAGES_HEADING: &str = "Attached image(s) from tool result:";
 /// What replaces media the host cannot take in its form.
 pub(super) const IMAGE_UNSENDABLE: &str =
     "(image omitted: the provider cannot receive it in this form)";
@@ -116,10 +115,10 @@ fn data_url(media: &Media, data: &str) -> String {
 /// form; a user image names a detail level, `auto`.
 fn image_url(media: &Media, ctx: &Context, user: bool) -> Option<Value> {
     let takes = ctx.quirks.media;
-    let url = match &media.source {
-        Source::Data { data } if takes.parts => data_url(media, data),
-        Source::Url { url } if takes.parts && takes.url_images => url.clone(),
-        Source::Data { .. } | Source::Url { .. } | Source::File { .. } => return None,
+    let url = match media.source.carried() {
+        Carried::Data(data) if takes.parts => data_url(media, &data),
+        Carried::Url(url) if takes.parts && takes.url_images => url.to_owned(),
+        Carried::Data(_) | Carried::Url(_) | Carried::File(_) => return None,
     };
     let mut part = obj!({"url": url});
     if user {
@@ -142,27 +141,31 @@ fn media_part(media: &Media, ctx: &Context) -> Result<Value, &'static str> {
     let pdf = |file_data: String| obj!({"file_data": file_data, "filename": "document.pdf"});
     let kind = media.media_type.split('/').next().unwrap_or_default();
     let takes = ctx.quirks.media;
-    match (kind, &media.source) {
-        ("image", _) if !ctx.images => Err(USER_IMAGE_OMITTED),
-        ("image", _) => image_url(media, ctx, true).ok_or(IMAGE_UNSENDABLE),
-        ("audio", Source::Data { data }) if takes.files => Ok(PartKind::InputAudio
-            .part(obj!({"data": data.as_str(), "format": audio_format(&media.media_type)}))),
-        ("audio", _) => Err(AUDIO_UNSENDABLE),
-        ("video", Source::Data { data }) if takes.video => {
-            Ok(PartKind::VideoUrl.part(obj!({"url": data_url(media, data)})))
+    if kind == "image" {
+        if !ctx.images {
+            return Err(USER_IMAGE_OMITTED);
         }
-        ("video", Source::Url { url }) if takes.video => {
-            Ok(PartKind::VideoUrl.part(obj!({"url": url.as_str()})))
+        return image_url(media, ctx, true).ok_or(IMAGE_UNSENDABLE);
+    }
+    match (kind, media.source.carried()) {
+        ("audio", Carried::Data(data)) if takes.files => Ok(PartKind::InputAudio
+            .part(obj!({"data": &*data, "format": audio_format(&media.media_type)}))),
+        ("audio", _) => Err(AUDIO_UNSENDABLE),
+        ("video", Carried::Data(data)) if takes.video => {
+            Ok(PartKind::VideoUrl.part(obj!({"url": data_url(media, &data)})))
+        }
+        ("video", Carried::Url(url)) if takes.video => {
+            Ok(PartKind::VideoUrl.part(obj!({"url": url})))
         }
         ("video", _) => Err(VIDEO_UNSENDABLE),
-        (_, Source::File { id }) if takes.files && ctx.quirks.file_ids => {
-            Ok(PartKind::File.part(obj!({"file_id": id.as_str()})))
+        (_, Carried::File(id)) if takes.files && ctx.quirks.file_ids => {
+            Ok(PartKind::File.part(obj!({"file_id": id})))
         }
         _ if media.media_type != "application/pdf" => Err(DOCUMENT_UNSENDABLE),
-        (_, Source::Data { data }) if takes.files => {
-            Ok(PartKind::File.part(pdf(data_url(media, data))))
+        (_, Carried::Data(data)) if takes.files => {
+            Ok(PartKind::File.part(pdf(data_url(media, &data))))
         }
-        (_, Source::Url { url }) if takes.url_pdfs => Ok(PartKind::File.part(pdf(url.clone()))),
+        (_, Carried::Url(url)) if takes.url_pdfs => Ok(PartKind::File.part(pdf(url.to_owned()))),
         _ => Err(DOCUMENT_UNSENDABLE),
     }
 }
@@ -217,23 +220,26 @@ fn push_user(messages: &mut Vec<Value>, mut parts: Vec<Value>) {
 }
 
 /// A result's parts: text, and the images the `tool` message can carry.
-/// One the model reads only from a user goes to `attached`, leaving a note.
+/// One the model reads only from a user goes to `attached`, leaving a note,
+/// after a tag naming the call it answers.
 fn result_parts(result: &ToolResult, ctx: &Context, attached: &mut Vec<Value>) -> Vec<Value> {
     let content = match &result.output {
         Output::Text(text) => return vec![text_part(text)],
         Output::Json(value) => return vec![text_part(value.raw())],
         Output::Content(content) => content,
     };
-    let mut parts = Vec::new();
+    let (mut parts, mut moved) = (Vec::new(), Vec::new());
     for part in content {
         match part {
             UserPart::Text(text) => parts.push(text_part(&text.text)),
             UserPart::Media(media) if media.media_type.starts_with("image/") => {
-                let image = |user| image_url(media, ctx, user).filter(|_| ctx.images);
-                if let Some(image) = image(false).filter(|_| ctx.quirks.image_tool_results) {
+                let image = |user| ctx.images.then(|| image_url(media, ctx, user)).flatten();
+                if ctx.quirks.image_tool_results
+                    && let Some(image) = image(false)
+                {
                     parts.push(image);
                 } else if let Some(image) = image(true) {
-                    attached.push(image);
+                    moved.push(image);
                     note(&mut parts, TOOL_IMAGE_ATTACHED);
                 } else {
                     note(&mut parts, TOOL_IMAGE_OMITTED);
@@ -244,6 +250,14 @@ fn result_parts(result: &ToolResult, ctx: &Context, attached: &mut Vec<Value>) -
                 note(&mut parts, placeholder);
             }
         }
+    }
+    if !moved.is_empty() {
+        let tag = Tag::from(tag::ResultMedia {
+            call: &result.id,
+            tool: &result.name,
+        });
+        attached.push(text_part(&tag.to_string()));
+        attached.append(&mut moved);
     }
     parts
 }
@@ -402,10 +416,7 @@ impl Wire {
                     messages.push(tool_message(result, ctx, &mut attached));
                     self.answered = true;
                 }
-                if !attached.is_empty() {
-                    attached.insert(0, text_part(TOOL_IMAGES_HEADING));
-                    push_user(messages, attached);
-                }
+                push_user(messages, attached);
             }
             Message::Assistant(assistant) => messages.extend(assistant_message(assistant, ctx)),
         }

@@ -11,8 +11,8 @@ use llm::tag::Part;
 use llm::{Assistant, Message, Messages, Tag, ToolMessage, ToolResult, tag};
 use protocol::publication::{ContextImage, ContextInput, ContextLayer, ContextValue, RunnerKind};
 use protocol::{
-    Body, CallId, Carried, Entry, EnvelopeId, Held, Mode, Outcome, OutputStream, Payload, Segment,
-    Segments, Seq, ToolOutcome, Verdict,
+    BlobRef, Body, CallId, Carried, Entry, EnvelopeId, Held, Mode, Outcome, OutputStream, Payload,
+    Segment, Segments, Seq, ToolOutcome, Verdict,
 };
 
 /// Provider replies remain intact; live updates and recovery share projection rules.
@@ -176,29 +176,70 @@ impl Waiting {
     }
 }
 
-/// `output`, telling the model where it reads what the result holds: each
-/// reference left out when it cannot be read.
-fn with_held(output: llm::Output, held: &[ext::Placed]) -> llm::Output {
+/// The image types a result's blob is shown to the model as: those every
+/// provider reads. Another is only named.
+const SHOWN: [&str; 3] = ["image/png", "image/jpeg", "image/webp"];
+
+/// `output`, telling the model where it reads what the result holds, each
+/// reference left out when it cannot be read; and showing it each image the
+/// result holds, read back by `bytes`, after what it already shows.
+fn with_held(
+    output: llm::Output,
+    held: &[ext::Placed],
+    bytes: impl Fn(&BlobRef) -> Option<Arc<[u8]>>,
+) -> llm::Output {
+    let image = |placed: &ext::Placed| match &placed.held {
+        Held::Blob(blob) if SHOWN.contains(&blob.media_type.as_str()) => Some(blob.clone()),
+        Held::Blob(_) | Held::Stream(_) => None,
+    };
     let lines: Vec<String> = (held.iter())
         .filter_map(|placed| {
             let at = placed.at.as_deref()?;
-            match &placed.held {
-                Held::Blob(_) => Some(format!("[full output: {at}]")),
-                Held::Stream(_) => Some(format!("[output, as it grows: {at}]")),
-            }
+            Some(match &placed.held {
+                Held::Blob(_) if image(placed).is_some() => format!("[image: {at}]"),
+                Held::Blob(_) => format!("[full output: {at}]"),
+                Held::Stream(_) => format!("[output, as it grows: {at}]"),
+            })
         })
         .collect();
-    if lines.is_empty() {
+    let images: Vec<llm::UserPart> = (held.iter().filter_map(image))
+        .filter_map(|blob| {
+            Some(llm::UserPart::Media(llm::Media {
+                source: llm::Source::Bytes {
+                    data: bytes(&blob)?,
+                },
+                media_type: blob.media_type.into(),
+                meta: llm::Meta::new(),
+            }))
+        })
+        .collect();
+    if lines.is_empty() && images.is_empty() {
         return output;
     }
-    let mut text = text_of(output);
-    for line in lines {
-        if !text.is_empty() {
-            text.push('\n');
+    let lines = lines.join("\n");
+    let mut parts = match output {
+        // What the presentation shows already, media included, stays.
+        llm::Output::Content(mut parts) => {
+            if !lines.is_empty() {
+                parts.push(llm::UserPart::Text(llm::Text::new(lines)));
+            }
+            parts
         }
-        text.push_str(&line);
-    }
-    llm::Output::Text(text)
+        output => {
+            let mut text = text_of(output);
+            if !text.is_empty() && !lines.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&lines);
+            if images.is_empty() {
+                return llm::Output::Text(text);
+            }
+            let text = (!text.is_empty()).then(|| llm::UserPart::Text(llm::Text::new(text)));
+            text.into_iter().collect()
+        }
+    };
+    parts.extend(images);
+    llm::Output::Content(parts)
 }
 
 /// An output as text, for a message of text alone.
@@ -390,7 +431,11 @@ impl Transcript {
         let ext::Presented { output, error } = if self.detached.contains(&call) {
             let text = "[it goes on in the background; its result follows once it ends]";
             ext::Presented {
-                output: with_held(llm::Output::Text(text.to_owned()), &self.name_held(held)),
+                output: with_held(
+                    llm::Output::Text(text.to_owned()),
+                    &self.name_held(held),
+                    |blob| self.places.bytes(blob),
+                ),
                 error: false,
             }
         } else {
@@ -475,7 +520,7 @@ impl Transcript {
         };
         let presented = self.registry.present_result(tool, outcome, &held, stored);
         ext::Presented {
-            output: with_held(presented.output, &held),
+            output: with_held(presented.output, &held, |blob| self.places.bytes(blob)),
             ..presented
         }
     }
@@ -734,6 +779,56 @@ mod tests {
 
     fn entry(seq: u64, body: Body) -> Entry {
         Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)
+    }
+
+    /// A result shows the model the images every provider reads, after what
+    /// its presentation showed already, media included; any other image it
+    /// holds is only named.
+    #[test]
+    fn a_result_shows_images_every_provider_reads_after_what_it_showed() {
+        let placed = |media_type: &str| ext::Placed {
+            held: Held::Blob(BlobRef {
+                id: BlobId([1; 32]),
+                size: 3,
+                media_type: media_type.into(),
+                origin: BlobOrigin::ToolOutput(CallId::new(1).unwrap()),
+            }),
+            at: Some(format!("/blobs/{media_type}")),
+        };
+        let media = |media_type: &str, source| {
+            llm::UserPart::Media(llm::Media {
+                media_type: media_type.into(),
+                source,
+                meta: llm::Meta::new(),
+            })
+        };
+        let drawn = media(
+            "image/png",
+            llm::Source::Data {
+                data: "AA==".into(),
+            },
+        );
+        let text = |text: &str| llm::UserPart::Text(llm::Text::new(text));
+        let output = with_held(
+            llm::Output::Content(vec![text("look"), drawn.clone()]),
+            &[placed("image/png"), placed("image/gif")],
+            |_| Some(Arc::from(&b"img"[..])),
+        );
+        let read = media(
+            "image/png",
+            llm::Source::Bytes {
+                data: Arc::from(&b"img"[..]),
+            },
+        );
+        assert_eq!(
+            output,
+            llm::Output::Content(vec![
+                text("look"),
+                drawn,
+                text("[image: /blobs/image/png]\n[full output: /blobs/image/gif]"),
+                read,
+            ])
+        );
     }
 
     fn input(segments: impl Into<Segments>, mode: Mode, taken: bool) -> Body {
