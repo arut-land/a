@@ -346,3 +346,61 @@ nonisolated private final class DelayedRecovery: ViewSource, Sendable {
     #expect(store.resyncs == 2)
     expectInStep(store, reducer, "update raced snapshot")
 }
+
+private func inputFrame(seq: UInt64, text: String) throws -> String {
+    let vector = Vector.all.first { $0.name == "a far behind renderer takes a snapshot" }!
+    var frame = try JSONSerialization.jsonObject(with: Data(vector.messages[1].utf8)) as! [String: Any]
+    frame["seq"] = seq
+    frame["segments"] = [["text": text]]
+    return String(decoding: try JSONSerialization.data(withJSONObject: frame), as: UTF8.self)
+}
+
+@Test func largeItemsRecoverWithoutARevisionGap() async throws {
+    let reducer = Reducer()
+    let store = SessionStore(source: reducer)
+    let text = String(repeating: "x", count: 1 << 20)
+    let update = try #require(try reducer.fold(message: inputFrame(seq: 1, text: text)))
+    #expect(update.revision == 1)
+    store.apply(update)
+    await store.recovery?.value
+    #expect(store.rev == 1)
+    #expect(store.items.first?.presentation.body?.text == text)
+    expectInStep(store, reducer, "large contiguous item")
+}
+
+@Test func anAsyncPatchNeverAppliesToAChangedBase() async throws {
+    let reducer = Reducer()
+    let first = try #require(try reducer.fold(message: inputFrame(seq: 1, text: "first")))
+    let second = try #require(try reducer.fold(message: inputFrame(seq: 2, text: String(repeating: "x", count: 1 << 20))))
+    let source = DelayedRecovery(reducer)
+    defer { source.release.signal() }
+    let store = SessionStore(source: source)
+    store.apply(second)
+    try await eventually("patch captured against empty base") { source.waiting.withLock { $0 } }
+    store.apply(first)
+    source.release.signal()
+    source.release.signal()
+    try await eventually("patch rebuilt against the advanced base") { store.rev == second.revision }
+    #expect(store.items.count == 2 && store.resyncs == 2)
+    expectInStep(store, reducer, "changed patch base")
+}
+
+@Test func largeStreamsRecoverCompleteTextWithoutReplacingItems() async throws {
+    let vector = Vector.all.first { $0.name == "retry replaces streamed text at every length" }!
+    let reducer = Reducer()
+    let store = SessionStore(source: reducer)
+    for message in vector.messages.prefix(3) {
+        if let update = try reducer.fold(message: message) { store.apply(update) }
+    }
+    let items = store.items
+    var frame = try JSONSerialization.jsonObject(with: Data(vector.messages[3].utf8)) as! [String: Any]
+    let text = String(repeating: "x", count: 1 << 20)
+    frame["text"] = text
+    let message = String(decoding: try JSONSerialization.data(withJSONObject: frame), as: UTF8.self)
+    let update = try #require(try reducer.fold(message: message))
+    store.apply(update)
+    await store.recovery?.value
+    #expect(store.streaming?.text == text)
+    #expect(store.items == items)
+    expectInStep(store, reducer, "large stream patch")
+}

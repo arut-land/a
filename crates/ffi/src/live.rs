@@ -563,7 +563,7 @@ impl Session {
 
     /// Every update from here on. Subscribe before `open` to see the
     /// attach; items dropped by a full buffer show as a `rev` gap, for
-    /// `resync`.
+    /// `resync`. An invalidation also requires recovery, without a revision gap.
     #[ffi_stream(item = ChangeBatch)]
     pub fn updates(&self) -> Arc<EventSubscription<ChangeBatch>> {
         lock(&self.feed).subscribe()
@@ -582,8 +582,8 @@ impl Session {
         lock(&self.feed).snapshot()
     }
 
-    /// What came after update `from`: the updates, or a snapshot when too
-    /// many were missed.
+    /// What came after `from`: replay, a coalesced patch, or a snapshot.
+    /// Builds display data; call off the UI thread.
     pub fn resync(&self, from: u64) -> Resync {
         lock(&self.feed).resync(from)
     }

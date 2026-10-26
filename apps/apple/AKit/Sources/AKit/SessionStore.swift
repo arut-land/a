@@ -161,11 +161,15 @@ public final class SessionStore {
         }
     }
 
-    /// Applies `update`: once, in order, catching up first on a gap.
+    /// Applies `update` once, recovering gaps and invalidations asynchronously.
     public func apply(_ update: ChangeBatch) {
         if update.revision <= rev { return }
         latestRevision = max(latestRevision, update.revision)
-        if update.revision == rev + 1 {
+        let invalidated = update.changes.contains { change in
+            if case .invalidated = change { return true }
+            return false
+        }
+        if update.revision == rev + 1 && !invalidated {
             fold(update)
             viewChanged?()
         } else {
@@ -184,10 +188,18 @@ public final class SessionStore {
             self.recovery = nil
             switch result {
             case .updates(let updates):
+                self.latestRevision = max(self.latestRevision, updates.last?.revision ?? self.rev)
                 for update in updates where update.revision == self.rev + 1 {
                     self.fold(update)
                 }
+            case .patch(let from, let update, let streaming):
+                self.latestRevision = max(self.latestRevision, update.revision)
+                if from == self.rev {
+                    self.fold(update)
+                    self.streaming = streaming
+                }
             case .snapshot(let snapshot):
+                self.latestRevision = max(self.latestRevision, snapshot.rev)
                 if snapshot.rev >= self.rev { self.adopt(snapshot) }
             }
             self.viewChanged?()
@@ -217,6 +229,8 @@ public final class SessionStore {
                 count += 1
             case .updated(let index, _):
                 guard Int(index) < count else { return }
+            case .invalidated:
+                return
             case .attached, .delta, .synced, .activity, .draining, .mismatch, .error, .link:
                 break
             }
@@ -245,7 +259,7 @@ public final class SessionStore {
             case .snapshot(let session, let workspace, let snapshot):
                 (sessionId, self.workspace, items) = (session, workspace, snapshot)
                 attachment = session.map { .attached(id: $0) } ?? .detached
-            case .activity, .draining:
+            case .activity, .draining, .invalidated:
                 break
             case .mismatch(_, let message):
                 problem = message

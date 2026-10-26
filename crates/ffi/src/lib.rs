@@ -303,7 +303,7 @@ pub enum OpenTarget {
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChangeBatch {
-    /// One more than the previous batch; a gap requires resynchronization.
+    /// One more than the previous batch; a gap or invalidation requires resynchronization.
     pub revision: u64,
     /// Cached byte charge for the current view and replay cache.
     pub retained_bytes: u64,
@@ -398,6 +398,11 @@ pub enum ViewChange {
     Updated {
         index: u32,
         item: DisplayItem,
+    },
+    /// Recover this batch through resync; large presentations are not queued.
+    Invalidated {
+        added: Vec<u32>,
+        updated: Vec<u32>,
     },
     /// Live text for the reply of `call`.
     Delta {
@@ -752,15 +757,25 @@ pub struct SessionSnapshot {
     pub state_hash: String,
 }
 
-/// The answer to a resync: the updates after the one asked from when they
-/// are still kept, else the whole view.
+/// Retained changes are replayed or coalesced against the requested revision;
+/// a reset or lost replay range requires the whole view.
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 // By value: that is how it crosses the boundary.
 #[allow(clippy::large_enum_variant)]
 pub enum Resync {
-    Updates { updates: Vec<ChangeBatch> },
-    Snapshot { snapshot: SessionSnapshot },
+    Updates {
+        updates: Vec<ChangeBatch>,
+    },
+    /// A coalesced replacement for changes since `from`, applied only to that base.
+    Patch {
+        from: u64,
+        update: ChangeBatch,
+        streaming: Option<StreamingText>,
+    },
+    Snapshot {
+        snapshot: SessionSnapshot,
+    },
 }
 
 fn index(i: usize) -> u32 {

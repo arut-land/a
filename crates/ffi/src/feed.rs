@@ -4,7 +4,7 @@
 //! rule (what runs, what waits, what the controls offer, whose reply is
 //! streaming) comes computed.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -12,14 +12,15 @@ use boltffi::{EventSubscription, StreamProducer, export};
 use client::{ConnId, Effect, Event, EventKind, Renderer, SessionClient, Show, Welcome};
 use protocol::{Caps, DaemonMsg, Decode};
 
-use crate::{ChangeBatch, ClientError, Resync, SessionSnapshot, TITLE, TurnInfo, ViewChange};
+use crate::{
+    ChangeBatch, ClientError, Resync, SessionSnapshot, StreamingText, TITLE, TurnInfo, ViewChange,
+};
 
 /// How many updates a stream buffers for a slow reader before it drops.
 const BUFFER: usize = 16;
 
-/// How many recent updates [`Feed::resync`] can hand back. An item crosses
-/// whole once and is patched after, so what they keep is about what the
-/// transcript holds.
+/// Disposable replay data: large presentations stay in the current view
+/// and cross only when a reader recovers their invalidations.
 const BUDGET: client::QueueBudget = client::QueueBudget {
     bytes: 4 << 20,
     requests: 512,
@@ -159,22 +160,42 @@ impl Feed {
             }
         }
         self.rev += 1;
-        let view = self.client.view();
-        let mut update = ChangeBatch {
-            revision: self.rev,
-            retained_bytes: 0,
-            seq: view.seq,
-            changes,
-            turn: self.client.turn().into(),
-            streaming: view.streaming.as_ref().map(|s| crate::StreamId {
-                call: s.call.get(),
-                attempt: s.attempt,
-            }),
-            title: view.side(TITLE).map(str::to_owned),
-        };
+        let mut update = self.update(changes);
+        // View data can be recovered; notices still cross intact.
+        if update.retained_bytes() > BUDGET.bytes / BUFFER
+            && !update.changes.iter().any(|change| {
+                matches!(
+                    change,
+                    ViewChange::Error { .. }
+                        | ViewChange::Mismatch { .. }
+                        | ViewChange::Link { .. }
+                )
+            })
+        {
+            let mut added = Vec::new();
+            let mut updated = Vec::new();
+            update.changes.retain_mut(|change| match change {
+                ViewChange::Added { index, .. } => {
+                    added.push(*index);
+                    false
+                }
+                ViewChange::Updated { index, .. } => {
+                    updated.push(*index);
+                    false
+                }
+                ViewChange::Delta { .. } => false,
+                ViewChange::Snapshot { items, .. } => {
+                    *items = Vec::new();
+                    true
+                }
+                _ => true,
+            });
+            update
+                .changes
+                .push(ViewChange::Invalidated { added, updated });
+            update.title = None;
+        }
         let bytes = update.retained_bytes();
-        // Oversized updates still reach a live reader intact. Only the disposable
-        // replay cache is invalidated; a missed update requires a snapshot.
         while !BUDGET.admits(self.bytes + bytes, self.recent.len(), false) {
             let Some(old) = self.recent.pop_front() else {
                 break;
@@ -190,6 +211,22 @@ impl Feed {
             self.recent.push_back(update.clone());
         }
         update
+    }
+
+    fn update(&self, changes: Vec<ViewChange>) -> ChangeBatch {
+        let view = self.client.view();
+        ChangeBatch {
+            revision: self.rev,
+            retained_bytes: self.retained_bytes() as u64,
+            seq: view.seq,
+            changes,
+            turn: self.client.turn().into(),
+            streaming: view.streaming.as_ref().map(|s| crate::StreamId {
+                call: s.call.get(),
+                attempt: s.attempt,
+            }),
+            title: view.side(TITLE).map(str::to_owned),
+        }
     }
 
     fn render(&mut self, show: Show) -> Option<ChangeBatch> {
@@ -230,27 +267,75 @@ impl Feed {
         SessionSnapshot::of(&self.client, self.rev, self.retained_bytes() as u64)
     }
 
-    /// The updates after rev `from`, or a snapshot once some are no longer
-    /// kept.
+    /// Replays retained changes, coalescing invalidations against `from`.
+    /// A lost replay range or replaced view requires a snapshot.
     pub fn resync(&self, from: u64) -> Resync {
         let kept = from == self.rev
             || self
                 .recent
                 .front()
                 .is_some_and(|u| u.revision <= from.saturating_add(1));
-        if kept {
-            Resync::Updates {
-                updates: self
-                    .recent
-                    .iter()
-                    .filter(|u| u.revision > from)
-                    .cloned()
-                    .collect(),
-            }
-        } else {
-            Resync::Snapshot {
+        if !kept {
+            return Resync::Snapshot {
                 snapshot: self.snapshot(),
+            };
+        }
+        let updates = || self.recent.iter().filter(|update| update.revision > from);
+        if !updates().any(|update| {
+            update
+                .changes
+                .iter()
+                .any(|change| matches!(change, ViewChange::Invalidated { .. }))
+        }) {
+            return Resync::Updates {
+                updates: updates().cloned().collect(),
+            };
+        }
+        let mut items = BTreeMap::new();
+        let mut changes = Vec::new();
+        for change in updates().flat_map(|update| &update.changes) {
+            match change {
+                ViewChange::Snapshot { .. } | ViewChange::Attached { reset: true, .. } => {
+                    return Resync::Snapshot {
+                        snapshot: self.snapshot(),
+                    };
+                }
+                ViewChange::Added { index, .. } => {
+                    items.insert(*index, true);
+                }
+                ViewChange::Updated { index, .. } => {
+                    items.entry(*index).or_insert(false);
+                }
+                ViewChange::Invalidated { added, updated } => {
+                    for index in added {
+                        items.insert(*index, true);
+                    }
+                    for index in updated {
+                        items.entry(*index).or_insert(false);
+                    }
+                }
+                ViewChange::Delta { .. } => {}
+                _ => changes.push(change.clone()),
             }
+        }
+        let view = self.client.view();
+        // Items only append between the view replacements rejected above.
+        for (index, added) in items {
+            let item = crate::DisplayItem::in_view(&view.items[index as usize], view);
+            changes.push(if added {
+                ViewChange::Added { index, item }
+            } else {
+                ViewChange::Updated { index, item }
+            });
+        }
+        Resync::Patch {
+            from,
+            update: self.update(changes),
+            streaming: view.streaming.as_ref().map(|stream| StreamingText {
+                call: stream.call.get(),
+                attempt: stream.attempt,
+                text: stream.text.clone(),
+            }),
         }
     }
 }
@@ -406,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_output_reaches_live_readers_without_a_revision_gap() {
+    fn oversized_output_recovers_without_a_revision_gap_or_history_rebuild() {
         for size in [1 << 20, BUDGET.bytes * 2] {
             let reducer = Reducer::new();
             let stream = reducer.updates();
@@ -437,11 +522,14 @@ mod tests {
             assert!(reducer.details(1).unwrap().contains(&"x".repeat(size)));
             let feed = lock(&reducer.feed);
             assert!(feed.bytes <= BUDGET.bytes);
-            if size > BUDGET.bytes {
-                assert!(matches!(feed.resync(0), Resync::Snapshot { .. }));
-            } else {
-                assert!(matches!(feed.resync(0), Resync::Updates { .. }));
-            }
+            let Resync::Patch { from, update, .. } = feed.resync(0) else {
+                panic!("large items recover through a patch");
+            };
+            assert_eq!((from, update.revision), (0, 1));
+            let [ViewChange::Added { item, index: 0 }] = update.changes.as_slice() else {
+                panic!("the patch adds the complete item");
+            };
+            assert_eq!(item.presentation.body.as_ref().unwrap().text.len(), size);
         }
     }
 
@@ -495,7 +583,71 @@ mod tests {
     }
 
     #[test]
-    fn a_large_stream_remains_complete_after_replay_eviction() {
+    fn slow_readers_do_not_queue_copies_of_cumulative_output() {
+        let reducer = Reducer::new();
+        let stream = reducer.updates();
+        let call = DaemonMsg::Entry(protocol::Entry::new(
+            protocol::Seq::new(1).unwrap(),
+            protocol::Epoch(0),
+            protocol::Body::ToolCall {
+                invoke: None,
+                tool: "output".into(),
+                input: protocol::Json::null(),
+                id: None,
+                card: None,
+                by: protocol::Audience::Model,
+            },
+        ));
+        reducer
+            .fold(&serde_json::to_string(&call).unwrap())
+            .unwrap();
+        for seq in 2..=BUFFER + 1 {
+            let progress = DaemonMsg::Entry(protocol::Entry::new(
+                protocol::Seq::new(seq as u64).unwrap(),
+                protocol::Epoch(0),
+                protocol::Body::Progress {
+                    call: protocol::CallId::new(1).unwrap(),
+                    text: "x".repeat(64 << 10),
+                },
+            ));
+            reducer
+                .fold(&serde_json::to_string(&progress).unwrap())
+                .unwrap();
+        }
+        let mut queued = 0;
+        while let Some(update) = stream.pop_event() {
+            queued += update.retained_bytes();
+        }
+        assert!(
+            queued <= BUDGET.bytes,
+            "queued {queued} bytes of cumulative output"
+        );
+        let Resync::Patch { update, .. } = reducer.resync(0) else {
+            panic!("retained invalidations recover without rebuilding history");
+        };
+        assert_eq!(update.revision, (BUFFER + 1) as u64);
+        let [ViewChange::Added { item, .. }] = update.changes.as_slice() else {
+            panic!("cumulative output is rendered once");
+        };
+        assert_eq!(
+            item.presentation.body.as_ref().unwrap().text.len(),
+            BUFFER * (64 << 10)
+        );
+
+        assert_eq!(
+            reducer.snapshot().items[0]
+                .presentation
+                .body
+                .as_ref()
+                .unwrap()
+                .text
+                .len(),
+            BUFFER * (64 << 10)
+        );
+    }
+
+    #[test]
+    fn large_stream_recovery_keeps_complete_text_without_rebuilding_items() {
         let reducer = Reducer::new();
         let message = DaemonMsg::Entry(protocol::Entry::new(
             protocol::Seq::new(1).unwrap(),
@@ -523,13 +675,110 @@ mod tests {
                 .fold(&serde_json::to_string(&message).unwrap())
                 .unwrap();
         }
-        let Resync::Snapshot { snapshot } = reducer.resync(0) else {
-            panic!("replay evicted");
+        let Resync::Patch {
+            update, streaming, ..
+        } = reducer.resync(0)
+        else {
+            panic!("large stream notifications retain their recovery metadata");
         };
-        assert_eq!(snapshot.streaming.unwrap().text, chunk.repeat(BUFFER + 4));
+        assert_eq!(streaming.unwrap().text, chunk.repeat(BUFFER + 4));
         assert_eq!(
-            snapshot.retained_bytes,
+            update.retained_bytes,
             lock(&reducer.feed).retained_bytes() as u64
+        );
+    }
+
+    #[test]
+    fn large_item_patches_do_not_rebuild_unchanged_history() {
+        let reducer = Reducer::new();
+        for seq in 1..=100 {
+            let message = DaemonMsg::Entry(protocol::Entry::new(
+                protocol::Seq::new(seq).unwrap(),
+                protocol::Epoch(0),
+                protocol::Body::Assistant {
+                    text: "history".into(),
+                },
+            ));
+            reducer
+                .fold(&serde_json::to_string(&message).unwrap())
+                .unwrap();
+        }
+        let from = reducer.snapshot().rev;
+        let message = DaemonMsg::Entry(protocol::Entry::new(
+            protocol::Seq::new(101).unwrap(),
+            protocol::Epoch(0),
+            protocol::Body::Assistant {
+                text: "x".repeat(1 << 20),
+            },
+        ));
+        reducer
+            .fold(&serde_json::to_string(&message).unwrap())
+            .unwrap();
+        let Resync::Patch { update, .. } = reducer.resync(from) else {
+            panic!("one new item is a patch");
+        };
+        let [ViewChange::Added { index: 100, item }] = update.changes.as_slice() else {
+            panic!("only the changed item crosses");
+        };
+        assert_eq!(item.presentation.body.as_ref().unwrap().text.len(), 1 << 20);
+        assert_eq!(reducer.snapshot().items.len(), 101);
+    }
+
+    #[test]
+    fn invalidated_indices_never_survive_a_view_replacement() {
+        let reducer = Reducer::new();
+        let message = DaemonMsg::Entry(protocol::Entry::new(
+            protocol::Seq::new(1).unwrap(),
+            protocol::Epoch(0),
+            protocol::Body::Assistant {
+                text: "x".repeat(1 << 20),
+            },
+        ));
+        reducer
+            .fold(&serde_json::to_string(&message).unwrap())
+            .unwrap();
+        let reset =
+            DaemonMsg::Snapshot(Box::new(protocol::view::SessionView::default().snapshot()));
+        reducer
+            .fold(&serde_json::to_string(&reset).unwrap())
+            .unwrap();
+        let Resync::Snapshot { snapshot } = reducer.resync(0) else {
+            panic!("a reset replaces the base");
+        };
+        assert_eq!(snapshot.items, Vec::<crate::DisplayItem>::new());
+    }
+
+    #[test]
+    fn large_view_replacements_queue_metadata_and_recover_the_complete_view() {
+        let reducer = Reducer::new();
+        let message = DaemonMsg::Entry(protocol::Entry::new(
+            protocol::Seq::new(1).unwrap(),
+            protocol::Epoch(0),
+            protocol::Body::Assistant {
+                text: "x".repeat(1 << 20),
+            },
+        ));
+        reducer
+            .fold(&serde_json::to_string(&message).unwrap())
+            .unwrap();
+        let snapshot = DaemonMsg::Snapshot(Box::new(lock(&reducer.feed).client.view().snapshot()));
+        let update = reducer
+            .fold(&serde_json::to_string(&snapshot).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(update.retained_bytes() < BUDGET.bytes / BUFFER);
+        let Resync::Snapshot { snapshot } = reducer.resync(1) else {
+            panic!("a replacement needs the whole view");
+        };
+        assert_eq!(
+            snapshot.items[0]
+                .presentation
+                .body
+                .as_ref()
+                .unwrap()
+                .text
+                .len(),
+            1 << 20
         );
     }
 
