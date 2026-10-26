@@ -170,8 +170,8 @@ class RealDaemon(unittest.TestCase):
             self.assertEqual(metrics["idle_rss_kib"]["samples"], [hosted_raw["rss"]])
             self.assertEqual(metrics["idle_daemon_cpu_ms"]["samples"], [hosted_raw["daemon_cpu_seconds"] * 1000])
             self.assertEqual(len(json.loads((output / "attach-0.json").read_text())), 500)
-            self.assertGreater(metrics["cold_reply_ms"]["median"], 0)
-            self.assertGreater(metrics["first_run_ls_ms"]["median"], 0)
+            self.assertEqual(metrics["cold_reply_ms"]["samples"], [hosted_raw["cold_reply_ms"]])
+            self.assertEqual(metrics["first_run_ls_ms"]["samples"], [hosted_raw["first_run_ls_ms"]])
 
     def test_isolated_daemons_stop_after_success_and_failure_and_retain_diagnostics(self):
         import psutil
@@ -192,6 +192,8 @@ class RealDaemon(unittest.TestCase):
                         self.assertLessEqual(sample["seconds"], time.monotonic() - started)
                         self.assertEqual(sample["daemon_cpu_seconds"], sample["after"][0]["cpu_seconds"] - sample["before"][0]["cpu_seconds"])
                         self.assertGreater(sample["rss"], 0)
+                        self.assertEqual(sample["cold_reply_ms"], active.cold_ms)
+                        self.assertEqual(sample["first_run_ls_ms"], active.first_run_ms)
                         if fail:
                             (home / "logs/retained.txt").write_text("failure diagnostic")
                             raise RuntimeError("sample failed")

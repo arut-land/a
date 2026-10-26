@@ -87,7 +87,8 @@ def idle_sample(active, idle_seconds, settle_seconds=3, retire_seconds=12):
     time.sleep(idle_seconds)
     after = [snapshot(p, threads=True) for p in (active.pid, active.client.pid)]
     elapsed = time.monotonic() - started
-    return dict(rss=rss, seconds=elapsed, daemon_pid=active.pid, client_pid=active.client.pid,
+    return dict(rss=rss, seconds=elapsed, cold_reply_ms=active.cold_ms,
+                first_run_ls_ms=active.first_run_ms, daemon_pid=active.pid, client_pid=active.client.pid,
                 before=before, after=after,
                 daemon_cpu_seconds=after[0]["cpu_seconds"] - before[0]["cpu_seconds"],
                 client_cpu_seconds=after[1]["cpu_seconds"] - before[1]["cpu_seconds"])

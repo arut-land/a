@@ -132,9 +132,9 @@ def budgets(output, binary=None, probe=None, samples=5):
             def cli(*args):
                 return run([binary, *args], env=env, cwd=home, capture_output=True, timeout=60)
 
-            first_run.append(active.first_run_ms)
-            cold.append(active.cold_ms)
             observation = idle_sample(active, 10)
+            first_run.append(observation["first_run_ls_ms"])
+            cold.append(observation["cold_reply_ms"])
             rss.append(observation["rss"])
             cpu.append(observation["daemon_cpu_seconds"] * 1000)
             client_cpu.append(observation["client_cpu_seconds"] * 1000)
