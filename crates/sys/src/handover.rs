@@ -136,16 +136,35 @@ pub fn encode<'a>(groups: impl IntoIterator<Item = (&'a Group, &'a serde_json::V
 
 /// Reads the record crossing under `number` and claims every group it
 /// names, each with what its owner said of it, or why it could not be
-/// claimed (its handles then closed).
+/// claimed. Resource numbers are duplicated, never taken from another owner;
+/// repeated groups or numbers are rejected before any group is claimed.
 pub fn read_record(
     number: crate::InheritedNumber,
 ) -> io::Result<Vec<(io::Result<Claimed>, serde_json::Value)>> {
     use std::io::Read;
-    let mut file = imp::own(number.raw())?;
+    let mut file = number.duplicate()?;
     let mut bytes = Vec::new();
     io::Seek::rewind(&mut file)?;
     file.read_to_end(&mut bytes)?;
     let record: Record = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    let mut numbers = std::collections::HashSet::from([number.raw()]);
+    let mut leaders = std::collections::HashSet::new();
+    for entry in &record.groups {
+        let group = &entry.group;
+        let handles = [
+            group.output,
+            #[cfg(windows)]
+            Some(group.job),
+            #[cfg(windows)]
+            Some(group.process),
+        ];
+        if !leaders.insert(group.pid) || handles.into_iter().flatten().any(|n| !numbers.insert(n)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repeated group or resource in handover record",
+            ));
+        }
+    }
     Ok((record.groups.into_iter())
         .map(|Entry { group, owner }| (imp::claim(&group), owner))
         .collect())
@@ -347,7 +366,7 @@ impl<'a> Successor<'a> {
 mod imp {
     use std::fs::File;
     use std::io::{self, Write};
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
 
     use super::{Claimed, Given, Group, Handover, Parked, Successor};
     use crate::{Child, ProcessLease, ProcessPipe};
@@ -377,7 +396,10 @@ mod imp {
     }
 
     pub fn claim(group: &Group) -> io::Result<Claimed> {
-        let output = group.output.map(own).transpose()?;
+        let output = group
+            .output
+            .map(|number| crate::InheritedNumber::from(number).duplicate())
+            .transpose()?;
         if let Some(output) = &output
             && !std::os::unix::fs::FileTypeExt::is_fifo(&output.metadata()?.file_type())
         {
@@ -428,26 +450,6 @@ mod imp {
             .exec()
     }
 
-    /// Takes `number`, which nothing in this image owns, as a file closed
-    /// on the next exec.
-    pub fn own(number: i32) -> io::Result<File> {
-        // SAFETY: fcntl validates arbitrary integers in the kernel.
-        let flags = unsafe { libc::fcntl(number, libc::F_GETFD) };
-        if number < 3 || flags < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no handed descriptor under that number",
-            ));
-        }
-        // SAFETY: fcntl only changes the descriptor's flags.
-        if unsafe { libc::fcntl(number, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the number names an open descriptor the previous image
-        // passed to this one alone, which nothing here owns yet.
-        Ok(unsafe { File::from_raw_fd(number) })
-    }
-
     /// Clears (`true`) or sets close-on-exec on each of `numbers`.
     pub fn inherit(numbers: &[i32], inherit: bool) -> io::Result<()> {
         for &number in numbers {
@@ -476,3 +478,91 @@ mod imp;
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+    use crate::Pass;
+    use std::io::Write;
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn reading_a_record_never_closes_its_callers_file() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&encode([])).unwrap();
+        for _ in 0..2 {
+            assert!(
+                read_record(crate::InheritedNumber::from(file.passed().0))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(file.metadata().is_ok());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn repeated_groups_and_resources_are_rejected_before_claiming_any_group() {
+        let handles: Vec<_> = (0..6).map(|_| tempfile::tempfile().unwrap()).collect();
+        let mut file = tempfile::tempfile().unwrap();
+        let group = Group {
+            pid: std::process::id(),
+            output: Some(handles[0].passed().0),
+            #[cfg(windows)]
+            job: handles[1].passed().0,
+            #[cfg(windows)]
+            process: handles[2].passed().0,
+        };
+        let other = Group {
+            pid: std::process::id() + 1,
+            output: Some(handles[3].passed().0),
+            #[cfg(windows)]
+            job: handles[4].passed().0,
+            #[cfg(windows)]
+            process: handles[5].passed().0,
+        };
+        for repeated in [
+            Group {
+                output: group.output,
+                ..other.clone()
+            },
+            Group {
+                pid: group.pid,
+                ..other
+            },
+        ] {
+            file.set_len(0).unwrap();
+            io::Seek::rewind(&mut file).unwrap();
+            let owner = serde_json::Value::Null;
+            file.write_all(&encode([(&group, &owner), (&repeated, &owner)]))
+                .unwrap();
+            let error = read_record(crate::InheritedNumber::from(file.passed().0)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(file.metadata().is_ok());
+            assert!(handles.iter().all(|handle| handle.metadata().is_ok()));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_record_cannot_claim_its_own_resource() {
+        let mut file = tempfile::tempfile().unwrap();
+        let group = Group {
+            pid: std::process::id(),
+            output: Some(file.passed().0),
+            #[cfg(windows)]
+            job: file.passed().0,
+            #[cfg(windows)]
+            process: file.passed().0,
+        };
+        file.write_all(&encode([(&group, &serde_json::Value::Null)]))
+            .unwrap();
+        assert_eq!(
+            read_record(crate::InheritedNumber::from(file.passed().0))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(file.metadata().is_ok());
+    }
+}

@@ -33,9 +33,32 @@ pub fn passed(handle: &impl AsRawHandle) -> Passed {
     )
 }
 
-pub fn duplicate(_number: i32) -> io::Result<File> {
-    // Windows startup does not inherit native resources through argv.
-    Err(io::ErrorKind::Unsupported.into())
+pub fn duplicate(number: i32) -> io::Result<File> {
+    use windows_sys::Win32::Foundation::{
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: returns a pseudo-handle for the calling process.
+    let process = unsafe { GetCurrentProcess() };
+    let original = number as isize as HANDLE;
+    let mut duplicate = null_mut();
+    // SAFETY: DuplicateHandle validates the untrusted value in the kernel and
+    // returns a new exclusively owned, non-inheritable handle on success.
+    ok(unsafe {
+        DuplicateHandle(
+            process,
+            original,
+            process,
+            &raw mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    })?;
+    let file = File::from(owned(duplicate)?);
+    // SAFETY: changes only inheritance, never takes ownership of the input.
+    ok(unsafe { SetHandleInformation(original, HANDLE_FLAG_INHERIT, 0) })?;
+    Ok(file)
 }
 
 pub fn adopt_lock(_file: File, _home: &crate::Home) -> Result<File, super::AdoptLockError> {
@@ -233,9 +256,6 @@ fn spawn_job_role(
 pub(super) fn members(job: &OwnedHandle) -> io::Result<Vec<u32>> {
     let mut count = 64;
     loop {
-        if count > super::MAX_MEMBERS {
-            return Err(io::Error::other("job exceeds supervision capacity"));
-        }
         // Pointer-sized storage aligns JOBOBJECT_BASIC_PROCESS_ID_LIST.
         let mut buffer = vec![0usize; count + 2];
         // SAFETY: the aligned allocation has the advertised writable byte count.
@@ -253,9 +273,6 @@ pub(super) fn members(job: &OwnedHandle) -> io::Result<Vec<u32>> {
             let header = buffer.as_ptr().cast::<u32>();
             // SAFETY: successful query initialized both DWORDs and the listed IDs.
             let len = unsafe { *header.add(1) } as usize;
-            if len > super::MAX_MEMBERS {
-                return Err(io::Error::other("job exceeds supervision capacity"));
-            }
             let offset = 8 / size_of::<usize>();
             return Ok(buffer[offset..offset + len]
                 .iter()

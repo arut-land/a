@@ -1,9 +1,9 @@
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Threading::GetProcessId;
@@ -41,9 +41,12 @@ pub fn give(child: Child, lease: ProcessLease, output: Option<Parked>) -> Given 
 }
 
 pub fn claim(group: &Group) -> io::Result<Claimed> {
-    let process = own(group.process)?;
-    let job = own(group.job)?;
-    let pipe = group.output.map(own).transpose()?;
+    let process = crate::InheritedNumber::from(group.process).duplicate()?;
+    let job = crate::InheritedNumber::from(group.job).duplicate()?;
+    let pipe = group
+        .output
+        .map(|number| crate::InheritedNumber::from(number).duplicate())
+        .transpose()?;
     // SAFETY: the handle is owned and open.
     if unsafe { GetProcessId(process.as_raw_handle()) } != group.pid {
         return Err(io::Error::new(
@@ -138,22 +141,6 @@ pub fn replace(handover: &mut Handover<'_>, mut cmd: std::process::Command) -> i
 
 pub fn number(file: &File) -> i32 {
     crate::proc::passed(file).0
-}
-
-/// Takes the handle `number` names, inherited from the build before and
-/// owned by nothing here, no longer inheritable.
-pub fn own(number: i32) -> io::Result<File> {
-    let handle = number as isize as HANDLE;
-    // SAFETY: the call validates the handle value in the kernel.
-    ok(unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) }).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "no handed handle under that number",
-        )
-    })?;
-    // SAFETY: the handle is open, inherited for this process alone, and
-    // nothing here owns it yet.
-    Ok(File::from(unsafe { OwnedHandle::from_raw_handle(handle) }))
 }
 
 /// Makes each of `handles` inheritable (`true`) by the child whose handle

@@ -412,9 +412,10 @@ turn. A command's `timeout` (`[ext.shell] timeout`, 120 s by default, at
 most 600 per call) is how long the session waits on it: past it the command
 goes on in the background, as a forced steer sends it (`Cx::detach`), its
 result coming back on the queue; only a call another call invoked, which
-must be waited on, is stopped at it. Group observation is capped at 4096
-members; exceeding it revokes the live lease. Following streams and enumerating groups use admitted
-storage workers, leaving reactor workers available for other sessions. Once
+must be waited on, is stopped at it. Group observation registers at most 64
+member exit watches at a time and observes again after an exit; group membership
+has no supervision count limit. Following streams and enumerating groups use
+admitted storage workers, leaving reactor workers available for other sessions. Once
 owned-scope cleanup ends, capture finishes accepted writes and drains at most
 1 MiB for up to 100 ms; escaped pipe holders cannot retain admission or delay
 session shutdown indefinitely.

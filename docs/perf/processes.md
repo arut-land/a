@@ -29,8 +29,10 @@ Admission covers queued futures as well as running processes, with 32 slots.
 Each captured process has one 64 KiB chunk in flight and a hard 64 MiB output
 limit, including background jobs. Stream writes apply storage back-pressure;
 following streams and enumerating groups run on admitted storage workers.
-Observation stops at 4096 members. Rendered head/tail, partial lines and terminal
-metadata have independent memory bounds. After owned-scope cleanup, capture
+Each observation registers at most 64 member exit watches; the next exit starts
+a fresh observation of the remaining group. Membership snapshots have no fixed
+count limit, so group size cannot revoke containment. Rendered head/tail, partial
+lines and terminal metadata have independent memory bounds. After owned-scope cleanup, capture
 finishes accepted disk writes and drains at most 1 MiB with a 100 ms pipe-drain
 deadline. Escaped pipe holders cannot retain completion or admission.
 

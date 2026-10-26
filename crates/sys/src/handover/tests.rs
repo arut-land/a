@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -120,7 +120,7 @@ fn a_handed_number_that_is_not_this_processs_child_is_refused() {
     let (reader, _writer) = io::pipe().unwrap();
     let group: Group = serde_json::from_value(serde_json::json!({
         "pid": 1,
-        "output": std::os::fd::OwnedFd::from(reader).into_raw_fd(),
+        "output": reader.as_raw_fd(),
     }))
     .unwrap();
     let error = imp::claim(&group).err().unwrap();
@@ -139,13 +139,10 @@ fn a_claimed_group_no_one_adopts_is_killed_and_reaped() {
     let given = given(&mut cmd, File::create(&path).unwrap());
     fs::remove_file(path).unwrap();
     let pid = given.group.pid;
-    // As an exec passes them on: owned by nothing until claimed.
-    for handle in given.handles {
-        let _ = handle.into_raw_fd();
-    }
     let claimed = imp::claim(&given.group).unwrap();
     assert!(crate::process_started(pid).is_some());
     drop(claimed);
+    assert!(given.handles.iter().all(|file| file.metadata().is_ok()));
     assert!(
         crate::process_started(pid).is_none(),
         "the group outlived its claim"
