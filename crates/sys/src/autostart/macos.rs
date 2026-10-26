@@ -63,21 +63,16 @@ fn contents(home: &Home) -> io::Result<String> {
 /// The existing registration owns controls, regardless of which client asks.
 fn owner(
     home: &Home,
-    overrides: &str,
-    mut loaded: impl FnMut(&str) -> io::Result<bool>,
+    mut registered: impl FnMut(&str) -> io::Result<bool>,
 ) -> io::Result<Option<String>> {
     if plist(home)?.try_exists()? {
         return Ok(Some(label(home)));
     }
-    // A disabled job may not be loaded after login. Its OS override still
-    // identifies the bundled registration; do not create a second plist.
-    Ok(
-        (override_state(overrides, APP_LABEL).is_some() || loaded(APP_LABEL)?)
-            .then(|| APP_LABEL.to_owned()),
-    )
+    // Overrides survive unregistration; only an existing service owns controls.
+    Ok(registered(APP_LABEL)?.then(|| APP_LABEL.to_owned()))
 }
 
-fn loaded(label: &str) -> io::Result<bool> {
+fn registered(label: &str) -> io::Result<bool> {
     let output = Command::new("launchctl")
         .arg("print")
         .arg(format!("{}/{label}", domain()))
@@ -107,7 +102,7 @@ fn switch(
 }
 
 pub(super) fn enable(home: &Home) -> io::Result<()> {
-    let owner = if let Some(owner) = owner(home, &disabled()?, loaded)? {
+    let owner = if let Some(owner) = owner(home, registered)? {
         owner
     } else {
         update(&plist(home)?, contents(home)?.as_bytes())?;
@@ -121,18 +116,25 @@ pub(super) fn enable_bundled() -> io::Result<()> {
 }
 
 pub(super) fn disable(home: &Home) -> io::Result<()> {
-    if let Some(owner) = owner(home, &disabled()?, loaded)? {
+    if let Some(owner) = owner(home, registered)? {
         switch(&owner, Switch::Disable, run)?;
     }
     Ok(())
 }
 
 pub(super) fn registration(home: &Home) -> io::Result<super::Registration> {
-    let disabled = disabled()?;
-    let Some(owner) = owner(home, &disabled, loaded)? else {
+    registration_with(home, &disabled()?, registered)
+}
+
+fn registration_with(
+    home: &Home,
+    disabled: &str,
+    registered: impl FnMut(&str) -> io::Result<bool>,
+) -> io::Result<super::Registration> {
+    let Some(owner) = owner(home, registered)? else {
         return Ok(super::Registration::Unregistered);
     };
-    Ok(if switched_off(&disabled, &owner) {
+    Ok(if switched_off(disabled, &owner) {
         super::Registration::Disabled
     } else {
         super::Registration::Enabled
@@ -215,22 +217,27 @@ mod tests {
     }
 
     #[test]
-    fn cli_controls_reuse_the_bundled_registration() {
+    fn overrides_cannot_create_a_bundled_registration() {
         let home = Home::from(std::env::temp_dir().join("a-autostart-bundle-owner"));
+        for listing in [
+            "\"dev.a.daemon\" => disabled",
+            "\"dev.a.daemon\" => enabled",
+        ] {
+            assert_eq!(
+                registration_with(&home, listing, |_| Ok(false)).unwrap(),
+                super::super::Registration::Unregistered,
+            );
+        }
         assert_eq!(
-            owner(&home, "", |label| Ok(label == APP_LABEL))
-                .unwrap()
-                .as_deref(),
-            Some(APP_LABEL)
+            registration_with(&home, "\"dev.a.daemon\" => disabled", |label| {
+                Ok(label == APP_LABEL)
+            })
+            .unwrap(),
+            super::super::Registration::Disabled,
         );
-        assert_eq!(owner(&home, "", |_| Ok(false)).unwrap(), None);
         assert_eq!(
-            owner(&home, "\"dev.a.daemon\" => disabled", |_| panic!(
-                "disabled registrations need not be loaded"
-            ))
-            .unwrap()
-            .as_deref(),
-            Some(APP_LABEL)
+            registration_with(&home, "", |label| Ok(label == APP_LABEL)).unwrap(),
+            super::super::Registration::Enabled,
         );
     }
 

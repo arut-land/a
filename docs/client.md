@@ -46,8 +46,10 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
     with zero lag (the client takes the daemon lock, binds the socket,
     hands both to a detached `a __daemon` and connects into its backlog;
     one client starts it at a time, under `start.lock`, and the others
-    retry a contended lock with cancellable runtime timers). [Autostart](autostart.md) only
-    starts the daemon earlier, at login; it never changes this path.
+    retry a contended lock with cancellable runtime timers). Registered Linux
+    installations instead ask their systemd user unit to start or replace the
+    daemon and connect after its readiness notification. Isolated and unmanaged
+    installations start directly. See [autostart](autostart.md).
   - `SshLink { host, prompt, home }` (`remote.rs`): another machine's, through
     the system `ssh` to `a bridge`, whose stdio carries the same frames
     after a sync line and the host's environment. The remote login shell

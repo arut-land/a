@@ -75,6 +75,8 @@ registration exists. launchd loads it at the next login, where `RunAtLoad`
 starts the daemon. The app initially registers its bundled agent
 (`dev.a.daemon`, which names its helper inside the bundle) through
 `SMAppService` and links to Login Items settings when approval is required.
+A standalone plist or a registered launchd service determines ownership;
+an enabled or disabled override alone cannot establish a registration.
 Once registered, CLI and app controls use the existing registration's owner:
 the app queries status and changes settings through its bundled CLI helper.
 Initial SMAppService registration explicitly hands the bundled owner to the
