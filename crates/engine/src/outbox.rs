@@ -173,16 +173,22 @@ impl FrameLog {
             if cursor >= last {
                 return None;
             }
-            Some(match self.batch(cursor + 1, last) {
-                Ok((_, entries)) => {
-                    cursor += entries.len() as u64;
-                    Ok(entries)
-                }
-                Err(error) => {
-                    cursor = last;
-                    Err(error)
-                }
-            })
+            Some(
+                match self.batch(cursor + 1, last).and_then(|run| {
+                    lines(&run)
+                        .map(|line| Entry::from_json(line).map_err(io::Error::other))
+                        .collect::<io::Result<Vec<_>>>()
+                }) {
+                    Ok(entries) => {
+                        cursor += entries.len() as u64;
+                        Ok(entries)
+                    }
+                    Err(error) => {
+                        cursor = last;
+                        Err(error)
+                    }
+                },
+            )
         })
     }
 
@@ -203,25 +209,31 @@ impl FrameLog {
         rt::unblock(rt, move || log.entries()).await
     }
 
-    fn batch(&self, next: u64, last: u64) -> io::Result<(Vec<u8>, Vec<Entry>)> {
+    fn batch(&self, next: u64, last: u64) -> io::Result<Vec<u8>> {
+        #[derive(serde::Deserialize)]
+        struct Position {
+            seq: protocol::Seq,
+        }
         let mut run = Vec::new();
         let reader = Arc::clone(&lock(&self.lines));
         let count = reader.read(next..=last, RUN, &mut run)?;
         if count == 0 || count > last - next + 1 || run.last() != Some(&b'\n') {
             return Err(io::Error::other("log read made no valid progress"));
         }
-        let entries: Vec<_> = lines(&run)
-            .map(|line| Entry::from_json(line).map_err(io::Error::other))
-            .collect::<io::Result<_>>()?;
-        if entries.len() as u64 != count
-            || entries
-                .iter()
-                .zip(next..)
-                .any(|(entry, seq)| entry.seq.get() != seq)
-        {
+        // The store validates entries when loading or appending. Recheck
+        // the read's shape and sequence without allocating their bodies.
+        let mut read = 0;
+        for line in lines(&run) {
+            let position: Position = serde_json::from_slice(line).map_err(io::Error::other)?;
+            if position.seq.get() != next + read {
+                return Err(io::Error::other("log batch is not contiguous"));
+            }
+            read += 1;
+        }
+        if read != count {
             return Err(io::Error::other("log batch is not contiguous"));
         }
-        Ok((run, entries))
+        Ok(run)
     }
 
     /// Queues the frames of the entries after `after`: from the tail when
@@ -234,7 +246,7 @@ impl FrameLog {
             return;
         };
         match self.batch(after + 1, last) {
-            Ok((run, _)) => ahead.extend(
+            Ok(run) => ahead.extend(
                 lines(&run)
                     .zip(after + 1..)
                     .map(|(line, seq)| Frame::from_line(seq, line)),
@@ -300,17 +312,25 @@ struct Shared {
 struct Queue {
     /// Frames to write once the client has every entry up to the seq each
     /// waits for, in order.
-    frames: VecDeque<(u64, Frame)>,
+    frames: VecDeque<Queued>,
     bytes: usize,
     follow: Option<Follow>,
+    /// The newest follow, whose entries newly queued frames depend on.
+    target: Option<Arc<FrameLog>>,
     /// The number of the last session followed.
     follows: u64,
     /// The writer is gone.
     closed: bool,
 }
 
+enum Queued {
+    Frame(u64, Frame),
+    Switch(Option<Follow>),
+}
+
 /// The session a client follows, and how far it has read its entries.
 struct Follow {
+    generation: u64,
     log: Arc<FrameLog>,
     /// The seq of the last entry written.
     cursor: u64,
@@ -342,7 +362,7 @@ impl Outbox {
     /// Queues `frame` behind every entry committed so far.
     pub fn send(&self, frame: Frame) -> Result<(), Closed> {
         let mut q = self.queue();
-        let after = q.follow.as_ref().map_or(0, |f| f.log.seq());
+        let after = q.target.as_ref().map_or(0, |log| log.seq());
         self.push(&mut q, after, frame)
     }
 
@@ -370,7 +390,7 @@ impl Outbox {
                     || (q.frames.len() < BUDGET.requests / 2
                         && q.bytes.saturating_add(len) <= window)
                 {
-                    let after = q.follow.as_ref().map_or(0, |f| f.log.seq());
+                    let after = q.target.as_ref().map_or(0, |log| log.seq());
                     return self.push(&mut q, after, frame);
                 }
             }
@@ -389,13 +409,21 @@ impl Outbox {
             return Err(Closed);
         }
         if let Some(kind) = frame.replaceable {
-            q.frames.retain(|(_, queued)| {
-                if queued.replaceable == Some(kind) {
+            // A replacement cannot cross a session switch's ordering fence.
+            let start = q
+                .frames
+                .iter()
+                .rposition(|item| matches!(item, Queued::Switch(_)))
+                .map_or(0, |i| i + 1);
+            let mut index = 0;
+            q.frames.retain(|item| {
+                let replace = index >= start
+                    && matches!(item, Queued::Frame(_, queued) if queued.replaceable == Some(kind));
+                index += 1;
+                if replace && let Queued::Frame(_, queued) = item {
                     q.bytes -= queued.as_bytes().len();
-                    false
-                } else {
-                    true
                 }
+                !replace
             });
         }
         let len = frame.as_bytes().len();
@@ -409,8 +437,12 @@ impl Outbox {
             let (bytes, requests) = q
                 .frames
                 .iter()
-                .filter(|(_, frame)| frame.class == Class::Ephemeral || frame.replaceable.is_some())
-                .fold((len, 0), |(bytes, requests), (_, frame)| {
+                .filter_map(|item| match item {
+                    Queued::Frame(_, frame) => Some(frame),
+                    Queued::Switch(_) => None,
+                })
+                .filter(|frame| frame.class == Class::Ephemeral || frame.replaceable.is_some())
+                .fold((len, 0), |(bytes, requests), frame| {
                     (bytes.saturating_add(frame.as_bytes().len()), requests + 1)
                 });
             BUDGET.admits(bytes, requests, false)
@@ -418,6 +450,7 @@ impl Outbox {
         if !reserved || !BUDGET.admits(q.bytes.saturating_add(len), q.frames.len(), true) {
             q.closed = true;
             q.follow = None;
+            q.target = None;
             q.frames.clear();
             q.bytes = 0;
             self.shared.ready.notify();
@@ -425,7 +458,7 @@ impl Outbox {
             return Err(Closed);
         }
         q.bytes += len;
-        q.frames.push_back((after, frame));
+        q.frames.push_back(Queued::Frame(after, frame));
         self.shared.ready.notify();
         Ok(())
     }
@@ -447,18 +480,14 @@ impl Outbox {
     #[must_use]
     pub fn follow(&self, log: Arc<FrameLog>, cursor: u64, frames: Vec<(u64, Frame)>) -> Self {
         let mut q = self.queue();
-        q.unfollow();
-        q.follow = Some(Follow {
-            log,
-            cursor,
-            ahead: VecDeque::new(),
-        });
+        q.switch(Some((log, cursor)));
         for (after, frame) in frames {
             if self.push(&mut q, after, frame).is_err() {
                 break;
             }
         }
         self.shared.ready.notify();
+        self.shared.room.notify();
         Self {
             shared: Arc::clone(&self.shared),
             following: q.follows,
@@ -467,7 +496,9 @@ impl Outbox {
 
     /// Stops following a session.
     pub fn unfollow(&self) {
-        self.queue().unfollow();
+        self.queue().switch(None);
+        self.shared.ready.notify();
+        self.shared.room.notify();
     }
 
     /// The next frame to write, once there is one; `None` once closed and
@@ -546,8 +577,8 @@ impl Outbox {
 
     fn accept_read(&self, cursor: u64, follows: u64, ahead: VecDeque<io::Result<Frame>>) {
         let mut q = self.queue();
-        if q.follows == follows
-            && let Some(follow) = &mut q.follow
+        if let Some(follow) = &mut q.follow
+            && follow.generation == follows
             && follow.cursor == cursor
         {
             follow.ahead = ahead;
@@ -567,6 +598,7 @@ impl Outbox {
         let mut q = self.queue();
         q.closed = true;
         q.follow = None;
+        q.target = None;
         q.frames.clear();
         q.bytes = 0;
         self.shared.ready.notify();
@@ -588,23 +620,31 @@ impl Queue {
     /// The next frame to write, if there is one now: the next queued if the
     /// client has the entries it waits for, else the next entry.
     fn step(&mut self) -> Step {
-        let cursor = self.follow.as_ref().map_or(u64::MAX, |f| f.cursor);
-        if self
-            .frames
-            .front()
-            .is_some_and(|&(after, _)| after <= cursor)
-        {
-            let Some((_, frame)) = self.frames.pop_front() else {
-                return Step::Nothing;
-            };
-            self.bytes -= frame.as_bytes().len();
-            return Step::Frame(frame);
+        loop {
+            match self.frames.front() {
+                Some(Queued::Switch(_)) => {
+                    let Some(Queued::Switch(follow)) = self.frames.pop_front() else {
+                        unreachable!()
+                    };
+                    self.follow = follow;
+                }
+                Some(Queued::Frame(after, _))
+                    if self.follow.as_ref().is_none_or(|f| *after <= f.cursor) =>
+                {
+                    let Some(Queued::Frame(_, frame)) = self.frames.pop_front() else {
+                        unreachable!()
+                    };
+                    self.bytes -= frame.as_bytes().len();
+                    return Step::Frame(frame);
+                }
+                _ => break,
+            }
         }
         let Some(follow) = self.follow.as_mut() else {
             return Step::Nothing;
         };
         match follow.ahead.pop_front() {
-            None => Step::Read(Arc::clone(&follow.log), follow.cursor, self.follows),
+            None => Step::Read(Arc::clone(&follow.log), follow.cursor, follow.generation),
             Some(Ok(frame)) => {
                 follow.cursor += 1;
                 Step::Frame(frame)
@@ -613,6 +653,7 @@ impl Queue {
             Some(Err(_)) => {
                 self.closed = true;
                 self.follow = None;
+                self.target = None;
                 self.frames.clear();
                 self.bytes = 0;
                 Step::Nothing
@@ -620,12 +661,34 @@ impl Queue {
         }
     }
 
-    /// What was queued for the session followed goes out first, as it is.
-    fn unfollow(&mut self) {
+    /// Retires the producer now; the writer changes logs only after every
+    /// queued frame and its entry dependencies have drained.
+    fn switch(&mut self, next: Option<(Arc<FrameLog>, u64)>) {
         self.follows += 1;
-        self.follow = None;
-        for (after, _) in &mut self.frames {
-            *after = 0;
+        if self.closed {
+            return;
+        }
+        if !BUDGET.admits(self.bytes, self.frames.len(), true) {
+            self.closed = true;
+            self.follow = None;
+            self.target = None;
+            self.frames.clear();
+            self.bytes = 0;
+            return;
+        }
+        self.target = next.as_ref().map(|(log, _)| Arc::clone(log));
+        let follow = next.map(|(log, cursor)| Follow {
+            generation: self.follows,
+            log,
+            cursor,
+            ahead: VecDeque::new(),
+        });
+        if self.frames.is_empty() {
+            self.follow = follow;
+        } else if let Some(Queued::Switch(queued)) = self.frames.back_mut() {
+            *queued = follow;
+        } else {
+            self.frames.push_back(Queued::Switch(follow));
         }
     }
 }
@@ -683,7 +746,13 @@ mod tests {
         outbox.send(latest.clone()).unwrap();
         let q = outbox.queue();
         assert_eq!(q.frames.len(), 1);
-        assert_eq!(q.frames.back().unwrap().1.as_bytes(), latest.as_bytes());
+        assert_eq!(
+            match q.frames.back().unwrap() {
+                Queued::Frame(_, frame) => frame.as_bytes(),
+                Queued::Switch(_) => panic!("expected frame"),
+            },
+            latest.as_bytes()
+        );
     }
 
     #[test]
@@ -731,10 +800,16 @@ mod tests {
             q.bytes,
             q.frames
                 .iter()
-                .map(|(_, frame)| frame.as_bytes().len())
+                .filter_map(|item| match item {
+                    Queued::Frame(_, frame) => Some(frame.as_bytes().len()),
+                    Queued::Switch(_) => None,
+                })
                 .sum::<usize>()
         );
-        for ((after, frame), expected) in q.frames.iter().rev().take(2).zip(latest.iter().rev()) {
+        for (item, expected) in q.frames.iter().rev().take(2).zip(latest.iter().rev()) {
+            let Queued::Frame(after, frame) = item else {
+                panic!("expected frame")
+            };
             assert_eq!(*after, 999);
             assert_eq!(frame.as_bytes(), expected.as_bytes());
         }
@@ -1045,7 +1120,10 @@ mod tests {
         // Entries stay in the shared log: what waits for this viewer is
         // its cursor and the bounded deltas, however far it lags.
         let q = outbox.queue();
-        assert!(q.frames.iter().all(|(_, f)| f.class == Class::Ephemeral));
+        assert!(q.frames.iter().all(|item| match item {
+            Queued::Frame(_, f) => f.class == Class::Ephemeral,
+            Queued::Switch(_) => true,
+        }));
         assert!(q.bytes <= BUDGET.bytes);
         assert_eq!(q.follow.as_ref().map(|f| f.cursor), Some(0));
         drop(q);
@@ -1077,6 +1155,75 @@ mod tests {
         let session = outbox.follow(log.frames(), 0, Vec::new());
         assert_eq!(written(&outbox), [Some(1)]);
         assert!(session.send(delta()).is_err());
+    }
+
+    #[test]
+    fn switching_sessions_drains_each_certified_prefix_before_the_next_session() {
+        let mut old = log(&["old one", "old two", "old three"]);
+        let next = log(&["new one", "new two"]);
+        let outbox = Outbox::new();
+        let first = outbox.follow(
+            old.frames(),
+            0,
+            vec![
+                (2, Frame::new(&DaemonMsg::Synced { seq: 2 }).unwrap()),
+                (
+                    3,
+                    Frame::new(&DaemonMsg::Activity {
+                        seq: 3,
+                        activity: protocol::Activity::Idle,
+                    })
+                    .unwrap(),
+                ),
+            ],
+        );
+        assert_eq!(outbox.try_next().unwrap().seq, Some(1));
+        let second = outbox.follow(
+            next.frames(),
+            0,
+            vec![(2, Frame::new(&DaemonMsg::Synced { seq: 2 }).unwrap())],
+        );
+        old.push("outside the old prefix");
+        assert!(first.send(delta()).is_err());
+        outbox.unfollow();
+        assert!(second.send(delta()).is_err());
+        assert_eq!(
+            written(&outbox),
+            [Some(2), None, Some(3), None, Some(1), Some(2), None]
+        );
+    }
+
+    #[test]
+    fn cold_raw_replay_matches_the_committed_frames_and_decoded_iteration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Jsonl::open(dir.path()).unwrap();
+        let header = crate::store::Header {
+            id: protocol::SessionId::new(),
+            workspace: "/w".into(),
+            parent: None,
+        };
+        let mut loaded = crate::store::LogStore::create(&store, &header).unwrap();
+        let expected: Vec<_> = ["quoted \" text\n", &"large ".repeat(RUN)]
+            .iter()
+            .map(|text| {
+                loaded
+                    .append(Body::Assistant {
+                        text: (*text).into(),
+                    })
+                    .unwrap()
+            })
+            .collect();
+        let frames = Arc::new(FrameLog::new(loaded.lines, loaded.seq));
+        assert_eq!(frames.entries().unwrap(), expected);
+        let outbox = Outbox::new();
+        let _session = outbox.follow(frames, 0, Vec::new());
+        for entry in expected {
+            assert_eq!(
+                outbox.try_next().unwrap().as_bytes(),
+                Frame::entry(&entry).unwrap().as_bytes()
+            );
+        }
+        assert!(outbox.try_next().is_none());
     }
 
     #[test]

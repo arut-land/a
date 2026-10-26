@@ -8,6 +8,9 @@
 mod app;
 mod http;
 mod page;
+/// The page state, exposed for cross-renderer integration tests.
+#[doc(hidden)]
+pub use page::Page;
 mod patch;
 mod style;
 /// Items as markup: public for the test that every renderer shows an item

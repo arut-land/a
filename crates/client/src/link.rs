@@ -10,9 +10,7 @@ use std::sync::{Arc, LazyLock};
 use std::task::{Context, Waker};
 use std::time::Duration;
 
-use protocol::{
-    Caps, ClientId, ClientMsg, DaemonMsg, Decode, Environment, MachineId, PROTO, Versions,
-};
+use protocol::{Caps, ClientId, ClientMsg, DaemonMsg, Decode, Environment, MachineId, PROTO};
 use rt::{BoxFuture, Rt, Runtime};
 use sys::{Home, Staged};
 
@@ -48,7 +46,7 @@ pub trait Link: fmt::Debug + Send + Sync + 'static {
     }
 
     /// Why a daemon speaking `theirs` cannot serve `build`. Blocking.
-    fn mismatch(&self, build: &Staged, theirs: Versions) -> Error {
+    fn mismatch(&self, build: &Staged, theirs: u32) -> Error {
         let _ = build;
         Error::Mismatch {
             theirs,
@@ -277,7 +275,7 @@ impl Link for LocalLink {
         Some(crate::diagnose(&self.0))
     }
 
-    fn mismatch(&self, build: &Staged, theirs: Versions) -> Error {
+    fn mismatch(&self, build: &Staged, theirs: u32) -> Error {
         let runtime = self.0.runtime();
         Error::Mismatch {
             theirs,
@@ -310,8 +308,8 @@ pub(crate) enum Greeting {
     /// The daemon's machine, and what holds an upgrade it waits for.
     Welcome(MachineId, Option<String>),
     Draining,
-    /// The daemon's versions.
-    Mismatch(Versions),
+    /// The daemon's exact protocol version.
+    Mismatch(u32),
 }
 
 /// Opens `link` and completes the hello, as `client` when it is named,
@@ -421,7 +419,6 @@ pub(crate) async fn hello(
         .send(&ClientMsg::Hello {
             proto: PROTO,
             build: build.to_owned(),
-            min: Versions::OURS.min_field(),
             caps: Caps::ALL,
             client,
             machine,
@@ -466,8 +463,8 @@ pub(crate) async fn hello(
             Vec::new(),
             Vec::new(),
         )),
-        Some(DaemonMsg::Mismatch { supported, min }) => Ok((
-            Greeting::Mismatch(Versions::new(min, supported)),
+        Some(DaemonMsg::Mismatch { supported }) => Ok((
+            Greeting::Mismatch(supported),
             Welcome::default(),
             Vec::new(),
             Vec::new(),

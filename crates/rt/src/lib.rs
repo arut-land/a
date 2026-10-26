@@ -50,6 +50,14 @@ pub enum BlockingClass {
 /// Default reservation for storage jobs whose buffers are owned by their caller.
 pub const STORAGE_BYTES: usize = 8 << 20;
 
+/// What the storage workers may hold at once, every job's reservation
+/// together: the most one job can reserve, which runs it alone.
+pub const STORAGE_BUDGET: usize = 64 << 20;
+
+/// What the CPU workers may hold at once, as [`STORAGE_BUDGET`] is for
+/// storage.
+pub const CPU_BUDGET: usize = 64 << 20;
+
 pub trait Runtime: Send + Sync + 'static {
     /// Runs `task` in the background; it is never awaited.
     fn spawn(&self, task: BoxFuture<'static, ()>);

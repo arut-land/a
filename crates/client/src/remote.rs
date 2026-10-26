@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use protocol::{ClientMsg, MachineId, Versions};
+use protocol::{ClientMsg, MachineId};
 use rt::{BoxFuture, Rt};
 use sys::{Home, Platform, Prompt, Staged};
 
@@ -114,7 +114,7 @@ impl Link for SshLink {
         self.prompt == Prompt::Terminal
     }
 
-    fn mismatch(&self, _: &Staged, theirs: Versions) -> Error {
+    fn mismatch(&self, _: &Staged, theirs: u32) -> Error {
         Error::Mismatch {
             theirs,
             newer: None,

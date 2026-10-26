@@ -24,6 +24,7 @@ mod background;
 mod bench;
 mod durable;
 mod handover;
+mod image;
 mod interrupt;
 mod invocation;
 mod later;
@@ -899,6 +900,22 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
 }
 
 #[test]
+fn a_childs_interrupted_result_does_not_prove_owner_cancellation() {
+    let child = SessionId::new();
+    let entries = [
+        entry(1, Body::Watch { child }),
+        entry(
+            2,
+            Body::Fired {
+                watch: Seq::new(1).unwrap(),
+                outcome: Outcome::Interrupted { output: None },
+            },
+        ),
+    ];
+    assert!(!cancelled_child(entries, child));
+}
+
+#[test]
 fn a_fired_watch_wakes_the_model_with_the_childs_result() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let fixture =
@@ -946,8 +963,15 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
         let mut log = log.to_vec();
         for e in &mut log {
             if let Body::Enqueue { envelope } = &mut e.body {
-                envelope.id.sender = SessionId::NIL;
-                envelope.destination = SessionId::NIL;
+                let mut id = envelope.id().clone();
+                id.sender = SessionId::NIL;
+                *envelope = protocol::Envelope::new(
+                    id,
+                    SessionId::NIL,
+                    envelope.payload().clone(),
+                    envelope.held.clone(),
+                )
+                .unwrap();
             }
         }
         log
@@ -1495,6 +1519,7 @@ fn the_model_gets_the_prompt_and_the_logged_context_first() {
         [
             "bash",
             "edit",
+            "read",
             "task",
             "fork_task",
             "background_task",
@@ -1680,9 +1705,9 @@ fn a_background_jobs_end_is_queued_once_holding_its_output_and_starts_no_turn() 
         .collect();
     let [end] = ends[..] else { panic!("{log:#?}") };
     assert_eq!(end.source(), protocol::Source::Job(call));
-    assert_eq!(end.id.purpose, protocol::EnvelopeId::JOB);
+    assert_eq!(end.id().purpose, protocol::EnvelopeId::JOB);
     assert_eq!(
-        end.payload,
+        end.payload().clone(),
         protocol::Carried::Job(format!(
             "[background job {} ended: exit code 3]",
             job_of(&log)
@@ -1812,13 +1837,10 @@ fn a_forced_steer_detaches_a_running_call_whose_outcome_comes_back_on_the_queue(
     session.halt();
     let back = (log.iter())
         .find_map(|e| match &e.body {
-            Body::Enqueue {
-                envelope:
-                    protocol::Envelope {
-                        payload: protocol::Carried::Detached(outcome),
-                        ..
-                    },
-            } => Some(outcome.clone()),
+            Body::Enqueue { envelope } => match envelope.payload() {
+                protocol::Carried::Detached(outcome) => Some(outcome.clone()),
+                _ => None,
+            },
             _ => None,
         })
         .unwrap();

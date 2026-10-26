@@ -30,10 +30,11 @@ pub enum Name {
     Truncated,
     Reasoning,
     ReasoningSummary,
+    ToolResultMedia,
 }
 
 impl Name {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::PastedContent,
         Self::Attachment,
         Self::Steer,
@@ -42,6 +43,7 @@ impl Name {
         Self::Truncated,
         Self::Reasoning,
         Self::ReasoningSummary,
+        Self::ToolResultMedia,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -54,6 +56,7 @@ impl Name {
             Self::Truncated => "truncated",
             Self::Reasoning => "reasoning",
             Self::ReasoningSummary => "reasoning-summary",
+            Self::ToolResultMedia => "tool-result-media",
         }
     }
 }
@@ -284,6 +287,23 @@ impl<'a> From<Attached<'a>> for Tag<'a> {
     }
 }
 
+/// What heads the media (images) of a tool call's result moved to a user
+/// message, for a model that reads none inside a result: the call they
+/// answer.
+#[derive(Clone, Copy, Debug)]
+pub struct ResultMedia<'a> {
+    pub call: &'a str,
+    pub tool: &'a str,
+}
+
+impl<'a> From<ResultMedia<'a>> for Tag<'a> {
+    fn from(media: ResultMedia<'a>) -> Self {
+        Tag::new(Name::ToolResultMedia)
+            .attr("call", media.call)
+            .attr("tool", media.tool)
+    }
+}
+
 /// Input given to the running turn mid-way, and who gave it: what they
 /// typed, and what they pasted or attached as its own tags.
 #[derive(Clone, Debug)]
@@ -417,6 +437,7 @@ mod tests {
             Name::Truncated => 5,
             Name::Reasoning => 6,
             Name::ReasoningSummary => 7,
+            Name::ToolResultMedia => 8,
         };
         assert_eq!(Name::ALL.map(place), std::array::from_fn(|i| i));
     }

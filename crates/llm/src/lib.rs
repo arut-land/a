@@ -8,6 +8,7 @@ mod accumulate;
 mod client;
 mod conversation;
 mod error;
+pub mod fit;
 pub mod hosts;
 pub use transport as http;
 mod json;

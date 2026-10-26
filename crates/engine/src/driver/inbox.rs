@@ -48,7 +48,7 @@ impl Actor {
             },
             |cancel| {
                 Box::pin(async move {
-                    let (id, recipient) = (envelope.id.clone(), envelope.destination);
+                    let (id, recipient) = (envelope.id().clone(), envelope.destination);
                     let result = match daemon {
                         Some(daemon) => super::unless(&cancel, daemon.deliver(envelope))
                             .await
@@ -78,7 +78,7 @@ impl Live {
         envelope: Envelope,
         cancel: &ext::Cancel,
     ) -> std::io::Result<(protocol::Outcome, Option<protocol::Json>)> {
-        let id = envelope.id.clone();
+        let id = envelope.id().clone();
         self.enqueue(envelope)
             .await
             .map_err(|e| std::io::Error::other(format!("{e:?}")))?;

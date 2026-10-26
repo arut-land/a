@@ -12,7 +12,6 @@ use serde_json::json;
 
 /// A session the daemon was running when it stopped.
 const BUSY_LOAD: Load<'static> = Load {
-    boot: Some("boot-1"),
     fresh: true,
     owner: Owner::None,
     abandoned: &[],
@@ -288,11 +287,10 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
     );
 }
 
-/// Process groups are killed only in the boot they ran in: elsewhere their
-/// ids are someone else's. Background ones are left over only on the first
-/// load since the daemon started.
+/// Recorded process ids grant no lease. A fresh load ends their streams;
+/// it never attempts to signal processes recovered from a log.
 #[test]
-fn leftover_processes_of_this_boot_are_killed() {
+fn replayed_process_ids_never_confer_process_ownership() {
     let end_job = |pgid| Work::EndStream {
         stream: protocol::OutputStream {
             session: SessionId::NIL,
@@ -318,10 +316,7 @@ fn leftover_processes_of_this_boot_are_killed() {
     let (_, fx) = resume(Reg::echo(), bodies(), &BUSY_LOAD);
     assert_plan(
         &fx,
-        (
-            vec![entry(6, tool_result(2, INTERRUPTED))],
-            vec![IDLE, Work::Kill { pgid: 7 }, Work::Kill { pgid: 8 }],
-        ),
+        (vec![entry(6, tool_result(2, INTERRUPTED))], vec![IDLE]),
     );
     // A background group outlives its call, until the session ends.
     let ended = [
@@ -332,7 +327,7 @@ fn leftover_processes_of_this_boot_are_killed() {
     ];
     let (_, fx) = resume(Reg::echo(), ended.clone(), &BUSY_LOAD);
     // Busy still, until what it wrote is back.
-    assert_plan(&fx, (vec![], vec![Work::Kill { pgid: 8 }, end_job(8)]));
+    assert_plan(&fx, (vec![], vec![end_job(8)]));
     let again = Load {
         fresh: false,
         ..BUSY_LOAD
@@ -472,16 +467,17 @@ fn a_failed_commit_is_resume() {
 
 #[test]
 fn abandoned_inbox_work_is_terminal_for_every_owned_conversation() {
-    let envelope = protocol::Envelope {
-        id: protocol::EnvelopeId {
+    let envelope = protocol::Envelope::new(
+        protocol::EnvelopeId {
             sender: SessionId::new(),
             call: CallId::new(1).unwrap(),
             purpose: "task".into(),
         },
-        destination: SessionId::new(),
-        payload: "hi".into(),
-        held: Vec::new(),
-    };
+        SessionId::new(),
+        "hi".into(),
+        Vec::new(),
+    )
+    .unwrap();
     for taken in [false, true] {
         let mut bodies = vec![Body::Enqueue {
             envelope: envelope.clone(),
@@ -494,7 +490,7 @@ fn abandoned_inbox_work_is_terminal_for_every_owned_conversation() {
         }
         let entries = log(bodies);
         let fact = log(vec![Body::ModelResult {
-            call: envelope.id.call,
+            call: envelope.id().call,
             outcome: Outcome::Interrupted { output: None },
             r#for: None,
             failure: None,

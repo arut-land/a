@@ -460,7 +460,7 @@ fn media_a_response_cannot_hold_follow_it() {
     assert_eq!(
         contents[1]["parts"],
         json!([
-            {"text": RESULT_IMAGES, "thought": false},
+            {"text": r#"<tool-result-media call="c" tool="shot"/>"#, "thought": false},
             {"inlineData": {"mimeType": "image/gif", "data": "Z2lm"}, "thought": false},
             {"fileData": {"mimeType": "image/png", "fileUri": "https://example.com/image.png"}, "thought": false},
             {"text": "next", "thought": false},

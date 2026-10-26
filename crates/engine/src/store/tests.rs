@@ -171,7 +171,12 @@ fn ordering_damage_is_read_only_even_behind_a_snapshot(store: &dyn LogStore) {
                             entries[..1].to_vec()
                         }
                     );
-                    assert!(loaded.writer.append(&mut [entry(2, 6)], true).is_err());
+                    assert!(
+                        loaded
+                            .writer
+                            .append(&mut [entry(2, 6)], AppendMode::Order)
+                            .is_err()
+                    );
                     assert!(
                         loaded
                             .lines
@@ -1161,7 +1166,10 @@ fn a_barrier_write_alone_does_not_survive_a_power_cut() {
     };
     let mut loaded = faulty.create(&header).unwrap();
     let mut entries = [entry(1, 0)];
-    loaded.writer.append(&mut entries, true).unwrap();
+    loaded
+        .writer
+        .append(&mut entries, AppendMode::Order)
+        .unwrap();
     loaded.writer.sync().unwrap();
     faulty.cut();
     assert_eq!(memory.entries(header.id).unwrap(), []);
@@ -1174,10 +1182,18 @@ fn a_read_only_writer_still_flushes_the_prefix_it_will_replay() {
     let header = header("/w");
     let mut loaded = faulty.create(&header).unwrap();
     let mut entries = [entry(1, 0)];
-    loaded.writer.append(&mut entries, true).unwrap();
+    loaded
+        .writer
+        .append(&mut entries, AppendMode::Order)
+        .unwrap();
     loaded.writer.keep(ReadOnly::Extensions);
     let mut forbidden = [entry(2, 0)];
-    assert!(loaded.writer.append(&mut forbidden, true).is_err());
+    assert!(
+        loaded
+            .writer
+            .append(&mut forbidden, AppendMode::Order)
+            .is_err()
+    );
     loaded.writer.sync().unwrap();
     loaded.writer.flush_inline().unwrap();
     assert_eq!(memory.entries(header.id).unwrap(), entries);

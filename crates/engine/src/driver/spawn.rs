@@ -434,7 +434,11 @@ impl Live {
         for entry in entries {
             match entry.body {
                 Body::Watch { child: watched } if watched == child => watch = Some(entry.seq),
-                Body::Fired { watch: fired, .. } if Some(fired) == watch => return false,
+                Body::Fired { watch: fired, .. } | Body::Unwatch { watch: fired }
+                    if Some(fired) == watch =>
+                {
+                    return false;
+                }
                 _ => {}
             }
         }

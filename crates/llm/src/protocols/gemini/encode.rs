@@ -21,13 +21,10 @@ use crate::models::google as model;
 use crate::protocol::{Encoded, Target};
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
-    AssistantPart, Effort, Format, Generation, Media, Message, Output, Request, SmolStr, Source,
+    AssistantPart, Carried, Effort, Format, Generation, Media, Message, Output, Request, SmolStr,
     Tool, ToolChoice, ToolResult, ToolWire, UserPart,
 };
-
-/// What leads the user content a tool result's images move to, for a model
-/// that reads no image inside a function response.
-pub(crate) const RESULT_IMAGES: &str = "Attached image(s) from tool result:";
+use crate::tag::{self, Tag};
 
 /// What a tool result that says nothing says instead: models answer it
 /// better than an empty one.
@@ -82,14 +79,14 @@ fn text_part(text: &str) -> Value {
 /// part, marked as no thought.
 fn media(media: &Media, whole: bool) -> Result<Value, Error> {
     let mime = media.media_type.as_str();
-    let mut part = match &media.source {
-        Source::Data { data } => {
-            obj!({"inlineData": obj!({"mimeType": mime, "data": data.as_str()})})
+    let mut part = match media.source.carried() {
+        Carried::Data(data) => {
+            obj!({"inlineData": obj!({"mimeType": mime, "data": &*data})})
         }
-        Source::Url { url } => {
-            obj!({"fileData": obj!({"mimeType": mime, "fileUri": url.as_str()})})
+        Carried::Url(url) => {
+            obj!({"fileData": obj!({"mimeType": mime, "fileUri": url})})
         }
-        Source::File { .. } => {
+        Carried::File(_) => {
             let why = "Gemini cannot carry media by a file id; send its URI as a URL";
             return Err(Error::unsupported(why));
         }
@@ -231,12 +228,12 @@ impl Contents {
                 self.add(Role::User, parts);
             }
             Message::Tool(tool) => {
-                let mut moved = vec![text_part(RESULT_IMAGES)];
+                let mut moved = Vec::new();
                 let parts = tool.results.iter();
                 let parts = parts.map(|result| function_response(result, model, ids, &mut moved));
                 let parts = parts.collect::<Result<_, _>>()?;
                 self.add(Role::User, parts);
-                if moved.len() > 1 {
+                if !moved.is_empty() {
                     self.add(Role::User, moved);
                 }
             }
@@ -267,7 +264,7 @@ pub(super) fn contents(
 /// A tool result as a function response. Its error says so under the
 /// `error` key, as Gemini's SDKs spell a failed function. Media it may not
 /// hold inline (JPEG, PNG or WEBP data) moves to `moved`, for a user
-/// content after the responses.
+/// content after the responses, after a tag naming the call it answers.
 fn function_response(
     result: &ToolResult,
     model: &str,
@@ -277,9 +274,9 @@ fn function_response(
     let images = model::reads_result_images(model);
     let inline_image = |part: &Media| {
         let image = matches!(&*part.media_type, "image/jpeg" | "image/png" | "image/webp");
-        image && matches!(part.source, Source::Data { .. })
+        image && part.source.is_inline()
     };
-    let (mut values, mut inline) = (Vec::new(), Vec::new());
+    let (mut values, mut inline, mut media_moved) = (Vec::new(), Vec::new(), Vec::new());
     match &result.output {
         Output::Text(text) => values.push(text.as_str().into()),
         // Gemini reads a result as a value, which goes into the contents
@@ -293,10 +290,18 @@ fn function_response(
                     UserPart::Media(part) if images && inline_image(part) => {
                         inline.push(media(part, false)?);
                     }
-                    UserPart::Media(part) => moved.push(media(part, true)?),
+                    UserPart::Media(part) => media_moved.push(media(part, true)?),
                 }
             }
         }
+    }
+    if !media_moved.is_empty() {
+        let tag = Tag::from(tag::ResultMedia {
+            call: &result.id,
+            tool: &result.name,
+        });
+        moved.push(text_part(&tag.to_string()));
+        moved.append(&mut media_moved);
     }
     let blank = |value: &Value| value.as_str().is_some_and(|text| text.trim().is_empty());
     if values.iter().all(blank) && inline.is_empty() {

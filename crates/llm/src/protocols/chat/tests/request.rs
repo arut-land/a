@@ -8,9 +8,7 @@ use serde_json::{Value, json};
 
 use super::{gateway, provider, request, sent, sent_to};
 use crate::Kind;
-use crate::protocols::chat::encode::{
-    DOCUMENT_UNSENDABLE, TOOL_IMAGE_ATTACHED, TOOL_IMAGES_HEADING,
-};
+use crate::protocols::chat::encode::{DOCUMENT_UNSENDABLE, TOOL_IMAGE_ATTACHED};
 use crate::protocols::chat::{PROTOCOL, Quirks};
 use crate::spec::{
     Assistant, AssistantPart, Effort, Format, Generation, Media, Message, Meta, Output, Request,
@@ -191,7 +189,7 @@ fn a_result_is_a_string_or_its_parts() {
     assert_eq!(
         openai["messages"][3],
         json!({"role": "user", "content": [
-            {"type": "text", "text": TOOL_IMAGES_HEADING},
+            {"type": "text", "text": r#"<tool-result-media call="call-id" tool="tool"/>"#},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo=",
                 "detail": "auto"}},
         ]})

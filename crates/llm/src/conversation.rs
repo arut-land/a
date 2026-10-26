@@ -68,6 +68,16 @@ impl Messages {
         list.messages.last_mut()
     }
 
+    /// The message at `at`, to change: it and every message after it take
+    /// new marks, as an encoding of any prefix past `at` holds it.
+    pub fn get_mut(&mut self, at: usize) -> Option<&mut Message> {
+        let list = self.list();
+        for kept in list.marks.get_mut(at..)? {
+            *kept = mark();
+        }
+        list.messages.get_mut(at)
+    }
+
     fn holds(&self, len: usize, mark: u64) -> bool {
         len.checked_sub(1)
             .is_some_and(|last| self.0.marks.get(last) == Some(&mark))

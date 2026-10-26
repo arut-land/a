@@ -6,12 +6,19 @@ publish.workspace = true
 
 [dependencies]
 ext.workspace = true
+# Decodes what not every provider reads (GIF, BMP) and scales what is too
+# large; what providers read within their limits passes through undecoded.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# A JPEG decoded at a DCT scale, an eighth of the work and memory or less.
+jpeg-decoder = { version = "0.3", default-features = false }
 llm.workspace = true
 protocol.workspace = true
 rt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sys.workspace = true
+# The PNG decoder `image` decodes with, read a row at a time.
+png = "0.18"
 
 [dev-dependencies]
 ext = { workspace = true, features = ["testing"] }
