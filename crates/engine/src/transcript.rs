@@ -34,11 +34,13 @@ pub struct Transcript {
     /// What is queued and not taken up, by seq: the model reads it once
     /// it is, where it is taken.
     waiting: HashMap<Seq, Waiting>,
-    /// Tools awaiting a detached or job completion, until it is formatted.
+    /// Tools awaiting their final detached or job completion.
     tools: HashMap<CallId, String>,
     /// Calls that went on in the background: the result logged for one
     /// is a placeholder, and its outcome comes queued.
     detached: HashSet<CallId>,
+    /// Process groups can outlive a detached call's own completion.
+    jobs: HashSet<CallId>,
     /// The seq of the last entry that changed the messages.
     last: u64,
     /// The seq of the last entry folded: the transcript goes on from the
@@ -47,7 +49,7 @@ pub struct Transcript {
     registry: Arc<Registry>,
     /// How references are named for the model.
     places: Places,
-    /// Streams awaiting a detached or job completion, until it is formatted.
+    /// Streams awaiting their final detached or job completion.
     streams: HashMap<CallId, OutputStream>,
 }
 
@@ -316,6 +318,7 @@ impl Transcript {
     ) -> io::Result<Self> {
         let mut edits = Vec::new();
         let mut background = HashSet::new();
+        let mut jobs = HashSet::new();
         entries(&mut |entry| {
             if let Some(edit) = context_edit(entry) {
                 edits.push(edit);
@@ -332,12 +335,16 @@ impl Transcript {
                     if matches!(envelope.payload(), Carried::Job(_) | Carried::Detached(_)) =>
                 {
                     background.insert(envelope.id().call);
+                    if matches!(envelope.payload(), Carried::Job(_)) {
+                        jobs.insert(envelope.id().call);
+                    }
                 }
                 _ => {}
             }
         })?;
         let edits = Edits::new(edits);
         let mut transcript = Self::empty(registry, system, places);
+        transcript.jobs = jobs;
         entries(&mut |entry| {
             transcript.through = entry.seq.get();
             match edits.at(entry.seq) {
@@ -371,6 +378,7 @@ impl Transcript {
             waiting: HashMap::new(),
             tools: HashMap::new(),
             detached: HashSet::new(),
+            jobs: HashSet::new(),
             last: 0,
             through: 0,
             registry,
@@ -395,9 +403,11 @@ impl Transcript {
             background: true,
             ..
         } = &e.body
-            && let Some((_, tool)) = self.calls.get(call)
         {
-            self.tools.insert(*call, tool.clone());
+            self.jobs.insert(*call);
+            if let Some((_, tool)) = self.calls.get(call) {
+                self.tools.insert(*call, tool.clone());
+            }
         } else if let Some(value) = context_fact(&e.body) {
             self.apply_input(e.seq, value, fresh);
         }
@@ -560,6 +570,7 @@ impl Transcript {
             }
             ContextValue::Background(call, outcome, held) => self.background(call, &outcome, &held),
             ContextValue::Job(call, text, held) => {
+                self.jobs.remove(&call);
                 // Its stream, sealed as the group ended, is read as a blob.
                 let log = (self.name_held(&held).into_iter()).find_map(|placed| placed.at);
                 self.ended(call, None, &text, log)
@@ -623,11 +634,16 @@ impl Transcript {
         note: &str,
         log: Option<String>,
     ) -> String {
-        let command = self.tools.remove(&call).unwrap_or_default();
-        let stream = self
-            .streams
-            .remove(&call)
-            .map(|stream| self.places.stream(stream));
+        let (command, stream) = if self.jobs.contains(&call) {
+            (
+                self.tools.get(&call).cloned(),
+                self.streams.get(&call).copied(),
+            )
+        } else {
+            (self.tools.remove(&call), self.streams.remove(&call))
+        };
+        let command = command.unwrap_or_default();
+        let stream = stream.map(|stream| self.places.stream(stream));
         let stream = log.or(stream);
         self.detached.remove(&call);
         let id = call.to_string();
@@ -857,6 +873,13 @@ fn project(
             places,
         );
         transcript.model_only = runner == RunnerKind::ModelOnly;
+        transcript.jobs = inputs
+            .iter()
+            .filter_map(|ContextInput(_, value)| match value {
+                ContextValue::Job(call, ..) => Some(*call),
+                _ => None,
+            })
+            .collect();
         let completions: HashSet<_> = inputs
             .iter()
             .filter_map(|ContextInput(_, value)| match value {

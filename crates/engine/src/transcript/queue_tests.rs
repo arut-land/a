@@ -388,6 +388,84 @@ fn completion_metadata_lives_only_until_background_completion_is_formatted() {
 }
 
 #[test]
+fn detached_completion_keeps_metadata_until_the_remaining_job_ends() {
+    let mut bodies = called();
+    bodies.extend([
+        Body::Detached { call: call(3) },
+        Body::ToolResult {
+            call: call(3),
+            outcome: Outcome::detached(),
+            card: None,
+            held: vec![Held::Stream(OutputStream {
+                session: SESSION,
+                call: call(3),
+            })],
+        },
+        Body::ToolProcess {
+            call: call(3),
+            pgid: 42,
+            boot: "boot".into(),
+            background: true,
+        },
+        Body::Enqueue {
+            envelope: Envelope::own(
+                SESSION,
+                call(3),
+                Carried::Detached(Outcome::Done {
+                    output: Json::encode("shell exited").unwrap().into(),
+                }),
+            ),
+        },
+        Body::Take {
+            input: seq(7),
+            into: None,
+        },
+        Body::Enqueue {
+            envelope: Envelope::own(SESSION, call(3), Carried::Job("descendants exited".into())),
+        },
+        Body::Take {
+            input: seq(9),
+            into: None,
+        },
+    ]);
+    let entries: Vec<_> = bodies
+        .into_iter()
+        .enumerate()
+        .map(|(at, body)| Entry::new(seq(at as u64 + 1), Epoch(0), body))
+        .collect();
+    let registry = Arc::new(Registry::default());
+    let mut live = Transcript::empty(Arc::clone(&registry), "", &Places::default());
+    for (at, entry) in entries.iter().enumerate() {
+        live.apply(entry, None);
+        let replay = Transcript::of(&entries[..=at], Arc::clone(&registry), "");
+        assert_eq!(replay.messages, live.messages);
+        if entry.seq == seq(8) {
+            for transcript in [&live, &replay] {
+                assert_eq!(transcript.tools.get(&call(3)).unwrap(), "sleep");
+                assert!(transcript.streams.contains_key(&call(3)));
+            }
+        }
+    }
+    assert!(live.tools.is_empty());
+    assert!(live.streams.is_empty());
+    assert!(live.jobs.is_empty());
+    let messages = live.into_messages();
+    let shown = format!("{messages:?}");
+    assert!(shown.contains("shell exited"), "{shown}");
+    assert!(shown.contains("descendants exited"), "{shown}");
+    assert_eq!(shown.matches(r#"command=\"sleep\""#).count(), 2, "{shown}");
+    assert_eq!(shown.matches(r#"log=\"stream:3\""#).count(), 2, "{shown}");
+    let replay = Transcript::of(&entries, Arc::clone(&registry), "");
+    assert!(replay.tools.is_empty());
+    assert!(replay.streams.is_empty());
+    assert!(replay.jobs.is_empty());
+    assert_eq!(
+        project(context_image(&entries), registry, "", &Places::default()).into_messages(),
+        messages
+    );
+}
+
+#[test]
 fn foreground_completions_retain_no_background_metadata() {
     let mut transcript = Transcript::empty(Arc::new(Registry::default()), "", &Places::default());
     for (at, body) in called()
