@@ -54,9 +54,15 @@ impl Client {
             .ok_or_else(|| Failure::Configuration("no process provider".into()))?;
         let mut env = cx.env.as_ref().map_or_else(
             || {
-                std::env::vars()
-                    .filter(|(k, _)| !protocol::Environment::is_secret(k))
-                    .collect()
+                protocol::Environment::new(
+                    protocol::HostPath::default(),
+                    std::env::vars_os(),
+                    false,
+                )
+                .vars
+                .into_iter()
+                .filter(|(k, _)| !protocol::Environment::is_secret(k))
+                .collect()
             },
             |e| e.vars.clone(),
         );
@@ -338,5 +344,61 @@ mod tests {
         assert!(process.alive());
         drop(rig);
         assert!(crate::lock(&mcp.0.clients).is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fallback_environment_skips_non_utf8_host_values() {
+        use std::os::unix::ffi::OsStringExt;
+        const CHILD: &str = "A_TEST_MCP_FALLBACK_ENV";
+        if std::env::var_os(CHILD).is_some() {
+            let rig = Rig::new(
+                "mcp-byte-environment",
+                Registry::default()
+                    .with(&ext_shell::Shell::default())
+                    .unwrap(),
+            );
+            let cx = rig.cx();
+            let server = Server {
+                name: "environment".parse().unwrap(),
+                description: String::new(),
+                transport: Transport::Stdio(vec![
+                    "/bin/sh".into(), "-c".into(),
+                    r#"printf '{"lang":"%s","terminfo":"%s"}\n' "$LANG" "${TERMINFO-unset}"; read release"#.into(),
+                ]),
+                env: BTreeMap::new(),
+            };
+            rt::block_on(async {
+                let mut client = Client::start(&server, &cx, Weak::new()).await.unwrap();
+                let (value, _) = client.read().await.unwrap();
+                assert_eq!(value, json!({"lang":"C", "terminfo":"unset"}));
+                client
+                    .child
+                    .input
+                    .as_ref()
+                    .unwrap()
+                    .write(b"release\n")
+                    .await
+                    .unwrap();
+                assert!(client.child.wait().await.unwrap().success());
+                client.child.ended().await;
+            });
+            return;
+        }
+        let rig = Rig::new("mcp-byte-environment-parent", Registry::default());
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "stdio::tests::fallback_environment_skips_non_utf8_host_values",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("A_HOME", &rig.dir)
+            .env("LANG", "C")
+            .env("TERMINFO", std::ffi::OsString::from_vec(vec![0xff]))
+            .env(std::ffi::OsString::from_vec(vec![b'X', 0xff]), "byte name")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }
