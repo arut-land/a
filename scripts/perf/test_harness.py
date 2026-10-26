@@ -17,10 +17,6 @@ import lifecycle
 import sessions
 
 
-def load_task(name):
-    return hosted.load_task(name)
-
-
 class Sessions(unittest.TestCase):
     def test_failed_subprocesses_write_artifacts_before_returning_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -149,7 +145,7 @@ class RealDaemon(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("PERF_TEST_PROBE"), "set PERF_TEST_PROBE to the real perf-attach example")
     def test_local_and_hosted_adapters_preserve_the_shared_raw_observations(self):
         binary = str(Path(os.environ["PERF_TEST_BINARY"]).resolve(strict=True))
-        local = load_task("idle-rss")
+        local = hosted.load_task("idle-rss")
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             # Shorten this lifecycle check; resource measurements use the production windows.
