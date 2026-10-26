@@ -72,7 +72,17 @@ fn main() -> ExitCode {
                     here(&home, args.host.as_ref())?,
                     token.as_deref().unwrap_or(&daemon.staged.id),
                 ),
-                Some(Cmd::Web { no_open }) => web(daemons.clone(), !no_open),
+                Some(Cmd::Web { no_open }) => {
+                    #[cfg(feature = "web")]
+                    {
+                        web::run(daemons.clone(), !no_open)
+                    }
+                    #[cfg(not(feature = "web"))]
+                    {
+                        let _ = no_open;
+                        Err(io::Error::other("this build of a has no web UI"))
+                    }
+                }
                 Some(Cmd::Daemon { .. }) => {
                     unreachable!("daemon commands are handled before installation")
                 }
@@ -310,10 +320,9 @@ fn repl(daemon: &client::Daemon, target: Target) -> io::Result<()> {
                 Input::Line(None) | Input::Busy => 0,
             }
     });
-    let events = tx.clone();
     let runtime: rt::Rt = std::sync::Arc::new(rt::Threads::default());
-    let driver = Driver::new(move |driver, event| events.event(driver, event, Input::Client))
-        .start(runtime.clone(), daemon.clone());
+    let driver =
+        Driver::with_inbox(tx.clone(), Input::Client).start(runtime.clone(), daemon.clone());
     let mut repl = Repl {
         client: SessionClient::new(Env::Origin),
         screen: Screen::default(),
@@ -690,16 +699,6 @@ fn fork(home: &Home, daemons: &Daemons, source: &str) -> io::Result<()> {
         .map_err(|e| wedged(daemon, e))?;
     sayln!("{}", session.short());
     Ok(())
-}
-
-#[cfg(feature = "web")]
-fn web(daemons: Daemons, open: bool) -> io::Result<()> {
-    web::run(daemons, open)
-}
-
-#[cfg(not(feature = "web"))]
-fn web(_daemons: Daemons, _open: bool) -> io::Result<()> {
-    Err(io::Error::other("this build of a has no web UI"))
 }
 
 /// What whoever started the daemon handed it, by descriptor or handle

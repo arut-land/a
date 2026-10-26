@@ -428,7 +428,11 @@ impl Daemon {
         on_drain: &(dyn Fn() + Sync),
         first: &(dyn Fn(Option<&Environment>) -> io::Result<Vec<ClientMsg>> + Sync),
     ) -> Result<Connection, Error> {
-        let result = link::connect(rt, self, client, start, first, on_drain).await;
+        let result = link::connect(rt, self, client, start, first, &|| {
+            on_drain();
+            std::future::ready(())
+        })
+        .await;
         if matches!(result, Err(Error::NotResponding)) {
             self.link.unanswered();
         }

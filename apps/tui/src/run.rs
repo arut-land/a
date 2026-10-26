@@ -30,10 +30,9 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
                 }
         },
     );
-    let events = tx.clone();
     let runtime: rt::Rt = std::sync::Arc::new(rt::Threads::default());
-    let driver = Driver::new(move |driver, event| events.event(driver, event, Event::Client))
-        .start(runtime.clone(), daemon.clone());
+    let driver =
+        Driver::with_inbox(tx.clone(), Event::Client).start(runtime.clone(), daemon.clone());
     let mut app = App::new(viewport, &target);
     let mut first = app.client.open(target);
     // The link may need the terminal (an ssh password) before raw mode starts.

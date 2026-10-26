@@ -58,10 +58,9 @@ pub fn run(
                 _ => 0,
             }
     });
-    let events = tx.clone();
     let runtime: rt::Rt = std::sync::Arc::new(rt::Threads::default());
-    let driver = Driver::new(move |driver, event| events.event(driver, event, Input::Client))
-        .start(runtime.clone(), daemon.clone());
+    let driver =
+        Driver::with_inbox(tx.clone(), Input::Client).start(runtime.clone(), daemon.clone());
     let stdin = tx.clone();
     // thread-exception: pipeline-stdin
     thread::spawn(move || {

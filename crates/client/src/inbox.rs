@@ -18,6 +18,7 @@ struct Queue<T> {
     items: VecDeque<(usize, T)>,
     posts: usize,
     bytes: usize,
+    first_bytes: usize,
     ended: bool,
     waker: Option<Waker>,
     taken: bool,
@@ -25,7 +26,11 @@ struct Queue<T> {
 
 impl<T> Queue<T> {
     fn pop(&mut self) -> Option<T> {
-        let (bytes, item) = self.first.pop_front().or_else(|| self.items.pop_front())?;
+        if let Some((bytes, item)) = self.first.pop_front() {
+            self.first_bytes -= bytes;
+            return Some(item);
+        }
+        let (bytes, item) = self.items.pop_front()?;
         self.bytes -= bytes;
         Some(item)
     }
@@ -34,6 +39,7 @@ impl<T> Queue<T> {
 struct Shared<T> {
     queue: Mutex<Queue<T>>,
     ready: Condvar,
+    space: rt::Notify,
     budget: QueueBudget,
     weight: fn(&T) -> usize,
 }
@@ -67,41 +73,55 @@ pub fn inbox<T>(budget: QueueBudget, weight: fn(&T) -> usize) -> (Post<T>, Inbox
             items: VecDeque::new(),
             posts: 1,
             bytes: 0,
+            first_bytes: 0,
             ended: false,
             waker: None,
             taken: true,
         }),
         ready: Condvar::new(),
+        space: rt::Notify::new(),
     });
     (Post(Arc::clone(&shared)), Inbox(shared))
 }
 
+#[derive(Clone, Copy)]
+enum Lane {
+    Control,
+    Data,
+    Stream,
+}
+
 impl<T> Post<T> {
-    /// An overflowing durable stream ends explicitly; reopening replays its log.
-    pub fn event(
-        &self,
-        driver: &crate::ClientHandle,
-        event: crate::Event,
-        wrap: fn(crate::Event) -> T,
-    ) {
-        let conn = event.conn;
-        if self.send(wrap(event)).is_err() {
-            let _ = driver.io(crate::Io::Hangup);
-            self.close_with(wrap(crate::Event {
-                conn,
-                kind: crate::EventKind::Closed(crate::Error::Busy),
-            }));
+    /// Waits for space without blocking a runtime worker. One oversized item
+    /// may occupy an otherwise empty data lane, so budgets never truncate history.
+    pub async fn send_async(&self, mut item: T) -> Result<(), T>
+    where
+        T: Send,
+    {
+        loop {
+            let seen = self.0.space.count();
+            item = match self.post(item, Lane::Stream) {
+                Ok(()) => return Ok(()),
+                Err(item) => item,
+            };
+            {
+                let queue = self.0.queue();
+                if !queue.taken || queue.ended {
+                    return Err(item);
+                }
+            }
+            self.0.space.until(|| self.0.space.count() != seen).await;
         }
     }
 
     /// Returns `item` if the byte/request budget is full or the receiver is gone.
     pub fn send(&self, item: T) -> Result<(), T> {
-        self.post(item, false)
+        self.post(item, Lane::Data)
     }
 
     /// Reserves priority capacity so keystrokes stay ahead of replay.
     pub fn send_first(&self, item: T) -> Result<(), T> {
-        self.post(item, true)
+        self.post(item, Lane::Control)
     }
 
     /// Replaces an incomplete backlog with an explicit terminal outcome.
@@ -110,30 +130,38 @@ impl<T> Post<T> {
         queue.first.clear();
         queue.items.clear();
         queue.bytes = 0;
+        queue.first_bytes = 0;
         queue.ended = true;
         queue.first.push_back((0, item));
         self.0.wake(&mut queue);
+        self.0.space.notify();
     }
 
-    fn post(&self, item: T, first: bool) -> Result<(), T> {
+    fn post(&self, item: T, lane: Lane) -> Result<(), T> {
         let mut queue = self.0.queue();
         let bytes = (self.0.weight)(&item);
-        if !queue.taken
-            || queue.ended
-            || !self.0.budget.admits(
-                queue.bytes.saturating_add(bytes),
-                queue.first.len() + queue.items.len(),
-                first,
+        let admitted = if matches!(lane, Lane::Control) {
+            self.0.budget.admits(
+                queue.first_bytes.saturating_add(bytes),
+                queue.first.len(),
+                true,
             )
-        {
+        } else {
+            self.0
+                .budget
+                .admits(queue.bytes.saturating_add(bytes), queue.items.len(), false)
+                || matches!(lane, Lane::Stream) && queue.items.is_empty()
+        };
+        if !queue.taken || queue.ended || !admitted {
             return Err(item);
         }
-        if first {
+        if matches!(lane, Lane::Control) {
             queue.first.push_back((bytes, item));
+            queue.first_bytes += bytes;
         } else {
             queue.items.push_back((bytes, item));
+            queue.bytes += bytes;
         }
-        queue.bytes += bytes;
         self.0.wake(&mut queue);
         Ok(())
     }
@@ -176,12 +204,17 @@ impl<T> Inbox<T> {
 
     /// The next item already queued.
     pub fn try_recv(&self) -> Option<T> {
-        self.0.queue().pop()
+        let item = self.0.queue().pop();
+        if item.is_some() {
+            self.0.space.notify();
+        }
+        item
     }
 
     pub fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         let mut queue = self.0.queue();
         if let Some(item) = queue.pop() {
+            self.0.space.notify();
             return Poll::Ready(Some(item));
         }
         if queue.posts == 0 || queue.ended {
@@ -195,6 +228,7 @@ impl<T> Inbox<T> {
         let mut queue = self.0.queue();
         loop {
             if let Some(item) = queue.pop() {
+                self.0.space.notify();
                 return Some(item);
             }
             if queue.posts == 0 || queue.ended {
@@ -220,6 +254,7 @@ impl<T> Drop for Inbox<T> {
         queue.first.clear();
         queue.items.clear();
         self.0.ready.notify_all();
+        self.0.space.notify();
     }
 }
 
@@ -229,6 +264,102 @@ mod tests {
     use std::time::Duration;
 
     use super::{QueueBudget, inbox};
+    use std::task::Poll;
+
+    #[test]
+    fn durable_backpressure_preserves_order_and_reserves_control_capacity() {
+        use std::future::Future;
+        use std::pin::pin;
+        use std::task::{Context, Waker};
+
+        for budget in [
+            QueueBudget {
+                bytes: 8192,
+                requests: 2,
+                control_reserve: 1,
+            },
+            QueueBudget {
+                bytes: 4097,
+                requests: 100,
+                control_reserve: 1,
+            },
+        ] {
+            let (post, inbox) = inbox(budget, String::len);
+            post.send("a".into()).unwrap();
+            let mut pending = pin!(post.send_async("b".into()));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(pending.as_mut().poll(&mut cx).is_pending());
+            post.send_first("interrupt".into()).unwrap();
+            assert_eq!(inbox.try_recv().as_deref(), Some("interrupt"));
+            assert!(pending.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(inbox.try_recv().as_deref(), Some("a"));
+            assert!(matches!(
+                pending.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+            assert_eq!(inbox.try_recv().as_deref(), Some("b"));
+        }
+    }
+
+    #[test]
+    fn an_oversized_event_is_delivered_without_starving_control() {
+        let (post, inbox) = inbox(
+            QueueBudget {
+                bytes: 8192,
+                requests: 2,
+                control_reserve: 1,
+            },
+            String::len,
+        );
+        rt::block_on(post.send_async("x".repeat(16384))).unwrap();
+        post.send_first("interrupt".into()).unwrap();
+        assert_eq!(inbox.try_recv().as_deref(), Some("interrupt"));
+        assert_eq!(inbox.try_recv().unwrap().len(), 16384);
+    }
+
+    #[test]
+    fn dropping_the_consumer_wakes_a_backpressured_producer() {
+        use rt::Runtime;
+        use std::sync::mpsc;
+
+        let (post, inbox) = inbox(
+            QueueBudget {
+                bytes: 8192,
+                requests: 2,
+                control_reserve: 1,
+            },
+            |_| 1,
+        );
+        post.send(1).unwrap();
+        let runtime = rt::Threads::new(1);
+        let (sent, received) = mpsc::channel();
+        let (waiting, pending) = mpsc::channel();
+        runtime.spawn(Box::pin(async move {
+            use std::future::{Future, poll_fn};
+            use std::pin::pin;
+
+            let mut send = pin!(post.send_async(2));
+            poll_fn(|cx| {
+                assert!(send.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            waiting.send(()).unwrap();
+            sent.send(send.await).unwrap();
+        }));
+        pending.recv_timeout(Duration::from_secs(2)).unwrap();
+        // A second task must run even while the producer awaits space.
+        let (progress, progressed) = mpsc::channel();
+        runtime.spawn(Box::pin(async move {
+            progress.send(()).unwrap();
+        }));
+        progressed.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(inbox);
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(2)
+        );
+    }
 
     #[test]
     fn byte_overload_returns_the_payload_and_a_terminal_outcome_is_observable() {
@@ -266,7 +397,13 @@ mod tests {
 
     #[test]
     fn what_is_posted_first_is_taken_before_the_backlog_in_its_own_order() {
-        let (post, inbox) = inbox(QueueBudget::default(), |_| size_of::<i32>());
+        let (post, inbox) = inbox(
+            QueueBudget {
+                control_reserve: 1,
+                ..QueueBudget::default()
+            },
+            |_| size_of::<i32>(),
+        );
         for n in 1..=3 {
             post.send(n).unwrap();
         }
