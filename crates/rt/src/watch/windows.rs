@@ -91,7 +91,19 @@ impl Native {
                 .get(parent)
                 .is_some_and(|h| h.identity == identity(parent))
             {
-                let handle = self.open(parent, Depth::Entries)?;
+                let mut handle = self.open(parent, Depth::Entries)?;
+                if let Some(old) = self.parents.remove(parent) {
+                    for held in self.held.values_mut() {
+                        if let Some(key) = held
+                            .parent
+                            .as_mut()
+                            .filter(|key| key.0 == parent && key.1 == old.serial)
+                        {
+                            key.1 = handle.serial;
+                            handle.refs += 1;
+                        }
+                    }
+                }
                 self.parents.insert(parent.to_owned(), handle);
             }
             let handle = self.parents.get_mut(parent).expect("opened");

@@ -499,3 +499,22 @@ fn a_replaced_parent_is_watched_by_new_subscriptions() {
     let file = dir.write("parent/new/file");
     until(&events, "the new root's entries", changed(&file));
 }
+
+#[cfg(windows)]
+#[test]
+fn a_replaced_parent_outlives_the_subscription_that_replaced_it() {
+    let dir = Dir::new();
+    fs::create_dir(dir.path("parent")).unwrap();
+    let hub = hub();
+    let (_old, events) = subscribe(&hub, Watch::entered(dir.path("parent/old")));
+    fs::rename(dir.path("parent"), dir.path("retired")).unwrap();
+    fs::create_dir(dir.path("parent")).unwrap();
+    let (new, _) = subscribe(&hub, Watch::entered(dir.path("parent/new")));
+    drop(new);
+    fs::create_dir(dir.path("parent/old")).unwrap();
+    until(&events, "arrival for the surviving subscription", |e| {
+        matches!(e, Event::Rescan)
+    });
+    let file = dir.write("parent/old/file");
+    until(&events, "the surviving root's entries", changed(&file));
+}
