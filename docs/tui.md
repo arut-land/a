@@ -174,9 +174,10 @@ crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
 
 - One thread owns the app and blocks on its `client::Inbox`. The terminal
   thread blocks in `poll` on stdin and a signal pipe with no timeout; the
-  `Driver` reads each connection on a thread of its own. The only timer is
+  `Driver` reads each connection on runtime tasks. The only timer is
   the working indicator's, armed while a turn works with nothing asked
-  and gone when it ends; an idle client sleeps in `poll`. Elapsed time and
+  and cancelled on transition to idle. Queued ticks carry identities, so
+  an old tick cannot disarm new work. An idle client waits on its inbox. Elapsed time and
   usage stay with the turn across calls; time awaiting approval or idle
   is excluded. Everything queued is folded before one frame; what the
   terminal thread posts (`Post::send_first`) is taken before the daemon's backlog,

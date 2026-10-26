@@ -6,3 +6,8 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # This stress invariant performs 1,001 sequential model turns in a debug build.
 filter = "test(title_regeneration_keeps_owner_context_out_of_thread_history)"
 slow-timeout = { period = "60s", terminate-after = 10 }
+
+[[profile.windows.overrides]]
+# This invariant creates and scans a real 2 GiB file on the native filesystem.
+filter = "test(unselected_lines_can_exceed_the_image_and_text_limits)"
+slow-timeout = { period = "60s", terminate-after = 10 }

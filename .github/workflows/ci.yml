@@ -104,6 +104,14 @@ jobs:
           install_args: rust mr-boxington cargo:cargo-machete
       - run: mise run machete
 
+  threads:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          python3 -m unittest discover -s scripts/check -p 'test_*.py'
+          python3 scripts/check/threads.py
+
   # Nothing `a` builds depends on tokio.
   no-tokio:
     runs-on: ubuntu-latest

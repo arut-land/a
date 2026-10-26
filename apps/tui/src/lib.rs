@@ -12,6 +12,9 @@
 //! Where raw terminal input is unsupported, [`viewport`] picks the line REPL.
 
 mod app;
+/// The screen state, exposed for cross-renderer integration tests.
+#[doc(hidden)]
+pub use app::App;
 mod editor;
 mod keys;
 mod render;
@@ -65,7 +68,7 @@ enum Event {
     /// From the session client's driver.
     Client(client::Event),
     /// The working indicator's clock; only waited for while a turn runs.
-    Tick,
+    Tick(u64),
 }
 
 pub use run::run;

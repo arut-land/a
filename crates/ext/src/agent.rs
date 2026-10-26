@@ -1,9 +1,12 @@
 //! Agents: what a session does with its inputs, as a fold over its log.
 
+use std::borrow::Cow;
+
+use protocol::ledger::Queued;
 use protocol::{CallId, Json, Outcome, Seq, ToolChoice, ToolOutcome};
 use smallvec::SmallVec;
 
-use crate::LoopPoints;
+use crate::{Boundary, LoopPoints, Requirement};
 
 /// What an agent asks for, in order.
 pub type Actions = SmallVec<[Action; 2]>;
@@ -129,6 +132,53 @@ impl Agent for ModelOnly {
             .into_iter()
             .collect(),
             _ => Actions::new(),
+        }
+    }
+}
+
+/// Who authorizes another provider attempt after an ambiguous outcome.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModelContract {
+    #[default]
+    Agent,
+    Caller,
+}
+
+impl ModelContract {
+    pub const fn admission(self) -> Requirement {
+        match self {
+            Self::Agent => Requirement::Ordered,
+            Self::Caller => Requirement::Durable,
+        }
+    }
+
+    pub const fn reactivates(self) -> bool {
+        matches!(self, Self::Caller)
+    }
+
+    pub const fn retries_on_recovery(self) -> bool {
+        matches!(self, Self::Agent)
+    }
+
+    pub const fn owns_retries(self) -> bool {
+        matches!(self, Self::Caller)
+    }
+
+    pub fn failure(self, failure: Option<Json>) -> Option<Json> {
+        match self {
+            Self::Agent => None,
+            Self::Caller => failure,
+        }
+    }
+
+    pub fn queue(self, boundary: Boundary, items: &[Queued]) -> Cow<'_, [Queued]> {
+        match self {
+            Self::Caller if boundary != Boundary::TurnEnd => items
+                .iter()
+                .filter(|item| item.source().visible())
+                .cloned()
+                .collect(),
+            Self::Agent | Self::Caller => Cow::Borrowed(items),
         }
     }
 }

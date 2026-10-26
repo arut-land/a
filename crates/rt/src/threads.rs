@@ -41,7 +41,7 @@ impl Config {
             storage: PoolLimits {
                 workers: (cores / 2).clamp(1, 4),
                 queue: 16,
-                bytes: 64 << 20,
+                bytes: crate::STORAGE_BUDGET,
             },
             network: PoolLimits {
                 workers: 8,
@@ -51,7 +51,7 @@ impl Config {
             cpu: PoolLimits {
                 workers: cores.saturating_sub(1).max(1),
                 queue: 8,
-                bytes: 64 << 20,
+                bytes: crate::CPU_BUDGET,
             },
             foreground: false,
         }
@@ -78,7 +78,28 @@ pub struct Threads {
     config: Config,
     lifecycle: Arc<Lifecycle>,
     workers: Mutex<Workers>,
-    blocking: [Arc<Blocking>; 4],
+    blocking: BlockingPools,
+}
+
+struct BlockingPools {
+    storage: Arc<Blocking>,
+    network: Arc<Blocking>,
+    cpu: Arc<Blocking>,
+    flush: Arc<Blocking>,
+}
+
+impl BlockingPools {
+    fn get(&self, class: BlockingClass) -> &Arc<Blocking> {
+        match class {
+            BlockingClass::Storage => &self.storage,
+            BlockingClass::Network => &self.network,
+            BlockingClass::Cpu => &self.cpu,
+        }
+    }
+
+    fn all(&self) -> [&Arc<Blocking>; 4] {
+        [&self.storage, &self.network, &self.cpu, &self.flush]
+    }
 }
 
 struct Workers {
@@ -197,6 +218,19 @@ impl Threads {
     pub fn configured(config: Config) -> Self {
         assert!(config.workers > 0);
         let lifecycle = Arc::new(Lifecycle::default());
+        let pool = |limits: PoolLimits| {
+            assert!(limits.workers > 0 && limits.queue > 0 && limits.bytes > 0);
+            Arc::new(Blocking {
+                limits,
+                foreground: config.foreground,
+                lifecycle: Arc::clone(&lifecycle),
+                #[cfg(test)]
+                start_gate: Mutex::default(),
+                state: Mutex::default(),
+                ready: Condvar::new(),
+                threads: Mutex::default(),
+            })
+        };
         Self {
             config,
             lifecycle: Arc::clone(&lifecycle),
@@ -204,29 +238,16 @@ impl Threads {
                 tasks: Some(Arc::default()),
                 threads: Vec::new(),
             }),
-            blocking: [
-                config.storage,
-                config.network,
-                config.cpu,
-                PoolLimits {
+            blocking: BlockingPools {
+                storage: pool(config.storage),
+                network: pool(config.network),
+                cpu: pool(config.cpu),
+                flush: pool(PoolLimits {
                     workers: 1,
                     queue: 1,
                     bytes: 1,
-                },
-            ]
-            .map(|limits| {
-                assert!(limits.workers > 0 && limits.queue > 0 && limits.bytes > 0);
-                Arc::new(Blocking {
-                    limits,
-                    foreground: config.foreground,
-                    lifecycle: Arc::clone(&lifecycle),
-                    #[cfg(test)]
-                    start_gate: Mutex::default(),
-                    state: Mutex::default(),
-                    ready: Condvar::new(),
-                    threads: Mutex::default(),
-                })
-            }),
+                }),
+            },
         }
     }
 
@@ -246,7 +267,7 @@ impl Threads {
         if tasks.is_none() && threads.is_empty() {
             return;
         }
-        for pool in &self.blocking {
+        for pool in self.blocking.all() {
             let mut state = lock(&pool.state);
             state.closed = true;
             pool.ready.notify_all();
@@ -254,7 +275,8 @@ impl Threads {
         }
         let blocking: Vec<_> = self
             .blocking
-            .iter()
+            .all()
+            .into_iter()
             .flat_map(|pool| std::mem::take(&mut *lock(&pool.threads)))
             .collect();
         let current = thread::current().id();
@@ -330,7 +352,7 @@ impl Runtime for Threads {
         work: Work,
     ) -> BoxFuture<'static, io::Result<()>> {
         Box::pin(Admission {
-            pool: Arc::clone(&self.blocking[class as usize]),
+            pool: Arc::clone(self.blocking.get(class)),
             bytes,
             work: Some(work),
             waiter: None,
@@ -339,7 +361,7 @@ impl Runtime for Threads {
 
     fn spawn_flush(&self, work: Work) -> BoxFuture<'static, io::Result<()>> {
         Box::pin(Admission {
-            pool: Arc::clone(&self.blocking[3]),
+            pool: Arc::clone(&self.blocking.flush),
             bytes: 0,
             work: Some(work),
             waiter: None,
@@ -551,7 +573,7 @@ mod tests {
     #[test]
     fn submission_bursts_count_starting_workers() {
         let rt = Threads::configured(Config::for_cores(4));
-        let pool = &rt.blocking[0];
+        let pool = &rt.blocking.storage;
         let gate = Arc::new(Gate::default());
         *lock(&pool.start_gate) = Some(Arc::clone(&gate));
         for _ in 0..16 {
@@ -563,6 +585,43 @@ mod tests {
         gate.open();
         rt.shutdown();
         assert_eq!(observed, (0, 2, 16));
+    }
+
+    #[test]
+    fn blocking_classes_obey_their_own_admission_budgets() {
+        let config = Config {
+            storage: PoolLimits {
+                workers: 1,
+                queue: 1,
+                bytes: 1,
+            },
+            network: PoolLimits {
+                workers: 1,
+                queue: 1,
+                bytes: 2,
+            },
+            cpu: PoolLimits {
+                workers: 1,
+                queue: 1,
+                bytes: 3,
+            },
+            ..Config::for_cores(1)
+        };
+        let rt = Threads::configured(config);
+        for (class, bytes) in [
+            (BlockingClass::Storage, 1),
+            (BlockingClass::Network, 2),
+            (BlockingClass::Cpu, 3),
+        ] {
+            let (sent, received) = std::sync::mpsc::channel();
+            block_on(rt.spawn_blocking(class, bytes, Box::new(move || sent.send(()).unwrap())))
+                .unwrap();
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(
+                block_on(rt.spawn_blocking(class, bytes + 1, Box::new(|| panic!("oversized"))))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -627,7 +686,7 @@ mod tests {
         rt.shutdown();
         assert_eq!(block_on(rx), None::<()>);
         assert!(lock(&rt.workers).threads.is_empty());
-        for pool in &rt.blocking {
+        for pool in rt.blocking.all() {
             let state = lock(&pool.state);
             assert_eq!((state.workers, state.starting, state.bytes), (0, 0, 0));
             assert!(state.closed && state.queue.is_empty());
@@ -732,7 +791,7 @@ mod tests {
                 .is_pending()
         );
         drop(pending);
-        assert!(lock(&rt.blocking[2].state).waiters.is_empty());
+        assert!(lock(&rt.blocking.cpu.state).waiters.is_empty());
         assert!(block_on(rt.spawn_blocking(BlockingClass::Cpu, 11, Box::new(|| {}))).is_err());
         gate.open();
         block_on(crate::unblock_with(&rt, BlockingClass::Cpu, 10, || ()));
@@ -751,7 +810,7 @@ mod tests {
             let config = Config::for_cores(cores);
             let expected = config.cpu.workers.min(config.cpu.bytes / bytes);
             let runtime = Threads::configured(config);
-            let pool = &runtime.blocking[BlockingClass::Cpu as usize];
+            let pool = &runtime.blocking.cpu;
             assert_eq!(lock(&pool.state).workers, 0, "no workers before demand");
             let gate = Arc::new(Gate::default());
             let (entered, running) = std::sync::mpsc::channel();

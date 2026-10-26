@@ -35,7 +35,9 @@ pub fn find_bash(search: Option<&str>) -> Option<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecordedIdentity(pub u32);
 
-const MAX_MEMBERS: usize = 4096;
+// Each observation opens at most this many native exit registrations. Once
+// any watched member exits, the next observation discovers the remaining group.
+const EXIT_WATCH_BATCH: usize = 64;
 
 impl RecordedIdentity {
     /// Whether any process of the group is still alive. A group we may not
@@ -113,11 +115,6 @@ impl ProcessLease {
                 });
             }
             let members = self.id.members();
-            if members.len() > MAX_MEMBERS {
-                return Err(io::Error::other(
-                    "process group exceeds supervision capacity",
-                ));
-            }
             Ok(members
                 .into_iter()
                 .filter(|pid| *pid != self.child.id() || !self.child.exited())
@@ -129,7 +126,8 @@ impl ProcessLease {
         }
     }
 
-    /// Opens exit notifications only for members verified under this live lease.
+    /// Opens a bounded batch of exit notifications under this live lease.
+    /// Observe again after an exit to cover groups of any size.
     pub fn exit_watches(&self) -> io::Result<Vec<ExitWatch>> {
         let mut watches = Vec::new();
         for pid in self.members()? {
@@ -139,6 +137,9 @@ impl ProcessLease {
             let watch = imp::member_watch(&self.handle, pid);
             if let Some(watch) = watch? {
                 watches.push(watch);
+                if watches.len() == EXIT_WATCH_BATCH {
+                    break;
+                }
             }
         }
         Ok(watches)
@@ -197,7 +198,7 @@ impl InheritedNumber {
 
     /// Duplicates through the OS before constructing an owner. The original
     /// number may belong to another Rust owner and is never closed here.
-    /// Both descriptors are close-on-exec so tools cannot retain daemon locks.
+    /// Both resources stop being inheritable so tools cannot retain daemon locks.
     pub fn duplicate(self) -> io::Result<File> {
         imp::duplicate(self.0)
     }
@@ -693,7 +694,6 @@ mod imp {
         };
         dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
             .filter(|pid| member(pid) == Some(true))
-            .take(super::MAX_MEMBERS + 1)
             .collect()
     }
 
@@ -718,13 +718,6 @@ mod imp {
             if count < pids.len() {
                 pids.truncate(count);
                 return pids.into_iter().filter_map(|p| p.try_into().ok()).collect();
-            }
-            if pids.len() > super::MAX_MEMBERS {
-                return pids
-                    .into_iter()
-                    .take(super::MAX_MEMBERS + 1)
-                    .filter_map(|p| p.try_into().ok())
-                    .collect();
             }
             pids.resize(pids.len() * 2, 0);
         }
@@ -952,6 +945,32 @@ mod tests {
                 .unwrap();
             assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), id);
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn exit_watch_batches_never_limit_group_membership() {
+        use std::io::BufRead;
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "i=0; while [ \"$i\" -lt {} ]; do sleep 30 & i=$((i+1)); done; echo ready; read _",
+                EXIT_WATCH_BATCH + 1,
+            ),
+        ]);
+        let (mut child, input, output) = spawn_stdio(&mut cmd).unwrap();
+        let mut ready = String::new();
+        io::BufReader::new(output).read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let members = child.group.members().unwrap();
+        let watches = child.group.exit_watches().unwrap();
+        assert!(members.len() > EXIT_WATCH_BATCH);
+        assert_eq!(watches.len(), EXIT_WATCH_BATCH);
+        assert!(child.group.alive());
+        child.group.signal(Signal::Kill).unwrap();
+        child.wait().unwrap();
+        drop(input);
     }
 
     #[test]

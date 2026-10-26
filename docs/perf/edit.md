@@ -10,7 +10,7 @@ even if another directory writer substitutes the public staging name. Restrictiv
 macOS staging ACLs are established before content is written. The source mode,
 owner and access policy are restored before publication; a preservation failure
 aborts the transaction. Linux xattrs, macOS xattrs/resource forks and Windows
-alternate streams count toward the byte bound and observe cancellation while
+alternate streams share the transaction size policy and observe cancellation while
 copying. Windows copies the source security policy and streams natively.
 
 The final check compares identity, content and preserved metadata. Linux uses
@@ -67,5 +67,18 @@ records publish relative to that directory handle. The reconstructible record
 needs no persistence barrier. General-purpose private saves still establish
 restrictive staging ACLs for arbitrary parent directories.
 
-No dependencies are added by this publication design. Native syscalls use the
-existing rustix/libc and windows-sys dependencies; all unsafe code stays in sys.
+Capture and transformed output use private temporary files from `tempfile`,
+which already supplies the repository's temporary-file lifecycle in tests. It
+handles native deletion and permissions without a new cleanup protocol. Native
+publication still uses rustix/libc and windows-sys; all unsafe code stays in sys.
+
+The edit tool imposes no file-size or matching-work ceiling. Capture, hashing,
+UTF-8 validation, exact matching, content comparison and publication stream
+through fixed buffers. The matcher uses `memchr` with an overlap window
+proportional to the supplied `old`, including overlapping occurrences. Worker reservations account for
+replacement arguments and the overlap window rather than the file's size. The
+detailed formatter retains at most 256 KiB of source text under its existing work
+budget; larger sources retain line counts with the bounded `[diff cut]` display.
+Output size does not determine whether a diff is formatted. The filesystem
+transaction owns any caller-requested size policy for capture and publication;
+the edit tool requests no file-size ceiling.

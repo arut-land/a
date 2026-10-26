@@ -12,11 +12,15 @@ fn publication_child() {
     let exchange = std::env::var_os("A_EDIT_PUBLICATION_EXCHANGE").as_deref()
         == Some(std::ffi::OsStr::new("1"));
     let conflict = std::env::var_os("A_EDIT_PUBLICATION_CONFLICT").is_some();
-    let transaction = EditTransaction::capture(&target, 1024).unwrap();
+    let transaction = EditTransaction::capture(&target, Some(1024)).unwrap();
     publication_step("captured");
     let result = transaction.publish_with_sync(
         b"new",
-        cfg!(unix),
+        if cfg!(unix) {
+            Persistence::Durable
+        } else {
+            Persistence::Visible
+        },
         File::sync_all,
         &|_| false,
         exchange,

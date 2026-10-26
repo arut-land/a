@@ -232,6 +232,7 @@ mod tests {
             [
                 "bash",
                 "edit",
+                "read",
                 #[cfg(feature = "search")]
                 "glob",
                 #[cfg(feature = "search")]
@@ -255,7 +256,7 @@ mod tests {
                 ("fork", 1),
                 ("prompt", 1),
                 ("shell", 1),
-                ("edit", 4),
+                ("edit", 5),
                 #[cfg(feature = "mcp")]
                 ("mcp", 1),
                 #[cfg(feature = "index")]
@@ -312,7 +313,7 @@ mod tests {
             ("loop", &[], 0),
             ("prompt", &[], 1),
             ("shell", &["bash"], 1),
-            ("edit", &["edit"], 1),
+            ("edit", &["edit", "read"], 1),
             ("retry", &[], 0),
             ("settings", &[], 0),
             ("skills", &["skill"], 0),

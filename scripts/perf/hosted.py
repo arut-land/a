@@ -375,16 +375,18 @@ def sessions(source, output):
     """Build only the engine's measurements, then run the concurrent-session layouts."""
     env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
                CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
-    result = run(["cargo", "test", "--release", *STD, "-p", "engine", "--lib", "--no-run",
-                  "--message-format=json"], cwd=source, env=env, stdout=subprocess.PIPE, text=True)
-    executables = [record["executable"] for line in result.stdout.splitlines()
-                   if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
-    assert len(executables) == 1, executables
-    binary = output / ("engine-bench" + SUFFIX)
-    shutil.copy2(executables[0], binary)
+    binaries = []
+    for target, name in [(["-p", "engine", "--lib"], "engine-bench"), (["-p", "rt", "--test", "round_trip"], "rt-round-trip")]:
+        result = run(["cargo", "test", "--release", *STD, *target, "--no-run",
+                      "--message-format=json"], cwd=source, env=env, stdout=subprocess.PIPE, text=True)
+        executables = [record["executable"] for line in result.stdout.splitlines()
+                       if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
+        assert len(executables) == 1, executables
+        binaries.append(output / (name + SUFFIX))
+        shutil.copy2(executables[0], binaries[-1])
     os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
-    run([sys.executable, ROOT / "scripts/perf/sessions.py", binary, "--output", output / "sessions",
-         "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5")], cwd=source)
+    run([sys.executable, ROOT / "scripts/perf/sessions.py", binaries[0], "--round-trip", binaries[1],
+         "--output", output / "sessions", "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5")], cwd=source)
     (output / "sessions" / "host.json").write_text(json.dumps(dict(
         platform=platform.platform(), machine=platform.machine(), hardware=hardware(),
         revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),

@@ -7,13 +7,10 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, LazyLock};
-use std::task::{Context, Waker};
 use std::time::Duration;
 
-use protocol::{
-    Caps, ClientId, ClientMsg, DaemonMsg, Decode, Environment, MachineId, PROTO, Versions,
-};
-use rt::{BoxFuture, Rt, Runtime};
+use protocol::{Caps, ClientId, ClientMsg, DaemonMsg, Decode, Environment, MachineId, PROTO};
+use rt::{BoxFuture, Rt};
 use sys::{Home, Staged};
 
 use crate::{Connection, Daemon, Diagnosis, Error, Welcome};
@@ -48,7 +45,7 @@ pub trait Link: fmt::Debug + Send + Sync + 'static {
     }
 
     /// Why a daemon speaking `theirs` cannot serve `build`. Blocking.
-    fn mismatch(&self, build: &Staged, theirs: Versions) -> Error {
+    fn mismatch(&self, build: &Staged, theirs: u32) -> Error {
         let _ = build;
         Error::Mismatch {
             theirs,
@@ -248,14 +245,11 @@ impl Link for LocalLink {
     ) -> BoxFuture<'a, Result<Opened, Error>> {
         let home = self.0.clone();
         Box::pin(async move {
+            if start == Start::Replace {
+                crate::stop_async(rt, &home).await?;
+            }
             let (stream, started) =
-                rt::unblock_with(&**rt, rt::BlockingClass::Network, 64 << 10, move || {
-                    if start == Start::Replace {
-                        crate::stop(&home)?;
-                    }
-                    crate::connect_or_spawn(&home, start != Start::Reuse)
-                })
-                .await?;
+                crate::connect_or_spawn(rt, &home, start != Start::Reuse).await?;
             Ok(Opened {
                 within: if started {
                     crate::START_TIMEOUT
@@ -277,7 +271,7 @@ impl Link for LocalLink {
         Some(crate::diagnose(&self.0))
     }
 
-    fn mismatch(&self, build: &Staged, theirs: Versions) -> Error {
+    fn mismatch(&self, build: &Staged, theirs: u32) -> Error {
         let runtime = self.0.runtime();
         Error::Mismatch {
             theirs,
@@ -310,8 +304,8 @@ pub(crate) enum Greeting {
     /// The daemon's machine, and what holds an upgrade it waits for.
     Welcome(MachineId, Option<String>),
     Draining,
-    /// The daemon's versions.
-    Mismatch(Versions),
+    /// The daemon's exact protocol version.
+    Mismatch(u32),
 }
 
 /// Opens `link` and completes the hello, as `client` when it is named,
@@ -320,13 +314,13 @@ pub(crate) enum Greeting {
 /// we connect, or draining for a newer build (`on_drain` says so first),
 /// gets one more try each; a daemon that does not welcome the client acts
 /// on none of `first`, so each try sends it again.
-pub(crate) async fn connect(
+pub(crate) async fn connect<F: Future<Output = ()> + Send>(
     rt: &Rt,
     daemon: &Daemon,
     client: Option<ClientId>,
     start: Start,
     first: &(dyn Fn(Option<&Environment>) -> io::Result<Vec<ClientMsg>> + Sync),
-    on_drain: &(dyn Fn() + Sync),
+    on_drain: &(dyn Fn() -> F + Sync),
 ) -> Result<Connection, Error> {
     let (link, build) = (&daemon.link, &daemon.staged);
     let mut start = start;
@@ -384,7 +378,7 @@ pub(crate) async fn connect(
                 return Err(rt::unblock(&**rt, move || link.mismatch(&build, theirs)).await);
             }
             Ok((Greeting::Draining, ..)) => {
-                on_drain();
+                on_drain().await;
                 // One still draining past its grace is wedged.
                 rt::or(stream.drained(&mut buffered), async {
                     rt.sleep(crate::DRAIN_TIMEOUT).await;
@@ -421,7 +415,6 @@ pub(crate) async fn hello(
         .send(&ClientMsg::Hello {
             proto: PROTO,
             build: build.to_owned(),
-            min: Versions::OURS.min_field(),
             caps: Caps::ALL,
             client,
             machine,
@@ -466,8 +459,8 @@ pub(crate) async fn hello(
             Vec::new(),
             Vec::new(),
         )),
-        Some(DaemonMsg::Mismatch { supported, min }) => Ok((
-            Greeting::Mismatch(Versions::new(min, supported)),
+        Some(DaemonMsg::Mismatch { supported }) => Ok((
+            Greeting::Mismatch(supported),
             Welcome::default(),
             Vec::new(),
             Vec::new(),
@@ -478,39 +471,5 @@ pub(crate) async fn hello(
     }
 }
 
-/// The runtime the blocking API drives a link on: its caller's thread is
-/// already one that may block, so blocking work runs right there.
-pub(crate) static BLOCKING: LazyLock<Rt> = LazyLock::new(|| Arc::new(Inline));
-
-struct Inline;
-
-impl Runtime for Inline {
-    fn spawn(&self, mut task: BoxFuture<'static, ()>) {
-        // Most finish at once (a reaped child); the rest get a thread.
-        if task
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending()
-        {
-            std::thread::spawn(move || rt::block_on(task));
-        }
-    }
-
-    fn spawn_blocking(
-        &self,
-        _: rt::BlockingClass,
-        _: usize,
-        work: Box<dyn FnOnce() + Send>,
-    ) -> BoxFuture<'static, io::Result<()>> {
-        work();
-        Box::pin(std::future::ready(Ok(())))
-    }
-
-    fn spawn_flush(&self, work: Box<dyn FnOnce() + Send>) -> BoxFuture<'static, io::Result<()>> {
-        self.spawn_blocking(rt::BlockingClass::Storage, 0, work)
-    }
-
-    fn reactor(&self) -> rt::Reactor {
-        rt::Reactor::AsyncIo
-    }
-}
+/// The shared runtime behind the blocking SDK entry points.
+pub(crate) static BLOCKING: LazyLock<Rt> = LazyLock::new(|| Arc::new(rt::Threads::new(1)));

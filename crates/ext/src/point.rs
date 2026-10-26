@@ -41,7 +41,7 @@
 //! the rule catches it and answers for it as the point's [`OnError`] says,
 //! so the policy a point declares is the one applied, at every call,
 //! wherever the point is asked. The points are a closed set, declared
-//! once by [`points!`], which also makes the [`Hooks`] table that holds
+//! once by `points!`, which also makes the [`Hooks`] table that holds
 //! their handlers: a point cannot be added without its slot.
 
 use std::any::{Any, TypeId};

@@ -57,7 +57,8 @@ pub mod testing;
 mod tool;
 
 pub use agent::{
-    Action, Actions, Agent, AgentKind, Inheritance, Input, ModelOnly, actions_from_json,
+    Action, Actions, Agent, AgentKind, Inheritance, Input, ModelContract, ModelOnly,
+    actions_from_json,
 };
 pub use assemble::{Need, Provides};
 pub use ext::{DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};

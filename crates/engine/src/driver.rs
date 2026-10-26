@@ -27,14 +27,14 @@ use ext::host::{Binding, Bound, Host, Parts, Registry, SessionServices};
 use ext::point::View;
 use ext::{BoxFuture, Called, Cancel, Cx, Flag, States};
 use kernel::{
-    Admission, Core, Durability, Event, Guarded, Load, Note, Owner, Replied, Requirement, StepPlan,
-    Ticket, Work as Effect,
+    Admission, Core, Event, Guarded, Load, Note, Owner, Replied, Requirement, StepPlan, Ticket,
+    Work as Effect,
 };
 use protocol::ledger::Ledger;
 use protocol::view::SessionView;
 use protocol::{
     Activity, Author, Body, CallId, DaemonMsg, Entry, Environment, Frame, Json, Mode, Outcome,
-    ReadOnly, Residency, SessionId, SessionSummary, ToolChoice,
+    ReadOnly, Residency, SessionId, SessionSummary, ToolChoice, WaitOn,
 };
 use rt::BlockingClass::Cpu;
 use rt::{channel, oneshot, or};
@@ -50,7 +50,7 @@ use kernel::SideFact;
 mod journal;
 #[path = "projection.rs"]
 mod projection;
-use journal::Journal;
+use journal::{FlushMode, Journal};
 use projection::{Invocations, Projection};
 #[path = "work.rs"]
 mod work;
@@ -102,6 +102,10 @@ impl Shared {
                         let rt = Arc::clone(&self.rt);
                         Arc::new(move |task| rt.spawn(task))
                     },
+                    {
+                        let rt = Arc::clone(&self.rt);
+                        Arc::new(move |duration| rt.sleep(duration))
+                    },
                     Arc::new(move |work| {
                         let admitted = rt.spawn_blocking(Cpu, rt::STORAGE_BYTES, work);
                         rt.spawn(Box::pin(async move {
@@ -146,7 +150,7 @@ impl Shared {
             if Some(seq) != active && !ledger.untaken().iter().any(|q| q.seq == seq) {
                 continue;
             }
-            let id = &envelope.id;
+            let id = envelope.id();
             let entries = if let Some(live) = self
                 .daemon
                 .upgrade()
@@ -182,10 +186,10 @@ impl Shared {
                 return Ok(Owner::Gone);
             };
             let cancelled = if let Some(live) = slot.live() {
-                cancelled_watch(live.frames.entries()?, child)
+                cancelled_child(live.frames.entries()?, child)
             } else {
                 let seq = self.catalog.get(parent.session).map_or(0, |r| r.entries);
-                cancelled_watch(self.store.prefix(parent.session, seq)?, child)
+                cancelled_child(self.store.prefix(parent.session, seq)?, child)
             };
             if cancelled {
                 return Ok(Owner::Cancelled);
@@ -199,15 +203,29 @@ impl Shared {
     }
 }
 
-fn cancelled_watch(entries: impl IntoIterator<Item = Entry>, child: SessionId) -> bool {
+fn cancelled_child(entries: impl IntoIterator<Item = Entry>, child: SessionId) -> bool {
     let mut watch = None;
+    let mut link = None;
+    let mut caller = None;
     for entry in entries {
         match entry.body {
-            Body::Watch { child: watched } if watched == child => watch = Some(entry.seq),
-            Body::Fired {
-                watch: fired,
+            Body::Link { child: linked, .. } if linked == child => {
+                link = Some(entry.seq);
+                caller = None;
+            }
+            Body::Wait {
+                call,
+                on: WaitOn::Child { link: waiting },
+            } if link == Some(waiting) => caller = Some(call),
+            // An awaited child still delivers its outcome. Its waiting
+            // call's interrupted result proves the owner's cancellation.
+            Body::ToolResult {
+                call,
                 outcome: Outcome::Interrupted { .. },
-            } if watch == Some(fired) => return true,
+                ..
+            } if caller == Some(call) => return true,
+            Body::Watch { child: watched } if watched == child => watch = Some(entry.seq),
+            Body::Unwatch { watch: cancelled } if watch == Some(cancelled) => return true,
             _ => {}
         }
     }
@@ -714,7 +732,6 @@ impl Live {
         let load = Load {
             session: Some(header.id),
             abandoned: &abandoned,
-            boot: sys::boot_id(),
             fresh,
             owner,
             busy,
@@ -2047,9 +2064,6 @@ impl Actor {
         Ok(())
     }
 
-    /// Appends a burst once, then admits each effect against the prefix
-    /// and requirement declared by the kernel. Publication and unsafe
-    /// effects share an epoch while ordered work keeps making progress.
     /// An ephemeral turn's result entry ends its attempt's watch; one an
     /// interrupt wrote first, before the turn reported, settles the attempt
     /// it cut off, sent or not.
@@ -2076,12 +2090,15 @@ impl Actor {
         }
     }
 
+    /// Appends a burst once, then admits each effect against the prefix
+    /// and requirement declared by the kernel. Publication and unsafe
+    /// effects share an epoch while ordered work keeps making progress.
     async fn carry(&mut self, plan: StepPlan) -> Result<(), ()> {
         let StepPlan {
             mut appends,
             commit,
             immediate,
-            admitted,
+            admitted: mut after,
         } = plan;
         for entry in &mut appends {
             let call = match &entry.body {
@@ -2103,7 +2120,6 @@ impl Actor {
             }
             self.settle_ephemeral(entry);
         }
-        let mut after = admitted;
         let busy = immediate.iter().rev().find_map(|work| match work {
             Effect::MarkBusy(busy) => Some(*busy),
             _ => None,
@@ -2143,8 +2159,12 @@ impl Actor {
         let written = if let Some(commit) = commit {
             self.commit(
                 &mut appends,
-                commit.durability == Durability::Barrier,
-                flush,
+                commit.durability.into(),
+                if flush {
+                    FlushMode::Immediate
+                } else {
+                    FlushMode::Deferred
+                },
                 self.listing(busy.unwrap_or_else(|| self.live.has_work())),
             )
             .await
@@ -2161,14 +2181,11 @@ impl Actor {
             .await;
             return Err(());
         }
-        self.admissions.extend(
-            after
-                .into_iter()
-                .map(|Guarded { admission, work }| Guarded {
-                    admission,
-                    work: Admitted::Effect(work),
-                }),
-        );
+        self.admissions
+            .extend(after.into_iter().map(|guarded| Guarded {
+                admission: guarded.admission,
+                work: Admitted::Effect(guarded.work),
+            }));
         self.admit().await;
         if busy == Some(false) {
             self.effect(Effect::MarkBusy(false)).await;
@@ -2390,7 +2407,6 @@ impl Actor {
         self.publish();
         let load = Load {
             session: Some(self.live.id),
-            boot: sys::boot_id(),
             busy: self.live.has_work(),
             abandoned: &abandoned,
             owner,
@@ -2532,8 +2548,6 @@ impl Actor {
                     );
                 }
             }
-            // A replayed process number carries no live OS ownership.
-            Effect::Kill { .. } => {}
             Effect::EndStream { stream, cut } => self.end_stream(stream, cut),
             Effect::DiscardStream { stream } => {
                 let store = Arc::clone(&shared.blobs);

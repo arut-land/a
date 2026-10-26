@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 
 use serde_json::{Value, json};
 
-use super::encode::{NO_OUTPUT, RESULT_IMAGES, contents, drop_finished_signatures};
+use super::encode::{NO_OUTPUT, contents, drop_finished_signatures};
 use super::*;
 use crate::json::Lenient;
 use crate::protocol::KeyStyle;

@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_LOCK_VIOLATION, ERROR_NO_DATA,
-    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, WAIT_TIMEOUT,
+    ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_CONNECTED,
+    ERROR_PIPE_NOT_CONNECTED, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
@@ -360,7 +360,7 @@ pub fn connect(path: &Path, _discovery: &Path) -> io::Result<Stream> {
     let mut owner = OpenOptions::new().read(true).write(true).open(path)?;
     match crate::fs::try_lock(&owner) {
         Ok(()) => return Err(io::ErrorKind::NotFound.into()),
-        Err(error) if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION.cast_signed()) => {}
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
         Err(error) => return Err(error),
     }
     let mut text = String::new();

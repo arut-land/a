@@ -245,10 +245,12 @@ const GIVE_BACK: Duration = Duration::from_millis(500);
 /// keep the client alive past a SIGTERM.
 fn end(signal: Signal) -> ! {
     let (given, wait) = mpsc::channel();
+    // thread-exception: terminal-giveback
     thread::spawn(move || {
         restore();
         let _ = given.send(());
     });
+    // thread-exception: terminal-deadline
     let _ = wait.recv_timeout(GIVE_BACK);
     sys::terminal::restore();
     sys::reraise(signal)
@@ -264,6 +266,7 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) -> Control {
     let mut reader = InputReader::new(signals);
     let control = Control::new(reader.control());
     let input_control = control.clone();
+    // thread-exception: terminal-input
     thread::spawn(move || {
         let mut decoder = Decoder::default();
         let mut buf = [0; 4096];

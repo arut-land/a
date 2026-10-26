@@ -9,20 +9,14 @@ use std::sync::{Mutex, PoisonError};
 
 use protocol::SessionId;
 
-/// Grants the leases on sessions' logs.
-pub trait LeaseAuthority: Send + Sync {
-    /// The epoch of a lease on session `id` newer than every one granted
-    /// before and than `floor`, the newest the log holds.
-    fn acquire(&self, id: SessionId, floor: u32) -> u32;
-}
-
 /// Leases granted in this process: enough while one daemon, holding the
 /// daemon lock, is the only process writing its sessions.
 #[derive(Default)]
 pub struct Local(Mutex<HashMap<SessionId, u32>>);
 
-impl LeaseAuthority for Local {
-    fn acquire(&self, id: SessionId, floor: u32) -> u32 {
+impl Local {
+    /// Grants an epoch newer than every previous lease and the log’s `floor`.
+    pub fn acquire(&self, id: SessionId, floor: u32) -> u32 {
         let mut granted = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let newest = granted.entry(id).or_default();
         *newest = (*newest).max(floor).saturating_add(1);

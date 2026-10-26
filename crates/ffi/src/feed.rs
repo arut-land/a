@@ -25,27 +25,36 @@ const BUDGET: client::QueueBudget = client::QueueBudget {
     control_reserve: 0,
 };
 
-impl ChangeBatch {
-    #[allow(unexpected_cfgs)]
-    fn retained_bytes(&self) -> usize {
-        #[cfg(not(boltffi_metadata))]
-        {
-            use boltffi::__private::wire::WireEncode;
-            self.wire_size()
+macro_rules! retained_bytes {
+    ($ty:ty) => {
+        impl $ty {
+            #[allow(unexpected_cfgs)]
+            fn retained_bytes(&self) -> usize {
+                #[cfg(not(boltffi_metadata))]
+                {
+                    use boltffi::__private::wire::WireEncode;
+                    self.wire_size()
+                }
+                // The binding scanner omits generated codecs and never executes this code.
+                #[cfg(boltffi_metadata)]
+                {
+                    0
+                }
+            }
         }
-        // The binding scanner omits generated codecs and never executes this code.
-        #[cfg(boltffi_metadata)]
-        {
-            0
-        }
-    }
+    };
 }
+
+retained_bytes!(ChangeBatch);
+retained_bytes!(crate::DisplayItem);
 
 pub(crate) struct Feed {
     pub client: SessionClient,
     rev: u64,
     bytes: usize,
-    pub retained_bytes: usize,
+    // Raw transcript items and the display payload Swift retains are distinct.
+    item_bytes: Vec<usize>,
+    payload_bytes: usize,
     recent: VecDeque<ChangeBatch>,
     producer: StreamProducer<ChangeBatch>,
 }
@@ -56,7 +65,8 @@ impl Feed {
             client,
             rev: 0,
             bytes: 0,
-            retained_bytes: 0,
+            item_bytes: Vec::new(),
+            payload_bytes: 0,
             recent: VecDeque::with_capacity(BUDGET.requests),
             producer: StreamProducer::new(BUFFER),
         }
@@ -67,6 +77,50 @@ impl Feed {
     }
 
     fn publish(&mut self, changes: Vec<ViewChange>) {
+        for change in &changes {
+            match change {
+                ViewChange::Attached { reset: true, .. } | ViewChange::Snapshot { .. } => {
+                    self.item_bytes = self
+                        .client
+                        .view()
+                        .items
+                        .iter()
+                        .map(|item| {
+                            serde_json::to_vec(item)
+                                .expect("view item serializes")
+                                .len()
+                                + crate::DisplayItem::in_view(item, self.client.view())
+                                    .retained_bytes()
+                        })
+                        .collect();
+                    self.payload_bytes = self.item_bytes.iter().sum();
+                }
+                ViewChange::Added {
+                    index,
+                    item: display,
+                }
+                | ViewChange::Updated {
+                    index,
+                    item: display,
+                } => {
+                    let index = *index as usize;
+                    if let Some(item) = self.client.view().items.get(index) {
+                        let bytes = serde_json::to_vec(item)
+                            .expect("view item serializes")
+                            .len()
+                            + display.retained_bytes();
+                        if matches!(change, ViewChange::Updated { .. }) {
+                            self.payload_bytes -= self.item_bytes[index];
+                            self.item_bytes[index] = bytes;
+                        } else {
+                            self.item_bytes.insert(index, bytes);
+                        }
+                        self.payload_bytes += bytes;
+                    }
+                }
+                _ => {}
+            }
+        }
         self.rev += 1;
         let view = self.client.view();
         let mut update = ChangeBatch {
@@ -74,11 +128,13 @@ impl Feed {
             seq: view.seq,
             changes,
             turn: self.client.turn().into(),
-            streaming: view.streaming.as_ref().map(|s| s.call.get()),
+            streaming: view.streaming.as_ref().map(|s| crate::StreamId {
+                call: s.call.get(),
+                attempt: s.attempt,
+            }),
             title: view.side(TITLE).map(str::to_owned),
         };
         let mut bytes = update.retained_bytes();
-        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
         if bytes > BUDGET.bytes / BUFFER {
             self.recent.clear();
             self.bytes = 0;
@@ -97,6 +153,20 @@ impl Feed {
         }
         self.bytes += bytes;
         self.recent.push_back(update);
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.payload_bytes
+            + serde_json::to_vec(&self.client.view().state)
+                .expect("view state serializes")
+                .len()
+            + self.bytes
+            + self
+                .client
+                .view()
+                .streaming
+                .as_ref()
+                .map_or(0, |s| s.text.len() * 2)
     }
 
     pub fn details(&self, key: u64) -> Option<String> {
@@ -249,6 +319,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retained_payload_releases_replaced_views_and_evicted_updates() {
+        let reducer = Reducer::new();
+        let message = DaemonMsg::Entry(protocol::Entry::new(
+            protocol::Seq::new(1).unwrap(),
+            protocol::Epoch(0),
+            protocol::Body::Assistant {
+                text: "x".repeat(1 << 20),
+            },
+        ));
+        reducer
+            .fold(&serde_json::to_string(&message).unwrap())
+            .unwrap();
+        assert!(lock(&reducer.feed).retained_bytes() >= 2 << 20);
+        let empty =
+            DaemonMsg::Snapshot(Box::new(protocol::view::SessionView::default().snapshot()));
+        reducer
+            .fold(&serde_json::to_string(&empty).unwrap())
+            .unwrap();
+        let mut feed = lock(&reducer.feed);
+        for _ in 0..BUDGET.requests * 2 {
+            feed.publish(vec![ViewChange::Error {
+                message: "x".repeat(16 << 10),
+            }]);
+        }
+        let retained = feed.retained_bytes();
+        assert!(retained <= BUDGET.bytes);
+        for _ in 0..BUDGET.requests * 2 {
+            feed.publish(vec![ViewChange::Error {
+                message: "x".repeat(16 << 10),
+            }]);
+        }
+        assert_eq!(
+            feed.retained_bytes(),
+            retained,
+            "lifetime traffic is not retained payload"
+        );
+        for _ in 0..BUDGET.requests * 2 {
+            feed.publish(vec![ViewChange::Activity]);
+        }
+        assert!(feed.retained_bytes() < 128 << 10);
+    }
+
+    #[test]
     fn oversized_updates_force_a_snapshot_instead_of_retaining_payload_copies() {
         let mut feed = Feed::new(SessionClient::new(client::Env::Keep));
         let stream = feed.subscribe();
@@ -334,6 +447,56 @@ mod display_tests {
                 updates: vec![batch]
             }
         );
+    }
+
+    #[test]
+    fn retained_state_and_rendered_text_survive_update_eviction_and_snapshots() {
+        for annotation in [false, true] {
+            let reducer = Reducer::new();
+            fold(&reducer, 1, tool());
+            let text = "€".repeat(128 << 10);
+            fold(
+                &reducer,
+                2,
+                if annotation {
+                    Body::Fact {
+                        fact: ExtensionFact::Annotation(Annotation {
+                            target: CallId::new(1).unwrap(),
+                            lifetime: AnnotationLifetime::Call,
+                            card: Card {
+                                body: text.clone(),
+                                ..Card::default()
+                            },
+                        }),
+                    }
+                } else {
+                    Body::Progress {
+                        call: CallId::new(1).unwrap(),
+                        text: text.clone(),
+                    }
+                },
+            );
+            {
+                let mut feed = lock(&reducer.feed);
+                for _ in 0..BUDGET.requests * 2 {
+                    feed.publish(vec![ViewChange::Activity]);
+                }
+                assert!(feed.retained_bytes() >= text.len() * 2);
+                assert!(feed.bytes < 128 << 10);
+            }
+            let snapshot =
+                DaemonMsg::Snapshot(Box::new(lock(&reducer.feed).client.view().snapshot()));
+            reducer
+                .fold(&serde_json::to_string(&snapshot).unwrap())
+                .unwrap();
+            assert!(lock(&reducer.feed).retained_bytes() >= text.len() * 2);
+            let empty =
+                DaemonMsg::Snapshot(Box::new(protocol::view::SessionView::default().snapshot()));
+            reducer
+                .fold(&serde_json::to_string(&empty).unwrap())
+                .unwrap();
+            assert!(lock(&reducer.feed).retained_bytes() < 128 << 10);
+        }
     }
 
     #[test]

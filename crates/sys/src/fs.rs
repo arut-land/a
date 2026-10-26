@@ -387,7 +387,7 @@ fn create_directory(dir: &Path, existing: bool) -> io::Result<()> {
         };
         // A unique sibling avoids sharing staging state with another creator.
         // WRITE_THROUGH publishes the directory before files beneath it commit.
-        let result = move_file(&pending, dir, false, true);
+        let result = move_file(&pending, dir, Replacement::Forbid, Persistence::Durable);
         if result.is_err() {
             let _ = fs::remove_dir(&pending);
         }
@@ -489,31 +489,44 @@ impl PrivateDirectory {
     }
 }
 
+/// Whether publication requests persistence barriers after making bytes visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Persistence {
+    Visible,
+    Durable,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Replacement {
+    Allow,
+    Forbid,
+}
+
 /// Replaces `path` with `bytes`, readable only by this user, so a reader
 /// sees the old file or the new one, never a torn or world-readable one.
 /// No persistence barrier is requested; configuration uses `write_private_durable`.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    save_private(path, |file| file.write_all(bytes), false)
+    save_private(path, |file| file.write_all(bytes), Persistence::Visible)
 }
 
-/// As [`write_private`], the content written by `write` as it goes: a
-/// large derived file (a search index) is never whole in memory.
+/// As [`write_private`], streaming the content without holding it whole.
 pub fn write_private_with(
     path: &Path,
     write: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
-    save_private(path, write, false)
+    save_private(path, write, Persistence::Visible)
 }
 
 /// Saves configuration with file and namespace persistence barriers.
 pub fn write_private_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    save_private(path, |file| file.write_all(bytes), true)
+    save_private(path, |file| file.write_all(bytes), Persistence::Durable)
 }
 
 fn save_private(
     path: &Path,
     write: impl FnOnce(&mut File) -> io::Result<()>,
-    durable: bool,
+    persistence: Persistence,
 ) -> io::Result<()> {
     let dir = path
         .parent()
@@ -532,20 +545,20 @@ fn save_private(
         #[cfg(target_vendor = "apple")]
         edit::access_acl(None, &file)?;
         write(&mut file)?;
-        if durable {
+        if persistence == Persistence::Durable {
             file.sync_all()?;
         }
         Ok(())
     })();
     drop(file);
     let written = written.and_then(|()| {
-        if durable {
+        if persistence == Persistence::Durable {
             publish(&tmp, path)
         } else {
             #[cfg(unix)]
             return replace(&tmp, path);
             #[cfg(windows)]
-            move_file(&tmp, path, true, false)
+            move_file(&tmp, path, Replacement::Allow, Persistence::Visible)
         }
     });
     if written.is_err() {
@@ -559,11 +572,16 @@ pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(unix)]
     return fs::rename(from, to);
     #[cfg(windows)]
-    move_file(from, to, true, true)
+    move_file(from, to, Replacement::Allow, Persistence::Durable)
 }
 
 #[cfg(windows)]
-fn move_file(from: &Path, to: &Path, replacing: bool, durable: bool) -> io::Result<()> {
+fn move_file(
+    from: &Path,
+    to: &Path,
+    replacing: Replacement,
+    persistence: Persistence,
+) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
@@ -579,11 +597,15 @@ fn move_file(from: &Path, to: &Path, replacing: bool, durable: bool) -> io::Resu
         MoveFileExW(
             from.as_ptr(),
             to.as_ptr(),
-            (if replacing {
+            (if replacing == Replacement::Allow {
                 MOVEFILE_REPLACE_EXISTING
             } else {
                 0
-            }) | if durable { MOVEFILE_WRITE_THROUGH } else { 0 },
+            }) | if persistence == Persistence::Durable {
+                MOVEFILE_WRITE_THROUGH
+            } else {
+                0
+            },
         )
     })
 }
@@ -613,7 +635,7 @@ pub fn publish(from: &Path, to: &Path) -> io::Result<()> {
         )
     }
     #[cfg(windows)]
-    move_file(from, to, true, true)
+    move_file(from, to, Replacement::Allow, Persistence::Durable)
 }
 
 /// Removes the durable name before best-effort reclamation of its contents.
@@ -635,7 +657,7 @@ pub fn publish_ordered(from: &Path, to: &Path) -> io::Result<()> {
         order_dir(to.parent().ok_or(io::ErrorKind::InvalidInput)?)
     }
     #[cfg(windows)]
-    move_file(from, to, false, true)
+    move_file(from, to, Replacement::Forbid, Persistence::Durable)
 }
 
 /// Makes `to` a read-only copy of `from`, sharing its storage where the
@@ -699,7 +721,7 @@ pub fn clone_file(from: &Path, staging: &Path, to: &Path) -> io::Result<()> {
             )
         }
         #[cfg(windows)]
-        move_file(&temporary, to, false, false)
+        move_file(&temporary, to, Replacement::Forbid, Persistence::Visible)
     })();
     // Gone once renamed; still ours after a failure or a link fallback.
     let _ = fs::remove_file(&temporary);
@@ -784,7 +806,7 @@ pub fn open_log(path: &Path, header: Option<&[u8]>) -> io::Result<(File, Publica
         file.write_all(header)?;
         file.sync_all()?;
         drop(file);
-        move_file(&pending, path, false, true)?;
+        move_file(&pending, path, Replacement::Forbid, Persistence::Durable)?;
     }
     let mut open = OpenOptions::new();
     open.read(true).append(true);
@@ -1326,7 +1348,15 @@ pub fn try_lock(file: &File) -> io::Result<()> {
     #[cfg(unix)]
     return file.try_lock().map_err(io::Error::from);
     #[cfg(windows)]
-    return windows_lock(file, true);
+    return windows_lock(file, true).map_err(|error| {
+        if error.raw_os_error()
+            == Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION.cast_signed())
+        {
+            io::Error::from(io::ErrorKind::WouldBlock)
+        } else {
+            error
+        }
+    });
 }
 
 /// Lets go of what [`lock`] took, the file kept open.
@@ -1405,7 +1435,10 @@ mod lock_tests {
         lock(&held).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"daemon identity");
         let other = File::options().read(true).write(true).open(&path).unwrap();
-        assert!(try_lock(&other).is_err());
+        assert_eq!(
+            try_lock(&other).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         drop(held);
         try_lock(&other).unwrap();
         drop(other);

@@ -255,6 +255,107 @@ cover every layout and session count.
   the sampler ends a turn on a failed call and counts it (`failed_calls`).
   The rerun had no stalls and no failed calls on any runner.
 
+## Reactor-driving workers (B1)
+
+**Not adopted.** Parking an async worker inside `async_io::block_on`
+removes a wakeup hop on some I/O events, but does not provide a reliable
+handoff of the reactor to another worker. The default workers continue to
+park through `rt::block_on`. There is no production `A_RT_PARK` switch.
+
+The candidate kept four workers and the shared fallback reactor thread,
+changing only how async workers waited. A and A2 both used the parked-worker
+baseline; `reactor` used the candidate. Twenty alternating rounds were
+requested at 1/8/32/128 sessions, with the same file-backed engine and real
+shell workload described above. A separate ignored `rt` round-trip test
+sent 5,000 loopback bytes per sample, paced by a 200 µs sleep, to find the
+workers parked before each event. Each sample used a fresh process.
+
+Hosted run [40216992716](https://github.com/arut-land/a/actions/runs/40216992716)
+measured revision `911937eb`. Its Linux context-switch counts read only the
+main thread and are invalid. Linux reruns
+[40232346328](https://github.com/arut-land/a/actions/runs/40232346328)
+(x64) and [40232348958](https://github.com/arut-land/a/actions/runs/40232348958)
+(ARM64), revision `63594c61`, sum live per-thread `/proc` counters instead;
+only these reruns supply Linux rows below. macOS uses native process
+accounting and Windows uses thread counters through psutil. Linux totals
+exclude threads already exited at the snapshot. The local M3 completed
+20 rounds. macOS hosted runs reached 18–19 rounds before the 150-minute
+step limit; Windows ARM supplied only three rounds and had an echoed-byte
+sample stall for more than 300 s. These incomplete runs are evidence
+against adoption, not full 20-round estimates. Windows CPU counters are
+quantised to about 15.6 ms.
+
+Values below are median paired differences, candidate minus A, with
+fixed-seed bootstrap 95% intervals (2,000 resamples). The A2 minus A column
+is the control band. Session rows use per-run delta p99 at 128 sessions;
+CPU and switches cover active turns, RSS is sampled after retirement.
+The pairs column counts B1 comparisons; A/A may have a different set of
+completed pairs, recorded in the CSV. Only completed matching rounds enter
+each estimate. Timeouts are excluded from latency estimates and remain
+failures; neither a timeout nor a
+truncated run establishes a latency bound. [All paired rows](runtime-reactor.csv)
+include both A/A and candidate comparisons at every session count, idle
+CPU/switches/threads, and round-trip CPU.
+
+| Runner | Pairs | A/A p99 ms | B1 p99 ms | B1 CPU ms | B1 switches | B1 idle RSS KiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| local M3 | 20 | -0.0448 [-0.0947, +0.0368] | -0.0132 [-0.0534, +0.0533] | -98.5 [-213, +215] | +1.02e+04 [+8.46e+03, +1.29e+04] | -80 [-304, +176] |
+| macos-15-intel | 17 | -0.123 [-0.298, +0.0558] | -0.0224 [-0.224, +0.324] | +902 [+836, +1.79e+03] | +1.19e+04 [+1.07e+04, +1.3e+04] | +32 [-64, +72] |
+| macos-latest | 17 | +0.0101 [-0.212, +0.0911] | -0.05 [-0.0911, +0.0995] | +391 [-268, +523] | +7.55e+03 [+7.13e+03, +7.7e+03] | +64 [-32, +176] |
+| ubuntu-24.04-arm | 19 | +0.0139 [-0.0331, +0.0597] | +0.0123 [-0.0198, +0.0396] | +110 [+70, +200] | +3.08e+03 [+1.02e+03, +4.38e+03] | -92 [-300, +352] |
+| ubuntu-latest | 19 | -0.00807 [-0.0325, +0.0059] | +0.0148 [-0.0102, +0.0305] | +130 [+90, +170] | +3.09e+03 [+2.34e+03, +3.78e+03] | -52 [-164, +456] |
+| windows-11-arm | 3 | -0.0291 [-0.3, +0.313] | +0.0966 [-0.146, +0.704] | -438 [-984, +78.1] | +3.27e+03 [+1.6e+03, +3.64e+03] | +44 [-8, +64] |
+| windows-latest | 20 | +0.00045 [-0.0278, +0.0304] | -0.0112 [-0.0421, +0.02] | -172 [-844, +78.1] | +1.46e+03 [+876, +2.08e+03] | -88 [-758, +458] |
+
+For the isolated echoed-byte test, A p99 is the baseline median in µs;
+the remaining columns are paired differences with the same intervals.
+
+| Runner | Pairs | A p99 µs | A/A p99 µs | B1 p99 µs | B1 switches |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| local M3 | 20 | 219 | -4.31 [-35, +22.6] | -15.5 [-32.3, +8.61] | -9.56e+03 [-1.02e+04, -9.13e+03] |
+| macos-15-intel | 19 | 551 | +7.27 [-10.2, +58.4] | -58.2 [-125, -18.5] | +1.86e+03 [+1.31e+03, +2.13e+03] |
+| macos-latest | 18 | 444 | -29.2 [-99.2, +34.3] | -26.3 [-158, +34.2] | +3.33e+03 [+2.66e+03, +4.06e+03] |
+| ubuntu-24.04-arm | 20 | 74.7 | +0.665 [-3.04, +2.3] | -10.1 [-12.1, -6.48] | -9.79e+03 [-9.8e+03, -9.79e+03] |
+| ubuntu-latest | 20 | 124 | +1.67 [-0.32, +3.48] | -18.4 [-20.4, -18] | -9.76e+03 [-9.77e+03, -9.75e+03] |
+| windows-11-arm | 3 | 149 | -3.1 [-10.1, -3] | +1.5e+04 [+1.5e+04, +1.5e+04] | -5.26e+03 [-5.39e+03, -4.99e+03] |
+| windows-latest | 20 | 180 | -2.85 [-10.5, -0.35] | +1.38e+03 [+5, +1.94e+03] | -1.21e+04 [-1.22e+04, -1.13e+04] |
+
+The local M3's median round-trip improves by about 10 µs at p50, but its
+p99 difference includes zero. Both corrected Linux reruns improve isolated
+round-trip p99 (x64 by 18.4 µs, ARM64 by 10.1 µs), but at 128 sessions add
+130/110 ms of active CPU and about 3,090/3,080 switches respectively. Each
+Linux rerun lost one baseline A/128 sample to a timeout after a client
+`WouldBlock` panic; ARM64 also lost one reactor/32 sample to the same
+failure. These missing samples reduce the corresponding pair counts.
+Session switches also increase on both hosted macOS runners and locally;
+Intel macOS also spends more active CPU. Session delta p99 does not show a
+consistent gain beyond the A/A band. Windows x64's paired round-trip p99
+rises by about 1.38 ms. Windows ARM's candidate round-trip p99 is 15.17 ms
+versus 149 µs for A, in addition to the stalled sample. Idle thread counts
+and memory do not show a consistent cost; those alone cannot justify
+adoption.
+
+The mechanism is visible in async-io 2.6.0's `src/driver.rs`. A `block_on`
+caller tries to acquire the shared reactor lock. Callers that fail park
+until their own task is notified. If the driving worker receives its own
+task notification, it leaves the reactor loop and drops the lock without
+waking a replacement driver. The explicit fallback-thread wake exists on
+the separate 500 µs fairness path, not on this own-task wake path. Meanwhile
+the dedicated async-io thread backs off with timed parks from 50 µs to
+10 ms while `block_on` callers exist. I/O can therefore wait for that
+thread's timeout even with parked workers available. On Windows those
+short sleeps can round to the OS timer resolution, matching the observed
+tail spikes. This explains the latency risk; it does not establish the
+cause of every stalled sample.
+
+Revisit only with an owned reactor over `polling` and explicit driver
+handoff: waking a worker for its task must transfer responsibility for
+I/O to another parked worker or the fallback driver. That belongs to the
+future `rt-edge-registration` / `win-iocp-direct` work. This branch retains
+only measurement tooling: echoed-byte timing, context-switch accounting,
+layout environments, and paired bootstrap reports. Production scheduling
+and extension boilerplate are unchanged.
+
 ## Acceptance and integration
 
 All six required invariants are exercised by name:

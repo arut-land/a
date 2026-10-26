@@ -331,10 +331,10 @@ impl Actor {
                     (!ledger.detached().iter().any(|d| d.call == *call)).then_some(*call)
                 }
                 Body::Enqueue { envelope }
-                    if envelope.id.purpose == protocol::EnvelopeId::DETACHED
-                        && envelope.source() == protocol::Source::Job(envelope.id.call) =>
+                    if envelope.id().purpose == protocol::EnvelopeId::DETACHED
+                        && envelope.source() == protocol::Source::Job(envelope.id().call) =>
                 {
-                    Some(envelope.id.call)
+                    Some(envelope.id().call)
                 }
                 _ => None,
             };

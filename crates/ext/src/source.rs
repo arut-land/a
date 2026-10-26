@@ -1,4 +1,4 @@
-//! Source preparation with injected inventory, capture and waiting operations.
+//! Source preparation with injected inventory and capture operations.
 use crate::Refused;
 
 /// Retry only unsettled observations and transient I/O, never rejected content.
@@ -24,20 +24,19 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// The window coalesces editor writes; it is not proof that a writer closed.
-/// Compare effective inputs, never notification counts: unrelated activity
+/// Two captures agreeing before compilation, and a third after it, are not
+/// proof that a writer closed: the quiet window that coalesces an editor's
+/// writes is the coordinator's, before it prepares. Compare effective inputs, never notification counts: unrelated activity
 /// must not prevent a settled source from making progress. Each capture must
 /// validate its reads; equality describes content, not native version churn.
 /// Callers arm watches before capture and retain every event delivered during
 /// preparation as pending work, including after rejection or retry. A later
-/// write's queued notification, not this quiet window, causes its next capture.
+/// write's queued notification, not the quiet window, causes its next capture.
 pub fn prepare<S: PartialEq, T>(
     mut capture: impl FnMut() -> Result<S, Error>,
-    mut wait: impl FnMut(&S),
     mut compile: impl FnMut(&S) -> Result<T, Refused>,
 ) -> Result<T, Error> {
     let before = capture()?;
-    wait(&before);
     if before != capture()? {
         return Err(Error::Retry(Refused(
             "sources changed during capture".into(),
@@ -63,13 +62,12 @@ mod tests {
             assert!(matches!(
                 prepare(
                     || Err::<u32, _>(Error::Retry(Refused("sharing violation".into()))),
-                    |_| {},
                     |_| Ok(()),
                 ),
                 Err(Error::Retry(_))
             ));
         }
-        assert_eq!(prepare(|| Ok(42), |_| {}, |value| Ok(*value)).unwrap(), 42);
+        assert_eq!(prepare(|| Ok(42), |value| Ok(*value)).unwrap(), 42);
     }
 
     #[test]
@@ -81,7 +79,6 @@ mod tests {
                     captures.set(captures.get() + 1);
                     Ok(42)
                 },
-                |_| {},
                 |_| Err::<(), _>(Refused("invalid".into())),
             )
             .is_err()

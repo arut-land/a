@@ -494,6 +494,13 @@ pub enum Source {
     Data {
         data: String,
     },
+    /// Bytes the caller holds (an image a tool read, kept as a blob), shared
+    /// rather than copied, and base64 only on the wire.
+    Bytes {
+        #[serde(serialize_with = "as_base64")]
+        #[cfg_attr(test, serde(deserialize_with = "from_base64"))]
+        data: Arc<[u8]>,
+    },
     Url {
         url: String,
     },
@@ -523,6 +530,52 @@ pub struct ToolCall {
     pub provider_executed: bool,
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
     pub meta: Meta,
+}
+
+fn as_base64<S: serde::Serializer>(data: &Arc<[u8]>, s: S) -> Result<S::Ok, S::Error> {
+    use base64::Engine as _;
+    s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(data))
+}
+
+#[cfg(test)]
+fn from_base64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Arc<[u8]>, D::Error> {
+    use base64::Engine as _;
+    let text = String::deserialize(d)?;
+    (base64::engine::general_purpose::STANDARD.decode(text))
+        .map(Into::into)
+        .map_err(serde::de::Error::custom)
+}
+
+/// A source as a wire carries it: inline as base64, by URL, or by a
+/// provider's file id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Carried<'a> {
+    Data(std::borrow::Cow<'a, str>),
+    Url(&'a str),
+    File(&'a str),
+}
+
+impl Source {
+    /// The source as a wire carries it. Bytes the caller holds are encoded
+    /// here, as a request is written, and nowhere before.
+    pub(crate) fn carried(&self) -> Carried<'_> {
+        use base64::Engine as _;
+        match self {
+            Self::Data { data } => Carried::Data(data.into()),
+            Self::Bytes { data } => Carried::Data(
+                base64::engine::general_purpose::STANDARD
+                    .encode(data)
+                    .into(),
+            ),
+            Self::Url { url } => Carried::Url(url),
+            Self::File { id } => Carried::File(id),
+        }
+    }
+
+    /// Whether the wire carries it inline, as base64 data.
+    pub(crate) const fn is_inline(&self) -> bool {
+        matches!(self, Self::Data { .. } | Self::Bytes { .. })
+    }
 }
 
 /// A call's arguments as a derived `Deserialize` reads them, buffered: a
