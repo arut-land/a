@@ -2,7 +2,8 @@
 
 use crate::support::{Isolated, TestProcess, deadline};
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -171,8 +172,12 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
     text.push_str("\n[ext.shell]\ntimeout = 1\n");
     fs::write(&config, text).unwrap();
     let older = older_build(&env);
-    let job = "$ (sleep 10; echo late) & echo now";
-    let ran = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", job]))
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let gate = format!("exec 3<>/dev/tcp/127.0.0.1/{port}; printf ready >&3; read -r reply <&3");
+    let job = format!("$ echo now; ({gate}; echo late) &");
+    let ran = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", &job]))
         .collect(deadline())
         .unwrap();
     assert!(
@@ -180,9 +185,11 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
         "{}",
         String::from_utf8_lossy(&ran.stderr)
     );
+    let mut job_release = child_at_gate(&listener);
     // Its client waits for the call's outcome, through the upgrade.
-    let call = "$ echo start; sleep 6; echo end; exit 7";
-    let waiting = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", call]));
+    let call = format!("$ echo start; {gate}; echo end; exit 7");
+    let waiting = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", &call]));
+    let mut call_release = child_at_gate(&listener);
     let detached = Instant::now() + Duration::from_secs(30);
     while !env
         .logs()
@@ -196,33 +203,46 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let older_pid = env.pid();
+    let older_build = env.home.runtime().current().unwrap();
     env.run(&["ls"]);
+    let successor = env.home.runtime().current().unwrap();
+    assert_ne!(successor, older_build);
+    let upgraded = deadline();
+    while !client::status(&env.home)
+        .is_ok_and(|status| status.is_some_and(|status| status.build == successor))
+    {
+        assert!(
+            Instant::now() < upgraded,
+            "the successor never took ownership"
+        );
+        env.run(&["ls"]);
+    }
     assert_eq!(
         env.pid() == older_pid,
         cfg!(unix),
         "where the newer build serves"
     );
-    // The daemon log is written behind the facts it records.
-    let ended = Instant::now() + Duration::from_secs(30);
-    let log = || fs::read_to_string(env.home.daemon_log()).unwrap_or_default();
-    // It is best effort: a fact may be lost under load, never made up.
-    while !log().contains(r#""handed_over":{"groups":2}"#) {
-        assert!(Instant::now() < ended, "{}", log());
-        std::thread::sleep(Duration::from_millis(100));
-    }
     let logged = |text: &str| {
         env.logs()
             .values()
             .any(|log| String::from_utf8_lossy(log).contains(text))
     };
+    assert!(!logged(r#""purpose":"job""#), "the gated job ended early");
+    assert!(
+        !logged(r#""purpose":"detached""#),
+        "the gated call ended early"
+    );
+    job_release.write_all(b"done\n").unwrap();
+    call_release.write_all(b"done\n").unwrap();
+    let ended = Instant::now() + Duration::from_secs(30);
     while !(logged(r#""purpose":"job""#) && logged(r#""purpose":"detached""#)) {
         assert!(Instant::now() < ended, "the work's ends never came");
         std::thread::sleep(Duration::from_millis(100));
     }
     let waited = waiting.collect(deadline()).unwrap();
     let said = String::from_utf8_lossy(&waited.stdout);
-    assert!(said.contains("start") && said.contains("end"), "{said}");
-    assert!(said.contains("exit"), "{said}");
+    assert!(said.contains(r#""output":"start\nend\n""#), "{said}");
+    assert!(said.contains(r#""exit":7"#), "{said}");
     let blobs = fs::read_dir(env.home.blobs_dir()).unwrap();
     let kept = (blobs.flatten())
         .filter(|fan| fan.file_name() != "open")
@@ -231,6 +251,36 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
         .flatten()
         .any(|blob| fs::read(blob.path()).is_ok_and(|bytes| bytes == b"now\nlate\n"));
     assert!(kept, "the job's output was not kept");
+    env.run(&["daemon", "stop"]);
+    let committed = env.logs();
+    env.run(&["ls"]);
+    assert_eq!(
+        env.logs(),
+        committed,
+        "the successor's outcomes were not durable"
+    );
+}
+
+fn child_at_gate(listener: &TcpListener) -> std::net::TcpStream {
+    let until = deadline();
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut bytes = [0; 5];
+                stream.read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes, b"ready");
+                return stream;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < until, "the child never reached its gate");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("accepting a gated child: {error}"),
+        }
+    }
 }
 
 #[test]

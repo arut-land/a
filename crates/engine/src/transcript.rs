@@ -1,8 +1,10 @@
 //! What a session's log says, read back for the model: the conversation
 //! it sees.
 
+#[cfg(test)]
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io;
 use std::sync::Arc;
 
 use ext::blob::Places;
@@ -32,12 +34,13 @@ pub struct Transcript {
     /// What is queued and not taken up, by seq: the model reads it once
     /// it is, where it is taken.
     waiting: HashMap<Seq, Waiting>,
-    /// The tool of each call the model made, by seq: what a result that
-    /// comes back from the background is named for.
+    /// Tools awaiting their final detached or job completion.
     tools: HashMap<CallId, String>,
     /// Calls that went on in the background: the result logged for one
     /// is a placeholder, and its outcome comes queued.
     detached: HashSet<CallId>,
+    /// Process groups can outlive a detached call's own completion.
+    jobs: HashSet<CallId>,
     /// The seq of the last entry that changed the messages.
     last: u64,
     /// The seq of the last entry folded: the transcript goes on from the
@@ -46,7 +49,7 @@ pub struct Transcript {
     registry: Arc<Registry>,
     /// How references are named for the model.
     places: Places,
-    /// The stream each call's result named, by call.
+    /// Streams awaiting their final detached or job completion.
     streams: HashMap<CallId, OutputStream>,
 }
 
@@ -266,7 +269,19 @@ impl Transcript {
         registry: Arc<Registry>,
         system: &str,
     ) -> Self {
-        Self::placed(entries, registry, system, &Places::default())
+        let entries: Vec<_> = entries.into_iter().collect();
+        Self::replay(
+            |each| {
+                for entry in &entries {
+                    each(entry.borrow());
+                }
+                Ok(())
+            },
+            registry,
+            system,
+            &Places::default(),
+        )
+        .expect("in-memory transcript replay cannot fail")
     }
 
     /// The transcript of `entries`, on `registry`, that `system` prompts,
@@ -275,25 +290,83 @@ impl Transcript {
     /// entry is what stands. References are named, and payloads held as
     /// blobs read, through `places`.
     pub fn placed(
-        entries: impl IntoIterator<Item = impl Borrow<Entry>>,
+        entries: &[Entry],
         registry: Arc<Registry>,
         system: &str,
         places: &Places,
     ) -> Self {
-        let entries: Vec<_> = entries.into_iter().collect();
-        let through = entries.last().map_or(0, |e| e.borrow().seq.get());
-        Self {
-            through,
-            ..project(
-                normalize(
-                    &entries.iter().map(Borrow::borrow).collect::<Vec<_>>(),
-                    false,
-                ),
-                registry,
-                system,
-                places,
-            )
-        }
+        Self::replay(
+            |each| {
+                for entry in entries {
+                    each(entry);
+                }
+                Ok(())
+            },
+            registry,
+            system,
+            places,
+        )
+        .expect("in-memory transcript replay cannot fail")
+    }
+
+    /// Replays a stable history twice, retaining edits and background call identities between passes.
+    pub(super) fn replay(
+        mut entries: impl FnMut(&mut dyn FnMut(&Entry)) -> io::Result<()>,
+        registry: Arc<Registry>,
+        system: &str,
+        places: &Places,
+    ) -> io::Result<Self> {
+        let mut edits = Vec::new();
+        let mut background = HashSet::new();
+        let mut jobs = HashSet::new();
+        entries(&mut |entry| {
+            if let Some(edit) = context_edit(entry) {
+                edits.push(edit);
+            }
+            match &entry.body {
+                Body::ToolProcess {
+                    call,
+                    background: true,
+                    ..
+                } => {
+                    background.insert(*call);
+                }
+                Body::Enqueue { envelope }
+                    if matches!(envelope.payload(), Carried::Job(_) | Carried::Detached(_)) =>
+                {
+                    background.insert(envelope.id().call);
+                    if matches!(envelope.payload(), Carried::Job(_)) {
+                        jobs.insert(envelope.id().call);
+                    }
+                }
+                _ => {}
+            }
+        })?;
+        let edits = Edits::new(edits);
+        let mut transcript = Self::empty(registry, system, places);
+        entries(&mut |entry| {
+            transcript.through = entry.seq.get();
+            match edits.at(entry.seq) {
+                Some((from, Some(text))) if from == entry.seq.get() => {
+                    transcript.apply_input(entry.seq, ContextValue::User(text.clone()), None);
+                }
+                Some(_) => {}
+                None => {
+                    if let Body::ToolCall {
+                        tool, id: Some(_), ..
+                    } = &entry.body
+                        && background.contains(&CallId(entry.seq))
+                    {
+                        transcript.tools.insert(CallId(entry.seq), tool.clone());
+                        if jobs.contains(&CallId(entry.seq)) {
+                            transcript.jobs.insert(CallId(entry.seq));
+                        }
+                    }
+                    transcript.apply(entry, None);
+                }
+            }
+        })?;
+        Ok(transcript)
     }
 
     fn empty(registry: Arc<Registry>, system: &str, places: &Places) -> Self {
@@ -307,6 +380,7 @@ impl Transcript {
             waiting: HashMap::new(),
             tools: HashMap::new(),
             detached: HashSet::new(),
+            jobs: HashSet::new(),
             last: 0,
             through: 0,
             registry,
@@ -325,6 +399,16 @@ impl Transcript {
                 let messages = project(image.image, Arc::clone(&self.registry), "", &self.places)
                     .into_context();
                 self.inherit(&messages, e.seq);
+            }
+        } else if let Body::ToolProcess {
+            call,
+            background: true,
+            ..
+        } = &e.body
+        {
+            self.jobs.insert(*call);
+            if let Some((_, tool)) = self.calls.get(call) {
+                self.tools.insert(*call, tool.clone());
             }
         } else if let Some(value) = context_fact(&e.body) {
             self.apply_input(e.seq, value, fresh);
@@ -403,7 +487,6 @@ impl Transcript {
                 }
             }
             ContextValue::ToolCall(id, tool) => {
-                self.tools.insert(CallId(seq), tool.clone());
                 self.calls.insert(CallId(seq), (id, tool));
                 return;
             }
@@ -427,6 +510,9 @@ impl Transcript {
             if let Held::Stream(stream) = held {
                 self.streams.insert(call, *stream);
             }
+        }
+        if self.detached.contains(&call) || self.streams.contains_key(&call) {
+            self.tools.insert(call, tool.clone());
         }
         let ext::Presented { output, error } = if self.detached.contains(&call) {
             let text = "[it goes on in the background; its result follows once it ends]";
@@ -486,6 +572,7 @@ impl Transcript {
             }
             ContextValue::Background(call, outcome, held) => self.background(call, &outcome, &held),
             ContextValue::Job(call, text, held) => {
+                self.jobs.remove(&call);
                 // Its stream, sealed as the group ended, is read as a blob.
                 let log = (self.name_held(&held).into_iter()).find_map(|placed| placed.at);
                 self.ended(call, None, &text, log)
@@ -539,22 +626,32 @@ impl Transcript {
             .collect()
     }
 
-    /// Where call `call`'s output streams, named by what its result held:
-    /// the session whose log holds the call, whoever projects it.
-    fn stream(&self, call: CallId) -> Option<String> {
-        Some(self.places.stream(*self.streams.get(&call)?))
-    }
-
     /// A call that went on in the background ended, as the model reads it:
     /// with its output, or with `note` about its end; its whole output at
     /// `log`, else where it streamed.
-    fn ended(&self, call: CallId, output: Option<&str>, note: &str, log: Option<String>) -> String {
-        let command = self.tools.get(&call).map_or("", String::as_str);
-        let stream = log.or_else(|| self.stream(call));
+    fn ended(
+        &mut self,
+        call: CallId,
+        output: Option<&str>,
+        note: &str,
+        log: Option<String>,
+    ) -> String {
+        let (command, stream) = if self.jobs.contains(&call) {
+            (
+                self.tools.get(&call).cloned(),
+                self.streams.get(&call).copied(),
+            )
+        } else {
+            (self.tools.remove(&call), self.streams.remove(&call))
+        };
+        let command = command.unwrap_or_default();
+        let stream = stream.map(|stream| self.places.stream(stream));
+        let stream = log.or(stream);
+        self.detached.remove(&call);
         let id = call.to_string();
         Tag::from(tag::BackgroundResult {
             call: &id,
-            command,
+            command: &command,
             exit: None,
             log: stream.as_deref(),
             output: output.or(Some(note)),
@@ -636,51 +733,86 @@ impl Transcript {
     }
 }
 
+fn context_edit(entry: &Entry) -> Option<(u64, u64, Option<String>)> {
+    match &entry.body {
+        Body::Edit {
+            target,
+            upto,
+            replace,
+        } => Some((
+            target.get(),
+            upto.unwrap_or(*target).get(),
+            replace.as_ref().and_then(|j| j.parse::<String>().ok()),
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 fn context_edits(
     entries: impl IntoIterator<Item = impl Borrow<Entry>>,
 ) -> Vec<(u64, u64, Option<String>)> {
     entries
         .into_iter()
-        .filter_map(|e| match &e.borrow().body {
-            Body::Edit {
-                target,
-                upto,
-                replace,
-            } => Some((
-                target.get(),
-                upto.unwrap_or(*target).get(),
-                replace.as_ref().and_then(|j| j.parse::<String>().ok()),
-            )),
-            _ => None,
-        })
+        .filter_map(|e| context_edit(e.borrow()))
         .collect()
+}
+
+/// Disjoint intervals select the latest edit, including edits of edit entries.
+struct Edits {
+    edits: Vec<(u64, u64, Option<String>)>,
+    spans: BTreeMap<u64, Option<usize>>,
+}
+
+impl Edits {
+    fn new(edits: Vec<(u64, u64, Option<String>)>) -> Self {
+        let mut events = BTreeMap::<u64, Vec<(usize, bool)>>::new();
+        for (index, (from, to, _)) in edits.iter().enumerate() {
+            if from > to {
+                continue;
+            }
+            events.entry(*from).or_default().push((index, true));
+            if let Some(end) = to.checked_add(1) {
+                events.entry(end).or_default().push((index, false));
+            }
+        }
+        let mut active = BTreeSet::new();
+        let mut spans = BTreeMap::new();
+        for (at, events) in events {
+            for (index, starts) in events {
+                if starts {
+                    active.insert(index);
+                } else {
+                    active.remove(&index);
+                }
+            }
+            spans.insert(at, active.last().copied());
+        }
+        Self { edits, spans }
+    }
+
+    fn at(&self, seq: Seq) -> Option<(u64, &Option<String>)> {
+        let index = self.spans.range(..=seq.get()).next_back()?.1.as_ref()?;
+        let (from, _, text) = &self.edits[*index];
+        Some((*from, text))
+    }
 }
 
 /// Edits stay in their owning layer; only inherited anchors are rebased.
 pub(crate) fn context_image(entries: &[Entry]) -> ContextImage {
-    normalize(&entries.iter().collect::<Vec<_>>(), true)
-}
-
-fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
-    let edits = context_edits(entries.iter().copied());
-    let completed = inherited.then(|| {
-        entries
-            .iter()
-            .filter_map(|e| match &e.body {
-                Body::ToolResult { call, .. } => Some(call.0),
-                Body::Take { input, .. } => Some(*input),
-                _ => None,
-            })
-            .collect::<HashSet<_>>()
-    });
+    let edits = Edits::new(entries.iter().filter_map(context_edit).collect());
+    let completed = entries
+        .iter()
+        .filter_map(|e| match &e.body {
+            Body::ToolResult { call, .. } => Some(call.0),
+            Body::Take { input, .. } => Some(*input),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     let mut image = vec![ContextLayer::default()];
     for e in entries {
-        let value = if let Some((from, _, text)) = edits
-            .iter()
-            .rev()
-            .find(|(from, to, _)| (*from..=*to).contains(&e.seq.get()))
-        {
-            if *from != e.seq.get() {
+        let value = if let Some((from, text)) = edits.at(e.seq) {
+            if from != e.seq.get() {
                 continue;
             }
             let Some(text) = text else {
@@ -710,17 +842,16 @@ fn normalize(entries: &[&Entry], inherited: bool) -> ContextImage {
             let Some(value) = context_fact(&e.body) else {
                 continue;
             };
-            if completed.as_ref().is_some_and(|done| {
-                matches!(
-                    value,
-                    ContextValue::ToolCall(..)
-                        | ContextValue::Queued(..)
-                        | ContextValue::Inbox(..)
-                        | ContextValue::Child(_)
-                        | ContextValue::Background(..)
-                        | ContextValue::Job(..)
-                ) && !done.contains(&e.seq)
-            }) {
+            if matches!(
+                value,
+                ContextValue::ToolCall(..)
+                    | ContextValue::Queued(..)
+                    | ContextValue::Inbox(..)
+                    | ContextValue::Child(_)
+                    | ContextValue::Background(..)
+                    | ContextValue::Job(..)
+            ) && !completed.contains(&e.seq)
+            {
                 continue;
             }
             value
@@ -744,7 +875,29 @@ fn project(
             places,
         );
         transcript.model_only = runner == RunnerKind::ModelOnly;
+        let jobs: HashSet<_> = inputs
+            .iter()
+            .filter_map(|ContextInput(_, value)| match value {
+                ContextValue::Job(call, ..) => Some(*call),
+                _ => None,
+            })
+            .collect();
+        let completions: HashSet<_> = inputs
+            .iter()
+            .filter_map(|ContextInput(_, value)| match value {
+                ContextValue::Job(call, ..) | ContextValue::Background(call, ..) => Some(*call),
+                _ => None,
+            })
+            .collect();
         for ContextInput(seq, value) in inputs {
+            if let ContextValue::ToolCall(_, tool) = &value
+                && completions.contains(&CallId(seq))
+            {
+                transcript.tools.insert(CallId(seq), tool.clone());
+                if jobs.contains(&CallId(seq)) {
+                    transcript.jobs.insert(CallId(seq));
+                }
+            }
             if let ContextValue::Inherited(child) = value {
                 transcript.inherit(
                     &inherited.remove(&child).expect("inherited scope reduced"),

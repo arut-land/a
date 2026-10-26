@@ -416,24 +416,30 @@ impl Actor {
         }
         let live = Arc::clone(&self.live);
         let view = self.projection.view.take();
-        let (view, frame) = rt::unblock_with(
+        let (view, frame) = rt::try_unblock_with(
             &*self.live.session.shared.rt,
             Cpu,
             rt::STORAGE_BYTES,
             move || {
-                let view = match view {
-                    Some(view) => view,
-                    None => SessionView::from_log(
+                let view = if let Some(view) = view {
+                    view
+                } else {
+                    let mut view = SessionView::from_log(
                         live.id,
                         protocol::HostPath::lossy(&live.workspace),
-                        live.frames.entries().ok()?,
-                    ),
+                        std::iter::empty::<Entry>(),
+                    );
+                    for batch in live.frames.batches_after(0) {
+                        view.extend(batch.ok()?);
+                    }
+                    view
                 };
                 let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view.snapshot()))).ok();
                 Some((view, frame))
             },
         )
-        .await?;
+        .await
+        .ok()??;
         self.projection.view = Some(view);
         self.projection.snapshot = Some((seq, frame.clone()));
         frame
@@ -455,7 +461,7 @@ impl Actor {
         let model_only = self.live.session.model_only();
         let places = self.live.session.blobs.places();
         let kept = self.projection.transcript.take();
-        let (transcript, messages) = rt::unblock_with(
+        let (transcript, messages) = rt::try_unblock_with(
             &*self.live.session.shared.rt,
             Cpu,
             rt::STORAGE_BYTES,
@@ -468,32 +474,64 @@ impl Actor {
                 // Each entry is read once: what was folded stays.
                 let transcript = if let Some(mut transcript) = kept {
                     let through = transcript.through();
-                    let after = frames.entries_after(through)?;
-                    for e in (after.iter().chain(&pending)).filter(|e| e.seq.get() > through) {
-                        transcript.apply(e, None);
+                    for batch in frames.batches_after(through) {
+                        for entry in batch? {
+                            transcript.apply(&entry, None);
+                        }
+                    }
+                    for entry in pending.iter().filter(|e| e.seq.get() > through) {
+                        transcript.apply(entry, None);
                     }
                     transcript
                 } else {
-                    let entries = frames.entries()?.into_iter().chain(pending.iter().cloned());
-                    Transcript::placed(entries, Arc::clone(&registry), system, &places)
+                    Transcript::replay(
+                        |each| {
+                            for batch in frames.batches_after(0) {
+                                for entry in batch? {
+                                    each(&entry);
+                                }
+                            }
+                            for entry in &pending {
+                                each(entry);
+                            }
+                            Ok(())
+                        },
+                        Arc::clone(&registry),
+                        system,
+                        &places,
+                    )?
                 };
                 if let Some(messages) = transcript.before(call.get()).cloned() {
                     return io::Result::Ok((transcript, messages));
                 }
-                let entries = frames.entries()?.into_iter().chain(pending);
-                let messages = Transcript::placed(
-                    entries.filter(|e| {
-                        e.seq < call.0 || matches!(e.body, Body::Context { .. } | Body::Edit { .. })
-                    }),
+                let messages = Transcript::replay(
+                    |each| {
+                        let mut before = |entry: &Entry| {
+                            if entry.seq < call.0
+                                || matches!(entry.body, Body::Context { .. } | Body::Edit { .. })
+                            {
+                                each(entry);
+                            }
+                        };
+                        for batch in frames.batches_after(0) {
+                            for entry in batch? {
+                                before(&entry);
+                            }
+                        }
+                        for entry in &pending {
+                            before(entry);
+                        }
+                        Ok(())
+                    },
                     Arc::clone(&registry),
                     system,
                     &places,
-                )
+                )?
                 .into_messages();
                 io::Result::Ok((transcript, messages))
             },
         )
-        .await?;
+        .await??;
         self.projection.transcript = Some(transcript);
         Ok(messages)
     }
@@ -503,6 +541,32 @@ impl Actor {
 mod tests {
     use super::*;
     use protocol::{Audience, Epoch, Json, Outcome, Seq};
+
+    #[test]
+    fn batched_snapshot_folding_matches_shared_view_vectors() {
+        use protocol::Decode as _;
+
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../protocol/tests/vectors/view.json")).unwrap();
+        for vector in vectors.as_array().unwrap() {
+            let mut view = SessionView::default();
+            for message in vector["messages"].as_array().unwrap() {
+                let message = DaemonMsg::from_json(message.to_string().as_bytes()).unwrap();
+                match message {
+                    DaemonMsg::Entry(entry) => view.extend([entry]),
+                    message => {
+                        view.fold(&message);
+                    }
+                }
+            }
+            assert_eq!(
+                format!("{:016x}", view.state_hash()),
+                vector["hash"].as_str().unwrap(),
+                "{}",
+                vector["name"]
+            );
+        }
+    }
 
     #[test]
     fn delegated_completion_identity_survives_checkpoints() {
