@@ -112,7 +112,7 @@ fn a_forced_steer_detaches_only_the_calls_that_can_go_on_in_the_background() {
         .log
         .iter()
         .find_map(|e| match &e.body {
-            Body::Enqueue { envelope } if envelope.id.purpose == EnvelopeId::DETACHED => {
+            Body::Enqueue { envelope } if envelope.id().purpose == EnvelopeId::DETACHED => {
                 Some((e.seq.get(), envelope.source()))
             }
             _ => None,
@@ -257,7 +257,7 @@ fn sealed(call: u64) -> BlobRef {
 fn queued(s: &Session) -> Vec<(protocol::Carried, Vec<Held>)> {
     (s.bodies().into_iter())
         .filter_map(|b| match b {
-            Body::Enqueue { envelope } => Some((envelope.payload.clone(), envelope.held.clone())),
+            Body::Enqueue { envelope } => Some((envelope.payload().clone(), envelope.held.clone())),
             _ => None,
         })
         .collect()
@@ -583,7 +583,7 @@ fn a_detached_calls_outcome_holds_what_its_result_would_have() {
     });
     let envelope = (s.bodies().into_iter())
         .find_map(|b| match b {
-            Body::Enqueue { envelope } if envelope.id.purpose == EnvelopeId::DETACHED => {
+            Body::Enqueue { envelope } if envelope.id().purpose == EnvelopeId::DETACHED => {
                 Some(envelope)
             }
             _ => None,

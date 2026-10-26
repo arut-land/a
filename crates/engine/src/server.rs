@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use protocol::{
     Author, Caps, ClientDecl, ClientId, ClientMsg, ClientSeq, DaemonMsg, Decode, Environment,
-    Frame, HomeSettings, MachineId, PROTO, Rejection, Role, SettingsChange, Versions,
+    Frame, HomeSettings, MachineId, PROTO, Rejection, Role, SettingsChange,
 };
 use rt::{Async, BoxFuture, Reactor};
 use sys::{Listener, OwnedConnection as Stream};
@@ -148,13 +148,20 @@ impl Frames {
                 self.buf.drain(..len);
                 return Ok(Some(msg));
             }
-            let at = self.buf.len();
-            self.buf.resize(at + (16 << 10), 0);
-            let read = &mut self.buf[at..];
-            let n = self.io.read_with(|mut s| s.read(read)).await;
-            self.buf.truncate(at + n.as_ref().map_or(0, |n| *n));
-            match n? {
-                0 if at == 0 => return Ok(None),
+            let n = self
+                .io
+                .read_with(|mut s| {
+                    // Scratch lives only while polling: an idle connection
+                    // retains received bytes, not a full read buffer. A direct
+                    // Vec read would retain the entire scratch allocation.
+                    let mut read = [0; 16 << 10];
+                    let n = s.read(&mut read)?;
+                    self.buf.extend_from_slice(&read[..n]);
+                    Ok(n)
+                })
+                .await?;
+            match n {
+                0 if self.buf.is_empty() => return Ok(None),
                 0 => return Err(io::ErrorKind::UnexpectedEof.into()),
                 _ => {}
             }
@@ -227,7 +234,7 @@ async fn upgrading(
     daemon: &Daemon,
     life: &Lifecycle,
     verdict: Verdict,
-    theirs: Versions,
+    theirs: u32,
 ) -> (Verdict, Option<String>) {
     if verdict != Verdict::Drain || life.draining().is_some() {
         return (verdict, None);
@@ -235,7 +242,7 @@ async fn upgrading(
     life.want();
     daemon.pulse.notify();
     let held = daemon.upgrade_held(life.runtime()).await;
-    let verdict = if held.is_some() && Versions::OURS.common(theirs).is_some() {
+    let verdict = if held.is_some() && theirs == PROTO {
         Verdict::Welcome
     } else {
         verdict
@@ -255,16 +262,15 @@ pub(crate) async fn handle_as(
         Some(ClientMsg::Hello {
             proto,
             build,
-            min,
             caps,
             client,
             machine,
         }) => {
-            let theirs = Versions::new(min, proto);
+            let theirs = proto;
             let caps = caps & Caps::SERVED;
             (life.verdict(theirs, &build), theirs, caps, client, machine)
         }
-        _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE, None, None),
+        _ => (Verdict::Mismatch, 0, Caps::NONE, None, None),
     };
     let (verdict, held) = upgrading(daemon, life, verdict, theirs).await;
     let outbox = Outbox::new();
@@ -278,8 +284,8 @@ pub(crate) async fn handle_as(
         async {
             // Whatever the client sent behind a hello that is not welcomed is read
             // and dropped, never acted on.
-            let result = match (verdict, Versions::OURS.common(theirs)) {
-                (Verdict::Welcome, Some(proto)) => match daemon.machine.id().await {
+            let result = match (verdict, theirs == PROTO) {
+                (Verdict::Welcome, true) => match daemon.machine.id().await {
                     Ok(ours) => {
                         let _registered = life.register(outbox.clone());
                         let mut conn = Conn {
@@ -298,7 +304,7 @@ pub(crate) async fn handle_as(
                         };
                         let registry = daemon.shared.registry.get();
                         conn.reply(&DaemonMsg::Welcome {
-                            proto,
+                            proto: PROTO,
                             build: life.build.clone(),
                             caps,
                             machine: ours,
@@ -326,17 +332,8 @@ pub(crate) async fn handle_as(
                     Ok(())
                 }
                 _ => {
-                    ext_logging::emit(ext_logging::Fact::Mismatch {
-                        min: theirs.min,
-                        max: theirs.max,
-                    });
-                    reply(
-                        &outbox,
-                        &DaemonMsg::Mismatch {
-                            supported: PROTO,
-                            min: Versions::OURS.min_field(),
-                        },
-                    );
+                    ext_logging::emit(ext_logging::Fact::Mismatch { proto: theirs });
+                    reply(&outbox, &DaemonMsg::Mismatch { supported: PROTO });
                     within(&daemon.shared.rt.reactor(), REFUSED_GRACE, frames.drain()).await;
                     Ok(())
                 }
@@ -802,7 +799,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn ready_incoming_frames_yield_before_reading_another_batch() {
+    fn incoming_frames_keep_only_received_bytes_and_yield_between_batches() {
         let root =
             std::env::temp_dir().join(format!("a-server-overload-{}", protocol::SessionId::new()));
         std::fs::create_dir_all(&root).unwrap();
@@ -825,6 +822,33 @@ mod tests {
         let stream = listener.accept().unwrap();
         let runtime = rt::Threads::new(1);
         let mut frames = Frames::new(Arc::new(Async::new(&runtime.reactor(), stream).unwrap()));
+        ClientMsg::Detach.write_frame(&mut &peer).unwrap();
+        assert!(matches!(
+            rt::block_on(frames.next::<ClientMsg>()).unwrap(),
+            Some(ClientMsg::Detach)
+        ));
+        assert!(
+            frames.buf.capacity() < 16 << 10,
+            "read scratch was retained"
+        );
+        let writer = std::thread::spawn(move || {
+            ClientMsg::Hello {
+                proto: PROTO,
+                build: "x".repeat(64 << 10),
+                caps: Caps::NONE,
+                client: None,
+                machine: None,
+            }
+            .write_frame(&mut &peer)
+            .unwrap();
+            peer
+        });
+        assert!(matches!(
+            rt::block_on(frames.next::<ClientMsg>()).unwrap(),
+            Some(ClientMsg::Hello { build, .. }) if build.len() == 64 << 10
+        ));
+        let peer = writer.join().unwrap();
+        frames.batch = 0;
         for _ in 0..65 {
             ClientMsg::Detach.write_frame(&mut frames.buf).unwrap();
         }

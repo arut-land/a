@@ -238,14 +238,18 @@ impl Provider {
             provider: self,
             model,
         };
-        let mut encoded = self.protocol.encode(&target, request)?;
-        if let Some(overlay) = &request.body {
-            // A conversation, or tools, the escape hatch states are the ones
-            // sent.
-            encoded.history = encoded.history.filter(|h| !overlay.contains_key(h.key));
-            encoded.tools = encoded.tools.filter(|t| !overlay.contains_key(t.key));
-            crate::json::overlay(&mut encoded.body, overlay);
-        }
+        let limits = crate::fit::Limits::of_protocol(self.protocol.key(), model);
+        let (encoded, payload) = crate::fit::fit(request, limits, |request| {
+            let mut encoded = self.protocol.encode(&target, request)?;
+            if let Some(overlay) = &request.body {
+                // A conversation, or tools, the escape hatch states are the ones
+                // sent.
+                encoded.history = encoded.history.filter(|h| !overlay.contains_key(h.key));
+                encoded.tools = encoded.tools.filter(|t| !overlay.contains_key(t.key));
+                crate::json::overlay(&mut encoded.body, overlay);
+            }
+            Ok(encoded)
+        })?;
         let mut uri = format!("{}{}", self.base_url, encoded.path);
         let mut builder = http::Request::post(&uri)
             .header(http::header::CONTENT_TYPE, "application/json")
@@ -275,7 +279,7 @@ impl Provider {
             builder = builder.extension(compression);
         }
         builder
-            .body(encoded.payload())
+            .body(payload)
             .map_err(|error| Error::unsupported(format!("invalid request: {error}")))
     }
 }

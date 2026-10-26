@@ -92,9 +92,16 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
         packages = ("engine", "llm")
     env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
                CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
+    if os.name == "nt":
+        # snmalloc checks Git Bash's MSYSTEM before the MSVC target.
+        env.pop("MSYSTEM", None)
     release = Path(env["CARGO_TARGET_DIR"]) / "release"
+    # Features select an allocator or heap for `a` and the engine's benches
+    # alone (docs/perf/allocators.md); the other benches keep their own.
+    features = list(variant.get("features", []))
     for fixture in [False, True]:
-        run(["cargo", "build-release", "-p", "a", *(["--features", "fixtures"] if fixture else []),
+        selected = features + (["fixtures"] if fixture else [])
+        run(["cargo", "build-release", "-p", "a", *(["--features", ",".join(selected)] if selected else []),
              *overrides], cwd=source, env=env)
         name = "a-fixtures" if fixture else "a"
         shutil.copy2(release / ("a" + SUFFIX), output / (name + SUFFIX))
@@ -108,15 +115,18 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
     ), indent=2) + "\n")
     if not benchmarks:
         return
-    run(["cargo", "build-release", "-p", "a", "--example", "perf-attach", *overrides], cwd=source, env=env)
-    run(["cargo", "test", "--release", *STD, "-p", "a", "--example", "perf-attach", *overrides],
+    chosen = ["--features", ",".join(features)] if features else []
+    run(["cargo", "build-release", "-p", "a", "--example", "perf-attach", *chosen, *overrides], cwd=source, env=env)
+    run(["cargo", "test", "--release", *STD, "-p", "a", "--example", "perf-attach", *chosen, *overrides],
         cwd=source, env=env)
     shutil.copy2(release / "examples" / ("perf-attach" + SUFFIX), output / ("perf-attach" + SUFFIX))
     for package, target in [("engine", ["--lib"]), ("protocol", ["--test", "bench"]),
                             ("llm", ["--test", "bench"]), ("tui", ["--lib"])]:
         if package not in packages:
             continue
+        allocator = [f for f in features if f.startswith("sys/")] if package == "engine" else []
         result = run(["cargo", "test", "--release", *STD, "-p", package, *target,
+                      *(["--features", ",".join(allocator)] if allocator else []),
                       "--no-run", "--message-format=json", *overrides], cwd=source, env=env,
                      stdout=subprocess.PIPE, text=True)
         executables = [record["executable"] for line in result.stdout.splitlines()
@@ -371,26 +381,68 @@ def paired(output, source, reference):
             checkpoint()
 
 
-def sessions(source, output):
-    """Build only the engine's measurements, then run the concurrent-session layouts."""
+def sessions(source, output, variant, reference=""):
+    """Build only the engine's measurements, then run the concurrent-session layouts.
+
+    A variant naming `allocators` builds the measurement once per allocator
+    and compares them (`segment` is Windows' segment heap, through the
+    executable's image options) instead of the runtime layouts."""
     env = dict(os.environ, CARGO_TARGET_DIR=str(source / "target/perf-build"),
                CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm")
-    binaries = []
-    for target, name in [(["-p", "engine", "--lib"], "engine-bench"), (["-p", "rt", "--test", "round_trip"], "rt-round-trip")]:
+    if os.name == "nt":
+        # snmalloc checks Git Bash's MSYSTEM before the MSVC target.
+        env.pop("MSYSTEM", None)
+
+    def benchmark(name, target=("-p", "engine", "--lib"), features=(), checkout=source):
+        build_env = dict(env, CARGO_TARGET_DIR=str(checkout / "target/perf-build"))
         result = run(["cargo", "test", "--release", *STD, *target, "--no-run",
-                      "--message-format=json"], cwd=source, env=env, stdout=subprocess.PIPE, text=True)
+                      *(["--features", ",".join(features)] if features else []),
+                      "--message-format=json"], cwd=checkout, env=build_env, stdout=subprocess.PIPE, text=True)
         executables = [record["executable"] for line in result.stdout.splitlines()
                        if (record := json.loads(line)).get("executable") and record.get("profile", {}).get("test")]
         assert len(executables) == 1, executables
-        binaries.append(output / (name + SUFFIX))
-        shutil.copy2(executables[0], binaries[-1])
+        binary = output / (name + SUFFIX)
+        shutil.copy2(executables[0], binary)
+        return binary
+
+    binary = benchmark("engine-bench")
+    extra = []
+    if reference:
+        reference_source = source.parent / "reference"
+        run(["git", "fetch", "--no-tags", "--depth=1", "origin", reference], cwd=source)
+        reference = subprocess.check_output(["git", "rev-parse", "FETCH_HEAD"], cwd=source, text=True).strip()
+        run(["git", "worktree", "add", "--detach", reference_source, reference], cwd=source)
+        extra.append(f"candidate={binary}")
+        binary = benchmark("engine-bench-reference", checkout=reference_source)
+    for allocator in variant.get("allocators", []):
+        if allocator == "segment":
+            if os.name != "nt":
+                continue
+            segmented = output / ("engine-bench-segment" + SUFFIX)
+            shutil.copy2(binary, segmented)
+            # FrontEndHeapDebugOptions 0x08 opts this image into the segment heap.
+            run(["reg", "add", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+                 "\\" + segmented.name, "/v", "FrontEndHeapDebugOptions", "/t", "REG_DWORD", "/d", "8", "/f"])
+            extra.append(f"segment={segmented}")
+        elif allocator == "jemalloc" and os.name == "nt":
+            continue
+        else:
+            extra.append(f"{allocator}={benchmark('engine-bench-' + allocator, features=['sys/' + allocator])}")
+    layouts = ["--layouts", "memory", *(arg for entry in extra for arg in ("--binary", entry))] \
+        if "allocators" in variant or reference else []
+    if "allocators" in variant and not reference:
+        layouts.append("--arena-policy")
+    round_trip = [] if layouts else ["--round-trip", benchmark("rt-round-trip", ("-p", "rt", "--test", "round_trip"))]
     os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
-    run([sys.executable, ROOT / "scripts/perf/sessions.py", binaries[0], "--round-trip", binaries[1],
-         "--output", output / "sessions", "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5")], cwd=source)
+    (output / "sessions").mkdir(exist_ok=True)
     (output / "sessions" / "host.json").write_text(json.dumps(dict(
         platform=platform.platform(), machine=platform.machine(), hardware=hardware(),
         revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
+        reference_revision=reference or None,
     ), indent=2) + "\n")
+    run([sys.executable, ROOT / "scripts/perf/sessions.py", binary, "--output", output / "sessions",
+         "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5"),
+         "--sessions", variant.get("sessions", "1,8,32,128"), *layouts, *round_trip], cwd=source)
 
 
 def main():
@@ -410,7 +462,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     variant = json.loads(args.variant or "{}")
     if args.phase == "sessions":
-        sessions(source, output)
+        sessions(source, output, variant, args.paired_ref)
         return
     if args.phase in ["all", "build"]:
         build(source, output, variant, benchmarks=not args.build_only)

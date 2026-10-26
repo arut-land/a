@@ -1600,16 +1600,21 @@ fn cancelled_queued_turns_never_reappear_after_restart() {
         .into_iter()
         .find(|live| live.parent.is_some_and(|p| p.session == session.id))
         .unwrap();
-    rt::block_on(child.enqueue(protocol::Envelope {
-        id: protocol::EnvelopeId {
-            sender: session.id,
-            call: CallId::new(999).unwrap(),
-            purpose: "queued".into(),
-        },
-        destination: child.id,
-        payload: "queued work".into(),
-        held: Vec::new(),
-    }))
+    rt::block_on(
+        child.enqueue(
+            protocol::Envelope::new(
+                protocol::EnvelopeId {
+                    sender: session.id,
+                    call: CallId::new(999).unwrap(),
+                    purpose: "queued".into(),
+                },
+                child.id,
+                "queued work".into(),
+                Vec::new(),
+            )
+            .unwrap(),
+        ),
+    )
     .unwrap();
     session.interrupt_now();
     let prefix = until(&child, "queued work discarded", |log| {

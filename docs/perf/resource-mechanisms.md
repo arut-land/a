@@ -132,6 +132,16 @@ released bytes and does not justify an allocator policy change. Some ARM zone
 counters wrap after relief and the counters are advisory; none is substituted
 for RSS. The uninstrumented cache observations remain separate.
 
+The later [sessions allocator campaign](allocators.md) revisits pressure
+relief on a different allocation topology. On Intel macOS, its retirement
+callback reduces 128-session idle RSS by 1,616 KiB [1,578, 1,656] in one
+20-round block and 1,658 KiB [1,628, 1,696] in another. Those observations do
+not contradict zero bytes returned from the earlier dropped-cache probe:
+the live state, allocator free lists and operating-system versions differ.
+On the local M3, explicit pressure relief still returns no RSS after the
+profiled workload, while removing retained read scratch reduces live heap
+from 18.8 to 16.3 MiB. Returning free pages cannot remove a live allocation.
+
 In all 20 Intel QoS pairs, `vmmap` reports identical retained allocation counts
 and live bytes at its reported precision. Its RSS delta therefore is not
 attributed to retained allocation growth. Page residency, image layout and

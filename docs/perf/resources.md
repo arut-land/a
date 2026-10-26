@@ -97,6 +97,16 @@ or justify a periodic trim. Musl released more memory after worker exit but had
 higher allocated RSS. Worker lifetime and allocation topology matter alongside
 the allocator; no replacement allocator is selected from idle RSS alone.
 
+The [application allocator campaign](allocators.md) retains the two-arena
+policy. In its 20-round, 128-session mimalloc comparison block, restoring
+glibc's default arena policy increases idle RSS by 656 KiB [440, 840] on
+Linux ARM64 and 696 KiB [394, 1060] on x86_64. Active CPU changes by
++0.825% [−0.531, +1.448] and −0.171% [−1.231, +1.376], respectively.
+These are paired median differences with 95% bootstrap intervals. The
+synthetic probe's different retention topology does not overturn the
+application result. The policy limits arena growth, not live application
+memory; it cannot reject a session or allocation.
+
 ## Channel policy
 
 The single-value handoff is one type-erased slot for every payload type: a

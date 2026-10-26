@@ -12,6 +12,45 @@ pub fn small_footprint() {
     }
 }
 
+/// Returns unused allocator pages to the operating system without moving live allocations.
+pub fn release() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: trimming takes no pointers and keeps every live block.
+        unsafe { libc::malloc_trim(0) };
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone with no goal relieves every zone as far as it can.
+        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{HeapOptimizeResources, HeapSetInformation};
+        use windows_sys::Win32::System::SystemServices::{
+            HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION, HEAP_OPTIMIZE_RESOURCES_INFORMATION,
+        };
+        let info = HEAP_OPTIMIZE_RESOURCES_INFORMATION {
+            Version: HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION,
+            Flags: 0,
+        };
+        // SAFETY: a null heap applies to every heap; `info` outlives the call.
+        unsafe {
+            HeapSetInformation(
+                std::ptr::null_mut(),
+                HeapOptimizeResources,
+                (&raw const info).cast(),
+                size_of_val(&info),
+            )
+        };
+    }
+}
+
 /// Zeroed words mapped straight from the OS: a page takes memory once it
 /// is first written, and dropping the mapping gives every page back at
 /// once. The allocator would keep a freed block this large for reuse (on

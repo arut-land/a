@@ -402,7 +402,6 @@ pub fn hello() -> ClientMsg {
     ClientMsg::Hello {
         proto: PROTO,
         build: "acceptance".to_owned(),
-        min: None,
         caps: protocol::Caps::NONE,
         client: None,
         machine: None,

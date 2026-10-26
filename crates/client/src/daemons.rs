@@ -41,10 +41,16 @@ impl Member {
 
     /// Its sessions, newest first.
     pub fn sessions(&self) -> Result<Vec<Listed>, Error> {
-        let conn = self.daemon.connect(&|| {})?;
+        rt::block_on(self.sessions_async(&crate::link::BLOCKING))
+    }
+
+    /// Lists this member's sessions on the supplied runtime.
+    pub async fn sessions_async(&self, rt: &rt::Rt) -> Result<Vec<Listed>, Error> {
+        let conn = self.daemon.connect_async(rt, &|| {}).await?;
         let machine = conn.machine;
         Ok(conn
-            .sessions()?
+            .sessions_async()
+            .await?
             .into_iter()
             .map(|summary| Listed {
                 on: self.name.clone(),
@@ -143,21 +149,27 @@ impl Daemons {
 
     /// Each member's sessions, newest first, asked of them all at once.
     pub fn sessions(&self) -> Vec<(&Member, Result<Vec<Listed>, Error>)> {
-        std::thread::scope(|scope| {
-            let asked: Vec<_> = self
-                .iter()
-                .map(|member| (member, scope.spawn(|| member.sessions())))
-                .collect();
-            asked
-                .into_iter()
-                .map(|(member, listing)| {
-                    let listed = listing
-                        .join()
-                        .unwrap_or_else(|_| Err(Error::Refused("listing panicked".into())));
-                    (member, listed)
-                })
-                .collect()
-        })
+        rt::block_on(self.sessions_async(&crate::link::BLOCKING))
+    }
+
+    /// Lists all members concurrently on the supplied runtime.
+    pub async fn sessions_async(&self, rt: &rt::Rt) -> Vec<(&Member, Result<Vec<Listed>, Error>)> {
+        let asked: Vec<_> = self
+            .iter()
+            .map(|member| {
+                let owned = member.clone();
+                let runtime = rt.clone();
+                (
+                    member,
+                    rt::spawn(&**rt, async move { owned.sessions_async(&runtime).await }),
+                )
+            })
+            .collect();
+        let mut listed = Vec::with_capacity(asked.len());
+        for (member, answer) in asked {
+            listed.push((member, answer.await));
+        }
+        listed
     }
 
     /// The member `<machine>:` names, with the rest; `None` without one.

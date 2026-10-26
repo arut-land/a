@@ -823,6 +823,23 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             ],
         ),
         (
+            "an interrupted reply keeps its durable text",
+            vec![
+                attached(),
+                msg(DaemonMsg::Synced { seq: 0 }),
+                entry(1, input("hi")),
+                entry(2, Body::ModelCall {
+                    request: None, model: "m".into(), attempt: 0,
+                    choice: protocol::ToolChoice::Auto, r#for: None, purpose: None,
+                }),
+                msg(DaemonMsg::Delta { call: call(2), text: "partial".into(), attempt: 0 }),
+                entry(3, Body::ModelResult {
+                    call: call(2), r#for: None, failure: None,
+                    outcome: Outcome::Interrupted { output: Some("durable partial".into()) },
+                }),
+            ],
+        ),
+        (
             "a streamed reply, then the committed one",
             vec![
                 attached(),
@@ -1649,4 +1666,24 @@ fn a_result_held_as_a_blob_is_shown_as_its_reference() {
             "5a".repeat(32)
         )
     );
+}
+
+#[test]
+fn interrupted_reply_text_is_identical_live_and_on_replay() {
+    let (_, messages) = scenarios()
+        .into_iter()
+        .find(|(name, _)| *name == "an interrupted reply keeps its durable text")
+        .unwrap();
+    for live in [true, false] {
+        let mut view = SessionView::default();
+        for value in &messages {
+            let message = DaemonMsg::from_json(value.to_string().as_bytes()).unwrap();
+            if live || !matches!(message, DaemonMsg::Delta { .. }) {
+                view.fold(&message);
+            }
+        }
+        assert!(view.items.iter().any(|item| matches!(item,
+            protocol::view::Item::Reply { text, status: protocol::view::Status::Interrupted, .. }
+                if text == "durable partial")));
+    }
 }

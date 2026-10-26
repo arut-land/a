@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -9,13 +9,14 @@ use super::*;
 const STAGE: &str = "A_TEST_HANDOVER_STAGE";
 const ROOT: &str = "A_TEST_HANDOVER_ROOT";
 const RECORD: &str = "A_TEST_HANDOVER_RECORD";
+const OUTPUT: &str = "A_TEST_HANDOVER_OUTPUT";
 const PID: &str = "A_TEST_HANDOVER_PID";
 
 fn rerun() -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.args([
         "--exact",
-        "handover::tests::an_exec_keeps_a_group_waitable_and_its_unread_output",
+        "handover::tests::an_exec_releases_originals_and_preserves_the_group_and_output",
         "--nocapture",
     ]);
     command
@@ -39,7 +40,7 @@ fn given(cmd: &mut Command, file: File) -> Given {
 // Miri runs no processes and validates no descriptors.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn an_exec_keeps_a_group_waitable_and_its_unread_output() {
+fn an_exec_releases_originals_and_preserves_the_group_and_output() {
     match std::env::var(STAGE).ok().as_deref() {
         Some("give") => {
             let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
@@ -60,6 +61,7 @@ fn an_exec_keeps_a_group_waitable_and_its_unread_output() {
             let mut next = rerun();
             next.env(STAGE, "adopt")
                 .env(RECORD, record.as_raw_fd().to_string())
+                .env(OUTPUT, given.group.output.unwrap().to_string())
                 .env(PID, std::process::id().to_string());
             let error = Successor::new(next)
                 .handles(std::slice::from_ref(&record))
@@ -71,7 +73,24 @@ fn an_exec_keeps_a_group_waitable_and_its_unread_output() {
             assert_eq!(std::env::var(PID).unwrap(), std::process::id().to_string());
             let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
             let number: i32 = std::env::var(RECORD).unwrap().parse().unwrap();
-            let mut claimed = read_record(crate::InheritedNumber::from(number)).unwrap();
+            let output_number: i32 = std::env::var(OUTPUT).unwrap().parse().unwrap();
+            let record_identity = identity(number).unwrap();
+            let pipe_identity = identity(output_number).unwrap();
+            // SAFETY: this is the successor after an actual exec. The original
+            // descriptors have no Rust owners in this process image.
+            let mut claimed =
+                unsafe { startup::read_inherited_record(crate::InheritedNumber::from(number)) }
+                    .unwrap();
+            assert_ne!(
+                identity(number),
+                Some(record_identity),
+                "record original leaked"
+            );
+            assert_ne!(
+                identity(output_number),
+                Some(pipe_identity),
+                "pipe original leaked"
+            );
             let (claimed, owner) = claimed.pop().unwrap();
             let claimed = claimed.unwrap();
             assert_eq!(owner, serde_json::json!({"call": 4}));
@@ -120,10 +139,12 @@ fn a_handed_number_that_is_not_this_processs_child_is_refused() {
     let (reader, _writer) = io::pipe().unwrap();
     let group: Group = serde_json::from_value(serde_json::json!({
         "pid": 1,
-        "output": std::os::fd::OwnedFd::from(reader).into_raw_fd(),
+        "output": reader.as_raw_fd(),
     }))
     .unwrap();
-    let error = imp::claim(&group).err().unwrap();
+    let error = imp::claim(&group, &mut |n| crate::InheritedNumber::from(n).duplicate())
+        .err()
+        .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
 }
 
@@ -139,15 +160,25 @@ fn a_claimed_group_no_one_adopts_is_killed_and_reaped() {
     let given = given(&mut cmd, File::create(&path).unwrap());
     fs::remove_file(path).unwrap();
     let pid = given.group.pid;
-    // As an exec passes them on: owned by nothing until claimed.
-    for handle in given.handles {
-        let _ = handle.into_raw_fd();
-    }
-    let claimed = imp::claim(&given.group).unwrap();
+    let claimed = imp::claim(&given.group, &mut |n| {
+        crate::InheritedNumber::from(n).duplicate()
+    })
+    .unwrap();
     assert!(crate::process_started(pid).is_some());
     drop(claimed);
+    assert!(given.handles.iter().all(|file| file.metadata().is_ok()));
     assert!(
         crate::process_started(pid).is_none(),
         "the group outlived its claim"
     );
+}
+
+fn identity(number: i32) -> Option<(libc::dev_t, libc::ino_t)> {
+    // SAFETY: a zeroed stat is valid writable storage for the native output.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat validates the integer without creating a borrow or owner.
+    if unsafe { libc::fstat(number, &raw mut stat) } != 0 {
+        return None;
+    }
+    Some((stat.st_dev, stat.st_ino))
 }

@@ -1,0 +1,9 @@
+{
+  "revision": "40f8663be1cbc800a825238682c26664e423d49c",
+  "variant": {},
+  "platform": "local Apple M3 macOS 27.0.1",
+  "shipped_bytes": 5243824,
+  "shipped_sha256": "89a74580bd3efa46b70d384e4f300d8391c42e0c78a9cb27aea41edbd61346f5",
+  "fixture_scan": "passed",
+  "command": "CARGO_BUILD_JOBS=2 cargo build-release -p a"
+}

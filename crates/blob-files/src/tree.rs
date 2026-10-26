@@ -8,7 +8,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once, PoisonError};
 use std::time::SystemTime;
 
 use blob::{BlobRef, BlobStore, Materialize, TreePath};
@@ -17,6 +17,7 @@ pub struct CacheDir {
     tree: PathBuf,
     staging: PathBuf,
     swept: Once,
+    access: Mutex<()>,
     store: Arc<dyn BlobStore>,
 }
 
@@ -29,6 +30,7 @@ impl CacheDir {
             tree: dir.join("tree"),
             staging: dir.join("staging"),
             swept: Once::new(),
+            access: Mutex::new(()),
             store,
         }
     }
@@ -51,10 +53,26 @@ impl Materialize for CacheDir {
     }
 
     fn ensure(&self, at: &TreePath, blob: &BlobRef) -> io::Result<()> {
+        let by_id = TreePath::by_id(&blob.id);
+        // Reserve the namespace on case-insensitive file systems too. Windows
+        // also ignores trailing dots/spaces in ordinary path components.
+        if at
+            .parts()
+            .next()
+            .is_some_and(|part| part.trim_end_matches(['.', ' ']).to_uppercase() == "BY-ID")
+            && *at != by_id
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "blob identity does not match its cache path",
+            ));
+        }
+        let _access = self.access.lock().unwrap_or_else(PoisonError::into_inner);
         let path = self.path(at);
         match fs::metadata(&path) {
-            Ok(file) if file.is_file() && file.len() == blob.size => return Ok(()),
-            // Another blob at this place: made again.
+            // Only a content-addressed name establishes identity. Aliases can change
+            // even when the new content has the same size.
+            Ok(file) if *at == by_id && file.is_file() => return Ok(()),
             Ok(_) => fs::remove_file(&path)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -62,14 +80,11 @@ impl Materialize for CacheDir {
         let dir = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
         sys::fs::private_dir(dir)?;
         let from = self.store.materialize(&blob.id)?;
-        match sys::fs::clone_file(&from, self.staging()?, &path) {
-            // Another call made it first, from the same blob.
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-            made => made,
-        }
+        sys::fs::clone_file(&from, self.staging()?, &path)
     }
 
     fn evict(&self, budget: u64) -> io::Result<u64> {
+        let _access = self.access.lock().unwrap_or_else(PoisonError::into_inner);
         let mut files: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
         let mut pending = vec![self.tree.clone()];
         while let Some(dir) = pending.pop() {

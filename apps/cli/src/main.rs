@@ -33,7 +33,9 @@ use sys::{Home, Staged};
 
 use crate::args::{Args, Autostart, Cmd, Daemon};
 
-fn main() -> ExitCode {
+sys::main!(run);
+
+fn run(startup: sys::handover::Startup) -> ExitCode {
     sys::small_footprint();
     // The daemon never wants one: whoever starts it gives it no terminal.
     if std::env::args_os()
@@ -72,7 +74,17 @@ fn main() -> ExitCode {
                     here(&home, args.host.as_ref())?,
                     token.as_deref().unwrap_or(&daemon.staged.id),
                 ),
-                Some(Cmd::Web { no_open }) => web(daemons.clone(), !no_open),
+                Some(Cmd::Web { no_open }) => {
+                    #[cfg(feature = "web")]
+                    {
+                        web::run(daemons.clone(), !no_open)
+                    }
+                    #[cfg(not(feature = "web"))]
+                    {
+                        let _ = no_open;
+                        Err(io::Error::other("this build of a has no web UI"))
+                    }
+                }
                 Some(Cmd::Daemon { .. }) => {
                     unreachable!("daemon commands are handled before installation")
                 }
@@ -89,7 +101,8 @@ fn main() -> ExitCode {
                     Handoff {
                         listen: listen_fd,
                         lock: lock_fd,
-                        handover: handover_fd,
+                        handover: handover_fd
+                            .map(|fd| startup.read_record(sys::InheritedNumber::from(fd))),
                     },
                     reset_breaker,
                     detached,
@@ -310,10 +323,9 @@ fn repl(daemon: &client::Daemon, target: Target) -> io::Result<()> {
                 Input::Line(None) | Input::Busy => 0,
             }
     });
-    let events = tx.clone();
     let runtime: rt::Rt = std::sync::Arc::new(rt::Threads::default());
-    let driver = Driver::new(move |driver, event| events.event(driver, event, Input::Client))
-        .start(runtime.clone(), daemon.clone());
+    let driver =
+        Driver::with_inbox(tx.clone(), Input::Client).start(runtime.clone(), daemon.clone());
     let mut repl = Repl {
         client: SessionClient::new(Env::Origin),
         screen: Screen::default(),
@@ -418,17 +430,20 @@ impl Repl {
         let Some(tx) = self.input.take() else {
             return;
         };
-        thread::spawn(move || {
-            for line in io::stdin().lock().lines() {
-                let Ok(line) = line else { break };
-                if tx.send(Input::Line(Some(line))).is_err() {
-                    tx.close_with(Input::Busy);
-                    return;
-                }
-            }
-            let _ = tx.send(Input::Line(None));
-        });
+        // thread-exception: repl-stdin
+        thread::spawn(move || read_lines(io::stdin().lock(), &tx));
     }
+}
+
+fn read_lines(input: impl BufRead, post: &client::Post<Input>) {
+    for line in input.lines() {
+        let Ok(line) = line else { break };
+        if post.send_first(Input::Line(Some(line))).is_err() {
+            post.close_with(Input::Busy);
+            return;
+        }
+    }
+    let _ = post.send_first(Input::Line(None));
 }
 
 /// Shows what the client tells; what ends the client is kept for the loop.
@@ -691,23 +706,12 @@ fn fork(home: &Home, daemons: &Daemons, source: &str) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "web")]
-fn web(daemons: Daemons, open: bool) -> io::Result<()> {
-    web::run(daemons, open)
-}
-
-#[cfg(not(feature = "web"))]
-fn web(_daemons: Daemons, _open: bool) -> io::Result<()> {
-    Err(io::Error::other("this build of a has no web UI"))
-}
-
-/// What whoever started the daemon handed it, by descriptor or handle
-/// number: a client its listener and lock, a daemon of the build before
-/// those and the record of its work ([`sys::handover`]).
+/// The listener and lock numbers passed by the starting client, and the
+/// previous daemon's groups already claimed at process entry.
 struct Handoff {
     listen: Option<i32>,
     lock: Option<i32>,
-    handover: Option<i32>,
+    handover: Option<io::Result<sys::handover::Claims>>,
 }
 
 /// The daemon. Started by a client (`listen_fd`), it leaves the client's
@@ -720,7 +724,7 @@ fn serve(
     Handoff {
         listen: listen_fd,
         lock: lock_fd,
-        handover: handover_fd,
+        handover,
     }: Handoff,
     reset_breaker: bool,
     detached: bool,
@@ -738,11 +742,7 @@ fn serve(
             return client::spawn_at_login(home);
         }
     }
-    // What the daemon of the build before handed this one is claimed
-    // first, every handle owned and closed on exec from here on.
-    let handed = handover_fd
-        .map(|fd| sys::handover::read_record(sys::InheritedNumber::from(fd)))
-        .transpose()?;
+    let handed = handover.transpose()?;
     sys::crash::install(home.crash_dir(), sys::crash::Build::of(&staged.id));
     // A daemon exec'd in place by the build before is where that one was:
     // its session and its stderr (a journal, a terminal) are its own.
@@ -1098,5 +1098,45 @@ mod approval_tests {
                 assert!(text.find(marker).unwrap() < reason, "{marker}: {text}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+    use std::io::{Seek, Write};
+
+    #[test]
+    fn replay_cannot_reject_lines_or_eof_or_erase_the_backlog() {
+        let (post, inbox) = client::inbox(
+            client::QueueBudget {
+                bytes: 8192,
+                requests: 4,
+                control_reserve: 1,
+            },
+            |_| 1,
+        );
+        for conn in 1..=3 {
+            post.send(Input::Client(Event {
+                conn: client::ConnId(conn),
+                kind: client::EventKind::Waiting,
+            }))
+            .ok()
+            .unwrap();
+        }
+        let mut input = tempfile::tempfile().unwrap();
+        input.write_all(b"first\nsecond\n").unwrap();
+        input.rewind().unwrap();
+        read_lines(io::BufReader::new(input), &post);
+        for expected in ["first", "second"] {
+            assert!(matches!(inbox.try_recv(), Some(Input::Line(Some(text))) if text == expected));
+        }
+        assert!(matches!(inbox.try_recv(), Some(Input::Line(None))));
+        for expected in 1..=3 {
+            assert!(
+                matches!(inbox.try_recv(), Some(Input::Client(Event { conn: client::ConnId(conn), .. })) if conn == expected)
+            );
+        }
+        assert!(inbox.try_recv().is_none());
     }
 }

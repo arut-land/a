@@ -16,8 +16,8 @@ SessionClient (session.rs)         no I/O: Link FSM, SessionView (protocol::view
   │ Effect::Io(Connect | Send | SendEnvironment | Hangup)   Event { conn, kind: Connected | Msg | … }
   │ Effect::Show(View | Link | Sessions | Notice)
   ▼
-Driver (drive.rs)                  pump: the one fixpoint loop; runtime tasks connect,
-  │                                read and write each connection
+Driver (drive.rs)                  pump: the one fixpoint loop; async transport tasks
+  │                                on the supplied runtime
   ▼
 transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: connect, connect_as,
            remote.rs, query.rs,    sessions, new_session, query, fetch; the one hello over any
@@ -46,7 +46,7 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
     with zero lag (the client takes the daemon lock, binds the socket,
     hands both to a detached `a __daemon` and connects into its backlog;
     one client starts it at a time, under `start.lock`, and the others
-    wait on that lock, not on a timer). [Autostart](autostart.md) only
+    retry a contended lock with cancellable runtime timers). [Autostart](autostart.md) only
     starts the daemon earlier, at login; it never changes this path.
   - `SshLink { host, prompt, home }` (`remote.rs`): another machine's, through
     the system `ssh` to `a bridge`, whose stdio carries the same frames
@@ -116,15 +116,23 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   `restart`), reads it asynchronously and posts each message to the sink as an
   `Event`; `Send` writes on the newest connection (the session client
   numbered it); `SendEnvironment` captures this process's environment
-  again (or asks the `origin` given) and sends it; `Hangup` drops the
+  again (or asks the `origin` given) and sends it. Initial `Env::Origin`
+  attaches ask the same callback locally and keep the bridge environment
+  remotely; `Hangup` drops the
   writer. `pump(renderer, effects)` is the fixpoint every app runs: the
   `Io` is done, the `Show`s go to the `Renderer`, and what showing asks
   for goes round again; a send that failed is shown as a notice. Cheap to
   clone; one per session client.
 - **`Inbox`.** The one queue the app's thread sleeps on, posted to by the
-  driver's and the input threads: a lock around a `VecDeque` rather than
+  driver's tasks and the input thread: a lock around a `VecDeque` rather than
   `mpsc`, which instantiates all three channel flavours per type (7–15 KiB
-  each).
+  each). `Driver::with_inbox` awaits space before reading another daemon
+  event; the budget bounds pending delivery, never the history that can be
+  opened. One oversized event can occupy an empty data lane. Priority input
+  has its own byte and request accounting, and outgoing control writes and
+  cancellation continue while delivery waits. Session connections carry an
+  `Attach`; list watches carry only their client identity and reconnect
+  without constructing a session attach.
 - **`Daemons`.** The daemons a client holds, one per machine, each a
   `Member { name, daemon }`; the first is the default, where a new session
   starts. Every app holds one today (this machine's as `local`, or
@@ -193,8 +201,8 @@ impl Renderer for App {
     fn show(&mut self, shown: Vec<Show>) -> Vec<Effect> { /* View, Link, Sessions, Notice */ }
 }
 
-let (post, inbox) = client::inbox();
-let driver = Driver::new(daemon, move |_, event| { let _ = post.send(Input::Daemon(event)); });
+let (post, inbox) = client::inbox(client::QueueBudget::default(), |_| 4096);
+let driver = Driver::with_inbox(post.clone(), Input::Daemon).start(runtime, daemon);
 let mut app = App { session: SessionClient::new(Env::Origin), .. };
 driver.pump(&mut app, app.session.attach(Attach::new(target, Env::Origin)));
 while let Some(input) = inbox.recv() {
@@ -225,15 +233,17 @@ Other rules the apps keep, by convention:
 - The view is `SessionView`, folded by the SDK; an app re-derives nothing
   from the transcript. What it keeps is screen state: scroll anchor, folded
   cards, the input, overlays, the tab's page.
-- Transport runs in cancellable runtime tasks. The input thread and
-  the reaper of a spawned daemon are never joined: process exit ends them,
-  and the terminal is restored by `Terminal`'s drop before that. Nothing
-  slow runs in a destructor; do not add a join.
-- A client never sleeps on a timer (`crates/client/tests/no_polling.rs`,
-  and the strace acceptance test on Linux): the inbox, the socket and the
-  daemon lock are waited on.
+- Transport and child reaping run as runtime tasks. Blocking SDK methods
+  drive async operations over a shared one-worker runtime. Contended file
+  locks retry nonblocking native attempts every 25 ms; cancellation drops
+  the file and timer, leaving Storage workers available for lock holders
+  and shutdown. Process creation uses the Storage pool. The terminal input thread is
+  detached, and `Terminal` restores the terminal before process exit.
+- Inbox and socket waits never poll (`crates/client/tests/no_polling.rs`
+  and the strace cold-start acceptance test on Linux). Only lock contention
+  retries on a timer; an uncontended start takes no timer path.
 - The first frame goes out before the daemon is reached; connecting (and
-  spawning the daemon) happens in the driver's runtime task.
+  spawning the daemon) happens on the driver's runtime.
 
 ## Tests
 
@@ -258,3 +268,13 @@ Other rules the apps keep, by convention:
   drive `a` against a daemon in an isolated `A_HOME` (`mise run
   acceptance` runs the first); `remote.rs`'s fake `ssh` refuses anything
   but plain words, as a non-POSIX login shell would.
+
+Async consumers can use `Daemon::connect_async`, `Daemon::query_async`,
+`Daemon::fetch_async`, `Answers::next_async` and `Fetched::read_async` on
+an existing runtime. The FFI uses these with bounded async channels, so a
+slow renderer yields the producer without blocking an executor worker.
+
+Machine route resolution and multi-daemon session listing also use the
+shared runtime. `Sources::resolve_async` runs `ssh -G` jobs on Storage;
+`Daemons::sessions_async` opens and reads each member concurrently as tasks.
+Their blocking entry points drive the same futures.

@@ -68,7 +68,7 @@ enum Event {
     /// From the session client's driver.
     Client(client::Event),
     /// The working indicator's clock; only waited for while a turn runs.
-    Tick,
+    Tick(u64),
 }
 
 pub use run::run;

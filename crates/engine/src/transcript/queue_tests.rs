@@ -229,7 +229,7 @@ fn a_held_blob_is_named_only_once_it_can_be_read() {
         .unwrap();
     let mut gone = kept.clone();
     gone.id = ext::blob::BlobId([9; 32]);
-    let shown = |blob: &ext::blob::BlobRef| {
+    let shown = |blob: &BlobRef| {
         let mut bodies = called();
         bodies.push(Body::ToolResult {
             call: call(3),

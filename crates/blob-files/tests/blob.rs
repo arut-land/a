@@ -332,14 +332,54 @@ fn the_tree_never_holds_what_a_crash_left_mid_copy() {
 }
 
 #[test]
-fn a_place_holding_another_blob_is_made_again() {
+fn content_addressed_paths_cannot_be_rebound_to_another_blob() {
     let home = Home::new();
     let tree = home.tree();
-    let (first, second) = (home.put(b"first"), home.put(b"the second"));
+    let first = home.put(b"first");
+    let second = home.put(b"other");
+    let at = TreePath::by_id(&first.id);
+    tree.ensure(&at, &first).unwrap();
+    assert_eq!(
+        tree.ensure(&at, &second).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    tree.ensure(&at, &first).unwrap();
+    assert_eq!(fs::read(tree.path(&at)).unwrap(), b"first");
+}
+
+#[test]
+fn filesystem_equivalent_aliases_cannot_replace_content_addressed_files() {
+    let home = Home::new();
+    let tree = home.tree();
+    let first = home.put(b"first");
+    let other = home.put(b"other");
+    let canonical = TreePath::by_id(&first.id);
+    tree.ensure(&canonical, &first).unwrap();
+    for namespace in ["BY-ID", "By-Id", "by-ID", "by-id.", "by-id ", "by-ıd"] {
+        let alias = TreePath::new(&format!("{namespace}/{}", first.id)).unwrap();
+        assert_eq!(
+            tree.ensure(&alias, &other).unwrap_err().kind(),
+            ErrorKind::InvalidInput,
+            "{namespace}"
+        );
+        assert_eq!(fs::read(tree.path(&canonical)).unwrap(), b"first");
+    }
+    tree.ensure(&canonical, &first).unwrap();
+    assert_eq!(fs::read(tree.path(&canonical)).unwrap(), b"first");
+}
+
+#[test]
+fn equal_length_blobs_never_share_an_alias_identity() {
+    let home = Home::new();
+    let tree = home.tree();
+    let (first, second) = (home.put(b"first"), home.put(b"other"));
     let at = TreePath::new("sessions/x/attachments/a.txt").unwrap();
     tree.ensure(&at, &first).unwrap();
     tree.ensure(&at, &second).unwrap();
-    assert_eq!(fs::read(tree.path(&at)).unwrap(), b"the second");
+    assert_eq!(fs::read(tree.path(&at)).unwrap(), b"other");
+    let reopened = CacheDir::new(home.dir.path().join("cache"), Arc::clone(&home.files) as _);
+    reopened.ensure(&at, &first).unwrap();
+    assert_eq!(fs::read(reopened.path(&at)).unwrap(), b"first");
     assert!(
         fs::metadata(tree.path(&at))
             .unwrap()

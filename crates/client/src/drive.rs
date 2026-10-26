@@ -14,7 +14,7 @@ use crate::{
     Attach, ConnId, Connection, Daemon, Effect, Error, Event, EventKind, Io, Notice, Show,
 };
 
-type Sink = dyn Fn(&ClientHandle, Event) + Send + Sync;
+type Sink = dyn Fn(&ClientHandle, Event) -> rt::BoxFuture<'static, bool> + Send + Sync;
 type Origin = dyn Fn() -> io::Result<Environment> + Send + Sync;
 
 /// What renders a session client's [`Show`] effects: an app's screen, a
@@ -63,14 +63,33 @@ pub fn pump(
 pub struct Driver {
     origin: Arc<Origin>,
     sink: Box<Sink>,
-    pub(crate) watch: bool,
 }
 
 /// Queues effects without waiting for the daemon. The last handle revokes I/O.
 #[derive(Clone)]
 pub struct ClientHandle(Arc<Handle>);
 
+#[derive(Clone)]
+enum Purpose {
+    Session(Attach),
+    Watch(ClientId),
+}
+
+impl Purpose {
+    fn client(&self) -> ClientId {
+        match self {
+            Self::Session(attach) => attach.client,
+            Self::Watch(client) => *client,
+        }
+    }
+}
+
 enum Request {
+    Connect {
+        conn: ConnId,
+        purpose: Purpose,
+        restart: bool,
+    },
     Io(Box<Io>),
     Flush(rt::oneshot::Sender<()>),
 }
@@ -91,6 +110,7 @@ struct Outbox {
 #[derive(Default)]
 struct Queued {
     items: VecDeque<(u64, usize, Request)>,
+    finished: Option<u64>,
     closed: bool,
 }
 
@@ -110,20 +130,27 @@ impl Outbox {
         if state.closed {
             return Err(Error::Closed);
         }
-        let replace =
-            matches!(&request, Request::Io(io) if matches!(&**io, Io::Connect { .. } | Io::Hangup));
+        let replace = matches!(&request, Request::Connect { .. })
+            || matches!(&request, Request::Io(io) if matches!(&**io, Io::Hangup));
+        if !replace && state.finished == Some(self.epoch.load(Ordering::Acquire)) {
+            return Err(Error::Closed);
+        }
         let coalesced =
             request.environment() && state.items.iter().any(|(_, _, item)| item.environment());
         let bytes = match &request {
             Request::Io(io) => match &**io {
                 Io::Send(msg) => msg.retained_bytes(),
-                Io::Connect { attach, .. } => match &attach.env {
-                    crate::Env::Given(env) => env.retained_bytes(),
-                    _ => 0,
-                },
                 _ => 0,
             },
-            Request::Flush(_) => 0,
+            Request::Connect {
+                purpose:
+                    Purpose::Session(Attach {
+                        env: crate::Env::Given(env),
+                        ..
+                    }),
+                ..
+            } => env.retained_bytes(),
+            Request::Connect { .. } | Request::Flush(_) => 0,
         };
         let mutation = request.mutation();
         let kept = |item: &Request| {
@@ -150,7 +177,9 @@ impl Outbox {
         }
         if replace {
             state.items.clear();
-            self.epoch.fetch_add(1, Ordering::AcqRel);
+            let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            state.finished =
+                matches!(&request, Request::Io(io) if matches!(&**io, Io::Hangup)).then_some(epoch);
         } else if coalesced {
             state.items.retain(|(_, _, item)| !item.environment());
         }
@@ -178,6 +207,19 @@ impl Outbox {
             }
             self.ready.until(|| self.ready.count() != seen).await;
         }
+    }
+
+    fn finish(&self, generation: u64) {
+        let abandoned = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.epoch.load(Ordering::Acquire) != generation {
+                return;
+            }
+            state.finished = Some(generation);
+            std::mem::take(&mut state.items)
+        };
+        // Dropping flush senders wakes their waiters, which may queue more I/O.
+        drop(abandoned);
     }
 
     fn close(&self) {
@@ -213,9 +255,32 @@ impl Driver {
     ) -> Self {
         Self {
             origin: Arc::new(origin),
-            sink: Box::new(sink),
-            watch: false,
+            sink: Box::new(move |handle, event| {
+                sink(handle, event);
+                Box::pin(std::future::ready(true))
+            }),
         }
+    }
+
+    /// Delivers every event with async backpressure; input keeps its own priority lane.
+    pub fn with_inbox<T: Send + 'static>(post: crate::Post<T>, wrap: fn(Event) -> T) -> Self {
+        Self {
+            origin: Arc::new(crate::capture),
+            sink: Box::new(move |_, event| {
+                let post = post.clone();
+                Box::pin(async move { post.send_async(wrap(event)).await.is_ok() })
+            }),
+        }
+    }
+
+    pub(crate) fn watch(self, rt: Rt, daemon: Daemon) -> ClientHandle {
+        let handle = self.start(rt, daemon);
+        let _ = handle.0.tx.send(Request::Connect {
+            conn: ConnId(1),
+            purpose: Purpose::Watch(ClientId::new()),
+            restart: false,
+        });
+        handle
     }
 
     pub fn start(self, rt: Rt, daemon: Daemon) -> ClientHandle {
@@ -236,16 +301,13 @@ impl Driver {
                 if generation != rx.epoch.load(Ordering::Acquire) {
                     continue;
                 }
-                let Request::Io(command) = command else {
-                    continue;
-                };
-                if let Io::Connect {
+                if let Request::Connect {
                     conn,
-                    attach,
+                    purpose,
                     restart,
-                } = *command
+                } = command
                 {
-                    let client = attach.client;
+                    let client = purpose.client();
                     let cancelled = || rx.epoch.load(Ordering::Acquire) != generation;
                     loop {
                         pending = rt::or(
@@ -258,7 +320,7 @@ impl Driver {
                                 &daemon,
                                 client,
                                 conn,
-                                attach.clone(),
+                                purpose.clone(),
                                 restart,
                                 &rx,
                                 generation,
@@ -266,7 +328,7 @@ impl Driver {
                             ),
                         )
                         .await;
-                        if !self.watch || cancelled() {
+                        if !matches!(purpose, Purpose::Watch(_)) || cancelled() {
                             break;
                         }
                         rt::or(
@@ -284,15 +346,26 @@ impl Driver {
         handle
     }
 
-    fn emit(&self, handle: &Weak<Handle>, conn: ConnId, generation: u64, kind: EventKind) -> bool {
-        if let Some(handle) = handle.upgrade()
-            && handle.tx.epoch.load(Ordering::Acquire) == generation
-        {
-            let handle = ClientHandle(handle);
-            (self.sink)(&handle, Event { conn, kind });
-            return handle.0.tx.epoch.load(Ordering::Acquire) == generation;
-        }
-        false
+    async fn emit(
+        &self,
+        handle: &Weak<Handle>,
+        conn: ConnId,
+        generation: u64,
+        kind: EventKind,
+    ) -> bool {
+        let sent = {
+            let Some(handle) = handle.upgrade() else {
+                return false;
+            };
+            if handle.tx.epoch.load(Ordering::Acquire) != generation {
+                return false;
+            }
+            (self.sink)(&ClientHandle(handle), Event { conn, kind })
+        };
+        sent.await
+            && handle
+                .upgrade()
+                .is_some_and(|handle| handle.tx.epoch.load(Ordering::Acquire) == generation)
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -302,15 +375,22 @@ impl Driver {
         daemon: &Daemon,
         client: ClientId,
         conn: ConnId,
-        attach: Attach,
+        purpose: Purpose,
         restart: bool,
         rx: &Outbox,
         generation: u64,
         handle: &Weak<Handle>,
     ) -> Option<(u64, Request)> {
+        {
+            let mut state = rx.state.lock().unwrap_or_else(PoisonError::into_inner);
+            // A watch retries without a new Connect effect or connection generation.
+            if rx.epoch.load(Ordering::Acquire) == generation {
+                state.finished = None;
+            }
+        }
         let made = self
             .open(
-                rt, daemon, client, conn, &attach, restart, generation, handle,
+                rt, daemon, client, conn, &purpose, restart, generation, handle,
             )
             .await;
         let Connection {
@@ -325,26 +405,30 @@ impl Driver {
         } = match made {
             Ok(connection) => connection,
             Err(error) => {
+                rx.finish(generation);
                 let kind = failure(rt, daemon, error).await;
-                self.emit(handle, conn, generation, kind);
+                self.emit(handle, conn, generation, kind).await;
                 return None;
             }
         };
-        if !self.emit(
-            handle,
-            conn,
-            generation,
-            EventKind::Connected {
-                welcome,
-                remote: remote.is_some(),
-                commands,
-                machine,
-                upgrade,
-            },
-        ) {
-            return None;
-        }
         let read = async {
+            if !self
+                .emit(
+                    handle,
+                    conn,
+                    generation,
+                    EventKind::Connected {
+                        welcome,
+                        remote: remote.is_some(),
+                        commands,
+                        machine,
+                        upgrade,
+                    },
+                )
+                .await
+            {
+                return (Error::Closed, None);
+            }
             let mut batch = 0;
             loop {
                 batch += 1;
@@ -354,7 +438,10 @@ impl Driver {
                 }
                 match stream.recv(&mut buffered).await {
                     Ok(Some(msg)) => {
-                        if !self.emit(handle, conn, generation, EventKind::Msg(msg)) {
+                        if !self
+                            .emit(handle, conn, generation, EventKind::Msg(msg))
+                            .await
+                        {
                             return (Error::Closed, None);
                         }
                     }
@@ -380,6 +467,9 @@ impl Driver {
                         continue;
                     }
                     Request::Io(command) => command,
+                    command @ Request::Connect { .. } => {
+                        return (Error::Closed, Some((epoch, command)));
+                    }
                 };
                 let result = match *command {
                     Io::Send(msg) => stream.send(&msg).await,
@@ -387,7 +477,7 @@ impl Driver {
                         let origin = self.origin.clone();
                         match rt::unblock_with(
                             &**rt,
-                            rt::BlockingClass::Network,
+                            rt::BlockingClass::Storage,
                             64 << 10,
                             move || origin(),
                         )
@@ -409,7 +499,9 @@ impl Driver {
             (Error::Closed, None)
         };
         let (why, pending) = rt::or(read, write).await;
-        self.emit(handle, conn, generation, EventKind::Closed(why));
+        rx.finish(generation);
+        self.emit(handle, conn, generation, EventKind::Closed(why))
+            .await;
         pending
     }
 
@@ -420,20 +512,22 @@ impl Driver {
         daemon: &Daemon,
         client: ClientId,
         conn: ConnId,
-        attach: &Attach,
+        purpose: &Purpose,
         restart: bool,
         generation: u64,
         handle: &Weak<Handle>,
     ) -> Result<Connection, Error> {
         let first = |remote: Option<&Environment>| {
-            Ok(vec![if self.watch {
-                ClientMsg::WatchSessions
-            } else {
-                crate::attaching(attach, || crate::origin(remote))?
+            Ok(vec![match purpose {
+                Purpose::Watch(_) => ClientMsg::WatchSessions,
+                Purpose::Session(attach) => crate::attaching(attach, || {
+                    remote.map_or_else(|| (self.origin)(), |env| Ok(env.clone()))
+                })?,
             }])
         };
-        let on_drain = || {
-            self.emit(handle, conn, generation, EventKind::Waiting);
+        let on_drain = || async {
+            self.emit(handle, conn, generation, EventKind::Waiting)
+                .await;
         };
         let start = if restart {
             Start::Replace
@@ -464,7 +558,18 @@ impl ClientHandle {
     /// takes the latest value; mutations are refused without changing their order.
     pub fn io(&self, io: Io) -> Result<(), Error> {
         let revokes = matches!(io, Io::Hangup | Io::Connect { .. });
-        let result = self.0.tx.send(Request::Io(Box::new(io)));
+        let result = self.0.tx.send(match io {
+            Io::Connect {
+                conn,
+                attach,
+                restart,
+            } => Request::Connect {
+                conn,
+                purpose: Purpose::Session(attach),
+                restart,
+            },
+            io => Request::Io(Box::new(io)),
+        });
         if revokes {
             self.0.tx.stop.notify();
         }
@@ -623,10 +728,22 @@ mod tests {
                     restart: false,
                 })
                 .unwrap();
+            let (peer, first) = self.welcome();
+            assert!(matches!(first, ClientMsg::Attach { env: None, .. }));
+            assert!(matches!(
+                received.recv_timeout(Duration::from_secs(2)).unwrap().kind,
+                EventKind::Connected { .. }
+            ));
+            (handle, peer)
+        }
+        fn welcome(&self) -> (sys::OwnedConnection, ClientMsg) {
             let mut peer = self.listener.accept().unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
-            read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+            assert!(matches!(
+                read_frame::<ClientMsg>(&mut peer).unwrap(),
+                Some(ClientMsg::Hello { .. })
+            ));
+            let first = read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
             write_frame(
                 &mut peer,
                 &DaemonMsg::Welcome {
@@ -640,11 +757,7 @@ mod tests {
                 },
             )
             .unwrap();
-            assert!(matches!(
-                received.recv_timeout(Duration::from_secs(2)).unwrap().kind,
-                EventKind::Connected { .. }
-            ));
-            (handle, peer)
+            (peer, first)
         }
     }
 
@@ -653,6 +766,213 @@ mod tests {
             self.listener.retirement().unwrap().retire().unwrap();
             std::fs::remove_dir_all(&self.root).unwrap();
         }
+    }
+
+    #[test]
+    fn replay_exceeding_the_inbox_budget_preserves_every_event_and_outgoing_control() {
+        let fixture = Fixture::new();
+        let runtime: Rt = Arc::new(rt::Threads::new(1));
+        let (post, inbox) = crate::inbox(
+            crate::QueueBudget {
+                bytes: 8192,
+                requests: 2,
+                control_reserve: 1,
+            },
+            Event::retained_bytes,
+        );
+        let handle =
+            Driver::with_inbox(post, std::convert::identity).start(runtime, fixture.daemon.clone());
+        handle
+            .io(Io::Connect {
+                conn: ConnId(1),
+                attach: Attach::new(Target::New, crate::Env::Keep),
+                restart: false,
+            })
+            .unwrap();
+        let (mut peer, _) = fixture.welcome();
+        let mut writer = peer.try_clone().unwrap();
+        let replay = std::thread::spawn(move || {
+            for seq in 1..=4096 {
+                write_frame(&mut writer, &DaemonMsg::Synced { seq }).unwrap();
+            }
+            writer
+        });
+        // Flush requires the independent writer task to run while Connected
+        // fills the inbox and replay is waiting for the consumer.
+        handle
+            .io(Io::Send(ClientMsg::Interrupt { client_seq: None }))
+            .unwrap();
+        rt::block_on(handle.flush()).unwrap();
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Interrupt { .. })
+        ));
+        assert!(matches!(
+            inbox.recv_timeout(Duration::from_secs(2)).unwrap().kind,
+            EventKind::Connected { .. }
+        ));
+        for expected in 1..=4096 {
+            assert!(
+                matches!(inbox.recv_timeout(Duration::from_secs(2)).unwrap().kind, EventKind::Msg(DaemonMsg::Synced { seq }) if seq == expected)
+            );
+        }
+        let writer = replay.join().unwrap();
+        drop(writer);
+        drop(peer);
+        assert!(matches!(
+            inbox.recv_timeout(Duration::from_secs(2)).unwrap().kind,
+            EventKind::Closed(Error::Closed)
+        ));
+        drop(handle);
+    }
+
+    #[test]
+    fn dropping_the_last_handle_cancels_a_backpressured_reader() {
+        let fixture = Fixture::new();
+        let runtime: Rt = Arc::new(rt::Threads::new(1));
+        let (post, inbox) = crate::inbox(
+            crate::QueueBudget {
+                bytes: 8192,
+                requests: 2,
+                control_reserve: 1,
+            },
+            Event::retained_bytes,
+        );
+        let handle =
+            Driver::with_inbox(post, std::convert::identity).start(runtime, fixture.daemon.clone());
+        handle
+            .io(Io::Connect {
+                conn: ConnId(1),
+                attach: Attach::new(Target::New, crate::Env::Keep),
+                restart: false,
+            })
+            .unwrap();
+        let (mut peer, _) = fixture.welcome();
+        write_frame(&mut peer, &DaemonMsg::Synced { seq: 1 }).unwrap();
+        rt::block_on(handle.flush()).unwrap();
+        drop(handle);
+        // Closing a stream with unread replay may reset the peer.
+        match read_frame::<ClientMsg>(&mut peer) {
+            Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("connection stayed open after dropping its handle: {other:?}"),
+        }
+        assert!(matches!(
+            inbox.recv_timeout(Duration::from_secs(2)).unwrap().kind,
+            EventKind::Connected { .. }
+        ));
+        assert!(inbox.recv_timeout(Duration::from_secs(2)).is_none());
+        assert!(inbox.closed());
+    }
+
+    #[test]
+    fn initial_attach_and_refresh_use_the_configured_origin() {
+        let fixture = Fixture::new();
+        let runtime: Rt = Arc::new(rt::Threads::new(1));
+        let (events, received) = mpsc::channel();
+        let handle = Driver::with_origin(
+            || {
+                Ok(Environment::new(
+                    "configured-origin".into(),
+                    [("FROM_CALLBACK".into(), "yes".into())],
+                    false,
+                ))
+            },
+            move |_, event| {
+                events.send(event).unwrap();
+            },
+        )
+        .start(runtime, fixture.daemon.clone());
+        handle
+            .io(Io::Connect {
+                conn: ConnId(1),
+                attach: Attach::new(Target::New, crate::Env::Origin),
+                restart: false,
+            })
+            .unwrap();
+        let (mut peer, first) = fixture.welcome();
+        let ClientMsg::Attach {
+            env: Some(initial),
+            workspace,
+            ..
+        } = first
+        else {
+            panic!("attach must carry the configured environment");
+        };
+        assert_eq!(initial.cwd.as_str(), "configured-origin");
+        assert_eq!(workspace.as_ref(), Some(&initial.cwd));
+        assert!(matches!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap().kind,
+            EventKind::Connected { .. }
+        ));
+        handle.io(Io::SendEnvironment).unwrap();
+        let Some(ClientMsg::Environment(refreshed)) = read_frame::<ClientMsg>(&mut peer).unwrap()
+        else {
+            panic!("expected environment refresh");
+        };
+        assert_eq!(initial, refreshed);
+        drop(handle);
+    }
+
+    #[derive(Debug)]
+    struct BridgeOrigin {
+        link: Arc<dyn crate::link::Link>,
+        env: Environment,
+    }
+
+    impl crate::link::Link for BridgeOrigin {
+        fn open<'a>(
+            &'a self,
+            rt: &'a Rt,
+            build: &'a sys::Staged,
+            start: Start,
+        ) -> rt::BoxFuture<'a, Result<crate::link::Opened, Error>> {
+            Box::pin(async move {
+                let mut opened = self.link.open(rt, build, start).await?;
+                opened.remote = Some(self.env.clone());
+                Ok(opened)
+            })
+        }
+    }
+
+    #[test]
+    fn a_remote_attach_keeps_the_bridges_environment() {
+        let fixture = Fixture::new();
+        let runtime: Rt = Arc::new(rt::Threads::new(1));
+        let remote = Environment::new(
+            "remote-workspace".into(),
+            [("REMOTE".into(), "yes".into())],
+            false,
+        );
+        let mut daemon = fixture.daemon.clone();
+        daemon.link = Arc::new(BridgeOrigin {
+            link: daemon.link.clone(),
+            env: remote.clone(),
+        });
+        let (events, received) = mpsc::channel();
+        let handle = Driver::with_origin(
+            || panic!("a remote attach must not capture the local origin"),
+            move |_, event| {
+                let _ = events.send(event);
+            },
+        )
+        .start(runtime, daemon);
+        handle
+            .io(Io::Connect {
+                conn: ConnId(1),
+                attach: Attach::new(Target::New, crate::Env::Origin),
+                restart: false,
+            })
+            .unwrap();
+        let (_peer, first) = fixture.welcome();
+        assert!(
+            matches!(first, ClientMsg::Attach { env: Some(env), workspace: Some(workspace), .. } if env == remote && workspace == remote.cwd)
+        );
+        assert!(matches!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap().kind,
+            EventKind::Connected { remote: true, .. }
+        ));
+        drop(handle);
     }
 
     fn large_input() -> ClientMsg {
@@ -797,9 +1117,9 @@ mod tests {
             Err(Error::Busy)
         );
         assert_eq!(
-            send(Io::Connect {
+            queue.send(Request::Connect {
                 conn: ConnId(2),
-                attach: Attach::new(Target::New, crate::Env::Given(oversized)),
+                purpose: Purpose::Session(Attach::new(Target::New, crate::Env::Given(oversized))),
                 restart: false
             }),
             Err(Error::Busy)
@@ -869,6 +1189,64 @@ mod tests {
         drop(handle);
         peer.read_to_end(&mut Vec::new()).unwrap();
         assert!(refused, "a stalled transport accepted every queued refresh");
+    }
+
+    #[test]
+    fn failed_writes_resolve_flushes_before_terminal_delivery() {
+        let fixture = Fixture::new();
+        let runtime: Rt = Arc::new(rt::Threads::new(1));
+        let (post, inbox) = crate::inbox(
+            crate::QueueBudget {
+                bytes: 8192,
+                requests: 2,
+                control_reserve: 1,
+            },
+            |_| 1,
+        );
+        post.send(Event {
+            conn: ConnId(1),
+            kind: EventKind::Waiting,
+        })
+        .unwrap();
+        let handle = Driver::with_inbox(post, std::convert::identity)
+            .start(runtime.clone(), fixture.daemon.clone());
+        handle
+            .io(Io::Connect {
+                conn: ConnId(1),
+                attach: Attach::new(Target::New, crate::Env::Keep),
+                restart: false,
+            })
+            .unwrap();
+        let (mut peer, _) = fixture.welcome();
+        handle.io(Io::Send(large_input())).unwrap();
+        peer.read_exact(&mut [0; 4]).unwrap();
+        let mut flush = pin!(handle.flush());
+        rt::block_on(poll_fn(|cx| {
+            assert!(flush.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }));
+        drop(peer);
+        assert_eq!(
+            rt::block_on(rt::or(async { Some(flush.await) }, async {
+                runtime.sleep(Duration::from_secs(2)).await;
+                None
+            })),
+            Some(Err(Error::Closed)),
+            "flush must finish while terminal delivery is backpressured"
+        );
+        assert_eq!(
+            rt::block_on(rt::or(async { Some(handle.flush().await) }, async {
+                runtime.sleep(Duration::from_secs(2)).await;
+                None
+            })),
+            Some(Err(Error::Closed)),
+            "later flushes must observe the ended connection too"
+        );
+        assert!(matches!(inbox.recv().unwrap().kind, EventKind::Waiting));
+        assert!(matches!(
+            inbox.recv_timeout(Duration::from_secs(2)).unwrap().kind,
+            EventKind::Closed(_)
+        ));
     }
 
     #[test]
@@ -980,34 +1358,12 @@ mod tests {
         });
         let (released, done) = mpsc::channel();
         let released = Released(released);
-        let mut driver = Driver::new(move |_, _| {
+        let driver = Driver::new(move |_, _| {
             let _ = &released;
         });
-        driver.watch = true;
-        let handle = driver.start(runtime.clone(), fixture.daemon.clone());
-        handle
-            .io(Io::Connect {
-                conn: ConnId(1),
-                attach: Attach::new(Target::New, crate::Env::Keep),
-                restart: false,
-            })
-            .unwrap();
-        let mut peer = fixture.listener.accept().unwrap();
-        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
-        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
-        write_frame(
-            &mut peer,
-            &DaemonMsg::Welcome {
-                proto: protocol::PROTO,
-                build: "test".into(),
-                caps: Caps::ALL,
-                machine: protocol::MachineId([0; 16]),
-                commands: Vec::new(),
-                queries: Vec::new(),
-                upgrade: None,
-            },
-        )
-        .unwrap();
+        let handle = driver.watch(runtime.clone(), fixture.daemon.clone());
+        let (peer, first) = fixture.welcome();
+        assert!(matches!(first, ClientMsg::WatchSessions));
         drop(peer);
         asleep.recv_timeout(Duration::from_secs(2)).unwrap();
         drop(handle);

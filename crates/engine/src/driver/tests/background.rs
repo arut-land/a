@@ -53,7 +53,7 @@ fn backgrounded(fixture: &Fixture, session: &Live, log: &[Entry], call: CallId) 
             && *held == [Held::Stream(stream)])));
     let back = (log.iter())
         .find_map(|e| match &e.body {
-            Body::Enqueue { envelope } if envelope.id.purpose == EnvelopeId::DETACHED => {
+            Body::Enqueue { envelope } if envelope.id().purpose == EnvelopeId::DETACHED => {
                 Some(envelope)
             }
             _ => None,
@@ -61,7 +61,7 @@ fn backgrounded(fixture: &Fixture, session: &Live, log: &[Entry], call: CallId) 
         .unwrap();
     let protocol::Carried::Detached(Outcome::Done {
         output: protocol::Payload::Inline(output),
-    }) = &back.payload
+    }) = back.payload()
     else {
         panic!("{back:?}")
     };

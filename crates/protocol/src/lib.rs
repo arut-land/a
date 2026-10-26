@@ -11,12 +11,8 @@ use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// The protocol this build speaks best.
-pub const PROTO: u32 = 36;
-
-/// The oldest protocol this build still speaks: a peer whose range
-/// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 36;
+/// The exact protocol this build speaks.
+pub const PROTO: u32 = 37;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -486,6 +482,8 @@ kinds! {
         /// it reaches the agent as the session's own envelope
         /// ([`EnvelopeId::CHILD`]).
         Fired "fired" { watch: Seq, outcome: ToolOutcome } = Durable;
+        /// Watch cancelled without delivering a result.
+        Unwatch "unwatch" { watch: Seq } = Durable;
         // ── environment and extensions ─────────────────────────────────
         /// The environment the session's commands run in from here on, as the
         /// attaching client captured it, secrets redacted.
@@ -539,6 +537,7 @@ impl Body {
             | Self::Spawned { .. }
             | Self::Watch { .. }
             | Self::Fired { .. }
+            | Self::Unwatch { .. }
             | Self::Environment { .. }
             | Self::Extensions { .. }
             | Self::Ext { .. }
@@ -1575,60 +1574,6 @@ impl SettingsChange {
     }
 }
 
-/// The protocol versions a peer speaks, `min..=max`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Versions {
-    pub min: u32,
-    pub max: u32,
-}
-
-impl Versions {
-    /// This build's.
-    pub const OURS: Self = Self {
-        min: PROTO_MIN,
-        max: PROTO,
-    };
-
-    /// `min..=max`, or just `max` without a `min`.
-    pub fn new(min: Option<u32>, max: u32) -> Self {
-        Self {
-            min: min.unwrap_or(max).min(max),
-            max,
-        }
-    }
-
-    /// The highest version in both ranges.
-    pub fn common(self, other: Self) -> Option<u32> {
-        let max = self.max.min(other.max);
-        (self.min.max(other.min) <= max).then_some(max)
-    }
-
-    /// `min` as a hello or mismatch carries it: left out when it is `max`.
-    pub fn min_field(self) -> Option<u32> {
-        (self.min < self.max).then_some(self.min)
-    }
-}
-
-/// Just the one version.
-impl From<u32> for Versions {
-    fn from(proto: u32) -> Self {
-        Self {
-            min: proto,
-            max: proto,
-        }
-    }
-}
-
-impl fmt::Display for Versions {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.min == self.max {
-            write!(f, "protocol {}", self.max)
-        } else {
-            write!(f, "protocols {}-{}", self.min, self.max)
-        }
-    }
-}
-
 /// What a client does for a session beyond showing it: declared on attach
 /// and changed live with [`ClientMsg::Declare`] (a phone going to the
 /// background, say). Calls the session routes to clients go to those that
@@ -1716,7 +1661,7 @@ kinds! {
     #[derive(Clone, Debug, Serialize)]
     pub enum ClientMsg: t = "t" in MsgFields {
         /// `build` is the client's staged build id (`<version>+<hash>`); it
-        /// speaks protocols `min..=proto`, or just `proto` without `min`, with
+        /// speaks exactly protocol `proto`, with
         /// capabilities `caps`. Its first messages (attach, input) may follow
         /// right behind, without waiting for the answer: unless that is a
         /// welcome, the daemon acts on none of them. `client` names it across
@@ -1728,7 +1673,6 @@ kinds! {
         Hello "hello" {
             proto: u32,
             build: String,
-            min: Option<u32> = default,
             caps: Caps = default,
             client: Option<ClientId> = default,
             machine: Option<MachineId> = default,
@@ -1917,9 +1861,8 @@ kinds! {
             /// this build serves meanwhile. `a daemon stop` ends it.
             upgrade: Option<String> = default,
         } = Control;
-        /// The daemon speaks protocols `min..=supported` (just `supported`
-        /// without `min`), none of the client's.
-        Mismatch "mismatch" { supported: u32, min: Option<u32> = default } = Control;
+        /// The daemon speaks exactly `supported`, which differs from the client.
+        Mismatch "mismatch" { supported: u32 } = Control;
         /// A newer build was staged: the daemon makes way for it, closing
         /// every connection. Clients then reconnect, which reaches the new
         /// build, and re-attach to replay what they missed. Sent as the reply
@@ -2231,11 +2174,15 @@ fn length(len: u32) -> io::Result<usize> {
 /// The body of the next frame, read once for every type and stream.
 fn read_body(r: &mut dyn Read) -> io::Result<Option<Vec<u8>>> {
     let mut len = [0; 4];
-    match r.read_exact(&mut len) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    loop {
+        match r.read(&mut len[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
     }
+    r.read_exact(&mut len[1..])?;
     let len = length(u32::from_le_bytes(len))?;
     let mut kind = [0];
     r.read_exact(&mut kind)?;
@@ -2322,9 +2269,9 @@ impl From<&str> for Carried {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "EnvelopeFields")]
 pub struct Envelope {
-    pub id: EnvelopeId,
+    id: EnvelopeId,
     pub destination: SessionId,
-    pub payload: Carried,
+    payload: Carried,
     /// What the payload references outside the log: a detached call's
     /// outcome holds what its result would have.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2340,28 +2287,57 @@ struct EnvelopeFields {
     held: Vec<Held>,
 }
 
+/// The envelope's purpose disagrees with what it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnvelopeError;
+
+impl fmt::Display for EnvelopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an envelope's purpose is not the one its payload is sent under")
+    }
+}
+
+impl std::error::Error for EnvelopeError {}
+
 impl TryFrom<EnvelopeFields> for Envelope {
-    type Error = &'static str;
+    type Error = EnvelopeError;
 
     fn try_from(f: EnvelopeFields) -> Result<Self, Self::Error> {
-        let reserved = [EnvelopeId::JOB, EnvelopeId::CHILD, EnvelopeId::DETACHED];
-        let fits = match f.payload.purpose() {
-            Some(purpose) => f.id.purpose == purpose,
-            None => !reserved.contains(&f.id.purpose.as_str()),
-        };
-        if !fits {
-            return Err("an envelope's purpose is not the one its payload is sent under");
-        }
-        Ok(Self {
-            id: f.id,
-            destination: f.destination,
-            payload: f.payload,
-            held: f.held,
-        })
+        Self::new(f.id, f.destination, f.payload, f.held)
     }
 }
 
 impl Envelope {
+    /// Validates the payload and its purpose at construction, as on decode.
+    pub fn new(
+        id: EnvelopeId,
+        destination: SessionId,
+        payload: Carried,
+        held: Vec<Held>,
+    ) -> Result<Self, EnvelopeError> {
+        let fits = match payload.purpose() {
+            Some(purpose) => id.purpose == purpose,
+            None => ![EnvelopeId::JOB, EnvelopeId::CHILD, EnvelopeId::DETACHED]
+                .contains(&id.purpose.as_str()),
+        };
+        if !fits {
+            return Err(EnvelopeError);
+        }
+        Ok(Self {
+            id,
+            destination,
+            payload,
+            held,
+        })
+    }
+
+    pub const fn id(&self) -> &EnvelopeId {
+        &self.id
+    }
+    pub const fn payload(&self) -> &Carried {
+        &self.payload
+    }
+
     /// An envelope session `session` sends itself, about its own call
     /// `call`: how what it started and stopped waiting on (a child, a
     /// detached call, a background job) reaches it, on the one queue,
@@ -2409,13 +2385,13 @@ pub struct Outgoing {
 
 impl Outgoing {
     /// The envelope recipient `to` is delivered.
-    pub fn to(&self, to: SessionId) -> Envelope {
-        Envelope {
-            id: self.id.clone(),
-            destination: to,
-            payload: Carried::Message(self.payload.clone()),
-            held: Vec::new(),
-        }
+    pub fn to(&self, to: SessionId) -> Result<Envelope, EnvelopeError> {
+        Envelope::new(
+            self.id.clone(),
+            to,
+            Carried::Message(self.payload.clone()),
+            Vec::new(),
+        )
     }
 }
 
@@ -2501,6 +2477,49 @@ mod tests {
         assert!(serde_json::from_str::<Envelope>(&child).is_err());
         let message = line.replace(r#"{"job":"ended"}"#, r#"{"message":"ended"}"#);
         assert!(serde_json::from_str::<Envelope>(&message).is_err());
+    }
+
+    #[test]
+    fn every_constructed_envelope_decodes_and_reserved_messages_are_rejected() {
+        for purpose in [
+            "message",
+            EnvelopeId::JOB,
+            EnvelopeId::CHILD,
+            EnvelopeId::DETACHED,
+        ] {
+            let outgoing = Outgoing {
+                id: EnvelopeId {
+                    sender: SessionId::NIL,
+                    call: CallId::new(2).unwrap(),
+                    purpose: purpose.into(),
+                },
+                recipients: vec![SessionId::NIL],
+                payload: "hello".into(),
+            };
+            let envelope = outgoing.to(SessionId::NIL);
+            if purpose == "message" {
+                let envelope = envelope.unwrap();
+                let wire = Json::encode(&envelope).unwrap();
+                assert_eq!(wire.parse::<Envelope>().unwrap(), envelope);
+            } else {
+                assert!(envelope.is_err());
+            }
+        }
+        for payload in [
+            Carried::Message("hello".into()),
+            Carried::Job("ended".into()),
+            Carried::Child(ToolOutcome::Interrupted { output: None }),
+            Carried::Detached(ToolOutcome::Interrupted { output: None }),
+        ] {
+            let envelope = Envelope::own(SessionId::NIL, CallId::new(2).unwrap(), payload);
+            assert_eq!(
+                Json::encode(&envelope)
+                    .unwrap()
+                    .parse::<Envelope>()
+                    .unwrap(),
+                envelope
+            );
+        }
     }
 
     /// What a child is spawned with references what its parent's entries
@@ -2637,6 +2656,12 @@ mod tests {
                 self.1 = self.1.max(buf.len());
                 self.0.read(buf)
             }
+        }
+        assert!(read_frame::<ClientMsg>(&mut &[][..]).unwrap().is_none());
+        for bytes in 1..4 {
+            let prefix = MAX_FRAME.to_le_bytes();
+            let err = read_frame::<ClientMsg>(&mut &prefix[..bytes]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         }
         let mut claim = MAX_FRAME.to_le_bytes().to_vec();
         claim.push(FrameKind::Json as u8);

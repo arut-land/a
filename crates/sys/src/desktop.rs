@@ -1,9 +1,10 @@
 use std::io;
 use std::process::{Command, Stdio};
-use std::thread;
 
-/// Opens a link without waiting for the browser to exit.
-pub fn open_browser(link: &str) -> io::Result<()> {
+/// Opens a link without waiting for the browser to exit: the opener it
+/// starts is returned for the caller to reap, as some stay until the
+/// browser they started exits.
+pub fn open_browser(link: &str) -> io::Result<crate::Child> {
     #[cfg(target_os = "macos")]
     let program = "open";
     #[cfg(windows)]
@@ -17,7 +18,7 @@ pub fn open_browser(link: &str) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     #[cfg(unix)]
-    let mut child = {
+    {
         let null = std::fs::File::options()
             .read(true)
             .write(true)
@@ -25,11 +26,12 @@ pub fn open_browser(link: &str) -> io::Result<()> {
         crate::proc::unix::SpawnPlan::new(&command, [&null, &null, &null])
             .inherit_snapshot()
             .uncontained()
-            .spawn()?
-    };
+            .spawn()
+    }
     #[cfg(windows)]
-    let mut child = command.spawn()?;
-    // Some openers stay until the browser they started exits.
-    thread::spawn(move || child.wait());
-    Ok(())
+    {
+        let child = command.spawn()?;
+        let id = child.id();
+        Ok(crate::Child::handed(child.into(), id))
+    }
 }

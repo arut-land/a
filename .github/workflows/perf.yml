@@ -18,6 +18,11 @@ on:
       runner:
         description: 'Runner label, or all'
         default: all
+        type: choice
+        options: [all, ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
+      harness_ref:
+        description: 'Harness revision (empty uses this workflow commit); pin for historical experiments'
+        default: ''
         type: string
       source_ref:
         description: 'Source revision (empty uses this workflow revision); main bootstraps a baseline'
@@ -71,36 +76,16 @@ env:
   CARGO_BUILD_JOBS: 4
 
 jobs:
-  matrix:
-    if: github.event_name != 'schedule' && !inputs.autostart
-    runs-on: ubuntu-latest
-    outputs:
-      runners: ${{ steps.select.outputs.runners }}
-    steps:
-      - uses: actions/checkout@v7
-      - id: select
-        env:
-          SELECTED: ${{ inputs.runner || 'all' }}
-        run: |
-          python3 - <<'PY'
-          import json, os
-          runners = ['ubuntu-latest', 'ubuntu-24.04-arm', 'windows-latest', 'windows-11-arm', 'macos-latest', 'macos-15-intel']
-          selected = os.environ['SELECTED']
-          assert selected == 'all' or selected in runners, selected
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write('runners=' + json.dumps(runners if selected == 'all' else [selected]) + '\n')
-          PY
-
   measure:
-    needs: matrix
+    if: github.event_name != 'schedule' && !inputs.autostart
     name: perf (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     # Twenty-round ablations and the session layouts need longer than the standard paired suite.
-    timeout-minutes: ${{ (inputs.ablation || inputs.sessions) && 180 || 90 }}
+    timeout-minutes: ${{ inputs.sessions && 240 || inputs.ablation && 180 || 90 }}
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(needs.matrix.outputs.runners) }}
+        runner: ${{ fromJSON(inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
     env:
       PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
       PERF_ABLATION: ${{ inputs.ablation || false }}
@@ -119,6 +104,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: harness
+          ref: ${{ inputs.harness_ref || github.sha }}
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.source_ref || github.sha }}
@@ -218,12 +204,12 @@ jobs:
           fi
       - name: Measure concurrently active sessions
         if: env.PERF_SESSIONS == 'true'
-        timeout-minutes: 150
+        timeout-minutes: 210
         run: |
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
-            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase sessions --source ../measured --runner '${{ matrix.runner }}'
+            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase sessions --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
           else
-            mise exec -- python scripts/perf/hosted.py --phase sessions --source ../measured --runner '${{ matrix.runner }}'
+            mise exec -- python scripts/perf/hosted.py --phase sessions --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
           fi
       - name: Compare with main
         if: always()
