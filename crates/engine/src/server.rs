@@ -152,7 +152,8 @@ impl Frames {
                 .io
                 .read_with(|mut s| {
                     // Scratch lives only while polling: an idle connection
-                    // retains received bytes, not a full read buffer.
+                    // retains received bytes, not a full read buffer. A direct
+                    // Vec read would retain the entire scratch allocation.
                     let mut read = [0; 16 << 10];
                     let n = s.read(&mut read)?;
                     self.buf.extend_from_slice(&read[..n]);

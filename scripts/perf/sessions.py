@@ -30,11 +30,11 @@ def percentile(values, q):
     return values[min(len(values) - 1, int(len(values) * q))]
 
 
-def memory_layouts(binaries):
+def memory_layouts(binaries, arena_policy=False):
     plain = "workers=4"
     labels = [("A", plain, {}, None), ("A2", plain, {}, None)]
     labels += [(label, plain, {}, label) for label in binaries]
-    if sys.platform == "linux":
+    if arena_policy and sys.platform == "linux":
         labels.append(("arenas", plain + ",arenas=default", {}, None))
     return labels
 
@@ -186,6 +186,8 @@ def main():
     parser.add_argument("--binary", dest="binaries", action="append", default=[],
                         help="LABEL=PATH: the same executable built with another allocator")
     parser.add_argument("--layouts", choices=["runtime", "memory"], default="runtime")
+    parser.add_argument("--arena-policy", action="store_true",
+                        help="compare glibc arena policies; requires a binary supporting arenas=default")
     parser.add_argument("--output", type=Path, default=Path("target/perf-sessions"))
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--sessions", default="1,8,32,128")
@@ -195,7 +197,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     cores = os.cpu_count()
     binaries = dict(entry.split("=", 1) for entry in args.binaries)
-    labels = (memory_layouts(binaries) if args.layouts == "memory"
+    labels = (memory_layouts(binaries, args.arena_policy) if args.layouts == "memory"
               else [(label, runtime, extra, None) for label, runtime, extra in layouts(cores)])
     counts = [int(n) for n in args.sessions.split(",")]
     raw = args.output / "sessions.jsonl"

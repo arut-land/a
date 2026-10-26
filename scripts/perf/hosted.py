@@ -430,6 +430,8 @@ def sessions(source, output, variant, reference=""):
             extra.append(f"{allocator}={benchmark('engine-bench-' + allocator, features=['sys/' + allocator])}")
     layouts = ["--layouts", "memory", *(arg for entry in extra for arg in ("--binary", entry))] \
         if "allocators" in variant or reference else []
+    if "allocators" in variant and not reference:
+        layouts.append("--arena-policy")
     round_trip = [] if layouts else ["--round-trip", benchmark("rt-round-trip", ("-p", "rt", "--test", "round_trip"))]
     os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
     (output / "sessions").mkdir(exist_ok=True)

@@ -14,18 +14,14 @@ pub fn small_footprint() {
 
 /// Returns unused allocator pages to the operating system without moving live allocations.
 pub fn release() {
-    system::release();
-}
-
-mod system {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    pub fn release() {
+    {
         // SAFETY: trimming takes no pointers and keeps every live block.
         unsafe { libc::malloc_trim(0) };
     }
 
     #[cfg(target_os = "macos")]
-    pub fn release() {
+    {
         unsafe extern "C" {
             fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
         }
@@ -34,7 +30,7 @@ mod system {
     }
 
     #[cfg(windows)]
-    pub fn release() {
+    {
         use windows_sys::Win32::System::Memory::{HeapOptimizeResources, HeapSetInformation};
         use windows_sys::Win32::System::SystemServices::{
             HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION, HEAP_OPTIMIZE_RESOURCES_INFORMATION,
@@ -53,14 +49,6 @@ mod system {
             )
         };
     }
-
-    // musl returns freed memory as it goes.
-    #[cfg(not(any(
-        all(target_os = "linux", target_env = "gnu"),
-        target_os = "macos",
-        windows
-    )))]
-    pub fn release() {}
 }
 
 /// Zeroed words mapped straight from the OS: a page takes memory once it

@@ -14,6 +14,32 @@ from stats import distribution
 
 
 class Comparison(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("psutil"), "hosted harness accounting dependency")
+    def test_historical_sessions_never_receive_current_arena_policy_options(self):
+        import json
+        import tempfile
+        import hosted
+        import sessions
+        for variant, reference in [({}, "origin/main"), ({"allocators": []}, "origin/main"),
+                                   ({"allocators": []}, "")]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / "engine"
+                binary.touch()
+                output = root / "output"
+                output.mkdir()
+                with mock.patch.object(hosted, "run") as run, \
+                     mock.patch.object(hosted.subprocess, "check_output", return_value="revision"), \
+                     mock.patch.object(hosted.platform, "platform", return_value="Linux"), \
+                     mock.patch.object(hosted, "hardware", return_value={}), \
+                     mock.patch.dict(os.environ), mock.patch.object(sys, "platform", "linux"):
+                    run.return_value.stdout = json.dumps(dict(executable=str(binary), profile=dict(test=True)))
+                    hosted.sessions(root, output, dict(variant, sessions="1"), reference)
+                    command = run.call_args.args[0]
+                    labels = sessions.memory_layouts({}, "--arena-policy" in command)
+                self.assertEqual([label for label, _, _, _ in labels],
+                                 ["A", "A2"] if reference else ["A", "A2", "arenas"])
+
     def test_allocator_effects_pair_rounds_before_resampling(self):
         import json
         import tempfile

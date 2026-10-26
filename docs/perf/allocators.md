@@ -12,7 +12,10 @@ A/A band. A wider interval leaves that target unqualified.
 The sessions campaign compares the system allocator twice (`A`, `A2`), the
 system allocator with the runtime's retirement callback (`rest`), and each
 replacement allocator. Linux also compares glibc's default arena policy
-(`arenas`) against `M_ARENA_MAX=2`. Each process runs three turns at either
+(`arenas`) against `M_ARENA_MAX=2`. In the current harness that experiment
+requires `--arena-policy`; hosted same-source allocator campaigns enable it,
+while historical-source comparisons omit it because the reference parser may
+not recognize `arenas=default`. Each process runs three turns at either
 1 or 128 concurrently attached sessions. Twenty rounds reverse layout order
 on alternate rounds. All builds finish before hosted measurements.
 
@@ -244,6 +247,19 @@ incomplete or large messages still grow normally. No frame-size or session
 memory limit was added. The regression test sends a small real frame,
 checks scratch retention, receives a 64 KiB frame, and checks cooperative
 yielding between ready batches.
+
+The stack buffer deliberately adds one copy of the received bytes into the
+persistent Vec per successful read. A direct-read experiment that resized the
+Vec by 16 KiB inside `read_with` still failed the retained-scratch invariant:
+truncating its length after reading does not release its capacity. Moving the
+resize inside the polling closure therefore loses the retention fix unless
+another allocation/shrink policy is added. Keep the stack copy rather than
+adding that policy. The measured complete-reader trade-off is roughly 2 MiB
+less idle RSS at 128 sessions, with the CPU/latency intervals below; those
+intervals include the copy and do not isolate its cost. On the local M3,
+active CPU changes by +0.452% [−2.861, 2.869] and turn p99 by −0.900%
+[−1.974, 0.774]. They do not establish that copying is free or prove strict
+non-inferiority on every hosted target.
 
 These single diagnostic samples establish attribution, not timing. The
 uninstrumented 20-round comparison uses `1190974f` against `48b9c3a0` on
