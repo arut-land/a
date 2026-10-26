@@ -348,6 +348,27 @@ fn content_addressed_paths_cannot_be_rebound_to_another_blob() {
 }
 
 #[test]
+fn filesystem_equivalent_aliases_cannot_replace_content_addressed_files() {
+    let home = Home::new();
+    let tree = home.tree();
+    let first = home.put(b"first");
+    let other = home.put(b"other");
+    let canonical = TreePath::by_id(&first.id);
+    tree.ensure(&canonical, &first).unwrap();
+    for namespace in ["BY-ID", "By-Id", "by-ID", "by-id.", "by-id ", "by-ıd"] {
+        let alias = TreePath::new(&format!("{namespace}/{}", first.id)).unwrap();
+        assert_eq!(
+            tree.ensure(&alias, &other).unwrap_err().kind(),
+            ErrorKind::InvalidInput,
+            "{namespace}"
+        );
+        assert_eq!(fs::read(tree.path(&canonical)).unwrap(), b"first");
+    }
+    tree.ensure(&canonical, &first).unwrap();
+    assert_eq!(fs::read(tree.path(&canonical)).unwrap(), b"first");
+}
+
+#[test]
 fn equal_length_blobs_never_share_an_alias_identity() {
     let home = Home::new();
     let tree = home.tree();

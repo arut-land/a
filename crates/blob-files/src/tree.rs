@@ -54,7 +54,14 @@ impl Materialize for CacheDir {
 
     fn ensure(&self, at: &TreePath, blob: &BlobRef) -> io::Result<()> {
         let by_id = TreePath::by_id(&blob.id);
-        if at.parts().next() == Some("by-id") && *at != by_id {
+        // Reserve the namespace on case-insensitive file systems too. Windows
+        // also ignores trailing dots/spaces in ordinary path components.
+        if at
+            .parts()
+            .next()
+            .is_some_and(|part| part.trim_end_matches(['.', ' ']).to_uppercase() == "BY-ID")
+            && *at != by_id
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "blob identity does not match its cache path",
