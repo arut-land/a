@@ -590,8 +590,9 @@ its caller. It owns admission, recovery, failure metadata and queue visibility;
 the kernel uses the same model-result settlement path for either contract.
 A cancelled watch logs `Unwatch`, without delivering a child result. `Fired`
 records an actual result, including one interrupted by the child itself, and
-recovery queues it exactly as live execution does. Replayed process identifiers
-never confer ownership; only the engine's live process leases can signal work.
+recovery queues it exactly as live execution does. A foreground child's owner
+cancellation is proved by its waiting call's interrupted result. Replayed process
+identifiers never confer ownership; only the engine's live process leases can signal work.
 
 The kernel remains a pure lifecycle reducer: ordered inputs, waits, watches,
 terminal results and commit requirements. It does not select models, discover

@@ -899,6 +899,22 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
 }
 
 #[test]
+fn a_childs_interrupted_result_does_not_prove_owner_cancellation() {
+    let child = SessionId::new();
+    let entries = [
+        entry(1, Body::Watch { child }),
+        entry(
+            2,
+            Body::Fired {
+                watch: Seq::new(1).unwrap(),
+                outcome: Outcome::Interrupted { output: None },
+            },
+        ),
+    ];
+    assert!(!cancelled_child(entries, child));
+}
+
+#[test]
 fn a_fired_watch_wakes_the_model_with_the_childs_result() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let fixture =

@@ -775,7 +775,7 @@ fn until(daemon: &Daemon, id: SessionId, done: impl Fn(&[Body]) -> bool + Sync) 
 }
 
 #[test]
-fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
+fn an_owned_child_interrupted_by_its_parent_stays_cancelled_after_reload() {
     let (root, home) = home("owned");
     std::fs::create_dir_all(&root).unwrap();
     let daemon = Daemon::load(&home, &echo()).unwrap();
@@ -803,7 +803,6 @@ fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
     daemon.hibernate(Duration::ZERO);
     let unloaded = daemon.children(id).is_empty();
     drop(daemon);
-    std::fs::remove_dir_all(&root).unwrap();
 
     assert_eq!(owned.len(), 1);
     assert_eq!(busy, Duration::ZERO);
@@ -821,6 +820,20 @@ fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
         "{parent_log:#?}"
     );
     assert!(unloaded);
+    drop(session);
+    drop(owned);
+    let again = Daemon::load(&home, &echo()).unwrap();
+    let restored = again.attach_to(&Target::Id(*child), PathBuf::new).unwrap();
+    restored.session().barrier();
+    assert!(
+        restored
+            .session()
+            .submit("cannot restart cancelled ownership")
+            .is_err()
+    );
+    drop(restored);
+    drop(again);
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

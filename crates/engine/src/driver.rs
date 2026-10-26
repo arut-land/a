@@ -34,7 +34,7 @@ use protocol::ledger::Ledger;
 use protocol::view::SessionView;
 use protocol::{
     Activity, Author, Body, CallId, DaemonMsg, Entry, Environment, Frame, Json, Mode, Outcome,
-    ReadOnly, Residency, SessionId, SessionSummary, ToolChoice,
+    ReadOnly, Residency, SessionId, SessionSummary, ToolChoice, WaitOn,
 };
 use rt::BlockingClass::Cpu;
 use rt::{channel, oneshot, or};
@@ -182,10 +182,10 @@ impl Shared {
                 return Ok(Owner::Gone);
             };
             let cancelled = if let Some(live) = slot.live() {
-                cancelled_watch(live.frames.entries()?, child)
+                cancelled_child(live.frames.entries()?, child)
             } else {
                 let seq = self.catalog.get(parent.session).map_or(0, |r| r.entries);
-                cancelled_watch(self.store.prefix(parent.session, seq)?, child)
+                cancelled_child(self.store.prefix(parent.session, seq)?, child)
             };
             if cancelled {
                 return Ok(Owner::Cancelled);
@@ -199,10 +199,27 @@ impl Shared {
     }
 }
 
-fn cancelled_watch(entries: impl IntoIterator<Item = Entry>, child: SessionId) -> bool {
+fn cancelled_child(entries: impl IntoIterator<Item = Entry>, child: SessionId) -> bool {
     let mut watch = None;
+    let mut link = None;
+    let mut caller = None;
     for entry in entries {
         match entry.body {
+            Body::Link { child: linked, .. } if linked == child => {
+                link = Some(entry.seq);
+                caller = None;
+            }
+            Body::Wait {
+                call,
+                on: WaitOn::Child { link: waiting },
+            } if link == Some(waiting) => caller = Some(call),
+            // An awaited child still delivers its outcome. Its waiting
+            // call's interrupted result proves the owner's cancellation.
+            Body::ToolResult {
+                call,
+                outcome: Outcome::Interrupted { .. },
+                ..
+            } if caller == Some(call) => return true,
             Body::Watch { child: watched } if watched == child => watch = Some(entry.seq),
             Body::Unwatch { watch: cancelled } if watch == Some(cancelled) => return true,
             _ => {}
