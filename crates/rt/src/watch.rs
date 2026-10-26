@@ -140,12 +140,18 @@ struct Shared {
     rt: Rt,
     state: Mutex<State>,
     /// What native threads report, routed by a task on the runtime.
-    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "android")),
+        expect(dead_code)
+    )]
     inbox: Mutex<Inbox>,
 }
 
 #[derive(Default)]
-#[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "android")),
+    expect(dead_code)
+)]
 struct Inbox {
     raws: Vec<Raw>,
     draining: bool,
@@ -175,10 +181,17 @@ struct Sub {
 enum Status {
     Live(Option<sys::fs::FileIdentity>),
     Gone,
-    Limit,
+    Limit(Admission),
     Unsupported,
     /// Failed, retried for the `n`th time next.
     Io(u32),
+}
+
+/// Which admission must be retried before the subscription is live.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Root,
+    Descendant,
 }
 
 /// What a native backend reports, in the filesystem's spelling.
@@ -199,7 +212,7 @@ enum Raw {
         expect(dead_code)
     )]
     Unwatched(PathBuf),
-    /// The OS removed a watch of its own accord: a watch is free again.
+    /// A watch was removed: capacity is free again.
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),
         expect(dead_code)
@@ -324,7 +337,10 @@ impl Shared {
     }
 
     /// Routes `raws` from a native thread, on a task of the runtime.
-    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "android")),
+        expect(dead_code)
+    )]
     fn post(self: &Arc<Self>, raws: Vec<Raw>) {
         let mut inbox = lock(&self.inbox);
         inbox.raws.extend(raws);
@@ -351,6 +367,7 @@ impl Shared {
 impl State {
     fn route(&mut self, raws: Vec<Raw>) {
         let mut roots = Vec::new();
+        let mut freed = false;
         for raw in raws {
             match raw {
                 Raw::Changed(path) => self.changed(&path, false, &mut roots),
@@ -382,13 +399,7 @@ impl State {
                         sub.entered.remove(&path);
                     }
                 }
-                Raw::Freed => {
-                    for id in self.ids() {
-                        if self.subs[&id].status == Status::Limit {
-                            self.recover(id);
-                        }
-                    }
-                }
+                Raw::Freed => freed = true,
                 Raw::Failed(path, error) => {
                     for id in self.ids() {
                         let sub = &self.subs[&id];
@@ -400,6 +411,13 @@ impl State {
                         }
                         self.failed(id, &error);
                     }
+                }
+            }
+        }
+        if freed {
+            for id in self.ids() {
+                if matches!(self.subs[&id].status, Status::Limit(_)) {
+                    self.recover(id);
                 }
             }
         }
@@ -489,7 +507,7 @@ impl State {
         let (status, error) = match native.arm(id, sub) {
             Ok(()) => (Status::Live(identity), None),
             Err(Unavailable::Gone) => (Status::Gone, None),
-            Err(Unavailable::Limit) => (Status::Limit, Some(Unavailable::Limit)),
+            Err(Unavailable::Limit) => (Status::Limit(Admission::Root), Some(Unavailable::Limit)),
             Err(Unavailable::Unsupported) => (Status::Unsupported, Some(Unavailable::Unsupported)),
             Err(error @ Unavailable::Io(_)) => {
                 let attempt = if let Status::Io(n) = was { n + 1 } else { 0 };
@@ -509,7 +527,7 @@ impl State {
                 self.retry(id, attempt);
                 Armed::Failed
             }
-            Status::Limit | Status::Unsupported => Armed::Failed,
+            Status::Limit(_) | Status::Unsupported => Armed::Failed,
         }
     }
 
@@ -517,7 +535,7 @@ impl State {
     fn recover(&mut self, id: u64) {
         let sub = self.subs.get_mut(&id).expect("listed");
         // An entered subscription enters again as it rescans.
-        if sub.scope == Scope::Entered {
+        if sub.scope == Scope::Entered && sub.status == Status::Limit(Admission::Descendant) {
             sub.status = Status::Live(identity(&sub.root));
             self.tell(id, Event::Rescan);
             return;
@@ -583,8 +601,8 @@ enum Armed {
 impl Sub {
     /// The OS ran out of watches for it: told once.
     fn limited(&mut self, rt: &Rt) {
-        if self.status != Status::Limit {
-            self.status = Status::Limit;
+        if !matches!(self.status, Status::Limit(_)) {
+            self.status = Status::Limit(Admission::Descendant);
             self.out.push(Event::Unavailable(Unavailable::Limit), rt);
         }
     }

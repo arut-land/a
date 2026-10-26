@@ -236,6 +236,9 @@ impl Native {
         if watched.dirs == 0 && watched.parents == 0 {
             self.dirs.remove(&wd);
             let _ = inotify::remove_watch(open.fd.get_ref(), wd);
+            if let Some(shared) = self.me.upgrade() {
+                shared.post(vec![Raw::Freed]);
+            }
         } else if role == Role::Dir && watched.dirs == 0 {
             // Back to a parent's events only (replacing the mask, not
             // adding to it), unless the path names another directory by now.
@@ -340,7 +343,9 @@ impl Native {
             }
             if dir && note.flags.contains(ReadFlags::MOVED_FROM) {
                 // Its watches follow it out, naming paths it no longer has.
-                raws.extend(self.forget_under(&path).into_iter().map(Raw::Unwatched));
+                let gone = self.forget_under(&path);
+                freed |= !gone.is_empty();
+                raws.extend(gone.into_iter().map(Raw::Unwatched));
             }
             raws.push(Raw::Changed(path));
         }

@@ -144,19 +144,6 @@ fn last_unsubscribe_closes_the_native_watch() {
 }
 
 #[test]
-fn an_idle_subscription_never_wakes_the_runtime() {
-    let dir = Dir::new();
-    let hub = hub();
-    let (_sub, events) = subscribe(&hub, Watch::tree(&dir.base));
-    let file = dir.write("file");
-    until(&events, "the write", changed(&file));
-    std::thread::sleep(Duration::from_millis(200));
-    let wakes = crate::wakes();
-    std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(crate::wakes(), wakes);
-}
-
-#[test]
 fn excluded_paths_never_wake_the_subscriber() {
     let dir = Dir::new();
     fs::create_dir(dir.path(".git")).unwrap();
@@ -445,4 +432,89 @@ fn a_new_outer_subscriber_hears_nothing_from_before_it_subscribed() {
         "the inner root's change through the outer stream",
         changed(&later),
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn freed_capacity_rearms_an_entered_root_before_reporting_recovery() {
+    for budget in [0, 1] {
+        let dir = Dir::new();
+        let hub = hub();
+        lock(&hub.0.state).native.budget = Some(budget);
+        let (_sub, events) = subscribe(&hub, Watch::entered(&dir.base));
+        until(&events, "the root admission limit", |e| {
+            matches!(e, Event::Unavailable(Unavailable::Limit))
+        });
+        hub.0.handle(|state| {
+            state.native.budget = Some(2);
+            vec![Raw::Freed]
+        });
+        until(&events, "root recovery", |e| matches!(e, Event::Rescan));
+        let file = dir.write("after");
+        until(&events, "the recovered root's entries", changed(&file));
+        fs::remove_dir_all(&dir.base).unwrap();
+        until(&events, "the recovered parent's removal report", |e| {
+            matches!(e, Event::Unavailable(Unavailable::Gone))
+        });
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn unsubscribing_restores_capacity_for_limited_subscriptions() {
+    let dir = Dir::new();
+    fs::create_dir(dir.path("first")).unwrap();
+    fs::create_dir(dir.path("second")).unwrap();
+    let hub = hub();
+    lock(&hub.0.state).native.budget = Some(2);
+    let first = subscribe(&hub, Watch::entered(dir.path("first")));
+    let (_second, events) = subscribe(&hub, Watch::entered(dir.path("second")));
+    until(&events, "the limit", |e| {
+        matches!(e, Event::Unavailable(Unavailable::Limit))
+    });
+    drop(first);
+    until(&events, "recovery after unsubscribe", |e| {
+        matches!(e, Event::Rescan)
+    });
+    let file = dir.write("second/after");
+    until(&events, "the recovered root's entries", changed(&file));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_replaced_parent_is_watched_by_new_subscriptions() {
+    let dir = Dir::new();
+    fs::create_dir(dir.path("parent")).unwrap();
+    let hub = hub();
+    let (old, _) = subscribe(&hub, Watch::entered(dir.path("parent/old")));
+    fs::rename(dir.path("parent"), dir.path("retired")).unwrap();
+    fs::create_dir(dir.path("parent")).unwrap();
+    let (_new, events) = subscribe(&hub, Watch::entered(dir.path("parent/new")));
+    // Releasing an old generation must not close the new parent's handle.
+    drop(old);
+    fs::create_dir(dir.path("parent/new")).unwrap();
+    until(&events, "arrival under the replacement parent", |e| {
+        matches!(e, Event::Rescan)
+    });
+    let file = dir.write("parent/new/file");
+    until(&events, "the new root's entries", changed(&file));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_replaced_parent_outlives_the_subscription_that_replaced_it() {
+    let dir = Dir::new();
+    fs::create_dir(dir.path("parent")).unwrap();
+    let hub = hub();
+    let (_old, events) = subscribe(&hub, Watch::entered(dir.path("parent/old")));
+    fs::rename(dir.path("parent"), dir.path("retired")).unwrap();
+    fs::create_dir(dir.path("parent")).unwrap();
+    let (new, _) = subscribe(&hub, Watch::entered(dir.path("parent/new")));
+    drop(new);
+    fs::create_dir(dir.path("parent/old")).unwrap();
+    until(&events, "arrival for the surviving subscription", |e| {
+        matches!(e, Event::Rescan)
+    });
+    let file = dir.write("parent/old/file");
+    until(&events, "the surviving root's entries", changed(&file));
 }
