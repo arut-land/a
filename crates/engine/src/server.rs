@@ -148,7 +148,6 @@ impl Frames {
                 self.buf.drain(..len);
                 return Ok(Some(msg));
             }
-            let at = self.buf.len();
             let n = self
                 .io
                 .read_with(|mut s| {
@@ -161,7 +160,7 @@ impl Frames {
                 })
                 .await?;
             match n {
-                0 if at == 0 => return Ok(None),
+                0 if self.buf.is_empty() => return Ok(None),
                 0 => return Err(io::ErrorKind::UnexpectedEof.into()),
                 _ => {}
             }
