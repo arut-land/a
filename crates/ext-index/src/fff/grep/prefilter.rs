@@ -1,4 +1,3 @@
-use crate::fff::MAX_FILE_SIZE;
 use crate::fff::index::constraints::ConstraintPlan;
 use crate::fff::query::{Constraint, ConstraintVec};
 use crate::fff::types::{Files, recent_first};
@@ -10,6 +9,7 @@ use crate::fff::types::{Files, recent_first};
 pub(crate) struct Known<'a> {
     pub(crate) candidates: Option<&'a [u64]>,
     pub(crate) binary: Option<&'a [u64]>,
+    pub(crate) unknown: Option<&'a [u64]>,
 }
 
 /// The slots of the files a grep reads, most recently modified first.
@@ -43,11 +43,12 @@ fn prefilter_files(files: &Files, constraints: &[Constraint<'_>], known: Known<'
             let file = &items[slot];
             !file.is_deleted()
                 && file.size > 0
-                && file.size <= MAX_FILE_SIZE
                 && known.binary.is_none_or(|bits| !bit(bits, slot))
-                && known
-                    .candidates
-                    .is_none_or(|bits| slot >= walked || bit(bits, slot))
+                && known.candidates.is_none_or(|bits| {
+                    slot >= walked
+                        || bit(bits, slot)
+                        || known.unknown.is_some_and(|bits| bit(bits, slot))
+                })
                 && plan
                     .as_ref()
                     .is_none_or(|plan| plan.matches(files.path(file), files.name(file)))
@@ -102,6 +103,7 @@ mod tests {
         let known = Known {
             candidates: Some(&even),
             binary: Some(&binary),
+            unknown: None,
         };
         let found: Vec<_> = files_to_search(&files, &[], known)
             .into_iter()

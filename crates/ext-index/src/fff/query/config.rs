@@ -27,7 +27,7 @@ pub trait ParserConfig {
         true
     }
 
-    /// Should parse location suffixes (e.g., file:12, file:12:4)
+    /// Should parse location suffixes (e.g., <file:12>, <file:12:4>)
     /// Disabled for grep modes where colon-number patterns like localhost:8080
     /// are search text, not file locations.
     fn enable_location(&self) -> bool {
@@ -45,7 +45,7 @@ pub trait ParserConfig {
         has_wildcards(token)
     }
 
-    /// If `true`, a PathSegment constraint that is the ONLY token in the
+    /// If `true`, a `PathSegment` constraint that is the ONLY token in the
     /// query is demoted to fuzzy text to avoid over filtering
     fn treat_lone_path_as_text(&self) -> bool {
         true

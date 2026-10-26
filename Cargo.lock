@@ -717,6 +717,7 @@ dependencies = [
  "ext-edit",
  "ext-fixtures",
  "ext-fork",
+ "ext-index",
  "ext-logging",
  "ext-metrics",
  "ext-policy",
@@ -855,18 +856,22 @@ version = "0.0.0"
 dependencies = [
  "aho-corasick",
  "bstr",
+ "crc",
  "ext",
  "globset",
  "ignore",
  "memchr",
  "neo_frizbee",
+ "protocol",
  "regex",
+ "regex-automata",
  "regex-syntax",
  "rt",
  "serde",
  "smallvec",
  "sys",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]

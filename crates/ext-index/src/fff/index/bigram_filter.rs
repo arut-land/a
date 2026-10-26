@@ -1,6 +1,6 @@
 //! The content prefilter: an inverted index from each printable bigram
 //! (and each pair one byte apart, the "skip-1" bigrams) to the files that
-//! hold it, ANDed per query so grep reads only files that can match.
+//! hold it, `ANDed` per query so grep reads only files that can match.
 //!
 //! FFF built it from many threads writing one shared slab through raw
 //! pointers. Here a builder is owned by the one job that fills it: the
@@ -8,6 +8,49 @@
 //! into the whole by bit position.
 
 use std::collections::HashMap;
+use std::io::{self, Read, Write};
+
+use crate::disk::{In, Out, invalid};
+
+/// Large retained columns must return their pages at rest. The ordinary
+/// allocator can retain freed blocks indefinitely (macOS deferred reclaim).
+#[derive(Debug)]
+enum Columns {
+    Mapped(sys::ZeroedWords),
+    Heap(Vec<u64>),
+}
+
+impl Columns {
+    fn new(len: usize) -> Self {
+        sys::ZeroedWords::new(len).map_or_else(|_| Self::Heap(vec![0; len]), Self::Mapped)
+    }
+
+    fn copied(words: &[u64]) -> Self {
+        let mut columns = Self::new(words.len());
+        columns.copy_from_slice(words);
+        columns
+    }
+}
+
+impl std::ops::Deref for Columns {
+    type Target = [u64];
+
+    fn deref(&self) -> &[u64] {
+        match self {
+            Self::Mapped(words) => words,
+            Self::Heap(words) => words,
+        }
+    }
+}
+
+impl std::ops::DerefMut for Columns {
+    fn deref_mut(&mut self) -> &mut [u64] {
+        match self {
+            Self::Mapped(words) => words,
+            Self::Heap(words) => words,
+        }
+    }
+}
 
 /// Maximum number of distinct bigrams tracked in the inverted index.
 /// 95 printable ASCII chars (32..=126) after lowercasing → ~70 distinct → 4900 possible.
@@ -80,6 +123,10 @@ impl BigramIndexBuilder {
     }
 
     #[inline]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "FFF column keys and slot coordinates use compact integer storage"
+    )]
     fn get_or_alloc_column(&mut self, key: u16) -> u16 {
         let slot = key_slot(key);
         let current = self.lookup[slot];
@@ -191,18 +238,18 @@ impl BigramIndexBuilder {
         let mut n1 = n[1];
 
         if n0 != 0 && n1 != 0 {
-            let key = (n0 as u16) << 8 | n1 as u16;
+            let key = u16::from(n0) << 8 | u16::from(n1);
             self.record_bigram(&mut seen_consec, key, word_idx, bit_mask);
         }
 
         for &cur in &n[2..] {
             if cur != 0 {
                 if n1 != 0 {
-                    let key = (n1 as u16) << 8 | cur as u16;
+                    let key = u16::from(n1) << 8 | u16::from(cur);
                     self.record_bigram(&mut seen_consec, key, word_idx, bit_mask);
                 }
                 if n0 != 0 {
-                    let key = (n0 as u16) << 8 | cur as u16;
+                    let key = u16::from(n0) << 8 | u16::from(cur);
                     skip_builder.record_bigram(&mut seen_skip, key, word_idx, bit_mask);
                 }
             }
@@ -228,6 +275,10 @@ impl BigramIndexBuilder {
         }
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "FFF column keys and slot coordinates use compact integer storage"
+    )]
     fn flush_seen(&mut self, seen: &[u64; SEEN_WORDS], word_idx: usize, bit_mask: u64) {
         // SEEN_WORDS is a multiple of 8, so the remainder is always empty.
         for (blk, block) in seen.as_chunks::<8>().0.iter().enumerate() {
@@ -255,6 +306,10 @@ impl BigramIndexBuilder {
 
     /// ORs `chunk`, a builder of the files from `first` on (a multiple of
     /// 64), into this one.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "FFF column keys and slot coordinates use compact integer storage"
+    )]
     pub(crate) fn merge(&mut self, chunk: &Self, first: usize) {
         debug_assert_eq!(first % 64, 0);
         let start = first / 64;
@@ -276,6 +331,10 @@ impl BigramIndexBuilder {
     }
 
     #[cfg(test)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "FFF column keys and slot coordinates use compact integer storage"
+    )]
     fn columns_used(&self) -> u16 {
         self.columns as u16
     }
@@ -294,6 +353,10 @@ impl BigramIndexBuilder {
     ///
     /// Keeps rare columns as gap lists unless `min_density_pct` excludes them.
     /// Ubiquitous columns (≥90%) are omitted because they barely filter.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "FFF column keys and slot coordinates use compact integer storage"
+    )]
     pub fn compress(self, min_density_pct: Option<u32>) -> BigramFilter {
         let words = self.words;
         let file_count = self.file_count;
@@ -362,7 +425,7 @@ impl BigramIndexBuilder {
             lookup[slot] = dense_count as u16;
             dense_count += 1;
         }
-        let dense = slab[..dense_count * words].to_vec();
+        let dense = Columns::copied(&slab[..dense_count * words]);
         drop(slab);
 
         for (i, slot) in sparse_slots.into_iter().enumerate() {
@@ -386,6 +449,10 @@ impl BigramIndexBuilder {
 }
 
 // Append the set bit positions of `bitset` as LEB128 gaps.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "FFF column keys and slot coordinates use compact integer storage"
+)]
 fn encode_sparse_column(bitset: &[u64], out: &mut Vec<u8>) {
     let mut prev = 0usize;
     for (w, &word) in bitset.iter().enumerate() {
@@ -456,7 +523,7 @@ pub struct BigramFilter {
     lookup: Vec<u16>,
     rare_keys: Vec<u64>,
     /// The dense columns side by side, `words` each.
-    dense: Vec<u64>,
+    dense: Columns,
     dense_count: usize,
     /// Sparse columns are numbered after the dense ones: column `dense_count + i`
     /// lives at `sparse_data[sparse_offsets[i]..sparse_offsets[i + 1]]`.
@@ -466,7 +533,7 @@ pub struct BigramFilter {
     file_count: usize,
     populated: usize,
     /// Optional skip-1 bigram index (stride 2). Built from character pairs
-    /// at distance 2, e.g. "ABCDE" → (A,C),(B,D),(C,E). ANDead with the
+    /// at distance 2, e.g. "ABCDE" → (A,C),(B,D),(C,E). `ANDead` with the
     /// consecutive bigram candidates during query to dramatically reduce
     /// false positives.
     skip_index: Option<Box<BigramFilter>>,
@@ -501,7 +568,8 @@ impl BigramFilter {
         let mut prev = pattern[0];
         for &b in &pattern[1..] {
             if (32..=126).contains(&prev) && (32..=126).contains(&b) {
-                let key = (prev.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+                let key =
+                    u16::from(prev.to_ascii_lowercase()) << 8 | u16::from(b.to_ascii_lowercase());
                 if let Some(col) = self.column_ref(key) {
                     Self::and_column(&mut result, col);
                     has_filter = true;
@@ -537,7 +605,8 @@ impl BigramFilter {
             let a = pattern[i];
             let b = pattern[i + 2];
             if (32..=126).contains(&a) && (32..=126).contains(&b) {
-                let key = (a.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+                let key =
+                    u16::from(a.to_ascii_lowercase()) << 8 | u16::from(b.to_ascii_lowercase());
                 if let Some(col) = self.column_ref(key) {
                     Self::and_column(&mut result, col);
                     has_filter = true;
@@ -661,7 +730,7 @@ impl BigramFilter {
 #[inline]
 fn normalize_byte_scalar(b: u8) -> u8 {
     let printable = b.wrapping_sub(32) <= 94;
-    let lower = b | ((b.wrapping_sub(b'A') < 26) as u8 * 0x20);
+    let lower = b | (u8::from(b.wrapping_sub(b'A') < 26) * 0x20);
     if printable { lower } else { 0 }
 }
 
@@ -676,7 +745,7 @@ pub fn extract_bigrams(content: &[u8]) -> Vec<u16> {
     let mut prev = content[0];
     for &b in &content[1..] {
         if (32..=126).contains(&prev) && (32..=126).contains(&b) {
-            let key = (prev.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+            let key = u16::from(prev.to_ascii_lowercase()) << 8 | u16::from(b.to_ascii_lowercase());
             let word = key as usize / 64;
             let bit = 1u64 << (key as usize % 64);
             if seen[word] & bit == 0 {
@@ -715,6 +784,10 @@ impl BigramOverlay {
             tombstones: vec![0u64; words],
             base_file_count,
         }
+    }
+
+    pub(crate) fn modified_count(&self) -> usize {
+        self.modified.len()
     }
 
     /// Records the bigrams a modified file holds now.
@@ -756,6 +829,271 @@ impl BigramOverlay {
     /// we can't extract precise bigrams, e.g. regex patterns).
     pub(crate) fn modified_indices(&self) -> Vec<usize> {
         self.modified.keys().copied().collect()
+    }
+}
+
+impl BigramFilter {
+    /// Remaps live slots and folds their overlay, one column at a time.
+    /// Skip pairs of edited files are conservatively retained: the overlay
+    /// stores consecutive pairs alone, so excluding any skip pair is unsound.
+    pub(crate) fn compact(
+        &self,
+        slots: &[usize],
+        overlay: &BigramOverlay,
+        budget: usize,
+    ) -> Option<Self> {
+        self.compact_columns(slots, overlay, false, budget)
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "FFF column keys and slot coordinates use compact integer storage"
+    )]
+    fn compact_columns(
+        &self,
+        slots: &[usize],
+        overlay: &BigramOverlay,
+        skip: bool,
+        budget: usize,
+    ) -> Option<Self> {
+        let mut compact = Self {
+            lookup: vec![NO_COLUMN; BIGRAM_KEY_SLOTS],
+            rare_keys: self.rare_keys.clone(),
+            dense: Columns::new(0),
+            dense_count: 0,
+            sparse_offsets: vec![0],
+            sparse_data: Vec::new(),
+            words: slots.len().div_ceil(64),
+            file_count: slots.len(),
+            populated: slots.len(),
+            skip_index: None,
+        };
+        let mut sparse_slots = Vec::new();
+        let mut dense = Vec::new();
+        if compact.heap_bytes() > budget {
+            return None;
+        }
+        for (key_slot, &col) in self.lookup.iter().enumerate() {
+            if col == NO_COLUMN {
+                continue;
+            }
+            let key = (((key_slot / 95 + 32) << 8) | (key_slot % 95 + 32)) as u16;
+            let old = self.column_bitset(key).expect("stored column");
+            let mut bits = vec![0; compact.words];
+            for (new, &old_slot) in slots.iter().enumerate() {
+                let present = if let Some(bigrams) = overlay.modified.get(&old_slot) {
+                    skip || bigrams.contains(&key)
+                } else {
+                    old.get(old_slot / 64)
+                        .is_some_and(|word| word & (1 << (old_slot % 64)) != 0)
+                };
+                if present {
+                    bits[new / 64] |= 1 << (new % 64);
+                }
+            }
+            let mut gaps = Vec::new();
+            encode_sparse_column(&bits, &mut gaps);
+            if gaps.len() < bits.len() * size_of::<u64>() {
+                sparse_slots.push(key_slot);
+                compact.sparse_data.extend(gaps);
+                compact
+                    .sparse_offsets
+                    .push(compact.sparse_data.len() as u32);
+            } else {
+                compact.lookup[key_slot] = compact.dense_count as u16;
+                dense.extend_from_slice(&bits);
+                compact.dense_count += 1;
+            }
+            if compact.heap_bytes() + dense.len() * 8 > budget {
+                return None;
+            }
+        }
+        compact.dense = Columns::copied(&dense);
+        for (i, slot) in sparse_slots.into_iter().enumerate() {
+            compact.lookup[slot] = (compact.dense_count + i) as u16;
+        }
+        compact.skip_index = self.skip_index.as_ref().and_then(|index| {
+            index
+                .compact_columns(slots, overlay, true, budget - compact.heap_bytes())
+                .map(Box::new)
+        });
+        Some(compact)
+    }
+
+    /// How many files it covers: the walked files it was built from.
+    pub(crate) fn file_count(&self) -> usize {
+        self.file_count
+    }
+
+    /// What its columns take, the skip-1 index's included.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.lookup.capacity() * size_of::<u16>()
+            + (self.rare_keys.capacity() + self.dense.len()) * size_of::<u64>()
+            + self.sparse_offsets.capacity() * size_of::<u32>()
+            + self.sparse_data.capacity()
+            + self.skip_index.as_ref().map_or(0, |skip| skip.heap_bytes())
+    }
+
+    pub(crate) fn encode(&self, out: &mut Out<impl Write>) -> io::Result<()> {
+        out.len(self.file_count)?;
+        out.len(self.populated)?;
+        out.len(self.dense_count)?;
+        out.halves(&self.lookup)?;
+        out.words(&self.rare_keys)?;
+        out.words(&self.dense[..self.dense_count * self.words])?;
+        out.u32s(&self.sparse_offsets)?;
+        out.bytes(&self.sparse_data)?;
+        match &self.skip_index {
+            None => out.u8(0),
+            Some(skip) => {
+                out.u8(1)?;
+                skip.encode(out)
+            }
+        }
+    }
+
+    /// The filter [`BigramFilter::encode`] wrote, if every column it
+    /// names is there and every gap list decodes to positions of its
+    /// files: no query of it can read past what it holds.
+    pub(crate) fn decode(input: &mut In<impl Read>) -> io::Result<Self> {
+        let mut base = Self::decode_columns(input)?;
+        base.skip_index = match input.u8()? {
+            0 => None,
+            1 => {
+                let skip = Self::decode_columns(input)?;
+                if input.u8()? != 0 || skip.file_count != base.file_count {
+                    return Err(invalid());
+                }
+                Some(Box::new(skip))
+            }
+            _ => return Err(invalid()),
+        };
+        Ok(base)
+    }
+
+    fn decode_columns(input: &mut In<impl Read>) -> io::Result<Self> {
+        let file_count = input.usize()?;
+        let populated = input.usize()?;
+        let dense_count = input.usize()?;
+        let lookup = input.halves()?;
+        let rare_keys = input.words()?;
+        let mut dense = Columns::new(input.len(8)?);
+        input.read_words(&mut dense)?;
+        let sparse_offsets = input.u32s()?;
+        let sparse_data = input.bytes()?;
+        let words = file_count.div_ceil(64);
+        let columns = dense_count
+            .checked_add(sparse_offsets.len().saturating_sub(1))
+            .ok_or_else(invalid)?;
+        let whole = populated <= file_count
+            && lookup.len() == BIGRAM_KEY_SLOTS
+            && rare_keys.len() == BIGRAM_KEY_SLOTS.div_ceil(64)
+            && Some(dense.len()) == dense_count.checked_mul(words)
+            && columns < NO_COLUMN as usize
+            && lookup
+                .iter()
+                .all(|&col| col == NO_COLUMN || (col as usize) < columns)
+            && sparse_offsets.first() == Some(&0)
+            && sparse_offsets.last().map(|&end| end as usize) == Some(sparse_data.len())
+            && sparse_offsets.windows(2).all(|pair| {
+                sparse_data
+                    .get(pair[0] as usize..pair[1] as usize)
+                    .is_some_and(|data| gaps_within(data, file_count))
+            });
+        if !whole {
+            return Err(invalid());
+        }
+        Ok(Self {
+            lookup,
+            rare_keys,
+            dense,
+            dense_count,
+            sparse_offsets,
+            sparse_data,
+            words,
+            file_count,
+            populated,
+            skip_index: None,
+        })
+    }
+}
+
+/// Whether `data` is a gap list of increasing positions below `files`, as
+/// `encode_sparse_column` writes one.
+fn gaps_within(data: &[u8], files: usize) -> bool {
+    let mut pos = 0usize;
+    let mut first = true;
+    let mut i = 0;
+    while i < data.len() {
+        let mut gap = 0usize;
+        let mut shift = 0;
+        loop {
+            let Some(&b) = data.get(i) else { return false };
+            i += 1;
+            if shift > 56 {
+                return false;
+            }
+            gap |= ((b & 0x7F) as usize) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        if gap == 0 && !first {
+            return false;
+        }
+        first = false;
+        pos = match pos.checked_add(gap) {
+            Some(pos) if pos < files => pos,
+            _ => return false,
+        };
+    }
+    true
+}
+
+impl BigramOverlay {
+    /// Whether it is of `walked` files: every file it names one of them.
+    pub(crate) fn fits(&self, walked: usize) -> bool {
+        self.base_file_count == walked
+            && self.tombstones.len() == walked.div_ceil(64)
+            && self.modified.keys().all(|&slot| slot < walked)
+    }
+
+    /// What its files' own bigrams take.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.tombstones.capacity() * size_of::<u64>()
+            + (self.modified.values())
+                .map(|bigrams| {
+                    bigrams.capacity() * size_of::<u16>() + size_of::<(usize, Vec<u16>)>()
+                })
+                .sum::<usize>()
+    }
+
+    pub(crate) fn encode(&self, out: &mut Out<impl Write>) -> io::Result<()> {
+        out.len(self.base_file_count)?;
+        out.words(&self.tombstones)?;
+        out.len(self.modified.len())?;
+        for (&slot, bigrams) in &self.modified {
+            out.len(slot)?;
+            out.halves(bigrams)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn decode(input: &mut In<impl Read>) -> io::Result<Self> {
+        let base_file_count = input.usize()?;
+        let tombstones = input.words()?;
+        let count = input.len(16)?;
+        let mut modified = HashMap::with_capacity(count);
+        for _ in 0..count {
+            let slot = input.usize()?;
+            modified.insert(slot, input.halves()?);
+        }
+        Ok(Self {
+            modified,
+            tombstones,
+            base_file_count,
+        })
     }
 }
 
@@ -866,7 +1204,7 @@ mod tests {
     /// Build a key the same way `add_file_content` does: two printable-ASCII
     /// bytes, lowercased, packed as `(hi << 8) | lo`.
     fn key(a: u8, b: u8) -> u16 {
-        ((a.to_ascii_lowercase() as u16) << 8) | b.to_ascii_lowercase() as u16
+        (u16::from(a.to_ascii_lowercase()) << 8) | u16::from(b.to_ascii_lowercase())
     }
 
     /// Return the sorted list of (consec, skip) bigram keys that should appear
@@ -904,6 +1242,10 @@ mod tests {
         b.column_bitset(col)[0] & 1 != 0
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test coordinates and values are bounded by the fixture"
+    )]
     fn run_and_compare(content: &[u8]) {
         let mut consec = BigramIndexBuilder::new(1);
         let mut skip = BigramIndexBuilder::new(1);
@@ -984,6 +1326,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test coordinates and values are bounded by the fixture"
+    )]
     fn add_file_case_is_lowered() {
         // Uppercase should be lowercased before keying, so "AB" == "ab".
         let mut upper = BigramIndexBuilder::new(1);
@@ -1061,6 +1407,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "test coordinates and values are bounded by the fixture"
+    )]
     fn add_file_long_content() {
         // Stress test: ~8 KB of printable ASCII. Should complete without
         // overflowing any stack-local bitset and produce the full set.
@@ -1072,6 +1422,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test coordinates and values are bounded by the fixture"
+    )]
     fn add_file_mixed_lengths_agree() {
         // Content of several lengths, with non-printable bytes and repeats,
         // records exactly the reference bigram set.
@@ -1091,6 +1445,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test coordinates and values are bounded by the fixture"
+    )]
     fn add_file_long_short_paths_agree() {
         // Same mixed content checked just below, at, and above
         // LONG_CONTENT_MIN_LEN so both add_short_content and add_long_content
@@ -1134,6 +1492,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test coordinates and values are bounded by the fixture"
+    )]
     fn chunks_merged_by_position_equal_one_builder() {
         let content = |i: usize| format!("file {i} holds {} and {}", i % 7, i * 31 % 101);
         let n = 300;
@@ -1167,5 +1529,50 @@ mod tests {
             }
         }
         assert_eq!(whole.populated, merged.populated);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_ranges_are_checked_before_they_are_sliced() {
+        let mut filter = BigramIndexBuilder::new(1).compress(None);
+        filter.sparse_offsets = vec![0, 100, 0];
+        let bytes = crate::disk::encoded(|out| filter.encode(out));
+        assert!(crate::disk::decoded(&bytes, BigramFilter::decode).is_err());
+    }
+
+    #[test]
+    fn skip_indexes_cannot_nest() {
+        let base = BigramIndexBuilder::new(1).compress(None);
+        let encoded = crate::disk::encoded(|out| base.encode(out));
+        let mut bytes = Vec::new();
+        for _ in 0..3000 {
+            bytes.extend_from_slice(&encoded[..encoded.len() - 1]);
+            bytes.push(1);
+        }
+        bytes.extend_from_slice(&encoded);
+        assert!(crate::disk::decoded(&bytes, BigramFilter::decode).is_err());
+    }
+
+    #[test]
+    fn compaction_allocates_only_dense_columns_and_obeys_its_budget() {
+        let mut builder = BigramIndexBuilder::new(4096);
+        let mut skip = BigramIndexBuilder::new(4096);
+        builder.add_file_content(&mut skip, 0, b"abcdefghijklmnopqrstuvwxyz");
+        let filter = builder.compress(None);
+        let slots: Vec<_> = (0..4096).collect();
+        let compact = filter
+            .compact(&slots, &BigramOverlay::new(4096), 40 << 10)
+            .unwrap();
+        assert_eq!(compact.dense.len(), compact.dense_count * compact.words);
+        assert!(compact.heap_bytes() <= 40 << 10);
+        assert!(
+            filter
+                .compact(&slots, &BigramOverlay::new(4096), 1)
+                .is_none()
+        );
     }
 }

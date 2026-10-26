@@ -78,6 +78,10 @@ pub(super) struct RegexSink<'r> {
 impl Sink for RegexSink<'_> {
     type Error = std::io::Error;
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "slice grep receives bounded file buffers and stores compact display coordinates"
+    )]
     fn matched(
         &mut self,
         searcher: &Searcher,

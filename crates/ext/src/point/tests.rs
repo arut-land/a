@@ -480,7 +480,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
 
     let entry = Entry::new(Seq::new(1).unwrap(), Epoch(0), protocol::Body::INTERRUPT);
     observes::<Observe>(cx, &entry);
-    observes::<SessionStart>(cx, ());
+    observes::<SessionStart>(cx, Started::Created);
     observes::<SessionEnd>(cx, ());
 
     // The one most-restrictive point: the strictest wins, the earliest of
@@ -550,7 +550,7 @@ fn a_point_with_no_handler_costs_nothing() {
             point_cx(&view),
             &Entry::new(Seq::new(1).unwrap(), Epoch(0), protocol::Body::INTERRUPT),
         );
-        hooks.session_start(&cx);
+        hooks.session_start(&cx, Started::Loaded);
         hooks.session_end(&cx);
     }
     assert_eq!(view.0.load(Ordering::SeqCst), 0);

@@ -507,15 +507,27 @@ enum Replacement {
 /// sees the old file or the new one, never a torn or world-readable one.
 /// No persistence barrier is requested; configuration uses `write_private_durable`.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    save_private(path, bytes, Persistence::Visible)
+    save_private(path, |file| file.write_all(bytes), Persistence::Visible)
+}
+
+/// As [`write_private`], streaming the content without holding it whole.
+pub fn write_private_with(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    save_private(path, write, Persistence::Visible)
 }
 
 /// Saves configuration with file and namespace persistence barriers.
 pub fn write_private_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    save_private(path, bytes, Persistence::Durable)
+    save_private(path, |file| file.write_all(bytes), Persistence::Durable)
 }
 
-fn save_private(path: &Path, bytes: &[u8], persistence: Persistence) -> io::Result<()> {
+fn save_private(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+    persistence: Persistence,
+) -> io::Result<()> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -532,7 +544,7 @@ fn save_private(path: &Path, bytes: &[u8], persistence: Persistence) -> io::Resu
     let written = (|| {
         #[cfg(target_vendor = "apple")]
         edit::access_acl(None, &file)?;
-        file.write_all(bytes)?;
+        write(&mut file)?;
         if persistence == Persistence::Durable {
             file.sync_all()?;
         }

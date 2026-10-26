@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use std::num::NonZeroUsize;
 
 /// Controls case sensitivity of the grep pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -32,7 +33,7 @@ pub enum GrepMode {
     /// Regex mode: uses the same exact matching engine as ripgrep
     Regex,
     /// Smart fuzzy mode, allows user to make either a couple of single char typos or long gaps
-    /// e.g. shcema -> shcema, or UserController -> UserAuthController
+    /// e.g. shcema -> shcema, or `UserController` -> `UserAuthController`
     Fuzzy,
 }
 
@@ -46,11 +47,11 @@ pub struct GrepMatch {
     /// Absolute byte offset of the matched line from the start of the file.
     #[serde(skip)]
     pub byte_offset: u64,
-    /// The matched line text, truncated to `MAX_LINE_DISPLAY_LEN`.
+    /// An excerpt around the first match, with omitted ends marked by `…`.
     pub text: String,
     /// Byte offsets `(start, end)` within `text` for each match.
     pub ranges: SmallVec<[(u32, u32); 4]>,
-    /// Fuzzy match score from neo_frizbee (only set in Fuzzy grep mode).
+    /// Fuzzy match score from `neo_frizbee` (only set in Fuzzy grep mode).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<u16>,
     /// Lines before the match (for context display). Empty when context is 0.
@@ -66,8 +67,8 @@ pub struct GrepMatch {
 pub struct GrepOptions {
     pub mode: GrepMode,
     pub casing: Casing,
-    /// The most matches kept from one file; 0 for every one.
-    pub max_matches_per_file: usize,
+    /// The most matches kept from one file; None for every one.
+    pub max_matches_per_file: Option<NonZeroUsize>,
     /// Number of context lines to include before each match. 0 = disabled.
     pub before_context: usize,
     /// Number of context lines to include after each match. 0 = disabled.
@@ -79,7 +80,7 @@ impl Default for GrepOptions {
         Self {
             mode: GrepMode::default(),
             casing: Casing::default(),
-            max_matches_per_file: 200,
+            max_matches_per_file: NonZeroUsize::new(200),
             before_context: 0,
             after_context: 0,
         }

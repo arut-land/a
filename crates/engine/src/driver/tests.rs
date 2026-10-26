@@ -3078,3 +3078,64 @@ fn environment_bursts_retain_one_payload_and_one_mailbox_marker() {
     drop(fixture);
     std::fs::remove_file(home).unwrap();
 }
+
+#[test]
+fn loaded_sessions_warm_the_index_and_created_sessions_wait_for_the_first_reply() {
+    use ext::Configured;
+
+    for loaded in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("hello.txt"), "hello").unwrap();
+        let index = ext_index::Index::configure(&ext::Empty("index")).unwrap();
+        let fixture = Fixture::new(
+            ext::LOOP,
+            Registry::default().with(&index).unwrap(),
+            openai(&Script::new(
+                &cassette("openai/streaming_grammar/tool_then_followup_text.yaml")[1..],
+            )),
+        );
+        let header = Header {
+            workspace: root.clone(),
+            ..Fixture::header()
+        };
+        let slot = fixture.2.new_slot(header.clone()).unwrap();
+        let mode = if loaded {
+            drop(fixture.0.store.create(&header).unwrap());
+            Open::Load
+        } else {
+            Open::Create
+        };
+        let live = Live::start(&header, &fixture.0, mode, Owner::None).unwrap();
+        let session = TestingLive(
+            fixture.2.started(&slot, Ok(live)).unwrap(),
+            Arc::clone(&fixture.2),
+        );
+        settle(&session);
+        let registry = fixture.0.registry.get();
+        let indexes = registry.service::<ext_index::Indexes>().unwrap();
+        let index = indexes.open(&root, Arc::clone(&fixture.0.rt), Arc::clone(&fixture.0.hub));
+        if !loaded {
+            assert_eq!(index.resident(), 0, "creating a session must not index");
+            session.submit("hi").unwrap();
+            settle(&session);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while index.resident() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the lifecycle hook warms the workspace"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            rt::block_on(index.search("hello".into(), 10))
+                .unwrap()
+                .files[0]
+                .path,
+            "hello.txt"
+        );
+        session.halt();
+    }
+}

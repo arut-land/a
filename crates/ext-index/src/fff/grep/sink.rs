@@ -1,6 +1,7 @@
 use super::types::GrepMatch;
 use crate::fff::searcher::{Searcher, SinkMatch};
 use smallvec::SmallVec;
+use std::num::NonZeroUsize;
 
 /// Maximum bytes of a matched line to keep for display. Prevents minified
 /// JS or huge single-line files from blowing up memory.
@@ -26,13 +27,17 @@ pub(super) fn strip_line_terminators(bytes: &[u8]) -> &[u8] {
 
 pub(super) struct SinkState {
     pub(super) matches: Vec<GrepMatch>,
-    pub(super) max_matches: usize,
+    pub(super) max_matches: Option<NonZeroUsize>,
     pub(super) before_context: usize,
     pub(super) after_context: usize,
 }
 
 impl SinkState {
     #[inline]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "slice grep receives bounded file buffers and stores compact display coordinates"
+    )]
     pub(super) fn prepare_line<'a>(
         line_bytes: &'a [u8],
         mat: &SinkMatch<'_>,
@@ -43,8 +48,8 @@ impl SinkState {
         // Trim trailing newline/CR directly on bytes to avoid UTF-8 conversion.
         let trimmed_bytes = strip_line_terminators(line_bytes);
 
-        // Truncate for display (floor to a char boundary).
-        let display_bytes = truncate_display_bytes(trimmed_bytes);
+        // Highlight the full line before choosing the display excerpt.
+        let display_bytes = trimmed_bytes;
 
         let display_len = display_bytes.len() as u32;
         (display_bytes, display_len, line_number, byte_offset)
@@ -72,7 +77,8 @@ impl SinkState {
             before: context_before,
             after: context_after,
         });
-        self.max_matches == 0 || self.matches.len() < self.max_matches
+        self.max_matches
+            .is_none_or(|limit| self.matches.len() < limit.get())
     }
 
     /// Extract context lines from the full buffer around a matched region.
@@ -158,7 +164,7 @@ pub(super) fn truncate_display_bytes(bytes: &[u8]) -> &[u8] {
     }
 }
 
-/// Split a multiline match blob (from the MultiLine searcher strategy) into
+/// Split a multiline match blob (from the `MultiLine` searcher strategy) into
 /// the first line and the remaining lines so `line_content` stays single-line.
 pub(super) fn split_multiline_blob(display_bytes: &[u8]) -> (&[u8], Vec<String>) {
     match memchr::memchr(b'\n', display_bytes) {
@@ -177,5 +183,35 @@ pub(super) fn split_multiline_blob(display_bytes: &[u8]) -> (&[u8], Vec<String>)
 // copied from the rust u8 private method
 #[inline]
 const fn is_utf8_char_boundary(b: u8) -> bool {
-    (b as i8) >= -0x40
+    b & 0xc0 != 0x80
+}
+
+/// Keep the first match visible and mark either omitted end explicitly.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "slice grep receives bounded file buffers and stores compact display coordinates"
+)]
+pub(super) fn excerpt(found: &mut GrepMatch) {
+    if found.text.len() <= MAX_LINE_DISPLAY_LEN {
+        return;
+    }
+    let first = found.ranges.first().map_or(0, |range| range.0 as usize);
+    let mut start = first.saturating_sub(MAX_LINE_DISPLAY_LEN / 4);
+    while !found.text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + MAX_LINE_DISPLAY_LEN).min(found.text.len());
+    while !found.text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = if start > 0 { "…" } else { "" };
+    let suffix = if end < found.text.len() { "…" } else { "" };
+    found
+        .ranges
+        .retain(|&mut (a, b)| (a as usize) < end && (b as usize) > start);
+    for (a, b) in &mut found.ranges {
+        *a = ((*a as usize).max(start) - start + prefix.len()) as u32;
+        *b = ((*b as usize).min(end) - start + prefix.len()) as u32;
+    }
+    found.text = format!("{prefix}{}{suffix}", &found.text[start..end]);
 }

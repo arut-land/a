@@ -1,5 +1,9 @@
 use smallvec::SmallVec;
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the file arena uses compact offsets checked at its boundary"
+)]
 pub(crate) fn char_indices_to_byte_offsets(
     line: &str,
     char_indices: &[u32],
@@ -33,6 +37,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the file arena uses compact offsets checked at its boundary"
+    )]
     fn offsets_match_character_ranges() {
         for line in ["", "abcdefghij", "aé文🦀e\u{301}z", "é🦀a文bc"] {
             let ranges: Vec<_> = line

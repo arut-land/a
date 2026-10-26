@@ -1,4 +1,4 @@
-//! Location parsing for file:line:col patterns
+//! Location parsing for <file:line:col> patterns
 //!
 //! Parses various location formats like:
 //! - `file:12` - Line number
@@ -116,7 +116,7 @@ fn try_parse_column_position(location: &str) -> Option<Location> {
     Some(Location::Position { line, col })
 }
 
-/// Parses various location formats like file:12, file:12:4, file:12-114
+/// Parses various location formats like <file:12>, <file:12:4>, <file:12-114>
 fn parse_column_location(query: &str) -> Option<(&str, Location)> {
     // Left to right, because `file:12:4` splits at its first colon. A Windows
     // drive letter (`C:\...`) just makes that first colon fail and we move on.

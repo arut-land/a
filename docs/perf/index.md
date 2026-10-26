@@ -111,3 +111,173 @@ The `index` feature adds 1.30 MiB to `a` (3.53 → 4.83 MiB, macOS arm64):
 `regex`'s engines, `ignore` and `globset`, `aho-corasick`, `neo_frizbee`
 and the port. No index is open in the idle RSS scenario (nothing asks),
 so the idle budget does not move.
+
+## Eager lifetime and persistence (2026-10-26)
+
+Measured on the same Apple M3 (16 GiB), macOS 27.0.1, using the Linux
+v6.12 release tarball in a temporary directory with an empty `.git`
+directory so the checked-in ignore rules apply: **86,602 files**. A
+standalone probe calls the real `Indexes`/`WorkspaceIndex` APIs over
+`rt::Threads::new(4)`, with the repository's size-oriented release settings
+(`opt-level = "z"`, fat LTO, one codegen unit). The probe gives content
+building 1 GiB, as in the earlier large-tree comparison; it uses a ten-second
+linger to observe held and resting states. Production defaults remain a
+128 MiB content-build budget and now a thirty-second linger.
+
+Three independent processes, separate initially empty caches, no deliberate
+page-cache eviction. Other sessions share this development host; load
+average was around four to six. The first run was slower (423 ms walk,
+7.22 s build); all runs are included below. These are local measurements
+on the Linux source tree, not measurements on a Linux host. Raw output,
+probe source, phase CPU/RSS samples and `footprint` reports are retained
+outside the worktree in `/private/tmp/index-eager-measure`.
+
+| Operation | Median | Range (three runs) |
+| --- | ---: | ---: |
+| Cold walk to searchable files | 218 ms | 201–424 ms |
+| Content build after the walk | 2.34 s | 2.30–7.22 s |
+| Same-daemon reload and first grep | 45.8 ms | 45.6–46.0 ms |
+| New-daemon snapshot read and first search | 42.2 ms | 41.1–49.5 ms |
+| New-daemon reload through verified search results | 337 ms | 296–403 ms |
+| CPU, same-daemon reload and first grep | 45.8 ms | 45.6–45.9 ms |
+| CPU, new-daemon reload and verification workload | 1.59 s | 1.45–1.62 s |
+| Raw cache reads into ordinary buffers, after verification | 4.21 ms | 4.15–4.69 ms |
+| CRC-32C over cached bytes, ten iterations per run | 8.00 ms | 7.71–9.33 ms |
+
+The same-daemon measurement includes decoding, CRC validation and the first
+grep. The new-daemon probe creates one file after the old store is dropped,
+then searches until that file appears; its CPU figure includes repeated
+fuzzy searches as well as the background verify walk and change comparison.
+These measurements describe the initial implementation before the review fixes.
+The current implementation makes grep wait for reconciliation and also rereads
+entries modified at or after the conservative observation watermark. Initial
+path searches can still use the snapshot while verification runs. The 42.2 ms
+row measures snapshot availability, not verified grep readiness. The earlier cold
+baseline was 185 ms walk plus 2.0 s build; the repeated current measurements
+are the closer comparison. Same-daemon reload avoids both operations.
+
+The cache is **37,229,401 bytes (35.50 MiB)**, file list and bigram columns
+combined. The live list/content heap accounting is **37,836,849 bytes**,
+falling to zero at rest; subscriptions and ignore rules remain. Persistence
+used 33–63 ms of process CPU; its wall time was observed behind the linger
+deadline and a ten-millisecond sampling interval, so is not reported as a
+separate write-latency measurement.
+
+| Memory | Held | Resting |
+| --- | ---: | ---: |
+| RSS, median | 66.95 MiB | 46.70 MiB |
+| RSS, range | 65.88–75.86 MiB | 45.62–52.38 MiB |
+| `footprint` physical footprint, median | 62 MB | 42 MB |
+
+Dropping ordinary `Vec` columns did not reliably reduce RSS: one initial
+process went from 70.3 MB held to 73.7 MB resting, with macOS retaining freed
+large allocations. Dense retained columns now use the existing
+`sys::ZeroedWords` anonymous mappings, including when decoded directly from
+disk. Dropping those returns their pages immediately; mapping refusal uses
+ordinary allocations so queries still work. File-list and smaller build
+allocations can remain in the allocator, and retained watcher/rule state
+also contributes to the resting process footprint. Resting is a reduction,
+not a promise to return a previously busy process to its startup RSS.
+
+**File-backed mmap is not taken.** Streaming load, validation and first
+query cost about 46 ms for 35.5 MiB; raw reads cost four milliseconds and
+CRC eight. A mapped format would still need validation and an implementation
+of the owned structures, would need an additional unsafe seam, and would
+complicate truncation and replacement (SIGBUS on Unix, replacement of
+mapped files on Windows). Anonymous owned mappings solve the observed
+allocator-retention problem without mapping cache files.
+
+**Linger is thirty seconds rather than five minutes.** Reload is about
+56 times cheaper than this run's median cold walk plus build. Thirty
+seconds retains a working index between nearby requests and replies,
+while releasing its large structures ten times sooner. A session's
+subsequent model replies renew the deadline. No periodic cleanup or idle
+polling was added: the retained regression tests observe zero runtime
+wake-ups for both quiet active and resting indexes.
+
+## Unused index state on macOS
+
+The idle budget opens a new session without sending a model message. The
+`Created` hook returns without warming it; the process-wide watch hub was
+already present on main. The branch nevertheless added a 16 KiB slicing-by-16
+CRC table in a relocatable static. In the release executable that table
+increased `__DATA_CONST` from 224 to 240 KiB. `vmmap` showed the entire region
+resident and dirty in the unused daemon, before any cache I/O.
+
+The table now lives in a boxed `OnceLock`, constructed on the first cache
+read or write. The fixed executable's `__DATA_CONST` is back to 224 KiB,
+including its dirty resident size. This keeps the same CRC algorithm and
+16-lane implementation; no cache-format or checksum-throughput tradeoff is
+needed. The workspace map and resting store are also boxed behind first
+use. Configuration before registration reuses its unpublished service
+allocation instead of constructing and discarding another one.
+
+Measured on the M3, macOS 27.0.1, with the size-optimized fixtures build and
+the real idle budget test, fresh isolated homes and a real terminal client.
+Main was `4ddd838c`; the candidate includes that main, including its removal
+of retained connection-read scratch. Five rounds alternated main/candidate
+order. RSS was sampled after the test's three-second idle window; `vmmap`
+and `heap` ran afterward, outside the measurement window.
+
+| Build | Daemon RSS samples, KiB | Median, KiB |
+| --- | --- | ---: |
+| main | 10512, 10512, 10496, 10480, 10432 | 10496 |
+| lazy index state and checksum table | 10400, 10464, 10384, 10400, 10464 | 10400 |
+
+The median paired difference is -80 KiB; the difference between medians is
+-96 KiB. Allocator residency and code-page placement vary, so the stable
+attribution is the removed 16 KiB of dirty static storage, not an assertion
+that every byte of the RSS difference was the table. All samples measured
+zero terminal-client CPU in the idle window. A store-only experiment left
+`__DATA_CONST` at 240 KiB and did not show a clear total-RSS improvement.
+
+`mise run budgets` was also run directly on main and the branch. On this
+machine both exceeded the unchanged 10 MiB absolute RSS threshold (initial
+main 10688 KiB, fixed branch 10656 KiB). These local failures are retained,
+not hidden by a new threshold or allocator policy. Hosted macOS budgets
+remain a required check for this change. Raw samples, full-suite outputs,
+and native memory maps are under `/private/tmp/index-idle`.
+
+
+### Executable pages before first use
+
+Deferring the table and store removed eager data, but did not by itself make
+the hosted macOS budget pass. After merging the async transport, main
+`b2a9dc5b` measured 10176 KiB on the hosted budget, and the branch measured
+10336 KiB (10400 KiB on its single retry). On the M3, live heap bytes were
+about 487 KiB in both binaries, while resident executable text was 3120 KiB
+on main and 3296 KiB on the branch. The real idle session log contained no
+model reply and its index cache directory was absent.
+
+A diagnostic build without the warm hooks reduced resident text by only
+16 KiB. Delaying hub construction did not help: generation sources already
+use that hub when a session starts. Path-only configuration, teardown
+outlining, service-factory laziness and compiler cold hints did not remove
+the code-page gap; those experiments were reverted.
+
+The CLI now uses the native linker's code-symbol grouping to place the
+index implementation and generated helpers in `__TEXT_EXEC`, an ordinary
+read/execute mapping. The registration facade remains in normal startup
+text. `warm` is kept out of line so a lifecycle callback that returns
+without warming does not contain cache setup. The source policy is
+`apps/cli/cold.symbols`; runtime allocation, timers and snapshot format are
+unchanged. The OS supplies demand paging. Broader client/UI grouping was
+measured and rejected because it pulled shared helpers into the mapping
+without improving the total.
+
+The first index-only comparison reduced resident executable pages by
+96 KiB (3296 KiB before; 3184 KiB ordinary text plus 16 KiB in the backend
+mapping). Allocator residency varies independently, so code-page and total
+RSS changes are reported separately. All samples captured RSS before native
+profiling and measured zero terminal-client CPU during the three-second
+window.
+
+A real CLI regression starts a daemon without a model reply, checks that
+no index cache exists, queries a file, waits for persistence, stops the
+daemon, makes a same-size edit, and checks that the first grep after restart
+finds the new text. This exercises first-use code, writable checksum state,
+persistence and reload through the linked executable. Panic propagation
+through the persistence callback was also checked with the LLVM backend;
+a plain-function control showed the dev Cranelift backend does not catch
+that panic, independently of code placement. No dev-backend change is part
+of this fix.

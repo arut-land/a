@@ -7,6 +7,7 @@ mod fuzzy_grep;
 #[allow(clippy::module_inception)]
 mod grep;
 mod prefilter;
+mod reader;
 mod regex;
 mod sink;
 mod types;

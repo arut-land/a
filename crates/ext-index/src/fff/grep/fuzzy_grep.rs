@@ -1,7 +1,8 @@
-use super::sink::{strip_line_terminators, truncate_display_bytes};
+use super::sink::strip_line_terminators;
 use super::types::GrepMatch;
-use crate::fff::match_offsets::char_indices_to_byte_offsets;
 use crate::fff::searcher::lines::LineStep;
+use smallvec::SmallVec;
+use std::num::NonZeroUsize;
 
 /// A fuzzy grep's matcher and the bounds a matched line must keep to: a
 /// typo or two, a dense span, few gaps.
@@ -14,15 +15,14 @@ pub(super) struct FuzzyGrep {
     max_gaps: usize,
     unique_needle_chars: Vec<u8>,
     min_chars_required: usize,
-    max_matches_per_file: usize,
 }
 
 impl FuzzyGrep {
-    pub(super) fn new(
-        grep_text: &str,
-        case_insensitive: bool,
-        max_matches_per_file: usize,
-    ) -> Self {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "slice grep receives bounded file buffers and stores compact display coordinates"
+    )]
+    pub(super) fn new(grep_text: &str, case_insensitive: bool) -> Self {
         // max_typos controls how many *needle* characters can be unmatched.
         // A transposition (e.g. "shcema" -> "schema") costs ~1 typo with
         // default gap penalties. We scale max_typos by needle length:
@@ -107,12 +107,15 @@ impl FuzzyGrep {
             max_gaps,
             unique_needle_chars,
             min_chars_required,
-            max_matches_per_file,
         }
     }
 
     /// The lines of `file_bytes` the needle fuzzily matches.
-    pub(super) fn file(&self, file_bytes: &[u8]) -> Vec<GrepMatch> {
+    pub(super) fn file(
+        &self,
+        file_bytes: &[u8],
+        max_matches_per_file: Option<NonZeroUsize>,
+    ) -> Vec<GrepMatch> {
         if self.min_chars_required > 0 {
             let found = self
                 .unique_needle_chars
@@ -171,20 +174,7 @@ impl FuzzyGrep {
             let idx = match_indices.index as usize;
             let raw_line = file_lines[idx];
 
-            let truncated = truncate_display_bytes(raw_line.as_bytes());
-            let display_line = &raw_line[..truncated.len()];
-
-            // If the line was truncated, re-compute indices on the shorter string.
-            if display_line.len() < raw_line.len() {
-                let Some(re_indices) = matcher
-                    .match_list_indices(&[display_line])
-                    .into_iter()
-                    .next()
-                else {
-                    continue;
-                };
-                match_indices = re_indices;
-            }
+            let display_line = raw_line;
 
             match_indices.indices.sort_unstable();
 
@@ -228,7 +218,18 @@ impl FuzzyGrep {
             }
 
             let (ln, bo) = line_meta[idx];
-            let ranges = char_indices_to_byte_offsets(display_line, &match_indices.indices);
+            // Frizbee returns byte indices, including every byte of a
+            // matched Unicode character, in either matching mode.
+            let mut ranges: SmallVec<[(u32, u32); 4]> = SmallVec::new();
+            for &index in &match_indices.indices {
+                if let Some(last) = ranges.last_mut()
+                    && last.1 == index
+                {
+                    last.1 += 1;
+                } else {
+                    ranges.push((index, index + 1));
+                }
+            }
             let col = ranges.first().map_or(0, |r| r.0 as usize);
 
             file_matches.push(GrepMatch {
@@ -242,7 +243,7 @@ impl FuzzyGrep {
                 after: Vec::new(),
             });
 
-            if self.max_matches_per_file != 0 && file_matches.len() >= self.max_matches_per_file {
+            if max_matches_per_file.is_some_and(|limit| file_matches.len() >= limit.get()) {
                 break;
             }
         }
@@ -257,8 +258,8 @@ mod tests {
 
     #[test]
     fn a_transposed_needle_finds_its_line_and_unrelated_lines_do_not_match() {
-        let grep = FuzzyGrep::new("shcema", true, 0);
-        let found = grep.file(b"fn validate_schema() {}\nhello world foo bar\n");
+        let grep = FuzzyGrep::new("shcema", true);
+        let found = grep.file(b"fn validate_schema() {}\nhello world foo bar\n", None);
         let lines: Vec<_> = found.iter().map(|m| m.line).collect();
         assert_eq!(lines, [1]);
         assert!(found[0].score.is_some());

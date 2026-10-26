@@ -19,7 +19,7 @@ pub struct FFFQuery<'a> {
     /// Parsed constraints (stack-allocated for ≤8 constraints)
     pub constraints: ConstraintVec<'a>,
     pub fuzzy_query: FuzzyQuery<'a>,
-    /// Parsed location (e.g., file:12:4 -> line 12, col 4)
+    /// Parsed location (e.g., <file:12:4> -> line 12, col 4)
     pub location: Option<Location>,
 }
 
@@ -43,6 +43,10 @@ impl<C: ParserConfig> QueryParser<C> {
             .collect()
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the algorithm keeps its ordered stages together"
+    )]
     pub fn parse<'a>(&self, query: &'a str) -> FFFQuery<'a> {
         let raw_query = query;
         let config: &C = &self.config;

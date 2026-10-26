@@ -1,6 +1,7 @@
 use aho_corasick::AhoCorasick;
 use memchr::memmem::Finder;
 use smallvec::SmallVec;
+use std::sync::OnceLock;
 
 use super::fuzzy_grep::FuzzyGrep;
 use super::regex::{RegexMatcher, RegexSink, build_regex};
@@ -103,6 +104,10 @@ struct PlainTextSink<'r> {
 impl Sink for PlainTextSink<'_> {
     type Error = std::io::Error;
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "slice grep receives bounded file buffers and stores compact display coordinates"
+    )]
     fn matched(
         &mut self,
         searcher: &Searcher,
@@ -184,6 +189,7 @@ pub(crate) struct Grep {
     after_context: usize,
     /// Why a regex fell back to literal matching.
     regex_error: Option<String>,
+    streaming: OnceLock<Result<super::reader::StreamRegex, String>>,
 }
 
 impl Grep {
@@ -197,16 +203,13 @@ impl Grep {
 
         if options.mode == GrepMode::Fuzzy {
             return Some(Self {
-                pattern: Pattern::Fuzzy(Box::new(FuzzyGrep::new(
-                    &grep_text,
-                    case_insensitive,
-                    options.max_matches_per_file,
-                ))),
+                pattern: Pattern::Fuzzy(Box::new(FuzzyGrep::new(&grep_text, case_insensitive))),
                 text: grep_text,
                 searcher: Searcher::new(),
                 options,
                 after_context: 0,
                 regex_error: None,
+                streaming: OnceLock::new(),
             });
         }
 
@@ -249,6 +252,7 @@ impl Grep {
             options,
             after_context,
             regex_error,
+            streaming: OnceLock::new(),
         })
     }
 
@@ -265,16 +269,80 @@ impl Grep {
         }
     }
 
+    /// Search a large file without buffering its whole content or lines.
+    pub(crate) fn reader(
+        &self,
+        file: &mut std::fs::File,
+        remaining: usize,
+        stopped: &dyn Fn() -> bool,
+    ) -> std::io::Result<Vec<GrepMatch>> {
+        let limit = self
+            .options
+            .max_matches_per_file
+            .map_or(remaining, |n| remaining.min(n.get()));
+        if let Pattern::Fuzzy(fuzzy) = &self.pattern {
+            return super::reader::fuzzy(
+                file,
+                fuzzy,
+                self.text.len().saturating_mul(12),
+                limit,
+                stopped,
+            );
+        }
+        let matcher = self.streaming.get_or_init(|| {
+            let pattern = match &self.pattern {
+                Pattern::Regex(re) => re.as_str().to_owned(),
+                Pattern::Plain { .. } => regex::escape(&self.text),
+                Pattern::Fuzzy(_) => unreachable!("handled above"),
+            };
+            super::reader::StreamRegex::new(
+                &pattern,
+                self.options.casing.is_insensitive_for(&self.text),
+                self.searcher.multi_line(),
+            )
+            .map_err(|error| error.to_string())
+        });
+        matcher
+            .as_ref()
+            .map_err(|error| std::io::Error::other(error.clone()))?
+            .search(
+                file,
+                limit,
+                GrepOptions {
+                    after_context: self.after_context,
+                    ..self.options
+                },
+                stopped,
+            )
+    }
+
     /// Every match in a file's content.
+    #[cfg(test)]
     pub(crate) fn file(&self, content: &[u8]) -> Vec<GrepMatch> {
+        self.file_limited(content, usize::MAX)
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "slice grep receives bounded file buffers and stores compact display coordinates"
+    )]
+    pub(crate) fn file_limited(&self, content: &[u8], remaining: usize) -> Vec<GrepMatch> {
+        if remaining == 0 {
+            return Vec::new();
+        }
+        let max_matches = std::num::NonZeroUsize::new(
+            self.options
+                .max_matches_per_file
+                .map_or(remaining, |limit| remaining.min(limit.get())),
+        );
         let state = SinkState {
             matches: Vec::with_capacity(4),
-            max_matches: self.options.max_matches_per_file,
+            max_matches,
             before_context: self.options.before_context,
             after_context: self.after_context,
         };
-        match &self.pattern {
-            Pattern::Fuzzy(fuzzy) => fuzzy.file(content),
+        let mut matches = match &self.pattern {
+            Pattern::Fuzzy(fuzzy) => fuzzy.file(content, max_matches),
             Pattern::Regex(re) => {
                 let matcher = RegexMatcher {
                     regex: re,
@@ -304,7 +372,9 @@ impl Grep {
                 let _ = self.searcher.search_slice(&matcher, content, &mut sink);
                 sink.state.matches
             }
-        }
+        };
+        matches.iter_mut().for_each(super::sink::excerpt);
+        matches
     }
 }
 
@@ -385,7 +455,7 @@ mod tests {
     #[test]
     fn sinks_stop_when_the_retained_match_limit_is_reached() {
         let options = GrepOptions {
-            max_matches_per_file: 1,
+            max_matches_per_file: std::num::NonZeroUsize::new(1),
             ..GrepOptions::default()
         };
         let found = grep("Needle", options).file(b"Needle();\nfn Needle() {}\nNeedle();\n");
@@ -431,7 +501,7 @@ mod tests {
         let multi = b"hello unicorn\nrainbow world\n";
         let winpath = b"let p = \"C:\\\\Users\\\\nvim-data\";\n";
         let options = GrepOptions {
-            max_matches_per_file: 0,
+            max_matches_per_file: None,
             ..GrepOptions::default()
         };
 
@@ -493,5 +563,109 @@ mod tests {
         };
         assert_eq!(lines("needle"), [1, 2, 3]);
         assert_eq!(lines("Needle"), [1]);
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use std::io::{Seek as _, Write as _};
+
+    fn exact(pattern: &str, mode: GrepMode) -> Grep {
+        let query = FFFQuery {
+            raw_query: pattern,
+            constraints: crate::fff::query::ConstraintVec::new(),
+            fuzzy_query: FuzzyQuery::Text(pattern),
+            location: None,
+        };
+        Grep::new(
+            &query,
+            GrepOptions {
+                mode,
+                ..GrepOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn every_mode_excerpts_the_match_instead_of_the_line_prefix() {
+        let text = format!("{}needle{}\n", "λ".repeat(300), "z".repeat(1000));
+        for mode in [GrepMode::Plain, GrepMode::Regex, GrepMode::Fuzzy] {
+            let hits = exact("needle", mode).file(text.as_bytes());
+            assert_eq!(hits.len(), 1, "{mode:?}");
+            let hit = &hits[0];
+            assert_eq!(hit.col, 600, "{mode:?}");
+            assert!(hit.text.starts_with('…') && hit.text.ends_with('…'));
+            let &(a, b) = hit.ranges.first().unwrap();
+            assert_eq!(&hit.text[a as usize..b as usize], "needle", "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn streaming_preserves_line_matches_anchors_and_context() {
+        let text = b"before\n  needle alpha needle\nnone\nneedle beta\nafter\n";
+        for (pattern, mode) in [
+            ("needle", GrepMode::Plain),
+            ("needle [a-z]+", GrepMode::Regex),
+            (r"^\s*needle", GrepMode::Regex),
+            (r"\Aneedle", GrepMode::Regex),
+            (r"alpha\z", GrepMode::Regex),
+            ("needle\\nnone", GrepMode::Plain),
+            ("needle\\nnone", GrepMode::Regex),
+            ("nedle", GrepMode::Fuzzy),
+        ] {
+            let grep = exact(pattern, mode);
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(text).unwrap();
+            file.rewind().unwrap();
+            let stream = grep.reader(&mut file, 200, &|| false).unwrap();
+            let slice = grep.file(text);
+            assert_eq!(stream, slice, "{pattern:?} {mode:?}");
+        }
+    }
+
+    #[test]
+    fn streaming_does_not_skip_lines_after_a_newline_match() {
+        let text = b"needle\nneedle\nneedle\n";
+        for pattern in ["needle\\n", "needle\\nneedle"] {
+            let grep = exact(pattern, GrepMode::Plain);
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(text).unwrap();
+            file.rewind().unwrap();
+            assert_eq!(
+                grep.reader(&mut file, 200, &|| false).unwrap(),
+                grep.file(text)
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_matches_across_buffers_and_arbitrarily_long_regex_spans() {
+        for (pattern, mode) in [
+            ("needle", GrepMode::Plain),
+            ("start.*needle", GrepMode::Regex),
+            ("nedle", GrepMode::Fuzzy),
+        ] {
+            let text = format!("start{}needle\nnext\n", "x".repeat((12 << 20) - 8));
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+            file.rewind().unwrap();
+            let hits = exact(pattern, mode)
+                .reader(&mut file, 1, &|| false)
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{mode:?}");
+            assert_eq!(hits[0].line, 1);
+            assert!(!hits[0].ranges.is_empty());
+            file.rewind().unwrap();
+            let checks = std::cell::Cell::new(0);
+            let hits = exact(pattern, mode)
+                .reader(&mut file, 1, &|| {
+                    checks.set(checks.get() + 1);
+                    checks.get() > 2
+                })
+                .unwrap();
+            assert!(hits.is_empty(), "{mode:?}");
+        }
     }
 }

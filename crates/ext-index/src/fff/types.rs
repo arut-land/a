@@ -6,6 +6,9 @@
 //! a tree of real paths and needs no `unsafe` to read.
 
 use std::cmp::Ordering;
+use std::io::{self, Read, Write};
+
+use crate::disk::{In, Out, invalid};
 
 /// One file: where its path is in the arena, and its size and age.
 #[derive(Clone, Debug)]
@@ -58,6 +61,10 @@ impl Files {
         files
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the file arena uses compact offsets checked at its boundary"
+    )]
     fn push(&mut self, found: &Found) -> Option<usize> {
         let len = u16::try_from(found.path.len()).ok()?;
         let start = u32::try_from(self.arena.len()).ok()?;
@@ -100,15 +107,17 @@ impl Files {
     }
 
     /// The slot of the live file at `path`.
+    /// A walked file removed and made again is in a slot after the walked
+    /// ones, its walked slot left a tombstone.
     pub(crate) fn find(&self, path: &str) -> Option<usize> {
         let walked = &self.items[..self.walked];
-        let found = walked
-            .binary_search_by(|f| self.path(f).cmp(path))
-            .ok()
-            .or_else(|| {
-                (self.walked..self.items.len()).find(|&i| self.path(&self.items[i]) == path)
-            })?;
-        (!self.items[found].deleted).then_some(found)
+        if let Ok(slot) = walked.binary_search_by(|f| self.path(f).cmp(path))
+            && !self.items[slot].deleted
+        {
+            return Some(slot);
+        }
+        (self.walked..self.items.len())
+            .find(|&i| !self.items[i].deleted && self.path(&self.items[i]) == path)
     }
 
     /// Records `found`, as new or changed: the slot it is in, and whether
@@ -152,11 +161,112 @@ impl Files {
             .collect()
     }
 
+    /// Live slots in path order: the mapping used when an idle index compacts.
+    pub(crate) fn compact_slots(&self) -> Vec<usize> {
+        let mut slots: Vec<_> = (0..self.items.len())
+            .filter(|&slot| !self.items[slot].deleted)
+            .collect();
+        slots.sort_unstable_by(|&a, &b| self.path(&self.items[a]).cmp(self.path(&self.items[b])));
+        slots
+    }
+
+    pub(crate) fn compact(&self, slots: &[usize]) -> Self {
+        Self::walked(
+            slots
+                .iter()
+                .map(|&slot| {
+                    let file = &self.items[slot];
+                    Found {
+                        path: self.path(file).to_owned(),
+                        size: file.size,
+                        modified: file.modified,
+                    }
+                })
+                .collect(),
+        )
+    }
+
     /// What the arena and the slots take.
     pub(crate) fn heap_bytes(&self) -> usize {
         self.arena.capacity() + self.items.capacity() * size_of::<FileItem>()
     }
+
+    pub(crate) fn encode(&self, out: &mut Out<impl Write>) -> io::Result<()> {
+        out.bytes(self.arena.as_bytes())?;
+        out.len(self.walked)?;
+        out.len(self.items.len())?;
+        for item in &self.items {
+            out.u32(item.start)?;
+            out.u32(u32::from(item.len) | u32::from(item.name) << 16)?;
+            out.u64(item.size)?;
+            out.u64(item.modified)?;
+            out.u8(u8::from(item.deleted))?;
+        }
+        Ok(())
+    }
+
+    /// The files [`Files::encode`] wrote, if they are what it writes: each
+    /// path within the arena, whole characters, the walked ones sorted.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the file arena uses compact offsets checked at its boundary"
+    )]
+    pub(crate) fn decode(input: &mut In<impl Read>) -> io::Result<Self> {
+        let arena = String::from_utf8(input.bytes()?).map_err(|_| invalid())?;
+        let walked = input.usize()?;
+        let count = input.len(ITEM_BYTES)?;
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            let start = input.u32()?;
+            let lengths = input.u32()?;
+            let item = FileItem {
+                start,
+                len: lengths as u16,
+                name: (lengths >> 16) as u16,
+                size: input.u64()?,
+                modified: input.u64()?,
+                deleted: match input.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(invalid()),
+                },
+            };
+            let (start, end) = (start as usize, start as usize + item.len as usize);
+            if end > arena.len()
+                || !arena.is_char_boundary(start)
+                || !arena.is_char_boundary(end)
+                || item.name > item.len
+                || !arena.is_char_boundary(start + item.name as usize)
+            {
+                return Err(invalid());
+            }
+            let path = &arena[start..end];
+            // Cache paths use the walk's portable slash-separated form.
+            if path.is_empty()
+                || path.contains(['\\', ':', '\0'])
+                || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+            {
+                return Err(invalid());
+            }
+            items.push(item);
+        }
+        let files = Self {
+            arena,
+            items,
+            walked,
+        };
+        let sorted = (files.items.get(..walked).ok_or_else(invalid)?)
+            .windows(2)
+            .all(|pair| files.path(&pair[0]) < files.path(&pair[1]));
+        if !sorted {
+            return Err(invalid());
+        }
+        Ok(files)
+    }
 }
+
+/// What [`Files::encode`] writes of each file.
+const ITEM_BYTES: u64 = 4 + 4 + 8 + 8 + 1;
 
 impl FileItem {
     pub(crate) fn is_deleted(&self) -> bool {
@@ -224,7 +334,50 @@ mod tests {
         assert_eq!(files.remove("src/a.rs"), Some(1));
         assert_eq!(files.find("src/a.rs"), None);
         assert_eq!(files.live_count(), 3);
-        // Back after a removal: a new slot, the old one stays a tombstone.
+        // Back after a removal: a new slot, the old one stays a tombstone,
+        // and it is found in its new one from then on.
         assert_eq!(files.upsert(&found("src/a.rs")), Some((4, true)));
+        assert_eq!(files.upsert(&found("src/a.rs")), Some((4, false)));
+        assert_eq!(files.live_count(), 4);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn cached_paths_cannot_escape_or_change_meaning_when_joined() {
+        for path in [
+            "",
+            "/etc/passwd",
+            "../outside",
+            "src/../../outside",
+            "src/./file",
+            "src//file",
+            "C:/outside",
+            "\\\\server\\share",
+            "src\\..\\outside",
+            "src/",
+            "nul\0path",
+        ] {
+            let files = Files::walked(vec![Found {
+                path: path.into(),
+                size: 1,
+                modified: 1,
+            }]);
+            let bytes = crate::disk::encoded(|out| files.encode(out));
+            assert!(
+                crate::disk::decoded(&bytes, Files::decode).is_err(),
+                "{path:?}"
+            );
+        }
+        let files = Files::walked(vec![Found {
+            path: "src/λ.rs".into(),
+            size: 1,
+            modified: 1,
+        }]);
+        let bytes = crate::disk::encoded(|out| files.encode(out));
+        assert!(crate::disk::decoded(&bytes, Files::decode).is_ok());
     }
 }
