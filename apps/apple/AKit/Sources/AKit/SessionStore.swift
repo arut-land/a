@@ -166,8 +166,10 @@ public final class SessionStore {
         if update.revision <= rev { return }
         latestRevision = max(latestRevision, update.revision)
         let invalidated = update.changes.contains { change in
-            if case .invalidated = change { return true }
-            return false
+            switch change {
+            case .invalidated, .viewInvalidated: return true
+            default: return false
+            }
         }
         if update.revision == rev + 1 && !invalidated {
             fold(update)
@@ -229,7 +231,7 @@ public final class SessionStore {
                 count += 1
             case .updated(let index, _):
                 guard Int(index) < count else { return }
-            case .invalidated:
+            case .invalidated, .viewInvalidated:
                 return
             case .attached, .delta, .synced, .activity, .draining, .mismatch, .error, .link:
                 break
@@ -259,7 +261,7 @@ public final class SessionStore {
             case .snapshot(let session, let workspace, let snapshot):
                 (sessionId, self.workspace, items) = (session, workspace, snapshot)
                 attachment = session.map { .attached(id: $0) } ?? .detached
-            case .activity, .draining, .invalidated:
+            case .activity, .draining, .invalidated, .viewInvalidated:
                 break
             case .mismatch(_, let message):
                 problem = message

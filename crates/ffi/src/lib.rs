@@ -404,6 +404,8 @@ pub enum ViewChange {
         added: Vec<u32>,
         updated: Vec<u32>,
     },
+    /// A complete view replacement is available through resync.
+    ViewInvalidated,
     /// Live text for the reply of `call`.
     Delta {
         call: u64,

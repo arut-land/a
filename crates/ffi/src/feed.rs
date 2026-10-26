@@ -174,7 +174,11 @@ impl Feed {
         {
             let mut added = Vec::new();
             let mut updated = Vec::new();
-            update.changes.retain_mut(|change| match change {
+            let replaced = update
+                .changes
+                .iter()
+                .any(|change| matches!(change, ViewChange::Snapshot { .. }));
+            update.changes.retain(|change| match change {
                 ViewChange::Added { index, .. } => {
                     added.push(*index);
                     false
@@ -183,16 +187,14 @@ impl Feed {
                     updated.push(*index);
                     false
                 }
-                ViewChange::Delta { .. } => false,
-                ViewChange::Snapshot { items, .. } => {
-                    *items = Vec::new();
-                    true
-                }
+                ViewChange::Delta { .. } | ViewChange::Snapshot { .. } => false,
                 _ => true,
             });
-            update
-                .changes
-                .push(ViewChange::Invalidated { added, updated });
+            update.changes.push(if replaced {
+                ViewChange::ViewInvalidated
+            } else {
+                ViewChange::Invalidated { added, updated }
+            });
             update.title = None;
         }
         let bytes = update.retained_bytes();
@@ -282,10 +284,12 @@ impl Feed {
         }
         let updates = || self.recent.iter().filter(|update| update.revision > from);
         if !updates().any(|update| {
-            update
-                .changes
-                .iter()
-                .any(|change| matches!(change, ViewChange::Invalidated { .. }))
+            update.changes.iter().any(|change| {
+                matches!(
+                    change,
+                    ViewChange::Invalidated { .. } | ViewChange::ViewInvalidated
+                )
+            })
         }) {
             return Resync::Updates {
                 updates: updates().cloned().collect(),
@@ -295,7 +299,9 @@ impl Feed {
         let mut changes = Vec::new();
         for change in updates().flat_map(|update| &update.changes) {
             match change {
-                ViewChange::Snapshot { .. } | ViewChange::Attached { reset: true, .. } => {
+                ViewChange::Snapshot { .. }
+                | ViewChange::ViewInvalidated
+                | ViewChange::Attached { reset: true, .. } => {
                     return Resync::Snapshot {
                         snapshot: self.snapshot(),
                     };
@@ -767,6 +773,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(update.retained_bytes() < BUDGET.bytes / BUFFER);
+        assert!(matches!(
+            update.changes.as_slice(),
+            [ViewChange::ViewInvalidated]
+        ));
         let Resync::Snapshot { snapshot } = reducer.resync(1) else {
             panic!("a replacement needs the whole view");
         };
