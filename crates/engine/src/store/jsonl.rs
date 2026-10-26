@@ -9,8 +9,8 @@ use protocol::{Decode, Entry, Json, ReadOnly, SessionId};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Encoded, Header, History, ImportStep, LeaseAuthority, Lines, Loaded, Local, Log, LogStore,
-    Snapshot, Writer, span,
+    Encoded, Header, History, ImportStep, Lines, Loaded, Local, Log, LogStore, Snapshot, Writer,
+    span,
 };
 
 /// A different header format makes the log read-only.
