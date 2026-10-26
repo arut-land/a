@@ -12,11 +12,15 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # A JPEG decoded at a DCT scale, an eighth of the work and memory or less.
 jpeg-decoder = { version = "0.3", default-features = false }
 llm.workspace = true
+# Count line breaks while validating bounded chunks.
+memchr.workspace = true
 protocol.workspace = true
 rt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sys.workspace = true
+# File-backed edit snapshots and output, independent of file size.
+tempfile = { version = "3", default-features = false }
 # The PNG decoder `image` decodes with, read a row at a time.
 png = "0.18"
 
