@@ -6,7 +6,7 @@
 //! A session is the client SDK's [`client::SessionClient`]: the app only
 //! renders it. Its updates arrive as a stream that drops items when its
 //! buffer is full, so each carries a `rev`: a client that sees a gap asks
-//! [`Session::resync`] for what it missed, or a fresh snapshot. Each update
+//! [`Session::recovery`] to build what it missed off the UI thread. Each update
 //! also carries the turn as the SDK computes it ([`TurnInfo`]), the call
 //! whose reply is streaming, and each item how it is shown
 //! ([`Presentation`]), so no rule is copied into Swift.
@@ -24,7 +24,7 @@ use protocol::view::{
 };
 use protocol::{CommandInfo, SessionSummary};
 
-pub use feed::Reducer;
+pub use feed::{Recovery, Reducer};
 pub use live::{BlobFetch, Client, QueryStream, Session, SessionWatch, find_session};
 
 /// The purpose of the side request that titles a session, as the app
@@ -303,8 +303,10 @@ pub enum OpenTarget {
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChangeBatch {
-    /// One more than the previous batch; a gap requires resynchronization.
+    /// One more than the previous batch; a gap or invalidation requires resynchronization.
     pub revision: u64,
+    /// Cached byte charge for the current view and replay cache.
+    pub retained_bytes: u64,
     /// The last log entry folded, after this update.
     pub seq: u64,
     pub changes: Vec<ViewChange>,
@@ -397,6 +399,13 @@ pub enum ViewChange {
         index: u32,
         item: DisplayItem,
     },
+    /// Recover this batch through resync; large presentations are not queued.
+    Invalidated {
+        added: Vec<u32>,
+        updated: Vec<u32>,
+    },
+    /// A complete view replacement is available through resync.
+    ViewInvalidated,
     /// Live text for the reply of `call`.
     Delta {
         call: u64,
@@ -734,6 +743,7 @@ pub struct StreamingText {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSnapshot {
     pub rev: u64,
+    pub retained_bytes: u64,
     pub seq: u64,
     pub session: Option<String>,
     pub workspace: String,
@@ -749,15 +759,25 @@ pub struct SessionSnapshot {
     pub state_hash: String,
 }
 
-/// The answer to a resync: the updates after the one asked from when they
-/// are still kept, else the whole view.
+/// Retained changes are replayed or coalesced against the requested revision;
+/// a reset or lost replay range requires the whole view.
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 // By value: that is how it crosses the boundary.
 #[allow(clippy::large_enum_variant)]
 pub enum Resync {
-    Updates { updates: Vec<ChangeBatch> },
-    Snapshot { snapshot: SessionSnapshot },
+    Updates {
+        updates: Vec<ChangeBatch>,
+    },
+    /// A coalesced replacement for changes since `from`, applied only to that base.
+    Patch {
+        from: u64,
+        update: ChangeBatch,
+        streaming: Option<StreamingText>,
+    },
+    Snapshot {
+        snapshot: SessionSnapshot,
+    },
 }
 
 fn index(i: usize) -> u32 {
@@ -870,26 +890,44 @@ impl From<&Recap> for RecapInfo {
 }
 
 impl SessionSnapshot {
-    fn of(client: &SessionClient, rev: u64) -> Self {
+    fn of(client: &SessionClient, rev: u64, retained_bytes: u64) -> Self {
         let view = client.view();
-        Self {
+        Self::with_items(
+            view,
             rev,
-            seq: view.seq,
-            session: view.session.map(|s| s.to_string()),
-            workspace: view.workspace.to_string(),
-            items: view
-                .items
+            retained_bytes,
+            client.link().into(),
+            client.turn().into(),
+            view.items
                 .iter()
                 .map(|item| DisplayItem::in_view(item, view))
                 .collect(),
-            link: client.link().into(),
+        )
+    }
+
+    fn with_items(
+        view: &SessionView,
+        rev: u64,
+        retained_bytes: u64,
+        link: LinkState,
+        turn: TurnInfo,
+        items: Vec<DisplayItem>,
+    ) -> Self {
+        Self {
+            rev,
+            retained_bytes,
+            seq: view.seq,
+            session: view.session.map(|s| s.to_string()),
+            workspace: view.workspace.to_string(),
+            items,
+            link,
             recap: view.recap.as_ref().map(Into::into),
             streaming: view.streaming.as_ref().map(|s| StreamingText {
                 call: s.call.get(),
                 attempt: s.attempt,
                 text: s.text.clone(),
             }),
-            turn: client.turn().into(),
+            turn,
             title: view.side(TITLE).map(str::to_owned),
             state_hash: format!("{:016x}", view.state_hash()),
         }

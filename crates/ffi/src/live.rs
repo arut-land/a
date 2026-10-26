@@ -22,7 +22,8 @@ use sys::{Home, Staged};
 use crate::feed::{Feed, lock};
 use crate::{
     AppAction, BlobPiece, ChangeBatch, CliStatus, ClientError, CommandHelp, OpenTarget,
-    QueryAnswer, Resync, SessionInfo, SessionListUpdate, SessionSnapshot, Settings, TurnInfo,
+    QueryAnswer, Recovery, Resync, SessionInfo, SessionListUpdate, SessionSnapshot, Settings,
+    TurnInfo,
 };
 
 fn runtime() -> &'static Arc<Threads> {
@@ -292,17 +293,19 @@ impl Cancel {
 impl QueryStream {
     /// The query `query` asks, as JSON: `{"service": "…", "scope":
     /// "daemon" | {"workspace": "<dir>"} | {"session": "<id>"}, "body":
-    /// …}`, the body as the query reads it.
+    /// …}`, the body as the query reads it. An omitted body is `null`.
     pub fn new(client: &Client, query: &str) -> Result<Self, ClientError> {
         let invalid = |message: String| ClientError::InvalidArgument { message };
-        let mut query: serde_json::Value =
+        let query: BTreeMap<String, &serde_json::value::RawValue> =
             serde_json::from_str(query).map_err(|e| invalid(e.to_string()))?;
-        let service = (query["service"].as_str())
-            .ok_or_else(|| invalid("a query names its service".into()))?
-            .to_owned();
-        let scope = serde_json::from_value(query["scope"].take())
-            .map_err(|e| invalid(format!("scope: {e}")))?;
-        let body = protocol::Json::encode(&query["body"]).map_err(|e| invalid(e.to_string()))?;
+        let field = |name| query.get(name).map_or("null", |raw| raw.get());
+        let service: String =
+            serde_json::from_str(field("service")).map_err(|e| invalid(format!("service: {e}")))?;
+        let scope: protocol::Scope =
+            serde_json::from_str(field("scope")).map_err(|e| invalid(format!("scope: {e}")))?;
+        let body = query.get("body").map_or_else(protocol::Json::null, |raw| {
+            protocol::Json::from((*raw).to_owned())
+        });
         // A few answers ahead of the app; past them the socket, then the
         // daemon's query, waits.
         let (sender, answers) = rt::channel::bounded_async(16);
@@ -539,7 +542,7 @@ impl Session {
                 #[cfg(test)]
                 let connected = matches!(event.kind, client::EventKind::Connected { .. });
                 let mut feed = lock(&shared);
-                let effects = feed.client.step(event);
+                let effects = feed.step(event);
                 #[cfg(test)]
                 if connected && let Some(pause) = lock(&replaying).take() {
                     pause();
@@ -561,7 +564,7 @@ impl Session {
 
     /// Every update from here on. Subscribe before `open` to see the
     /// attach; items dropped by a full buffer show as a `rev` gap, for
-    /// `resync`.
+    /// `resync`. An invalidation also requires recovery, without a revision gap.
     #[ffi_stream(item = ChangeBatch)]
     pub fn updates(&self) -> Arc<EventSubscription<ChangeBatch>> {
         lock(&self.feed).subscribe()
@@ -580,10 +583,15 @@ impl Session {
         lock(&self.feed).snapshot()
     }
 
-    /// What came after update `from`: the updates, or a snapshot when too
-    /// many were missed.
+    /// What came after `from`: replay, a coalesced patch, or a snapshot.
+    /// Builds display data; call off the UI thread.
     pub fn resync(&self, from: u64) -> Resync {
-        lock(&self.feed).resync(from)
+        self.recovery(from).build().expect("uncancelled recovery")
+    }
+
+    /// Prepares a recovery handle without locking or rendering the feed.
+    pub fn recovery(&self, from: u64) -> Recovery {
+        Recovery::new(Arc::clone(&self.feed), from)
     }
 
     /// What the controls offer for the turn now.
@@ -843,6 +851,34 @@ mod tests {
             vars: Vec::new(),
         };
         (client, home, root, listener, owner)
+    }
+
+    #[test]
+    fn query_bodies_preserve_raw_json_and_missing_bodies_are_null() {
+        let (client, _home, _root, _listener, _owner) = client_fixture();
+        let raw = r#"{ "z": 1e+02, "a": [true,  null], "escaped": "\u0061" }"#;
+        for body in [Some(raw), None] {
+            let suffix = body.map_or_else(String::new, |body| format!(",\"body\":{body}"));
+            let query = QueryStream::new(
+                &client,
+                &format!("{{\"service\":\"echo\",\"scope\":\"daemon\"{suffix}}}"),
+            )
+            .unwrap();
+            let asked = lock(&query.asked);
+            let (_, scope, payload) = &asked.as_ref().unwrap().query;
+            assert_eq!(*scope, protocol::Scope::Daemon);
+            assert_eq!(payload.raw(), body.unwrap_or("null"));
+        }
+        let escaped = QueryStream::new(
+            &client,
+            r#"{"serv\u0069ce":"echo","scope":"daemon","b\u006fdy": { "x": 1e0 }}"#,
+        )
+        .unwrap();
+        let asked = lock(&escaped.asked);
+        let (service, _, body) = &asked.as_ref().unwrap().query;
+        assert_eq!(service, "echo");
+        assert_eq!(body.raw(), r#"{ "x": 1e0 }"#);
+        assert!(QueryStream::new(&client, r#"{"service":"echo","scope":"invalid"}"#).is_err());
     }
 
     #[test]
