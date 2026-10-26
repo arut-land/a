@@ -73,7 +73,12 @@ while an `on_stop` error passes. Hooks cannot await effects.
 text. `a.fold{name = "count", initial = 0, apply = function(state, change)
 return state + change end}` declares durable JSON state. Reducers run in a
 separate VM without effects. On every application, live or replayed, the host
-re-evaluates the source in a fresh environment and resets the private VM's PRNG.
+re-evaluates the source in a fresh environment and resets the private VM's PRNG
+with seed zero. Durable code may reseed it with
+`math.randomseed(seed[, second])`: an integer seed is required, and the second
+seed defaults to zero. `next` and `pairs` are unavailable in the reducer VM
+because hash traversal order varies between VMs. Use `ipairs` for arrays or
+access explicitly ordered keys.
 Closure upvalues and global mutations cannot survive an application; only the
 JSON state passed in and returned carries session data. Another session's
 reductions therefore cannot change replay. Reducers spend instruction fuel only;
@@ -162,10 +167,12 @@ timeout_ms = 25
 Memory is capped per VM; a mod with folds has a separate reducer VM.
 An owned invocation chain shares its instruction and dispatch allowance,
 including named descendants on other workers or in other mod VMs. Sequential
-hooks share a dispatch allowance too. Generation preparation shares one instruction allowance across
-the tool and reducer VM compilations, including recovery. Reducer applications
-budget both source preparation and reduction by instructions too. Active poll time accumulates across resumes,
-excluding awaited I/O; this is not an OS-enforced hard deadline for native functions.
+hooks share a dispatch allowance too. Generation preparation shares one
+instruction allowance across the tool and reducer VM compilations, including
+recovery. Reducer applications budget both source preparation and reduction
+by instructions too. For non-durable calls, active poll time accumulates
+across resumes, excluding awaited I/O; this is not an OS-enforced hard
+deadline for native functions.
 Each generation admits at most 16 executing calls and 64 waiters. A call releases
 its permit while awaiting a delegated tool, then reacquires before resuming;
 waiting owners cannot occupy the capacity their children need. Cancellation

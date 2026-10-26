@@ -12,7 +12,7 @@ use ext::{
     Refused, Registrar, Replay, Text,
 };
 use mlua::chunk::ChunkMode;
-use mlua::{Function, HookTriggers, Lua, LuaSerdeExt, StdLib, Table, Value, VmState};
+use mlua::{Function, HookTriggers, Integer, Lua, LuaSerdeExt, StdLib, Table, Value, VmState};
 use protocol::{Audience, Card, Json, Outcome, Payload};
 
 #[derive(Clone, Copy)]
@@ -286,15 +286,24 @@ fn sandbox(limits: Limits, vm_mode: VmMode) -> mlua::Result<(Lua, Callbacks, Tab
     for name in ["find", "match", "gmatch", "gsub", "dump"] {
         strings.set(name, Value::Nil)?;
     }
+    if vm_mode == VmMode::Fold {
+        // Hash traversal can change both a durable value and its fuel cost across VMs.
+        for name in ["next", "pairs"] {
+            lua.globals().set(name, Value::Nil)?;
+        }
+        let math: Table = lua.globals().get("math")?;
+        let seed: Function = math.get("randomseed")?;
+        math.set(
+            "randomseed",
+            lua.create_function(move |_, (first, second): (Integer, Option<Integer>)| {
+                seed.call::<(Integer, Integer)>((first, second.unwrap_or(0)))
+            })?,
+        )?;
+        math.get::<Function>("randomseed")?.call::<()>(0)?;
+    }
     for name in ["string", "table", "math"] {
         let library: Table = lua.globals().get(name)?;
         lua.globals().set(name, readonly(&lua, library)?)?;
-    }
-    if vm_mode == VmMode::Fold {
-        lua.globals()
-            .get::<Table>("math")?
-            .get::<Function>("randomseed")?
-            .call::<()>(0)?;
     }
     let globals = lua.create_table()?;
     for pair in lua.globals().pairs::<Value, Value>() {
@@ -1397,37 +1406,98 @@ mod tests {
     }
 
     #[test]
-    fn durable_reducers_ignore_deadlines_but_replay_fuel_rejections() {
-        let source = "a.fold{name='count',initial=0,apply=function(state,change) if change<0 then while true do end end; return state+change end}; a.tool{name='test',description='test',input={type='object'},run=function(_,cx) cx.update('count',1); return cx.state('count') end}";
+    fn fresh_vm_replay_preserves_each_reducer_decision_and_value() {
+        let source = r"
+            local seed = math.randomseed
+            a.fold{name='count',initial={count=0},apply=function(state,change)
+                if change == 'fuel' then while true do end end
+                if change == 'unseeded' then seed() end
+                if change == 'pairs' then
+                    for key in pairs({alpha=1,beta=2}) do state.key=key end
+                end
+                if change == 'next' then state.key=next({alpha=1,beta=2}) end
+                local first, second
+                if change == 'seeded' then first,second=seed(7) end
+                if change == 'seed_pair' then first,second=seed(7,9) end
+                local order=''
+                for _,key in ipairs({'beta','alpha'}) do order=order..key end
+                return {count=state.count+1,random=math.random(),
+                    first=first,second=second,order=order}
+            end}
+        ";
         let mut module = Mod::load("test", source, &[], Limits::default()).unwrap();
         Arc::get_mut(&mut module.folds[0]).unwrap().limits.slice = Duration::ZERO;
         let rig = Rig::new(
-            "lua-fuel-replay",
+            "lua-fresh-vm-replay",
             Registry::default()
                 .with_dyn(ext::Tier::User, &module)
                 .unwrap(),
         );
-        assert_eq!(rig.done("test", &json!({})), 1);
-        let rejected = rt::block_on(rig.cx().update_erased(
-            "test",
-            "count",
-            Json::encode(&-1).unwrap(),
-        ));
-        assert!(
-            matches!(&rejected, Err(ext::MutationError::Rejected(error)) if error.contains("budget"))
-        );
-        let mut replay = rig.registry.states();
-        let log = rig.log.lock().unwrap();
-        replay.replay(log.iter());
-        assert_eq!(
-            replay
-                .erased("test", "count")
+        let mut live = Vec::new();
+        for (change, accepted) in [
+            ("default", true),
+            ("unseeded", false),
+            ("seeded", true),
+            ("pairs", false),
+            ("next", false),
+            ("fuel", false),
+            ("seed_pair", true),
+            ("default", true),
+        ] {
+            let result = rt::block_on(rig.cx().update_erased(
+                "test",
+                "count",
+                Json::encode(&change).unwrap(),
+            ));
+            assert_eq!(result.is_ok(), accepted, "change {change}: {result:?}");
+            let state: serde_json::Value = rig
+                .cx()
+                .state_erased("test", "count")
                 .unwrap()
-                .parse::<u64>()
-                .unwrap(),
-            1
+                .parse()
+                .unwrap();
+            if change == "seeded" || change == "seed_pair" {
+                assert_eq!(state["first"], 7);
+                assert_eq!(state["second"], if change == "seeded" { 0 } else { 9 });
+                assert_eq!(state["order"], "betaalpha");
+            }
+            live.push((result, state));
+        }
+        let restored = Mod::restore("test", &module.image).unwrap();
+        let mut replay = Registry::default()
+            .with_dyn(ext::Tier::User, &restored)
+            .unwrap()
+            .states();
+        let log = rig.log.lock().unwrap();
+        assert_eq!(log.len(), live.len());
+        for (entry, (result, state)) in log.iter().zip(live) {
+            replay.apply(entry);
+            assert_eq!(replay.mutation_result(entry), result, "entry {}", entry.seq);
+            assert_eq!(
+                replay
+                    .erased("test", "count")
+                    .unwrap()
+                    .parse::<serde_json::Value>()
+                    .unwrap(),
+                state,
+                "entry {}",
+                entry.seq
+            );
+        }
+    }
+
+    #[test]
+    fn non_durable_vms_keep_native_randomness_and_unordered_iteration() {
+        let rig = Rig::new(
+            "lua-live-iteration",
+            registry(
+                &tool(
+                    "math.randomseed(); local key,value=next({alpha=1}); assert(key=='alpha' and value==1); for key,value in pairs({beta=2}) do assert(key=='beta' and value==2) end; return true",
+                ),
+                &[],
+            ),
         );
-        assert_eq!(replay.mutation_result(log.last().unwrap()), rejected);
+        assert_eq!(rig.done("test", &json!({})), true);
     }
 
     #[test]
