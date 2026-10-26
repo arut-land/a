@@ -18,6 +18,11 @@ class ThreadRules(unittest.TestCase):
             ("use std::thread::*;", "spawn(|| {}); sleep(d); Builder::new();",
              ["spawn", "sleep", "Builder"]),
             ("use std::thread::spawn as r#launch;", "r#launch(|| {});", ["spawn"]),
+            ("use std::thread as workers; use self::workers::spawn as launch;",
+             "launch(|| {});", ["spawn"]),
+            ("use std::thread as workers;", "crate::workers::spawn(|| {});", ["spawn"]),
+            ("use std::thread as workers;",
+             "use custom as workers; crate::workers::spawn(|| {});", ["spawn"]),
             ("", "std::thread::spawn(|| {}); std::thread::sleep(d);", ["spawn", "sleep"]),
         ]
         for imports, body, expected in cases:
@@ -36,6 +41,18 @@ fn four() { nap(d); }
 """
         self.assertEqual([(f.function, f.api) for f in threads.findings(source)],
                          [("two", "spawn"), ("three", "sleep")])
+
+    def test_parent_module_imports_resolve_thread_aliases(self):
+        source = """
+use std::thread as workers;
+mod inner {
+    use custom as workers;
+    use super::workers::spawn as launch;
+    fn run() { launch(|| {}); }
+}
+"""
+        self.assertEqual([(f.function, f.api) for f in threads.findings(source)],
+                         [("run", "spawn")])
 
     def test_comments_literals_and_test_items_are_not_calls(self):
         source = '''

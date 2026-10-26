@@ -158,9 +158,26 @@ def findings(source):
     items = tokens(source)
     found = []
 
-    def scope(start, end, inherited, function=""):
+    def resolve(path, aliases, modules, module):
+        base = aliases
+        if path[0] == "crate":
+            base = modules[0] if modules else aliases
+            path = path[1:]
+        elif path[0] == "self":
+            base = aliases if module or not modules else modules[-1]
+            path = path[1:]
+        elif path[0] == "super":
+            parents = modules if module else modules[:-1]
+            count = 0
+            while path and path[0] == "super":
+                count += 1
+                path = path[1:]
+            base = parents[-count] if count <= len(parents) else {}
+        return base.get(path[0], (path[0],)) + path[1:] if path else ()
+
+    def scope(start, end, inherited, function="", modules=(), module=False):
         bindings, children, refs = [], [], []
-        pos, next_function = start, None
+        pos, next_function, next_module = start, None, False
         while pos < end:
             value = items[pos].value
             if value == "#" and pos + 1 < end and items[pos + 1].value == "[":
@@ -187,14 +204,18 @@ def findings(source):
                 bindings.append((items[pos + 4].value, ("std",)))
             if value == "fn" and pos + 1 < end and items[pos + 1].value.isidentifier():
                 next_function = items[pos + 1].value
+            if value == "mod" and pos + 1 < end and items[pos + 1].value.isidentifier():
+                next_module = True
             if value == "{":
                 stop = closing(items, pos)
-                children.append((pos + 1, stop, next_function or function))
+                children.append((pos + 1, stop, next_function or function, next_module))
                 next_function = None
+                next_module = False
                 pos = stop + 1
                 continue
             if value == ";":
                 next_function = None
+                next_module = False
             refs.append(pos)
             pos += 1
         aliases = dict(inherited)
@@ -202,7 +223,7 @@ def findings(source):
         for _ in range(len(bindings) + 1):
             previous = dict(aliases)
             for name, path in bindings:
-                target = aliases.get(path[0], (path[0],)) + path[1:]
+                target = resolve(path, aliases, modules, module)
                 if name == "*":
                     if target == ("std", "thread", "*"):
                         aliases.update((api, ("std", "thread", api)) for api in APIS)
@@ -223,14 +244,15 @@ def findings(source):
             while stop + 2 < end and items[stop + 1].value == "::":
                 path.append(items[stop + 2].value)
                 stop += 2
-            target = aliases.get(path[0], (path[0],)) + tuple(path[1:])
+            target = resolve(tuple(path), aliases, modules, module)
             if target[:2] == ("std", "thread") and len(target) > 2 and target[2] in APIS:
                 found.append(Finding(items[pos].line, function, target[2]))
             consumed = stop
-        for child_start, child_end, child_function in children:
-            scope(child_start, child_end, aliases, child_function)
+        child_modules = modules + (aliases,) if module else modules
+        for child_start, child_end, child_function, child_module in children:
+            scope(child_start, child_end, aliases, child_function, child_modules, child_module)
 
-    scope(0, len(items), {"std": ("std",), "thread": ("std", "thread")})
+    scope(0, len(items), {"std": ("std",), "thread": ("std", "thread")}, module=True)
     return sorted(found)
 
 
