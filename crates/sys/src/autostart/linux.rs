@@ -177,6 +177,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support AF_UNIX sockets")]
     fn readiness_reaches_both_native_notify_socket_names() {
         use std::os::linux::net::SocketAddrExt;
         use std::os::unix::net::{SocketAddr, UnixDatagram};
