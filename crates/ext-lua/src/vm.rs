@@ -272,11 +272,11 @@ impl Contributions {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VmMode {
-    Live,
-    Fold,
+    Module,
+    Reducer,
 }
 
-fn sandbox(limits: Limits, vm_mode: VmMode) -> mlua::Result<(Lua, Callbacks, Table)> {
+fn sandbox(limits: Limits) -> mlua::Result<(Lua, Callbacks, Table)> {
     let lua = Lua::new_with(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH,
         mlua::LuaOptions::default(),
@@ -307,18 +307,42 @@ fn sandbox(limits: Limits, vm_mode: VmMode) -> mlua::Result<(Lua, Callbacks, Tab
     for name in ["find", "match", "gmatch", "gsub", "dump"] {
         strings.set(name, Value::Nil)?;
     }
-    if vm_mode == VmMode::Fold {
-        ordered_iteration(&lua)?;
-        let math: Table = lua.globals().get("math")?;
-        let seed: Function = math.get("randomseed")?;
-        math.set(
-            "randomseed",
-            lua.create_function(move |_, (first, second): (Integer, Option<Integer>)| {
-                seed.call::<(Integer, Integer)>((first, second.unwrap_or(0)))
-            })?,
-        )?;
-        math.get::<Function>("randomseed")?.call::<()>(0)?;
-    }
+    // Preparation is durable even in the VM that will later dispatch tools.
+    // Wrappers decide at invocation time, including when source captures them.
+    ordered_iteration(&lua)?;
+    let math: Table = lua.globals().get("math")?;
+    let seed: Function = math.get("randomseed")?;
+    let random: Function = math.get("random")?;
+    seed.call::<()>((0, 0))?;
+    let seeded = Arc::new(AtomicBool::new(false));
+    let native_seed = seed.clone();
+    let random_seeded = Arc::clone(&seeded);
+    math.set(
+        "random",
+        lua.create_function(move |lua, args: mlua::MultiValue| {
+            // Honor explicit preparation seeds; otherwise defer Lua's native default
+            // seeding until the first non-durable call, never during preparation.
+            if non_durable_dispatch(lua) && !random_seeded.load(Ordering::Relaxed) {
+                native_seed.call::<mlua::MultiValue>(())?;
+                random_seeded.store(true, Ordering::Relaxed);
+            }
+            random.call::<mlua::MultiValue>(args)
+        })?,
+    )?;
+    math.set(
+        "randomseed",
+        lua.create_function(move |lua, args: mlua::MultiValue| {
+            let result = if non_durable_dispatch(lua) {
+                seed.call::<mlua::MultiValue>(args)?
+            } else {
+                let (first, second): (Integer, Option<Integer>) =
+                    mlua::FromLuaMulti::from_lua_multi(args, lua)?;
+                seed.call::<mlua::MultiValue>((first, second.unwrap_or(0)))?
+            };
+            seeded.store(true, Ordering::Relaxed);
+            Ok(result)
+        })?,
+    )?;
     for name in ["string", "table", "math"] {
         let library: Table = lua.globals().get(name)?;
         lua.globals().set(name, readonly(&lua, library)?)?;
@@ -331,51 +355,135 @@ fn sandbox(limits: Limits, vm_mode: VmMode) -> mlua::Result<(Lua, Callbacks, Tab
     Ok((lua, callbacks, globals))
 }
 
+fn non_durable_dispatch(lua: &Lua) -> bool {
+    lua.app_data_ref::<Arc<Budget>>()
+        .is_some_and(|budget| budget.wall.is_some())
+}
+
 fn ordered_iteration(lua: &Lua) -> mlua::Result<()> {
     let cache = lua.create_table()?;
     let weak = lua.create_table()?;
     weak.raw_set("__mode", "k")?;
     cache.set_metatable(Some(weak))?;
+    let native_next: Function = lua.globals().get("next")?;
+    let native_pairs: Function = lua.globals().get("pairs")?;
     lua.globals().set(
         "next",
         lua.create_function(move |lua, (table, previous): (Table, Value)| {
-            let snapshot: Option<Table> = if previous.is_nil() {
-                None
-            } else {
-                cache.raw_get(table.clone())?
-            };
-            let snapshot = if let Some(snapshot) = snapshot {
-                snapshot
-            } else {
-                let snapshot = ordered_snapshot(lua, &table)?;
-                cache.raw_set(table.clone(), snapshot.clone())?;
-                snapshot
-            };
-            let result = ordered_successor(lua, &table, &snapshot, previous)?;
-            if matches!(result.front(), Some(Value::Nil)) {
-                cache.raw_remove(table)?;
+            if non_durable_dispatch(lua) {
+                return native_next.call::<mlua::MultiValue>((table, previous));
             }
-            Ok(result)
+            let cached: Option<Table> = cache.raw_get(table.clone())?;
+            let snapshot = match cached {
+                Some(snapshot) if !previous.is_nil() => snapshot,
+                cached => {
+                    let snapshot = ordered_snapshot(lua, &table, cached.as_ref())?;
+                    cache.raw_set(table.clone(), snapshot.clone())?;
+                    snapshot
+                }
+            };
+            ordered_successor(lua, &table, &snapshot, previous)
         })?,
     )?;
     lua.globals().set(
         "pairs",
-        lua.create_function(|lua, table: Table| {
-            let snapshot = ordered_snapshot(lua, &table)?;
+        lua.create_function(move |lua, table: Table| {
+            if non_durable_dispatch(lua) {
+                return native_pairs.call::<mlua::MultiValue>(table);
+            }
+            let snapshot = ordered_snapshot(lua, &table, None)?;
             let iterator = lua.create_function(move |lua, (table, previous): (Table, Value)| {
                 ordered_successor(lua, &table, &snapshot, previous)
             })?;
-            Ok((iterator, table, Value::Nil))
+            Ok(mlua::MultiValue::from_vec(vec![
+                Value::Function(iterator),
+                Value::Table(table),
+                Value::Nil,
+            ]))
         })?,
     )?;
     Ok(())
 }
 
-fn ordered_snapshot(lua: &Lua, table: &Table) -> mlua::Result<Table> {
-    let mut keys = table
+fn validate_keys(lua: &Lua, keys: &[Value]) -> mlua::Result<()> {
+    enum Visit {
+        Value(Value),
+        Leave(Table),
+    }
+    let mut work: Vec<_> = keys.iter().cloned().map(Visit::Value).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut active = std::collections::HashSet::new();
+    let mut unsupported = std::collections::BTreeSet::new();
+    let mut cyclic = false;
+    // Visit each table once, but every edge, regardless of hash order. Finish
+    // the full fuel charge before choosing a rejection: exhaustion wins, then
+    // unsupported types in lexical order, then cycles (duplicates come later).
+    while let Some(visit) = work.pop() {
+        iteration_fuel(lua, 1)?;
+        match visit {
+            Visit::Leave(table) => {
+                active.remove(&table.to_pointer());
+            }
+            Visit::Value(Value::Table(table)) => {
+                if !seen.insert(table.to_pointer()) {
+                    cyclic |= active.contains(&table.to_pointer());
+                    continue;
+                }
+                active.insert(table.to_pointer());
+                work.push(Visit::Leave(table.clone()));
+                for pair in table.pairs::<Value, Value>() {
+                    let (key, value) = pair?;
+                    work.push(Visit::Value(key));
+                    work.push(Visit::Value(value));
+                }
+            }
+            Visit::Value(Value::String(value)) => {
+                iteration_fuel(lua, value.as_bytes().len() as u64)?;
+            }
+            Visit::Value(Value::Integer(_) | Value::Number(_) | Value::Boolean(_)) => {}
+            Visit::Value(Value::LightUserData(value)) if value.0.is_null() => {}
+            Visit::Value(value) => {
+                unsupported.insert(value.type_name());
+            }
+        }
+    }
+    if let Some(kind) = unsupported.first() {
+        return Err(mlua::Error::runtime(format!(
+            "durable iteration cannot order {kind} keys or table-key contents reproducibly"
+        )));
+    }
+    if cyclic {
+        return Err(mlua::Error::runtime(
+            "durable iteration cannot order cyclic table keys reproducibly",
+        ));
+    }
+    Ok(())
+}
+
+fn sorting_fuel(lua: &Lua, count: usize, width: usize) -> mlua::Result<()> {
+    // Sorting can compare the entire common prefix. Charge a byte-sensitive
+    // n log n allowance before sorting, never the hash-dependent comparator count.
+    let levels = if count > 1 {
+        2 * u64::from(count.ilog2() + 1)
+    } else {
+        0
+    };
+    iteration_fuel(
+        lua,
+        (count as u64).saturating_mul(levels.saturating_mul(width as u64 + 1).saturating_add(1)),
+    )
+}
+
+fn ordered_snapshot(lua: &Lua, table: &Table, previous: Option<&Table>) -> mlua::Result<Table> {
+    let keys = table
+        .clone()
         .pairs::<Value, Value>()
-        .map(|pair| {
-            let (key, _) = pair?;
+        .map(|pair| pair.map(|(key, _)| key))
+        .collect::<mlua::Result<Vec<_>>>()?;
+    validate_keys(lua, &keys)?;
+    let mut keys = keys
+        .into_iter()
+        .map(|key| {
             let rank = match &key {
                 Value::Integer(_) => 0,
                 Value::String(_) => 1,
@@ -393,11 +501,52 @@ fn ordered_snapshot(lua: &Lua, table: &Table) -> mlua::Result<Table> {
             Ok((rank, key, encoding))
         })
         .collect::<mlua::Result<Vec<_>>>()?;
-    // Native sorting must spend fuel independently of the VM's hash traversal order.
-    iteration_fuel(
+    let current_count = keys.len();
+    // A nested restart must not discard the predecessor of an outer traversal.
+    // Keep only one ordered union, including tombstones, until the table dies.
+    if let Some(previous) = previous {
+        let old: Table = previous.raw_get("keys")?;
+        let encodings: Table = previous.raw_get("encodings")?;
+        for key in old.sequence_values::<Value>() {
+            let key = key?;
+            if table.raw_get::<Value>(key.clone())?.is_nil() {
+                let rank = match &key {
+                    Value::Integer(_) => 0,
+                    Value::String(_) => 1,
+                    Value::Number(_) => 2,
+                    Value::Boolean(_) => 3,
+                    Value::LightUserData(_) => 4,
+                    _ => 5,
+                };
+                let encoding: mlua::LuaString = encodings.raw_get(key.clone())?;
+                keys.push((rank, key, encoding.as_bytes().to_vec()));
+            }
+        }
+    }
+    sorting_fuel(
         lua,
-        keys.len() as u64 * (1 + u64::from(keys.len().checked_ilog2().unwrap_or(0))),
+        keys.len(),
+        keys.iter()
+            .map(|(_, key, encoding)| {
+                if let Value::String(key) = key {
+                    key.as_bytes().len()
+                } else {
+                    encoding.len()
+                }
+            })
+            .max()
+            .unwrap_or(0),
     )?;
+    // Only simultaneous live keys need distinct structures; tombstones do not.
+    let mut structures = std::collections::HashSet::new();
+    if keys[..current_count]
+        .iter()
+        .any(|(rank, _, encoding)| *rank == 5 && !structures.insert(encoding))
+    {
+        return Err(mlua::Error::runtime(
+            "durable iteration cannot order structurally identical table keys reproducibly",
+        ));
+    }
     keys.sort_unstable_by(
         |(rank, key, encoding), (other_rank, other, other_encoding)| {
             rank.cmp(other_rank).then_with(|| match (key, other) {
@@ -409,18 +558,11 @@ fn ordered_snapshot(lua: &Lua, table: &Table) -> mlua::Result<Table> {
             })
         },
     );
-    // Equal structures cannot distinguish two identities without falling back to addresses.
-    if keys
-        .windows(2)
-        .any(|pair| pair[0].0 == 5 && pair[1].0 == 5 && pair[0].2 == pair[1].2)
-    {
-        return Err(mlua::Error::runtime(
-            "durable iteration cannot order structurally identical table keys reproducibly",
-        ));
-    }
     let positions = lua.create_table()?;
-    for (index, (_, key, _)) in keys.iter().enumerate() {
+    let encodings = lua.create_table()?;
+    for (index, (_, key, encoding)) in keys.iter().enumerate() {
         positions.raw_set(key.clone(), index + 1)?;
+        encodings.raw_set(key.clone(), lua.create_string(encoding)?)?;
     }
     let snapshot = lua.create_table()?;
     snapshot.raw_set(
@@ -428,6 +570,7 @@ fn ordered_snapshot(lua: &Lua, table: &Table) -> mlua::Result<Table> {
         lua.create_sequence_from(keys.into_iter().map(|(_, key, _)| key))?,
     )?;
     snapshot.raw_set("positions", positions)?;
+    snapshot.raw_set("encodings", encodings)?;
     Ok(snapshot)
 }
 
@@ -441,34 +584,27 @@ fn unordered_key(value: &Value) -> mlua::Error {
 fn canonical_key(lua: &Lua, key: Value) -> mlua::Result<Vec<u8>> {
     enum Work {
         Value(Value),
-        Table(Table, usize),
+        Table(usize),
     }
     let mut work = vec![Work::Value(key)];
-    let mut active = std::collections::HashSet::new();
     let mut encoded: Vec<Vec<u8>> = Vec::new();
     // An explicit stack avoids making the native stack the limit on key depth.
     while let Some(item) = work.pop() {
         iteration_fuel(lua, 1)?;
         let bytes = match item {
             Work::Value(Value::Table(table)) => {
-                if !active.insert(table.to_pointer()) {
-                    return Err(mlua::Error::runtime(
-                        "durable iteration cannot order cyclic table keys reproducibly",
-                    ));
-                }
                 let entries = table
                     .clone()
                     .pairs::<Value, Value>()
                     .collect::<mlua::Result<Vec<_>>>()?;
-                work.push(Work::Table(table, entries.len()));
+                work.push(Work::Table(entries.len()));
                 for (key, value) in entries {
                     work.push(Work::Value(value));
                     work.push(Work::Value(key));
                 }
                 continue;
             }
-            Work::Table(table, count) => {
-                active.remove(&table.to_pointer());
+            Work::Table(count) => {
                 let start = encoded.len() - count * 2;
                 let mut entries = encoded.drain(start..).collect::<Vec<_>>();
                 let mut pairs = entries
@@ -477,9 +613,14 @@ fn canonical_key(lua: &Lua, key: Value) -> mlua::Result<Vec<u8>> {
                     .iter_mut()
                     .map(|pair| (std::mem::take(&mut pair[0]), std::mem::take(&mut pair[1])))
                     .collect::<Vec<_>>();
-                iteration_fuel(
+                sorting_fuel(
                     lua,
-                    count as u64 * (1 + u64::from(count.checked_ilog2().unwrap_or(0))),
+                    count,
+                    pairs
+                        .iter()
+                        .map(|(key, value)| key.len() + value.len())
+                        .max()
+                        .unwrap_or(0),
                 )?;
                 pairs.sort_unstable();
                 let mut bytes = vec![5];
@@ -721,7 +862,7 @@ impl Mod {
             source,
             tools,
             limits,
-            VmMode::Live,
+            VmMode::Module,
             &Budget::fuel(limits),
         )
         .map_err(|why| Refused(format!("lua {name}: {why}")))
@@ -735,7 +876,7 @@ impl Mod {
         vm_mode: VmMode,
         budget: &Arc<Budget>,
     ) -> mlua::Result<Self> {
-        let (lua, callbacks, globals) = sandbox(limits, vm_mode)?;
+        let (lua, callbacks, globals) = sandbox(limits)?;
         let _active = ActiveBudget::new(&lua, budget);
         let made = register(&lua, &lua.globals())?;
         let hook = Arc::clone(budget);
@@ -765,7 +906,7 @@ impl Mod {
             folds: Vec::new(),
             agents: Vec::new(),
         };
-        if vm_mode == VmMode::Live {
+        if vm_mode == VmMode::Module {
             for spec in made.agents {
                 result.agents.push((
                     text_field(&spec, "name", 128)?,
@@ -816,11 +957,12 @@ impl Mod {
                 ));
             }
         }
-        if vm_mode == VmMode::Live && !made.folds.is_empty() {
+        if vm_mode == VmMode::Module && !made.folds.is_empty() {
             // Folding happens under the session state lock. Its VM must never
             // share a lock with callbacks that read that session's state.
-            result.folds = Self::compile(&name, source, tools, limits, VmMode::Fold, budget)?.folds;
-        } else if vm_mode == VmMode::Fold {
+            result.folds =
+                Self::compile(&name, source, tools, limits, VmMode::Reducer, budget)?.folds;
+        } else if vm_mode == VmMode::Reducer {
             let source: Arc<str> = source.into();
             for (slot, spec) in made.folds.into_iter().enumerate() {
                 result.folds.push(Arc::new(LuaFold {
@@ -1458,7 +1600,7 @@ mod tests {
                 .value,
             "fast"
         );
-        let (lua, _, _) = sandbox(limits, VmMode::Live).unwrap();
+        let (lua, _, _) = sandbox(limits).unwrap();
         let inner = lua
             .load("return function() local n=0; for i=1,1000 do n=n+i end; return n end")
             .eval::<Function>()
@@ -1740,6 +1882,10 @@ mod tests {
             a.fold{name='order',initial='',apply=function(_,change)
                 if change == 'function' then for _ in pairs({[function() end]=1}) do end end
                 if change == 'cycle' then local key={}; key.self=key; next({[key]=1}) end
+                if change == 'mixed' then
+                    local cyclic={}; cyclic.self=cyclic
+                    next({[cyclic]=1,[function() end]=2})
+                end
                 if change == 'equal' then next({[{}]=1,[{}]=2}) end
                 local shared={beta=2,alpha=1}
                 local first={nested=shared,again=shared,label='a'}
@@ -1763,6 +1909,7 @@ mod tests {
             ("table", None),
             ("function", Some("function keys or table-key contents")),
             ("cycle", Some("cyclic table keys")),
+            ("mixed", Some("function keys or table-key contents")),
             ("equal", Some("structurally identical table keys")),
             ("table", None),
         ] {
@@ -1829,6 +1976,8 @@ mod tests {
                 local key,value=next(table)
                 assert(key=='alpha' and value==false)
                 table.alpha=nil
+                local nested=next(table)
+                assert(nested=='beta' and next(table,nested)==nil)
                 key,value=next(table,key)
                 assert(key=='beta' and value==2)
                 table.beta=nil
@@ -1974,6 +2123,146 @@ mod tests {
                 .unwrap(),
             live
         );
+    }
+
+    #[test]
+    fn both_preparation_passes_and_recovery_use_deterministic_builtins() {
+        let source = r"
+            local captured_next,captured_pairs,seed=next,pairs,math.randomseed
+            if next({[false]=1,[true]=1}) then while true do end end
+            local prepared=math.random()
+            a.fold{name='random',initial=prepared,apply=function(state) return state end}
+            a.tool{name='test',description='test',input={type='object'},run=function()
+                seed()
+                local key=function() end
+                assert(captured_next({[key]=1})==key)
+                for found in captured_pairs({[key]=1}) do assert(found==key) end
+                return prepared
+            end}
+        ";
+        let original = Mod::load("test", source, &[], Limits::default()).unwrap();
+        let expected = original.folds[0]
+            .initial()
+            .parse::<serde_json::Value>()
+            .unwrap();
+        for _ in 0..16 {
+            let restored = Mod::restore("test", &original.image).unwrap();
+            for module in [&original, &restored] {
+                let rig = Rig::new(
+                    "lua-preparation-builtins",
+                    Registry::default()
+                        .with_dyn(ext::Tier::User, module)
+                        .unwrap(),
+                );
+                assert_eq!(rig.done("test", &json!({})), expected);
+                assert_eq!(
+                    rig.cx()
+                        .state_erased("test", "random")
+                        .unwrap()
+                        .parse::<serde_json::Value>()
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_source_seeds_are_preserved_by_native_dispatch() {
+        let native = Lua::new();
+        let expected: i64 = native
+            .load("math.randomseed(7,0); math.random(); return math.random(1,1000000)")
+            .eval()
+            .unwrap();
+        let source = "math.randomseed(7); math.random(); a.tool{name='test',description='test',input={type='object'},run=function() return math.random(1,1000000) end}";
+        let rig = Rig::new("lua-explicit-source-seed", registry(source, &[]));
+        assert_eq!(rig.done("test", &json!({})), json!(expected));
+    }
+
+    #[test]
+    fn rejection_precedence_and_fuel_ignore_native_hash_order() {
+        for fuel in [1, 16, 80, 512, 10_000] {
+            let mut expected = None;
+            for padding in 0..32 {
+                let (lua, _, _) = sandbox(Limits::default()).unwrap();
+                let _padding = (0..padding)
+                    .map(|_| lua.create_table().unwrap())
+                    .collect::<Vec<_>>();
+                let table: Table = lua
+                    .load(
+                        r"
+                    local flip=...
+                    local cyclic={}; cyclic.self=cyclic
+                    local key=function() end
+                    local result={}
+                    if flip then result[key]=1; result[cyclic]=1
+                    else result[cyclic]=1; result[key]=1 end
+                    result[string.rep('x',128)]=1
+                    return result
+                ",
+                    )
+                    .call(padding % 2 == 0)
+                    .unwrap();
+                let budget = Budget::fuel(Limits {
+                    instructions: fuel,
+                    ..Limits::default()
+                });
+                let _active = ActiveBudget::new(&lua, &budget);
+                let error = lua
+                    .globals()
+                    .get::<Function>("next")
+                    .unwrap()
+                    .call::<Value>(table)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(if fuel < 128 {
+                        "budget exhausted"
+                    } else {
+                        "cannot order function keys or table-key contents reproducibly"
+                    }),
+                    "fuel {fuel}: {error}"
+                );
+                if let Some(expected) = &expected {
+                    assert_eq!(&error, expected, "fuel {fuel}, padding {padding}");
+                } else {
+                    expected = Some(error);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_common_prefixes_spend_byte_sensitive_sorting_fuel() {
+        for width in [1, 128] {
+            let (lua, _, _) = sandbox(Limits::default()).unwrap();
+            let table: Table = lua
+                .load(
+                    r"
+                local prefix=string.rep('x',...)
+                local result={}
+                for i=1,16 do result[prefix..i]=i end
+                return result
+            ",
+                )
+                .call(width)
+                .unwrap();
+            let budget = Budget::fuel(Limits {
+                instructions: 5_000,
+                ..Limits::default()
+            });
+            let _active = ActiveBudget::new(&lua, &budget);
+            let result = lua
+                .globals()
+                .get::<Function>("pairs")
+                .unwrap()
+                .call::<mlua::MultiValue>(table);
+            if width == 1 {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert!(result.unwrap_err().to_string().contains("budget exhausted"));
+            }
+        }
     }
 
     #[test]

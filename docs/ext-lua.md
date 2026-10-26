@@ -72,7 +72,12 @@ while an `on_stop` error passes. Hooks cannot await effects.
 `a.text{name = "name", order = 0, text = "system text"}` contributes system
 text. `a.fold{name = "count", initial = 0, apply = function(state, change)
 return state + change end}` declares durable JSON state. Reducers run in a
-separate VM without effects. On every application, live or replayed, the host
+separate VM without effects. Both source preparation passes and recovery use
+deterministic iteration and a PRNG seeded with zero, including in the VM that
+will later run tools. Captured builtins switch to native iteration and unrestricted
+seeding only during non-durable dispatch. Explicit source seeds remain in effect
+for tool calls; otherwise native default seeding is deferred to dispatch.
+On every application, live or replayed, the host
 re-evaluates the source in a fresh environment and resets the private VM's PRNG
 with seed zero. Durable code may reseed it with
 `math.randomseed(seed[, second])`: an integer seed is required, and the second
@@ -90,12 +95,22 @@ structure alone cannot distinguish their identities. Function, userdata and thre
 keys, including such values inside table keys, raise
 `durable iteration cannot order <type> keys or table-key contents reproducibly`
 because those values have no reproducible structural identity. `a.null` remains
-an allowed scalar marker. Non-durable calls retain native `pairs` and `next`.
-Iterator keys are captured at the start of a traversal; value updates remain visible and deleted keys are
-skipped. Restart `next` with a nil key to capture additions. `pairs` iterators
-keep independent snapshots, including when nested on the same table. Snapshots
-use Lua-managed memory. Ordering work spends fuel based on key count and the
-bytes processed by structural encoding.
+an allowed scalar marker. Validation completes its graph scan before choosing
+an error: fuel exhaustion takes precedence, then unsupported types in lexical
+order, then cycles, then identical table structures. The scan visits each table
+once and every edge, so its fuel and rejection do not depend on native hash order.
+Non-durable calls retain native `pairs` and `next`.
+
+Iterator keys are captured at the start of a traversal; value updates remain
+visible and deleted keys are skipped. Restart `next` with a nil key to capture
+additions. Its per-table cache retains deleted predecessors across overlapping
+traversals until that table is collected, so a nested restart or traversal ending
+cannot invalidate an outer traversal. `pairs` iterators keep independent
+snapshots, including when nested on the same table. Snapshots use Lua-managed
+memory. Ordering spends fuel before sorting, based on key count, logarithmic
+comparison depth and maximum key byte length (including structural encodings);
+long common prefixes therefore consume more fuel. Structural encoding also
+charges for the bytes it processes.
 Closure upvalues and global mutations cannot survive an application; only the
 JSON state passed in and returned carries session data. Another session's
 reductions therefore cannot change replay. Reducers spend instruction fuel only;
