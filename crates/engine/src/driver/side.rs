@@ -317,6 +317,7 @@ pub(super) async fn run_side(
     if side.context != ext::Context::OwnerPrefix {
         return run_side_once(session, cx, side, messages, model, at, observed).await;
     }
+    // Preparation includes the registry instructions in this mandatory suffix.
     let prefix = &messages[..messages.len() - side.messages.len()];
     let mut summaries = String::new();
     let mut usage = llm::Usage::default();
@@ -511,6 +512,7 @@ async fn ephemeral_turn(
     execution: &mut Option<Json>,
 ) -> Result<(Outcome, Option<Json>), llm::Error> {
     let invalid = |e: String| llm::Error::new(llm::Kind::InvalidRequest, e);
+    let mut side = side.clone();
     let prepared = async {
         let authority = super::spawn::SpawnIntent::from_json(&admitted.thread.authority)
             .map_err(|e| invalid(e.to_string()))?;
@@ -539,7 +541,10 @@ async fn ephemeral_turn(
             .chain(side.messages.iter().cloned())
             .collect();
         let messages = match side.context {
-            ext::Context::OwnerPrefix => complete_prefix(context, &side.messages),
+            ext::Context::OwnerPrefix => {
+                side.messages = current;
+                complete_prefix(context, &side.messages)
+            }
             ext::Context::Fresh | ext::Context::Owner => side
                 .bounds()
                 .assemble(&[], &context, &current)
@@ -574,7 +579,7 @@ async fn ephemeral_turn(
         Box::pin(run_side(
             session,
             &cx,
-            side,
+            &side,
             messages,
             &model,
             at,
@@ -731,7 +736,7 @@ impl Actor {
             _ => return Err("model-only turn has no admitted input".into()),
         };
         let text = text.as_str();
-        let (turn, prefix) = keyed
+        let (mut turn, prefix) = keyed
             .then(|| ext::ModelTurn::from_intent(text).ok())
             .flatten()
             .or_else(|| {
@@ -769,7 +774,10 @@ impl Actor {
             .chain(turn.messages.iter().cloned())
             .collect();
         let messages = match turn.context {
-            ext::Context::OwnerPrefix => complete_prefix(context, &turn.messages),
+            ext::Context::OwnerPrefix => {
+                turn.messages = current;
+                complete_prefix(context, &turn.messages)
+            }
             ext::Context::Fresh | ext::Context::Owner => {
                 policy.assemble(&history, &context, &current)?
             }

@@ -341,6 +341,7 @@ impl Tool for Probe {
             let probe = probe().ephemeral();
             let probe = match how {
                 "-owner" => probe.owner_context(),
+                "-prefix" => probe.owner_prefix(),
                 "-timeout" => probe.budget(ext::Budget {
                     timeout: Duration::from_millis(50),
                     ..ext::Budget::default()
@@ -513,6 +514,35 @@ fn an_ephemeral_turn_with_owner_context_sends_the_owners_conversation() {
     let sent = bodies[0].to_string();
     assert!(sent.contains("ephemeral-owner"), "{sent}");
     assert!(sent.contains("Say hi."), "{sent}");
+}
+
+#[test]
+fn every_ephemeral_prefix_chunk_keeps_registry_system_instructions() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::default()
+        .with(&KindText("ephemeral registry instruction".into()))
+        .unwrap()
+        .with(&TitleHistory(Arc::clone(&captured)))
+        .unwrap();
+    let http = Flaky::new([]);
+    let entries: Vec<_> = (0..20)
+        .flat_map(|n| {
+            [
+                entry(n * 2 + 1, user(&format!("request-{n}"))),
+                entry(n * 2 + 2, echo(&format!("answer-{n}"))),
+            ]
+        })
+        .collect();
+    let session = probes(&http, registry).start(&entries);
+    session.submit("ephemeral-prefix").unwrap();
+    settle(&session);
+    session.halt();
+    let chunks = lock(&captured);
+    assert!(chunks.len() > 1, "prefix must span summary inputs");
+    assert!(chunks.iter().all(|chunk| chunk.iter().any(|message| {
+        matches!(message, llm::Message::System(prompt) if prompt.text() == "ephemeral registry instruction")
+    })));
+    assert_eq!(http.sent(), 0);
 }
 
 /// An ephemeral turn cut off by its deadline still settles the attempt it
@@ -2290,6 +2320,8 @@ fn compaction_covers_the_full_edited_prefix_across_exchange_and_byte_windows() {
     let registry = Registry::default()
         .with(&ext_compact::Compact::default())
         .unwrap()
+        .with(&KindText("retain registry instructions".into()))
+        .unwrap()
         .with(&TitleHistory(Arc::clone(&captured)))
         .unwrap();
     let http = Flaky::new([]);
@@ -2319,6 +2351,9 @@ fn compaction_covers_the_full_edited_prefix_across_exchange_and_byte_windows() {
     session.halt();
     let chunks = lock(&captured);
     assert!(chunks.len() > 3, "large prefix must span summary inputs");
+    assert!(chunks.iter().all(|chunk| chunk.iter().any(|message| {
+        matches!(message, llm::Message::System(prompt) if prompt.text() == "retain registry instructions")
+    })));
     let text = format!("{chunks:?}");
     for n in 0..20 {
         assert!(
