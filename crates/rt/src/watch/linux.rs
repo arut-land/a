@@ -349,15 +349,11 @@ impl Native {
             let Some(watched) = self.dirs.get(&note.wd) else {
                 continue;
             };
-            let aliases: Vec<PathBuf> = watched
-                .aliases
-                .keys()
-                .map(|alias| alias.to_path_buf())
-                .collect();
+            let aliases: Vec<Arc<Path>> = watched.aliases.keys().cloned().collect();
             for alias in aliases {
                 let Some(name) = &note.name else {
                     // The directory itself: removed, moved, or its attributes.
-                    raws.push(Raw::Changed(alias));
+                    raws.push(Raw::Changed(alias.to_path_buf()));
                     continue;
                 };
                 let path = alias.join(name);
