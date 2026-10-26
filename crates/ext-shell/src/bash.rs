@@ -375,7 +375,7 @@ async fn execute<D: crate::dialect::Dialect>(
             ..Ran::default()
         });
     }
-    let env = environment(cx, std::env::vars());
+    let env = environment(cx, std::env::vars_os());
     // Both streams share the one file, and its offset: in the order written.
     let Stream { file, open: log } = cx.blobs.stream(cx.call, OUTPUT_CAP)?;
     if input.background {
@@ -672,15 +672,18 @@ fn spawn_with<D: crate::dialect::Dialect>(
 /// its secrets), quieted, and told which session and model it serves.
 fn environment(
     cx: &Cx,
-    daemon: impl Iterator<Item = (String, String)>,
+    daemon: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> BTreeMap<String, String> {
-    let mut env = cx.env.as_ref().map_or_default(|env| env.vars.clone());
-    if cx.env.is_none() {
-        // Inserted one by one: collecting would sort, in code of its own.
-        for (name, value) in daemon.filter(|(name, _)| !Environment::is_secret(name)) {
-            env.insert(name, value);
-        }
-    }
+    let mut env = cx.env.as_ref().map_or_else(
+        || {
+            Environment::new(protocol::HostPath::default(), daemon, false)
+                .vars
+                .into_iter()
+                .filter(|(name, _)| !Environment::is_secret(name))
+                .collect()
+        },
+        |env| env.vars.clone(),
+    );
     for (name, value) in QUIET {
         env.insert(name.to_owned(), value.to_owned());
     }

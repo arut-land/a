@@ -23,26 +23,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-const MAX_PROCESSES: usize = 32;
-static PROCESSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-struct Permit;
-impl Permit {
-    fn acquire() -> io::Result<Self> {
-        use std::sync::atomic::Ordering::AcqRel;
-        PROCESSES
-            .try_update(AcqRel, std::sync::atomic::Ordering::Acquire, |n| {
-                (n < MAX_PROCESSES).then_some(n + 1)
-            })
-            .map(|_| Self)
-            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "process capacity exhausted"))
-    }
-}
-impl Drop for Permit {
-    fn drop(&mut self) {
-        PROCESSES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
-}
-
 struct Live {
     id: u32,
     group: Mutex<Option<sys::ProcessLease>>,
@@ -51,7 +31,6 @@ struct Live {
     copied: Flag,
     captured: Mutex<Option<io::Result<()>>>,
     ended: Flag,
-    permit: Mutex<Option<Permit>>,
     runtime: rt::Rt,
     /// The supervision running now, which a handover stops.
     watch: Mutex<Watch>,
@@ -78,12 +57,7 @@ struct Parted {
 }
 
 impl Live {
-    fn new(
-        child: &sys::Child,
-        group: sys::ProcessLease,
-        permit: Permit,
-        runtime: rt::Rt,
-    ) -> Arc<Self> {
+    fn new(child: &sys::Child, group: sys::ProcessLease, runtime: rt::Rt) -> Arc<Self> {
         Arc::new_cyclic(|this| Self {
             id: child.id(),
             group: Mutex::new(Some(group)),
@@ -92,7 +66,6 @@ impl Live {
             copied: Flag::default(),
             captured: Mutex::default(),
             ended: Flag::default(),
-            permit: Mutex::new(Some(permit)),
             runtime,
             watch: Mutex::default(),
             parted: Mutex::default(),
@@ -210,7 +183,6 @@ impl Parting for Stopped {
         let live = &self.live;
         lock(&live.captured).get_or_insert(Ok(()));
         live.copied.set();
-        lock(&live.permit).take();
         live.ended.set();
         ext::Given {
             group: ext::Json::encode(&given.group).unwrap_or_default(),
@@ -284,7 +256,6 @@ impl Drop for Reap {
         self.complete();
         lock(&self.live.captured).get_or_insert_with(|| Err(io::ErrorKind::Interrupted.into()));
         self.live.copied.set();
-        lock(&self.live.permit).take();
         self.live.ended.set();
     }
 }
@@ -313,7 +284,6 @@ impl Processes for Provider {
             let claimed: sys::handover::Claimed = claimed
                 .take()
                 .ok_or_else(|| io::Error::other("not a group this build claimed"))?;
-            let permit = Permit::acquire()?;
             let rt = cx
                 .service_arc::<dyn rt::Runtime>()
                 .ok_or_else(|| io::Error::other("no runtime"))?;
@@ -322,7 +292,7 @@ impl Processes for Provider {
                 group,
                 capture,
             } = claimed.adopt(output);
-            let live = Live::new(&child, group, permit, Arc::clone(&rt));
+            let live = Live::new(&child, group, Arc::clone(&rt));
             supervise(
                 &rt,
                 (Reap::new(child, live), None, capture),
@@ -334,29 +304,9 @@ impl Processes for Provider {
     }
 }
 
-fn launch(
+async fn launch(
     cx: &Cx,
-    launch: LaunchSpec,
-    watch: impl FnOnce(&mut sys::Child) -> io::Result<sys::ExitWatch>,
-    register: impl FnOnce(
-        &rt::Reactor,
-        sys::ProcessPipe,
-        u32,
-    ) -> io::Result<rt::Async<sys::ProcessPipe>>,
-) -> impl Future<Output = io::Result<OwnedProcess>> {
-    let admitted = match Permit::acquire() {
-        Ok(permit) => Ok((permit, launch)),
-        Err(error) => {
-            drop(launch);
-            Err(error)
-        }
-    };
-    launch_admitted(cx, admitted, watch, register)
-}
-
-async fn launch_admitted(
-    cx: &Cx,
-    admitted: io::Result<(Permit, LaunchSpec)>,
+    mut launch: LaunchSpec,
     watch: impl FnOnce(&mut sys::Child) -> io::Result<sys::ExitWatch>,
     register: impl FnOnce(
         &rt::Reactor,
@@ -364,7 +314,6 @@ async fn launch_admitted(
         u32,
     ) -> io::Result<rt::Async<sys::ProcessPipe>>,
 ) -> io::Result<OwnedProcess> {
-    let (permit, mut launch) = admitted?;
     let rt = cx
         .service_arc::<dyn rt::Runtime>()
         .ok_or_else(|| io::Error::other("no runtime"))?;
@@ -377,42 +326,32 @@ async fn launch_admitted(
         return Err(io::Error::other("a spawn hook left no program to run"));
     }
     let cancel = cx.cancel.clone();
-    let (sent, received) = rt::oneshot::channel();
     let runtime = Arc::clone(&rt);
-    rt.spawn_blocking(
-        rt::BlockingClass::Storage,
-        0,
-        Box::new(move || {
-            sent.send((|| {
-                if cancel.is_set() {
-                    return Err(io::ErrorKind::Interrupted.into());
-                }
-                let mut cmd = std::process::Command::new(&launch.process.argv[0]);
-                cmd.args(&launch.process.argv[1..])
-                    .env_clear()
-                    .envs(&launch.process.env)
-                    .current_dir(&launch.process.cwd);
-                let (contained, pipes) = match launch.output {
-                    ProcessOutput::File(file) => (sys::spawn_group_captured(&mut cmd, file)?, None),
-                    ProcessOutput::Stdio => {
-                        let (child, input, output) = sys::spawn_stdio(&mut cmd)?;
-                        (child, Some((input, output)))
-                    }
-                };
-                let sys::ContainedChild {
-                    child,
-                    group,
-                    capture,
-                } = contained;
-                let live = Live::new(&child, group, permit, runtime);
-                Ok::<_, io::Error>((Reap::new(child, live), pipes, capture))
-            })());
-        }),
-    )
-    .await?;
-    let launched = received
-        .await
-        .ok_or_else(|| io::Error::other("process launch stopped"))??;
+    let launched = rt::try_unblock_with(&*rt, rt::BlockingClass::Storage, 0, move || {
+        if cancel.is_set() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let mut cmd = std::process::Command::new(&launch.process.argv[0]);
+        cmd.args(&launch.process.argv[1..])
+            .env_clear()
+            .envs(&launch.process.env)
+            .current_dir(&launch.process.cwd);
+        let (contained, pipes) = match launch.output {
+            ProcessOutput::File(file) => (sys::spawn_group_captured(&mut cmd, file)?, None),
+            ProcessOutput::Stdio => {
+                let (child, input, output) = sys::spawn_stdio(&mut cmd)?;
+                (child, Some((input, output)))
+            }
+        };
+        let sys::ContainedChild {
+            child,
+            group,
+            capture,
+        } = contained;
+        let live = Live::new(&child, group, runtime);
+        Ok::<_, io::Error>((Reap::new(child, live), pipes, capture))
+    })
+    .await??;
     if cx.cancel.is_set() {
         return Err(io::ErrorKind::Interrupted.into());
     }
@@ -462,11 +401,11 @@ async fn watch_over(
         Ok(watch) => Some(rt::Async::for_reading(&reactor, watch)?),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             // Exit observation can precede waitable status; reaping must not block the reactor.
-            owned = rt::unblock_with(&**rt, rt::BlockingClass::Storage, 0, move || {
+            owned = rt::try_unblock_with(&**rt, rt::BlockingClass::Storage, 0, move || {
                 owned.complete();
                 owned
             })
-            .await;
+            .await?;
             None
         }
         Err(e) => return Err(e),
@@ -763,14 +702,14 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn escaped_stdout_cannot_hold_a_timeout_or_its_capacity() {
-        escaped_stdout_releases_capacity(false);
+    fn escaped_stdout_cannot_hold_a_timeout() {
+        escaped_stdout_finishes(false);
     }
 
     #[test]
     #[cfg(unix)]
-    fn escaped_stdout_cannot_hold_cancellation_or_its_capacity() {
-        escaped_stdout_releases_capacity(true);
+    fn escaped_stdout_cannot_hold_cancellation() {
+        escaped_stdout_finishes(true);
     }
 
     #[cfg(unix)]
@@ -815,7 +754,7 @@ int main(int argc, char **argv) {
     }
 
     #[cfg(unix)]
-    fn escaped_stdout_releases_capacity(cancel: bool) {
+    fn escaped_stdout_finishes(cancel: bool) {
         use std::os::unix::net::UnixListener;
         use std::time::{Duration, Instant};
         let rig = Rig::new(
@@ -839,11 +778,6 @@ int main(int argc, char **argv) {
             let socket = rig.dir.join("release.sock");
             let listener = UnixListener::bind(&socket).unwrap();
             listener.set_nonblocking(true).unwrap();
-            let cx = rig.cx();
-            // Leave only one slot for the command whose cleanup is under test.
-            let queued: Vec<_> = (0..MAX_PROCESSES - 1)
-                .map(|_| Provider.spawn(&cx, spec(&cx, "true")))
-                .collect();
             let command = format!("'{}' '{}' & wait", executable.display(), socket.display());
             std::thread::scope(|scope| {
                 let (sent, received) = std::sync::mpsc::sync_channel(1);
@@ -884,22 +818,10 @@ int main(int argc, char **argv) {
                     assert!(result["output"].as_str().unwrap().contains("escaped"));
                     let replacement = Rig::new("escaped-replacement", Registry::default());
                     let replacement_cx = replacement.cx();
-                    let released_by = Instant::now() + Duration::from_secs(2);
-                    let next = loop {
-                        match rt::block_on(
-                            Provider.spawn(&replacement_cx, spec(&replacement_cx, "true")),
-                        ) {
-                            Ok(next) => break next,
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                assert!(
-                                    Instant::now() < released_by,
-                                    "completion retained its permit"
-                                );
-                                std::thread::sleep(Duration::from_millis(5));
-                            }
-                            Err(error) => panic!("{error}"),
-                        }
-                    };
+                    let next = rt::block_on(
+                        Provider.spawn(&replacement_cx, spec(&replacement_cx, "true")),
+                    )
+                    .unwrap();
                     rt::block_on(next.ended());
                 }
                 holder.shutdown(std::net::Shutdown::Write).unwrap();
@@ -910,52 +832,51 @@ int main(int argc, char **argv) {
                     "escaped stdout retained completion: {result:?}"
                 );
             });
-            drop(queued);
         }
     }
 
     #[test]
-    fn outstanding_launches_are_bounded_and_completion_releases_capacity() {
-        let rig = Rig::new("process-capacity", Registry::default());
+    fn quiet_helpers_do_not_prevent_an_unrelated_launch() {
+        let rig = Rig::new("process-ownership", Registry::default());
         let cx = rig.cx();
         rt::block_on(async {
-            let mut queued: Vec<_> = (0..MAX_PROCESSES)
-                .map(|_| Provider.spawn(&cx, spec(&cx, "read -r line")))
-                .collect();
-            assert_eq!(
-                Provider
-                    .spawn(&cx, spec(&cx, "read -r line"))
-                    .await
-                    .err()
-                    .expect("queued work exceeded capacity")
-                    .kind(),
-                io::ErrorKind::WouldBlock
-            );
-            drop(queued.pop());
-            queued.push(Provider.spawn(&cx, spec(&cx, "read -r line")));
             let mut children = Vec::new();
-            for launching in queued {
-                children.push(launching.await.unwrap());
+            for _ in 0..32 {
+                let child = Provider
+                    .spawn(&cx, spec(&cx, "echo ready; read -r line"))
+                    .await
+                    .unwrap();
+                let mut ready = [0; 6];
+                let mut read = 0;
+                while read < ready.len() {
+                    let n = child
+                        .output
+                        .as_ref()
+                        .unwrap()
+                        .read(&mut ready[read..])
+                        .await
+                        .unwrap();
+                    assert_ne!(n, 0);
+                    read += n;
+                }
+                assert_eq!(&ready, b"ready\n");
+                children.push(child);
             }
-            let refused = Provider
-                .spawn(&cx, spec(&cx, "read -r line"))
-                .await
-                .err()
-                .expect("capacity was exceeded");
-            assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
-            let child = children.pop().unwrap();
-            let completion = Arc::clone(&child.process);
-            drop(child);
-            completion.ended().await;
-            let replacement = Provider
-                .spawn(&cx, spec(&cx, "read -r line"))
-                .await
-                .unwrap();
-            drop(replacement);
+            let unrelated = Provider.spawn(&cx, spec(&cx, "exit 17")).await.unwrap();
+            assert_eq!(unrelated.wait().await.unwrap().code(), Some(17));
+            unrelated.ended().await;
             for child in children {
-                let completion = Arc::clone(&child.process);
-                drop(child);
-                completion.ended().await;
+                assert!(child.try_wait().unwrap().is_none());
+                child
+                    .input
+                    .as_ref()
+                    .unwrap()
+                    .write(b"release\n")
+                    .await
+                    .unwrap();
+                assert!(child.wait().await.unwrap().success());
+                child.ended().await;
+                assert!(!child.alive());
             }
         });
     }
@@ -1051,6 +972,29 @@ int main(int argc, char **argv) {
         fn contribute(&self, r: &mut Registrar) {
             r.provide::<dyn rt::Runtime>(self.0.clone());
         }
+    }
+
+    #[test]
+    fn cancellation_while_launch_is_queued_starts_no_child() {
+        let runtime = Arc::new(Manual::default());
+        runtime.defer.store(true, Ordering::Release);
+        let rig = Rig::new(
+            "queued-cancellation",
+            Registry::default()
+                .with(&ManualService(Arc::clone(&runtime)))
+                .unwrap(),
+        );
+        let cx = rig.cx();
+        let mut launching = Provider.spawn(&cx, spec(&cx, "read -r line"));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(launching.as_mut().poll(&mut context).is_pending());
+        rig.cancel.set();
+        lock(&runtime.blocking).pop().expect("launch was queued")();
+        let Poll::Ready(Err(error)) = launching.as_mut().poll(&mut context) else {
+            panic!("cancelled launch must complete without starting a child");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(lock(&runtime.tasks).is_empty());
     }
 
     #[test]
