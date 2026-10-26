@@ -138,13 +138,13 @@ impl App {
                 Some(Signals { draft, .. }) if draft.trim().is_empty() => done(true),
                 Some(Signals { tab, draft }) => {
                     let (reply, admitted) = rt::oneshot::channel();
-                    if !self.tell(&tab, TabIn::Line(draft, reply)) {
+                    if !self.tell(&tab, TabIn::Line(draft.clone(), reply)) {
                         done(false)
                     } else if admitted.await == Some(true) {
                         whole(
                             StatusCode::OK,
                             "application/json",
-                            br#"{"draft":""}"#.to_vec(),
+                            serde_json::to_vec(&serde_json::json!({ "admitted": draft })).unwrap(),
                         )
                     } else {
                         text(StatusCode::CONFLICT, "submission rejected; draft kept")

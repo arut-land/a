@@ -19,8 +19,8 @@ pub struct Page {
     shown: Option<End>,
     /// The title the page shows.
     titled: Option<String>,
-    /// Text streamed since the last patch, for one reply.
-    streamed: Option<(protocol::CallId, String)>,
+    /// Text streamed since the last patch, for one reply attempt.
+    streamed: Option<(protocol::CallId, u16, String)>,
     /// Events not yet sent.
     out: Vec<u8>,
 }
@@ -140,11 +140,19 @@ impl Page {
             _ => return,
         };
         if let Change::Delta { call, text } = change {
+            let attempt = self
+                .client
+                .view()
+                .streaming
+                .as_ref()
+                .expect("delta streams a reply")
+                .attempt;
             match &mut self.streamed {
-                Some((c, t)) if *c == call => t.push_str(&text),
+                Some((c, a, t)) if (*c, *a) == (call, attempt) => t.push_str(&text),
+                Some((c, ..)) if *c == call => self.streamed = Some((call, attempt, text)),
                 _ => {
                     self.flush();
-                    self.streamed = Some((call, text));
+                    self.streamed = Some((call, attempt, text));
                 }
             }
             return;
@@ -199,7 +207,7 @@ impl Page {
     /// Adds the text streamed into reply `call` to its element; the first
     /// text replaces the reply's "thinking…".
     fn flush(&mut self) {
-        let Some((call, text)) = self.streamed.take() else {
+        let Some((call, attempt, text)) = self.streamed.take() else {
             return;
         };
         let view = self.client.view();
@@ -208,7 +216,7 @@ impl Page {
         let started = view
             .streaming
             .as_ref()
-            .is_none_or(|s| s.call != call || s.text.len() == text.len());
+            .is_none_or(|s| s.call != call || s.attempt != attempt || s.text.len() == text.len());
         if started {
             let Some(item) = view.items.iter().find(|i| i.key() == call.0) else {
                 return;
@@ -500,6 +508,54 @@ mod tests {
         assert!(
             settled[1].contains("<div id=\"end\"") && !settled[1].contains("Stop"),
             "{settled:?}"
+        );
+    }
+
+    #[test]
+    fn retries_in_one_batch_replace_buffered_text_before_appending() {
+        let mut page = synced();
+        page.fold(&[entry(
+            2,
+            Body::ModelCall {
+                request: None,
+                model: "m".into(),
+                attempt: 0,
+                choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: None,
+            },
+        )]);
+        events(&mut page);
+        page.fold(&[
+            delta(2, "failed attempt"),
+            DaemonMsg::Delta {
+                call: CallId::new(2).unwrap(),
+                attempt: 1,
+                text: "€new".into(),
+            },
+            DaemonMsg::Delta {
+                call: CallId::new(2).unwrap(),
+                attempt: 1,
+                text: "!".into(),
+            },
+        ]);
+        let patches = events(&mut page);
+        assert_eq!(patches.len(), 1);
+        let reply = patches[0]
+            .split_once("<span id=\"reply-2\">")
+            .and_then(|(_, tail)| tail.split_once("</span>"))
+            .map(|(text, _)| text);
+        assert_eq!(reply, Some("€new!"), "{patches:?}");
+        page.fold(&[DaemonMsg::Delta {
+            call: CallId::new(2).unwrap(),
+            attempt: 1,
+            text: "?".into(),
+        }]);
+        assert_eq!(
+            events(&mut page),
+            [
+                "event: datastar-patch-elements\ndata: selector #reply-2\ndata: mode append\ndata: elements <span>?</span>"
+            ]
         );
     }
 

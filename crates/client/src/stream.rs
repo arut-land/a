@@ -12,7 +12,7 @@ pub enum ReplyEvent<'a> {
 pub struct ReplyStream {
     session: Option<SessionId>,
     settled: u64,
-    open: Option<(Seq, String)>,
+    open: Option<(Seq, Option<u16>, String)>,
 }
 
 impl ReplyStream {
@@ -23,7 +23,7 @@ impl ReplyStream {
             self.session = view.session;
             self.settled = 0;
         }
-        if let Some((seq, _)) = &self.open
+        if let Some((seq, _, _)) = &self.open
             && !view.items.iter().any(|item| item.key() == *seq)
         {
             events.push(ReplyEvent::End);
@@ -49,10 +49,16 @@ impl ReplyStream {
             if text.is_empty() && !item.settled() {
                 break;
             }
-            let (_, mut printed) = self.open.take().unwrap_or_else(|| {
+            let (_, attempt, mut printed) = self.open.take().unwrap_or_else(|| {
                 events.push(ReplyEvent::Start);
-                (item.key(), String::new())
+                (item.key(), None, String::new())
             });
+            if let Some(live) = live
+                && attempt.is_some_and(|attempt| attempt != live.attempt)
+            {
+                events.extend([ReplyEvent::End, ReplyEvent::Start]);
+                printed.clear();
+            }
             if let Some(suffix) = text.strip_prefix(printed.as_str()) {
                 if !suffix.is_empty() {
                     events.push(ReplyEvent::Text(suffix));
@@ -67,7 +73,7 @@ impl ReplyStream {
                 events.push(ReplyEvent::End);
                 self.settled = item.key().get();
             } else {
-                self.open = Some((item.key(), printed));
+                self.open = Some((item.key(), live.map(|s| s.attempt).or(attempt), printed));
                 // Preserve transcript order: an ended frontier cannot pass an open reply.
                 break;
             }
@@ -165,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_text_is_emitted_once() {
+    fn each_retry_starts_a_new_output_line() {
         let mut stream = ReplyStream::default();
         let mut view = reply(SessionId::new(), Status::Running, "");
         let call = CallId::new(1).unwrap();
@@ -183,7 +189,14 @@ mod tests {
             text: "reply".into(),
             attempt: 1,
         });
-        assert_eq!(stream.project(&view), [ReplyEvent::Text("ly")]);
+        assert_eq!(
+            stream.project(&view),
+            [
+                ReplyEvent::End,
+                ReplyEvent::Start,
+                ReplyEvent::Text("reply")
+            ]
+        );
         let snapshot = reply(view.session.unwrap(), Status::Done, "reply").snapshot();
         view.fold(&DaemonMsg::Snapshot(Box::new(snapshot)));
         assert_eq!(stream.project(&view), [ReplyEvent::End]);
@@ -390,7 +403,14 @@ mod tests {
 
     #[test]
     fn retry_replacement_cannot_drop_a_unicode_reply_at_an_old_byte_offset() {
-        for (first, replacement) in [("a", "é"), ("hello", "world"), ("é", "a")] {
+        for (first, replacement) in [
+            ("a", "é"),
+            ("hello", "world"),
+            ("é", "a"),
+            ("€same", "€"),
+            ("€", "€longer"),
+            ("same", "same"),
+        ] {
             let call = CallId::new(1).unwrap();
             let mut view = reply(SessionId::new(), Status::Running, "");
             let mut stream = ReplyStream::default();
@@ -417,7 +437,7 @@ mod tests {
                 ]
             );
             assert_eq!(stream.project(&view), []);
-            assert_eq!(stream.open.as_ref().map(|(seq, _)| *seq), Some(call.0));
+            assert_eq!(stream.open.as_ref().map(|(seq, _, _)| *seq), Some(call.0));
             view.fold(&DaemonMsg::Snapshot(Box::new(
                 reply(view.session.unwrap(), Status::Done, replacement).snapshot(),
             )));
@@ -427,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn an_identical_retry_can_rebuild_its_prefix_without_duplicate_output() {
+    fn identical_retries_restart_once_and_append_each_chunk_once() {
         let call = CallId::new(1).unwrap();
         let mut view = reply(SessionId::new(), Status::Running, "");
         let mut stream = ReplyStream::default();
@@ -440,12 +460,18 @@ mod tests {
             stream.project(&view),
             [ReplyEvent::Start, ReplyEvent::Text("héllo")]
         );
-        for text in ["h", "é", "llo"] {
+        for (index, text) in ["h", "é", "llo"].into_iter().enumerate() {
             view.fold(&DaemonMsg::Delta {
                 call,
                 text: text.into(),
                 attempt: 1,
             });
+            let expected = if index == 0 {
+                vec![ReplyEvent::End, ReplyEvent::Start, ReplyEvent::Text(text)]
+            } else {
+                vec![ReplyEvent::Text(text)]
+            };
+            assert_eq!(stream.project(&view), expected);
             assert_eq!(stream.project(&view), []);
         }
         view.fold(&DaemonMsg::Snapshot(Box::new(

@@ -150,9 +150,9 @@ pub fn mark_reply(rows: &mut [Line]) {
 /// so a long reply costs no more per delta than a short one.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Live {
+    identity: Option<(CallId, u16)>,
     /// The text's bytes wrapped for good (up to a newline), whether they
     /// end inside a code fence, and the rows they made.
-    identity: Option<(CallId, u16)>,
     done: usize,
     fenced: bool,
     kept: usize,

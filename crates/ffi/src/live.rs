@@ -560,7 +560,7 @@ impl Session {
 
     /// A conservative byte charge for current view payloads and retained updates.
     pub fn retained_bytes(&self) -> u64 {
-        lock(&self.feed).retained_bytes as u64
+        lock(&self.feed).retained_bytes() as u64
     }
 
     pub fn details(&self, key: u64) -> Option<String> {

@@ -400,7 +400,7 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     assert_eq!(sent.status(), 200, "{}", sent.0);
     // Datastar takes it as a patch of the page's signals.
     assert_eq!(sent.header("content-type"), Some("application/json"));
-    assert_eq!(sent.body(), r#"{"draft":""}"#);
+    assert_eq!(sent.body(), r#"{"admitted":"hello web"}"#);
     events.until("the line and its echo", |p| {
         shown(p).matches(">hello web<").count() == 2
     });
