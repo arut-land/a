@@ -46,6 +46,7 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}-${{ github.sha }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - &mise
         uses: jdx/mise-action@v5
         with:
