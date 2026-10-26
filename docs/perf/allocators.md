@@ -54,7 +54,11 @@ python3 scripts/perf/allocator_effects.py paired.json --output effects.json
 
 ## Campaign provenance
 
-The allocator campaign source is `cfd5ae5d`, before the later merge of main.
+The mimalloc, rpmalloc and segment-heap campaign source is `cfd5ae5d`, before
+the later merge of main. The corrected jemalloc/snmalloc sessions block and
+snmalloc paired suite use `c249a084`, which includes that merge and the
+read-scratch change. Each allocator is compared with its own same-source
+system build; absolute footprints across those blocks are not interchangeable.
 The local M3 allocator binaries were saved by the preceding build campaign.
 Hosted sessions are split to stay within the 150-minute measurement step:
 
@@ -114,12 +118,16 @@ The four experimental allocator features, their native build dependencies and
 the forwarding global-allocator seam have been removed. Their pinned source
 commits above preserve reproducibility. The final binary uses Rust's native
 system allocator directly; measurement helpers continue to label it `system`.
-Windows segment heap and the retirement callback are separate decisions.
+The Windows segment-heap manifest is also rejected: idle RSS changes by
+−92 KiB [−112, −52] on x64, overlapping its A/A band of ±80 KiB, and
++8 KiB [−4, 28] on ARM64. These are 20 matched daemon pairs. Its experimental
+feature and manifest rewrite have been removed. The retirement callback is
+a separate decision.
 
 ## Support and dependencies
 
 Candidates are mimalloc 0.1.52, tikv-jemallocator 0.7, snmalloc-rs 0.7.6 and
-rpmalloc 0.2.2. Only one replacement can be selected in a build. jemalloc
+rpmalloc 0.2.2. Experimental builds admitted one replacement at a time. jemalloc
 has no MSVC implementation: its feature selects the system allocator there,
 and the sessions campaign skips that comparison. It must not be reported as
 a Windows jemalloc result.
@@ -176,6 +184,33 @@ uninstrumented 20-round comparison uses `1190974f` against `48b9c3a0` on
 all six hosted targets. Large transcript, snapshot and view caches remain
 reconstructible state; dropping them indiscriminately also creates rebuild
 work. The read scratch can be removed without choosing a cache lifetime.
+
+## Local M3 paired results
+
+Twenty alternating rounds at 128 sessions; values are median paired changes
+with 95% bootstrap intervals. Memory is KiB, CPU and latency are percent.
+The four-allocator block has a shared A/A control; the corrected snmalloc and
+read-scratch block has its own control.
+
+| Comparison | Idle RSS, KiB | Active CPU, % | Turn p99, % |
+| --- | ---: | ---: | ---: |
+| A/A, original block | −64 [−352, 296] | −0.521 [−5.556, 8.861] | −0.094 [−1.879, 1.098] |
+| mimalloc | 56040 [55400, 56248] | 1.187 [−2.434, 6.007] | 1.642 [−1.720, 3.448] |
+| jemalloc | 46104 [45912, 46264] | 0.370 [−5.111, 4.953] | 1.862 [−1.195, 5.037] |
+| rpmalloc | 92320 [91944, 92520] | −1.206 [−8.469, 2.319] | 0.587 [−1.740, 3.365] |
+| A/A, corrected block | 80 [−200, 304] | 0.515 [−1.953, 5.870] | 1.027 [−1.420, 2.540] |
+| snmalloc, release mode | 59504 [59064, 59592] | −1.266 [−6.644, 2.865] | −0.596 [−1.613, 1.660] |
+| Read scratch on polling stack | −2256 [−2440, −1952] | 0.452 [−2.861, 2.869] | −0.900 [−1.974, 0.774] |
+| Retirement callback, corrected block | 184 [−408, 360] | −0.054 [−3.090, 2.616] | 0.655 [−1.251, 2.594] |
+
+Physical footprint in the corrected block falls by 2,247.988 KiB
+[1,944, 2,448] after the read-scratch change. Its A/A interval is
+[−216.012, 304.023] KiB. Both RSS and footprint beat that control band;
+CPU and latency stay within it. Every sample completes without failed calls
+or dropped deltas. The original block overlapped local checks, profiling and
+builds during its early rounds, so its noisy CPU intervals cannot establish
+a throughput win. The original snmalloc binary had C++ debug mode enabled;
+its measurements are retained for provenance and superseded by release mode.
 
 ## Prior evidence
 

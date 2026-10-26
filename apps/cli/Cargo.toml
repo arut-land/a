@@ -74,9 +74,6 @@ search = ["index", "dep:ext-search"]
 # The `echo` agent and `sleep` tool; the tests build them in, as the
 # dev-dependency below turns them on.
 fixtures = ["ext-fixtures/on"]
-# Windows' segment heap for the process heap, measured against the default
-# (docs/perf/allocators.md).
-segment-heap = []
 
 # TLS uses the host's crypto library and trust store on every platform.
 [dependencies.llm]
