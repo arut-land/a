@@ -860,6 +860,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore)]
     fn procfs_identity_and_membership_ignore_non_utf8_command_names() {
         use std::io::{BufRead, Write};
         const CHILD: &str = "A_TEST_PROC_NAME";
