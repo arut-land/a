@@ -397,7 +397,7 @@ mod tests {
         let epoch = target.enroll().unwrap().dispatch(&runtime);
         hold.started();
         assert_eq!(backing.entries(header.id).unwrap().len(), 1);
-        assert!(faulty.pending(header.id).is_empty());
+        assert_eq!(faulty.pending(header.id), []);
         target.append(&mut [entry(3)], AppendMode::Order).unwrap();
         hold.release();
         rt::block_on(epoch).unwrap();
