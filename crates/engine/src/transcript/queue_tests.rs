@@ -409,3 +409,60 @@ fn foreground_completions_retain_no_background_metadata() {
     assert!(transcript.streams.is_empty());
     assert!(transcript.detached.is_empty());
 }
+
+#[test]
+fn background_jobs_keep_their_name_without_publishing_a_stream() {
+    let mut bodies = called();
+    bodies.extend([
+        Body::ToolProcess {
+            call: call(3),
+            pgid: 42,
+            boot: "boot".into(),
+            background: true,
+        },
+        Body::ToolResult {
+            call: call(3),
+            outcome: Outcome::Done {
+                output: Json::null().into(),
+            },
+            card: None,
+            held: Vec::new(),
+        },
+        Body::Enqueue {
+            envelope: Envelope::own(SESSION, call(3), Carried::Job("finished".into())),
+        },
+        Body::Take {
+            input: seq(6),
+            into: None,
+        },
+        Body::Edit {
+            target: seq(4),
+            upto: None,
+            replace: None,
+        },
+    ]);
+    let entries: Vec<_> = bodies
+        .into_iter()
+        .enumerate()
+        .map(|(at, body)| Entry::new(seq(at as u64 + 1), Epoch(0), body))
+        .collect();
+    let registry = Arc::new(Registry::default());
+    let mut live = Transcript::empty(Arc::clone(&registry), "", &Places::default());
+    for entry in &entries {
+        live.apply(entry, None);
+    }
+    assert!(live.tools.is_empty());
+    assert!(live.streams.is_empty());
+    let messages = live.into_messages();
+    let text = format!("{:?}", messages.last().unwrap());
+    assert!(text.contains(r#"command=\"sleep\""#), "{text}");
+    assert!(text.contains("finished"), "{text}");
+    assert_eq!(
+        Transcript::of(&entries, Arc::clone(&registry), "").into_messages(),
+        messages
+    );
+    assert_eq!(
+        project(context_image(&entries), registry, "", &Places::default()).into_messages(),
+        messages
+    );
+}

@@ -698,6 +698,52 @@ fn batch_replay_preserves_inherited_layers_and_latest_overlapping_edits() {
 #[test]
 #[ignore = "a measurement; run alone or on a hosted runner"]
 fn bench_loading_a_long_log_transcript_reconstruction() {
+    let binary = std::env::current_exe().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+    let metrics = output_dir.path().join("reconstruction.json");
+    let commands = ["staged_transcript_reconstruction", "streaming_transcript_reconstruction"]
+        .map(|name| format!("{binary:?} --exact transcript::context_image_tests::{name} --ignored --nocapture --test-threads=1"));
+    let output = std::process::Command::new("hyperfine")
+        .args([
+            "-N",
+            "--runs",
+            "5",
+            "--warmup",
+            "1",
+            "--metrics",
+            "all",
+            "--show-output",
+        ])
+        .arg("--export-json")
+        .arg(&metrics)
+        .args(commands)
+        .output()
+        .unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success());
+    eprintln!("{}", std::fs::read_to_string(metrics).unwrap());
+}
+
+#[test]
+#[ignore = "a measurement; run alone or on a hosted runner"]
+fn staged_transcript_reconstruction() {
+    measure_reconstruction(Reconstruction::Staged);
+}
+
+#[test]
+#[ignore = "a measurement; run alone or on a hosted runner"]
+fn streaming_transcript_reconstruction() {
+    measure_reconstruction(Reconstruction::Streaming);
+}
+
+#[derive(Clone, Copy)]
+enum Reconstruction {
+    Staged,
+    Streaming,
+}
+
+fn measure_reconstruction(pipeline: Reconstruction) {
     use crate::store::LogStore;
     use std::time::{Duration, Instant};
 
@@ -736,55 +782,54 @@ fn bench_loading_a_long_log_transcript_reconstruction() {
         .unwrap();
     let frames = crate::outbox::FrameLog::new(loaded.lines, 16385);
     let registry = Arc::new(Registry::default());
-    for staged in [true, false] {
-        sys::release();
-        let before = resident_kib();
-        let mut sampled_peak = before;
-        let mut elapsed = Duration::ZERO;
-        let transcript = if staged {
-            let start = Instant::now();
-            let entries = frames.entries().unwrap();
-            elapsed += start.elapsed();
-            sampled_peak = sampled_peak.max(resident_kib());
-            let start = Instant::now();
-            let image = context_image(&entries);
-            elapsed += start.elapsed();
-            sampled_peak = sampled_peak.max(resident_kib());
-            let start = Instant::now();
-            let transcript = project(image, Arc::clone(&registry), "", &Places::default());
-            elapsed += start.elapsed();
-            sampled_peak = sampled_peak.max(resident_kib());
-            transcript
-        } else {
-            let start = Instant::now();
-            let transcript = Transcript::replay(
-                |each| {
-                    for batch in frames.batches_after(0) {
-                        for entry in batch? {
-                            each(&entry);
-                        }
+    let staged = matches!(pipeline, Reconstruction::Staged);
+    sys::release();
+    let before = resident_kib();
+    let mut sampled_peak = before;
+    let mut elapsed = Duration::ZERO;
+    let transcript = if staged {
+        let start = Instant::now();
+        let entries = frames.entries().unwrap();
+        elapsed += start.elapsed();
+        sampled_peak = sampled_peak.max(resident_kib());
+        let start = Instant::now();
+        let image = context_image(&entries);
+        elapsed += start.elapsed();
+        sampled_peak = sampled_peak.max(resident_kib());
+        let start = Instant::now();
+        let transcript = project(image, Arc::clone(&registry), "", &Places::default());
+        elapsed += start.elapsed();
+        sampled_peak = sampled_peak.max(resident_kib());
+        transcript
+    } else {
+        let start = Instant::now();
+        let transcript = Transcript::replay(
+            |each| {
+                for batch in frames.batches_after(0) {
+                    for entry in batch? {
+                        each(&entry);
                     }
-                    Ok(())
-                },
-                Arc::clone(&registry),
-                "",
-                &Places::default(),
-            )
-            .unwrap();
-            elapsed += start.elapsed();
-            sampled_peak = sampled_peak.max(resident_kib());
-            transcript
-        };
-        sys::release();
-        let retained = resident_kib().saturating_sub(before);
-        let messages = transcript.into_messages();
-        assert_eq!(messages.len(), 12289);
-        assert_eq!(messages.get(4096), Some(&Message::user("summary")));
-        eprintln!(
-            "transcript staged={staged}: 16385 entries, elapsed={elapsed:?}, sampled_peak_delta_kib={}, retained_result_delta_kib={retained}",
-            sampled_peak.saturating_sub(before)
-        );
-    }
+                }
+                Ok(())
+            },
+            Arc::clone(&registry),
+            "",
+            &Places::default(),
+        )
+        .unwrap();
+        elapsed += start.elapsed();
+        sampled_peak = sampled_peak.max(resident_kib());
+        transcript
+    };
+    sys::release();
+    let retained = resident_kib().saturating_sub(before);
+    let messages = transcript.into_messages();
+    assert_eq!(messages.len(), 12289);
+    assert_eq!(messages.get(4096), Some(&Message::user("summary")));
+    eprintln!(
+        "transcript staged={staged}: 16385 entries, elapsed={elapsed:?}, sampled_peak_delta_kib={}, retained_result_delta_kib={retained}",
+        sampled_peak.saturating_sub(before)
+    );
 }
 
 fn resident_kib() -> u64 {

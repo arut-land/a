@@ -307,7 +307,7 @@ impl Transcript {
         .expect("in-memory transcript replay cannot fail")
     }
 
-    /// Replays a stable history twice, retaining only edits between passes.
+    /// Replays a stable history twice, retaining edits and background call identities between passes.
     pub(super) fn replay(
         mut entries: impl FnMut(&mut dyn FnMut(&Entry)) -> io::Result<()>,
         registry: Arc<Registry>,
@@ -315,9 +315,25 @@ impl Transcript {
         places: &Places,
     ) -> io::Result<Self> {
         let mut edits = Vec::new();
+        let mut background = HashSet::new();
         entries(&mut |entry| {
             if let Some(edit) = context_edit(entry) {
                 edits.push(edit);
+            }
+            match &entry.body {
+                Body::ToolProcess {
+                    call,
+                    background: true,
+                    ..
+                } => {
+                    background.insert(*call);
+                }
+                Body::Enqueue { envelope }
+                    if matches!(envelope.payload(), Carried::Job(_) | Carried::Detached(_)) =>
+                {
+                    background.insert(envelope.id().call);
+                }
+                _ => {}
             }
         })?;
         let edits = Edits::new(edits);
@@ -329,7 +345,16 @@ impl Transcript {
                     transcript.apply_input(entry.seq, ContextValue::User(text.clone()), None);
                 }
                 Some(_) => {}
-                None => transcript.apply(entry, None),
+                None => {
+                    if let Body::ToolCall {
+                        tool, id: Some(_), ..
+                    } = &entry.body
+                        && background.contains(&CallId(entry.seq))
+                    {
+                        transcript.tools.insert(CallId(entry.seq), tool.clone());
+                    }
+                    transcript.apply(entry, None);
+                }
             }
         })?;
         Ok(transcript)
@@ -365,6 +390,14 @@ impl Transcript {
                     .into_context();
                 self.inherit(&messages, e.seq);
             }
+        } else if let Body::ToolProcess {
+            call,
+            background: true,
+            ..
+        } = &e.body
+            && let Some((_, tool)) = self.calls.get(call)
+        {
+            self.tools.insert(*call, tool.clone());
         } else if let Some(value) = context_fact(&e.body) {
             self.apply_input(e.seq, value, fresh);
         }
@@ -824,7 +857,19 @@ fn project(
             places,
         );
         transcript.model_only = runner == RunnerKind::ModelOnly;
+        let completions: HashSet<_> = inputs
+            .iter()
+            .filter_map(|ContextInput(_, value)| match value {
+                ContextValue::Job(call, ..) | ContextValue::Background(call, ..) => Some(*call),
+                _ => None,
+            })
+            .collect();
         for ContextInput(seq, value) in inputs {
+            if let ContextValue::ToolCall(_, tool) = &value
+                && completions.contains(&CallId(seq))
+            {
+                transcript.tools.insert(CallId(seq), tool.clone());
+            }
             if let ContextValue::Inherited(child) = value {
                 transcript.inherit(
                     &inherited.remove(&child).expect("inherited scope reduced"),
