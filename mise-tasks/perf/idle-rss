@@ -3,51 +3,16 @@
 """Fresh fixture homes; measure an idle line REPL and its daemon on every OS."""
 import argparse
 import json
-import os
 from pathlib import Path
-import queue
-import subprocess
 import sys
-import tempfile
-import threading
-import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/perf"))
-from process import snapshot, stop_daemon
+from lifecycle import daemon, idle_sample
 
 
-def sample(binary, idle_seconds):
-    with tempfile.TemporaryDirectory(prefix="a-rss-", dir=os.environ.get("RUNNER_TEMP")) as directory:
-        home = Path(directory)
-        (home / "config.toml").write_text('[daemon]\nagent = "echo"\nidle_secs = 120\n')
-        env = dict(os.environ, A_HOME=str(home), A_TUI="plain")
-        env.pop("A_HOST", None)
-        client = subprocess.Popen([binary], env=env, cwd=home, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        try:
-            first = queue.Queue()
-            threading.Thread(target=lambda: first.put(client.stdout.readline()), daemon=True).start()
-            assert first.get(timeout=30).startswith(b"[session")
-            pid = int((home / "run/daemon.pid").read_text().splitlines()[0])
-            time.sleep(3)
-            rss = snapshot(pid)["rss_kib"]
-            time.sleep(12)
-            before = [snapshot(p)["cpu_seconds"] for p in (pid, client.pid)]
-            started = time.monotonic()
-            time.sleep(idle_seconds)
-            elapsed = time.monotonic() - started
-            after = [snapshot(p) for p in (pid, client.pid)]
-            return dict(rss=rss, seconds=elapsed,
-                        daemon_cpu_seconds=after[0]["cpu_seconds"] - before[0],
-                        client_cpu_seconds=after[1]["cpu_seconds"] - before[1])
-        finally:
-            client.stdin.close()
-            try:
-                client.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                client.kill()
-                client.wait()
-            stop_daemon(binary, env, home)
+def sample(binary, idle_seconds, output=None, trial=0):
+    with daemon(binary, output, trial, ready_timeout=30) as active:
+        return idle_sample(active, idle_seconds)
 
 
 def main():
@@ -61,7 +26,8 @@ def main():
     if args.samples < 1 or args.idle_seconds < 0:
         parser.error("samples must be positive and idle-seconds nonnegative")
     args.output.mkdir(parents=True, exist_ok=True)
-    samples = [sample(str(args.binary.resolve(strict=True)), args.idle_seconds) for _ in range(args.samples)]
+    samples = [sample(str(args.binary.resolve(strict=True)), args.idle_seconds, args.output, trial)
+               for trial in range(args.samples)]
     record = dict(commit=args.label, rss=[value["rss"] for value in samples],
                   bytes=args.binary.stat().st_size, samples=samples)
     print(json.dumps(record))
