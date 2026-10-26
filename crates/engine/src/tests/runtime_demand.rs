@@ -29,7 +29,10 @@ fn concurrent_session_sizing() {
                 )
             })
             .collect();
-        loaded.writer.append(&mut entries, true).unwrap();
+        loaded
+            .writer
+            .append(&mut entries, crate::store::AppendMode::Order)
+            .unwrap();
         loaded.writer.flush_inline().unwrap();
         headers.push(header);
     }
