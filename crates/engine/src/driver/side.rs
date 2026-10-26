@@ -539,11 +539,7 @@ async fn ephemeral_turn(
             .chain(side.messages.iter().cloned())
             .collect();
         let messages = match side.context {
-            ext::Context::OwnerPrefix => context
-                .iter()
-                .chain(side.messages.iter())
-                .cloned()
-                .collect(),
+            ext::Context::OwnerPrefix => complete_prefix(context, &side.messages),
             ext::Context::Fresh | ext::Context::Owner => side
                 .bounds()
                 .assemble(&[], &context, &current)
@@ -773,11 +769,7 @@ impl Actor {
             .chain(turn.messages.iter().cloned())
             .collect();
         let messages = match turn.context {
-            ext::Context::OwnerPrefix => context
-                .iter()
-                .chain(turn.messages.iter())
-                .cloned()
-                .collect(),
+            ext::Context::OwnerPrefix => complete_prefix(context, &turn.messages),
             ext::Context::Fresh | ext::Context::Owner => {
                 policy.assemble(&history, &context, &current)?
             }
@@ -789,4 +781,11 @@ impl Actor {
             .map_err(|error| llm::Error::new(llm::Kind::InvalidRequest, error));
         Ok(super::InFlight::Thread(Box::new((turn, messages, model))))
     }
+}
+
+fn complete_prefix(mut context: llm::Messages, current: &llm::Messages) -> llm::Messages {
+    for message in current.iter().cloned() {
+        context.push(message);
+    }
+    context
 }

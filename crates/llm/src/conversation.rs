@@ -196,8 +196,9 @@ impl ContextPolicy {
 
 impl ContextPolicy {
     /// Covers every exchange in order, repeating `current` on each input.
-    /// Large exchanges become consecutive serialized text fragments; media
-    /// stays native and indivisible, even when it exceeds the byte target.
+    /// Large exchanges become consecutive serialized text fragments. Media
+    /// and opaque provider items stay native and indivisible, even when
+    /// they exceed the byte target.
     pub fn cover<'a>(
         self,
         prefix: &'a [Message],
@@ -205,7 +206,7 @@ impl ContextPolicy {
     ) -> impl Iterator<Item = Result<Messages, String>> + 'a {
         let mut exchanges = exchanges(prefix).peekable();
         let mut fragment: Option<(crate::Json, usize)> = None;
-        let mut media = Vec::new().into_iter();
+        let mut native = Vec::new().into_iter();
         std::iter::from_fn(move || {
             let result: Result<Option<Messages>, String> = (|| {
                 let mandatory =
@@ -213,7 +214,7 @@ impl ContextPolicy {
                 let room = (self.bytes as usize)
                     .checked_sub(mandatory)
                     .ok_or("summary instructions leave no room for context")?;
-                if fragment.is_none() && media.len() == 0 {
+                if fragment.is_none() && native.len() == 0 {
                     let Some(exchange) = exchanges.next() else {
                         return Ok(None);
                     };
@@ -244,15 +245,13 @@ impl ContextPolicy {
                         crate::Json::encode(&exchange).map_err(|e| e.to_string())?,
                         0,
                     ));
-                    media = parts.into_iter();
+                    native = parts.into_iter();
                 }
-                if let Some(part) = media.next() {
+                if let Some(message) = native.next() {
                     return Ok(Some(
-                        std::iter::once(Message::User(crate::User {
-                            content: vec![part],
-                        }))
-                        .chain(current.iter().cloned())
-                        .collect(),
+                        std::iter::once(message)
+                            .chain(current.iter().cloned())
+                            .collect(),
                     ));
                 }
                 let Some((json, offset)) = &mut fragment else {
@@ -296,17 +295,19 @@ impl ContextPolicy {
 
 // A text fragment must not expose provider-private replay metadata (signatures,
 // encrypted reasoning, native ids). Native requests still carry it unchanged.
-fn readable_exchange(message: &mut Message, media: &mut Vec<crate::UserPart>) {
-    fn user_parts(parts: &mut [crate::UserPart], media: &mut Vec<crate::UserPart>) {
+fn readable_exchange(message: &mut Message, native: &mut Vec<Message>) {
+    fn user_parts(parts: &mut [crate::UserPart], native: &mut Vec<Message>) {
         for part in parts {
-            if let crate::UserPart::Text(text) = part {
-                text.meta.clear();
-            }
-            if matches!(part, crate::UserPart::Media(_)) {
-                media.push(std::mem::replace(
-                    part,
-                    crate::UserPart::Text(crate::Text::new("[media supplied separately]")),
-                ));
+            match part {
+                crate::UserPart::Text(text) => text.meta.clear(),
+                crate::UserPart::Media(_) => {
+                    native.push(Message::User(crate::User {
+                        content: vec![std::mem::replace(
+                            part,
+                            crate::UserPart::Text(crate::Text::new("[media supplied separately]")),
+                        )],
+                    }));
+                }
             }
         }
     }
@@ -316,36 +317,51 @@ fn readable_exchange(message: &mut Message, media: &mut Vec<crate::UserPart>) {
                 text.meta.clear();
             }
         }
-        Message::User(user) => user_parts(&mut user.content, media),
+        Message::User(user) => user_parts(&mut user.content, native),
         Message::Assistant(reply) => {
-            reply.origin = None;
+            let origin = reply.origin.take();
+            let mut opaque = Vec::new();
             for part in &mut reply.content {
-                part.meta_mut().clear();
                 match part {
+                    crate::AssistantPart::Opaque(_) => {
+                        opaque.push(std::mem::replace(
+                            part,
+                            crate::AssistantPart::Text(crate::Text::new(
+                                "[provider item supplied separately]",
+                            )),
+                        ));
+                    }
                     crate::AssistantPart::Media(image) => {
-                        media.push(crate::UserPart::Media(image.clone()));
+                        native.push(Message::User(crate::User {
+                            content: vec![crate::UserPart::Media(image.clone())],
+                        }));
                         *part = crate::AssistantPart::Text(crate::Text::new(
                             "[media supplied separately]",
                         ));
                     }
                     crate::AssistantPart::ToolResult(result) => {
-                        result.meta.clear();
                         if let crate::Output::Content(parts) = &mut result.output {
-                            user_parts(parts, media);
+                            user_parts(parts, native);
                         }
                     }
                     crate::AssistantPart::Text(_)
                     | crate::AssistantPart::Reasoning(_)
-                    | crate::AssistantPart::ToolCall(_)
-                    | crate::AssistantPart::Opaque(_) => {}
+                    | crate::AssistantPart::ToolCall(_) => {}
                 }
+                part.meta_mut().clear();
+            }
+            if !opaque.is_empty() {
+                native.push(Message::Assistant(crate::Assistant {
+                    content: opaque,
+                    origin,
+                }));
             }
         }
         Message::Tool(tool) => {
             for result in &mut tool.results {
                 result.meta.clear();
                 if let crate::Output::Content(parts) = &mut result.output {
-                    user_parts(parts, media);
+                    user_parts(parts, native);
                 }
             }
         }

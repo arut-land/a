@@ -351,3 +351,41 @@ fn serialized_summary_fragments_never_expose_private_provider_replay_data() {
     };
     assert!(original.content[0].meta().get("responses").is_some());
 }
+
+#[test]
+fn oversized_exchanges_keep_opaque_provider_items_native() {
+    let mut meta = crate::Meta::new();
+    meta.insert(
+        "responses",
+        &json!({"hosted_result": "source content", "id": "native-id"}),
+    );
+    let opaque = AssistantPart::Opaque(crate::Opaque { meta });
+    let origin = crate::origin(&providers()[2], "model");
+    let prefix = [Message::Assistant(Assistant {
+        content: vec![
+            AssistantPart::Text(Text::new("large answer".repeat(10_000))),
+            opaque.clone(),
+        ],
+        origin: Some(origin.clone()),
+    })];
+    let current = vec![Message::user("summary")].into();
+    let chunks: Vec<_> = ContextPolicy {
+        exchanges: 8,
+        bytes: 65536,
+    }
+    .cover(&prefix, &current)
+    .collect::<Result<_, _>>()
+    .unwrap();
+    let expected = Message::Assistant(Assistant {
+        content: vec![opaque],
+        origin: Some(origin),
+    });
+    assert!(chunks.iter().any(|chunk| chunk.contains(&expected)));
+    for chunk in chunks {
+        for message in chunk.iter() {
+            if let Message::User(user) = message {
+                assert!(!format!("{user:?}").contains("native-id"));
+            }
+        }
+    }
+}
