@@ -109,6 +109,8 @@ impl Extension for Index {
 }
 
 /// Gets the index of the session's workspace ready, as its use draws near.
+// Keep cache setup out of the lifecycle callbacks that return without using it.
+#[inline(never)]
 fn warm(indexes: &Indexes, cx: &PointCx<'_>) {
     if let (Some(rt), Some(hub)) = (
         cx.service_arc::<dyn rt::Runtime>(),

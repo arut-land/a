@@ -64,7 +64,10 @@ are not UTF-8 are left out.
 
 Registration retains configuration only. The workspace map and resting store
 are created on first use; the checksum table is created on first cache I/O.
-An unused index has no workspace state, cache store, or checksum table.
+An unused index has no workspace state, cache store, or checksum table. The macOS
+CLI also groups the implementation's executable code separately from its
+registration facade. The native loader pages backend code in as query and
+warm work uses it; this adds no runtime task.
 
 A loaded session starts warming its workspace index through
 `SessionStart(Started::Loaded)`. A created session waits for its first
