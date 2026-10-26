@@ -76,8 +76,9 @@ The edit tool imposes no file-size or matching-work ceiling. Capture, hashing,
 UTF-8 validation, exact matching, content comparison and publication stream
 through fixed buffers. The matcher retains a prefix table proportional to the
 supplied `old`, including overlapping occurrences. Worker reservations account for
-replacement arguments and the matcher table rather than the file's size. Files
-and combined replacement text up to 64 KiB use the detailed formatter; larger
-edits retain line counts with the bounded `[diff cut]` display. The filesystem
+replacement arguments and the matcher table rather than the file's size. The
+detailed formatter retains at most 256 KiB of source text under its existing work
+budget; larger sources retain line counts with the bounded `[diff cut]` display.
+Output size does not determine whether a diff is formatted. The filesystem
 transaction owns any caller-requested size policy for capture and publication;
-the edit tool requests the representable size rather than a memory limit.
+the edit tool requests no file-size ceiling.

@@ -19,6 +19,7 @@ use ext::{Cx, Fold, Json, Schema, Tool};
 pub struct Edit;
 
 const DIFF_LIMIT: usize = 16 * 1024;
+const DIFF_WORK: usize = 1 << 20;
 
 #[derive(Clone, Copy)]
 struct Limits {
@@ -28,7 +29,7 @@ struct Limits {
 
 const LIMITS: Limits = Limits {
     diff_bytes: DIFF_LIMIT,
-    diff_work: 1 << 20,
+    diff_work: DIFF_WORK,
 };
 
 #[derive(Deserialize, Schema)]
@@ -295,7 +296,7 @@ impl Transaction<'_> {
 }
 
 // Fixed file buffers, plus the caller-owned replacement strings and matcher table.
-const STREAM_BYTES: usize = 512 << 10;
+const STREAM_BYTES: usize = 1 << 20;
 const CHUNK: usize = 64 << 10;
 
 fn hash_file(mut file: &File) -> io::Result<u64> {
@@ -392,28 +393,6 @@ fn apply_file(
         .transpose()?
         .unwrap_or(0);
     let mut content = tempfile::tempfile()?;
-    // The detailed diff only needs small text. Larger edits use the same bounded
-    // diff omission as the formatter's work limit.
-    if length <= CHUNK as u64 && edits.iter().map(|edit| edit.new.len()).sum::<usize>() <= CHUNK {
-        let text = original
-            .map(|mut file| {
-                file.rewind()?;
-                let mut text = String::new();
-                file.read_to_string(&mut text).map(|_| text)
-            })
-            .transpose()
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::InvalidData {
-                    EditError::InvalidText
-                } else {
-                    error.into()
-                }
-            })?;
-        let (result, diff) = apply(text.as_deref(), edits, limits).map_err(EditError::Failed)?;
-        content.write_all(result.as_bytes())?;
-        content.rewind()?;
-        return Ok((content, diff));
-    }
     let whole = matches!(edits, [Replace { old, .. }] if old.is_empty());
     if original.is_none() && !whole {
         return Err(EditError::Failed(
@@ -425,9 +404,18 @@ fn apply_file(
     }
     let lines = original.map(text_lines).transpose()?.unwrap_or(0);
     let spans = replacement_spans(original, edits, length)?;
+    // A larger source exhausts the formatter's work budget on its first hunk.
+    // Keep only the text the formatter can use, independent of output size.
+    let preview = original
+        .filter(|_| length <= (limits.diff_work / 4).min(DIFF_WORK / 4) as u64)
+        .map(|mut file| {
+            file.rewind()?;
+            let mut text = String::new();
+            file.read_to_string(&mut text).map(|_| text)
+        })
+        .transpose()?;
     let mut diff = Diff::default();
-    diff.cut(limits);
-    let mut last = 0;
+    let (mut last, mut old_line, mut new_line) = (0, 1, 1);
     for (start, end, index) in spans {
         let edit = &edits[index];
         if let Some(mut source) = original {
@@ -435,23 +423,41 @@ fn apply_file(
             io::copy(&mut source.take(start - last), &mut content)?;
         }
         content.write_all(edit.new.as_bytes())?;
-        let prefix = if start > 0 {
-            let mut source = original.expect("nonzero source offset");
-            source.seek(io::SeekFrom::Start(start - 1))?;
-            let mut byte = [0];
-            source.read_exact(&mut byte)?;
-            byte[0] != b'\n'
+        if let Some(text) = &preview {
+            let start = usize::try_from(start).expect("preview bounds the source offset");
+            let end = usize::try_from(end).expect("preview bounds the source offset");
+            let skipped = text
+                [usize::try_from(last).expect("preview bounds the source offset")..start]
+                .matches('\n')
+                .count();
+            old_line += skipped;
+            new_line += skipped;
+            diff.hunk(text, (start, end), &edit.new, (old_line, new_line), limits);
+            old_line += text[start..end].matches('\n').count();
+            new_line += edit.new.matches('\n').count();
+        } else if let Some(mut source) = original {
+            if diff.work == 0 {
+                diff.cut(limits);
+            }
+            let prefix = if start > 0 {
+                source.seek(io::SeekFrom::Start(start - 1))?;
+                let mut byte = [0];
+                source.read_exact(&mut byte)?;
+                byte[0] != b'\n'
+            } else {
+                false
+            };
+            let count = |text: &str| {
+                text.matches('\n').count()
+                    + usize::from(
+                        end < length || (!text.ends_with('\n') && (!text.is_empty() || prefix)),
+                    )
+            };
+            diff.removed += if whole { lines } else { count(&edit.old) };
+            diff.added += count(&edit.new);
         } else {
-            false
-        };
-        let count = |text: &str| {
-            text.matches('\n').count()
-                + usize::from(
-                    end < length || (!text.ends_with('\n') && (!text.is_empty() || prefix)),
-                )
-        };
-        diff.removed += if whole { lines } else { count(&edit.old) };
-        diff.added += count(&edit.new);
+            diff.hunk("", (0, 0), &edit.new, (1, 1), limits);
+        }
         last = end;
     }
     if let Some(mut source) = original {
@@ -514,75 +520,6 @@ struct Diff {
     added: usize,
     removed: usize,
     work: usize,
-}
-
-fn apply(
-    original: Option<&str>,
-    edits: &[Replace],
-    limits: Limits,
-) -> Result<(String, Diff), String> {
-    let whole = matches!(edits, [Replace { old, .. }] if old.is_empty());
-    let original = match original {
-        Some(text) => text,
-        None if whole => "",
-        None => return Err("no such file; to create it, give one edit with an empty `old`".into()),
-    };
-    if edits.is_empty() {
-        return Err("no edits".to_owned());
-    }
-    let mut spans = Vec::with_capacity(edits.len());
-    for (n, Replace { old, new }) in (1..).zip(edits) {
-        if whole {
-            spans.push((0, original.len(), new.as_str(), n));
-            break;
-        }
-        if old.is_empty() {
-            return Err(format!(
-                "edit {n}: an empty `old` only works as the only edit"
-            ));
-        }
-        let Some(at) = original.find(old.as_str()) else {
-            return Err(format!("edit {n}: `old` is not in the file"));
-        };
-        let after_first = at
-            + original[at..]
-                .chars()
-                .next()
-                .expect("nonempty old")
-                .len_utf8();
-        if original[after_first..].contains(old.as_str()) {
-            return Err(format!(
-                "edit {n}: `old` appears more than once; include more of the text around it"
-            ));
-        }
-        spans.push((at, at + old.len(), new.as_str(), n));
-    }
-    spans.sort_unstable_by_key(|span| span.0);
-    for pair in spans.windows(2) {
-        if pair[1].0 < pair[0].1 {
-            return Err(format!("edits {} and {} overlap", pair[0].3, pair[1].3));
-        }
-    }
-    let size = spans
-        .iter()
-        .fold(original.len(), |size, &(start, end, new, _)| {
-            size - (end - start) + new.len()
-        });
-    let (mut content, mut diff, mut last) = (String::with_capacity(size), Diff::default(), 0);
-    let (mut old_line, mut new_line) = (1, 1);
-    for &(start, end, new, _) in &spans {
-        content.push_str(&original[last..start]);
-        content.push_str(new);
-        let skipped = original[last..start].matches('\n').count();
-        old_line += skipped;
-        new_line += skipped;
-        last = end;
-        diff.hunk(original, (start, end), new, (old_line, new_line), limits);
-        old_line += original[start..end].matches('\n').count();
-        new_line += new.matches('\n').count();
-    }
-    content.push_str(&original[last..]);
-    Ok((content, diff))
 }
 
 impl Diff {
@@ -661,6 +598,26 @@ mod tests {
     use protocol::Outcome;
     use serde_json::Value;
     use serde_json::json;
+
+    fn apply(
+        original: Option<&str>,
+        edits: &[Replace],
+        limits: Limits,
+    ) -> Result<(String, Diff), String> {
+        let source = original.map(|text| {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+            file
+        });
+        let (mut file, diff) =
+            apply_file(source.as_ref(), edits, limits).map_err(|error| match error {
+                EditError::Failed(message) => message,
+                error => format!("{error:?}"),
+            })?;
+        let mut content = String::new();
+        file.read_to_string(&mut content).unwrap();
+        Ok((content, diff))
+    }
 
     fn edits(pairs: &[(&str, &str)]) -> Vec<Replace> {
         pairs
@@ -796,6 +753,20 @@ mod tests {
             std::fs::read(rig.workspace().join("invalid")).unwrap(),
             invalid
         );
+    }
+
+    #[test]
+    fn streaming_keeps_every_hunk_the_diff_budget_can_format() {
+        let original = format!("{}target\n", "padding\n".repeat(12000));
+        let (_, diff) = apply(Some(&original), &edits(&[("target", "next")]), LIMITS).unwrap();
+        assert!(diff.text.contains("-target\n+next\n"), "{}", diff.text);
+        let (_, diff) = apply(
+            Some("first\nsecond\n"),
+            &edits(&[("first", "one"), ("second", &"x".repeat(300 << 10))]),
+            LIMITS,
+        )
+        .unwrap();
+        assert_eq!(diff.text, "@@ -1,1 +1,1 @@\n-first\n+one\n\n[diff cut]\n");
     }
 
     #[test]
