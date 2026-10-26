@@ -387,3 +387,82 @@ fn body_overlays_consume_the_image_budget_without_cutting_text() {
         1
     );
 }
+
+#[test]
+fn parallel_results_precede_relocated_media_even_when_delivered_separately() {
+    for split in [false, true] {
+        let mut request = held();
+        let Message::Assistant(assistant) = request.messages.get_mut(1).unwrap() else {
+            panic!()
+        };
+        let mut second = assistant.content[0].clone();
+        if let AssistantPart::ToolCall(call) = &mut second {
+            call.id = "call_2".into();
+        }
+        assistant.content.push(second);
+        let Message::Tool(tool) = request.messages.get_mut(2).unwrap() else {
+            panic!()
+        };
+        let mut second = tool.results[0].clone();
+        second.id = "call_2".into();
+        if split {
+            request.messages.push(Message::Tool(ToolMessage {
+                results: vec![second],
+            }));
+        } else {
+            tool.results.push(second);
+        }
+        let targets = targets();
+        for (provider, model) in [&targets[0], &targets[5]] {
+            let sent = body(provider, model, &request);
+            if provider.id.as_str() == "openai" {
+                let messages = sent["messages"].as_array().unwrap();
+                assert_eq!(messages[2]["role"], "tool");
+                assert_eq!(messages[3]["role"], "tool");
+                assert_eq!(messages[4]["role"], "user");
+            } else {
+                let contents = sent["contents"].as_array().unwrap();
+                let responses = contents[2]["parts"].as_array().unwrap();
+                assert_eq!(responses.len(), 2);
+                assert!(
+                    responses
+                        .iter()
+                        .all(|part| part.get("functionResponse").is_some())
+                );
+                assert!(contents[3].to_string().contains(PNG_BASE64));
+            }
+        }
+    }
+}
+
+#[test]
+fn failures_keep_their_context_and_media_on_wires_without_an_error_field() {
+    for output in [
+        Output::Text("permission denied".into()),
+        Output::Json(llm::Json::encode(&json!({"reason": "permission denied"})).unwrap()),
+        Output::Content(vec![]),
+        {
+            let Message::Tool(tool) = &held().messages[2] else {
+                panic!()
+            };
+            tool.results[0].output.clone()
+        },
+    ] {
+        let mut request = held();
+        let Message::Tool(tool) = request.messages.get_mut(2).unwrap() else {
+            panic!()
+        };
+        tool.results[0].error = true;
+        tool.results[0].output = output.clone();
+        let targets = targets();
+        for (provider, model) in [&targets[0], &targets[3]] {
+            let sent = body(provider, model, &request).to_string();
+            assert!(sent.contains("[tool error]"), "{model}: {sent}");
+            match &output {
+                Output::Text(_) | Output::Json(_) => assert!(sent.contains("permission denied")),
+                Output::Content(parts) if !parts.is_empty() => assert!(sent.contains(PNG_BASE64)),
+                Output::Content(_) => {}
+            }
+        }
+    }
+}
