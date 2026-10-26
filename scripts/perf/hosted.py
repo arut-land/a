@@ -393,9 +393,9 @@ def sessions(source, output, variant, reference=""):
         # snmalloc checks Git Bash's MSYSTEM before the MSVC target.
         env.pop("MSYSTEM", None)
 
-    def engine(name, features=(), checkout=source):
+    def benchmark(name, target=("-p", "engine", "--lib"), features=(), checkout=source):
         build_env = dict(env, CARGO_TARGET_DIR=str(checkout / "target/perf-build"))
-        result = run(["cargo", "test", "--release", *STD, "-p", "engine", "--lib", "--no-run",
+        result = run(["cargo", "test", "--release", *STD, *target, "--no-run",
                       *(["--features", ",".join(features)] if features else []),
                       "--message-format=json"], cwd=checkout, env=build_env, stdout=subprocess.PIPE, text=True)
         executables = [record["executable"] for line in result.stdout.splitlines()
@@ -405,7 +405,7 @@ def sessions(source, output, variant, reference=""):
         shutil.copy2(executables[0], binary)
         return binary
 
-    binary = engine("engine-bench")
+    binary = benchmark("engine-bench")
     extra = []
     if reference:
         reference_source = source.parent / "reference"
@@ -413,7 +413,7 @@ def sessions(source, output, variant, reference=""):
         reference = subprocess.check_output(["git", "rev-parse", "FETCH_HEAD"], cwd=source, text=True).strip()
         run(["git", "worktree", "add", "--detach", reference_source, reference], cwd=source)
         extra.append(f"candidate={binary}")
-        binary = engine("engine-bench-reference", checkout=reference_source)
+        binary = benchmark("engine-bench-reference", checkout=reference_source)
     for allocator in variant.get("allocators", []):
         if allocator == "segment":
             if os.name != "nt":
@@ -427,9 +427,10 @@ def sessions(source, output, variant, reference=""):
         elif allocator == "jemalloc" and os.name == "nt":
             continue
         else:
-            extra.append(f"{allocator}={engine('engine-bench-' + allocator, ['sys/' + allocator])}")
+            extra.append(f"{allocator}={benchmark('engine-bench-' + allocator, features=['sys/' + allocator])}")
     layouts = ["--layouts", "memory", *(arg for entry in extra for arg in ("--binary", entry))] \
         if "allocators" in variant or reference else []
+    round_trip = [] if layouts else ["--round-trip", benchmark("rt-round-trip", ("-p", "rt", "--test", "round_trip"))]
     os.environ.update(A_PERF_PYTHON=sys.executable, A_PERF_PROCESS=str(ROOT / "scripts/perf/process.py"))
     (output / "sessions").mkdir(exist_ok=True)
     (output / "sessions" / "host.json").write_text(json.dumps(dict(
@@ -439,7 +440,7 @@ def sessions(source, output, variant, reference=""):
     ), indent=2) + "\n")
     run([sys.executable, ROOT / "scripts/perf/sessions.py", binary, "--output", output / "sessions",
          "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5"),
-         "--sessions", variant.get("sessions", "1,8,32,128"), *layouts], cwd=source)
+         "--sessions", variant.get("sessions", "1,8,32,128"), *layouts, *round_trip], cwd=source)
 
 
 def main():

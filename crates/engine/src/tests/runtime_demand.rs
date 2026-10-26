@@ -29,7 +29,10 @@ fn concurrent_session_sizing() {
                 )
             })
             .collect();
-        loaded.writer.append(&mut entries, true).unwrap();
+        loaded
+            .writer
+            .append(&mut entries, crate::store::AppendMode::Order)
+            .unwrap();
         loaded.writer.flush_inline().unwrap();
         headers.push(header);
     }
@@ -442,6 +445,9 @@ fn concurrent_active_sessions() {
     let cpu = |a: &serde_json::Value, b: &serde_json::Value| {
         (b["cpu_seconds"].as_f64().unwrap() - a["cpu_seconds"].as_f64().unwrap()) * 1000.0
     };
+    let switches = |a: &serde_json::Value, b: &serde_json::Value| {
+        b["ctx_switches"].as_u64().unwrap() - a["ctx_switches"].as_u64().unwrap()
+    };
     let mut record = json!({
             "runtime": variant,
             "sessions": load.sessions,
@@ -456,10 +462,12 @@ fn concurrent_active_sessions() {
             "turn_ms": turns,
             "active_wall_ms": wall.as_secs_f64() * 1000.0,
             "active_cpu_ms": cpu(&active, &ended),
+            "active_switches": switches(&active, &ended),
             "baseline_rss_kib": before["rss_kib"],
             "idle_rss_kib": settled["rss_kib"],
             "idle_threads": settled["thread_count"],
             "idle_cpu_ms": cpu(&settled, &idle),
+            "idle_switches": switches(&settled, &idle),
             // Lifetime peaks: the resident set (Linux, Windows) or footprint (macOS).
             "peak_kib": settled.get("peak_rss_kib").or(settled.get("peak_footprint_kib")),
             "idle_footprint_kib": settled.get("footprint_kib"),

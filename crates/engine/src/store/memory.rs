@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use protocol::{Decode, Entry, SessionId};
 
 use super::{
-    Encoded, Header, History, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Snapshot,
-    Writer, not_found, span,
+    Encoded, Header, History, Lines, Loaded, Local, Log, LogStore, Snapshot, Writer, not_found,
+    span,
 };
 
 /// Sessions held in this process, for tests: durable until it exits. Each

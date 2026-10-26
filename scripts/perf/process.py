@@ -11,7 +11,8 @@ def snapshot(pid, threads=False):
     result = {"rss_kib": process.memory_info().rss / 1024,
               "cpu_seconds": cpu.user + cpu.system,
               "user_seconds": cpu.user, "kernel_seconds": cpu.system,
-              "thread_count": process.num_threads()}
+              "thread_count": process.num_threads(),
+              "ctx_switches": switches(process)}
     try:
         result.update(memory_peaks(pid, process))
     except (OSError, AttributeError):
@@ -44,6 +45,24 @@ def memory_peaks(pid, process):
         fields = struct.unpack_from("<40Q", buffer, 16)
         return {"footprint_kib": fields[7] / 1024, "peak_footprint_kib": fields[28] / 1024}
     return {}
+
+
+def switches(process):
+    """Context switches of the whole process: the task's count on macOS and the
+    threads' counters on Windows. Linux's /proc/<pid>/status (what psutil reads)
+    counts the main thread only, so the live threads' counts are summed there."""
+    if not sys.platform.startswith("linux"):
+        return sum(process.num_ctx_switches())
+    from pathlib import Path
+    total = 0
+    for task in Path(f"/proc/{process.pid}/task").iterdir():
+        try:
+            status = (task / "status").read_text()
+        except OSError:
+            continue  # exited since listed
+        total += sum(int(value) for name, value in (line.split(":", 1) for line in status.splitlines())
+                     if name in ("voluntary_ctxt_switches", "nonvoluntary_ctxt_switches"))
+    return total
 
 
 def run_timed(argv, timeout=300, check=True, **kwargs):
