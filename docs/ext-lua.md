@@ -162,9 +162,9 @@ timeout_ms = 25
 Memory is capped per VM; a mod with folds has a separate reducer VM.
 An owned invocation chain shares its instruction and dispatch allowance,
 including named descendants on other workers or in other mod VMs. Sequential
-hooks share a dispatch allowance too. Preparation shares one allowance across
-the tool and reducer VM compilations. Reducer applications budget both source
-preparation and reduction. Active poll time accumulates across resumes,
+hooks share a dispatch allowance too. Generation preparation shares one instruction allowance across
+the tool and reducer VM compilations, including recovery. Reducer applications
+budget both source preparation and reduction by instructions too. Active poll time accumulates across resumes,
 excluding awaited I/O; this is not an OS-enforced hard deadline for native functions.
 Each generation admits at most 16 executing calls and 64 waiters. A call releases
 its permit while awaiting a delegated tool, then reacquires before resuming;

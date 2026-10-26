@@ -470,8 +470,8 @@ impl Mod {
                 "lua {name}: lua limits must be positive (at least 1000 instructions)"
             )));
         }
-        // Lua's parser does not run instruction hooks. Bound its input before
-        // compilation and check the shared preparation deadline around native work.
+        // Lua's parser does not run instruction hooks, so bound its input.
+        // Recorded generations must prepare with the same fuel during recovery.
         if source.len() > limits.memory / 4 {
             return Err(Refused(format!(
                 "lua {name}: lua preparation source exceeds budget"
@@ -483,7 +483,7 @@ impl Mod {
             tools,
             limits,
             VmMode::Live,
-            &Budget::new(limits),
+            &Budget::fuel(limits),
         )
         .map_err(|why| Refused(format!("lua {name}: {why}")))
     }
@@ -496,7 +496,6 @@ impl Mod {
         vm_mode: VmMode,
         budget: &Arc<Budget>,
     ) -> mlua::Result<Self> {
-        budget.check_time()?;
         let (lua, callbacks, globals) = sandbox(limits, vm_mode)?;
         let made = register(&lua, &lua.globals())?;
         let hook = Arc::clone(budget);
@@ -510,7 +509,6 @@ impl Mod {
             HookTriggers::new().every_nth_instruction(1000),
             move |_, _| hook.check(),
         )?;
-        budget.check_time()?;
         thread.resume::<()>(())?;
         let mut made = std::mem::take(&mut *locked(&made));
         let name = Name::from(name);
@@ -596,7 +594,6 @@ impl Mod {
                 }));
             }
         }
-        budget.check_time()?;
         Ok(result)
     }
 }
@@ -1534,7 +1531,30 @@ mod tests {
     }
 
     #[test]
-    fn preparation_rejects_oversized_source_expired_deadlines_and_exhausted_instructions() {
+    fn recorded_generation_preparation_depends_on_fuel_not_elapsed_time() {
+        let limits = Limits {
+            slice: Duration::from_nanos(1),
+            ..Limits::default()
+        };
+        let source =
+            "a.fold{name='count',initial=0,apply=function(state,change) return state+change end}";
+        let module = Mod::load("test", source, &[], limits).unwrap();
+        let restored = Mod::restore("test", &module.image).unwrap();
+        assert_eq!(restored.image, module.image);
+        for module in [&module, &restored] {
+            assert_eq!(
+                module.folds[0]
+                    .apply(&Json::encode(&1).unwrap(), &Json::encode(&2).unwrap())
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap(),
+                3
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_rejects_oversized_source_and_exhausted_instructions() {
         let limits = Limits::default();
         let source = " ".repeat(limits.memory / 4 + 1);
         assert!(
@@ -1543,15 +1563,6 @@ mod tests {
                 .unwrap()
                 .0
                 .contains("preparation source")
-        );
-        let budget = Budget::new(limits);
-        *locked(&budget.wall.as_ref().unwrap().until) = Instant::now();
-        assert!(
-            Mod::compile("deadline", "return", &[], limits, VmMode::Live, &budget)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("budget")
         );
         let limits = Limits {
             instructions: 6_000,
