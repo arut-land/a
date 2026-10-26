@@ -436,8 +436,8 @@ fn without_a_client_the_daemons_secrets_stay_out() {
         "CLIENT_SECRET",
         "LANG",
     ]
-    .map(|k| (k.to_owned(), "v".to_owned()));
-    let env = environment(&cx, daemon.into_iter());
+    .map(|k| (k.into(), "v".into()));
+    let env = environment(&cx, daemon);
     assert!(env.contains_key("PATH") && env.contains_key("LANG"));
     for secret in [
         "OPENAI_API_KEY",
@@ -581,24 +581,63 @@ fn a_background_command_returns_at_once_with_its_log() {
     assert!(model(&ran).starts_with(&format!("[running in the background: job {}", job.pgid)));
 }
 
-/// Its end is an event, not something a poll finds: noticed within
-/// moments, whether the shell itself or a process it left behind ends
-/// last, and the leader is reaped (a zombie would keep the group alive).
 #[test]
-fn a_job_end_is_seen_at_once() {
+fn a_job_end_is_reported_after_its_last_process_exits() {
+    use std::io::Write;
     let rig = rig("job-ends");
-    for command in ["sleep 1", "(sleep 1 &); exit 0"] {
+    let gate = rig.dir.join("release");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&gate)
+            .status()
+            .unwrap()
+            .success()
+    );
+    for command in [
+        format!("read -r release < '{}'", gate.display()),
+        format!("(read -r release < '{}' &); exit 0", gate.display()),
+    ] {
         let mut seen = rig.ends.count();
         let ran = bash(&rig, &json!({ "command": command, "background": true }));
         let pgid = ran.background.unwrap().pgid;
-        let started = Instant::now();
+        // Opening the writer synchronizes with the real child's read.
+        let mut release = std::fs::OpenOptions::new().write(true).open(&gate).unwrap();
+        assert_eq!(rig.ends.count(), seen);
+        assert!(sys::RecordedIdentity(pgid).alive());
+        release.write_all(b"finish\n").unwrap();
+        drop(release);
         rt::block_on(rig.ends.changed(&mut seen));
-        let took = started.elapsed();
         assert!(!sys::RecordedIdentity(pgid).alive(), "{command}");
-        // Re-checking on a backoff would first look again at 1.55 s.
-        assert!(took >= Duration::from_millis(900), "{command}: {took:?}");
-        assert!(took < Duration::from_millis(1300), "{command}: {took:?}");
     }
+}
+
+#[test]
+fn fallback_environment_skips_non_utf8_host_values() {
+    use std::os::unix::ffi::OsStringExt;
+    const CHILD: &str = "A_TEST_FALLBACK_ENV";
+    if std::env::var_os(CHILD).is_some() {
+        let rig = rig("byte-environment");
+        assert!(rig.env.is_none());
+        let ran = run(&rig, r#"printf '%s:%s' "$LANG" "${TERMINFO-unset}""#);
+        assert_eq!(ran.output, "C:unset");
+        assert_eq!(ran.exit, Some(0));
+        return;
+    }
+    let home = rig("byte-environment-parent");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "bash::tests::fallback_environment_skips_non_utf8_host_values",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("A_HOME", &home.dir)
+        .env("LANG", "C")
+        .env("TERMINFO", std::ffi::OsString::from_vec(vec![0xff]))
+        .env(std::ffi::OsString::from_vec(vec![b'X', 0xff]), "byte name")
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 /// Wraps every process in `env`, adding a variable.
@@ -800,7 +839,7 @@ fn continuous_output_yields_to_other_sessions() {
                         sys::shell::ExecutionFacts::current(),
                         "exit 0",
                         &cx.dir(),
-                        environment(&cx, std::env::vars()),
+                        environment(&cx, std::env::vars_os()),
                         None,
                     )
                     .unwrap(),

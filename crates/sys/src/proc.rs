@@ -584,11 +584,18 @@ mod imp {
 
     #[cfg(target_os = "linux")]
     pub fn process_started(pid: u32) -> Option<u64> {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
         // Field 22, counting from the pid; the command name before it, in
         // parentheses, may hold spaces.
-        let (_, rest) = stat.rsplit_once(')')?;
-        rest.split_whitespace().nth(19)?.parse().ok()
+        let rest = &stat[stat.iter().rposition(|b| *b == b')')? + 1..];
+        std::str::from_utf8(
+            rest.split(u8::is_ascii_whitespace)
+                .filter(|v| !v.is_empty())
+                .nth(19)?,
+        )
+        .ok()?
+        .parse()
+        .ok()
     }
 
     /// In microseconds since the epoch.
@@ -685,12 +692,14 @@ mod imp {
             return Vec::new();
         };
         let member = |pid: &u32| {
-            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
             // After the command name, in parentheses: state, ppid, pgrp.
-            let (_, rest) = stat.rsplit_once(')')?;
-            let mut fields = rest.split_whitespace();
+            let rest = &stat[stat.iter().rposition(|b| *b == b')')? + 1..];
+            let mut fields = rest
+                .split(u8::is_ascii_whitespace)
+                .filter(|v| !v.is_empty());
             let state = fields.next()?;
-            Some(state != "Z" && fields.nth(1)?.parse() == Ok(pgid))
+            Some(state != b"Z" && std::str::from_utf8(fields.nth(1)?).ok()?.parse() == Ok(pgid))
         };
         dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
             .filter(|pid| member(pid) == Some(true))
@@ -850,6 +859,51 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore)]
+    fn procfs_identity_and_membership_ignore_non_utf8_command_names() {
+        use std::io::{BufRead, Write};
+        const CHILD: &str = "A_TEST_PROC_NAME";
+        if std::env::var_os(CHILD).is_some() {
+            std::fs::write("/proc/self/comm", b"a ) \xff").unwrap();
+            println!("ready");
+            io::stdout().flush().unwrap();
+            io::stdin().read_line(&mut String::new()).unwrap();
+            return;
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "proc::tests::procfs_identity_and_membership_ignore_non_utf8_command_names",
+                "--nocapture",
+            ])
+            .env(CHILD, "1");
+        let (mut child, mut input, output) = spawn_stdio(&mut command).unwrap();
+        let mut output = io::BufReader::new(output);
+        let mut line = String::new();
+        loop {
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "child never started"
+            );
+            if line.trim() == "ready" {
+                break;
+            }
+            line.clear();
+        }
+        assert!(
+            String::from_utf8(std::fs::read(format!("/proc/{}/stat", child.id())).unwrap())
+                .is_err()
+        );
+        assert!(process_started(child.id()).is_some());
+        assert!(child.group.members().unwrap().contains(&child.id()));
+        input.write_all(b"release\n").unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
     fn adopted_daemon_lock_excludes_an_independent_opener() {
         let dir = std::env::temp_dir().join(format!("a-c02-review-lock-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("run")).unwrap();
@@ -986,6 +1040,11 @@ mod tests {
             .stdin(std::process::Stdio::piped());
         let (mut child, input, _output) = spawn_stdio(&mut cmd).unwrap();
         let watch = child.child.exit_watch().unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            std::fs::read_link(format!("/proc/self/fd/{}", watch.as_raw_fd())).unwrap(),
+            std::path::Path::new("anon_inode:[pidfd]")
+        );
         assert!(!readable(&watch, 50));
         // The shell and its background sleep.
         let group = RecordedIdentity(child.id());

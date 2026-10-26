@@ -7,8 +7,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 
 use super::{Passed, SpawnEnvironment};
 use crate::Signal;
@@ -20,8 +20,6 @@ struct OwnedChild {
     pid: u32,
     watch: Option<OwnedFd>,
     group: bool,
-    /// Readable once the child exits, where it has no `watch`.
-    unwatched: Mutex<Option<OwnedFd>>,
     /// Handed to the next build: this process's image no longer signals or
     /// reaps it, the one it execs into does.
     released: AtomicBool,
@@ -99,14 +97,11 @@ impl Child {
             pid,
             watch: None,
             group: true,
-            unwatched: Mutex::new(None),
             released: AtomicBool::new(false),
         }));
         match super::imp::exit_watch(pid) {
             Ok(watch) => Arc::get_mut(&mut child.0).unwrap().watch = Some(watch),
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ENOSYS) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
         Ok(child)
@@ -151,70 +146,14 @@ impl Child {
         if let Some(watch) = &self.0.watch {
             return watch.try_clone();
         }
-        let mut unwatched = (self.0.unwatched.lock()).unwrap_or_else(PoisonError::into_inner);
-        if unwatched.is_none() {
-            let (reader, writer) = io::pipe()?;
-            // A Darwin child gone before it could be watched reads as
-            // ended at once; dropping the writer is what says so.
-            if self.observe(true)?.is_none() {
-                unwatched::watch(self.id(), writer.into());
-            }
-            *unwatched = Some(reader.into());
+        // Darwin can report a child gone before kqueue registration.
+        // An observed status supplies readiness without a polling worker.
+        if self.observe(true)?.is_none() {
+            return Err(io::ErrorKind::NotFound.into());
         }
-        unwatched
-            .as_ref()
-            .expect("registered exit watch")
-            .try_clone()
-    }
-}
-
-/// Children with no native exit notification: those on Linux before 5.3,
-/// which has no pidfds and is not a supported target. One thread checks
-/// them all in turn without reaping them, and closes each one's pipe as it
-/// exits; it ends with the last of them. Unoptimized on purpose: it only
-/// keeps such a kernel working.
-mod unwatched {
-    use std::os::fd::OwnedFd;
-    use std::sync::{Mutex, PoisonError};
-    use std::time::Duration;
-
-    /// How often an unwatched child is looked at.
-    const SLICE: Duration = Duration::from_millis(100);
-
-    /// Each child's pid and the writer its exit closes; whether the thread runs.
-    static WATCHED: Mutex<(Vec<(u32, OwnedFd)>, bool)> = Mutex::new((Vec::new(), false));
-
-    pub(super) fn watch(pid: u32, writer: OwnedFd) {
-        let mut watched = WATCHED.lock().unwrap_or_else(PoisonError::into_inner);
-        watched.0.push((pid, writer));
-        if watched.1 {
-            return;
-        }
-        watched.1 = std::thread::Builder::new()
-            .name("a-child-exits".into())
-            .spawn(run)
-            .is_ok();
-    }
-
-    /// Called before the child is reaped, after which its pid may name another.
-    pub(super) fn forget(pid: u32) {
-        let mut watched = WATCHED.lock().unwrap_or_else(PoisonError::into_inner);
-        watched.0.retain(|(watched, _)| *watched != pid);
-    }
-
-    fn run() {
-        loop {
-            let mut watched = WATCHED.lock().unwrap_or_else(PoisonError::into_inner);
-            watched
-                .0
-                .retain(|(pid, _)| matches!(super::observe(libc::P_PID, *pid, true), Ok(None)));
-            if watched.0.is_empty() {
-                watched.1 = false;
-                return;
-            }
-            drop(watched);
-            std::thread::sleep(SLICE);
-        }
+        let (reader, writer) = io::pipe()?;
+        drop(writer);
+        Ok(reader.into())
     }
 }
 
@@ -303,15 +242,6 @@ impl Drop for OwnedChild {
         let owned = self.observe(true).is_ok();
         if self.group && owned {
             let _ = super::imp::signal_group(self.pid, Signal::Kill);
-        }
-        if self
-            .unwatched
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-            .is_some()
-        {
-            unwatched::forget(self.pid);
         }
         #[cfg(target_os = "linux")]
         if let Some(watch) = &self.watch
@@ -490,13 +420,10 @@ impl<'a> SpawnPlan<'a> {
             pid: pid.cast_unsigned(),
             watch: None,
             group: self.group,
-            unwatched: Mutex::new(None),
             released: AtomicBool::new(false),
         }));
         match super::imp::exit_watch(child.id()) {
             Ok(watch) => Arc::get_mut(&mut child.0).unwrap().watch = Some(watch),
-            #[cfg(target_os = "linux")]
-            Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {}
             // Darwin may report ESRCH for a child already exited. Its unreaped
             // status still pins identity, and an owned wait supplies readiness.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -855,13 +782,15 @@ mod tests {
     }
 
     #[test]
-    fn a_child_without_a_native_exit_watch_is_seen_to_exit_and_stays_waitable() {
+    #[cfg(target_vendor = "apple")]
+    fn an_already_exited_child_without_kqueue_reads_as_ended() {
         let null = null();
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 30"]);
+        command.args(["-c", "exit 17"]);
         let mut child = SpawnPlan::new(&command, [&null, &null, &null])
             .spawn()
             .unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(17));
         Arc::get_mut(&mut child.0).unwrap().watch.take();
         let watch = child.exit_watch().unwrap();
         let mut fds = [rustix::event::PollFd::new(
@@ -870,13 +799,9 @@ mod tests {
         )];
         assert_eq!(
             rustix::event::poll(&mut fds, Some(&rustix::event::Timespec::default())).unwrap(),
-            0
+            1
         );
-        child.kill().unwrap();
-        let timeout = rustix::event::Timespec::try_from(std::time::Duration::from_secs(5)).unwrap();
-        assert_eq!(rustix::event::poll(&mut fds, Some(&timeout)).unwrap(), 1);
-        assert!(!child.wait().unwrap().success());
-        assert!(!child.wait().unwrap().success());
+        assert_eq!(child.wait().unwrap().code(), Some(17));
     }
 }
 
