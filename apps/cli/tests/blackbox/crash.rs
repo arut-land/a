@@ -153,7 +153,7 @@ fn a_crash_leaves_no_stream_open_and_what_it_cut_off_holds_what_it_wrote() {
     let queued = || {
         (env.log(id).into_iter())
             .filter_map(|e| match e.body {
-                Body::Enqueue { envelope } => Some((envelope.payload, envelope.held)),
+                Body::Enqueue { envelope } => Some((envelope.payload().clone(), envelope.held)),
                 _ => None,
             })
             .collect::<Vec<_>>()

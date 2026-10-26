@@ -34,7 +34,7 @@ use protocol::ledger::Ledger;
 use protocol::view::SessionView;
 use protocol::{
     Activity, Author, Body, CallId, DaemonMsg, Entry, Environment, Frame, Json, Mode, Outcome,
-    ReadOnly, Residency, SessionId, SessionSummary, ToolChoice,
+    ReadOnly, Residency, SessionId, SessionSummary, ToolChoice, WaitOn,
 };
 use rt::BlockingClass::Cpu;
 use rt::{channel, oneshot, or};
@@ -150,7 +150,7 @@ impl Shared {
             if Some(seq) != active && !ledger.untaken().iter().any(|q| q.seq == seq) {
                 continue;
             }
-            let id = &envelope.id;
+            let id = envelope.id();
             let entries = if let Some(live) = self
                 .daemon
                 .upgrade()
@@ -186,10 +186,10 @@ impl Shared {
                 return Ok(Owner::Gone);
             };
             let cancelled = if let Some(live) = slot.live() {
-                cancelled_watch(live.frames.entries()?, child)
+                cancelled_child(live.frames.entries()?, child)
             } else {
                 let seq = self.catalog.get(parent.session).map_or(0, |r| r.entries);
-                cancelled_watch(self.store.prefix(parent.session, seq)?, child)
+                cancelled_child(self.store.prefix(parent.session, seq)?, child)
             };
             if cancelled {
                 return Ok(Owner::Cancelled);
@@ -203,15 +203,29 @@ impl Shared {
     }
 }
 
-fn cancelled_watch(entries: impl IntoIterator<Item = Entry>, child: SessionId) -> bool {
+fn cancelled_child(entries: impl IntoIterator<Item = Entry>, child: SessionId) -> bool {
     let mut watch = None;
+    let mut link = None;
+    let mut caller = None;
     for entry in entries {
         match entry.body {
-            Body::Watch { child: watched } if watched == child => watch = Some(entry.seq),
-            Body::Fired {
-                watch: fired,
+            Body::Link { child: linked, .. } if linked == child => {
+                link = Some(entry.seq);
+                caller = None;
+            }
+            Body::Wait {
+                call,
+                on: WaitOn::Child { link: waiting },
+            } if link == Some(waiting) => caller = Some(call),
+            // An awaited child still delivers its outcome. Its waiting
+            // call's interrupted result proves the owner's cancellation.
+            Body::ToolResult {
+                call,
                 outcome: Outcome::Interrupted { .. },
-            } if watch == Some(fired) => return true,
+                ..
+            } if caller == Some(call) => return true,
+            Body::Watch { child: watched } if watched == child => watch = Some(entry.seq),
+            Body::Unwatch { watch: cancelled } if watch == Some(cancelled) => return true,
             _ => {}
         }
     }
@@ -718,7 +732,6 @@ impl Live {
         let load = Load {
             session: Some(header.id),
             abandoned: &abandoned,
-            boot: sys::boot_id(),
             fresh,
             owner,
             busy,
@@ -2390,7 +2403,6 @@ impl Actor {
         self.publish();
         let load = Load {
             session: Some(self.live.id),
-            boot: sys::boot_id(),
             busy: self.live.has_work(),
             abandoned: &abandoned,
             owner,
@@ -2532,8 +2544,6 @@ impl Actor {
                     );
                 }
             }
-            // A replayed process number carries no live OS ownership.
-            Effect::Kill { .. } => {}
             Effect::EndStream { stream, cut } => self.end_stream(stream, cut),
             Effect::DiscardStream { stream } => {
                 let store = Arc::clone(&shared.blobs);

@@ -128,9 +128,9 @@ fn context_fact(body: &Body) -> Option<ContextValue> {
         } => ContextValue::User(text.clone()),
         Body::Input { segments, mode, .. } => ContextValue::Queued(segments.clone(), *mode),
         Body::Enqueue { envelope } => {
-            let (call, held) = (envelope.id.call, envelope.held.clone());
-            match &envelope.payload {
-                Carried::Message(text) => ContextValue::Inbox(envelope.id.clone(), text.clone()),
+            let (call, held) = (envelope.id().call, envelope.held.clone());
+            match envelope.payload() {
+                Carried::Message(text) => ContextValue::Inbox(envelope.id().clone(), text.clone()),
                 Carried::Job(text) => ContextValue::Job(call, text.clone(), held),
                 Carried::Child(outcome) => ContextValue::Child(outcome.clone()),
                 Carried::Detached(outcome) => ContextValue::Background(call, outcome.clone(), held),
@@ -817,16 +817,17 @@ mod tests {
     #[test]
     fn another_sessions_message_names_its_sender_and_channel() {
         let sender = SessionId::new();
-        let envelope = protocol::Envelope {
-            id: EnvelopeId {
+        let envelope = protocol::Envelope::new(
+            EnvelopeId {
                 sender,
                 call: CallId::new(3).unwrap(),
                 purpose: "subagent:message/0".into(),
             },
-            destination: SessionId::new(),
-            payload: "hello".into(),
-            held: Vec::new(),
-        };
+            SessionId::new(),
+            "hello".into(),
+            Vec::new(),
+        )
+        .unwrap();
         let entries = [entry(1, Body::Enqueue { envelope }), entry(2, take(1))];
         assert_eq!(
             said(&seen(&entries, Registry::default())),

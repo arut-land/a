@@ -191,8 +191,7 @@ pub enum Fact {
         sessions: usize,
     },
     Mismatch {
-        min: u32,
-        max: u32,
+        proto: u32,
     },
     ProviderError {
         session: SessionId,

@@ -226,7 +226,7 @@ fn a_log_folds_to_what_its_session_did() {
     let end = Ledger::of(&entries);
     assert_eq!(end.activity(), Activity::Approval);
     assert_eq!(end.untaken().len(), 1);
-    assert_eq!(end.turn_start(), 2);
+    assert_eq!(end.turn_start(), Seq::new(2));
     assert!(end.has_context());
 }
 

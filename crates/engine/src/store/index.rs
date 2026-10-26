@@ -74,8 +74,9 @@ impl Index {
                 self.resolve(*call, entry.seq, done);
             }
             Body::Enqueue { envelope } => {
-                if !self.enqueues.iter().any(|(id, _)| *id == envelope.id) {
-                    self.enqueues.push((envelope.id.clone(), CallId(entry.seq)));
+                if !self.enqueues.iter().any(|(id, _)| id == envelope.id()) {
+                    self.enqueues
+                        .push((envelope.id().clone(), CallId(entry.seq)));
                 }
             }
             Body::Input { taken: true, .. } => self.input = None,
@@ -206,16 +207,17 @@ mod tests {
             .role(ext::ModelRole::Fast)
             .request(CallId::new(1).unwrap());
         let owner = CallId::new(1).unwrap();
-        let envelope = Envelope {
-            id: EnvelopeId {
+        let envelope = Envelope::new(
+            EnvelopeId {
                 sender: SessionId::new(),
                 call: owner,
                 purpose: "delivery".into(),
             },
-            destination: child,
-            payload: "message".into(),
-            held: Vec::new(),
-        };
+            child,
+            "message".into(),
+            Vec::new(),
+        )
+        .unwrap();
         let mut bodies = vec![
             Body::ModelCall {
                 model: "test".into(),
@@ -253,12 +255,12 @@ mod tests {
                 into: None,
             },
             Body::Outbox {
-                envelope_id: envelope.id.clone(),
+                envelope_id: envelope.id().clone(),
                 recipients: vec![envelope.destination],
                 payload: "message".into(),
             },
             Body::Ack {
-                envelope_id: envelope.id.clone(),
+                envelope_id: envelope.id().clone(),
                 recipient: envelope.destination,
                 refusal: None,
             },
@@ -366,9 +368,9 @@ mod tests {
                     envelope: envelope.clone(),
                 },
             ));
-            assert!(ledger.received(&envelope.id));
+            assert!(ledger.received(envelope.id()));
             assert_eq!(ledger.inbox_len(), 0);
-            assert_eq!(ledger.acknowledged(&envelope.id), Some(&None));
+            assert_eq!(ledger.acknowledged(envelope.id()), Some(&None));
             assert_eq!(ledger.outbox(), []);
         }
         std::fs::remove_dir_all(dir).unwrap();

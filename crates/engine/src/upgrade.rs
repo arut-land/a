@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use protocol::{DaemonMsg, Frame, Versions};
+use protocol::{DaemonMsg, Frame};
 use sys::Runtime;
 
 use crate::lock;
@@ -49,16 +49,10 @@ impl Verdict {
     /// `own` means a newer build was staged (staging never downgrades), and a
     /// client of another build is the cue to hand over. Clients of this very
     /// build keep being served until then, whatever `current` says.
-    pub fn of(
-        proto: impl Into<Versions>,
-        client: &str,
-        own: &str,
-        current: Option<&str>,
-        draining: bool,
-    ) -> Self {
+    pub fn of(proto: u32, client: &str, own: &str, current: Option<&str>, draining: bool) -> Self {
         if draining || (client != own && current.is_some_and(|c| c != own)) {
             Self::Drain
-        } else if Versions::OURS.common(proto.into()).is_some() {
+        } else if proto == protocol::PROTO {
             Self::Welcome
         } else {
             Self::Mismatch
@@ -94,7 +88,7 @@ impl Lifecycle {
         }
     }
 
-    pub fn verdict(&self, proto: impl Into<Versions>, client: &str) -> Verdict {
+    pub fn verdict(&self, proto: u32, client: &str) -> Verdict {
         // A `current` that cannot be started is no reason to stop serving.
         let current = self
             .runtime

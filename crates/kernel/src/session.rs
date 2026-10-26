@@ -1,6 +1,5 @@
 //! The turn and call state machine: one [`Core`] per session.
 
-use protocol::publication::RunnerKind;
 use std::mem;
 use std::sync::Arc;
 
@@ -27,6 +26,18 @@ const AGENT: &str = "agent";
 /// whatever the `request_error` point says: a daemon that keeps dying
 /// mid-call cannot retry it forever.
 pub const RESTART_CAP: u16 = 10;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Facts {
+    Notes,
+    Changed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Effects {
+    Internal,
+    External,
+}
 
 /// How a tool call ended, as its result is logged.
 struct Ended {
@@ -68,8 +79,7 @@ impl Core {
     /// cancels what it has in flight and passes what committed), a
     /// registry reload or a panic.
     ///
-    /// Links are re-armed; process groups left over in this boot are
-    /// killed; a command cut off is interrupted; each open call goes on as
+    /// Links are re-armed; a command cut off is interrupted; each open call goes on as
     /// its phase says (a gate is asked again, a wait stays, a safe call
     /// runs again, an unsafe one is interrupted with the output it logged,
     /// a model call counts the attempt it cut off as failed); then what the agent
@@ -324,7 +334,14 @@ impl Core {
                 .any(|entry| !matches!(entry.body, Body::Progress { .. } | Body::Ext { .. }));
             fx.commit = Some(crate::Commit {
                 through,
-                durability: self.commit(fact, fx.immediate.iter().any(Work::external)),
+                durability: self.commit(
+                    if fact { Facts::Changed } else { Facts::Notes },
+                    if fx.immediate.iter().any(Work::external) {
+                        Effects::External
+                    } else {
+                        Effects::Internal
+                    },
+                ),
                 publish: fact && self.turn == Turn::Idle,
             });
         }
@@ -337,18 +354,13 @@ impl Core {
                         Requirement::Durable
                     })
                 }
-                Work::Prepare { .. } | Work::Send { .. }
-                    if self.registry.runner() == RunnerKind::ModelOnly =>
-                {
-                    Some(Requirement::Durable)
+                Work::Prepare { .. } | Work::Send { .. } => {
+                    Some(self.registry.model_contract().admission())
                 }
-                Work::Prepare { .. }
-                | Work::Send { .. }
-                | Work::Sleep { .. }
+                Work::Sleep { .. }
                 | Work::Await { .. }
                 | Work::Recover { .. }
                 | Work::Adopt { .. }
-                | Work::Kill { .. }
                 | Work::EndStream { .. } => Some(Requirement::Ordered),
                 Work::Invocation { .. }
                 | Work::Reply { .. }
@@ -377,10 +389,10 @@ impl Core {
     /// How durable a step's entries are to be: holding `fact`s beyond
     /// notes or not, `before` an external effect or not, with the turn as
     /// it stands.
-    fn commit(&self, fact: bool, before: bool) -> Durability {
-        let barrier = before
+    fn commit(&self, fact: Facts, before: Effects) -> Durability {
+        let barrier = before == Effects::External
             || match self.barriers {
-                Barriers::Step => fact,
+                Barriers::Step => fact == Facts::Changed,
                 Barriers::Effects => self.turn == Turn::Idle,
             };
         if barrier {
@@ -394,6 +406,13 @@ impl Core {
     /// intent commits before any delivery, and the send is answered once
     /// every recipient has answered.
     fn send_envelope(&mut self, outgoing: &protocol::Outgoing, ticket: Ticket, fx: &mut StepPlan) {
+        if outgoing.to(self.session).is_err() {
+            fx.immediate.push(Work::Delivery {
+                ticket,
+                result: Err(protocol::InboxRefusal::Unauthorized),
+            });
+            return;
+        }
         let id = &outgoing.id;
         if let Some(refusal) = self.fold.ledger.acknowledged(id) {
             let result = refusal.clone().map_or(Ok(()), Err);
@@ -417,10 +436,17 @@ impl Core {
                 },
             );
         }
-        let envelopes: Vec<Envelope> = (self.fold.ledger.outbox().iter())
+        let envelopes = (self.fold.ledger.outbox().iter())
             .filter(|e| e.id == *id)
             .flat_map(protocol::ledger::Sending::envelopes)
-            .collect();
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(envelopes) = envelopes else {
+            fx.immediate.push(Work::Delivery {
+                ticket,
+                result: Err(protocol::InboxRefusal::Unauthorized),
+            });
+            return;
+        };
         for envelope in envelopes {
             fx.immediate.push(Work::Deliver {
                 envelope,
@@ -430,14 +456,13 @@ impl Core {
     }
 
     fn enqueue(&mut self, envelope: Envelope, ticket: Ticket, fx: &mut StepPlan) {
-        if self.registry.runner() == RunnerKind::ModelOnly
-            && !self.fold.ledger.received(&envelope.id)
+        if self.registry.model_contract().reactivates() && !self.fold.ledger.received(envelope.id())
         {
             self.owned_cancelled = false;
         }
         let result = if self.owned_cancelled {
             Err(protocol::InboxRefusal::Unavailable)
-        } else if self.fold.ledger.received(&envelope.id) {
+        } else if self.fold.ledger.received(envelope.id()) {
             Ok(())
         } else if self.fold.ledger.inbox_len() >= protocol::INBOX_CAPACITY {
             Err(protocol::InboxRefusal::Full)
@@ -544,7 +569,7 @@ impl Core {
                 self.turn = Turn::Acting {
                     open: SmallVec::new(),
                 };
-                self.settle(call, Outcome::Interrupted { output: None }, fx);
+                self.settle(call, Outcome::Interrupted { output: None }, None, fx);
             }
             Turn::Acting { ref open } => {
                 let running: SmallVec<[CallId; 2]> = (open.iter())
@@ -613,7 +638,7 @@ impl Core {
         fx: &mut StepPlan,
     ) -> Option<Seq> {
         let envelope = Envelope::own(self.session, call, payload).holding(held);
-        if self.fold.ledger.received(&envelope.id) {
+        if self.fold.ledger.received(envelope.id()) {
             return None;
         }
         Some(self.append(fx, Body::Enqueue { envelope }).0)
@@ -652,9 +677,10 @@ impl Core {
             .armed()
             .filter_map(|(_, child)| self.fold.owner(child).is_none().then_some(child))
             .collect();
+        let background = background || !detached.is_empty();
         for child in detached {
             fx.immediate.push(Work::Interrupt { child });
-            self.fire(child, &Outcome::Interrupted { output: None }, fx);
+            self.unwatch(child, fx);
         }
         let sides: Vec<_> = self
             .fold
@@ -664,7 +690,7 @@ impl Core {
             .collect();
         for side in sides {
             fx.immediate.push(Work::Cancel { call: side });
-            self.settle(side, Outcome::Interrupted { output: None }, fx);
+            self.settle(side, Outcome::Interrupted { output: None }, None, fx);
         }
         let open = match mem::take(&mut self.turn) {
             // With no turn to stop, the calls in the background end now.
@@ -685,7 +711,7 @@ impl Core {
                     // Nothing is out to report.
                     ModelPhase::Backoff | ModelPhase::Recovering => {
                         self.failed = None;
-                        self.settle(call, Outcome::Interrupted { output: None }, fx);
+                        self.settle(call, Outcome::Interrupted { output: None }, None, fx);
                         SmallVec::new()
                     }
                 }
@@ -700,14 +726,16 @@ impl Core {
                         }
                         (Step::Queued { .. } | Step::Awaiting { .. }, _) => {
                             fx.immediate.push(Work::Cancel { call });
-                            self.settle(call, self.interrupted(call), fx);
+                            self.settle(call, self.interrupted(call), None, fx);
                         }
                         // Its child stops first, and reports.
                         (Step::Waiting, Some(child)) => {
                             fx.immediate.push(Work::Interrupt { child });
                             left.push(call);
                         }
-                        (Step::Waiting, None) => self.settle(call, self.interrupted(call), fx),
+                        (Step::Waiting, None) => {
+                            self.settle(call, self.interrupted(call), None, fx);
+                        }
                     }
                 }
                 left
@@ -741,7 +769,7 @@ impl Core {
             WaitOn::Approval => {
                 self.close(call);
                 let error = "the user did not approve this call".to_owned();
-                self.settle(call, Outcome::Failed { error }, fx);
+                self.settle(call, Outcome::Failed { error }, None, fx);
             }
             _ => self.resume_call(call, value, fx),
         }
@@ -773,23 +801,12 @@ impl Core {
                 self.turn = Turn::Acting {
                     open: SmallVec::new(),
                 };
-                if self.registry.runner() == RunnerKind::ModelOnly && failure.is_some() {
-                    self.append(
-                        fx,
-                        Body::ModelResult {
-                            call,
-                            r#for: None,
-                            outcome,
-                            failure,
-                        },
-                    );
-                } else {
-                    self.settle(call, outcome, fx);
-                }
+                let failure = self.registry.model_contract().failure(failure);
+                self.settle(call, outcome, failure, fx);
             }
             Turn::Stopping { open, .. } if open.contains(&call) => {
                 self.close(call);
-                self.settle(call, outcome(replied), fx);
+                self.settle(call, outcome(replied), None, fx);
             }
             _ => {}
         }
@@ -875,7 +892,7 @@ impl Core {
             self.turn = Turn::Acting {
                 open: SmallVec::new(),
             };
-            self.settle(call, Outcome::Failed { error }, fx);
+            self.settle(call, Outcome::Failed { error }, None, fx);
         }
     }
 
@@ -925,7 +942,7 @@ impl Core {
         fx: &mut StepPlan,
     ) {
         let open = self.fold.ledger.call(side).is_some_and(|o| {
-            matches!(o.call, Call::Side { .. }) || self.registry.runner() == RunnerKind::ModelOnly
+            matches!(o.call, Call::Side { .. }) || self.registry.model_contract().owns_retries()
         });
         if open {
             self.decide(Some(side), by, decision, fx);
@@ -1163,19 +1180,8 @@ impl Core {
         if items.is_empty() {
             return SmallVec::new();
         }
-        let visible: Vec<Queued>;
-        let items =
-            if self.registry.runner() == RunnerKind::ModelOnly && boundary != Boundary::TurnEnd {
-                visible = items
-                    .iter()
-                    .filter(|q| q.source().visible())
-                    .cloned()
-                    .collect();
-                &visible[..]
-            } else {
-                items
-            };
-        let queue = QueueView::new(items);
+        let items = self.registry.model_contract().queue(boundary, items);
+        let queue = QueueView::new(&items);
         (self.registry.loop_points().dequeue(boundary, queue)).of(boundary, queue)
     }
 
@@ -1307,10 +1313,22 @@ impl Core {
         match (&self.turn, self.step_of(call)) {
             (Turn::Stopping { .. }, Some(_)) => {
                 self.close(call);
-                self.settle(call, self.interrupted(call), fx);
+                self.settle(call, self.interrupted(call), None, fx);
             }
             (_, Some(Step::Waiting)) => self.resume_call(call, to_json(outcome), fx),
             _ => {}
+        }
+    }
+
+    fn unwatch(&mut self, child: SessionId, fx: &mut StepPlan) {
+        let watches: SmallVec<[Seq; 1]> = self
+            .fold
+            .ledger
+            .armed()
+            .filter_map(|(watch, watched)| (watched == child).then_some(watch))
+            .collect();
+        for watch in watches {
+            self.append(fx, Body::Unwatch { watch });
         }
     }
 
@@ -1504,7 +1522,7 @@ impl Core {
                 let call = self.call(&tool, &input, id, Audience::Model, None, fx);
                 let reason = why.clone();
                 self.decide(Some(call), AGENT, Verdict::Block { reason }, fx);
-                self.settle(call, Outcome::Failed { error: why }, fx);
+                self.settle(call, Outcome::Failed { error: why }, None, fx);
             }
             Next::Command { name, args } => {
                 let input = args_of(args);
@@ -1598,7 +1616,7 @@ impl Core {
         for call in children {
             fx.immediate.push(Work::Cancel { call });
             self.close(call);
-            self.settle(call, self.interrupted(call), fx);
+            self.settle(call, self.interrupted(call), None, fx);
         }
     }
 
@@ -1663,7 +1681,7 @@ impl Core {
         match gate {
             Gate::Run if resumed && !self.safe(call) => {
                 self.close(call);
-                self.settle(call, self.interrupted(call), fx);
+                self.settle(call, self.interrupted(call), None, fx);
             }
             Gate::Run => {
                 let Some((tool, _)) = self.tool_of(call) else {
@@ -1684,7 +1702,7 @@ impl Core {
             }
             Gate::Refuse(error) => {
                 self.close(call);
-                self.settle(call, Outcome::Failed { error }, fx);
+                self.settle(call, Outcome::Failed { error }, None, fx);
             }
         }
     }
@@ -1738,7 +1756,7 @@ impl Core {
                 }
             };
             let call = self.call(&tool, &input, id, by, None, fx);
-            self.settle(call, Outcome::Interrupted { output: None }, fx);
+            self.settle(call, Outcome::Interrupted { output: None }, None, fx);
         }
         self.interrupted_entry(origin, fx);
         self.fold.stepped = false;
@@ -1784,7 +1802,7 @@ impl Core {
         // Settled with something new since it last reported (one given no
         // input yet has not run).
         let settled = self.turn == Turn::Idle && !queued && !armed && !outgoing && !background;
-        let ran = ledger.turn_start() > 0;
+        let ran = ledger.turn_start().is_some();
         if settled && self.child && ran && ledger.seq() > self.reported {
             self.reported = ledger.seq();
             let outcome = ledger.result().cloned().unwrap_or_else(|| Outcome::Failed {
@@ -1797,26 +1815,6 @@ impl Core {
     // ── recovery ──────────────────────────────────────────────────────
 
     fn recover(&mut self, load: &Load<'_>, fx: &mut StepPlan) {
-        let ledger = &self.fold.ledger;
-        let here = |boot: &str| load.boot == Some(boot);
-        let open = ledger.open_calls().map(|(_, open)| open);
-        let commands = ledger.open_commands().filter_map(|seq| ledger.call(seq));
-        let mut kills: SmallVec<[u32; 2]> = open
-            .chain(commands)
-            .flat_map(|open| &open.processes)
-            .filter(|(_, boot)| here(boot))
-            .map(|&(pgid, _)| pgid)
-            .collect();
-        if load.fresh {
-            let jobs = ledger.background().iter().filter(|job| here(&job.boot));
-            for job in jobs {
-                if !kills.contains(&job.pgid) {
-                    kills.push(job.pgid);
-                }
-            }
-        }
-        fx.immediate
-            .extend(kills.into_iter().map(|pgid| Work::Kill { pgid }));
         if load.fresh {
             self.end_jobs(load.reheld, fx);
         }
@@ -1841,7 +1839,7 @@ impl Core {
         // A command cut off is not run again.
         let commands: SmallVec<[CallId; 1]> = self.fold.ledger.open_commands().collect();
         for call in commands {
-            self.settle(call, self.interrupted(call), fx);
+            self.settle(call, self.interrupted(call), None, fx);
         }
         let open: Vec<(CallId, Call, Phase)> = (self.fold.ledger.open_calls())
             .map(|(call, open)| (call, open.call.clone(), open.phase.clone()))
@@ -1854,22 +1852,24 @@ impl Core {
         for (call, kind, phase) in open {
             match kind {
                 Call::Model { attempt, .. } => {
-                    if self.registry.runner() == RunnerKind::Agent {
+                    if self.registry.model_contract().retries_on_recovery() {
                         self.restart(call, attempt, fx);
                     } else {
-                        self.settle(call, Outcome::Interrupted { output: None }, fx);
+                        self.settle(call, Outcome::Interrupted { output: None }, None, fx);
                     }
                 }
                 Call::Tool {
                     invoke: Some(key), ..
                 } => {
                     if self.fold.ledger.call(key.parent).is_none() {
-                        self.settle(call, self.interrupted(call), fx);
+                        self.settle(call, self.interrupted(call), None, fx);
                     }
                 }
                 Call::Tool { tool, input, .. } => self.reopen(call, &tool, &input, &phase, fx),
                 // Its owner asks again, if it still wants an answer.
-                Call::Side { .. } => self.settle(call, Outcome::Interrupted { output: None }, fx),
+                Call::Side { .. } => {
+                    self.settle(call, Outcome::Interrupted { output: None }, None, fx);
+                }
             }
         }
     }
@@ -1884,7 +1884,7 @@ impl Core {
         let children: Vec<_> = self.fold.ledger.armed().map(|(_, child)| child).collect();
         for child in children {
             fx.immediate.push(Work::Interrupt { child });
-            self.fire(child, &Outcome::Interrupted { output: None }, fx);
+            self.unwatch(child, fx);
         }
         let calls: Vec<_> = self
             .fold
@@ -1895,7 +1895,7 @@ impl Core {
             .collect();
         let interrupted = !calls.is_empty() || background;
         for call in calls {
-            self.settle(call, self.interrupted(call), fx);
+            self.settle(call, self.interrupted(call), None, fx);
         }
         if interrupted || !matches!(self.fold.ledger.result(), Some(Outcome::Interrupted { .. })) {
             self.interrupted_entry(None, fx);
@@ -2050,13 +2050,35 @@ impl Core {
     /// Re-arms links: a link not yet watched is watched, and every child
     /// still watched is started, so it runs to its end and reports back.
     fn relink(&mut self, fx: &mut StepPlan) {
-        let unacknowledged =
-            (self.fold.ledger.outbox().iter()).flat_map(protocol::ledger::Sending::envelopes);
-        fx.immediate
-            .extend(unacknowledged.map(|envelope| Work::Deliver {
-                envelope,
-                ticket: None,
-            }));
+        let unacknowledged: Vec<_> = self
+            .fold
+            .ledger
+            .pending_outbox()
+            .flat_map(|sending| {
+                sending
+                    .pending
+                    .iter()
+                    .map(|&recipient| (sending.id.clone(), recipient, sending.to(recipient)))
+            })
+            .collect();
+        for (envelope_id, recipient, envelope) in unacknowledged {
+            match envelope {
+                Ok(envelope) => fx.immediate.push(Work::Deliver {
+                    envelope,
+                    ticket: None,
+                }),
+                Err(_) => {
+                    self.append(
+                        fx,
+                        Body::Ack {
+                            envelope_id,
+                            recipient,
+                            refusal: Some(protocol::InboxRefusal::Unauthorized),
+                        },
+                    );
+                }
+            }
+        }
         let ledger = &self.fold.ledger;
         let links: SmallVec<[_; 1]> = (ledger.links().iter())
             .filter_map(|link| {
@@ -2080,11 +2102,11 @@ impl Core {
         let error = llm::Error::new(llm::Kind::Incomplete, "the daemon stopped during the call");
         if attempt >= RESTART_CAP {
             let error = format!("{error}; gave up after {attempt} attempts");
-            return self.settle(call, Outcome::Failed { error }, fx);
+            return self.settle(call, Outcome::Failed { error }, None, fx);
         }
         if !self.retry(call, attempt, &error, fx) {
             let error = error.to_string();
-            self.settle(call, Outcome::Failed { error }, fx);
+            self.settle(call, Outcome::Failed { error }, None, fx);
         }
     }
 
@@ -2096,7 +2118,7 @@ impl Core {
                 let reason = why.clone();
                 self.decide(Some(call), AGENT, Verdict::Block { reason }, fx);
             }
-            return self.settle(call, Outcome::Failed { error: why }, fx);
+            return self.settle(call, Outcome::Failed { error: why }, None, fx);
         }
         match *phase {
             Phase::Gating { at } => match self.registry.gate(call, tool, input) {
@@ -2119,7 +2141,7 @@ impl Core {
             },
             Phase::Waiting(_) => self.set_step(call, Step::Waiting),
             Phase::Running if self.safe(call) => self.run(call, fx),
-            Phase::Running => self.settle(call, self.interrupted(call), fx),
+            Phase::Running => self.settle(call, self.interrupted(call), None, fx),
             Phase::Settled(kind) => {
                 let outcome = match kind {
                     OutcomeKind::Done => Outcome::Done {
@@ -2130,7 +2152,7 @@ impl Core {
                     },
                     OutcomeKind::Interrupted => self.interrupted(call),
                 };
-                self.settle(call, outcome, fx);
+                self.settle(call, outcome, None, fx);
             }
         }
     }
@@ -2160,7 +2182,7 @@ impl Core {
     /// was interrupted) takes the side requests made on its behalf that are
     /// still out with it, their ends logged first; one done leaves them to
     /// end as they do.
-    fn settle(&mut self, call: CallId, outcome: Outcome, fx: &mut StepPlan) {
+    fn settle(&mut self, call: CallId, outcome: Outcome, failure: Option<Json>, fx: &mut StepPlan) {
         self.cancel_invocations(call, fx);
         let done = matches!(outcome, Outcome::Done { .. });
         let sides: SmallVec<[CallId; 1]> = (self.fold.ledger.open_calls())
@@ -2185,7 +2207,7 @@ impl Core {
                     Call::Side { of } => Some(*of),
                     _ => None,
                 },
-                failure: None,
+                failure,
                 call,
                 outcome,
             },
@@ -2239,10 +2261,7 @@ impl Core {
     /// The tool and input call `call` runs with: as its gate left it.
     pub fn tool_of(&self, call: CallId) -> Option<(String, Json)> {
         match &self.fold.ledger.call(call)?.call {
-            Call::Tool { tool, input, .. } => {
-                let input = self.fold.input_of(call).unwrap_or(input);
-                Some((tool.clone(), input.clone()))
-            }
+            Call::Tool { tool, input, .. } => Some((tool.clone(), input.clone())),
             Call::Model { .. } | Call::Side { .. } => None,
         }
     }
