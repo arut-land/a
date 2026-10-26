@@ -146,6 +146,18 @@ impl<T: std::os::windows::io::AsSocket> Async<T> {
     }
 }
 
+impl Async<std::net::TcpStream> {
+    /// Connects to `addr` without blocking: the handshake completes on the
+    /// reactor, and the stream comes back registered and non-blocking.
+    pub async fn connect(reactor: &Reactor, addr: std::net::SocketAddr) -> io::Result<Self> {
+        match reactor {
+            Reactor::AsyncIo => Ok(Self(Inner::AsyncIo(
+                async_io::Async::<std::net::TcpStream>::connect(addr).await?,
+            ))),
+        }
+    }
+}
+
 #[cfg(unix)]
 impl Async<std::fs::File> {
     /// Child output only needs read readiness.

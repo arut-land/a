@@ -225,7 +225,8 @@ cover every layout and session count.
   cost is delta p99 rising to about 6.5 ms and idle RSS doubling to 68 MiB
   (allocator retention after 128 concurrent streams). Windows is the
   exception: its turns are bound by PowerShell start-up, and the wider lane
-  changes nothing there.
+  changes nothing there. Since then HTTP no longer runs on the lane: the
+  transport is async on the reactor ([transport.md](transport.md)).
 - **Under load, live deltas were dropped at the start of a reply (fixed).**
   With 128 concurrent streams, macos-15-intel lost 9384 of 17280 deltas
   (54%). A model call's request starts as soon as its `model_call` entry is
@@ -253,7 +254,10 @@ cover every layout and session count.
   pool. The pool's probe now releases the socket from the finished request
   (`cancelling_a_finished_request_never_closes_its_pooled_connection`), and
   the sampler ends a turn on a failed call and counts it (`failed_calls`).
-  The rerun had no stalls and no failed calls on any runner.
+  The rerun had no stalls and no failed calls on any runner. The async
+  transport that replaced ureq has no such window: a connection belongs to
+  the reply reading it until the pool takes it, and nothing else can close
+  it.
 
 ## Reactor-driving workers (B1)
 

@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-ureq = ["transport/ureq"]
+client = ["transport/client"]
 tls-native = ["transport/tls-native"]
 tls-rustls = ["transport/tls-rustls"]
 

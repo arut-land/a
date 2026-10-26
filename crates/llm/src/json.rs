@@ -430,7 +430,7 @@ fn partial_object(text: &str, limits: DecodeLimits) -> Option<Map<String, Value>
 /// call while it streams. It never fails: complete JSON parses as is, text
 /// with raw control characters or invalid escapes is repaired first, a
 /// cut-off prefix keeps the longest object it states
-/// ([`parse_partial_object`]), and anything else is an empty object, as is
+/// (`parse_partial_object`), and anything else is an empty object, as is
 /// a top level that is not an object.
 ///
 /// It is for display only. A call's arguments are what its end states, and

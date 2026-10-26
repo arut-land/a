@@ -16,7 +16,7 @@ ext-logging.workspace = true
 crc32c = "0.6.8"
 ext.workspace = true
 kernel.workspace = true
-llm = { workspace = true, features = ["ureq"] }
+llm = { workspace = true, features = ["client"] }
 memchr.workspace = true
 rt = { workspace = true, features = ["watch"] }
 serde.workspace = true

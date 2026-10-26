@@ -672,7 +672,7 @@ fn the_kernel_does_no_io() {
         "sys",
         "store",
         "engine",
-        "ureq",
+        "ureq-proto",
         "mio",
         "rustix",
         "tokio",

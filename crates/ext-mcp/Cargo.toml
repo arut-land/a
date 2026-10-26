@@ -7,7 +7,7 @@ autotests = false
 
 [dependencies]
 sha2 = { version = "0.11", default-features = false }
-transport = { workspace = true, features = ["ureq"] }
+transport = { workspace = true, features = ["client"] }
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 ext.workspace = true
 ext-derive.workspace = true

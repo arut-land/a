@@ -5,25 +5,41 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-# An HTTP client over ureq, run through the `rt` runtime; with neither TLS
-# feature it speaks plain http only.
-ureq = ["dep:ureq", "dep:rt"]
+# The HTTP/1.1 client, async over the `rt` reactor; with neither TLS feature
+# it speaks plain http only.
+client = ["dep:rt", "dep:sys", "dep:ureq-proto", "dep:base64", "dep:futures-lite", "dep:async-compression", "dep:mzstd"]
 # Binaries select TLS features; this library makes no platform choice.
 # Host crypto and trust (Security.framework, SChannel, OpenSSL), without a
-# bundled crypto implementation or duplicate certificate bundle.
-tls-native = ["ureq", "ureq/native-tls-no-default"]
-# rustls with the platform verifier. Not `rustls`, which adds webpki-roots:
-# Mozilla's roots, linked because ureq matches on `RootCerts` at run time
-# though the platform verifier never reads them (129 KiB on macOS).
-tls-rustls = ["ureq", "ureq/rustls-no-provider", "ureq/_ring", "ureq/platform-verifier"]
+# bundled crypto implementation or certificate bundle.
+tls-native = ["client", "dep:native-tls"]
+# rustls with the platform verifier, over ring.
+tls-rustls = ["client", "dep:rustls", "dep:rustls-platform-verifier"]
 
 [dependencies]
+async-compression = { version = "0.4", default-features = false, features = ["futures-io", "gzip"], optional = true }
+# Proxy credentials; ureq-proto links it already.
+base64 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
+# `stream::unfold`: rt links it already.
+futures-lite = { version = "2", default-features = false, features = ["std"], optional = true }
 http.workspace = true
+mzstd = { version = "0.2.8", default-features = false, features = ["std", "compression", "decompression"], optional = true }
+native-tls = { version = "0.2.14", default-features = false, optional = true }
 rt = { workspace = true, optional = true }
-ureq = { workspace = true, optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }
+rustls-platform-verifier = { version = "0.7", default-features = false, optional = true }
+# TCP keep-alive.
+sys = { workspace = true, optional = true }
+# HTTP/1.1 as a sans-IO state machine: the protocol ureq runs, driven here
+# over non-blocking sockets.
+ureq-proto = { version = "0.6.5", default-features = false, features = ["client"], optional = true }
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["pem"] }
+getrandom = { version = "0.4", features = ["sys_rng"] }
+rsa = "0.10.0-rc.19"
+sha2 = { version = "0.11", default-features = false, features = ["oid"] }
+time = { version = "0.3", default-features = false, features = ["std"] }
 rt.workspace = true
 
 [lints]

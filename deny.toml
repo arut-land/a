@@ -13,6 +13,7 @@ targets = [
 [advisories]
 yanked = "deny"
 ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "transport tests generate ephemeral RSA keys and self-sign certificates locally; TLS private-key operations use native TLS/rustls, so no network-observable RSA oracle exists" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is test-only: the llm parity tests read recorded YAML cassettes" },
 ]
 
@@ -21,7 +22,6 @@ allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
-    "CDLA-Permissive-2.0",
     "CC0-1.0",
     "ISC",
     "MIT",
@@ -49,8 +49,8 @@ deny = [
     # builds free of it.
     { crate = "tokio", reason = "the engine runs on rt; rt's tokio adapter is opt-in" },
     { crate = "async-std", reason = "the engine runs on rt" },
-    { crate = "hyper", reason = "ureq is the HTTP client" },
-    { crate = "reqwest", reason = "ureq is the HTTP client" },
+    { crate = "hyper", reason = "transport is the HTTP client, async over rt" },
+    { crate = "reqwest", reason = "transport is the HTTP client, async over rt" },
     # The optional rustls transport uses ring; the binary uses native TLS.
     { crate = "aws-lc-sys", reason = "rustls uses ring" },
 ]
@@ -58,11 +58,9 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Require immutable revisions for the two upstream fixes.
+# Require immutable revisions for upstream fixes.
 required-git-spec = "rev"
 allow-git = [
-    # Native TLS without an unused Mozilla certificate bundle.
-    "https://github.com/algesten/ureq",
     # Scheduler state must outlive wakes racing executor destruction.
     "https://github.com/smol-rs/async-executor",
 ]

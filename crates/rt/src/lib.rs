@@ -188,6 +188,46 @@ where
     }
 }
 
+/// The addresses `host` names, an IP literal without a lookup. A name goes
+/// to the OS resolver (`getaddrinfo` and its equivalents), which only
+/// blocks, so it runs briefly on the network lane: once per new
+/// connection, never for a pooled one.
+pub fn resolve(
+    rt: &dyn Runtime,
+    host: &str,
+    port: u16,
+) -> impl Future<Output = std::io::Result<Vec<std::net::SocketAddr>>> + Send + 'static {
+    let literal = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .ok();
+    let host = host.to_owned();
+    let (tx, rx) = oneshot::channel();
+    let admitted = literal.is_none().then(|| {
+        rt.spawn_blocking(
+            BlockingClass::Network,
+            64 << 10,
+            Box::new(move || {
+                use std::net::ToSocketAddrs as _;
+                tx.send(
+                    (host.as_str(), port)
+                        .to_socket_addrs()
+                        .map(Iterator::collect),
+                );
+            }),
+        )
+    });
+    async move {
+        if let Some(ip) = literal {
+            return Ok(vec![std::net::SocketAddr::new(ip, port)]);
+        }
+        admitted.expect("a name is looked up").await?;
+        rx.await
+            .unwrap_or_else(|| Err(std::io::Error::other("the resolver went away")))
+    }
+}
+
 /// Spawns `task` and returns a future of its output.
 pub fn spawn<T, F>(rt: &dyn Runtime, task: F) -> impl Future<Output = T> + Send + 'static
 where

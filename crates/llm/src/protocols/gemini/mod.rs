@@ -126,6 +126,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[(
         base_url_env: &["GEMINI_BASE_URL"],
         key: KeyStyle::Header("x-goog-api-key"),
         keyless: false,
+        compression: None,
     },
     Quirks::GEMINI,
 )];

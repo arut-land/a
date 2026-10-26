@@ -33,6 +33,7 @@ pub mod log;
 mod login;
 mod machine;
 mod memory;
+pub mod net;
 mod paths;
 mod platform;
 mod proc;

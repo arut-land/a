@@ -46,8 +46,8 @@ fn read_request(reader: &mut BufReader<TcpStream>) {
     reader.read_exact(&mut vec![0; length]).unwrap();
 }
 
-/// A session on `gpt-5.6` at the provider on `port`, over ureq.
-fn over_ureq(port: u16) -> (Fixture, PathBuf) {
+/// A session on `gpt-5.6` at the provider on `port`, over the real HTTP client.
+fn over_http(port: u16) -> (Fixture, PathBuf) {
     let home = std::env::temp_dir().join(format!("a-engine-port-{port}.toml"));
     let env = format!(
         "model = \"gpt-5.6\"\n[env]\nOPENAI_API_KEY = \"daemon\"\nOPENAI_BASE_URL = \"http://127.0.0.1:{port}/v1\"\n"
@@ -55,7 +55,7 @@ fn over_ureq(port: u16) -> (Fixture, PathBuf) {
     std::fs::write(&home, env).unwrap();
     let models = Models {
         settings: crate::config::Settings::new(home.clone(), None),
-        http: Arc::new(llm::Ureq::new(
+        http: Arc::new(llm::Client::new(
             Arc::new(rt::Threads::new(1)),
             llm::Redirects::Follow,
         )),
@@ -74,7 +74,7 @@ fn model_result(log: &[Entry]) -> Option<&Outcome> {
 #[test]
 fn an_interrupt_while_the_model_thinks_closes_its_connection() {
     let (port, got, closed) = provider(String::new());
-    let (fixture, home) = over_ureq(port);
+    let (fixture, home) = over_http(port);
     let session = fixture.start(&[]);
     session.submit("hi").unwrap();
     got.recv().unwrap();
@@ -102,7 +102,7 @@ fn an_interrupt_mid_reply_closes_its_connection_and_keeps_the_text_so_far() {
     let text = serde_json::from_str::<Value>(data).unwrap()["delta"].clone();
     let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
     let (port, got, closed) = provider(format!("{head}{}", &recorded[..cut]));
-    let (fixture, home) = over_ureq(port);
+    let (fixture, home) = over_http(port);
     let session = fixture.start(&[]);
     let outbox = Outbox::new();
     session.follow(&outbox, 0);
@@ -215,7 +215,7 @@ fn a_connection_closed_mid_request_settles_its_call() {
         reader.read_exact(&mut [0; 64]).unwrap();
         stream.shutdown(std::net::Shutdown::Both).unwrap();
     });
-    let (fixture, home) = over_ureq(port);
+    let (fixture, home) = over_http(port);
     let session = fixture.start(&[]);
     session.submit("hi").unwrap();
     settle(&session);
