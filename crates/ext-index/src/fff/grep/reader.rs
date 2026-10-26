@@ -59,6 +59,10 @@ impl StreamRegex {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the streaming cursor, match spans and display coordinates advance together"
+    )]
     pub(super) fn search(
         &self,
         file: &mut File,
@@ -85,13 +89,24 @@ impl StreamRegex {
             }
             let (line_start, number) = locate(&mut reader, from, start, line, stopped)?;
             let display_line_end = line_end(&mut reader, start, stopped)?;
+            let first_end = end;
+            let end = if self.multiline && options.mode == GrepMode::Regex {
+                self.adjacent(
+                    &mut reader,
+                    (&mut forward, &mut reverse),
+                    start..end,
+                    stopped,
+                )?
+            } else {
+                end
+            };
             let display = Display::read(&mut reader, start, line_start..display_line_end)?;
             let mut ranges: SmallVec<[(u32, u32); 4]> =
-                [display.range(start..end)].into_iter().collect();
+                [display.range(start..first_end)].into_iter().collect();
             let mut cursor = if options.mode == GrepMode::Plain {
                 start + 1
             } else {
-                end.max(start + 1)
+                first_end.max(start + 1)
             };
             while cursor < display.end && !stopped() {
                 let Some(next_end) = self.end(
@@ -144,7 +159,11 @@ impl StreamRegex {
                 )?,
             });
             // A grep reports a matching line once, including empty regexes.
-            let next = line_end(&mut reader, end.max(start), stopped)?;
+            let next = if options.mode == GrepMode::Plain {
+                display_line_end
+            } else {
+                line_end(&mut reader, end.saturating_sub(1).max(start), stopped)?
+            };
             if next == from {
                 break;
             }
@@ -157,6 +176,39 @@ impl StreamRegex {
             }
         }
         Ok(found)
+    }
+
+    /// Slice grep coalesces adjacent multiline regex hits into one blob.
+    /// Keep that behavior using offsets, without retaining the blob's bytes.
+    fn adjacent(
+        &self,
+        reader: &mut BufReader<&mut File>,
+        caches: (&mut dfa::Cache, &mut dfa::Cache),
+        first: Range<u64>,
+        stopped: &dyn Fn() -> bool,
+    ) -> io::Result<u64> {
+        let (forward, reverse) = caches;
+        let mut end = first.end;
+        let mut cursor = end.max(first.start + 1);
+        let mut last_line_end = line_end(reader, end.saturating_sub(1).max(first.start), stopped)?;
+        while !stopped() {
+            let Some(next_end) = self.end(reader, forward, cursor, None, stopped)? else {
+                break;
+            };
+            let start = self.start(reader, reverse, cursor, next_end, stopped)?;
+            if start > last_line_end
+                && locate(reader, last_line_end, start, 0, stopped)?.0 > last_line_end
+            {
+                break;
+            }
+            end = next_end;
+            last_line_end = line_end(reader, end.saturating_sub(1).max(start), stopped)?;
+            cursor = end.max(start + 1);
+            if byte_at(reader, Some(cursor))?.is_none() {
+                break;
+            }
+        }
+        Ok(end)
     }
 
     fn end(

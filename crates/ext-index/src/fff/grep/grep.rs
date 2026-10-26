@@ -626,6 +626,21 @@ mod reader_tests {
     }
 
     #[test]
+    fn streaming_does_not_skip_lines_after_a_newline_match() {
+        let text = b"needle\nneedle\nneedle\n";
+        for pattern in ["needle\\n", "needle\\nneedle"] {
+            let grep = exact(pattern, GrepMode::Plain);
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(text).unwrap();
+            file.rewind().unwrap();
+            assert_eq!(
+                grep.reader(&mut file, 200, &|| false).unwrap(),
+                grep.file(text)
+            );
+        }
+    }
+
+    #[test]
     fn streaming_matches_across_buffers_and_arbitrarily_long_regex_spans() {
         for (pattern, mode) in [
             ("needle", GrepMode::Plain),
