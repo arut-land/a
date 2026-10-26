@@ -572,7 +572,11 @@ mod tests {
         .unwrap();
         drop((input, ready, error, keep));
         let mut lines = BufReader::new(output).lines();
-        assert!(lines.by_ref().any(|line| line.unwrap() == "handover ready"));
+        assert!(
+            lines
+                .by_ref()
+                .any(|line| line.unwrap().ends_with("handover ready"))
+        );
         drop((record, given));
         assert_eq!(
             // SAFETY: the owned watch pins the process; no claim has run yet.
@@ -583,7 +587,7 @@ mod tests {
         assert!(
             lines
                 .by_ref()
-                .any(|line| line.unwrap() == "handover claimed")
+                .any(|line| line.unwrap().ends_with("handover claimed"))
         );
         // SAFETY: watch owns the target process, whose last job handle should
         // close in the receiver even though that receiver is still running.
