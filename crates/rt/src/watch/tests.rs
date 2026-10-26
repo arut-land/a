@@ -518,3 +518,311 @@ fn a_replaced_parent_outlives_the_subscription_that_replaced_it() {
     let file = dir.write("parent/old/file");
     until(&events, "the surviving root's entries", changed(&file));
 }
+
+#[test]
+fn pending_rescans_subsume_detail_without_erasing_availability() {
+    let mut queue = Queue::default();
+    for i in 0..=DETAIL_PATHS {
+        queue.push(Event::Changed(vec![PathBuf::from(format!(
+            "different/{i}"
+        ))]));
+    }
+    queue.push(Event::Unavailable(Unavailable::Gone));
+    queue.push(Event::Rescan);
+    queue.push(Event::Changed(vec![PathBuf::from("back/file")]));
+    assert!(matches!(
+        queue.events.as_slice(),
+        [
+            Pending::Rescan,
+            Pending::Unavailable(Unavailable::Gone),
+            Pending::Rescan,
+        ]
+    ));
+}
+
+#[test]
+fn pending_path_bytes_collapse_to_a_rescan_without_erasing_availability() {
+    let mut queue = Queue::default();
+    queue.push(Event::Unavailable(Unavailable::Limit));
+    queue.push(Event::Changed(vec![PathBuf::from(
+        "x".repeat(DETAIL_BYTES + 1),
+    )]));
+    assert!(matches!(
+        queue.events.as_slice(),
+        [Pending::Unavailable(Unavailable::Limit), Pending::Rescan,]
+    ));
+    queue.push(Event::Unavailable(Unavailable::Gone));
+    queue.push(Event::Changed(vec![PathBuf::from("back")]));
+    queue.push(Event::Rescan);
+    assert!(matches!(
+        queue.events.as_slice(),
+        [
+            Pending::Unavailable(Unavailable::Limit),
+            Pending::Rescan,
+            Pending::Unavailable(Unavailable::Gone),
+            Pending::Rescan,
+        ]
+    ));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+#[test]
+fn a_stalled_native_inbox_retains_one_rescan_instead_of_path_history() {
+    let mut inbox = Inbox::default();
+    for i in 0..100_000 {
+        inbox.push(Raw::Created(PathBuf::from(format!("tree/{i}"))));
+    }
+    assert!(matches!(inbox.raws.as_slice(), [Raw::Rescan(None)]));
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        for _ in 0..10_000 {
+            inbox.push(Raw::Freed);
+        }
+        assert!(matches!(
+            inbox.raws.as_slice(),
+            [Raw::Rescan(None), Raw::Freed]
+        ));
+        inbox.push(Raw::Failed(None, io::Error::other("stream failed")));
+        inbox.push(Raw::Changed(PathBuf::from("recovered/file")));
+        assert!(matches!(
+            inbox.raws.as_slice(),
+            [
+                Raw::Rescan(None),
+                Raw::Freed,
+                Raw::Failed(None, _),
+                Raw::Changed(_)
+            ]
+        ));
+    }
+}
+
+#[test]
+fn a_stalled_subscriber_coalesces_detail_and_preserves_availability_order() {
+    let dir = Dir::new();
+    let hub = Hub::new(Arc::new(crate::Threads::new(2)));
+    let (send, events) = channel();
+    let (release, released) = channel::<()>();
+    let mut first = true;
+    let sub = hub.subscribe(Watch::tree(&dir.base), move |batch| {
+        let _ = send.send(batch);
+        if std::mem::take(&mut first) {
+            let _ = released.recv();
+        }
+    });
+    dir.write("first");
+    events.recv_timeout(Duration::from_secs(10)).unwrap();
+    for i in 0..DETAIL_PATHS * 3 {
+        dir.write(&format!("file-{i}"));
+    }
+    let delivery = Arc::clone(&lock(&hub.0.state).subs[&sub.id].out);
+    let wait_for = |predicate: &dyn Fn(&[Pending]) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !predicate(&lock(&delivery.queue).events) {
+            assert!(
+                Instant::now() < deadline,
+                "pending delivery did not reach expected state"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait_for(&|events| matches!(events, [Pending::Rescan]));
+    fs::remove_dir_all(&dir.base).unwrap();
+    wait_for(&|events| {
+        events
+            .iter()
+            .any(|e| matches!(e, Pending::Unavailable(Unavailable::Gone)))
+    });
+    fs::create_dir(&dir.base).unwrap();
+    wait_for(&|events| matches!(events.last(), Some(Pending::Rescan)));
+    release.send(()).unwrap();
+    let batch = events.recv_timeout(Duration::from_secs(10)).unwrap();
+    let gone = batch
+        .iter()
+        .position(|e| matches!(e, Event::Unavailable(Unavailable::Gone)))
+        .unwrap();
+    assert!(
+        batch[..gone].iter().any(|e| matches!(e, Event::Rescan)),
+        "{batch:?}"
+    );
+    assert!(
+        batch[gone + 1..].iter().any(|e| matches!(e, Event::Rescan)),
+        "{batch:?}"
+    );
+    let file = dir.write("after");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let batch = events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        if batch.iter().any(changed(&file)) {
+            break;
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn sustained_writes_allow_other_tasks_and_unsubscribe_to_progress() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Writer {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+    let dir = Dir::new();
+    let hub = hub();
+    let (sub, events) = subscribe(&hub, Watch::tree(&dir.base));
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    let root = dir.base.clone();
+    let _writer = Writer {
+        stop,
+        thread: Some(std::thread::spawn(move || {
+            let mut i = 0;
+            while !stopped.load(Ordering::Relaxed) {
+                fs::write(root.join(format!("file-{}", i % 16)), i.to_string()).unwrap();
+                i += 1;
+            }
+        })),
+    };
+    events.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (send, progress) = channel();
+    hub.runtime().spawn(Box::pin(async move {
+        crate::yield_now().await;
+        drop(sub);
+        send.send(()).unwrap();
+    }));
+    progress.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(hub.watches(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bind_aliases_keep_each_subscribers_pathname_and_watch_lifetime() {
+    use std::process::Command;
+    struct Mount(PathBuf);
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            assert!(
+                Command::new("sudo")
+                    .args(["-n", "umount"])
+                    .arg(&self.0)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+    let dir = Dir::new();
+    fs::create_dir_all(dir.path("real/nested")).unwrap();
+    fs::create_dir(dir.path("alias")).unwrap();
+    let mounted = Command::new("sudo")
+        .args(["-n", "mount", "--bind"])
+        .arg(dir.path("real"))
+        .arg(dir.path("alias"))
+        .output();
+    match mounted {
+        Ok(output) if output.status.success() => {}
+        result => {
+            eprintln!("SKIP: bind mounts are unsupported in this environment: {result:?}");
+            return;
+        }
+    }
+    let _mount = Mount(dir.path("alias"));
+    let hub = hub();
+    let (real_sub, real) = subscribe(&hub, Watch::tree(dir.path("real")));
+    let watches = hub.watches();
+    let (alias_sub, alias) = subscribe(&hub, Watch::entered(dir.path("alias")));
+    alias_sub.enter(&dir.path("alias/nested"));
+    assert_eq!(hub.watches(), watches);
+    dir.write("real/nested/first");
+    until(
+        &real,
+        "the original pathname",
+        changed(&dir.path("real/nested/first")),
+    );
+    until(
+        &alias,
+        "the alias pathname",
+        changed(&dir.path("alias/nested/first")),
+    );
+    drop(real_sub);
+    dir.write("real/nested/after");
+    until(
+        &alias,
+        "the surviving alias",
+        changed(&dir.path("alias/nested/after")),
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_coalesced_native_burst_still_reports_a_root_that_disappeared() {
+    let dir = Dir::new();
+    let hub = hub();
+    let (_sub, events) = subscribe(&hub, Watch::tree(&dir.base));
+    // The native callback can keep posting while the runtime cannot route.
+    let state = lock(&hub.0.state);
+    for i in 0..DETAIL_PATHS * 3 {
+        dir.write(&format!("file-{i}"));
+    }
+    fs::remove_dir_all(&dir.base).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !lock(&hub.0.inbox).rescanning {
+        assert!(
+            Instant::now() < deadline,
+            "native inbox did not coalesce the burst"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(state);
+    until(
+        &events,
+        "the missing root after native coalescing",
+        |event| matches!(event, Event::Unavailable(Unavailable::Gone)),
+    );
+    fs::create_dir(&dir.base).unwrap();
+    until(&events, "recovery after native coalescing", |event| {
+        matches!(event, Event::Rescan)
+    });
+}
+
+#[test]
+fn a_stalled_delivery_retains_one_invalidation_per_path() {
+    let hub = hub();
+    let delivery = Arc::new(Delivery {
+        queue: Mutex::new(Queue {
+            running: true,
+            ..Queue::default()
+        }),
+        sink: Mutex::new(Box::new(|_| {})),
+    });
+    for _ in 0..10_000 {
+        delivery.push(
+            Event::Changed(vec![PathBuf::from("same/file")]),
+            hub.runtime(),
+        );
+    }
+    let events: Vec<Event> = std::mem::take(&mut lock(&delivery.queue).events)
+        .into_iter()
+        .map(Event::from)
+        .collect();
+    let paths: Vec<_> = events
+        .into_iter()
+        .flat_map(|event| match event {
+            Event::Changed(paths) => paths,
+            _ => panic!("one pathname must retain detail"),
+        })
+        .collect();
+    eprintln!(
+        "pending_paths={} path_payload_bytes={}",
+        paths.len(),
+        paths.iter().map(|p| p.as_os_str().len()).sum::<usize>()
+    );
+    assert_eq!(paths.len(), 1);
+}
