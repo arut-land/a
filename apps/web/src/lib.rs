@@ -68,11 +68,13 @@ pub fn run(daemons: Daemons, open: bool) -> io::Result<()> {
 async fn accept<T>(mut next: impl AsyncFnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         match next().await {
-            // Neither error says anything about the next pending connection.
+            // These failures leave the listener available for the next connection.
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
                 ) => {}
             result => return result,
         }
@@ -169,12 +171,17 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_or_aborted_accept_preserves_the_next_connection() {
+    fn a_transient_accept_failure_preserves_the_next_connection() {
         let rt = rt::Threads::new(1);
         let listener =
             rt::Async::socket(&rt.reactor(), TcpListener::bind(("127.0.0.1", 0)).unwrap()).unwrap();
         let peer = TcpStream::connect(listener.get_ref().local_addr().unwrap()).unwrap();
-        let mut errors = [io::ErrorKind::Interrupted, io::ErrorKind::ConnectionAborted].into_iter();
+        let mut errors = [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+        ]
+        .into_iter();
         let (stream, _) = rt::block_on(accept(async || {
             listener
                 .read_with(|listener| match errors.next() {
