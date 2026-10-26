@@ -1,6 +1,7 @@
 """An isolated fixture daemon and the native idle observations shared by adapters."""
 from contextlib import contextmanager
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import queue
@@ -71,7 +72,8 @@ def daemon(binary, output=None, trial=0, first_run=False, ready_timeout=60):
                         if path.is_file():
                             shutil.copy2(path, output / f"failed-{trial}-{path.name}")
                     stderr.seek(0)
-                    (output / f"failed-{trial}-client.stderr").write_bytes(stderr.read())
+                    (output / f"failed-{trial}-client.json").write_text(
+                        json.dumps(dict(stderr=stderr.read().decode(errors="replace"))) + "\n")
                 raise
 
 

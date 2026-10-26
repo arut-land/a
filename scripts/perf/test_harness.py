@@ -202,7 +202,7 @@ class RealDaemon(unittest.TestCase):
                 self.assertFalse(client.is_running())
                 self.assertFalse(home.exists())
             self.assertEqual((output / "failed-1-retained.txt").read_text(), "failure diagnostic")
-            self.assertTrue((output / "failed-1-client.stderr").is_file())
+            self.assertEqual(json.loads((output / "failed-1-client.json").read_text()), dict(stderr=""))
 
 
 if __name__ == "__main__":
