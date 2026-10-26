@@ -310,9 +310,9 @@ pub struct ChangeBatch {
     pub changes: Vec<ViewChange>,
     /// The turn after this update.
     pub turn: TurnInfo,
-    /// The call whose reply is streaming in after this update: the text
-    /// shown for it is the deltas since it became this.
-    pub streaming: Option<u64>,
+    /// The reply attempt streaming after this update. A different identity
+    /// replaces the previous attempt's text before applying its deltas.
+    pub streaming: Option<StreamId>,
     /// The session's title after this update, once its model named it.
     pub title: Option<String>,
 }
@@ -715,8 +715,16 @@ impl From<&Link> for LinkState {
 
 #[data]
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamId {
+    pub call: u64,
+    pub attempt: u16,
+}
+
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamingText {
     pub call: u64,
+    pub attempt: u16,
     pub text: String,
 }
 
@@ -878,6 +886,7 @@ impl SessionSnapshot {
             recap: view.recap.as_ref().map(Into::into),
             streaming: view.streaming.as_ref().map(|s| StreamingText {
                 call: s.call.get(),
+                attempt: s.attempt,
                 text: s.text.clone(),
             }),
             turn: client.turn().into(),

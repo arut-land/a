@@ -651,7 +651,10 @@ mod tests {
                         text: "done".into(),
                     },
                 )];
-                loaded.writer.append(&mut entries, true).unwrap();
+                loaded
+                    .writer
+                    .append(&mut entries, crate::store::AppendMode::Order)
+                    .unwrap();
             }
             if cut_at >= 3 {
                 loaded.writer.flush_inline().unwrap();

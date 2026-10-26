@@ -28,7 +28,7 @@
 
 use std::fs::File;
 
-use ext_logging::{Fact, Fault, Operation, Stop, emit as fact};
+use ext_logging::{Fact, Fault, Operation, Stop, emit};
 use protocol::{CallId, Json, SessionId};
 use serde::{Deserialize, Serialize};
 
@@ -185,10 +185,10 @@ impl Exit {
         if let Err(e) = sys::crash::exited(&self.home, &self.pid) {
             fault(&e);
         }
-        fact(Fact::HandedOver {
+        emit(Fact::HandedOver {
             groups: given.len(),
         });
-        fact(Fact::Stopped {
+        emit(Fact::Stopped {
             reason: Stop::Upgrade,
         });
         ext_logging::flush(&*daemon.shared.rt).await;
@@ -225,7 +225,7 @@ fn fault(e: &std::io::Error) {
 }
 
 fn fault_in(session: Option<SessionId>, e: &std::io::Error) {
-    fact(Fact::Fault {
+    emit(Fact::Fault {
         session,
         operation: Operation::Handover,
         kind: Fault(e.kind()),

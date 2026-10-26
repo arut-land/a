@@ -99,13 +99,13 @@ public final class SessionStore {
 
     /// A line typed, parsed by the commands every client shares; what it
     /// asks of the app comes back.
-    public func submit(_ line: String) async -> AppAction? {
-        guard let session else { return nil }
+    public func submit(_ line: String) async throws -> AppAction? {
+        guard let session else { throw ClientError.notOpen }
         do {
             return try session.submit(line: line)
         } catch {
             problem = error.localizedDescription
-            return nil
+            throw error
         }
     }
 
@@ -204,8 +204,8 @@ public final class SessionStore {
             }
         }
         (rev, seq, turn, title) = (update.revision, update.seq, update.turn, update.title)
-        if streaming?.call != update.streaming {
-            streaming = update.streaming.map { StreamingText(call: $0, text: "") }
+        if streaming?.call != update.streaming?.call || streaming?.attempt != update.streaming?.attempt {
+            streaming = update.streaming.map { StreamingText(call: $0.call, attempt: $0.attempt, text: "") }
         }
         for change in update.changes {
             switch change {

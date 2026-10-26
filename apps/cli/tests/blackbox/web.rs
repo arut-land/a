@@ -393,11 +393,14 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     );
     wait_for("the tab to attach", || clients(&env, &session) == [1]);
 
+    let rejected = web.call("/api/send", TAB, "/interrupt");
+    assert_eq!(rejected.status(), 409, "{}", rejected.0);
+    assert!(!rejected.body().contains(r#"{"draft":""}"#));
     let sent = web.call("/api/send", TAB, "hello web");
     assert_eq!(sent.status(), 200, "{}", sent.0);
     // Datastar takes it as a patch of the page's signals.
     assert_eq!(sent.header("content-type"), Some("application/json"));
-    assert_eq!(sent.body(), r#"{"draft":""}"#);
+    assert_eq!(sent.body(), r#"{"admitted":"hello web"}"#);
     events.until("the line and its echo", |p| {
         shown(p).matches(">hello web<").count() == 2
     });

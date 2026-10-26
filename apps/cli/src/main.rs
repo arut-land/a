@@ -8,13 +8,6 @@ macro_rules! sayln {
     };
 }
 
-/// [`out`]s formatted text.
-macro_rules! say {
-    ($($arg:tt)*) => {
-        $crate::out(format_args!($($arg)*))
-    };
-}
-
 macro_rules! errln {
     ($($arg:tt)*) => {
         $crate::write(std::io::stderr().lock(), 1, format_args!("{}\n", format_args!($($arg)*)))
@@ -454,7 +447,8 @@ impl Renderer for Repl {
                         self.exit = Some(Err(io::Error::other(message.clone())));
                         continue;
                     }
-                    self.screen.show(&update.change, self.client.view());
+                    self.screen
+                        .show(&update.change, self.client.view(), &mut out);
                 }
                 Show::Notice(notice) => eprintln!("[{}]", client::sanitize(&notice.to_string())),
                 Show::Sessions => {
@@ -500,31 +494,40 @@ struct Screen {
 }
 
 impl Screen {
-    fn show(&mut self, change: &Change, view: &SessionView) {
+    fn show(
+        &mut self,
+        change: &Change,
+        view: &SessionView,
+        emit: &mut dyn FnMut(fmt::Arguments<'_>),
+    ) {
         if !matches!(change, Change::Batch { .. }) {
             for event in self.stream.project(view) {
                 match event {
-                    client::ReplyEvent::Start => say!("a    "),
-                    client::ReplyEvent::Text(text) => say!("{text}"),
-                    client::ReplyEvent::End => sayln!(),
+                    client::ReplyEvent::Start => emit(format_args!("a    ")),
+                    client::ReplyEvent::Text(text) => emit(format_args!("{text}")),
+                    client::ReplyEvent::End => emit(format_args!("\n")),
                 }
             }
         }
         match change {
             Change::Batch { changes } => {
                 for change in changes {
-                    self.show(change, view);
+                    self.show(change, view, emit);
                 }
             }
             Change::Attached {
                 session, workspace, ..
             } => {
                 self.synced = false;
-                sayln!("[session {} · {}]", session.short(), workspace);
+                emit(format_args!(
+                    "[session {} · {}]\n",
+                    session.short(),
+                    workspace
+                ));
             }
             Change::Added { item, .. } => {
                 if !matches!(item, Item::Assistant { .. }) {
-                    print_all(&added(item));
+                    print_all(&added(item), emit);
                 }
             }
             // Sent in place of a long replay: shown as the replay would be.
@@ -533,21 +536,21 @@ impl Screen {
                     if matches!(item.present().kind, Kind::Reply | Kind::Assistant) {
                         continue;
                     }
-                    print_all(&added(item));
+                    print_all(&added(item), emit);
                     if item.settled() {
-                        print_all(&outcome(&item.present()));
+                        print_all(&outcome(&item.present()), emit);
                     }
                 }
             }
-            Change::Updated { index, part } => self.updated(&view.items[*index], *part, view),
+            Change::Updated { index, part } => self.updated(&view.items[*index], *part, view, emit),
             Change::Synced => {
                 self.synced = true;
                 if let Some(recap) = &view.recap {
-                    sayln!("[{}]", recap_line(recap));
+                    emit(format_args!("[{}]\n", recap_line(recap)));
                 }
                 for call in view.state.inbox() {
                     if let Some(item) = view.items.iter().find(|i| i.key() == call.0) {
-                        sayln!("{}", ask(&view.present(item)));
+                        emit(format_args!("{}\n", ask(&view.present(item))));
                     }
                 }
             }
@@ -557,37 +560,45 @@ impl Screen {
         }
     }
 
-    fn updated(&mut self, item: &Item, part: Part, view: &SessionView) {
+    fn updated(
+        &mut self,
+        item: &Item,
+        part: Part,
+        view: &SessionView,
+        emit: &mut dyn FnMut(fmt::Arguments<'_>),
+    ) {
         let p = view.present(item);
         match (part, p.kind) {
             (Part::Outcome, Kind::Reply) => {
                 if let Some(usage) = p.usage {
-                    sayln!("     · {usage}");
+                    emit(format_args!("     · {usage}\n"));
                 }
                 if !p.status.is_empty() {
-                    sayln!("  └ {}", p.status);
+                    emit(format_args!("  └ {}\n", p.status));
                 }
             }
-            (Part::Outcome, Kind::Tool | Kind::Command | Kind::Child) => print_all(&outcome(&p)),
+            (Part::Outcome, Kind::Tool | Kind::Command | Kind::Child) => {
+                print_all(&outcome(&p), emit);
+            }
             (Part::Phase, _) if self.synced && p.buttons != protocol::view::Buttons::None => {
-                sayln!("{}", ask(&p));
+                emit(format_args!("{}\n", ask(&p)));
             }
             (Part::Presentation, _) if self.synced => {
                 if let Some(text) = description_update(&p) {
-                    sayln!("{text}");
+                    emit(format_args!("{text}\n"));
                 }
             }
             (Part::Answer { approved }, _) => {
-                sayln!("  · {}", answer_line(approved));
+                emit(format_args!("  · {}\n", answer_line(approved)));
             }
             _ => {}
         }
     }
 }
 
-fn print_all(lines: &[String]) {
+fn print_all(lines: &[String], emit: &mut dyn FnMut(fmt::Arguments<'_>)) {
     for line in lines {
-        sayln!("{line}");
+        emit(format_args!("{line}\n"));
     }
 }
 
@@ -788,102 +799,220 @@ fn serve(
     )
 }
 
-/// Every renderer shows an item the same way: whatever one says of an
-/// item (its title, its status, its body), the others say too, over the
-/// shared view vectors. The layout is each renderer's; the words are not.
+/// Drive the renderers through the SDK and inspect their emitted updates.
 #[cfg(all(test, unix, feature = "web"))]
 mod parity {
-    use protocol::view::{Kind, SessionView, Shown};
-    use protocol::{DaemonMsg, Decode};
+    use super::*;
+    use client::{ConnId, Event, EventKind, Welcome};
+    use protocol::{Body, CallId, Caps, DaemonMsg, Entry, Epoch, Json, Seq};
 
-    /// Text as a renderer that cannot wrap, colour or indent would have it.
-    fn bare(text: &str) -> String {
-        text.chars().filter(|c| !c.is_whitespace()).collect()
+    struct Renderers {
+        tui: tui::App,
+        web: web::Page,
+        repl: Screen,
+        view: SessionView,
     }
 
-    /// The text of markup: tags dropped, entities read back.
-    fn text_of_html(html: &str) -> String {
-        let mut text = String::new();
-        let mut tag = false;
-        for c in html.chars() {
-            match c {
-                '<' => tag = true,
-                '>' => tag = false,
-                c if !tag => text.push(c),
-                _ => {}
-            }
+    impl Renderers {
+        fn new() -> Self {
+            let session = protocol::SessionId::new();
+            let mut tui = tui::App::new(tui::Viewport::Full, &Target::New);
+            tui.client.open(Target::New);
+            let (mut web, _) = web::Page::new(session);
+            let connected = || Event {
+                conn: ConnId(1),
+                kind: EventKind::Connected {
+                    welcome: Welcome {
+                        proto: protocol::PROTO,
+                        caps: Caps::ALL,
+                    },
+                    remote: false,
+                    commands: Vec::new(),
+                    machine: protocol::MachineId([0; 16]),
+                    upgrade: None,
+                },
+            };
+            let effects = tui.client.step(connected());
+            client::pump(|_| Ok(()), &mut tui, effects);
+            let effects = web.client.step(connected());
+            client::pump(|_| Ok(()), &mut web, effects);
+            let mut renderers = Self {
+                tui,
+                web,
+                repl: Screen::default(),
+                view: SessionView::default(),
+            };
+            renderers.fold(&DaemonMsg::Attached {
+                session,
+                workspace: "/work".into(),
+            });
+            renderers.fold(&DaemonMsg::Synced { seq: 0 });
+            renderers
         }
-        text.replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&#39;", "'")
-            .replace("&amp;", "&")
+
+        fn fold(&mut self, message: &DaemonMsg) -> (String, Vec<String>, Vec<String>) {
+            let mut repl = String::new();
+            if let Some(update) = self.view.fold(message) {
+                self.repl.show(&update.change, &self.view, &mut |args| {
+                    use std::fmt::Write;
+                    write!(repl, "{args}").unwrap();
+                });
+            }
+            let event = || Event {
+                conn: ConnId(1),
+                kind: EventKind::Msg(message.clone()),
+            };
+            let effects = self.tui.client.step(event());
+            client::pump(|_| Ok(()), &mut self.tui, effects);
+            self.tui.draw(200, 40);
+            let tui = self.tui.canvas().grid().rows();
+            let effects = self.web.client.step(event());
+            client::pump(|_| Ok(()), &mut self.web, effects);
+            self.web.settle();
+            let patches = String::from_utf8(self.web.take()).unwrap();
+            let web = patches
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: elements "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let web = web
+                .split('>')
+                .skip(1)
+                .filter_map(|part| part.split_once('<').map(|(text, _)| text.to_owned()))
+                .filter(|text| !text.is_empty())
+                .collect();
+            (repl, tui, web)
+        }
+    }
+
+    fn entry(seq: u64, body: Body) -> DaemonMsg {
+        DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
     }
 
     #[test]
-    fn every_renderer_shows_an_item_the_same_way() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../crates/protocol/tests/vectors/view.json"
+    fn progress_is_distinct_from_the_command_and_controls_are_rendered() {
+        let mut renderers = Renderers::new();
+        let call = CallId::new(1).unwrap();
+        let added = renderers.fold(&entry(
+            1,
+            Body::ToolCall {
+                invoke: None,
+                tool: "bash".into(),
+                input: Json::encode(&serde_json::json!({"command": "echo hi"})).unwrap(),
+                id: None,
+                card: None,
+                by: protocol::Audience::Model,
+            },
+        ));
+        let progress = renderers.fold(&entry(
+            2,
+            Body::Progress {
+                call,
+                text: "hi".into(),
+            },
+        ));
+        renderers.fold(&entry(
+            3,
+            Body::ToolCall {
+                invoke: None,
+                tool: "bash".into(),
+                input: Json::encode(&serde_json::json!({"command": "echo controls"})).unwrap(),
+                id: None,
+                card: None,
+                by: protocol::Audience::Model,
+            },
+        ));
+        let ask = renderers.fold(&entry(
+            4,
+            Body::Decision {
+                by: "policy".into(),
+                call: CallId::new(3),
+                d: protocol::Verdict::Permission {
+                    permission: protocol::Permission::Ask(protocol::ApprovalReason::Mode {
+                        mode: "ask".into(),
+                    }),
+                },
+            },
+        ));
+        assert_eq!(added.0, "tool $ echo hi\n");
+        assert_eq!(added.2, ["$ echo hi", "running…", "Stop"]);
+        // The line REPL waits for an outcome; live renderers show progress now.
+        assert_eq!(progress.0, "");
+        assert_eq!(progress.2, ["$ echo hi", "running…", "hi"]);
+        assert!(progress.1.iter().any(|row| row == "  ⎿  hi"));
+        assert_eq!(
+            ask.0,
+            concat!(
+                "Call: bash\ninput[\"command\"]:\necho controls\nArguments (JSON):\n",
+                "{\"command\":\"echo controls\"}\nWhy: the ask mode requires approval for this tool\n",
+                "? $ echo controls  waiting for approval  [y/n]\n",
+            )
         );
-        let vectors: Vec<serde_json::Value> =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        let mut items = 0;
-        for vector in vectors {
-            let mut view = SessionView::default();
-            for m in vector["messages"].as_array().unwrap() {
-                view.fold(&DaemonMsg::from_json(m.to_string().as_bytes()).unwrap());
-            }
-            for item in &view.items {
-                let p = item.present();
-                if p.kind == Kind::Side {
-                    continue;
-                }
-                items += 1;
-                let look = tui::view::Look {
-                    verbose: true,
-                    ..tui::view::Look::default()
-                };
-                let tui = tui::view::texts(&tui::view::rows(item, 200, look)).join("\n");
-                let web = text_of_html(&web::view::html(web::view::ItemRow { item, view: &view }));
-                // The line printer prints an item as it is added, asks when it
-                // asks, and ends it once settled: in between it says nothing.
-                let mut repl = super::added(item);
-                let asking = p.buttons != protocol::view::Buttons::None;
-                if asking {
-                    repl.push(super::ask(&p));
-                }
-                if item.settled() {
-                    repl.extend(super::outcome(&p));
-                }
-                let repl = repl.join("\n");
-                let repl_status = item.settled() || asking;
-                // A reply's title is its model, shown with its usage, which the
-                // terminal keeps in its status line.
-                let title = if p.kind == Kind::Reply { "" } else { &p.title };
-                let said = [
-                    bare(title),
-                    bare(&p.status),
-                    match &p.body {
-                        Shown::None => String::new(),
-                        body => bare(body.text().lines().next().unwrap_or_default()),
-                    },
-                ];
-                for (name, shown) in [("tui", &tui), ("web", &web), ("repl", &repl)] {
-                    let shown = bare(shown);
-                    for (n, word) in said.iter().enumerate() {
-                        if n == 1 && name == "repl" && !repl_status {
-                            continue;
-                        }
-                        assert!(
-                            shown.contains(word.as_str()),
-                            "{name} leaves {word:?} out of {item:?}:\n{shown}"
-                        );
-                    }
-                }
-            }
+        assert_eq!(
+            ask.2,
+            [
+                "$ echo controls",
+                "waiting for approval",
+                "Call: bash\ninput[\"command\"]:\necho controls\nArguments (JSON):\n{\"command\":\"echo controls\"}",
+                "Why: the ask mode requires approval for this tool",
+                "Run this?",
+                "Approve",
+                "Deny",
+            ]
+        );
+        for expected in [
+            "Do you want to proceed? $ echo controls",
+            "❯ 1. Yes",
+            "  2. No",
+        ] {
+            assert!(ask.1.iter().any(|row| row == expected), "{ask:#?}");
         }
-        assert!(items > 20, "{items} items checked");
+    }
+
+    #[test]
+    fn streamed_retries_replace_the_visible_reply_and_start_a_new_repl_line() {
+        let mut renderers = Renderers::new();
+        renderers.fold(&entry(
+            1,
+            Body::ModelCall {
+                request: None,
+                model: "m".into(),
+                attempt: 0,
+                choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: None,
+            },
+        ));
+        for (attempt, text) in ["a\nold", "€new!", "€same", "€"].into_iter().enumerate() {
+            let captured = renderers.fold(&DaemonMsg::Delta {
+                call: CallId::new(1).unwrap(),
+                attempt: u16::try_from(attempt).unwrap(),
+                text: text.into(),
+            });
+            let prefix = if attempt == 0 { "a    " } else { "\na    " };
+            assert_eq!(captured.0, format!("{prefix}{text}"));
+            assert_eq!(captured.2, [text, "▍"]);
+            let expected = if attempt == 0 {
+                vec!["⏺ a".into(), "  old▍".into()]
+            } else {
+                vec![format!("⏺ {text}▍")]
+            };
+            let reply: Vec<_> = captured
+                .1
+                .iter()
+                .filter(|row| row.starts_with("⏺ ") || row.starts_with("  "))
+                .cloned()
+                .collect();
+            assert_eq!(reply, expected);
+        }
+        let continued = renderers.fold(&DaemonMsg::Delta {
+            call: CallId::new(1).unwrap(),
+            attempt: 3,
+            text: "!".into(),
+        });
+        assert_eq!(continued.0, "!");
+        assert_eq!(continued.2, ["!"]);
+        assert!(continued.1.iter().any(|row| row == "⏺ €!▍"));
     }
 }
 

@@ -31,7 +31,7 @@ type Tabs = Mutex<HashMap<String, (u64, Arc<Post<TabIn>>)>>;
 enum TabIn {
     Client(Event),
     /// A line typed in the composer.
-    Line(String),
+    Line(String, rt::oneshot::Sender<bool>),
     Cmd(Cmd),
 }
 
@@ -137,15 +137,17 @@ impl App {
             (&Method::POST, "/api/send", _) => match signals(&body) {
                 Some(Signals { draft, .. }) if draft.trim().is_empty() => done(true),
                 Some(Signals { tab, draft }) => {
-                    if self.tell(&tab, TabIn::Line(draft)) {
-                        // Empties the composer.
+                    let (reply, admitted) = rt::oneshot::channel();
+                    if !self.tell(&tab, TabIn::Line(draft.clone(), reply)) {
+                        done(false)
+                    } else if admitted.await == Some(true) {
                         whole(
                             StatusCode::OK,
                             "application/json",
-                            br#"{"draft":""}"#.to_vec(),
+                            serde_json::to_vec(&serde_json::json!({ "admitted": draft })).unwrap(),
                         )
                     } else {
-                        done(false)
+                        text(StatusCode::CONFLICT, "submission rejected; draft kept")
                     }
                 }
                 None => done(false),
@@ -228,7 +230,7 @@ impl Live {
             size_of::<TabIn>()
                 + match input {
                     TabIn::Client(event) => event.retained_bytes(),
-                    TabIn::Line(text) => text.len(),
+                    TabIn::Line(text, _) => text.len(),
                     TabIn::Cmd(_) => 4096,
                 }
         });
@@ -263,12 +265,15 @@ impl Live {
                 return None;
             }
             for input in Self::batch(&self.inbox).await? {
-                let effects = match input {
-                    TabIn::Client(event) => self.page.client.step(event),
-                    TabIn::Line(text) => self.page.line(&text),
-                    TabIn::Cmd(cmd) => self.page.command(cmd),
+                let (effects, admission) = match input {
+                    TabIn::Client(event) => (self.page.client.step(event), None),
+                    TabIn::Line(text, reply) => (self.page.line(&text), Some(reply)),
+                    TabIn::Cmd(cmd) => (self.page.command(cmd), None),
                 };
                 self.driver.pump(&mut self.page, effects);
+                if let Some(reply) = admission {
+                    reply.send(self.page.admitted());
+                }
             }
             self.page.settle();
             rt::yield_now().await;

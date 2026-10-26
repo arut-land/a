@@ -69,14 +69,14 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     #expect(other.recap?.line.hasPrefix("recap · you: $ echo hello · ran bash") == true)
 
     #expect(!store.turn.running && !store.turn.canInterrupt)
-    #expect(await store.submit("/help") == .help)
+    #expect(try await store.submit("/help") == .help)
     #expect(store.commands.contains { $0.usage == "/interrupt" })
     await store.send("$ sleep 30")
     try await eventually("the second ask") { store.turn.asking != nil }
     await store.approve(call: store.turn.asking!, approved: true)
     try await eventually("the call to run") { store.turn.running && store.turn.asking == nil }
     #expect(store.turn.canInterrupt)
-    #expect(await store.submit("/interrupt") == nil)
+    #expect(try await store.submit("/interrupt") == nil)
     try await eventually("the call to stop") { !store.turn.running }
 
     await store.detach()
@@ -143,7 +143,7 @@ func fork_rekeys_the_cached_store() async throws {
         $0.kind == .assistant && $0.presentation.body?.text == "before fork"
     } }
 
-    _ = await store.submit("/fork")
+    _ = try await store.submit("/fork")
     try await eventually("fork attached") { store.link == .live && store.sessionId != original }
     let fork = try #require(store.sessionId)
     #expect(cache.stores[original] == nil)
@@ -221,4 +221,18 @@ func evicted_sessions_release_connections() async throws {
     let reopened = bounded.open(id, client: client)
     try await eventually("byte budget evicts inactive views") { bounded.stores.isEmpty }
     #expect(reopened.cacheState == .detached)
+}
+
+@Test(.enabled(if: live != nil))
+func aRejectedSubmissionThrowsWithoutConsumingTheDraft() async throws {
+    let client = try Client(helper: live!)
+    let store = SessionStore(session: Session(client: client))
+    store.open(.new(workspace: FileManager.default.temporaryDirectory.path))
+    try await eventually("live for admission") { store.link == .live }
+    let draft = "/interrupt"
+    await #expect(throws: ClientError.self) { try await store.submit(draft) }
+    #expect(store.problem != nil)
+    #expect(!store.turn.running)
+    #expect(try await store.submit("/help") == .help)
+    await store.detach()
 }

@@ -19,8 +19,8 @@ pub struct Page {
     shown: Option<End>,
     /// The title the page shows.
     titled: Option<String>,
-    /// Text streamed since the last patch, for one reply.
-    streamed: Option<(protocol::CallId, String)>,
+    /// Text streamed since the last patch, for one reply attempt.
+    streamed: Option<(protocol::CallId, u16, String)>,
     /// Events not yet sent.
     out: Vec<u8>,
 }
@@ -58,8 +58,16 @@ impl Page {
     pub fn line(&mut self, text: &str) -> Vec<Effect> {
         match client::parse(text, self.client.turn().asking) {
             None => Vec::new(),
-            Some(cmd) => self.command(cmd),
+            Some(cmd) => {
+                self.error = None;
+                self.command(cmd)
+            }
         }
+    }
+
+    /// Whether the last line was admitted by the SDK and driver pump.
+    pub fn admitted(&self) -> bool {
+        self.error.is_none()
     }
 
     pub fn command(&mut self, cmd: Cmd) -> Vec<Effect> {
@@ -132,11 +140,19 @@ impl Page {
             _ => return,
         };
         if let Change::Delta { call, text } = change {
+            let attempt = self
+                .client
+                .view()
+                .streaming
+                .as_ref()
+                .expect("delta streams a reply")
+                .attempt;
             match &mut self.streamed {
-                Some((c, t)) if *c == call => t.push_str(&text),
+                Some((c, a, t)) if (*c, *a) == (call, attempt) => t.push_str(&text),
+                Some((c, ..)) if *c == call => self.streamed = Some((call, attempt, text)),
                 _ => {
                     self.flush();
-                    self.streamed = Some((call, text));
+                    self.streamed = Some((call, attempt, text));
                 }
             }
             return;
@@ -191,7 +207,7 @@ impl Page {
     /// Adds the text streamed into reply `call` to its element; the first
     /// text replaces the reply's "thinking…".
     fn flush(&mut self) {
-        let Some((call, text)) = self.streamed.take() else {
+        let Some((call, attempt, text)) = self.streamed.take() else {
             return;
         };
         let view = self.client.view();
@@ -200,7 +216,7 @@ impl Page {
         let started = view
             .streaming
             .as_ref()
-            .is_none_or(|s| s.call != call || s.text.len() == text.len());
+            .is_none_or(|s| s.call != call || s.attempt != attempt || s.text.len() == text.len());
         if started {
             let Some(item) = view.items.iter().find(|i| i.key() == call.0) else {
                 return;
@@ -385,6 +401,23 @@ mod tests {
     }
 
     #[test]
+    fn submission_admission_includes_sdk_and_driver_rejection() {
+        let mut page = synced();
+        let effects = page.line("/interrupt");
+        client::pump(|_| Ok(()), &mut page, effects);
+        assert!(!page.admitted());
+        let effects = page.line("send this draft");
+        client::pump(|_| Ok(()), &mut page, effects);
+        assert!(page.admitted());
+        let effects = page.line("transport rejected");
+        client::pump(|_| Err(Error::Busy), &mut page, effects);
+        assert!(!page.admitted());
+        let effects = page.line("/help");
+        client::pump(|_| Ok(()), &mut page, effects);
+        assert!(!page.admitted());
+    }
+
+    #[test]
     fn the_transcript_shows_whole_once_synced() {
         let mut page = page();
         page.fold(&[
@@ -475,6 +508,54 @@ mod tests {
         assert!(
             settled[1].contains("<div id=\"end\"") && !settled[1].contains("Stop"),
             "{settled:?}"
+        );
+    }
+
+    #[test]
+    fn retries_in_one_batch_replace_buffered_text_before_appending() {
+        let mut page = synced();
+        page.fold(&[entry(
+            2,
+            Body::ModelCall {
+                request: None,
+                model: "m".into(),
+                attempt: 0,
+                choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: None,
+            },
+        )]);
+        events(&mut page);
+        page.fold(&[
+            delta(2, "failed attempt"),
+            DaemonMsg::Delta {
+                call: CallId::new(2).unwrap(),
+                attempt: 1,
+                text: "€new".into(),
+            },
+            DaemonMsg::Delta {
+                call: CallId::new(2).unwrap(),
+                attempt: 1,
+                text: "!".into(),
+            },
+        ]);
+        let patches = events(&mut page);
+        assert_eq!(patches.len(), 1);
+        let reply = patches[0]
+            .split_once("<span id=\"reply-2\">")
+            .and_then(|(_, tail)| tail.split_once("</span>"))
+            .map(|(text, _)| text);
+        assert_eq!(reply, Some("€new!"), "{patches:?}");
+        page.fold(&[DaemonMsg::Delta {
+            call: CallId::new(2).unwrap(),
+            attempt: 1,
+            text: "?".into(),
+        }]);
+        assert_eq!(
+            events(&mut page),
+            [
+                "event: datastar-patch-elements\ndata: selector #reply-2\ndata: mode append\ndata: elements <span>?</span>"
+            ]
         );
     }
 

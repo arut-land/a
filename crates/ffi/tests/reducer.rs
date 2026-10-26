@@ -138,7 +138,10 @@ fn an_update_says_whose_reply_is_streaming() {
     );
     assert_eq!(
         reducer.fold(&delta.to_string()).unwrap().unwrap().streaming,
-        Some(1)
+        Some(a_ffi::StreamId {
+            call: 1,
+            attempt: 0
+        })
     );
     let settled = reducer.fold(&reply.to_string()).unwrap().unwrap();
     assert_eq!(settled.streaming, None);

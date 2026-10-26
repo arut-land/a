@@ -64,11 +64,19 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
 
 @Test func aStoreAppliesTheUpdatesToTheSameView() throws {
     for vector in Vector.all {
-        let (reducer, updates) = try vector.fold()
+        let reducer = Reducer()
         let store = SessionStore(source: reducer)
-        updates.forEach(store.apply)
-        // Repeats change nothing.
-        updates.forEach(store.apply)
+        for message in vector.messages {
+            if let update = try reducer.fold(message: message) {
+                store.apply(update)
+                store.apply(update)
+                let snapshot = reducer.snapshot()
+                #expect(store.items == snapshot.items, "\(vector.name)")
+                #expect(store.streaming == snapshot.streaming, "\(vector.name)")
+                #expect(store.turn == snapshot.turn, "\(vector.name)")
+                #expect(store.rev == snapshot.rev && store.seq == snapshot.seq, "\(vector.name)")
+            }
+        }
         expectInStep(store, reducer, vector.name)
         #expect(store.resyncs == 0)
     }
@@ -88,17 +96,15 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
 
 @Test func aStoreFarBehindTakesASnapshot() throws {
     let reducer = Reducer()
-    _ = try reducer.fold(
-        message: #"{"t":"attached","session":"00000000-0000-0000-0000-00000000000a","workspace":"/w"}"#)
+    let vector = Vector.all.first { $0.name == "a far behind renderer takes a snapshot" }!
     let store = SessionStore(source: reducer)
     var last: ChangeBatch?
-    for seq in 1...1000 {
-        last = try reducer.fold(
-            message: #"{"t":"entry","seq":\#(seq),"epoch":0,"kind":"input","segments":[{"text":"m\#(seq)"}],"taken":true}"#)
+    for message in vector.messages {
+        last = try reducer.fold(message: message)
     }
     store.apply(last!)
     expectInStep(store, reducer, "far behind")
-    #expect(store.items.count == 1000 && store.resyncs == 1)
+    #expect(store.items.count == 1 && store.resyncs == 1)
 }
 
 /// An interrupt settles a call waiting for approval, so Stop shows for one.
@@ -119,11 +125,8 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
 @Test func aTitlingReplyTitlesTheStore() throws {
     let reducer = Reducer()
     let store = SessionStore(source: reducer)
-    for message in [
-        #"{"t":"attached","session":"00000000-0000-0000-0000-00000000000a","workspace":"/w"}"#,
-        #"{"t":"entry","seq":1,"epoch":0,"kind":"model_call","model":"m","purpose":"title"}"#,
-        #"{"t":"entry","seq":2,"epoch":0,"kind":"model_result","call":1,"outcome":{"status":"done","output":{"message":{"content":[{"type":"text","text":"Fix the parser"}]}}}}"#,
-    ] {
+    let vector = Vector.all.first { $0.name == "a titling reply titles the store" }!
+    for message in vector.messages {
         if let update = try reducer.fold(message: message) { store.apply(update) }
     }
     #expect(store.title == "Fix the parser")
@@ -243,7 +246,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
             turn: turn, streaming: nil, title: "original"))
         store.apply(ChangeBatch(
             revision: 2, seq: 99, changes: [.error(message: "discarded")] + changes,
-            turn: reducer.turn(), streaming: 123, title: "discarded"))
+            turn: reducer.turn(), streaming: StreamId(call: 123, attempt: 0), title: "discarded"))
         #expect(store.items == [item])
         #expect(store.rev == 1 && store.seq == 1)
         #expect(store.title == "original")
@@ -257,4 +260,15 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
         #expect(store.items == [item, next])
         #expect(store.rev == 2 && store.seq == 2 && store.title == "retry")
     }
+}
+
+@Test func aRetryReplacesStreamedTextAtEveryLength() throws {
+    let vector = Vector.all.first { $0.name == "retry replaces streamed text at every length" }!
+    let reducer = Reducer()
+    let store = SessionStore(source: reducer)
+    for message in vector.messages {
+        if let update = try reducer.fold(message: message) { store.apply(update) }
+        expectInStep(store, reducer, vector.name)
+    }
+    #expect(store.streaming?.text == "€")
 }

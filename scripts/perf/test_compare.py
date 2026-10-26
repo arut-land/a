@@ -86,11 +86,13 @@ class Comparison(unittest.TestCase):
         process = mock.Mock()
         process.cpu_times.return_value = mock.Mock(user=1, system=2)
         process.memory_info.return_value = mock.Mock(rss=4096)
+        process.num_ctx_switches.return_value = (5, 6)
         with mock.patch("psutil.Process", return_value=process), mock.patch("sys.platform", "darwin"):
             result = snapshot(1, threads=True)
         process.threads.assert_not_called()
         self.assertEqual(result["cpu_seconds"], 3)
         self.assertEqual(result["rss_kib"], 4)
+        self.assertEqual(result["ctx_switches"], 11)
 
     def test_artifact_redirects_never_forward_github_tokens_to_storage(self):
         import urllib.request
