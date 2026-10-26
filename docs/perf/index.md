@@ -148,8 +148,11 @@ The same-daemon measurement includes decoding, CRC validation and the first
 grep. The new-daemon probe creates one file after the old store is dropped,
 then searches until that file appears; its CPU figure includes repeated
 fuzzy searches as well as the background verify walk and change comparison.
-Verification does not reread unchanged source contents. Initial searches
-can use the snapshot while that verification runs. The earlier cold
+These measurements describe the initial implementation before the review fixes.
+The current implementation makes grep wait for reconciliation and also rereads
+entries modified at or after the conservative observation watermark. Initial
+path searches can still use the snapshot while verification runs. The 42.2 ms
+row measures snapshot availability, not verified grep readiness. The earlier cold
 baseline was 185 ms walk plus 2.0 s build; the repeated current measurements
 are the closer comparison. Same-daemon reload avoids both operations.
 

@@ -37,6 +37,10 @@ pub(crate) struct Searched {
 
 /// The typos a query may make: a short query that may make many matches
 /// everything.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "FFF scores and path coordinates use compact integer storage"
+)]
 pub(crate) fn max_typos(query: &FFFQuery<'_>) -> u16 {
     let effective = match &query.fuzzy_query {
         FuzzyQuery::Text(t) => *t,
@@ -124,6 +128,10 @@ fn config(parts: &[&str], max_typos: u16) -> neo_frizbee::Config {
 
 /// Each part matched against every path: the paths every part matched,
 /// their scores averaged. `Match::index` is into `paths`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "FFF scores and path coordinates use compact integer storage"
+)]
 fn match_fuzzy_parts(
     fuzzy_parts: &[&str],
     paths: &[&str],
@@ -203,6 +211,18 @@ fn match_fuzzy_parts(
 
 /// Every match of the parts in `paths` (the paths of `working`'s slots),
 /// scored.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "FFF scores and path coordinates use compact integer storage"
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "FFF scores and path coordinates use compact integer storage"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the algorithm keeps its ordered stages together"
+)]
 fn score_matches(
     files: &Files,
     working: &[usize],
@@ -403,6 +423,10 @@ pub(crate) fn sort_and_take(
 
 /// Where in each of `paths` the query's parts matched, as byte ranges:
 /// what a client highlights.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "FFF scores and path coordinates use compact integer storage"
+)]
 pub(crate) fn match_ranges(query: &FFFQuery<'_>, paths: &[&str]) -> Vec<SmallVec<[(u32, u32); 4]>> {
     let parts: SmallVec<[&str; 4]> = match &query.fuzzy_query {
         FuzzyQuery::Text(text) if text.len() >= 2 => smallvec::smallvec![*text],
@@ -482,6 +506,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::similar_names,
+        reason = "test cases name closely related score components"
+    )]
     fn scored_in_parts_a_search_ranks_as_scored_whole() {
         let paths: Vec<String> = (0..700)
             .map(|i| format!("src/m{}/controller_{i}.rs", i % 9))
@@ -530,6 +558,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "FFF scores and path coordinates use compact integer storage"
+    )]
     fn longer_second_part_preserves_matches_and_first_part_positions() {
         let paths = [
             "src/controller.rs",

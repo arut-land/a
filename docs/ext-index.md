@@ -110,33 +110,47 @@ workspace does not start an index merely by starting the daemon.
 
 The cache consists of `<crc64(root)>.files` and `.bigrams`, inside a private
 0700 directory, with 0600 files (the platform's private-file equivalent on
-Windows). Both use a magic, format version 1, little-endian counted fields,
-and CRC-32C. The file-list snapshot names its root and timestamp, path
+Windows). Both use a magic, format version 2, little-endian counted fields,
+and CRC-32C. The file-list snapshot names its root, unique snapshot identity,
+conservative content-observation watermark, path
 arena, file metadata, walked prefix and tombstones, and optionally the
-content build id, binary-file bitset and edit overlay. The bigram file
-names the same build and holds the compressed consecutive and skip-pair
+content build id, binary and unknown-content bitsets, and edit overlay.
+The bigram file names the same build and holds the compressed consecutive and skip-pair
 columns. A new content build is written before the file list naming it;
 edits can rewrite the file list without rewriting unchanged bigram columns.
 
-Reads check lengths against remaining bytes, UTF-8 and arena bounds,
-walked-path ordering, bitset sizes, column references, sparse gap lists,
-build ids and checksums. An invalid file list is discarded and rebuilt;
+Reads check lengths against remaining bytes and the content-memory budget,
+UTF-8, normalized nonempty workspace-relative paths, arena bounds,
+walked-path ordering, bitset sizes, every sparse offset and gap list,
+at most one optional skip index, build ids and checksums. An invalid file list is discarded and rebuilt;
 an invalid content file leaves the file list usable and rebuilds content.
 The cache is derived state, never a source of session facts.
 
-Reload within the same daemon applies the pending watch events without
-walking. Without a retained reliable subscription, the loaded snapshot
-answers immediately while a background walk verifies it. Only files whose
-size or modification time differs, or whose modification time is in the
-snapshot's second or later, are reread into the content overlay. The last
-rule is git's racily-clean timestamp rule. New and removed files are
-installed through the same incremental change path, preserving content
-slot identities.
+Reload within the same daemon applies pending watch events without walking
+only when the snapshot identity matches the one that daemon published.
+Another daemon's publication, even of an older snapshot, requires verification.
+Grep waits for verification and pending-event reconciliation before taking its
+file list and content index; path completion can use the snapshot meanwhile.
+Only files whose size or modification time differs, or whose modification time
+is in the observation watermark's second or later, are reread into the content
+overlay. The watermark precedes content observation and never advances merely
+because persistence happens later. This preserves git's racily-clean timestamp
+rule across a crash with undelivered watch events. New and removed files use
+the incremental change path, preserving content slot identities.
+
+Partial and failed content reads are unknown, so they never exclude a grep
+candidate. Files over the 2 MiB content-index limit are searched normally;
+files over 10 MiB use fixed I/O buffers, lazy DFA caches and seeking to recover
+regex spans without retaining whole lines. Fuzzy search overlaps windows by
+its maximum accepted span. Cancellation is checked between I/O buffers, and
+both file and global match allowances stop collection exactly. Display text
+is an excerpt around the match, with omitted ends marked by an ellipsis.
 
 When deleted slots, added slots and edited base slots together exceed a
 quarter of slots, rest compacts the path arena and folds the overlay into
-remapped bigram columns. Existing file contents are not reread; added
-files are indexed then. Edited files' skip-pair columns stay conservative
+remapped bigram columns within the content budget. Only actual dense columns
+receive dense storage; if content cannot fit, grep scans files instead.
+Existing file contents are not reread; added files are indexed then. Edited files' skip-pair columns stay conservative
 because the overlay stores consecutive pairs alone. Binary bits are
 remapped with the files. Cache files unopened for thirty days and resting
 watch subscriptions unused that long are reclaimed during another rest,

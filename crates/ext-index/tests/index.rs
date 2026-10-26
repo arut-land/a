@@ -419,9 +419,12 @@ fn an_index_reopened_after_edits_made_while_it_rested_sees_them() {
     tree.write("src/fresh/new.rs", "unicorn\n");
     std::fs::remove_file(tree.root().join("src/gone.rs")).unwrap();
     let index = indexes.open(tree.root(), rt, hub);
-    eventually("what changed at rest is seen", || {
-        grep(&index, "unicorn").0 == ["src/edited.rs", "src/fresh/new.rs"]
-    });
+    // Let the real watch delivery finish while the index is still resting.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        grep(&index, "unicorn").0,
+        ["src/edited.rs", "src/fresh/new.rs"]
+    );
     assert!(grep(&index, "unicorn").1.prefiltered);
     assert!(!search(&index, "").contains(&"src/gone.rs".to_owned()));
     assert!(search(&index, "").contains(&"src/kept.rs".to_owned()));
@@ -450,9 +453,7 @@ fn an_index_another_daemon_kept_is_checked_against_the_tree_before_it_is_trusted
 
     let indexes = kept(store.path(), Duration::from_secs(60));
     let index = open(&indexes, tree.root(), runtime());
-    eventually("what changed meanwhile is seen", || {
-        grep(&index, "unicorn").0 == ["src/edited.rs", "src/new.rs"]
-    });
+    assert_eq!(grep(&index, "unicorn").0, ["src/edited.rs", "src/new.rs"]);
     let (_, summary) = grep(&index, "unicorn");
     assert!(summary.prefiltered);
     // The content index came from disk: only what changed is read.
@@ -587,4 +588,150 @@ fn dropping_the_index_store_releases_its_resting_indexes() {
         "the store owns resting indexes without an ownership cycle",
         || weak.upgrade().is_none(),
     );
+}
+
+#[test]
+fn grep_never_exceeds_the_total_allowance_in_any_mode() {
+    let tree = Tree::new();
+    tree.write("a.txt", &"needle\n".repeat(199));
+    tree.write("b.txt", &"needle\n".repeat(200));
+    let indexes = Indexes::new(Limits::default());
+    let index = open(&indexes, tree.root(), runtime());
+    for mode in [
+        ext_index::GrepMode::Plain,
+        ext_index::GrepMode::Regex,
+        ext_index::GrepMode::Fuzzy,
+    ] {
+        for limit in [0, 1, 200, 300, 399] {
+            let mut matches = 0;
+            let summary = rt::block_on(index.grep(
+                GrepQuery {
+                    pattern: Pattern::Exact {
+                        pattern: "needle".into(),
+                        glob: None,
+                    },
+                    options: GrepOptions {
+                        mode,
+                        ..GrepOptions::default()
+                    },
+                    limit,
+                },
+                &Cancel::default(),
+                |g| matches += g.matches.len(),
+            ))
+            .unwrap();
+            assert_eq!(matches, limit, "{mode:?}, limit={limit}");
+            assert_eq!(summary.matches, limit);
+        }
+    }
+}
+
+#[test]
+fn partial_content_is_unknown_during_build_edit_compaction_and_reload() {
+    let tree = Tree::new();
+    let store = tempfile::tempdir().unwrap();
+    let text = format!("{}\nneedle\n", "x".repeat((2 << 20) + 1));
+    tree.write("large.txt", &text);
+    tree.write("edit.txt", "before");
+    let indexes = kept(store.path(), Duration::from_millis(300));
+    let index = open(&indexes, tree.root(), runtime());
+    assert_eq!(grep(&index, "needle").0, ["large.txt"]);
+    tree.write("edit.txt", &text);
+    eventually("the watcher reconciles partial content", || {
+        grep(&index, "needle").0.len() == 2
+    });
+    rested(&index);
+    assert_eq!(grep(&index, "needle").0, ["edit.txt", "large.txt"]);
+}
+
+#[test]
+fn a_snapshot_published_by_another_daemon_requires_verification() {
+    let tree = Tree::new();
+    let store = tempfile::tempdir().unwrap();
+    tree.write("a.txt", "before");
+    let indexes = kept(store.path(), Duration::from_millis(300));
+    let index = open(&indexes, tree.root(), runtime());
+    assert_eq!(grep(&index, "before").0, ["a.txt"]);
+    rested(&index);
+    let saved: Vec<_> = std::fs::read_dir(store.path())
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    tree.write("a.txt", "needle");
+    tree.write("new.txt", "needle");
+    eventually("the first daemon consumes the edits", || {
+        grep(&index, "needle").0.len() == 2
+    });
+    rested(&index);
+    // Publish an older, internally valid snapshot after this daemon consumed
+    // the edit events. Its pending set no longer describes this snapshot.
+    for (path, bytes) in saved {
+        std::fs::write(path, bytes).unwrap();
+    }
+    assert_eq!(grep(&index, "needle").0, ["a.txt", "new.txt"]);
+}
+
+#[test]
+fn reload_respects_a_smaller_content_budget_without_losing_results() {
+    let tree = Tree::new();
+    for i in 0..20 {
+        tree.write(&format!("f{i}.txt"), "other");
+    }
+    let store = tempfile::tempdir().unwrap();
+    tree.write("a.txt", "needle");
+    {
+        let indexes = kept(store.path(), Duration::from_millis(200));
+        let index = open(&indexes, tree.root(), runtime());
+        assert!(grep(&index, "needle").1.prefiltered);
+        rested(&index);
+    }
+    let indexes = Indexes::new(Limits {
+        memory: 8192,
+        ..Limits::default()
+    })
+    .kept_in(store.path());
+    let index = open(&indexes, tree.root(), runtime());
+    let (paths, summary) = grep(&index, "needle");
+    assert_eq!(paths, ["a.txt"]);
+    assert!(!summary.prefiltered);
+    assert!(index.resident() <= 8192);
+}
+
+#[test]
+fn grep_streams_files_larger_than_ten_mebibytes_in_every_mode() {
+    let tree = Tree::new();
+    tree.write("large.txt", &format!("{}needle\n", "x".repeat(12 << 20)));
+    let indexes = Indexes::new(Limits::default());
+    let index = open(&indexes, tree.root(), runtime());
+    for mode in [
+        ext_index::GrepMode::Plain,
+        ext_index::GrepMode::Regex,
+        ext_index::GrepMode::Fuzzy,
+    ] {
+        let mut hits = Vec::new();
+        let summary = rt::block_on(index.grep(
+            GrepQuery {
+                pattern: Pattern::Exact {
+                    pattern: "needle".into(),
+                    glob: None,
+                },
+                options: GrepOptions {
+                    mode,
+                    ..GrepOptions::default()
+                },
+                limit: 1,
+            },
+            &Cancel::default(),
+            |g| hits.extend(g.matches),
+        ))
+        .unwrap();
+        assert_eq!(summary.matches, 1, "{mode:?}");
+        assert_eq!(hits[0].col, 12 << 20, "{mode:?}");
+        assert_eq!(hits[0].byte_offset, 0, "{mode:?}");
+        assert!(hits[0].text.contains("needle"));
+    }
 }

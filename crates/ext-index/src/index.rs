@@ -229,6 +229,9 @@ struct State {
     dirty: bool,
     /// The build of the content index the bigrams file holds.
     bigrams_on_disk: Option<u64>,
+    snapshot: Option<uuid::Uuid>,
+    /// Earliest observation represented by this snapshot, never its write time.
+    observed: u64,
 }
 
 /// What a closed index has on disk, and what changed since it was written.
@@ -242,7 +245,7 @@ enum Stored {
     Unseen,
     /// Written as the index came to rest, its subscription kept: what
     /// changed since is in [`State::pending`].
-    Watched,
+    Watched(uuid::Uuid),
 }
 
 /// The index's subscriptions: the tree, entered as it is walked, and the
@@ -290,6 +293,8 @@ pub(crate) struct ContentIndex {
     overlay: BigramOverlay,
     /// One bit per walked file: binary, never searched.
     binary: Arc<Vec<u64>>,
+    /// Partially read or unreadable content cannot exclude a candidate.
+    unknown: Arc<Vec<u64>>,
 }
 
 #[derive(Default)]
@@ -412,7 +417,6 @@ impl WorkspaceIndex {
                 if due > now {
                     me.rt.sleep(due - now).await;
                 } else if me.rest().await {
-                    me.state().keeper = false;
                     break;
                 }
             }
@@ -426,40 +430,62 @@ impl WorkspaceIndex {
     /// It stays open instead (`false`), for another linger, if it is busy
     /// or used meanwhile; it closes, as with no store, if it cannot be
     /// written.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the algorithm keeps its ordered stages together"
+    )]
     async fn rest(&self) -> bool {
         let Some((store, place)) = self
             .store
             .as_ref()
             .and_then(|(store, place)| store.upgrade().map(|store| (store, place)))
         else {
+            let mut state = self.state();
+            if state
+                .last_used
+                .is_some_and(|used| self.rt.now() < used + self.limits.linger)
+            {
+                return false;
+            }
+            state.keeper = false;
             return true;
         };
-        let (files, content, used, mut write_bigrams) = {
+        let (files, content, used, mut write_bigrams, observed, snapshot) = {
             let mut state = self.state();
             if state.busy != Busy::Idle || matches!(state.content, Content::Building { .. }) {
                 state.last_used = Some(self.rt.now());
                 return false;
             }
             let Some(files) = state.files.clone() else {
+                state.keeper = false;
                 return true;
             };
             let content = match &state.content {
                 Content::Ready(content) => Some(Arc::clone(content)),
                 Content::Absent | Content::Refused | Content::Building { .. } => None,
             };
-            let write_bigrams = content
-                .as_ref()
-                .is_some_and(|content| state.bigrams_on_disk != Some(content.id));
+            let write_bigrams = content.as_ref().and_then(|content| {
+                (state.bigrams_on_disk != Some(content.id)).then_some(WriteBigrams)
+            });
             state.busy = Busy::Persisting;
             (
                 state.dirty.then_some(files),
                 content,
                 state.last_used,
                 write_bigrams,
+                state.observed,
+                state.snapshot,
             )
         };
         let (files, content, compacted) = self.compact(files, content).await;
-        write_bigrams |= compacted && content.is_some();
+        if compacted && content.is_some() {
+            write_bigrams = Some(WriteBigrams);
+        }
+        let snapshot = if files.is_some() {
+            Some(uuid::Uuid::now_v7())
+        } else {
+            snapshot
+        };
         let written = match &files {
             None => Ok(()),
             Some(files) => {
@@ -469,6 +495,8 @@ impl WorkspaceIndex {
                     Arc::clone(files),
                     content.clone(),
                     write_bigrams,
+                    observed,
+                    snapshot.expect("a write has an identity"),
                 )
                 .await
             }
@@ -481,9 +509,13 @@ impl WorkspaceIndex {
             state.stored = Stored::None;
             state.files = None;
             state.content = Content::Absent;
+            state.keeper = false;
+            drop(state);
+            self.changed.notify();
             return true;
         }
         state.dirty = false;
+        state.snapshot = snapshot;
         if compacted {
             state.files = files;
             state.content = content
@@ -506,10 +538,12 @@ impl WorkspaceIndex {
             state.stored = Stored::Unseen;
             state.watching.take()
         } else {
-            state.stored = Stored::Watched;
+            state.stored = Stored::Watched(snapshot.expect("stored snapshot has an identity"));
             None
         };
+        state.keeper = false;
         drop(state);
+        self.changed.notify();
         drop(release);
         store.retire(self.rt.now());
         if let Some(me) = self.me() {
@@ -518,13 +552,19 @@ impl WorkspaceIndex {
         true
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the persistence boundary owns one complete snapshot"
+    )]
     async fn persist(
         &self,
         dir: PathBuf,
         place: disk::Place,
         files: Arc<Files>,
         content: Option<Arc<ContentIndex>>,
-        write_bigrams: bool,
+        write_bigrams: Option<WriteBigrams>,
+        observed: u64,
+        snapshot: uuid::Uuid,
     ) -> io::Result<()> {
         let root = Arc::clone(&self.root);
         rt::unblock_with(&*self.rt, BlockingClass::Storage, 0, move || {
@@ -532,17 +572,12 @@ impl WorkspaceIndex {
             disk::prune(&dir, &place);
             let content = content.as_ref().map(|content| disk::Content {
                 id: content.id,
-                filter: write_bigrams.then_some(&*content.filter),
+                filter: write_bigrams.map(|WriteBigrams| &*content.filter),
                 overlay: &content.overlay,
                 binary: &content.binary,
+                unknown: &content.unknown,
             });
-            disk::write(
-                &place,
-                &root,
-                seconds(SystemTime::now()),
-                &files,
-                content.as_ref(),
-            )
+            disk::write(&place, &root, observed, snapshot, &files, content.as_ref())
         })
         .await
     }
@@ -560,15 +595,21 @@ impl WorkspaceIndex {
                 + content.as_ref().map_or(0, |c| c.overlay.modified_count());
             if changed > files.items().len() / 4 {
                 let root = Arc::clone(&self.root);
+                let budget = self.limits.memory;
                 let (files, content) =
                     rt::unblock_with(&*self.rt, BlockingClass::Storage, 0, move || {
                         let slots = files.compact_slots();
-                        let content = content.map(|content| {
+                        let compacted_files = Arc::new(files.compact(&slots));
+                        let content = content.and_then(|content| {
                             let mut overlay = content.overlay.clone();
                             let mut binary = vec![0u64; slots.len().div_ceil(64)];
+                            let mut unknown = vec![0u64; slots.len().div_ceil(64)];
                             let mut buf = Vec::new();
                             for (new, &old) in slots.iter().enumerate() {
                                 let is_binary = if old < files.walked_count() {
+                                    if content.unknown[old / 64] & (1 << (old % 64)) != 0 {
+                                        unknown[new / 64] |= 1 << (new % 64);
+                                    }
                                     content.binary[old / 64] & (1 << (old % 64)) != 0
                                 } else {
                                     match content_of(
@@ -581,20 +622,32 @@ impl WorkspaceIndex {
                                             false
                                         }
                                         Read::Binary => true,
+                                        Read::Unknown => {
+                                            unknown[new / 64] |= 1 << (new % 64);
+                                            false
+                                        }
                                     }
                                 };
                                 if is_binary {
                                     binary[new / 64] |= 1 << (new % 64);
                                 }
                             }
-                            Arc::new(ContentIndex {
+                            let overlay_empty = BigramOverlay::new(slots.len());
+                            let filter_budget = budget.checked_sub(
+                                compacted_files.heap_bytes()
+                                    + (binary.len() + unknown.len()) * 8
+                                    + overlay_empty.heap_bytes(),
+                            )?;
+                            let filter = content.filter.compact(&slots, &overlay, filter_budget)?;
+                            Some(Arc::new(ContentIndex {
                                 id: build_id(),
-                                filter: Arc::new(content.filter.compact(&slots, &overlay)),
-                                overlay: BigramOverlay::new(slots.len()),
+                                filter: Arc::new(filter),
+                                overlay: overlay_empty,
                                 binary: Arc::new(binary),
-                            })
+                                unknown: Arc::new(unknown),
+                            }))
                         });
-                        (Arc::new(files.compact(&slots)), content)
+                        (compacted_files, content)
                     })
                     .await;
                 (Some(files), content, true)
@@ -614,7 +667,7 @@ impl WorkspaceIndex {
             Content::Ready(content) => {
                 content.filter.heap_bytes()
                     + content.overlay.heap_bytes()
-                    + content.binary.len() * size_of::<u64>()
+                    + (content.binary.len() + content.unknown.len()) * size_of::<u64>()
             }
             Content::Absent | Content::Refused | Content::Building { .. } => 0,
         };
@@ -697,7 +750,13 @@ impl WorkspaceIndex {
             Arc::clone(&self.root),
             Arc::clone(&self.closed),
         );
-        let tree = self.state().tree;
+        let tree = {
+            let mut state = self.state();
+            if matches!(walk, Walk::Replace) {
+                state.observed = seconds(SystemTime::now());
+            }
+            state.tree
+        };
         self.rt.spawn(Box::pin(async move {
             let tree = if let Some(tree) = tree {
                 tree
@@ -752,8 +811,9 @@ impl WorkspaceIndex {
     async fn load(&self) {
         let root = Arc::clone(&self.root);
         let place = self.store.as_ref().map(|(_, place)| place.clone());
+        let budget = self.limits.memory;
         let loaded = rt::unblock_with(&*self.rt, BlockingClass::Storage, 0, move || {
-            disk::read(&place?, &root)
+            disk::read(&place?, &root, budget)
         })
         .await;
         let Some(loaded) = loaded else {
@@ -771,13 +831,16 @@ impl WorkspaceIndex {
                     filter: Arc::new(content.filter),
                     overlay: content.overlay,
                     binary: Arc::new(content.binary),
+                    unknown: Arc::new(content.unknown),
                 }))
             });
             state.epoch += 1;
             state.walked_at = Some(self.rt.now());
             state.dirty = false;
+            state.snapshot = Some(loaded.snapshot);
+            state.observed = loaded.taken;
             // Unwatched, what the subscription saw is not all that changed.
-            let verify = state.stored != Stored::Watched
+            let verify = state.stored != Stored::Watched(loaded.snapshot)
                 || state.pending.rescan
                 || state.rules.is_none()
                 || matches!(state.tree, Some(Tree::Unwatched(_)));
@@ -911,6 +974,8 @@ impl WorkspaceIndex {
             return;
         }
         if state.pending.paths.is_empty() {
+            drop(state);
+            self.changed.notify();
             return;
         }
         let Some(rules) = state.rules.clone() else {
@@ -995,11 +1060,19 @@ impl WorkspaceIndex {
                 };
                 let bit = 1u64 << (slot % 64);
                 match read {
+                    Some(Read::Unknown) => {
+                        Arc::make_mut(&mut ready.binary)[slot / 64] &= !bit;
+                        Arc::make_mut(&mut ready.unknown)[slot / 64] |= bit;
+                    }
                     Some(Read::Text(bigrams)) => {
+                        Arc::make_mut(&mut ready.unknown)[slot / 64] &= !bit;
                         Arc::make_mut(&mut ready.binary)[slot / 64] &= !bit;
                         ready.overlay.modify_bigrams(slot, bigrams);
                     }
-                    Some(Read::Binary) => Arc::make_mut(&mut ready.binary)[slot / 64] |= bit,
+                    Some(Read::Binary) => {
+                        Arc::make_mut(&mut ready.binary)[slot / 64] |= bit;
+                        Arc::make_mut(&mut ready.unknown)[slot / 64] &= !bit;
+                    }
                     // Looked at before the content index was there: looked at again.
                     None => unread.push(path),
                 }
@@ -1022,11 +1095,28 @@ impl WorkspaceIndex {
     /// workspace may use. Both are taken under one lock: the index's bits
     /// are positions in these files.
     async fn content(&self) -> Result<(Arc<Files>, Option<Arc<ContentIndex>>), String> {
-        self.files().await?;
         loop {
+            self.files().await?;
+            self.changed
+                .until(|| {
+                    let state = self.state();
+                    state.files.is_none()
+                        || (!matches!(state.busy, Busy::Walking | Busy::Applying)
+                            && state.pending.paths.is_empty()
+                            && !state.pending.rescan)
+                })
+                .await;
             let (files, build) = {
                 let mut state = self.state();
-                let files = Arc::clone(state.files.as_ref().expect("walked once"));
+                let Some(files) = state.files.clone() else {
+                    continue;
+                };
+                if matches!(state.busy, Busy::Walking | Busy::Applying)
+                    || !state.pending.paths.is_empty()
+                    || state.pending.rescan
+                {
+                    continue;
+                }
                 match &state.content {
                     Content::Ready(content) => return Ok((files, Some(Arc::clone(content)))),
                     Content::Refused => return Ok((files, None)),
@@ -1070,7 +1160,7 @@ impl WorkspaceIndex {
         self.rt.spawn(Box::pin(async move {
             let built = build(&rt, &root, files, closed).await;
             let Some(index) = weak.upgrade() else { return };
-            let touched = {
+            {
                 let mut state = index.state();
                 // A walk since installed other files, and set the content
                 // index aside for one built from them.
@@ -1082,15 +1172,12 @@ impl WorkspaceIndex {
                 };
                 state.content = built.map_or(Content::Refused, |c| Content::Ready(Arc::new(c)));
                 state.dirty = true;
-                touched
-            };
-            index.changed.notify();
-            // What changed while it was built is read again into it.
-            index
-                .state()
-                .pending
-                .paths
-                .extend(touched.into_iter().map(|path| root.join(path)));
+                // Publish touched paths atomically with the completed build.
+                state
+                    .pending
+                    .paths
+                    .extend(touched.into_iter().map(|path| root.join(path)));
+            }
             index.apply();
         }));
     }
@@ -1204,6 +1291,12 @@ impl WorkspaceIndex {
         cancel: &Cancel,
         mut found: impl FnMut(Grepped) + Send,
     ) -> Result<GrepSummary, String> {
+        if query.limit == 0 {
+            return Ok(GrepSummary {
+                stopped: Some(Stopped::AtLimit),
+                ..GrepSummary::default()
+            });
+        }
         let parsed = query.parse();
         let Some(grep) = Grep::new(&parsed, query.options) else {
             return Ok(GrepSummary::default());
@@ -1217,14 +1310,16 @@ impl WorkspaceIndex {
             found: &mut found,
         };
         let grep = Arc::new(grep);
-        let mut summary = self.grep_files(&mut run, &parsed, &grep).await;
+        let mut summary = self.grep_files(&mut run, &parsed, &grep).await?;
         // Constraint parsing can swallow tokens meant literally (`!=` as an
         // exclusion): a constrained search that found nothing is retried as
         // the whole raw text, keeping only a file path it named.
         if summary.matches == 0 && summary.stopped.is_none() && !parsed.constraints.is_empty() {
             let literal = parsed.literal();
             if let Some(retry) = Grep::new(&literal, query.options) {
-                summary = self.grep_files(&mut run, &literal, &Arc::new(retry)).await;
+                summary = self
+                    .grep_files(&mut run, &literal, &Arc::new(retry))
+                    .await?;
             }
         }
         summary.regex_error = grep.regex_error().map(str::to_owned);
@@ -1236,7 +1331,7 @@ impl WorkspaceIndex {
         run: &mut Run<'_, impl FnMut(Grepped) + Send>,
         parsed: &FFFQuery<'_>,
         grep: &Arc<Grep>,
-    ) -> GrepSummary {
+    ) -> Result<GrepSummary, String> {
         let (files, content, limit, cancel) = (run.files, run.content, run.limit, run.cancel);
         let candidates = content.and_then(|content| {
             let (filter, overlay) = (Some(&*content.filter), Some(&content.overlay));
@@ -1249,6 +1344,7 @@ impl WorkspaceIndex {
         let known = Known {
             candidates: candidates.as_deref(),
             binary: content.map(|content| content.binary.as_slice()),
+            unknown: content.map(|content| content.unknown.as_slice()),
         };
         let slots = grep::files_to_search(files, &parsed.constraints, known);
         let mut summary = GrepSummary {
@@ -1264,36 +1360,38 @@ impl WorkspaceIndex {
                 && let Some(chunk) = chunks.next()
             {
                 let (files, grep, stop) = (Arc::clone(files), Arc::clone(grep), Arc::clone(&stop));
+                let cancel = cancel.clone();
                 let root = Arc::clone(&self.root);
                 // Spawned, so it is admitted now rather than when awaited.
                 let job = rt::unblock_with(
                     &*self.rt,
                     BlockingClass::Storage,
                     GREP_JOB_BYTES,
-                    move || grep_chunk(&root, &files, &grep, &chunk, &stop),
+                    move || grep_chunk(&root, &files, &grep, &chunk, &stop, &cancel, limit),
                 );
                 running.push_back(rt::spawn(&*self.rt, job));
             }
             let Some(next) = running.pop_front() else {
                 break;
             };
-            let (searched, chunk) = next.await;
+            let (searched, chunk) = next.await.map_err(|error| error.to_string())?;
             if cancel.is_set() {
                 summary.stopped = Some(Stopped::Cancelled);
-                return summary;
+                return Ok(summary);
             }
             summary.searched += searched;
-            for grepped in chunk {
+            for mut grepped in chunk {
+                grepped.matches.truncate(limit - summary.matches);
                 summary.matched_files += 1;
                 summary.matches += grepped.matches.len();
                 (run.found)(grepped);
                 if summary.matches >= limit {
                     summary.stopped = Some(Stopped::AtLimit);
-                    return summary;
+                    return Ok(summary);
                 }
             }
         }
-        summary
+        Ok(summary)
     }
 }
 
@@ -1342,6 +1440,9 @@ impl GrepQuery {
     }
 }
 
+#[derive(Clone, Copy)]
+struct WriteBigrams;
+
 struct SetOnDrop(Arc<AtomicBool>);
 
 impl Drop for SetOnDrop {
@@ -1357,21 +1458,57 @@ fn grep_chunk(
     grep: &Grep,
     chunk: &[usize],
     stop: &AtomicBool,
-) -> (usize, Vec<Grepped>) {
+    cancel: &Cancel,
+    limit: usize,
+) -> io::Result<(usize, Vec<Grepped>)> {
     let _never = sys::fs::NeverFetch::new();
     let mut buf = Vec::new();
     let mut found = Vec::new();
     let mut searched = 0;
+    let mut remaining = limit;
     for &slot in chunk {
-        if stop.load(Ordering::Acquire) {
+        if stop.load(Ordering::Acquire) || cancel.is_set() || remaining == 0 {
             break;
         }
         searched += 1;
         let path = files.path(&files.items()[slot]);
-        if read(&root.join(path), MAX_FILE_SIZE, &mut buf).is_err() || is_binary(&buf) {
+        let stopped = || stop.load(Ordering::Acquire) || cancel.is_set();
+        let Ok(sys::fs::RegularFile::Open(mut file)) = sys::fs::open_regular(&root.join(path))
+        else {
+            continue;
+        };
+        buf.clear();
+        let Ok(_) = (&mut file).take(8 << 10).read_to_end(&mut buf) else {
+            continue;
+        };
+        if is_binary(&buf) {
             continue;
         }
-        let matches = grep.file(&buf);
+        if io::Seek::rewind(&mut file).is_err() {
+            continue;
+        }
+        let matches = if files.items()[slot].size > MAX_FILE_SIZE {
+            grep.reader(&mut file, remaining, &stopped)?
+        } else {
+            // A file may have grown since the walk; never search only its prefix.
+            buf.clear();
+            if (&mut file)
+                .take(MAX_FILE_SIZE + 1)
+                .read_to_end(&mut buf)
+                .is_err()
+            {
+                continue;
+            }
+            if buf.len() as u64 > MAX_FILE_SIZE {
+                if io::Seek::rewind(&mut file).is_err() {
+                    continue;
+                }
+                grep.reader(&mut file, remaining, &stopped)?
+            } else {
+                grep.file_limited(&buf, remaining)
+            }
+        };
+        remaining -= matches.len();
         if !matches.is_empty() {
             found.push(Grepped {
                 path: path.to_owned(),
@@ -1379,7 +1516,7 @@ fn grep_chunk(
             });
         }
     }
-    (searched, found)
+    Ok((searched, found))
 }
 
 /// Every file under the root, from one blocking job, with the rules it
@@ -1412,6 +1549,7 @@ async fn build(
     let mut consec = BigramIndexBuilder::new(walked);
     let mut skip = BigramIndexBuilder::new(walked);
     let mut binary = vec![0u64; walked.div_ceil(64)];
+    let mut unknown = vec![0u64; walked.div_ceil(64)];
     let mut firsts = (0..walked).step_by(BUILD_CHUNK);
     let mut running = std::collections::VecDeque::new();
     loop {
@@ -1434,10 +1572,13 @@ async fn build(
             break;
         };
         let (first, chunk) = next.await;
-        let (chunk_consec, chunk_skip, chunk_binary) = chunk?;
+        let (chunk_consec, chunk_skip, chunk_binary, chunk_unknown) = chunk?;
         consec.merge(&chunk_consec, first);
         skip.merge(&chunk_skip, first);
         for (word, bits) in binary[first / 64..].iter_mut().zip(chunk_binary) {
+            *word |= bits;
+        }
+        for (word, bits) in unknown[first / 64..].iter_mut().zip(chunk_unknown) {
             *word |= bits;
         }
     }
@@ -1455,10 +1596,11 @@ async fn build(
         filter: Arc::new(filter),
         overlay: BigramOverlay::new(walked),
         binary: Arc::new(binary),
+        unknown: Arc::new(unknown),
     })
 }
 
-type Chunk = (BigramIndexBuilder, BigramIndexBuilder, Vec<u64>);
+type Chunk = (BigramIndexBuilder, BigramIndexBuilder, Vec<u64>, Vec<u64>);
 
 /// The bigrams of walked files `first..first + len`, and which are binary.
 fn build_chunk(
@@ -1472,6 +1614,7 @@ fn build_chunk(
     let mut consec = BigramIndexBuilder::new(len);
     let mut skip = BigramIndexBuilder::new(len);
     let mut binary = vec![0u64; len.div_ceil(64)];
+    let mut unknown = vec![0u64; len.div_ceil(64)];
     let mut buf = Vec::new();
     for i in 0..len {
         if closed.load(Ordering::Acquire) {
@@ -1483,6 +1626,7 @@ fn build_chunk(
         }
         let path = root.join(files.path(file));
         if read(&path, MAX_INDEXABLE_FILE_SIZE as u64, &mut buf).is_err() {
+            unknown[i / 64] |= 1 << (i % 64);
             continue;
         }
         if memchr::memchr(0, &buf).is_some() {
@@ -1491,7 +1635,7 @@ fn build_chunk(
         }
         consec.add_file_content(&mut skip, i, &buf);
     }
-    Some((consec, skip, binary))
+    Some((consec, skip, binary, unknown))
 }
 
 /// What a change on disk turned out to be, looked at off the lock.
@@ -1518,6 +1662,7 @@ impl Change {
 enum Read {
     Text(Vec<u16>),
     Binary,
+    Unknown,
 }
 
 /// What `paths` (absolute) are now: files the walk would find, the
@@ -1590,7 +1735,8 @@ fn look(
 fn content_of(root: &Path, path: &str, buf: &mut Vec<u8>) -> Read {
     match read(&root.join(path), MAX_INDEXABLE_FILE_SIZE as u64, buf) {
         Ok(()) if memchr::memchr(0, buf).is_none() => Read::Text(extract_bigrams(buf)),
-        _ => Read::Binary,
+        Ok(()) => Read::Binary,
+        Err(_) => Read::Unknown,
     }
 }
 
@@ -1688,7 +1834,10 @@ fn read(path: &Path, limit: u64, buf: &mut Vec<u8>) -> io::Result<()> {
     let sys::fs::RegularFile::Open(file) = sys::fs::open_regular(path)? else {
         return Err(io::ErrorKind::InvalidInput.into());
     };
-    file.take(limit).read_to_end(buf)?;
+    file.take(limit + 1).read_to_end(buf)?;
+    if buf.len() as u64 > limit {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
     Ok(())
 }
 
@@ -1786,7 +1935,7 @@ mod tests {
         });
         assert_eq!(index.resident(), 0);
         let (_, place) = index.store.as_ref().unwrap();
-        let stored = disk::read(place, &root).unwrap();
+        let stored = disk::read(place, &root, usize::MAX).unwrap();
         assert_eq!(stored.files.items().len(), 66);
         assert_eq!(stored.files.walked_count(), 66);
         assert_eq!(stored.content.as_ref().unwrap().overlay.modified_count(), 0);
@@ -1875,6 +2024,120 @@ mod tests {
                     .is_some_and(|files| files.find("after.txt").is_some())
             },
         );
+    }
+
+    #[test]
+    fn persistence_keeps_the_observation_watermark_for_racy_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("racy.txt");
+        std::fs::write(&path, "before").unwrap();
+        let observed = seconds(SystemTime::now());
+        let time = UNIX_EPOCH + Duration::from_secs(observed);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        let cache = dir.path().join("cache");
+        let rt: Rt = Arc::new(rt::Threads::new(2));
+        let indexes = Indexes::new(Limits::default()).kept_in(&cache);
+        let index = indexes.open(&root, Arc::clone(&rt), Arc::new(Hub::new(Arc::clone(&rt))));
+        rt::block_on(index.content()).unwrap();
+        drop(index.state().watching.take());
+        index.state().observed = observed;
+        // Simulate an edit whose event has not reached this snapshot before
+        // publication. Size and second-resolution mtime are unchanged.
+        std::fs::write(&path, "needle").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        eventually(
+            "publication is in a later second",
+            Duration::from_secs(3),
+            || seconds(SystemTime::now()) > observed,
+        );
+        assert!(rt::block_on(index.rest()));
+        let place = &index.store.as_ref().unwrap().1;
+        assert_eq!(
+            disk::read(place, &root, usize::MAX).unwrap().taken,
+            observed
+        );
+        drop(index);
+        drop(indexes);
+        let indexes = Indexes::new(Limits::default()).kept_in(&cache);
+        let index = indexes.open(&root, Arc::clone(&rt), Arc::new(Hub::new(Arc::clone(&rt))));
+        let mut hits = Vec::new();
+        rt::block_on(index.grep(
+            GrepQuery {
+                pattern: Pattern::Typed("needle".into()),
+                options: GrepOptions::default(),
+                limit: 10,
+            },
+            &Cancel::default(),
+            |hit| hits.push(hit.path),
+        ))
+        .unwrap();
+        assert_eq!(hits, ["racy.txt"]);
+    }
+
+    #[test]
+    fn rest_retires_its_keeper_before_a_query_can_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "before").unwrap();
+        let rt: Rt = Arc::new(rt::Threads::new(2));
+        let indexes = Indexes::new(Limits::default()).kept_in(dir.path().join("cache"));
+        let index = indexes.open(&root, Arc::clone(&rt), Arc::new(Hub::new(Arc::clone(&rt))));
+        rt::block_on(index.content()).unwrap();
+        assert!(index.state().keeper);
+        assert!(rt::block_on(index.rest()));
+        assert!(
+            !index.state().keeper,
+            "retirement is part of the locked rest transition"
+        );
+        rt::block_on(index.content()).unwrap();
+        assert!(index.state().keeper, "reload starts its own keeper");
+    }
+
+    #[test]
+    fn the_first_grep_after_reload_waits_for_pending_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "before").unwrap();
+        let rt: Rt = Arc::new(rt::Threads::new(2));
+        let indexes = Indexes::new(Limits::default()).kept_in(dir.path().join("cache"));
+        let index = indexes.open(&root, Arc::clone(&rt), Arc::new(Hub::new(Arc::clone(&rt))));
+        rt::block_on(index.content()).unwrap();
+        assert!(rt::block_on(index.rest()));
+        std::fs::write(root.join("a.txt"), "needle").unwrap();
+        std::fs::write(root.join("b.txt"), "needle").unwrap();
+        // Deliver the real watch event synchronously so the test controls
+        // delivery, while loading and change application remain asynchronous.
+        index.changed_on_disk(vec![Event::Changed(vec![
+            root.join("a.txt"),
+            root.join("b.txt"),
+        ])]);
+        let mut hits = Vec::new();
+        rt::block_on(index.grep(
+            GrepQuery {
+                pattern: Pattern::Typed("needle".into()),
+                options: GrepOptions::default(),
+                limit: 10,
+            },
+            &Cancel::default(),
+            |hit| hits.push(hit.path),
+        ))
+        .unwrap();
+        hits.sort();
+        assert_eq!(hits, ["a.txt", "b.txt"]);
     }
 
     fn eventually(what: &str, within: Duration, mut check: impl FnMut() -> bool) {

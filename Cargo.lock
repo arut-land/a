@@ -749,12 +749,14 @@ dependencies = [
  "neo_frizbee",
  "protocol",
  "regex",
+ "regex-automata",
  "regex-syntax",
  "rt",
  "serde",
  "smallvec",
  "sys",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]

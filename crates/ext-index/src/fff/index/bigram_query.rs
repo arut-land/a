@@ -48,7 +48,7 @@ fn consec_key(a: u8, b: u8) -> Option<u16> {
     let al = a.to_ascii_lowercase();
     let bl = b.to_ascii_lowercase();
     if (32..=126).contains(&al) && (32..=126).contains(&bl) {
-        Some((al as u16) << 8 | bl as u16)
+        Some(u16::from(al) << 8 | u16::from(bl))
     } else {
         None
     }
@@ -153,8 +153,8 @@ impl HirInfo {
 }
 
 /// Prefilter fuzzy query. The algorithm is the following:
-/// we allow max_typos = min(len/3,2) every typo destroys at most 2 consecutive bigrams
-/// So out of N bigrams at least N - 2 * max_typos have to present in the matching fil
+/// we allow `max_typos` = min(len/3,2) every typo destroys at most 2 consecutive bigrams
+/// So out of N bigrams at least N - 2 * `max_typos` have to present in the matching fil
 pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQuery {
     let lower: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
 
@@ -448,6 +448,10 @@ fn decompose_alternation(alts: &[Hir]) -> HirInfo {
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "FFF column keys and slot coordinates use compact integer storage"
+)]
 fn expand_class(class: &Class) -> Option<InlineArray> {
     let mut bytes = InlineArray::new();
     match class {
@@ -867,7 +871,7 @@ mod tests {
     const S: bool = true;
 
     /// Top 15+ commonly used regex patterns from
-    /// https://digitalfortress.tech/tips/top-15-commonly-used-regex/
+    /// <https://digitalfortress.tech/tips/top-15-commonly-used-regex/>
     /// plus typical grep patterns used by agentic tools.
     ///
     /// Each entry: `(regex, Option<&[Bg]>)`.

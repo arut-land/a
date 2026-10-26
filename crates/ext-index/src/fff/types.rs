@@ -61,6 +61,10 @@ impl Files {
         files
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the file arena uses compact offsets checked at its boundary"
+    )]
     fn push(&mut self, found: &Found) -> Option<usize> {
         let len = u16::try_from(found.path.len()).ok()?;
         let start = u32::try_from(self.arena.len()).ok()?;
@@ -203,6 +207,10 @@ impl Files {
 
     /// The files [`Files::encode`] wrote, if they are what it writes: each
     /// path within the arena, whole characters, the walked ones sorted.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the file arena uses compact offsets checked at its boundary"
+    )]
     pub(crate) fn decode(input: &mut In<impl Read>) -> io::Result<Self> {
         let arena = String::from_utf8(input.bytes()?).map_err(|_| invalid())?;
         let walked = input.usize()?;
@@ -229,6 +237,14 @@ impl Files {
                 || !arena.is_char_boundary(end)
                 || item.name > item.len
                 || !arena.is_char_boundary(start + item.name as usize)
+            {
+                return Err(invalid());
+            }
+            let path = &arena[start..end];
+            // Cache paths use the walk's portable slash-separated form.
+            if path.is_empty()
+                || path.contains(['\\', ':', '\0'])
+                || path.split('/').any(|part| matches!(part, "" | "." | ".."))
             {
                 return Err(invalid());
             }
@@ -323,5 +339,45 @@ mod tests {
         assert_eq!(files.upsert(&found("src/a.rs")), Some((4, true)));
         assert_eq!(files.upsert(&found("src/a.rs")), Some((4, false)));
         assert_eq!(files.live_count(), 4);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn cached_paths_cannot_escape_or_change_meaning_when_joined() {
+        for path in [
+            "",
+            "/etc/passwd",
+            "../outside",
+            "src/../../outside",
+            "src/./file",
+            "src//file",
+            "C:/outside",
+            "\\\\server\\share",
+            "src\\..\\outside",
+            "src/",
+            "nul\0path",
+        ] {
+            let files = Files::walked(vec![Found {
+                path: path.into(),
+                size: 1,
+                modified: 1,
+            }]);
+            let bytes = crate::disk::encoded(|out| files.encode(out));
+            assert!(
+                crate::disk::decoded(&bytes, Files::decode).is_err(),
+                "{path:?}"
+            );
+        }
+        let files = Files::walked(vec![Found {
+            path: "src/λ.rs".into(),
+            size: 1,
+            modified: 1,
+        }]);
+        let bytes = crate::disk::encoded(|out| files.encode(out));
+        assert!(crate::disk::decoded(&bytes, Files::decode).is_ok());
     }
 }

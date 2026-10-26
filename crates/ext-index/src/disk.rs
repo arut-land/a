@@ -23,7 +23,7 @@ use crate::fff::index::{BigramFilter, BigramOverlay};
 use crate::fff::types::Files;
 
 /// Bumped with any change to what either file holds or means.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 /// Idle caches are retained for a month; reclamation happens only at rest.
 pub(crate) const MAX_AGE: Duration = Duration::from_hours(720);
@@ -53,6 +53,7 @@ impl Place {
 /// What a file list on disk holds.
 pub(crate) struct Stored {
     pub(crate) files: Files,
+    pub(crate) snapshot: uuid::Uuid,
     /// When it was taken, in seconds since the epoch: a file modified in
     /// that second or later may have changed since without its size or
     /// time telling (as git treats a racily clean entry).
@@ -65,6 +66,7 @@ pub(crate) struct StoredContent {
     pub(crate) filter: BigramFilter,
     pub(crate) overlay: BigramOverlay,
     pub(crate) binary: Vec<u64>,
+    pub(crate) unknown: Vec<u64>,
 }
 
 /// What [`write`] writes of the content index.
@@ -75,6 +77,7 @@ pub(crate) struct Content<'a> {
     pub(crate) filter: Option<&'a BigramFilter>,
     pub(crate) overlay: &'a BigramOverlay,
     pub(crate) binary: &'a [u64],
+    pub(crate) unknown: &'a [u64],
 }
 
 /// Writes the file list (and the content index, when it is new) of the
@@ -84,6 +87,7 @@ pub(crate) fn write(
     place: &Place,
     root: &Path,
     taken: u64,
+    snapshot: uuid::Uuid,
     files: &Files,
     content: Option<&Content<'_>>,
 ) -> io::Result<()> {
@@ -101,6 +105,7 @@ pub(crate) fn write(
     save(&place.files, FILES, |out| {
         out.bytes(root.as_os_str().as_encoded_bytes())?;
         out.u64(taken)?;
+        out.bytes(snapshot.as_bytes())?;
         files.encode(out)?;
         match content {
             None => out.u8(0),
@@ -108,6 +113,7 @@ pub(crate) fn write(
                 out.u8(1)?;
                 out.u64(content.id)?;
                 out.words(content.binary)?;
+                out.words(content.unknown)?;
                 content.overlay.encode(out)
             }
         }
@@ -118,49 +124,59 @@ pub(crate) fn write(
 /// and whole: `None` for anything else (missing, torn, another format,
 /// another root's). A content index whose build is not on disk, or does
 /// not fit the files, is left out.
-pub(crate) fn read(place: &Place, root: &Path) -> Option<Stored> {
-    let (files, taken, content) = load(&place.files, FILES, |input| {
+pub(crate) fn read(place: &Place, root: &Path, budget: usize) -> Option<Stored> {
+    let (files, taken, snapshot, content) = load(&place.files, FILES, |input| {
         if input.bytes()? != root.as_os_str().as_encoded_bytes() {
             return Err(invalid());
         }
         let taken = input.u64()?;
+        let snapshot = uuid::Uuid::from_slice(&input.bytes()?).map_err(|_| invalid())?;
         let files = Files::decode(input)?;
+        input.budget = budget.saturating_sub(files.heap_bytes());
         let content = match input.u8()? {
             0 => None,
             1 => {
                 let id = input.u64()?;
                 let binary = input.words()?;
+                let unknown = input.words()?;
                 let overlay = BigramOverlay::decode(input)?;
-                Some((id, binary, overlay))
+                Some((id, binary, unknown, overlay))
             }
             _ => return Err(invalid()),
         };
-        Ok((files, taken, content))
+        Ok((files, taken, snapshot, content))
     })
     .ok()?;
     let walked = files.walked_count();
-    let content = content.and_then(|(id, binary, overlay)| {
+    let content = content.and_then(|(id, binary, unknown, overlay)| {
         let filter = load(&place.bigrams, BIGRAMS, |input| {
             if input.u64()? != id {
                 return Err(invalid());
             }
+            input.budget = budget
+                .saturating_sub(files.heap_bytes())
+                .saturating_sub((binary.len() + unknown.len()) * 8)
+                .saturating_sub(overlay.heap_bytes());
             BigramFilter::decode(input)
         })
         .ok()?;
         (filter.file_count() == walked
             && binary.len() == walked.div_ceil(64)
+            && unknown.len() == walked.div_ceil(64)
             && overlay.fits(walked))
         .then_some(StoredContent {
             id,
             filter,
             overlay,
             binary,
+            unknown,
         })
     });
     touch(&place.files);
     touch(&place.bigrams);
     Some(Stored {
         files,
+        snapshot,
         taken,
         content,
     })
@@ -196,6 +212,7 @@ fn load<T>(
         inner: BufReader::with_capacity(64 << 10, file),
         check: CHECK.digest(),
         left: len.checked_sub(4).ok_or_else(invalid)?,
+        budget: usize::MAX,
     };
     if input.take::<8>()? != magic || input.u32()? != FORMAT {
         return Err(invalid());
@@ -288,6 +305,7 @@ pub(crate) struct In<R> {
     check: crc::Digest<'static, u32, Table<16>>,
     /// Bytes before the checksum not yet read.
     left: u64,
+    budget: usize,
 }
 
 impl<R: Read> In<R> {
@@ -322,7 +340,15 @@ impl<R: Read> In<R> {
         if len.checked_mul(size).is_none_or(|bytes| bytes > self.left) {
             return Err(invalid());
         }
-        usize::try_from(len).map_err(|_| invalid())
+        let len = usize::try_from(len).map_err(|_| invalid())?;
+        self.budget = self
+            .budget
+            .checked_sub(
+                len.checked_mul(usize::try_from(size).map_err(|_| invalid())?)
+                    .ok_or_else(invalid)?,
+            )
+            .ok_or_else(invalid)?;
+        Ok(len)
     }
 
     pub(crate) fn usize(&mut self) -> io::Result<usize> {
@@ -417,6 +443,30 @@ pub(crate) fn prune(dir: &Path, current: &Place) {
 }
 
 #[cfg(test)]
+pub(crate) fn encoded(write: impl FnOnce(&mut Out<Vec<u8>>) -> io::Result<()>) -> Vec<u8> {
+    let mut out = Out {
+        inner: Vec::new(),
+        check: CHECK.digest(),
+    };
+    write(&mut out).unwrap();
+    out.inner
+}
+
+#[cfg(test)]
+pub(crate) fn decoded<'a, T>(
+    bytes: &'a [u8],
+    read: impl FnOnce(&mut In<&'a [u8]>) -> io::Result<T>,
+) -> io::Result<T> {
+    let mut input = In {
+        inner: bytes,
+        left: bytes.len() as u64,
+        check: CHECK.digest(),
+        budget: usize::MAX,
+    };
+    read(&mut input)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -425,14 +475,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("workspace");
         let place = Place::new(dir.path(), &root);
-        write(&place, &root, 0, &Files::default(), None).unwrap();
+        write(
+            &place,
+            &root,
+            0,
+            uuid::Uuid::now_v7(),
+            &Files::default(),
+            None,
+        )
+        .unwrap();
         File::options()
             .write(true)
             .open(&place.files)
             .unwrap()
             .set_modified(SystemTime::now() - MAX_AGE - Duration::from_hours(24))
             .unwrap();
-        assert!(read(&place, &root).is_some());
+        assert!(read(&place, &root, usize::MAX).is_some());
         prune(dir.path(), &Place::new(dir.path(), Path::new("another")));
         assert!(
             place.files.exists(),

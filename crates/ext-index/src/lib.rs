@@ -32,18 +32,6 @@ use protocol::Body;
 use serde::{Deserialize, Serialize};
 
 mod disk;
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    clippy::similar_names,
-    clippy::too_many_lines,
-    clippy::doc_markdown,
-    clippy::must_use_candidate,
-    clippy::missing_errors_doc,
-    clippy::module_name_repetitions
-)]
 pub(crate) mod fff;
 mod index;
 
