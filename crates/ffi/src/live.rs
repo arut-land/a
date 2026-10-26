@@ -302,8 +302,9 @@ impl QueryStream {
             serde_json::from_str(field("service")).map_err(|e| invalid(format!("service: {e}")))?;
         let scope: protocol::Scope =
             serde_json::from_str(field("scope")).map_err(|e| invalid(format!("scope: {e}")))?;
-        let body: protocol::Json =
-            serde_json::from_str(field("body")).map_err(|e| invalid(e.to_string()))?;
+        let body = query.get("body").map_or_else(protocol::Json::null, |raw| {
+            protocol::Json::from((*raw).to_owned())
+        });
         // A few answers ahead of the app; past them the socket, then the
         // daemon's query, waits.
         let (sender, answers) = rt::channel::bounded_async(16);
