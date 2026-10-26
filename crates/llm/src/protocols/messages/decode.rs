@@ -693,7 +693,11 @@ impl MessagesDecoder {
         let mut delta = frame.delta.0.map_or_default(|delta| delta.rest);
         self.note_container(delta.get("container"));
         // Only a `message_delta` with a stop reason ends the reply.
-        let Some(stop) = delta.str_at("stop_reason") else {
+        let Some(stop) = delta
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
             return Ok(Flow::More);
         };
         let terminal = tree(frame.usage);
@@ -705,17 +709,6 @@ impl MessagesDecoder {
         }
         let details = delta.remove("stop_details");
         self.end(usage, Some(&stop), details.as_ref())
-    }
-}
-
-/// A string field of an object of fields.
-trait StrAt {
-    fn str_at(&self, key: &str) -> Option<String>;
-}
-
-impl StrAt for Object {
-    fn str_at(&self, key: &str) -> Option<String> {
-        self.get(key)?.as_str().map(str::to_owned)
     }
 }
 

@@ -57,12 +57,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
     presented_rows(item, &item.present(), width, look)
 }
 
-pub(crate) fn presented_rows(
-    item: &Item,
-    p: &Presented<'_>,
-    width: usize,
-    look: Look,
-) -> Vec<Line> {
+pub fn presented_rows(item: &Item, p: &Presented<'_>, width: usize, look: Look) -> Vec<Line> {
     let blank = Line::default();
     match p.kind {
         Kind::User => {
@@ -155,6 +150,7 @@ pub fn mark_reply(rows: &mut [Line]) {
 /// so a long reply costs no more per delta than a short one.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Live {
+    identity: Option<(CallId, u16)>,
     /// The text's bytes wrapped for good (up to a newline), whether they
     /// end inside a code fence, and the rows they made.
     done: usize,
@@ -167,9 +163,14 @@ pub struct Live {
 impl Live {
     /// Brings `rows` (empty, or as this left them) up to `text`, the
     /// reply's live text so far.
-    pub fn update(&mut self, rows: &mut Vec<Line>, text: &str, width: usize) {
-        if rows.is_empty() || text.len() < self.seen {
-            *self = Self::default();
+    pub fn update(&mut self, rows: &mut Vec<Line>, stream: &protocol::view::Stream, width: usize) {
+        let text = &stream.text;
+        let identity = Some((stream.call, stream.attempt));
+        if self.identity != identity || rows.is_empty() || text.len() < self.seen {
+            *self = Self {
+                identity,
+                ..Self::default()
+            };
             rows.clear();
             rows.push(Line::default());
             self.kept = 1;
@@ -517,7 +518,15 @@ mod tests {
         assert!(rows_of(&item, Look::default()).len() <= 1);
         let mut live = Live::default();
         let mut lines = Vec::new();
-        live.update(&mut lines, "hello **world**", 40);
+        live.update(
+            &mut lines,
+            &protocol::view::Stream {
+                call: CallId::new(3).unwrap(),
+                attempt: 0,
+                text: "hello **world**".into(),
+            },
+            40,
+        );
         assert_eq!(texts(&lines)[1], "⏺ hello world▍");
     }
 
@@ -528,7 +537,15 @@ mod tests {
         let mut live = Live::default();
         let mut lines = Vec::new();
         for end in (0..=text.len()).filter(|&i| text.is_char_boundary(i)) {
-            live.update(&mut lines, &text[..end], 20);
+            live.update(
+                &mut lines,
+                &protocol::view::Stream {
+                    call: CallId::new(3).unwrap(),
+                    attempt: 0,
+                    text: text[..end].into(),
+                },
+                20,
+            );
             let mut whole = vec![Line::default()];
             whole.extend(markdown(&text[..end], 20, Style::new()));
             mark_reply(&mut whole);

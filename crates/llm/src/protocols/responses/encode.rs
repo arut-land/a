@@ -16,7 +16,7 @@ use crate::protocol::{Encoded, Target};
 use crate::protocols::schema;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
-    AssistantPart, Effort, Format, Media, Message, Output, Request, SmolStr, Source, Tool,
+    AssistantPart, Carried, Effort, Format, Media, Message, Output, Request, SmolStr, Tool,
     ToolChoice, ToolResult, ToolWire, UserPart,
 };
 
@@ -205,25 +205,25 @@ enum ResultOutput<'a> {
 fn user_part(media: &Media) -> Result<Value, Error> {
     let kind = &media.media_type;
     if kind.starts_with("image/") {
-        let (key, source) = match &media.source {
-            Source::Data { data } => ("image_url", format!("data:{kind};base64,{data}")),
-            Source::Url { url } => ("image_url", url.clone()),
-            Source::File { id } => ("file_id", id.to_string()),
+        let (key, source) = match media.source.carried() {
+            Carried::Data(data) => ("image_url", format!("data:{kind};base64,{data}")),
+            Carried::Url(url) => ("image_url", url.to_owned()),
+            Carried::File(id) => ("file_id", id.to_owned()),
         };
         return Ok(json!({"type": PartType::InputImage, "detail": "auto", key: source}));
     }
-    let (key, source) = match &media.source {
-        Source::File { id } => ("file_id", id.to_string()),
+    let (key, source) = match media.source.carried() {
+        Carried::File(id) => ("file_id", id.to_owned()),
         // `input_file` reads the type of a file it fetches itself.
-        Source::Url { url } => ("file_url", url.clone()),
-        Source::Data { data } if kind == "application/pdf" => {
+        Carried::Url(url) => ("file_url", url.to_owned()),
+        Carried::Data(data) if kind == "application/pdf" => {
             let data = format!("data:application/pdf;base64,{data}");
             let filename = "document.pdf";
             return Ok(
                 json!({"type": PartType::InputFile, "file_data": data, "filename": filename}),
             );
         }
-        Source::Data { .. } => return Err(unsendable(&format!("{kind} file"))),
+        Carried::Data(_) => return Err(unsendable(&format!("{kind} file"))),
     };
     Ok(json!({"type": PartType::InputFile, key: source}))
 }
@@ -356,9 +356,26 @@ impl Input {
     fn results(&mut self, results: &[ToolResult], out: &mut Settled) -> Result<(), Error> {
         for result in results {
             let custom = self.custom.contains(&result.id);
+            let output = result_output(&result.output)?;
+            let output = if result.error {
+                match output {
+                    ResultOutput::Text(text) => {
+                        ResultOutput::Text(format!("[tool error]\n{text}").into())
+                    }
+                    ResultOutput::Parts(mut parts) => {
+                        parts.insert(
+                            0,
+                            json!({"type": PartType::InputText, "text": "[tool error]"}),
+                        );
+                        ResultOutput::Parts(parts)
+                    }
+                }
+            } else {
+                output
+            };
             let item = OutputItem {
                 call_id: &result.id,
-                output: result_output(&result.output)?,
+                output,
                 status: (!custom).then_some(Status::Completed),
                 kind: if custom {
                     ItemType::CustomToolCallOutput

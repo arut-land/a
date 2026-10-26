@@ -39,7 +39,7 @@ impl<'a> Directory<'a> {
                     })
             };
             #[cfg(windows)]
-            let created = relative(parent, &name, true, true);
+            let created = relative(parent, &name, ObjectKind::Directory, Creation::CreateNew);
             let file = match created {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -196,7 +196,12 @@ impl<'a> Staged<'a> {
         rustix::fs::renameat(&self.directory.file, CONTENT, self.directory.parent, name)?;
         #[cfg(windows)]
         {
-            rename(&self.file, self.directory.parent, name, true)?;
+            rename(
+                &self.file,
+                self.directory.parent,
+                name,
+                super::Replacement::Allow,
+            )?;
             self.published = true;
         }
         Ok(())
@@ -214,25 +219,46 @@ impl<'a> Staged<'a> {
         }
         #[cfg(windows)]
         {
-            rename(&self.file, self.directory.parent, name, false)?;
+            rename(
+                &self.file,
+                self.directory.parent,
+                name,
+                super::Replacement::Forbid,
+            )?;
             self.published = true;
             Ok(())
         }
     }
 
     #[cfg(all(unix, test))]
-    pub fn fallback(&mut self, name: &OsStr) -> io::Result<()> {
-        let source = &self.directory.file;
-        let target = self.directory.parent;
-        rustix::fs::linkat(source, CONTENT, target, name, rustix::fs::AtFlags::empty())?;
-        Ok(())
+    pub fn publish_without_native_rename(&mut self, name: &OsStr) -> io::Result<()> {
+        no_replace_with(
+            &self.directory.file,
+            OsStr::new(CONTENT),
+            self.directory.parent,
+            name,
+            || Err(rustix::io::Errno::NOTSUP),
+        )
     }
 }
 
 #[cfg(unix)]
 pub(super) fn no_replace(source: &File, from: &OsStr, target: &File, to: &OsStr) -> io::Result<()> {
-    use rustix::fs::{AtFlags, RenameFlags, linkat, renameat_with};
-    match renameat_with(source, from, target, to, RenameFlags::NOREPLACE) {
+    no_replace_with(source, from, target, to, || {
+        rustix::fs::renameat_with(source, from, target, to, rustix::fs::RenameFlags::NOREPLACE)
+    })
+}
+
+#[cfg(unix)]
+fn no_replace_with(
+    source: &File,
+    from: &OsStr,
+    target: &File,
+    to: &OsStr,
+    rename: impl FnOnce() -> rustix::io::Result<()>,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, linkat};
+    match rename() {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::NOTSUP) => {
             // Publication is complete once linkat succeeds. Cleanup is separate:
@@ -261,30 +287,44 @@ impl Drop for Staged<'_> {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObjectKind {
+    File,
+    Directory,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Creation {
+    Open,
+    CreateNew,
+}
+
+#[cfg(windows)]
 pub(super) fn relative(
     parent: &File,
     name: &OsStr,
-    directory: bool,
-    create: bool,
+    kind: ObjectKind,
+    creation: Creation,
 ) -> io::Result<File> {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     let sharing = FILE_SHARE_READ
-        | if directory {
+        | if kind == ObjectKind::Directory {
             FILE_SHARE_WRITE
         } else {
             FILE_SHARE_DELETE
         };
-    relative_shared(parent, name, directory, create, sharing)
+    relative_shared(parent, name, kind, creation, sharing)
 }
 
 #[cfg(windows)]
 fn relative_shared(
     parent: &File,
     name: &OsStr,
-    directory: bool,
-    create: bool,
+    kind: ObjectKind,
+    creation: Creation,
     sharing: u32,
 ) -> io::Result<File> {
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
@@ -309,7 +349,7 @@ fn relative_shared(
         MaximumLength: length,
         Buffer: encoded.as_ptr().cast_mut(),
     };
-    let security = create
+    let security = (creation == Creation::CreateNew)
         .then(crate::windows::Security::user_only)
         .transpose()?;
     let attributes = OBJECT_ATTRIBUTES {
@@ -326,9 +366,9 @@ fn relative_shared(
     let mut status = IO_STATUS_BLOCK::default();
     let access = GENERIC_READ
         | SYNCHRONIZE
-        | if create {
+        | if creation == Creation::CreateNew {
             GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER
-        } else if directory {
+        } else if kind == ObjectKind::Directory {
             DELETE
         } else {
             0
@@ -344,12 +384,16 @@ fn relative_shared(
             std::ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
             sharing,
-            if create { FILE_CREATE } else { FILE_OPEN },
+            if creation == Creation::CreateNew {
+                FILE_CREATE
+            } else {
+                FILE_OPEN
+            },
             FILE_SYNCHRONOUS_IO_NONALERT
                 | FILE_OPEN_REPARSE_POINT
-                | if directory {
+                | if kind == ObjectKind::Directory {
                     FILE_DIRECTORY_FILE
-                } else if create {
+                } else if creation == Creation::CreateNew {
                     FILE_NON_DIRECTORY_FILE
                 } else {
                     0
@@ -393,7 +437,12 @@ fn remove(file: &File) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub(super) fn rename(file: &File, parent: &File, to: &OsStr, replacing: bool) -> io::Result<()> {
+pub(super) fn rename(
+    file: &File,
+    parent: &File,
+    to: &OsStr,
+    replacing: super::Replacement,
+) -> io::Result<()> {
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
     use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformationEx, NtSetInformationFile};
     use windows_sys::Win32::{
@@ -412,7 +461,7 @@ pub(super) fn rename(file: &File, parent: &File, to: &OsStr, replacing: bool) ->
     // SAFETY: aligned storage covers the header and UTF-16 tail. Both directory
     // and source handles stay owned throughout this synchronous atomic rename.
     let result = unsafe {
-        (*info).Anonymous.Flags = 0x2 | u32::from(replacing); // POSIX_SEMANTICS | REPLACE_IF_EXISTS
+        (*info).Anonymous.Flags = 0x2 | u32::from(replacing == super::Replacement::Allow); // POSIX_SEMANTICS | REPLACE_IF_EXISTS
         (*info).RootDirectory = parent.as_raw_handle();
         (*info).FileNameLength = u32::try_from(name.len() * 2).expect("checked buffer length");
         // The tail pointer derives from the whole buffer, not the 1-element field.

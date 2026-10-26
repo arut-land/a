@@ -395,7 +395,7 @@ impl Extension for Lingers {
 fn detached_back(log: &[Entry]) -> Option<&Entry> {
     log.iter().find(|e| {
         matches!(&e.body, Body::Enqueue { envelope }
-            if envelope.id.purpose == protocol::EnvelopeId::DETACHED)
+            if envelope.id().purpose == protocol::EnvelopeId::DETACHED)
     })
 }
 
@@ -436,16 +436,12 @@ fn a_detached_calls_spilled_result_comes_back_as_its_blob() {
     .places();
     session.halt();
     let back = detached_back(&log).unwrap();
-    let Body::Enqueue {
-        envelope:
-            protocol::Envelope {
-                payload:
-                    protocol::Carried::Detached(Outcome::Done {
-                        output: Payload::Blob(blob),
-                    }),
-                ..
-            },
-    } = &back.body
+    let Body::Enqueue { envelope } = &back.body else {
+        panic!("{back:?}")
+    };
+    let protocol::Carried::Detached(Outcome::Done {
+        output: Payload::Blob(blob),
+    }) = envelope.payload()
     else {
         panic!("{back:?}")
     };

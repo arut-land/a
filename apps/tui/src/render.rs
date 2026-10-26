@@ -109,8 +109,7 @@ impl Grid {
         u16::try_from(at).unwrap_or(self.w)
     }
 
-    /// The rows as text, trailing blanks trimmed: what a test asserts on.
-    #[cfg(test)]
+    /// The rows as text, trailing blanks trimmed.
     pub fn rows(&self) -> Vec<String> {
         (0..self.h)
             .map(|y| {

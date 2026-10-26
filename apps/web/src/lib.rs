@@ -8,6 +8,9 @@
 mod app;
 mod http;
 mod page;
+/// The page state, exposed for cross-renderer integration tests.
+#[doc(hidden)]
+pub use page::Page;
 mod patch;
 mod style;
 /// Items as markup: public for the test that every renderer shows an item
@@ -43,8 +46,11 @@ pub fn run(daemons: Daemons, open: bool) -> io::Result<()> {
         )
     });
     drop(out);
-    if open && let Err(e) = sys::open_browser(&link) {
-        eprintln!("[could not open a browser: {e}; open the link above]");
+    if open {
+        match sys::open_browser(&link) {
+            Ok(opener) => rt::reap(&*rt, opener),
+            Err(e) => eprintln!("[could not open a browser: {e}; open the link above]"),
+        }
     }
     // Each connection is a task of its own; this thread only waits for the
     // next, through the reactor.

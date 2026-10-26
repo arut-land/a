@@ -46,6 +46,7 @@ pub struct Pty {
     master: File,
     pub child: Child,
     sink: Arc<Sink>,
+    read_done: mpsc::Receiver<()>,
     started: Instant,
     /// Reaped by [`Pty::wait`]: nothing is signalled or waited for again.
     reaped: bool,
@@ -97,6 +98,7 @@ impl Env {
         let master = File::from(master);
         let sink = Arc::new(Sink::default());
         let (mut reader, written) = (master.try_clone().unwrap(), Arc::clone(&sink));
+        let (finished, read_done) = mpsc::channel();
         // Nothing answers the client: it never asks the terminal anything
         // (`no_terminal_queries` in the tui crate), so one that did would
         // hang here, and the test with it.
@@ -116,14 +118,16 @@ impl Env {
                 drop(out);
                 written.wrote.notify_all();
                 if deaf {
-                    return;
+                    break;
                 }
             }
+            let _ = finished.send(());
         });
         Pty {
             master,
             child,
             sink,
+            read_done,
             started,
             reaped: false,
             cols,
@@ -244,6 +248,10 @@ impl Pty {
             .unwrap()
             .expect("the child was reaped by someone else");
         self.reaped = true;
+        // Reaping the child does not mean the reader captured its last write.
+        self.read_done
+            .recv_timeout(Duration::from_secs(10))
+            .expect("PTY output did not close after the child exited");
         ExitStatus::from_raw(status.as_raw())
     }
 }

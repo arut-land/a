@@ -57,6 +57,7 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
     drop(writer);
     let group = crate::ProcessLease::new(&child);
     let child = Capture(child, group);
+    let exit = child.0.exit_watch()?;
     let mut stdout = reader;
     fcntl_setfl(&stdout, fcntl_getfl(&stdout)? | OFlags::NONBLOCK)?;
     let mut out = Vec::new();
@@ -103,15 +104,18 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
         if eof && exited {
             break;
         }
-        // Pipe EOF does not imply process exit. Poll in bounded slices so
-        // either event is covered by the same deadline, without a reader thread.
-        let slice = remaining.min(Duration::from_millis(10));
-        let wait = Timespec {
-            tv_sec: 0,
-            tv_nsec: i64::from(slice.subsec_nanos()),
+        // Pipe EOF does not imply process exit: the wait covers whichever
+        // of the two is still due, under the same deadline.
+        let wait = Timespec::try_from(remaining).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let mut fds = [
+            PollFd::new(&stdout, PollFlags::IN),
+            PollFd::new(&exit, PollFlags::IN),
+        ];
+        let fds = match (eof, exited) {
+            (false, false) => &mut fds[..],
+            (false, true) => &mut fds[..1],
+            (true, _) => &mut fds[1..],
         };
-        let mut fds = [PollFd::new(&stdout, PollFlags::IN)];
-        let fds = if eof { &mut [][..] } else { &mut fds[..] };
         match poll(fds, Some(&wait)) {
             Ok(_) | Err(rustix::io::Errno::INTR) => {}
             Err(e) => return Err(e.into()),

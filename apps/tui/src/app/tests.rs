@@ -1640,3 +1640,35 @@ fn both_viewports_keep_complete_approval_input_before_summaries_and_controls() {
         }
     }
 }
+
+#[test]
+fn a_retry_rewraps_multibyte_text_instead_of_reusing_byte_offsets() {
+    let (mut app, _) = app(
+        Viewport::Inline,
+        &[entry(
+            1,
+            Body::ModelCall {
+                request: None,
+                model: "m".into(),
+                attempt: 0,
+                choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: None,
+            },
+        )],
+    );
+    for (attempt, text) in ["a\nold", "€new!", "€same", "€"].into_iter().enumerate() {
+        app.fold(&DaemonMsg::Delta {
+            call: CallId::new(1).unwrap(),
+            attempt: u16::try_from(attempt).unwrap(),
+            text: text.into(),
+        });
+        let got = crate::view::texts(app.rows(0, 40));
+        let expected = if attempt == 0 {
+            vec![String::new(), "⏺ a".to_owned(), "  old▍".to_owned()]
+        } else {
+            vec![String::new(), format!("⏺ {text}▍")]
+        };
+        assert_eq!(got, expected, "attempt {attempt}");
+    }
+}

@@ -65,7 +65,7 @@ fn blob_holds(env: &Env, text: &str) -> bool {
 
 fn detached_outcome(entries: &[Entry]) -> Option<String> {
     entries.iter().find_map(|e| match &e.body {
-        Body::Enqueue { envelope } => match &envelope.payload {
+        Body::Enqueue { envelope } => match envelope.payload() {
             protocol::Carried::Detached(outcome) => serde_json::to_string(outcome).ok(),
             _ => None,
         },
@@ -76,7 +76,7 @@ fn detached_outcome(entries: &[Entry]) -> Option<String> {
 fn job_ended_holding_a_blob(entries: &[Entry]) -> bool {
     entries.iter().any(|e| {
         matches!(&e.body, Body::Enqueue { envelope }
-            if envelope.id.purpose == EnvelopeId::JOB
+            if envelope.id().purpose == EnvelopeId::JOB
                 && matches!(envelope.held.as_slice(), [Held::Blob(_)]))
     })
 }

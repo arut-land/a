@@ -56,8 +56,9 @@ retry. Snapshots retain this same edit-aware projection. An edited body or reloc
 can be loaded again after adoption. Unknown names return the typed
 `LoadError::UnknownSkill { name }` inside the tool's result and publish nothing.
 Loads are exclusive, so concurrent model requests cannot publish the same
-instructions twice. An interrupted load is unsafe to replay: recovery does not
-rerun it against current files. The transcript reads the recorded context; the
+instructions twice. An interrupted load is unsafe to replay: its publication may
+already be committed without its result. Repeating it could change the result
+or publish command arguments twice. Calls read the retained catalog, not files. The transcript reads the recorded context; the
 publication projection reads only log entries. Neither reopens a skill during replay.
 Opening a workspace subscription does prepare current files, independently of
 replaying the recorded conversation.
@@ -158,3 +159,9 @@ context until loading is requested. The skills source restores its own layer
 and delegates the underlying recorded installation to Lua when present; neither
 layer decodes the other's images. Restored installation identity is checked
 against the recorded installation before the fork is accepted.
+
+Workspace source notifications reset the coordinator's 100 ms quiet
+window. Writes during preparation coalesce into one followup after quiet.
+`Sources::open` receives the host's `Delay` callback, so the
+wait yields an async task before `Prepare` admits blocking generation work;
+the loader chooses no reactor and sleeps no worker.

@@ -271,8 +271,8 @@ impl ext::host::Binding for ModelOnlyBinding {
     fn agent(&self) -> Box<dyn ext::Agent> {
         Box::new(ext::ModelOnly)
     }
-    fn runner(&self) -> protocol::publication::RunnerKind {
-        protocol::publication::RunnerKind::ModelOnly
+    fn model_contract(&self) -> ext::ModelContract {
+        ext::ModelContract::Caller
     }
     fn installed(&self) -> Vec<protocol::Installed> {
         self.registry.installed()

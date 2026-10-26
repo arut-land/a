@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::{Attach, ClientHandle, ConnId, Daemons, Driver, Env, Error, EventKind, Io, Listed};
+use crate::{ClientHandle, Daemons, Driver, Error, EventKind, Listed};
 use protocol::MachineId;
 
 /// Dropping the watch revokes connection attempts, reads and reconnect backoff.
@@ -30,7 +30,7 @@ impl SessionWatch {
             .enumerate()
             .map(|(at, member)| {
                 let (lists, on) = (Arc::clone(&lists), member.name.clone());
-                let mut driver = Driver::new(move |_, event| match event.kind {
+                Driver::new(move |_, event| match event.kind {
                     EventKind::Connected { machine, .. } => lists.connected(at, machine),
                     EventKind::Msg(protocol::DaemonMsg::Sessions { sessions }) => {
                         lists.listed(at, &on, sessions);
@@ -38,15 +38,8 @@ impl SessionWatch {
                     EventKind::Failed(error) => lists.failed(at, &on, error),
                     EventKind::Wedged(_) => lists.failed(at, &on, Error::NotResponding),
                     _ => {}
-                });
-                driver.watch = true;
-                let handle = driver.start(rt.clone(), member.daemon.clone());
-                let _ = handle.io(Io::Connect {
-                    conn: ConnId(1),
-                    attach: Attach::new(protocol::Target::New, Env::Keep),
-                    restart: false,
-                });
-                handle
+                })
+                .watch(rt.clone(), member.daemon.clone())
             })
             .collect();
         Self { _handles: handles }

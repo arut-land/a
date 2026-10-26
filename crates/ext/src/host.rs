@@ -792,8 +792,6 @@ pub trait GenerationLayer: Send + Sync {
         previous: Option<&PreparedLayer>,
         initial: bool,
     ) -> Result<PreparedLayer, PrepareError>;
-    /// Injects the runtime timer; the coordinator cancels it on events or drop.
-    fn delay(&self, duration: Duration) -> BoxFuture<'static, ()>;
     fn validate(&self, _workspace: &Path, _prepared: &PreparedLayer) -> Result<bool, PrepareError> {
         Ok(true)
     }
@@ -825,6 +823,7 @@ struct Workspace {
     preparing: Mutex<Vec<PreparedLayer>>,
     pending: Mutex<Preparation>,
     spawn: Spawn,
+    delay: Delay,
     watch: Watch,
     watches: Mutex<Vec<Box<dyn Any + Send + Sync>>>,
     changed: Arc<Changed>,
@@ -835,9 +834,10 @@ struct Workspace {
 #[derive(Default)]
 struct Preparation {
     running: bool,
-    dirty: bool,
+    changes: u64,
     attempts: u32,
     retry: Option<Cancel>,
+    settle: Option<Cancel>,
 }
 
 impl Coordinator {
@@ -863,6 +863,7 @@ impl Sources for Coordinator {
         &self,
         path: &Path,
         spawn: Spawn,
+        delay: Delay,
         prepare: Prepare,
         watch: Watch,
     ) -> Result<Arc<dyn Generations>, Refused> {
@@ -878,6 +879,7 @@ impl Sources for Coordinator {
                 preparing: Mutex::default(),
                 pending: Mutex::default(),
                 spawn,
+                delay,
                 watch,
                 watches: Mutex::default(),
                 updates: Updates::default(),
@@ -998,7 +1000,7 @@ impl Workspace {
 
     fn retry(self: &Arc<Self>) {
         let mut pending = lock(&self.pending);
-        if pending.retry.is_some() || pending.running || pending.dirty {
+        if pending.retry.is_some() || pending.running {
             return;
         }
         let delay = Duration::from_millis((100 << pending.attempts.min(6)).min(5000));
@@ -1006,7 +1008,7 @@ impl Workspace {
         let cancel = Cancel::default();
         pending.retry = Some(cancel.clone());
         drop(pending);
-        let wait = self.layers[0].delay(delay);
+        let wait = (self.delay)(delay);
         let weak = Arc::downgrade(self);
         (self.spawn)(Box::pin(async move {
             if cancel.until(wait).await.is_some()
@@ -1019,25 +1021,67 @@ impl Workspace {
 
     fn changed(self: &Arc<Self>, prepare: &Prepare) {
         let mut pending = lock(&self.pending);
-        if let Some(cancel) = pending.retry.take() {
-            cancel.set();
-        }
-        pending.dirty = true;
-        if pending.running {
-            return;
-        }
+        let retry = pending.retry.take();
+        let settle = pending.settle.clone();
+        pending.changes += 1;
+        let start = !pending.running;
         pending.running = true;
         drop(pending);
+        for cancel in retry.into_iter().chain(settle) {
+            cancel.set();
+        }
+        if start {
+            self.settle(Arc::clone(prepare));
+        }
+    }
+
+    /// Prepares the next generation once its sources have been quiet for
+    /// [`SETTLE`], which coalesces an editor's writes: a timer on the host's
+    /// runtime, so no worker sleeps through it. Changes during preparation
+    /// coalesce into one followup after another quiet window.
+    fn settle(self: &Arc<Self>, prepare: Prepare) {
         let weak = Arc::downgrade(self);
-        prepare(Box::new(move || {
-            while let Some(workspace) = weak.upgrade() {
-                lock(&workspace.pending).dirty = false;
-                let result = workspace.rebuild(false);
-                let mut pending = lock(&workspace.pending);
-                if result.is_ok() {
-                    pending.attempts = 0;
+        (self.spawn)(Box::pin(async move {
+            loop {
+                let Some(workspace) = weak.upgrade() else {
+                    return;
+                };
+                let cancel = Cancel::default();
+                let (seen, previous) = {
+                    let mut pending = lock(&workspace.pending);
+                    (pending.changes, pending.settle.replace(cancel.clone()))
+                };
+                drop(previous);
+                let wait = (workspace.delay)(SETTLE);
+                drop(workspace);
+                if cancel.until(wait).await.is_none() {
+                    continue;
                 }
-                if !pending.dirty {
+                let next = Arc::clone(&prepare);
+                prepare(Box::new(move || {
+                    let Some(workspace) = weak.upgrade() else {
+                        return;
+                    };
+                    let mut pending = lock(&workspace.pending);
+                    pending.settle = None;
+                    // An event can arrive after quiet, while the job waits
+                    // for admission. It still needs its own quiet window.
+                    if pending.changes != seen {
+                        drop(pending);
+                        workspace.settle(next);
+                        return;
+                    }
+                    drop(pending);
+                    let result = workspace.rebuild(false);
+                    let mut pending = lock(&workspace.pending);
+                    if result.is_ok() {
+                        pending.attempts = 0;
+                    }
+                    if pending.changes != seen {
+                        drop(pending);
+                        workspace.settle(next);
+                        return;
+                    }
                     pending.running = false;
                     drop(pending);
                     if let Err(error) = result {
@@ -1046,8 +1090,8 @@ impl Workspace {
                             PrepareError::Rejected(error) => eprintln!("warning: {error}"),
                         }
                     }
-                    break;
-                }
+                }));
+                return;
             }
         }));
     }
@@ -1055,7 +1099,11 @@ impl Workspace {
 
 impl Drop for Workspace {
     fn drop(&mut self) {
-        if let Some(cancel) = lock(&self.pending).retry.take() {
+        let mut pending = lock(&self.pending);
+        let retry = pending.retry.take();
+        let settle = pending.settle.take();
+        drop(pending);
+        for cancel in retry.into_iter().chain(settle) {
             cancel.set();
         }
     }
@@ -1130,6 +1178,13 @@ pub type Prepare = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 /// Schedules owned asynchronous subscription work on the host runtime.
 pub type Spawn = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>;
 
+/// A timer on the host runtime, resolving after the duration.
+pub type Delay = Arc<dyn Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// How long a workspace's sources stay quiet before a change to them is
+/// prepared.
+const SETTLE: Duration = Duration::from_millis(100);
+
 /// Watches the tree at a path, calling `changed` on anything that happens
 /// in it, until what it returns is dropped: the engine's file watcher.
 pub type Watch = Arc<dyn Fn(&Path, Arc<Changed>) -> Box<dyn Any + Send + Sync> + Send + Sync>;
@@ -1139,6 +1194,7 @@ pub trait Sources: Send + Sync {
         &self,
         workspace: &Path,
         spawn: Spawn,
+        delay: Delay,
         prepare: Prepare,
         watch: Watch,
     ) -> Result<Arc<dyn Generations>, Refused>;
@@ -1183,9 +1239,9 @@ pub trait Binding: Send + Sync {
     /// A new agent, of the kind the session runs.
     fn agent(&self) -> Box<dyn Agent>;
 
-    /// Ambiguous provider attempts require explicit new spend in model-only runners.
-    fn runner(&self) -> protocol::publication::RunnerKind {
-        protocol::publication::RunnerKind::Agent
+    /// Who authorizes provider attempts, live and after recovery.
+    fn model_contract(&self) -> crate::ModelContract {
+        crate::ModelContract::Agent
     }
 
     /// What the agent asks at its decisions: the handlers at the loop

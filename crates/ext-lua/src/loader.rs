@@ -76,17 +76,8 @@ impl GenerationLayer for Loader {
     ) -> Result<PreparedLayer, PrepareError> {
         ext::source::prepare(
             || self.capture(workspace),
-            |files: &Files| {
-                if !files.is_empty() {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            },
             |found| self.compile(found, base, previous, initial),
         )
-    }
-
-    fn delay(&self, duration: Duration) -> ext::BoxFuture<'static, ()> {
-        rt::Reactor::AsyncIo.sleep(duration)
     }
 
     fn validate(&self, workspace: &Path, prepared: &PreparedLayer) -> Result<bool, PrepareError> {
@@ -335,7 +326,6 @@ mod tests {
                 fs::rename(directory.join("save.lua.tmp"), directory.join("b.lua")).unwrap();
                 loader.capture(&rig.workspace())
             },
-            |_| {},
             |files| loader.compile(files, &Registry::default(), Some(&previous), false),
         )
         .unwrap();
@@ -478,7 +468,13 @@ mod tests {
         .unwrap();
         let loader = Loader::new(&root, sys::config::Exts::default()).unwrap();
         let source = Coordinator::new(Registry::default(), vec![Arc::new(loader)])
-            .open(&root, spawn(), Arc::new(|_| {}), ext::testing::watch())
+            .open(
+                &root,
+                spawn(),
+                ext::testing::delay(),
+                Arc::new(|_| {}),
+                ext::testing::watch(),
+            )
             .unwrap();
         let installed = source.snapshot().registry.installed();
         fs::remove_file(file).unwrap();
@@ -498,7 +494,13 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let loader = Loader::new(&root, sys::config::Exts::default()).unwrap();
         let workspace = Coordinator::new(Registry::default(), vec![Arc::new(loader)])
-            .open(&root, spawn(), Arc::new(|_| {}), ext::testing::watch())
+            .open(
+                &root,
+                spawn(),
+                ext::testing::delay(),
+                Arc::new(|_| {}),
+                ext::testing::watch(),
+            )
             .unwrap();
         let registry = workspace.snapshot().registry;
         let weak = Arc::downgrade(&registry);
@@ -518,6 +520,7 @@ mod tests {
             .open(
                 &root,
                 spawn(),
+                ext::testing::delay(),
                 Arc::new(move |work| {
                     send.send(work).unwrap();
                 }),

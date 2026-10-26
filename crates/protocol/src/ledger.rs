@@ -43,9 +43,8 @@ pub struct Ledger {
     /// The last mutation logged of each client that named itself.
     clients: Vec<(ClientId, ClientSeq)>,
     result: Option<ToolOutcome>,
-    /// The seq of the input that started the current turn; 0 before the
-    /// first.
-    turn: u64,
+    /// The input that started the current turn, if any.
+    turn: Option<Seq>,
 }
 
 /// A call between its intent and its outcome.
@@ -207,8 +206,8 @@ pub enum Item {
 
 impl From<&crate::Envelope> for Item {
     fn from(envelope: &crate::Envelope) -> Self {
-        let (sender, call) = (envelope.id.sender, envelope.id.call);
-        match &envelope.payload {
+        let (sender, call) = (envelope.id().sender, envelope.id().call);
+        match envelope.payload() {
             Carried::Message(text) => Self::Message(sender, text.clone()),
             Carried::Job(text) => Self::Job(call, text.clone()),
             Carried::Child(outcome) => Self::Child(call.0, outcome.clone()),
@@ -268,17 +267,19 @@ pub struct Sending {
 
 impl Sending {
     /// The envelope recipient `to` is delivered.
-    pub fn to(&self, to: SessionId) -> crate::Envelope {
-        crate::Envelope {
-            id: self.id.clone(),
-            destination: to,
-            payload: Carried::Message(self.payload.clone()),
-            held: Vec::new(),
-        }
+    pub fn to(&self, to: SessionId) -> Result<crate::Envelope, crate::EnvelopeError> {
+        crate::Envelope::new(
+            self.id.clone(),
+            to,
+            Carried::Message(self.payload.clone()),
+            Vec::new(),
+        )
     }
 
     /// The envelopes yet to be taken in.
-    pub fn envelopes(&self) -> impl Iterator<Item = crate::Envelope> + '_ {
+    pub fn envelopes(
+        &self,
+    ) -> impl Iterator<Item = Result<crate::Envelope, crate::EnvelopeError>> + '_ {
         self.pending.iter().map(|&to| self.to(to))
     }
 }
@@ -358,9 +359,9 @@ impl Ledger {
             Body::Enqueue { envelope } => {
                 if self
                     .identities
-                    .entry(envelope.id.purpose.clone())
+                    .entry(envelope.id().purpose.clone())
                     .or_default()
-                    .insert((envelope.id.sender.0.as_u128(), envelope.id.call.0.get()))
+                    .insert((envelope.id().sender.0.as_u128(), envelope.id().call.0.get()))
                 {
                     let item = Item::from(envelope);
                     if let Item::Detached(call, _) = item {
@@ -383,7 +384,7 @@ impl Ledger {
                 ..
             } => {
                 if *taken {
-                    self.turn = seq.get();
+                    self.turn = Some(seq);
                 } else {
                     self.untaken.push(Queued {
                         seq,
@@ -398,7 +399,7 @@ impl Ledger {
                     && !self.untaken.remove(at).steer
                     && into.is_none()
                 {
-                    self.turn = seq.get();
+                    self.turn = Some(seq);
                 }
             }
             Body::Withdraw { input, .. } => {
@@ -428,6 +429,7 @@ impl Ledger {
             | Body::Wait { .. }
             | Body::Watch { .. }
             | Body::Fired { .. }
+            | Body::Unwatch { .. }
             | Body::Answer { .. } => self.track(CallId(seq), body),
             // What runs in the background ends with the interrupt.
             Body::Interrupt { .. } => {
@@ -533,6 +535,9 @@ impl Ledger {
                 if let Err(at) = self.watched.binary_search(&child.0.as_u128()) {
                     self.watched.insert(at, child.0.as_u128());
                 }
+            }
+            Body::Unwatch { watch } => {
+                self.armed.remove(*watch);
             }
             Body::Fired { watch, outcome } => {
                 self.armed.remove(*watch);
@@ -744,8 +749,8 @@ impl Ledger {
         self.result.as_ref()
     }
 
-    /// The seq of the current turn's input; 0 before the first.
-    pub const fn turn_start(&self) -> u64 {
+    /// The current turn's input, if a turn has started.
+    pub const fn turn_start(&self) -> Option<Seq> {
         self.turn
     }
 
@@ -892,7 +897,11 @@ mod durable_tests {
         };
         let half = fold([outbox(), ack(a, Some(InboxRefusal::Full))]);
         assert_eq!(half.acknowledged(&id), None);
-        let pending: Vec<Envelope> = half.pending_outbox().flat_map(Sending::envelopes).collect();
+        let pending: Vec<Envelope> = half
+            .pending_outbox()
+            .flat_map(Sending::envelopes)
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(
             pending.iter().map(|e| e.destination).collect::<Vec<_>>(),
             [b]
@@ -934,12 +943,16 @@ mod durable_tests {
         assert_eq!(withdrawn.untaken(), []);
         assert_eq!(
             withdrawn.turn_start(),
-            0,
+            None,
             "a withdrawn input starts nothing"
         );
         let taken = fold([queued(), take(), withdraw()]);
         assert_eq!(taken.untaken(), []);
-        assert_eq!(taken.turn_start(), 2, "the take came first and stands");
+        assert_eq!(
+            taken.turn_start(),
+            Some(seq(2)),
+            "the take came first and stands"
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use protocol::{
     Author, Caps, ClientDecl, ClientId, ClientMsg, ClientSeq, DaemonMsg, Decode, Environment,
-    Frame, HomeSettings, MachineId, PROTO, Rejection, Role, SettingsChange, Versions,
+    Frame, HomeSettings, MachineId, PROTO, Rejection, Role, SettingsChange,
 };
 use rt::{Async, BoxFuture, Reactor};
 use sys::{Listener, OwnedConnection as Stream};
@@ -233,7 +233,7 @@ async fn upgrading(
     daemon: &Daemon,
     life: &Lifecycle,
     verdict: Verdict,
-    theirs: Versions,
+    theirs: u32,
 ) -> (Verdict, Option<String>) {
     if verdict != Verdict::Drain || life.draining().is_some() {
         return (verdict, None);
@@ -241,7 +241,7 @@ async fn upgrading(
     life.want();
     daemon.pulse.notify();
     let held = daemon.upgrade_held(life.runtime()).await;
-    let verdict = if held.is_some() && Versions::OURS.common(theirs).is_some() {
+    let verdict = if held.is_some() && theirs == PROTO {
         Verdict::Welcome
     } else {
         verdict
@@ -261,16 +261,15 @@ pub(crate) async fn handle_as(
         Some(ClientMsg::Hello {
             proto,
             build,
-            min,
             caps,
             client,
             machine,
         }) => {
-            let theirs = Versions::new(min, proto);
+            let theirs = proto;
             let caps = caps & Caps::SERVED;
             (life.verdict(theirs, &build), theirs, caps, client, machine)
         }
-        _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE, None, None),
+        _ => (Verdict::Mismatch, 0, Caps::NONE, None, None),
     };
     let (verdict, held) = upgrading(daemon, life, verdict, theirs).await;
     let outbox = Outbox::new();
@@ -284,8 +283,8 @@ pub(crate) async fn handle_as(
         async {
             // Whatever the client sent behind a hello that is not welcomed is read
             // and dropped, never acted on.
-            let result = match (verdict, Versions::OURS.common(theirs)) {
-                (Verdict::Welcome, Some(proto)) => match daemon.machine.id().await {
+            let result = match (verdict, theirs == PROTO) {
+                (Verdict::Welcome, true) => match daemon.machine.id().await {
                     Ok(ours) => {
                         let _registered = life.register(outbox.clone());
                         let mut conn = Conn {
@@ -304,7 +303,7 @@ pub(crate) async fn handle_as(
                         };
                         let registry = daemon.shared.registry.get();
                         conn.reply(&DaemonMsg::Welcome {
-                            proto,
+                            proto: PROTO,
                             build: life.build.clone(),
                             caps,
                             machine: ours,
@@ -332,17 +331,8 @@ pub(crate) async fn handle_as(
                     Ok(())
                 }
                 _ => {
-                    ext_logging::emit(ext_logging::Fact::Mismatch {
-                        min: theirs.min,
-                        max: theirs.max,
-                    });
-                    reply(
-                        &outbox,
-                        &DaemonMsg::Mismatch {
-                            supported: PROTO,
-                            min: Versions::OURS.min_field(),
-                        },
-                    );
+                    ext_logging::emit(ext_logging::Fact::Mismatch { proto: theirs });
+                    reply(&outbox, &DaemonMsg::Mismatch { supported: PROTO });
                     within(&daemon.shared.rt.reactor(), REFUSED_GRACE, frames.drain()).await;
                     Ok(())
                 }

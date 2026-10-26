@@ -20,15 +20,11 @@ struct OwnedChild {
     pid: u32,
     watch: Option<OwnedFd>,
     group: bool,
-    waiter: Mutex<Option<Waiter>>,
+    /// Readable once the child exits, where it has no `watch`.
+    unwatched: Mutex<Option<OwnedFd>>,
     /// Handed to the next build: this process's image no longer signals or
     /// reaps it, the one it execs into does.
     released: AtomicBool,
-}
-
-struct Waiter {
-    reader: OwnedFd,
-    thread: std::thread::JoinHandle<()>,
 }
 
 impl Child {
@@ -103,7 +99,7 @@ impl Child {
             pid,
             watch: None,
             group: true,
-            waiter: Mutex::new(None),
+            unwatched: Mutex::new(None),
             released: AtomicBool::new(false),
         }));
         match super::imp::exit_watch(pid) {
@@ -155,29 +151,70 @@ impl Child {
         if let Some(watch) = &self.0.watch {
             return watch.try_clone();
         }
-        // One event-driven waiter per owned child on kernels without pidfds.
-        // Its status remains unreaped until OwnedChild joins it and reaps.
-        let mut waiter = self.0.waiter.lock().unwrap_or_else(PoisonError::into_inner);
-        if waiter.is_none() {
-            let (reader, mut writer) = io::pipe()?;
-            let pid = self.id();
-            let thread = std::thread::Builder::new()
-                .name("a-child-wait".into())
-                .spawn(move || {
-                    use std::io::Write;
-                    let _ = observe(libc::P_PID, pid, false);
-                    let _ = writer.write_all(&[1]);
-                })?;
-            *waiter = Some(Waiter {
-                reader: reader.into(),
-                thread,
-            });
+        let mut unwatched = (self.0.unwatched.lock()).unwrap_or_else(PoisonError::into_inner);
+        if unwatched.is_none() {
+            let (reader, writer) = io::pipe()?;
+            // A Darwin child gone before it could be watched reads as
+            // ended at once; dropping the writer is what says so.
+            if self.observe(true)?.is_none() {
+                unwatched::watch(self.id(), writer.into());
+            }
+            *unwatched = Some(reader.into());
         }
-        waiter
+        unwatched
             .as_ref()
-            .expect("registered child waiter")
-            .reader
+            .expect("registered exit watch")
             .try_clone()
+    }
+}
+
+/// Children with no native exit notification: those on Linux before 5.3,
+/// which has no pidfds and is not a supported target. One thread checks
+/// them all in turn without reaping them, and closes each one's pipe as it
+/// exits; it ends with the last of them. Unoptimized on purpose: it only
+/// keeps such a kernel working.
+mod unwatched {
+    use std::os::fd::OwnedFd;
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
+
+    /// How often an unwatched child is looked at.
+    const SLICE: Duration = Duration::from_millis(100);
+
+    /// Each child's pid and the writer its exit closes; whether the thread runs.
+    static WATCHED: Mutex<(Vec<(u32, OwnedFd)>, bool)> = Mutex::new((Vec::new(), false));
+
+    pub(super) fn watch(pid: u32, writer: OwnedFd) {
+        let mut watched = WATCHED.lock().unwrap_or_else(PoisonError::into_inner);
+        watched.0.push((pid, writer));
+        if watched.1 {
+            return;
+        }
+        watched.1 = std::thread::Builder::new()
+            .name("a-child-exits".into())
+            .spawn(run)
+            .is_ok();
+    }
+
+    /// Called before the child is reaped, after which its pid may name another.
+    pub(super) fn forget(pid: u32) {
+        let mut watched = WATCHED.lock().unwrap_or_else(PoisonError::into_inner);
+        watched.0.retain(|(watched, _)| *watched != pid);
+    }
+
+    fn run() {
+        loop {
+            let mut watched = WATCHED.lock().unwrap_or_else(PoisonError::into_inner);
+            watched
+                .0
+                .retain(|(pid, _)| matches!(super::observe(libc::P_PID, *pid, true), Ok(None)));
+            if watched.0.is_empty() {
+                watched.1 = false;
+                return;
+            }
+            drop(watched);
+            std::thread::sleep(SLICE);
+        }
     }
 }
 
@@ -260,7 +297,6 @@ impl OwnedChild {
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        // A waiter still blocked on it ends with this image.
         if *self.released.get_mut() {
             return;
         }
@@ -268,13 +304,14 @@ impl Drop for OwnedChild {
         if self.group && owned {
             let _ = super::imp::signal_group(self.pid, Signal::Kill);
         }
-        if let Some(waiter) = self
-            .waiter
+        if self
+            .unwatched
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+            .is_some()
         {
-            let _ = waiter.thread.join();
+            unwatched::forget(self.pid);
         }
         #[cfg(target_os = "linux")]
         if let Some(watch) = &self.watch
@@ -453,7 +490,7 @@ impl<'a> SpawnPlan<'a> {
             pid: pid.cast_unsigned(),
             watch: None,
             group: self.group,
-            waiter: Mutex::new(None),
+            unwatched: Mutex::new(None),
             released: AtomicBool::new(false),
         }));
         match super::imp::exit_watch(child.id()) {
@@ -818,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_wait_fallback_is_event_driven_and_keeps_the_child_waitable() {
+    fn a_child_without_a_native_exit_watch_is_seen_to_exit_and_stays_waitable() {
         let null = null();
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "sleep 30"]);

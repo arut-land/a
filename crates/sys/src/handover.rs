@@ -46,6 +46,24 @@ pub struct Group {
     process: i32,
 }
 
+impl Group {
+    fn numbers(&self) -> impl Iterator<Item = i32> {
+        [
+            self.output,
+            #[cfg(windows)]
+            Some(self.job),
+            #[cfg(windows)]
+            Some(self.process),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+#[path = "handover/startup.rs"]
+pub(crate) mod startup;
+pub use startup::{Startup, enter};
+
 /// A group's output pipe, stopped between two reads for a handover: what
 /// was read but not yet kept comes back with it ([`park`]).
 pub struct Parked(File);
@@ -134,22 +152,48 @@ pub fn encode<'a>(groups: impl IntoIterator<Item = (&'a Group, &'a serde_json::V
     serde_json::to_vec(&Record { groups }).unwrap_or_default()
 }
 
-/// Reads the record crossing under `number` and claims every group it
-/// names, each with what its owner said of it, or why it could not be
-/// claimed (its handles then closed).
-pub fn read_record(
-    number: crate::InheritedNumber,
-) -> io::Result<Vec<(io::Result<Claimed>, serde_json::Value)>> {
+/// Claimed groups paired with the state supplied by their owners.
+pub type Claims = Vec<(io::Result<Claimed>, serde_json::Value)>;
+
+/// Reads caller-supplied numbers without taking ownership of their originals.
+/// Repeated groups or numbers are rejected before any group is claimed.
+pub fn read_record(number: crate::InheritedNumber) -> io::Result<Claims> {
+    let record = decode(number.duplicate()?)?;
+    validate(&record, number)?;
+    Ok(claim_record(record, |number| {
+        crate::InheritedNumber::from(number).duplicate()
+    }))
+}
+
+fn decode(mut file: File) -> io::Result<Record> {
     use std::io::Read;
-    let mut file = imp::own(number.raw())?;
     let mut bytes = Vec::new();
-    #[cfg(unix)]
     io::Seek::rewind(&mut file)?;
     file.read_to_end(&mut bytes)?;
-    let record: Record = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    Ok((record.groups.into_iter())
-        .map(|Entry { group, owner }| (imp::claim(&group), owner))
-        .collect())
+    serde_json::from_slice(&bytes).map_err(io::Error::other)
+}
+
+fn validate(record: &Record, number: crate::InheritedNumber) -> io::Result<()> {
+    let mut numbers = std::collections::HashSet::from([number.raw()]);
+    let mut leaders = std::collections::HashSet::new();
+    for entry in &record.groups {
+        let group = &entry.group;
+        if !leaders.insert(group.pid) || group.numbers().any(|n| !numbers.insert(n)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repeated group or resource in handover record",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn claim_record(record: Record, mut duplicate: impl FnMut(i32) -> io::Result<File>) -> Claims {
+    record
+        .groups
+        .into_iter()
+        .map(|Entry { group, owner }| (imp::claim(&group, &mut duplicate), owner))
+        .collect()
 }
 
 /// Lets TERM, INT and HUP through again in an image the build before
@@ -348,7 +392,7 @@ impl<'a> Successor<'a> {
 mod imp {
     use std::fs::File;
     use std::io::{self, Write};
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
 
     use super::{Claimed, Given, Group, Handover, Parked, Successor};
     use crate::{Child, ProcessLease, ProcessPipe};
@@ -377,8 +421,11 @@ mod imp {
         }
     }
 
-    pub fn claim(group: &Group) -> io::Result<Claimed> {
-        let output = group.output.map(own).transpose()?;
+    pub fn claim(
+        group: &Group,
+        duplicate: &mut impl FnMut(i32) -> io::Result<File>,
+    ) -> io::Result<Claimed> {
+        let output = group.output.map(duplicate).transpose()?;
         if let Some(output) = &output
             && !std::os::unix::fs::FileTypeExt::is_fifo(&output.metadata()?.file_type())
         {
@@ -394,6 +441,23 @@ mod imp {
             lease,
             output,
         })
+    }
+
+    /// # Safety
+    /// The number must name an inherited descriptor with no Rust owner.
+    pub unsafe fn take_inherited(number: i32) -> io::Result<File> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: fcntl validates the integer without constructing a borrow.
+        let flags = unsafe { libc::fcntl(number, libc::F_GETFD) };
+        if number < 3 || flags < 0 || flags & libc::FD_CLOEXEC != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no inherited descriptor under that number",
+            ));
+        }
+        // SAFETY: the caller guarantees exclusive ownership of this inherited
+        // original. Newly opened application descriptors are close-on-exec.
+        Ok(unsafe { File::from_raw_fd(number) })
     }
 
     /// An unlinked private file, so nothing but the descriptor reaches it
@@ -429,26 +493,6 @@ mod imp {
             .exec()
     }
 
-    /// Takes `number`, which nothing in this image owns, as a file closed
-    /// on the next exec.
-    pub fn own(number: i32) -> io::Result<File> {
-        // SAFETY: fcntl validates arbitrary integers in the kernel.
-        let flags = unsafe { libc::fcntl(number, libc::F_GETFD) };
-        if number < 3 || flags < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no handed descriptor under that number",
-            ));
-        }
-        // SAFETY: fcntl only changes the descriptor's flags.
-        if unsafe { libc::fcntl(number, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the number names an open descriptor the previous image
-        // passed to this one alone, which nothing here owns yet.
-        Ok(unsafe { File::from_raw_fd(number) })
-    }
-
     /// Clears (`true`) or sets close-on-exec on each of `numbers`.
     pub fn inherit(numbers: &[i32], inherit: bool) -> io::Result<()> {
         for &number in numbers {
@@ -477,3 +521,91 @@ mod imp;
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+    use crate::Pass;
+    use std::io::Write;
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn reading_a_record_never_closes_its_callers_file() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&encode([])).unwrap();
+        for _ in 0..2 {
+            assert!(
+                read_record(crate::InheritedNumber::from(file.passed().0))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(file.metadata().is_ok());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn repeated_groups_and_resources_are_rejected_before_claiming_any_group() {
+        let handles: Vec<_> = (0..6).map(|_| tempfile::tempfile().unwrap()).collect();
+        let mut file = tempfile::tempfile().unwrap();
+        let group = Group {
+            pid: std::process::id(),
+            output: Some(handles[0].passed().0),
+            #[cfg(windows)]
+            job: handles[1].passed().0,
+            #[cfg(windows)]
+            process: handles[2].passed().0,
+        };
+        let other = Group {
+            pid: std::process::id() + 1,
+            output: Some(handles[3].passed().0),
+            #[cfg(windows)]
+            job: handles[4].passed().0,
+            #[cfg(windows)]
+            process: handles[5].passed().0,
+        };
+        for repeated in [
+            Group {
+                output: group.output,
+                ..other.clone()
+            },
+            Group {
+                pid: group.pid,
+                ..other
+            },
+        ] {
+            file.set_len(0).unwrap();
+            io::Seek::rewind(&mut file).unwrap();
+            let owner = serde_json::Value::Null;
+            file.write_all(&encode([(&group, &owner), (&repeated, &owner)]))
+                .unwrap();
+            let error = read_record(crate::InheritedNumber::from(file.passed().0)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(file.metadata().is_ok());
+            assert!(handles.iter().all(|handle| handle.metadata().is_ok()));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_record_cannot_claim_its_own_resource() {
+        let mut file = tempfile::tempfile().unwrap();
+        let group = Group {
+            pid: std::process::id(),
+            output: Some(file.passed().0),
+            #[cfg(windows)]
+            job: file.passed().0,
+            #[cfg(windows)]
+            process: file.passed().0,
+        };
+        file.write_all(&encode([(&group, &serde_json::Value::Null)]))
+            .unwrap();
+        assert_eq!(
+            read_record(crate::InheritedNumber::from(file.passed().0))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(file.metadata().is_ok());
+    }
+}
