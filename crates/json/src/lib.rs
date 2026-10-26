@@ -16,9 +16,8 @@ use serde_json::value::RawValue;
 /// and written out again as that text: decoding a payload checks it but
 /// builds nothing of it, and encoding it is a copy.
 ///
-/// Two are equal when their text is: what this workspace encodes is
-/// compact, with an object's keys in order, so the same value has the same
-/// text. Shared: a clone is a count.
+/// Equality compares text, including whitespace and object key order;
+/// semantically equivalent JSON can compare unequal. Shared: a clone is a count.
 #[derive(Clone)]
 pub struct Json(Arc<RawValue>);
 

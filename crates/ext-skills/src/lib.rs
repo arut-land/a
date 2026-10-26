@@ -192,7 +192,8 @@ impl Tool for Load {
     const NAME: &'static str = "skill";
     const DESCRIPTION: &'static str =
         "Load a named skill's instructions into the conversation. Consult the skill index first.";
-    // A crash must never turn a recorded request into a read of newer files.
+    // Publication can commit before the tool result. Repeating the call could
+    // change Loaded to AlreadyLoaded or publish command arguments twice.
     const REPLAY: ext::Replay = ext::Replay::Unsafe;
 
     async fn call(&self, input: &Input, cx: &Cx) -> Result<Self::Out, String> {
@@ -275,6 +276,51 @@ mod publication_tests {
     use ext::host::Registry;
     use ext::testing::Rig;
     use serde_json::json;
+
+    #[test]
+    fn interrupted_loads_cannot_repeat_committed_publications() {
+        let catalog = Catalog::new(Arc::new(BTreeMap::from([(
+            "review".into(),
+            Skill {
+                description: "Review".into(),
+                directory: "/workspace".into(),
+                body: "Review instructions".into(),
+            },
+        )])));
+        let rig = Rig::new(
+            "interrupted-skill-publication",
+            Registry::default()
+                .with_dyn(ext::Tier::Pre, &catalog)
+                .unwrap(),
+        );
+        assert_eq!(<Load as Tool>::REPLAY, ext::Replay::Unsafe);
+        let command = rig.registry.tools().get("review").unwrap();
+        assert_eq!(command.replay(), ext::Replay::Unsafe);
+        assert_eq!(
+            rig.done("skill", &json!({"name":"review"})),
+            json!({"Ok":"loaded"})
+        );
+        // The publication is durable even if the caller never records this result.
+        rig.restart();
+        assert_eq!(
+            rig.done("skill", &json!({"name":"review"})),
+            json!({"Ok":"already_loaded"})
+        );
+        rig.done("review", &json!({"args":"check this"}));
+        rig.restart();
+        rig.done("review", &json!({"args":"check this"}));
+        assert_eq!(
+            rig.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| matches!(
+                    &entry.body, protocol::Body::Context { text, .. } if text.contains("check this")
+                ))
+                .count(),
+            2
+        );
+    }
 
     #[test]
     fn publication_keys_do_not_repeat_the_published_content() {

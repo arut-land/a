@@ -51,6 +51,14 @@ pub enum BlockingClass {
 /// Default reservation for storage jobs whose buffers are owned by their caller.
 pub const STORAGE_BYTES: usize = 8 << 20;
 
+/// What the storage workers may hold at once, every job's reservation
+/// together: the most one job can reserve, which runs it alone.
+pub const STORAGE_BUDGET: usize = 64 << 20;
+
+/// What the CPU workers may hold at once, as [`STORAGE_BUDGET`] is for
+/// storage.
+pub const CPU_BUDGET: usize = 64 << 20;
+
 pub trait Runtime: Send + Sync + 'static {
     /// Runs `task` in the background; it is never awaited.
     fn spawn(&self, task: BoxFuture<'static, ()>);
@@ -152,11 +160,31 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    let result = try_unblock_with(rt, class, bytes, work);
+    async move { result.await.expect("blocking work failed") }
+}
+
+/// Runs blocking work, reporting refused admission or a lost worker as an error.
+/// `bytes` reserves captures and working buffers until completion.
+///
+/// # Errors
+/// Returns the runtime's admission error, or an error if the worker panics.
+pub fn try_unblock_with<T, F>(
+    rt: &dyn Runtime,
+    class: BlockingClass,
+    bytes: usize,
+    work: F,
+) -> impl Future<Output = std::io::Result<T>> + Send + 'static
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
     let (tx, rx) = oneshot::channel();
     let admitted = rt.spawn_blocking(class, bytes, Box::new(move || tx.send(work())));
     async move {
-        admitted.await.expect("blocking admission failed");
-        rx.await.expect("blocking work panicked")
+        admitted.await?;
+        rx.await
+            .ok_or_else(|| std::io::Error::other("blocking worker panicked"))
     }
 }
 

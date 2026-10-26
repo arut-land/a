@@ -326,6 +326,16 @@ impl Places {
         Some(text)
     }
 
+    /// What `blob` holds, as bytes: an image a result holds, read back
+    /// for the model. `None` if it cannot be read. Blocks: run it on a
+    /// storage worker.
+    pub fn bytes(&self, blob: &BlobRef) -> Option<Arc<[u8]>> {
+        let (store, _) = self.store.as_ref()?;
+        let mut bytes = Vec::with_capacity(usize::try_from(blob.size).ok()?);
+        store.open(&blob.id).ok()?.read_to_end(&mut bytes).ok()?;
+        Some(bytes.into())
+    }
+
     /// Where `stream` is read, named from the reference alone: once it
     /// ends it is gone from there (sealed, or dropped), and what reports
     /// its end names the blob it became, so every projection of a log

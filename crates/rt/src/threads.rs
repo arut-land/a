@@ -41,7 +41,7 @@ impl Config {
             storage: PoolLimits {
                 workers: (cores / 2).clamp(1, 4),
                 queue: 16,
-                bytes: 64 << 20,
+                bytes: crate::STORAGE_BUDGET,
             },
             network: PoolLimits {
                 workers: 8,
@@ -51,7 +51,7 @@ impl Config {
             cpu: PoolLimits {
                 workers: cores.saturating_sub(1).max(1),
                 queue: 8,
-                bytes: 64 << 20,
+                bytes: crate::CPU_BUDGET,
             },
             foreground: false,
         }

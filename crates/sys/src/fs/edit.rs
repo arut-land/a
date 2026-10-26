@@ -151,14 +151,14 @@ pub struct EditTransaction {
     observed_parent: PathBuf,
     name: OsString,
     source: Option<(File, Signature)>,
-    original: Option<Vec<u8>>,
-    limit: usize,
+    original: Option<File>,
+    limit: Option<usize>,
     #[cfg(windows)]
     stream_bytes: u64,
 }
 
 impl EditTransaction {
-    pub fn capture(path: &Path, limit: usize) -> Result<Self, EditError> {
+    pub fn capture(path: &Path, limit: Option<usize>) -> Result<Self, EditError> {
         let name = path
             .file_name()
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?
@@ -199,16 +199,19 @@ impl EditTransaction {
         };
         let signature = signature(&file)?;
         #[cfg(target_vendor = "apple")]
-        mac_xattrs(&file, file.metadata()?.len(), limit)?;
+        mac_xattrs(&file, file.metadata()?.len(), limit.unwrap_or(usize::MAX))?;
         #[cfg(target_os = "linux")]
-        linux_xattrs(&file, file.metadata()?.len(), limit)?;
+        linux_xattrs(&file, file.metadata()?.len(), limit.unwrap_or(usize::MAX))?;
         #[cfg(windows)]
         {
-            transaction.stream_bytes = stream_bytes(&file, limit)?;
+            transaction.stream_bytes = stream_bytes(&file, limit.unwrap_or(usize::MAX))?;
         }
-        let mut bytes = Vec::new();
-        (&mut file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > limit {
+        let mut bytes = tempfile::tempfile()?;
+        let count = io::copy(
+            &mut (&mut file).take(limit.map_or(u64::MAX, |limit| (limit as u64).saturating_add(1))),
+            &mut bytes,
+        )?;
+        if limit.is_some_and(|limit| count > limit as u64) {
             return Err(EditError::TooLarge);
         }
         if signature != self::signature(&file)? {
@@ -219,8 +222,8 @@ impl EditTransaction {
         Ok(transaction)
     }
 
-    pub fn original(&self) -> Option<&[u8]> {
-        self.original.as_deref()
+    pub fn original(&self) -> Option<&File> {
+        self.original.as_ref()
     }
 
     fn open_source(&self) -> Result<File, EditError> {
@@ -282,7 +285,7 @@ impl EditTransaction {
                 if *before != signature(&current)? || *before != signature(source)? {
                     return Err(EditError::Conflict(EditConflict::Changed));
                 }
-                let original = self.original.as_deref().expect("source has captured bytes");
+                let original = self.original.as_ref().expect("source has captured bytes");
                 check_bytes(&mut current, original)?;
                 if *before != signature(&current)? {
                     return Err(EditError::Conflict(EditConflict::Changed));
@@ -305,12 +308,59 @@ impl EditTransaction {
         durable: bool,
         should_cancel: &(dyn Fn(u64) -> bool + Sync),
     ) -> Result<EditReceipt, EditError> {
-        self.publish_with_sync(bytes, durable, File::sync_all, should_cancel, true, || {})
+        self.publish_reader(
+            &mut io::Cursor::new(bytes),
+            bytes.len() as u64,
+            durable,
+            should_cancel,
+        )
     }
 
+    /// Streams an exact-length result through the same atomic publication protocol.
+    pub fn publish_reader(
+        self,
+        reader: &mut dyn Read,
+        length: u64,
+        durable: bool,
+        should_cancel: &(dyn Fn(u64) -> bool + Sync),
+    ) -> Result<EditReceipt, EditError> {
+        self.publish_stream(
+            reader,
+            length,
+            durable,
+            File::sync_all,
+            should_cancel,
+            true,
+            || {},
+        )
+    }
+
+    #[cfg(test)]
     fn publish_with_sync(
         self,
         bytes: &[u8],
+        durable: bool,
+        sync_parent: impl FnOnce(&File) -> io::Result<()>,
+        should_cancel: &(dyn Fn(u64) -> bool + Sync),
+        exchange: bool,
+        before_commit: impl FnOnce(),
+    ) -> Result<EditReceipt, EditError> {
+        self.publish_stream(
+            &mut io::Cursor::new(bytes),
+            bytes.len() as u64,
+            durable,
+            sync_parent,
+            should_cancel,
+            exchange,
+            before_commit,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "publication test checkpoints")]
+    fn publish_stream(
+        self,
+        reader: &mut dyn Read,
+        length: u64,
         durable: bool,
         sync_parent: impl FnOnce(&File) -> io::Result<()>,
         should_cancel: &(dyn Fn(u64) -> bool + Sync),
@@ -325,32 +375,22 @@ impl EditTransaction {
             )
             .into());
         }
-        if bytes.len() > self.limit {
-            return Err(EditError::TooLarge);
-        }
+        let metadata_content = self.output_size(length)?;
+        #[cfg(windows)]
+        let _ = metadata_content;
         #[cfg(unix)]
         let mut copied = 0;
         #[cfg(windows)]
         let mut copied = self.stream_bytes;
-        #[cfg(windows)]
-        {
-            let streams = self
-                .stream_bytes
-                .saturating_sub(self.original.as_ref().map_or(0, |b| b.len() as u64));
-            if streams.saturating_add(bytes.len() as u64) > self.limit as u64 {
-                return Err(EditError::TooLarge);
-            }
-        }
         check_cancel(should_cancel, 0)?;
         self.revalidate()?;
-        #[cfg(unix)]
-        let metadata_content = self
-            .original
-            .as_ref()
-            .map_or(bytes.len(), |original| original.len().max(bytes.len()));
         #[cfg(target_vendor = "apple")]
         if let Some((source, _)) = &self.source {
-            mac_xattrs(source, metadata_content as u64, self.limit)?;
+            mac_xattrs(
+                source,
+                metadata_content as u64,
+                self.limit.unwrap_or(usize::MAX),
+            )?;
         }
         let mut staged = self
             .stage(should_cancel)
@@ -361,12 +401,8 @@ impl EditTransaction {
             })?;
         publication_checkpoint!("staged");
         staged.file.rewind()?;
-        for chunk in bytes.chunks(65536) {
-            check_cancel(should_cancel, copied)?;
-            staged.file.write_all(chunk)?;
-            copied += chunk.len() as u64;
-        }
-        staged.file.set_len(bytes.len() as u64)?;
+        copy_content(reader, &mut staged.file, length, &mut copied, should_cancel)?;
+        staged.file.set_len(length)?;
         publication_checkpoint!("written");
         check_cancel(should_cancel, copied)?;
         #[cfg(unix)]
@@ -414,6 +450,28 @@ impl EditTransaction {
         })
     }
 
+    fn output_size(&self, length: u64) -> Result<usize, EditError> {
+        if self.limit.is_some_and(|limit| length > limit as u64) {
+            return Err(EditError::TooLarge);
+        }
+        let original = self
+            .original
+            .as_ref()
+            .map(|file| file.metadata().map(|m| m.len()))
+            .transpose()?
+            .unwrap_or(0);
+        #[cfg(windows)]
+        if self.limit.is_some_and(|limit| {
+            self.stream_bytes
+                .saturating_sub(original)
+                .saturating_add(length)
+                > limit as u64
+        }) {
+            return Err(EditError::TooLarge);
+        }
+        usize::try_from(original.max(length)).map_err(|_| EditError::TooLarge)
+    }
+
     #[cfg(unix)]
     fn copy_metadata(
         &self,
@@ -428,7 +486,7 @@ impl EditTransaction {
                 source,
                 staged,
                 metadata_content,
-                self.limit,
+                self.limit.unwrap_or(usize::MAX),
                 copied,
                 should_cancel,
             )?;
@@ -437,7 +495,7 @@ impl EditTransaction {
                 source,
                 staged,
                 metadata_content,
-                self.limit,
+                self.limit.unwrap_or(usize::MAX),
                 copied,
                 should_cancel,
             )?;
@@ -528,11 +586,8 @@ impl EditTransaction {
             return Err(EditError::Conflict(EditConflict::Changed));
         }
         displaced.rewind()?;
-        check_bytes(
-            displaced,
-            self.original.as_deref().expect("captured source"),
-        )?;
-        if !preserved_metadata_matches(displaced, snapshot, self.limit)?
+        check_bytes(displaced, self.original.as_ref().expect("captured source"))?;
+        if !preserved_metadata_matches(displaced, snapshot, self.limit.unwrap_or(usize::MAX))?
             || signature(displaced)? != observed
         {
             return Err(EditError::Conflict(EditConflict::Changed));
@@ -542,7 +597,7 @@ impl EditTransaction {
 
     fn revalidate_staged(&self, staged: &File) -> Result<(), EditError> {
         if let Some((source, _)) = &self.source
-            && !preserved_metadata_matches(source, staged, self.limit)?
+            && !preserved_metadata_matches(source, staged, self.limit.unwrap_or(usize::MAX))?
         {
             return Err(EditError::Conflict(EditConflict::Changed));
         }
@@ -565,23 +620,44 @@ impl EditTransaction {
     }
 }
 
-fn check_bytes(current: &mut File, original: &[u8]) -> Result<(), EditError> {
-    let mut at = 0;
-    let mut buffer = [0; 8192];
+fn copy_content(
+    reader: &mut dyn Read,
+    output: &mut File,
+    mut remaining: u64,
+    copied: &mut u64,
+    should_cancel: &(dyn Fn(u64) -> bool + Sync),
+) -> io::Result<()> {
+    let mut buffer = vec![0; 65536];
+    while remaining > 0 {
+        check_cancel(should_cancel, *copied)?;
+        let count =
+            usize::try_from(remaining.min(buffer.len() as u64)).expect("bounded buffer length");
+        reader.read_exact(&mut buffer[..count])?;
+        output.write_all(&buffer[..count])?;
+        remaining -= count as u64;
+        *copied += count as u64;
+    }
+    Ok(())
+}
+
+fn check_bytes(current: &mut File, mut original: &File) -> Result<(), EditError> {
+    original.rewind()?;
+    let mut buffer = vec![0; 65536];
+    let mut expected = vec![0; 65536];
     loop {
         let count = current.read(&mut buffer)?;
         if count == 0 {
-            break;
+            if original.read(&mut expected[..1])? != 0 {
+                return Err(EditError::Conflict(EditConflict::Changed));
+            }
+            return Ok(());
         }
-        if original.get(at..at + count) != Some(&buffer[..count]) {
+        if original.read_exact(&mut expected[..count]).is_err()
+            || buffer[..count] != expected[..count]
+        {
             return Err(EditError::Conflict(EditConflict::Changed));
         }
-        at += count;
     }
-    if at != original.len() {
-        return Err(EditError::Conflict(EditConflict::Changed));
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -1584,13 +1660,13 @@ fn stage_windows(
             true,
         );
     };
-    stream_bytes(source, transaction.limit)?;
+    stream_bytes(source, transaction.limit.unwrap_or(usize::MAX))?;
     let context = std::sync::Mutex::new(CopyContext {
         source,
         destination: None,
         error: None,
         should_cancel,
-        limit: transaction.limit as u64,
+        limit: transaction.limit.map_or(u64::MAX, |limit| limit as u64),
         announced: 0,
         last_stream: 0,
     });
@@ -1883,7 +1959,7 @@ mod tests {
         }
 
         fn capture(&self) -> EditTransaction {
-            EditTransaction::capture(&self.target(), 1 << 20).unwrap()
+            EditTransaction::capture(&self.target(), Some(1 << 20)).unwrap()
         }
 
         fn only_target_remains(&self) {
@@ -2012,18 +2088,34 @@ mod tests {
     }
 
     #[test]
+    fn a_truncated_output_stream_never_publishes() {
+        let work = Workspace::new();
+        fs::write(work.target(), b"original").unwrap();
+        let mut output = tempfile::tempfile().unwrap();
+        output.write_all(b"short").unwrap();
+        output.rewind().unwrap();
+        assert!(
+            work.capture()
+                .publish_reader(&mut output, 6, false, &|_| false)
+                .is_err()
+        );
+        assert_eq!(fs::read(work.target()).unwrap(), b"original");
+        work.only_target_remains();
+    }
+
+    #[test]
     fn rejection_and_abandonment_leave_the_original_untouched() {
         let work = Workspace::new();
         fs::write(work.target(), b"original").unwrap();
         assert!(matches!(
-            EditTransaction::capture(&work.target(), 2),
+            EditTransaction::capture(&work.target(), Some(2)),
             Err(EditError::TooLarge)
         ));
         drop(work.capture());
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
         work.only_target_remains();
         assert!(matches!(
-            EditTransaction::capture(&work.0, 16),
+            EditTransaction::capture(&work.0, Some(16)),
             Err(EditError::NotRegular)
         ));
     }
@@ -2074,7 +2166,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let transaction = EditTransaction::capture(&work.target(), 8 << 20).unwrap();
+        let transaction = EditTransaction::capture(&work.target(), Some(8 << 20)).unwrap();
         let mut staged = transaction.stage(&|_| false).unwrap();
         staged.file.write_all(&vec![b'x'; 8 << 20]).unwrap();
         for path in [
@@ -2194,7 +2286,7 @@ mod tests {
         let alias = work.0.join("alias");
         fs::hard_link(work.target(), &alias).unwrap();
         assert!(matches!(
-            EditTransaction::capture(&work.target(), 16),
+            EditTransaction::capture(&work.target(), Some(16)),
             Err(EditError::MultipleLinks)
         ));
         assert_eq!(fs::read(alias).unwrap(), b"original");
@@ -2212,7 +2304,7 @@ mod tests {
         symlink(&fifo, work.target()).unwrap();
         for path in [&fifo, &work.target(), Path::new("/dev/null")] {
             assert!(matches!(
-                EditTransaction::capture(path, 32),
+                EditTransaction::capture(path, Some(32)),
                 Err(EditError::NotRegular)
             ));
         }
@@ -2279,7 +2371,7 @@ mod tests {
         let moved = work.0.join("moved");
         fs::create_dir(&parent).unwrap();
         fs::write(parent.join("file"), b"original").unwrap();
-        let transaction = EditTransaction::capture(&parent.join("file"), 4096).unwrap();
+        let transaction = EditTransaction::capture(&parent.join("file"), Some(4096)).unwrap();
         fs::rename(&parent, &moved).unwrap();
         fs::create_dir(&parent).unwrap();
         fs::write(parent.join("file"), b"unrelated").unwrap();
@@ -2304,7 +2396,7 @@ mod tests {
             fs::write(parent.join("file"), b"original").unwrap();
         }
         symlink(&first, &alias).unwrap();
-        let transaction = EditTransaction::capture(&alias.join("file"), 4096).unwrap();
+        let transaction = EditTransaction::capture(&alias.join("file"), Some(4096)).unwrap();
         fs::remove_file(&alias).unwrap();
         symlink(&second, &alias).unwrap();
         assert!(matches!(
@@ -2550,7 +2642,7 @@ mod tests {
         let stream = work.0.join("target:Zone.Identifier");
         fs::write(&stream, b"[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
         assert!(matches!(
-            EditTransaction::capture(&stream, 128),
+            EditTransaction::capture(&stream, Some(128)),
             Err(EditError::NotRegular)
         ));
         work.capture().publish(b"new", false, &|_| false).unwrap();
@@ -2565,7 +2657,7 @@ mod tests {
         fs::write(work.target(), b"original").unwrap();
         fs::write(work.0.join("target:payload"), vec![b'x'; 65536]).unwrap();
         assert!(matches!(
-            EditTransaction::capture(&work.target(), 128),
+            EditTransaction::capture(&work.target(), Some(128)),
             Err(EditError::TooLarge)
         ));
         assert_eq!(fs::read(work.target()).unwrap(), b"original");
@@ -2581,7 +2673,7 @@ mod tests {
         let stream = work.0.join("target:payload");
         fs::write(&stream, vec![b'x'; 12 << 20]).unwrap();
         let copying_stream = AtomicBool::new(false);
-        let transaction = EditTransaction::capture(&work.target(), 16 << 20).unwrap();
+        let transaction = EditTransaction::capture(&work.target(), Some(16 << 20)).unwrap();
         let result = transaction.publish(b"replacement", false, &|copied| {
             if copied > 65536 {
                 copying_stream.store(true, Ordering::SeqCst);
@@ -2661,10 +2753,10 @@ mod tests {
         fs::write(work.target(), b"original").unwrap();
         resource_fork(&work.target(), &vec![b'f'; 12 << 20]);
         assert!(matches!(
-            EditTransaction::capture(&work.target(), 1 << 20),
+            EditTransaction::capture(&work.target(), Some(1 << 20)),
             Err(EditError::TooLarge)
         ));
-        let transaction = EditTransaction::capture(&work.target(), 16 << 20).unwrap();
+        let transaction = EditTransaction::capture(&work.target(), Some(16 << 20)).unwrap();
         assert!(matches!(
             transaction.publish(&vec![b'x'; 5 << 20], false, &|_| false),
             Err(EditError::TooLarge)
@@ -2681,7 +2773,7 @@ mod tests {
         let work = Workspace::new();
         fs::write(work.target(), b"original").unwrap();
         resource_fork(&work.target(), &vec![b'f'; 12 << 20]);
-        let transaction = EditTransaction::capture(&work.target(), 16 << 20).unwrap();
+        let transaction = EditTransaction::capture(&work.target(), Some(16 << 20)).unwrap();
         let observed = AtomicBool::new(false);
         let result = transaction.publish(b"replacement", false, &|copied| {
             if copied > 65536 {
@@ -2951,10 +3043,10 @@ mod tests {
             fsetxattr(&source, name, &[b'x'; 512], XattrFlags::empty()).unwrap();
         }
         assert!(matches!(
-            EditTransaction::capture(&work.target(), 900),
+            EditTransaction::capture(&work.target(), Some(900)),
             Err(EditError::TooLarge)
         ));
-        let transaction = EditTransaction::capture(&work.target(), 4096).unwrap();
+        let transaction = EditTransaction::capture(&work.target(), Some(4096)).unwrap();
         assert!(matches!(
             transaction.publish(&[b'x'; 3100], false, &|_| false),
             Err(EditError::TooLarge)
@@ -3053,7 +3145,7 @@ mod tests {
                 Mode::RUSR | Mode::WUSR,
             )
             .unwrap();
-            let transaction = EditTransaction::capture(Path::new("/target"), 128).unwrap();
+            let transaction = EditTransaction::capture(Path::new("/target"), Some(128)).unwrap();
             let mut staged = transaction.stage(&|_| false).unwrap();
             // Transfer our objects before dropping credentials. This also makes
             // AT_EMPTY_PATH require privilege on kernels that accept same-cred fds.

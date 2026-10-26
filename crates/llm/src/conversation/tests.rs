@@ -129,6 +129,19 @@ fn a_change_before_the_end_is_encoded_again() {
         assert_eq!(folded(), messages.len());
         assert_eq!(sent, body(&provider, &Messages::from(messages.to_vec())));
         folded();
+        // A message changed before the end: every prefix past it is
+        // encoded again, though the last message is the same.
+        messages.push(Message::user("next"));
+        body(&provider, &messages);
+        folded();
+        let Some(Message::Tool(tool)) = messages.get_mut(4) else {
+            panic!("the tool message");
+        };
+        tool.results[0].output = Output::Text("changed again".into());
+        let sent = body(&provider, &messages);
+        assert_eq!(folded(), messages.len());
+        assert_eq!(sent, body(&provider, &Messages::from(messages.to_vec())));
+        folded();
         // A copy that grows apart keeps what the shared prefix encoded.
         let mut copy = messages.clone();
         copy.push(Message::user("and then"));

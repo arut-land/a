@@ -24,6 +24,7 @@ mod background;
 mod bench;
 mod durable;
 mod handover;
+mod image;
 mod interrupt;
 mod invocation;
 mod later;
@@ -1518,6 +1519,7 @@ fn the_model_gets_the_prompt_and_the_logged_context_first() {
         [
             "bash",
             "edit",
+            "read",
             "task",
             "fork_task",
             "background_task",

@@ -72,11 +72,49 @@ while an `on_stop` error passes. Hooks cannot await effects.
 `a.text{name = "name", order = 0, text = "system text"}` contributes system
 text. `a.fold{name = "count", initial = 0, apply = function(state, change)
 return state + change end}` declares durable JSON state. Reducers run in a
-separate VM without effects. On every application, live or replayed, the host
-re-evaluates the source in a fresh environment and resets the private VM's PRNG.
+separate VM without effects. Both source preparation passes and recovery use
+deterministic iteration and a PRNG seeded with zero, including in the VM that
+will later run tools. Captured builtins switch to native iteration and unrestricted
+seeding only during non-durable dispatch. Explicit source seeds remain in effect
+for tool calls; otherwise native default seeding is deferred to dispatch.
+On every application, live or replayed, the host
+re-evaluates the source in a fresh environment and resets the private VM's PRNG
+with seed zero. Durable code may reseed it with
+`math.randomseed(seed[, second])`: an integer seed is required, and the second
+seed defaults to zero. Durable `pairs` and `next` traverse keys in a stable
+order: integers ascending, strings by their bytes, non-integral numbers ascending,
+booleans (`false` before `true`), the null marker, then table keys. Table keys
+are ordered by a canonical structural encoding: scalar types have distinct tags,
+strings preserve their bytes, and nested tables encode their entries in sorted
+order with lengths framing each part. This includes both keys and values;
+shared acyclic subtrees encode by contents. Cycles raise
+`durable iteration cannot order cyclic table keys reproducibly`. Distinct table
+keys with identical encodings raise
+`durable iteration cannot order structurally identical table keys reproducibly`:
+structure alone cannot distinguish their identities. Function, userdata and thread
+keys, including such values inside table keys, raise
+`durable iteration cannot order <type> keys or table-key contents reproducibly`
+because those values have no reproducible structural identity. `a.null` remains
+an allowed scalar marker. Validation completes its graph scan before choosing
+an error: fuel exhaustion takes precedence, then unsupported types in lexical
+order, then cycles, then identical table structures. The scan visits each table
+once and every edge, so its fuel and rejection do not depend on native hash order.
+Non-durable calls retain native `pairs` and `next`.
+
+Iterator keys are captured at the start of a traversal; value updates remain
+visible and deleted keys are skipped. Restart `next` with a nil key to capture
+additions. Its per-table cache retains deleted predecessors across overlapping
+traversals until that table is collected, so a nested restart or traversal ending
+cannot invalidate an outer traversal. `pairs` iterators keep independent
+snapshots, including when nested on the same table. Snapshots use Lua-managed
+memory. Ordering spends fuel before sorting, based on key count, logarithmic
+comparison depth and maximum key byte length (including structural encodings);
+long common prefixes therefore consume more fuel. Structural encoding also
+charges for the bytes it processes.
 Closure upvalues and global mutations cannot survive an application; only the
 JSON state passed in and returned carries session data. Another session's
-reductions therefore cannot change replay. A failed reduction leaves its
+reductions therefore cannot change replay. Reducers spend instruction fuel only;
+wall-clock deadlines apply to non-durable calls. A failed reduction leaves its
 previous value intact. Tool, hook and agent globals remain generation-wide,
 shared by sessions and discarded on reload.
 
@@ -161,10 +199,12 @@ timeout_ms = 25
 Memory is capped per VM; a mod with folds has a separate reducer VM.
 An owned invocation chain shares its instruction and dispatch allowance,
 including named descendants on other workers or in other mod VMs. Sequential
-hooks share a dispatch allowance too. Preparation shares one allowance across
-the tool and reducer VM compilations. Reducer applications budget both source
-preparation and reduction. Active poll time accumulates across resumes,
-excluding awaited I/O; this is not an OS-enforced hard deadline for native functions.
+hooks share a dispatch allowance too. Generation preparation shares one
+instruction allowance across the tool and reducer VM compilations, including
+recovery. Reducer applications budget both source preparation and reduction
+by instructions too. For non-durable calls, active poll time accumulates
+across resumes, excluding awaited I/O; this is not an OS-enforced hard
+deadline for native functions.
 Each generation admits at most 16 executing calls and 64 waiters. A call releases
 its permit while awaiting a delegated tool, then reacquires before resuming;
 waiting owners cannot occupy the capacity their children need. Cancellation

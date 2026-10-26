@@ -156,9 +156,10 @@ without scanning the directory tree on a clean start.
 
 ### Blobs
 
-Bytes too large for a log line (cut tool output now; pastes and attachments
-later) are blobs: content-addressed by SHA-256 (`protocol::BlobId`), owned by
-the store beside the logs that reference them, one namespace per daemon. An
+Bytes too large for a log line (cut tool output and images now; pastes and
+attachments later) are blobs: content-addressed by SHA-256
+(`protocol::BlobId`), owned by the store beside the logs that reference
+them, one namespace per daemon. An
 entry holds a `BlobRef { id, size, media_type, origin }`, never a path, so a
 fork or child references its parent's blobs rather than its files. What an
 entry references outside the log lives in one typed field and nowhere else:
@@ -178,7 +179,13 @@ another payload's purpose does not decode. A child's result held as a blob
 is read back for its parent as a tool's is. `Body::blobs` lists every
 reference an entry holds, wherever in it, a spawn's context image included:
 what a projection must not name on the session's actor, and what a sweep
-keeps.
+keeps. Tool result images are held blob references; their bytes are loaded
+outside the session actor and projected as `llm::Source::Bytes`, becoming
+base64 only at the provider codec boundary. PNG/JPEG/WebP held blobs become
+image parts alongside existing media. Models that accept images inside tool
+results receive them there; other vision models receive a user message
+with a `tool-result-media` tag naming the call. Request fitting leaves out
+older images only for that request, without changing durable facts.
 
 The seam is the `blob` crate (re-exported as `ext::blob`), which does no I/O:
 `BlobStore` (`writer`, `stream`, `open`, `materialize`, `sweep`),
@@ -220,7 +227,20 @@ from what the log records, whoever's session projects it. A blob is named
 `<cache>/tree/by-id/<id>` only once `Materialize::ensure` (idempotent, a stat
 once made) has made it readable, so a path survives a restart or a deleted
 cache; a stream is named by its path in the store if it is there. What cannot
-be read is left unnamed. Pastes and attachments are named the same way. An
+be read is left unnamed. Pastes and attachments are named the same way.
+An image a result holds (`Held::Blob` whose media type is `image/*`, as
+`read` records one) is also shown: the transcript reads its bytes back
+through `Places::bytes` and appends it to the result as an
+`llm::Source::Bytes` part, after the text and its `[image: <path>]` line.
+The bytes are never base64 in the log or the transcript; each codec encodes
+them as it writes the request (`Source::carried`). Where the model reads an
+image inside a tool result the codec puts it there (Messages `tool_result`
+blocks, Responses `function_call_output` parts, Gemini 3 `functionResponse`
+parts, Chat hosts with `image_tool_results`); elsewhere it follows the
+results in a user message, after `<tool-result-media call="…" tool="…"/>`
+naming the call, and a model that reads no images gets a note in its place.
+That choice is the codec's, from the model facts in `llm::models` and the
+host's quirks: the boundary that owns them. An
 entry that holds something is projected on a blocking worker, never folded
 into the live transcript on the session's actor. A projection without a store
 names a blob by its tree place and a stream `stream:<call>`.
@@ -446,7 +466,7 @@ The linked extensions own:
 
 | Crate | Responsibility |
 | --- | --- |
-| `ext-shell`, `ext-edit` | One streaming native shell tool, its output as blobs, and `edit` |
+| `ext-shell`, `ext-edit` | One streaming native shell tool, its output as blobs; `edit`, and `read` (text, and images held as blobs) |
 | `ext-mcp` | Lazy external tools over stdio and Streamable HTTP |
 | `ext-prompt` | System prompt |
 | `ext-policy` | Permission modes, judge and guarded operator floor |

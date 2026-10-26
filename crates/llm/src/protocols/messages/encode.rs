@@ -8,6 +8,9 @@ use std::num::NonZeroU32;
 
 use std::borrow::Cow;
 
+use base64::Engine;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+
 use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::{Map, Value, json};
 
@@ -27,7 +30,7 @@ use crate::models::anthropic::{
 use crate::protocol::{Encoded, Target};
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
-    Assistant, AssistantPart, Format, Json, Media, Message, Output, Request, Source, System, Tool,
+    Assistant, AssistantPart, Carried, Format, Json, Media, Message, Output, Request, System, Tool,
     ToolChoice, ToolResult, ToolWire, UserPart,
 };
 
@@ -249,8 +252,15 @@ impl Block<'_> {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static SERIALIZED_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Serialize for Block<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        #[cfg(test)]
+        SERIALIZED_BLOCKS.with(|count| count.set(count.get() + 1));
         match self {
             Self::Text(text) => {
                 let mut block = s.serialize_map(Some(2))?;
@@ -294,6 +304,7 @@ struct Placed<'a> {
     system: Vec<Value>,
     sent: Vec<Sent<'a>>,
     follows: Option<bool>,
+    unresolved: bool,
 }
 
 /// The turns of `messages`, placed after turns that left `follows`.
@@ -332,6 +343,7 @@ fn place(messages: &[Message], mid: bool, mut follows: Option<bool>) -> Result<P
             Turn::User(_) => (slot, next) = (slot || next, false),
         }
     }
+    let mut unresolved = false;
     let (mut system, mut sent, mut deferred) = (Vec::new(), Vec::new(), Vec::new());
     // Whether a system message may follow the last turn that is not one: a
     // user turn, or an assistant turn ending in a server tool's result.
@@ -346,6 +358,7 @@ fn place(messages: &[Message], mid: bool, mut follows: Option<bool>) -> Result<P
                 } else if mid && follows.is_some() && slot_after[at] {
                     deferred.push(text);
                 } else {
+                    unresolved |= mid && follows.is_some();
                     system.push(text_block(&text));
                 }
             }
@@ -374,14 +387,14 @@ fn place(messages: &[Message], mid: bool, mut follows: Option<bool>) -> Result<P
         system,
         sent,
         follows,
+        unresolved,
     })
 }
 
 /// The conversation, a message at a time. The turns up to an assistant
 /// message settle with it; those after it wait for the request, which
 /// places its breakpoints on the last. A system message mid-conversation,
-/// on a model that takes one there, goes where every turn after it says,
-/// so from it on nothing settles.
+/// on a model that takes one there, waits until a valid user slot places it.
 #[derive(Clone)]
 pub(super) struct Turns {
     /// Whether the model takes mid-conversation system messages.
@@ -391,10 +404,6 @@ pub(super) struct Turns {
     follows: Option<bool>,
     /// The messages since the turns that settled.
     open: Vec<Message>,
-    /// Whether a message other than a system message came.
-    begun: bool,
-    /// Whether a system message came mid-conversation on `mid`.
-    pinned: bool,
     /// The id of the container the last turn holding one ran in.
     container: Option<String>,
     /// The markers of the messages settled.
@@ -419,8 +428,6 @@ impl Turns {
             system: Vec::new(),
             follows: None,
             open: Vec::new(),
-            begun: false,
-            pinned: false,
             container: None,
             markers: Markers::default(),
         }
@@ -456,21 +463,15 @@ impl Fold for Turns {
     }
 
     fn push(&mut self, _: usize, message: &Message, out: &mut Settled) -> Result<(), Error> {
-        match message {
-            Message::System(system) => {
-                self.pinned |= self.mid && self.begun && !system.text().is_empty();
-            }
-            _ => self.begun = true,
-        }
         self.open.push(message.clone());
-        if self.pinned || !matches!(message, Message::Assistant(_)) {
+        if !matches!(message, Message::Assistant(_)) {
             return Ok(());
         }
         let placed = place(&self.open, self.mid, self.follows)?;
         // A turn that sends nothing leaves the last message the one
         // before, which takes the request's breakpoint.
         let last = placed.sent.last();
-        if last.map(|message| message.role) == Some("assistant") {
+        if !placed.unresolved && last.map(|message| message.role) == Some("assistant") {
             let blocks = placed.sent.iter().flat_map(|sent| &sent.content);
             self.markers = self
                 .markers
@@ -582,52 +583,33 @@ fn media_block(media: &Media) -> Result<Value, Error> {
     let image = kind.starts_with("image/");
     let pdf = kind == "application/pdf";
     let readable = ["image/jpeg", "image/png", "image/gif", "image/webp"].contains(&kind);
-    let source = match &media.source {
+    let source = match media.source.carried() {
         _ if kind.starts_with("audio/") || kind.starts_with("video/") => None,
-        Source::File { id } => Some(obj!({"type": "file", "file_id": id.as_str()})),
+        Carried::File(id) => Some(obj!({"type": "file", "file_id": id})),
         // Anthropic's document URL source is for PDFs and names no type, so
         // an untyped URL is one.
-        Source::Url { url } if image || pdf || kind.is_empty() => {
-            Some(obj!({"type": "url", "url": url.as_str()}))
+        Carried::Url(url) if image || pdf || kind.is_empty() => {
+            Some(obj!({"type": "url", "url": url}))
         }
-        Source::Data { data } if pdf || readable => {
-            Some(obj!({"type": "base64", "media_type": kind, "data": data.as_str()}))
+        Carried::Data(data) if pdf || readable => {
+            Some(obj!({"type": "base64", "media_type": kind, "data": &*data}))
         }
-        Source::Url { .. } => None,
-        Source::Data { .. } if image || kind.is_empty() => None,
-        Source::Data { data } => base64(data)
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .map(|text| obj!({"type": "text", "media_type": "text/plain", "data": text})),
+        Carried::Url(_) => None,
+        Carried::Data(_) if image || kind.is_empty() => None,
+        Carried::Data(data) => GeneralPurpose::new(
+            &base64::alphabet::STANDARD,
+            GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+        )
+        .decode(&*data)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|text| obj!({"type": "text", "media_type": "text/plain", "data": text})),
     };
     let source = source.ok_or_else(|| {
         let kind = if kind.is_empty() { "untyped" } else { kind };
         Error::unsupported(format!("the Messages API cannot carry this {kind} media"))
     })?;
     Ok(obj!({"type": if image { "image" } else { "document" }, "source": source}))
-}
-
-/// Standard base64 decoded, padding optional; `None` for anything else.
-fn base64(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() * 3 / 4);
-    let (mut word, mut bits) = (0_u32, 0);
-    for byte in text.trim_end_matches('=').bytes() {
-        let digit = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        };
-        word = word << 6 | u32::from(digit);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((word >> bits).to_le_bytes()[0]);
-        }
-    }
-    // A last digit alone carries no whole byte.
-    (bits < 6).then_some(out)
 }
 
 /// The keys of a stale item a rebuilt part keeps: the `caller` that ties a
@@ -730,4 +712,68 @@ fn sendable(item: &Value) -> Value {
     let mut sent = fields.clone();
     sent.retain(|key, value| !value.is_null() && (keep.is_empty() || keep.contains(&key.as_str())));
     Value::Object(sent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Meta;
+    use crate::protocol::Provider;
+
+    #[test]
+    fn placed_system_messages_do_not_reserialize_settled_turns() {
+        let provider = Provider::new(
+            "anthropic",
+            "http://local",
+            crate::Auth::None,
+            super::super::Messages::new(super::super::HOSTS[0].1),
+        );
+        let mut request = Request {
+            model: "claude-sonnet-5-5".into(),
+            ..Request::default()
+        };
+        assert!(takes_mid_conversation_system(&request.model));
+        request.messages.push(Message::user("start"));
+        request.messages.push(Message::assistant("initial answer"));
+        request.messages.push(Message::system("instruction"));
+        // This placement is unresolved until the next user/assistant slot.
+        provider
+            .request(&request.model, &request)
+            .unwrap()
+            .body()
+            .to_vec();
+        request.messages.push(Message::user("continue"));
+        SERIALIZED_BLOCKS.with(|count| count.set(0));
+        for _ in 0..64 {
+            request.messages.push(Message::assistant("answer"));
+            provider
+                .request(&request.model, &request)
+                .unwrap()
+                .body()
+                .to_vec();
+            request.messages.push(Message::user("continue"));
+        }
+        let blocks = SERIALIZED_BLOCKS.with(std::cell::Cell::get);
+        assert!(blocks <= 256, "encoded {blocks} blocks for 64 appends");
+    }
+
+    #[test]
+    fn text_documents_accept_optional_padding_but_reject_malformed_base64() {
+        for data in ["Zg==", "Zg"] {
+            let media = Media {
+                media_type: "text/plain".into(),
+                source: crate::Source::Data { data: data.into() },
+                meta: Meta::new(),
+            };
+            assert_eq!(media_block(&media).unwrap()["source"]["data"], "f");
+        }
+        for data in ["Zg===", "Zh==", "Z", "Zg=x"] {
+            let media = Media {
+                media_type: "text/plain".into(),
+                source: crate::Source::Data { data: data.into() },
+                meta: Meta::new(),
+            };
+            assert!(media_block(&media).is_err(), "{data}");
+        }
+    }
 }
