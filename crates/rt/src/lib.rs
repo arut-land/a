@@ -7,6 +7,7 @@
 //! [`reap`] waits for a detached child through its native exit watch.
 //! [`EventSink`] is the observability seam, free when off.
 
+mod budget;
 pub mod channel;
 mod events;
 mod flush;
@@ -25,6 +26,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
+pub use budget::{Budget, Credit};
 pub use events::{Event, EventSink, Noop, Stderr};
 pub use flush::{FlushEpoch, FlushLeader, FlushRequest, Flusher, unblock_flush};
 /// The first of two futures to resolve, the left polled first: every

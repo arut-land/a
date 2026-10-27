@@ -27,6 +27,67 @@ fn threads_run_spawned_blocking_and_timed_work() {
 }
 
 #[test]
+fn cancelling_a_credit_waiter_never_releases_another_owners_bytes() {
+    let budget = Budget::new(10);
+    let held = block_on(budget.acquire(6));
+    let shared = budget.clone();
+    let mut cancelled = Box::pin(shared.acquire(5));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+    drop(cancelled);
+    let remaining = block_on(shared.acquire(4));
+    let mut next = Box::pin(budget.acquire(1));
+    assert!(next.as_mut().poll(&mut cx).is_pending());
+    drop(remaining);
+    let next = block_on(next);
+    let mut all = Box::pin(budget.acquire(10));
+    assert!(all.as_mut().poll(&mut cx).is_pending());
+    drop(next);
+    assert!(all.as_mut().poll(&mut cx).is_pending());
+    drop(held);
+    drop(block_on(all));
+}
+
+#[test]
+fn oversized_retained_data_runs_alone_without_being_refused() {
+    let budget = Budget::new(10);
+    let held = block_on(budget.acquire(1));
+    let mut oversized = Box::pin(budget.acquire(usize::MAX));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(oversized.as_mut().poll(&mut cx).is_pending());
+    drop(held);
+    let oversized = block_on(oversized);
+    let mut small = Box::pin(budget.acquire(1));
+    assert!(small.as_mut().poll(&mut cx).is_pending());
+    drop(oversized);
+    drop(block_on(small));
+}
+
+#[test]
+fn accepted_workers_keep_credit_after_their_caller_is_cancelled() {
+    let rt = Threads::new(1);
+    let budget = Budget::new(10);
+    let credit = block_on(budget.acquire(10));
+    let (started, running) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let mut work = Box::pin(try_unblock_with(&rt, BlockingClass::Cpu, 10, move || {
+        started.send(()).unwrap();
+        released.recv().unwrap();
+        credit
+    }));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(work.as_mut().poll(&mut cx).is_pending());
+    running.recv_timeout(Duration::from_secs(3)).unwrap();
+    drop(work);
+    let mut next = Box::pin(budget.acquire(1));
+    assert!(next.as_mut().poll(&mut cx).is_pending());
+    // Waiting retained data cannot occupy a storage worker.
+    assert_eq!(block_on(unblock(&rt, || 7)), 7);
+    release.send(()).unwrap();
+    drop(block_on(next));
+}
+
+#[test]
 fn blocking_pool_runs_work_concurrently() {
     let rt = Threads::configured(Config::for_cores(4));
     let running = Arc::new(AtomicUsize::new(0));
