@@ -157,11 +157,24 @@ fn call(request: &Value, marker: &str, children: &mut Vec<std::process::Child>) 
             }
             json!({"resultType":"complete","content":[]})
         }
+        "fragmented" | "adjacent" => {
+            framed_reply(request);
+            return None;
+        }
         "crash" => std::process::exit(7),
-        "wait" => {
+        "wait" | "partial-wait" => {
             send(
                 &json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":id,"progress":1,"message":"waiting"}}),
             );
+            if tool == "partial-wait" {
+                let mut out = std::io::stdout().lock();
+                let bytes = serde_json::to_vec(
+                    &json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete"}}),
+                )
+                .unwrap();
+                out.write_all(&bytes[..bytes.len() / 2]).unwrap();
+                out.flush().unwrap();
+            }
             std::fs::write(format!("{marker}.ready"), "ready").unwrap();
             return None;
         }
@@ -185,4 +198,32 @@ fn call(request: &Value, marker: &str, children: &mut Vec<std::process::Child>) 
         }
     };
     Some(result)
+}
+
+fn framed_reply(request: &Value) {
+    let id = &request["id"];
+    let tool = request["params"]["name"].as_str().unwrap();
+    let result = json!({"resultType":"complete","content":[{"type":"text","text":request["params"]["arguments"]["text"]}]});
+    let mut bytes = Vec::new();
+    if tool == "adjacent" {
+        for message in ["first\n", "last\n"] {
+            serde_json::to_writer(&mut bytes, &json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":id,"message":message}})).unwrap();
+            bytes.push(b'\n');
+        }
+    }
+    serde_json::to_writer(
+        &mut bytes,
+        &json!({"jsonrpc":"2.0","id":id,"result":result}),
+    )
+    .unwrap();
+    bytes.push(b'\n');
+    let mut out = std::io::stdout().lock();
+    for chunk in bytes.chunks(if tool == "fragmented" {
+        137
+    } else {
+        bytes.len()
+    }) {
+        out.write_all(chunk).unwrap();
+        out.flush().unwrap();
+    }
 }
