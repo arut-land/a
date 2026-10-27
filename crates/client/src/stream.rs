@@ -1,4 +1,4 @@
-use protocol::view::{Item, Kind, SessionView};
+use protocol::view::{Change, Item, Kind, SessionView};
 use protocol::{Seq, SessionId};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -13,9 +13,40 @@ pub struct ReplyStream {
     session: Option<SessionId>,
     settled: u64,
     open: Option<(Seq, Option<u16>, String)>,
+    #[cfg(test)]
+    inspected: usize,
 }
 
 impl ReplyStream {
+    /// Projects a change against the view after that change has been folded.
+    pub fn update<'a>(&mut self, view: &'a SessionView, change: &Change) -> Vec<ReplyEvent<'a>> {
+        if self.session == view.session
+            && let Change::Delta { call, text } = change
+        {
+            if call.0.get() <= self.settled {
+                return Vec::new();
+            }
+            if let Some((seq, attempt, printed)) = &mut self.open
+                && *seq == call.0
+                && let Some(live) = &view.streaming
+                && live.call == *call
+                && *attempt == Some(live.attempt)
+                && live.text.len() == printed.len() + text.len()
+            {
+                // The reducer appends within an attempt; only reconciliation
+                // needs to compare text already emitted before a reconnect.
+                let suffix = &live.text[printed.len()..];
+                printed.push_str(suffix);
+                return if suffix.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![ReplyEvent::Text(suffix)]
+                };
+            }
+        }
+        self.project(view)
+    }
+
     pub fn project<'a>(&mut self, view: &'a SessionView) -> Vec<ReplyEvent<'a>> {
         let mut events = Vec::new();
         if self.session != view.session {
@@ -24,16 +55,35 @@ impl ReplyStream {
             self.settled = 0;
         }
         if let Some((seq, _, _)) = &self.open
-            && !view.items.iter().any(|item| item.key() == *seq)
+            && view
+                .items
+                .binary_search_by_key(seq, |item| {
+                    #[cfg(test)]
+                    {
+                        self.inspected += 1;
+                    }
+                    item.key()
+                })
+                .is_err()
         {
             events.push(ReplyEvent::End);
             self.settled = self.settled.max(seq.get());
             self.open = None;
         }
-        for item in &view.items {
-            if item.key().get() <= self.settled
-                || !matches!(item.present().kind, Kind::Reply | Kind::Assistant)
+        let start = view.items.partition_point(|item| {
+            #[cfg(test)]
             {
+                self.inspected += 1;
+            }
+            item.key().get() <= self.settled
+        });
+        for item in &view.items[start..] {
+            #[cfg(test)]
+            {
+                self.inspected += 1;
+            }
+            if !matches!(item.present().kind, Kind::Reply | Kind::Assistant) {
+                self.settled = item.key().get();
                 continue;
             }
             let live = view
@@ -168,6 +218,195 @@ mod tests {
 
     fn entry(seq: u64, body: Body) -> Entry {
         Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)
+    }
+
+    #[test]
+    fn replayed_additions_only_visit_items_beyond_the_sequence_frontier() {
+        let mut view = SessionView::default();
+        view.session = Some(SessionId::new());
+        view.items = (1..=50_000)
+            .map(|seq| Item::User {
+                seq: Seq::new(seq).unwrap(),
+                text: "history".into(),
+            })
+            .collect();
+        let mut stream = ReplyStream::default();
+        assert_eq!(stream.project(&view), []);
+        stream.inspected = 0;
+        let update = view
+            .fold(&DaemonMsg::Entry(entry(
+                50_001,
+                Body::Assistant {
+                    text: "reply".into(),
+                },
+            )))
+            .unwrap();
+        assert_eq!(
+            stream.update(&view, &update.change),
+            [
+                ReplyEvent::Start,
+                ReplyEvent::Text("reply"),
+                ReplyEvent::End
+            ]
+        );
+        assert!(stream.inspected <= 20, "visited {} items", stream.inspected);
+    }
+
+    #[test]
+    fn delta_projection_preserves_unicode_retries_and_snapshot_reconciliation() {
+        let mut view = reply(SessionId::new(), Status::Running, "épré");
+        let call = CallId::new(1).unwrap();
+        let mut stream = ReplyStream::default();
+        assert_eq!(
+            stream.project(&view),
+            [ReplyEvent::Start, ReplyEvent::Text("épré")]
+        );
+        for (attempt, text, expected) in [
+            (0, "é", vec![]),
+            (0, "pré", vec![]),
+            (0, "世界", vec![ReplyEvent::Text("世界")]),
+            (
+                1,
+                "é",
+                vec![ReplyEvent::End, ReplyEvent::Start, ReplyEvent::Text("é")],
+            ),
+            (1, "世界", vec![ReplyEvent::Text("世界")]),
+        ] {
+            let update = view
+                .fold(&DaemonMsg::Delta {
+                    call,
+                    text: text.into(),
+                    attempt,
+                })
+                .unwrap();
+            assert_eq!(stream.update(&view, &update.change), expected);
+            assert_eq!(stream.update(&view, &update.change), []);
+        }
+        let snapshot = reply(view.session.unwrap(), Status::Done, "é世界!").snapshot();
+        let update = view.fold(&DaemonMsg::Snapshot(Box::new(snapshot))).unwrap();
+        assert_eq!(
+            stream.update(&view, &update.change),
+            [ReplyEvent::Text("!"), ReplyEvent::End]
+        );
+        let update = view
+            .fold(&DaemonMsg::Delta {
+                call,
+                text: "late".into(),
+                attempt: 1,
+            })
+            .unwrap();
+        assert_eq!(stream.update(&view, &update.change), []);
+        let snapshot = reply(SessionId::new(), Status::Done, "new session").snapshot();
+        let update = view.fold(&DaemonMsg::Snapshot(Box::new(snapshot))).unwrap();
+        assert_eq!(
+            stream.update(&view, &update.change),
+            [
+                ReplyEvent::Start,
+                ReplyEvent::Text("new session"),
+                ReplyEvent::End
+            ]
+        );
+    }
+
+    #[test]
+    fn deltas_cannot_overtake_an_earlier_open_reply() {
+        let mut view = reply(SessionId::new(), Status::Running, "first");
+        let call = CallId::new(2).unwrap();
+        view.items.push(Item::Reply {
+            call,
+            model: "m".into(),
+            text: String::new(),
+            status: Status::Running,
+            usage: None,
+            purpose: None,
+            owner: None,
+        });
+        let mut stream = ReplyStream::default();
+        assert_eq!(
+            stream.project(&view),
+            [ReplyEvent::Start, ReplyEvent::Text("first")]
+        );
+        let update = view
+            .fold(&DaemonMsg::Delta {
+                call,
+                text: "second".into(),
+                attempt: 0,
+            })
+            .unwrap();
+        assert_eq!(stream.update(&view, &update.change), []);
+        let Item::Reply { status, .. } = &mut view.items[0] else {
+            unreachable!()
+        };
+        *status = Status::Done;
+        let update = view
+            .fold(&DaemonMsg::Snapshot(Box::new(view.snapshot())))
+            .unwrap();
+        assert_eq!(
+            stream.update(&view, &update.change),
+            [
+                ReplyEvent::End,
+                ReplyEvent::Start,
+                ReplyEvent::Text("second")
+            ]
+        );
+        let update = view
+            .fold(&DaemonMsg::Delta {
+                call,
+                text: "!".into(),
+                attempt: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            stream.update(&view, &update.change),
+            [ReplyEvent::Text("!")]
+        );
+    }
+
+    #[test]
+    fn steady_deltas_never_inspect_history_or_reconcile_the_printed_prefix() {
+        for history in [0, 50_000] {
+            let mut view = SessionView::default();
+            view.session = Some(SessionId::new());
+            view.items = (1..=history)
+                .map(|seq| Item::Assistant {
+                    seq: Seq::new(seq).unwrap(),
+                    text: "history".into(),
+                })
+                .collect();
+            let mut stream = ReplyStream::default();
+            stream.project(&view);
+            let call = CallId::new(history + 1).unwrap();
+            view.fold(&DaemonMsg::Entry(entry(
+                history + 1,
+                Body::ModelCall {
+                    model: "m".into(),
+                    purpose: None,
+                    r#for: None,
+                    attempt: 0,
+                    choice: protocol::ToolChoice::None,
+                    request: None,
+                },
+            )));
+            for index in 0..100 {
+                let update = view
+                    .fold(&DaemonMsg::Delta {
+                        call,
+                        text: "é世界".into(),
+                        attempt: 0,
+                    })
+                    .unwrap();
+                let expected = if index == 0 {
+                    vec![ReplyEvent::Start, ReplyEvent::Text("é世界")]
+                } else {
+                    vec![ReplyEvent::Text("é世界")]
+                };
+                stream.inspected = 0;
+                assert_eq!(stream.update(&view, &update.change), expected);
+                if index > 0 {
+                    assert_eq!(stream.inspected, 0, "history {history}, delta {index}");
+                }
+            }
+        }
     }
 
     #[test]
