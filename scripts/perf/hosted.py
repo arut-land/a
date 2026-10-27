@@ -375,7 +375,7 @@ def main():
     parser.add_argument("--bloat", action="store_true", help="also collect crate/function size attribution")
     args = parser.parse_args()
     output, source = args.output.resolve(), args.source.resolve()
-    if args.phase in ["all", "build"] and output.exists() and any(output.iterdir()):
+    if args.phase in ["all", "build"] and output.exists() and any(p.name != "host.json" for p in output.iterdir()):
         parser.error("measurement output must be empty; select a new --output directory")
     output.mkdir(parents=True, exist_ok=True)
     variant = json.loads(args.variant or "{}")

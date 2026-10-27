@@ -353,6 +353,7 @@ class Diagnostics(unittest.TestCase):
              mock.patch.object(hosted.platform, "platform", return_value="test host"), \
              mock.patch.object(hosted.subprocess, "check_output", return_value="toolchain"), \
              mock.patch.object(hosted, "build", side_effect=RuntimeError("build failed")):
+            (Path(directory) / "host.json").write_text('{"before_toolchain":true}')
             with self.assertRaisesRegex(RuntimeError, "build failed"):
                 hosted.main()
             self.assertEqual(json.loads((Path(directory) / "host.json").read_text())["hardware"]["cores"], 4)
