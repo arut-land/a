@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import tempfile
 import time
@@ -126,6 +127,25 @@ class Sessions(unittest.TestCase):
 
 
 class Builds(unittest.TestCase):
+    @unittest.skipUnless(sys.version_info >= (3, 11) and shutil.which("cargo"), "probe builds require Python 3.11+ and Cargo")
+    def test_generated_workload_manifests_stay_independent_inside_another_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Cargo.toml").write_text('[workspace]\nmembers=[]\n')
+            output = root / "output"
+            output.mkdir()
+            binary = root / "probe"
+            binary.write_bytes(b"artifact")
+            def cargo(arguments, **kwargs):
+                manifest = arguments[arguments.index("--manifest-path") + 1]
+                metadata = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version=1",
+                    "--manifest-path", manifest], cwd=kwargs["cwd"], env=kwargs["env"],
+                    capture_output=True, text=True, check=True, timeout=120)
+                self.assertEqual(Path(json.loads(metadata.stdout)["workspace_root"]).resolve(), Path(manifest).parent.resolve())
+                return subprocess.CompletedProcess(arguments, 0, json.dumps(dict(executable=str(binary))))
+            build.probe(Path(__file__).resolve().parents[2], output, build.environment(root / "target"),
+                        memory_only=True, run=cargo)
+
     def test_executable_discovery_uses_the_cargo_artifact_in_a_custom_target(self):
         with tempfile.TemporaryDirectory() as directory:
             actual = Path(directory) / "custom" / "a.exe"

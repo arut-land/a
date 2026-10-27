@@ -9,7 +9,7 @@ def snapshot(pid, threads=False):
     process = psutil.Process(pid)
     cpu = process.cpu_times()
     memory = process.memory_info()
-    result = {"rss_kib": process.memory_info().rss / 1024,
+    result = {"rss_kib": memory.rss / 1024,
               "cpu_seconds": cpu.user + cpu.system,
               "user_seconds": cpu.user, "kernel_seconds": cpu.system,
               "thread_count": process.num_threads(),
@@ -47,6 +47,7 @@ def memory_maps(pid):
             region["mapped_bytes"] = region.pop("rss")
         windows_residency(pid, maps)
     return dict(source="QueryWorkingSetEx" if sys.platform == "win32" else "smaps",
+                memory=process.memory_full_info()._asdict(),
                 maps=maps, executable=process.exe(),
                 executable_resident_bytes=sum(m.get("resident_bytes", m.get("rss", 0)) for m in maps
                                               if m["path"] == process.exe()),

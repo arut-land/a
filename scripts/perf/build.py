@@ -103,6 +103,7 @@ def benchmark(source, env, target, overrides=(), features=(), destination=None, 
 def probe(source, output, env, variant=None, memory_only=False, run=subprocess.run):
     """Build against real modules without adding benchmark APIs to the product."""
     import tomllib
+    variant = variant or {}
     root = Path(env["CARGO_TARGET_DIR"]).resolve() / ("perf-memory-probe-source" if memory_only else "perf-probe-source")
     root.mkdir(parents=True, exist_ok=True)
     harness = Path(__file__).resolve().parent.as_posix()
@@ -113,11 +114,15 @@ def probe(source, output, env, variant=None, memory_only=False, run=subprocess.r
         text = Path(__file__).with_name("probe.rs").read_text().replace("@SOURCE@", source.as_posix()).replace("@HARNESS@", harness)
     (root / "main.rs").write_text(text)
     dependencies = tomllib.loads((source / "Cargo.toml").read_text())["workspace"]["dependencies"]
-    manifest = '[package]\nname="perf-probe"\nversion="0.0.0"\nedition="2024"\n[[bin]]\nname="perf-probe"\npath="main.rs"\n[dependencies]\n'
+    manifest = '[workspace]\n[package]\nname="perf-probe"\nversion="0.0.0"\nedition="2024"\n[[bin]]\nname="perf-probe"\npath="main.rs"\n[dependencies]\n'
     for name in (["protocol", "sys"] if memory_only else ["client", "protocol", "tui", "sys", "serde_json"]):
         value = dependencies[name]
         if isinstance(value, dict):
             value = dict(value)
+            if name == "sys":
+                selected = [feature.split("/", 1)[1] for feature in variant.get("features", []) if feature.startswith("sys/")]
+                if selected:
+                    value["features"] = [*value.get("features", []), *selected]
             if "path" in value:
                 value["path"] = str(source / value["path"])
             encoded = "{ " + ", ".join(f"{key} = {json.dumps(item)}" for key, item in value.items()) + " }"
@@ -130,7 +135,7 @@ def probe(source, output, env, variant=None, memory_only=False, run=subprocess.r
     (root / "Cargo.toml").write_text(manifest)
     shutil.copy2(source / "Cargo.lock", root / "Cargo.lock")
     result = run(["cargo", "build", *release_arguments(), "--manifest-path", str(root / "Cargo.toml"),
-                  *variant_arguments(variant or {}), "--message-format=json"], cwd=source, env=env,
+                  *variant_arguments(variant), "--message-format=json"], cwd=source, env=env,
                  check=True, stdout=subprocess.PIPE, text=True)
     binaries = [Path(record["executable"]) for line in result.stdout.splitlines()
                 if (record := json.loads(line)).get("executable")]

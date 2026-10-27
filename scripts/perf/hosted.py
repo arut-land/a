@@ -378,10 +378,12 @@ def main():
     if args.phase in ["all", "build"] and output.exists() and any(output.iterdir()):
         parser.error("measurement output must be empty; select a new --output directory")
     output.mkdir(parents=True, exist_ok=True)
+    variant = json.loads(args.variant or "{}")
     (output / "host.json").write_text(json.dumps(dict(
         platform=platform.platform(), machine=platform.machine(), hardware=hardware(),
+        revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
+        workflow_revision=os.environ.get("GITHUB_SHA"), variant=variant,
         toolchain=subprocess.check_output(["rustc", "-vV"], text=True)), indent=2) + "\n")
-    variant = json.loads(args.variant or "{}")
     if args.phase in ("memory", "evidence", "survey"):
         from evidence import measure
         if args.phase in ("memory", "survey"):
@@ -389,6 +391,7 @@ def main():
         if args.phase == "survey":
             binary = benchmark(source, environment(Path(os.environ.get("CARGO_TARGET_DIR", source / "target/perf-build"))),
                                ["-p", "engine", "--lib"], variant_arguments(variant),
+                               features=[feature for feature in variant.get("features", []) if feature.startswith("sys/")],
                                destination=output / ("engine-bench" + SUFFIX), run=run)
             run([sys.executable, ROOT / "scripts/perf/sessions.py", binary, "--layouts", "memory",
                  "--rounds", os.environ.get("PERF_EVIDENCE_ROUNDS", "3"), "--sessions", variant.get("sessions", "1,32,128"),

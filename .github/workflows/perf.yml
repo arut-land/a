@@ -142,7 +142,6 @@ jobs:
           PYTHON
           echo "RUSTUP_HOME=$RUNNER_TEMP/perf-rustup" >> "$GITHUB_ENV"
           echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
-      - run: python -m unittest discover -s scripts/perf -p 'test_*.py'
       - uses: actions/cache/restore@v6
         id: cache
         with:
@@ -155,6 +154,7 @@ jobs:
       # ARM Windows has no Cranelift component; release and benches use LLVM.
       - id: toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src
+      - run: python -m unittest discover -s scripts/perf -p 'test_*.py'
       - uses: jdx/mise-action@v5
         with:
           working_directory: harness
