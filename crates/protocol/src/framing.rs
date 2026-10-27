@@ -43,7 +43,12 @@ impl<'a> FrameReader<'a> {
         };
         let msg = T::from_json(body.json()?)?;
         match self.accumulation {
-            Accumulation::Partial => *self.buffered = self.buffered[len..].to_vec(),
+            Accumulation::Partial => {
+                // Returning a growth allocation at its received size keeps native
+                // allocators from reusing oversized blocks for decoded messages.
+                let completed = std::mem::take(self.buffered).into_boxed_slice();
+                *self.buffered = completed[len..].to_vec();
+            }
             Accumulation::Empty => {
                 self.buffered.drain(..len);
                 if self.buffered.is_empty() {
