@@ -3,7 +3,7 @@
 /// Records a debug phase only in builds with `events`. Details are never
 /// constructed otherwise. `A_PHASE_DIR` selects per-process files in an
 /// existing directory; without it records go to stderr.
-#[inline(always)]
+#[inline]
 pub fn phase(name: &'static str, detail: impl FnOnce() -> String) {
     #[cfg(feature = "events")]
     enabled::phase(name, detail);
@@ -46,5 +46,15 @@ mod enabled {
         } else {
             let _ = std::io::stderr().lock().write_all(line.as_bytes());
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "events")))]
+mod tests {
+    #[test]
+    fn disabled_phases_never_construct_their_details() {
+        super::phase("disabled", || {
+            panic!("disabled phase constructed its details")
+        });
     }
 }

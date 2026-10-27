@@ -581,6 +581,13 @@ impl Operation {
     /// Cancels the operation in flight and waits until the kernel lets go
     /// of its buffer: its length, if it completed first.
     fn join(&mut self) -> Option<usize> {
+        crate::phase("pipe.cancel.begin", || {
+            format!(
+                "handle={:p} event={:p}",
+                self.file.as_raw_handle(),
+                self.raw.hEvent
+            )
+        });
         self.pending = false;
         let mut length = 0;
         // SAFETY: cancellation alone does not release the kernel's borrow;
@@ -595,11 +602,17 @@ impl Operation {
                     1,
                 ) != 0
                 {
+                    crate::phase("pipe.cancel.done", || {
+                        format!("handle={:p} length={length}", self.file.as_raw_handle())
+                    });
                     return Some(length as usize);
                 }
                 if io::Error::last_os_error().raw_os_error()
                     != Some(ERROR_IO_INCOMPLETE.cast_signed())
                 {
+                    crate::phase("pipe.cancel.error", || {
+                        format!("handle={:p}", self.file.as_raw_handle())
+                    });
                     return None;
                 }
                 // Shutdown may have signalled the event before kernel
