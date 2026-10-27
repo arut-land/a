@@ -385,35 +385,34 @@ fn lines(
     let to = limit.map_or(usize::MAX, |limit| from.saturating_add(limit));
     let (mut text, mut total, mut open) = (Vec::new(), 0, false);
     loop {
-        if !(from..to).contains(&(total + 1)) {
-            let skipped = reader
-                .skip_until(b'\n')
-                .map_err(|e| format!("{shown}: {e}"))?;
-            if skipped == 0 {
-                break;
-            }
-            total += 1;
-            continue;
-        }
         let buffer = reader.fill_buf().map_err(|e| format!("{shown}: {e}"))?;
         if buffer.is_empty() {
             break;
         }
-        let end = buffer
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(buffer.len(), |at| at + 1);
-        if (text.len() + end) as u64 > TEXT_LIMIT {
+        let breaks = memchr::memchr_iter(b'\n', buffer).count();
+        let boundary = |line: usize| {
+            let skipped = line.saturating_sub(total + 1);
+            if skipped == 0 {
+                0
+            } else if skipped > breaks {
+                buffer.len()
+            } else {
+                memchr::memchr_iter(b'\n', buffer)
+                    .nth(skipped - 1)
+                    .map_or(buffer.len(), |at| at + 1)
+            }
+        };
+        let selected = &buffer[boundary(from)..boundary(to)];
+        if (text.len() + selected.len()) as u64 > TEXT_LIMIT {
             return Err(format!(
                 "{shown}: the lines asked for are more than read takes at once ({TEXT_LIMIT} bytes); ask for fewer"
             ));
         }
-        text.extend_from_slice(&buffer[..end]);
-        open = buffer[end - 1] != b'\n';
-        if !open {
-            total += 1;
-        }
-        reader.consume(end);
+        text.extend_from_slice(selected);
+        total += breaks;
+        open = buffer.last() != Some(&b'\n');
+        let consumed = buffer.len();
+        reader.consume(consumed);
     }
     if open {
         total += 1;
@@ -728,5 +727,52 @@ fn encode(image: DynamicImage) -> Result<Prepared, String> {
             return Err("the image does not fit what providers take".into());
         }
         image = fit(image, width.max(height) / 4 * 3);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_windows_consume_each_buffer_once() {
+        struct Counted {
+            bytes: Cursor<Vec<u8>>,
+            fills: usize,
+        }
+
+        impl io::Read for Counted {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.bytes.read(bytes)
+            }
+        }
+
+        impl BufRead for Counted {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                self.fills += 1;
+                self.bytes.fill_buf()
+            }
+
+            fn consume(&mut self, amount: usize) {
+                self.bytes.consume(amount);
+            }
+        }
+
+        let mut reader = Counted {
+            bytes: Cursor::new(b"excluded\nselected\nexcluded\nlast".to_vec()),
+            fills: 0,
+        };
+        let Contents::Text(text) = lines(
+            &mut reader,
+            PathBuf::from("text"),
+            (Some(2), Some(1)),
+            "text",
+        )
+        .unwrap() else {
+            panic!("the window is text");
+        };
+        assert_eq!(text.text, "selected\n");
+        assert_eq!(text.total, 4);
+        assert_eq!(reader.fills, 2, "one data buffer and EOF");
     }
 }
