@@ -29,8 +29,10 @@ impl Query for Echo {
         cx: &QueryCx<Workspace>,
     ) -> Streamed<String, impl Future<Output = Result<String, String>> + Send, String> {
         let path = cx.scope.path.display().to_string();
-        stream(move |updates| async move {
-            (0..said.times).for_each(|_| updates.send(said.text.clone()));
+        stream(move |mut updates| async move {
+            for _ in 0..said.times {
+                updates.send(said.text.clone()).await;
+            }
             Ok(format!("{} in {path}", said.text))
         })
     }
@@ -115,4 +117,56 @@ fn a_request_is_read_once_into_its_type() {
     let at = At::Workspace(Arc::from(Path::new("/w")));
     let (_, reply) = ask("echo", r#"{"text":1}"#, &at);
     assert!(reply.unwrap_err().starts_with("invalid request"));
+}
+
+#[test]
+fn a_blocked_query_sink_suspends_the_producer_until_delivery() {
+    use std::future::poll_fn;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    struct Gate {
+        open: AtomicBool,
+        delivered: Mutex<Vec<usize>>,
+    }
+    impl Sink for Gate {
+        fn send(&self, update: Json) -> BoxFuture<'_, ()> {
+            Box::pin(async move {
+                poll_fn(|_| {
+                    if self.open.load(Ordering::Relaxed) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                self.delivered.lock().unwrap().push(update.parse().unwrap());
+            })
+        }
+    }
+
+    let produced = AtomicUsize::new(0);
+    let produced = &produced;
+    let streamed = stream(|mut updates| async move {
+        for i in 0..1_000 {
+            produced.fetch_add(1, Ordering::Relaxed);
+            updates.send(i).await;
+        }
+        Ok::<_, String>("done")
+    });
+    let sink = Gate {
+        open: AtomicBool::new(false),
+        delivered: Mutex::default(),
+    };
+    let mut answer = Answered::run(streamed, &sink);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(answer.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(produced.load(Ordering::Relaxed), 1);
+    assert!(sink.delivered.lock().unwrap().is_empty());
+    sink.open.store(true, Ordering::Relaxed);
+    assert_eq!(rt::block_on(answer), Ok("done"));
+    assert_eq!(
+        *sink.delivered.lock().unwrap(),
+        (0..1_000).collect::<Vec<_>>()
+    );
 }

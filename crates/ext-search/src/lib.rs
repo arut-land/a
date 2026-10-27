@@ -158,7 +158,7 @@ impl Tool for Grep {
         };
         let mut files = Vec::new();
         let summary = index
-            .grep(query, &cx.cancel, |grepped| {
+            .grep(query, &cx.cancel, |grepped: ext_index::Grepped| {
                 files.push(GrepFile {
                     path: grepped.path,
                     matches: grepped.matches.into_iter().map(Line::from).collect(),

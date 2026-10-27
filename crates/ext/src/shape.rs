@@ -4,13 +4,12 @@
 //! partial outputs as it runs, its progress, before it ends with its
 //! output.
 
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::Poll;
+use std::task::{Poll, Waker};
 
 use crate::BoxFuture;
 
@@ -35,45 +34,87 @@ pub enum Waits {}
 /// The shape of a call that streams partial outputs of type `P`.
 pub struct Streams<P>(Infallible, PhantomData<P>);
 
-impl<O: Send> Output<O, Now> for Result<O, String> {
-    fn run<'a>(self, _: Progress<'a>) -> BoxFuture<'a, Result<O, String>>
-    where
-        Self: 'a,
-    {
-        Box::pin(std::future::ready(self))
-    }
-}
-
-impl<O, F> Output<O, Waits> for F
+impl<O, M, T> Output<O, M> for T
 where
-    F: Future<Output = Result<O, String>> + Send,
+    T: Run<O, M>,
+    T::Partial: AsRef<str>,
 {
-    fn run<'a>(self, _: Progress<'a>) -> BoxFuture<'a, Result<O, String>>
+    fn run<'a>(self, progress: Progress<'a>) -> BoxFuture<'a, Result<O, String>>
     where
         Self: 'a,
     {
-        Box::pin(self)
+        Box::pin(self.run_with(move |partial| {
+            progress(partial.as_ref());
+            std::future::ready(Ok(()))
+        }))
     }
 }
 
-impl<O, P, F> Output<O, Streams<P>> for Streamed<P, F, O>
+/// The shared runner; adapters only decide how a partial is delivered.
+#[doc(hidden)]
+pub trait Run<O, M>: Send {
+    type Partial: Send;
+
+    fn run_with<'a, F: Future<Output = Result<(), String>> + Send + 'a>(
+        self,
+        send: impl FnMut(Self::Partial) -> F + Send + 'a,
+    ) -> impl Future<Output = Result<O, String>> + Send + 'a
+    where
+        Self: 'a;
+}
+
+impl<O: Send> Run<O, Now> for Result<O, String> {
+    type Partial = String;
+
+    fn run_with<'a, F: Future<Output = Result<(), String>> + Send + 'a>(
+        self,
+        _: impl FnMut(String) -> F + Send + 'a,
+    ) -> impl Future<Output = Result<O, String>> + Send + 'a
+    where
+        Self: 'a,
+    {
+        std::future::ready(self)
+    }
+}
+
+impl<O, W> Run<O, Waits> for W
+where
+    W: Future<Output = Result<O, String>> + Send,
+{
+    type Partial = String;
+
+    fn run_with<'a, F: Future<Output = Result<(), String>> + Send + 'a>(
+        self,
+        _: impl FnMut(String) -> F + Send + 'a,
+    ) -> impl Future<Output = Result<O, String>> + Send + 'a
+    where
+        Self: 'a,
+    {
+        self
+    }
+}
+
+impl<O, P, W> Run<O, Streams<P>> for Streamed<P, W, O>
 where
     O: Send,
-    P: AsRef<str> + Send,
-    F: Future<Output = Result<O, String>> + Send,
+    P: Send,
+    W: Future<Output = Result<O, String>> + Send,
 {
-    fn run<'a>(mut self, progress: Progress<'a>) -> BoxFuture<'a, Result<O, String>>
+    type Partial = P;
+
+    async fn run_with<'a, F: Future<Output = Result<(), String>> + Send + 'a>(
+        mut self,
+        mut send: impl FnMut(P) -> F + Send + 'a,
+    ) -> Result<O, String>
     where
         Self: 'a,
     {
-        Box::pin(async move {
-            loop {
-                match self.next().await {
-                    Next::Partial(partial) => progress(partial.as_ref()),
-                    Next::Done(output) => return output,
-                }
+        loop {
+            match self.next().await {
+                Next::Partial(partial) => send(partial).await?,
+                Next::Done(output) => return output,
             }
-        })
+        }
     }
 }
 
@@ -83,8 +124,7 @@ where
 pub struct Streamed<P, F, O> {
     partials: Partials<P>,
     work: Pin<Box<F>>,
-    /// The output, once the work is done and partials it sent are left.
-    done: Option<Result<O, String>>,
+    output: PhantomData<O>,
 }
 
 /// What a [`Streamed`] call yields next.
@@ -96,28 +136,30 @@ pub enum Next<P, O> {
 }
 
 /// Where a [`Streamed`] call's work sends its partial outputs.
-pub struct Partials<P>(Arc<Mutex<VecDeque<P>>>);
+pub struct Partials<P>(Arc<Mutex<Handoff<P>>>);
 
-impl<P> Clone for Partials<P> {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
+struct Handoff<P> {
+    partial: Option<P>,
+    producer: Option<Waker>,
 }
 
 impl<P> Partials<P> {
-    /// Reports `partial`, in order.
-    pub fn send(&self, partial: P) {
+    /// Hands off `partial` in order, suspending until the consumer takes it.
+    /// Work resumes when the consumer asks for the next update.
+    pub async fn send(&mut self, partial: P) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push_back(partial);
-    }
-
-    fn take(&self) -> Option<P> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front()
+            .partial = Some(partial);
+        poll_fn(|cx| {
+            let mut handoff = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if handoff.partial.is_none() {
+                return Poll::Ready(());
+            }
+            handoff.producer = Some(cx.waker().clone());
+            Poll::Pending
+        })
+        .await;
     }
 }
 
@@ -127,12 +169,15 @@ pub fn stream<P, O, F>(work: impl FnOnce(Partials<P>) -> F) -> Streamed<P, F, O>
 where
     F: Future<Output = Result<O, String>>,
 {
-    let partials = Partials(Arc::default());
-    let work = Box::pin(work(partials.clone()));
+    let partials = Partials(Arc::new(Mutex::new(Handoff {
+        partial: None,
+        producer: None,
+    })));
+    let work = Box::pin(work(Partials(Arc::clone(&partials.0))));
     Streamed {
         partials,
         work,
-        done: None,
+        output: PhantomData,
     }
 }
 
@@ -141,25 +186,22 @@ impl<P, O, F: Future<Output = Result<O, String>>> Streamed<P, F, O> {
     /// it sent is taken, its output; nothing after that.
     pub async fn next(&mut self) -> Next<P, O> {
         poll_fn(|cx| {
-            if let Some(partial) = self.partials.take() {
+            let output = self.work.as_mut().poll(cx);
+            let (partial, producer) = {
+                let mut handoff = self
+                    .partials
+                    .0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                (handoff.partial.take(), handoff.producer.take())
+            };
+            if let Some(producer) = producer {
+                producer.wake();
+            }
+            if let Some(partial) = partial {
                 return Poll::Ready(Next::Partial(partial));
             }
-            if let Some(output) = self.done.take() {
-                return Poll::Ready(Next::Done(output));
-            }
-            match self.work.as_mut().poll(cx) {
-                Poll::Ready(output) => Poll::Ready(match self.partials.take() {
-                    Some(partial) => {
-                        self.done = Some(output);
-                        Next::Partial(partial)
-                    }
-                    None => Next::Done(output),
-                }),
-                Poll::Pending => self
-                    .partials
-                    .take()
-                    .map_or(Poll::Pending, |p| Poll::Ready(Next::Partial(p))),
-            }
+            output.map(Next::Done)
         })
         .await
     }
