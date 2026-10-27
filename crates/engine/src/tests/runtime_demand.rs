@@ -338,28 +338,34 @@ fn paced_provider(replies: Vec<Vec<String>>, pace: Duration) -> (u16, Written) {
 /// This process's resident set (KiB), CPU seconds and threads, as the
 /// hosted harness's native counters report them.
 fn usage() -> serde_json::Value {
-    let python = std::env::var("A_PERF_PYTHON").unwrap_or_else(|_| "python3".into());
-    let script = std::env::var("A_PERF_PROCESS").unwrap_or_else(|_| {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/perf/process.py").into()
-    });
-    let out = std::process::Command::new(python)
-        .args([script, std::process::id().to_string()])
-        .output()
-        .unwrap();
+    accounting("perf-snapshot")
+}
+
+fn accounting(request: &str) -> serde_json::Value {
     assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        std::env::var("A_PERF_OBSERVER").as_deref() == Ok("1"),
+        "run this measurement through scripts/perf/sessions.py for external accounting"
     );
-    serde_json::from_slice(&out.stdout).unwrap()
+    eprintln!("{request}");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).unwrap();
+    serde_json::from_str(&line).expect("the external observer returns native process counters")
 }
 
 /// What one client saw of its session's turns.
 struct Seen {
     deltas: Vec<Delta>,
     turns: Vec<Duration>,
-    /// Model calls that failed: each ends its turn early.
+    /// Failed model or tool calls; a failed model call ends its turn early.
     failed: usize,
+    phases: Vec<serde_json::Value>,
+}
+
+static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn timestamp(at: Instant) -> u128 {
+    at.duration_since(*ORIGIN.get_or_init(Instant::now))
+        .as_micros()
 }
 
 /// One measured sample's shape, from `A_BENCH_*`.
@@ -382,6 +388,7 @@ struct Load {
 #[test]
 #[ignore = "release-only sizing measurement; see docs/perf/runtime-demand.md"]
 fn concurrent_active_sessions() {
+    ORIGIN.get_or_init(Instant::now);
     let var =
         |name: &str, default: u64| std::env::var(name).map_or(default, |n| n.parse().unwrap());
     let load = Load {
@@ -438,9 +445,9 @@ fn concurrent_active_sessions() {
     let (deltas, dropped_at) = deliveries(&seen, &written.lock().unwrap());
     // Blocking workers retire after ten idle seconds.
     std::thread::sleep(Duration::from_secs(12));
-    let settled = usage();
-    std::thread::sleep(Duration::from_secs(5));
-    let idle = usage();
+    let window = accounting("perf-idle");
+    let settled = &window["before"];
+    let idle = &window["after"];
     let rest = at_rest(release, clients);
     let cpu = |a: &serde_json::Value, b: &serde_json::Value| {
         (b["cpu_seconds"].as_f64().unwrap() - a["cpu_seconds"].as_f64().unwrap()) * 1000.0
@@ -458,6 +465,9 @@ fn concurrent_active_sessions() {
             "delta_ms": deltas,
             "dropped_deltas": dropped_at.values().sum::<usize>(),
             "failed_calls": seen.iter().map(|(_, seen)| seen.failed).sum::<usize>(),
+            "phases": phase_trace(&seen, &written),
+            "phase_clock": "monotonic microseconds from process-local origin",
+            "unobserved_phases": ["provider_receive", "provider_decode", "daemon_visibility", "server_outbox"],
             "dropped_at": dropped_at,
             "turn_ms": turns,
             "active_wall_ms": wall.as_secs_f64() * 1000.0,
@@ -466,8 +476,9 @@ fn concurrent_active_sessions() {
             "baseline_rss_kib": before["rss_kib"],
             "idle_rss_kib": settled["rss_kib"],
             "idle_threads": settled["thread_count"],
-            "idle_cpu_ms": cpu(&settled, &idle),
-            "idle_switches": switches(&settled, &idle),
+            "idle_cpu_ms": cpu(settled, idle),
+            "idle_switches": switches(settled, idle),
+            "idle_seconds": window["seconds"],
             // Lifetime peaks: the resident set (Linux, Windows) or footprint (macOS).
             "peak_kib": settled.get("peak_rss_kib").or(settled.get("peak_footprint_kib")),
             "idle_footprint_kib": settled.get("footprint_kib"),
@@ -478,6 +489,20 @@ fn concurrent_active_sessions() {
     drop(daemon);
     runtime.shutdown();
     let _ = std::fs::remove_dir_all(root);
+}
+
+fn phase_trace(seen: &[(usize, Seen)], written: &Written) -> Vec<serde_json::Value> {
+    let written = written.lock().unwrap();
+    seen.iter()
+        .map(|(session, seen)| {
+            json!({
+                "session": session, "events": seen.phases,
+                "provider_writes_us": written[session].iter().map(|delta| json!({
+                    "turn": delta.turn, "text": delta.text, "at_us": timestamp(delta.at)
+                })).collect::<Vec<_>>()
+            })
+        })
+        .collect()
 }
 
 /// What the allocator hands back at rest, then once every client has
@@ -620,6 +645,8 @@ fn serve(home: &Home, port: u16, variant: &str) -> (crate::Owner, Arc<rt::Thread
 struct Client {
     stream: sys::OwnedConnection,
     reader: std::io::BufReader<sys::OwnedConnection>,
+    received: Instant,
+    decoded: Instant,
 }
 
 impl Client {
@@ -629,7 +656,12 @@ impl Client {
             .set_read_timeout(Some(Duration::from_secs(120)))
             .unwrap();
         let reader = std::io::BufReader::new(stream.try_clone().unwrap());
-        let mut client = Self { stream, reader };
+        let mut client = Self {
+            stream,
+            reader,
+            received: Instant::now(),
+            decoded: Instant::now(),
+        };
         client.send(&protocol::ClientMsg::Hello {
             proto: protocol::PROTO,
             build: "bench".into(),
@@ -660,6 +692,7 @@ impl Client {
             deltas: Vec::new(),
             turns: Vec::new(),
             failed: 0,
+            phases: Vec::new(),
         };
         for turn in 0..load.turns {
             let asked = Instant::now();
@@ -674,14 +707,24 @@ impl Client {
                 match self.recv() {
                     protocol::DaemonMsg::Delta { text, .. } => {
                         let at = Instant::now();
+                        seen.phases.push(json!({
+                            "turn": turn, "text": text,
+                            "client_received_us": timestamp(self.received),
+                            "client_decoded_us": timestamp(self.decoded),
+                            "client_observed_us": timestamp(at),
+                        }));
                         seen.deltas.push(Delta { turn, text, at });
                     }
-                    protocol::DaemonMsg::Entry(entry) => {
-                        if let Body::ModelResult { outcome, .. } = entry.body {
+                    protocol::DaemonMsg::Entry(entry) => match entry.body {
+                        Body::ModelResult { outcome, .. } => {
                             results += 1;
                             failed |= matches!(outcome, Outcome::Failed { .. });
                         }
-                    }
+                        Body::ToolResult { outcome, .. } => {
+                            seen.failed += usize::from(!matches!(outcome, Outcome::Done { .. }));
+                        }
+                        _ => {}
+                    },
                     protocol::DaemonMsg::Activity { activity, .. } => match activity {
                         Activity::Idle if results == 2 || failed => break,
                         Activity::Idle | Activity::Running => {}
@@ -701,8 +744,48 @@ impl Client {
     }
 
     fn recv(&mut self) -> protocol::DaemonMsg {
-        protocol::read_frame(&mut self.reader)
-            .unwrap()
-            .expect("the daemon hung up")
+        let (message, received, decoded) = receive(&mut self.reader);
+        self.received = received;
+        self.decoded = decoded;
+        message
     }
+}
+
+/// Timestamp reads around the real frame decoder, including buffered reads.
+fn receive(reader: &mut impl std::io::Read) -> (protocol::DaemonMsg, Instant, Instant) {
+    struct Received<'a, R> {
+        reader: &'a mut R,
+        at: Instant,
+    }
+    impl<R: std::io::Read> std::io::Read for Received<'_, R> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let result = self.reader.read(bytes);
+            self.at = Instant::now();
+            result
+        }
+    }
+    let mut reader = Received {
+        reader,
+        at: Instant::now(),
+    };
+    let message = protocol::read_frame(&mut reader)
+        .unwrap()
+        .expect("the daemon hung up");
+    (message, reader.at, Instant::now())
+}
+
+#[test]
+fn client_receive_precedes_decode_in_the_real_frame_reader() {
+    let frame = protocol::Frame::new(&protocol::DaemonMsg::Delta {
+        call: CallId::new(1).unwrap(),
+        attempt: 0,
+        text: "streamed 日本語".into(),
+    })
+    .unwrap();
+    let started = Instant::now();
+    let (message, received, decoded) = receive(&mut std::io::Cursor::new(frame.as_bytes()));
+    assert!(started <= received && received <= decoded);
+    assert!(
+        matches!(message, protocol::DaemonMsg::Delta { text, .. } if text == "streamed 日本語")
+    );
 }

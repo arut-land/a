@@ -14,6 +14,20 @@ import time
 from process import snapshot, stop_daemon
 
 
+def checked(argv, output=None, label="command", **kwargs):
+    """Keep prep failures before the isolated home and its logs disappear."""
+    try:
+        return subprocess.run(argv, capture_output=True, check=True, **kwargs)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        if output is not None:
+            def decoded(value):
+                return value.decode(errors="replace") if isinstance(value, bytes) else value
+            (output / f"failed-{label}.json").write_text(json.dumps(dict(
+                argv=list(map(str, argv)), returncode=getattr(error, "returncode", None),
+                error=str(error), stdout=decoded(error.stdout), stderr=decoded(error.stderr)), indent=2) + "\n")
+        raise
+
+
 @dataclass
 class Daemon:
     home: Path
@@ -39,8 +53,7 @@ def daemon(binary, output=None, trial=0, first_run=False, ready_timeout=60):
                     if first_run:
                         started = time.perf_counter()
                         # Pipes avoid polling quantization in short cold-start samples.
-                        subprocess.run([binary, "ls"], env=env, cwd=home,
-                                       capture_output=True, check=True, timeout=60)
+                        checked([binary, "ls"], output, f"{trial}-prep-ls", env=env, cwd=home, timeout=60)
                         first_run_ms = (time.perf_counter() - started) * 1000
                         stop_daemon(binary, env, home)
                     started = time.perf_counter()

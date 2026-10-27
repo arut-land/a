@@ -22,7 +22,8 @@ portable RSS adapter. Provider cassettes and encoded fixtures are unchanged.
 ## Build and accounting
 
 Build, measurement and optional reference rounds are separate job steps.
-Builds finish before timing starts. Both binaries use `cargo build-release`:
+Builds finish before timing starts. Both binaries use the release arguments in
+`scripts/perf/build.py`, equivalent to `cargo build-release`:
 rebuilt std with its compact algorithms, the source release profile (main uses level z), unwinding, fat LTO, one codegen unit, stripped
 symbols and the source checkout's native linker flags. The default binary
 must exclude the sleep fixture and include the edit tool; the second binary
@@ -30,6 +31,21 @@ enables fixtures for deterministic echo workloads. Size is measured and reported
 Tuning decisions prioritize latency, CPU, idle and peak RSS, reliability and
 native platform behaviour. The JSON records the source and harness
 revisions, Rust version, Cargo configuration, profile and variant.
+
+`mise run size` and `mise run startup` consume Cargo's `compiler-artifact`
+executable path, including when `CARGO_TARGET_DIR` or the target triple changes
+the output location. `mise run bloat` shares the rebuilt-std arguments; its
+only profile difference is retaining the symbols needed for attribution.
+Staging retains matching dSYM, DWP and PDB sidecars, with an identity manifest
+containing the image and symbol-file SHA-256 hashes and native UUID, ELF notes
+or PE debug-directory output. Windows PDB lookup follows the PE CodeView
+reference, since Rust target hyphens can become underscores in PDB names.
+The upload includes the symbol bundles themselves.
+
+`host.json` is written before builds and measurements, so failed runs retain
+hardware and toolchain metadata. Failed prep commands keep their argv, exit
+status, stdout and stderr separately from the idle line client's stderr.
+These captures and native map diagnostics run outside timing windows.
 
 The mbx store and Cargo downloads are cached by OS, architecture and
 configuration. Rustup installs an explicitly native host toolchain in a private runner-local
@@ -53,6 +69,83 @@ not conceal a regression in another. It is a measurement
 dependency, not a shipped Rust dependency. `/proc` and macOS resident sets
 include shared resident pages; Windows uses working set, not private bytes.
 Do not compare memory values between OSes as if they shared one definition.
+
+Snapshots retain page-fault counters: Linux minor/major faults, macOS faults
+and page-ins, and Windows page faults. Unix fresh-home launches also retain
+`wait4` minor/major faults; Windows launches retain `GetProcessMemoryInfo`'s
+fault count. These are lifetime counters, not proof of disk-cold startup.
+`memory-*.json` includes executable-image and executable-code residency:
+Linux uses smaps, macOS uses the rounded `vmmap -resident` columns, and Windows
+uses `QueryWorkingSetEx`'s valid-page bit. On Windows psutil's map field named
+`rss` is `VirtualQueryEx.RegionSize`; artifacts rename it `mapped_bytes` and
+store the separately queried `resident_bytes`. Whole-process working set
+remains `rss_kib`. Mappings and process counters are sequential observations,
+so their totals need not match exactly. See the native
+[QueryWorkingSetEx contract](https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-queryworkingsetex)
+and [working-set flags](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-psapi_working_set_ex_block).
+
+## Round-2 survey workloads
+
+Normal hosted runs include `scripts/perf/evidence.py`. Dispatch with
+`survey=true` to build only the fixture binary, survey probe and engine load
+measurement; `runner=linux-windows` selects the two x64 lanes in one dispatch.
+Dispatch with `memory=true` to build only the fixture binary and the small
+protocol/sys memory probe: it skips the CPU probe and all saved benchmark
+executables. The corresponding local commands are `hosted.py --phase survey`
+and `hosted.py --phase memory`, with explicit `--source`, `--output` and
+`--runner` arguments. `CARGO_TARGET_DIR` is respected by these builds.
+
+Three rounds reverse the complete control/load ordering on alternating rounds.
+Every completed observation is appended immediately to `samples.jsonl`;
+`evidence.json` keeps raw observations, timing medians and min/max/p10/p90
+spreads, skipped capabilities and failures. Numeric measurements do not gate
+the run. Failed tool outcomes, incomplete workloads or wrong output sizes do.
+Tool validation reads the engine's real log, joining results to agent calls;
+user configuration calls such as `--mode auto` are separate. A successful CLI
+exit alone is insufficient. Large shell output must hold the expected exact
+1,048,576-byte blob; image reads must each complete and hold their image.
+Shell workloads reuse `sys::shell::ExecutionFacts` through the release probe,
+so a Windows host with native Bash uses its registered Bash tool. Standalone
+`perf:workloads` accepts `--probe`; without it, preparation builds a sys/protocol
+probe outside the worktree before starting measurements.
+
+| Workload | Control / load |
+| --- | --- |
+| quiet shell | 1 MiB output / quiet `exit 0`, through the native shell tool |
+| reply projection | 0 / 50,000 prior items, 4,096 32-byte deltas through the real reducer and reply stream |
+| edit | 1 / 64 MiB real UTF-8 file, one exact replacement |
+| TUI paragraph | newline / unfinished paragraph, 2,000 32-byte updates at width 100 |
+| web title | 0 / 50,000 prior items, 4,096 delta batches through the actual page and patch code |
+| subscriptions | 20,000 list / watch-disconnect cycles on a quiet daemon |
+| attachments | 20,000 list / attach-sync-detach cycles |
+| image reads | 1 / 8 concurrent reads of a 4,000×3,000, 36,000,054-byte BMP |
+| replay buffers | 240 bare / environment-bearing session attachments held idle, then detached |
+| PTY cache | 32 / 5,000 validated echo turns with a real 100×30 terminal attached; two Ctrl-O toggles restore the display mode |
+
+The Rust probe is built under the target directory against workspace crates
+and actual web source modules; it adds no production APIs or dependencies to
+the shipped graph. Memory-only mode includes just its protocol/sys portion.
+Each daemon uses a fresh isolated home. Memory observations distinguish
+resident/footprint samples from live-heap attribution: RSS remaining after
+cleanup is not by itself evidence of a leak. Windows PTY-cache observations
+are explicitly marked unavailable until a ConPTY launcher is exposed by the
+sys test seam; there is no pipe-rendering substitute.
+
+The many-session runner samples native counters from its parent. In an idle
+window the measured process blocks once, while the parent takes both snapshots
+five seconds apart, then returns the observations. No accounting child is
+launched by the measured process. `phases` preserves provider writes and
+client receive/decode/observation timestamps per session, turn and delta, in
+microseconds from one process-local monotonic origin. Receive means the last
+read by the protocol decoder, including buffered reads. The reader delegates
+framing and decoding to protocol; it does not duplicate the wire format.
+
+Provider receive/decode, daemon visibility and server-outbox timestamps remain
+explicitly listed in `unobserved_phases`. Collecting those requires test hooks
+in `crates/llm/src`, `crates/engine/src/driver.rs`, `projection.rs` and
+`outbox.rs`/`server.rs`, outside this harness branch's ownership. The available
+client timestamps cannot attribute those internal phases or establish the
+cause of Windows throughput and Intel macOS tails.
 
 All daemons use isolated homes and stop through their own binary and `A_HOME`.
 Collection waits for the captured daemon PID to exit before deleting its home;

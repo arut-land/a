@@ -13,10 +13,11 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import psutil
 
-from process import run_timed
-from build import STD, SUFFIX, benchmark, environment, stage, variant_arguments
-from lifecycle import daemon, idle_sample
+from process import memory_maps, run_timed, snapshot
+from build import STD, SUFFIX, benchmark, dumpbin, environment, executable, probe, release_arguments, stage, variant_arguments
+from lifecycle import checked, daemon, idle_sample
 from stats import distribution
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -62,13 +63,7 @@ def hardware():
 
 
 def windows_image(binary):
-    tool = shutil.which("dumpbin")
-    if tool is None:
-        installer = Path(os.environ["ProgramFiles(x86)"]) / "Microsoft Visual Studio/Installer/vswhere.exe"
-        location = subprocess.check_output([str(installer), "-latest", "-property", "installationPath"], text=True).strip()
-        native = "arm64" if platform.machine().lower() == "arm64" else "x64"
-        tools = sorted((Path(location) / "VC/Tools/MSVC").glob(f"*/bin/Host*/{native}/dumpbin.exe"), reverse=True)
-        tool = str(tools[0])
+    tool = dumpbin()
     headers = subprocess.check_output([tool, "/nologo", "/headers", "/dependents", str(binary)], text=True, errors="replace")
     dependencies = [line.strip() for line in headers.splitlines() if line.strip().lower().endswith(".dll")]
     assert dependencies, "dumpbin must report real PE imports"
@@ -79,17 +74,16 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
     overrides = variant_arguments(variant)
     if os.environ.get("PERF_ABLATION") == "true":
         packages = ("engine", "llm")
-    env = environment(source / "target/perf-build")
-    release = Path(env["CARGO_TARGET_DIR"]) / "release"
+    env = environment(Path(os.environ.get("CARGO_TARGET_DIR", source / "target/perf-build")))
     # Features select an allocator or heap for `a` and the engine's benches
     # alone (docs/perf/allocators.md); the other benches keep their own.
     features = list(variant.get("features", []))
     for fixture in [False, True]:
         selected = features + (["fixtures"] if fixture else [])
-        run(["cargo", "build-release", "-p", "a", *(["--features", ",".join(selected)] if selected else []),
-             *overrides], cwd=source, env=env)
+        binary = executable(source, env, [*(["--features", ",".join(selected)] if selected else []),
+                                        *overrides], run=run)
         name = "a-fixtures" if fixture else "a"
-        stage(release / ("a" + SUFFIX), output / (name + SUFFIX))
+        stage(binary, output / (name + SUFFIX))
     (output / "build.json").write_text(json.dumps(dict(
         revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
         variant=variant,
@@ -101,10 +95,11 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
     if not benchmarks:
         return
     chosen = ["--features", ",".join(features)] if features else []
-    run(["cargo", "build-release", "-p", "a", "--example", "perf-attach", *chosen, *overrides], cwd=source, env=env)
+    attach = executable(source, env, ["--example", "perf-attach", *chosen, *overrides],
+                        run=run, name="perf-attach", kind="example")
     run(["cargo", "test", "--release", *STD, "-p", "a", "--example", "perf-attach", *chosen, *overrides],
         cwd=source, env=env)
-    stage(release / "examples" / ("perf-attach" + SUFFIX), output / ("perf-attach" + SUFFIX))
+    stage(attach, output / ("perf-attach" + SUFFIX))
     for package, target in [("engine", ["--lib"]), ("protocol", ["--test", "bench"]),
                             ("llm", ["--test", "bench"]), ("tui", ["--lib"])]:
         if package not in packages:
@@ -119,7 +114,16 @@ def build(source, output, variant, benchmarks=True, packages=("engine", "protoco
         if p.is_file() and p.name in ["a" + SUFFIX, "a-fixtures" + SUFFIX, "engine-bench" + SUFFIX, "llm-bench" + SUFFIX]
     }
     (output / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    probe(source, output, env, variant, run=run)
     run(["rustc", ROOT / "scripts/perf/floor.rs", "-O", "-o", output / ("floor" + SUFFIX)], cwd=source)
+
+
+def memory_build(source, output, variant, memory_only=True):
+    env = environment(Path(os.environ.get("CARGO_TARGET_DIR", source / "target/perf-build")))
+    binary = executable(source, env, ["--features", ",".join(["fixtures", *variant.get("features", [])]),
+                                      *variant_arguments(variant)], run=run)
+    stage(binary, output / ("a-fixtures" + SUFFIX))
+    probe(source, output, env, variant, memory_only=memory_only, run=run)
 
 
 def budgets(output, binary=None, probe=None, samples=5):
@@ -130,7 +134,7 @@ def budgets(output, binary=None, probe=None, samples=5):
             home, env, pid = active.home, active.env, active.pid
 
             def cli(*args):
-                return run([binary, *args], env=env, cwd=home, capture_output=True, timeout=60)
+                return checked([binary, *args], output, f"{trial}-prep", env=env, cwd=home, timeout=60)
 
             observation = idle_sample(active, 10)
             first_run.append(observation["first_run_ls_ms"])
@@ -139,23 +143,11 @@ def budgets(output, binary=None, probe=None, samples=5):
             cpu.append(observation["daemon_cpu_seconds"] * 1000)
             client_cpu.append(observation["client_cpu_seconds"] * 1000)
             (output / f"idle-{trial}.json").write_text(json.dumps(observation, indent=2))
-            if os.environ.get("PERF_ABLATION") == "true":
-                import psutil
-                diagnostic = {}
-                process = psutil.Process(pid)
-                if sys.platform == "darwin":
-                    try:
-                        maps = subprocess.run(["vmmap", "-summary", str(pid)], capture_output=True, text=True, timeout=10)
-                        diagnostic["vmmap"] = maps.stdout + maps.stderr
-                    except subprocess.TimeoutExpired:
-                        diagnostic["maps_error"] = "vmmap exceeded 10 seconds"
-                else:
-                    try:
-                        diagnostic["memory"] = process.memory_full_info()._asdict()
-                        diagnostic["maps"] = [m._asdict() for m in process.memory_maps(grouped=True)]
-                    except (psutil.Error, NotImplementedError, AttributeError) as error:
-                        diagnostic["maps_error"] = str(error)
-                (output / f"memory-{trial}.json").write_text(json.dumps(diagnostic, indent=2))
+            try:
+                diagnostic = dict(counters=snapshot(pid), **memory_maps(pid))
+            except (OSError, subprocess.SubprocessError, psutil.Error, NotImplementedError, AttributeError, ValueError) as error:
+                diagnostic = dict(maps_error=str(error))
+            (output / f"memory-{trial}.json").write_text(json.dumps(diagnostic, indent=2))
             session = cli("new").stdout.decode().strip()
             for n in range(10):
                 cli("-p", f"message {n}", "resume", session)
@@ -222,9 +214,9 @@ def summarize(output, source, variant, runner):
 
 
 def bloat(source, output, variant):
-    env = environment(source / "target/perf-build")
+    env = environment(Path(os.environ.get("CARGO_TARGET_DIR", source / "target/perf-build")))
     for label, extra in [("crates", ["--crates"]), ("functions", ["-n", "100"] )]:
-        result = run(["cargo", "bloat", "--release", "-p", "a", *STD, *variant_arguments(variant),
+        result = run(["cargo", "bloat", *release_arguments(), "-p", "a", *variant_arguments(variant),
                       "--config", 'profile.release.strip="none"',
                       "--message-format=json", *extra], cwd=source, env=env,
                      stdout=subprocess.PIPE, text=True)
@@ -328,7 +320,7 @@ def sessions(source, output, variant, reference=""):
     and compares them (`segment` is Windows' segment heap, through the
     executable's image options) instead of the runtime layouts."""
     def build_benchmark(name, target=("-p", "engine", "--lib"), features=(), checkout=source):
-        return benchmark(checkout, environment(checkout / "target/perf-build"), target,
+        return benchmark(checkout, environment(Path(os.environ.get("CARGO_TARGET_DIR", checkout / "target/perf-build"))), target,
                          variant_arguments(variant), features, output / (name + SUFFIX), run=run)
 
     binary = build_benchmark("engine-bench")
@@ -373,7 +365,7 @@ def sessions(source, output, variant, reference=""):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", choices=["all", "build", "measure", "paired", "sessions"], default="all")
+    parser.add_argument("--phase", choices=["all", "build", "measure", "paired", "sessions", "evidence", "memory", "survey"], default="all")
     parser.add_argument("--source", type=Path, default=ROOT)
     parser.add_argument("--output", type=Path, default=ROOT / "target/hosted-perf")
     parser.add_argument("--variant", default="{}", help='JSON: {"rustflags": [...], "config": [...]}')
@@ -383,10 +375,31 @@ def main():
     parser.add_argument("--bloat", action="store_true", help="also collect crate/function size attribution")
     args = parser.parse_args()
     output, source = args.output.resolve(), args.source.resolve()
-    if args.phase in ["all", "build"] and output.exists() and any(output.iterdir()):
+    if args.phase in ["all", "build"] and output.exists() and any(p.name != "host.json" for p in output.iterdir()):
         parser.error("measurement output must be empty; select a new --output directory")
     output.mkdir(parents=True, exist_ok=True)
     variant = json.loads(args.variant or "{}")
+    (output / "host.json").write_text(json.dumps(dict(
+        platform=platform.platform(), machine=platform.machine(), hardware=hardware(),
+        revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
+        workflow_revision=os.environ.get("GITHUB_SHA"), variant=variant,
+        toolchain=subprocess.check_output(["rustc", "-vV"], text=True)), indent=2) + "\n")
+    if args.phase in ("memory", "evidence", "survey"):
+        from evidence import measure
+        if args.phase in ("memory", "survey"):
+            memory_build(source, output, variant, memory_only=args.phase == "memory")
+        if args.phase == "survey":
+            binary = benchmark(source, environment(Path(os.environ.get("CARGO_TARGET_DIR", source / "target/perf-build"))),
+                               ["-p", "engine", "--lib"], variant_arguments(variant),
+                               features=[feature for feature in variant.get("features", []) if feature.startswith("sys/")],
+                               destination=output / ("engine-bench" + SUFFIX), run=run)
+            run([sys.executable, ROOT / "scripts/perf/sessions.py", binary, "--layouts", "memory",
+                 "--rounds", os.environ.get("PERF_EVIDENCE_ROUNDS", "3"), "--sessions", variant.get("sessions", "1,32,128"),
+                 "--output", output / "sessions"], cwd=source)
+        measure(output / ("a-fixtures" + SUFFIX), output / ("perf-probe" + SUFFIX),
+                output / "evidence", rounds=int(os.environ.get("PERF_EVIDENCE_ROUNDS", "3")),
+                memory_only=args.phase == "memory")
+        return
     if args.phase == "sessions":
         sessions(source, output, variant, args.paired_ref)
         return
@@ -413,7 +426,7 @@ def main():
         samples = [measure_windows([str(output / ("a" + SUFFIX)), "--version"]) for _ in range(5)]
         (output / "startup-native.json").write_text(json.dumps({"native_samples": samples}))
     run([sys.executable, ROOT / "mise-tasks/perf/workloads", output / ("a-fixtures" + SUFFIX), "cli",
-         "--runs", "20", "--output", output])
+         "--runs", "20", "--output", output, "--probe", output / ("perf-probe" + SUFFIX)])
     run([sys.executable, ROOT / "mise-tasks/perf/benches", output, output / "cli/transcript.jsonl", "--runs", "5"])
     try:
         summarize(output, source, variant, args.runner)

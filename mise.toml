@@ -57,11 +57,11 @@ test = { run = [
 # Sequential: the tests and clippy would rebuild the same target at once.
 check = { depends = ["check:fmt", "check:clippy"], run = "mise run test" }
 # Size is reported; the fixture scan still verifies the shipped feature set.
-size = { depends = ["release"], run = "python3 scripts/perf/size.py target/release/a" }
+size = "python3 scripts/perf/build.py size"
 # The floor is native on Windows too; interpreter startup is not a process floor.
-startup = { depends = ["release"], run = "python3 scripts/perf/startup.py target/release/a" }
+startup = "python3 scripts/perf/build.py startup"
 
-bloat = "cargo bloat --release --crates -n 20"
+bloat = "python3 scripts/perf/build.py bloat"
 "bloat:lines" = "cargo llvm-lines --release -p a | head -30"
 # Shell completions (bash, zsh, fish, nu, PowerShell, elvish: usage's
 # scripts, which ask `a __complete_word__` on each Tab) and the man page,

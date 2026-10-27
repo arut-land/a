@@ -19,7 +19,7 @@ on:
         description: 'Runner label, or all'
         default: all
         type: choice
-        options: [all, ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
+        options: [all, linux-windows, ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
       harness_ref:
         description: 'Harness revision (empty uses this workflow commit); pin for historical experiments'
         default: ''
@@ -60,6 +60,14 @@ on:
         description: 'Run only the concurrently active sessions layouts (docs/perf/runtime-demand.md)'
         default: false
         type: boolean
+      memory:
+        description: 'Only memory survey workloads; skip unrelated benchmark builds'
+        default: false
+        type: boolean
+      survey:
+        description: 'Only round-2 CPU, memory and concurrent-session evidence'
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -80,12 +88,12 @@ jobs:
     if: github.event_name != 'schedule' && !inputs.autostart
     name: perf (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    # Twenty-round ablations and the session layouts need longer than the standard paired suite.
-    timeout-minutes: ${{ inputs.sessions && 240 || inputs.ablation && 180 || 90 }}
+    # Churn workloads and twenty-round ablations need longer than the standard suite.
+    timeout-minutes: ${{ inputs.sessions && 240 || (inputs.ablation || inputs.survey || inputs.memory) && 180 || 90 }}
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
+        runner: ${{ fromJSON(inputs.runner == 'linux-windows' && '["ubuntu-latest", "windows-latest"]' || inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
     env:
       PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
       PERF_ABLATION: ${{ inputs.ablation || false }}
@@ -94,6 +102,8 @@ jobs:
       PERF_BUILD_ONLY: ${{ inputs.build_only }}
       PERF_BLOAT: ${{ inputs.bloat }}
       PERF_SESSIONS: ${{ inputs.sessions || false }}
+      PERF_MEMORY: ${{ inputs.memory || false }}
+      PERF_SURVEY: ${{ inputs.survey || false }}
     defaults:
       run:
         shell: bash
@@ -116,7 +126,15 @@ jobs:
         run: |
           python -m pip install psutil==7.2.2
           python - <<'PYTHON'
-          import os, tomllib
+          import json, os, platform, sys, tomllib
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/perf')
+          from hosted import hardware
+          output = Path('target/hosted-perf')
+          output.mkdir(parents=True, exist_ok=True)
+          (output / 'host.json').write_text(json.dumps(dict(
+              platform=platform.platform(), machine=platform.machine(), hardware=hardware(),
+              workflow_revision=os.environ.get('GITHUB_SHA')), indent=2) + '\n')
           targets = {
               ('Linux', 'X64'): 'x86_64-unknown-linux-gnu',
               ('Linux', 'ARM64'): 'aarch64-unknown-linux-gnu',
@@ -132,7 +150,6 @@ jobs:
           PYTHON
           echo "RUSTUP_HOME=$RUNNER_TEMP/perf-rustup" >> "$GITHUB_ENV"
           echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
-      - run: python -m unittest discover -s scripts/perf -p 'test_*.py'
       - uses: actions/cache/restore@v6
         id: cache
         with:
@@ -145,6 +162,7 @@ jobs:
       # ARM Windows has no Cranelift component; release and benches use LLVM.
       - id: toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src
+      - run: python -m unittest discover -s scripts/perf -p 'test_*.py'
       - uses: jdx/mise-action@v5
         with:
           working_directory: harness
@@ -174,7 +192,7 @@ jobs:
           PY
       - name: Build release binaries and saved benchmarks
         id: build
-        if: env.PERF_SESSIONS != 'true'
+        if: env.PERF_SESSIONS != 'true' && env.PERF_MEMORY != 'true' && env.PERF_SURVEY != 'true'
         run: |
           extra=()
           if [[ "$PERF_BUILD_ONLY" == true ]]; then extra+=(--build-only); fi
@@ -186,7 +204,7 @@ jobs:
           fi
       - name: Measure startup workloads and benches
         timeout-minutes: 20
-        if: env.PERF_BUILD_ONLY != 'true' && env.PERF_ABLATION != 'true' && env.PERF_SESSIONS != 'true'
+        if: env.PERF_BUILD_ONLY != 'true' && env.PERF_ABLATION != 'true' && env.PERF_SESSIONS != 'true' && env.PERF_MEMORY != 'true' && env.PERF_SURVEY != 'true'
         run: |
           if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
             python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
@@ -210,6 +228,17 @@ jobs:
             PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase sessions --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
           else
             mise exec -- python scripts/perf/hosted.py --phase sessions --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
+          fi
+      - name: Measure survey CPU and memory workloads
+        if: env.PERF_BUILD_ONLY != 'true' && env.PERF_ABLATION != 'true' && env.PERF_SESSIONS != 'true'
+        run: |
+          phase=evidence
+          if [[ "$PERF_MEMORY" == true ]]; then phase=memory; fi
+          if [[ "$PERF_SURVEY" == true ]]; then phase=survey; fi
+          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
+            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase "$phase" --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
+          else
+            mise exec -- python scripts/perf/hosted.py --phase "$phase" --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
           fi
       - name: Compare with main
         if: always()
@@ -239,12 +268,21 @@ jobs:
         with:
           name: perf-${{ matrix.runner }}
           path: |
-            harness/target/hosted-perf/a
-            harness/target/hosted-perf/a.exe
+            harness/target/hosted-perf/**/a
+            harness/target/hosted-perf/**/a.exe
+            harness/target/hosted-perf/**/a-fixtures
+            harness/target/hosted-perf/**/a-fixtures.exe
+            harness/target/hosted-perf/**/*-bench
+            harness/target/hosted-perf/**/*-bench.exe
+            harness/target/hosted-perf/**/perf-probe
+            harness/target/hosted-perf/**/perf-probe.exe
             harness/target/hosted-perf/**/*.json
             harness/target/hosted-perf/**/*.jsonl
             harness/target/hosted-perf/**/*.md
             harness/target/hosted-perf/**/*.callgrind
+            harness/target/hosted-perf/**/*.dSYM/**
+            harness/target/hosted-perf/**/*.dwp
+            harness/target/hosted-perf/**/*.pdb
           if-no-files-found: warn
           retention-days: 30
       - uses: actions/cache/save@v6
