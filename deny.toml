@@ -63,4 +63,6 @@ required-git-spec = "rev"
 allow-git = [
     # Scheduler state must outlive wakes racing executor destruction.
     "https://github.com/smol-rs/async-executor",
+    # IOCP updates queued while a wait starts are lost (smol-rs/polling#271).
+    "https://github.com/Rajaniraiyn/polling",
 ]
