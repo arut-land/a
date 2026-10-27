@@ -1,12 +1,14 @@
 //! Transcript items as rows: messages, replies, and tool call cards, laid
 //! out from what [`Item::present`] says of each.
 
+use std::borrow::Cow;
+
 use protocol::view::md::{self, Block, Inline};
 use protocol::view::{Glyph, Item, Kind, Presented, Shown};
 use protocol::{CallId, Json};
 
 use super::render::ellipsize;
-use super::text::{Action, Color, Line, Modifier, Span, Style, sanitize, wrap};
+use super::text::{Action, Color, Line, Modifier, Span, Style, sanitize, wrap, wrap_checkpoints};
 
 /// How much of a card's output shows unless everything is expanded.
 const TAIL: usize = 10;
@@ -145,52 +147,293 @@ pub fn mark_reply(rows: &mut [Line]) {
     }
 }
 
-/// Where a reply streaming in was wrapped to: the lines that ended are
-/// wrapped once and kept; each delta wraps only the open last line again,
-/// so a long reply costs no more per delta than a short one.
-#[derive(Clone, Copy, Debug, Default)]
+/// Completed display rows stay in the caller's cache. Inline state and
+/// pending spaces advance once; only the unfinished visible row rewraps.
+#[derive(Default)]
 pub struct Live {
-    identity: Option<(CallId, u16)>,
-    /// The text's bytes wrapped for good (up to a newline), whether they
-    /// end inside a code fence, and the rows they made.
-    done: usize,
-    fenced: bool,
-    kept: usize,
-    /// The text's length when last wrapped.
+    identity: Option<(CallId, u16, usize)>,
     seen: usize,
+    kept: usize,
+    fenced: bool,
+    sanitizer: Option<client::Sanitizer>,
+    open: String,
+    leading: usize,
+    continuation: Option<Continuation>,
+    #[cfg(test)]
+    rewrapped: usize,
+    #[cfg(test)]
+    parsed: usize,
+}
+
+#[derive(Default)]
+struct Continuation {
+    first: Vec<Span>,
+    rest: Vec<Span>,
+    style: Style,
+    spans: Vec<Span>,
+    spaces: Vec<Span>,
+    space_count: usize,
+    bold: bool,
+    code: bool,
+    star: bool,
+    leading: Leading,
+}
+
+#[derive(Default)]
+enum Leading {
+    #[default]
+    Keep,
+    Trim,
+}
+
+impl Continuation {
+    fn push(&mut self, text: &str, width: usize) {
+        let text = if matches!(self.leading, Leading::Trim) {
+            let text = text.trim_start();
+            if text.is_empty() {
+                return;
+            }
+            self.leading = Leading::Keep;
+            text
+        } else {
+            text
+        };
+        let text = if self.star {
+            Cow::Owned(format!("*{text}"))
+        } else {
+            Cow::Borrowed(text)
+        };
+        self.star = false;
+        let (mut at, mut from) = (0, 0);
+        while at < text.len() {
+            let delimiter = if text.as_bytes()[at] == b'`' {
+                Some(1)
+            } else if !self.code && text.as_bytes()[at..].starts_with(b"**") {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(delimiter) = delimiter {
+                self.push_text(&text[from..at], self.pen(), width);
+                if delimiter == 1 {
+                    self.code = !self.code;
+                } else {
+                    self.bold = !self.bold;
+                }
+                at += delimiter;
+                from = at;
+                continue;
+            }
+            if !self.code && at + 1 == text.len() && text.as_bytes()[at] == b'*' {
+                self.star = true;
+                break;
+            }
+            at += 1;
+        }
+        self.push_text(&text[from..at], self.pen(), width);
+    }
+
+    fn push_text(&mut self, text: &str, style: Style, width: usize) {
+        let visible = text.trim_end_matches(' ');
+        if !visible.is_empty() {
+            self.spans.append(&mut self.spaces);
+            self.space_count = 0;
+            self.spans.push(Span::new(visible, style));
+        }
+        // A row can show at most `width` spaces. One more carries
+        // overflow into the next word's wrap decision; later spaces
+        // cannot affect its placement or any visible pen.
+        let spaces = text.len() - visible.len();
+        let keep = spaces.min(width.saturating_add(1).saturating_sub(self.space_count));
+        if keep > 0 {
+            self.spaces
+                .push(Span::new(&text[text.len() - keep..], style));
+        }
+        self.space_count += spaces;
+    }
+
+    fn pen(&self) -> Style {
+        if self.code {
+            CODE
+        } else if self.bold {
+            self.style.bold()
+        } else {
+            self.style
+        }
+    }
 }
 
 impl Live {
-    /// Brings `rows` (empty, or as this left them) up to `text`, the
-    /// reply's live text so far.
+    /// Brings `rows` (empty, or as this left them) up to the live text.
     pub fn update(&mut self, rows: &mut Vec<Line>, stream: &protocol::view::Stream, width: usize) {
-        let text = &stream.text;
-        let identity = Some((stream.call, stream.attempt));
-        if self.identity != identity || rows.is_empty() || text.len() < self.seen {
+        let identity = Some((stream.call, stream.attempt, width));
+        if self.identity != identity || rows.is_empty() || stream.text.len() < self.seen {
             *self = Self {
                 identity,
+                kept: 1,
                 ..Self::default()
             };
             rows.clear();
             rows.push(Line::default());
-            self.kept = 1;
-        } else if text.len() == self.seen {
+        } else if stream.text.len() == self.seen {
             return;
         }
         rows.truncate(self.kept);
-        if let Some(nl) = text[self.done..].rfind('\n') {
-            let end = self.done + nl;
-            let ended = sanitize(&text[self.done..end]);
-            self.fenced = markdown_into(rows, &ended, width, Style::new(), self.fenced);
-            (self.done, self.kept) = (end + 1, rows.len());
+        let added = &stream.text[self.seen..];
+        let added =
+            if self.sanitizer.is_some() || added.chars().any(|c| c.is_control() && c != '\n') {
+                Cow::Owned(
+                    self.sanitizer
+                        .get_or_insert_with(client::Sanitizer::default)
+                        .push(added.as_bytes()),
+                )
+            } else {
+                Cow::Borrowed(added)
+            };
+        let mut parts = added.split('\n').peekable();
+        while let Some(part) = parts.next() {
+            if let Some(c) = &mut self.continuation {
+                #[cfg(test)]
+                {
+                    self.parsed += part.len() + usize::from(c.star);
+                }
+                c.push(part, width);
+            } else {
+                let part = if !self.fenced && self.open.is_empty() {
+                    let spaces = part.bytes().take_while(|&b| b == b' ').count();
+                    self.leading += spaces;
+                    &part[spaces..]
+                } else {
+                    part
+                };
+                self.open.push_str(part);
+            }
+            if parts.peek().is_some() {
+                self.fenced = if self.continuation.is_some() || self.leading > 0 {
+                    self.wrap_open(rows, width)
+                } else {
+                    markdown_into(rows, &self.open, width, Style::new(), self.fenced)
+                };
+                self.kept = rows.len();
+                self.open.clear();
+                self.leading = 0;
+                self.continuation = None;
+            } else {
+                self.wrap_open(rows, width);
+            }
         }
-        let open = sanitize(&text[self.done..]);
-        markdown_into(rows, &open, width, Style::new(), self.fenced);
         if let Some(last) = rows.last_mut() {
             last.spans.push(Span::new("▍", MUTED));
         }
         mark_reply(rows);
-        self.seen = text.len();
+        self.seen = stream.text.len();
+    }
+
+    fn wrap_open(&mut self, rows: &mut Vec<Line>, width: usize) -> bool {
+        if self.continuation.is_none() {
+            // Block indentation is a u8; paragraph indentation can only
+            // occupy one row. Keep the full count until the block is known.
+            let source = if self.leading == 0 {
+                Cow::Borrowed(self.open.as_str())
+            } else {
+                Cow::Owned(format!(
+                    "{}{open}",
+                    " ".repeat(self.leading.min(width.max(usize::from(u8::MAX)))),
+                    open = self.open
+                ))
+            };
+            #[cfg(test)]
+            {
+                self.parsed += source.len();
+            }
+            let block = md::blocks(&source)
+                .fenced(self.fenced)
+                .next()
+                .expect("a logical line always has one block");
+            match block {
+                Block::Fence(line) => {
+                    rows.push(Line::plain(format!("  {line}"), CODE.dim()));
+                    return !self.fenced;
+                }
+                Block::Code(line) => {
+                    rows.push(Line::plain(format!("  {line}"), CODE));
+                    return self.fenced;
+                }
+                block => {
+                    let trimmed = source.trim_start();
+                    let ambiguous = trimmed.is_empty()
+                        || matches!(trimmed, "-" | "*" | "`" | "``")
+                        || (trimmed.len() <= 6 && trimmed.bytes().all(|b| b == b'#'));
+                    if ambiguous {
+                        markdown_into(rows, &source, width, Style::new(), self.fenced);
+                        return self.fenced;
+                    }
+                    let (first, rest, body, style) = layout(block, Style::new());
+                    let mut continuation = Continuation {
+                        first,
+                        rest,
+                        style,
+                        leading: if matches!(block, Block::Quote("")) {
+                            Leading::Trim
+                        } else {
+                            Leading::Keep
+                        },
+                        ..Continuation::default()
+                    };
+                    continuation.push(body, width);
+                    self.continuation = Some(continuation);
+                }
+            }
+            self.open.clear();
+            self.leading = 0;
+        }
+        let c = self
+            .continuation
+            .as_mut()
+            .expect("the block has a wrapping layout");
+        let preview = if c.star {
+            let mut spans = c.spans.clone();
+            spans.extend_from_slice(&c.spaces);
+            spans.push(Span::new("*", c.pen()));
+            Cow::Owned(spans)
+        } else {
+            Cow::Borrowed(c.spans.as_slice())
+        };
+        #[cfg(test)]
+        {
+            self.rewrapped += preview.iter().map(|span| span.text.len()).sum::<usize>();
+        }
+        let word_start = preview
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, span)| span.text.rfind(' ').map(|at| (i, at + 1)))
+            .unwrap_or((0, 0));
+        let mut checkpoint = None;
+        rows.extend(wrap_checkpoints(
+            &preview,
+            width,
+            &c.first,
+            &c.rest,
+            |candidate| {
+                // The preview's final '*' may disappear when the next delta
+                // completes '**', letting its word fit on the preceding row.
+                if candidate.span < c.spans.len()
+                    && !(c.star
+                        && candidate.word_start
+                        && (candidate.span, candidate.byte) >= word_start)
+                {
+                    checkpoint = Some(candidate);
+                }
+            },
+        ));
+        if let Some(checkpoint) = checkpoint {
+            c.spans.drain(..checkpoint.span);
+            c.spans[0].text = c.spans[0].text[checkpoint.byte..].into();
+            c.first.clone_from(&c.rest);
+            self.kept += checkpoint.rows;
+        }
+        self.fenced
     }
 }
 
@@ -206,45 +449,52 @@ pub fn markdown(text: &str, width: usize, base: Style) -> Vec<Line> {
 /// whether it starts inside a code fence, and whether it ends in one comes
 /// back.
 fn markdown_into(out: &mut Vec<Line>, text: &str, width: usize, base: Style, fenced: bool) -> bool {
-    let pad = |s: String, style| vec![Span::new(s, style)];
     let mut blocks = md::blocks(text).fenced(fenced);
     for block in &mut blocks {
-        let (first, rest, body, style) = match block {
+        match block {
             Block::Fence(line) => {
                 out.push(Line::plain(format!("  {line}"), CODE.dim()));
                 continue;
             }
-            // Code is not reflowed; long lines are cut by the screen.
             Block::Code(line) => {
                 out.push(Line::plain(format!("  {line}"), CODE));
                 continue;
             }
-            Block::Heading(_, text) => (
-                pad("  ".into(), base),
-                pad("  ".into(), base),
-                text,
-                base.bold(),
-            ),
-            Block::Bullet { indent, text } => {
-                let pad_to = " ".repeat(usize::from(indent));
-                (
-                    pad(format!("  {pad_to}• "), base),
-                    pad(format!("  {pad_to}  "), base),
-                    text,
-                    base,
-                )
-            }
-            Block::Quote(text) => (
-                pad("  │ ".into(), base.dim()),
-                pad("  │ ".into(), base.dim()),
-                text,
-                base.italic(),
-            ),
-            Block::Para(text) => (pad("  ".into(), base), pad("  ".into(), base), text, base),
-        };
+            _ => {}
+        }
+        let (first, rest, body, style) = layout(block, base);
         out.extend(wrap(&inline(body, style), width, &first, &rest));
     }
     blocks.in_fence()
+}
+
+fn layout(block: Block<'_>, base: Style) -> (Vec<Span>, Vec<Span>, &str, Style) {
+    let pad = |s: String, style| vec![Span::new(s, style)];
+    match block {
+        Block::Heading(_, text) => (
+            pad("  ".into(), base),
+            pad("  ".into(), base),
+            text,
+            base.bold(),
+        ),
+        Block::Bullet { indent, text } => {
+            let pad_to = " ".repeat(usize::from(indent));
+            (
+                pad(format!("  {pad_to}• "), base),
+                pad(format!("  {pad_to}  "), base),
+                text,
+                base,
+            )
+        }
+        Block::Quote(text) => (
+            pad("  │ ".into(), base.dim()),
+            pad("  │ ".into(), base.dim()),
+            text,
+            base.italic(),
+        ),
+        Block::Para(text) => (pad("  ".into(), base), pad("  ".into(), base), text, base),
+        Block::Fence(_) | Block::Code(_) => unreachable!("verbatim blocks have no wrapping layout"),
+    }
 }
 
 /// Inline `**bold**` and `` `code` `` within one line.
@@ -551,6 +801,161 @@ mod tests {
             mark_reply(&mut whole);
             whole.last_mut().unwrap().spans.push(Span::new("▍", MUTED));
             assert_eq!(lines, whole, "at {end}");
+        }
+    }
+
+    #[test]
+    fn incremental_rows_equal_whole_markdown_for_random_chunkings() {
+        let fragments = [
+            "plain words ",
+            "**bold words** ",
+            "`code ** literal` ",
+            "*",
+            "**",
+            "`",
+            "日本語 ",
+            "e\u{301} 😀 ",
+            "a_very_long_unbroken_word",
+            "  ",
+            "\n# Heading\n",
+            "\n  - bullet words ",
+            "\n> quoted words ",
+            "\n```rust\ncode **raw** ",
+            "\n```\n",
+            "\x1b[31mred\x1b[0m ",
+            "\x1b]title\x07",
+            "\t",
+            "\n",
+            "######",
+            "\n      ",
+        ];
+        for seed in 1..=256_u64 {
+            let mut random = seed;
+            let mut next = || {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                random
+            };
+            let mut text = String::new();
+            let choices = if seed % 2 == 0 {
+                &fragments[..10]
+            } else {
+                &fragments[..]
+            };
+            for _ in 0..40 {
+                text.push_str(choices[usize::try_from(next() % choices.len() as u64).unwrap()]);
+            }
+            let mut live = Live::default();
+            let mut rows = Vec::new();
+            let mut stream = protocol::view::Stream {
+                call: CallId::new(3).unwrap(),
+                attempt: 0,
+                text: String::new(),
+            };
+            let mut width = usize::try_from(next() % 40).unwrap();
+            let mut end = 0;
+            while end < text.len() {
+                end = (end + 1 + usize::try_from(next() % 31).unwrap()).min(text.len());
+                while !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                stream.text = text[..end].into();
+                // Resize without changing text, then retry the same call with
+                // a shorter prefix as the real stream does on a new attempt.
+                if next() % 13 == 0 {
+                    width = usize::try_from(next() % 40).unwrap();
+                }
+                live.update(&mut rows, &stream, width);
+                let mut whole = vec![Line::default()];
+                whole.extend(markdown(&stream.text, width, Style::new()));
+                mark_reply(&mut whole);
+                whole.last_mut().unwrap().spans.push(Span::new("▍", MUTED));
+                assert_eq!(
+                    rows, whole,
+                    "seed {seed}, width {width}, at {end}: {:?}",
+                    stream.text
+                );
+                if next() % 19 == 0 {
+                    width = usize::try_from(next() % 40).unwrap();
+                    live.update(&mut rows, &stream, width);
+                    let mut whole = vec![Line::default()];
+                    whole.extend(markdown(&stream.text, width, Style::new()));
+                    mark_reply(&mut whole);
+                    whole.last_mut().unwrap().spans.push(Span::new("▍", MUTED));
+                    assert_eq!(rows, whole, "resize seed {seed}, at {end}");
+                    stream.attempt += 1;
+                    stream.text.clear();
+                    live.update(&mut rows, &stream, width);
+                    assert_eq!(texts(&rows), ["", "⏺ ▍"]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_paragraph_rewraps_only_its_unstable_suffix() {
+        for (seed, chunk) in [
+            ("", "plain text with spaces to wrap.  "),
+            ("", "abcdefghijklmnopqrstuvwxyzabcdef"),
+            ("hello ", "                                "),
+            ("", "                                "),
+            ("", "********************************"),
+            ("", "**"),
+            ("hello ", "** ** "),
+            (">", "                                "),
+        ] {
+            let mut live = Live::default();
+            let mut rows = Vec::new();
+            let mut stream = protocol::view::Stream {
+                call: CallId::new(3).unwrap(),
+                attempt: 0,
+                text: String::new(),
+            };
+            stream.text.push_str(seed);
+            live.update(&mut rows, &stream, 100);
+            for _ in 0..2000 {
+                stream.text.push_str(chunk);
+                let before = live.rewrapped + live.parsed;
+                live.update(&mut rows, &stream, 100);
+                assert!(
+                    live.rewrapped + live.parsed - before <= 255 + 2 * chunk.len() + 1,
+                    "chunk {chunk:?}"
+                );
+            }
+            if chunk.bytes().any(|b| b.is_ascii_alphabetic()) {
+                assert!(
+                    live.kept > 500,
+                    "display rows must commit before the logical newline"
+                );
+            }
+            if chunk.bytes().all(|b| b == b' ') && seed == "hello " {
+                let pending = live.continuation.as_ref().unwrap();
+                assert_eq!(pending.space_count, 64_001);
+                assert_eq!(
+                    pending
+                        .spaces
+                        .iter()
+                        .map(|span| span.text.len())
+                        .sum::<usize>(),
+                    101
+                );
+            }
+            if seed.is_empty() && chunk.bytes().all(|b| b == b' ') {
+                assert_eq!(live.leading, 64_000);
+                assert_eq!(live.open, "");
+                stream.text.push_str("- **tail** `code` end");
+            } else {
+                stream.text.push_str(" **tail** `code` end");
+            }
+            for width in [100, 1, 20, 300] {
+                live.update(&mut rows, &stream, width);
+                let mut whole = vec![Line::default()];
+                whole.extend(markdown(&stream.text, width, Style::new()));
+                mark_reply(&mut whole);
+                whole.last_mut().unwrap().spans.push(Span::new("▍", MUTED));
+                assert_eq!(rows, whole, "chunk {chunk:?}, width {width}");
+            }
         }
     }
 
