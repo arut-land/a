@@ -43,6 +43,7 @@ print(json.dumps(dict(cargo=shutil.which('cargo'), rustc=shutil.which('rustc'),
         # Scope this contract to measurement; autostart has its own toolchain setup.
         workflow = (hosted.ROOT / ".github/workflows/perf.yml").read_text().split("  measure:", 1)[1].split("  autostart:", 1)[0]
         selection = workflow.index("--phase toolchain")
+        self.assertLess(workflow.index("jdx/mise-action"), selection)
         for consumer in ("cargo install", "Swatinem/rust-cache", "--phase build"):
             self.assertLess(selection, workflow.index(consumer))
         self.assertNotIn("PERF_CARGO", workflow)

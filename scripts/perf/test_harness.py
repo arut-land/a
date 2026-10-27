@@ -20,6 +20,42 @@ import evidence
 import process
 
 
+@unittest.skipUnless(sys.platform == "darwin", "requires native vmmap")
+class MemoryMaps(unittest.TestCase):
+    def test_executable_residency_matches_native_aliases_and_paths_with_spaces(self):
+        with tempfile.TemporaryDirectory(prefix="map paths ") as directory:
+            root = Path(directory).resolve()
+            binary = root / "cat with spaces"
+            shutil.copy("/bin/cat", binary)
+            # vmmap cannot inspect a copy that retains the system platform signature.
+            subprocess.run(["codesign", "--force", "--sign", "-", str(binary)],
+                           check=True, capture_output=True)
+            alias = root / "symlink with spaces"
+            alias.symlink_to(binary)
+            child = subprocess.Popen([str(alias)], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            try:
+                child.stdin.write(b"ready\n")
+                child.stdin.flush()
+                self.assertEqual(child.stdout.readline(), b"ready\n")
+                raw = subprocess.check_output(["vmmap", "-resident", str(child.pid)], text=True)
+                for executable in (binary, alias):
+                    result = process.vmmap_executable(raw, str(executable))
+                    self.assertGreater(result["executable_resident_bytes"], 0)
+                    self.assertGreater(result["executable_code_resident_bytes"], 0)
+                    self.assertEqual(result["executable"], str(binary))
+            finally:
+                child.terminate()
+                child.communicate(timeout=10)
+
+    def test_failed_attribution_retains_native_output_without_zero_residency(self):
+        # The process and diagnostic are real; only failed identification is injected.
+        with mock.patch.object(process, "vmmap_executable", side_effect=ValueError("unidentified image")):
+            result = process.memory_maps(os.getpid())
+        self.assertIn("Virtual Memory Map", result["vmmap"])
+        self.assertEqual(result["maps_error"], "unidentified image")
+        self.assertNotIn("executable_resident_bytes", result)
+
+
 class Sessions(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
