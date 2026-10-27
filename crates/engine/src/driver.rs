@@ -987,7 +987,7 @@ impl Live {
 struct Folding {
     core: Core,
     states: States,
-    snapshot: Option<Snapshot>,
+    snapshot: Option<u64>,
     has_input: bool,
     invocations: Invocations,
 }
@@ -1073,7 +1073,7 @@ impl Folding {
         }
         self.states.restore(&image.states)?;
         self.invocations = image.invocations;
-        self.snapshot = Some(snapshot.clone());
+        self.snapshot = Some(snapshot.covers);
         let core = Core::restore(Arc::clone(binding), image.ledger);
         self.core = core.with_barriers(shared.barriers);
         self.has_input = image.has_input;
@@ -1284,7 +1284,8 @@ impl Actor {
         let frames = Arc::clone(&self.live.frames);
         let pending: Vec<Entry> = self.pending_entries().collect();
         let registry = Arc::clone(&newest);
-        let snapshot = self.journal.fold_snapshot.clone();
+        let snapshot = self.journal.fold_snapshot;
+        let session = self.live.id;
         let boundary = self.core.ledger().seq();
         let live = self.live.session.state_view();
         let prepared = rt::unblock_with(
@@ -1296,6 +1297,7 @@ impl Actor {
                 let ((), mut folding) =
                     Folding::rebuild(&binding, &registry, &shared, |restore, each| {
                         let after = snapshot
+                            .and_then(|covers| shared.store.read_snapshot(session, covers))
                             .filter(|s| restore(s.clone()))
                             .map_or(0, |s| s.covers);
                         let mut seen = after;
