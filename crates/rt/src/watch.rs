@@ -162,6 +162,9 @@ struct Inbox {
     draining: bool,
 }
 
+// One root and its overlapping parent need no index selection.
+const DIRECT_SUBSCRIPTIONS: usize = 2;
+
 struct State {
     rt: Rt,
     me: Weak<Shared>,
@@ -170,6 +173,8 @@ struct State {
     next: u64,
     #[cfg(test)]
     routing_checks: usize,
+    #[cfg(test)]
+    index_selections: usize,
     native: native::Native,
 }
 
@@ -247,6 +252,8 @@ impl Hub {
                 next: 0,
                 #[cfg(test)]
                 routing_checks: 0,
+                #[cfg(test)]
+                index_selections: 0,
             }),
             inbox: Mutex::default(),
         }))
@@ -500,12 +507,19 @@ impl State {
 
     /// Something at `path` changed (`created`, a directory appeared there).
     fn changed(&mut self, path: &Path, created: bool, roots: &mut Vec<u64>) {
-        let ids = self.related(path);
+        let ids = if self.subs.len() <= DIRECT_SUBSCRIPTIONS {
+            None
+        } else {
+            #[cfg(test)]
+            {
+                self.index_selections += 1;
+            }
+            Some(self.related(path))
+        };
         let State {
             subs, native, rt, ..
         } = self;
-        for id in ids {
-            let sub = subs.get_mut(&id).expect("indexed");
+        let mut changed = |id, sub: &mut Sub| {
             #[cfg(test)]
             {
                 self.routing_checks += 1;
@@ -516,7 +530,7 @@ impl State {
                 || (sub.status == Status::Gone && path.starts_with(&sub.real))
             {
                 roots.push(id);
-                continue;
+                return;
             }
             // An entered directory that went is entered again only when
             // asked, as Linux's watch on it is gone.
@@ -524,13 +538,22 @@ impl State {
                 sub.entered.retain(|dir| !dir.starts_with(path));
             }
             let Some(reported) = sub.visible(path).then(|| sub.reported(path)).flatten() else {
-                continue;
+                return;
             };
             // Its directories are watched before it is told of them.
             if created && sub.scope == Scope::Tree && native.grow(id, sub, path).is_err() {
                 sub.limited(rt);
             }
             sub.out.push(Event::Changed(vec![reported]), rt);
+        };
+        if let Some(ids) = ids {
+            for id in ids {
+                changed(id, subs.get_mut(&id).expect("indexed"));
+            }
+        } else {
+            for (&id, sub) in subs.iter_mut() {
+                changed(id, sub);
+            }
         }
     }
 

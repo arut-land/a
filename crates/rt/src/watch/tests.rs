@@ -895,17 +895,17 @@ fn a_rearmed_alias_routes_only_its_current_target() {
         "the new target in the alias spelling",
         changed(&dir.path("alias/file")),
     );
-    let mut state = lock(&hub.0.state);
-    state.routing_checks = 0;
-    state.changed(&dir.path("first/file"), false, &mut Vec::new());
-    assert_eq!(state.routing_checks, 0, "the old target stayed indexed");
+    let state = lock(&hub.0.state);
+    assert!(
+        state.related(&dir.path("first/file")).is_empty(),
+        "the old target stayed indexed"
+    );
     drop(state);
     drop(sub);
-    let mut state = lock(&hub.0.state);
-    state.routing_checks = 0;
-    state.changed(&dir.path("second/file"), false, &mut Vec::new());
-    assert_eq!(
-        state.routing_checks, 0,
+    assert!(
+        lock(&hub.0.state)
+            .related(&dir.path("second/file"))
+            .is_empty(),
         "the dropped subscription stayed indexed"
     );
 }
@@ -994,4 +994,22 @@ fn failed_narrowing_keeps_coverage_without_blocking_new_subscriptions() {
     drop(bad);
     let file = dir.write("good/after");
     until(&events, "the narrowed stream", changed(&file));
+}
+
+#[test]
+fn one_root_and_its_parent_route_without_index_selection() {
+    for subscriptions in [1, 2] {
+        let dir = Dir::new();
+        fs::create_dir(dir.path("child")).unwrap();
+        let hub = hub();
+        let (_child, _) = subscribe(&hub, Watch::tree(dir.path("child")));
+        let _parent = (subscriptions == 2).then(|| subscribe(&hub, Watch::tree(&dir.base)));
+        let mut state = lock(&hub.0.state);
+        state.index_selections = 0;
+        state.changed(&dir.path("child/file"), false, &mut Vec::new());
+        assert_eq!(
+            state.index_selections, 0,
+            "{subscriptions} subscriptions used selection"
+        );
+    }
 }
