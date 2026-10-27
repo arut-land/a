@@ -363,7 +363,7 @@ async fn execute<D: crate::dialect::Dialect>(
     timeout: u64,
     input: &Command,
     cx: &Cx,
-    progress: Partials<String>,
+    mut progress: Partials<String>,
 ) -> io::Result<Ran> {
     let started = runtime(cx)?.now();
     let dir = cx.dir();
@@ -408,7 +408,7 @@ async fn execute<D: crate::dialect::Dialect>(
         limit: Duration::from_secs(limit),
         detached: &detached,
     };
-    let done = supervise::<D>(child, output, supervised, cx, &progress).await?;
+    let done = supervise::<D>(child, output, supervised, cx, &mut progress).await?;
     let ran = finish(cx, done, log, report, dir, limit).await?;
     Ok(Ran {
         duration_ms: duration_ms(started),
@@ -423,7 +423,7 @@ async fn resume<D: crate::dialect::Dialect>(
     detached: Detached,
     claimed: ext::Native,
     cx: &Cx,
-    progress: Partials<String>,
+    mut progress: Partials<String>,
 ) -> io::Result<Ran> {
     let Stream { file, open: log } = cx.blobs.reopen(cx.call, OUTPUT_CAP)?;
     let report = log.path().with_extension("cwd");
@@ -435,7 +435,7 @@ async fn resume<D: crate::dialect::Dialect>(
         log: log.path(),
         written,
     };
-    let done = supervise::<D>(child, output, Supervised::Resumed, cx, &progress).await?;
+    let done = supervise::<D>(child, output, Supervised::Resumed, cx, &mut progress).await?;
     let ran = finish(cx, done, log, report, detached.dir, 0).await?;
     Ok(Ran {
         duration_ms: now_ms().saturating_sub(detached.started),
@@ -873,7 +873,7 @@ async fn supervise<D: crate::dialect::Dialect>(
     Followed { log, written }: Followed<'_>,
     supervised: Supervised<'_>,
     cx: &Cx,
-    progress: &Partials<String>,
+    progress: &mut Partials<String>,
 ) -> io::Result<Finished> {
     let rt = runtime(cx)?;
     let start = rt.now();
@@ -922,7 +922,7 @@ async fn supervise<D: crate::dialect::Dialect>(
         if unreported && now >= reported + REPORT {
             unreported = false;
             if let Some(text) = live.take() {
-                progress.send(text);
+                progress.send(text).await;
                 reported = now;
             }
         }

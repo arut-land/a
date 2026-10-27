@@ -619,7 +619,7 @@ fn grep_never_exceeds_the_total_allowance_in_any_mode() {
                     limit,
                 },
                 &Cancel::default(),
-                |g| matches += g.matches.len(),
+                |g: Grepped| matches += g.matches.len(),
             ))
             .unwrap();
             assert_eq!(matches, limit, "{mode:?}, limit={limit}");
@@ -728,7 +728,7 @@ fn grep_streams_files_larger_than_ten_mebibytes_in_every_mode() {
                 limit: 1,
             },
             &Cancel::default(),
-            |g| hits.extend(g.matches),
+            |g: Grepped| hits.extend(g.matches),
         ))
         .unwrap();
         assert_eq!(summary.matches, 1, "{mode:?}");
