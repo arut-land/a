@@ -1621,7 +1621,7 @@ fn both_viewports_keep_complete_approval_input_before_summaries_and_controls() {
                     })
                     .unwrap(),
             );
-            let text = super::super::view::texts(app.rows(0, 120)).join("\n");
+            let text = super::super::view::texts(app.rows(0, 120).lines).join("\n");
             let reason = text.find("Why:").unwrap();
             let summary = text.find("Model summary (unverified):").unwrap();
             assert!(reason < summary && summary < text.find("Do you want to proceed?").unwrap());
@@ -1670,13 +1670,14 @@ fn a_retry_rewraps_multibyte_text_instead_of_reusing_byte_offsets() {
             },
         )],
     );
+    app.body = 30;
     for (attempt, text) in ["a\nold", "€new!", "€same", "€"].into_iter().enumerate() {
         app.fold(&DaemonMsg::Delta {
             call: CallId::new(1).unwrap(),
             attempt: u16::try_from(attempt).unwrap(),
             text: text.into(),
         });
-        let got = crate::view::texts(app.rows(0, 40));
+        let got = crate::view::texts(app.rows(0, 40).lines);
         let expected = if attempt == 0 {
             vec![String::new(), "⏺ a".to_owned(), "  old▍".to_owned()]
         } else {
@@ -1800,4 +1801,213 @@ fn invisible_items_do_not_own_cached_rows() {
     app.draw(100, 30);
     assert!(app.cache.is_empty());
     assert_eq!(app.view().items.len(), 256);
+}
+
+#[test]
+fn attaching_another_session_discards_recall_and_drafts() {
+    let (mut app, _) = app(Viewport::Full, &[]);
+    app.editor.insert("old input");
+    press(&mut app, Key::Enter);
+    app.editor.insert("old draft");
+    app.fold(&DaemonMsg::Attached {
+        session: SessionId::new(),
+        workspace: ws(),
+    });
+    assert!(app.editor.is_empty());
+    press(&mut app, Key::Up);
+    assert!(app.editor.is_empty());
+}
+
+#[test]
+fn one_visible_item_retains_only_the_viewports_rows() {
+    let (mut app, _) = app(
+        Viewport::Full,
+        &[entry(
+            1,
+            Body::Assistant {
+                text: "word ".repeat(1024 * 1024),
+            },
+        )],
+    );
+    frame(&mut app, 100, 30);
+    assert!(
+        app.cache
+            .values()
+            .map(|rows| rows.lines.len())
+            .sum::<usize>()
+            <= usize::from(app.body)
+    );
+}
+
+#[test]
+fn recall_borrows_committed_input_and_restores_a_draft() {
+    let (mut app, _) = app(Viewport::Full, &[]);
+    for (seq, text) in [(1, "first"), (2, "second")] {
+        app.editor.insert(text);
+        let Some(Effect::Cmd(cmd)) = press(&mut app, Key::Enter) else {
+            panic!("input must submit")
+        };
+        app.command(cmd);
+        assert_eq!(app.client.pending_inputs().count(), 1);
+        app.fold(&entry(
+            seq,
+            Body::Input {
+                segments: text.into(),
+                mode: protocol::Mode::Queue,
+                taken: true,
+                origin: None,
+                force: false,
+            },
+        ));
+        app.fold(&DaemonMsg::Ack { client_seq: seq });
+        assert_eq!(app.client.pending_inputs().count(), 0);
+    }
+    app.editor.insert("draft");
+    press(&mut app, Key::Up);
+    assert_eq!(app.editor.text(), "second");
+    press(&mut app, Key::Up);
+    assert_eq!(app.editor.text(), "first");
+    press(&mut app, Key::Down);
+    press(&mut app, Key::Down);
+    assert_eq!(app.editor.text(), "draft");
+}
+
+#[test]
+fn equal_pending_input_is_retained_until_a_new_daemon_fact_owns_it() {
+    let (mut app, _) = app(
+        Viewport::Full,
+        &[entry(
+            1,
+            Body::Input {
+                segments: "same".into(),
+                mode: protocol::Mode::Queue,
+                taken: true,
+                origin: None,
+                force: false,
+            },
+        )],
+    );
+    app.editor.insert("same");
+    let Some(Effect::Cmd(cmd)) = press(&mut app, Key::Enter) else {
+        panic!("input must submit")
+    };
+    app.command(cmd);
+    app.fold(&DaemonMsg::Activity {
+        seq: 1,
+        activity: Activity::Idle,
+    });
+    assert_eq!(app.client.pending_inputs().count(), 1);
+    app.fold(&entry(
+        2,
+        Body::Input {
+            segments: "same".into(),
+            mode: protocol::Mode::Queue,
+            taken: false,
+            origin: None,
+            force: false,
+        },
+    ));
+    app.fold(&DaemonMsg::Ack { client_seq: 1 });
+    assert_eq!(app.client.pending_inputs().count(), 0);
+    press(&mut app, Key::Up);
+    assert_eq!(app.editor.text(), "same");
+}
+
+#[test]
+#[ignore = "a release measurement"]
+fn large_stream_frame_cost() {
+    let model = CallId::new(1).unwrap();
+    let (mut app, _) = app(
+        Viewport::Full,
+        &[entry(
+            1,
+            Body::ModelCall {
+                request: None,
+                model: "m".into(),
+                attempt: 0,
+                choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: None,
+            },
+        )],
+    );
+    let term = Term::default();
+    let mut screen = Screen::new(Viewport::Full, term.clone());
+    let chunk = "plain **bold** `code` words here ".repeat(128);
+    let mut frames = Vec::new();
+    let mut bytes = 0;
+    while bytes < 5 * 1024 * 1024 {
+        app.fold(&DaemonMsg::Delta {
+            call: model,
+            text: chunk.clone(),
+            attempt: 0,
+        });
+        let started = std::time::Instant::now();
+        screen.draw(&mut app, (100, 30)).unwrap();
+        frames.push(started.elapsed().as_nanos());
+        term.take();
+        bytes += chunk.len();
+    }
+    frames.sort_unstable();
+    println!(
+        "frame_cost {}",
+        serde_json::json!({
+            "bytes": bytes, "frames": frames.len(), "min_ns": frames[0],
+            "median_ns": frames[frames.len()/2], "p95_ns": frames[frames.len()*95/100],
+            "max_ns": frames[frames.len()-1], "total_ns": frames.iter().sum::<u128>()
+        })
+    );
+}
+
+#[test]
+fn opening_a_new_session_hides_the_previous_queue_before_attach() {
+    let (mut app, _) = app(
+        Viewport::Full,
+        &[entry(
+            1,
+            Body::Input {
+                segments: "old queue".into(),
+                mode: protocol::Mode::Queue,
+                taken: false,
+                origin: None,
+                force: false,
+            },
+        )],
+    );
+    app.command(Cmd::Open(Target::New));
+    press(&mut app, Key::Up);
+    assert!(app.editor.is_empty());
+}
+
+#[test]
+fn recall_uses_the_command_item_after_it_replaces_user_text() {
+    let (mut app, _) = app(
+        Viewport::Full,
+        &[
+            entry(
+                1,
+                Body::Input {
+                    segments: "/model fast".into(),
+                    mode: protocol::Mode::Queue,
+                    taken: true,
+                    origin: None,
+                    force: false,
+                },
+            ),
+            entry(
+                2,
+                Body::ToolCall {
+                    invoke: None,
+                    tool: "model".into(),
+                    input: Json::encode(&json!({"args": "fast"})).unwrap(),
+                    id: None,
+                    card: None,
+                    by: Audience::User,
+                },
+            ),
+        ],
+    );
+    assert_eq!(app.view().items.len(), 1);
+    press(&mut app, Key::Up);
+    assert_eq!(app.editor.text(), "/model fast");
 }
