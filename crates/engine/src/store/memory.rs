@@ -159,6 +159,13 @@ impl LogStore for Memory {
         Ok(headers)
     }
 
+    fn read_snapshot(&self, id: SessionId, covers: u64) -> Option<Snapshot> {
+        lock(&self.shared(id).ok()?.snapshot)
+            .as_ref()
+            .filter(|snapshot| snapshot.covers == covers)
+            .cloned()
+    }
+
     fn load(
         &self,
         id: SessionId,

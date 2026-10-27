@@ -191,6 +191,10 @@ impl LogStore for Faulty {
         self.inner.headers()
     }
 
+    fn read_snapshot(&self, id: SessionId, covers: u64) -> Option<Snapshot> {
+        self.inner.read_snapshot(id, covers)
+    }
+
     fn load(
         &self,
         id: SessionId,

@@ -348,6 +348,14 @@ pub trait LogStore: Send + Sync {
         each: &mut dyn FnMut(Entry),
     ) -> io::Result<Loaded>;
 
+    /// Reads the checkpoint previously kept or accepted for this session's
+    /// `covers`. Missing, corrupt or replaced checkpoints return `None` so
+    /// reconstruction can fold the log instead. This does not validate a
+    /// log prefix or acquire a writer's lease, unlike [`LogStore::load`].
+    fn read_snapshot(&self, _id: SessionId, _covers: u64) -> Option<Snapshot> {
+        None
+    }
+
     /// One session's committed entries, read without taking its lease: its
     /// writer goes on appending.
     #[cfg(test)]
