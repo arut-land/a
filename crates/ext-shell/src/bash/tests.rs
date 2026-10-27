@@ -854,7 +854,7 @@ fn continuous_output_yields_to_other_sessions() {
         let observed = &advanced;
         let cx = &cx;
         let log = &log;
-        let mut work = ext::stream(|progress| async move {
+        let mut work = ext::stream(|mut progress| async move {
             let detached = Detached {
                 dir: cx.dir(),
                 started: 0,
@@ -868,7 +868,7 @@ fn continuous_output_yields_to_other_sessions() {
                 Followed { log, written },
                 supervised,
                 cx,
-                &progress,
+                &mut progress,
             )
             .await
             .unwrap();
@@ -1018,7 +1018,7 @@ fn a_quiet_group_ending_wakes_supervision_without_a_timer() {
         assert!(process.wait().await.unwrap().success());
         assert!(process.alive(), "the quiet descendant must still be gated");
         let cx = &cx;
-        let mut work = ext::stream(|progress| async move {
+        let mut work = ext::stream(|mut progress| async move {
             let detached = Detached {
                 dir: cx.dir(),
                 started: 0,
@@ -1031,7 +1031,7 @@ fn a_quiet_group_ending_wakes_supervision_without_a_timer() {
                     detached: &detached,
                 },
                 cx,
-                &progress,
+                &mut progress,
             )
             .await
             .unwrap();

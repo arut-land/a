@@ -16,6 +16,7 @@
 //! grep reads every file.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1298,13 +1299,14 @@ impl WorkspaceIndex {
 
     /// Greps the workspace for `query`, each file's matches given to
     /// `found` as its chunk is read, up to its limit or until `cancel`,
-    /// which is checked between chunks. Dropping the future stops the jobs
+    /// which is checked between chunks. Delivery is awaited before advancing.
+    /// Dropping the future stops the jobs
     /// it started at their next file.
     pub async fn grep(
         &self,
         query: GrepQuery,
         cancel: &Cancel,
-        mut found: impl FnMut(Grepped) + Send,
+        mut found: impl GrepSink,
     ) -> Result<GrepSummary, String> {
         if query.limit == 0 {
             return Ok(GrepSummary {
@@ -1343,7 +1345,7 @@ impl WorkspaceIndex {
 
     async fn grep_files(
         &self,
-        run: &mut Run<'_, impl FnMut(Grepped) + Send>,
+        run: &mut Run<'_, impl GrepSink>,
         parsed: &FFFQuery<'_>,
         grep: &Arc<Grep>,
     ) -> Result<GrepSummary, String> {
@@ -1399,7 +1401,7 @@ impl WorkspaceIndex {
                 grepped.matches.truncate(limit - summary.matches);
                 summary.matched_files += 1;
                 summary.matches += grepped.matches.len();
-                (run.found)(grepped);
+                run.found.found(grepped).await;
                 if summary.matches >= limit {
                     summary.stopped = Some(Stopped::AtLimit);
                     return Ok(summary);
@@ -1407,6 +1409,18 @@ impl WorkspaceIndex {
             }
         }
         Ok(summary)
+    }
+}
+
+/// Receives each file's matches before grep advances to the next file.
+pub trait GrepSink: Send {
+    /// Delivers one file's matches, suspending grep until accepted.
+    fn found(&mut self, file: Grepped) -> impl Future<Output = ()> + Send;
+}
+
+impl<F: FnMut(Grepped) + Send> GrepSink for F {
+    async fn found(&mut self, file: Grepped) {
+        self(file);
     }
 }
 
@@ -1866,6 +1880,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grep_waits_for_each_delivery_before_advancing() {
+        struct Paused {
+            seen: Arc<AtomicUsize>,
+            entered: ext::Flag,
+            resume: ext::Flag,
+        }
+        impl GrepSink for Paused {
+            fn found(&mut self, _: Grepped) -> impl Future<Output = ()> + Send {
+                self.seen.fetch_add(1, Ordering::Relaxed);
+                self.entered.set();
+                self.resume.wait()
+            }
+        }
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        for i in 0..100 {
+            std::fs::write(root.join(format!("{i}.txt")), "needle").unwrap();
+        }
+        let rt: Rt = Arc::new(rt::Threads::new(2));
+        let indexes = Indexes::new(Limits::default());
+        let index = indexes.open(&root, Arc::clone(&rt), Arc::new(Hub::new(Arc::clone(&rt))));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let entered = ext::Flag::default();
+        let resume = ext::Flag::default();
+        let cancel = Cancel::default();
+        let work = index.grep(
+            GrepQuery {
+                pattern: Pattern::Typed("needle".into()),
+                options: GrepOptions::default(),
+                limit: usize::MAX,
+            },
+            &cancel,
+            Paused {
+                seen: Arc::clone(&seen),
+                entered: entered.clone(),
+                resume: resume.clone(),
+            },
+        );
+        rt::block_on(rt::or(
+            async {
+                let (summary, ()) = rt::zip(work, async {
+                    entered.wait().await;
+                    assert_eq!(seen.load(Ordering::Relaxed), 1);
+                    resume.set();
+                })
+                .await;
+                assert_eq!(summary.unwrap().matches, 100);
+                assert_eq!(seen.load(Ordering::Relaxed), 100);
+            },
+            async {
+                rt.sleep(Duration::from_secs(10)).await;
+                panic!("grep did not reach or resume its paced sink");
+            },
+        ));
+    }
+
+    #[test]
     fn unused_index_configuration_holds_no_open_or_resting_store() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap().join("ws");
@@ -1986,11 +2060,14 @@ mod tests {
                 limit: usize::MAX,
             };
             let mut filtered = Vec::new();
-            rt::block_on(index.grep(query.clone(), &Cancel::default(), |g| filtered.push(g.path)))
-                .unwrap();
+            rt::block_on(index.grep(query.clone(), &Cancel::default(), |g: Grepped| {
+                filtered.push(g.path);
+            }))
+            .unwrap();
             index.state().content = Content::Refused;
             let mut scanned = Vec::new();
-            rt::block_on(index.grep(query, &Cancel::default(), |g| scanned.push(g.path))).unwrap();
+            rt::block_on(index.grep(query, &Cancel::default(), |g: Grepped| scanned.push(g.path)))
+                .unwrap();
             filtered.sort();
             scanned.sort();
             assert_eq!(filtered, scanned);
@@ -2120,7 +2197,7 @@ mod tests {
                 limit: 10,
             },
             &Cancel::default(),
-            |hit| hits.push(hit.path),
+            |hit: Grepped| hits.push(hit.path),
         ))
         .unwrap();
         assert_eq!(hits, ["racy.txt"]);
@@ -2173,7 +2250,7 @@ mod tests {
                 limit: 10,
             },
             &Cancel::default(),
-            |hit| hits.push(hit.path),
+            |hit: Grepped| hits.push(hit.path),
         ))
         .unwrap();
         hits.sort();

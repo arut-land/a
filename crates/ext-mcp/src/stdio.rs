@@ -13,6 +13,7 @@ pub(crate) struct Client {
     child: OwnedProcess,
     active: Arc<AtomicBool>,
     pending: Vec<u8>,
+    scanned: usize,
     scratch: Box<[u8; 8192]>,
     next: u64,
     inflight: Option<u64>,
@@ -109,6 +110,7 @@ impl Client {
             child,
             active,
             pending: Vec::new(),
+            scanned: 0,
             scratch: Box::new([0; 8192]),
             next: 0,
             inflight: None,
@@ -167,18 +169,25 @@ impl Client {
 
     async fn read(&mut self) -> Result<(Value, usize), Failure> {
         loop {
-            if let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+            if let Some(end) = self.pending[self.scanned..]
+                .iter()
+                .position(|b| *b == b'\n')
+            {
+                let end = self.scanned + end;
                 if end > rpc::LIMIT {
                     return Err(Failure::Limit);
                 }
                 let value = serde_json::from_slice(&self.pending[..end])
                     .map_err(|e| Failure::Protocol(e.to_string()))?;
-                self.pending.drain(..=end);
+                // Keep only unread bytes, not the completed message's allocation.
+                self.pending = self.pending[end + 1..].to_vec();
+                self.scanned = 0;
                 return Ok((value, end + 1));
             }
             if self.pending.len() > rpc::LIMIT {
                 return Err(Failure::Limit);
             }
+            self.scanned = self.pending.len();
             let n = self
                 .child
                 .output
@@ -231,6 +240,73 @@ mod tests {
                 .unwrap(),
         );
         (mcp, rig, server)
+    }
+
+    #[test]
+    fn completed_frames_release_storage_and_keep_adjacent_messages() {
+        let (mcp, rig, mut server) = fixture("frame-storage");
+        let Transport::Stdio(argv) = &mut server.transport else {
+            unreachable!()
+        };
+        *argv.last_mut().unwrap() =
+            r#"printf '\"'; printf '%0900000d' 0; printf '\"\n{\"next\":true}\n'; read -r line"#
+                .into();
+        rt::block_on(async {
+            let mut client = Client::start(&server, &rig.cx(), Arc::downgrade(&mcp.0))
+                .await
+                .unwrap();
+            let (value, bytes) = client.read().await.unwrap();
+            assert_eq!(value.as_str().unwrap().len(), 900_000);
+            assert_eq!(bytes, 900_003);
+            assert!(client.pending.capacity() <= client.scratch.len());
+            let (value, bytes) = client.read().await.unwrap();
+            assert_eq!(value, json!({"next":true}));
+            assert_eq!(bytes, 14);
+            assert_eq!(client.pending.capacity(), 0);
+        });
+    }
+
+    #[test]
+    fn cancelling_a_read_preserves_the_fragment_and_scan_cursor() {
+        use std::task::Poll;
+
+        let (mcp, rig, mut server) = fixture("frame-cancel");
+        let Transport::Stdio(argv) = &mut server.transport else {
+            unreachable!()
+        };
+        *argv.last_mut().unwrap() =
+            r#"printf '\"fragment'; read -r line; printf 'ed\"\n'; read -r line"#.into();
+        rt::block_on(async {
+            let mut client = Client::start(&server, &rig.cx(), Arc::downgrade(&mcp.0))
+                .await
+                .unwrap();
+            while client.pending.is_empty() {
+                {
+                    let mut read = std::pin::pin!(client.read());
+                    std::future::poll_fn(|cx| {
+                        assert!(read.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                rt::Reactor::AsyncIo.sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(client.pending, b"\"fragment");
+            assert_eq!(client.scanned, client.pending.len());
+            client
+                .child
+                .input
+                .as_ref()
+                .unwrap()
+                .write(b"continue\n")
+                .await
+                .unwrap();
+            let (value, bytes) = client.read().await.unwrap();
+            assert_eq!(value, json!("fragmented"));
+            assert_eq!(bytes, 13);
+            assert_eq!(client.pending.capacity(), 0);
+            assert_eq!(client.scanned, 0);
+        });
     }
 
     const ENV_OUT: &str = "A_TEST_MCP_ENV_OUT";
