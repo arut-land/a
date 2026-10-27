@@ -180,23 +180,47 @@ impl Frames {
 /// ready at a time, up to [`WRITE_BATCH`] bytes: the client's cursor into
 /// what it is sent, moved on as the socket takes it.
 async fn write_out(io: Arc<Async<Stream>>, outbox: Outbox, rt: rt::Rt) {
-    let mut batch = Vec::new();
+    let mut writer = Writer {
+        io,
+        batch: Vec::new(),
+    };
     while let Some(frame) = outbox.next(&*rt).await {
-        batch.extend_from_slice(frame.as_bytes());
-        while batch.len() < WRITE_BATCH
-            && let Some(frame) = outbox.try_ready()
-        {
-            batch.extend_from_slice(frame.as_bytes());
-        }
-        if io.write_all(&batch).await.is_err() {
+        if writer.write(frame, &outbox).await.is_err() {
             outbox.abandon();
-            let _ = io.get_ref().shutdown(std::net::Shutdown::Both);
+            let _ = writer.io.get_ref().shutdown(std::net::Shutdown::Both);
             return;
         }
-        batch.clear();
         rt::yield_now().await;
     }
-    let _ = io.get_ref().shutdown(std::net::Shutdown::Both);
+    let _ = writer.io.get_ref().shutdown(std::net::Shutdown::Both);
+}
+
+struct Writer {
+    io: Arc<Async<Stream>>,
+    batch: Vec<u8>,
+}
+
+impl Writer {
+    async fn write(&mut self, first: Frame, outbox: &Outbox) -> io::Result<()> {
+        let next = if first.as_bytes().len() < WRITE_BATCH {
+            outbox.try_ready()
+        } else {
+            None
+        };
+        let Some(next) = next else {
+            return self.io.write_all(first.as_bytes()).await;
+        };
+        self.batch.extend_from_slice(first.as_bytes());
+        self.batch.extend_from_slice(next.as_bytes());
+        while self.batch.len() < WRITE_BATCH
+            && let Some(frame) = outbox.try_ready()
+        {
+            self.batch.extend_from_slice(frame.as_bytes());
+        }
+        // Only the in-flight write owns scratch; an idle writer retains none.
+        let batch = std::mem::take(&mut self.batch);
+        self.io.write_all(&batch).await
+    }
 }
 
 /// How a connection reached the daemon: its endpoint, the one way in, which
@@ -798,12 +822,7 @@ mod tests {
     use rt::Runtime as _;
     use std::io::Write;
 
-    #[test]
-    fn incoming_frames_keep_only_received_bytes_and_yield_between_batches() {
-        let root =
-            std::env::temp_dir().join(format!("a-server-overload-{}", protocol::SessionId::new()));
-        std::fs::create_dir_all(&root).unwrap();
-        let home = sys::Home::from(root.clone());
+    fn connection(home: &sys::Home) -> (std::fs::File, Listener, Stream, Stream) {
         std::fs::create_dir_all(home.run_dir()).unwrap();
         let owner = std::fs::File::options()
             .read(true)
@@ -820,6 +839,14 @@ mod tests {
         let listener = home.bind().unwrap();
         let peer = home.endpoint().connect().unwrap();
         let stream = listener.accept().unwrap();
+        (owner, listener, peer, stream)
+    }
+
+    #[test]
+    fn incoming_frames_keep_only_received_bytes_and_yield_between_batches() {
+        let root = tempfile::tempdir().unwrap();
+        let home = sys::Home::from(root.path().to_path_buf());
+        let (_owner, listener, peer, stream) = connection(&home);
         let runtime = rt::Threads::new(1);
         let mut frames = Frames::new(Arc::new(Async::new(&runtime.reactor(), stream).unwrap()));
         ClientMsg::Detach.write_frame(&mut &peer).unwrap();
@@ -873,6 +900,53 @@ mod tests {
         drop(peer);
         drop(listener);
         home.endpoint().remove();
-        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn idle_writers_retain_no_batch_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let home = sys::Home::from(root.path().to_path_buf());
+        let (_owner, listener, peer, stream) = connection(&home);
+        let runtime = rt::Threads::new(1);
+        let io = Arc::new(Async::new(&runtime.reactor(), stream).unwrap());
+        let outbox = Outbox::new();
+        let first = Frame::new(&DaemonMsg::Error {
+            message: "a".repeat(14 << 10),
+        })
+        .unwrap();
+        let second = Frame::new(&DaemonMsg::Error {
+            message: "b".repeat(14 << 10),
+        })
+        .unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut reader = io::BufReader::new(&peer);
+            for expected in ['a', 'b', 'a'] {
+                assert!(
+                    matches!(protocol::read_frame::<DaemonMsg>(&mut reader).unwrap(),
+                    Some(DaemonMsg::Error { message }) if message == expected.to_string().repeat(14 << 10))
+                );
+            }
+        });
+        let mut writer = Writer {
+            io,
+            batch: Vec::new(),
+        };
+        outbox.send(second).unwrap();
+        rt::block_on(writer.write(first.clone(), &outbox)).unwrap();
+        assert_eq!(
+            writer.batch.capacity(),
+            0,
+            "coalesced scratch survived its write"
+        );
+        rt::block_on(writer.write(first, &outbox)).unwrap();
+        assert_eq!(
+            writer.batch.capacity(),
+            0,
+            "a single frame retained scratch"
+        );
+        reader.join().unwrap();
+        drop(writer);
+        drop(listener);
+        home.endpoint().remove();
     }
 }
