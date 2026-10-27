@@ -266,6 +266,26 @@ impl Rows<'_> {
 /// rest after `rest`. Leading spaces are kept (indentation); spaces a wrap
 /// lands on are dropped.
 pub fn wrap(spans: &[Span], width: usize, first: &[Span], rest: &[Span]) -> Vec<Line> {
+    wrap_checkpoints(spans, width, first, rest, |_| {})
+}
+
+/// A source position at a display-row boundary. The caller can retain
+/// earlier rows once the markup before this position is stable.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Checkpoint {
+    pub span: usize,
+    pub byte: usize,
+    pub rows: usize,
+    pub word_start: bool,
+}
+
+pub(super) fn wrap_checkpoints(
+    spans: &[Span],
+    width: usize,
+    first: &[Span],
+    rest: &[Span],
+    mut checkpoint: impl FnMut(Checkpoint),
+) -> Vec<Line> {
     let rest_w: usize = rest.iter().map(|s| width_of(&s.text)).sum();
     let mut out = Rows {
         lines: vec![Line::from(first)],
@@ -277,41 +297,55 @@ pub fn wrap(spans: &[Span], width: usize, first: &[Span], rest: &[Span]) -> Vec<
     let mut start = col;
     // The spans the spaces before a word came from, and the word's pieces.
     let mut spaces: Vec<&Span> = Vec::new();
-    let mut word: Vec<(&Span, &str)> = Vec::new();
-    let mut place = |out: &mut Rows, spaces: &mut Vec<&Span>, word: &mut Vec<(&Span, &str)>| {
-        let ww: usize = word.iter().map(|(_, text)| width_of(text)).sum();
-        let at_start = col == start;
-        if !at_start && col + spaces.len() + ww > width {
-            out.newline();
-            col = rest_w;
-            start = col;
-            spaces.clear();
-        } else if at_start && out.lines.len() > 1 {
-            spaces.clear();
-        }
-        for space in spaces.drain(..) {
-            if col < width {
-                out.push(space, " ");
-                col += 1;
+    let mut word: Vec<(usize, &Span, &str)> = Vec::new();
+    let mut place =
+        |out: &mut Rows, spaces: &mut Vec<&Span>, word: &mut Vec<(usize, &Span, &str)>| {
+            let ww: usize = word.iter().map(|(_, _, text)| width_of(text)).sum();
+            let at_start = col == start;
+            if !at_start && col + spaces.len() + ww > width {
+                let (span, from, text) = word[0];
+                checkpoint(Checkpoint {
+                    span,
+                    byte: text.as_ptr().addr() - from.text.as_ptr().addr(),
+                    rows: out.lines.len(),
+                    word_start: true,
+                });
+                out.newline();
+                col = rest_w;
+                start = col;
+                spaces.clear();
+            } else if at_start && out.lines.len() > 1 {
+                spaces.clear();
             }
-        }
-        for (span, text) in word.drain(..) {
-            let mut from = 0;
-            for (i, ch) in text.char_indices() {
-                let cw = usize::from(char_width(ch));
-                if col + cw > width && col > start {
-                    out.push(span, &text[from..i]);
-                    from = i;
-                    out.newline();
-                    col = rest_w;
-                    start = col;
+            for space in spaces.drain(..) {
+                if col < width {
+                    out.push(space, " ");
+                    col += 1;
                 }
-                col += cw;
             }
-            out.push(span, &text[from..]);
-        }
-    };
-    for span in spans {
+            for (index, span, text) in word.drain(..) {
+                let mut from = 0;
+                for (i, ch) in text.char_indices() {
+                    let cw = usize::from(char_width(ch));
+                    if col + cw > width && col > start {
+                        out.push(span, &text[from..i]);
+                        from = i;
+                        checkpoint(Checkpoint {
+                            span: index,
+                            byte: text.as_ptr().addr() - span.text.as_ptr().addr() + i,
+                            rows: out.lines.len(),
+                            word_start: false,
+                        });
+                        out.newline();
+                        col = rest_w;
+                        start = col;
+                    }
+                    col += cw;
+                }
+                out.push(span, &text[from..]);
+            }
+        };
+    for (index, span) in spans.iter().enumerate() {
         let text = span.text.as_str();
         let mut from = 0;
         for (i, ch) in text.char_indices() {
@@ -319,7 +353,7 @@ pub fn wrap(spans: &[Span], width: usize, first: &[Span], rest: &[Span]) -> Vec<
                 continue;
             }
             if i > from {
-                word.push((span, &text[from..i]));
+                word.push((index, span, &text[from..i]));
             }
             if !word.is_empty() {
                 place(&mut out, &mut spaces, &mut word);
@@ -328,7 +362,7 @@ pub fn wrap(spans: &[Span], width: usize, first: &[Span], rest: &[Span]) -> Vec<
             from = i + 1;
         }
         if from < text.len() {
-            word.push((span, &text[from..]));
+            word.push((index, span, &text[from..]));
         }
     }
     if !word.is_empty() {
