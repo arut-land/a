@@ -19,6 +19,11 @@ from pathlib import Path
 import statistics
 import subprocess
 import sys
+import tempfile
+import threading
+import time
+
+from process import snapshot
 
 TEST = "tests::runtime_demand::concurrent_active_sessions"
 MEMORY = ["peak_kib", "idle_footprint_kib", "release_ms", "released_rss_kib", "released_footprint_kib",
@@ -144,6 +149,8 @@ def trips_table(trips):
 
 
 def execute(command, env, timeout=300):
+    if env.get("A_PERF_OBSERVER") == "1":
+        return observed_execute(command, env, timeout)
     try:
         result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=timeout)
         return result.stdout, result.stderr, f"exit {result.returncode}" if result.returncode else None
@@ -153,6 +160,57 @@ def execute(command, env, timeout=300):
         return out, err, "timed out"
     except OSError as error:
         return "", str(error), "could not execute"
+
+
+def observed_execute(command, env, timeout):
+    """Account from the parent: the measured process never launches its sampler."""
+    with tempfile.TemporaryFile(mode="w+") as out:
+        try:
+            child = subprocess.Popen(command, env=env, stdin=subprocess.PIPE, stdout=out,
+                                     stderr=subprocess.PIPE, text=True)
+        except OSError as error:
+            return "", str(error), "could not execute"
+        errors = []
+        def observe():
+            try:
+                for line in child.stderr:
+                    if line.strip() in ("perf-snapshot", "perf-idle"):
+                        record = snapshot(child.pid, threads=True)
+                        if line.strip() == "perf-idle":
+                            started = time.monotonic()
+                            time.sleep(float(env.get("A_PERF_IDLE_SECONDS", "5")))
+                            record = dict(before=record, after=snapshot(child.pid, threads=True),
+                                          seconds=time.monotonic() - started)
+                        child.stdin.write(json.dumps(record) + "\n")
+                        child.stdin.flush()
+                    else:
+                        errors.append(line)
+            except Exception as error:
+                errors.append(f"external observer failed: {error}\n")
+                child.kill()
+        observer = threading.Thread(target=observe, daemon=True)
+        observer.start()
+        failed = None
+        try:
+            child.wait(timeout=timeout)
+            failed = f"exit {child.returncode}" if child.returncode else None
+        except subprocess.TimeoutExpired:
+            import psutil
+            owner = psutil.Process(child.pid)
+            for process in reversed(owner.children(recursive=True)):
+                try:
+                    process.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            child.kill()
+            child.wait()
+            failed = "timed out"
+        finally:
+            observer.join(timeout=10)
+            child.stdin.close()
+            child.stderr.close()
+        out.seek(0)
+        return out.read(), "".join(errors), failed
 
 
 def table(summary):
@@ -221,7 +279,7 @@ def main(argv=None):
                 print("round trip", round, f"p50={trip['p50_us']}us p99={trip['p99_us']}us", flush=True)
         for sessions in counts:
             for label, runtime, extra, built in order:
-                env = dict(os.environ, **extra, A_BENCH_RUNTIME=runtime, A_BENCH_SESSIONS=str(sessions),
+                env = dict(os.environ, **extra, A_PERF_OBSERVER="1", A_BENCH_RUNTIME=runtime, A_BENCH_SESSIONS=str(sessions),
                            A_BENCH_TURNS=str(args.turns), A_BENCH_PACE_MS=str(args.pace_ms))
                 out, err, failed = execute(
                     [str(binaries[built] if built else args.binary), TEST, "--exact", "--ignored", "--nocapture", "--test-threads=1"],
@@ -239,6 +297,12 @@ def main(argv=None):
                 line = next(line for line in out.splitlines() if '{"' in line)
                 record = json.loads(line[line.index('{"'):])
                 record.update(label=label, round=round)
+                if record.get("failed_calls", 0):
+                    failure = dict(label=label, runtime=runtime, sessions=sessions, round=round,
+                                   failed=f"{record['failed_calls']} failed calls", stdout=out, stderr=err)
+                    failures.append(failure)
+                    with (args.output / "failures.jsonl").open("a") as stream:
+                        stream.write(json.dumps(failure) + "\n")
                 records.append(record)
                 with raw.open("a") as stream:
                     stream.write(json.dumps(record) + "\n")

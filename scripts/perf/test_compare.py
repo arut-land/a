@@ -113,7 +113,8 @@ class Comparison(unittest.TestCase):
                 binary.parent.mkdir(parents=True)
                 binary.touch()
                 def run(arguments, **kwargs):
-                    return mock.Mock(stdout=json.dumps(dict(executable=str(binary), profile=dict(test=True))))
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps(dict(
+                        executable=str(binary), profile=dict(test=True))), "")
                 with mock.patch.object(sys, "argv", ["build-variant", "z", "--output", directory, "--tests", *selection]), \
                      mock.patch.object(task.subprocess, "run", side_effect=run) as cargo, \
                      mock.patch.object(task.subprocess, "check_output", side_effect=[b"", "revision"]):

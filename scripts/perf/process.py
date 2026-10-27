@@ -8,11 +8,19 @@ import psutil
 def snapshot(pid, threads=False):
     process = psutil.Process(pid)
     cpu = process.cpu_times()
+    memory = process.memory_info()
     result = {"rss_kib": process.memory_info().rss / 1024,
               "cpu_seconds": cpu.user + cpu.system,
               "user_seconds": cpu.user, "kernel_seconds": cpu.system,
               "thread_count": process.num_threads(),
               "ctx_switches": switches(process)}
+    for field in ("pfaults", "pageins", "num_page_faults"):
+        if hasattr(memory, field):
+            result[field] = getattr(memory, field)
+    if sys.platform == "linux":
+        from pathlib import Path
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        result.update(minor_faults=int(fields[7]), major_faults=int(fields[9]))
     try:
         result.update(memory_peaks(pid, process))
     except (OSError, AttributeError):
@@ -22,6 +30,90 @@ def snapshot(pid, threads=False):
         result["threads"] = [dict(id=t.id, user_seconds=t.user_time, kernel_seconds=t.system_time)
                              for t in process.threads()]
     return result
+
+
+def memory_maps(pid):
+    """Diagnostic only: region size and residency have separate units/fields."""
+    process = psutil.Process(pid)
+    if sys.platform == "darwin":
+        import subprocess
+        result = subprocess.run(["vmmap", "-resident", str(pid)], capture_output=True,
+                                text=True, timeout=30, check=True)
+        return dict(source="vmmap -resident (rounded native region columns)", vmmap=result.stdout,
+                    **vmmap_executable(result.stdout, process.exe()))
+    maps = [m._asdict() for m in process.memory_maps(grouped=False)]
+    if sys.platform == "win32":
+        for region in maps:
+            region["mapped_bytes"] = region.pop("rss")
+        windows_residency(pid, maps)
+    return dict(source="QueryWorkingSetEx" if sys.platform == "win32" else "smaps",
+                maps=maps, executable=process.exe(),
+                executable_resident_bytes=sum(m.get("resident_bytes", m.get("rss", 0)) for m in maps
+                                              if m["path"] == process.exe()),
+                executable_code_resident_bytes=sum(m.get("resident_bytes", m.get("rss", 0)) for m in maps
+                    if m["path"] == process.exe() and "x" in m.get("perms", "")))
+
+
+def vmmap_executable(text, executable):
+    import re
+    from pathlib import Path
+    executable = str(Path(executable).resolve())
+    mapped, resident, code = [], [], []
+    for line in text.splitlines():
+        if not line.endswith(" " + executable):
+            continue
+        match = re.match(r"(\S+)\s+[0-9a-f]+-[0-9a-f]+\s+\[\s*([\d.]+[BKMG]?)\s+([\d.]+[BKMG]?)", line)
+        if match is None:
+            continue
+        region, virtual, physical = match.groups()
+        def size(value):
+            scale = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+            return float(value[:-1]) * scale[value[-1]] if value[-1] in scale else float(value)
+        mapped.append(size(virtual))
+        resident.append(size(physical))
+        if region == "__TEXT":
+            code.append(size(physical))
+    if not resident:
+        raise ValueError(f"vmmap did not identify the executable {executable}")
+    return dict(executable=executable, executable_mapped_bytes=sum(mapped),
+                executable_resident_bytes=sum(resident), executable_code_resident_bytes=sum(code))
+
+
+def windows_residency(pid, maps):
+    import ctypes
+    from ctypes import wintypes
+    import mmap
+
+    class Page(ctypes.Structure):
+        _fields_ = [("address", ctypes.c_void_p), ("flags", ctypes.c_size_t)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    psapi.QueryWorkingSetEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+    psapi.QueryWorkingSetEx.restype = wintypes.BOOL
+    handle = kernel.OpenProcess(0x0400, False, pid)  # PROCESS_QUERY_INFORMATION
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        for region in maps:
+            start = int(region["addr"], 16)
+            end = start + region["mapped_bytes"]
+            resident = 0
+            # Bound diagnostic scratch, not the number or size of mappings.
+            for base in range(start, end, mmap.PAGESIZE * 4096):
+                pages = (Page * min(4096, (end - base + mmap.PAGESIZE - 1) // mmap.PAGESIZE))()
+                for n, page in enumerate(pages):
+                    page.address = base + n * mmap.PAGESIZE
+                if not psapi.QueryWorkingSetEx(handle, pages, ctypes.sizeof(pages)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                resident += sum(bool(page.flags & 1) for page in pages) * mmap.PAGESIZE
+            region["resident_bytes"] = resident
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def memory_peaks(pid, process):
@@ -180,7 +272,8 @@ def measure_windows(argv, **kwargs):
                                         for value in times[2:]]
         assert memory.peak > 0, "Windows must report a real peak working set"
         return dict(wall_seconds=elapsed, cpu_seconds=user_seconds + kernel_seconds,
-                    user_seconds=user_seconds, kernel_seconds=kernel_seconds, peak_rss_kib=memory.peak / 1024)
+                    user_seconds=user_seconds, kernel_seconds=kernel_seconds, peak_rss_kib=memory.peak / 1024,
+                    page_faults=memory.faults)
     finally:
         if child.poll() is None:
             child.kill()

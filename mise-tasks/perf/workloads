@@ -53,6 +53,7 @@ def fresh_new(binary, env, workspace):
             child.returncode = os.waitstatus_to_exitcode(status)
             result = dict(cpu_seconds=usage.ru_utime + usage.ru_stime,
                           user_seconds=usage.ru_utime, kernel_seconds=usage.ru_stime,
+                          minor_faults=usage.ru_minflt, major_faults=usage.ru_majflt,
                           peak_rss_kib=usage.ru_maxrss / (1024 if sys.platform == "darwin" else 1))
         else:
             child.wait()
@@ -75,6 +76,51 @@ def shell_command(argv):
 def command(argv):
     # Hyperfine -N uses shell_words on every OS, including Windows.
     return shlex.join(argv)
+
+
+def tool_results(home):
+    results = []
+    for path in (home / "sessions").glob("*/log.jsonl"):
+        entries = [json.loads(line) for line in path.read_text().splitlines()]
+        calls = {entry["seq"]: entry["tool"] for entry in entries
+                 if entry.get("kind") == "tool_call" and entry.get("by") != "user"}
+        results.extend(dict(entry, tool=calls[entry["call"]]) for entry in entries
+                       if entry.get("kind") == "tool_result" and entry["call"] in calls)
+    return results
+
+
+def validate_tools(results, expected, output_bytes=None):
+    if len(results) != expected:
+        raise ValueError(f"expected {expected} tool results, received {len(results)}")
+    for result in results:
+        outcome = result["outcome"]
+        if outcome["status"] != "done":
+            raise ValueError(f"tool did not complete: {result}")
+        output = outcome.get("output", {})
+        if result.get("tool") in ("bash", "powershell") and (not isinstance(output, dict) or output.get("exit") != 0):
+            raise ValueError(f"shell did not succeed: {result}")
+        if output_bytes is not None:
+            # Large shell output is held whole while its display is truncated.
+            sizes = [held["blob"]["size"] for held in result.get("held", [])]
+            if output_bytes not in sizes:
+                raise ValueError(f"expected a {output_bytes}-byte output blob, received {sizes}")
+
+
+def shell_prompt(code):
+    argv = [sys.executable, "-c", code]
+    shell = ("& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in argv)
+             if os.name == "nt" else shlex.join(argv))
+    return shell_call(shell)
+
+
+def shell_call(command):
+    return "call " + ("powershell" if os.name == "nt" else "bash") + " " + json.dumps(dict(command=command))
+
+
+def large_output_prompt():
+    # Write directly so PowerShell's object pipeline cannot append a newline.
+    return (shell_call('[Console]::Out.Write("x" * 1048576)') if os.name == "nt"
+            else shell_prompt('import sys; sys.stdout.write("x"*1048576)'))
 
 
 def main():
@@ -165,7 +211,12 @@ def main():
             bench("echo", command([binary, "-p", "perf echo"]))
             # The shell extension creates and logs a real tool result. The echo
             # agent avoids provider/network variance; policy uses its normal path.
-            bench("big-tool-result", command([binary, "--mode", "auto", "-p", '$ python3 -c "print(chr(120)*1048576)"']))
+            before = len(tool_results(home))
+            bench("big-tool-result", command([binary, "--mode", "auto", "-p",
+                  large_output_prompt()]))
+            results = tool_results(home)[before:]
+            (output / "big-tool-outcomes.json").write_text(json.dumps(results, indent=2))
+            validate_tools(results, args.runs + 3 + (5 if os.name == "nt" else 0), 1048576)
             session = run("new").stdout.decode().strip()
             payload = ("**transcript** `json` 日本語 \\\"\n" * 512)
             for _ in range(64):
