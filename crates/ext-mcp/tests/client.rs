@@ -143,7 +143,8 @@ fn cancellation_kills_the_process_even_when_the_server_ignores_it() {
     let rig = rig("cancel", Duration::from_secs(10));
     let cx = rig.cx();
     let input =
-        protocol::Json::encode(&json!({"server":"fixture","tool":"wait","arguments":{}})).unwrap();
+        protocol::Json::encode(&json!({"server":"fixture","tool":"partial-wait","arguments":{}}))
+            .unwrap();
     rt::block_on(async {
         let call = async {
             rig.registry
@@ -153,7 +154,9 @@ fn cancellation_kills_the_process_even_when_the_server_ignores_it() {
         };
         let cancel = async {
             let reactor = rt::Reactor::AsyncIo;
-            while rig.progress.lock().unwrap().as_str() != "waiting" {
+            while !rig.workspace().join("effects-cancel.ready").exists()
+                || rig.progress.lock().unwrap().as_str() != "waiting"
+            {
                 reactor.sleep(Duration::from_millis(10)).await;
             }
             rig.cancel.set();
@@ -338,4 +341,21 @@ fn schema_publications_follow_effective_context_across_restart_and_edits() {
     let count = rig.log.lock().unwrap().iter().filter(|e| matches!(&e.body, protocol::Body::Context { publication: Some(p), .. } if p.namespace == "mcp-schemas")).count();
     assert_eq!(count, 2);
     finish(rig);
+}
+
+#[test]
+fn fragmented_and_adjacent_messages_preserve_exact_results() {
+    for tool in ["fragmented", "adjacent"] {
+        let rig = rig(tool, Duration::from_secs(10));
+        let text = "é🦀".repeat(4000);
+        let result = rig.done(
+            "mcp_call",
+            &json!({"server":"fixture","tool":tool,"arguments":{"text":text}}),
+        );
+        assert_eq!(result["ok"]["content"][0]["text"], text);
+        if tool == "adjacent" {
+            assert_eq!(*rig.progress.lock().unwrap(), "first\nlast\n");
+        }
+        finish(rig);
+    }
 }
