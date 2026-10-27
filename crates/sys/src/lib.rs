@@ -17,6 +17,8 @@ pub mod config;
 pub mod console;
 pub mod crash;
 mod desktop;
+mod diagnostic;
+pub use diagnostic::phase;
 #[cfg(windows)]
 mod directory_watch;
 #[cfg(windows)]

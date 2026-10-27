@@ -6,7 +6,7 @@ publish.workspace = true
 
 [features]
 # Optional debug events on stderr; separate from typed daemon diagnostics.
-events = []
+events = ["rt/events"]
 
 [dependencies]
 blob-files.workspace = true

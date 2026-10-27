@@ -217,7 +217,11 @@ pub fn accept(listener: &Listener) -> io::Result<Stream> {
 }
 
 fn accept_for(listener: &Listener, owner: &str) -> io::Result<Stream> {
+    crate::phase("pipe.accept.begin", || format!("listener={listener:p}"));
     let mut state = lock(&listener.state);
+    crate::phase("pipe.accept.locked", || {
+        format!("handle={:p}", state.file.as_raw_handle())
+    });
     loop {
         if state.operation.is_none() {
             let mut op = Operation::new(
@@ -239,6 +243,13 @@ fn accept_for(listener: &Listener, owner: &str) -> io::Result<Stream> {
                     _ => return Err(error),
                 }
             }
+            crate::phase("pipe.accept.submitted", || {
+                format!(
+                    "handle={:p} success={success} pending={}",
+                    op.file.as_raw_handle(),
+                    op.pending
+                )
+            });
             state.operation = Some(op);
         }
         match state
@@ -257,8 +268,14 @@ fn accept_for(listener: &Listener, owner: &str) -> io::Result<Stream> {
         let next = instance(&listener.path, false)?;
         state.operation = None;
         let connected = std::mem::replace(&mut state.file, next);
+        crate::phase("pipe.accept.connected", || {
+            format!("handle={:p}", connected.as_raw_handle())
+        });
         verify_client(&connected, owner)
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+        crate::phase("pipe.accept.verified", || {
+            format!("handle={:p}", connected.as_raw_handle())
+        });
         return Stream::new(connected);
     }
 }
@@ -404,6 +421,9 @@ fn connect_pipe(path: &Path, expected: Option<u32>) -> io::Result<Stream> {
         ));
     }
     verify_sid(&user_sid(Some(pid))?, &user_sid(None)?)?;
+    crate::phase("pipe.connect.done", || {
+        format!("handle={:p} server={pid}", file.as_raw_handle())
+    });
     Stream::new(Arc::new(file))
 }
 
@@ -487,6 +507,13 @@ impl Operation {
             return Err(io::Error::last_os_error());
         }
         self.pending = true;
+        crate::phase("pipe.submit", || {
+            format!(
+                "handle={:p} event={:p} write={write} size={size} success={success}",
+                self.file.as_raw_handle(),
+                self.raw.hEvent
+            )
+        });
         Ok(())
     }
 
@@ -515,6 +542,13 @@ impl Operation {
         };
         if success == 0 {
             let error = io::Error::last_os_error();
+            crate::phase("pipe.finish.error", || {
+                format!(
+                    "handle={:p} event={:p} error={error:?}",
+                    self.file.as_raw_handle(),
+                    self.raw.hEvent
+                )
+            });
             if error.raw_os_error() == Some(ERROR_IO_INCOMPLETE.cast_signed()) {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
@@ -523,6 +557,13 @@ impl Operation {
         }
         self.pending = false;
         self.length = length as usize;
+        crate::phase("pipe.finish.done", || {
+            format!(
+                "handle={:p} event={:p} length={length}",
+                self.file.as_raw_handle(),
+                self.raw.hEvent
+            )
+        });
         Ok(self.length)
     }
 }
@@ -591,7 +632,13 @@ impl Read for &Stream {
         if bytes.is_empty() || connection.read_closed.load(Ordering::Acquire) {
             return Ok(0);
         }
+        crate::phase("pipe.read.begin", || {
+            format!("handle={:p}", connection.file.as_raw_handle())
+        });
         let mut read = lock(&connection.read);
+        crate::phase("pipe.read.locked", || {
+            format!("handle={:p}", connection.file.as_raw_handle())
+        });
         if read.is_none() {
             let mut op = Operation::new(
                 Arc::clone(&connection.file),
@@ -640,7 +687,13 @@ impl Write for &Stream {
         if bytes.is_empty() {
             return Ok(0);
         }
+        crate::phase("pipe.write.begin", || {
+            format!("handle={:p}", connection.file.as_raw_handle())
+        });
         let mut write = lock(&connection.write);
+        crate::phase("pipe.write.locked", || {
+            format!("handle={:p}", connection.file.as_raw_handle())
+        });
         if let Some(op) = write.as_mut() {
             op.finish(connection.nonblocking.load(Ordering::Acquire), None)?;
             *write = None;
@@ -662,7 +715,13 @@ impl Write for &Stream {
         if connection.write_closed.load(Ordering::Acquire) {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
+        crate::phase("pipe.flush.begin", || {
+            format!("handle={:p}", connection.file.as_raw_handle())
+        });
         let mut write = lock(&connection.write);
+        crate::phase("pipe.flush.locked", || {
+            format!("handle={:p}", connection.file.as_raw_handle())
+        });
         if let Some(op) = write.as_mut() {
             op.finish(connection.nonblocking.load(Ordering::Acquire), None)?;
             *write = None;

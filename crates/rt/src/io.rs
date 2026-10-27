@@ -108,6 +108,7 @@ impl<T: sys::CompletionSource> Async<T> {
     pub fn new(reactor: &Reactor, io: T) -> io::Result<Self> {
         match reactor {
             Reactor::AsyncIo => {
+                sys::phase("completion.register.begin", || format!("io={:p}", &io));
                 io.nonblocking()?;
                 let [read, write] = io.completion_events()?;
                 Ok(Self(Inner::Completion {
@@ -261,12 +262,30 @@ impl<T: Source> Async<T> {
         mut op: impl FnMut(&T) -> io::Result<R>,
     ) -> io::Result<R> {
         loop {
+            sys::phase("completion.attempt", || {
+                format!("io={:p} write={write}", self.get_ref())
+            });
             match op(self.get_ref()) {
                 // Readiness that comes after the attempt is the next.
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    sys::phase("completion.wait.begin", || {
+                        format!("io={:p} write={write}", self.get_ref())
+                    });
                     self.ready(write).await?;
+                    sys::phase("completion.wait.done", || {
+                        format!("io={:p} write={write}", self.get_ref())
+                    });
                 }
-                result => return result,
+                result => {
+                    sys::phase("completion.result", || {
+                        format!(
+                            "io={:p} write={write} error={:?}",
+                            self.get_ref(),
+                            result.as_ref().err()
+                        )
+                    });
+                    return result;
+                }
             }
         }
     }

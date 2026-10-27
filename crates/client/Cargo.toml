@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+events = ["rt/events"]
+
 [dependencies]
 # Watches machines.toml and the ssh configuration for the host list.
 rt = { workspace = true, features = ["watch"] }

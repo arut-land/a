@@ -324,6 +324,7 @@ pub(crate) async fn connect<F: Future<Output = ()> + Send>(
     let (link, build) = (&daemon.link, &daemon.staged);
     let mut start = start;
     for _ in 0..3 {
+        sys::phase("hello.open.begin", String::new);
         let Opened {
             stream,
             machine,
@@ -331,6 +332,9 @@ pub(crate) async fn connect<F: Future<Output = ()> + Send>(
             remote,
             within,
         } = link.open(rt, build, start).await?;
+        sys::phase("hello.open.done", || {
+            format!("within_ms={}", within.as_millis())
+        });
         start = start.again();
         let first = first(remote.as_ref())?;
         // To a pinned machine, nothing (an environment, say) goes out
@@ -344,10 +348,12 @@ pub(crate) async fn connect<F: Future<Output = ()> + Send>(
             hello(&*stream, &mut buffered, &build.id, client, machine, behind),
             async {
                 rt.sleep(within).await;
+                sys::phase("hello.deadline", String::new);
                 Err(Error::NotResponding)
             },
         )
         .await;
+        sys::phase("hello.result", || format!("ok={}", greeting.is_ok()));
         match greeting {
             Ok((Greeting::Welcome(theirs, upgrade), welcome, commands, queries)) => {
                 if let Some(pinned) = daemon.pinned.filter(|&pinned| pinned != theirs) {
@@ -416,6 +422,7 @@ pub(crate) async fn hello(
     ),
     Error,
 > {
+    sys::phase("hello.send.begin", String::new);
     stream
         .send(&ClientMsg::Hello {
             proto: PROTO,
@@ -425,16 +432,22 @@ pub(crate) async fn hello(
             machine,
         })
         .await?;
+    sys::phase("hello.send.done", String::new);
     // A daemon that refuses the hello may hang up before reading these, so
     // failing to send them matters only once welcomed.
     let mut sent = Ok(());
     for msg in first {
+        sys::phase("hello.first.begin", String::new);
         sent = stream.send(msg).await;
+        sys::phase("hello.first.done", || format!("ok={}", sent.is_ok()));
         if sent.is_err() {
             break;
         }
     }
-    match stream.recv(buffered).await? {
+    sys::phase("hello.receive.begin", String::new);
+    let received = stream.recv(buffered).await;
+    sys::phase("hello.receive.done", || format!("ok={}", received.is_ok()));
+    match received? {
         Some(DaemonMsg::Welcome {
             proto,
             caps,
