@@ -826,3 +826,172 @@ fn a_stalled_delivery_retains_one_invalidation_per_path() {
     );
     assert_eq!(paths.len(), 1);
 }
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn dropping_an_outer_root_restores_only_surviving_coverage() {
+    let dir = Dir::new();
+    for child in ["first", "second"] {
+        fs::create_dir(dir.path(child)).unwrap();
+    }
+    let hub = hub();
+    let (_first, first) = subscribe(&hub, Watch::tree(dir.path("first")));
+    let (_second, second) = subscribe(&hub, Watch::tree(dir.path("second")));
+    let narrow = hub.watches();
+    let (outer, _) = subscribe(&hub, Watch::tree(&dir.base));
+    let queued = dir.write("first/queued");
+    drop(outer);
+    assert_eq!(hub.watches(), narrow, "historical outer coverage survived");
+    until(
+        &first,
+        "the change queued before narrowing",
+        changed(&queued),
+    );
+    let after = dir.write("first/after");
+    until(&first, "the first replacement watch", changed(&after));
+    let after = dir.write("second/after");
+    until(&second, "the second replacement watch", changed(&after));
+}
+
+#[test]
+fn changed_paths_only_visit_related_subscription_roots() {
+    let dir = Dir::new();
+    let hub = hub();
+    let (_outer, _) = subscribe(&hub, Watch::tree(&dir.base));
+    let children: Vec<_> = (0..128)
+        .map(|i| {
+            let root = dir.path(&format!("child-{i}"));
+            fs::create_dir(&root).unwrap();
+            subscribe(&hub, Watch::tree(root))
+        })
+        .collect();
+    let mut state = lock(&hub.0.state);
+    state.routing_checks = 0;
+    state.changed(&dir.path("child-0/file"), false, &mut Vec::new());
+    assert_eq!(state.routing_checks, 2, "unrelated roots were inspected");
+    drop(state);
+    drop(children);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_rearmed_alias_routes_only_its_current_target() {
+    let dir = Dir::new();
+    for child in ["first", "second"] {
+        fs::create_dir(dir.path(child)).unwrap();
+    }
+    std::os::unix::fs::symlink(dir.path("first"), dir.path("alias")).unwrap();
+    let hub = hub();
+    let (sub, events) = subscribe(&hub, Watch::tree(dir.path("alias")));
+    fs::remove_file(dir.path("alias")).unwrap();
+    std::os::unix::fs::symlink(dir.path("second"), dir.path("alias")).unwrap();
+    hub.0.handle(|_| vec![Raw::Changed(dir.path("first"))]);
+    until(&events, "the retargeted root", |e| {
+        matches!(e, Event::Rescan)
+    });
+    dir.write("second/file");
+    until(
+        &events,
+        "the new target in the alias spelling",
+        changed(&dir.path("alias/file")),
+    );
+    let mut state = lock(&hub.0.state);
+    state.routing_checks = 0;
+    state.changed(&dir.path("first/file"), false, &mut Vec::new());
+    assert_eq!(state.routing_checks, 0, "the old target stayed indexed");
+    drop(state);
+    drop(sub);
+    let mut state = lock(&hub.0.state);
+    state.routing_checks = 0;
+    state.changed(&dir.path("second/file"), false, &mut Vec::new());
+    assert_eq!(
+        state.routing_checks, 0,
+        "the dropped subscription stayed indexed"
+    );
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn narrowed_missing_roots_keep_following_their_shared_parent() {
+    let dir = Dir::new();
+    let hub = hub();
+    let (outer, _) = subscribe(&hub, Watch::tree(&dir.base));
+    let (first, _) = subscribe(&hub, Watch::tree(dir.path("first")));
+    let (_second, second) = subscribe(&hub, Watch::tree(dir.path("second")));
+    drop(outer);
+    drop(first);
+    fs::create_dir(dir.path("second")).unwrap();
+    until(&second, "arrival through the surviving parent watch", |e| {
+        matches!(e, Event::Rescan)
+    });
+    let file = dir.write("second/file");
+    until(&second, "the surviving root's file", changed(&file));
+}
+
+#[test]
+fn unrelated_index_predecessors_cannot_hide_ancestors_or_descendants() {
+    let dir = Dir::new();
+    for child in ["a/x/nested", "a/y/deep", "ab"] {
+        fs::create_dir_all(dir.path(child)).unwrap();
+    }
+    let hub = hub();
+    let (outer, _) = subscribe(&hub, Watch::tree(&dir.base));
+    let (a, _) = subscribe(&hub, Watch::tree(dir.path("a")));
+    let (_x, _) = subscribe(&hub, Watch::tree(dir.path("a/x/nested")));
+    let (y, _) = subscribe(&hub, Watch::tree(dir.path("a/y/deep")));
+    let (_ab, _) = subscribe(&hub, Watch::tree(dir.path("ab")));
+    let state = lock(&hub.0.state);
+    for (path, expected) in [
+        ("a/y/file", BTreeSet::from([outer.id, a.id])),
+        ("a/y", BTreeSet::from([outer.id, a.id, y.id])),
+        ("a/y/deep", BTreeSet::from([outer.id, a.id, y.id])),
+        ("a/y/deep/file", BTreeSet::from([outer.id, a.id, y.id])),
+        ("a/z/file", BTreeSet::from([outer.id, a.id])),
+    ] {
+        let related: BTreeSet<_> = state.related(&dir.path(path)).into_iter().collect();
+        assert_eq!(related, expected, "{path}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_failed_admission_never_blocks_an_unrelated_root() {
+    let dir = Dir::new();
+    fs::create_dir(dir.path("good")).unwrap();
+    let hub = hub();
+    let (_bad, _) = subscribe(&hub, Watch::tree(dir.path("bad\0root")));
+    let (good, events) = subscribe(&hub, Watch::tree(dir.path("good")));
+    assert!(matches!(
+        lock(&hub.0.state).subs[&good.id].status,
+        Status::Live(_)
+    ));
+    let file = dir.write("good/file");
+    until(&events, "the independently admitted root", changed(&file));
+    drop(good);
+    assert_eq!(
+        hub.watches(),
+        0,
+        "failed demand retained unrelated coverage"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn failed_narrowing_keeps_coverage_without_blocking_new_subscriptions() {
+    let dir = Dir::new();
+    fs::create_dir(dir.path("good")).unwrap();
+    let hub = hub();
+    let (outer, _) = subscribe(&hub, Watch::tree(&dir.base));
+    let (bad, _) = subscribe(&hub, Watch::tree(dir.path("bad\0root")));
+    drop(outer);
+    let (good, events) = subscribe(&hub, Watch::tree(dir.path("good")));
+    assert!(matches!(
+        lock(&hub.0.state).subs[&good.id].status,
+        Status::Live(_)
+    ));
+    let file = dir.write("good/before");
+    until(&events, "the retained covering stream", changed(&file));
+    drop(bad);
+    let file = dir.write("good/after");
+    until(&events, "the narrowed stream", changed(&file));
+}

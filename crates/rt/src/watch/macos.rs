@@ -3,7 +3,7 @@
 //! `WatchRoot` reports the root itself going and coming back, so nothing
 //! above a root is watched separately.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Weak;
 
@@ -14,14 +14,9 @@ use crate::Rt;
 
 pub(super) struct Native {
     me: Weak<Shared>,
-    streams: BTreeMap<PathBuf, Stream>,
-    /// The stream each subscription rides on.
-    held: HashMap<u64, PathBuf>,
-}
-
-struct Stream {
-    refs: usize,
-    stream: FsEventStream,
+    streams: BTreeMap<PathBuf, FsEventStream>,
+    /// Requested roots stay independent of the streams covering them.
+    requested: HashMap<u64, PathBuf>,
 }
 
 impl Native {
@@ -29,20 +24,22 @@ impl Native {
         Self {
             me,
             streams: BTreeMap::new(),
-            held: HashMap::new(),
+            requested: HashMap::new(),
         }
     }
 
     pub(super) fn arm(&mut self, id: u64, sub: &Sub) -> Result<(), Unavailable> {
-        let key = if let Some(key) = sub.real.ancestors().find(|a| self.streams.contains_key(*a)) {
-            key.to_owned()
-        } else {
-            self.open(&sub.real)?;
-            sub.real.clone()
-        };
-        self.streams.get_mut(&key).expect("opened").refs += 1;
-        if let Some(old) = self.held.insert(id, key) {
-            self.release(&old);
+        let old = self.requested.insert(id, sub.real.clone());
+        if let Err(error) = self.reconcile() {
+            match old {
+                Some(root) => {
+                    self.requested.insert(id, root);
+                }
+                None => {
+                    self.requested.remove(&id);
+                }
+            }
+            return Err(error);
         }
         if sub.real.is_dir() {
             Ok(())
@@ -52,9 +49,10 @@ impl Native {
     }
 
     pub(super) fn disarm(&mut self, id: u64) {
-        if let Some(key) = self.held.remove(&id) {
-            self.release(&key);
-        }
+        self.requested.remove(&id);
+        // If replacement admission fails, existing coverage still serves
+        // the survivors. The next subscription change tries again.
+        let _ = self.reconcile();
     }
 
     #[allow(
@@ -80,45 +78,82 @@ impl Native {
         self.streams.len()
     }
 
-    /// Starts a stream at `root`, which then serves the subscriptions of
-    /// the streams under it: those close once it runs.
-    fn open(&mut self, root: &Path) -> Result<(), Unavailable> {
-        let nested: Vec<PathBuf> = (self.streams.keys())
-            .filter(|key| key.starts_with(root))
+    fn reconcile(&mut self) -> Result<(), Unavailable> {
+        let requested: BTreeSet<&Path> = self.requested.values().map(PathBuf::as_path).collect();
+        let mut roots: BTreeSet<PathBuf> = requested
+            .iter()
+            .filter(|root| {
+                !root
+                    .ancestors()
+                    .skip(1)
+                    .any(|parent| requested.contains(parent))
+            })
+            .map(|root| root.to_path_buf())
+            .collect();
+        let mut added = BTreeMap::new();
+        let mut covered_failures = Vec::new();
+        for root in roots
+            .iter()
+            .filter(|root| !self.streams.contains_key(*root))
+        {
+            let (me, key) = (self.me.clone(), root.clone());
+            let stream = FsEventStream::new(root, move |events| {
+                if let Some(shared) = me.upgrade() {
+                    shared.post(events.into_iter().map(|e| raw(e, &key)).collect());
+                }
+            });
+            match stream {
+                Ok(stream) => {
+                    added.insert(root.clone(), stream);
+                }
+                Err(_)
+                    if root
+                        .ancestors()
+                        .any(|parent| self.streams.contains_key(parent)) =>
+                {
+                    covered_failures.push(root.clone());
+                }
+                Err(error) => {
+                    return Err(match error.kind() {
+                        std::io::ErrorKind::Unsupported => Unavailable::Unsupported,
+                        _ => Unavailable::Io(error),
+                    });
+                }
+            }
+        }
+        // Failed narrowing retains its covering stream without preventing
+        // independent roots from being admitted.
+        roots.extend(
+            self.streams
+                .keys()
+                .filter(|root| {
+                    covered_failures
+                        .iter()
+                        .any(|failed| failed.starts_with(root))
+                })
+                .cloned(),
+        );
+        let coverage: BTreeSet<PathBuf> = roots
+            .iter()
+            .filter(|root| {
+                !root
+                    .ancestors()
+                    .skip(1)
+                    .any(|parent| roots.contains(parent))
+            })
             .cloned()
             .collect();
-        let (me, key) = (self.me.clone(), root.to_owned());
-        let stream = FsEventStream::new(root, move |events| {
-            if let Some(shared) = me.upgrade() {
-                shared.post(events.into_iter().map(|e| raw(e, &key)).collect());
+        self.streams.append(&mut added);
+        self.streams.retain(|root, stream| {
+            if coverage.contains(root) {
+                return true;
             }
-        })
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::Unsupported => Unavailable::Unsupported,
-            _ => Unavailable::Io(error),
-        })?;
-        let mut refs = 0;
-        for key in nested {
-            let nested = self.streams.remove(&key).expect("listed");
-            // What it holds is delivered before it goes, the new stream
-            // already running: nothing under it falls between the two.
-            nested.stream.flush();
-            refs += nested.refs;
-            for held in self.held.values_mut().filter(|held| **held == key) {
-                root.clone_into(held);
-            }
-        }
-        self.streams
-            .insert(root.to_owned(), Stream { refs, stream });
+            // Every replacement is running before pending events are
+            // drained and the old coverage is released.
+            stream.flush();
+            false
+        });
         Ok(())
-    }
-
-    fn release(&mut self, key: &Path) {
-        let stream = self.streams.get_mut(key).expect("held");
-        stream.refs -= 1;
-        if stream.refs == 0 {
-            self.streams.remove(key);
-        }
     }
 }
 
