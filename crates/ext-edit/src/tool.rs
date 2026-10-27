@@ -246,9 +246,9 @@ impl Transaction<'_> {
         let (transaction, content, edited, hash) = self
             .run(Storage, STREAM_BYTES + captured, move || {
                 let original = transaction.original();
-                if let Some(bytes) = original {
+                if let (Some(bytes), Some(prior)) = (original, prior_hash) {
                     let current = hash_file(bytes)?;
-                    if prior_hash.is_some_and(|prior| prior != current) {
+                    if prior != current {
                         return Err(EditError::Stale(Wrote {
                             path,
                             hash: current,
@@ -309,6 +309,8 @@ fn hash_file(mut file: &File) -> io::Result<u64> {
             file.rewind()?;
             return Ok(hash);
         }
+        #[cfg(test)]
+        tests::HASHED_BYTES.update(|bytes| bytes + count);
         for &byte in &buffer[..count] {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
         }
@@ -607,6 +609,97 @@ mod tests {
                 new: (*new).into(),
             })
             .collect()
+    }
+
+    std::thread_local! {
+        pub(super) static HASHED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn first_edit_hashes_only_the_output() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting {
+            inner: rt::Threads,
+            hashed: Arc<AtomicUsize>,
+        }
+
+        impl rt::Runtime for Counting {
+            fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+                self.inner.spawn(task);
+            }
+
+            fn spawn_flush(
+                &self,
+                work: Box<dyn FnOnce() + Send>,
+            ) -> rt::BoxFuture<'static, io::Result<()>> {
+                self.inner.spawn_flush(work)
+            }
+
+            fn reactor(&self) -> rt::Reactor {
+                self.inner.reactor()
+            }
+
+            fn spawn_blocking(
+                &self,
+                class: rt::BlockingClass,
+                bytes: usize,
+                work: Box<dyn FnOnce() + Send>,
+            ) -> rt::BoxFuture<'static, io::Result<()>> {
+                let hashed = self.hashed.clone();
+                let (done, completed) = rt::oneshot::channel();
+                let admitted = self.inner.spawn_blocking(
+                    class,
+                    bytes,
+                    Box::new(move || {
+                        HASHED_BYTES.set(0);
+                        work();
+                        hashed.fetch_add(HASHED_BYTES.get(), Ordering::Relaxed);
+                        done.send(());
+                    }),
+                );
+                Box::pin(async move {
+                    admitted.await?;
+                    completed.await.unwrap();
+                    Ok(())
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("target");
+        let original = format!("{}before", "x".repeat(CHUNK * 2));
+        let output = format!("{}after", "x".repeat(CHUNK * 2));
+        let runtime = Counting {
+            inner: rt::Threads::new(1),
+            hashed: Arc::new(AtomicUsize::new(0)),
+        };
+        std::fs::write(&path, &original).unwrap();
+        let prior = hash_file(&File::open(&path).unwrap()).unwrap();
+        for prior_hash in [None, Some(prior)] {
+            std::fs::write(&path, &original).unwrap();
+            runtime.hashed.store(0, Ordering::Relaxed);
+            let (edited, hash) = rt::block_on(
+                Transaction {
+                    rt: &runtime,
+                    cancel: &ext::Cancel::default(),
+                }
+                .edit(
+                    path.clone(),
+                    edits(&[("before", "after")]).into(),
+                    prior_hash,
+                    LIMITS,
+                ),
+            )
+            .unwrap();
+            assert!(edited.publication.visible);
+            assert_eq!(std::fs::read(&path).unwrap(), output.as_bytes());
+            assert_eq!(hash, hash_file(&File::open(&path).unwrap()).unwrap());
+            assert_eq!(
+                runtime.hashed.load(Ordering::Relaxed),
+                output.len() + prior_hash.map_or(0, |_| original.len())
+            );
+        }
     }
 
     #[test]
