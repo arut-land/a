@@ -198,6 +198,67 @@ fn text_is_read_as_text_a_window_of_lines_if_asked() {
     assert_eq!(error, "b.bin is neither text nor an image");
 }
 
+#[test]
+fn text_windows_preserve_line_boundaries_and_exact_totals() {
+    let rig = Rig::new("read-line-boundaries", registry());
+    for parts in [
+        ["one\n".to_owned(), "two\n".to_owned(), "last".to_owned()],
+        [
+            "one\r\n".to_owned(),
+            "two\r\n".to_owned(),
+            "last\r\n".to_owned(),
+        ],
+        [
+            format!("{}\r\n", "x".repeat(8191)),
+            format!("{}\n", "β".repeat(8193)),
+            "last".to_owned(),
+        ],
+        ["\n".to_owned(), "\n".to_owned(), "\n".to_owned()],
+    ] {
+        std::fs::write(rig.workspace().join("text.txt"), parts.concat()).unwrap();
+        for (offset, limit, from, expected, count) in [
+            (None, None, 1, parts.concat(), 3),
+            (Some(0), Some(1), 1, parts[0].clone(), 1),
+            (Some(2), Some(1), 2, parts[1].clone(), 1),
+            (Some(3), Some(9), 3, parts[2].clone(), 1),
+            (Some(2), Some(usize::MAX), 2, parts[1..].concat(), 2),
+            (Some(1), Some(0), 1, String::new(), 0),
+            (Some(2), Some(0), 2, String::new(), 0),
+            (Some(4), None, 4, String::new(), 0),
+            (Some(usize::MAX), Some(1), usize::MAX, String::new(), 0),
+        ] {
+            let out = rig.done(
+                "read",
+                &json!({"path": "text.txt", "offset": offset, "limit": limit}),
+            );
+            assert_eq!(
+                out["text"]["text"], expected,
+                "offset={offset:?}, limit={limit:?}"
+            );
+            assert_eq!(out["text"]["from"], from);
+            assert_eq!(out["text"]["lines"], count);
+            assert_eq!(out["text"]["total"], 3);
+        }
+    }
+    std::fs::write(rig.workspace().join("empty.txt"), []).unwrap();
+    let out = rig.done("read", &json!({"path": "empty.txt", "limit": 0}));
+    assert_eq!(out["text"]["text"], "");
+    assert_eq!(out["text"]["lines"], 0);
+    assert_eq!(out["text"]["total"], 0);
+}
+
+#[test]
+fn excluded_bytes_do_not_need_to_be_utf8() {
+    let rig = Rig::new("read-excluded-bytes", registry());
+    std::fs::write(rig.workspace().join("text.txt"), b"\xff\nselected\n\xfe").unwrap();
+    let out = rig.done(
+        "read",
+        &json!({"path": "text.txt", "offset": 2, "limit": 1}),
+    );
+    assert_eq!(out["text"]["text"], "selected\n");
+    assert_eq!(out["text"]["total"], 3);
+}
+
 /// A note that starts as an image format's magic does (`BM`, `P1`) is
 /// read as the text it is: only a header that reads as an image of a
 /// format read here makes a file one.
