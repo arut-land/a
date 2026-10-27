@@ -277,12 +277,12 @@ mod tests {
             request: Request,
             _: &QueryCx<ext::query::Daemon>,
         ) -> Streamed<String, impl Future<Output = Result<String, String>> + Send, String> {
-            stream(move |updates| async move {
+            stream(move |mut updates| async move {
                 match request {
                     Request::Reply => Ok("x".repeat(16 << 20)),
                     Request::Update => {
-                        updates.send("x".repeat(16 << 20));
-                        updates.send("after the failed update".into());
+                        updates.send("x".repeat(16 << 20)).await;
+                        updates.send("after the failed update".into()).await;
                         Ok("done".into())
                     }
                     Request::Small => Ok("small".into()),

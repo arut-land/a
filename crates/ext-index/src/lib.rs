@@ -37,8 +37,8 @@ mod index;
 
 pub use fff::grep::{Casing, GrepMatch, GrepMode, GrepOptions};
 pub use index::{
-    GrepQuery, GrepSummary, Grepped, Indexes, Limits, Pattern, Searched, SearchedFile, Stopped,
-    WorkspaceIndex,
+    GrepQuery, GrepSink, GrepSummary, Grepped, Indexes, Limits, Pattern, Searched, SearchedFile,
+    Stopped, WorkspaceIndex,
 };
 
 /// The `index` extension: its queries and tools share one [`Indexes`].
@@ -310,15 +310,18 @@ impl Query for FileGrep {
                 },
                 limit: request.limit,
             };
-            let summary = index
-                .grep(query, &cancel, |grepped| {
-                    updates.send(GrepFile {
-                        path: grepped.path,
-                        matches: grepped.matches.into_iter().map(Line::from).collect(),
-                    });
-                })
-                .await?;
+            let summary = index.grep(query, &cancel, updates).await?;
             Ok(summary.into())
         })
+    }
+}
+
+impl GrepSink for Partials<GrepFile> {
+    async fn found(&mut self, grepped: Grepped) {
+        self.send(GrepFile {
+            path: grepped.path,
+            matches: grepped.matches.into_iter().map(Line::from).collect(),
+        })
+        .await;
     }
 }

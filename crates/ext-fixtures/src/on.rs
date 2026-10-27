@@ -171,8 +171,10 @@ impl Query for Said {
         cx: &QueryCx<Workspace>,
     ) -> Streamed<String, impl Future<Output = Result<Echoed, String>> + Send, Echoed> {
         let workspace = cx.scope.path.to_path_buf();
-        stream(move |updates| async move {
-            (0..say.times).for_each(|_| updates.send(say.text.clone()));
+        stream(move |mut updates| async move {
+            for _ in 0..say.times {
+                updates.send(say.text.clone()).await;
+            }
             if say.hold {
                 std::future::pending::<()>().await;
             }

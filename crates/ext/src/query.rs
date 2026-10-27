@@ -5,12 +5,11 @@
 //! publish or change state.
 //!
 //! Its shape is the type its `answer` returns, as a tool's is: a reply at
-//! once, a future of one, or a [`Streamed`] answer whose partials go to
+//! once, a future of one, or a [`crate::Streamed`] answer whose partials go to
 //! the client as updates before its reply. What it is asked about is its
 //! [`Query::Scope`]: the daemon, a workspace or a session, each a type
 //! holding what the query is given about it.
 
-use std::future::Future;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
@@ -20,7 +19,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::host::{Registry, SessionServices};
-use crate::shape::{Next, Now, Streamed, Streams, Waits};
+use crate::shape::Run;
 use crate::{BoxFuture, Cancel};
 
 /// A service clients query: `r.query(FileSearch)`.
@@ -36,7 +35,7 @@ pub trait Query: Send + Sync + 'static {
 
     /// Answers `request`. What an implementation names as its return type
     /// is its shape ([`Answered`]): a `Result<Self::Reply, String>`, a
-    /// future of one (an `async fn`), or a [`Streamed`] answer whose
+    /// future of one (an `async fn`), or a [`crate::Streamed`] answer whose
     /// partials are its updates.
     fn answer(&self, request: Self::Request, cx: &QueryCx<Self::Scope>) -> impl Send;
 }
@@ -172,48 +171,22 @@ pub trait Answered<R, M>: Send {
         Self: 'a;
 }
 
-impl<R: Send> Answered<R, Now> for Result<R, String> {
-    fn run<'a>(self, _: Updates<'a>) -> BoxFuture<'a, Result<R, String>>
-    where
-        Self: 'a,
-    {
-        Box::pin(std::future::ready(self))
-    }
-}
-
-impl<R, F> Answered<R, Waits> for F
+impl<R, M, T> Answered<R, M> for T
 where
-    F: Future<Output = Result<R, String>> + Send,
+    T: Run<R, M>,
+    T::Partial: Serialize,
 {
-    fn run<'a>(self, _: Updates<'a>) -> BoxFuture<'a, Result<R, String>>
+    fn run<'a>(self, updates: Updates<'a>) -> BoxFuture<'a, Result<R, String>>
     where
         Self: 'a,
     {
-        Box::pin(self)
-    }
-}
-
-impl<R, P, F> Answered<R, Streams<P>> for Streamed<P, F, R>
-where
-    R: Send,
-    P: Serialize + Send,
-    F: Future<Output = Result<R, String>> + Send,
-{
-    fn run<'a>(mut self, updates: Updates<'a>) -> BoxFuture<'a, Result<R, String>>
-    where
-        Self: 'a,
-    {
-        Box::pin(async move {
-            loop {
-                match self.next().await {
-                    Next::Partial(partial) => {
-                        let update = Json::encode(&partial).map_err(|e| e.to_string())?;
-                        updates.send(update).await;
-                    }
-                    Next::Done(reply) => return reply,
-                }
+        Box::pin(self.run_with(move |partial| {
+            let update = Json::encode(&partial).map_err(|e| e.to_string());
+            async move {
+                updates.send(update?).await;
+                Ok(())
             }
-        })
+        }))
     }
 }
 

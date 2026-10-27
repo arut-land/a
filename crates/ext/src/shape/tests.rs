@@ -74,9 +74,9 @@ impl Tool for Count {
         _: &Cx,
     ) -> Streamed<String, impl Future<Output = Result<u64, String>> + Send, u64> {
         let n = input.0;
-        stream(move |partials: Partials<String>| async move {
+        stream(move |mut partials: Partials<String>| async move {
             for i in 1..=n {
-                partials.send(format!("{i} "));
+                partials.send(format!("{i} ")).await;
                 std::future::ready(()).await;
             }
             Ok((1..=n).sum())
@@ -186,12 +186,12 @@ fn the_call_shape_follows_the_return_type() {
 /// nothing after; a call's partials are its progress.
 #[test]
 fn a_streaming_tool_reports_partials_then_its_result() {
-    let mut streamed = stream(|partials: Partials<&str>| async move {
-        partials.send("a");
+    let mut streamed = stream(|mut partials: Partials<&str>| async move {
+        partials.send("a").await;
         std::future::ready(()).await;
-        partials.send("b");
+        partials.send("b").await;
         // Sent as it ends: still before the output.
-        partials.send("c");
+        partials.send("c").await;
         Ok::<_, String>(3)
     });
     let mut got = Vec::new();
@@ -218,4 +218,87 @@ fn a_tool_input_is_read_once_per_call() {
     let _ = tool.present(&parsed);
     assert!(parsed.get::<Counted>().is_some());
     assert_eq!(READS.get(), 1);
+}
+
+#[test]
+fn taking_an_update_keeps_its_producer_suspended_until_the_next_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let resumed = Arc::new(AtomicUsize::new(0));
+    let producer = Arc::clone(&resumed);
+    let mut streamed = stream(move |mut partials| async move {
+        for i in 0..100_000 {
+            partials.send(i).await;
+            producer.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    assert_eq!(rt::block_on(streamed.next()), Next::Partial(0));
+    assert_eq!(resumed.load(Ordering::Relaxed), 0);
+    assert_eq!(rt::block_on(streamed.next()), Next::Partial(1));
+    assert_eq!(resumed.load(Ordering::Relaxed), 1);
+    drop(streamed);
+    assert_eq!(resumed.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn dropping_a_stream_drops_its_suspended_producer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Producer(Arc<AtomicBool>);
+    impl Drop for Producer {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let producer = Producer(Arc::clone(&dropped));
+    let mut streamed = stream(move |mut partials| async move {
+        let _producer = producer;
+        partials.send("first").await;
+        std::future::pending::<()>().await;
+        Ok::<(), String>(())
+    });
+    assert_eq!(rt::block_on(streamed.next()), Next::Partial("first"));
+    assert!(!dropped.load(Ordering::Relaxed));
+    drop(streamed);
+    assert!(dropped.load(Ordering::Relaxed));
+}
+
+#[test]
+fn every_update_is_delivered_before_completion_without_a_count_cap() {
+    let mut streamed = stream(|mut partials| async move {
+        for i in 0..100_000 {
+            partials.send(i).await;
+        }
+        Err::<(), _>("finished".to_owned())
+    });
+    for i in 0..100_000 {
+        assert_eq!(rt::block_on(streamed.next()), Next::Partial(i));
+    }
+    assert_eq!(
+        rt::block_on(streamed.next()),
+        Next::Done(Err("finished".to_owned()))
+    );
+}
+
+#[test]
+fn cancelling_a_send_withdraws_its_update_before_completion() {
+    let mut streamed = stream(|mut partials| async move {
+        let partial = Arc::new(());
+        let pending = Arc::downgrade(&partial);
+        let mut send = Box::pin(partials.send(partial));
+        poll_fn(|cx| {
+            assert!(send.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(send);
+        assert!(
+            pending.upgrade().is_none(),
+            "cancellation releases the update"
+        );
+        Ok::<_, String>("done")
+    });
+    assert_eq!(rt::block_on(streamed.next()), Next::Done(Ok("done")));
 }
