@@ -3,17 +3,30 @@
 #[cfg(all(windows, feature = "events-etw"))]
 pub use enabled::backend::PhaseSession;
 
-/// Records a debug phase only in builds with `events`. Details are never
-/// constructed otherwise. `A_PHASE_DIR` selects per-process files in an
-/// existing directory. It can also be set at compile time for children
-/// started with a cleared environment. Without either, records go to stderr.
-/// Windows builds with `events-etw` send records to an ETW collector instead.
+/// Emits a phase in an event-enabled build; neither argument is evaluated otherwise.
+#[cfg(feature = "events")]
+#[macro_export]
+macro_rules! phase {
+    ($name:expr, $detail:expr $(,)?) => {
+        $crate::phase($name, $detail)
+    };
+}
+
+/// Emits a phase in an event-enabled build; neither argument is evaluated otherwise.
+#[cfg(not(feature = "events"))]
+#[macro_export]
+macro_rules! phase {
+    ($name:expr, $detail:expr $(,)?) => {{}};
+}
+
+/// `A_PHASE_DIR` selects per-process files in an existing directory. It can
+/// also be set at compile time for children with cleared environments.
+/// Without either, records go to stderr. Windows builds with `events-etw`
+/// send records to an ETW collector instead.
+#[cfg(feature = "events")]
 #[inline]
 pub fn phase(name: &'static str, detail: impl FnOnce() -> String) {
-    #[cfg(feature = "events")]
     enabled::phase(name, detail);
-    #[cfg(not(feature = "events"))]
-    let _ = (name, detail);
 }
 
 #[cfg(feature = "events")]
@@ -127,9 +140,10 @@ mod enabled {
 #[cfg(all(test, not(feature = "events")))]
 mod tests {
     #[test]
-    fn disabled_phases_never_construct_their_details() {
-        super::phase("disabled", || {
-            panic!("disabled phase constructed its details")
-        });
+    fn disabled_phases_never_evaluate_their_arguments() {
+        crate::phase!(
+            panic!("disabled phase evaluated its name"),
+            panic!("disabled phase evaluated its details"),
+        );
     }
 }

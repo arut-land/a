@@ -20,6 +20,8 @@ mod desktop;
 mod diagnostic;
 #[cfg(all(windows, feature = "events-etw"))]
 pub use diagnostic::PhaseSession;
+#[cfg(feature = "events")]
+#[doc(hidden)]
 pub use diagnostic::phase;
 #[cfg(windows)]
 mod directory_watch;
