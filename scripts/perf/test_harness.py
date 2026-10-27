@@ -23,7 +23,7 @@ import process
 @unittest.skipUnless(sys.platform == "darwin", "requires native vmmap")
 class MemoryMaps(unittest.TestCase):
     def test_executable_residency_matches_native_aliases_and_paths_with_spaces(self):
-        with tempfile.TemporaryDirectory(prefix="map paths ") as directory:
+        with tempfile.TemporaryDirectory(prefix="map paths ", dir="/tmp") as directory:
             root = Path(directory).resolve()
             binary = root / "cat with spaces"
             shutil.copy("/bin/cat", binary)
