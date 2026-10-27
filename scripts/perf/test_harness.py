@@ -211,6 +211,9 @@ class Builds(unittest.TestCase):
             binary.touch()
             result = subprocess.CompletedProcess([], 0, json.dumps(dict(executable=str(binary), profile=dict(test=True))))
             with mock.patch.object(hosted, "run", return_value=result) as run, \
+                 mock.patch.object(sys, "platform", "win32"), \
+                 mock.patch.object(build, "dumpbin", return_value="perf-test-no-native-tool"), \
+                 mock.patch.object(build.shutil, "which", return_value=None), \
                  mock.patch.object(hosted.subprocess, "check_output", return_value="revision"), \
                  mock.patch.object(hosted, "hardware", return_value={}), \
                  mock.patch.object(hosted.platform, "platform", return_value="test host"):

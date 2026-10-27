@@ -116,6 +116,9 @@ class Comparison(unittest.TestCase):
                     return subprocess.CompletedProcess(arguments, 0, json.dumps(dict(
                         executable=str(binary), profile=dict(test=True))), "")
                 with mock.patch.object(sys, "argv", ["build-variant", "z", "--output", directory, "--tests", *selection]), \
+                     mock.patch.object(sys, "platform", "win32"), \
+                     mock.patch("build.dumpbin", return_value="perf-test-no-native-tool"), \
+                     mock.patch("build.shutil.which", return_value=None), \
                      mock.patch.object(task.subprocess, "run", side_effect=run) as cargo, \
                      mock.patch.object(task.subprocess, "check_output", side_effect=[b"", "revision"]):
                     task.main()
