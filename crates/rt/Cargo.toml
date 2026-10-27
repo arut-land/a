@@ -6,6 +6,7 @@ publish.workspace = true
 
 [features]
 events = ["sys/events"]
+events-etw = ["events", "sys/events-etw"]
 default = ["threads"]
 # The built-in runtime: async-executor's workers and a blocking pool of
 # our own (the `blocking` crate's polls every 500 ms while idle).

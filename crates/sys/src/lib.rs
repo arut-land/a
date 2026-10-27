@@ -18,6 +18,8 @@ pub mod console;
 pub mod crash;
 mod desktop;
 mod diagnostic;
+#[cfg(all(windows, feature = "events-etw"))]
+pub use diagnostic::PhaseSession;
 pub use diagnostic::phase;
 #[cfg(windows)]
 mod directory_watch;

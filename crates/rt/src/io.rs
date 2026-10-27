@@ -52,6 +52,8 @@ enum Inner<T: Source> {
         events: [async_io::os::windows::Waitable<std::os::windows::io::OwnedHandle>; 2],
         complete_write: fn(&T) -> io::Result<()>,
         io: T,
+        #[cfg(feature = "events-etw")]
+        _phases: Option<sys::PhaseSession>,
     },
     #[cfg(test)]
     FakeCompletion {
@@ -108,6 +110,8 @@ impl<T: sys::CompletionSource> Async<T> {
     pub fn new(reactor: &Reactor, io: T) -> io::Result<Self> {
         match reactor {
             Reactor::AsyncIo => {
+                #[cfg(feature = "events-etw")]
+                let phases = sys::PhaseSession::register();
                 sys::phase("completion.register.begin", || format!("io={:p}", &io));
                 io.nonblocking()?;
                 let [read, write] = io.completion_events()?;
@@ -118,6 +122,8 @@ impl<T: sys::CompletionSource> Async<T> {
                     ],
                     complete_write: T::complete_write,
                     io,
+                    #[cfg(feature = "events-etw")]
+                    _phases: phases,
                 }))
             }
         }

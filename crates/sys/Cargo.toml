@@ -7,6 +7,7 @@ publish.workspace = true
 [features]
 # Optional phase records for native I/O investigations.
 events = []
+events-etw = ["events"]
 # Terminal fixtures, and shell facts for tests that register tools
 # without starting a daemon.
 test-support = []
