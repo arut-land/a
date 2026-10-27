@@ -478,6 +478,61 @@ fn allocation_phases_exclude_fixtures_and_reset_their_peak() {
 }
 
 // Resource tests run alone: the counter includes all of the runtime's workers.
+#[test]
+#[ignore = "resource test: run alone; converts eight concurrent 12 MP images"]
+fn waiting_image_reads_do_not_retain_whole_inputs() {
+    let _resource = RESOURCE.lock().unwrap();
+    let rig = Rig::new("read-admission", registry());
+    write(&rig, "image.bmp", &picture(4000, 3000), ImageFormat::Bmp);
+    let together = std::sync::Barrier::new(8);
+    let called = within_peak("concurrent images", Some(128 << 20), || {
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        together.wait();
+                        rig.called("read", &json!({"path": "image.bmp"}))
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        })
+    });
+    for call in called {
+        assert!(matches!(call.outcome, Outcome::Done { .. }), "{call:?}");
+        let [Held::Blob(blob)] = &call.held[..] else {
+            panic!("the image result must hold its blob: {:?}", call.held);
+        };
+        let mut bytes = Vec::new();
+        rig.blobs
+            .open(&blob.id)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let sent = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((sent.width(), sent.height()), (2000, 1500));
+    }
+}
+
+#[test]
+#[ignore = "resource test: run alone; reads an image larger than both worker budgets"]
+fn images_larger_than_the_retained_budget_still_complete() {
+    let _resource = RESOURCE.lock().unwrap();
+    let rig = Rig::new("read-oversized", registry());
+    write(&rig, "large.bmp", &picture(5000, 5000), ImageFormat::Bmp);
+    assert!(
+        std::fs::metadata(rig.workspace().join("large.bmp"))
+            .unwrap()
+            .len()
+            > rt::CPU_BUDGET as u64
+    );
+    let (_, bytes, _) = read(&rig, "large.bmp");
+    let sent = image::load_from_memory(&bytes).unwrap();
+    assert_eq!((sent.width(), sent.height()), (2000, 2000));
+}
+
 static RESOURCE: Mutex<()> = Mutex::new(());
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
