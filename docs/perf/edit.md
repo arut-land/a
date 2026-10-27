@@ -82,3 +82,45 @@ budget; larger sources retain line counts with the bounded `[diff cut]` display.
 Output size does not determine whether a diff is formatted. The filesystem
 transaction owns any caller-requested size policy for capture and publication;
 the edit tool requests no file-size ceiling.
+
+Windows native security updates distinguish stored inheritance state from the
+`SE_DACL_AUTO_INHERIT_REQ` command bit. When copying a DACL marked
+`SE_DACL_AUTO_INHERITED`, the edit transaction supplies that command to
+`NtSetSecurityObject`, then removes the command from its comparison descriptor.
+It verifies the original owner, group, DACL entries and control bits, including
+explicit inheritance protection, against the stored result. It does not ask for
+SACL access or enable privileges.
+
+This matters for files created inside an existing isolated home after daemon
+startup secures that home with `private_dir`/`SetSecurityInfo`. Ordinary Rust
+unit-test temporary directories did not exercise that setup. Native Windows x64
+reproduction found identical owner, group and DACL bytes after the old setter,
+but descriptor control changed from `0x8404` to `0x8004`: Windows cleared the
+source's automatic-inheritance state. Both volumes were NTFS. A regression
+creates and secures an existing home through the real filesystem implementation,
+then checks successful publication, exact contents and the complete access
+policy, including the automatic-inheritance bit.
+
+
+Hosted Windows x64 [qualification and paired measurements](https://github.com/arut-land/a/actions/runs/40449265793)
+use the survey's release build policy and the unchanged 1/64 MiB edit workload.
+Three rounds alternate reference/candidate, candidate/reference,
+reference/candidate on one runner. All six reference attempts fail with the ACL
+error; all six candidate edits complete and pass content validation. The final
+regression fails with the reference setter; all 23 candidate native edit tests
+and native clippy pass. Local macOS verification passes 185 sys tests and the
+workspace Windows cross-lint.
+
+Tool-attempt wall time in ms, median [min–max] over three samples per size:
+
+| Input | Reference (failed) | Candidate (completed) |
+| --- | --- | --- |
+| 1 MiB | 86.754 [80.533–94.732] | 136.896 [135.178–139.146] |
+| 64 MiB | 431.260 [430.649–431.789] | 553.856 [548.135–565.709] |
+
+Daemon CPU ms for reference/candidate are respectively 0.000 [0.000–15.625] /
+0.000 [0.000–31.250] at 1 MiB, and 359.375 [359.375–375.000] /
+437.500 [406.250–437.500] at 64 MiB. The native CPU timer is coarse; zero readings
+do not imply zero work. Failed attempts and completed edits do different work,
+so these observations do not establish a speedup or regression. Raw paired
+observations and both executables are in the run's `acl-paired` artifact.

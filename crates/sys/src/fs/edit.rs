@@ -1520,6 +1520,16 @@ impl WindowsPolicy {
         self.0.as_ptr().cast_mut().cast()
     }
 
+    fn control(&self) -> io::Result<u16> {
+        use windows_sys::Win32::Security::GetSecurityDescriptorControl;
+        let (mut control, mut revision) = (0, 0);
+        // SAFETY: self retains the kernel-validated descriptor; outputs are writable.
+        crate::windows::ok(unsafe {
+            GetSecurityDescriptorControl(self.descriptor(), &raw mut control, &raw mut revision)
+        })?;
+        Ok(control)
+    }
+
     fn matches(&self, other: &Self) -> io::Result<bool> {
         use windows_sys::Win32::Security::{
             EqualSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
@@ -1882,8 +1892,25 @@ fn preserve_metadata(source: &File, destination: &File) -> io::Result<()> {
 #[cfg(windows)]
 fn copy_access_policy(source: &File, destination: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
-    // Compare the stored descriptor, without parent-dependent ACE presentation flags.
-    let policy = WindowsPolicy::read(source)?;
+    use windows_sys::Win32::Security::{
+        SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERITED, SetSecurityDescriptorControl,
+    };
+    let mut policy = WindowsPolicy::read(source)?;
+    let control = policy.control()?;
+    // The native setter consumes AUTO_INHERIT_REQ as a command: without it,
+    // it clears AUTO_INHERITED even when the supplied descriptor has it set.
+    // SAFETY: policy exclusively owns this aligned, writable descriptor.
+    crate::windows::ok(unsafe {
+        SetSecurityDescriptorControl(
+            policy.0.as_mut_ptr().cast(),
+            SE_DACL_AUTO_INHERIT_REQ,
+            if control & SE_DACL_AUTO_INHERITED != 0 {
+                SE_DACL_AUTO_INHERIT_REQ
+            } else {
+                0
+            },
+        )
+    })?;
     // SAFETY: both the destination handle and aligned descriptor remain live.
     let status = unsafe {
         windows_sys::Wdk::Storage::FileSystem::NtSetSecurityObject(
@@ -1898,6 +1925,15 @@ fn copy_access_policy(source: &File, destination: &File) -> io::Result<()> {
             unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) }.cast_signed(),
         ));
     }
+    // Compare the stored policy, excluding the set-only command we supplied.
+    // SAFETY: policy still exclusively owns the writable descriptor.
+    crate::windows::ok(unsafe {
+        SetSecurityDescriptorControl(
+            policy.0.as_mut_ptr().cast(),
+            SE_DACL_AUTO_INHERIT_REQ,
+            control & SE_DACL_AUTO_INHERIT_REQ,
+        )
+    })?;
     if !policy.matches(&WindowsPolicy::read(destination)?)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -2631,6 +2667,28 @@ mod tests {
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(!text.contains("allow execute"), "{text}");
         assert_eq!(fs::read(work.target()).unwrap(), b"new");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn secured_home_inherited_access_survives_safe_save() {
+        use windows_sys::Win32::Security::SE_DACL_AUTO_INHERITED;
+        let root = std::env::var_os("RUNNER_TEMP").map_or_else(std::env::temp_dir, PathBuf::from);
+        let work = Workspace(root.join(temporary_name()));
+        fs::create_dir(&work.0).unwrap();
+        super::super::private_dir(&work.0).unwrap();
+        fs::write(work.target(), b"original").unwrap();
+        let before = WindowsPolicy::read(&File::open(work.target()).unwrap()).unwrap();
+        assert_ne!(before.control().unwrap() & SE_DACL_AUTO_INHERITED, 0);
+        EditTransaction::capture(&work.target(), None)
+            .unwrap()
+            .publish(b"replacement", Persistence::Visible, &|_| false)
+            .unwrap();
+        let after = WindowsPolicy::read(&File::open(work.target()).unwrap()).unwrap();
+        assert_eq!(before.control().unwrap(), after.control().unwrap());
+        assert!(before.matches(&after).unwrap());
+        assert_eq!(fs::read(work.target()).unwrap(), b"replacement");
+        work.only_target_remains();
     }
 
     #[cfg(windows)]
