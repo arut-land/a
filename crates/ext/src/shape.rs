@@ -8,7 +8,7 @@ use std::convert::Infallible;
 use std::future::{Future, poll_fn};
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Poll, Waker};
 
 use crate::BoxFuture;
@@ -139,24 +139,39 @@ pub enum Next<P, O> {
 pub struct Partials<P>(Arc<Mutex<Handoff<P>>>);
 
 struct Handoff<P> {
+    // Only the send future owns an unconsumed update; cancelling it
+    // withdraws the registration without leaving a result to drain.
+    pending: Weak<Mutex<Pending<P>>>,
+}
+
+struct Pending<P> {
     partial: Option<P>,
     producer: Option<Waker>,
 }
 
 impl<P> Partials<P> {
     /// Hands off `partial` in order, suspending until the consumer takes it.
-    /// Work resumes when the consumer asks for the next update.
+    /// Work resumes when the consumer asks for the next update. Dropping
+    /// the send before consumption withdraws the update.
     pub async fn send(&mut self, partial: P) {
+        let pending = Arc::new(Mutex::new(Pending {
+            partial: Some(partial),
+            producer: None,
+        }));
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .partial = Some(partial);
+            .pending = Arc::downgrade(&pending);
         poll_fn(|cx| {
-            let mut handoff = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            if handoff.partial.is_none() {
-                return Poll::Ready(());
-            }
-            handoff.producer = Some(cx.waker().clone());
+            let waker = cx.waker().clone();
+            let previous = {
+                let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
+                if pending.partial.is_none() {
+                    return Poll::Ready(());
+                }
+                pending.producer.replace(waker)
+            };
+            drop(previous);
             Poll::Pending
         })
         .await;
@@ -170,8 +185,7 @@ where
     F: Future<Output = Result<O, String>>,
 {
     let partials = Partials(Arc::new(Mutex::new(Handoff {
-        partial: None,
-        producer: None,
+        pending: Weak::new(),
     })));
     let work = Box::pin(work(Partials(Arc::clone(&partials.0))));
     Streamed {
@@ -187,19 +201,24 @@ impl<P, O, F: Future<Output = Result<O, String>>> Streamed<P, F, O> {
     pub async fn next(&mut self) -> Next<P, O> {
         poll_fn(|cx| {
             let output = self.work.as_mut().poll(cx);
-            let (partial, producer) = {
-                let mut handoff = self
-                    .partials
-                    .0
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                (handoff.partial.take(), handoff.producer.take())
-            };
-            if let Some(producer) = producer {
-                producer.wake();
-            }
-            if let Some(partial) = partial {
-                return Poll::Ready(Next::Partial(partial));
+            let pending = self
+                .partials
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pending
+                .upgrade();
+            if let Some(pending) = pending {
+                let (partial, producer) = {
+                    let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
+                    (pending.partial.take(), pending.producer.take())
+                };
+                if let Some(producer) = producer {
+                    producer.wake();
+                }
+                if let Some(partial) = partial {
+                    return Poll::Ready(Next::Partial(partial));
+                }
             }
             output.map(Next::Done)
         })

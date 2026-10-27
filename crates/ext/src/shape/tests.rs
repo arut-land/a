@@ -281,3 +281,24 @@ fn every_update_is_delivered_before_completion_without_a_count_cap() {
         Next::Done(Err("finished".to_owned()))
     );
 }
+
+#[test]
+fn cancelling_a_send_withdraws_its_update_before_completion() {
+    let mut streamed = stream(|mut partials| async move {
+        let partial = Arc::new(());
+        let pending = Arc::downgrade(&partial);
+        let mut send = Box::pin(partials.send(partial));
+        poll_fn(|cx| {
+            assert!(send.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(send);
+        assert!(
+            pending.upgrade().is_none(),
+            "cancellation releases the update"
+        );
+        Ok::<_, String>("done")
+    });
+    assert_eq!(rt::block_on(streamed.next()), Next::Done(Ok("done")));
+}
