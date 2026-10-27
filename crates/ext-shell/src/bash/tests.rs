@@ -1,5 +1,6 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -913,4 +914,142 @@ fn unterminated_terminal_metadata_cannot_grow_retained_output() {
     assert!(ALLOC.peak().saturating_sub(baseline) < 256 << 10);
     assert_eq!(output.finish().render().text, "");
     assert_eq!(live.take(), None);
+}
+
+struct HeldTimers {
+    inner: rt::Rt,
+    now: Instant,
+    idle: ext::Flag,
+}
+
+impl rt::Runtime for HeldTimers {
+    fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+        self.inner.spawn(task);
+    }
+
+    fn spawn_blocking(
+        &self,
+        class: rt::BlockingClass,
+        bytes: usize,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
+        self.inner.spawn_blocking(class, bytes, work)
+    }
+
+    fn spawn_flush(
+        &self,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
+        self.inner.spawn_flush(work)
+    }
+
+    fn reactor(&self) -> rt::Reactor {
+        self.inner.reactor()
+    }
+
+    fn now(&self) -> Instant {
+        self.now
+    }
+
+    fn sleep(&self, duration: Duration) -> rt::BoxFuture<'static, ()> {
+        let idle = self.idle.clone();
+        Box::pin(async move {
+            if duration == IDLE {
+                idle.set();
+            }
+            std::future::pending::<()>().await;
+        })
+    }
+}
+
+impl Extension for HeldTimers {
+    const NAME: &'static str = "held-timers";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn rt::Runtime>(Arc::new(Self {
+            inner: Arc::clone(&self.inner),
+            now: self.now,
+            idle: self.idle.clone(),
+        }));
+    }
+}
+
+#[test]
+fn a_quiet_group_ending_wakes_supervision_without_a_timer() {
+    let timers = HeldTimers {
+        inner: Arc::new(rt::Threads::default()),
+        now: Instant::now(),
+        idle: ext::Flag::default(),
+    };
+    let rig = Rig::new(
+        "quiet-ended",
+        Registry::default()
+            .with(&crate::Shell::default())
+            .and_then(|r| r.with(&timers))
+            .unwrap(),
+    );
+    let cx = rig.cx();
+    rt::block_on(async {
+        let Stream { file, open } = cx.blobs.stream(cx.call, u64::MAX).unwrap();
+        let log = open.path();
+        let written =
+            rt::Async::for_reading(&timers.inner.reactor(), sys::write_watch(log).unwrap())
+                .unwrap();
+        let process = cx
+            .service::<dyn Processes>()
+            .unwrap()
+            .spawn(
+                &cx,
+                LaunchSpec {
+                    process: spawn_with::<crate::dialect::Bash>(
+                        sys::shell::ExecutionFacts::current(),
+                        "(while [ ! -f release ]; do sleep 0.01; done) & exit 0",
+                        &cx.dir(),
+                        environment(&cx, std::env::vars_os()),
+                        None,
+                    )
+                    .unwrap(),
+                    output: ProcessOutput::File(file),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(process.wait().await.unwrap().success());
+        assert!(process.alive(), "the quiet descendant must still be gated");
+        let cx = &cx;
+        let mut work = ext::stream(|progress| async move {
+            let detached = Detached {
+                dir: cx.dir(),
+                started: 0,
+            };
+            let finished = supervise::<crate::dialect::Bash>(
+                process,
+                Followed { log, written },
+                Supervised::Launched {
+                    limit: Duration::from_secs(5),
+                    detached: &detached,
+                },
+                cx,
+                &progress,
+            )
+            .await
+            .unwrap();
+            assert!(finished.status.success());
+            assert!(!finished.lingering);
+            assert_eq!(finished.output.render().text, "");
+            Ok::<_, String>(())
+        });
+        rt::or(
+            async { while !matches!(work.next().await, shape::Next::Done(Ok(()))) {} },
+            async {
+                timers.idle.wait().await;
+                // Only release the descendant once the post-exit wait is polled.
+                std::fs::write(cx.dir().join("release"), []).unwrap();
+                timers.inner.sleep(Duration::from_secs(10)).await;
+                panic!("group completion depended on a held supervisor timer");
+            },
+        )
+        .await;
+    });
 }
