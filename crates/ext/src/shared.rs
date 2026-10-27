@@ -1,6 +1,6 @@
 //! One value per workspace, shared by everything working there: made on
 //! first use and dropped with its last user, so a workspace nobody works
-//! in costs nothing.
+//! in releases its value. Expired map entries retire on the next miss.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -24,10 +24,10 @@ impl<T> WorkspaceShared<T> {
     /// `OnceLock` of its own, while users of other workspaces never wait.
     pub fn get_or_make(&self, workspace: &Path, make: impl FnOnce(&Weak<T>) -> T) -> Arc<T> {
         let mut open = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        open.retain(|_, slot| slot.strong_count() > 0);
         if let Some(value) = open.get(workspace).and_then(Weak::upgrade) {
             return value;
         }
+        open.retain(|_, slot| slot.strong_count() > 0);
         let value = Arc::new_cyclic(make);
         open.insert(workspace.to_owned(), Arc::downgrade(&value));
         value
@@ -66,5 +66,23 @@ mod tests {
         let weak = Arc::downgrade(&value);
         drop(value);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn live_hits_leave_retirement_to_the_next_miss() {
+        let shared = WorkspaceShared::<()>::default();
+        let live = shared.get_or_make(Path::new("live"), |_| ());
+        drop(shared.get_or_make(Path::new("expired"), |_| ()));
+        let hit = shared.get_or_make(Path::new("live"), |_| panic!("live value replaced"));
+        assert!(Arc::ptr_eq(&live, &hit));
+        assert_eq!(shared.0.lock().unwrap().len(), 2);
+        let new = shared.get_or_make(Path::new("new"), |_| ());
+        let open = shared.0.lock().unwrap();
+        assert_eq!(open.len(), 2);
+        assert!(!open.contains_key(Path::new("expired")));
+        assert!(Arc::ptr_eq(
+            &new,
+            &open[Path::new("new")].upgrade().unwrap()
+        ));
     }
 }
