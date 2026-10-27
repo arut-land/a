@@ -49,8 +49,10 @@ short = first + first * ((64 << 20) // 22)
 long = first + (b"x" * 4095 + b"\n") * 16384
 ```
 
-The short file is 67,108,866 bytes, 3,050,403 lines; the control is
-67,108,886 bytes, 16,385 lines. Both preserve the same first line.
+The short file is 70,159,269 bytes, 3,050,403 lines; the control is
+67,108,887 bytes, 16,385 lines. The survey generator divides by 22 even
+though its repeated short line is 23 bytes, so its nominal 64 MiB short
+file is actually 66.91 MiB. Both preserve the same first line.
 Before changing the fold, an A/A run (both lanes the baseline binary,
 five alternating rounds) reproduced the CPU gap: short-line CPU/read
 44.58 ms [40.20–47.63], control 12.36 ms [11.29–14.30], across ten batches
