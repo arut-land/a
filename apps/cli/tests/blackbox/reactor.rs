@@ -111,6 +111,7 @@ fn a_running_quiet_command_costs_no_threads() {
             accepted.is_some()
         });
         let (mut stream, _) = accepted.unwrap();
+        stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         let mut ready = [0; 5];
         stream.read_exact(&mut ready).unwrap();
@@ -169,6 +170,7 @@ fn a_command_backgrounded_at_its_timeout_never_wakes_the_daemon() {
         accepted.is_some()
     });
     let (mut release, _) = accepted.unwrap();
+    release.set_nonblocking(false).unwrap();
     release.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     let mut ready = [0; 5];
     release.read_exact(&mut ready).unwrap();
@@ -214,6 +216,7 @@ fn the_last_job_holds_the_daemon_until_it_ends() {
         accepted.is_some()
     });
     let (mut release, _) = accepted.unwrap();
+    release.set_nonblocking(false).unwrap();
     release.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     let mut ready = [0; 5];
     release.read_exact(&mut ready).unwrap();
