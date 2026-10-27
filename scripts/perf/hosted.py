@@ -426,7 +426,7 @@ def main():
         samples = [measure_windows([str(output / ("a" + SUFFIX)), "--version"]) for _ in range(5)]
         (output / "startup-native.json").write_text(json.dumps({"native_samples": samples}))
     run([sys.executable, ROOT / "mise-tasks/perf/workloads", output / ("a-fixtures" + SUFFIX), "cli",
-         "--runs", "20", "--output", output])
+         "--runs", "20", "--output", output, "--probe", output / ("perf-probe" + SUFFIX)])
     run([sys.executable, ROOT / "mise-tasks/perf/benches", output, output / "cli/transcript.jsonl", "--runs", "5"])
     try:
         summarize(output, source, variant, args.runner)

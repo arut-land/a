@@ -2,8 +2,9 @@
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -58,11 +59,26 @@ def dumpbin():
 
 
 def stage(binary, destination):
+    native_identity = None
+    # Native IDs let offline symbolication check the image/debug-file pairing.
+    tool = "dwarfdump" if sys.platform == "darwin" else "readelf" if sys.platform == "linux" else dumpbin()
+    if shutil.which(tool):
+        args = ["--uuid"] if sys.platform == "darwin" else ["-n"] if sys.platform == "linux" else ["/nologo", "/headers"]
+        paths = [str(binary)]
+        if sys.platform == "darwin" and Path(str(binary) + ".dSYM").exists():
+            paths.append(str(binary) + ".dSYM")
+        result = subprocess.run([tool, *args, *paths], capture_output=True, text=True, check=False)
+        native_identity = dict(tool=tool, returncode=result.returncode,
+                               stdout=result.stdout, stderr=result.stderr)
+    pdb = binary.with_suffix(".pdb")
+    if sys.platform == "win32" and native_identity:
+        if match := re.search(r"Format: RSDS, \{[^}]+\}, \d+, (.+\.pdb)", native_identity["stdout"]):
+            pdb = binary.parent / PureWindowsPath(match[1].strip()).name
     shutil.copy2(binary, destination)
     retained = []
     for symbols, staged in [(Path(str(binary) + ".dSYM"), Path(str(destination) + ".dSYM")),
                             (Path(str(binary) + ".dwp"), Path(str(destination) + ".dwp")),
-                            (binary.with_suffix(".pdb"), destination.with_suffix(".pdb"))]:
+                            (pdb, destination.with_suffix(".pdb"))]:
         if not symbols.exists():
             continue
         if symbols.is_dir():
@@ -74,16 +90,8 @@ def stage(binary, destination):
     files = [destination, *retained]
     identity = dict(source=str(binary), files={str(p.relative_to(destination.parent)): dict(
         bytes=p.stat().st_size, sha256=hashlib.sha256(p.read_bytes()).hexdigest()) for p in files})
-    # Native IDs let offline symbolication check the image/debug-file pairing.
-    tool = "dwarfdump" if sys.platform == "darwin" else "readelf" if sys.platform == "linux" else dumpbin()
-    if shutil.which(tool):
-        args = ["--uuid"] if sys.platform == "darwin" else ["-n"] if sys.platform == "linux" else ["/nologo", "/headers"]
-        paths = [str(binary)]
-        if sys.platform == "darwin" and Path(str(binary) + ".dSYM").exists():
-            paths.append(str(binary) + ".dSYM")
-        result = subprocess.run([tool, *args, *paths], capture_output=True, text=True, check=False)
-        identity["native_identity"] = dict(tool=tool, returncode=result.returncode,
-                                           stdout=result.stdout, stderr=result.stderr)
+    if native_identity:
+        identity["native_identity"] = native_identity
     Path(str(destination) + ".identity.json").write_text(json.dumps(identity, indent=2) + "\n")
     return destination
 

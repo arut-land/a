@@ -170,7 +170,8 @@ def sample(case, binary, probe, output, memory_only=False):
         if name == "quiet-shell":
             from hosted import load_task
             workload = load_task("workloads")
-            prompt = workload.large_output_prompt() if control else workload.shell_call("exit 0" if os.name == "nt" else "true")
+            shell = workload.selected_shell(probe, active.home, active.env, output=output)
+            prompt = workload.large_output_prompt(shell) if control else workload.shell_call("exit 0", shell)
             result = tool(binary, active, prompt)
             if control:
                 load_task("workloads").validate_tools(result["results"], 1, 1048576)

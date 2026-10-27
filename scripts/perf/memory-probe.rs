@@ -13,6 +13,16 @@ fn marker(label: &str) {
 pub fn run(args: &[String]) {
     let home = sys::Home::from(std::path::PathBuf::from(&args[0]));
     let mode = &args[1];
+    if mode == "shell" {
+        let paths = sys::Paths::from(std::path::PathBuf::from(&args[0]));
+        println!(
+            "{}",
+            sys::shell::ExecutionFacts::initialize(&paths)
+                .unwrap()
+                .tool()
+        );
+        return;
+    }
     let count: usize = args[2].parse().unwrap();
     let first = std::cell::Cell::new(true);
     let connect = || {

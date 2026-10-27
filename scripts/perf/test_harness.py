@@ -171,6 +171,25 @@ class Builds(unittest.TestCase):
             self.assertEqual(destination.with_suffix(".pdb").read_bytes(), b"PDB")
             self.assertEqual(identity["files"]["fixture.exe"]["bytes"], source.stat().st_size)
 
+    def test_windows_symbols_follow_the_pe_reference_instead_of_the_target_spelling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "perf-probe.exe"
+            source.write_bytes(b"artifact")
+            (root / "perf_probe.pdb").write_bytes(b"referenced PDB")
+            source.with_suffix(".pdb").write_bytes(b"unrelated PDB")
+            destination = root / "staged.exe"
+            with mock.patch.object(sys, "platform", "win32"), \
+                 mock.patch.object(build, "dumpbin", return_value="dumpbin"), \
+                 mock.patch.object(build.shutil, "which", return_value="dumpbin"), \
+                 mock.patch.object(build.subprocess, "run", return_value=subprocess.CompletedProcess(
+                     [], 0, "Format: RSDS, {D1163AC9-8FB0-47FA-A500-4173905F5536}, 1, perf_probe.pdb", "")):
+                build.stage(source, destination)
+            self.assertEqual(destination.with_suffix(".pdb").read_bytes(), b"referenced PDB")
+            identity = json.loads(Path(str(destination) + ".identity.json").read_text())
+            self.assertIn("staged.pdb", identity["files"])
+            self.assertIn("perf_probe.pdb", identity["native_identity"]["stdout"])
+
     def test_memory_build_never_requests_unrelated_test_binaries(self):
         with tempfile.TemporaryDirectory() as directory, \
              mock.patch.object(hosted, "executable") as executable, \
@@ -228,6 +247,21 @@ class Builds(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("PERF_TEST_BINARY"), "set PERF_TEST_BINARY to a real fixture-enabled a")
 class RealDaemon(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("PERF_TEST_WORKLOAD_PROBE"), "native shell selection probe")
+    def test_shell_workloads_use_sys_selection_instead_of_the_host_os(self):
+        binary = str(Path(os.environ["PERF_TEST_BINARY"]).resolve(strict=True))
+        probe = Path(os.environ["PERF_TEST_WORKLOAD_PROBE"]).resolve(strict=True)
+        workload = hosted.load_task("workloads")
+        with lifecycle.daemon(binary) as active:
+            shell = workload.selected_shell(probe, active.home, active.env)
+            with mock.patch.object(workload.os, "name", "nt" if os.name != "nt" else "posix"):
+                prompt = workload.large_output_prompt(shell)
+            subprocess.run([binary, "--mode", "auto", "-p", prompt], env=active.env, cwd=active.home,
+                           capture_output=True, check=True, timeout=60)
+            records = workload.tool_results(active.home)
+            workload.validate_tools(records, 1, 1048576)
+            self.assertEqual(records[0]["tool"], shell)
+
     @unittest.skipUnless(os.environ.get("PERF_TEST_WORKLOAD_PROBE"), "set PERF_TEST_WORKLOAD_PROBE to the real survey probe")
     def test_subscription_churn_and_replay_probes_complete_and_release_their_clients(self):
         binary = Path(os.environ["PERF_TEST_BINARY"]).resolve(strict=True)
@@ -268,20 +302,24 @@ class RealDaemon(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "tool did not complete"):
                 workload.validate_tools(workload.tool_results(active.home), 1)
 
+    @unittest.skipUnless(os.environ.get("PERF_TEST_WORKLOAD_PROBE"), "native shell selection probe")
     def test_cli_success_cannot_hide_a_nonzero_shell_exit(self):
         binary = str(Path(os.environ["PERF_TEST_BINARY"]).resolve(strict=True))
         workload = hosted.load_task("workloads")
         with lifecycle.daemon(binary) as active:
-            subprocess.run([binary, "--mode", "auto", "-p", workload.shell_call("exit 17")],
+            shell = workload.selected_shell(Path(os.environ["PERF_TEST_WORKLOAD_PROBE"]), active.home, active.env)
+            subprocess.run([binary, "--mode", "auto", "-p", workload.shell_call("exit 17", shell)],
                            env=active.env, cwd=active.home, capture_output=True, timeout=30, check=True)
             with self.assertRaisesRegex(ValueError, "shell did not succeed"):
                 workload.validate_tools(workload.tool_results(active.home), 1)
 
+    @unittest.skipUnless(os.environ.get("PERF_TEST_WORKLOAD_PROBE"), "native shell selection probe")
     def test_large_shell_output_is_validated_from_the_real_blob_reference(self):
         binary = str(Path(os.environ["PERF_TEST_BINARY"]).resolve(strict=True))
         workload = hosted.load_task("workloads")
         with lifecycle.daemon(binary) as active:
-            result = subprocess.run([binary, "--mode", "auto", "-p", workload.large_output_prompt()], env=active.env, cwd=active.home,
+            shell = workload.selected_shell(Path(os.environ["PERF_TEST_WORKLOAD_PROBE"]), active.home, active.env)
+            result = subprocess.run([binary, "--mode", "auto", "-p", workload.large_output_prompt(shell)], env=active.env, cwd=active.home,
                 capture_output=True, timeout=60)
             result.check_returncode()
             records = workload.tool_results(active.home)

@@ -38,7 +38,9 @@ the output location. `mise run bloat` shares the rebuilt-std arguments; its
 only profile difference is retaining the symbols needed for attribution.
 Staging retains matching dSYM, DWP and PDB sidecars, with an identity manifest
 containing the image and symbol-file SHA-256 hashes and native UUID, ELF notes
-or PE debug-directory output. The upload includes the symbol bundles themselves.
+or PE debug-directory output. Windows PDB lookup follows the PE CodeView
+reference, since Rust target hyphens can become underscores in PDB names.
+The upload includes the symbol bundles themselves.
 
 `host.json` is written before builds and measurements, so failed runs retain
 hardware and toolchain metadata. Failed prep commands keep their argv, exit
@@ -102,10 +104,14 @@ Tool validation reads the engine's real log, joining results to agent calls;
 user configuration calls such as `--mode auto` are separate. A successful CLI
 exit alone is insufficient. Large shell output must hold the expected exact
 1,048,576-byte blob; image reads must each complete and hold their image.
+Shell workloads reuse `sys::shell::ExecutionFacts` through the release probe,
+so a Windows host with native Bash uses its registered Bash tool. Standalone
+`perf:workloads` accepts `--probe`; without it, preparation builds a sys/protocol
+probe outside the worktree before starting measurements.
 
 | Workload | Control / load |
 | --- | --- |
-| quiet shell | 1 MiB output / quiet `true` or PowerShell `exit 0`, through the native shell tool |
+| quiet shell | 1 MiB output / quiet `exit 0`, through the native shell tool |
 | reply projection | 0 / 50,000 prior items, 4,096 32-byte deltas through the real reducer and reply stream |
 | edit | 1 / 64 MiB real UTF-8 file, one exact replacement |
 | TUI paragraph | newline / unfinished paragraph, 2,000 32-byte updates at width 100 |
