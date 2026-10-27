@@ -136,16 +136,15 @@ impl Frames {
 
     /// The next message; `None` once the client hung up between frames.
     async fn next<T: Decode>(&mut self) -> io::Result<Option<T>> {
+        let mut frames = protocol::FrameReader::new(&mut self.buf);
         loop {
             if self.batch >= WRITE_BATCH {
                 self.batch = 0;
                 rt::yield_now().await;
             }
-            if let Some((len, body)) = protocol::frame_in(&self.buf)? {
+            if let Some((len, msg)) = frames.decode()? {
                 self.batch += len.max(WRITE_BATCH / 64);
-                let msg = T::from_json(body.json()?)?;
                 self.bytes = len;
-                self.buf.drain(..len);
                 return Ok(Some(msg));
             }
             let n = self
@@ -156,12 +155,12 @@ impl Frames {
                     // Vec read would retain the entire scratch allocation.
                     let mut read = [0; 16 << 10];
                     let n = s.read(&mut read)?;
-                    self.buf.extend_from_slice(&read[..n]);
+                    frames.extend_from_slice(&read[..n]);
                     Ok(n)
                 })
                 .await?;
             match n {
-                0 if self.buf.is_empty() => return Ok(None),
+                0 if frames.is_empty() => return Ok(None),
                 0 => return Err(io::ErrorKind::UnexpectedEof.into()),
                 _ => {}
             }
@@ -875,6 +874,7 @@ mod tests {
             Some(ClientMsg::Hello { build, .. }) if build.len() == 64 << 10
         ));
         let peer = writer.join().unwrap();
+        assert_eq!(frames.buf.capacity(), 0, "completed frame retained storage");
         frames.batch = 0;
         for _ in 0..65 {
             ClientMsg::Detach.write_frame(&mut frames.buf).unwrap();

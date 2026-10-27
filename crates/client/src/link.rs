@@ -145,13 +145,15 @@ impl dyn Stream + '_ {
 
     /// The next frame, from what is `buffered` and then the stream.
     pub(crate) async fn recv<T: Decode>(&self, buffered: &mut Vec<u8>) -> io::Result<Option<T>> {
+        let mut frames = protocol::FrameReader::new(buffered);
         loop {
-            if let Some((len, body)) = protocol::frame_in(buffered)? {
-                let msg = T::from_json(body.json()?)?;
-                buffered.drain(..len);
+            if let Some((_, msg)) = frames.decode()? {
                 return Ok(Some(msg));
             }
-            if !self.fill(buffered).await? {
+            let mut read = frames.read_buffer(8192);
+            let n = self.read(read.as_mut()).await?;
+            read.filled(n);
+            if n == 0 {
                 return Ok(None);
             }
         }
@@ -478,3 +480,53 @@ pub(crate) async fn hello(
 
 /// The shared runtime behind the blocking SDK entry points.
 pub(crate) static BLOCKING: LazyLock<Rt> = LazyLock::new(|| Arc::new(rt::Threads::new(1)));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_frames_keep_their_bytes_and_completed_frames_release_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let home = Home::from(root.path().to_path_buf());
+        std::fs::create_dir_all(home.run_dir()).unwrap();
+        let owner = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(home.daemon_pid_file())
+            .unwrap();
+        sys::fs::lock(&owner).unwrap();
+        write!(&owner, "{}", sys::crash::Record::current("test")).unwrap();
+        let listener = home.bind().unwrap();
+        let peer = home.endpoint().connect().unwrap();
+        let runtime: Rt = Arc::new(rt::Threads::new(1));
+        let opened = socket(&runtime, listener.accept().unwrap()).unwrap();
+        let mut wire = Vec::new();
+        ClientMsg::Hello {
+            proto: PROTO,
+            build: "x".repeat(5 << 20),
+            caps: Caps::NONE,
+            client: None,
+            machine: None,
+        }
+        .write_frame(&mut wire)
+        .unwrap();
+        // A link may already have received the start of a frame with its preamble.
+        let mut buffered = wire[..4096].to_vec();
+        let writer = std::thread::spawn(move || {
+            Write::write_all(&mut &peer, &wire[4096..]).unwrap();
+            peer
+        });
+        assert!(matches!(
+            rt::block_on(opened.stream.recv::<ClientMsg>(&mut buffered)).unwrap(),
+            Some(ClientMsg::Hello { build, .. }) if build.len() == 5 << 20
+        ));
+        assert_eq!(buffered.capacity(), 0, "completed frame retained storage");
+        let peer = writer.join().unwrap();
+        drop(peer);
+        drop(opened);
+        drop(listener);
+        home.endpoint().remove();
+    }
+}
