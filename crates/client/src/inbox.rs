@@ -55,8 +55,10 @@ struct Shared<T> {
 }
 
 impl<T> Shared<T> {
-    fn wake(&self, queue: &mut Queue<T>) {
-        if let Some(waker) = queue.waker.take() {
+    fn wake(&self, mut queue: MutexGuard<'_, Queue<T>>) {
+        let waker = queue.waker.take();
+        drop(queue);
+        if let Some(waker) = waker {
             waker.wake();
         }
         self.ready.notify_one();
@@ -143,7 +145,7 @@ impl<T> Post<T> {
         queue.first_bytes = 0;
         queue.ended = true;
         queue.first.push_back((0, item));
-        self.0.wake(&mut queue);
+        self.0.wake(queue);
         self.0.space.notify();
     }
 
@@ -172,7 +174,7 @@ impl<T> Post<T> {
             queue.items.push_back((bytes, item));
             queue.bytes += bytes;
         }
-        self.0.wake(&mut queue);
+        self.0.wake(queue);
         Ok(())
     }
 }
@@ -189,7 +191,7 @@ impl<T> Drop for Post<T> {
         let mut queue = self.0.queue();
         queue.posts -= 1;
         if queue.posts == 0 {
-            self.0.wake(&mut queue);
+            self.0.wake(queue);
         }
     }
 }
@@ -224,13 +226,16 @@ impl<T> Inbox<T> {
     pub fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         let mut queue = self.0.queue();
         if let Some(item) = queue.pop() {
+            drop(queue);
             self.0.space.notify();
             return Poll::Ready(Some(item));
         }
         if queue.posts == 0 || queue.ended {
             return Poll::Ready(None);
         }
-        queue.waker = Some(cx.waker().clone());
+        let previous = queue.waker.replace(cx.waker().clone());
+        drop(queue);
+        drop(previous);
         Poll::Pending
     }
 
@@ -238,6 +243,7 @@ impl<T> Inbox<T> {
         let mut queue = self.0.queue();
         loop {
             if let Some(item) = queue.pop() {
+                drop(queue);
                 self.0.space.notify();
                 return Some(item);
             }
@@ -263,6 +269,9 @@ impl<T> Drop for Inbox<T> {
         queue.taken = false;
         queue.first.clear();
         queue.items.clear();
+        let waker = queue.waker.take();
+        drop(queue);
+        drop(waker);
         self.0.ready.notify_all();
         self.0.space.notify();
     }
@@ -270,17 +279,17 @@ impl<T> Drop for Inbox<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Weak};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::thread;
     use std::time::Duration;
 
     use super::{QueueBudget, inbox};
-    use std::task::Poll;
 
     #[test]
     fn durable_backpressure_preserves_order_and_reserves_control_capacity() {
         use std::future::Future;
         use std::pin::pin;
-        use std::task::{Context, Waker};
 
         for budget in [
             QueueBudget {
@@ -435,5 +444,98 @@ mod tests {
         let (_post, inbox) = inbox::<u8>(QueueBudget::default(), |_| 1);
         assert_eq!(inbox.recv_timeout(Duration::from_millis(5)), None);
         assert_eq!(inbox.try_recv(), None);
+    }
+
+    struct Unlocked(Weak<super::Shared<u8>>);
+
+    impl Unlocked {
+        fn check(&self) {
+            if let Some(shared) = self.0.upgrade() {
+                assert!(
+                    shared.queue.try_lock().is_ok(),
+                    "waker callback held the queue lock"
+                );
+            }
+        }
+    }
+
+    impl Wake for Unlocked {
+        fn wake(self: Arc<Self>) {
+            self.check();
+        }
+    }
+
+    impl Drop for Unlocked {
+        fn drop(&mut self) {
+            // Releasing a replaced waker can run arbitrary task cleanup too.
+            if !thread::panicking() {
+                self.check();
+            }
+        }
+    }
+
+    fn register(inbox: &super::Inbox<u8>) {
+        let waker = Waker::from(Arc::new(Unlocked(Arc::downgrade(&inbox.0))));
+        assert!(
+            inbox
+                .poll_recv(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+    }
+
+    #[test]
+    fn receiver_wakers_run_and_are_released_outside_the_queue_lock() {
+        for action in 0..5 {
+            let (post, inbox) = inbox(QueueBudget::default(), |_| 1);
+            register(&inbox);
+            match action {
+                0 => post.send(1).unwrap(),
+                1 => post.send_first(1).unwrap(),
+                2 => post.close_with(1),
+                3 => drop(post),
+                4 => {
+                    register(&inbox);
+                    drop(inbox);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn producer_wakers_run_outside_the_queue_lock() {
+        use std::future::Future;
+        use std::pin::pin;
+
+        for action in 0..5 {
+            let (post, inbox) = inbox(
+                QueueBudget {
+                    requests: 1,
+                    control_reserve: 0,
+                    ..QueueBudget::default()
+                },
+                |_| 1,
+            );
+            post.send(1).unwrap();
+            let mut pending = pin!(post.send_async(2));
+            let waker = Waker::from(Arc::new(Unlocked(Arc::downgrade(&inbox.0))));
+            assert!(
+                pending
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            match action {
+                0 => assert_eq!(inbox.try_recv(), Some(1)),
+                1 => assert_eq!(
+                    inbox.poll_recv(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Some(1))
+                ),
+                2 => assert_eq!(inbox.recv(), Some(1)),
+                3 => post.close_with(3),
+                4 => drop(inbox),
+                _ => unreachable!(),
+            }
+        }
     }
 }
