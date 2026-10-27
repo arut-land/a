@@ -225,7 +225,7 @@ impl Once {
             }
             return;
         }
-        let events = self.stream.project(self.client.view());
+        let events = self.stream.update(self.client.view(), change);
         if self.taken() {
             for event in events {
                 match event {

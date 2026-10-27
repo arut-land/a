@@ -558,7 +558,7 @@ impl Screen {
         emit: &mut dyn FnMut(fmt::Arguments<'_>),
     ) {
         if !matches!(change, Change::Batch { .. }) {
-            for event in self.stream.project(view) {
+            for event in self.stream.update(view, change) {
                 match event {
                     client::ReplyEvent::Start => emit(format_args!("a    ")),
                     client::ReplyEvent::Text(text) => emit(format_args!("{text}")),
