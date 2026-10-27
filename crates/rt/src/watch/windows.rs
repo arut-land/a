@@ -302,11 +302,14 @@ impl Native {
             )
             .await;
             // Closed, perhaps for a handle that took over: what completed
-            // meanwhile is still told.
-            if let Ok(Some(paths)) = watch.get_ref().take()
-                && let Some(shared) = me.upgrade()
-            {
-                shared.handle(|_| paths.into_iter().map(Raw::Changed).collect());
+            // meanwhile is still told, an overflow as a rescan.
+            let Some(shared) = me.upgrade() else { return };
+            match watch.get_ref().take() {
+                Ok(Some(paths)) => {
+                    shared.handle(|_| paths.into_iter().map(Raw::Changed).collect());
+                }
+                Ok(None) => shared.handle(|_| vec![Raw::Rescan(Some(key))]),
+                Err(_) => {}
             }
         }));
         Ok(Handle {
