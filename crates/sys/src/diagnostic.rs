@@ -2,7 +2,8 @@
 
 /// Records a debug phase only in builds with `events`. Details are never
 /// constructed otherwise. `A_PHASE_DIR` selects per-process files in an
-/// existing directory; without it records go to stderr.
+/// existing directory. It can also be set at compile time for children
+/// started with a cleared environment. Without either, records go to stderr.
 #[inline]
 pub fn phase(name: &'static str, detail: impl FnOnce() -> String) {
     #[cfg(feature = "events")]
@@ -19,7 +20,8 @@ mod enabled {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static FILE: LazyLock<Option<Mutex<File>>> = LazyLock::new(|| {
-        let directory = std::env::var_os("A_PHASE_DIR")?;
+        let directory = std::env::var_os("A_PHASE_DIR")
+            .or_else(|| option_env!("A_PHASE_DIR").map(std::ffi::OsString::from))?;
         OpenOptions::new()
             .create(true)
             .append(true)
