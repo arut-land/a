@@ -22,6 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -161,11 +162,19 @@ struct Inbox {
     draining: bool,
 }
 
+// One root and its overlapping parent need no index selection.
+const DIRECT_SUBSCRIPTIONS: usize = 2;
+
 struct State {
     rt: Rt,
     me: Weak<Shared>,
     subs: BTreeMap<u64, Sub>,
+    roots: BTreeMap<PathBuf, BTreeSet<u64>>,
     next: u64,
+    #[cfg(test)]
+    routing_checks: usize,
+    #[cfg(test)]
+    index_selections: usize,
     native: native::Native,
 }
 
@@ -239,7 +248,12 @@ impl Hub {
                 rt,
                 me: me.clone(),
                 subs: BTreeMap::new(),
+                roots: BTreeMap::new(),
                 next: 0,
+                #[cfg(test)]
+                routing_checks: 0,
+                #[cfg(test)]
+                index_selections: 0,
             }),
             inbox: Mutex::default(),
         }))
@@ -322,6 +336,7 @@ impl Subscription {
 impl Drop for Subscription {
     fn drop(&mut self) {
         let mut state = lock(&self.hub.state);
+        state.unindex(self.id);
         let sub = state.subs.remove(&self.id);
         state.native.disarm(self.id);
         drop(state);
@@ -394,7 +409,7 @@ impl State {
                     }
                 }
                 Raw::Rescan(Some(path)) => {
-                    for id in self.ids() {
+                    for id in self.related(&path) {
                         let sub = &self.subs[&id];
                         let event = if sub.real.starts_with(&path) {
                             Event::Rescan
@@ -409,20 +424,20 @@ impl State {
                     }
                 }
                 Raw::Unwatched(path) => {
-                    for sub in self.subs.values_mut() {
-                        sub.entered.remove(&path);
+                    for id in self.related(&path) {
+                        self.subs
+                            .get_mut(&id)
+                            .expect("indexed")
+                            .entered
+                            .remove(&path);
                     }
                 }
                 Raw::Freed => freed = true,
                 Raw::Failed(path, error) => {
-                    for id in self.ids() {
-                        let sub = &self.subs[&id];
-                        if path
-                            .as_ref()
-                            .is_some_and(|p| !sub.real.starts_with(p) && !p.starts_with(&sub.real))
-                        {
-                            continue;
-                        }
+                    for id in path
+                        .as_ref()
+                        .map_or_else(|| self.ids(), |path| self.related(path))
+                    {
                         self.failed(id, &error);
                     }
                 }
@@ -446,19 +461,76 @@ impl State {
         self.subs.keys().copied().collect()
     }
 
+    /// Ancestors receive visible detail; descendants may have been
+    /// replaced or invalidated by a change above their root.
+    fn related(&self, path: &Path) -> Vec<u64> {
+        let mut ids = Vec::new();
+        let mut at = path.parent();
+        while let Some(bound) = at {
+            let Some((root, subscribers)) = self
+                .roots
+                .range::<Path, _>((Bound::Unbounded, Bound::Included(bound)))
+                .next_back()
+            else {
+                break;
+            };
+            if bound.starts_with(root) {
+                ids.extend(subscribers);
+                at = root.parent();
+            } else {
+                // An unrelated predecessor's descendants cannot contain
+                // an ancestor of this path. Skip to their common prefix.
+                at = bound
+                    .ancestors()
+                    .skip(1)
+                    .find(|parent| root.starts_with(parent));
+            }
+        }
+        ids.extend(
+            self.roots
+                .range::<Path, _>((Bound::Included(path), Bound::Unbounded))
+                .take_while(|(root, _)| root.starts_with(path))
+                .flat_map(|(_, ids)| ids),
+        );
+        ids
+    }
+
+    fn unindex(&mut self, id: u64) {
+        let root = &self.subs[&id].real;
+        if let Some(ids) = self.roots.get_mut(root) {
+            ids.remove(&id);
+            if ids.is_empty() {
+                self.roots.remove(root);
+            }
+        }
+    }
+
     /// Something at `path` changed (`created`, a directory appeared there).
     fn changed(&mut self, path: &Path, created: bool, roots: &mut Vec<u64>) {
+        let ids = if self.subs.len() <= DIRECT_SUBSCRIPTIONS {
+            None
+        } else {
+            #[cfg(test)]
+            {
+                self.index_selections += 1;
+            }
+            Some(self.related(path))
+        };
         let State {
             subs, native, rt, ..
         } = self;
-        for (&id, sub) in subs.iter_mut() {
+        let mut changed = |id, sub: &mut Sub| {
+            #[cfg(test)]
+            {
+                self.routing_checks += 1;
+            }
             // A change under a root thought gone shows it back, even when
             // what made it again was coalesced away.
             if sub.real.starts_with(path)
                 || (sub.status == Status::Gone && path.starts_with(&sub.real))
             {
                 roots.push(id);
-                continue;
+                return;
             }
             // An entered directory that went is entered again only when
             // asked, as Linux's watch on it is gone.
@@ -466,13 +538,22 @@ impl State {
                 sub.entered.retain(|dir| !dir.starts_with(path));
             }
             let Some(reported) = sub.visible(path).then(|| sub.reported(path)).flatten() else {
-                continue;
+                return;
             };
             // Its directories are watched before it is told of them.
             if created && sub.scope == Scope::Tree && native.grow(id, sub, path).is_err() {
                 sub.limited(rt);
             }
             sub.out.push(Event::Changed(vec![reported]), rt);
+        };
+        if let Some(ids) = ids {
+            for id in ids {
+                changed(id, subs.get_mut(&id).expect("indexed"));
+            }
+        } else {
+            for (&id, sub) in subs.iter_mut() {
+                changed(id, sub);
+            }
         }
     }
 
@@ -510,11 +591,17 @@ impl State {
     /// failure other than [`Unavailable::Gone`] is told as it begins, and
     /// an I/O failure retried.
     fn rearm(&mut self, id: u64) -> Armed {
+        self.unindex(id);
         let State {
-            subs, native, rt, ..
+            subs,
+            native,
+            rt,
+            roots,
+            ..
         } = self;
         let sub = subs.get_mut(&id).expect("subscribed");
         sub.real = resolve(&sub.root);
+        roots.entry(sub.real.clone()).or_default().insert(id);
         sub.entered.clear();
         let identity = identity(&sub.root);
         let was = sub.status;

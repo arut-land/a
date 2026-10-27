@@ -35,6 +35,6 @@ impl Extension for Edit {
         r.tool(tool::Edit)
             .fold::<tool::Seen>()
             .text(Text::system("edit", 20, "`edit` replaces exact text in regular files, preserving metadata. Each nonempty `old` must match exactly once; include enough surrounding text and do not overlap edits. One empty `old` replaces the whole file. Inspect a file before editing; after a stale-read conflict, inspect it again. Links are rejected. Publication is atomic; the receipt reports durability and concurrency limits. On conflict, inspect the file and retry.").for_tool(tool::Edit::NAME));
-        r.tool(read::Read);
+        r.tool(read::Read::default());
     }
 }

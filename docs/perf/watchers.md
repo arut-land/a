@@ -120,6 +120,150 @@ macOS) or a timed wait (Windows) of its own, watches every directory of a
 recursive root on Linux, and reports through callbacks on its threads,
 which the old watcher had to bounce back to the runtime.
 
+## Coverage and routing follow current demand
+
+Requested roots and native coverage have separate ownership. On macOS the
+backend derives the outermost requested roots on subscription changes;
+on Windows each holder retains its requested root alongside the shared
+handle's path and generation. Removing an outer subscription restores
+coverage for the surviving roots. Every replacement stream or directory
+read is armed before releasing broader coverage; macOS flushes pending
+callbacks and Windows drains the closing handle's completed buffer. If
+replacement admission fails, the working broader coverage remains until
+a later subscription change can narrow it. A failed initial admission owns
+no native demand; a failure while narrowing keeps its covering stream and
+allows unrelated roots to arm. This adds no idle timer.
+
+Two surviving siblings can therefore need two recursive watches instead
+of retaining one watch on their former ancestor. This is the original
+child-only resource layout, and prevents unrelated sibling writes from
+entering the process. Linux already counts the requested directories and
+roles independently, so its native ownership needs no change.
+
+Hubs with one or two subscriptions route changed paths directly through the
+subscription map, avoiding index queries, ID-list allocation and secondary
+subscription lookups for a root and its overlapping parent. Larger hubs use
+a canonical-root `BTreeMap<PathBuf, BTreeSet<u64>>` index. The index remains
+current across both paths, so subscribing or dropping across the threshold
+needs no reconstruction.
+A changed path selects subscriptions at its ancestors and in its descendant
+range before applying visibility, exclusions, entered-directory scope and
+alias translation. Coalesced invalidations and failures use the same index;
+global invalidations still reach every subscription. Rearming updates the
+index after resolving the root, including unavailable roots, and dropping
+a subscription removes its entry. Index memory grows with requested roots
+and subscriptions, with no cap on either. Routing costs depend on path depth,
+index lookup and affected subscriptions instead of scanning unrelated roots.
+Predecessor lookups jump between indexed ancestors or their common prefixes;
+paths and range bounds are borrowed, avoiding a lookup for every absolute-path
+component and avoiding a temporary path allocation per event.
+
+### Round 2 reproduction
+
+Apple M3, macOS 27.0.1 arm64; baseline `02f5ef52`. Both executables use
+`cargo build-release`, two build jobs, the same external probe and lockfile,
+and a four-worker runtime. The external writer's CPU is excluded.
+
+* Coverage: subscribe to `keep`, optionally subscribe to its parent and
+  immediately drop that subscription, then create 20,000 one-byte files in
+  sibling `noise`. Six rounds reverse narrow/broaden order and executable
+  order.
+* Routing: retain one parent stream and 1/32/128 child subscriptions, then
+  create 20,000 one-byte files in `keep`. Five rounds reverse layout and
+  executable order.
+* Each fresh process settles for two seconds before its native accounting
+  snapshot. After writing, allow three seconds for delivery, take the final
+  snapshot, and sample another two seconds to check for late work. Fresh
+  temporary directories are outside the worktree. Only one watcher workload
+  runs at a time on this shared host.
+
+Before editing the implementation, the unchanged release probe reproduced
+routing CPU medians of 480 / 1,068 / 2,688 ms for 1/32/128 children, with
+ranges 317–551 / 909–1,174 / 2,287–2,720 ms (five reversed rounds).
+
+Phase-1 interleaved routing results (median CPU; min–max in parentheses):
+
+| Child subscriptions | Before, ms | After, ms |
+| --- | ---: | ---: |
+| 1 | 298 (282–446) | 328 (321–490) |
+| 32 | 734 (732–955) | 346 (337–521) |
+| 128 | 1616 (1570–1728) | 546 (345–582) |
+
+The phase-1 index reduces the 32- and 128-child medians by 53% and 66%.
+The one-child median increases by 10% (about 31 ms CPU per 20,000
+creations); this phase-1 cost motivated the review fix below. Native delivery
+batching and context switches also vary, so these are whole-process
+workload results rather than isolated lookup timings.
+
+Phase-1 coverage results (six pairs; median with min–max):
+
+| Surviving subscription / history | CPU before, ms | CPU after, ms | Switches before | Switches after |
+| --- | ---: | ---: | ---: | ---: |
+| Child only | 0 (0–0) | 0 (0–0) | 0 (0–0) | 0 (0–0) |
+| Child after dropping parent | 99.94 (92.33–254.06) | 0.064 (0.021–0.121) | 16,061 (15,262–21,017) | 1 (1–3) |
+
+Every two-second follow-up window in all 54 final samples recorded zero
+CPU and context-switch increments. The idle-runtime invariant also passes.
+
+The index has a measured memory cost: with 128 children, whole-process
+physical footprint before writing was 2,112 KiB (2,112–2,144) before and
+2,304 KiB (2,272–2,448) after. After the burst it was 2,816 KiB
+(2,752–2,912) before and 2,720 KiB (2,640–2,784) after. These include the
+runtime and native backend; they do not isolate index allocations.
+
+The private invariants have regression tests for restoring sibling coverage
+without losing queued changes, inspecting only related roots, and removing
+old alias targets and dropped subscriptions from routing. Those three fail
+against the previous implementation. Additional tests cover common-prefix
+jumps past unrelated predecessors and shared-parent recovery after narrowing.
+Failed-admission tests use the real FSEvents boundary to check that both
+initial failures and failed narrowing leave unrelated admission available.
+Existing tests cover alias spelling,
+root replacement, missing-root recovery, exclusions, scope, handoff and
+zero runtime wakes while idle.
+
+### Phase 2: direct routing for small hubs
+
+The review fix bypasses changed-path selection for at most two subscriptions
+and shares the existing delivery logic between direct and indexed traversal.
+The invariant `one_root_and_its_parent_route_without_index_selection` fails
+on the phase-1 implementation and passes with the direct path. The existing
+129-subscription invariant still visits only its two related subscriptions.
+Windows cancellation/overflow handling is unchanged by the review fix.
+
+Same M3, release flags, saved main probe, writer and settling windows as
+above. Five reversed 1/32/128 layout rounds were followed by five additional
+one-child pairs to check the common-case result against host variation.
+All executable orders alternate; medians and min–max are milliseconds CPU.
+
+| Child subscriptions | Pairs | Main | Review fix |
+| --- | ---: | ---: | ---: |
+| 1 | 10 | 519.59 (285.28–639.29) | 519.50 (448.97–703.81) |
+| 32 | 5 | 1,176.97 (1,003.22–1,240.12) | 617.93 (560.06–661.70) |
+| 128 | 5 | 2,656.89 (2,322.26–4,030.04) | 485.53 (313.47–769.98) |
+
+The one-child medians are equal within observed variation. Its paired
+review-minus-main differences have median +15.34 ms and range −84.54 to
++215.11 ms; native batching and scheduling remain variable on this shared
+host. The 32/128-child median reductions are 47%/82%.
+
+Six fresh coverage pairs retain the other gain: after dropping a parent,
+sibling-write CPU is 249.22 ms (100.33–330.59) on main and 0.058 ms
+(0.052–0.090) with the review fix. Context switches are 19,426.5
+(4,872–26,444) versus 1 (1–2). Child-only controls record zero CPU and switches.
+One of 64 two-second follow-ups records 0.047 ms CPU and one switch; the
+others record zero. The idle-runtime wake invariant passes.
+
+With 128 children, ready-state whole-process physical footprint is
+2,160 KiB (2,112–2,176) on main and 2,352 KiB (2,320–2,384) after the fix.
+The +192 KiB median index cost remains. These totals include native/runtime
+allocation and do not isolate the index.
+
+Windows and Linux watcher performance remain unmeasured. The hosted perf
+workflow has no watcher probe; adding one requires files outside this branch's
+owned paths. Native platform tests run in the post-review CI workflow;
+macOS is checked locally on the M3.
+
 ## Preparation
 
 The generation coordinator arms its watches before the first capture.

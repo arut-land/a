@@ -41,7 +41,7 @@ use rt::{channel, oneshot, or};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Model, Models};
-use crate::outbox::{FrameLog, Outbox};
+use crate::outbox::{FrameLog, Outbox, Subscribers};
 use crate::transcript::Transcript;
 use crate::{Daemon, lock};
 use kernel::SideFact;
@@ -395,7 +395,7 @@ pub struct Live {
     pub parent: Option<Parent>,
     /// The committed entries, encoded once for every client.
     frames: Arc<FrameLog>,
-    followers: Mutex<Vec<Outbox>>,
+    followers: Mutex<Subscribers>,
     /// Live text of calls whose `model_call` entry is not shown yet, with
     /// the fence it was streamed under: a stream can start before its call
     /// is durable, and its deltas follow the call once it is shown.

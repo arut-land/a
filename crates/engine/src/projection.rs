@@ -403,7 +403,7 @@ impl Actor {
                 .map(|f| (seq, f)),
         );
         let follower = client.follow(Arc::clone(&live.frames), cursor, frames);
-        lock(&live.followers).push(follower);
+        lock(&live.followers).push(&follower);
     }
 
     /// The snapshot at entry `seq`, the last committed, made once for every

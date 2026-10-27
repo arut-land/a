@@ -26,7 +26,23 @@ use serde::{Deserialize, Serialize};
 
 use ext::{Concurrency, Cx, Json, Replay, Schema, Tool};
 
-pub struct Read;
+pub struct Read {
+    retained: rt::Budget,
+}
+
+impl Default for Read {
+    fn default() -> Self {
+        Self {
+            retained: rt::Budget::new(rt::CPU_BUDGET),
+        }
+    }
+}
+
+// Data drops before its credit, even when an accepted worker outlives its caller.
+struct Retained<T> {
+    data: T,
+    credit: rt::Credit,
+}
 
 #[derive(Deserialize, Schema)]
 pub struct ReadInput {
@@ -139,14 +155,21 @@ impl Tool for Read {
                     "{shown}: an image of {size} bytes is more than read takes ({IMAGE_LIMIT})"
                 ));
             }
+            // The credit covers the input and the prepared output until it is kept.
+            let credit = self
+                .retained
+                .acquire(usize::try_from(size).unwrap_or(usize::MAX).max(MAX_BYTES))
+                .await;
             let file = path.clone();
             // A file past the storage workers' budget reserves all of it.
             let reserved = usize::try_from(size)
                 .map_or(rt::STORAGE_BUDGET, |size| size.min(rt::STORAGE_BUDGET));
-            let bytes = rt::try_unblock_with(rt, Storage, reserved, move || whole(&file, size))
-                .await
-                .and_then(|read| read)
-                .map_err(fail)?;
+            let bytes = rt::try_unblock_with(rt, Storage, reserved, move || {
+                whole(&file, size).map(|data| Retained { data, credit })
+            })
+            .await
+            .and_then(|read| read)
+            .map_err(fail)?;
             let (sent, converted) = picture(rt, bytes, header, shown).await?;
             return keep(rt, cx, path, sent, converted, window != (None, None)).await;
         }
@@ -237,10 +260,10 @@ impl Tool for Read {
 /// is sent was converted from it.
 async fn picture(
     rt: &dyn rt::Runtime,
-    bytes: Vec<u8>,
+    bytes: Retained<Vec<u8>>,
     header: Header,
     shown: &str,
-) -> Result<(Prepared, Option<Picture>), String> {
+) -> Result<(Retained<Prepared>, Option<Picture>), String> {
     let Header {
         format,
         width,
@@ -248,34 +271,45 @@ async fn picture(
         orientation,
         decode,
     } = header;
-    let fits = width.max(height) <= MAX_EDGE && bytes.len() <= MAX_BYTES;
+    let fits = width.max(height) <= MAX_EDGE && bytes.data.len() <= MAX_BYTES;
     if SENT.contains(&format) && fits && orientation == Orientation::NoTransforms {
         let media_type = format.to_mime_type();
         let sent = Prepared {
-            bytes,
+            bytes: bytes.data,
             media_type,
             width,
             height,
         };
-        return Ok((sent, None));
+        return Ok((
+            Retained {
+                data: sent,
+                credit: bytes.credit,
+            },
+            None,
+        ));
     }
     let original = Picture {
         media_type: format.to_mime_type().to_owned(),
         width,
         height,
-        bytes: bytes.len() as u64,
+        bytes: bytes.data.len() as u64,
     };
     // What converting holds at most: the file and what it decodes to,
     // then the image scaled to fit, and what that encodes to. A photo can
     // need more than the CPU workers' whole budget: it then reserves all
     // of it, and runs alone, rather than not at all.
     let decoded = usize::try_from(decode.bytes()).unwrap_or(usize::MAX);
-    let work = (bytes.len())
+    let work = (bytes.data.len())
         .saturating_add(decoded.max(SCALED))
         .saturating_add(MAX_BYTES)
         .min(rt::CPU_BUDGET);
     let converted = rt::try_unblock_with(rt, Cpu, work, move || {
-        convert(bytes, format, decode, orientation)
+        // Capture both fields together so cancellation preserves their drop order.
+        let retained = bytes;
+        convert(retained.data, format, decode, orientation).map(|data| Retained {
+            data,
+            credit: retained.credit,
+        })
     })
     .await
     .and_then(|converted| converted.map_err(io::Error::other))
@@ -288,15 +322,16 @@ async fn keep(
     rt: &dyn rt::Runtime,
     cx: &Cx,
     path: PathBuf,
-    sent: Prepared,
+    sent: Retained<Prepared>,
     converted: Option<Picture>,
     window_ignored: bool,
 ) -> Result<Contents, String> {
     let (blobs, call) = (cx.blobs.clone(), cx.call);
-    let (media_type, width, height) = (sent.media_type, sent.width, sent.height);
-    let blob = rt::try_unblock_with(rt, Storage, sent.bytes.len(), move || {
-        let mut writer = blobs.writer(sent.bytes.len() as u64)?;
-        writer.write_all(&sent.bytes)?;
+    let (media_type, width, height) = (sent.data.media_type, sent.data.width, sent.data.height);
+    let blob = rt::try_unblock_with(rt, Storage, sent.data.bytes.len(), move || {
+        let retained = sent;
+        let mut writer = blobs.writer(retained.data.bytes.len() as u64)?;
+        writer.write_all(&retained.data.bytes)?;
         writer.finish(media_type, BlobOrigin::ToolOutput(call))
     })
     .await

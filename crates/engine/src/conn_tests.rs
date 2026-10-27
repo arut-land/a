@@ -223,6 +223,19 @@ fn resent_once(fixture: &mut Fixture, again: impl FnOnce(&mut Fixture)) {
 }
 
 #[test]
+fn disconnect_unregisters_session_watches_without_a_later_publication() {
+    let fixture = Fixture::new("unregister-watch");
+    let mut peer = fixture.connect();
+    peer.send(&hello(Caps::ALL));
+    peer.recv();
+    peer.send(&ClientMsg::WatchSessions);
+    assert!(matches!(peer.recv(), DaemonMsg::Sessions { .. }));
+    assert!(!lock(&fixture.daemon.watchers).0.is_empty());
+    drop(peer);
+    assert!(lock(&fixture.daemon.watchers).0.is_empty());
+}
+
+#[test]
 fn a_resend_after_reconnect_runs_once() {
     resent_once(&mut Fixture::new("resend"), |_| {});
 }

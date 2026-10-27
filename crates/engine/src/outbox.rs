@@ -8,7 +8,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::store::Lines;
 use protocol::{BlobId, Class, Decode, Entry, Frame, Held};
@@ -305,7 +305,106 @@ pub struct Outbox {
     following: u64,
 }
 
+/// Registrations are owned by their outbox, never by a publisher. Removing
+/// one does not change the outbox's queued frames or session-switch fences.
+#[derive(Default)]
+pub(crate) struct Subscribers(Arc<Mutex<Vec<Subscriber>>>);
+
+#[derive(Clone)]
+struct Subscriber {
+    shared: Weak<Shared>,
+    following: u64,
+}
+
+struct Registration {
+    subscribers: Weak<Mutex<Vec<Subscriber>>>,
+    subscriber: Subscriber,
+}
+
+#[derive(Default)]
+struct Registrations {
+    watching: Option<Registration>,
+    following: Option<Registration>,
+}
+
+impl Subscribers {
+    pub(crate) fn is_empty(&self) -> bool {
+        lock(&self.0).is_empty()
+    }
+
+    pub(crate) fn push(&self, outbox: &Outbox) {
+        let mut registrations = lock(&outbox.shared.registrations);
+        let registration = if outbox.following == 0 {
+            &mut registrations.watching
+        } else {
+            &mut registrations.following
+        };
+        {
+            let q = outbox.queue();
+            if q.closed || (outbox.following != 0 && outbox.following != q.follows) {
+                return;
+            }
+        }
+        // Repeating WatchSessions replaces the list, not its registration.
+        drop(registration.take());
+        let subscriber = Subscriber {
+            shared: Arc::downgrade(&outbox.shared),
+            following: outbox.following,
+        };
+        lock(&self.0).push(subscriber.clone());
+        *registration = Some(Registration {
+            subscribers: Arc::downgrade(&self.0),
+            subscriber,
+        });
+    }
+
+    pub(crate) fn retain(&self, mut send: impl FnMut(&Outbox) -> bool) {
+        // Drop upgraded owners outside the registry lock: the last owner
+        // unregisters itself, including when a connection ends mid-publish.
+        let outboxes: Vec<_> = lock(&self.0)
+            .iter()
+            .filter_map(|subscriber| {
+                Some(Outbox {
+                    shared: subscriber.shared.upgrade()?,
+                    following: subscriber.following,
+                })
+            })
+            .collect();
+        for outbox in outboxes {
+            if !send(&outbox) {
+                Subscriber {
+                    shared: Arc::downgrade(&outbox.shared),
+                    following: outbox.following,
+                }
+                .unregister(&self.0);
+            }
+        }
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let Some(subscribers) = self.subscribers.upgrade() else {
+            return;
+        };
+        self.subscriber.unregister(&subscribers);
+    }
+}
+
+impl Subscriber {
+    fn unregister(&self, subscribers: &Mutex<Vec<Self>>) {
+        let mut subscribers = lock(subscribers);
+        subscribers.retain(|subscriber| {
+            subscriber.following != self.following || !subscriber.shared.ptr_eq(&self.shared)
+        });
+        if subscribers.is_empty() {
+            *subscribers = Vec::new();
+        }
+    }
+}
+
 struct Shared {
+    registrations: Mutex<Registrations>,
     queue: Mutex<Queue>,
     /// Notified as there may be more to write: the writer's one wake.
     ready: rt::Notify,
@@ -353,6 +452,7 @@ impl Outbox {
     pub fn new() -> Self {
         Self {
             shared: Arc::new(Shared {
+                registrations: Mutex::default(),
                 queue: Mutex::default(),
                 ready: rt::Notify::new(),
                 room: rt::Notify::new(),
@@ -485,6 +585,8 @@ impl Outbox {
     /// entries commit. The outbox returned is the session's.
     #[must_use]
     pub fn follow(&self, log: Arc<FrameLog>, cursor: u64, frames: Vec<(u64, Frame)>) -> Self {
+        let mut registrations = lock(&self.shared.registrations);
+        drop(registrations.following.take());
         let mut q = self.queue();
         q.switch(Some((log, cursor)));
         for (after, frame) in frames {
@@ -502,6 +604,8 @@ impl Outbox {
 
     /// Stops following a session.
     pub fn unfollow(&self) {
+        let mut registrations = lock(&self.shared.registrations);
+        drop(registrations.following.take());
         self.queue().switch(None);
         self.shared.ready.notify();
         self.shared.room.notify();
@@ -601,6 +705,7 @@ impl Outbox {
     /// now on.
     pub fn close(&self) {
         self.queue().closed = true;
+        drop(std::mem::take(&mut *lock(&self.shared.registrations)));
         self.shared.ready.notify();
         self.shared.room.notify();
     }
@@ -613,6 +718,8 @@ impl Outbox {
         q.target = None;
         q.frames.clear();
         q.bytes = 0;
+        drop(q);
+        drop(std::mem::take(&mut *lock(&self.shared.registrations)));
         self.shared.ready.notify();
         self.shared.room.notify();
     }
@@ -718,6 +825,79 @@ mod tests {
             },
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn disconnected_subscribers_unregister_without_publication() {
+        for end in [Outbox::close, Outbox::abandon] {
+            let subscribers = Subscribers::default();
+            let outbox = Outbox::new();
+            subscribers.push(&outbox);
+            assert_eq!(lock(&subscribers.0).len(), 1);
+            end(&outbox);
+            assert!(subscribers.is_empty());
+            assert_eq!(lock(&subscribers.0).capacity(), 0);
+        }
+        let subscribers = Subscribers::default();
+        let outbox = Outbox::new();
+        subscribers.push(&outbox);
+        drop(outbox);
+        assert!(subscribers.is_empty());
+        assert_eq!(lock(&subscribers.0).capacity(), 0);
+    }
+
+    #[test]
+    fn the_last_subscriber_owner_can_end_during_publication() {
+        let subscribers = Subscribers::default();
+        let mut outbox = Some(Outbox::new());
+        subscribers.push(outbox.as_ref().unwrap());
+        subscribers.retain(|_| {
+            drop(outbox.take());
+            true
+        });
+        assert!(subscribers.is_empty());
+        assert_eq!(lock(&subscribers.0).capacity(), 0);
+    }
+
+    #[test]
+    fn unfollow_unregisters_only_the_session_and_preserves_queued_frames() {
+        let watchers = Subscribers::default();
+        let followers = Subscribers::default();
+        let outbox = Outbox::new();
+        watchers.push(&outbox);
+        let shown = log(&["before detach"]);
+        followers.push(&outbox.follow(
+            shown.frames(),
+            0,
+            vec![(1, Frame::new(&DaemonMsg::Synced { seq: 1 }).unwrap())],
+        ));
+        outbox.unfollow();
+        assert!(followers.is_empty());
+        assert_eq!(lock(&followers.0).capacity(), 0);
+        assert!(!watchers.is_empty());
+        outbox.close();
+        assert!(watchers.is_empty());
+        assert_eq!(written(&outbox), vec![Some(1), None]);
+    }
+
+    #[test]
+    fn repeated_watches_and_session_switches_replace_their_registration() {
+        let watchers = Subscribers::default();
+        let old = Subscribers::default();
+        let new = Subscribers::default();
+        let outbox = Outbox::new();
+        watchers.push(&outbox);
+        watchers.push(&outbox);
+        assert_eq!(lock(&watchers.0).len(), 1);
+        let shown = log(&[]);
+        old.push(&outbox.follow(shown.frames(), 0, Vec::new()));
+        new.push(&outbox.follow(shown.frames(), 0, Vec::new()));
+        assert!(old.is_empty());
+        assert_eq!(lock(&new.0).len(), 1);
+        assert_eq!(lock(&watchers.0).len(), 1);
+        outbox.close();
+        assert!(new.is_empty());
+        assert!(watchers.is_empty());
     }
 
     #[test]

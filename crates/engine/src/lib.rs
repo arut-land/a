@@ -26,7 +26,7 @@ use crate::store::{Header, Jsonl};
 use driver::{Attachment, Live, Open, Request, Shared};
 use ext::Flag;
 use ext_logging::{Build, Fact, Fault, Operation, Stop, emit as fact};
-use outbox::Outbox;
+use outbox::{Outbox, Subscribers};
 use protocol::{
     Body, DaemonMsg, Entry, Environment, Frame, Json, MachineId, Mode, SessionId, SessionSummary,
     Target,
@@ -225,7 +225,7 @@ struct Daemon {
     jobs: rt::Notify,
     /// The connections watching the session list, and the list as they
     /// were last sent it.
-    watchers: Mutex<(Vec<Outbox>, Vec<SessionSummary>)>,
+    watchers: Mutex<(Subscribers, Vec<SessionSummary>)>,
     /// The first request to stop, whether from a client or a signal.
     stopping: Mutex<Option<Stop>>,
     /// When it started, in seconds since the Unix epoch.
@@ -960,7 +960,7 @@ impl Daemon {
                 sessions: sessions.clone(),
             },
         );
-        watchers.0.push(outbox.clone());
+        watchers.0.push(outbox);
         watchers.1 = sessions;
     }
 
@@ -971,6 +971,7 @@ impl Daemon {
     fn publish_list(&self) {
         let mut watchers = lock(&self.watchers);
         if watchers.0.is_empty() {
+            watchers.1 = Vec::new();
             return;
         }
         let sessions = self.list();

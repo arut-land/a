@@ -266,6 +266,9 @@ fn child_at_gate(listener: &TcpListener) -> std::net::TcpStream {
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // Windows and macOS hand the listener's nonblocking mode to
+                // accepted sockets, so the read below could see WouldBlock.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(30)))
                     .unwrap();

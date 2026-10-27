@@ -891,7 +891,11 @@ async fn supervise<D: crate::dialect::Dialect>(
             .min();
         let wait = next.map(|at| at.saturating_duration_since(now));
         if !behind && wait.is_none_or(|wait| !wait.is_zero()) {
-            let writes = written.readable_result();
+            let ended = when(exited, async {
+                child.ended().await;
+                Ok(())
+            });
+            let changed = rt::or(written.readable_result(), ended);
             let exits = when(!exited, async { child.wait().await.map(|_| ()) });
             let cancelled = when(matches!(run, Run::Running { .. }), async {
                 cx.cancel.wait().await;
@@ -901,7 +905,7 @@ async fn supervise<D: crate::dialect::Dialect>(
                 rt.sleep(wait.unwrap_or_default()).await;
                 Ok(())
             });
-            rt::or(writes, rt::or(exits, rt::or(cancelled, sleep))).await?;
+            rt::or(changed, rt::or(exits, rt::or(cancelled, sleep))).await?;
         }
         written.get_ref().clear();
         let read;

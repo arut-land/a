@@ -4,7 +4,7 @@
 //! the root. A handle follows its directory, not its path, so a root
 //! replaced at its path is opened again.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
@@ -17,6 +17,8 @@ pub(super) struct Native {
     trees: BTreeMap<PathBuf, Handle>,
     parents: BTreeMap<PathBuf, Handle>,
     held: HashMap<u64, Held>,
+    /// Replacement holders participate in handle-generation transfers too.
+    staged: Vec<(u64, Held)>,
     serial: u64,
 }
 
@@ -25,6 +27,8 @@ type Key = (PathBuf, u64);
 
 #[derive(Default)]
 struct Held {
+    /// The requested root, independent of the handle covering it.
+    root: PathBuf,
     tree: Option<Key>,
     parent: Option<Key>,
 }
@@ -56,24 +60,30 @@ impl Native {
             trees: BTreeMap::new(),
             parents: BTreeMap::new(),
             held: HashMap::new(),
+            staged: Vec::new(),
             serial: 0,
         }
     }
 
     pub(super) fn arm(&mut self, id: u64, sub: &Sub) -> Result<(), Unavailable> {
-        let mut held = Held::default();
-        let result = self.arm_into(&mut held, sub);
+        let mut held = Held {
+            root: sub.real.clone(),
+            ..Held::default()
+        };
+        let result = self.arm_into(&mut held);
         // Held anew before the old ones go, so what both need stays open.
         if let Some(old) = self.held.insert(id, held) {
             self.release(old);
         }
+        self.narrow();
         result
     }
 
     /// What is above the root is watched before the root is looked at,
     /// so a root made meanwhile is either seen here or heard of there.
-    fn arm_into(&mut self, held: &mut Held, sub: &Sub) -> Result<(), Unavailable> {
-        let parent = existing_parent(&sub.real);
+    fn arm_into(&mut self, held: &mut Held) -> Result<(), Unavailable> {
+        let root = &held.root;
+        let parent = existing_parent(root);
         let covering = parent.and_then(|parent| {
             (parent.ancestors())
                 .find(|dir| (self.trees.get(*dir)).is_some_and(|h| h.identity == identity(dir)))
@@ -93,7 +103,11 @@ impl Native {
             {
                 let mut handle = self.open(parent, Depth::Entries)?;
                 if let Some(old) = self.parents.remove(parent) {
-                    for held in self.held.values_mut() {
+                    for held in self
+                        .held
+                        .values_mut()
+                        .chain(self.staged.iter_mut().map(|(_, held)| held))
+                    {
                         if let Some(key) = held
                             .parent
                             .as_mut()
@@ -110,20 +124,20 @@ impl Native {
             handle.refs += 1;
             held.parent = Some((parent.to_owned(), handle.serial));
         }
-        if !sub.real.is_dir() {
+        if !root.is_dir() {
             return Err(Unavailable::Gone);
         }
         if held.tree.is_none() {
             let shared = self
                 .trees
-                .get(&sub.real)
-                .is_some_and(|h| h.identity == identity(&sub.real));
+                .get(root)
+                .is_some_and(|h| h.identity == identity(root));
             if !shared {
-                self.open_tree(&sub.real)?;
+                self.open_tree(root)?;
             }
-            let handle = self.trees.get_mut(&sub.real).expect("opened");
+            let handle = self.trees.get_mut(root).expect("opened");
             handle.refs += 1;
-            held.tree = Some((sub.real.clone(), handle.serial));
+            held.tree = Some((root.to_owned(), handle.serial));
         }
         Ok(())
     }
@@ -132,6 +146,7 @@ impl Native {
         if let Some(held) = self.held.remove(&id) {
             self.release(held);
         }
+        self.narrow();
     }
 
     /// A recursive handle hears every directory under its root.
@@ -167,7 +182,11 @@ impl Native {
             .collect();
         for key in nested {
             let old = self.trees.remove(&key).expect("listed");
-            for held in self.held.values_mut() {
+            for held in self
+                .held
+                .values_mut()
+                .chain(self.staged.iter_mut().map(|(_, held)| held))
+            {
                 if let Some(tree) = held
                     .tree
                     .as_mut()
@@ -180,6 +199,67 @@ impl Native {
         }
         self.trees.insert(root.to_owned(), handle);
         Ok(())
+    }
+
+    fn narrow(&mut self) {
+        let requested: BTreeSet<&Path> =
+            self.held.values().map(|held| held.root.as_path()).collect();
+        let obsolete: Vec<PathBuf> = self
+            .trees
+            .keys()
+            .filter(|root| !requested.contains(root.as_path()))
+            .cloned()
+            .collect();
+        for root in obsolete {
+            let Some(old) = self.trees.remove(&root) else {
+                continue;
+            };
+            let mut requests: Vec<_> = self
+                .held
+                .iter()
+                .filter(|(_, held)| {
+                    held.tree
+                        .as_ref()
+                        .is_some_and(|key| key.0 == root && key.1 == old.serial)
+                })
+                .map(|(&id, held)| (held.root.clone(), id))
+                .collect();
+            // Opening ancestors first shares their coverage with nested
+            // requests instead of opening handles that would be replaced.
+            requests.sort_unstable();
+            let mut failed = false;
+            for (root, id) in requests {
+                let mut held = Held {
+                    root,
+                    ..Held::default()
+                };
+                match self.arm_into(&mut held) {
+                    Ok(()) | Err(Unavailable::Gone) => self.staged.push((id, held)),
+                    Err(_) => {
+                        self.release(held);
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if failed {
+                for (_, held) in std::mem::take(&mut self.staged) {
+                    self.release(held);
+                }
+                // Admission failed: retain working coverage until the
+                // next subscription change can try narrowing again.
+                self.trees.insert(root, old);
+                continue;
+            }
+            for (id, held) in std::mem::take(&mut self.staged) {
+                if let Some(held) = self.held.insert(id, held) {
+                    self.release(held);
+                }
+            }
+            // Replacement reads are armed before the old handle closes;
+            // its task drains the last completed buffer on cancellation.
+            drop(old);
+        }
     }
 
     fn open(&mut self, path: &Path, depth: Depth) -> Result<Handle, Unavailable> {
