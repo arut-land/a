@@ -3,7 +3,7 @@
 //! synced, then each change alone.
 
 use client::{Attach, Cmd, Effect, Env, Link, Renderer, SessionClient, Show};
-use protocol::view::{Change, Update};
+use protocol::view::{Change, Item, Part, Status, Update};
 use protocol::{SessionId, Target};
 
 use crate::patch::Patch;
@@ -19,6 +19,8 @@ pub struct Page {
     shown: Option<End>,
     /// The title the page shows.
     titled: Option<String>,
+    /// Whether a view change could have changed the cached title.
+    title_dirty: bool,
     /// Text streamed since the last patch, for one reply attempt.
     streamed: Option<(protocol::CallId, u16, String)>,
     /// Events not yet sent.
@@ -38,6 +40,7 @@ impl Page {
             error: None,
             shown: None,
             titled: None,
+            title_dirty: true,
             streamed: None,
             out: Vec::new(),
         };
@@ -112,6 +115,21 @@ impl Page {
             }
             return;
         }
+        self.title_dirty |= match &update.change {
+            Change::Snapshot | Change::Attached { reset: true, .. } => true,
+            Change::Added { item, .. } => matches!(item,
+                Item::Reply { purpose: Some(purpose), status: Status::Done, .. }
+                    if purpose == "title"
+            ),
+            Change::Updated {
+                index,
+                part: Part::Outcome,
+            } => matches!(
+                &self.client.view().items[*index],
+                Item::Reply { purpose: Some(purpose), .. } if purpose == "title"
+            ),
+            _ => false,
+        };
         if let Change::Attached { .. } = &update.change
             && self.forking
             && let Some(session) = self.client.view().session
@@ -196,6 +214,10 @@ impl Page {
 
     /// Shows the session's title again if it changed.
     fn show_title(&mut self) {
+        if !self.title_dirty {
+            return;
+        }
+        self.title_dirty = false;
         let title = self.client.view().side("title");
         if title != self.titled.as_deref() {
             let span = html(TitleSpan { title });
@@ -562,32 +584,18 @@ mod tests {
     #[test]
     fn a_titling_reply_titles_the_bar_and_not_the_transcript() {
         let mut page = synced();
-        page.fold(&[entry(
-            2,
-            Body::ModelCall {
-                request: None,
-                model: "m".into(),
-                attempt: 0,
-                choice: protocol::ToolChoice::Auto,
-                r#for: Some(CallId::new(1).unwrap()),
-                purpose: Some("title".into()),
-            },
-        )]);
+        assert!(!page.title_dirty);
+        let [call, result] = title(2, "Greeting <you>");
+        page.fold(&[call]);
         page.take();
-        let reply = serde_json::json!({
-            "message": { "content": [{ "type": "text", "text": "Greeting <you>" }] },
+        let conn = page.client.connection();
+        page.event(Event {
+            conn,
+            kind: EventKind::Msg(result),
         });
-        page.fold(&[entry(
-            3,
-            Body::ModelResult {
-                r#for: Some(CallId::new(1).unwrap()),
-                failure: None,
-                call: CallId::new(2).unwrap(),
-                outcome: Outcome::Done {
-                    output: Json::encode(&reply).unwrap(),
-                },
-            },
-        )]);
+        assert!(page.title_dirty);
+        page.settle();
+        assert!(!page.title_dirty);
         let titled = events(&mut page);
         let title = "data: elements <span id=\"title\"";
         let shown: Vec<_> = titled.iter().filter(|e| e.contains("Greeting")).collect();
@@ -598,6 +606,144 @@ mod tests {
         );
         page.fold(&[]);
         assert_eq!(events(&mut page), NONE, "the title shows once");
+    }
+
+    fn title(seq: u64, text: &str) -> [DaemonMsg; 2] {
+        [
+            entry(
+                seq,
+                Body::ModelCall {
+                    request: None,
+                    model: "m".into(),
+                    attempt: 0,
+                    choice: protocol::ToolChoice::Auto,
+                    r#for: Some(CallId::new(1).unwrap()),
+                    purpose: Some("title".into()),
+                },
+            ),
+            entry(
+                seq + 1,
+                Body::ModelResult {
+                    r#for: Some(CallId::new(1).unwrap()),
+                    failure: None,
+                    call: CallId::new(seq).unwrap(),
+                    outcome: Outcome::Done {
+                        output: Json::encode(&serde_json::json!({
+                            "message": { "content": [{ "type": "text", "text": text }] },
+                        }))
+                        .unwrap(),
+                    },
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn an_absent_title_stays_cached_during_deltas_and_unrelated_items() {
+        let mut page = synced();
+        assert!(!page.title_dirty);
+        page.fold(&[entry(
+            2,
+            Body::ModelCall {
+                request: None,
+                model: "m".into(),
+                attempt: 0,
+                choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: None,
+            },
+        )]);
+        page.take();
+        for msg in [delta(2, "a"), user(3, "next")] {
+            let conn = page.client.connection();
+            page.event(Event {
+                conn,
+                kind: EventKind::Msg(msg),
+            });
+            assert!(!page.title_dirty, "unrelated update invalidated the title");
+            page.settle();
+            assert_eq!(page.titled, None);
+        }
+    }
+
+    #[test]
+    fn snapshots_replace_and_remove_the_cached_title() {
+        let mut page = synced();
+        page.fold(&title(2, "Old"));
+        page.take();
+        for text in [Some("New"), None] {
+            let mut view = protocol::view::SessionView::default();
+            view.fold(&DaemonMsg::Attached {
+                session: page.client.view().session.unwrap(),
+                workspace: "/w".into(),
+            });
+            view.fold(&user(1, "hi"));
+            if let Some(text) = text {
+                for msg in title(2, text) {
+                    view.fold(&msg);
+                }
+            }
+            page.fold(&[DaemonMsg::Snapshot(Box::new(view.snapshot()))]);
+            assert_eq!(page.titled.as_deref(), text);
+            assert!(events(&mut page).iter().any(|e| e.contains("id=\"title\"")));
+            assert!(!page.title_dirty);
+        }
+    }
+
+    #[test]
+    fn a_replayed_title_waits_for_reconnect_to_sync() {
+        let mut page = synced();
+        page.fold(&title(2, "Old"));
+        page.take();
+        page.fold(&[DaemonMsg::Draining { held: None }]);
+        let session = page.client.view().session.unwrap();
+        page.event(closed(1));
+        page.event(connected(2));
+        page.fold(&[DaemonMsg::Attached {
+            session,
+            workspace: "/w".into(),
+        }]);
+        page.fold(&title(4, "Replayed"));
+        assert_eq!(events(&mut page), NONE);
+        assert_eq!(page.titled.as_deref(), Some("Old"));
+        assert!(page.title_dirty);
+        page.fold(&[DaemonMsg::Synced { seq: 5 }]);
+        assert_eq!(page.titled.as_deref(), Some("Replayed"));
+        assert!(!page.title_dirty);
+        assert!(
+            events(&mut page)
+                .iter()
+                .any(|e| e.contains("id=\"title\"") && e.contains("Replayed"))
+        );
+    }
+
+    #[test]
+    fn switching_sessions_clears_the_cached_title() {
+        let mut page = synced();
+        page.fold(&title(2, "Old"));
+        page.take();
+        let session = SessionId::new();
+        let effects = page.client.attach(client::Attach::new(
+            protocol::Target::Id(session),
+            client::Env::Keep,
+        ));
+        client::pump(|_| Ok(()), &mut page, effects);
+        page.event(connected(2));
+        page.fold(&[
+            DaemonMsg::Attached {
+                session,
+                workspace: "/w".into(),
+            },
+            user(1, "new session"),
+            DaemonMsg::Synced { seq: 1 },
+        ]);
+        assert_eq!(page.titled, None);
+        assert!(!page.title_dirty);
+        assert!(
+            events(&mut page)
+                .iter()
+                .any(|e| e.contains("id=\"title\"") && !e.contains("Old"))
+        );
     }
 
     #[test]
