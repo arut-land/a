@@ -458,12 +458,14 @@ fn an_index_another_daemon_kept_is_checked_against_the_tree_before_it_is_trusted
     assert!(summary.prefiltered);
     // The content index came from disk: only what changed is read.
     assert!(summary.searched <= 3, "{summary:?}");
-    let listed = search(&index, "");
+    // Targeted queries: an empty one ranks by whole-second mtime, so a kept
+    // file may fall outside its first page.
+    let ignored = search(&index, "src/f1");
     assert!(
-        !listed.iter().any(|p| p.starts_with("src/f1")),
-        "{listed:?}"
+        !ignored.iter().any(|p| p.starts_with("src/f1")),
+        "{ignored:?}"
     );
-    assert!(listed.contains(&"src/f2.rs".to_owned()));
+    assert!(search(&index, "src/f2.rs").contains(&"src/f2.rs".to_owned()));
 }
 
 #[test]
