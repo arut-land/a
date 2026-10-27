@@ -47,11 +47,21 @@ hardware and toolchain metadata. Failed prep commands keep their argv, exit
 status, stdout and stderr separately from the idle line client's stderr.
 These captures and native map diagnostics run outside timing windows.
 
-The mbx store and Cargo downloads are cached by OS, architecture and
-configuration. Rustup installs an explicitly native host toolchain in a private runner-local
-directory outside the cache, so a
-cancelled installation cannot leave a partial toolchain in subsequent runs. Intel macOS uses rust-cache for native Cargo artifacts because
-mbx 1.24.1 publishes no Intel macOS executable. Windows ARM installs native
+Cargo downloads are cached by OS, architecture and configuration. Rustup
+installs an explicitly native host toolchain in a private runner-local directory
+outside the cache, so a cancelled installation cannot leave a partial toolchain
+in subsequent runs. After mise installs the measurement tools, the toolchain's
+bin directory is written once to `GITHUB_PATH`, before tests, Cargo-consuming
+cache actions and cargo-bloat installation. Every later step inherits that
+PATH, including nested Cargo calls made by cargo-bloat and metadata consumers.
+The measurement steps do not re-enter `mise exec`, which would select its Cargo
+wrapper again. Compiler versions and release arguments stay the same.
+
+Intel macOS retains its rust-cache artifact cache. The measurement job does not
+install mbx or cache its action store: builds use native Cargo on every runner.
+Windows ARM installs native Hyperfine from the checked-in mise lockfile. Release
+and benchmark builds use LLVM; they do not need a Cranelift component.
+
 Hyperfine and mbx from the checked-in mise lockfile. Release and benchmark
 builds use LLVM; they do not need a Cranelift component.
 
