@@ -8,7 +8,7 @@ mod scroll;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use super::editor::{Edit, Editor};
 use super::keys::{Input, Key, Mouse};
@@ -68,8 +68,8 @@ pub struct App {
     viewport: Viewport,
     /// This shell's workspace: the picker starts on its latest session.
     workspace: HostPath,
-    /// Per item, its rows when last drawn; `None` is out of date.
-    cache: Vec<Option<Rows>>,
+    /// Rows owned by the viewport and the current scroll traversal.
+    cache: BTreeMap<usize, Rows>,
     collapsed: HashSet<protocol::Seq>,
     verbose: bool,
     /// Scrolled back: the top row shown, as (item, row within it), which
@@ -172,7 +172,7 @@ impl App {
             client: SessionClient::new(Env::Origin),
             viewport,
             workspace: HostPath::default(),
-            cache: Vec::new(),
+            cache: BTreeMap::new(),
             collapsed: HashSet::new(),
             verbose: false,
             anchor: None,
@@ -299,13 +299,11 @@ impl App {
                 if let Item::User { text, .. } = &item {
                     self.editor.remember(text);
                 }
-                self.cache.resize_with(len, || None);
-                self.cache[index] = None;
+                self.cache.remove(&index);
             }
             Change::Updated { index, .. } => {
                 spend(&mut self.tokens, &self.client.view().items[index]);
-                self.cache.resize_with(len, || None);
-                self.cache[index] = None;
+                self.cache.remove(&index);
             }
             Change::Synced => self.recap_hidden = false,
             Change::Error { message } => {
@@ -381,7 +379,7 @@ impl App {
                 if self.viewport == Viewport::Inline {
                     self.anchor = None;
                 }
-                self.cache.iter_mut().for_each(|r| *r = None);
+                self.cache.clear();
             }
             Key::Ctrl('l') => return Some(Effect::Redraw),
             Key::PageUp => self.scroll_by(page),
@@ -603,9 +601,8 @@ impl App {
             .view()
             .items
             .binary_search_by_key(&key, Item::key)
-            && let Some(slot) = self.cache.get_mut(at)
         {
-            *slot = None;
+            self.cache.remove(&at);
         }
     }
 
@@ -723,12 +720,15 @@ mod display_tests {
             )));
         }
         app.cache = (0..2)
-            .map(|_| {
-                Some(Rows {
-                    width: 80,
-                    lines: Vec::new(),
-                    live: None,
-                })
+            .map(|i| {
+                (
+                    i,
+                    Rows {
+                        width: 80,
+                        lines: Vec::new(),
+                        live: None,
+                    },
+                )
             })
             .collect();
         app.fold(&DaemonMsg::Entry(Entry::new(
@@ -742,9 +742,9 @@ mod display_tests {
                 },
             },
         )));
-        assert_eq!(app.cache.len(), 3);
-        assert_eq!(app.cache[0].as_ref().unwrap().width, 80);
-        assert!(app.cache[1].is_none());
-        assert!(app.cache[2].is_none());
+        assert_eq!(app.cache.len(), 1);
+        assert_eq!(app.cache[&0].width, 80);
+        assert!(!app.cache.contains_key(&1));
+        assert!(!app.cache.contains_key(&2));
     }
 }

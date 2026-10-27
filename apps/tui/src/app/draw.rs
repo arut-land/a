@@ -46,7 +46,10 @@ impl App {
             .get(self.committed)
             .is_some_and(Item::settled)
         {
-            out.extend_from_slice(self.rows(self.committed, usize::from(width)));
+            self.rows(self.committed, usize::from(width));
+            if let Some(rows) = self.cache.remove(&self.committed) {
+                out.extend(rows.lines);
+            }
             self.committed += 1;
         }
         out
@@ -64,6 +67,7 @@ impl App {
             let take = len.min(n - out.len());
             out.splice(0..0, (len - take..len).map(|row| (i, row)));
         }
+        self.keep_window(&out);
         out
     }
 

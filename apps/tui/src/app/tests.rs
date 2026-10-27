@@ -1160,6 +1160,19 @@ fn render_cost() {
         frame(&mut app, 120);
         scroll.push(t.elapsed());
     }
+    let mut page = Vec::new();
+    for i in 0..500 {
+        let t = Instant::now();
+        app.input(Input::Key(if i % 2 == 0 {
+            Key::PageUp
+        } else {
+            Key::PageDown
+        }));
+        frame(&mut app, 120);
+        page.push(t.elapsed());
+    }
+    page.sort();
+    eprintln!("page rewrap p50 {:?} p99 {:?}", page[250], page[495]);
     let t = Instant::now();
     frame(&mut app, 119);
     let rewrap = t.elapsed();
@@ -1671,4 +1684,120 @@ fn a_retry_rewraps_multibyte_text_instead_of_reusing_byte_offsets() {
         };
         assert_eq!(got, expected, "attempt {attempt}");
     }
+}
+
+#[test]
+fn rows_leave_the_viewport_without_losing_history() {
+    let (mut app, _) = app(Viewport::Full, &[]);
+    for seq in 1..=256 {
+        app.fold(&entry(
+            seq,
+            Body::Assistant {
+                text: format!("message {seq}"),
+            },
+        ));
+        app.fold(&DaemonMsg::Activity {
+            seq,
+            activity: Activity::Idle,
+        });
+        frame(&mut app, 100, 30);
+    }
+    assert!(app.cache.len() <= usize::from(app.body));
+    assert_eq!(app.view().items.len(), 256);
+    let (_, latest) = frame(&mut app, 100, 30);
+    app.scroll_by(i32::MAX);
+    assert!(app.cache.len() <= 2 * usize::from(app.body) + 1);
+    let (_, oldest) = frame(&mut app, 100, 30);
+    find(&oldest, "message 1");
+    assert!(app.cache.len() <= usize::from(app.body));
+    app.scroll_by(-i32::MAX);
+    let (_, restored) = frame(&mut app, 100, 30);
+    assert_eq!(restored, latest);
+    assert_eq!(app.view().items.len(), 256);
+}
+
+#[test]
+fn inline_scrollback_releases_rows_but_can_review_them_again() {
+    let msgs: Vec<_> = (1..=256)
+        .map(|seq| {
+            entry(
+                seq,
+                Body::Assistant {
+                    text: format!("message {seq}"),
+                },
+            )
+        })
+        .collect();
+    let (mut app, _) = app(Viewport::Inline, &msgs);
+    let printed = app.scrollback(100);
+    assert!(printed.iter().any(|line| line.text().contains("message 1")));
+    assert!(app.cache.is_empty());
+    assert_eq!(app.view().items.len(), 256);
+    press(&mut app, Key::Ctrl('o'));
+    frame(&mut app, 100, 30);
+    app.scroll_by(i32::MAX);
+    let (_, rows) = frame(&mut app, 100, 30);
+    find(&rows, "message 1");
+}
+
+/// Process CPU can be sampled around this streaming-only workload.
+#[test]
+#[ignore = "a measurement"]
+fn streaming_cost() {
+    let model = CallId::new(1).unwrap();
+    let (mut app, _) = app(
+        Viewport::Full,
+        &[entry(
+            1,
+            Body::ModelCall {
+                request: None,
+                model: "m".into(),
+                attempt: 0,
+                choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: None,
+            },
+        )],
+    );
+    let term = Term::default();
+    let mut screen = Screen::new(Viewport::Full, term.clone());
+    for _ in 0..5000 {
+        app.fold(&DaemonMsg::Delta {
+            call: model,
+            text: "one streamed line to wrap.\n".into(),
+            attempt: 0,
+        });
+        screen.draw(&mut app, (100, 30)).unwrap();
+        term.take();
+    }
+    assert!(
+        app.canvas()
+            .grid()
+            .rows()
+            .iter()
+            .any(|row| row.contains("one streamed line"))
+    );
+}
+
+#[test]
+fn invisible_items_do_not_own_cached_rows() {
+    let msgs: Vec<_> = (1..=256)
+        .map(|seq| {
+            entry(
+                seq,
+                Body::ModelCall {
+                    request: None,
+                    model: "m".into(),
+                    attempt: 0,
+                    choice: protocol::ToolChoice::Auto,
+                    r#for: None,
+                    purpose: None,
+                },
+            )
+        })
+        .collect();
+    let (mut app, _) = app(Viewport::Full, &msgs);
+    app.draw(100, 30);
+    assert!(app.cache.is_empty());
+    assert_eq!(app.view().items.len(), 256);
 }

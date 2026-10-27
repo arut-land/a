@@ -12,10 +12,6 @@ use super::{App, Rows};
 impl App {
     /// Item `i`'s rows at `width`, wrapped now if out of date.
     pub(super) fn rows(&mut self, i: usize, width: usize) -> &[Line] {
-        let len = self.client.view().items.len();
-        if self.cache.len() != len {
-            self.cache.resize_with(len, || None);
-        }
         let item = &self.client.view().items[i];
         let streaming = self
             .client
@@ -23,33 +19,38 @@ impl App {
             .streaming
             .as_ref()
             .filter(|s| matches!(item, Item::Reply { call, .. } if *call == s.call));
-        let slot = &mut self.cache[i];
-        if let Some(live) = streaming {
-            let rows = match slot {
-                Some(rows) if rows.width == width && rows.live.is_some() => rows,
-                _ => slot.insert(Rows {
-                    width,
-                    lines: Vec::new(),
-                    live: Some(Live::default()),
-                }),
-            };
-            if let Some(state) = &mut rows.live {
-                state.update(&mut rows.lines, live, width);
-            }
-        } else if slot
-            .as_ref()
-            .is_none_or(|r| r.width != width || r.live.is_some())
+        if self
+            .cache
+            .get(&i)
+            .is_none_or(|r| r.width != width || r.live.is_some() != streaming.is_some())
         {
             let look = Look {
                 collapsed: self.collapsed.contains(&item.key()),
                 verbose: self.verbose,
                 deny: self.deny,
             };
-            *slot = Some(Rows {
-                width,
-                lines: view::presented_rows(item, &self.client.view().present(item), width, look),
-                live: None,
-            });
+            self.cache.insert(
+                i,
+                Rows {
+                    width,
+                    lines: if streaming.is_some() {
+                        Vec::new()
+                    } else {
+                        view::presented_rows(item, &self.client.view().present(item), width, look)
+                    },
+                    live: streaming.map(|_| Live::default()),
+                },
+            );
+        }
+        if let Some(live) = streaming
+            && let Some(rows) = self.cache.get_mut(&i)
+            && let Some(state) = &mut rows.live
+        {
+            state.update(&mut rows.lines, live, width);
+        }
+        // Hidden items must not turn a viewport-sized walk into retained history.
+        if self.cached(i).is_empty() {
+            self.cache.remove(&i);
         }
         self.cached(i)
     }
@@ -69,10 +70,7 @@ impl App {
 
     /// Item `i`'s rows as last wrapped by [`Self::rows`].
     pub(super) fn cached(&self, i: usize) -> &[Line] {
-        self.cache
-            .get(i)
-            .and_then(Option::as_ref)
-            .map_or(&[], |r| &r.lines)
+        self.cache.get(&i).map_or(&[], |r| &r.lines)
     }
 
     /// The rows a `body`-tall transcript shows, as (item, row within it):
@@ -97,7 +95,18 @@ impl App {
             self.anchor = None;
             return self.window(width, body);
         }
+        self.keep_window(&out);
         out
+    }
+
+    /// Keep only the items contributing rows to this viewport.
+    pub(super) fn keep_window(&mut self, shown: &[(usize, usize)]) {
+        self.cache.retain(|i, _| {
+            shown
+                .first()
+                .zip(shown.last())
+                .is_some_and(|(first, last)| (first.0..=last.0).contains(i))
+        });
     }
 
     /// Scrolls `up` rows toward older output (negative: newer).
@@ -120,6 +129,7 @@ impl App {
                     (row, n) = (0, 0);
                     break;
                 }
+                self.cache.remove(&i);
                 i -= 1;
                 row = self.rows(i, width).len();
             }
@@ -135,6 +145,7 @@ impl App {
                 if row < len {
                     break;
                 }
+                self.cache.remove(&i);
                 row -= len;
                 i += 1;
             }
