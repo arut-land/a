@@ -1,0 +1,51 @@
+platform,trial,role,metric,charged_bytes,rss_bytes,independent_charge_bytes,gate_pass
+M3 macOS ARM64,0,baseline,physical footprint,3506680,11059200,3506680.0,True
+M3 macOS ARM64,0,retained,physical footprint,20300280,27901952,20300280.0,False
+M3 macOS ARM64,1,retained,physical footprint,20300280,27901952,20300280.0,False
+M3 macOS ARM64,1,baseline,physical footprint,3523040,11091968,3523040.0,True
+M3 macOS ARM64,2,baseline,physical footprint,3506680,11059200,3506680.0,True
+M3 macOS ARM64,2,retained,physical footprint,20333048,27934720,20333048.0,False
+M3 macOS ARM64,3,retained,physical footprint,20251128,27852800,20251128.0,False
+M3 macOS ARM64,3,baseline,physical footprint,3424760,10977280,3424760.0,True
+M3 macOS ARM64,4,baseline,physical footprint,3539472,11075584,3539472.0,True
+M3 macOS ARM64,4,retained,physical footprint,20300280,27934720,20300280.0,False
+Linux x64,0,baseline,PSS,7609344,10809344,7612416,True
+Linux x64,0,retained,PSS,24438784,27615232,24441856,False
+Linux x64,1,retained,PSS,24419328,27619328,24422400,False
+Linux x64,1,baseline,PSS,7605248,10805248,7608320,True
+Linux x64,2,baseline,PSS,7630848,10858496,7634944,True
+Linux x64,2,retained,PSS,24036352,27267072,24039424,False
+Linux x64,3,retained,PSS,24413184,27648000,24416256,False
+Linux x64,3,baseline,PSS,7568384,10768384,7571456,True
+Linux x64,4,baseline,PSS,7641088,10838016,7645184,True
+Linux x64,4,retained,PSS,24548352,27783168,24551424,False
+Hosted macOS ARM64,0,baseline,physical footprint,2802624,10731520,2802624.0,True
+Hosted macOS ARM64,0,retained,physical footprint,19645440,27525120,19645440.0,False
+Hosted macOS ARM64,1,retained,physical footprint,19579840,27443200,19579840.0,False
+Hosted macOS ARM64,1,baseline,physical footprint,2802624,10731520,2802624.0,True
+Hosted macOS ARM64,2,baseline,physical footprint,2769856,10698752,2769856.0,True
+Hosted macOS ARM64,2,retained,physical footprint,19629056,27475968,19629056.0,False
+Hosted macOS ARM64,3,retained,physical footprint,19678208,27557888,19678208.0,False
+Hosted macOS ARM64,3,baseline,physical footprint,2638720,10551296,2638720.0,True
+Hosted macOS ARM64,4,baseline,physical footprint,2769856,10698752,2769856.0,True
+Hosted macOS ARM64,4,retained,physical footprint,19629056,27508736,19629056.0,False
+Windows x64,0,baseline,private commit,2318336,10145792,2318336,True
+Windows x64,0,retained,private commit,19140608,26931200,19140608,False
+Windows x64,1,retained,private commit,19107840,26906624,19107840,False
+Windows x64,1,baseline,private commit,2166784,10047488,2166784,True
+Windows x64,2,baseline,private commit,2154496,10055680,2154496,True
+Windows x64,2,retained,private commit,18976768,26832896,18976768,False
+Windows x64,3,retained,private commit,18972672,26824704,18972672,False
+Windows x64,3,baseline,private commit,2326528,10145792,2326528,True
+Windows x64,4,baseline,private commit,2187264,10084352,2187264,True
+Windows x64,4,retained,private commit,19005440,26853376,19005440,False
+Windows ARM64,0,baseline,private commit,2224128,10846208,2224128,True
+Windows ARM64,0,retained,private commit,19038208,27504640,19038208,False
+Windows ARM64,1,retained,private commit,19066880,27525120,19066880,False
+Windows ARM64,1,baseline,private commit,2236416,10846208,2236416,True
+Windows ARM64,2,baseline,private commit,2240512,10858496,2240512,True
+Windows ARM64,2,retained,private commit,19034112,27680768,19034112,False
+Windows ARM64,3,retained,private commit,19050496,27680768,19050496,False
+Windows ARM64,3,baseline,private commit,2236416,10919936,2236416,True
+Windows ARM64,4,baseline,private commit,2228224,10915840,2228224,True
+Windows ARM64,4,retained,private commit,19054592,27701248,19054592,False

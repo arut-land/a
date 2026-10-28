@@ -72,5 +72,32 @@ Apple M3, macOS 27.0.1; five fresh-home AB/BA pairs. Values are KiB, median
 
 The main runtime's worst-case charged margin is 6,783.48 KiB (6.62 MiB).
 The old RSS assertion would reject all five normal samples. No product
-allocation or runtime policy changed. Hosted results follow when the four
-native lanes complete.
+allocation or runtime policy changed.
+
+All four hosted lanes in [perf run 40706095506](https://github.com/arut-land/a/actions/runs/40706095506)
+passed at implementation revision `68c9c191`. Each lane ran the real-child
+4 MiB reader invariants, then five interleaved normal/retained daemon pairs.
+Every normal sample passed the actual Windows adapter memory assertion;
+every retained build was rejected. Values below are KiB, median [min–max].
+
+| Native target | Normal charge | Retained-build charge | Normal RSS (diagnostic) | Worst normal margin |
+| --- | ---: | ---: | ---: | ---: |
+| M3 macOS ARM64 | 3,424.49 [3,344.49–3,456.52] | 19,824.49 [19,776.49–19,856.49] | 10,800.00 [10,720.00–10,832.00] | 6,783.48 |
+| Linux x64 | 7,431.00 [7,391.00–7,462.00] | 23,847.00 [23,473.00–23,973.00] | 10,556.00 [10,516.00–10,604.00] | 2,778.00 |
+| Hosted macOS ARM64 | 2,704.94 [2,576.88–2,736.94] | 19,169.00 [19,120.94–19,217.00] | 10,448.00 [10,304.00–10,480.00] | 7,503.06 |
+| Windows x64 | 2,136.00 [2,104.00–2,272.00] | 18,560.00 [18,528.00–18,692.00] | 9,848.00 [9,812.00–9,908.00] | 7,968.00 |
+| Windows ARM64 | 2,184.00 [2,172.00–2,188.00] | 18,604.00 [18,588.00–18,620.00] | 10,604.00 [10,592.00–10,664.00] | 8,052.00 |
+
+[Raw samples](idle-charge.csv) include the independent native-library
+cross-check for each observation. All five targets used the same reader
+source SHA-256, `c36380eb4826e5b63f220a525d8c61e6940b46c2d0c0a35aa2f4d1e5d3209e82`. M3 was measured
+in the working tree before the implementation commit; its normal runtime
+is main `63ac410a`. The reader is called by the observer and test process,
+not by the daemon. The hosted lanes measured the clean implementation commit.
+No product allocation reduction is claimed.
+
+The actual Unix terminal budget test was also exercised in five fresh-home
+pairs on the M3: all five normal daemons passed (printed charge 3,328–3,488
+KiB), and all five retained daemons failed (19,824–19,904 KiB). Terminal
+client CPU remained zero in every three-second window. Its worst-case
+normal charged margin exceeds 6.59 MiB.
