@@ -904,5 +904,7 @@ main/candidate revisions and fixture hash; `approved/release-samples.jsonl` and
 all MCP/OAuth tests and twelve release CLI tests. Check, fmt, all-target/all-feature
 clippy with `-D warnings`, Windows workspace lint, rustdoc and the normal no-Tokio
 scan pass. The new identity invariant also fails if both admission classes are
-made identical. All ten final benchmark homes stopped successfully and have no
-remaining helper PIDs. No MCP dependency, wire or corpus changes are introduced.
+made identical. All ten final benchmark daemon stops succeeded. Candidate cleanup
+snapshots contain no remaining helper PIDs. One baseline cleanup snapshot listed
+a PID that was absent at the final audit; the original record and follow-up audit
+are retained. No MCP dependency, wire or corpus changes are introduced.
