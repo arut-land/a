@@ -427,7 +427,7 @@ jobs:
                           started = time.perf_counter()
                           try:
                               run = subprocess.run([str(executables[variant][suite]), '--exact', name, '--nocapture'],
-                                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=125)
+                                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
                               code, output = run.returncode, run.stdout.decode(errors='replace')
                           except subprocess.TimeoutExpired as error:
                               code, output = 'timeout', (error.stdout or b'').decode(errors='replace')

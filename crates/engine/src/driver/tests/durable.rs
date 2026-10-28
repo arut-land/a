@@ -32,7 +32,8 @@ fn shutdown_consumes_a_prefetched_flush_completion() {
         flush();
     }
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    for mut task in lock(&h.runtime.tasks).take().unwrap() {
+    let tasks = lock(&h.runtime.tasks).take().unwrap();
+    for mut task in tasks {
         let _ = task.as_mut().poll(&mut cx);
     }
     let ended = h.actor.as_mut().poll(&mut cx).is_ready();

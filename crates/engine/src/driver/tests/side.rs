@@ -974,8 +974,6 @@ impl Extension for BackgroundCompletion {
 
 #[test]
 fn shutdown_never_admits_a_background_side_call_waiting_for_its_flush() {
-    let measured = Instant::now();
-    eprintln!("side {:?}: start", measured.elapsed());
     let faulty = Arc::new(crate::store::Faulty::new(Arc::new(Memory::default())));
     let http = Flaky::new([Reply::Events(text_reply())]);
     let completed = Flag::default();
@@ -993,7 +991,6 @@ fn shutdown_never_admits_a_background_side_call_waiting_for_its_flush() {
         },
     );
     let session = harness.create();
-    eprintln!("side {:?}: created", measured.elapsed());
     settle(&session);
     let flush = faulty.hold_flush_containing(session.id, |entry| {
         matches!(&entry.body,
@@ -1010,22 +1007,16 @@ fn shutdown_never_admits_a_background_side_call_waiting_for_its_flush() {
         origin: None,
         reply,
     });
-    eprintln!("side {:?}: waiting for flush", measured.elapsed());
     flush.started();
-    eprintln!("side {:?}: flush started", measured.elapsed());
     session.wait(
         "owner finished before background admission",
         PATIENCE,
         || !session.has_work(),
     );
     assert_eq!(http.sent(), 0);
-    eprintln!("side {:?}: owner finished", measured.elapsed());
     session.stop();
-    eprintln!("side {:?}: stopped", measured.elapsed());
     flush.release();
-    eprintln!("side {:?}: released", measured.elapsed());
     rt::block_on(session.ended.wait());
-    eprintln!("side {:?}: ended", measured.elapsed());
     let _ = rt::block_on(ack);
     assert!(rt::block_on(first(completed.wait(), harness.0.rt.sleep(PATIENCE))).is_some());
     assert_eq!(
