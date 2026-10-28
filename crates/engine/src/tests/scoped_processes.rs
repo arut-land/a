@@ -482,10 +482,9 @@ fn last_demand_and_shutdown_reap_the_process_and_its_descendants() {
         }
         rt::block_on(control.ended());
         assert!(sys::process_started(control.id()).is_none());
-        assert!(
-            sys::process_started(descendant).is_none(),
-            "descendant survived completed retirement"
-        );
+        let alive = sys::process_started(descendant);
+        eprintln!("WIN_REAP {:?} stage {stage} descendant {descendant} {alive:?}", std::time::SystemTime::now());
+        assert!(alive.is_none(), "descendant survived completed retirement");
     }
     drop((cx, session, daemon));
     std::fs::remove_dir_all(root).unwrap();

@@ -274,6 +274,7 @@ pub(super) fn members(job: &OwnedHandle) -> io::Result<Vec<u32>> {
             // SAFETY: successful query initialized both DWORDs and the listed IDs.
             let len = unsafe { *header.add(1) } as usize;
             let offset = 8 / size_of::<usize>();
+            eprintln!("WIN_REAP {:?} members {:?}", std::time::SystemTime::now(), &buffer[offset..offset + len]);
             return Ok(buffer[offset..offset + len]
                 .iter()
                 .filter_map(|&pid| pid.try_into().ok())
@@ -296,7 +297,10 @@ pub fn group_alive(_id: u32) -> bool {
 
 pub(super) fn terminate_group(job: &OwnedHandle) -> io::Result<()> {
     // SAFETY: the borrowed job remains owned throughout termination.
-    ok(unsafe { TerminateJobObject(job.as_raw_handle(), 1) })
+    eprintln!("WIN_REAP {:?} terminate begin", std::time::SystemTime::now());
+    let result = ok(unsafe { TerminateJobObject(job.as_raw_handle(), 1) });
+    eprintln!("WIN_REAP {:?} terminate end {result:?}", std::time::SystemTime::now());
+    result
 }
 
 pub fn process_started(pid: u32) -> Option<u64> {
@@ -360,6 +364,7 @@ pub fn member_watch(job: &OwnedHandle, pid: u32) -> io::Result<Option<ExitWatch>
             &raw mut member,
         )
     })?;
+    eprintln!("WIN_REAP {:?} member {pid} {member}", std::time::SystemTime::now());
     Ok((member != 0).then_some(process))
 }
 
