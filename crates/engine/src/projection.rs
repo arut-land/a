@@ -464,63 +464,22 @@ impl Actor {
         .await?
     }
 
-    /// The conversation the model sees before entry `call`: the
-    /// transcript as it stands, gone on with on a blocking worker from
-    /// where it stopped short, or, with none, made from the whole log.
     fn canonical_source(
         &self,
         call: CallId,
     ) -> Arc<dyn Fn() -> Result<llm::Messages, llm::Error> + Send + Sync> {
-        let source_through = self.journal.ordered_seq;
-        let source_frames = Arc::clone(&self.live.frames);
-        let source_registry = Arc::downgrade(&self.registry);
-        let source_pending: Vec<_> = self.pending_entries().collect();
-        let source_places = self.live.session.blobs.places();
-        let model_only = self.live.session.model_only();
-        Arc::new(move || {
-            let source_registry = source_registry.upgrade().ok_or_else(|| {
-                llm::Error::new(
-                    llm::Kind::Other,
-                    "canonical history's registry generation has retired",
-                )
-            })?;
-            Transcript::replay(
-                |each| {
-                    'history: for batch in source_frames.batches_after(0) {
-                        for entry in batch? {
-                            if entry.seq.get() > source_through {
-                                break 'history;
-                            }
-                            if entry.seq < call.0
-                                || matches!(entry.body, Body::Context { .. } | Body::Edit { .. })
-                            {
-                                each(&entry);
-                            }
-                        }
-                    }
-                    for entry in &source_pending {
-                        if entry.seq.get() <= source_through
-                            && (entry.seq < call.0
-                                || matches!(entry.body, Body::Context { .. } | Body::Edit { .. }))
-                        {
-                            each(entry);
-                        }
-                    }
-                    Ok(())
-                },
-                Arc::clone(&source_registry),
-                if model_only {
-                    ""
-                } else {
-                    source_registry.system_prompt()
-                },
-                &source_places,
-            )
-            .map(Transcript::into_messages)
-            .map_err(|error| llm::Error::new(llm::Kind::Other, error.to_string()))
-        })
+        history_reader(
+            Arc::clone(&self.live.frames),
+            &self.registry,
+            self.pending_entries().collect(),
+            self.live.session.blobs.places(),
+            self.live.session.model_only(),
+            self.journal.ordered_seq,
+            call,
+        )
     }
 
+    /// The conversation the model sees before entry `call`, extended on a CPU worker.
     pub(super) async fn conversation(&mut self, call: CallId) -> io::Result<llm::Conversation> {
         let restore = self.canonical_source(call);
         if let Some(messages) = (self.projection.transcript.as_ref())
@@ -622,10 +581,115 @@ impl Actor {
     }
 }
 
+fn history_reader(
+    source_frames: Arc<super::FrameLog>,
+    registry: &Arc<ext::host::Registry>,
+    source_pending: Vec<Entry>,
+    source_places: ext::blob::Places,
+    model_only: bool,
+    source_through: u64,
+    call: CallId,
+) -> Arc<dyn Fn() -> Result<llm::Messages, llm::Error> + Send + Sync> {
+    let source_committed = source_frames.seq();
+    let source_registry = Arc::downgrade(registry);
+    Arc::new(move || {
+        let source_registry = source_registry.upgrade().ok_or_else(|| {
+            llm::Error::new(
+                llm::Kind::Other,
+                "canonical history's registry generation has retired",
+            )
+        })?;
+        Transcript::replay(
+            |each| {
+                'history: for batch in source_frames.batches_after(0) {
+                    for entry in batch? {
+                        if entry.seq.get() > source_committed {
+                            break 'history;
+                        }
+                        if entry.seq < call.0
+                            || matches!(entry.body, Body::Context { .. } | Body::Edit { .. })
+                        {
+                            each(&entry);
+                        }
+                    }
+                }
+                for entry in &source_pending {
+                    if entry.seq.get() <= source_through
+                        && (entry.seq < call.0
+                            || matches!(entry.body, Body::Context { .. } | Body::Edit { .. }))
+                    {
+                        each(entry);
+                    }
+                }
+                Ok(())
+            },
+            Arc::clone(&source_registry),
+            if model_only {
+                ""
+            } else {
+                source_registry.system_prompt()
+            },
+            &source_places,
+        )
+        .map(Transcript::into_messages)
+        .map_err(|error| llm::Error::new(llm::Kind::Other, error.to_string()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use protocol::{Audience, Epoch, Json, Outcome, Seq};
+
+    #[test]
+    fn saved_history_readers_replay_pending_entries_once_after_flush() {
+        use crate::store::{AppendMode, Header, Jsonl, LogStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Jsonl::open(dir.path()).unwrap();
+        let mut loaded = store
+            .create(&Header {
+                id: protocol::SessionId::new(),
+                workspace: dir.path().into(),
+                parent: None,
+            })
+            .unwrap();
+        loaded
+            .append(Body::Assistant {
+                text: "committed".into(),
+            })
+            .unwrap();
+        let frames = Arc::new(super::super::FrameLog::new(
+            Arc::clone(&loaded.lines),
+            loaded.seq,
+        ));
+        let mut pending = [Entry::new(
+            Seq::new(loaded.seq + 1).unwrap(),
+            Epoch(0),
+            Body::Assistant {
+                text: "pending".into(),
+            },
+        )];
+        loaded
+            .writer
+            .append(&mut pending, AppendMode::Write)
+            .unwrap();
+        let registry = Arc::new(ext::host::Registry::default());
+        let reader = history_reader(
+            Arc::clone(&frames),
+            &registry,
+            pending.to_vec(),
+            ext::blob::Places::default(),
+            true,
+            pending[0].seq.get(),
+            CallId::new(pending[0].seq.get() + 1).unwrap(),
+        );
+        let before = reader().unwrap();
+        assert!(Json::encode(&before).unwrap().raw().contains("pending"));
+        loaded.writer.flush_inline().unwrap();
+        frames.push(pending[0].seq.get(), None);
+        assert_eq!(reader().unwrap(), before);
+    }
 
     #[test]
     fn batched_snapshot_folding_matches_shared_view_vectors() {
