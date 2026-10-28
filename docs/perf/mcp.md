@@ -300,3 +300,295 @@ speculative hardening or out-of-scope source edits were needed.
 Raw scripts, release probes and JSONL observations for this round are
 retained outside the worktree at `/private/tmp/mcp-frame-buffer-r3` for
 independent review. Branch CI is deferred until that review.
+
+## HTTP OAuth (round 3)
+
+The client uses the existing pooled HTTP transport with redirects refused.
+A 401 discovers protected-resource and authorization-server metadata, then uses
+an authorization code with S256 PKCE and resource indicators. Stored credentials
+bind the resource, issuer and client identity. A rejected access token can refresh;
+`invalid_grant` starts a new authorization. A 403 `insufficient_scope` requests the
+union of previous and challenged scopes. Only explicit authorization challenges
+permit retrying the original operation; other transport failures remain terminal.
+
+The default client ID is the single `OAUTH_CLIENT_ID` constant:
+`https://arut.land/.well-known/oauth-client/a.json`. The owner will host this
+metadata document; this change adds no hosted copy. The local fixture resolves
+that URL to its own document without contacting the public host. A server needing
+a pre-registered public client can set `<server>_client_id` and `<server>_issuer`
+together. The issuer must appear in that resource's metadata and match the
+validated authorization-server metadata. No need for dynamic registration was
+demonstrated, so it is not implemented.
+
+Authorization uses an ephemeral `127.0.0.1` listener through `rt`, with callback
+path `/oauth/callback`. An internal tool presents the authorization URL using the
+existing approval card. The headless daemon never opens a browser. The verifier,
+callback code and tokens stay outside tool inputs, results and session logs.
+Authorization state belongs to the credential store, independent of session replay.
+For a daemon on another host, the browser must be able to reach that host's
+loopback callback, for example through an SSH tunnel; automatic callback forwarding
+would need client/transport work outside the owned paths.
+
+`sys::credentials` uses Keychain on macOS and Credential Manager on Windows.
+Native calls run on the existing storage workers. Windows stores multiple native
+credential parts so its 2560-byte blob limit does not limit OAuth token length.
+The native round-trip test covers 10,000-byte values, replacement and deletion.
+It also reproduced macOS treating an empty data update as unchanged; a byte of
+native framing permits an empty value to replace an existing value.
+Integration tests use an isolated private-file store, never existing credentials.
+Linux uses the explicitly permitted 0600 file under the instance's state directory,
+inside a 0700 directory, through the existing private-file implementation.
+
+### Dependency comparison
+
+On the M3, Rust nightly-2026-10-17, `opt-level=z`, fat LTO, one codegen unit,
+stripped, a standalone Secret Service reader using `secret-service` 5.2.0 with
+`default-features=false, features=["rt-async-io-crypto-rust"]` linked **1,222,320
+bytes**. Its normal dependency graph contained **96 distinct packages including
+the probe** on macOS and **97** for Linux, with no crate named `tokio` in either. The same probe using `std::fs::read`
+linked **286,368 bytes**. The **935,952-byte** difference is an isolated reader
+comparison, not a predicted change to `a`; it does not include shared-dependency
+elimination in `a`. It establishes the substantial D-Bus/crypto surface needed
+for this otherwise small storage operation. This implementation chooses the
+permitted private-file backend instead of another D-Bus client and executor.
+Neither probe contacted a Secret Service daemon. These figures are native macOS
+code-size observations, not Linux runtime performance measurements.
+
+Header challenges use `http-auth` 0.1.10 with default features disabled; form
+encoding uses `form_urlencoded` 1.2.2. They handle quoted challenge parameters,
+multiple schemes and percent encoding rather than introducing custom parsers.
+Only `http-auth` is a new package in the workspace lock resolution; its `memchr`
+dependency, `form_urlencoded` and `percent-encoding` were already present.
+
+There is no OAuth background task, connection, poller or refresh timer. Credentials
+are loaded only after an authorization challenge, then shared in memory for that
+registry. Public servers and successful authenticated calls perform no credential
+I/O. Discovery, refresh and browser interaction happen only after a challenge. Payload clones share their existing
+`Arc` pieces while authentication retries, rather than copying the request body.
+The protected-server invariant failed on the original release client with
+`expected a JSON-RPC 2.0 object`, before OAuth was implemented. Tests also caught
+and removed an eager credential-read dependency: a public server now succeeds even
+when the credential directory is unavailable. Warm protected calls reuse validated
+credentials without storage I/O, and a new MCP instance restores them from storage.
+
+### Release and idle observations
+
+Both shipped builds passed `mise run size` and its fixture scan. Baseline product
+source is `7318ef3f`, candidate product source is `8c4942e3`; the later main merge
+through `9370a19c` changes tooling/scripts/docs only, with no product Rust,
+manifest, lockfile, release-profile or Rust-toolchain changes. The same native
+M3, nightly-2026-10-17, `CARGO_BUILD_JOBS=2`, and shipped release profile were used.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Shipped bytes (exact) | 6,789,424 | 6,873,712 |
+| Idle daemon RSS, KiB | 10,632 [10,576–10,704] | 10,560 [10,480–10,624] |
+| Idle daemon CPU over 3 seconds, ms | 0 [0–0] | 0 [0–0] |
+| Daemon threads | 7 [7–7] | 7 [7–7] |
+
+Size increases **84,288 bytes (82.31 KiB, 1.24%)**. Size is deterministic, with
+zero observed spread. RSS and CPU are medians [minimum–maximum] from six samples
+per build. Order alternates AB/BA across six rounds. Every sample starts a fresh
+isolated home and plain client with one configured loopback HTTP MCP server,
+waits 12 seconds for blocking workers to retire, then observes CPU for three
+seconds. Provider variables are removed and replaced with a loopback URL and
+dummy credentials. The loopback server received zero requests. Each daemon was
+stopped with its isolated `A_HOME` before deleting the home.
+
+CPU accounting had only floating-point residuals below 10^-12 seconds; values
+above are rounded to milliseconds. The overlapping RSS ranges do not establish a
+memory improvement or an exact zero-byte cost. The observation establishes no
+added idle CPU or threads in this workload, alongside the absence of OAuth-owned
+background tasks. These shared-host macOS observations are not cross-platform
+performance guarantees.
+
+After main integration, touched-crate checks and all **305 tests** passed (two
+existing tests skipped), as did formatting, all-target clippy with `-D warnings`,
+documentation generation and workspace Windows lint. The normal all-target
+dependency graph contains no crate named `tokio`. No wire or recorded-provider
+fixture changed. Phase-1 verification used an external source mirror for the generated lockfile
+resolution. The owner committed that resolution in `e814148d` before phase 2.
+
+
+### Independent review fixes
+
+Authorization question names now come from a typed counter in the SDK's parent
+invocation context. Pagination and other HTTP requests in the same operation
+share that counter; per-request authorization retries remain independent. The
+counter is allocated only when authorization is presented, lives for the parent
+operation, and adds no background work or idle activity.
+
+The local HTTP fixture publishes its readiness URL with `sys::fs::write_private`,
+whose atomic replacement exposes a complete file. Readers can no longer mistake
+an empty file between creation and writing for readiness.
+
+`paginated_authorization_names_are_unique_in_the_engine` starts the real engine
+in an isolated process and home, sends typed client messages over its native IPC,
+and runs one `mcp_list` against the real local HTTP fixture. Page one requires
+initial authorization; page two requires a scope upgrade. The original code
+reproduced the failure: only one authorization invocation was accepted and the
+parent returned `authorization declined`. With the fix, two invocations complete,
+both pages finish, and the granted scope is `read write`. Only the browser and
+remote authorization server are fixtures. Existing workspace crates `engine` and
+`ext-fixtures` are test-only dependencies; no production dependency was added.
+
+On the M3, all 45 MCP tests passed. The engine pagination regression and the
+previously flaky no-scope authorization test each passed 20 consecutive stress
+iterations. Touched-crate check, all-target clippy with `-D warnings`, formatting,
+and the workspace Windows lint passed. The owner-approved metadata URL remains
+unchanged and still requires hosting by the owner. The owner subsequently authorized generated lockfile ownership; commit
+`07db53a1` integrates the two existing-workspace test-dependency edges. No registry
+package was added by that patch.
+
+The post-review shipped build passed `mise run size` and its fixture scan at
+**6,873,760 bytes**, 48 bytes above the phase-1 candidate and 84,336 bytes above
+the original pre-OAuth baseline. These are exact size observations, not new idle
+measurements; the interleaved phase-1 idle observations above remain the measured
+RSS/CPU evidence.
+
+The single phase-2 CI dispatch is run `40668274523` at `e04de3af`. Its Miri job
+stopped on the credential file invariant because Miri cannot interpret native
+`open` flags (`0x800`). The test is now explicitly ignored under Miri, like the
+native credential-store invariant; ordinary native credential tests still pass.
+This is a deterministic interpreter limitation, so no failed-job retry was made.
+The follow-up is locally verified and is not covered by the already dispatched
+SHA. Local runtime Miri invariants passed; the full local sys Miri suite stops
+earlier at the existing, out-of-scope config test's unsupported macOS `acl_init`.
+
+
+### Credential lifecycle coordination (owner-approved follow-up)
+
+`Authorizations` owns one lifecycle for each exact configured server name,
+resource URI, issuer and client ID. The daemon's existing MCP instance shares
+that value across its sessions and connections. `Mcp::with_authorizations` lets
+separately composed instances share the same value, providing the small typed
+seam for the forthcoming daemon-wide scoping work. No process-global cache or
+cross-home singleton was added.
+
+Requests receive a numbered access-token generation; refresh credentials remain
+inside the owner. Immutable access-token bytes are shared through `Arc<str>`.
+This uses Serde's existing `rc` feature, with no new package. Credential load,
+refresh, reauthorization, native persistence and publication form one owned
+transaction. Concurrent callers join its result. A late 401 from an older
+generation reuses the newer publication, including its shared failure, instead
+of redeeming the old refresh token again. A transient refresh error retains the
+last persisted refresh credential for a later operation to retry.
+
+The token endpoint's optional `expires_in` is recorded as an absolute expiration
+in the private credential record (see [RFC 6749, section 5.1](https://www.rfc-editor.org/rfc/rfc6749#section-5.1)).
+An incoming request with an expired generation joins renewal before sending the
+expired token. Missing expiry leaves rejection-driven renewal in place. There
+is no expiry timer, idle connection or maintenance task. Idle RSS and CPU were
+not remeasured for this follow-up; the earlier idle observations remain
+historical evidence, not an exact zero-byte cost claim for the new owner.
+
+The runtime owns the renewal future. Cancelling a caller drops that caller's
+wait and presentation candidacy while other callers continue awaiting the
+transaction. A reauthorization selects a live waiting caller's existing approval
+presentation. Native storage completion precedes publishing a replacement:
+storage writes are not abandoned at the network deadline, since accepted native
+jobs can outlive a dropped future. The existing configured MCP timeout bounds
+network work. No new pagination, scope, token-length or caller-count cap was added.
+
+The real-engine regressions use sixteen sessions and connections, a local HTTP
+fixture with rotating refresh tokens, and a delayed old-generation 401 after the
+replacement can already have been published. The fixture checks that both access
+and refresh replacements are on disk before accepting their first use. Separate
+cases cover one shared authorization after revocation, a shared declined result,
+expiry before HTTP, starter cancellation during refresh, transient failure and
+retry, concurrent scope step-up, and sharing between separately composed MCP
+instances. All 55 MCP tests passed in dev and release builds. All eight lifecycle
+integration cases passed 20 stress iterations each. Clippy with `-D warnings`,
+formatting, workspace Windows lint, documentation and the normal all-target tokio
+ban check passed. Both private lifecycle invariants passed Miri.
+
+The original release client reproduced sixteen refresh redemptions for one
+rotating token. An initial measurement also exposed a losing request deleting a
+replacement saved by another request. The fixture now returns a failed response
+for that persistence violation rather than panicking, allowing complete samples.
+Both compared binaries use the same final fixture. Six samples per build run in
+alternating AB/BA rounds on the shared M3, with fresh isolated homes, the shipped
+release profile, nightly-2026-10-17 and two Cargo build jobs. Before product code
+is `07db53a1` with the regression harness added; the after build includes this
+coordinator. Values below are medians [minimum–maximum].
+
+| Whole regression command | Before | After |
+| --- | ---: | ---: |
+| Refresh redemptions | 16 [16–16] | 1 [1–1] |
+| Wall time, ms | 1,038.05 [965.76–1,150.21] | 816.68 [767.67–1,150.28] |
+| User + system CPU, ms | 100 [100–110] | 90 [80–100] |
+| Native time maximum RSS, KiB | 11,664 [11,648–11,680] | 11,184 [11,120–11,296] |
+
+The before regression fails; all sixteen after requests complete. These timings
+include daemon startup, fixture delays and shutdown, and compare failed versus
+successful execution. They do not establish an equivalent-success latency or
+CPU/RSS improvement. Native `time -lp` reports command resource usage, not idle
+daemon RSS or the sum of concurrent processes' RSS. CPU values have 10 ms
+resolution. No samples were discarded from the final complete six-round replay.
+Raw samples, initial/provisional runs, source hashes and the replay script are
+retained outside the worktree beside `mcp-oauth-refresh.report.md`.
+
+Pending approval cards still belong to an engine parent call. Interrupting the
+chosen parent while its approval is pending can end that question and give every
+waiter the shared authorization-declined result. Preserving that pending card
+across its parent's interruption needs an SDK/engine authority lifetime seam
+outside these owned paths (`Cx::invoke`, `ContextOrigin`, and invocation/cancellation
+ownership). The coordinator can select another live caller before presenting,
+and refresh work survives starter cancellation; the pending-card lifetime remains
+an integration requirement for the owner/scoping lane. No SDK, engine, protocol,
+client or UI changes were made here. The owner explicitly deferred interrupted
+multipart Windows credential writes; that case remains unchanged. The approved
+client metadata URL remains the owner's unhosted placeholder.
+
+CI is deferred until independent review, as requested.
+
+The shipped coordinator build passed `mise run size` and its fixture scan at
+**6,907,008 bytes**, versus the previously measured pre-coordination OAuth build's
+**6,873,760 bytes**: **+33,248 bytes (32.47 KiB, 0.484%)**. That baseline's product
+code is unchanged through `07db53a1`; the intervening lockfile and Miri-only test
+changes do not ship. This is the complete feature delta, including expiry,
+coordination and shared access-token serialization, rather than an isolated cost
+attribution to Serde's `rc` feature. These are exact native M3 size observations;
+Linux and Windows execution of this follow-up awaits the post-review CI run.
+
+
+### Scope step-up review fix
+
+A `403 insufficient_scope` leaves the previous access and refresh credential
+intact while an upgrade is presented. Successful authorization is persisted
+before replacing that grant. Declining or failing an upgrade keeps the stored
+bytes unchanged. New operations can still obtain the cached prior access token,
+while callers awaiting the failed upgrade continue to share its failure. A
+rejected `401` credential still follows the existing revocation path.
+
+The real-engine invariants
+`declining_scope_step_up_preserves_previously_granted_access` and
+`failing_scope_step_up_preserves_previously_granted_access` establish a read
+grant, reject the write upgrade, compare the stored credential bytes, perform a
+read without another card, and then refresh the original grant without another
+card. They failed on the original release client: the grant was removed and the
+read needed one extra authorization. Both pass after the fix. The private
+lifecycle invariant also checks that cached access remains available to new
+operations without hiding the failed outcome from older waiters.
+
+Six release samples per build, alternating AB/BA on the shared M3 against the same
+fixture, observed unchanged stored grants in **0/6 before versus 6/6 after**.
+The subsequent original-scope operation required **1 [1–1]** extra approval card
+before versus **0 [0–0]** after (median [minimum–maximum]). Whole regression-command
+wall times were **708.71 [703.90–1,048.30] ms** before and
+**659.12 [653.54–730.52] ms** after. These include fixture delays, startup and
+shutdown and compare failed with successful execution; they are diagnostic
+observations, not an equivalent-success latency claim. The after build also
+integrates main through `1af5daf3`; no CPU/RSS effect is attributed to this fix.
+Raw samples and source/binary hashes are retained with `mcp-oauth-stepup.report.md`.
+
+After main integration, all 58 MCP tests passed in dev and release profiles.
+Both review regressions passed 20 stress iterations each. All three lifecycle invariants passed Miri; formatting, all-target clippy with
+`-D warnings`, documentation, workspace Windows lint and the normal all-target
+tokio ban check passed. The earlier native credential-file Miri annotation is
+included in this branch and will be covered by the phase-2 CI dispatch.
+
+The pending-card parent-lifetime seam remains tracked for `mcp-elicit` /
+`mcp-instances`. The owner-approved metadata URL and interrupted multipart Windows
+credential-write decisions remain unchanged. This review fix introduces no new
+dependency, wire change or additional hardening.

@@ -12,6 +12,7 @@ pub mod channel;
 mod events;
 mod flush;
 mod io;
+mod loopback;
 mod notify;
 pub mod oneshot;
 #[cfg(feature = "threads")]
@@ -36,6 +37,7 @@ pub use futures_lite::future::yield_now;
 /// Polls both futures to completion within their owner's lifetime.
 pub use futures_lite::future::zip;
 pub use io::{Async, Reactor, Source, capture_output};
+pub use loopback::LoopbackListener;
 pub use notify::Notify;
 #[cfg(feature = "threads")]
 pub use threads::{Config, PoolLimits, Threads};
