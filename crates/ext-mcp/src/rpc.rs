@@ -58,6 +58,7 @@ pub(crate) fn decode(message: &Value, id: u64) -> Result<Option<Value>, Failure>
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn http(
     url: &str,
     method: &str,
@@ -70,6 +71,25 @@ pub(crate) async fn http(
         .expect("engine HTTP clients")
         .client(transport::RedirectPolicy::Refuse);
     exchange(&*client, url, method, params, headers, cx).await
+}
+
+pub(crate) async fn http_authorized(
+    url: &str,
+    method: &str,
+    params: Value,
+    headers: http::HeaderMap,
+    connection: crate::oauth::Connection,
+    cx: &Cx,
+) -> Result<Value, Failure> {
+    let client = crate::oauth::Client {
+        inner: cx
+            .service::<dyn transport::HttpClients>()
+            .expect("engine HTTP clients")
+            .client(transport::RedirectPolicy::Refuse),
+        cx: cx.clone(),
+        connection,
+    };
+    exchange(&client, url, method, params, headers, cx).await
 }
 
 async fn exchange(

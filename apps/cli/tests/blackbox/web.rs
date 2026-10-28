@@ -458,6 +458,23 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     assert_eq!(env.pid(), pid);
 }
 
+#[test]
+fn a_live_composer_never_throws_or_discards_a_newer_draft() {
+    let env = Env::new("web-browser");
+    let web = Web::start(&env);
+    let result = Command::new("node")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../web/test-live.mjs"))
+        .arg(format!("http://{}/?token={}", web.host(), web.token))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "browser regression: {}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 /// Each change goes out alone: a new item is added before the end, and
 /// nothing shown is sent again, however long the transcript grows.
 #[test]

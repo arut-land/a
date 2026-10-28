@@ -2613,3 +2613,5 @@ fn a_handed_group_no_session_takes_up_is_killed_as_the_daemon_loads() {
     runtime.shutdown();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+mod scoped_processes;

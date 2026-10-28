@@ -1,0 +1,777 @@
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::Path;
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use ext::host::Registry;
+use ext::testing::Rig;
+use ext::{Answer, Configured, Extension, Refused, Registrar, Table};
+use ext_mcp::{Mcp, Server, Transport};
+use serde_json::json;
+
+struct Peer(Child);
+impl Drop for Peer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        self.0.wait().unwrap();
+    }
+}
+
+struct Browser {
+    credentials: sys::credentials::Credentials,
+    approvals: Arc<AtomicUsize>,
+    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    decline_write: bool,
+}
+impl Extension for Browser {
+    const NAME: &'static str = "oauth-test-browser";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        let approvals = Arc::clone(&self.approvals);
+        let threads = Arc::clone(&self.threads);
+        let decline_write = self.decline_write;
+        r.provide(Arc::new(self.credentials.clone()))
+            .on::<ext::point::Approve>(move |_, call| {
+                if call.tool != "mcp_authorize" {
+                    return Answer::Now(None);
+                }
+                let input: serde_json::Value = call.input.parse().unwrap();
+                let url = input["url"].as_str().unwrap().to_owned();
+                approvals.fetch_add(1, Ordering::SeqCst);
+                let uri: http::Uri = url.parse().unwrap();
+                if decline_write
+                    && form_urlencoded::parse(uri.query().unwrap().as_bytes()).any(
+                        |(key, value)| {
+                            key == "scope" && value.split_whitespace().any(|scope| scope == "write")
+                        },
+                    )
+                {
+                    return Answer::Now(Some(false));
+                }
+                threads.lock().unwrap().push(std::thread::spawn(move || {
+                    let response = get(&url);
+                    let redirect = response
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Location: "))
+                        .unwrap();
+                    let response = get(redirect);
+                    assert!(response.starts_with("HTTP/1.1 200"));
+                }));
+                Answer::Now(Some(true))
+            });
+    }
+}
+struct Settings(sys::config::Table);
+impl Table for Settings {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn text(&self, key: &str) -> Result<Option<&str>, Refused> {
+        self.0.text(key).map_err(|e| Refused(e.to_string()))
+    }
+    fn whole(&self, key: &str) -> Result<Option<u64>, Refused> {
+        self.0.whole(key).map_err(|e| Refused(e.to_string()))
+    }
+    fn flag(&self, key: &str) -> Result<Option<bool>, Refused> {
+        self.0.flag(key).map_err(|e| Refused(e.to_string()))
+    }
+    fn list(&self, key: &str) -> Result<Option<&[String]>, Refused> {
+        self.0.list(key).map_err(|e| Refused(e.to_string()))
+    }
+}
+
+fn get(url: &str) -> String {
+    let uri: http::Uri = url.parse().unwrap();
+    let mut stream = TcpStream::connect(uri.authority().unwrap().as_str()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        uri.path_and_query().unwrap(),
+        uri.authority().unwrap()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+fn configured(root: &Rig, origin: &str, scenario: &str) -> Mcp {
+    if matches!(scenario, "preregistered" | "wrong-registration-issuer") {
+        let path = root.dir.join("config.toml");
+        let issuer = if scenario == "wrong-registration-issuer" {
+            "wrong"
+        } else {
+            "issuer"
+        };
+        std::fs::write(&path, format!("[ext.mcp]\nservers = [\"fixture\"]\nfixture_url = \"{origin}/mcp\"\nfixture_client_id = \"fixture-client\"\nfixture_issuer = \"{origin}/{issuer}\"\n")).unwrap();
+        Mcp::configure(&Settings(
+            sys::Config::read(&path).unwrap().ext.table("mcp"),
+        ))
+        .unwrap()
+    } else {
+        Mcp::new(
+            vec![Server {
+                name: "fixture".parse().unwrap(),
+                description: String::new(),
+                transport: Transport::Http(format!("{origin}/mcp")),
+                env: BTreeMap::default(),
+            }],
+            Duration::from_secs(10),
+        )
+        .unwrap()
+    }
+}
+
+fn serve(marker: &Path, scenario: &str) -> (Peer, String) {
+    let peer = Peer(
+        Command::new(env!("CARGO_BIN_EXE_mcp-fixture"))
+            .arg("--http")
+            .arg(marker)
+            .arg(scenario)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let origin = loop {
+        if let Ok(url) = std::fs::read_to_string(marker) {
+            break url;
+        }
+        assert!(Instant::now() < deadline, "fixture did not bind");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    (peer, origin)
+}
+
+fn exercise(scenario: &str) {
+    let root = Rig::new("oauth-home", Registry::default());
+    let marker = root.dir.join("endpoint");
+    let (_peer, origin) = serve(&marker, scenario);
+    let browser = Browser {
+        credentials: sys::credentials::Credentials::isolated(root.dir.join("credentials")),
+        approvals: Arc::default(),
+        threads: Arc::default(),
+        decline_write: false,
+    };
+    let mcp = configured(&root, &origin, scenario);
+    let rig = Rig::new(
+        "oauth",
+        Registry::default()
+            .with(&mcp)
+            .unwrap()
+            .with(&browser)
+            .unwrap(),
+    );
+    let result = rig.done("mcp_list", &json!({"server":"fixture"}));
+    if scenario.starts_with("wrong-") {
+        assert!(
+            result["failed"]["transport"]
+                .as_str()
+                .unwrap()
+                .contains("issuer mismatch"),
+            "{result}"
+        );
+        assert!(!marker.with_extension("tokens").exists());
+    } else {
+        assert_eq!(
+            result["ok"],
+            json!([]),
+            "authorization must finish: {result}"
+        );
+        if scenario == "cached" {
+            std::fs::remove_dir_all(root.dir.join("credentials")).unwrap();
+            std::fs::write(root.dir.join("credentials"), b"store unavailable").unwrap();
+        }
+        let result = rig.done("mcp_list", &json!({"server":"fixture"}));
+        assert_eq!(
+            result["ok"],
+            json!([]),
+            "later operation must finish: {result}"
+        );
+        if scenario == "basic" {
+            let fresh = Rig::new(
+                "oauth-restarted",
+                Registry::default()
+                    .with(&configured(&root, &origin, scenario))
+                    .unwrap()
+                    .with(&browser)
+                    .unwrap(),
+            );
+            assert_eq!(
+                fresh.done("mcp_list", &json!({"server":"fixture"}))["ok"],
+                json!([])
+            );
+        }
+        let expected = usize::from(matches!(
+            scenario,
+            "stepup" | "during-call-stepup" | "revoked"
+        )) + 1;
+        assert_eq!(browser.approvals.load(Ordering::SeqCst), expected);
+        assert_eq!(
+            std::fs::read_to_string(marker.with_extension("tokens")).unwrap(),
+            if matches!(
+                scenario,
+                "refresh" | "revoked" | "stepup" | "during-call-stepup"
+            ) {
+                "2"
+            } else {
+                "1"
+            }
+        );
+        if matches!(scenario, "stepup" | "during-call-stepup") {
+            assert_eq!(
+                std::fs::read_to_string(marker.with_extension("scope")).unwrap(),
+                "read write"
+            );
+        }
+    }
+    for browser in browser.threads.lock().unwrap().drain(..) {
+        browser.join().unwrap();
+    }
+    let log = rig.log.lock().unwrap();
+    let log = serde_json::to_string(&*log).unwrap();
+    for secret in [
+        "fixture-refresh",
+        "fixture-code",
+        "code_verifier",
+        "access-1",
+        "access-2",
+    ] {
+        assert!(!log.contains(secret), "secret reached the session log");
+    }
+}
+
+#[test]
+fn a_protected_http_server_is_authorized_without_per_server_client_configuration() {
+    exercise("basic");
+}
+#[test]
+fn an_expired_token_is_refreshed_without_reopening_authorization() {
+    exercise("refresh");
+}
+#[test]
+fn a_revoked_refresh_token_requires_new_authorization() {
+    exercise("revoked");
+}
+#[test]
+fn step_up_authorization_preserves_previously_granted_scopes() {
+    exercise("stepup");
+}
+#[test]
+fn discovery_rejects_a_metadata_issuer_that_differs_from_its_url() {
+    exercise("wrong-metadata-issuer");
+}
+#[test]
+fn a_wrong_redirect_issuer_never_reaches_the_token_endpoint() {
+    exercise("wrong-response-issuer");
+}
+
+#[test]
+fn each_scope_upgrade_in_one_operation_gets_its_own_authorization_question() {
+    exercise("during-call-stepup");
+}
+
+#[test]
+fn a_pre_registered_client_id_is_used_when_metadata_documents_are_unavailable() {
+    exercise("preregistered");
+}
+
+#[test]
+fn a_pre_registered_client_id_cannot_be_sent_to_another_issuer() {
+    exercise("wrong-registration-issuer");
+}
+
+#[test]
+fn authorization_omits_scope_when_neither_challenge_nor_metadata_names_one() {
+    exercise("no-scope");
+}
+
+#[test]
+fn successful_protected_calls_reuse_credentials_without_reopening_the_store() {
+    exercise("cached");
+}
+
+#[test]
+fn oauth_engine_process() {
+    let Some(root) = std::env::var_os("A_MCP_TEST_HOME") else {
+        return;
+    };
+    let home = sys::Home::from(std::path::PathBuf::from(root));
+    let mut config = engine::Config::load(&home);
+    config.agent = Some(ext_fixtures::ECHO.into());
+    config.extensions = |config| {
+        let table = Settings(config.ext.table("mcp"));
+        let browser = Browser {
+            credentials: sys::credentials::Credentials::isolated(
+                config
+                    .ext
+                    .table("oauth-test-browser")
+                    .text("credentials")
+                    .unwrap()
+                    .unwrap()
+                    .into(),
+            ),
+            approvals: Arc::default(),
+            threads: Arc::default(),
+            decline_write: config
+                .ext
+                .table("oauth-test-browser")
+                .flag("decline_write")
+                .unwrap()
+                .unwrap_or(false),
+        };
+        Registry::default()
+            .with(&Mcp::configure(&table)?)?
+            .with(&ext_fixtures::Fixtures)?
+            .with(&browser)
+    };
+    engine::serve(
+        &home.bind().unwrap(),
+        &home,
+        &config,
+        "oauth-test",
+        engine::Start::default(),
+    )
+    .unwrap();
+}
+
+struct Engine {
+    root: Rig,
+    fixture: Peer,
+    daemon: Peer,
+    origin: String,
+}
+
+impl Engine {
+    fn new(scenario: &str) -> Self {
+        let root = Rig::new("oauth-engine", Registry::default());
+        let (fixture, origin) = serve(&root.dir.join("endpoint"), scenario);
+        let home = sys::Home::from(root.dir.clone());
+        std::fs::write(home.config_file(), format!(
+            "[ext.mcp]\nservers=[\"fixture\"]\nfixture_url=\"{origin}/mcp\"\n[ext.oauth-test-browser]\ncredentials={}\ndecline_write={}\n",
+            serde_json::to_string(&root.dir.join("credentials")).unwrap(),
+            scenario == "declined-stepup",
+        )).unwrap();
+        let daemon = Peer(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "oauth_engine_process", "--nocapture"])
+                .env("A_MCP_TEST_HOME", &root.dir)
+                .spawn()
+                .unwrap(),
+        );
+        Self {
+            root,
+            fixture,
+            daemon,
+            origin,
+        }
+    }
+
+    fn stop(&mut self) {
+        let mut client = connect(&sys::Home::from(self.root.dir.clone()));
+        protocol::write_frame(&mut client, &protocol::ClientMsg::Shutdown).unwrap();
+        assert!(self.daemon.0.wait().unwrap().success());
+        self.fixture.0.kill().unwrap();
+        self.fixture.0.wait().unwrap();
+    }
+}
+
+struct Client {
+    writer: sys::OwnedConnection,
+    reader: std::io::BufReader<sys::OwnedConnection>,
+}
+impl Client {
+    fn attach(root: &Path) -> Self {
+        use protocol::{ClientMsg, DaemonMsg, read_frame, write_frame};
+        let mut writer = connect(&sys::Home::from(root.to_owned()));
+        let mut reader = std::io::BufReader::new(writer.try_clone().unwrap());
+        write_frame(
+            &mut writer,
+            &ClientMsg::Attach {
+                target: protocol::Target::New,
+                workspace: Some(root.to_owned().try_into().unwrap()),
+                since: 0,
+                env: Some(protocol::Environment::default()),
+                decl: protocol::ClientDecl::default(),
+            },
+        )
+        .unwrap();
+        loop {
+            if matches!(
+                read_frame::<DaemonMsg>(&mut reader).unwrap(),
+                Some(DaemonMsg::Synced { .. })
+            ) {
+                break;
+            }
+        }
+        Self { writer, reader }
+    }
+
+    fn list(&mut self) -> (serde_json::Value, usize) {
+        use protocol::{Body, ClientMsg, DaemonMsg, Outcome, read_frame, write_frame};
+        write_frame(
+            &mut self.writer,
+            &ClientMsg::Input {
+                segments: "call mcp_list {\"server\":\"fixture\"}".into(),
+                mode: protocol::Mode::default(),
+                force: false,
+                client_seq: None,
+            },
+        )
+        .unwrap();
+        let mut parent = None;
+        let mut authorizations = 0;
+        loop {
+            let message = read_frame::<DaemonMsg>(&mut self.reader)
+                .unwrap()
+                .expect("engine hung up");
+            match message {
+                DaemonMsg::Entry(entry) => match entry.body {
+                    Body::ToolCall { tool, .. } if tool == "mcp_list" => {
+                        parent = Some(protocol::CallId(entry.seq));
+                    }
+                    Body::ToolCall { tool, .. } if tool == "mcp_authorize" => authorizations += 1,
+                    Body::ToolResult { call, outcome, .. } if Some(call) == parent => {
+                        return (
+                            match outcome {
+                                Outcome::Done {
+                                    output: protocol::Payload::Inline(output),
+                                } => output.parse().unwrap(),
+                                Outcome::Interrupted { .. } => json!({"interrupted":true}),
+                                other => panic!("{other:?}"),
+                            },
+                            authorizations,
+                        );
+                    }
+                    _ => {}
+                },
+                DaemonMsg::Error { message } => panic!("{message}"),
+                _ => {}
+            }
+        }
+    }
+}
+
+#[test]
+fn paginated_authorization_names_are_unique_in_the_engine() {
+    let mut engine = Engine::new("paginated");
+    let (result, authorizations) = Client::attach(&engine.root.dir).list();
+    engine.stop();
+    assert_eq!(authorizations, 2, "{result}");
+    assert_eq!(result["ok"], json!([]), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(engine.root.dir.join("endpoint.scope")).unwrap(),
+        "read write"
+    );
+}
+
+fn rejected_step_up(scenario: &str) {
+    let mut engine = Engine::new(scenario);
+    let first = Client::attach(&engine.root.dir).list();
+    let credential = std::fs::read_dir(engine.root.dir.join("credentials"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let saved = std::fs::read(&credential).unwrap();
+    let upgrade = Client::attach(&engine.root.dir).list();
+    let preserved = std::fs::read(&credential).ok().as_deref() == Some(saved.as_slice());
+    let original_scope = Client::attach(&engine.root.dir).list();
+    assert!(get(&format!("{}/expire/1", engine.origin)).starts_with("HTTP/1.1 200"));
+    let refreshed = Client::attach(&engine.root.dir).list();
+    let issued = std::fs::read_to_string(engine.root.dir.join("endpoint.tokens")).unwrap();
+    let scope = std::fs::read_to_string(engine.root.dir.join("endpoint.scope")).unwrap();
+    engine.stop();
+    eprintln!(
+        "step_up_preserved={preserved} original_scope_cards={} refresh_cards={}",
+        original_scope.1, refreshed.1
+    );
+    assert_eq!(first, (json!({"ok":[]}), 1));
+    assert!(
+        upgrade.0["failed"]["transport"]
+            .as_str()
+            .unwrap()
+            .contains("declined"),
+        "{upgrade:?}"
+    );
+    assert_eq!(upgrade.1, 1);
+    assert!(
+        preserved,
+        "a rejected upgrade must leave the stored grant unchanged"
+    );
+    assert_eq!(original_scope, (json!({"ok":[]}), 0));
+    assert_eq!(refreshed, (json!({"ok":[]}), 0));
+    assert_eq!(issued, "2");
+    assert_eq!(scope, "read");
+}
+
+#[test]
+fn declining_scope_step_up_preserves_previously_granted_access() {
+    rejected_step_up("declined-stepup");
+}
+
+#[test]
+fn failing_scope_step_up_preserves_previously_granted_access() {
+    rejected_step_up("failed-stepup");
+}
+
+fn concurrent_refresh(scenario: &str) {
+    let mut engine = Engine::new(scenario);
+    let first = Client::attach(&engine.root.dir).list();
+    assert_eq!(first, (json!({"ok":[]}), 1));
+    let control = if scenario == "rotating-expiry" {
+        "wait-expiry"
+    } else {
+        "expire/16"
+    };
+    assert!(get(&format!("{}/{control}", engine.origin)).starts_with("HTTP/1.1 200"));
+    let workers: Vec<_> = (0..16)
+        .map(|_| {
+            let home = engine.root.dir.clone();
+            std::thread::spawn(move || Client::attach(&home).list())
+        })
+        .collect();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(std::thread::JoinHandle::join)
+        .collect();
+    let retried = if scenario == "rotating-transient" {
+        Some(Client::attach(&engine.root.dir).list())
+    } else {
+        None
+    };
+    engine.stop();
+    let results: Vec<_> = results.into_iter().map(Result::unwrap).collect();
+    let attempts = std::fs::read_to_string(engine.root.dir.join("endpoint.refreshes")).unwrap();
+    eprintln!("oauth_refresh_attempts={attempts}");
+    assert_eq!(
+        attempts,
+        if scenario == "rotating-transient" {
+            "2"
+        } else if scenario == "rotating-stepup" {
+            "0"
+        } else {
+            "1"
+        }
+    );
+    assert_eq!(
+        results.iter().map(|(_, cards)| cards).sum::<usize>(),
+        usize::from(matches!(
+            scenario,
+            "rotating-revoked" | "rotating-denied" | "rotating-stepup"
+        ))
+    );
+    if scenario == "rotating-expiry" {
+        assert_eq!(
+            std::fs::read_to_string(engine.root.dir.join("endpoint.old-requests")).unwrap(),
+            "0"
+        );
+    }
+    if let Some(retried) = retried {
+        assert_eq!(retried, (json!({"ok":[]}), 0));
+    }
+    for (result, _) in results {
+        if scenario == "rotating-transient" {
+            assert!(
+                result["failed"]["transport"]
+                    .as_str()
+                    .unwrap()
+                    .contains("token endpoint rejected"),
+                "{result}"
+            );
+        } else if scenario == "rotating-denied" {
+            assert!(
+                result["failed"]["transport"]
+                    .as_str()
+                    .unwrap()
+                    .contains("declined"),
+                "{result}"
+            );
+        } else {
+            assert_eq!(result["ok"], json!([]), "{result}");
+        }
+    }
+}
+
+#[test]
+fn rotating_refresh_tokens_are_redeemed_exactly_once() {
+    concurrent_refresh("rotating");
+}
+
+#[test]
+fn a_revoked_shared_refresh_token_presents_one_authorization_for_all_sessions() {
+    concurrent_refresh("rotating-revoked");
+}
+
+#[test]
+fn a_declined_shared_authorization_resumes_every_waiter_with_the_same_failure() {
+    concurrent_refresh("rotating-denied");
+}
+
+#[test]
+fn concurrent_scope_step_up_uses_one_authorization_transaction() {
+    concurrent_refresh("rotating-stepup");
+}
+
+#[test]
+fn transient_refresh_failure_preserves_the_credential_for_a_later_retry() {
+    concurrent_refresh("rotating-transient");
+}
+
+#[test]
+fn token_expiry_joins_renewal_before_sending_an_expired_generation() {
+    concurrent_refresh("rotating-expiry");
+}
+
+#[test]
+fn cancelling_the_refresh_starter_does_not_cancel_other_sessions_renewal() {
+    let mut engine = Engine::new("rotating-cancel");
+    assert_eq!(
+        Client::attach(&engine.root.dir).list(),
+        (json!({"ok":[]}), 1)
+    );
+    assert!(get(&format!("{}/expire/1", engine.origin)).starts_with("HTTP/1.1 200"));
+    let mut leader = Client::attach(&engine.root.dir);
+    let mut interrupt = leader.writer.try_clone().unwrap();
+    let leader = std::thread::spawn(move || leader.list());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !engine.root.dir.join("endpoint.refresh-start").exists() {
+        assert!(Instant::now() < deadline, "refresh did not start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let workers: Vec<_> = (0..16)
+        .map(|_| {
+            let home = engine.root.dir.clone();
+            std::thread::spawn(move || Client::attach(&home).list())
+        })
+        .collect();
+    protocol::write_frame(
+        &mut interrupt,
+        &protocol::ClientMsg::Interrupt { client_seq: None },
+    )
+    .unwrap();
+    let cancelled = leader.join();
+    std::fs::write(engine.root.dir.join("endpoint.release"), b"ready").unwrap();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(std::thread::JoinHandle::join)
+        .collect();
+    engine.stop();
+    let cancelled = cancelled.unwrap().0;
+    assert!(
+        cancelled == json!({"interrupted":true}) || cancelled == json!({"failed":"cancelled"}),
+        "{cancelled}"
+    );
+    for result in results {
+        assert_eq!(result.unwrap(), (json!({"ok":[]}), 0));
+    }
+    assert_eq!(
+        std::fs::read_to_string(engine.root.dir.join("endpoint.refreshes")).unwrap(),
+        "1"
+    );
+}
+
+#[test]
+fn separately_composed_mcp_instances_share_the_same_credential_lifecycle() {
+    let root = Rig::new("oauth-shared-owner", Registry::default());
+    let marker = root.dir.join("endpoint");
+    let (mut fixture, origin) = serve(&marker, "rotating");
+    let browser = Browser {
+        credentials: sys::credentials::Credentials::isolated(root.dir.join("credentials")),
+        approvals: Arc::default(),
+        threads: Arc::default(),
+        decline_write: false,
+    };
+    let authorizations = ext_mcp::Authorizations::default();
+    let rigs: Vec<_> = (0..2)
+        .map(|_| {
+            let mcp = Mcp::with_authorizations(
+                vec![Server {
+                    name: "fixture".parse().unwrap(),
+                    description: String::new(),
+                    transport: Transport::Http(format!("{origin}/mcp")),
+                    env: BTreeMap::new(),
+                }],
+                Duration::from_secs(10),
+                authorizations.clone(),
+            )
+            .unwrap();
+            Arc::new(Rig::new(
+                "oauth-shared-client",
+                Registry::default()
+                    .with(&mcp)
+                    .unwrap()
+                    .with(&browser)
+                    .unwrap(),
+            ))
+        })
+        .collect();
+    assert_eq!(
+        rigs[0].done("mcp_list", &json!({"server":"fixture"})),
+        json!({"ok":[]})
+    );
+    assert!(get(&format!("{origin}/expire/2")).starts_with("HTTP/1.1 200"));
+    let workers: Vec<_> = rigs
+        .iter()
+        .map(|rig| {
+            let rig = Arc::clone(rig);
+            std::thread::spawn(move || rig.done("mcp_list", &json!({"server":"fixture"})))
+        })
+        .collect();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(std::thread::JoinHandle::join)
+        .collect();
+    fixture.0.kill().unwrap();
+    fixture.0.wait().unwrap();
+    for result in results {
+        assert_eq!(result.unwrap(), json!({"ok":[]}));
+    }
+    assert_eq!(
+        std::fs::read_to_string(marker.with_extension("refreshes")).unwrap(),
+        "1"
+    );
+    assert_eq!(browser.approvals.load(Ordering::SeqCst), 1);
+    for browser in browser.threads.lock().unwrap().drain(..) {
+        browser.join().unwrap();
+    }
+}
+
+fn connect(home: &sys::Home) -> sys::OwnedConnection {
+    use protocol::{ClientMsg, DaemonMsg, read_frame, write_frame};
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut writer = loop {
+        if let Ok(connection) = home.endpoint().connect() {
+            break connection;
+        }
+        assert!(Instant::now() < deadline, "engine did not bind");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    writer
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    write_frame(
+        &mut writer,
+        &ClientMsg::Hello {
+            proto: protocol::PROTO,
+            build: "oauth-test".into(),
+            caps: protocol::Caps::ALL,
+            client: None,
+            machine: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        read_frame::<DaemonMsg>(&mut writer).unwrap(),
+        Some(DaemonMsg::Welcome { .. })
+    ));
+    writer
+}

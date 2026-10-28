@@ -895,6 +895,11 @@ impl Live {
     }
 
     pub(crate) fn stop(&self) {
+        self.session
+            .services
+            .get::<ext::SessionLifetimes>()
+            .expect("session lifetimes")
+            .close();
         self.send(Msg::Stop);
         for job in lock(&self.session.jobs).iter() {
             let _ = job.lease.signal(ext::ProcessSignal::Kill);
@@ -2449,6 +2454,12 @@ impl Actor {
     }
 
     fn retire_contexts(&mut self) {
+        self.live
+            .session
+            .services
+            .get::<ext::SessionLifetimes>()
+            .expect("session lifetimes")
+            .clear();
         self.live.session.fence.fetch_add(1, Ordering::SeqCst);
         self.live.session.cancel_all();
         // Retirement also cancels the deferred sync task; later writes need a new timer.
@@ -3113,8 +3124,9 @@ impl Live {
 impl Session {
     fn new(header: &Header, shared: &Arc<Shared>, mail: Mail, registry: &Registry) -> Arc<Self> {
         Arc::new_cyclic(|session| Self {
-            services: Arc::new(
-                SessionServices::default()
+            services: Arc::new({
+                let services = SessionServices::default()
+                    .with::<ext::SessionLifetimes>(Arc::new(ext::SessionLifetimes::default()))
                     .with::<dyn ext::Layers>(Arc::new(SessionLayers(session.clone())))
                     .with::<dyn rt::Runtime>(Arc::clone(&shared.rt))
                     .with::<rt::watch::Hub>(Arc::clone(&shared.hub))
@@ -3123,8 +3135,16 @@ impl Session {
                         shared.http_clients.get_or_init(|| {
                             Arc::new(transport::Clients::new(Arc::clone(&shared.rt)))
                         }),
-                    )),
-            ),
+                    ));
+                match shared
+                    .daemon
+                    .upgrade()
+                    .and_then(|daemon| daemon.queried.get_arc::<ext::Lifetimes>().cloned())
+                {
+                    Some(lifetimes) => services.with::<ext::Lifetimes>(lifetimes),
+                    None => services,
+                }
+            }),
             spawn: Mutex::default(),
             fence: AtomicU64::new(0),
             id: header.id,

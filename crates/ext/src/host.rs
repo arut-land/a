@@ -82,11 +82,13 @@ impl SessionServices {
         self
     }
 
-    pub(crate) fn get<S: ?Sized + 'static>(&self) -> Option<&S> {
+    /// Borrows a stable engine service without call authority.
+    pub fn get<S: ?Sized + 'static>(&self) -> Option<&S> {
         self.get_arc::<S>().map(AsRef::as_ref)
     }
 
-    pub(crate) fn get_arc<S: ?Sized + 'static>(&self) -> Option<&Arc<S>> {
+    /// Retains a stable engine service without call authority.
+    pub fn get_arc<S: ?Sized + 'static>(&self) -> Option<&Arc<S>> {
         let ty = TypeId::of::<S>();
         (self.0.iter())
             .find(|(t, _)| *t == ty)
