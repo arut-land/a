@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 pub fn serve(marker: &str, scenario: &str) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
-    std::fs::write(marker, &origin).unwrap();
+    sys::fs::write_private(std::path::Path::new(marker), origin.as_bytes()).unwrap();
     let mut state = State {
         origin,
         scenario,
@@ -68,13 +68,18 @@ impl State<'_> {
         let origin = &self.origin;
         if target == "/mcp" {
             self.calls += 1;
+            let request: Value = serde_json::from_slice(body).unwrap();
+            let later_page = request["params"]["cursor"] == "next";
             let authorized = head.lines().any(|line| {
                 line.eq_ignore_ascii_case(&format!("authorization: Bearer access-{}", self.tokens))
             });
             let needs_auth =
                 !authorized || (matches!(self.scenario, "refresh" | "revoked") && self.calls == 3);
             let step_up = (self.scenario == "stepup" && self.calls == 3)
-                || (self.scenario == "during-call-stepup" && self.calls == 2);
+                || (self.scenario == "during-call-stepup" && self.calls == 2)
+                || (self.scenario == "paginated"
+                    && later_page
+                    && !self.scope.split_whitespace().any(|scope| scope == "write"));
             if needs_auth || step_up {
                 let (status, extra) = if step_up {
                     (403, ", error=\"insufficient_scope\", scope=\"write\"")
@@ -91,11 +96,15 @@ impl State<'_> {
                     json!({"error":"authorization_required"}),
                 );
             }
-            let request: Value = serde_json::from_slice(body).unwrap();
+            let result = if self.scenario == "paginated" && !later_page {
+                json!({"resultType":"complete","tools":[],"nextCursor":"next"})
+            } else {
+                json!({"resultType":"complete","tools":[]})
+            };
             return (
                 200,
                 String::new(),
-                json!({"jsonrpc":"2.0","id":request["id"],"result":{"resultType":"complete","tools":[]}}),
+                json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
             );
         }
         if target == "/metadata" {

@@ -16,7 +16,7 @@ use serde_json::json;
 struct Peer(Child);
 impl Drop for Peer {
     fn drop(&mut self) {
-        self.0.kill().unwrap();
+        let _ = self.0.kill();
         self.0.wait().unwrap();
     }
 }
@@ -282,4 +282,160 @@ fn authorization_omits_scope_when_neither_challenge_nor_metadata_names_one() {
 #[test]
 fn successful_protected_calls_reuse_credentials_without_reopening_the_store() {
     exercise("cached");
+}
+
+#[test]
+fn oauth_engine_process() {
+    let Some(root) = std::env::var_os("A_MCP_TEST_HOME") else {
+        return;
+    };
+    let home = sys::Home::from(std::path::PathBuf::from(root));
+    let mut config = engine::Config::load(&home);
+    config.agent = Some(ext_fixtures::ECHO.into());
+    config.extensions = |config| {
+        let table = Settings(config.ext.table("mcp"));
+        let browser = Browser {
+            credentials: sys::credentials::Credentials::isolated(
+                config
+                    .ext
+                    .table("oauth-test-browser")
+                    .text("credentials")
+                    .unwrap()
+                    .unwrap()
+                    .into(),
+            ),
+            approvals: Arc::default(),
+            threads: Arc::default(),
+        };
+        Registry::default()
+            .with(&Mcp::configure(&table)?)?
+            .with(&ext_fixtures::Fixtures)?
+            .with(&browser)
+    };
+    engine::serve(
+        &home.bind().unwrap(),
+        &home,
+        &config,
+        "oauth-test",
+        engine::Start::default(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn paginated_authorization_names_are_unique_in_the_engine() {
+    use protocol::{Body, ClientMsg, DaemonMsg, Outcome, read_frame, write_frame};
+
+    let root = Rig::new("oauth-engine", Registry::default());
+    let marker = root.dir.join("endpoint");
+    let (_fixture, origin) = serve(&marker, "paginated");
+    let home = sys::Home::from(root.dir.clone());
+    std::fs::write(home.config_file(), format!(
+        "[ext.mcp]\nservers=[\"fixture\"]\nfixture_url=\"{origin}/mcp\"\n[ext.oauth-test-browser]\ncredentials={}\n",
+        serde_json::to_string(&root.dir.join("credentials")).unwrap(),
+    )).unwrap();
+    let mut daemon = Peer(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "oauth_engine_process", "--nocapture"])
+            .env("A_MCP_TEST_HOME", &root.dir)
+            .spawn()
+            .unwrap(),
+    );
+    let mut writer = connect(&home);
+    let mut reader = std::io::BufReader::new(writer.try_clone().unwrap());
+    write_frame(
+        &mut writer,
+        &ClientMsg::Attach {
+            target: protocol::Target::New,
+            workspace: Some(root.dir.clone().try_into().unwrap()),
+            since: 0,
+            env: Some(protocol::Environment::default()),
+            decl: protocol::ClientDecl::default(),
+        },
+    )
+    .unwrap();
+    loop {
+        if matches!(
+            read_frame::<DaemonMsg>(&mut reader).unwrap(),
+            Some(DaemonMsg::Synced { .. })
+        ) {
+            break;
+        }
+    }
+    write_frame(
+        &mut writer,
+        &ClientMsg::Input {
+            segments: "call mcp_list {\"server\":\"fixture\"}".into(),
+            mode: protocol::Mode::default(),
+            force: false,
+            client_seq: None,
+        },
+    )
+    .unwrap();
+    let mut parent = None;
+    let mut authorizations = 0;
+    let result = loop {
+        let message = read_frame::<DaemonMsg>(&mut reader)
+            .unwrap()
+            .expect("engine hung up");
+        match message {
+            DaemonMsg::Entry(entry) => match entry.body {
+                Body::ToolCall { tool, .. } if tool == "mcp_list" => {
+                    parent = Some(protocol::CallId(entry.seq));
+                }
+                Body::ToolCall { tool, .. } if tool == "mcp_authorize" => authorizations += 1,
+                Body::ToolResult { call, outcome, .. } if Some(call) == parent => break outcome,
+                _ => {}
+            },
+            DaemonMsg::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    };
+    write_frame(&mut writer, &ClientMsg::Shutdown).unwrap();
+    assert!(daemon.0.wait().unwrap().success());
+    assert_eq!(authorizations, 2, "{result:?}");
+    let Outcome::Done { output } = result else {
+        panic!("{result:?}");
+    };
+    let protocol::Payload::Inline(output) = output else {
+        panic!("expected inline result");
+    };
+    let output: serde_json::Value = output.parse().unwrap();
+    assert_eq!(output["ok"], json!([]), "{output}");
+    assert_eq!(
+        std::fs::read_to_string(marker.with_extension("scope")).unwrap(),
+        "read write"
+    );
+}
+
+fn connect(home: &sys::Home) -> sys::OwnedConnection {
+    use protocol::{ClientMsg, DaemonMsg, read_frame, write_frame};
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut writer = loop {
+        if let Ok(connection) = home.endpoint().connect() {
+            break connection;
+        }
+        assert!(Instant::now() < deadline, "engine did not bind");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    writer
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    write_frame(
+        &mut writer,
+        &ClientMsg::Hello {
+            proto: protocol::PROTO,
+            build: "oauth-test".into(),
+            caps: protocol::Caps::ALL,
+            client: None,
+            machine: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        read_frame::<DaemonMsg>(&mut writer).unwrap(),
+        Some(DaemonMsg::Welcome { .. })
+    ));
+    writer
 }

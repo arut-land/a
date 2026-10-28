@@ -406,7 +406,43 @@ After main integration, touched-crate checks and all **305 tests** passed (two
 existing tests skipped), as did formatting, all-target clippy with `-D warnings`,
 documentation generation and workspace Windows lint. The normal all-target
 dependency graph contains no crate named `tokio`. No wire or recorded-provider
-fixture changed. Verification and builds used an external source mirror because
-`Cargo.lock` is outside this task's owned paths. Its generated companion patch
-adds only the two direct dependency edges and `http-auth` 0.1.10; the owner must
-apply that lockfile update before CI. CI remains deferred for independent review.
+fixture changed. Phase-1 verification used an external source mirror for the generated lockfile
+resolution. The owner committed that resolution in `e814148d` before phase 2.
+
+
+### Independent review fixes
+
+Authorization question names now come from a typed counter in the SDK's parent
+invocation context. Pagination and other HTTP requests in the same operation
+share that counter; per-request authorization retries remain independent. The
+counter is allocated only when authorization is presented, lives for the parent
+operation, and adds no background work or idle activity.
+
+The local HTTP fixture publishes its readiness URL with `sys::fs::write_private`,
+whose atomic replacement exposes a complete file. Readers can no longer mistake
+an empty file between creation and writing for readiness.
+
+`paginated_authorization_names_are_unique_in_the_engine` starts the real engine
+in an isolated process and home, sends typed client messages over its native IPC,
+and runs one `mcp_list` against the real local HTTP fixture. Page one requires
+initial authorization; page two requires a scope upgrade. The original code
+reproduced the failure: only one authorization invocation was accepted and the
+parent returned `authorization declined`. With the fix, two invocations complete,
+both pages finish, and the granted scope is `read write`. Only the browser and
+remote authorization server are fixtures. Existing workspace crates `engine` and
+`ext-fixtures` are test-only dependencies; no production dependency was added.
+
+On the M3, all 45 MCP tests passed. The engine pagination regression and the
+previously flaky no-scope authorization test each passed 20 consecutive stress
+iterations. Touched-crate check, all-target clippy with `-D warnings`, formatting,
+and the workspace Windows lint passed. The owner-approved metadata URL remains
+unchanged and still requires hosting by the owner. The engine regression adds
+two generated test-dependency edges to `Cargo.lock`; that file is outside the
+owned paths, so the companion patch is left for owner integration. CI commands
+resolve the same existing workspace packages without adding registry packages.
+
+The post-review shipped build passed `mise run size` and its fixture scan at
+**6,873,760 bytes**, 48 bytes above the phase-1 candidate and 84,336 bytes above
+the original pre-OAuth baseline. These are exact size observations, not new idle
+measurements; the interleaved phase-1 idle observations above remain the measured
+RSS/CPU evidence.

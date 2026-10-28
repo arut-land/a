@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::poll_fn;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -155,11 +156,7 @@ impl Http for Client {
                 if authorizations == 2 {
                     return Err(failure("authorization rejected after retry"));
                 }
-                credential = Some(
-                    authorization
-                        .renew(status, &challenge, credential, authorizations)
-                        .await?,
-                );
+                credential = Some(authorization.renew(status, &challenge, credential).await?);
                 authorizations += 1;
             }
         })
@@ -208,7 +205,6 @@ impl Authorization<'_> {
         status: http::StatusCode,
         challenge: &BTreeMap<String, String>,
         previous: Option<Arc<Credential>>,
-        attempt: usize,
     ) -> std::io::Result<Arc<Credential>> {
         let (resource_metadata, server) =
             discover(self.client, &self.resource, challenge, self.registration).await?;
@@ -269,7 +265,6 @@ impl Authorization<'_> {
                 &self.resource,
                 client_id,
                 &scopes,
-                attempt,
             )
             .await?
         };
@@ -476,6 +471,9 @@ async fn token(
     Ok(Some(token))
 }
 
+#[derive(Default)]
+struct AuthorizationNames(AtomicUsize);
+
 async fn authorize(
     client: &dyn Http,
     cx: &Cx,
@@ -483,7 +481,6 @@ async fn authorize(
     resource: &str,
     client_id: &str,
     scopes: &str,
-    attempt: usize,
 ) -> std::io::Result<Tokens> {
     let runtime = cx
         .service::<dyn rt::Runtime>()
@@ -520,9 +517,14 @@ async fn authorize(
             "?"
         }
     );
+    // HTTP requests, including later pages, share the parent call's namespace.
+    let names = cx
+        .invocation()
+        .local(0, || Arc::new(AuthorizationNames::default()));
+    let name = names.0.fetch_add(1, Ordering::Relaxed);
     let shown = cx
         .invoke(
-            &format!("oauth-authorize-{attempt}"),
+            &format!("oauth-authorize-{name}"),
             Authorize::NAME,
             &protocol::Json::encode(&json!({"url":url}))
                 .map_err(|_| failure("authorization presentation failed"))?,
