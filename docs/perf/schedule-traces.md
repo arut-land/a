@@ -1,196 +1,194 @@
 # Explicit schedule traces
 
-The Infinity survey's section 2 identifies a reproducibility gap, not an
-outstanding product defect or a measured product speedup. At baseline
-`f343ff3708e9f70823788798fe089342f6e6dfcf`, kernel invariants already crash at
-entry cuts and native admission tests already deliver flush notifications out
-of order. They do not share an explicit decision artifact or an explorer that
-shrinks those choices. This change adds that test infrastructure. It changes
-no production code, dependency, protocol, log format or product limit.
+The Infinity survey's section 2 identified missing reproducible decision
+artifacts, not an outstanding product defect or a demonstrated product speedup.
+The harness runs the real kernel and engine. No production implementation,
+dependency, protocol, recorded fixture or product limit changes.
 
-## Workload and boundaries
+## Decisions and actual batches
 
-`crates/kernel/tests/schedules.rs` supplies the vocabulary used by both the
-kernel invariant suite and the engine admission suite:
+`crates/kernel/tests/schedules.rs` supplies a disposable token format shared
+by the kernel invariant suite and native admission tests:
 
-| Token | Decision |
+| Token | Meaning |
 | --- | --- |
-| `input` | The workload's one input arrival |
-| `progress` | The held safe tool reports progress |
-| `complete` | Deliver that tool's successful completion |
-| `cancel` | Deliver the client's interrupt |
-| `batch` | End a driver batch; the native runner requests sync and drains preceding ingress |
-| `flush:1:ok` | Deliver the later flush notification |
-| `flush:0:ok` / `flush:0:err` | Resolve the earlier held flush with the selected result |
-| `crash:N` | Reload only the first N entries |
-| `recovered-complete` | Explicitly complete the safe call restarted by the pure kernel |
+| `input` | The workload's `sleep 1` input arrives |
+| `progress` | The held safe call reports `ordered` |
+| `cancel` | The client interrupts |
+| `complete` | The tool completes successfully with `finished` |
+| `batch` | Deliver the preceding group together, then finish that driver burst |
+| `flush:1:ok` | Deliver the later epoch's successful notification |
+| `flush:0:ok` / `flush:0:err` | Resolve the earlier held epoch with the chosen result |
+| `crash:N` | Restart from the first N log entries, between closed groups |
+| `recovered-complete` | Explicitly complete a safe call restarted by the pure runner; also needs `batch` |
 
-The payloads are fixed by this workload: `sleep 1` and `finished` at the pure
-boundary; the existing held harbor tool and recorded OpenAI cassette in the
-native rig. There is no random seed, generated provider wire data, wall clock
-choice or implicit response to an unfamiliar effect. Invalid or exhausted
-scripts are rejected. The parser also rejects unknown tokens.
+Every ingress group must end with `batch`. Empty groups, unterminated groups,
+crashes inside a group and mixed flush/event groups are rejected. Flushes have
+their own groups because the real driver handles `Msg::Flushed` outside its
+ordinary bursts. These constraints bind the trace to the existing driver seam;
+they do not impose product limits.
 
-The explorer merges client cancellation, tool completion and the two flush
-notifications, retaining order within each source. The initial input and
-progress each have an explicit batch boundary. Twelve tail orders, sixteen
-additional batch placements and two earlier-flush results give **384 live
-schedules**. The real `Core::step`, `Core::resume` and fold run each schedule;
-there is no copied transition function. Successful earlier epochs explore
-all entry cuts; an earlier failure certifies none of the new turn, so its
-recovery cut is zero. This gives **1,248 crash traces**, each spelling out a
-recovery completion if one is needed.
+The pure runner steps Core through every event in a group before carrying its
+plans. It admits the group's work only at its boundary, as the real driver
+carries a combined burst after all its events. Core itself has no flush API:
+flush groups mark native journal decisions, whose behavior is tested by the
+native runner rather than a copied journal state machine.
 
-`Core` does not accept flush notifications or know driver batches. Its trace
-projection checks real admission requirements and recovery, and deliberately
-leaves journal choices to the native runner. It does not simulate durability
-with a second journal state machine. Six selected delivery/batch combinations
-per earlier-flush result run through the actual engine, `Faulty` over a real
-JSONL store, the held safe tool and the recorded provider fixture. These
-include later notification before, between and after cancellation/completion,
-with and without extra batch boundaries. A real power cut checks the retained
-prefix, and each selected resulting log is restarted at every entry cut on
-JSONL using the existing fixture's crash-prefix loading seam: 12 selected live
-traces and 66 native prefix restarts in total.
+The native test captures the actor future and all spawned async jobs in a
+runtime defined entirely in the owned test file. Storage operations use real
+files; cache flushes run on the real `rt::Threads` runtime. Only an explicit
+actor poll consumes ingress. Progress, cancellation and the tool's actual
+completion are queued while the actor is paused, and the batch token then
+allows the actor to run. In particular:
 
-The native flusher serializes its syscalls. As in the pre-existing epoch test,
-the later notification is injected independently while the earlier syscall is
-held. This exercises notification delivery, not concurrent native flush
-syscalls. Prefix restarts are entry-cut recovery tests, not a claim to have
-interrupted a filesystem syscall at every byte. Native readiness and process
-lifetime tests remain necessary; this is not a runtime simulator.
+```text
+cancel complete batch
+cancel batch complete batch
+```
 
-The checks require safe work to wait for ordering, unsafe tool admission to
-require durability (in the existing state matrix), one result for each retained
-call, the selected completion outcome, the selected cancellation order, no
-publication beyond an unresolved prefix, no follow-up after interruption,
-no work at rest and the same ledger after folding the final log again. A
-settled log must produce no new admitted work or facts on resume. Different
-cancellation orders are allowed to record different facts.
+produce different delivery boundaries. The first delivers completion before
+cancellation has reached the actual tool context; the second observes an
+already-cancelled context when delivering completion. The test asserts this
+against the real context, not just against a local list of token groups.
+Progress and sync are likewise queued before one actor poll. There is no
+per-token `positions()` or quiescence wait that silently creates extra bursts.
+A position read occurs only after group delivery. While finishing a burst,
+necessary IO and cancelled-job continuations drain with new external arrivals
+frozen; a pending continuation with no runnable job or flush is an error.
+
+The initial input starts one held replay-safe tool after ordering and before
+publication. The progress group establishes the later prefix. A later success
+notification is explicitly injected while the earlier syscall remains held,
+as in the existing admission test. The real native flusher serializes its
+syscalls; this tests notification delivery rather than concurrent flush
+syscalls. Resolving the earlier epoch releases the real held flushes and
+collects their notifications in deterministic task-registration order.
+
+## Bounded coverage
+
+The explorer preserves order within the client, tool and notification sources.
+Its tail has twelve event orders. Adjacency permits six additional merged
+cancel/completion groups, giving **18 valid groupings per earlier-flush result**:
+**36 live schedules** and **117 pure crash traces**. Each successful earlier
+epoch explores all entry cuts; an earlier failure certifies none of the new
+turn and therefore has cut zero. A recovery completion, when required, is an
+explicit token and closed batch.
+
+The native subset has cancellation before completion, with both before the
+earlier flush resolves. It covers later notification before, between and after
+them, including merged and split cancel/completion delivery: **10 live traces
+and 45 native prefix restarts**. Native traces use the existing echo agent and
+a held safe tool, keeping every competing completion explicit. The existing
+recorded-provider admission tests still run in the full engine suite; the
+batch explorer does not claim to control provider/runtime scheduling.
+
+These counts supersede phase 1's 384/1,248 and 12/66 claims. Those included batch
+tokens that did not control real bursts. The revised counts enumerate actual,
+valid groupings; invalid boundaries are not additional schedule coverage.
+
+## Recovery assertions
+
+Each native trace runs over `Faulty` backed by real JSONL. A real power cut
+checks its retained publication prefix. Every selected entry cut is then
+loaded through the existing crash-prefix fixture on JSONL.
+
+For each cut the assertions require:
+
+- The entire supplied prefix retains the same sequence numbers and bodies.
+  The fixture deliberately assigns the new writer's lease epoch when loading.
+- Each retained input owns exactly one `sleep` intent with `seconds: 1`, and
+  exactly one result for that call with the scripted `finished` outcome.
+- Expected recovery runs a separate real `Core::resume` on that prefix and
+  explicitly completes any replay-safe work it requests. Unknown work fails;
+  there is no second recovery state machine.
+- The native final facts and folded ledger equal that expected recovery.
+  Independent input/intent/result assertions still fail if both real Core
+  executions erroneously drop retained work.
+- The recovered kernel is at rest, and a further resume produces no work or
+  new entries. Failed epochs do not publish their speculative suffix.
+
+The pure checks also require admission to cover intent, safe work to require
+ordering, one settled call per retained input, the scripted outcome, the
+selected cancellation ordering, no owned work at rest and identical live and
+reloaded ledgers. The existing state matrix independently checks durable
+admission for unsafe tools. Different cancellation orders may record different
+facts. Entry-cut tests are not claims about interruption of native syscalls at
+every byte, nor replacements for native endpoint/process/wakeup tests.
 
 ## Replay and shrinking
 
-A pure invariant failure prints the full trace and a minimized replay command:
+The exact replay command prints **before** a candidate enters real Core,
+including candidates used during shrinking and crash-prefix probing. A Core
+panic therefore leaves its candidate identified even under the dev profile's
+Cranelift unwinding restriction. A subprocess test triggers a real panicking
+gate and asserts that the exact command precedes that panic on stderr.
 
 ```sh
-A_SCHEDULE_TRACE='input batch progress batch cancel complete flush:1:ok flush:0:ok crash:2 recovered-complete' \
+A_SCHEDULE_TRACE='input batch progress batch cancel complete batch flush:1:ok batch flush:0:ok batch crash:2 recovered-complete batch' \
   cargo test -p kernel --test invariants every_held_epoch -- --nocapture
-```
 
-Native traces print the same token format, with a separate entry point:
-
-```sh
-A_NATIVE_SCHEDULE_TRACE='input batch progress batch cancel complete flush:1:ok flush:0:ok crash:2' \
+A_NATIVE_SCHEDULE_TRACE='input batch progress batch cancel complete batch flush:1:ok batch flush:0:ok batch crash:2' \
   cargo test -p engine scripted_epoch_delivery -- --nocapture
 ```
 
-Native replay supports the selected family: cancellation before tool
-completion, both before the earlier flush resolves. Its provider/tool fixture
-behavior is fixed; recovery has no competing test-owned completions. Pure
-replay supports the whole explored family. Entry numbers belong to each
-backend's log, since the native recorded-provider run also logs model facts.
+Harness invariant failures return explicit errors and shrink by deleting
+subsequences and reducing crash cuts. Candidates must preserve causal
+prerequisites, bound groups and completion choices. The result is minimal under
+those reductions, not necessarily globally shortest. Product panics print their
+exact candidate; shrinking them is not claimed to work without unwinding.
 
-Shrinking deletes decisions without rearranging surviving source events and
-lowers crash cuts. Candidates must retain causal prerequisites and explicit
-completion choices; invalid candidates do not count as reproduced invariant
-failures. The shrinker is deletion-minimal under those constraints, not a
-claim of globally shortest traces. Its tests use the real Core's cancellation
-fact as a retained witness and check parsing, source order, crash-cut reduction
-and unbound work rejection. Harness invariants return explicit errors, so
-shrinking also works under the dev profile's Cranelift unwinding restriction.
-A product panic is not converted into a harness invariant failure.
+## Measurements and verification
 
-## Measurements
+This is test infrastructure. No daemon CPU, RSS or latency gain is claimed.
+Phase-1 measurements remain historical observations of its superseded harness,
+not evidence of real batch exploration. Before review changes, release runs of
+that explorer took 375.894/77.867/78.924 ms and its native test took
+1978.480/1640.377/1568.809 ms on the shared M3. Cold first observations are
+retained, not silently discarded.
 
-Measurements use release executables on the shared Apple M3, with
-`CARGO_BUILD_JOBS=2` through `mise exec --`. Baseline executables were retained
-before edits. Final comparisons alternate A/B and B/A, rather than collecting
-all baseline samples before all candidate samples. Reported spread is the
-observed minimum–maximum, not a significance interval. Builds and checks are
-excluded from the timed workload.
+Reviewed release measurements alternate A/B and B/A against retained phase-1
+executables, reporting medians and observed minimum–maximum spreads. The new
+search and native fixture execute different work, so their timings measure
+harness cost, not a product speedup. Unchanged recovery/notification tests are
+also compared with identical arguments. Raw observations and executable hashes
+are retained in `scratchpad/r3/schedule-traces-phase2-measurements.json`.
 
-Before editing, seven groups reproduced the two existing invariants. Each
-kernel group ran twenty fresh processes; each engine group ran five. Including
-the cold first group, kernel recovery was median 7.640 ms per invocation
-(6.799–35.314 ms); reordered native notification was 7.524 ms
-(7.145–90.964 ms). These reproduce the existing paths and their shared-host
-spread. Neither baseline has an explorer to time.
+Seven warm paired groups on the shared Apple M3 (8 CPUs, 16 GiB, macOS 27.0.1)
+gave these costs. Cells are median (observed minimum–maximum), in milliseconds.
+The first two rows use identical workloads, ten invocations per group. Harness
+rows use one invocation per group and execute different search/fixture work.
+Both executables in this comparison use production base `f343ff37`; these
+measurements precede the later upstream integration.
 
-Final measurements used seven alternating A/B–B/A groups after one warm-up
-per executable. The host was an 8-core Apple M3 with 16 GiB RAM, macOS 27.0.1
-(26A434). Wall time includes spawning fresh test processes; child user plus
-system CPU comes from `getrusage(RUSAGE_CHILDREN)`. Each cell below is median
-(minimum–maximum), in milliseconds. There were twenty invocations per group
-for recovery and ten for notification delivery; both versions ran exactly one
-matching test per invocation.
-
-| Same workload | Before wall ms | After wall ms | Before CPU ms | After CPU ms |
+| Workload | Phase 1 wall ms | Reviewed wall ms | Phase 1 CPU ms | Reviewed CPU ms |
 | --- | --- | --- | --- | --- |
-| `recovery_is_just_resume` | 6.703 (5.856–8.985) | 7.018 (6.172–8.925) | 4.313 (3.673–5.234) | 4.064 (3.729–4.388) |
-| `later_epoch_notifications_cannot_skip_an_unresolved_prefix` | 20.163 (12.620–22.720) | 20.343 (14.834–23.766) | 9.622 (8.715–10.738) | 9.257 (9.167–10.516) |
+| Unchanged kernel recovery | 11.350 (10.457–15.580) | 11.701 (10.270–14.417) | 8.338 (7.767–8.697) | 8.212 (7.595–9.113) |
+| Unchanged native notification | 13.505 (12.568–16.572) | 13.834 (12.291–17.682) | 9.967 (9.396–10.692) | 10.287 (7.557–11.011) |
+| Pure explorer (coverage revised) | 80.777 (77.329–90.391) | 14.676 (12.877–21.262) | 78.757 (75.190–87.532) | 12.135 (10.859–18.263) |
+| Native traces (fixture and coverage revised) | 1527.675 (1475.033–1669.030) | 867.862 (833.885–913.139) | 197.473 (181.695–254.275) | 99.589 (88.736–114.670) |
 
-The overlapping observed ranges provide no evidence of a product performance
-change. Initial and final host-load levels differ, which is why the comparison
-uses final interleaved observations rather than subtracting the initial cold
-reproduction numbers.
+Separate fresh `/usr/bin/time -l` samples measured peak process RSS (MiB):
 
-The larger suites deliberately execute more work. Seven paired groups ran
-three invocations of the kernel invariant suite and one of the admission suite
-per group. These measure the coverage cost, not identical test sets:
+| Reviewed workload | Median (minimum–maximum) |
+| --- | --- |
+| explorer | 7.281 (7.203–7.297) |
+| native | 11.312 (11.297–11.359) |
 
-| Suite | Tests before → after | Before wall ms | After wall ms | Before CPU ms | After CPU ms |
-| --- | --- | --- | --- | --- | --- |
-| Kernel invariants | 17 → 20 | 390.796 (354.270–441.398) | 525.872 (413.633–549.904) | 324.429 (305.885–354.527) | 439.936 (391.642–459.450) |
-| Native admission | 21 → 22 | 121.220 (50.175–261.614) | 3042.936 (2938.105–3412.042) | 64.409 (50.830–82.833) | 327.607 (307.912–386.578) |
+Wall times include process startup. CPU is child user plus system time from
+`getrusage(RUSAGE_CHILDREN)`; RSS is process peak, not retained heap or daemon
+memory. Unchanged workloads have overlapping spreads. The revised explorer
+does less duplicated/invalid search work; its timings cannot be treated as a
+product performance improvement.
 
-The new workloads were also run individually seven times, alternating with
-the corresponding baseline reference. Separate fresh `/usr/bin/time -l` runs
-measured process peak RSS; this is not retained heap or daemon memory:
+Native macOS checks use one external target directory and
+`CARGO_BUILD_JOBS=2 mise exec --`: touched-crate check/nextest, formatting,
+all-target/all-feature clippy with warnings denied, and `mise run check:windows`.
+Linux and Windows native results and the single dispatched CI run ID are
+recorded in the final report after review fixes are pushed. The target is
+cleaned and deleted at handoff.
 
-| Added workload | Wall ms | CPU ms | Peak RSS MiB |
-| --- | --- | --- | --- |
-| 384 live schedules plus 1,248 crash traces | 89.189 (75.108–99.650) | 85.921 (71.678–95.849) | 3.500 (3.484–3.516) |
-| 12 native traces plus 66 JSONL restarts | 2466.254 (1577.463–4058.196) | 235.386 (166.940–275.391) | 12.609 (12.500–12.703) |
-
-There is no pre-change explorer workload to compare against. The fixed search
-is small enough for ordinary tests; the native cost includes real files,
-flushes and repeated engine startup. It is not a daemon CPU, RSS or latency
-improvement.
-
-To reproduce, retain the release executables from the baseline, rebuild with
-`cargo test --release -p kernel --test invariants --no-run` and
-`cargo test --release -p engine --lib --no-run`, then alternate the old and new
-executables with `--test-threads=1`. The first table uses `--exact` with its
-listed test names (the native name has the prefix
-`driver::tests::admission::`). The suite table uses no filter for invariants
-and the filter `driver::tests::admission::` for engine. The new tests are
-`--exact schedule_checks::every_held_epoch_trace_settles_once_and_reloads_the_same_fold`
-and `--exact driver::tests::admission::scripted_epoch_delivery_and_crash_cuts_preserve_native_admission`.
-Always set the external `CARGO_TARGET_DIR` and use `CARGO_BUILD_JOBS=2 mise exec --`.
-Raw paired samples, CPU observations, RSS samples, test counts and executable
-SHA-256s are retained with the phase-1 report in
-`scratchpad/r3/schedule-traces-measurements.json`.
-
-## Verification and pending work
-
-Phase 1 passed `cargo check -p kernel -p engine`, the touched crates' full
-nextest run (506 passed, 14 skipped), formatting, all-target/all-feature clippy
-with warnings denied and `mise run check:windows`. Release measurements also
-reran both complete measured suites in every paired group. Linux and Windows native
-execution belongs to phase 2 after independent review; CI is not dispatched
-in phase 1. The only target directory is outside the worktree and is cleaned
-at handoff.
-
-No product bug has been found by this workload. No product hardening is added.
-A full native scheduler simulator or cross-backend trace lowering with
-identical log entry numbers would require broader test/runtime seams outside
-this ownership; neither is claimed here. Their failure coverage, likelihood
-of exposing another bug and implementation cost are unmeasured. They remain
-owner-pending rather than a reason to change engine production files.
-
-An additional `cargo doc --no-deps -p kernel -p engine` completed with an
-existing warning: public `Successor` documentation links to private `handover`
-in `crates/engine/src/lib.rs:1267`. It affects generated documentation, not
-runtime behavior; it reproduces on documentation builds. Fixing the link would
-be a small documentation edit outside the owned paths, so it is left for the
-owner.
+No product bug or speculative product hardening has been added. A full runtime
+simulator remains outside this ownership. An existing rustdoc warning in
+unowned `crates/engine/src/lib.rs` links public `Successor` docs to private
+`handover`; it affects documentation only and remains owner-pending (small
+comment edit, observed on documentation builds).

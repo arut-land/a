@@ -961,9 +961,9 @@ mod schedule_checks {
     }
 
     impl Run {
-        fn new() -> Self {
+        fn new(registry: std::sync::Arc<dyn kernel::Binding>) -> Self {
             Self {
-                session: Session::new(Reg::echo().arc()),
+                session: Session::new(registry),
                 pending: None,
                 recovered: false,
             }
@@ -996,7 +996,7 @@ mod schedule_checks {
             )
         }
 
-        fn apply(&mut self, step: Decision) -> Checked<()> {
+        fn apply(&mut self, step: Decision) -> Checked<StepPlan> {
             let event = match step {
                 Decision::Input if self.session.log.is_empty() => user("sleep 1"),
                 Decision::Progress if self.pending.is_some() => Event::Note {
@@ -1022,20 +1022,37 @@ mod schedule_checks {
                     self.session = session;
                     self.pending = None;
                     self.recovered = true;
-                    return self.plan(&plan);
+                    return Ok(plan);
                 }
-                // These belong to the native journal, outside Core's projection.
-                Decision::Batch | Decision::Flush { .. } => return Ok(()),
+                // Core exposes admission, while the native runner owns journal delivery.
+                Decision::Flush { .. } => return Ok(StepPlan::default()),
                 _ => return Err(Failure::Invalid(format!("unbound decision: {step:?}"))),
             };
-            let plan = self.session.step(event);
-            self.plan(&plan)
+            Ok(self.session.step(event))
         }
 
         fn replay(trace: &Trace) -> Checked<Self> {
-            let mut run = Self::new();
-            for step in &trace.0 {
-                run.apply(*step)?;
+            Self::replay_with(trace, Reg::echo().arc())
+        }
+
+        fn replay_with(
+            trace: &Trace,
+            registry: std::sync::Arc<dyn kernel::Binding>,
+        ) -> Checked<Self> {
+            eprintln!(
+                "replay: A_SCHEDULE_TRACE='{trace}' cargo test -p kernel --test invariants every_held_epoch -- --nocapture"
+            );
+            let groups = trace.groups().map_err(Failure::Invalid)?;
+            let mut run = Self::new(registry);
+            for group in groups {
+                let plans = group
+                    .iter()
+                    .map(|step| run.apply(*step))
+                    .collect::<Checked<Vec<_>>>()?;
+                // The driver carries a merged burst only after stepping all its events.
+                for plan in plans {
+                    run.plan(&plan)?;
+                }
             }
             Ok(run)
         }
@@ -1157,7 +1174,9 @@ mod schedule_checks {
                     let recovered =
                         Run::replay(&crashed).unwrap_or_else(|error| failed(&crashed, &error));
                     if recovered.pending.is_some() {
-                        crashed.0.push(Decision::RecoveredComplete);
+                        crashed
+                            .0
+                            .extend([Decision::RecoveredComplete, Decision::Batch]);
                     }
                     checked(&crashed);
                     count += 1;
@@ -1170,7 +1189,7 @@ mod schedule_checks {
     #[test]
     fn shrinking_keeps_source_order_and_an_exact_replay() {
         let traces = trace::held_epochs(Result::Failure);
-        assert_eq!(traces.len(), 192);
+        assert_eq!(traces.len(), 18);
         let mut orders = std::collections::BTreeSet::new();
         for trace in traces {
             let unbatched = Trace(
@@ -1211,7 +1230,18 @@ mod schedule_checks {
             if small.0.iter().position(|s| *s == Decision::Cancel)
                 < small.0.iter().position(|s| *s == Decision::Complete)
             {
-                assert_eq!(small.0.len(), 7);
+                for i in 0..small.0.len() {
+                    let mut candidate = small.clone();
+                    candidate.0.remove(i);
+                    assert!(
+                        !(candidate.validate().is_ok()
+                            && Run::replay(&candidate).is_ok_and(|r| r
+                                .session
+                                .log
+                                .iter()
+                                .any(|e| matches!(e.body, Body::Interrupt { .. }))))
+                    );
+                }
                 checked(&small);
             }
         }
@@ -1230,8 +1260,63 @@ mod schedule_checks {
     fn an_unbound_effect_never_gets_an_implicit_completion() {
         let mut session = Session::new(Reg::modeled().arc());
         let plan = session.step(user("hello"));
-        assert!(matches!(Run::new().plan(&plan), Err(Failure::Invariant(_))));
+        assert!(matches!(
+            Run::new(Reg::echo().arc()).plan(&plan),
+            Err(Failure::Invariant(_))
+        ));
         let incomplete: Trace = "input batch batch flush:1:ok flush:0:ok".parse().unwrap();
         assert!(matches!(check(&incomplete), Err(Failure::Invalid(_))));
+        for text in [
+            "input batch batch progress batch cancel complete batch flush:1:ok batch flush:0:ok batch",
+            "input batch progress batch cancel complete flush:1:ok batch flush:0:ok batch",
+            "input batch progress batch cancel complete batch flush:1:ok batch flush:0:ok",
+        ] {
+            assert!(text.parse::<Trace>().unwrap().validate().is_err(), "{text}");
+        }
+        let merged: Trace =
+            "input batch progress batch cancel complete batch flush:1:ok batch flush:0:ok batch"
+                .parse()
+                .unwrap();
+        assert!(
+            merged
+                .groups()
+                .unwrap()
+                .contains(&[Decision::Cancel, Decision::Complete].as_slice())
+        );
+    }
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the dev backend cannot unwind product frames, so inspect the real panic in a child"
+    )]
+    fn a_product_panic_prints_the_exact_candidate_before_entering_core() {
+        const CHILD: &str = "SCHEDULE_PANIC_CHILD";
+        let text =
+            "input batch progress batch cancel complete batch flush:1:ok batch flush:0:ok batch";
+        if std::env::var_os(CHILD).is_some() {
+            let _ = Run::replay_with(
+                &text.parse().unwrap(),
+                Reg::echo().policy(super::common::Policy::Panic).arc(),
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "schedule_checks::a_product_panic_prints_the_exact_candidate_before_entering_core",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let replay = stderr
+            .find(&format!("A_SCHEDULE_TRACE='{text}'"))
+            .expect("missing exact replay trace");
+        let panic = stderr
+            .find("the gate broke")
+            .expect("the real Core must reach the panicking gate");
+        assert!(replay < panic, "{stderr}");
     }
 }

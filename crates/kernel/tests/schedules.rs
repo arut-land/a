@@ -51,11 +51,47 @@ pub mod trace {
     pub struct Trace(pub Vec<Decision>);
 
     impl Trace {
+        pub fn groups(&self) -> std::result::Result<Vec<&[Decision]>, String> {
+            let mut groups = Vec::new();
+            let mut start = 0;
+            for (i, decision) in self.0.iter().enumerate() {
+                match decision {
+                    Decision::Batch => {
+                        let group = &self.0[start..i];
+                        if group.is_empty() {
+                            return Err("empty batch boundary".into());
+                        }
+                        // The actual driver handles flush notifications outside its bursts.
+                        if group.len() != 1
+                            && group.iter().any(|s| matches!(s, Decision::Flush { .. }))
+                        {
+                            return Err("flush delivery needs its own batch".into());
+                        }
+                        groups.push(group);
+                        start = i + 1;
+                    }
+                    Decision::Crash { .. } => {
+                        if start != i {
+                            return Err("crash inside an unbound batch".into());
+                        }
+                        groups.push(&self.0[i..=i]);
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            if start != self.0.len() {
+                return Err("unterminated batch".into());
+            }
+            Ok(groups)
+        }
+
         pub fn validate(&self) -> std::result::Result<(), String> {
-            if self.0.first() != Some(&Decision::Input) {
+            self.groups()?;
+            if !self.0.starts_with(&[Decision::Input, Decision::Batch]) {
                 return Err("trace must start with its input arrival".into());
             }
-            let mut seen = [false; 7];
+            let mut seen = [false; 8];
             let mut batches = 0;
             for step in &self.0 {
                 let slot = match step {
@@ -63,7 +99,7 @@ pub mod trace {
                     Decision::Progress if !seen[2] && !seen[6] => 1,
                     Decision::Complete if !seen[6] => 2,
                     Decision::Cancel if !seen[6] => 3,
-                    Decision::Batch if !seen[6] => {
+                    Decision::Batch if !seen[6] || seen[7] => {
                         batches += 1;
                         continue;
                     }
@@ -74,7 +110,7 @@ pub mod trace {
                         4 + *epoch
                     }
                     Decision::Crash { .. } if seen[2] && seen[4] && seen[5] => 6,
-                    Decision::RecoveredComplete if seen[6] => continue,
+                    Decision::RecoveredComplete if seen[6] => 7,
                     _ => return Err(format!("unbound decision: {step:?}")),
                 };
                 if std::mem::replace(&mut seen[slot], true) {
@@ -225,21 +261,23 @@ pub mod trace {
         ])
         .into_iter()
         .flat_map(|tail| {
-            (0..16).map(move |batches| {
-                let mut steps = vec![
-                    Decision::Input,
-                    Decision::Batch,
-                    Decision::Progress,
-                    Decision::Batch,
-                ];
-                for (i, step) in tail.0.iter().enumerate() {
-                    steps.push(*step);
-                    if batches & (1 << i) != 0 {
-                        steps.push(Decision::Batch);
+            (0..16)
+                .map(move |batches| {
+                    let mut steps = vec![
+                        Decision::Input,
+                        Decision::Batch,
+                        Decision::Progress,
+                        Decision::Batch,
+                    ];
+                    for (i, step) in tail.0.iter().enumerate() {
+                        steps.push(*step);
+                        if batches & (1 << i) != 0 {
+                            steps.push(Decision::Batch);
+                        }
                     }
-                }
-                Trace(steps)
-            })
+                    Trace(steps)
+                })
+                .filter(|trace| trace.validate().is_ok())
         })
         .collect()
     }
