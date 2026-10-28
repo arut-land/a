@@ -539,7 +539,10 @@ reuse positive server TTLs, with the earliest page expiry and notification
 invalidation. Private results bind the actual OAuth owner generation; expiry
 and single-flight renewal are checked before lookup, and generation changes
 between pages prevent caching. Missing/zero TTL and input-required outcomes
-stay uncached; nothing refreshes or launches in the background while unused.
+stay uncached, including concurrent cold consumers whose joined result is
+ineligible or already expired. Invalid cursors discard partial discovery and
+restart within the same page-request budget. Nothing refreshes or launches in
+the background while unused.
 The client targets MCP 2026-07-28 without a legacy handshake fallback. HTTP
 uses the shared credential owner and transport pool; sampling and elicitation
 remain unsupported.

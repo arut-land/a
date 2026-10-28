@@ -732,3 +732,117 @@ scratchpad's `r3/mcp-instances/`: `release-samples.jsonl`, `release-summary.json
 `http-release.jsonl`, `http-release-summary.json`, `candidate-source.json`, host
 metadata, cleanup records and the `release-measure.py`, `http-release.py` and
 `release-summary.py` runners. Builds use `perf2/tgt-mcp-instances`.
+
+
+## Independent review fixes (round 3)
+
+The cold-discovery finding is reproduced: eight overlapping consumers of a
+changing no-TTL peer received one snapshot. Followers now inspect the completed
+result's positive TTL, earliest page deadline, authorization generation and
+invalidation revision before reuse. An ineligible result makes each follower
+fetch independently. Known uncached lists fetch directly without another worker
+or retained flight. Missing/zero TTL and an expired first page all have native
+loopback invariants; each consumer receives its own changing result.
+
+An invalid pagination cursor discards the partial list, duplicate-name set, byte
+budget and freshness state, then restarts at page one. The existing 64-request
+operation budget includes restarts. HTTP and stdio invariants invalidate one
+cursor and complete a fresh traversal; perpetual invalidation reaches the
+budget. Completed fresh traversals cache normally, without discarded tools.
+The new cold-list and cursor invariants failed against the previous code.
+
+### Memory attribution
+
+A temporary test-only probe at actual key construction and actor startup, using
+a real fixture child, recorded the following ARM64 inventory. These are inline
+Rust sizes and owned string capacities, not a byte-exact heap census: allocator
+nodes, task allocations and fragmentation cannot be summed from these values.
+
+| Component in the reviewed implementation | Observed size / ownership | Change |
+| --- | --- | --- |
+| Launch identity | 104 inline bytes; seven environment entries own 3,800 payload bytes plus 336 bytes of string headers and B-tree storage; argv owns another 228 payload bytes | Retain the immutable client environment through its existing `Arc`; declaration settings imply argv and overrides. Build a launch spec only on startup. |
+| Discovery state | 464 inline bytes, plus weak flight/result allocations retained after completion | Keep a small state and allocate entries on demand; completed uncached discovery retains no entry or flight. |
+| Authorization slot | Even `None` occupies 128 bytes | An opaque shared generation identity makes the slot pointer-sized (8 bytes here), preserving recipient, credential-owner and generation equality. |
+| Scoped registry / leases | One key and SDK demand entry per activated instance; a request lease wrapper is 16 bytes | Keep the required ownership and last-release semantics; no session-count cap. |
+| Routing | State is 136 bytes; a pending record is 312 bytes, with zero pending records after requests settle; actor future is 1,432 bytes | Retain per-request ownership and globally unique IDs; no idle request table entries. |
+| Reader scratch | 8,192 bytes per helper, also present in main | Start at 512 bytes, grow to the same 8,192-byte read chunk for active frames and release the larger chunk when the frame completes. Frame limits and large-frame support are unchanged. |
+
+Startup context and declaration clones now happen inside the reserved startup
+closure. Ready-instance lookups carry references instead of unused startup
+contexts. The opaque-slot invariant fails on the previous implementation
+(`128 != 8`) and passes on the real current type. Existing large/adjacent frame
+and cancelled-fragment tests cover adaptive reader storage.
+
+### Default-scope release comparison
+
+Five alternating AB/BA pairs repeat the original default-scope workload, with
+sharing disabled, at 1, 32 and 128 retained sessions. The baseline remains
+`63ac410a`; both versions use the identical preserved baseline fixture binary.
+Each newly added session lists, lists again, loads a schema and calls echo, then
+settles for twelve seconds followed by a three-second idle window. Homes and
+workspaces are isolated; provider environment is absent. All values below are
+medians [minimum–maximum] over five runs on the shared M3. No samples are removed.
+
+| Sessions | Version | Daemon footprint MiB | Daemon RSS MiB | First-list p50 ms |
+| ---: | --- | --- | --- | --- |
+| 1 | main | 3.594 [3.532–3.719] | 11.328 [11.266–11.438] | 11.178 [10.070–14.696] |
+| 1 | review fixes | 3.657 [3.594–3.719] | 11.375 [11.312–11.438] | 10.257 [8.122–14.269] |
+| 32 | main | 6.125 [6.110–6.172] | 13.859 [13.828–13.906] | 10.029 [9.979–14.029] |
+| 32 | review fixes | 6.094 [6.047–6.157] | 13.812 [12.844–13.875] | 10.958 [9.921–13.870] |
+| 128 | main | 13.610 [13.438–13.672] | 21.312 [18.688–21.406] | 13.000 [9.083–14.137] |
+| 128 | review fixes | 13.266 [13.266–13.329] | 20.984 [20.078–21.047] | 11.065 [9.558–20.039] |
+
+Every run retains exactly 1 / 32 / 128 helper processes, respectively. At 128,
+daemon footprint is 0.344 MiB below the interleaved main median, instead of the
+reviewed 1.360 MiB increase. At 32 it is 0.031 MiB below main. The one-session
+full-sweep median is still 0.063 MiB above main, with overlapping ranges; this
+sweep alone does not establish the requested no-increase condition there.
+
+Five additional alternating AB/BA pairs repeat the same one-session stage and
+collect `vmmap -summary` and `heap -s --showSizes --noContent` only after the
+settled/idle counters. Footprint is 3.704 [3.641–3.766] MiB before and 3.672
+[3.563–3.719] after; live malloc bytes are 408,208 [406,928–409,712] before and
+407,184 [405,904–407,408] after. The diagnostic repeat reverses the footprint
+median difference and has slightly lower live heap. Native maps show variation
+in dirty small-allocation regions, allocator metadata and cached stacks, while
+settled live thread counts remain seven in both versions. These observations
+qualify the small-run result; they do not prove a deterministic per-run footprint
+bound. No allocator-specific mitigation is added.
+
+At 128, daemon CPU per first-list operation is 3.363 [2.047–3.802] ms before and
+2.575 [1.953–3.732] after, using batch deltas over the 96 new sessions. All thirty
+three-second idle CPU windows have zero increments at OS resolution. Latency
+ranges overlap and the M3 is shared; no universal latency or CPU gain is claimed.
+
+The comparison binary corresponds to `bdbf0c52` after merging main `e0202822`;
+the merge contributes unrelated engine shutdown/test fixes. The original main
+baseline and fixture hashes remain pinned. Earlier intermediate comparisons are
+retained rather than discarded: `phase2/` precedes the compact authorization
+identity and `phase2-final/` precedes deferring startup-context clones. The final
+full-sweep samples/summary are `phase2-lazy/release-{samples.jsonl,summary.json}`;
+the diagnostic repeat and native maps are in `phase2-profile/`. Binary/source
+hashes, validation logs and the reproducing scripts remain beside them in the
+external task scratchpad. All forty new benchmark-home cleanup records report
+successful daemon stop and no remaining recorded helper PIDs.
+
+The selected suite passes 105 native tests, including twelve MCP daemon tests
+against the release comparison binary and every OAuth lifecycle test. Touched
+crate checks, fmt, all-target/all-feature clippy with `-D warnings`, the full
+Windows cross-target lint, rustdoc and the normal-dependency no-Tokio scan pass.
+No dependency, wire, corpus, credential lifecycle or feature limit changes.
+
+### Remaining review gate
+
+The shared-launch policy finding is confirmed and remains unfixed. The current
+SDK exposes session-context execution of spawn hooks, but not presence inspection
+of the active registry from `Cx`. Calling that chain under the first caller would
+still not admit a declaration-owned policy. The minimal needed ownership extension
+is `crates/ext/src/tool.rs`: expose generic hook presence so MCP can reject broader
+scope whenever a session-bound Spawn handler exists, before key construction or
+reuse of a ready instance. A concrete SDK patch proposal is retained externally
+as `phase2-policy-sdk-proposal.patch`; no SDK files have been edited. The real
+refusing/wrapping-hook invariant and launch-policy identity binding await this
+seam. Hosted CI is intentionally undispatched while this P1 remains open; Linux
+and Windows green and target cleanup are still pending. `hibernate_secs=0` remains
+on the coordinator's follow-up list, unchanged here. No speculative hardening is
+added.
