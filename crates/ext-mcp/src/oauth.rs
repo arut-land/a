@@ -72,6 +72,90 @@ pub(crate) struct Client {
     pub connection: Connection,
 }
 
+/// A cache identity retains the owner, never an access or refresh token.
+/// Anonymous identities are bound to the same registry and exact recipient.
+#[derive(Clone)]
+pub(crate) struct GenerationId {
+    registry: Authorizations,
+    identity: Identity,
+    owner: Option<Arc<Owner>>,
+    number: Option<u64>,
+}
+
+impl PartialEq for GenerationId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.registry.0, &other.registry.0)
+            && self.identity == other.identity
+            && self.number == other.number
+            && match (&self.owner, &other.owner) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+impl Eq for GenerationId {}
+
+impl Client {
+    fn identity(&self, url: &str) -> Identity {
+        Identity {
+            server: self.connection.server.clone(),
+            resource: url.to_owned(),
+            registration: self.connection.registration.clone(),
+        }
+    }
+
+    async fn prepare(
+        &self,
+        identity: &Identity,
+    ) -> std::io::Result<(Option<Arc<Owner>>, Option<Generation>)> {
+        let owner = crate::lock(&self.connection.authorizations.0)
+            .active
+            .get(identity)
+            .cloned();
+        let generation = if let Some(owner) = &owner {
+            let generation = owner.access(&self.cx).await?;
+            if generation
+                .as_ref()
+                .and_then(|g| g.credential.as_ref().ok())
+                .is_some_and(AccessToken::expired)
+            {
+                Some(
+                    owner
+                        .renew(
+                            generation.as_ref().map(|g| g.number),
+                            RenewalRequest {
+                                status: http::StatusCode::UNAUTHORIZED,
+                                challenge: BTreeMap::new(),
+                                client: Arc::clone(&self.inner),
+                                cx: self.cx.clone(),
+                                deadline: Instant::now() + self.connection.timeout,
+                            },
+                        )
+                        .await?,
+                )
+            } else {
+                generation
+            }
+        } else {
+            None
+        };
+        Ok((owner, generation))
+    }
+
+    pub(crate) async fn generation(&self, url: &str) -> std::io::Result<GenerationId> {
+        let uri: http::Uri = url.parse().map_err(|_| failure("invalid resource URI"))?;
+        let identity = self.identity(&uri.to_string());
+        let (owner, generation) = self.prepare(&identity).await?;
+        Ok(GenerationId {
+            registry: self.connection.authorizations.clone(),
+            identity,
+            owner,
+            number: generation.as_ref().map(|g| g.number),
+        })
+    }
+}
+
 // No Debug: persisted and in-memory credentials contain secrets.
 #[derive(Serialize, Deserialize)]
 struct Credential {
@@ -263,46 +347,29 @@ impl Http for Client {
     ) -> llm::http::BoxFuture<'static, std::io::Result<llm::http::Response>> {
         let inner = Arc::clone(&self.inner);
         let cx = self.cx.clone();
-        let identity = Identity {
-            server: self.connection.server.clone(),
-            resource: request.uri().to_string(),
-            registration: self.connection.registration.clone(),
-        };
+        let identity = self.identity(&request.uri().to_string());
         let owners = self.connection.authorizations.clone();
         let timeout = self.connection.timeout;
+        // Preparing a cache lookup and sending a request use the same owner path.
+        let prepared_client = Self {
+            inner: Arc::clone(&inner),
+            cx: cx.clone(),
+            connection: Connection {
+                server: self.connection.server.clone(),
+                registration: self.connection.registration.clone(),
+                authorizations: owners.clone(),
+                timeout,
+            },
+        };
         Box::pin(async move {
-            let mut owner = crate::lock(&owners.0).active.get(&identity).cloned();
-            let mut generation = if let Some(owner) = &owner {
-                owner.access(&cx).await?
-            } else {
-                None
-            };
+            let (mut owner, mut generation) = prepared_client.prepare(&identity).await?;
             let (parts, body) = request.into_parts();
             let mut authorizations = 0;
             loop {
-                let mut credential = generation
+                let credential = generation
                     .as_ref()
                     .and_then(|g| g.credential.as_ref().ok())
                     .cloned();
-                if credential.as_ref().is_some_and(AccessToken::expired) {
-                    generation = Some(
-                        owner
-                            .as_ref()
-                            .expect("issued generation")
-                            .renew(
-                                generation.as_ref().map(|g| g.number),
-                                RenewalRequest {
-                                    status: http::StatusCode::UNAUTHORIZED,
-                                    challenge: BTreeMap::new(),
-                                    client: Arc::clone(&inner),
-                                    cx: cx.clone(),
-                                    deadline: Instant::now() + timeout,
-                                },
-                            )
-                            .await?,
-                    );
-                    credential = Some(generation.as_ref().expect("renewed generation").token()?);
-                }
                 let mut request = http::Request::new(body.clone());
                 *request.method_mut() = parts.method.clone();
                 *request.uri_mut() = parts.uri.clone();
@@ -317,7 +384,13 @@ impl Http for Client {
                         .headers_mut()
                         .insert(http::header::AUTHORIZATION, header);
                 }
-                let response = inner.send(request).await?;
+                let mut response = inner.send(request).await?;
+                response.extensions_mut().insert(GenerationId {
+                    registry: owners.clone(),
+                    identity: identity.clone(),
+                    owner: owner.clone(),
+                    number: generation.as_ref().map(|g| g.number),
+                });
                 let status = response.status();
                 if status != http::StatusCode::UNAUTHORIZED && status != http::StatusCode::FORBIDDEN
                 {

@@ -4,9 +4,12 @@
 /// Default public native-client identity; hosting is managed by the owner.
 pub const OAUTH_CLIENT_ID: &str = "https://arut.land/.well-known/oauth-client/a.json";
 
+mod config;
 mod discovery;
 mod headers;
+mod identity;
 mod incoming;
+mod instance;
 mod name;
 mod oauth;
 pub use name::{ServerName, ToolName};
@@ -16,12 +19,11 @@ mod rpc;
 mod stdio;
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use ext::{Configured, Cx, Extension, Refused, Registrar, Table, Text, Tool};
-use protocol::{Card, Mark, SessionId};
+use protocol::{Card, Mark};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -49,11 +51,18 @@ pub struct Mcp(Arc<Inner>);
 struct Inner {
     servers: Vec<Server>,
     timeout: Duration,
-    clients: Mutex<HashMap<(SessionId, ServerName), stdio::Client>>,
+    instances: OnceLock<ext::Scoped<identity::Identity, instance::Instance>>,
+    scopes: Vec<config::Scope>,
+    directory: Option<std::path::PathBuf>,
+    environment: Option<BTreeMap<String, String>>,
+    declaration: u64,
+    retired: ext::Cancel,
+    discovery: Vec<discovery::Cache>,
     registrations: BTreeMap<ServerName, oauth::Registration>,
     auth: Authorizations,
 }
 
+#[derive(Clone)]
 struct RemoteTool {
     name: ToolName,
     definition: Value,
@@ -104,14 +113,24 @@ impl Mcp {
             return Err(Refused("ext.mcp.timeout_secs must be 1..600".into()));
         }
         Ok(Self(Arc::new(Inner {
+            scopes: vec![config::Scope::Session; servers.len()],
+            discovery: servers
+                .iter()
+                .map(|_| discovery::Cache::default())
+                .collect(),
             servers,
             timeout,
-            clients: Mutex::default(),
+            instances: OnceLock::new(),
+            directory: None,
+            environment: None,
+            declaration: rpc::next_id(),
+            retired: ext::Cancel::default(),
             registrations: BTreeMap::new(),
             auth: authorizations,
         })))
     }
 
+    #[cfg(test)]
     async fn request(
         &self,
         server: &ServerName,
@@ -143,54 +162,33 @@ impl Mcp {
         if cx.cancel.is_set() {
             return Err(Failure::Cancelled);
         }
+        let deadline = rt.now() + self.0.timeout;
         let work = async {
             match &server.transport {
                 Transport::Stdio(_) => {
-                    let key = (cx.session, server.name.clone());
-                    let client = lock(&self.0.clients).remove(&key);
-                    let mut client = if let Some(client) = client.filter(stdio::Client::alive) {
-                        client
-                    } else {
-                        let mut client =
-                            stdio::Client::start(server, cx, Arc::downgrade(&self.0)).await?;
-                        let discovered = client.request("server/discover", json!({}), cx).await?;
-                        if !discovered["supportedVersions"]
-                            .as_array()
-                            .is_some_and(|v| v.iter().any(|v| v == rpc::VERSION))
-                        {
-                            return Err(Failure::Protocol(
-                                "server does not support MCP 2026-07-28".into(),
-                            ));
-                        }
-                        client
-                    };
-                    // The lease is outside the map across await: dropping a
-                    // cancelled future kills its child instead of caching it.
-                    let result = client.request(method, params, cx).await;
-                    if result.is_ok() {
-                        let mut clients = lock(&self.0.clients);
-                        if client.alive() {
-                            clients.insert(key, client);
-                        }
+                    let lease = self.acquire(server, cx).await?;
+                    lease.request(method, params, cx, deadline).await
+                }
+                Transport::Http(url) => rpc::http_authorized(
+                    url,
+                    method,
+                    params,
+                    headers,
+                    oauth::Connection {
+                        server: server.name.clone(),
+                        registration: self.0.registrations.get(&server.name).cloned(),
+                        authorizations: self.0.auth.clone(),
+                        timeout: self.0.timeout,
+                    },
+                    cx,
+                )
+                .await
+                .map(|reply| {
+                    if reply.changed {
+                        self.cache(server).invalidate();
                     }
-                    result
-                }
-                Transport::Http(url) => {
-                    rpc::http_authorized(
-                        url,
-                        method,
-                        params,
-                        headers,
-                        oauth::Connection {
-                            server: server.name.clone(),
-                            registration: self.0.registrations.get(&server.name).cloned(),
-                            authorizations: self.0.auth.clone(),
-                            timeout: self.0.timeout,
-                        },
-                        cx,
-                    )
-                    .await
-                }
+                    reply.value
+                }),
             }
         };
         rt::or(work, async {
@@ -216,8 +214,205 @@ impl Mcp {
             .any(|s| &s.name == name && matches!(s.transport, Transport::Http(_)))
     }
 
-    async fn tools(&self, server: &ServerName, cx: &Cx) -> Result<Vec<RemoteTool>, Failure> {
+    /// Binds shared launches to the trusted declaration's directory, before installation.
+    pub fn declared_in(
+        mut self,
+        directory: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, Refused> {
+        let inner = Arc::get_mut(&mut self.0)
+            .ok_or_else(|| Refused("MCP declaration is already installed".into()))?;
+        inner.directory = Some(directory.into());
+        Ok(self)
+    }
+
+    fn cache(&self, server: &Server) -> &discovery::Cache {
+        &self.0.discovery[self
+            .0
+            .servers
+            .iter()
+            .position(|s| s.name == server.name)
+            .expect("configured server")]
+    }
+
+    fn connection(&self, server: &Server) -> oauth::Connection {
+        oauth::Connection {
+            server: server.name.clone(),
+            registration: self.0.registrations.get(&server.name).cloned(),
+            authorizations: self.0.auth.clone(),
+            timeout: self.0.timeout,
+        }
+    }
+
+    async fn acquire(
+        &self,
+        server: &Server,
+        cx: &Cx,
+    ) -> Result<ext::ScopeLease<instance::Instance>, Failure> {
+        let runtime = cx.service::<dyn rt::Runtime>().expect("MCP runtime");
+        rt::or(self.acquire_inner(server, cx), async {
+            rt::or(
+                async {
+                    cx.cancel.wait().await;
+                    Err(Failure::Cancelled)
+                },
+                async {
+                    runtime.sleep(self.0.timeout).await;
+                    Err(Failure::Timeout)
+                },
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn acquire_inner(
+        &self,
+        server: &Server,
+        cx: &Cx,
+    ) -> Result<ext::ScopeLease<instance::Instance>, Failure> {
+        let index = self
+            .0
+            .servers
+            .iter()
+            .position(|s| s.name == server.name)
+            .expect("configured server");
+        let scope = self.0.scopes[index];
+        let cwd = match scope {
+            config::Scope::Session => cx.dir(),
+            config::Scope::Workspace => cx.workspace.to_path_buf(),
+            config::Scope::User => self.0.directory.clone().ok_or_else(|| {
+                Failure::Configuration("shared MCP declaration has no directory".into())
+            })?,
+        };
+        let env = if scope.shared() {
+            self.0
+                .environment
+                .clone()
+                .expect("shared declaration environment")
+        } else {
+            stdio::environment(cx)
+        };
+        let spec = stdio::spec(server, cwd, env);
+        let key = ext::InstanceKey {
+            identity: identity::Identity {
+                declaration: self.0.declaration,
+                server: server.name.clone(),
+                argv: spec.argv.clone(),
+                cwd: spec.cwd.clone(),
+                env: spec.env.clone(),
+            },
+            scope: scope.key(cx),
+        };
+        let lifetimes = cx
+            .service_arc::<ext::Lifetimes>()
+            .ok_or_else(|| Failure::Configuration("no scope lifetimes".into()))?;
+        let registry = self.0.instances.get_or_init(|| ext::Scoped::new(lifetimes));
+        let processes = cx
+            .service_arc::<dyn ext::Processes>()
+            .ok_or_else(|| Failure::Configuration("no process provider".into()))?;
+        let launcher = processes
+            .launcher(cx)
+            .map_err(|e| Failure::Spawn(e.to_string()))?;
+        let mut startup_cx = cx.clone();
+        let timeout = self.0.timeout;
+        let retired = self.0.retired.clone();
+        let lease = registry
+            .acquire(key, move |cancel| {
+                Box::pin(async move {
+                    startup_cx.cancel = cancel.clone();
+                    let launch = ext::LaunchSpec {
+                        process: spec,
+                        output: ext::ProcessOutput::Stdio,
+                    };
+                    let child = if scope.shared() {
+                        launcher.spawn(cancel.clone(), launch).await?
+                    } else {
+                        processes.spawn(&startup_cx, launch).await?
+                    };
+                    let runtime = startup_cx
+                        .service_arc::<dyn rt::Runtime>()
+                        .expect("MCP runtime");
+                    let instance =
+                        instance::Instance::start(child, cancel, retired, scope, &runtime);
+                    if let Err(error) = instance
+                        .discover(&startup_cx, runtime.now() + timeout)
+                        .await
+                    {
+                        use ext::ScopedResource;
+                        instance.close().await;
+                        return Err(std::io::Error::other(error));
+                    }
+                    Ok(instance)
+                })
+            })
+            .await
+            .map_err(|e| {
+                e.get_ref()
+                    .and_then(|e| e.downcast_ref::<Failure>())
+                    .cloned()
+                    .unwrap_or_else(|| Failure::Spawn(e.to_string()))
+            })?;
+        cx.service::<ext::SessionLifetimes>()
+            .ok_or_else(|| Failure::Configuration("no session lifetimes".into()))?
+            .retain(&lease)
+            .map_err(|_| Failure::Cancelled)?;
+        Ok(lease)
+    }
+
+    async fn tools(&self, name: &ServerName, cx: &Cx) -> Result<Arc<[RemoteTool]>, Failure> {
+        let server = self
+            .0
+            .servers
+            .iter()
+            .find(|s| &s.name == name)
+            .ok_or_else(|| Failure::Configuration(format!("unknown MCP server: {name}")))?
+            .clone();
+        let lease = if matches!(server.transport, Transport::Stdio(_)) {
+            Some(self.acquire(&server, cx).await?)
+        } else {
+            None
+        };
+        let authorization = if let Transport::Http(url) = &server.transport {
+            Some(
+                rpc::client(self.connection(&server), cx)
+                    .generation(url)
+                    .await
+                    .map_err(|e| Failure::Transport(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let cache = lease.as_ref().map_or_else(
+            || self.cache(&server).clone(),
+            |lease| lease.discovery.clone(),
+        );
+        let revision = lease
+            .as_ref()
+            .map_or_else(|| cache.revision(), |lease| lease.revision());
+        let owner = self.clone();
+        cache
+            .get(
+                discovery::Key {
+                    authorization,
+                    revision,
+                },
+                cx,
+                move |cx| Box::pin(async move { owner.fetch_tools(server, lease, cx).await }),
+            )
+            .await
+    }
+
+    async fn fetch_tools(
+        &self,
+        server: Server,
+        lease: Option<ext::ScopeLease<instance::Instance>>,
+        cx: Cx,
+    ) -> Result<discovery::Loaded, Failure> {
         let mut tools = Vec::new();
+        let mut freshness = discovery::Freshness::default();
+        let revision = lease
+            .as_ref()
+            .map_or_else(|| self.cache(&server).revision(), |lease| lease.revision());
         let mut budget = discovery::Budget::default();
         let mut cursor = None;
         let mut seen = std::collections::BTreeSet::new();
@@ -227,7 +422,38 @@ impl Mcp {
             let params = cursor
                 .as_ref()
                 .map_or_else(|| json!({}), |c| json!({"cursor":c}));
-            let mut result = self.request(server, "tools/list", params, cx).await?;
+            let (mut result, received, generation) = if let Some(lease) = &lease {
+                (
+                    lease
+                        .request(
+                            "tools/list",
+                            params,
+                            &cx,
+                            std::time::Instant::now() + self.0.timeout,
+                        )
+                        .await?,
+                    std::time::Instant::now(),
+                    None,
+                )
+            } else {
+                let Transport::Http(url) = &server.transport else {
+                    unreachable!("HTTP discovery")
+                };
+                let reply = rpc::http_authorized(
+                    url,
+                    "tools/list",
+                    params,
+                    http::HeaderMap::new(),
+                    self.connection(&server),
+                    &cx,
+                )
+                .await?;
+                if reply.changed {
+                    self.cache(&server).invalidate();
+                }
+                (reply.value, reply.received, reply.authorization)
+            };
+            freshness.include(&result, received, generation);
             budget.include(&result)?;
             let page = result
                 .get_mut("tools")
@@ -246,7 +472,7 @@ impl Mcp {
                         "duplicate tool or missing inputSchema".into(),
                     ));
                 }
-                if self.is_http(server)
+                if self.is_http(&server.name)
                     && headers::parameters(&tool["inputSchema"], &Value::Null).is_err()
                 {
                     continue;
@@ -264,10 +490,23 @@ impl Mcp {
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             if cursor.is_none() {
-                return Ok(tools);
+                if lease
+                    .as_ref()
+                    .map_or_else(|| self.cache(&server).revision(), |lease| lease.revision())
+                    != revision
+                {
+                    freshness.invalidate();
+                }
+                return Ok(freshness.list(tools));
             }
         }
         Err(Failure::Limit)
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.retired.set();
     }
 }
 
@@ -275,6 +514,8 @@ impl Configured for Mcp {
     fn configure(table: &impl Table) -> Result<Self, Refused> {
         let mut servers = Vec::new();
         let mut registrations = BTreeMap::new();
+        let mut scopes = Vec::new();
+        let sharing = table.flag("experimental_stdio_sharing")?.unwrap_or(false);
         for name in table.list("servers")?.unwrap_or_default() {
             let name: ServerName = name.parse().map_err(Refused)?;
             let argv = table.list(&name)?;
@@ -289,6 +530,7 @@ impl Configured for Mcp {
                     )));
                 }
             };
+            scopes.push(config::Scope::read(table, &name, &transport, sharing)?);
             match (
                 table.text(&format!("{name}_client_id"))?,
                 table.text(&format!("{name}_issuer"))?,
@@ -327,9 +569,13 @@ impl Configured for Mcp {
             servers,
             Duration::from_secs(table.whole("timeout_secs")?.unwrap_or(120)),
         )?;
-        Arc::get_mut(&mut mcp.0)
-            .expect("new MCP instance")
-            .registrations = registrations;
+        let inner = Arc::get_mut(&mut mcp.0).expect("new MCP declaration");
+        inner.scopes = scopes;
+        inner.registrations = registrations;
+        if inner.scopes.iter().any(|scope| scope.shared()) {
+            inner.environment = Some(stdio::snapshot());
+            inner.directory = Some(std::env::current_dir().map_err(|e| Refused(e.to_string()))?);
+        }
         Ok(mcp)
     }
 }
@@ -398,7 +644,7 @@ pub struct CallInput {
 
 /// Failures remain typed in the logged output, distinct from remote
 /// `isError` tool results. No remote error is automatically retried.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Failure {
     Configuration(String),
@@ -414,6 +660,13 @@ pub enum Failure {
     InputRequired,
     Limit,
 }
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for Failure {}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -464,7 +717,7 @@ impl Tool for List {
             .map(|tools| {
                 Value::Array(
                     tools
-                        .into_iter()
+                        .iter()
                         .map(|t| json!({"name":t.name,"description":t.definition["description"].as_str().map(discovery::description)}))
                         .collect(),
                 )
@@ -494,7 +747,8 @@ impl Tool for Schema {
         "Load one MCP tool schema into recorded context before calling it.";
     async fn call(&self, input: &SchemaInput, cx: &Cx) -> Result<ResultFact, String> {
         let result = async {
-            let remote = self.0.tools(&input.server, cx).await?.into_iter()
+            let tools = self.0.tools(&input.server, cx).await?;
+            let remote = tools.iter()
                 .find(|t| t.name == input.tool)
                 .ok_or_else(|| Failure::Protocol("unknown tool".into()))?;
             let definition = protocol::Json::encode(&remote.definition)

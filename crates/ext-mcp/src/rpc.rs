@@ -13,6 +13,34 @@ use crate::Failure;
 pub(crate) const LIMIT: usize = 1024 * 1024;
 pub(crate) const VERSION: &str = "2026-07-28";
 
+pub(crate) fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(crate) struct Reply {
+    pub value: Value,
+    pub authorization: Option<crate::oauth::GenerationId>,
+    pub received: std::time::Instant,
+    pub changed: bool,
+}
+
+impl Reply {
+    fn received(
+        value: Value,
+        authorization: Option<crate::oauth::GenerationId>,
+        cx: &Cx,
+        incoming: &crate::incoming::Incoming,
+    ) -> Self {
+        Self {
+            value,
+            authorization,
+            received: cx.service::<dyn rt::Runtime>().expect("MCP runtime").now(),
+            changed: incoming.changed,
+        }
+    }
+}
+
 pub(crate) fn request(id: u64, method: &str, mut params: Value) -> Value {
     params["_meta"] = json!({
         "io.modelcontextprotocol/protocolVersion": VERSION,
@@ -73,6 +101,17 @@ pub(crate) async fn http(
     exchange(&*client, url, method, params, headers, cx).await
 }
 
+pub(crate) fn client(connection: crate::oauth::Connection, cx: &Cx) -> crate::oauth::Client {
+    crate::oauth::Client {
+        inner: cx
+            .service::<dyn transport::HttpClients>()
+            .expect("engine HTTP clients")
+            .client(transport::RedirectPolicy::Refuse),
+        cx: cx.clone(),
+        connection,
+    }
+}
+
 pub(crate) async fn http_authorized(
     url: &str,
     method: &str,
@@ -80,18 +119,30 @@ pub(crate) async fn http_authorized(
     headers: http::HeaderMap,
     connection: crate::oauth::Connection,
     cx: &Cx,
-) -> Result<Value, Failure> {
-    let client = crate::oauth::Client {
-        inner: cx
-            .service::<dyn transport::HttpClients>()
-            .expect("engine HTTP clients")
-            .client(transport::RedirectPolicy::Refuse),
-        cx: cx.clone(),
-        connection,
-    };
-    exchange(&client, url, method, params, headers, cx).await
+) -> Result<Reply, Failure> {
+    let timeout = connection.timeout;
+    let client = client(connection, cx);
+    let runtime = cx.service::<dyn rt::Runtime>().expect("MCP runtime");
+    rt::or(
+        exchange_reply(&client, url, method, params, headers, cx),
+        async {
+            rt::or(
+                async {
+                    cx.cancel.wait().await;
+                    Err(Failure::Cancelled)
+                },
+                async {
+                    runtime.sleep(timeout).await;
+                    Err(Failure::Timeout)
+                },
+            )
+            .await
+        },
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn exchange(
     client: &dyn Http,
     url: &str,
@@ -100,8 +151,20 @@ async fn exchange(
     headers: http::HeaderMap,
     cx: &Cx,
 ) -> Result<Value, Failure> {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    exchange_reply(client, url, method, params, headers, cx)
+        .await
+        .map(|reply| reply.value)
+}
+
+async fn exchange_reply(
+    client: &dyn Http,
+    url: &str,
+    method: &str,
+    params: Value,
+    headers: http::HeaderMap,
+    cx: &Cx,
+) -> Result<Reply, Failure> {
+    let id = next_id();
     let message = request(id, method, params);
     let mut incoming = crate::incoming::Incoming::new(id);
     let bytes = serde_json::to_vec(&message).map_err(protocol)?;
@@ -124,6 +187,10 @@ async fn exchange(
         .map_err(protocol)?;
     let response = client.send(request).await.map_err(transport)?;
     let status = response.status();
+    let authorization = response
+        .extensions()
+        .get::<crate::oauth::GenerationId>()
+        .cloned();
     if status.is_redirection() {
         return Err(Failure::Redirect {
             status: status.as_u16(),
@@ -166,7 +233,8 @@ async fn exchange(
                         event.clear();
                         incoming.publish(cx, result.is_some());
                         if let Some(result) = result {
-                            return http_result(status, result);
+                            return http_result(status, result)
+                                .map(|value| Reply::received(value, authorization, cx, &incoming));
                         }
                     }
                 } else if let Some(data) = line.strip_prefix(b"data:") {
@@ -187,7 +255,7 @@ async fn exchange(
         .decode(&value, pending.len())?
         .ok_or_else(|| Failure::Protocol(format!("HTTP {status}: no response")))?;
     incoming.publish(cx, true);
-    http_result(status, result)
+    http_result(status, result).map(|value| Reply::received(value, authorization, cx, &incoming))
 }
 
 fn http_result(status: http::StatusCode, result: Value) -> Result<Value, Failure> {

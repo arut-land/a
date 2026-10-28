@@ -521,16 +521,28 @@ The model initially sees a compact server index via `Text::generation`;
 listing tools and loading a selected schema are explicit calls. Schema
 loading uses the same typed `Cx::publish` context primitive as skills,
 including edit-aware deduplication. Stdio servers start on first use,
-one per server per session, with their process groups owned by the daemon.
+one per server per session by default. Experimental, explicitly configured
+workspace/user scopes share exact trusted launch identities through the SDK's
+single-flight scoped registry. Activated session leases release on hibernation;
+last release and daemon shutdown await native process-tree cleanup. Requests
+have globally unique IDs and separate response/progress authority. Shared
+cancellation drains only that exchange to its existing deadline before retiring
+an unresponsive instance; session cancellation kills the tree.
 All MCP operations are external, unsafe to replay, and admitted only after
 their intent is durable; progress and typed results become logged facts.
 Streamable HTTP reuses the existing model HTTP transport and runtime with
 an explicit refusal of redirects. Per-request notification and publication
 budgets coalesce progress into a bounded latest value. Discovery has an
 aggregate byte budget; compact summaries and typed names keep the result
-and its card safely below the protocol frame limit.
-The client targets MCP 2026-07-28 without a legacy handshake fallback;
-HTTP authentication, sampling and elicitation remain unsupported.
+and its card safely below the protocol frame limit. Validated discovery lists
+reuse positive server TTLs, with the earliest page expiry and notification
+invalidation. Private results bind the actual OAuth owner generation; expiry
+and single-flight renewal are checked before lookup, and generation changes
+between pages prevent caching. Missing/zero TTL and input-required outcomes
+stay uncached; nothing refreshes or launches in the background while unused.
+The client targets MCP 2026-07-28 without a legacy handshake fallback. HTTP
+uses the shared credential owner and transport pool; sampling and elicitation
+remain unsupported.
 
 
 ## Runtime, wire and clients

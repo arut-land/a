@@ -151,7 +151,7 @@ impl State {
             ) && self.calls == 3)
                 || (self.scenario == "during-call-stepup" && self.calls == 2)
                 || (self.scenario == "rotating-stepup" && self.expired)
-                || (self.scenario == "paginated"
+                || (matches!(self.scenario.as_str(), "paginated" | "cache-paginated")
                     && later_page
                     && !self.scope.split_whitespace().any(|scope| scope == "write"));
             if needs_auth || step_up {
@@ -190,11 +190,7 @@ impl State {
                     );
                 }
             }
-            let result = if self.scenario == "paginated" && !later_page {
-                json!({"resultType":"complete","tools":[],"nextCursor":"next"})
-            } else {
-                json!({"resultType":"complete","tools":[]})
-            };
+            let result = self.list_result(&request);
             return (
                 200,
                 String::new(),
@@ -222,6 +218,35 @@ impl State {
             return self.token(body);
         }
         (404, String::new(), json!({}))
+    }
+
+    fn list_result(&self, request: &Value) -> Value {
+        let later_page = request["params"]["cursor"] == "next";
+        let mut result =
+            if matches!(self.scenario.as_str(), "paginated" | "cache-paginated") && !later_page {
+                json!({"resultType":"complete","tools":[],"nextCursor":"next"})
+            } else {
+                json!({"resultType":"complete","tools":[]})
+            };
+        if self.scenario.starts_with("cache-") {
+            if request["method"] == "tools/list" {
+                use std::io::Write;
+                writeln!(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("{}.lists", self.marker))
+                        .unwrap(),
+                    "{} {later_page}",
+                    self.tokens
+                )
+                .unwrap();
+                result["tools"] = json!([{"name":if later_page {"second"} else {"echo"},"description":format!("generation {}", self.tokens),"inputSchema":{"type":"object"}}]);
+            }
+            result["ttlMs"] = json!(300_000);
+            result["cacheScope"] = json!("private");
+        }
+        result
     }
 
     fn authorize(&mut self, query: &str) -> (u16, String, Value) {
@@ -336,7 +361,7 @@ impl State {
         (
             200,
             String::new(),
-            json!({"access_token":format!("access-{}", self.tokens),"token_type":"Bearer","refresh_token":if self.scenario.starts_with("rotating") {format!("fixture-refresh-{}", self.tokens)} else {"fixture-refresh".into()},"scope":self.scope,"expires_in":if self.scenario == "rotating-expiry" && self.tokens == 1 {1} else {3600}}),
+            json!({"access_token":format!("access-{}", self.tokens),"token_type":"Bearer","refresh_token":if self.scenario.starts_with("rotating") {format!("fixture-refresh-{}", self.tokens)} else {"fixture-refresh".into()},"scope":self.scope,"expires_in":if matches!(self.scenario.as_str(), "rotating-expiry" | "cache-expiry") && self.tokens == 1 {1} else {3600}}),
         )
     }
 }

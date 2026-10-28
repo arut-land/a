@@ -12,6 +12,10 @@ extension owns every key; the daemon and kernel have no MCP settings.
 [ext.mcp]
 servers = ["docs", "tracker"]
 timeout_secs = 120 # 1..600, per request
+experimental_stdio_sharing = false
+
+# Broader stdio scopes require the experimental flag above.
+docs_scope = "session" # session (default), workspace, user
 
 docs = ["/usr/local/bin/docs-mcp", "--read-only"]
 docs_description = "Internal documentation search"
@@ -30,8 +34,9 @@ Each name selects either its argument list or `<name>_url`, never both. Commands
 are argv, not shell text. The child's directory and non-secret environment
 come from the attaching client (or daemon when none attached), with
 `<name>_env` overriding explicitly. Spawn hooks can wrap or refuse it.
-HTTP currently supports unauthenticated endpoints; OAuth and configured
-HTTP credentials are not implemented. Workspace `.mcp.json` is not read.
+HTTP uses the daemon's shared transport pool and OAuth credential owner. Optional
+`<name>_client_id` and `<name>_issuer` configure pre-registered clients together.
+Workspace `.mcp.json` and workspace executable declarations are not read.
 
 The shared SDK `Text::generation` path records an index containing only
 server names and descriptions when a session adopts its registry generation.
@@ -43,20 +48,47 @@ tool and exact schema content. Replay deduplicates effective publications;
 edits or compaction that hide the context allow it to load again. `mcp_call {server, tool, arguments}` executes it. Schemas are
 fetched with the server's paginated `tools/list`; lists are projected down
 before entering the log/model context. Only an explicit schema load
-publishes a definition; no remote schemas enter the initial request. Definitions are fetched afresh rather than cached across
-turns, so list changes need no subscription. HTTP calls fetch their
-selected definition to construct required mirrored parameter headers.
+publishes a definition; no remote schemas enter the initial request. Discovery
+shares an immutable validated list while every page has a positive server TTL.
+The earliest page expiry limits the whole list. Missing, zero or invalid TTLs
+stay uncached; known immediately stale lists fetch independently. Concurrent
+eligible discovery joins one fetch. Private HTTP lists bind the credential
+owner's opaque authorization generation, including anonymous authorization.
+Lookup observes expiry and joins any renewal first; each response reports its
+actual generation after challenge/retry. Changing generation or visibility
+between pages prevents caching that aggregate. Relevant list-change notifications,
+process retirement and configuration replacement invalidate reuse. Freshness is
+checked only on access: no polling or subscription stream. Tool results and
+`input_required` outcomes are never cached. HTTP calls use the selected definition
+to construct required mirrored parameter headers.
 
-One stdio process per server per session is retained by the daemon until
-its session's process ownership ends. Session scope isolates clients'
-working directories, launch environments and credentials. This intentionally
-chooses isolation over the spec's recommendation to share transports
-across conversations. Calls are exclusive within a session. Another
-session never inherits that session's connection. The engine owns the
-process group and records it for recovery; an exit watcher reaps its
-leader and removes the cached pipes. Registry destruction also kills
-retained groups. Abnormal requests drop their connection, kill the whole
-group and never reuse a channel that could contain a late response.
+Stdio defaults to one instance per configured target per session, regardless of
+configuration provenance. The MCP specification defines no process shareability
+or instance scope. Set `experimental_stdio_sharing = true` and explicitly choose
+`<name>_scope = "workspace"` or `"user"` only for servers whose application state
+may be shared. Broader scopes are rejected without the flag; HTTP rejects scope
+settings because remote process lifetime belongs to the server. User means this
+daemon/home's principal, not all OS users. Workspace uses the engine's workspace
+identity; separate worktrees remain separate. A deliberately shared server can
+retain global browser or other application state: request routing is no sandbox.
+
+One daemon registry reserves each exact declaration/scope/launch identity before
+startup, so concurrent demand performs one spawn and one discovery probe. Session
+launches use their client's cwd, environment and spawn hooks. Shared launches use
+the trusted declaration's captured non-secret daemon environment plus explicit
+server overrides, and the workspace directory or user configuration directory;
+the first caller never supplies the shared environment or session spawn hooks.
+Different declarations, argv, cwd, environment and scopes never alias.
+
+The SDK's scoped process owner retains only activated leases. Hibernation drops
+one session's demand; the last lease, configuration retirement or daemon shutdown
+awaits native tree cleanup. Idle helpers hold neither session work nor daemon
+liveness. A crash retires that generation; only another explicit call may start
+its successor. Globally unique request IDs and a per-request ingress/progress map
+allow replies to arrive out of order. One writer serializes whole frames while
+the reader continues routing replies. A 32 MiB admission budget waits before
+allocating frames and retains each request's credit through cancellation drain;
+it delays demand without rejecting features or limiting the total session count.
 
 All three tools use SDK `Replay::Unsafe` and the ordinary external tool
 path: policy and approval precede dispatch, the intent has a durable
@@ -78,9 +110,11 @@ are not provided; an `input_required` response is a typed failure.
 
 Stdio uses newline-delimited JSON-RPC with per-request version and
 capabilities, and probes `server/discover` before its first operation.
-There is no `initialize` fallback. Cancellation attempts a nonblocking
-`notifications/cancelled` write and then kills the process group, including
-servers that ignore notifications. HTTP refuses all redirects before any
+There is no `initialize` fallback. Session cancellation retires the process tree.
+Shared cancellation removes the caller's context and queues an MCP cancellation
+for that request. Only its charged ingress/drain record remains until the reply
+or the original exchange deadline. An undrained exchange retires the instance at
+that deadline; collateral calls fail and are never replayed automatically. HTTP refuses all redirects before any
 resend, including same-origin redirects: configure the final endpoint
 explicitly. Provider HTTP callers choose their redirect policy explicitly.
 HTTP uses `llm::Client` over the existing runtime, supports JSON and

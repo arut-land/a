@@ -775,3 +775,76 @@ fn connect(home: &sys::Home) -> sys::OwnedConnection {
     ));
     writer
 }
+
+#[test]
+fn private_discovery_tracks_the_actual_authorization_generation_after_refresh_and_expiry() {
+    for scenario in ["cache-generations", "cache-expiry", "cache-paginated"] {
+        let root = Rig::new(scenario, Registry::default());
+        let marker = root.dir.join("endpoint");
+        let (_peer, origin) = serve(&marker, scenario);
+        let browser = Browser {
+            credentials: sys::credentials::Credentials::isolated(root.dir.join("credentials")),
+            approvals: Arc::default(),
+            threads: Arc::default(),
+            decline_write: false,
+        };
+        let mcp = configured(&root, &origin, scenario);
+        let rig = Rig::new(
+            "private-cache",
+            Registry::default()
+                .with(&mcp)
+                .unwrap()
+                .with(&browser)
+                .unwrap(),
+        );
+        let first = rig.done("mcp_list", &json!({"server":"fixture"}));
+        assert_eq!(
+            first["ok"][0]["description"], "generation 1",
+            "{scenario}: {first}"
+        );
+        if scenario == "cache-paginated" {
+            assert_eq!(first["ok"][1]["description"], "generation 2");
+            let second = rig.done("mcp_list", &json!({"server":"fixture"}));
+            assert_eq!(second["ok"][0]["description"], "generation 2");
+            assert_eq!(rig.done("mcp_list", &json!({"server":"fixture"})), second);
+            assert_eq!(
+                std::fs::read_to_string(marker.with_extension("lists"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                4
+            );
+        } else {
+            assert_eq!(rig.done("mcp_list", &json!({"server":"fixture"})), first);
+            let control = if scenario == "cache-expiry" {
+                "wait-expiry"
+            } else {
+                "expire/1"
+            };
+            assert!(get(&format!("{origin}/{control}")).starts_with("HTTP/1.1 200"));
+            if scenario == "cache-generations" {
+                let called = rig.done(
+                    "mcp_call",
+                    &json!({"server":"fixture","tool":"echo","arguments":{}}),
+                );
+                assert!(called.get("ok").is_some(), "{called}");
+            }
+            let second = rig.done("mcp_list", &json!({"server":"fixture"}));
+            assert_eq!(
+                second["ok"][0]["description"], "generation 2",
+                "{scenario}: {second}"
+            );
+            assert_eq!(rig.done("mcp_list", &json!({"server":"fixture"})), second);
+            assert_eq!(
+                std::fs::read_to_string(marker.with_extension("lists"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        }
+        for thread in browser.threads.lock().unwrap().drain(..) {
+            thread.join().unwrap();
+        }
+    }
+}

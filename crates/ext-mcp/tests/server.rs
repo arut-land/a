@@ -34,6 +34,7 @@ fn main() {
         }
     }
     let mut children = Vec::new();
+    let mut browser = String::new();
     writeln!(
         OpenOptions::new()
             .create(true)
@@ -60,10 +61,15 @@ fn main() {
         );
         let result = match method {
             "server/discover" => {
+                writeln!(
+                    OpenOptions::new().append(true).open(&marker).unwrap(),
+                    "discover"
+                )
+                .unwrap();
                 json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}})
             }
             "tools/list" => tools(&request, &marker),
-            "tools/call" => match call(&request, &marker, &mut children) {
+            "tools/call" => match call(&request, &marker, &mut children, &mut browser) {
                 Some(result) => result,
                 None => continue,
             },
@@ -123,7 +129,12 @@ fn tree(marker: &str, children: &mut Vec<std::process::Child>) {
     .unwrap();
 }
 
-fn call(request: &Value, marker: &str, children: &mut Vec<std::process::Child>) -> Option<Value> {
+fn call(
+    request: &Value,
+    marker: &str,
+    children: &mut Vec<std::process::Child>,
+    browser: &mut String,
+) -> Option<Value> {
     let id = &request["id"];
     let tool = request["params"]["name"].as_str().unwrap();
     writeln!(
@@ -132,6 +143,21 @@ fn call(request: &Value, marker: &str, children: &mut Vec<std::process::Child>) 
     )
     .unwrap();
     let result = match tool {
+        "launch-context" => {
+            json!({"resultType":"complete","cwd":std::env::current_dir().unwrap(),"identity":std::env::var("A_MCP_IDENTITY").ok(),"caller":std::env::var("A_MCP_CALLER").ok()})
+        }
+        "browser-set" => {
+            request["params"]["arguments"]["page"]
+                .as_str()
+                .unwrap()
+                .clone_into(browser);
+            json!({"resultType":"complete","page":browser})
+        }
+        "browser-get" => json!({"resultType":"complete","page":browser}),
+        "reorder" => {
+            reorder(request);
+            return None;
+        }
         "tree" | "tree-wait" => {
             tree(marker, children);
             if tool == "tree-wait" {
@@ -235,4 +261,17 @@ fn framed_reply(request: &Value) {
         out.write_all(chunk).unwrap();
         out.flush().unwrap();
     }
+}
+
+fn reorder(request: &Value) {
+    let request = request.clone();
+    std::thread::spawn(move || {
+        let index = request["params"]["arguments"]["index"].as_u64().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis((31 - index % 32) * 2));
+        let id = &request["id"];
+        send(
+            &json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":id,"message":format!("request {index}\n")}}),
+        );
+        send(&json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete","index":index}}));
+    });
 }

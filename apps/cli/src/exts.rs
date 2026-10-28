@@ -62,7 +62,10 @@ fn linked(
     #[cfg(feature = "edit")]
     let built = built.with(Tier::Pre, &configured::<ext_edit::Edit>(config)?)?;
     #[cfg(feature = "mcp")]
-    let built = built.with(Tier::Pre, &configured::<ext_mcp::Mcp>(config)?)?;
+    let built = built.with(
+        Tier::Pre,
+        &configured::<ext_mcp::Mcp>(config)?.declared_in(home.config_dir())?,
+    )?;
     #[cfg(feature = "index")]
     let built = built.with(
         Tier::Pre,

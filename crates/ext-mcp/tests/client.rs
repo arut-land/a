@@ -1,5 +1,7 @@
 #![cfg(feature = "fixture")]
 
+use std::collections::BTreeMap;
+
 use ext::host::Registry;
 use ext::testing::Rig;
 use ext::{Extension, Replay};
@@ -16,7 +18,7 @@ fn rig(name: &str, timeout: Duration) -> Rig {
                 env!("CARGO_BIN_EXE_mcp-fixture").into(),
                 format!("effects-{name}"),
             ]),
-            env: std::collections::BTreeMap::default(),
+            env: BTreeMap::default(),
         }],
         timeout,
     )
@@ -358,4 +360,304 @@ fn fragmented_and_adjacent_messages_preserve_exact_results() {
         }
         finish(rig);
     }
+}
+
+#[test]
+fn concurrent_requests_start_once_and_reordered_replies_keep_their_owner() {
+    let rig = std::sync::Arc::new(rig("multiplexed", Duration::from_secs(10)));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(128));
+    let workers: Vec<_> = (0..128)
+        .map(|index| {
+            let rig = std::sync::Arc::clone(&rig);
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let result = rig.done(
+                    "mcp_call",
+                    &json!({"server":"fixture","tool":"reorder","arguments":{"index":index}}),
+                );
+                assert_eq!(result["ok"]["index"], index, "{result}");
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let effects = std::fs::read_to_string(rig.workspace().join("effects-multiplexed")).unwrap();
+    assert_eq!(
+        effects.lines().filter(|l| l.starts_with("start ")).count(),
+        1
+    );
+    assert_eq!(effects.lines().filter(|l| *l == "discover").count(), 1);
+    finish(std::sync::Arc::try_unwrap(rig).ok().unwrap());
+}
+
+struct DiscoveryPeer {
+    url: String,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DiscoveryPeer {
+    fn new(mode: &'static str) -> Self {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            let mut lists = 0;
+            for stream in listener.incoming() {
+                if stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                let mut stream = stream.unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    head.push(byte[0]);
+                }
+                let length = std::str::from_utf8(&head)
+                    .unwrap()
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                recorded.lock().unwrap().push(request.clone());
+                let is_list = request["method"] == "tools/list";
+                let mut result = if is_list {
+                    lists += 1;
+                    let page = request["params"]["cursor"].as_str().unwrap_or("first");
+                    let mut value = json!({"resultType":"complete","cacheScope":"private","ttlMs":300_000,"tools":[{"name":if page == "first" {"echo"} else {"second"},"description":format!("list {lists}"),"inputSchema":{"type":"object"}}]});
+                    match mode {
+                        "missing" => {
+                            value.as_object_mut().unwrap().remove("ttlMs");
+                        }
+                        "zero" => value["ttlMs"] = json!(0),
+                        "expired" => value["ttlMs"] = json!(1),
+                        "pages" => {
+                            if page == "first" {
+                                value["ttlMs"] = json!(1);
+                                value["nextCursor"] = json!("second");
+                            } else {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                        }
+                        "mrtr" if lists == 1 => {
+                            value = json!({"resultType":"input_required","ttlMs":300_000,"cacheScope":"private","inputRequests":{}});
+                        }
+                        _ => {}
+                    }
+                    // Concurrent cold readers must overlap a real pending HTTP request.
+                    if mode == "single-flight" {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    value
+                } else {
+                    json!({"resultType":"complete","content":[]})
+                };
+                if !is_list {
+                    result["tool"] = request["params"]["name"].clone();
+                }
+                let response = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                let (content_type, body) = if (mode == "notification" && !is_list)
+                    || (mode == "notification-during-list" && is_list)
+                {
+                    let notice =
+                        json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"});
+                    (
+                        "text/event-stream",
+                        format!("data: {notice}\n\ndata: {response}\n\n").into_bytes(),
+                    )
+                } else {
+                    ("application/json", serde_json::to_vec(&response).unwrap())
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        Self {
+            url,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn rig(&self) -> Rig {
+        let mcp = Mcp::new(
+            vec![Server {
+                name: "fixture".parse().unwrap(),
+                description: String::new(),
+                transport: Transport::Http(self.url.clone()),
+                env: BTreeMap::default(),
+            }],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        Rig::new("discovery-cache", Registry::default().with(&mcp).unwrap())
+    }
+
+    fn lists(&self) -> usize {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "tools/list")
+            .count()
+    }
+}
+impl Drop for DiscoveryPeer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let address = self
+            .url
+            .strip_prefix("http://")
+            .unwrap()
+            .strip_suffix("/mcp")
+            .unwrap();
+        let _ = std::net::TcpStream::connect(address);
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
+#[test]
+fn only_fresh_complete_lists_are_reused_and_every_page_limits_freshness() {
+    for mode in [
+        "positive",
+        "missing",
+        "zero",
+        "expired",
+        "pages",
+        "mrtr",
+        "notification-during-list",
+    ] {
+        let peer = DiscoveryPeer::new(mode);
+        let rig = peer.rig();
+        let first = rig.done("mcp_list", &json!({"server":"fixture"}));
+        if mode == "mrtr" {
+            assert_eq!(first["failed"], "input_required");
+        } else {
+            assert!(first.get("ok").is_some(), "{mode}: {first}");
+        }
+        if mode == "expired" {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let second = rig.done("mcp_list", &json!({"server":"fixture"}));
+        assert!(second.get("ok").is_some(), "{mode}: {second}");
+        assert_eq!(
+            peer.lists(),
+            match mode {
+                "positive" => 1,
+                "pages" => 4,
+                _ => 2,
+            },
+            "{mode}"
+        );
+        if mode == "pages" {
+            let requests = peer.requests.lock().unwrap();
+            assert!(requests[0]["params"].get("cursor").is_none());
+            assert_eq!(requests[1]["params"]["cursor"], "second");
+        }
+    }
+}
+
+#[test]
+fn concurrent_cache_demand_sends_one_list_and_notifications_invalidate_it() {
+    let peer = DiscoveryPeer::new("single-flight");
+    let rig = std::sync::Arc::new(peer.rig());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(32));
+    let workers: Vec<_> = (0..32)
+        .map(|_| {
+            let rig = std::sync::Arc::clone(&rig);
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                assert!(
+                    rig.done("mcp_list", &json!({"server":"fixture"}))
+                        .get("ok")
+                        .is_some()
+                );
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(peer.lists(), 1);
+    let peer = DiscoveryPeer::new("notification");
+    let rig = peer.rig();
+    assert!(
+        rig.done("mcp_list", &json!({"server":"fixture"}))
+            .get("ok")
+            .is_some()
+    );
+    assert!(
+        rig.done(
+            "mcp_call",
+            &json!({"server":"fixture","tool":"echo","arguments":{}})
+        )
+        .get("ok")
+        .is_some()
+    );
+    assert!(
+        rig.done("mcp_list", &json!({"server":"fixture"}))
+            .get("ok")
+            .is_some()
+    );
+    assert_eq!(peer.lists(), 2);
+}
+
+#[test]
+fn changing_a_sessions_launch_environment_selects_a_distinct_instance() {
+    let rig = rig("exact-environment", Duration::from_secs(10));
+    for identity in ["first", "second", "first"] {
+        let mut cx = rig.cx();
+        let mut env = protocol::Environment::new(
+            cx.workspace.to_path_buf().try_into().unwrap(),
+            std::env::vars_os(),
+            false,
+        );
+        env.vars
+            .retain(|key, _| !protocol::Environment::is_secret(key));
+        env.vars.insert("A_MCP_IDENTITY".into(), identity.into());
+        env.vars.insert("A_MCP_CALLER".into(), identity.into());
+        cx.env = Some(std::sync::Arc::new(env));
+        let input = protocol::Json::encode(
+            &json!({"server":"fixture","tool":"launch-context","arguments":{}}),
+        )
+        .unwrap();
+        let called = rt::block_on(rig.registry.tools().run("mcp_call", &input, None, &cx));
+        let protocol::Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        } = called.outcome
+        else {
+            panic!("no completed request")
+        };
+        let result: Value = output.parse().unwrap();
+        assert_eq!(result["ok"]["identity"], identity);
+        assert_eq!(result["ok"]["caller"], identity);
+    }
+    let effects =
+        std::fs::read_to_string(rig.workspace().join("effects-exact-environment")).unwrap();
+    assert_eq!(
+        effects.lines().filter(|l| l.starts_with("start ")).count(),
+        2
+    );
+    finish(rig);
 }

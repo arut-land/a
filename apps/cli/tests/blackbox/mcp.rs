@@ -289,3 +289,228 @@ fn an_mcp_server_never_holds_an_upgrade_and_starts_again_after_it() {
         "{starts}"
     );
 }
+
+fn scoped(scope: &str, extra: &str) -> Env {
+    let env = Env::new(&format!("mcp-scope-{scope}"));
+    env.daemon("crash_limit = 0\nhibernate_secs = 1");
+    let fixture = std::path::Path::new(env!("CARGO_BIN_EXE_a")).with_file_name("mcp-fixture");
+    env.ext("mcp", &format!(
+        "servers = [\"fixture\"]\nfixture = [{:?}, {:?}]\nexperimental_stdio_sharing = true\nfixture_scope = {scope:?}\n{extra}",
+        fixture.to_str().unwrap(), env.root.join("effects").to_str().unwrap(),
+    ));
+    env
+}
+
+fn completed(conn: &mut crate::common::Conn) -> (serde_json::Value, Vec<protocol::Entry>) {
+    let entries = conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
+    let Body::ToolResult {
+        outcome: Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        },
+        ..
+    } = &entries.last().unwrap().body
+    else {
+        panic!("MCP did not complete: {entries:?}")
+    };
+    (output.parse().unwrap(), entries)
+}
+
+fn invoke(
+    conn: &mut crate::common::Conn,
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> serde_json::Value {
+    conn.input(&format!(
+        "call mcp_call {}",
+        json!({"server":"fixture","tool":tool,"arguments":arguments})
+    ));
+    completed(conn).0
+}
+
+#[test]
+fn session_scope_isolates_server_globals_and_shared_scope_is_explicitly_stateful() {
+    for scope in ["session", "workspace", "user"] {
+        let env = scoped(scope, "");
+        env.start();
+        let mut first = env.connect();
+        let mut second = env.connect();
+        first.attach(Target::New, &env.ws);
+        second.attach(Target::New, &env.ws);
+        assert!(!env.root.join("effects").exists());
+        assert_eq!(
+            invoke(&mut first, "browser-set", &json!({"page":"private-page"}))["ok"]["page"],
+            "private-page"
+        );
+        assert_eq!(
+            invoke(&mut second, "browser-get", &json!({}))["ok"]["page"],
+            if scope == "session" {
+                ""
+            } else {
+                "private-page"
+            }
+        );
+        let starts = fs::read_to_string(env.root.join("effects"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("start "))
+            .count();
+        assert_eq!(starts, if scope == "session" { 2 } else { 1 });
+    }
+}
+
+#[test]
+fn workspace_scope_separates_worktrees_while_user_scope_uses_its_declaration() {
+    for scope in ["workspace", "user"] {
+        let env = scoped(scope, "fixture_env = [\"A_MCP_IDENTITY=declaration\"]");
+        let other = env.root.join("other-worktree");
+        fs::create_dir(&other).unwrap();
+        env.start();
+        let mut first = env.connect();
+        let mut second = env.connect();
+        first.attach(Target::New, &env.ws);
+        second.attach(Target::New, &other);
+        for (client, workspace, identity) in [
+            (&mut first, &env.ws, "first"),
+            (&mut second, &other, "second"),
+        ] {
+            client.send(&ClientMsg::Environment(protocol::Environment {
+                cwd: workspace.to_owned().try_into().unwrap(),
+                vars: std::collections::BTreeMap::from([("A_MCP_CALLER".into(), identity.into())]),
+                ..protocol::Environment::default()
+            }));
+            let context = invoke(client, "launch-context", &json!({}));
+            assert_eq!(context["ok"]["identity"], "declaration");
+            assert!(context["ok"]["caller"].is_null(), "{context}");
+            assert_eq!(
+                context["ok"]["cwd"],
+                json!(if scope == "workspace" {
+                    workspace.as_path()
+                } else {
+                    env.home.config_dir()
+                })
+            );
+        }
+        let starts = fs::read_to_string(env.root.join("effects"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("start "))
+            .count();
+        assert_eq!(starts, if scope == "workspace" { 2 } else { 1 });
+    }
+}
+
+#[test]
+fn shared_cancellation_and_hibernation_preserve_other_calls_and_last_release_reaps_descendants() {
+    let env = scoped("workspace", "timeout_secs = 5");
+    env.start();
+    let mut first = env.connect();
+    let mut second = env.connect();
+    let (first_session, _) = first.attach(Target::New, &env.ws);
+    second.attach(Target::New, &env.ws);
+    call(&mut first, "wait");
+    first.until(|e| matches!(e.body, Body::Progress { .. }));
+    let server = pid(&env);
+    second.input(&format!(
+        "call mcp_call {}",
+        json!({"server":"fixture","tool":"reorder","arguments":{"index":0}})
+    ));
+    first.send(&ClientMsg::INTERRUPT);
+    first.until(|e| matches!(e.body, Body::ToolResult { .. }));
+    drop(first);
+    let (result, entries) = completed(&mut second);
+    assert_eq!(result["ok"]["index"], 0);
+    assert!(entries.iter().all(
+        |entry| !matches!(&entry.body, Body::Progress { text, .. } if text.contains("waiting"))
+    ));
+    wait_for(
+        "the cancelled session to hibernate while its peer stays attached",
+        || {
+            env.run(&["ls"]).lines().any(|line| {
+                line.starts_with(&first_session.short().to_string()) && line.contains("hibernated")
+            })
+        },
+    );
+    assert!(sys::RecordedIdentity(server).alive());
+    assert!(invoke(&mut second, "tree", &json!({})).get("ok").is_some());
+    let effects = fs::read_to_string(env.root.join("effects")).unwrap();
+    assert_eq!(
+        effects.lines().filter(|l| l.starts_with("start ")).count(),
+        1
+    );
+    let descendant: u32 = effects
+        .lines()
+        .find_map(|l| l.strip_prefix("descendant "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    drop(second);
+    wait_for("last MCP lease and descendant cleanup", || {
+        !sys::RecordedIdentity(server).alive()
+    });
+    assert!(!sys::RecordedIdentity(descendant).alive());
+}
+
+#[test]
+fn shared_drains_retire_at_the_exchange_deadline_and_never_replay_effects() {
+    let env = scoped("workspace", "timeout_secs = 1");
+    env.start();
+    let mut first = env.connect();
+    let mut second = env.connect();
+    first.attach(Target::New, &env.ws);
+    second.attach(Target::New, &env.ws);
+    call(&mut first, "wait");
+    first.until(|e| matches!(e.body, Body::Progress { .. }));
+    let server = pid(&env);
+    assert!(invoke(&mut second, "echo", &json!({})).get("ok").is_some());
+    first.send(&ClientMsg::INTERRUPT);
+    first.until(|e| matches!(e.body, Body::ToolResult { .. }));
+    assert!(sys::RecordedIdentity(server).alive());
+    wait_for("the cancelled exchange's existing drain deadline", || {
+        !sys::RecordedIdentity(server).alive()
+    });
+    assert!(invoke(&mut second, "echo", &json!({})).get("ok").is_some());
+    let effects = fs::read_to_string(env.root.join("effects")).unwrap();
+    assert_eq!(effects.lines().filter(|l| *l == "call wait").count(), 1);
+    assert_eq!(
+        effects.lines().filter(|l| l.starts_with("start ")).count(),
+        2
+    );
+}
+
+#[test]
+fn concurrent_sessions_share_one_startup_and_receive_only_their_responses_and_progress() {
+    let env = scoped("workspace", "");
+    env.start();
+    let mut clients: Vec<_> = (0..128)
+        .map(|_| {
+            let mut conn = env.connect();
+            conn.attach(Target::New, &env.ws);
+            conn
+        })
+        .collect();
+    for (index, conn) in clients.iter_mut().enumerate() {
+        conn.input(&format!(
+            "call mcp_call {}",
+            json!({"server":"fixture","tool":"reorder","arguments":{"index":index}})
+        ));
+    }
+    for (index, conn) in clients.iter_mut().enumerate() {
+        let (result, entries) = completed(conn);
+        assert_eq!(result["ok"]["index"], index);
+        let expected = format!("request {index}\n");
+        let progress: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| match &entry.body {
+                Body::Progress { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(progress, vec![&expected]);
+    }
+    let effects = fs::read_to_string(env.root.join("effects")).unwrap();
+    assert_eq!(
+        effects.lines().filter(|l| l.starts_with("start ")).count(),
+        1
+    );
+    assert_eq!(effects.lines().filter(|l| *l == "discover").count(), 1);
+}

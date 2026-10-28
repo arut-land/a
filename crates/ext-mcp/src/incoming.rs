@@ -18,6 +18,7 @@ pub(crate) struct Incoming {
     remaining: usize,
     bytes: usize,
     progress: Progress,
+    pub(crate) changed: bool,
 }
 
 impl Incoming {
@@ -27,6 +28,7 @@ impl Incoming {
             remaining: NOTIFICATIONS,
             bytes: NOTIFICATION_BYTES,
             progress: Progress::default(),
+            changed: false,
         }
     }
 
@@ -37,6 +39,7 @@ impl Incoming {
     ) -> Result<Option<Value>, Failure> {
         let result = rpc::decode(message, self.id)?;
         if result.is_none() {
+            self.changed |= message["method"] == "notifications/tools/list_changed";
             self.remaining = self.remaining.checked_sub(1).ok_or(Failure::Limit)?;
             self.bytes = self.bytes.checked_sub(bytes).ok_or(Failure::Limit)?;
             if message["method"] == "notifications/progress"
@@ -74,6 +77,14 @@ impl Incoming {
             }
             self.publish(cx, false);
         }
+    }
+
+    pub(crate) fn next_publication(&self) -> Option<Instant> {
+        (self.progress.pending.is_some() && self.progress.sent < PUBLICATIONS - 1).then(|| {
+            self.progress
+                .last
+                .map_or_else(Instant::now, |last| last + INTERVAL)
+        })
     }
 
     pub(crate) fn publish(&mut self, cx: &Cx, finished: bool) {
