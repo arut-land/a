@@ -93,7 +93,7 @@ jobs:
       - *mise
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
-      # Idle daemon RSS (10 MiB) is held exactly; cold start and attach
+      # Idle daemon charged memory (10 MiB) is held exactly; cold start and attach
       # latency too where strict, else with slack.
       - run: mise run budgets
 

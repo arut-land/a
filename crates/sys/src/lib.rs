@@ -38,6 +38,7 @@ pub mod net;
 mod paths;
 mod platform;
 mod proc;
+pub mod process_memory;
 pub mod resources;
 mod runtime;
 pub mod shell;

@@ -55,6 +55,21 @@ fn attach(home: &sys::Home, target: Target) -> (protocol::SessionId, Vec<Entry>,
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--memory") {
+        let pid = std::env::args()
+            .nth(2)
+            .expect("process id")
+            .parse()
+            .unwrap();
+        println!(
+            "{}",
+            serde_json::json!({
+                "charged_bytes": sys::process_memory::charged_bytes(pid).unwrap(),
+                "metric": sys::process_memory::METRIC,
+            })
+        );
+        return;
+    }
     let home = sys::Home::from(std::path::PathBuf::from(
         std::env::var_os("A_HOME").expect("isolated A_HOME"),
     ));

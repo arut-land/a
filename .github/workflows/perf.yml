@@ -7,6 +7,10 @@ on:
     - cron: '17 4 * * 1'
   workflow_dispatch:
     inputs:
+      idle_charge:
+        description: "Validate native idle charge and a throwaway retained allocation"
+        default: false
+        type: boolean
       autostart:
         description: 'Run only the hosted autostart probe'
         default: false
@@ -84,8 +88,55 @@ env:
   CARGO_BUILD_JOBS: 4
 
 jobs:
+  idle-charge:
+    if: inputs.idle_charge
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+      PYTHONDONTWRITEBYTECODE: 1
+    name: idle charge (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python -m pip install psutil==7.2.2
+      - name: Select native Rust toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          echo "RUSTUP_TOOLCHAIN=$channel-${{ matrix.target }}" >> "$GITHUB_ENV"
+          rustup toolchain install "$channel-${{ matrix.target }}" --profile minimal --component rust-src
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang mold pkg-config libssl-dev
+      - name: Validate real processes and the retained-allocation rejection
+        run: python scripts/perf/idle-charge.py --output "$RUNNER_TEMP/idle-charge-output" --target "$RUNNER_TEMP/idle-charge-target"
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: idle-charge-${{ matrix.os }}
+          path: ${{ runner.temp }}/idle-charge-output/*.json
+
   measure:
-    if: github.event_name != 'schedule' && !inputs.autostart
+    if: github.event_name != 'schedule' && !inputs.autostart && !inputs.idle_charge
     name: perf (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     # Churn workloads and twenty-round ablations need longer than the standard suite.

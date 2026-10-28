@@ -207,7 +207,7 @@ never addresses the user's default home.
 | First run | Five fresh homes; initial `ls`, including immutable build installation and daemon startup |
 | Cold first reply | Five fresh homes; stage once, stop, then line REPL spawn through first session line |
 | Attach | Five independent daemons; ten recorded echo turns; 500 connect/hello/attach/replays each, through `Synced` |
-| Idle | Five homes; daemon RSS at three seconds; CPU after fifteen seconds settling, then ten seconds with no profiling |
+| Idle | Five homes; daemon charged memory and diagnostic RSS at three seconds; CPU after fifteen seconds settling, then ten seconds with no profiling |
 | CLI workloads | Three warmups, twenty runs: version, fresh-home/new, cold/warm new, echo, 1 MiB shell output, long transcript |
 | Engine/JSON/LLM/TUI benches | One warmup, five runs per saved release benchmark executable; LLM decodes recorded provider cassettes |
 
@@ -244,7 +244,8 @@ small gains. Size is exact; timing and memory remain observations.
 Perf fails only on harness errors, including invalid or incomplete replay; numeric
 measurements never fail a lane. Idle CPU reports the maximum, every window
 count and the number of nonzero windows, including Windows watcher ticks.
-CI gates idle RSS below 10,240 KiB, cold reply and attach latency (strict on
+CI gates idle [charged memory](idle-charge.md) below 10,240 KiB and reports
+RSS without asserting it. It also gates cold reply and attach latency (strict on
 Linux, with CI slack on macOS), attach replay length, terminal first-paint,
 PTY-client idle and quiet-shell wakes.
 

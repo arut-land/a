@@ -219,7 +219,7 @@ impl std::fmt::Display for Passed {
     }
 }
 
-/// What a child can be handed with [`pass`].
+/// What a child can be handed through [`Pass::passed`].
 pub trait Pass {
     fn passed(&self) -> Passed;
 }
