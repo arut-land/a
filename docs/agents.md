@@ -425,13 +425,22 @@ fresh exchanges and cannot address a source-owned log.
 
 ### Context and bounds
 
-`Fresh` supplies only the extension's messages. `Owner` records the owner
-sequence strictly before the owning call; execution projects that immutable
-prefix once as a per-turn input, retaining rich messages and opaque provider
-state. Only extension instructions and replies enter thread history; owner
-prefixes never accumulate there. Projection accepts an owner image coupling
-that prefix to its own admitted registry, including registrations excluded
-from the child.
+`Fresh` supplies only the extension's messages. `Owner` freezes an immutable
+content cut strictly before the owning call. Each input carries that cut,
+independently of earlier inputs in the same thread. Admission extends only the
+new local log suffix; execution reads the recent graph exchanges its existing
+bounds request. Taken inbox inputs count as exchanges too. Rich messages and
+opaque provider state remain intact. Only extension instructions and replies
+enter thread history; owner prefixes never accumulate there.
+
+A live input borrows its producer's admitted presentation registry until
+settlement or cancellation, including registrations excluded from the child;
+it grants no execution authority. A separate immutable presentation edge on
+the cut records the installed sources and selected registrations. Cold
+pending-input recovery restores that generation from this witness, without
+reading the owner's log. The witness keeps history in its original projection
+scope, preserving pending provider exchanges. Compaction's `OwnerPrefix`
+requests all effective context, and a full-context agent fork remains unbounded.
 
 The turn's bounds, a recent-exchange window and an assembled message-byte
 ceiling, are frozen with the runner at admission; configuration cannot

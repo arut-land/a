@@ -186,7 +186,7 @@ impl Shared {
                 return Ok(Owner::Gone);
             };
             let cancelled = if let Some(live) = slot.live() {
-                cancelled_child(live.frames.entries()?, child)
+                live.child_owners()?.cancelled(child)
             } else {
                 let seq = self.catalog.get(parent.session).map_or(0, |r| r.entries);
                 cancelled_child(self.store.prefix(parent.session, seq)?, child)
@@ -203,33 +203,121 @@ impl Shared {
     }
 }
 
-fn cancelled_child(entries: impl IntoIterator<Item = Entry>, child: SessionId) -> bool {
-    let mut watch = None;
-    let mut link = None;
-    let mut caller = None;
-    for entry in entries {
-        match entry.body {
-            Body::Link { child: linked, .. } if linked == child => {
-                link = Some(entry.seq);
-                caller = None;
+#[derive(Default)]
+struct ChildOwners {
+    through: u64,
+    children: std::collections::HashMap<SessionId, ChildOwner>,
+    links: std::collections::HashMap<protocol::Seq, SessionId>,
+    waits: std::collections::HashMap<CallId, std::collections::HashSet<SessionId>>,
+    watches: std::collections::HashMap<protocol::Seq, SessionId>,
+}
+
+#[derive(Default)]
+struct ChildOwner {
+    link: Option<protocol::Seq>,
+    caller: Option<CallId>,
+    watch: Option<protocol::Seq>,
+    watch_settled: bool,
+    cancelled: bool,
+}
+
+impl ChildOwners {
+    fn apply(&mut self, entry: &Entry) {
+        self.through = entry.seq.get();
+        match &entry.body {
+            Body::Link { child, .. } => {
+                let owner = self.children.entry(*child).or_default();
+                if let Some(link) = owner.link.replace(entry.seq) {
+                    self.links.remove(&link);
+                }
+                if let Some(call) = owner.caller.take()
+                    && let Some(children) = self.waits.get_mut(&call)
+                {
+                    children.remove(child);
+                }
+                self.links.insert(entry.seq, *child);
             }
             Body::Wait {
                 call,
-                on: WaitOn::Child { link: waiting },
-            } if link == Some(waiting) => caller = Some(call),
-            // An awaited child still delivers its outcome. Its waiting
-            // call's interrupted result proves the owner's cancellation.
-            Body::ToolResult {
-                call,
-                outcome: Outcome::Interrupted { .. },
-                ..
-            } if caller == Some(call) => return true,
-            Body::Watch { child: watched } if watched == child => watch = Some(entry.seq),
-            Body::Unwatch { watch: cancelled } if watch == Some(cancelled) => return true,
+                on: WaitOn::Child { link },
+            } => {
+                if let Some(child) = self.links.get(link) {
+                    let owner = self.children.get_mut(child).expect("linked child");
+                    if let Some(previous) = owner.caller.replace(*call)
+                        && let Some(children) = self.waits.get_mut(&previous)
+                    {
+                        children.remove(child);
+                    }
+                    self.waits.entry(*call).or_default().insert(*child);
+                }
+            }
+            Body::ToolResult { call, outcome, .. } => {
+                if let Some(children) = self.waits.remove(call) {
+                    for child in children {
+                        let owner = self.children.get_mut(&child).expect("awaited child");
+                        owner.caller = None;
+                        owner.cancelled |= matches!(outcome, Outcome::Interrupted { .. });
+                    }
+                }
+            }
+            Body::Watch { child } => {
+                let owner = self.children.entry(*child).or_default();
+                if let Some(watch) = owner.watch.replace(entry.seq) {
+                    self.watches.remove(&watch);
+                }
+                self.watches.insert(entry.seq, *child);
+            }
+            Body::Fired { watch, .. } => {
+                if let Some(child) = self.watches.get(watch) {
+                    self.children
+                        .get_mut(child)
+                        .expect("watched child")
+                        .watch_settled = true;
+                }
+            }
+            Body::Unwatch { watch } => {
+                if let Some(child) = self.watches.get(watch) {
+                    let owner = self.children.get_mut(child).expect("watched child");
+                    owner.watch_settled = true;
+                    owner.cancelled = true;
+                }
+            }
             _ => {}
         }
     }
-    false
+
+    fn cancelled(&self, child: SessionId) -> bool {
+        self.children
+            .get(&child)
+            .is_some_and(|owner| owner.cancelled)
+    }
+
+    fn pending(&self, child: SessionId) -> bool {
+        self.children
+            .get(&child)
+            .is_some_and(|owner| owner.watch.is_some() && !owner.watch_settled)
+    }
+}
+
+impl Live {
+    fn child_owners(&self) -> io::Result<std::sync::MutexGuard<'_, ChildOwners>> {
+        let mut owners = lock(&self.session.child_owners);
+        let through = owners.through;
+        for batch in self.frames.batches_after(through) {
+            for entry in batch? {
+                owners.apply(&entry);
+            }
+        }
+        Ok(owners)
+    }
+}
+
+fn cancelled_child(entries: impl IntoIterator<Item = Entry>, child: SessionId) -> bool {
+    let mut owners = ChildOwners::default();
+    for entry in entries {
+        owners.apply(&entry);
+    }
+    owners.cancelled(child)
 }
 
 fn recorded_registry(
@@ -342,6 +430,9 @@ struct Session {
     services: Arc<SessionServices>,
     spawn: Mutex<Option<spawn::SpawnIntent>>,
     context_cuts: Mutex<crate::context::Cuts>,
+    presentation: Mutex<crate::context::Presentation>,
+    child_owners: Mutex<ChildOwners>,
+    input_registries: Mutex<std::collections::HashMap<protocol::EnvelopeId, Arc<Registry>>>,
     fence: AtomicU64,
     id: SessionId,
     workspace: Arc<Path>,
@@ -3156,6 +3247,9 @@ impl Session {
             }),
             spawn: Mutex::default(),
             context_cuts: Mutex::default(),
+            presentation: Mutex::default(),
+            child_owners: Mutex::default(),
+            input_registries: Mutex::default(),
             fence: AtomicU64::new(0),
             id: header.id,
             workspace: Arc::from(header.workspace.as_path()),

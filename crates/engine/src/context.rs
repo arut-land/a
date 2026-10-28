@@ -35,6 +35,7 @@ pub(crate) fn append(
     let mut publications = previous.publications.clone();
     let mut node = ContextNode {
         previous: previous.root,
+        presentation: None,
         runner: previous.runner,
         inputs: Vec::new(),
         inherited: Vec::new(),
@@ -74,6 +75,111 @@ pub(crate) fn append(
         root: Some(write(&node, store)?),
         publications,
     })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct PresentationImage {
+    pub(crate) installed: Vec<protocol::Installed>,
+    pub(crate) extensions: Vec<String>,
+}
+
+impl PresentationImage {
+    pub(crate) fn of(registry: &ext::host::Registry) -> io::Result<protocol::Json> {
+        protocol::Json::encode(&Self {
+            installed: registry.installed(),
+            extensions: registry
+                .extensions()
+                .map(|(name, _)| name.to_owned())
+                .collect(),
+        })
+        .map_err(io::Error::other)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Presentation {
+    registry: std::sync::Weak<ext::host::Registry>,
+    root: Option<BlobRef>,
+}
+
+impl Presentation {
+    pub(crate) fn freeze(
+        &mut self,
+        registry: &std::sync::Arc<ext::host::Registry>,
+        store: &dyn BlobStore,
+    ) -> io::Result<BlobRef> {
+        if self
+            .registry
+            .upgrade()
+            .is_some_and(|kept| std::sync::Arc::ptr_eq(&kept, registry))
+            && let Some(root) = &self.root
+        {
+            return Ok(root.clone());
+        }
+        let metadata = PresentationImage::of(registry)?;
+        let root = write(
+            &ContextNode {
+                previous: None,
+                presentation: None,
+                runner: protocol::publication::RunnerKind::Agent,
+                inputs: vec![ContextInput(
+                    protocol::Seq::new(1).unwrap(),
+                    ContextValue::Presentation(metadata),
+                )],
+                inherited: Vec::new(),
+                edits: Vec::new(),
+            },
+            store,
+        )?;
+        self.registry = std::sync::Arc::downgrade(registry);
+        self.root = Some(root.clone());
+        Ok(root)
+    }
+}
+
+/// Presentation metadata is a separate edge, so history keeps its original projection scope.
+pub(crate) fn with_presentation(
+    image: ContextImage,
+    presentation: BlobRef,
+    store: &dyn BlobStore,
+) -> io::Result<ContextImage> {
+    Ok(ContextImage {
+        runner: image.runner,
+        publications: image.publications,
+        root: Some(write(
+            &ContextNode {
+                previous: image.root,
+                presentation: Some(presentation),
+                runner: image.runner,
+                inputs: Vec::new(),
+                inherited: Vec::new(),
+                edits: Vec::new(),
+            },
+            store,
+        )?),
+    })
+}
+
+pub(crate) fn presentation(image: &ContextImage, places: &Places) -> io::Result<protocol::Json> {
+    let root = image
+        .root
+        .as_ref()
+        .ok_or_else(|| io::Error::other("missing presentation cut"))?;
+    let node = read(root, places)?;
+    let metadata = node
+        .presentation
+        .ok_or_else(|| io::Error::other("missing presentation witness"))?;
+    read(&metadata, places)?
+        .inputs
+        .into_iter()
+        .find_map(|ContextInput(_, value)| {
+            if let ContextValue::Presentation(image) = value {
+                Some(image)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| io::Error::other("missing presentation witness"))
 }
 
 fn write(node: &ContextNode, store: &dyn BlobStore) -> io::Result<BlobRef> {
@@ -231,7 +337,7 @@ fn suffix_start(nodes: &[ContextNode], exchanges: u16) -> Option<protocol::Seq> 
         .filter_map(|ContextInput(seq, value)| match edits.at(*seq) {
             Some((from, Some(_))) if from == seq.get() => Some(*seq),
             None if matches!(value, ContextValue::User(_))
-                || matches!(value, ContextValue::Queued(..) if taken.contains(seq)) =>
+                || matches!(value, ContextValue::Queued(..) | ContextValue::Inbox(..) if taken.contains(seq)) =>
             {
                 Some(*seq)
             }
@@ -283,54 +389,18 @@ pub(crate) fn test_places() -> Places {
 }
 
 #[cfg(test)]
-pub(crate) fn test_image(layers: Vec<ContextLayer>) -> ContextImage {
+pub(crate) fn test_append(entries: &[Entry]) -> ContextImage {
+    test_append_chunks(entries, 1)
+}
+
+#[cfg(test)]
+pub(crate) fn test_append_chunks(entries: &[Entry], chunk: usize) -> ContextImage {
     TEST_STORE.with(|(_, store, _)| {
-        let mut cuts = BTreeMap::new();
-        for (scope, layer) in layers.into_iter().enumerate().rev() {
-            let mut node = ContextNode {
-                previous: None,
-                runner: layer.0,
-                inputs: layer.1,
-                inherited: Vec::new(),
-                edits: Vec::new(),
-            };
-            for ContextInput(_, value) in &mut node.inputs {
-                if let ContextValue::Inherited(child) = value {
-                    let at = node.inherited.len();
-                    node.inherited.push(cuts.get(child).cloned().unwrap());
-                    *child = at;
-                }
-            }
-            let mut publications = protocol::publication::Publications::default();
-            for ContextInput(seq, value) in &node.inputs {
-                let body = match value {
-                    ContextValue::Context(text, publication) => Body::Context {
-                        text: text.clone(),
-                        publication: publication.clone(),
-                    },
-                    ContextValue::Inherited(at) => Body::Spawned {
-                        intent: SpawnImage {
-                            runner: node.runner,
-                            authority: protocol::Json::null(),
-                            image: node.inherited[*at].clone(),
-                        }
-                        .to_json()
-                        .unwrap(),
-                    },
-                    _ => continue,
-                };
-                publications.apply(&Entry::new(*seq, protocol::Epoch(0), body));
-            }
-            cuts.insert(
-                scope,
-                ContextImage {
-                    runner: node.runner,
-                    root: Some(write(&node, &**store).unwrap()),
-                    publications,
-                },
-            );
-        }
-        cuts.remove(&0).unwrap_or_default()
+        entries
+            .chunks(chunk)
+            .fold(ContextImage::default(), |cut, entries| {
+                append(cut, entries.iter().cloned(), &**store).unwrap()
+            })
     })
 }
 
@@ -536,6 +606,214 @@ mod tests {
                 "the full projection still needs the removed ancestor"
             );
         });
+    }
+
+    #[test]
+    fn bounded_thread_history_reads_only_taken_inbox_exchanges() {
+        TEST_STORE.with(|(_, store, places)| {
+            let old = append(
+                ContextImage::default(),
+                [
+                    entry(
+                        1,
+                        Body::Spawned {
+                            intent: SpawnImage {
+                                runner: RunnerKind::ModelOnly,
+                                authority: Json::null(),
+                                image: ContextImage::default(),
+                            }
+                            .to_json()
+                            .unwrap(),
+                        },
+                    ),
+                    user(2, "unrequested ancestor"),
+                ],
+                &**store,
+            )
+            .unwrap();
+            let mut cut = old.clone();
+            let mut entries = Vec::new();
+            for seq in [3, 5, 7, 9] {
+                let turn =
+                    ext::Conversation::turn::<ext_title::Title>("test", format!("input {seq}"))
+                        .request(CallId::new(seq).unwrap());
+                let text = protocol::publication::ThreadInput {
+                    turn: turn.intent(None).unwrap(),
+                    context: ContextImage::default(),
+                }
+                .to_json()
+                .unwrap();
+                entries.extend([
+                    entry(
+                        seq,
+                        Body::Enqueue {
+                            envelope: protocol::Envelope::new(
+                                protocol::EnvelopeId {
+                                    sender: SessionId::new(),
+                                    call: CallId::new(seq).unwrap(),
+                                    purpose: "title".into(),
+                                },
+                                SessionId::NIL,
+                                protocol::Carried::Message(text.raw().into()),
+                                Vec::new(),
+                            )
+                            .unwrap(),
+                        },
+                    ),
+                    entry(
+                        seq + 1,
+                        Body::Take {
+                            input: protocol::Seq::new(seq).unwrap(),
+                            into: None,
+                        },
+                    ),
+                ]);
+            }
+            cut = append(cut, entries, &**store).unwrap();
+            let registry = Arc::new(ext::host::Registry::default());
+            let full = crate::transcript::Transcript::cut(&cut, registry.clone(), "", places, None)
+                .unwrap()
+                .into_messages();
+            let policy = llm::ContextPolicy {
+                exchanges: 1,
+                bytes: 4096,
+            };
+            let current = llm::Messages::from_iter([llm::Message::user("mandatory")]);
+            let expected = policy.assemble(&full, &[], &current).unwrap();
+            std::fs::remove_file(store.materialize(&old.root.unwrap().id).unwrap()).unwrap();
+            let recent = crate::transcript::Transcript::cut(
+                &cut,
+                registry,
+                "",
+                places,
+                Some(policy.exchanges),
+            )
+            .unwrap()
+            .into_messages();
+            assert_eq!(policy.assemble(&recent, &[], &current).unwrap(), expected);
+            assert!(expand(&cut, places).is_err());
+        });
+    }
+
+    #[test]
+    fn an_owner_cut_preserves_pending_provider_exchanges() {
+        TEST_STORE.with(|(_, store, places)| {
+            let reply = llm::Response {
+                message: llm::Assistant {
+                    content: vec![llm::AssistantPart::ToolCall(llm::ToolCall {
+                        id: "pending".into(),
+                        name: "read".into(),
+                        input: Json::encode(&serde_json::json!({})).unwrap(),
+                        invalid: None,
+                        provider_executed: false,
+                        meta: llm::Meta::new(),
+                    })],
+                    origin: None,
+                },
+                finish: llm::Finish::new(llm::Reason::ToolCalls, None),
+                usage: llm::Usage::default(),
+                id: None,
+                model: None,
+                meta: llm::Meta::new(),
+            };
+            let entries = [
+                user(1, "owner request"),
+                entry(
+                    2,
+                    Body::ModelResult {
+                        call: CallId::new(2).unwrap(),
+                        outcome: protocol::Outcome::Done {
+                            output: Json::encode(&reply).unwrap(),
+                        },
+                        r#for: None,
+                        failure: None,
+                    },
+                ),
+            ];
+            let registry = Arc::new(ext::host::Registry::default());
+            let expected =
+                crate::transcript::Transcript::placed(&entries, registry.clone(), "system", places)
+                    .unwrap()
+                    .into_messages();
+            assert!(expected.iter().any(|message| matches!(message,
+                llm::Message::Assistant(reply) if reply.tool_calls().any(|call| call.id == "pending"))));
+            let base = append(ContextImage::default(), entries, &**store).unwrap();
+            let metadata = Presentation::default().freeze(&registry, &**store).unwrap();
+            let cut = with_presentation(base, metadata, &**store).unwrap();
+            let actual =
+                crate::transcript::Transcript::cut(&cut, registry, "system", places, Some(2))
+                    .unwrap()
+                    .into_messages();
+            assert_eq!(actual, expected);
+        });
+    }
+
+    #[test]
+    fn an_admitted_side_cut_pins_its_presentation_before_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = Jsonl::open(dir.path().join("logs")).unwrap();
+        let store =
+            Arc::new(blob_files::Files::open(dir.path().join("blobs"), dir.path()).unwrap());
+        let tree = Arc::new(blob_files::CacheDir::new(
+            dir.path().join("tree"),
+            store.clone(),
+        ));
+        let places = Places::new(store.clone(), tree);
+        let registry = Arc::new(ext::host::Registry::default());
+        let metadata = Presentation::default().freeze(&registry, &*store).unwrap();
+        let cut = with_presentation(ContextImage::default(), metadata.clone(), &*store).unwrap();
+        let header = Header {
+            id: SessionId::new(),
+            workspace: dir.path().into(),
+            parent: None,
+        };
+        let mut loaded = logs.create(&header).unwrap();
+        loaded.append(user(1, "owner input").body).unwrap();
+        loaded
+            .append(Body::ModelCall {
+                model: "recorded".into(),
+                attempt: 0,
+                choice: protocol::ToolChoice::None,
+                r#for: CallId::new(1),
+                purpose: Some("side".into()),
+                request: Some(
+                    protocol::publication::ThreadImage {
+                        turn: Json::null(),
+                        authority: SpawnImage {
+                            runner: RunnerKind::ModelOnly,
+                            authority: Json::null(),
+                            image: cut.clone(),
+                        }
+                        .to_json()
+                        .unwrap(),
+                    }
+                    .to_json()
+                    .unwrap(),
+                ),
+            })
+            .unwrap();
+        drop(loaded);
+        let mut pending: Vec<_> = logs
+            .entries(header.id)
+            .unwrap()
+            .iter()
+            .flat_map(|entry| entry.body.blobs())
+            .collect();
+        let mut live = HashSet::new();
+        while let Some(protocol::Held::Blob(blob)) = pending.pop() {
+            if live.insert(blob.id) && blob.origin == BlobOrigin::Context {
+                pending.extend(read(&blob, &places).unwrap().blobs());
+            }
+        }
+        store.sweep(&|id| live.contains(id)).unwrap();
+        assert!(
+            store.materialize(&metadata.id).is_ok(),
+            "the witness must survive with no delivered child"
+        );
+        assert_eq!(
+            presentation(&cut, &places).unwrap(),
+            PresentationImage::of(&registry).unwrap()
+        );
     }
 
     #[test]

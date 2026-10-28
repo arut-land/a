@@ -938,6 +938,12 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             ),
         ),
         sample("entry_outbox", entry(1, Body::Outbox { envelope_id: envelope().id().clone(), recipients: vec![envelope().destination, SessionId(Uuid::from_u128(0xd))], payload: "hello".into() })),
+        sample("entry_thread_input", entry(1, Body::Enqueue { envelope: protocol::Envelope::new(
+            protocol::EnvelopeId { sender: SESSION, call: CallId::new(1).unwrap(), purpose: "example".into() },
+            SessionId(Uuid::from_u128(0xb)), protocol::Carried::Message(protocol::publication::ThreadInput {
+                turn: protocol::Json::null(), context: context_image(),
+            }.to_json().unwrap().raw().into()), context_image().root.into_iter().map(protocol::Held::Blob).collect(),
+        ).unwrap() })),
         sample("entry_enqueue", entry(1, Body::Enqueue { envelope: envelope() })),
         sample("entry_enqueue_detached", entry(19, Body::Enqueue { envelope: protocol::Envelope::own(SESSION, CallId::new(4).unwrap(), protocol::Carried::Detached(protocol::ToolOutcome::Interrupted { output: None })).holding(vec![protocol::Held::Blob(protocol::BlobRef { id: protocol::BlobId([0x0f; 32]), size: 9000, media_type: "text/plain".into(), origin: protocol::BlobOrigin::ToolOutput(CallId::new(4).unwrap()) })]) })),
         sample("entry_enqueue_own", entry(18, Body::Enqueue { envelope: protocol::Envelope::own(SESSION, CallId::new(16).unwrap(), protocol::Carried::Child(protocol::ToolOutcome::Interrupted { output: None })) })),

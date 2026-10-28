@@ -114,7 +114,7 @@ impl Actor {
         let first = (!side.is_ephemeral())
             .then(|| self.journal.index.thread(&identity.thread))
             .flatten();
-        let thread = if let Some(first) = first {
+        let mut thread = if let Some(first) = first {
             let Body::ModelCall {
                 request: Some(request),
                 ..
@@ -133,6 +133,23 @@ impl Actor {
                 authority: frozen.into_json().ok()?,
             }
         };
+        let mut authority = super::spawn::SpawnIntent::from_json(&thread.authority).ok()?;
+        authority.image = match side.context {
+            ext::Context::Owner | ext::Context::OwnerPrefix => {
+                let cut = self.context_cut(of.get() - 1).await.ok()?;
+                let session = Arc::clone(&self.live.session);
+                let registry = Arc::clone(&registry);
+                rt::unblock(&*self.live.session.shared.rt, move || {
+                    let presentation =
+                        lock(&session.presentation).freeze(&registry, &*session.shared.blobs)?;
+                    crate::context::with_presentation(cut, presentation, &*session.shared.blobs)
+                })
+                .await
+                .ok()?
+            }
+            ext::Context::Fresh => protocol::publication::ContextImage::default(),
+        };
+        thread.authority = authority.into_json().ok()?;
         let model = super::spawn::SpawnIntent::from_json(&thread.authority)
             .ok()?
             .model;
@@ -531,54 +548,8 @@ async fn ephemeral_turn(
     started: std::time::Instant,
     execution: &mut Option<Json>,
 ) -> Result<(Outcome, Option<Json>), llm::Error> {
-    let invalid = |e: String| llm::Error::new(llm::Kind::InvalidRequest, e);
     let mut side = side.clone();
-    let prepared = async {
-        let authority = super::spawn::SpawnIntent::from_json(&admitted.thread.authority)
-            .map_err(|e| invalid(e.to_string()))?;
-        if let Some(refusal) = authority.refusal {
-            return Err(invalid(format!("{refusal:?}")));
-        }
-        let child = registry
-            .select(ext::Inheritance::All, Some(authority.extensions.as_slice()))
-            .map_err(|e| invalid(e.to_string()))?;
-        let context = match side.context {
-            ext::Context::Owner | ext::Context::OwnerPrefix => {
-                let (shared, owner, through) =
-                    (Arc::clone(&session.shared), session.id, origin.id.get() - 1);
-                rt::unblock(&*session.shared.rt, move || {
-                    shared.owner_image(owner, through)
-                })
-                .await
-                .map_err(|e| invalid(e.to_string()))?
-            }
-            ext::Context::Fresh => llm::Messages::default(),
-        };
-        let system = child.system_prompt();
-        let current: llm::Messages = (!system.is_empty())
-            .then(|| llm::Message::system(system))
-            .into_iter()
-            .chain(side.messages.iter().cloned())
-            .collect();
-        let messages = match side.context {
-            ext::Context::OwnerPrefix => {
-                side.messages = current;
-                complete_prefix(context, &side.messages)
-            }
-            ext::Context::Fresh | ext::Context::Owner => side
-                .bounds()
-                .assemble(&[], &context, &current)
-                .map_err(invalid)?,
-        };
-        let model = authority.routing.and_then(|route| {
-            session
-                .shared
-                .models
-                .routed(&session.workspace, lock(&session.env).as_deref(), &route)
-        });
-        Ok((messages, model.map_err(invalid)))
-    };
-    let (messages, model) = match prepared.await {
+    let (messages, model) = match prepare_ephemeral(session, admitted, &mut side, registry).await {
         Ok(prepared) => prepared,
         Err(error) => return Ok(failed(&error)),
     };
@@ -627,6 +598,66 @@ async fn ephemeral_turn(
         Replied::Failed(error) => failed(&error),
         Replied::Interrupted(_) => (Outcome::Interrupted { output: None }, None),
     })
+}
+
+async fn prepare_ephemeral(
+    session: &Session,
+    admitted: &SideAdmitted,
+    side: &mut ext::ModelTurn,
+    registry: &Arc<ext::host::Registry>,
+) -> Result<(llm::Messages, Result<Model, llm::Error>), llm::Error> {
+    let invalid = |e: String| llm::Error::new(llm::Kind::InvalidRequest, e);
+    let authority = super::spawn::SpawnIntent::from_json(&admitted.thread.authority)
+        .map_err(|e| invalid(e.to_string()))?;
+    if let Some(refusal) = authority.refusal {
+        return Err(invalid(format!("{refusal:?}")));
+    }
+    let child = registry
+        .select(ext::Inheritance::All, Some(authority.extensions.as_slice()))
+        .map_err(|e| invalid(e.to_string()))?;
+    let context_mode = side.context;
+    let image = authority.image;
+    let registry = Arc::clone(registry);
+    let places = session.blobs.places();
+    let exchanges = (side.context != ext::Context::OwnerPrefix).then_some(side.bounds().exchanges);
+    let context = rt::unblock(&*session.shared.rt, move || {
+        if context_mode == ext::Context::Fresh {
+            return Ok(llm::Messages::default());
+        }
+        super::Transcript::cut(
+            &image,
+            Arc::clone(&registry),
+            registry.system_prompt(),
+            &places,
+            exchanges,
+        )
+        .map(super::Transcript::into_messages)
+    })
+    .await
+    .map_err(|e| invalid(e.to_string()))?;
+    let system = child.system_prompt();
+    let current: llm::Messages = (!system.is_empty())
+        .then(|| llm::Message::system(system))
+        .into_iter()
+        .chain(side.messages.iter().cloned())
+        .collect();
+    let messages = match side.context {
+        ext::Context::OwnerPrefix => {
+            side.messages = current;
+            complete_prefix(context, &side.messages)
+        }
+        ext::Context::Fresh | ext::Context::Owner => side
+            .bounds()
+            .assemble(&[], &context, &current)
+            .map_err(invalid)?,
+    };
+    let model = authority.routing.and_then(|route| {
+        session
+            .shared
+            .models
+            .routed(&session.workspace, lock(&session.env).as_deref(), &route)
+    });
+    Ok((messages, model.map_err(invalid)))
 }
 
 fn failed(error: &llm::Error) -> (Outcome, Option<Json>) {
@@ -681,6 +712,18 @@ pub(super) fn sided(
     (outcome, answer)
 }
 
+/// The input borrows its producer's presentation generation only while it is in flight.
+struct InputRegistry<'a> {
+    session: &'a Session,
+    input: protocol::EnvelopeId,
+}
+
+impl Drop for InputRegistry<'_> {
+    fn drop(&mut self) {
+        lock(&self.session.input_registries).remove(&self.input);
+    }
+}
+
 impl super::Daemon {
     async fn model_turn(
         &self,
@@ -710,8 +753,25 @@ impl super::Daemon {
                     call: call.get(),
                 }),
             };
+            let input = protocol::publication::ThreadInput {
+                turn: image.turn,
+                context: authority.image.clone(),
+            };
+            let held = input
+                .context
+                .root
+                .iter()
+                .cloned()
+                .map(protocol::Held::Blob)
+                .collect();
+            let mut spawned = authority;
+            spawned.image = protocol::publication::ContextImage::default();
             let live = self
-                .owned_conversation(header, image.authority, Some(Arc::clone(registry)))
+                .owned_conversation(
+                    header,
+                    spawned.into_json().map_err(std::io::Error::other)?,
+                    Some(Arc::clone(registry)),
+                )
                 .await?;
             if let Some(env) = lock(&owner.env).clone() {
                 live.set_env(env)?;
@@ -719,12 +779,17 @@ impl super::Daemon {
             if cancel.is_set() {
                 return Ok((Outcome::Interrupted { output: None }, None));
             }
+            lock(&live.session.input_registries).insert(id.clone(), Arc::clone(registry));
+            let _registry = InputRegistry {
+                session: &live.session,
+                input: id.clone(),
+            };
             live.exchange(
                 protocol::Envelope::new(
                     id,
                     live.id,
-                    Carried::Message(image.turn.raw().into()),
-                    Vec::new(),
+                    Carried::Message(input.to_json().map_err(std::io::Error::other)?.raw().into()),
+                    held,
                 )
                 .map_err(std::io::Error::other)?,
                 cancel,
@@ -733,6 +798,38 @@ impl super::Daemon {
         }
         .await;
         result.map_err(|error: std::io::Error| llm::Error::new(llm::Kind::Other, error.to_string()))
+    }
+}
+
+impl Session {
+    pub(super) async fn thread_context(
+        self: &Arc<Self>,
+        key: &protocol::EnvelopeId,
+        context: protocol::publication::ContextImage,
+        exchanges: Option<u16>,
+    ) -> std::io::Result<llm::Messages> {
+        let registry = lock(&self.input_registries).get(key).cloned();
+        let owner = key.sender;
+        let session = Arc::clone(self);
+        rt::unblock(&*self.shared.rt, move || {
+            let shared = &session.shared;
+            let places =
+                ext::blob::Blobs::new(Arc::clone(&shared.blobs), Arc::clone(&shared.tree), owner)
+                    .places();
+            let registry = match registry {
+                Some(registry) => registry,
+                None => shared.presentation_registry(&session.workspace, &context, &places)?,
+            };
+            super::Transcript::cut(
+                &context,
+                Arc::clone(&registry),
+                registry.system_prompt(),
+                &places,
+                exchanges,
+            )
+            .map(super::Transcript::into_messages)
+        })
+        .await
     }
 }
 
@@ -747,22 +844,30 @@ impl Actor {
         if let Body::Take { input, .. } = entry.body {
             entry = self.indexed_entry(input).await.map_err(|e| e.to_string())?;
         }
-        let (text, keyed) = match &entry.body {
+        let (text, key) = match &entry.body {
             Body::Enqueue { envelope } => match envelope.payload() {
-                Carried::Message(text) => (text.clone(), true),
+                Carried::Message(text) => (text.clone(), Some(envelope.id().clone())),
                 _ => return Err("model-only turn has no admitted input".into()),
             },
-            Body::Input { segments, .. } => (segments.text(), false),
+            Body::Input { segments, .. } => (segments.text(), None),
             _ => return Err("model-only turn has no admitted input".into()),
         };
         let text = text.as_str();
-        let (mut turn, prefix) = keyed
-            .then(|| ext::ModelTurn::from_intent(text).ok())
-            .flatten()
+        let frozen = key.as_ref().and_then(|_| {
+            let json = serde_json::from_str::<Json>(text).ok()?;
+            let image = protocol::publication::ThreadInput::from_json(&json).ok()?;
+            let (turn, prefix) = ext::ModelTurn::from_intent(image.turn.raw()).ok()?;
+            Some((turn, image.context, prefix))
+        });
+        let (mut turn, context, prefix) = frozen
             .or_else(|| {
                 let spawn = lock(&self.live.session.spawn);
                 let spawn = spawn.as_ref()?;
-                Some((ext::ModelTurn::typed(&spawn.request, call, text)?, None))
+                Some((
+                    ext::ModelTurn::typed(&spawn.request, call, text)?,
+                    protocol::publication::ContextImage::default(),
+                    None,
+                ))
             })
             .ok_or("model-only turn has no admitted authority")?;
         let policy = lock(&self.live.session.spawn)
@@ -776,14 +881,16 @@ impl Actor {
                 .await
                 .map_err(|e| e.to_string())?,
         };
-        let context = if let Some(seq) = prefix {
-            let parent = self.live.parent.ok_or("model-only context has no owner")?;
-            let shared = Arc::clone(&self.live.session.shared);
-            rt::unblock(&*self.live.session.shared.rt, move || {
-                shared.owner_image(parent.session, seq.get() - 1)
-            })
-            .await
-            .map_err(|e| e.to_string())?
+        let context = if let (Some(key), Some(_)) = (key.as_ref(), prefix) {
+            self.live
+                .session
+                .thread_context(
+                    key,
+                    context,
+                    (turn.context != ext::Context::OwnerPrefix).then_some(policy.exchanges),
+                )
+                .await
+                .map_err(|e| e.to_string())?
         } else {
             llm::Messages::default()
         };

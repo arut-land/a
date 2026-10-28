@@ -309,37 +309,7 @@ impl Actor {
                     "prefix is not committed in the owning conversation".into(),
                 ));
             } else {
-                let session = Arc::clone(&self.live.session);
-                let frames = Arc::clone(&self.live.frames);
-                let pending: Vec<_> = self.pending_entries().collect();
-                let result = rt::unblock(&*self.live.session.shared.rt, move || {
-                    #[cfg(test)]
-                    crate::context::register_test_places(session.blobs.places());
-                    let mut cuts = lock(&session.context_cuts);
-                    let (through, previous) = cuts.before(seq.get());
-                    if through == seq.get() {
-                        return Ok(previous);
-                    }
-                    let mut entries = Vec::new();
-                    'committed: for batch in frames.batches_after(through) {
-                        for entry in batch? {
-                            if entry.seq > seq {
-                                break 'committed;
-                            }
-                            entries.push(entry);
-                        }
-                    }
-                    let committed = entries.last().map_or(through, |entry| entry.seq.get());
-                    entries.extend(
-                        pending
-                            .into_iter()
-                            .filter(|entry| entry.seq.get() > committed && entry.seq <= seq),
-                    );
-                    let image = crate::context::append(previous, entries, &*session.shared.blobs)?;
-                    cuts.insert(seq.get(), image.clone());
-                    io::Result::Ok(image)
-                })
-                .await;
+                let result = self.context_cut(seq.get()).await;
                 match result {
                     Ok(cut) => image = cut,
                     Err(error) => refusal = Some(SpawnRefusal::Unavailable(error.to_string())),
@@ -441,22 +411,8 @@ impl ext::Conversations for CallPorts {
 
 impl Live {
     pub(crate) fn pending_child(&self, child: SessionId) -> bool {
-        let mut watch = None;
-        let Ok(entries) = self.frames.entries() else {
-            return false;
-        };
-        for entry in entries {
-            match entry.body {
-                Body::Watch { child: watched } if watched == child => watch = Some(entry.seq),
-                Body::Fired { watch: fired, .. } | Body::Unwatch { watch: fired }
-                    if Some(fired) == watch =>
-                {
-                    return false;
-                }
-                _ => {}
-            }
-        }
-        watch.is_some()
+        self.child_owners()
+            .is_ok_and(|owners| owners.pending(child))
     }
 
     pub(crate) fn bound(self: Arc<Self>, budget: ext::Budget) {

@@ -1,9 +1,9 @@
 use super::*;
 use protocol::{Epoch, Json, Mode, SessionId};
-fn spawn_image(image: Vec<ContextLayer>) -> Json {
+fn spawn_image(image: protocol::publication::ContextImage) -> Json {
     let intent = crate::tests::spawn_intent(1, "");
     let mut intent = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
-    intent.image = crate::context::test_image(image);
+    intent.image = image;
     intent.into_json().unwrap()
 }
 
@@ -21,7 +21,7 @@ fn a_prefix_preserves_on_stop_context() {
     )];
     let registry = Arc::new(Registry::default());
     let expected = Transcript::of(&entries, registry.clone(), "").into_context();
-    let image = context_image(&entries);
+    let image = crate::context::test_append(&entries);
     let intent = spawn_image(image);
     let actual = Transcript::of([entry(1, Body::Spawned { intent })], registry, "").into_messages();
     assert_eq!(actual, expected);
@@ -86,9 +86,10 @@ fn a_prefix_projects_edits_and_publications_without_executable_ownership() {
             },
         ),
     ];
-    let image = context_image(&entries);
+    let image = crate::context::test_append(&entries);
     assert!(
-        image
+        crate::context::expand(&image, &crate::context::test_places())
+            .unwrap()
             .iter()
             .flat_map(|ContextLayer(_, inputs)| inputs)
             .all(|input| !matches!(input.1, ContextValue::ToolCall(..)))
@@ -173,7 +174,7 @@ fn pending_exchanges_never_become_child_work() {
             force: false,
         },
     ));
-    let image = context_image(&entries);
+    let image = crate::context::test_append(&entries);
     let intent = spawn_image(image);
     let child = [entry(
         1,
@@ -282,7 +283,7 @@ fn normalized_context_equals_recursive_projection() {
         },
     )];
     for depth in 0..12 {
-        let intent = spawn_image(context_image(&entries));
+        let intent = spawn_image(crate::context::test_append(&entries));
         entries = vec![
             entry(1, Body::Spawned { intent }),
             entry(
@@ -326,9 +327,10 @@ fn normalized_context_equals_recursive_projection() {
             Transcript::of(&entries, registry.clone(), "").into_context(),
             expected
         );
-        let image = context_image(&entries);
+        let image = crate::context::test_append(&entries);
         assert!(
-            image
+            crate::context::expand(&image, &crate::context::test_places())
+                .unwrap()
                 .iter()
                 .flat_map(|ContextLayer(_, inputs)| inputs)
                 .all(|input| !matches!(&input.1, ContextValue::Assistant(text) if text.is_empty()))
@@ -406,7 +408,7 @@ fn provider_state_and_publication_identity_survive_normalization() {
         entries = vec![entry(
             1,
             Body::Spawned {
-                intent: spawn_image(context_image(&entries)),
+                intent: spawn_image(crate::context::test_append(&entries)),
             },
         )];
         let messages = Transcript::of(&entries, Arc::new(Registry::default()), "").into_context();
@@ -431,7 +433,7 @@ fn provider_state_and_publication_identity_survive_normalization() {
     let child = [entry(
         1,
         Body::Spawned {
-            intent: spawn_image(context_image(&entries)),
+            intent: spawn_image(crate::context::test_append(&entries)),
         },
     )];
     assert!(
@@ -439,6 +441,171 @@ fn provider_state_and_publication_identity_survive_normalization() {
             .publications()
             .is_empty()
     );
+}
+
+#[test]
+fn incremental_graph_cuts_preserve_provider_bytes_across_segment_edits() {
+    use llm::protocols::{chat, gemini, messages, responses};
+
+    let url = "http://127.0.0.1:9";
+    let cases = [
+        (
+            llm::Provider::new(
+                "deepseek",
+                url,
+                llm::Auth::None,
+                chat::Chat::new(chat::HOSTS[0].1),
+            ),
+            "deepseek/reasoning_matrix/text_streamed.yaml",
+        ),
+        (
+            llm::Provider::new(
+                "anthropic",
+                url,
+                llm::Auth::None,
+                messages::Messages::new(messages::HOSTS[0].1),
+            ),
+            "anthropic/raw_stream_capture_matrix/terminal_raw_round_trips_for_thinking_stream.yaml",
+        ),
+        (
+            llm::Provider::new(
+                "openai",
+                url,
+                llm::Auth::None,
+                responses::Responses::new(responses::HOSTS[0].1),
+            ),
+            "openai/gpt_5_6_reasoning/streaming_metadata.yaml",
+        ),
+        (
+            llm::Provider::new(
+                "gemini",
+                url,
+                llm::Auth::None,
+                gemini::Gemini::new(gemini::HOSTS[0].1),
+            ),
+            "gemini/history_survival_matrix/streaming.yaml",
+        ),
+    ];
+    for (provider, cassette) in cases {
+        let response = recorded_response(&provider, cassette);
+        let entries = [
+            entry(
+                1,
+                Body::Input {
+                    segments: "original".into(),
+                    mode: Mode::Queue,
+                    taken: true,
+                    origin: None,
+                    force: false,
+                },
+            ),
+            response_entry(2, &response),
+            entry(
+                3,
+                Body::Assistant {
+                    text: "removed in a later segment".into(),
+                },
+            ),
+            response_entry(4, &response),
+            edit_entry(5, 1, None, Some("edited across the result boundary")),
+            edit_entry(6, 3, None, None),
+            entry(
+                7,
+                Body::Context {
+                    text: "published context".into(),
+                    publication: None,
+                },
+            ),
+            edit_entry(8, 1, Some(3), Some("latest overlapping edit")),
+        ];
+        for end in 1..=entries.len() {
+            let registry = Arc::new(Registry::default());
+            let direct = Transcript::of(&entries[..end], registry.clone(), "").into_context();
+            for chunk in [1, 2, end] {
+                let cut = crate::context::test_append_chunks(&entries[..end], chunk);
+                let projected = Transcript::cut(
+                    &cut,
+                    Arc::clone(&registry),
+                    "",
+                    &crate::context::test_places(),
+                    None,
+                )
+                .unwrap()
+                .into_context();
+                assert_eq!(projected, direct, "{cassette} prefix {end}");
+                assert_eq!(
+                    provider_bytes(&provider, projected),
+                    provider_bytes(&provider, direct.clone()),
+                    "{cassette} prefix {end}"
+                );
+            }
+        }
+    }
+}
+
+fn provider_bytes(provider: &llm::Provider, messages: Messages) -> Vec<u8> {
+    let mut request = llm::Request {
+        model: "recorded".into(),
+        messages: messages.into(),
+        ..llm::Request::default()
+    };
+    request.generation.max_output_tokens = std::num::NonZeroU32::new(64);
+    provider
+        .request("recorded", &request)
+        .unwrap()
+        .body()
+        .to_vec()
+}
+
+fn recorded_response(provider: &llm::Provider, cassette: &str) -> llm::Response {
+    struct Recorded(String);
+    impl llm::http::Http for Recorded {
+        fn send(
+            &self,
+            _: http::Request<llm::http::Payload>,
+        ) -> llm::http::BoxFuture<'static, io::Result<llm::http::Response>> {
+            let response = http::Response::builder()
+                .status(200)
+                .body(llm::http::body([self.0.clone().into_bytes()]))
+                .unwrap();
+            Box::pin(std::future::ready(Ok(response)))
+        }
+    }
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/rig/cassettes")
+            .join(cassette),
+    )
+    .unwrap();
+    let doc: serde_yaml_ng::Value = serde::Deserialize::deserialize(
+        serde_yaml_ng::Deserializer::from_str(&text).next().unwrap(),
+    )
+    .unwrap();
+    rt::block_on(llm::generate(
+        &Recorded(doc["then"]["body"].as_str().unwrap().into()),
+        provider,
+        &llm::Request {
+            model: "recorded".into(),
+            generation: llm::Generation {
+                max_output_tokens: std::num::NonZeroU32::new(64),
+                ..llm::Generation::default()
+            },
+            messages: vec![Message::user("fixture")].into(),
+            ..llm::Request::default()
+        },
+    ))
+    .unwrap()
+}
+
+fn edit_entry(seq: u64, target: u64, upto: Option<u64>, replace: Option<&str>) -> Entry {
+    entry(
+        seq,
+        Body::Edit {
+            target: Seq::new(target).unwrap(),
+            upto: upto.map(|seq| Seq::new(seq).unwrap()),
+            replace: replace.map(|text| Json::encode(text).unwrap()),
+        },
+    )
 }
 
 fn response_entry(seq: u64, response: &llm::Response) -> Entry {
@@ -513,7 +680,7 @@ fn identical_local_sequences_and_provider_ids_remain_in_their_scopes() {
         let mut child = vec![entry(
             1,
             Body::Spawned {
-                intent: spawn_image(context_image(&entries)),
+                intent: spawn_image(crate::context::test_append(&entries)),
             },
         )];
         child.extend(exchange(text));
@@ -523,7 +690,8 @@ fn identical_local_sequences_and_provider_ids_remain_in_their_scopes() {
         assert_eq!(actual, expected);
         entries = child;
     }
-    let image = context_image(&entries);
+    let image = crate::context::test_append(&entries);
+    let image = crate::context::expand(&image, &crate::context::test_places()).unwrap();
     assert_eq!(image.len(), 3);
     assert_eq!(
         image
@@ -581,7 +749,7 @@ fn model_only_inputs_keep_their_interpretation_across_agent_scopes() {
         Transcript::of(&entries, registry.clone(), "").into_context(),
         expected
     );
-    let mut image = context_image(&entries);
+    let mut image = crate::context::test_append(&entries);
     for _ in 0..3 {
         let child = entry(
             1,
@@ -596,7 +764,7 @@ fn model_only_inputs_keep_their_interpretation_across_agent_scopes() {
             Transcript::of([&child], registry.clone(), "").into_context(),
             expected
         );
-        image = context_image(std::slice::from_ref(&child));
+        image = crate::context::test_append(std::slice::from_ref(&child));
     }
 }
 
@@ -613,13 +781,13 @@ fn batch_replay_preserves_inherited_layers_and_latest_overlapping_edits() {
             parent: None,
         })
         .unwrap();
-    let ancestor = context_image(&[entry(
+    let ancestor = crate::context::test_append(&[entry(
         1,
         Body::Assistant {
             text: "ancestor".into(),
         },
     )]);
-    let parent = context_image(&[
+    let parent = crate::context::test_append(&[
         entry(
             1,
             Body::Spawned {
@@ -803,11 +971,16 @@ fn measure_reconstruction(pipeline: Reconstruction) {
         elapsed += start.elapsed();
         sampled_peak = sampled_peak.max(resident_kib());
         let start = Instant::now();
-        let image = context_image(&entries);
+        let image = crate::context::test_append(&entries);
         elapsed += start.elapsed();
         sampled_peak = sampled_peak.max(resident_kib());
         let start = Instant::now();
-        let transcript = project(image, Arc::clone(&registry), "", &Places::default());
+        let transcript = project(
+            crate::context::expand(&image, &crate::context::test_places()).unwrap(),
+            Arc::clone(&registry),
+            "",
+            &Places::default(),
+        );
         elapsed += start.elapsed();
         sampled_peak = sampled_peak.max(resident_kib());
         transcript

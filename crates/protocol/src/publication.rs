@@ -39,6 +39,7 @@ pub struct ContextImage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextNode {
     pub previous: Option<BlobRef>,
+    pub presentation: Option<BlobRef>,
     pub runner: RunnerKind,
     pub inputs: Vec<ContextInput>,
     pub inherited: Vec<ContextImage>,
@@ -80,6 +81,7 @@ pub enum ContextValue {
     /// An unprojected position can still be the anchor of a later edit.
     Position,
     Inherited(usize),
+    Presentation(Json),
     User(String),
     /// Input waiting to be taken up, as it was given: how a model reads
     /// it depends on who takes it.
@@ -123,6 +125,7 @@ impl ContextValue {
             Self::Job(_, _, held) => found.extend(held.iter().cloned()),
             Self::Position
             | Self::Inherited(_)
+            | Self::Presentation(_)
             | Self::User(_)
             | Self::Inbox(..)
             | Self::Taken(_)
@@ -143,6 +146,7 @@ impl ContextNode {
     pub fn blobs(&self) -> Vec<crate::Held> {
         self.previous
             .iter()
+            .chain(self.presentation.iter())
             .chain(
                 self.inherited
                     .iter()
@@ -164,6 +168,23 @@ impl ContextNode {
 pub struct ThreadImage {
     pub turn: Json,
     pub authority: Json,
+}
+
+/// One side input names its frozen owner cut; thread authority is admitted separately.
+pub struct ThreadInput {
+    pub turn: Json,
+    pub context: ContextImage,
+}
+
+impl ThreadInput {
+    pub fn from_json(json: &Json) -> serde_json::Result<Self> {
+        let (turn, context) = json.parse()?;
+        Ok(Self { turn, context })
+    }
+
+    pub fn to_json(&self) -> serde_json::Result<Json> {
+        Json::encode(&(&self.turn, &self.context))
+    }
 }
 
 impl ThreadImage {

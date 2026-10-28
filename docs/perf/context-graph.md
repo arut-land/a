@@ -7,7 +7,7 @@ admission/spawn facts retain graph roots; a collector follows node references.
 The protocol/view envelope still carries effective publication identities, and
 execution authority remains private to each session. No dependency was added.
 
-This is a **partial performance acceptance**. The former turn-64 frame failure
+**Performance acceptance remains incomplete.** The former turn-64 frame failure
 is fixed, and link-image duplication is removed. Late-turn CPU is substantially
 lower but still rises. Proposal #2, forkable prepared encoded prefixes, was not
 started because the owner's condition requires #1 to be green first. Client
@@ -66,11 +66,12 @@ The baseline reproduced a stream closure on turn 64; its generated link at
 seq 2152 has a 16,932,256-byte stored line. The 16 MiB frame ceiling remains
 unchanged. No inherited input was truncated to pass the case.
 
-The late CPU gate remains incomplete. `Shared::owner_image` still reads/folds
-the owner log before a per-input side request selects its small context.
-A new fork also reconstructs/prepares its inherited messages. Whole-session
-process counters do not isolate those costs from necessary wire transmission.
-No numerical saving from the unimplemented prepared-prefix proposal is claimed.
+At the initial review, the late CPU gate remained incomplete:
+`Shared::owner_image` read/folded the owner log before selecting small side
+context, and new forks reconstructed/prepared their inherited messages. The
+review revision below removes the repeated live owner-log scans. Process
+counters still include complete-context encoding and transmission; no saving
+from the unimplemented prepared-prefix proposal is claimed.
 
 ## Verification and scope
 
@@ -102,3 +103,81 @@ hashes and compressed stopped-home archives are retained outside the worktree:
 Only `accepted-*` samples enter the figures. The full phase-1 report includes
 RSS, live consumer CPU/memory, attach/fold spreads, lifecycle states and detailed
 allocation attribution. Earlier diagnostic runs are excluded.
+
+## Independent-review revision
+
+Per-input owner side context now freezes a graph cut and reads its requested
+exchange suffix directly. Admission extends only new local log entries;
+`Shared::owner_image` and its repeated owner-log fold are removed. Taken inbox
+messages delimit thread exchanges, so their bounded history also stops at its
+requested suffix. Full-context forks and compaction retain their full context
+contract. No history or feature is capped.
+
+Live inputs borrow the exact producer presentation registry until settlement
+or cancellation. A typed immutable presentation edge stores its source manifest
+and selected registrations for cold replay without the owner log. That edge
+does not introduce an inherited history scope: pending assistant tool calls
+remain intact. It grants no child execution authority. Child ownership queries
+also advance an incremental fact projection instead of rescanning old replies.
+
+Projection tests now construct all cuts through production `context::append`.
+Recorded Chat, Responses, Messages and Gemini request bytes are compared with
+direct replay at every prefix, across single-entry and multi-entry appends,
+model-result boundaries and overlapping cross-segment edits. Additional real
+file-store tests cover bounded inbox reads, cold owner presentation recovery,
+pending provider calls, incremental child ownership and admission-only graph
+retention. The previous test-only context normalizer and layer writer are gone.
+
+This revision changes PROTO 38 → 39. The corpus and view vectors were generated
+by their tests; v38 remains immutable. No compatibility path or dependency was
+added. The review comparison uses `bf01db76` as its before arm, rather than the
+pre-graph baseline in the historical tables above.
+
+
+The repeated review matrix uses the same workload and release build settings,
+three interleaved before/after runs per scale. Only `measured-*` cases enter
+these new figures. Values are median [minimum–maximum], n=3; CPU is daemon
+user+kernel milliseconds per root turn. The slope is an ordinary least-squares
+fit over rounds 9–32, not an isolated codec benchmark. Residency is after
+construction and before rendering clients attach.
+
+| Roots ×32 | Arm | First 4 CPU ms/turn | Last 4 CPU ms/turn | CPU slope 9–32 ms/depth | Live malloc MiB | RSS MiB | Physical footprint MiB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | before | 78.21 [76.55–105.46] | 365.91 [365.53–420.74] | 10.40 [9.92–11.92] | 219.79 [219.62–220.46] | 303.16 [296.97–318.88] | 295.19 [288.99–310.92] |
+| 1 | after | 92.62 [70.55–92.91] | 117.41 [116.16–130.77] | 1.57 [0.42–1.74] | 221.35 [220.70–221.59] | 243.98 [243.64–245.06] | 236.00 [235.67–237.08] |
+| 4 | before | 83.29 [82.34–97.93] | 405.67 [401.33–506.93] | 11.55 [11.46–13.64] | 866.44 [864.27–868.41] | 933.20 [919.61–935.55] | 859.89 [843.58–860.85] |
+| 4 | after | 77.11 [76.10–97.71] | 150.22 [147.01–203.78] | 2.76 [2.64–4.02] | 874.62 [869.81–875.75] | 956.84 [937.97–961.95] | 949.35 [930.45–954.47] |
+| 8 | before | 87.70 [87.19–108.27] | 484.45 [466.43–518.15] | 14.54 [10.78–16.54] | 1723.87 [1721.55–1727.84] | 1942.84 [1930.11–1948.94] | 1896.69 [1879.60–1905.22] |
+| 8 | after | 83.67 [80.65–84.75] | 187.48 [182.88–242.89] | 3.87 [3.82–6.50] | 1730.15 [1729.05–1737.26] | 1884.59 [1871.70–1887.30] | 1834.00 [1830.64–1841.19] |
+
+Late CPU is substantially lower, but every after-arm slope remains positive.
+The required flat end-to-end CPU gate is **unmet**; no owner waiver was received.
+Full-context fork request traffic remains 0.323 MiB/turn in the first four turns
+and 5.128 MiB/turn in the last four, in both arms (sum of fork-role request
+bytes per root turn). The bounded cursor does not cap those requests. A separate
+20-second native sampling diagnostic observes graph projection, provider
+encoding and durability work; it does not isolate all remaining CPU by role.
+Proposal #2 remains unstarted, pending #1 acceptance.
+
+Live heap is slightly higher in this revision, and physical footprint does not
+improve uniformly across scales. New cut and child-ownership indexes retain
+metadata; this measurement is not an exclusive heap attribution. Reachable
+graph storage also increases because per-input side cuts and thread history
+now have durable roots. The complete report includes those bytes and client,
+detach, attach/fold and cold-recovery tables. The first three after archives were
+revalidated with presentation-edge traversal; this corrects attribution only,
+without changing runtime samples.
+
+All three 64-turn cases completed an additional live turn and a fresh-daemon
+reattach with matching hashes: 65 turns and 520 tool calls each, all done.
+Across the 21 matrix/acceptance cases, 2,769 root turns and 22,152 tool calls
+completed. The separate sampling diagnostic is excluded from these counts.
+All 491 engine/protocol tests passed (15 skipped), along with fmt, package
+check, clippy with warnings denied and the Windows workspace cross-lint.
+Rustdoc retains its pre-existing private-link warning. The earlier detached
+cancellation assertion did not recur, so no unrelated cancellation fix is claimed.
+
+The phase-1 review report and complete evidence are in the scratch directory
+above: `context-graph.review.report.md`, `measured-summary.json`,
+`measured-traffic.json`, `review-provenance.json`, and `review-completion.json`.
+No CI was dispatched. This revision is for re-review; the CPU gate is still open.

@@ -99,7 +99,7 @@ fn a_side_call_dies_with_its_call() {
     until(&session, "asked aside", |log| !sides(log).is_empty());
     http.wait_sent(2);
     let child = session
-        .1
+        .daemon
         .loaded()
         .into_iter()
         .find(|live| live.parent.is_some_and(|p| p.session == session.id))
@@ -464,7 +464,7 @@ fn an_ephemeral_turn_writes_no_child_log_and_still_reuses_its_key() {
     settle(&session);
     let log = log_of(&session);
     let children = session
-        .1
+        .daemon
         .loaded()
         .into_iter()
         .filter(|live| live.parent.is_some_and(|p| p.session == session.id))
@@ -611,7 +611,7 @@ fn ambiguous_recovery_never_re_spends() {
     http.wait_sent(1);
     let prefix = log_of(&session);
     let child = session
-        .1
+        .daemon
         .loaded()
         .into_iter()
         .find(|live| live.parent.is_some_and(|p| p.session == session.id))
@@ -707,7 +707,7 @@ fn retry_policy_applies_to_side_calls_without_reentering_compaction() {
     session.halt();
     assert_eq!(http.sent(), 2);
     let executor = session
-        .1
+        .daemon
         .loaded()
         .into_iter()
         .find(|live| live.parent.is_some_and(|p| p.session == session.id))
@@ -1138,7 +1138,11 @@ fn compacted_forks_keep_loaded_skills_in_context_and_background_results_out() {
     let slot = fixture.2.new_slot(header.clone()).unwrap();
     let session = Live::start(&header, &fixture.0, Open::Create, Owner::None).unwrap();
     fixture.2.started(&slot, Ok(Arc::clone(&session))).unwrap();
-    let session = TestingLive(session, Arc::clone(&fixture.2));
+    let session = TestingLive {
+        live: session,
+        daemon: Arc::clone(&fixture.2),
+        _scratch: Arc::clone(&fixture.3),
+    };
     let load = |session: &Arc<Live>, expected: &str| {
         session.submit("/review").unwrap();
         settle(session);
@@ -1629,7 +1633,7 @@ fn cancelled_queued_turns_never_reappear_after_restart() {
     session.submit("background").unwrap();
     http.wait_sent(1);
     let child = session
-        .1
+        .daemon
         .loaded()
         .into_iter()
         .find(|live| live.parent.is_some_and(|p| p.session == session.id))
@@ -1743,7 +1747,7 @@ fn recovered_side_inbox_never_spends_an_abandoned_turn() {
     http.wait_sent(1);
     let parent_prefix = log_of(&session);
     let child = session
-        .1
+        .daemon
         .loaded()
         .into_iter()
         .find(|live| live.parent.is_some_and(|p| p.session == session.id))
@@ -1913,6 +1917,106 @@ impl Extension for OwnerOnlyText {
             "owner transcript instruction",
         ));
     }
+}
+
+struct OwnerPresentation;
+impl Extension for OwnerPresentation {
+    const NAME: &'static str = "owner-presentation";
+    const VERSION: u32 = 1;
+    const INHERIT: bool = false;
+    fn contribute(&self, r: &mut Registrar) {
+        r.on::<point::PresentResult>(|(), _| {
+            Rewrite::Replace(ext::Presented {
+                output: llm::Output::Text("owner-only tool presentation".into()),
+                error: false,
+            })
+        });
+    }
+}
+
+#[test]
+fn bounded_owner_context_keeps_presentations_excluded_from_the_thread() {
+    let http = Flaky::new(
+        cassette("openai/streaming_grammar/tool_then_followup_text.yaml")
+            .into_iter()
+            .map(Reply::Events),
+    );
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::default()
+        .with(&Harbor)
+        .unwrap()
+        .with(&ext_title::Title)
+        .unwrap()
+        .with(&OwnerPresentation)
+        .unwrap()
+        .with(&TitleHistory(Arc::clone(&captured)))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::on(
+        Arc::new(crate::store::Jsonl::open(dir.path()).unwrap()),
+        ext::LOOP,
+        registry,
+        Models {
+            http: Arc::clone(&http) as Arc<dyn Http>,
+            ..openai(&Script::new(&[]))
+        },
+    );
+    let session = fixture.start(&[]);
+    session.submit("Call the tool, then answer.").unwrap();
+    settle(&session);
+    session.submit("/title after the tool").unwrap();
+    settle(&session);
+    let shown = format!("{:?}", lock(&captured).last().unwrap());
+    assert!(shown.contains("owner-only tool presentation"), "{shown}");
+    let contexts = fixture
+        .2
+        .loaded()
+        .iter()
+        .map(|live| lock(&live.session.input_registries).len())
+        .sum::<usize>();
+    assert_eq!(
+        contexts, 0,
+        "settled inputs release their producer generations"
+    );
+    let thread = fixture
+        .2
+        .loaded()
+        .into_iter()
+        .find(|live| {
+            live.parent
+                .is_some_and(|parent| parent.session == session.id)
+                && live.session.model_only()
+        })
+        .unwrap();
+    let (key, input) = log_of(&thread)
+        .iter()
+        .rev()
+        .find_map(|entry| {
+            if let Body::Enqueue { envelope } = &entry.body
+                && let protocol::Carried::Message(text) = envelope.payload()
+            {
+                let input = protocol::publication::ThreadInput::from_json(
+                    &serde_json::from_str::<Json>(text).unwrap(),
+                )
+                .unwrap();
+                Some((envelope.id().clone(), input))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let (_, prefix) = ext::ModelTurn::from_intent(input.turn.raw()).unwrap();
+    session.halt();
+    std::fs::remove_file(dir.path().join(session.id.to_string()).join("log.jsonl")).unwrap();
+    assert!(fixture.0.store.prefix(session.id, 1).is_err());
+    assert!(prefix.is_some());
+    let cold = rt::block_on(thread.session.thread_context(&key, input.context, Some(2))).unwrap();
+    assert!(
+        Json::encode(&cold)
+            .unwrap()
+            .raw()
+            .contains("owner-only tool presentation")
+    );
 }
 
 #[test]
@@ -2274,7 +2378,7 @@ fn metrics_queries_read_owned_attempts_from_committed_prefixes() {
     settle(&session);
     session.halt();
     let executor = session
-        .1
+        .daemon
         .loaded()
         .into_iter()
         .find(|live| live.parent.is_some_and(|p| p.session == session.id))
@@ -2457,7 +2561,7 @@ fn compaction_summarises_inherited_context_with_local_edit_precedence() {
         entry(2, echo("inherited answer")),
     ];
     let mut intent = spawn::SpawnIntent::from_json(&crate::tests::spawn_intent(1, "")).unwrap();
-    intent.image = crate::context::test_image(crate::transcript::context_image(&inherited));
+    intent.image = crate::context::test_append(&inherited);
     intent.settings = ext::Checkpoint::default();
     let entries = [
         entry(

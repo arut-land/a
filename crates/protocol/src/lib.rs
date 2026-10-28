@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The exact protocol this build speaks.
-pub const PROTO: u32 = 38;
+pub const PROTO: u32 = 39;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -557,6 +557,17 @@ impl Body {
     pub fn blobs(&self) -> Vec<Held> {
         let mut found = Vec::new();
         match self {
+            Self::ModelCall {
+                request: Some(request),
+                ..
+            } => {
+                if let Ok(thread) = publication::ThreadImage::from_json(request)
+                    && let Ok(spawn) = publication::SpawnImage::from_json(&thread.authority)
+                    && let Some(root) = spawn.image.root
+                {
+                    found.push(Held::Blob(root));
+                }
+            }
             Self::ToolResult { outcome, held, .. } => {
                 found.extend(held.iter().cloned());
                 outcome_blob(outcome, &mut found);

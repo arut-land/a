@@ -6,34 +6,38 @@ use super::{
 };
 
 impl super::Shared {
-    pub(super) fn owner_image(
+    pub(super) fn presentation_registry(
         &self,
-        owner: super::SessionId,
-        through: u64,
-    ) -> io::Result<llm::Messages> {
-        let header = self
-            .catalog
-            .get(owner)
-            .ok_or_else(|| io::Error::other("missing context owner"))?
-            .header;
-        let entries = self.store.prefix(owner, through)?;
-        let source = self.source(&header.workspace)?;
-        let installed = entries.iter().rev().find_map(|e| match &e.body {
-            Body::Extensions { installed } => Some(installed.as_slice()),
-            _ => None,
-        });
-        let current = super::recorded_registry(self, source.as_ref(), installed)?;
-        let registry = if header.parent.is_some() {
-            super::spawn::restore(&header, self, super::Open::Load, source.as_ref(), current)?.0
+        workspace: &std::path::Path,
+        cut: &protocol::publication::ContextImage,
+        places: &ext::blob::Places,
+    ) -> io::Result<Arc<ext::host::Registry>> {
+        let image: crate::context::PresentationImage = crate::context::presentation(cut, places)?
+            .parse()
+            .map_err(io::Error::other)?;
+        let source = self.source(workspace)?;
+        let registry = super::recorded_registry(self, source.as_ref(), Some(&image.installed))?;
+        let registry = if registry
+            .extensions()
+            .map(|(name, _)| name)
+            .eq(image.extensions.iter().map(String::as_str))
+        {
+            registry
         } else {
-            current
+            Arc::new(
+                registry
+                    .select(ext::Inheritance::All, Some(&image.extensions))
+                    .map_err(io::Error::other)?,
+            )
         };
-        let system = registry.system_prompt();
-        // Named and read as the owner's own transcript does: a payload its
-        // log holds as a blob is read back from the store.
-        let blobs = ext::blob::Blobs::new(Arc::clone(&self.blobs), Arc::clone(&self.tree), owner);
-        let places = blobs.places();
-        Ok(Transcript::placed(&entries, Arc::clone(&registry), system, &places)?.into_messages())
+        if !registry
+            .extensions()
+            .map(|(name, _)| name)
+            .eq(image.extensions.iter().map(String::as_str))
+        {
+            return Err(io::Error::other("frozen presentation registrations differ"));
+        }
+        Ok(registry)
     }
 }
 
@@ -316,7 +320,7 @@ impl Actor {
                 .as_mut()
                 .is_some_and(|transcript| {
                     transcript.through() + 1 == e.seq.get()
-                        && (matches!(e.body, Body::Link { .. }) || e.body.blobs().is_empty())
+                        && (e.body.blobs().iter().all(|held| matches!(held, protocol::Held::Blob(blob) if blob.origin == protocol::BlobOrigin::Context)))
                         && !transcript.apply(e, replied.map(|(_, m)| m))
                 })
             {
@@ -468,20 +472,49 @@ impl Actor {
         call: CallId,
         exchanges: u16,
     ) -> io::Result<llm::Messages> {
-        let restore = history_reader(
-            Arc::clone(&self.live.frames),
-            &self.registry,
-            self.pending_entries().collect(),
-            self.live.session.blobs.places(),
-            self.live.session.model_only(),
-            HistoryCut {
-                through: self.journal.ordered_seq,
-                call,
-                exchanges: Some(exchanges),
-            },
-        );
+        let cut = self.context_cut(call.get() - 1).await?;
+        let registry = Arc::clone(&self.registry);
+        let places = self.live.session.blobs.places();
         rt::unblock(&*self.live.session.shared.rt, move || {
-            restore().map_err(io::Error::other)
+            Transcript::cut(&cut, registry, "", &places, Some(exchanges))
+                .map(Transcript::into_messages)
+        })
+        .await
+    }
+
+    pub(super) async fn context_cut(
+        &mut self,
+        through: u64,
+    ) -> io::Result<protocol::publication::ContextImage> {
+        let session = Arc::clone(&self.live.session);
+        let frames = Arc::clone(&self.live.frames);
+        let pending: Vec<_> = self.pending_entries().collect();
+        rt::unblock(&*self.live.session.shared.rt, move || {
+            #[cfg(test)]
+            crate::context::register_test_places(session.blobs.places());
+            let mut cuts = lock(&session.context_cuts);
+            let (after, previous) = cuts.before(through);
+            if after == through {
+                return Ok(previous);
+            }
+            let mut entries = Vec::new();
+            'committed: for batch in frames.batches_after(after) {
+                for entry in batch? {
+                    if entry.seq.get() > through {
+                        break 'committed;
+                    }
+                    entries.push(entry);
+                }
+            }
+            let committed = entries.last().map_or(after, |entry| entry.seq.get());
+            entries.extend(
+                pending
+                    .into_iter()
+                    .filter(|entry| entry.seq.get() > committed && entry.seq.get() <= through),
+            );
+            let image = crate::context::append(previous, entries, &*session.shared.blobs)?;
+            cuts.insert(through, image.clone());
+            Ok(image)
         })
         .await
     }

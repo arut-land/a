@@ -14,6 +14,7 @@ fn malformed_cut_edges_and_positions_are_rejected_before_projection() {
     ] {
         let node = ContextNode {
             previous: None,
+            presentation: None,
             runner: RunnerKind::Agent,
             inputs,
             inherited: Vec::new(),

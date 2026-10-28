@@ -243,24 +243,28 @@ struct Fixture(
     Arc<tempfile::TempDir>,
 );
 
-struct TestingLive(Arc<Live>, Arc<Daemon>);
+struct TestingLive {
+    live: Arc<Live>,
+    daemon: Arc<Daemon>,
+    _scratch: Arc<tempfile::TempDir>,
+}
 impl std::ops::Deref for TestingLive {
     type Target = Arc<Live>;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.live
     }
 }
 impl TestingLive {
     fn halt(&self) {
-        self.0.halt();
-        self.1.wait("owned admissions drained", PATIENCE, || {
-            self.1.slots().iter().all(|slot| {
-                slot.header.parent.is_none_or(|p| p.session != self.0.id)
+        self.live.halt();
+        self.daemon.wait("owned admissions drained", PATIENCE, || {
+            self.daemon.slots().iter().all(|slot| {
+                slot.header.parent.is_none_or(|p| p.session != self.live.id)
                     || !matches!(*lock(&slot.residency), crate::Residency::Loading { .. })
             })
         });
-        for live in self.1.loaded() {
-            if live.parent.is_some_and(|p| p.session == self.0.id) {
+        for live in self.daemon.loaded() {
+            if live.parent.is_some_and(|p| p.session == self.live.id) {
                 live.halt();
             }
         }
@@ -401,7 +405,11 @@ impl Fixture {
         let slot = self.2.new_slot(header.clone()).unwrap();
         let live = Live::start(&header, &self.0, Open::Create, Owner::None).unwrap();
         let live = self.2.started(&slot, Ok(live)).unwrap();
-        TestingLive(live, Arc::clone(&self.2))
+        TestingLive {
+            live,
+            daemon: Arc::clone(&self.2),
+            _scratch: Arc::clone(&self.3),
+        }
     }
 
     /// A session whose log holds `entries`, started as after a crash, once
@@ -424,7 +432,11 @@ impl Fixture {
         let slot = self.2.new_slot(header.clone()).unwrap();
         let live = Live::start(&header, &self.0, Open::Load, Owner::None).unwrap();
         let live = self.2.started(&slot, Ok(live)).unwrap();
-        TestingLive(live, Arc::clone(&self.2))
+        TestingLive {
+            live,
+            daemon: Arc::clone(&self.2),
+            _scratch: Arc::clone(&self.3),
+        }
     }
 }
 
@@ -903,6 +915,75 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
         )),
         "{log:#?}"
     );
+}
+
+#[test]
+fn child_ownership_queries_never_reread_a_settled_prefix() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::on(
+        Arc::new(crate::store::Jsonl::open(dir.path()).unwrap()),
+        ext_fixtures::ECHO,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.start(&[entry(
+        1,
+        Body::Assistant {
+            text: "settled prefix".repeat(1024),
+        },
+    )]);
+    let child = Header {
+        id: SessionId::new(),
+        workspace: dir.path().into(),
+        parent: Some(Parent {
+            session: session.id,
+            call: 1,
+        }),
+    };
+    assert!(matches!(fixture.0.owner(&child).unwrap(), Owner::Present));
+    let path = dir.path().join(session.id.to_string()).join("log.jsonl");
+    let bytes = std::fs::read(&path).unwrap();
+    let at = bytes.iter().position(|b| *b == b'\n').unwrap() + 1;
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.seek(SeekFrom::Start(at as u64)).unwrap();
+    file.write_all(b"!").unwrap();
+    assert!(
+        session.frames.entries().is_err(),
+        "the settled source is unavailable"
+    );
+    let answer = fixture.0.owner(&child);
+    let pending = session.pending_child(child.id);
+    file.seek(SeekFrom::Start(at as u64)).unwrap();
+    file.write_all(&bytes[at..=at]).unwrap();
+    assert!(matches!(answer.unwrap(), Owner::Present));
+    assert!(!pending);
+    session.halt();
+}
+
+#[test]
+fn a_terminal_watch_never_becomes_a_pending_admission_again() {
+    let child = SessionId::new();
+    for terminal in [
+        Body::Fired {
+            watch: Seq::new(1).unwrap(),
+            outcome: Outcome::Interrupted { output: None },
+        },
+        Body::Unwatch {
+            watch: Seq::new(1).unwrap(),
+        },
+    ] {
+        let mut owners = ChildOwners::default();
+        for entry in [
+            entry(1, Body::Watch { child }),
+            entry(2, terminal),
+            entry(3, Body::Watch { child }),
+        ] {
+            owners.apply(&entry);
+        }
+        assert!(!owners.pending(child));
+    }
 }
 
 #[test]
@@ -3286,10 +3367,11 @@ fn loaded_sessions_warm_the_index_and_created_sessions_wait_for_the_first_reply(
             Open::Create
         };
         let live = Live::start(&header, &fixture.0, mode, Owner::None).unwrap();
-        let session = TestingLive(
-            fixture.2.started(&slot, Ok(live)).unwrap(),
-            Arc::clone(&fixture.2),
-        );
+        let session = TestingLive {
+            live: fixture.2.started(&slot, Ok(live)).unwrap(),
+            daemon: Arc::clone(&fixture.2),
+            _scratch: Arc::clone(&fixture.3),
+        };
         settle(&session);
         let registry = fixture.0.registry.get();
         let indexes = registry.service::<ext_index::Indexes>().unwrap();

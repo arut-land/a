@@ -292,6 +292,7 @@ impl Transcript {
     /// text, a user's message, or are left out; the latest edit of an
     /// entry is what stands. References are named, and payloads held as
     /// blobs read, through `places`.
+    #[cfg(test)]
     pub fn placed(
         entries: &[Entry],
         registry: Arc<Registry>,
@@ -309,6 +310,20 @@ impl Transcript {
             system,
             places,
         )
+    }
+
+    pub(super) fn cut(
+        image: &protocol::publication::ContextImage,
+        registry: Arc<Registry>,
+        system: &str,
+        places: &Places,
+        exchanges: Option<u16>,
+    ) -> io::Result<Self> {
+        let layers = match exchanges {
+            Some(exchanges) => crate::context::expand_bounded(image, places, exchanges)?,
+            None => crate::context::expand(image, places)?,
+        };
+        Ok(project(layers, registry, system, places))
     }
 
     /// Replays a stable history twice, retaining edits and background call identities between passes.
@@ -474,11 +489,29 @@ impl Transcript {
                 Some(waiting) if self.model_only => {
                     // As the side-thread runner reads it: what was given,
                     // untagged.
-                    let text = match waiting {
-                        Waiting::Input(segments, _) => segments.text(),
-                        Waiting::Inbox(_, text) | Waiting::Own(text) => text,
+                    let (text, turn) = match waiting {
+                        Waiting::Input(segments, _) => {
+                            let text = segments.text();
+                            let turn = ext::ModelTurn::from_intent(&text)
+                                .ok()
+                                .map(|(turn, _)| turn);
+                            (text, turn)
+                        }
+                        Waiting::Inbox(_, text) => {
+                            let turn = serde_json::from_str::<protocol::Json>(&text)
+                                .ok()
+                                .and_then(|json| {
+                                    protocol::publication::ThreadInput::from_json(&json).ok()
+                                })
+                                .and_then(|input| {
+                                    ext::ModelTurn::from_intent(input.turn.raw()).ok()
+                                })
+                                .map(|(turn, _)| turn);
+                            (text, turn)
+                        }
+                        Waiting::Own(text) => (text, None),
                     };
-                    if let Ok((turn, _)) = ext::ModelTurn::from_intent(&text) {
+                    if let Some(turn) = turn {
                         for message in turn.messages.iter() {
                             self.messages.push(message.clone());
                         }
@@ -529,7 +562,9 @@ impl Transcript {
             ContextValue::ToolResult(call, outcome, held) => {
                 return self.answer(seq, call, &outcome, &held);
             }
-            ContextValue::Inherited(_) | ContextValue::Position => return,
+            ContextValue::Presentation(_) | ContextValue::Inherited(_) | ContextValue::Position => {
+                return;
+            }
         };
         self.messages.push(message);
         self.last = seq.get();
@@ -852,72 +887,6 @@ impl Edits {
         let (from, _, text) = &self.edits[*index];
         Some((*from, text))
     }
-}
-
-/// Edits stay in their owning layer; only inherited anchors are rebased.
-#[cfg(test)]
-pub(crate) fn context_image(entries: &[Entry]) -> Vec<ContextLayer> {
-    let edits = Edits::new(entries.iter().filter_map(context_edit).collect());
-    let completed = entries
-        .iter()
-        .filter_map(|e| match &e.body {
-            Body::ToolResult { call, .. } => Some(call.0),
-            Body::Take { input, .. } => Some(*input),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let mut image = vec![ContextLayer::default()];
-    for e in entries {
-        let value = if let Some((from, text)) = edits.at(e.seq) {
-            if from != e.seq.get() {
-                continue;
-            }
-            let Some(text) = text else {
-                continue;
-            };
-            ContextValue::User(text.clone())
-        } else if let Body::Spawned { intent } = &e.body {
-            let Ok(spawn) = protocol::publication::SpawnImage::from_json(intent) else {
-                continue;
-            };
-            image[0].0 = spawn.runner;
-            let mut inherited =
-                crate::context::expand(&spawn.image, &crate::context::test_places()).unwrap();
-            let offset = image.len();
-            if inherited.is_empty() {
-                image.push(ContextLayer::default());
-            } else {
-                for ContextLayer(_, inputs) in &mut inherited {
-                    for ContextInput(_, value) in inputs {
-                        if let ContextValue::Inherited(scope) = value {
-                            *scope += offset;
-                        }
-                    }
-                }
-                image.extend(inherited);
-            }
-            ContextValue::Inherited(offset)
-        } else {
-            let Some(value) = context_fact(&e.body) else {
-                continue;
-            };
-            if matches!(
-                value,
-                ContextValue::ToolCall(..)
-                    | ContextValue::Queued(..)
-                    | ContextValue::Inbox(..)
-                    | ContextValue::Child(_)
-                    | ContextValue::Background(..)
-                    | ContextValue::Job(..)
-            ) && !completed.contains(&e.seq)
-            {
-                continue;
-            }
-            value
-        };
-        image[0].1.push(ContextInput(e.seq, value));
-    }
-    image
 }
 
 fn project(

@@ -463,7 +463,15 @@ fn detached_completion_keeps_metadata_until_the_remaining_job_ends() {
     assert!(replay.streams.is_empty());
     assert!(replay.jobs.is_empty());
     assert_eq!(
-        project(context_image(&entries), registry, "", &Places::default()).into_messages(),
+        Transcript::cut(
+            &crate::context::test_append(&entries),
+            registry,
+            "",
+            &Places::default(),
+            None
+        )
+        .unwrap()
+        .into_messages(),
         messages
     );
 }
@@ -543,7 +551,15 @@ fn background_jobs_keep_their_name_without_publishing_a_stream() {
         messages
     );
     assert_eq!(
-        project(context_image(&entries), registry, "", &Places::default()).into_messages(),
+        Transcript::cut(
+            &crate::context::test_append(&entries),
+            registry,
+            "",
+            &Places::default(),
+            None
+        )
+        .unwrap()
+        .into_messages(),
         messages
     );
 }
