@@ -293,8 +293,10 @@ mod native {
 /// caller's existing format limit, not a residency limit.
 #[derive(Debug)]
 pub struct TransientBuffer {
+    // Keep the initialized scratch high-water mark across reads and cancellation.
     heap: Vec<u8>,
     start: usize,
+    end: usize,
     pages: Option<Box<PageBuffer>>,
     storage: Storage,
     maximum: usize,
@@ -309,7 +311,7 @@ enum Storage {
 
 // Native discard and refault costs differ; see docs/perf/frame-buffers.md.
 #[cfg(target_vendor = "apple")]
-const PAGE_THRESHOLD: usize = 256 << 10;
+const PAGE_THRESHOLD: usize = 2 << 20;
 #[cfg(target_os = "linux")]
 const PAGE_THRESHOLD: usize = 4 << 20;
 #[cfg(windows)]
@@ -320,6 +322,7 @@ impl TransientBuffer {
         Self {
             heap: Vec::new(),
             start: 0,
+            end: 0,
             pages: None,
             storage: Storage::Heap,
             maximum,
@@ -354,10 +357,12 @@ impl TransientBuffer {
             self.pages = Some(Box::new(PageBuffer::new(self.maximum)?));
         }
         let pages = self.pages.as_deref_mut().expect("reservation created");
-        pages.prepare(self.heap.len() - self.start)?;
-        pages.as_mut().copy_from_slice(&self.heap[self.start..]);
-        self.heap.clear();
+        pages.prepare(self.end - self.start)?;
+        pages
+            .as_mut()
+            .copy_from_slice(&self.heap[self.start..self.end]);
         self.start = 0;
+        self.end = 0;
         self.storage = Storage::Pages;
         Ok(())
     }
@@ -370,7 +375,11 @@ impl TransientBuffer {
         match self.storage {
             Storage::Heap => {
                 self.compact();
-                self.heap.extend_from_slice(bytes);
+                if end > self.heap.len() {
+                    self.heap.resize(end, 0);
+                }
+                self.heap[self.end..end].copy_from_slice(bytes);
+                self.end = end;
             }
             Storage::Pages => {
                 let pages = self.pages.as_deref_mut().expect("active mapping");
@@ -387,7 +396,7 @@ impl TransientBuffer {
             self.utf8 = len == 0;
         }
         match self.storage {
-            Storage::Heap => self.heap.truncate(self.start + self.len().min(len)),
+            Storage::Heap => self.end = self.start + self.len().min(len),
             Storage::Pages => self
                 .pages
                 .as_deref_mut()
@@ -400,7 +409,7 @@ impl TransientBuffer {
     pub fn clear(&mut self) -> io::Result<()> {
         self.utf8 = true;
         self.start = 0;
-        self.heap.clear();
+        self.end = 0;
         if self.storage == Storage::Pages {
             self.discard_pages()?;
         }
@@ -421,7 +430,11 @@ impl TransientBuffer {
                 let pages = self.pages.as_deref_mut().expect("active mapping");
                 let remaining = pages.len() - len;
                 if remaining <= PAGE_THRESHOLD {
-                    self.heap.extend_from_slice(&pages.as_ref()[len..]);
+                    if remaining > self.heap.len() {
+                        self.heap.resize(remaining, 0);
+                    }
+                    self.heap[..remaining].copy_from_slice(&pages.as_ref()[len..]);
+                    self.end = remaining;
                     self.discard_pages()?;
                 } else {
                     pages.as_mut().copy_within(len.., 0);
@@ -475,7 +488,10 @@ impl TransientBuffer {
         match self.storage {
             Storage::Heap => {
                 self.compact();
-                self.heap.resize(kept + len, 0);
+                if kept + len > self.heap.len() {
+                    self.heap.resize(kept + len, 0);
+                }
+                self.end = kept + len;
             }
             Storage::Pages => self
                 .pages
@@ -500,7 +516,8 @@ impl TransientBuffer {
     #[inline]
     fn compact(&mut self) {
         if self.start != 0 {
-            self.heap.drain(..self.start);
+            self.heap.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
             self.start = 0;
         }
     }
@@ -509,7 +526,7 @@ impl AsRef<[u8]> for TransientBuffer {
     #[inline]
     fn as_ref(&self) -> &[u8] {
         match self.storage {
-            Storage::Heap => &self.heap[self.start..],
+            Storage::Heap => &self.heap[self.start..self.end],
             Storage::Pages => self.pages.as_deref().expect("active mapping").as_ref(),
         }
     }
@@ -519,7 +536,7 @@ impl AsMut<[u8]> for TransientBuffer {
     fn as_mut(&mut self) -> &mut [u8] {
         self.utf8 = false;
         match self.storage {
-            Storage::Heap => &mut self.heap[self.start..],
+            Storage::Heap => &mut self.heap[self.start..self.end],
             Storage::Pages => self.pages.as_deref_mut().expect("active mapping").as_mut(),
         }
     }
@@ -555,6 +572,7 @@ pub struct ReadBuffer<'a> {
 }
 impl ReadBuffer<'_> {
     pub fn filled(mut self, len: usize) {
+        self.buffer.utf8 = false;
         self.kept += len;
     }
 }
@@ -717,6 +735,35 @@ mod tests {
         bytes.consume(12).unwrap();
         bytes.extend_from_slice(b"next").unwrap();
         assert_eq!(bytes.as_ref(), b"next");
+    }
+
+    #[test]
+    fn small_read_scratch_stays_initialized_between_reads() {
+        let mut bytes = TransientBuffer::new(64 << 10);
+        let mut read = bytes.read_buffer(8192).unwrap();
+        read.as_mut().fill(0xa5);
+        read.filled(8192);
+        bytes.clear().unwrap();
+        assert!(bytes.is_empty());
+        {
+            let mut cancelled = bytes.read_buffer(8192).unwrap();
+            assert!(cancelled.as_mut().iter().all(|&b| b == 0xa5));
+            cancelled.as_mut().fill(0x71);
+        }
+        assert!(bytes.is_empty());
+        let mut read = bytes.read_buffer(8192).unwrap();
+        assert!(read.as_mut().iter().all(|&b| b == 0x71));
+        read.filled(3);
+        assert_eq!(bytes.as_ref(), &[0x71; 3]);
+    }
+
+    #[test]
+    fn committing_read_scratch_cannot_preserve_a_text_guarantee() {
+        let mut bytes = TransientBuffer::new(8192);
+        bytes.extend_from_slice(&[0xff]).unwrap();
+        bytes.clear().unwrap();
+        bytes.read_buffer(1).unwrap().filled(1);
+        assert!(bytes.as_str().is_err());
     }
 
     #[test]

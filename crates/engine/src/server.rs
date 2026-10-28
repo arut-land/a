@@ -149,7 +149,7 @@ impl Frames {
             let n = self
                 .io
                 .read_with(|mut s| {
-                    let mut read = self.buf.read_buffer(16 << 10)?;
+                    let mut read = self.buf.read_buffer(WRITE_BATCH)?;
                     let n = s.read(read.as_mut())?;
                     read.filled(n);
                     Ok(n)
@@ -849,7 +849,7 @@ mod tests {
             Some(ClientMsg::Detach)
         ));
         assert!(
-            frames.buf.capacity() <= 16 << 10,
+            frames.buf.capacity() <= WRITE_BATCH,
             "read scratch was retained"
         );
         let writer = std::thread::spawn(move || {
@@ -871,7 +871,7 @@ mod tests {
         let peer = writer.join().unwrap();
         assert!(frames.buf.is_empty(), "completed frame retained input");
         assert!(
-            frames.buf.capacity() <= 16 << 10,
+            frames.buf.capacity() <= WRITE_BATCH,
             "completed frame retained heap storage"
         );
         frames.batch = 0;

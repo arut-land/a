@@ -104,7 +104,7 @@ pub trait Stream: Send + Sync {
     ) -> BoxFuture<'a, io::Result<bool>> {
         Box::pin(async move {
             while buffered.needs_more()? {
-                let mut read = buffered.read_buffer(8192)?;
+                let mut read = buffered.read_buffer(64 << 10)?;
                 let n = self.read(read.as_mut()).await?;
                 read.filled(n);
                 if n == 0 {
@@ -154,7 +154,7 @@ where
     ) -> BoxFuture<'a, io::Result<bool>> {
         Box::pin(self.read.read_with(move |mut io| {
             while buffered.needs_more()? {
-                let mut read = buffered.read_buffer(8192)?;
+                let mut read = buffered.read_buffer(64 << 10)?;
                 let n = io.read(read.as_mut())?;
                 read.filled(n);
                 if n == 0 {

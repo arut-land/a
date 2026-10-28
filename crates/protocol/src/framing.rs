@@ -21,7 +21,7 @@ impl Default for FrameReader {
 impl FrameReader {
     pub const fn new() -> Self {
         Self {
-            buffered: sys::TransientBuffer::new(crate::MAX_FRAME as usize + 4 + (16 << 10)),
+            buffered: sys::TransientBuffer::new(crate::MAX_FRAME as usize + 4 + (64 << 10)),
             end: None,
         }
     }
@@ -141,6 +141,36 @@ mod tests {
             ));
             assert!(reader.is_empty());
         }
+    }
+
+    #[test]
+    fn a_maximum_frame_keeps_room_for_the_next_read_batch() {
+        use std::io::Read;
+
+        let large = Frame::new(&DaemonMsg::Error {
+            message: "x".repeat(crate::MAX_FRAME as usize - 128),
+        })
+        .unwrap();
+        let split = large.as_bytes().len() - 1;
+        let mut reader = FrameReader::new();
+        reader
+            .extend_from_slice(&large.as_bytes()[..split])
+            .unwrap();
+        assert!(reader.decode::<DaemonMsg>().unwrap().is_none());
+        let mut remaining = large.as_bytes()[split..].to_vec();
+        ClientMsg::Detach.write_frame(&mut remaining).unwrap();
+        let mut read = reader.read_buffer(64 << 10).unwrap();
+        let n = remaining.as_slice().read(read.as_mut()).unwrap();
+        read.filled(n);
+        assert!(matches!(
+            reader.decode().unwrap(),
+            Some((_, DaemonMsg::Error { .. }))
+        ));
+        assert!(matches!(
+            reader.decode().unwrap(),
+            Some((_, ClientMsg::Detach))
+        ));
+        assert!(reader.is_empty());
     }
 
     #[test]
