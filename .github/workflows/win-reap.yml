@@ -1,4 +1,5 @@
 name: win-reap diagnostics
+run-name: windows retirement verification on merged main
 on:
   push:
     branches: [win-reap]
@@ -42,7 +43,8 @@ jobs:
             git show "e02028221a76049595e74828425d95f900433602:crates/sys/src/$file" | Set-Content "crates/sys/src/$file" -Encoding utf8NoBOM
           }
           foreach ($profile in @('release', 'dev')) {
-            $flags = if ($profile -eq 'release') { @('--release') } else { @() }
+            $flags = @()
+            if ($profile -eq 'release') { $flags = @('--release') }
             cargo test @flags -p engine --lib --no-run --message-format=json | Set-Content "$env:RUNNER_TEMP/before-$profile.jsonl"
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
             $records = Get-Content "$env:RUNNER_TEMP/before-$profile.jsonl" | ForEach-Object { $_ | ConvertFrom-Json }
@@ -53,7 +55,8 @@ jobs:
           cargo clippy -p sys -p engine -p ext-shell --all-targets -- -D warnings
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           foreach ($profile in @('release', 'dev')) {
-            $flags = if ($profile -eq 'release') { @('--release') } else { @() }
+            $flags = @()
+            if ($profile -eq 'release') { $flags = @('--release') }
             cargo test @flags -p engine -p sys --lib --no-run --message-format=json | Set-Content "$env:RUNNER_TEMP/after-$profile.jsonl"
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
           }

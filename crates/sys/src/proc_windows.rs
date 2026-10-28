@@ -45,7 +45,9 @@ impl Job {
     pub(super) fn into_handle(self) -> OwnedHandle {
         self.handle
     }
+}
 
+impl AsRawHandle for Job {
     fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
         self.handle.as_raw_handle()
     }
