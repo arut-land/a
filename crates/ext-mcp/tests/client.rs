@@ -401,7 +401,7 @@ struct DiscoveryPeer {
 
 impl DiscoveryPeer {
     fn new(mode: &'static str) -> Self {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -420,24 +420,7 @@ impl DiscoveryPeer {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
-                let mut head = Vec::new();
-                while !head.ends_with(b"\r\n\r\n") {
-                    let mut byte = [0];
-                    stream.read_exact(&mut byte).unwrap();
-                    head.push(byte[0]);
-                }
-                let length = std::str::from_utf8(&head)
-                    .unwrap()
-                    .lines()
-                    .find_map(|line| {
-                        let (key, value) = line.split_once(':')?;
-                        key.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap();
-                let mut body = vec![0; length];
-                stream.read_exact(&mut body).unwrap();
-                let request: Value = serde_json::from_slice(&body).unwrap();
+                let request = Self::read_request(&mut stream);
                 recorded.lock().unwrap().push(request.clone());
                 let is_list = request["method"] == "tools/list";
                 let mut result = if is_list {
@@ -445,17 +428,29 @@ impl DiscoveryPeer {
                     let page = request["params"]["cursor"].as_str().unwrap_or("first");
                     let mut value = json!({"resultType":"complete","cacheScope":"private","ttlMs":300_000,"tools":[{"name":if page == "first" {"echo"} else {"second"},"description":format!("list {lists}"),"inputSchema":{"type":"object"}}]});
                     match mode {
-                        "missing" => {
+                        "missing" | "cold-missing" => {
                             value.as_object_mut().unwrap().remove("ttlMs");
                         }
-                        "zero" => value["ttlMs"] = json!(0),
+                        "zero" | "cold-zero" => value["ttlMs"] = json!(0),
                         "expired" => value["ttlMs"] = json!(1),
-                        "pages" => {
+                        "pages" | "cold-pages" => {
                             if page == "first" {
                                 value["ttlMs"] = json!(1);
                                 value["nextCursor"] = json!("second");
                             } else {
                                 std::thread::sleep(Duration::from_millis(10));
+                            }
+                        }
+                        "cursor-once" | "cursor-always" => {
+                            if page == "first" {
+                                value["tools"][0]["name"] = json!(if lists == 1 {
+                                    "discarded"
+                                } else {
+                                    "fresh-first"
+                                });
+                                value["nextCursor"] = json!("second");
+                            } else {
+                                value["tools"][0]["name"] = json!("fresh-second");
                             }
                         }
                         "mrtr" if lists == 1 => {
@@ -464,7 +459,7 @@ impl DiscoveryPeer {
                         _ => {}
                     }
                     // Concurrent cold readers must overlap a real pending HTTP request.
-                    if mode == "single-flight" {
+                    if mode == "single-flight" || mode.starts_with("cold-") {
                         std::thread::sleep(Duration::from_millis(100));
                     }
                     value
@@ -474,7 +469,13 @@ impl DiscoveryPeer {
                 if !is_list {
                     result["tool"] = request["params"]["name"].clone();
                 }
-                let response = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                let response = if request["params"]["cursor"].is_string()
+                    && (mode == "cursor-always" || (mode == "cursor-once" && lists == 2))
+                {
+                    json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32602,"message":"invalid cursor"}})
+                } else {
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                };
                 let (content_type, body) = if (mode == "notification" && !is_list)
                     || (mode == "notification-during-list" && is_list)
                 {
@@ -497,6 +498,28 @@ impl DiscoveryPeer {
             stop,
             thread: Some(thread),
         }
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Value {
+        use std::io::Read;
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let length = std::str::from_utf8(&head)
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 
     fn rig(&self) -> Rig {
@@ -658,6 +681,77 @@ fn changing_a_sessions_launch_environment_selects_a_distinct_instance() {
     assert_eq!(
         effects.lines().filter(|l| l.starts_with("start ")).count(),
         2
+    );
+    finish(rig);
+}
+
+#[test]
+fn overlapping_cold_consumers_never_reuse_an_uncacheable_list() {
+    for mode in ["cold-missing", "cold-zero", "cold-pages"] {
+        let peer = DiscoveryPeer::new(mode);
+        let rig = std::sync::Arc::new(peer.rig());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let rig = std::sync::Arc::clone(&rig);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = rig.done("mcp_list", &json!({"server":"fixture"}));
+                    result["ok"][0]["description"].as_str().unwrap().to_owned()
+                })
+            })
+            .collect();
+        let snapshots: std::collections::BTreeSet<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            snapshots.len(),
+            8,
+            "{mode}: each consumer must receive its own changing response"
+        );
+        assert_eq!(
+            peer.lists(),
+            if mode == "cold-pages" { 16 } else { 8 },
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn invalid_cursors_discard_partial_discovery_and_restart_with_a_bounded_budget() {
+    let peer = DiscoveryPeer::new("cursor-once");
+    let rig = peer.rig();
+    let result = rig.done("mcp_list", &json!({"server":"fixture"}));
+    assert_eq!(result["ok"][0]["name"], "fresh-first", "{result}");
+    assert_eq!(result["ok"][1]["name"], "fresh-second");
+    assert_eq!(peer.lists(), 4);
+    assert_eq!(rig.done("mcp_list", &json!({"server":"fixture"})), result);
+    assert_eq!(peer.lists(), 4);
+    let peer = DiscoveryPeer::new("cursor-always");
+    let rig = peer.rig();
+    assert_eq!(
+        rig.done("mcp_list", &json!({"server":"fixture"}))["failed"],
+        "limit"
+    );
+    assert_eq!(peer.lists(), 64);
+}
+
+#[test]
+fn stdio_cursor_restarts_never_publish_or_cache_the_discarded_pages() {
+    let rig = rig("review-restart", Duration::from_secs(10));
+    let result = rig.done("mcp_list", &json!({"server":"fixture"}));
+    assert_eq!(result["ok"][0]["name"], "fresh-first", "{result}");
+    assert_eq!(result["ok"][1]["name"], "fresh-second");
+    assert_eq!(rig.done("mcp_list", &json!({"server":"fixture"})), result);
+    let effects = std::fs::read_to_string(rig.workspace().join("effects-review-restart")).unwrap();
+    assert_eq!(
+        effects
+            .lines()
+            .filter(|line| line.starts_with("list "))
+            .count(),
+        4
     );
     finish(rig);
 }

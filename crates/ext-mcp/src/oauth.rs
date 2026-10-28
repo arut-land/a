@@ -75,7 +75,9 @@ pub(crate) struct Client {
 /// A cache identity retains the owner, never an access or refresh token.
 /// Anonymous identities are bound to the same registry and exact recipient.
 #[derive(Clone)]
-pub(crate) struct GenerationId {
+pub(crate) struct GenerationId(Arc<GenerationIdentity>);
+
+struct GenerationIdentity {
     registry: Authorizations,
     identity: Identity,
     owner: Option<Arc<Owner>>,
@@ -84,10 +86,10 @@ pub(crate) struct GenerationId {
 
 impl PartialEq for GenerationId {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.registry.0, &other.registry.0)
-            && self.identity == other.identity
-            && self.number == other.number
-            && match (&self.owner, &other.owner) {
+        Arc::ptr_eq(&self.0.registry.0, &other.0.registry.0)
+            && self.0.identity == other.0.identity
+            && self.0.number == other.0.number
+            && match (&self.0.owner, &other.0.owner) {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                 (None, None) => true,
                 _ => false,
@@ -147,12 +149,12 @@ impl Client {
         let uri: http::Uri = url.parse().map_err(|_| failure("invalid resource URI"))?;
         let identity = self.identity(&uri.to_string());
         let (owner, generation) = self.prepare(&identity).await?;
-        Ok(GenerationId {
+        Ok(GenerationId(Arc::new(GenerationIdentity {
             registry: self.connection.authorizations.clone(),
             identity,
             owner,
             number: generation.as_ref().map(|g| g.number),
-        })
+        })))
     }
 }
 
@@ -385,12 +387,14 @@ impl Http for Client {
                         .insert(http::header::AUTHORIZATION, header);
                 }
                 let mut response = inner.send(request).await?;
-                response.extensions_mut().insert(GenerationId {
-                    registry: owners.clone(),
-                    identity: identity.clone(),
-                    owner: owner.clone(),
-                    number: generation.as_ref().map(|g| g.number),
-                });
+                response
+                    .extensions_mut()
+                    .insert(GenerationId(Arc::new(GenerationIdentity {
+                        registry: owners.clone(),
+                        identity: identity.clone(),
+                        owner: owner.clone(),
+                        number: generation.as_ref().map(|g| g.number),
+                    })));
                 let status = response.status();
                 if status != http::StatusCode::UNAUTHORIZED && status != http::StatusCode::FORBIDDEN
                 {
@@ -1019,6 +1023,11 @@ fn failure(message: &str) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_authorization_keeps_stdio_discovery_slots_pointer_sized() {
+        assert_eq!(size_of::<Option<GenerationId>>(), size_of::<usize>());
+    }
 
     #[test]
     fn issued_generations_share_immutable_access_token_bytes() {

@@ -68,7 +68,25 @@ fn main() {
                 .unwrap();
                 json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}})
             }
-            "tools/list" => tools(&request, &marker),
+            "tools/list" => {
+                writeln!(
+                    OpenOptions::new().append(true).open(&marker).unwrap(),
+                    "list {:?}",
+                    request["params"].get("cursor")
+                )
+                .unwrap();
+                if marker.contains("review-restart")
+                    && request["params"].get("cursor").is_some()
+                    && !std::path::Path::new(&format!("{marker}.invalidated")).exists()
+                {
+                    std::fs::write(format!("{marker}.invalidated"), b"ready").unwrap();
+                    send(
+                        &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"invalid cursor"}}),
+                    );
+                    continue;
+                }
+                tools(&request, &marker)
+            }
             "tools/call" => match call(&request, &marker, &mut children, &mut browser) {
                 Some(result) => result,
                 None => continue,
@@ -85,6 +103,15 @@ fn main() {
 
 fn tools(request: &Value, marker: &str) -> Value {
     match () {
+        () if marker.contains("review-restart") => {
+            let restarted = std::path::Path::new(&format!("{marker}.invalidated")).exists();
+            let later = request["params"].get("cursor").is_some();
+            let mut result = json!({"resultType":"complete","ttlMs":300_000,"cacheScope":"private","tools":[{"name":if later {"fresh-second"} else if restarted {"fresh-first"} else {"discarded"},"inputSchema":{"type":"object"}}]});
+            if !later {
+                result["nextCursor"] = json!("next");
+            }
+            result
+        }
         () if marker.contains("review-large-list") => {
             let page: usize = request["params"]["cursor"]
                 .as_str()

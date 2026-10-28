@@ -65,6 +65,10 @@ pub(crate) struct Cache(Arc<Mutex<State>>);
 struct State {
     revision: u64,
     uncached: bool,
+    entry: Option<Box<Entry>>,
+}
+#[derive(Default)]
+struct Entry {
     ready: Option<(Key, Loaded)>,
     flight: Option<(Key, Weak<Flight>, Weak<Demand>)>,
 }
@@ -87,7 +91,40 @@ impl Cache {
     pub(crate) fn invalidate(&self) {
         let mut state = crate::lock(&self.0);
         state.revision += 1;
-        state.ready = None;
+        state.entry = None;
+    }
+
+    fn publish(&self, key: &Key, loaded: &Loaded, now: Instant) {
+        let mut state = crate::lock(&self.0);
+        if state.revision != key.revision {
+            return;
+        }
+        state.uncached = loaded.expires.is_none_or(|expiry| now >= expiry);
+        if state.uncached {
+            state.entry = None;
+            return;
+        }
+        let entry = state.entry.get_or_insert_with(Box::default);
+        entry.ready = Some((
+            Key {
+                authorization: loaded.authorization.clone(),
+                revision: key.revision,
+            },
+            loaded.clone(),
+        ));
+        entry.flight = None;
+    }
+
+    fn abandon(&self, done: &Arc<Flight>) {
+        let mut state = crate::lock(&self.0);
+        if state
+            .entry
+            .as_ref()
+            .and_then(|entry| entry.flight.as_ref())
+            .is_some_and(|(_, flight, _)| std::ptr::eq(flight.as_ptr(), Arc::as_ptr(done)))
+        {
+            state.entry = None;
+        }
     }
 
     pub(crate) async fn get(
@@ -97,81 +134,96 @@ impl Cache {
         fetch: impl FnOnce(Cx) -> ext::BoxFuture<'static, Result<Loaded, Failure>> + Send + 'static,
     ) -> Result<Arc<[crate::RemoteTool]>, Failure> {
         let runtime = cx.service_arc::<dyn rt::Runtime>().expect("MCP runtime");
-        let (flight, demand, start) = {
+        let selected = {
             let mut state = crate::lock(&self.0);
-            if let Some((cached_key, loaded)) = &state.ready
+            if let Some((cached_key, loaded)) =
+                state.entry.as_ref().and_then(|entry| entry.ready.as_ref())
                 && cached_key.revision == key.revision
                 && state.revision == key.revision
-                && loaded.expires.is_some_and(|expiry| runtime.now() < expiry)
-                && (loaded.authorization.is_none() || loaded.authorization == key.authorization)
+                && loaded.reusable(&key, runtime.now())
             {
                 return Ok(Arc::clone(&loaded.tools));
             }
-            state.ready = None;
-            let joining = state
-                .flight
-                .as_ref()
-                .filter(|(current, _, _)| !state.uncached && current == &key)
-                .and_then(|(_, flight, demand)| {
-                    Some((
-                        flight.upgrade().filter(|flight| !flight.done.is_set())?,
-                        demand.upgrade()?,
-                    ))
-                });
-            if let Some((flight, demand)) = joining {
-                (flight, demand, false)
+            if state.uncached {
+                None
             } else {
-                let flight = Arc::new(Flight {
-                    done: Flag::default(),
-                    result: Mutex::default(),
-                });
-                let demand = Arc::new(Demand(Cancel::default()));
-                state.flight = Some((
-                    key.clone(),
-                    Arc::downgrade(&flight),
-                    Arc::downgrade(&demand),
-                ));
-                (flight, demand, true)
+                let entry = state.entry.get_or_insert_with(Box::default);
+                entry.ready = None;
+                let joining = entry
+                    .flight
+                    .as_ref()
+                    .filter(|(current, _, _)| current == &key)
+                    .and_then(|(_, flight, demand)| {
+                        Some((
+                            flight.upgrade().filter(|flight| !flight.done.is_set())?,
+                            demand.upgrade()?,
+                        ))
+                    });
+                if let Some((flight, demand)) = joining {
+                    Some((flight, demand, false))
+                } else {
+                    let flight = Arc::new(Flight {
+                        done: Flag::default(),
+                        result: Mutex::default(),
+                    });
+                    let demand = Arc::new(Demand(Cancel::default()));
+                    entry.flight = Some((
+                        key.clone(),
+                        Arc::downgrade(&flight),
+                        Arc::downgrade(&demand),
+                    ));
+                    Some((flight, demand, true))
+                }
             }
         };
-        if start {
+        let Some((flight, demand, start)) = selected else {
+            let loaded = fetch(cx.clone()).await?;
+            self.publish(&key, &loaded, runtime.now());
+            return Ok(loaded.tools);
+        };
+        let fetch = if start {
             let mut work_cx = cx.clone();
             work_cx.cancel = demand.0.clone();
             let cancel = demand.0.clone();
             let done = Arc::clone(&flight);
             let cache = self.clone();
+            let work_key = key.clone();
+            let clock = Arc::clone(&runtime);
             runtime.spawn(Box::pin(async move {
                 let result = cancel
                     .until(fetch(work_cx))
                     .await
                     .unwrap_or(Err(Failure::Cancelled));
                 if let Ok(loaded) = &result {
-                    let mut state = crate::lock(&cache.0);
-                    if state.revision == key.revision {
-                        // Known immediately stale lists remain independent requests.
-                        state.uncached = loaded.expires.is_none();
-                        if loaded.expires.is_some() {
-                            let stored_key = Key {
-                                authorization: loaded.authorization.clone(),
-                                revision: key.revision,
-                            };
-                            state.ready = Some((stored_key, loaded.clone()));
-                        }
-                    }
+                    cache.publish(&work_key, loaded, clock.now());
+                } else {
+                    cache.abandon(&done);
                 }
                 *crate::lock(&done.result) = Some(result);
                 done.done.set();
             }));
-        }
+            None
+        } else {
+            Some(fetch)
+        };
         let _demand = demand;
         rt::or(
             async {
                 flight.done.wait().await;
-                crate::lock(&flight.result)
+                let loaded = crate::lock(&flight.result)
                     .as_ref()
                     .expect("completed discovery")
-                    .clone()
-                    .map(|loaded| loaded.tools)
+                    .clone()?;
+                if start
+                    || (self.revision() == key.revision && loaded.reusable(&key, runtime.now()))
+                {
+                    return Ok(loaded.tools);
+                }
+                // Joining unfinished work does not make its eventual result cacheable.
+                let loaded =
+                    fetch.expect("a follower retains its independent fetch")(cx.clone()).await?;
+                self.publish(&key, &loaded, runtime.now());
+                Ok(loaded.tools)
             },
             async {
                 cx.cancel.wait().await;
@@ -179,6 +231,13 @@ impl Cache {
             },
         )
         .await
+    }
+}
+
+impl Loaded {
+    fn reusable(&self, key: &Key, now: Instant) -> bool {
+        self.expires.is_some_and(|expiry| now < expiry)
+            && (self.authorization.is_none() || self.authorization == key.authorization)
     }
 }
 

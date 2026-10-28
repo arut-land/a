@@ -51,8 +51,9 @@ before entering the log/model context. Only an explicit schema load
 publishes a definition; no remote schemas enter the initial request. Discovery
 shares an immutable validated list while every page has a positive server TTL.
 The earliest page expiry limits the whole list. Missing, zero or invalid TTLs
-stay uncached; known immediately stale lists fetch independently. Concurrent
-eligible discovery joins one fetch. Private HTTP lists bind the credential
+stay uncached. Cold followers join unfinished discovery, then reuse its result
+only if it is eligible and still fresh; otherwise each fetches independently.
+Known uncached lists fetch independently. Concurrent eligible discovery joins one fetch. Private HTTP lists bind the credential
 owner's opaque authorization generation, including anonymous authorization.
 Lookup observes expiry and joins any renewal first; each response reports its
 actual generation after challenge/retry. Changing generation or visibility
@@ -104,8 +105,9 @@ cards are pure functions of the logged input and result.
 configuration, spawn, transport, refused redirect, crash, timeout,
 cancellation, protocol, remote JSON-RPC error, unsupported input request,
 and size limit. Remote
-`isError` results stay intact and get a bad card. No request retries
-implicitly. Sampling, elicitation, resources, prompts and subscriptions
+`isError` results stay intact and get a bad card. An invalid pagination cursor
+discards the partial list and restarts discovery from page one, within the same
+64-request operation budget. Effectful calls never retry implicitly. Sampling, elicitation, resources, prompts and subscriptions
 are not provided; an `input_required` response is a typed failure.
 
 Stdio uses newline-delimited JSON-RPC with per-request version and
@@ -123,7 +125,7 @@ request-scoped SSE, and closes its response stream on cancellation. It mirrors m
 when necessary. Invalid header annotations are excluded from HTTP tool
 lists. Responses are bounded at 1 MiB. Discovery also has a 1 MiB aggregate
 budget across all pages, before any schema retention or projection; lists
-are further limited to 64 pages / 4096 tools. Exceeding any budget returns
+are further limited to 64 page requests (including cursor restarts) / 4096 tools. Exceeding any budget returns
 `Failure::Limit`. Index descriptions use a deterministic UTF-8 prefix,
 at most 512 bytes including an ellipsis. A retained result plus its escaped
 card therefore leaves headroom in the 16 MiB protocol frame.

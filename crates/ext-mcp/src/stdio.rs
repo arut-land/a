@@ -3,16 +3,14 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use ext::{Cx, OwnedProcess, SpawnSpec};
+use ext::{OwnedProcess, SpawnSpec};
 use serde_json::Value;
 
 use crate::{Failure, Server, Transport, rpc};
 
-pub(crate) fn environment(cx: &Cx) -> BTreeMap<String, String> {
-    cx.env
-        .as_ref()
-        .map_or_else(snapshot, |env| env.vars.clone())
-}
+// Grow for active frames; dormant helpers retain only the initial chunk.
+const INITIAL_READ: usize = 512;
+const MAX_READ: usize = 8192;
 
 pub(crate) fn snapshot() -> BTreeMap<String, String> {
     protocol::Environment::new(protocol::HostPath::default(), std::env::vars_os(), false)
@@ -38,7 +36,7 @@ pub(crate) fn spec(server: &Server, cwd: PathBuf, mut env: BTreeMap<String, Stri
 pub(crate) struct Reader {
     pending: Vec<u8>,
     scanned: usize,
-    scratch: Box<[u8; 8192]>,
+    scratch: Box<[u8]>,
 }
 
 impl Default for Reader {
@@ -46,7 +44,7 @@ impl Default for Reader {
         Self {
             pending: Vec::new(),
             scanned: 0,
-            scratch: Box::new([0; 8192]),
+            scratch: vec![0; INITIAL_READ].into_boxed_slice(),
         }
     }
 }
@@ -67,6 +65,9 @@ impl Reader {
                 // Keep only unread bytes, not the completed message's allocation.
                 self.pending = self.pending[end + 1..].to_vec();
                 self.scanned = 0;
+                if self.scratch.len() > INITIAL_READ {
+                    self.scratch = vec![0; INITIAL_READ].into_boxed_slice();
+                }
                 return Ok((value, end + 1));
             }
             if self.pending.len() > rpc::LIMIT {
@@ -84,6 +85,9 @@ impl Reader {
                 return Err(Failure::Crashed);
             }
             self.pending.extend_from_slice(&self.scratch[..n]);
+            if n == self.scratch.len() && self.scratch.len() < MAX_READ {
+                self.scratch = vec![0; self.scratch.len() * 2].into_boxed_slice();
+            }
         }
     }
 }
@@ -100,7 +104,7 @@ mod tests {
     use super::*;
     use ext::host::Registry;
     use ext::testing::Rig;
-    use ext::{LaunchSpec, ProcessOutput, Processes};
+    use ext::{Cx, LaunchSpec, ProcessOutput, Processes};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -117,7 +121,13 @@ mod tests {
                 .spawn(
                     cx,
                     LaunchSpec {
-                        process: spec(server, cx.dir(), environment(cx)),
+                        process: spec(
+                            server,
+                            cx.dir(),
+                            cx.env
+                                .as_ref()
+                                .map_or_else(snapshot, |env| env.vars.clone()),
+                        ),
                         output: ProcessOutput::Stdio,
                     },
                 )
@@ -169,7 +179,8 @@ mod tests {
             let (value, bytes) = client.read().await.unwrap();
             assert_eq!(value.as_str().unwrap().len(), 900_000);
             assert_eq!(bytes, 900_003);
-            assert!(client.reader.pending.capacity() <= client.reader.scratch.len());
+            assert!(client.reader.pending.capacity() <= MAX_READ);
+            assert_eq!(client.reader.scratch.len(), INITIAL_READ);
             let (value, bytes) = client.read().await.unwrap();
             assert_eq!(value, json!({"next":true}));
             assert_eq!(bytes, 14);

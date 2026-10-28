@@ -54,7 +54,7 @@ struct Inner {
     instances: OnceLock<ext::Scoped<identity::Identity, instance::Instance>>,
     scopes: Vec<config::Scope>,
     directory: Option<std::path::PathBuf>,
-    environment: Option<BTreeMap<String, String>>,
+    environment: OnceLock<BTreeMap<String, String>>,
     declaration: u64,
     retired: ext::Cancel,
     discovery: Vec<discovery::Cache>,
@@ -122,7 +122,7 @@ impl Mcp {
             timeout,
             instances: OnceLock::new(),
             directory: None,
-            environment: None,
+            environment: OnceLock::new(),
             declaration: rpc::next_id(),
             retired: ext::Cancel::default(),
             registrations: BTreeMap::new(),
@@ -284,22 +284,13 @@ impl Mcp {
                 Failure::Configuration("shared MCP declaration has no directory".into())
             })?,
         };
-        let env = if scope.shared() {
-            self.0
-                .environment
-                .clone()
-                .expect("shared declaration environment")
-        } else {
-            stdio::environment(cx)
-        };
-        let spec = stdio::spec(server, cwd, env);
+        let env = identity::Environment(if scope.shared() { None } else { cx.env.clone() });
         let key = ext::InstanceKey {
             identity: identity::Identity {
                 declaration: self.0.declaration,
                 server: server.name.clone(),
-                argv: spec.argv.clone(),
-                cwd: spec.cwd.clone(),
-                env: spec.env.clone(),
+                cwd: cwd.clone(),
+                env: env.clone(),
             },
             scope: scope.key(cx),
         };
@@ -307,12 +298,7 @@ impl Mcp {
             .service_arc::<ext::Lifetimes>()
             .ok_or_else(|| Failure::Configuration("no scope lifetimes".into()))?;
         let registry = self.0.instances.get_or_init(|| ext::Scoped::new(lifetimes));
-        let processes = cx
-            .service_arc::<dyn ext::Processes>()
-            .ok_or_else(|| Failure::Configuration("no process provider".into()))?;
-        let launcher = processes
-            .launcher(cx)
-            .map_err(|e| Failure::Spawn(e.to_string()))?;
+        let owner = self.clone();
         let mut startup_cx = cx.clone();
         let timeout = self.0.timeout;
         let retired = self.0.retired.clone();
@@ -320,12 +306,22 @@ impl Mcp {
             .acquire(key, move |cancel| {
                 Box::pin(async move {
                     startup_cx.cancel = cancel.clone();
+                    let environment = env.0.as_ref().map_or_else(
+                        || owner.0.environment.get_or_init(stdio::snapshot).clone(),
+                        |env| env.vars.clone(),
+                    );
+                    let processes = startup_cx
+                        .service::<dyn ext::Processes>()
+                        .ok_or_else(|| std::io::Error::other("no process provider"))?;
                     let launch = ext::LaunchSpec {
-                        process: spec,
+                        process: stdio::spec(&owner.0.servers[index], cwd, environment),
                         output: ext::ProcessOutput::Stdio,
                     };
                     let child = if scope.shared() {
-                        launcher.spawn(cancel.clone(), launch).await?
+                        processes
+                            .launcher(&startup_cx)?
+                            .spawn(cancel.clone(), launch)
+                            .await?
                     } else {
                         processes.spawn(&startup_cx, launch).await?
                     };
@@ -402,6 +398,43 @@ impl Mcp {
             .await
     }
 
+    async fn tools_page(
+        &self,
+        server: &Server,
+        instance: Option<&instance::Instance>,
+        params: Value,
+        cx: &Cx,
+    ) -> Result<rpc::Reply, Failure> {
+        let runtime = cx.service::<dyn rt::Runtime>().expect("MCP runtime");
+        if let Some(instance) = instance {
+            let value = instance
+                .request("tools/list", params, cx, runtime.now() + self.0.timeout)
+                .await?;
+            return Ok(rpc::Reply {
+                value,
+                received: runtime.now(),
+                authorization: None,
+                changed: false,
+            });
+        }
+        let Transport::Http(url) = &server.transport else {
+            unreachable!("HTTP discovery")
+        };
+        let reply = rpc::http_authorized(
+            url,
+            "tools/list",
+            params,
+            http::HeaderMap::new(),
+            self.connection(server),
+            cx,
+        )
+        .await?;
+        if reply.changed {
+            self.cache(server).invalidate();
+        }
+        Ok(reply)
+    }
+
     async fn fetch_tools(
         &self,
         server: Server,
@@ -422,38 +455,23 @@ impl Mcp {
             let params = cursor
                 .as_ref()
                 .map_or_else(|| json!({}), |c| json!({"cursor":c}));
-            let (mut result, received, generation) = if let Some(lease) = &lease {
-                (
-                    lease
-                        .request(
-                            "tools/list",
-                            params,
-                            &cx,
-                            std::time::Instant::now() + self.0.timeout,
-                        )
-                        .await?,
-                    std::time::Instant::now(),
-                    None,
-                )
-            } else {
-                let Transport::Http(url) = &server.transport else {
-                    unreachable!("HTTP discovery")
-                };
-                let reply = rpc::http_authorized(
-                    url,
-                    "tools/list",
-                    params,
-                    http::HeaderMap::new(),
-                    self.connection(&server),
-                    &cx,
-                )
-                .await?;
-                if reply.changed {
-                    self.cache(&server).invalidate();
+            let page = self
+                .tools_page(&server, lease.as_deref(), params, &cx)
+                .await;
+            let page = match page {
+                Err(Failure::Remote { code: -32602, .. }) if cursor.is_some() => {
+                    // The aggregate owns its pages; none is published before completion.
+                    tools.clear();
+                    seen.clear();
+                    cursor = None;
+                    freshness = discovery::Freshness::default();
+                    budget = discovery::Budget::default();
+                    continue;
                 }
-                (reply.value, reply.received, reply.authorization)
+                result => result?,
             };
-            freshness.include(&result, received, generation);
+            let mut result = page.value;
+            freshness.include(&result, page.received, page.authorization);
             budget.include(&result)?;
             let page = result
                 .get_mut("tools")
@@ -573,7 +591,10 @@ impl Configured for Mcp {
         inner.scopes = scopes;
         inner.registrations = registrations;
         if inner.scopes.iter().any(|scope| scope.shared()) {
-            inner.environment = Some(stdio::snapshot());
+            inner
+                .environment
+                .set(stdio::snapshot())
+                .expect("new declaration environment");
             inner.directory = Some(std::env::current_dir().map_err(|e| Refused(e.to_string()))?);
         }
         Ok(mcp)
