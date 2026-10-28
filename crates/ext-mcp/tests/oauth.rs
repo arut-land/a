@@ -662,11 +662,31 @@ fn token_expiry_joins_renewal_before_sending_an_expired_generation() {
     concurrent_refresh("rotating-expiry");
 }
 
+fn cancel_pending_tool(rig: &Rig, tool: &str, input: &serde_json::Value) -> serde_json::Value {
+    let cx = rig.cx();
+    let input = protocol::Json::encode(input).unwrap();
+    let called = rt::block_on(rt::or(
+        rig.registry.tools().run(tool, &input, None, &cx),
+        async {
+            // The first branch has already polled the real lookup.
+            rig.cancel.set();
+            std::future::pending().await
+        },
+    ));
+    let protocol::Outcome::Done {
+        output: protocol::Payload::Inline(output),
+    } = called.outcome
+    else {
+        panic!("expected a typed MCP failure");
+    };
+    output.parse().unwrap()
+}
+
 #[test]
 fn generation_waiters_keep_their_own_deadlines_and_cancellation_during_shared_renewal() {
     let root = Rig::new("generation-waiters", Registry::default());
     let marker = root.dir.join("endpoint");
-    let (_peer, origin) = serve(&marker, "rotating-cancel");
+    let (peer, origin) = serve(&marker, "rotating-cancel");
     let browser = Browser {
         credentials: sys::credentials::Credentials::isolated(root.dir.join("credentials")),
         approvals: Arc::default(),
@@ -714,23 +734,7 @@ fn generation_waiters_keep_their_own_deadlines_and_cancellation_during_shared_re
                 let started = Instant::now();
                 let input = json!({"server":"fixture","tool":"echo","arguments":{}});
                 let result = if cancelled {
-                    let cx = rig.cx();
-                    let input = protocol::Json::encode(&input).unwrap();
-                    let called = rt::block_on(rt::or(
-                        rig.registry.tools().run(tool, &input, None, &cx),
-                        async {
-                            // The first branch has already polled the real lookup.
-                            rig.cancel.set();
-                            std::future::pending().await
-                        },
-                    ));
-                    let protocol::Outcome::Done {
-                        output: protocol::Payload::Inline(output),
-                    } = called.outcome
-                    else {
-                        panic!("expected a typed MCP failure");
-                    };
-                    output.parse().unwrap()
+                    cancel_pending_tool(&rig, tool, &input)
                 } else {
                     rig.done(tool, &input)
                 };
@@ -769,7 +773,7 @@ fn generation_waiters_keep_their_own_deadlines_and_cancellation_during_shared_re
     for thread in browser.threads.lock().unwrap().drain(..) {
         thread.join().unwrap();
     }
-    drop(_peer);
+    drop(peer);
     assert_eq!(
         prompt, 6,
         "every short/cancelled waiter must return before the renewal is released"

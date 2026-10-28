@@ -61,31 +61,10 @@ fn main() {
         );
         let result = match method {
             "server/discover" => {
-                writeln!(
-                    OpenOptions::new().append(true).open(&marker).unwrap(),
-                    "discover"
-                )
-                .unwrap();
-                if marker.contains("discover-crash") || marker.contains("discover-version") {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while !std::path::Path::new(&format!("{marker}.release")).exists() {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "discovery was not released"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                }
-                if marker.contains("discover-crash") {
+                let Some(result) = discover(&marker) else {
                     return;
-                }
-                if marker.contains("discover-version") {
-                    send(
-                        &json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete","supportedVersions":["unsupported"]}}),
-                    );
-                    continue;
-                }
-                json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}})
+                };
+                result
             }
             "tools/list" => {
                 writeln!(
@@ -118,6 +97,33 @@ fn main() {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+fn discover(marker: &str) -> Option<Value> {
+    writeln!(
+        OpenOptions::new().append(true).open(marker).unwrap(),
+        "discover"
+    )
+    .unwrap();
+    if marker.contains("discover-crash") || marker.contains("discover-version") {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !std::path::Path::new(&format!("{marker}.release")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "discovery was not released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    if marker.contains("discover-crash") {
+        return None;
+    }
+    let version = if marker.contains("discover-version") {
+        "unsupported"
+    } else {
+        "2026-07-28"
+    };
+    Some(json!({"resultType":"complete","supportedVersions":[version],"capabilities":{"tools":{}}}))
 }
 
 fn tools(request: &Value, marker: &str) -> Value {

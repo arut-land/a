@@ -923,3 +923,64 @@ without confusing a PID with a group or a subsequently reused PID. Production
 code and the measured release executables are unchanged. No failed-job rerun is
 used for this error; a replacement CI dispatch requires an owner exception to
 the one-dispatch instruction.
+
+
+### Caller-owned authorization waits and typed startup fan-out
+
+The focused review reproduced two failures on `410239d5`: generation lookup
+waited outside the caller's timeout/cancellation guard, and `Scoped` reconstructed
+startup I/O errors from `(ErrorKind, String)`, making the MCP downcast ineffective.
+The release regressions fail before the fix: a discovery crash is reported as
+`Spawn("Crashed")`, and all six short/cancelled generation waiters remain blocked
+until the fixture releases another caller's renewal.
+
+Generation lookup now uses the same timeout/cancellation guard as HTTP exchange
+and instance acquisition. Dropping this wait releases its OAuth participation;
+the existing credential owner continues renewal for remaining callers. No OAuth
+credential-owner implementation changes are needed. MCP carries startup's typed
+`Result<Instance, Failure>` as the scoped resource value, retaining failed outcomes
+only through joined demand. Failed discovery cleans up its child before publishing
+the outcome. A pipe actor has its own cancellation signal so handshake cleanup
+cannot cancel the scope before fan-out. Only successful outcomes can create a
+session-retained MCP lease; a subsequent explicit request can retry after cleanup.
+The SDK registry and its lifetime implementation are unchanged.
+
+The real-child invariant polls eight list callers into one gated discovery, then
+checks one launch/probe, typed crash/unsupported-version outcomes for every caller,
+and an explicit later retry. The OAuth invariant uses one shared credential owner,
+a 10-second renewal caller, and list/schema/call waiters with 100 ms timeouts or
+cancellation after their first poll. Its loopback fixture holds renewal until all
+short waiters finish or the one-second regression observation expires, always
+releases it and joins the owned callers, and checks exactly one refresh and a
+successful long caller. A baseline debug negative run left one fixture process;
+its exact command and PID were verified and terminated, recorded in
+`rereview-negative-cleanup.json`. Subsequent negative/positive samples explicitly
+close the fixture before the failing assertions.
+
+Five alternating AB/BA pairs run preserved release test executables on the shared
+M3, with provider variables absent and isolated `A_HOME`/credential stores. Both
+versions use the same real fixture and workload. These measure waiter release in
+a deliberately delayed renewal, not remote-server throughput. Some local checks
+ran concurrently; no quiet-host qualification is claimed. Milliseconds are median
+[minimum–maximum] across the five samples:
+
+| Waiter | Before | After |
+| --- | ---: | ---: |
+| timed list | 1019.466 [1016.608–1049.861] | 102.131 [100.196–103.770] |
+| timed schema | 1019.597 [1016.435–1049.505] | 101.138 [100.748–103.252] |
+| timed call | 1019.466 [1017.132–1050.996] | 101.770 [100.384–103.586] |
+| cancelled list | 1017.404 [1006.772–1036.057] | 0.023 [0.021–0.084] |
+| cancelled schema | 1017.132 [1006.832–1035.701] | 0.025 [0.021–0.112] |
+| cancelled call | 1017.059 [1006.979–1035.631] | 0.020 [0.013–0.237] |
+
+Every baseline sample fails the prompt-return invariant; every candidate sample
+passes it and preserves the shared renewal. `rereview-samples.jsonl`,
+`rereview-summary.json`, per-sample logs and executable hash manifests retain the
+complete evidence under the external MCP scratch directory. The fix is
+`444d7316`; `6546616f` merges main `1e60834a` before final validation. Debug and
+release suites each pass all 73 MCP tests, including every OAuth lifecycle test.
+After the fixture dispatcher and cancellation helper refactor, all 73 debug tests
+and both focused release regressions pass again. Check, fmt, all-target/all-feature
+clippy with `-D warnings`, workspace Windows lint and rustdoc pass.
+No dependencies, wire formats, corpus, feature limits or speculative hardening
+change. `hibernate_secs=0` remains the coordinator's follow-up.
