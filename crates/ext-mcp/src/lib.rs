@@ -277,6 +277,7 @@ impl Mcp {
             .position(|s| s.name == server.name)
             .expect("configured server");
         let scope = self.0.scopes[index];
+        let policy = identity::Policy::admit(self.0.declaration, scope, cx)?;
         let cwd = match scope {
             config::Scope::Session => cx.dir(),
             config::Scope::Workspace => cx.workspace.to_path_buf(),
@@ -287,7 +288,7 @@ impl Mcp {
         let env = identity::Environment(if scope.shared() { None } else { cx.env.clone() });
         let key = ext::InstanceKey {
             identity: identity::Identity {
-                declaration: self.0.declaration,
+                policy,
                 server: server.name.clone(),
                 cwd: cwd.clone(),
                 env: env.clone(),

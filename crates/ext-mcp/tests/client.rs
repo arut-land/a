@@ -755,3 +755,199 @@ fn stdio_cursor_restarts_never_publish_or_cache_the_discarded_pages() {
     );
     finish(rig);
 }
+
+struct PolicySettings(sys::config::Table);
+impl ext::Table for PolicySettings {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn text(&self, key: &str) -> Result<Option<&str>, ext::Refused> {
+        self.0.text(key).map_err(|e| ext::Refused(e.to_string()))
+    }
+    fn whole(&self, key: &str) -> Result<Option<u64>, ext::Refused> {
+        self.0.whole(key).map_err(|e| ext::Refused(e.to_string()))
+    }
+    fn flag(&self, key: &str) -> Result<Option<bool>, ext::Refused> {
+        self.0.flag(key).map_err(|e| ext::Refused(e.to_string()))
+    }
+    fn list(&self, key: &str) -> Result<Option<&[String]>, ext::Refused> {
+        self.0.list(key).map_err(|e| ext::Refused(e.to_string()))
+    }
+}
+
+fn policy_mcp(scope: &str, argv: &[String], root: &std::path::Path) -> Mcp {
+    use ext::Configured;
+    let settings: sys::Config = format!(
+        "[ext.mcp]\nservers=[\"fixture\"]\nfixture={}\nfixture_scope={scope:?}\nexperimental_stdio_sharing={}\n",
+        serde_json::to_string(argv).unwrap(), scope != "session",
+    ).parse().unwrap();
+    Mcp::configure(&PolicySettings(settings.ext.table("mcp")))
+        .unwrap()
+        .declared_in(root)
+        .unwrap()
+}
+
+#[derive(Clone)]
+enum SpawnPolicy {
+    Refuse,
+    Wrap(Vec<String>),
+}
+impl Extension for SpawnPolicy {
+    const NAME: &'static str = "spawn-policy";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut ext::Registrar) {
+        let policy = self.clone();
+        r.on::<ext::point::Spawn>(move |_, spawn| match &policy {
+            Self::Refuse => ext::point::Rewrite::Stop("execution refused".into()),
+            Self::Wrap(argv) => {
+                let mut wrapped = spawn.clone();
+                wrapped.argv.clone_from(argv);
+                wrapped
+                    .env
+                    .insert("A_MCP_IDENTITY".into(), "wrapped".into());
+                ext::point::Rewrite::Replace(wrapped)
+            }
+        });
+    }
+}
+
+#[test]
+fn session_spawn_policy_is_applied_and_shared_launches_reject_session_hooks() {
+    for scope in ["session", "workspace", "user"] {
+        for wrapping in [false, true] {
+            let root = Rig::new("spawn-policy-root", Registry::default());
+            let marker = root.dir.join("effects");
+            let argv = vec![
+                env!("CARGO_BIN_EXE_mcp-fixture").into(),
+                marker.to_str().unwrap().into(),
+            ];
+            let policy = if wrapping {
+                SpawnPolicy::Wrap(argv.clone())
+            } else {
+                SpawnPolicy::Refuse
+            };
+            let declaration = if wrapping {
+                vec!["must-be-rewritten-by-spawn-policy".into()]
+            } else {
+                argv
+            };
+            let mcp = policy_mcp(scope, &declaration, &root.workspace());
+            let rig = Rig::new(
+                "spawn-policy",
+                Registry::default()
+                    .with(&ext_shell::Shell::default())
+                    .unwrap()
+                    .with(&mcp)
+                    .unwrap()
+                    .with(&policy)
+                    .unwrap(),
+            );
+            let result = rig.done(
+                "mcp_call",
+                &json!({"server":"fixture","tool":"launch-context","arguments":{}}),
+            );
+            if scope != "session" {
+                assert!(
+                    result["failed"]["configuration"]
+                        .as_str()
+                        .is_some_and(|why| why.contains("spawn hooks")),
+                    "{scope}: {result}"
+                );
+                assert!(!marker.exists());
+            } else if wrapping {
+                assert_eq!(result["ok"]["identity"], "wrapped", "{result}");
+                assert!(marker.exists());
+            } else {
+                assert!(
+                    result["failed"]["spawn"]
+                        .as_str()
+                        .is_some_and(|why| why.contains("execution refused")),
+                    "{result}"
+                );
+                assert!(!marker.exists());
+            }
+            let child = marker.exists().then(|| {
+                let effects = std::fs::read_to_string(&marker).unwrap();
+                let pid = effects
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .strip_prefix("start ")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let child = sys::RecordedIdentity(pid);
+                assert!(child.alive());
+                child
+            });
+            finish(rig);
+            if let Some(child) = child {
+                assert!(!child.alive());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_hooked_session_cannot_reuse_an_already_admitted_shared_instance() {
+    let root = Rig::new("shared-policy-root", Registry::default());
+    let marker = root.dir.join("effects");
+    let argv = vec![
+        env!("CARGO_BIN_EXE_mcp-fixture").into(),
+        marker.to_str().unwrap().into(),
+    ];
+    let mcp = policy_mcp("workspace", &argv, &root.workspace());
+    let owner = Rig::new(
+        "shared-policy-owner",
+        Registry::default()
+            .with(&ext_shell::Shell::default())
+            .unwrap()
+            .with(&mcp)
+            .unwrap(),
+    );
+    let input = json!({"server":"fixture","tool":"launch-context","arguments":{}});
+    assert!(owner.done("mcp_call", &input).get("ok").is_some());
+    let hooked = Rig::new(
+        "shared-policy-hooked",
+        Registry::default()
+            .with(&ext_shell::Shell::default())
+            .unwrap()
+            .with(&mcp)
+            .unwrap()
+            .with(&SpawnPolicy::Refuse)
+            .unwrap(),
+    );
+    let mut cx = hooked.cx();
+    cx.workspace = owner.cx().workspace;
+    let result = rt::block_on(hooked.registry.tools().run(
+        "mcp_call",
+        &protocol::Json::encode(&input).unwrap(),
+        None,
+        &cx,
+    ));
+    let protocol::Outcome::Done {
+        output: protocol::Payload::Inline(output),
+    } = result.outcome
+    else {
+        panic!("{result:?}")
+    };
+    let output: Value = output.parse().unwrap();
+    assert!(
+        output["failed"]["configuration"]
+            .as_str()
+            .is_some_and(|why| why.contains("spawn hooks")),
+        "{output}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("start "))
+            .count(),
+        1
+    );
+    assert!(owner.done("mcp_call", &input).get("ok").is_some());
+    drop(cx);
+    finish(hooked);
+    finish(owner);
+}

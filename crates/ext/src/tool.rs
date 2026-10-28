@@ -19,7 +19,7 @@ use crate::BoxFuture;
 use crate::CwdOf;
 use crate::flag::{Cancel, Flag};
 use crate::host::{Host, SessionServices};
-use crate::point::{PointCx, View};
+use crate::point::{Point, PointCx, View};
 use crate::schema::Schema;
 use crate::shape::Output;
 #[cfg(doc)]
@@ -349,6 +349,11 @@ impl Cx {
             .service_arc::<S>()
             .or_else(|| self.services.get_arc::<S>())
             .cloned()
+    }
+
+    /// Whether this call's active registry has handlers at point `P`.
+    pub fn has_handlers<P: Point>(&self) -> bool {
+        !P::slot(self.host.registry().hooks()).is_empty()
     }
 
     /// The call's session, as handlers at decision points see it.
