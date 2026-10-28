@@ -256,7 +256,6 @@ impl Drop for Reap {
         self.complete();
         lock(&self.live.captured).get_or_insert_with(|| Err(io::ErrorKind::Interrupted.into()));
         self.live.copied.set();
-        eprintln!("WIN_REAP {:?} ended {}", std::time::SystemTime::now(), self.live.id);
         self.live.ended.set();
     }
 }

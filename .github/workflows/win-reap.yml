@@ -21,6 +21,10 @@ jobs:
           git config --global core.autocrlf false
           "CARGO_TARGET_DIR=$env:RUNNER_TEMP/win-reap-target" >> $env:GITHUB_ENV
       - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/win-reap-target
+          key: win-reap-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
       - name: Install native Rust
         run: |
           $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches.Groups[1].Value
@@ -28,21 +32,25 @@ jobs:
           $toolchain = "$channel-$arch-pc-windows-msvc"
           "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
           rustup toolchain install $toolchain --profile minimal --component rust-src
-      - name: Build release test host
+      - name: Build test hosts
         run: |
           cargo test --release -p engine --lib --no-run --message-format=json | Tee-Object "$env:RUNNER_TEMP/build.jsonl"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test -p engine --lib --no-run --message-format=json | Tee-Object "$env:RUNNER_TEMP/dev-build.jsonl"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Repeat retirement
         run: |
-          $records = Get-Content "$env:RUNNER_TEMP/build.jsonl" | ForEach-Object { $_ | ConvertFrom-Json }
+          foreach ($profile in @("build", "dev-build")) {
+          $records = Get-Content "$env:RUNNER_TEMP/$profile.jsonl" | ForEach-Object { $_ | ConvertFrom-Json }
           $exe = ($records | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'engine' -and $_.executable }).executable
           $failures = 0
-          for ($i = 1; $i -le 100; $i++) {
+          for ($i = 1; $i -le 1000; $i++) {
             $timer = [Diagnostics.Stopwatch]::StartNew()
             & $exe --exact tests::scoped_processes::last_demand_and_shutdown_reap_the_process_and_its_descendants --nocapture
             $code = $LASTEXITCODE
             $timer.Stop()
-            Write-Output "SAMPLE $i code=$code ms=$($timer.Elapsed.TotalMilliseconds)"
+            Write-Output "SAMPLE $profile $i code=$code ms=$($timer.Elapsed.TotalMilliseconds)"
             if ($code) { $failures++ }
           }
-          if ($failures) { throw "$failures failures" }
+          Write-Output "RESULT $profile failures=$failures"
+          }

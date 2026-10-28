@@ -27,6 +27,16 @@ use crate::windows::{Security, ok, owned};
 
 pub type ExitWatch = OwnedHandle;
 
+static TRACE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static LEADERS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+fn trace(message: std::fmt::Arguments<'_>) {
+    TRACE.lock().unwrap().push(format!(
+        "WIN_REAP {:?} {message}",
+        std::time::SystemTime::now()
+    ));
+}
+
 pub fn passed(handle: &impl AsRawHandle) -> Passed {
     Passed(
         i32::try_from(handle.as_raw_handle() as isize).expect("Windows handle values fit 32 bits"),
@@ -242,6 +252,7 @@ fn spawn_job_role(
         environment,
     }
     .spawn()?;
+    LEADERS.lock().unwrap().push(child.id());
     let group = ProcessLease {
         id: RecordedIdentity(child.id()),
         handle: job,
@@ -274,7 +285,7 @@ pub(super) fn members(job: &OwnedHandle) -> io::Result<Vec<u32>> {
             // SAFETY: successful query initialized both DWORDs and the listed IDs.
             let len = unsafe { *header.add(1) } as usize;
             let offset = 8 / size_of::<usize>();
-            eprintln!("WIN_REAP {:?} members {:?}", std::time::SystemTime::now(), &buffer[offset..offset + len]);
+            trace(format_args!("members {:?}", &buffer[offset..offset + len]));
             return Ok(buffer[offset..offset + len]
                 .iter()
                 .filter_map(|&pid| pid.try_into().ok())
@@ -297,27 +308,40 @@ pub fn group_alive(_id: u32) -> bool {
 
 pub(super) fn terminate_group(job: &OwnedHandle) -> io::Result<()> {
     // SAFETY: the borrowed job remains owned throughout termination.
-    eprintln!("WIN_REAP {:?} terminate begin", std::time::SystemTime::now());
+    trace(format_args!("terminate begin"));
     let result = ok(unsafe { TerminateJobObject(job.as_raw_handle(), 1) });
-    eprintln!("WIN_REAP {:?} terminate end {result:?}", std::time::SystemTime::now());
+    trace(format_args!("terminate end {result:?}"));
     result
 }
 
 pub fn process_started(pid: u32) -> Option<u64> {
-    // SAFETY: scalar inputs, checked owned result.
-    let process =
-        owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid) })
-            .ok()?;
-    // Retained handles keep an exited process object queryable. A signalled
-    // process is gone even while its creation time remains available.
-    // SAFETY: this owned process handle includes SYNCHRONIZE access.
-    if unsafe {
-        windows_sys::Win32::System::Threading::WaitForSingleObject(process.as_raw_handle(), 0)
-    } != windows_sys::Win32::Foundation::WAIT_TIMEOUT
-    {
-        return None;
+    let result = (|| {
+        // SAFETY: scalar inputs, checked owned result.
+        let process =
+            owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid) })
+                .ok()?;
+        // Retained handles keep an exited process object queryable. A signalled
+        // process is gone even while its creation time remains available.
+        // SAFETY: this owned process handle includes SYNCHRONIZE access.
+        if unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(process.as_raw_handle(), 0)
+        } != windows_sys::Win32::Foundation::WAIT_TIMEOUT
+        {
+            return None;
+        }
+        created_at(&process).ok()
+    })();
+    if !LEADERS.lock().unwrap().contains(&pid) {
+        let events = std::mem::take(&mut *TRACE.lock().unwrap());
+        for event in events {
+            eprintln!("{event}");
+        }
+        eprintln!(
+            "WIN_REAP {:?} probe {pid} {result:?}",
+            std::time::SystemTime::now()
+        );
     }
-    created_at(&process).ok()
+    result
 }
 
 fn created_at(process: &OwnedHandle) -> io::Result<u64> {
@@ -364,7 +388,7 @@ pub fn member_watch(job: &OwnedHandle, pid: u32) -> io::Result<Option<ExitWatch>
             &raw mut member,
         )
     })?;
-    eprintln!("WIN_REAP {:?} member {pid} {member}", std::time::SystemTime::now());
+    trace(format_args!("member {pid} {member}"));
     Ok((member != 0).then_some(process))
 }
 

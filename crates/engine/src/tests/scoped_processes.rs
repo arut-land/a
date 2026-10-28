@@ -480,10 +480,16 @@ fn last_demand_and_shutdown_reap_the_process_and_its_descendants() {
             rt::block_on(daemon.shutdown());
             drop(child);
         }
+        let retirement = Instant::now();
         rt::block_on(control.ended());
+        let completed = Instant::now();
         assert!(sys::process_started(control.id()).is_none());
         let alive = sys::process_started(descendant);
-        eprintln!("WIN_REAP {:?} stage {stage} descendant {descendant} {alive:?}", std::time::SystemTime::now());
+        eprintln!(
+            "WIN_REAP {:?} stage {stage} descendant {descendant} {alive:?} wait {:?}",
+            std::time::SystemTime::now(),
+            completed.duration_since(retirement)
+        );
         assert!(alive.is_none(), "descendant survived completed retirement");
     }
     drop((cx, session, daemon));
