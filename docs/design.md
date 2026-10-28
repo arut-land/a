@@ -523,7 +523,9 @@ loading uses the same typed `Cx::publish` context primitive as skills,
 including edit-aware deduplication. Stdio servers start on first use,
 one per server per session by default. Experimental, explicitly configured
 workspace/user scopes share exact trusted launch identities through the SDK's
-single-flight scoped registry. Activated session leases release on hibernation;
+single-flight scoped registry. Broader scopes reject session-bound spawn hooks
+before identity lookup; admitted launch policy is part of that identity.
+Activated session leases release on hibernation;
 last release and daemon shutdown await native process-tree cleanup. Requests
 have globally unique IDs and separate response/progress authority. Shared
 cancellation drains only that exchange to its existing deadline before retiring

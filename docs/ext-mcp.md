@@ -79,6 +79,10 @@ launches use their client's cwd, environment and spawn hooks. Shared launches us
 the trusted declaration's captured non-secret daemon environment plus explicit
 server overrides, and the workspace directory or user configuration directory;
 the first caller never supplies the shared environment or session spawn hooks.
+Calls using broader scope are refused whenever their active registry has spawn
+hooks: those handlers require a session context. Session scope applies their
+refusals and command rewrites. The admitted policy is bound to the declaration
+in the launch identity, before registry lookup or reuse.
 Different declarations, argv, cwd, environment and scopes never alias.
 
 The SDK's scoped process owner retains only activated leases. Hibernation drops

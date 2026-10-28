@@ -831,18 +831,78 @@ crate checks, fmt, all-target/all-feature clippy with `-D warnings`, the full
 Windows cross-target lint, rustdoc and the normal-dependency no-Tokio scan pass.
 No dependency, wire, corpus, credential lifecycle or feature limit changes.
 
-### Remaining review gate
+### Launch policy admission and OAuth fixture ownership
 
-The shared-launch policy finding is confirmed and remains unfixed. The current
-SDK exposes session-context execution of spawn hooks, but not presence inspection
-of the active registry from `Cx`. Calling that chain under the first caller would
-still not admit a declaration-owned policy. The minimal needed ownership extension
-is `crates/ext/src/tool.rs`: expose generic hook presence so MCP can reject broader
-scope whenever a session-bound Spawn handler exists, before key construction or
-reuse of a ready instance. A concrete SDK patch proposal is retained externally
-as `phase2-policy-sdk-proposal.patch`; no SDK files have been edited. The real
-refusing/wrapping-hook invariant and launch-policy identity binding await this
-seam. Hosted CI is intentionally undispatched while this P1 remains open; Linux
-and Windows green and target cleanup are still pending. `hibernate_secs=0` remains
-on the coordinator's follow-up list, unchanged here. No speculative hardening is
-added.
+After the owner extended SDK ownership to `crates/ext/src/tool.rs`,
+`Cx::has_handlers<P>()` exposes presence in the active registry without executing
+handlers or exposing the registry. MCP admits launch policy before constructing
+an identity or looking up a ready instance. Broader scope admits only the empty
+spawn chain: the current Spawn handlers require session authority. A private
+policy value binds the declaration and session/declaration policy class into the
+identity. Session launches continue through `Processes::spawn`, including refusal
+and command rewriting. HTTP transport ownership is unchanged.
+
+Real-child tests cover refusing and rewriting hooks at session/workspace/user
+scope, actual rewritten argv/environment, reaping the wrapped child, and a hooked
+session trying to join an already running unhooked shared instance. Both policy
+invariants fail when the admission guard is disabled and pass with it enabled.
+
+The hosted Windows OAuth failure is reproduced in
+[40709033654](https://github.com/arut-land/a/actions/runs/40709033654): the child
+reports `AddrInUse` / another daemon running, followed by the parent's bind
+timeout. The Windows discovery implementation briefly tries the daemon-record
+lock; probing before the fixture's child claims that record can win the lock and
+make startup fail. Each fixture already has a unique isolated home. The child now
+owns its listener and acknowledges readiness from extension installation, after
+the engine's exclusive record claim and publication. The parent blocks on that
+acknowledgement and drains child output, then performs one endpoint connection.
+There is no connection retry or sleep. The child also receives explicit isolated
+`A_HOME`. A native invariant checks that acknowledgement follows exclusive record
+ownership; it fails against the previous fixture with a missing record and passes
+with the handshake. OAuth single-flight/rotation lifecycle tests remain intact.
+
+`hibernate_secs=0` remains on the coordinator's follow-up list, unchanged here.
+No speculative hardening is added.
+
+### Final matched-main comparison after policy admission
+
+Main advanced to `f3a51b4e` with native frame buffers and the charged-memory
+budget work. It is merged in `39013482`. The final comparison rebuilds that exact
+main and the candidate, with `fixtures`, jobs=2 and the same preserved fixture
+binary. Both programs therefore include the same engine/protocol/frame changes;
+these absolute values must not be compared to the earlier `63ac410a` table to
+attribute MCP savings. Five alternating AB/BA pairs repeat the identical default
+scope workload, isolated homes, sanitized provider environment and 12+3-second
+settle/idle windows. Values are median [minimum–maximum].
+
+| Sessions | Version | Daemon footprint MiB | Daemon RSS MiB | First-list p50 ms |
+| ---: | --- | --- | --- | --- |
+| 1 | matched main | 3.657 [3.610–3.688] | 11.359 [11.312–11.391] | 12.613 [10.273–29.183] |
+| 1 | final candidate | 3.688 [3.594–3.782] | 11.484 [11.391–11.562] | 10.312 [10.275–27.744] |
+| 32 | matched main | 7.938 [7.891–8.000] | 15.641 [15.594–15.703] | 10.961 [9.996–14.747] |
+| 32 | final candidate | 7.969 [7.907–8.047] | 15.766 [15.703–15.828] | 10.704 [10.096–12.988] |
+| 128 | matched main | 20.891 [20.860–20.907] | 28.547 [19.453–28.594] | 12.101 [10.028–18.862] |
+| 128 | final candidate | 20.750 [20.610–20.829] | 28.531 [28.391–28.594] | 9.994 [9.959–15.952] |
+
+At 128 sessions, footprint is 0.141 MiB below matched main, with non-overlapping
+sample ranges. The 1- and 32-session medians remain 0.031 MiB higher, with
+overlapping ranges; these rows do not establish the literal no-increase goal.
+No samples are dropped or allocator-specific mitigation added. Every run retains
+exactly 1/32/128 helpers. All thirty idle CPU windows have zero increments at OS
+resolution. First-list CPU at 128 is 3.114 [2.027–4.884] ms per operation before
+and 2.128 [1.899–3.605] after, over the batch of 96 new sessions. Latency and CPU
+ranges overlap on this shared M3; no universal gain is claimed.
+
+Release acceptance checks caught Cargo's shared primary-output alias when the
+external main build left its binary at `release/a` and the candidate build was
+considered fresh. No measurements used that output. Candidate SDK/MCP/CLI release
+artifacts were rebuilt, distinct executable hashes checked, and the release CLI
+suite passed before sampling. `approved-source.json` pins both executable hashes,
+main/candidate revisions and fixture hash; `approved/release-samples.jsonl` and
+`approved/release-summary.json` retain every sample. The native validation log is
+`approved-final-validation.log`: 194 selected tests pass, including SDK invariants,
+all MCP/OAuth tests and twelve release CLI tests. Check, fmt, all-target/all-feature
+clippy with `-D warnings`, Windows workspace lint, rustdoc and the normal no-Tokio
+scan pass. The new identity invariant also fails if both admission classes are
+made identical. All ten final benchmark homes stopped successfully and have no
+remaining helper PIDs. No MCP dependency, wire or corpus changes are introduced.
