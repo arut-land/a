@@ -208,6 +208,99 @@ hash-performance comparison. Attach p99 was **193.54 µs**; the separate
 release quiet-shell budget also passed with **zero runtime wakes** in one
 second.
 
+## Incremental stdio framing
+
+Measured 2026-10-27 on the shared M3 (macOS 27.0.1 arm64,
+Rust 1.101.0-nightly `5d8fec066`). Baseline is `5b6d12c1`; the candidate
+changes only stdio framing in production. Both use the survey's release
+probe profile: opt-level `z`, fat LTO, one codegen unit, identical resolved
+dependencies, and `CARGO_BUILD_JOBS=2`. These are shared-host observations,
+not quiet-machine or cross-platform latency qualifications.
+
+The finding was confirmed before editing production code. Every pipe read
+searched the entire accumulated message, making fragmented frames take
+quadratic search work. Removing consumed bytes with `Vec::drain` kept the
+largest frame's allocation on each cached connection. Initial baseline
+reproduction measured 20.24 ms CPU/call [19.30–23.33] for 900,000-byte
+responses; two footprint samples ranged 38.09–39.22 MiB at 32 cached
+connections and 130.03–132.88 MiB at 128.
+
+The connection now remembers how many pending bytes were searched. It
+searches only newly read bytes and, after decoding a complete frame,
+replaces its allocation with only the unread suffix. That suffix comes
+from the final 8 KiB read; an empty suffix allocates nothing. Incomplete
+messages keep their bytes and cursor across a dropped read future. This
+removes repeated prefix scans and completed-frame retention without a new
+dependency, message limit, wire change, or background task.
+
+The workload is the survey's real stdio Python MCP peer and public MCP
+extension probe (`api-probe/src/main.rs` and `mcp-peer.py` from the
+`r3-tools-load` evidence archive). Local crate paths were retargeted to this
+worktree, with the same manifest and lockfile for both binaries. One warmup
+call precedes timing. Five rounds alternate baseline/candidate order,
+reversing it each round: 30 calls per round at 900,000 bytes and 1,000 at
+32 bytes. CPU is the client process's user plus system CPU divided by the
+call count; the peer's CPU is excluded. Every result's exact text length is
+checked. Values below are medians of round statistics [minimum–maximum].
+P99 uses nearest rank; a 30-call round's p99 is its maximum.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| 900,000-byte CPU/call, ms | 26.16 [23.68–27.39] | 5.88 [5.74–6.27] |
+| 900,000-byte round p50, ms | 28.81 [24.73–31.33] | 8.11 [7.99–9.91] |
+| 900,000-byte round p99, ms | 34.62 [31.24–49.03] | 9.42 [8.62–18.65] |
+| 32-byte round p50, µs | 52.29 [51.13–53.38] | 54.04 [50.75–55.25] |
+| 32-byte round p99, µs | 120.29 [73.83–307.12] | 290.21 [75.79–781.21] |
+
+Large-response client CPU falls 77.5%. Pooling the 150 large calls per
+build gives p50/p99 of 28.38/41.42 ms before and 8.21/13.82 ms after.
+The initial 32-byte pooled p50/p99 is 51.88/145.33 µs before and
+52.38/341.12 µs after. The initial timing batch overlapped the local
+Windows lint build. A second five-round alternating 32-byte batch after
+that build completed gives the following results; other users of this
+shared machine were not controlled.
+
+| Follow-up 32-byte metric | Before | After |
+| --- | ---: | ---: |
+| Round p50, µs | 55.77 [33.65–61.85] | 57.29 [51.83–64.50] |
+| Round p99, µs | 416.92 [317.58–485.92] | 286.58 [109.21–523.42] |
+| Pooled p50 / p99, µs | 55.29 / 416.92 | 55.67 / 371.00 |
+
+Small-call medians remain close; tails change direction between batches.
+These samples do not establish a small-call tail regression or a quiet-host
+nonregression guarantee.
+
+For footprint, three independent rounds alternate order at each connection
+count. Each connection makes a 32-byte warmup, a 900,000-byte call, then a
+32-byte call, and remains cached. The probe waits 12 seconds, records native
+macOS physical footprint, then observes another five seconds before
+teardown, matching the survey's settling window. Values are MiB,
+median [minimum–maximum], for the client probe including its in-process rig.
+
+| Cached connections | Before | After |
+| --- | ---: | ---: |
+| 32 | 37.70 [37.08–39.64] | 12.59 [12.48–12.63] |
+| 128 | 129.66 [129.64–131.22] | 14.91 [14.86–14.94] |
+
+The median reduction is 25.11 MiB at 32 connections and 114.75 MiB at 128.
+Absolute figures differ from the earlier survey on `d6bb6cc`; both sides
+here run the same newer base and dependencies.
+
+Regression coverage uses real child pipes. The completed-frame storage
+test failed on the original implementation's retained capacity, then
+passed with the fix. Tests also cover resuming a cancelled partial read
+with its cursor intact, fragmented UTF-8 replies, adjacent notifications
+and replies, and cancellation while a peer has emitted an unfinished
+reply. Process cleanup remains exercised through the real extension rig.
+
+Validation: all 32 MCP tests passed with the `fixture` feature; crate
+check, formatting, clippy on all targets/features with `-D warnings`,
+documentation generation, and workspace `check:windows` passed. No
+speculative hardening or out-of-scope source edits were needed.
+Raw scripts, release probes and JSONL observations for this round are
+retained outside the worktree at `/private/tmp/mcp-frame-buffer-r3` for
+independent review. Branch CI is deferred until that review.
+
 ## HTTP OAuth (round 3)
 
 The client uses the existing pooled HTTP transport with redirects refused.

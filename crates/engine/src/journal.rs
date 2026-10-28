@@ -13,7 +13,8 @@ pub(super) struct Journal {
     pub(super) index: crate::store::index::Index,
     /// `None` only while a commit has it on a blocking thread.
     pub(super) writer: Option<Writer>,
-    pub(super) fold_snapshot: Option<Snapshot>,
+    /// The checkpoint kept for this session, read from the store on rebuild.
+    pub(super) fold_snapshot: Option<u64>,
     /// Entries written and not yet durable, in order, with whoever waits
     /// for each: shown to no one until a sync. A seq a client has seen is
     /// one that survives a power cut, so it is never given out twice.
@@ -320,15 +321,15 @@ impl Actor {
                 .and_then(|image| {
                     let snapshot = Snapshot { covers, image };
                     writer.snapshot(&snapshot)?;
-                    Ok(snapshot)
+                    Ok(covers)
                 });
             (writer, taken)
         })
         .await;
         self.journal.writer = Some(writer);
         match taken {
-            Ok(snapshot) => {
-                self.journal.fold_snapshot = Some(snapshot);
+            Ok(covers) => {
+                self.journal.fold_snapshot = Some(covers);
                 crate::session_event("snapshot", self.live.id, || format!("at {covers}"));
             }
             Err(e) => {
