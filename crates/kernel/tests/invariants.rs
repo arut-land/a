@@ -947,3 +947,23 @@ fn every_external_effect_has_an_explicit_admission() {
         }
     }
 }
+
+#[test]
+fn user_questions_request_durable_publication_under_either_durability_setting() {
+    for barriers in [kernel::Barriers::Step, kernel::Barriers::Effects] {
+        let mut session = Session::with_barriers(Reg::modeled().arc(), barriers);
+        session.step(user("question"));
+        session.step(prepared(2));
+        session.step(model_done(2, &[("bash", json!({"command":"true"}))]));
+        let plan = session.step(Event::Waits {
+            call: id(4),
+            on: WaitOn::Question {
+                request: Box::new(protocol::QuestionWait {
+                    question: protocol::Question::confirm("Continue?".into()),
+                    checkpoint: Some(Json::null()),
+                }),
+            },
+        });
+        assert!(plan.commit.unwrap().publish);
+    }
+}

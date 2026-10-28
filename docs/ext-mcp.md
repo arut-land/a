@@ -204,3 +204,7 @@ OAuth authorization uses a service-owned question port. Its card remains
 answerable after the presenting tool is interrupted, and the shared renewal
 publishes one result to its waiters. OAuth's live callback listener cannot be
 restored, so restart cancels that card rather than reviving an unusable URL.
+
+The shared OAuth card has no human-wait deadline. Ordinary HTTP callers keep
+their existing per-request deadlines and cancellation; a renewal and its card
+can outlive those waiters, completing credentials for remaining or later calls.

@@ -672,7 +672,9 @@ for the distributed design. Each needs its own contract and measurements.
 ## Typed user questions
 
 Policy gates and extension questions share `Question`, `QuestionAnswer` and
-sequence identity. A gate derives its Confirm question from its permission
+sequence identity. Pending user questions request immediate durable publication,
+so their frames do not wait for the otherwise-idle sync timer. A gate derives
+its Confirm question from its permission
 decision; an extension parks with `WaitOn::Question` and a private checkpoint.
 The log contains the question as asked, the checkpoint required to continue,
 and the answer, decline or cancel. Draft edits and browser opening remain

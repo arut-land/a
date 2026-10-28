@@ -295,5 +295,7 @@ Form responses use `{"submit":{"field":"value"}}`, content-free confirmation
 and URL responses use `{"accept":{}}`, and each response can instead be
 `"decline"` or `"cancel"`. The envelope is
 `{"question":QUESTION_SEQ,"responses":{"SERVER_KEY":RESPONSE}}`.
-Client disconnect leaves questions open. Explicit Cancel is an answer; Stop
+A state-only Continue prompt uses `{"continue":"proceed"}` (or `"decline"` /
+`"cancel"` inside that response). Batches support a separate response for each
+prompt. Client disconnect leaves questions open. Explicit Cancel is an answer; Stop
 is an interrupt. Opening a URL is local and never submits an answer.

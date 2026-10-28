@@ -415,6 +415,8 @@ Ctrl-N declines, and Esc answers Cancel. Strings are literal text; numbers and
 booleans use JSON values, and multiple choices use a JSON array of option
 values. Ctrl-U omits an optional field; Alt-I includes it, including an empty
 string. Defaults are editable. Invalid values leave the form open with an error.
+The draft stays local until the answer is committed, including when sending
+is refused; the conversation draft is then restored.
 Batches include an accept/decline/cancel response field for each prompt.
 Ctrl-O explicitly opens the displayed URL through the native browser; repeated
 actions cycle through all URLs in a batch. Submit/Continue is separate from

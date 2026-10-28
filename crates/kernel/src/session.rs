@@ -365,14 +365,14 @@ impl Core {
                 through,
                 durability: self.commit(
                     if fact { Facts::Changed } else { Facts::Notes },
-                    if fx.immediate.iter().any(Work::external)
-                    {
+                    if fx.immediate.iter().any(Work::external) {
                         Effects::External
                     } else {
                         Effects::Internal
                     },
                 ),
-                publish: fact && self.turn == Turn::Idle,
+                publish: fact
+                    && (self.turn == Turn::Idle || self.fold.ledger.inbox().next().is_some()),
             });
         }
         for work in mem::take(&mut fx.immediate) {
