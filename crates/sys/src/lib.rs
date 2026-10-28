@@ -35,6 +35,7 @@ mod login;
 mod machine;
 mod memory;
 pub mod net;
+mod page_buffer;
 mod paths;
 mod platform;
 mod proc;
@@ -61,6 +62,7 @@ pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
 pub use machine::machine_id;
 pub use memory::{ZeroedWords, release, small_footprint};
+pub use page_buffer::{ReadBuffer, TransientBuffer};
 /// The resolved locations belonging to one daemon.
 pub use paths::Paths as Home;
 pub use paths::{InstallLayout, Paths, RemoteLayout};

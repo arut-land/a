@@ -20,7 +20,7 @@ use crate::{Connection, Daemon, Error};
 /// what came is not exactly what was asked for and it says it sent.
 pub struct Fetched {
     stream: Arc<dyn Stream>,
-    buffered: Vec<u8>,
+    buffered: protocol::FrameReader,
     blob: BlobId,
     /// The offset of the next byte due.
     next: u64,
@@ -199,7 +199,7 @@ impl Fetched {
                     self.chunk.extend_from_slice(chunk.bytes);
                     self.at = 0;
                     self.next += chunk.bytes.len() as u64;
-                    self.buffered.drain(..len);
+                    self.buffered.consume(len)?;
                     return Ok(true);
                 }
                 Framed::Chunk(chunk) => Err(invalid(format!(
@@ -214,12 +214,12 @@ impl Fetched {
                     DaemonMsg::Reply { id: ID, outcome } => self.ended(outcome),
                     DaemonMsg::NotHeld { id: ID } => Err(Unfetched::NotHeld.into()),
                     _ => {
-                        self.buffered.drain(..len);
+                        self.buffered.consume(len)?;
                         continue;
                     }
                 },
             };
-            self.buffered.drain(..len);
+            self.buffered.consume(len)?;
             self.done = true;
             return ended.map(|()| false);
         }

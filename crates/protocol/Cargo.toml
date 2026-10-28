@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# Return large receive buffers to the OS while retaining their address range.
+native-buffer = ["dep:sys"]
+
 [dependencies]
+sys = { workspace = true, optional = true }
 json.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
