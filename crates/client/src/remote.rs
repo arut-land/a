@@ -219,7 +219,7 @@ impl SshLink {
         let sync = format!("{SYNC} {token}");
         let ran = format!("{SHELL} {token}");
         let mut shell = false;
-        let mut buffered = Vec::new();
+        let mut buffered = protocol::FrameReader::new();
         while let Some(line) = stream.line(&mut buffered).await? {
             shell |= line.trim_ascii_end() == ran.as_bytes();
             if line.trim_ascii_end().strip_prefix(sync.as_bytes()) == Some(WITH_ENV) {

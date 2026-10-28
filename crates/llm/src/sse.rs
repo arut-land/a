@@ -31,16 +31,22 @@ impl Default for DecodeLimits {
 
 const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SseFramer {
-    buffer: Vec<u8>,
+    buffer: sys::TransientBuffer,
     limits: DecodeLimits,
     frame_bytes: usize,
     bom_prefix: usize,
     bom_done: bool,
     /// The event being assembled from its field lines.
-    event_type: String,
-    data: String,
+    event_type: sys::TransientBuffer,
+    data: sys::TransientBuffer,
+}
+
+impl Default for SseFramer {
+    fn default() -> Self {
+        Self::with_limits(DecodeLimits::default())
+    }
 }
 
 impl SseFramer {
@@ -56,8 +62,8 @@ impl SseFramer {
         chunk: &[u8],
         mut each: impl FnMut(Frame<'_>) -> Result<Flow, Error>,
     ) -> Result<Flow, Error> {
-        let chunk = self.strip_bom(chunk)?;
-        for &byte in chunk {
+        let mut chunk = self.strip_bom(chunk)?;
+        while let Some((&byte, rest)) = chunk.split_first() {
             if self.buffer.last() == Some(&b'\r') {
                 if byte == b'\n' {
                     self.charge(1)?;
@@ -68,8 +74,19 @@ impl SseFramer {
                     return Ok(flow);
                 }
                 if byte == b'\n' {
+                    chunk = rest;
                     continue;
                 }
+            }
+            let end = chunk
+                .iter()
+                .position(|&b| b == b'\r' || b == b'\n')
+                .unwrap_or(chunk.len());
+            if end > 0 {
+                self.charge(end)?;
+                self.buffer.extend_from_slice(&chunk[..end])?;
+                chunk = &chunk[end..];
+                continue;
             }
             self.charge(1)?;
             if byte == b'\n' {
@@ -78,8 +95,9 @@ impl SseFramer {
                     return Ok(flow);
                 }
             } else {
-                self.buffer.push(byte);
+                self.buffer.push(byte)?;
             }
+            chunk = rest;
         }
         Ok(Flow::More)
     }
@@ -94,8 +112,13 @@ impl SseFramer {
 
     pub(crate) fn with_limits(limits: DecodeLimits) -> Self {
         Self {
+            buffer: sys::TransientBuffer::new(limits.frame_bytes),
+            event_type: sys::TransientBuffer::new(limits.frame_bytes),
+            data: sys::TransientBuffer::new(limits.frame_bytes),
             limits,
-            ..Self::default()
+            frame_bytes: 0,
+            bom_prefix: 0,
+            bom_done: false,
         }
     }
 
@@ -114,8 +137,8 @@ impl SseFramer {
             if size > self.limits.frame_bytes {
                 return Err(Error::limit("SSE frame bytes"));
             }
-            line_field(&line, &mut self.event_type, &mut self.data);
-            self.buffer.clear();
+            line_field(&line, &mut self.event_type, &mut self.data)?;
+            self.buffer.clear()?;
             return Ok(Flow::More);
         }
         self.frame_bytes = 0;
@@ -127,13 +150,15 @@ impl SseFramer {
                 event: if self.event_type.is_empty() {
                     "message"
                 } else {
-                    &self.event_type
+                    self.event_type
+                        .as_str()
+                        .expect("event fields are typed text")
                 },
-                data: &self.data,
+                data: self.data.as_str().expect("data fields are typed text"),
             })
         };
-        self.data.clear();
-        self.event_type.clear();
+        self.data.clear()?;
+        self.event_type.clear()?;
         flow
     }
 
@@ -148,7 +173,7 @@ impl SseFramer {
                 let matched = std::mem::take(&mut self.bom_prefix);
                 self.bom_done = true;
                 self.charge(matched)?;
-                self.buffer.extend_from_slice(&BOM[..matched]);
+                self.buffer.extend_from_slice(&BOM[..matched])?;
                 return Ok(rest);
             }
             self.bom_prefix += 1;
@@ -164,22 +189,30 @@ impl SseFramer {
 }
 
 /// One non-blank field line into the event being assembled.
-fn line_field(line: &str, event_type: &mut String, data: &mut String) {
+fn line_field(
+    line: &str,
+    event_type: &mut sys::TransientBuffer,
+    data: &mut sys::TransientBuffer,
+) -> Result<(), Error> {
     if line.starts_with(':') {
-        return;
+        return Ok(());
     }
     let (field, value) = match line.split_once(':') {
         Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
         None => (line, ""),
     };
     match field {
-        "event" => value.clone_into(event_type),
+        "event" => {
+            event_type.clear()?;
+            event_type.push_str(value)?;
+        }
         "data" => {
-            data.push_str(value);
-            data.push('\n');
+            data.push_str(value)?;
+            data.push(b'\n')?;
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Every event `chunk` completes, as `(event, data)`.
@@ -195,3 +228,35 @@ pub(crate) fn events(framer: &mut SseFramer, chunk: &[u8]) -> Vec<(String, Strin
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn completed_large_events_return_to_the_small_buffers() {
+        let mut wire = Vec::new();
+        write!(&mut wire, "data: ").unwrap();
+        serde_json::to_writer(&mut wire, &"x".repeat(5 << 20)).unwrap();
+        writeln!(&mut wire, "\n").unwrap();
+        let mut framer = SseFramer::default();
+        for _ in 0..3 {
+            let mut seen = 0;
+            for chunk in wire.chunks(16 << 10) {
+                framer
+                    .push(chunk, |frame| {
+                        seen += 1;
+                        assert_eq!(frame.data.len(), (5 << 20) + 2);
+                        Ok(Flow::More)
+                    })
+                    .unwrap();
+            }
+            assert_eq!(seen, 1);
+            assert!(framer.buffer.is_empty());
+            assert!(framer.data.is_empty());
+            assert!(framer.buffer.capacity() < wire.len());
+            assert!(framer.data.capacity() < wire.len() / 2);
+        }
+    }
+}
