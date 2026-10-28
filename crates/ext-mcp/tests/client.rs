@@ -1174,3 +1174,46 @@ fn declining_or_cancelling_a_state_only_round_sends_no_invented_input_key() {
         finish(rig);
     }
 }
+
+#[test]
+fn an_empty_input_request_map_can_continue_without_opaque_server_state() {
+    let rig = rig("empty-input-map", Duration::from_secs(2));
+    let cx = rig.cx();
+    let input =
+        protocol::Json::encode(&json!({"server":"fixture","tool":"ask_empty","arguments":{}}))
+            .unwrap();
+    let tools = rig.registry.tools();
+    let tool = tools.get("mcp_call").unwrap();
+    let first = rt::block_on(tools.run("mcp_call", &input, None, &cx))
+        .parked
+        .expect("an empty request map is a valid manual continuation");
+    let answer = protocol::QuestionAnswer {
+        question: protocol::Seq::new(1).unwrap(),
+        responses: first
+            .question
+            .prompts
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    protocol::Response::Continue(protocol::ContinueAnswer::Proceed),
+                )
+            })
+            .collect(),
+    };
+    first.question.validate(&answer).unwrap();
+    let result =
+        rt::block_on(tool.answer(tool.parse(&input).unwrap(), first.checkpoint, answer, &cx));
+    assert!(result.parked.is_none());
+    let protocol::Outcome::Done {
+        output: protocol::Payload::Inline(output),
+    } = result.outcome
+    else {
+        panic!("a completed continuation");
+    };
+    assert_eq!(
+        output.parse::<Value>().unwrap()["ok"]["resultType"],
+        "complete"
+    );
+    finish(rig);
+}

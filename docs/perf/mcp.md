@@ -1011,10 +1011,10 @@ fresh isolated home, settles for two seconds, then reads RSS and cumulative
 
 | Idle metric | Before: median [min–max], IQR | After: median [min–max], IQR |
 | --- | --- | --- |
-| RSS, KiB | 9,760 [9,728–9,840], 28 | 9,792 [9,696–9,840], 52 |
+| RSS, KiB | 9,800 [9,728–9,872], 32 | 9,864 [9,824–9,984], 56 |
 | CPU seconds per window | 0.00 [0.00–0.00], 0 | 0.00 [0.00–0.00], 0 |
 
-The RSS median differs by 32 KiB (0.33%), within overlapping ranges. These
+The RSS median rises by 64 KiB (0.65%), within overlapping ranges. These
 short CPU windows have `ps`'s centisecond resolution; they show no detected
 idle CPU increase, not a universal zero-CPU guarantee. Shipped binary bytes
 are **7,023,504 → 7,206,176** (+182,672 bytes / 178.39 KiB / 2.60%).
@@ -1030,11 +1030,13 @@ test answers exclude human time and browser navigation.
 
 | Workload, milliseconds | Before: median [min–max], IQR | After: median [min–max], IQR |
 | --- | --- | --- |
-| Confirmation acknowledgement, `f343ff37` → final | 3.005 [1.534–17.184], 0.778 | 3.002 [1.451–6.122], 0.188 |
-| Form + URL, `bd101801` → final | 107.026 [96.933–141.206], 3.588 | 21.018 [12.722–41.396], 4.814 |
+| Confirmation acknowledgement, `f343ff37` → final | 3.081 [1.472–24.686], 1.970 | 3.940 [1.432–17.667], 4.992 |
+| Form + URL, `bd101801` → final | 109.994 [86.975–683.272], 89.260 | 22.044 [13.175–310.126], 53.466 |
 
-The form/URL median falls **80.36%**. The measured delay came from publication:
-parked questions had no admitted external work and did not request immediate
+Confirmation acknowledgement rises 0.859 ms (27.88%) in this run, with wide
+overlapping ranges on the shared host; this does not establish unchanged
+confirmation latency. The form/URL median falls **79.96%**. The measured delay
+came from publication: parked questions had no admitted external work and did not request immediate
 publication while the turn was active, so each waited for the existing 50 ms
 sync timer. The kernel now requests publication while its user-question inbox
 is nonempty. The engine performs the existing durable flush before exposing

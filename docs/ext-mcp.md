@@ -177,10 +177,10 @@ configuration source.
 
 `mcp_call` supports MCP 2026-07-28 MRTR form and URL elicitation. Each
 `input_required` response becomes one durable question containing every keyed
-input request, plus its opaque `requestState`. A state-only round becomes an
-explicit Continue step. Only the latest state and answers are sent in a new
-request, with the original tool arguments and frozen mirrored headers. IDs
-include a daemon boot UUID and monotonic sequence, so restart cannot reuse an
+input request, plus its opaque `requestState`. A round without requested inputs
+becomes an explicit Continue step, including an empty input map without
+`requestState`. Only the latest state and answers are sent in a new request,
+with the original tool arguments and frozen mirrored headers. IDs include a daemon boot UUID and monotonic sequence, so restart cannot reuse an
 earlier request ID. No original effect is restarted to resume a question.
 
 The form boundary decodes the restricted schema: string formats/length,

@@ -14,7 +14,7 @@
   "references": {
     "before": "f343ff37",
     "before_prompt_flush": "bd101801",
-    "after": "mcp-elicit with immediate pending-question publication"
+    "after": "mcp-elicit with immediate pending-question publication and valid empty input maps"
   },
   "method": {
     "idle": "10 pairs, alternating AB/BA; fresh isolated A_HOME; 2 s settle then 3 s RSS/ps CPU window; specific daemon stop after every sample",
@@ -31,7 +31,7 @@
     },
     "mcp-after": {
       "bytes": 7206176,
-      "sha256": "64e2af35fb8a0d77ee3dca49971cdc92319faaed00cdc957eed994dbcf498cc1"
+      "sha256": "d313b9e6b7dde3fa837d230417a7ad697c77c455337c1a84c531598c03942366"
     },
     "mcp-before-fixtures": {
       "bytes": 7073280,
@@ -50,8 +50,8 @@
       "sha256": "2ab289b85cd83fe9581e6430414decfdfc2dddddddc7ba32a74320647e192504"
     },
     "mcp-after-fixtures": {
-      "bytes": 7222960,
-      "sha256": "45dad9888d311f94d88429f762bfd6dcedc8f7a4334267f4bebc8013eda34759"
+      "bytes": 7222976,
+      "sha256": "01db5b1da9f9d26d1a52e3dad7bce6b36ba600abae2dee3e9b5d1722548a844b"
     },
     "mcp-after-bench": {
       "bytes": 1659888,
@@ -62,12 +62,12 @@
     "before": {
       "rss_kib": {
         "n": 10,
-        "median": 9760.0,
+        "median": 9800.0,
         "min": 9728,
-        "max": 9840,
-        "q1": 9748.0,
-        "q3": 9776.0,
-        "iqr": 28.0
+        "max": 9872,
+        "q1": 9776.0,
+        "q3": 9808.0,
+        "iqr": 32.0
       },
       "cpu_seconds": {
         "n": 10,
@@ -82,12 +82,12 @@
     "after": {
       "rss_kib": {
         "n": 10,
-        "median": 9792.0,
-        "min": 9696,
-        "max": 9840,
-        "q1": 9764.0,
-        "q3": 9816.0,
-        "iqr": 52.0
+        "median": 9864.0,
+        "min": 9824,
+        "max": 9984,
+        "q1": 9844.0,
+        "q3": 9900.0,
+        "iqr": 56.0
       },
       "cpu_seconds": {
         "n": 10,
@@ -104,41 +104,41 @@
     "confirmation": {
       "before": {
         "n": 300,
-        "median": 3005.0,
-        "min": 1534,
-        "max": 17184,
-        "q1": 2969.75,
-        "q3": 3747.5,
-        "iqr": 777.75
+        "median": 3080.5,
+        "min": 1472,
+        "max": 24686,
+        "q1": 2987.75,
+        "q3": 4957.25,
+        "iqr": 1969.5
       },
       "after": {
         "n": 300,
-        "median": 3002.0,
-        "min": 1451,
-        "max": 6122,
-        "q1": 2963.75,
-        "q3": 3152.0,
-        "iqr": 188.25
+        "median": 3939.5,
+        "min": 1432,
+        "max": 17667,
+        "q1": 3001.0,
+        "q3": 7992.5,
+        "iqr": 4991.5
       }
     },
     "elicitation": {
       "before_prompt_flush": {
         "n": 300,
-        "median": 107025.5,
-        "min": 96933,
-        "max": 141206,
-        "q1": 105970.25,
-        "q3": 109558.5,
-        "iqr": 3588.25
+        "median": 109993.5,
+        "min": 86975,
+        "max": 683272,
+        "q1": 107006.75,
+        "q3": 196266.25,
+        "iqr": 89259.5
       },
       "after": {
         "n": 300,
-        "median": 21018.0,
-        "min": 12722,
-        "max": 41396,
-        "q1": 20128.0,
-        "q3": 24942.0,
-        "iqr": 4814.0
+        "median": 22043.5,
+        "min": 13175,
+        "max": 310126,
+        "q1": 20056.0,
+        "q3": 73522.25,
+        "iqr": 53466.25
       }
     }
   }

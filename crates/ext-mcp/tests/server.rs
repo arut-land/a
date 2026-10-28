@@ -280,8 +280,8 @@ fn call(
             return None;
         }
         "ask" => question_round(request, marker),
-        "ask_state" => json!({"resultType":"input_required","requestState":"state-only"}),
-        "input" => json!({"resultType":"input_required","inputRequests":{}}),
+        "ask_state" | "ask_empty" => empty_round(request),
+        "input" => json!({"resultType":"input_required"}),
         _ => {
             json!({"resultType":"complete","content":[{"type":"text","text":request["params"]["arguments"].to_string()}]})
         }
@@ -328,6 +328,20 @@ fn reorder(request: &Value) {
         );
         send(&json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete","index":index}}));
     });
+}
+
+fn empty_round(request: &Value) -> Value {
+    let params = &request["params"];
+    if params["name"] == "ask_state" {
+        return json!({"resultType":"input_required","requestState":"state-only"});
+    }
+    if let Some(responses) = params.get("inputResponses") {
+        assert_eq!(responses, &json!({}));
+        assert!(params.get("requestState").is_none());
+        json!({"resultType":"complete","content":[]})
+    } else {
+        json!({"resultType":"input_required","inputRequests":{}})
+    }
 }
 
 fn question_round(request: &Value, marker: &str) -> Value {

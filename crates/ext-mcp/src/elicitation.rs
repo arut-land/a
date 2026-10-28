@@ -208,7 +208,7 @@ fn decode(server: &ServerName, value: &Value) -> Result<(Question, Option<String
         }
     }
     if prompts.is_empty() {
-        if state.is_none() {
+        if state.is_none() && value.get("inputRequests").is_none() {
             return Err(invalid("input_required has neither requests nor state"));
         }
         prompts.insert(
