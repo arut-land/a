@@ -9,7 +9,7 @@
       "{\"attempt\":2,\"call\":1,\"t\":\"delta\",\"text\":\"€same\"}",
       "{\"attempt\":3,\"call\":1,\"t\":\"delta\",\"text\":\"€\"}"
     ],
-    "hash": "0fe38b0bc8f7f73a",
+    "hash": "5bac8284f832926e",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -72,8 +72,10 @@
           [
             1,
             {
+              "independent": false,
               "phase": "running",
-              "progress": null
+              "progress": null,
+              "question_seq": null
             }
           ]
         ],
@@ -7918,7 +7920,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "0bf5c74add33d97a",
+    "hash": "c2e4c2e4e9ec79f8",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -8093,12 +8095,14 @@
                   "title": ""
                 }
               ],
+              "independent": false,
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
               },
-              "progress": null
+              "progress": null,
+              "question_seq": 3
             }
           ]
         ],
@@ -8260,7 +8264,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "0304561f974076b0",
+    "hash": "63242e9be170a13e",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -8468,12 +8472,14 @@
                   "title": ""
                 }
               ],
+              "independent": false,
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
               },
-              "progress": null
+              "progress": null,
+              "question_seq": 3
             }
           ]
         ],
@@ -8645,7 +8651,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Lists files in the current directory.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":5,\"t\":\"entry\"}",
       "{\"seq\":5,\"t\":\"synced\"}"
     ],
-    "hash": "37580c17f7f29dd6",
+    "hash": "237a148936eecb7d",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -8783,12 +8789,14 @@
                   "title": ""
                 }
               ],
+              "independent": false,
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
               },
-              "progress": null
+              "progress": null,
+              "question_seq": 2
             }
           ]
         ],
@@ -9580,7 +9588,7 @@
       "{\"epoch\":0,\"input\":{\"command\":\"echo hi\"},\"kind\":\"tool_call\",\"seq\":1,\"t\":\"entry\",\"tool\":\"bash\"}",
       "{\"by\":\"policy\",\"call\":1,\"d\":\"permission\",\"epoch\":0,\"kind\":\"decision\",\"permission\":{\"ask\":{\"mode\":{\"mode\":\"ask\"}}},\"seq\":2,\"t\":\"entry\"}",
       "{\"seq\":2,\"t\":\"synced\"}",
-      "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":true}",
+      "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":3,\"responses\":{\"confirm\":{\"accept\":{}}}}}",
       "{\"call\":1,\"card\":{\"body\":\"hi\\n\",\"note\":\"exit 0\",\"title\":\"$ echo hi\"},\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}"
     ],
     "hash": "6764b2dcffae203e",
@@ -9626,7 +9634,14 @@
         "kind": "answer",
         "seq": 3,
         "t": "entry",
-        "value": true
+        "value": {
+          "question": 3,
+          "responses": {
+            "confirm": {
+              "accept": {}
+            }
+          }
+        }
       },
       {
         "call": 1,
@@ -10593,11 +10608,11 @@
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":2,\"t\":\"delta\",\"text\":\"thinking\"}",
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"items\":[{\"seq\":1,\"text\":\"one\",\"type\":\"user\"},{\"call\":2,\"model\":\"m\",\"status\":{\"status\":\"running\"},\"text\":\"\",\"type\":\"reply\",\"usage\":null},{\"call\":3,\"input\":{\"command\":\"echo hi\"},\"outcome\":null,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"reason\":{\"mode\":{\"mode\":\"ask\"}},\"tool\":\"bash\",\"type\":\"tool\"}],\"seq\":4,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[[2,{\"phase\":\"running\",\"progress\":null}],[3,{\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"progress\":null}]],\"queued\":[],\"taken\":[],\"turn\":1},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
+      "{\"items\":[{\"seq\":1,\"text\":\"one\",\"type\":\"user\"},{\"call\":2,\"model\":\"m\",\"status\":{\"status\":\"running\"},\"text\":\"\",\"type\":\"reply\",\"usage\":null},{\"call\":3,\"input\":{\"command\":\"echo hi\"},\"outcome\":null,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"reason\":{\"mode\":{\"mode\":\"ask\"}},\"tool\":\"bash\",\"type\":\"tool\"}],\"seq\":4,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[[2,{\"independent\":false,\"phase\":\"running\",\"progress\":null,\"question_seq\":null}],[3,{\"independent\":false,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"progress\":null,\"question_seq\":4}]],\"queued\":[],\"taken\":[],\"turn\":1},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
       "{\"seq\":4,\"t\":\"synced\"}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":5,\"t\":\"entry\",\"text\":\"done\"}"
     ],
-    "hash": "48aaa9db9d36a1bf",
+    "hash": "ff1ac2681746e0fc",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -10681,19 +10696,23 @@
             [
               2,
               {
+                "independent": false,
                 "phase": "running",
-                "progress": null
+                "progress": null,
+                "question_seq": null
               }
             ],
             [
               3,
               {
+                "independent": false,
                 "phase": {
                   "waiting": {
                     "on": "approval"
                   }
                 },
-                "progress": null
+                "progress": null,
+                "question_seq": 4
               }
             ]
           ],
@@ -10766,19 +10785,23 @@
           [
             2,
             {
+              "independent": false,
               "phase": "running",
-              "progress": null
+              "progress": null,
+              "question_seq": null
             }
           ],
           [
             3,
             {
+              "independent": false,
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
               },
-              "progress": null
+              "progress": null,
+              "question_seq": 4
             }
           ]
         ],
@@ -11076,7 +11099,7 @@
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":29,\"t\":\"entry\",\"text\":\"a38\"}",
       "{\"cwd\":\"/w1\",\"epoch\":0,\"kind\":\"environment\",\"seq\":30,\"t\":\"entry\",\"tty\":false,\"vars\":{}}"
     ],
-    "hash": "02156b35c53370c2",
+    "hash": "5d368bef1194cbad",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -11660,19 +11683,23 @@
           [
             6,
             {
+              "independent": false,
               "phase": "running",
-              "progress": null
+              "progress": null,
+              "question_seq": null
             }
           ],
           [
             27,
             {
+              "independent": false,
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
               },
-              "progress": null
+              "progress": null,
+              "question_seq": 28
             }
           ]
         ],
@@ -12581,7 +12608,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "9fa46f95d11fac02",
+    "hash": "4d059486e4273588",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -12755,12 +12782,14 @@
                   "title": ""
                 }
               ],
+              "independent": false,
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
               },
-              "progress": null
+              "progress": null,
+              "question_seq": 3
             }
           ]
         ],
@@ -12920,7 +12949,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "91673466797cfdfe",
+    "hash": "7c546636d96e214c",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -13127,12 +13156,14 @@
                   "title": ""
                 }
               ],
+              "independent": false,
               "phase": {
                 "waiting": {
                   "on": "approval"
                 }
               },
-              "progress": null
+              "progress": null,
+              "question_seq": 3
             }
           ]
         ],
@@ -13288,6 +13319,648 @@
         },
         "rev": 9,
         "seq": 6
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":1,\"t\":\"entry\",\"tool\":\"remote\"}",
+      "{\"call\":1,\"checkpoint\":\"opaque state\",\"epoch\":0,\"kind\":\"wait\",\"on\":\"question\",\"question\":{\"prompts\":{\"settings\":{\"form\":{\"fields\":[{\"default\":false,\"description\":null,\"kind\":\"boolean\",\"name\":\"enabled\",\"required\":true,\"title\":\"Enabled\"}],\"message\":\"Choose settings\"}}},\"source\":\"fixture\"},\"seq\":2,\"t\":\"entry\"}",
+      "{\"seq\":2,\"t\":\"synced\"}",
+      "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":2,\"responses\":{\"settings\":{\"submit\":{\"enabled\":false}}}}}"
+    ],
+    "hash": "af6dcf892d8d7b63",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "input": null,
+        "kind": "tool_call",
+        "seq": 1,
+        "t": "entry",
+        "tool": "remote"
+      },
+      {
+        "call": 1,
+        "checkpoint": "opaque state",
+        "epoch": 0,
+        "kind": "wait",
+        "on": "question",
+        "question": {
+          "prompts": {
+            "settings": {
+              "form": {
+                "fields": [
+                  {
+                    "default": false,
+                    "description": null,
+                    "kind": "boolean",
+                    "name": "enabled",
+                    "required": true,
+                    "title": "Enabled"
+                  }
+                ],
+                "message": "Choose settings"
+              }
+            }
+          },
+          "source": "fixture"
+        },
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "seq": 2,
+        "t": "synced"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "answer",
+        "seq": 3,
+        "t": "entry",
+        "value": {
+          "question": 2,
+          "responses": {
+            "settings": {
+              "submit": {
+                "enabled": false
+              }
+            }
+          }
+        }
+      }
+    ],
+    "name": "typed form submitted",
+    "state": {
+      "items": [
+        {
+          "call": 1,
+          "input": null,
+          "outcome": null,
+          "phase": "running",
+          "tool": "remote",
+          "type": "tool"
+        }
+      ],
+      "seq": 3,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [
+          [
+            1,
+            {
+              "independent": false,
+              "phase": "running",
+              "progress": null,
+              "question_seq": 2
+            }
+          ]
+        ],
+        "queued": [],
+        "taken": [],
+        "turn": 0
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "input": null,
+            "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
+            "tool": "remote",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "phase"
+          }
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 4,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "phase"
+          }
+        },
+        "rev": 5,
+        "seq": 3
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":1,\"t\":\"entry\",\"tool\":\"remote\"}",
+      "{\"call\":1,\"checkpoint\":\"opaque state\",\"epoch\":0,\"kind\":\"wait\",\"on\":\"question\",\"question\":{\"prompts\":{\"settings\":{\"form\":{\"fields\":[{\"default\":false,\"description\":null,\"kind\":\"boolean\",\"name\":\"enabled\",\"required\":true,\"title\":\"Enabled\"}],\"message\":\"Choose settings\"}}},\"source\":\"fixture\"},\"seq\":2,\"t\":\"entry\"}",
+      "{\"seq\":2,\"t\":\"synced\"}",
+      "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":2,\"responses\":{\"settings\":\"decline\"}}}"
+    ],
+    "hash": "af6dcf892d8d7b63",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "input": null,
+        "kind": "tool_call",
+        "seq": 1,
+        "t": "entry",
+        "tool": "remote"
+      },
+      {
+        "call": 1,
+        "checkpoint": "opaque state",
+        "epoch": 0,
+        "kind": "wait",
+        "on": "question",
+        "question": {
+          "prompts": {
+            "settings": {
+              "form": {
+                "fields": [
+                  {
+                    "default": false,
+                    "description": null,
+                    "kind": "boolean",
+                    "name": "enabled",
+                    "required": true,
+                    "title": "Enabled"
+                  }
+                ],
+                "message": "Choose settings"
+              }
+            }
+          },
+          "source": "fixture"
+        },
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "seq": 2,
+        "t": "synced"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "answer",
+        "seq": 3,
+        "t": "entry",
+        "value": {
+          "question": 2,
+          "responses": {
+            "settings": "decline"
+          }
+        }
+      }
+    ],
+    "name": "typed form declined",
+    "state": {
+      "items": [
+        {
+          "call": 1,
+          "input": null,
+          "outcome": null,
+          "phase": "running",
+          "tool": "remote",
+          "type": "tool"
+        }
+      ],
+      "seq": 3,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [
+          [
+            1,
+            {
+              "independent": false,
+              "phase": "running",
+              "progress": null,
+              "question_seq": 2
+            }
+          ]
+        ],
+        "queued": [],
+        "taken": [],
+        "turn": 0
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "input": null,
+            "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
+            "tool": "remote",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "phase"
+          }
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 4,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "phase"
+          }
+        },
+        "rev": 5,
+        "seq": 3
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":1,\"t\":\"entry\",\"tool\":\"remote\"}",
+      "{\"call\":1,\"checkpoint\":\"opaque state\",\"epoch\":0,\"kind\":\"wait\",\"on\":\"question\",\"question\":{\"prompts\":{\"settings\":{\"form\":{\"fields\":[{\"default\":false,\"description\":null,\"kind\":\"boolean\",\"name\":\"enabled\",\"required\":true,\"title\":\"Enabled\"}],\"message\":\"Choose settings\"}}},\"source\":\"fixture\"},\"seq\":2,\"t\":\"entry\"}",
+      "{\"seq\":2,\"t\":\"synced\"}",
+      "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":2,\"responses\":{\"settings\":\"cancel\"}}}"
+    ],
+    "hash": "af6dcf892d8d7b63",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "input": null,
+        "kind": "tool_call",
+        "seq": 1,
+        "t": "entry",
+        "tool": "remote"
+      },
+      {
+        "call": 1,
+        "checkpoint": "opaque state",
+        "epoch": 0,
+        "kind": "wait",
+        "on": "question",
+        "question": {
+          "prompts": {
+            "settings": {
+              "form": {
+                "fields": [
+                  {
+                    "default": false,
+                    "description": null,
+                    "kind": "boolean",
+                    "name": "enabled",
+                    "required": true,
+                    "title": "Enabled"
+                  }
+                ],
+                "message": "Choose settings"
+              }
+            }
+          },
+          "source": "fixture"
+        },
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "seq": 2,
+        "t": "synced"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "answer",
+        "seq": 3,
+        "t": "entry",
+        "value": {
+          "question": 2,
+          "responses": {
+            "settings": "cancel"
+          }
+        }
+      }
+    ],
+    "name": "typed form cancelled",
+    "state": {
+      "items": [
+        {
+          "call": 1,
+          "input": null,
+          "outcome": null,
+          "phase": "running",
+          "tool": "remote",
+          "type": "tool"
+        }
+      ],
+      "seq": 3,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [
+          [
+            1,
+            {
+              "independent": false,
+              "phase": "running",
+              "progress": null,
+              "question_seq": 2
+            }
+          ]
+        ],
+        "queued": [],
+        "taken": [],
+        "turn": 0
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "input": null,
+            "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
+            "tool": "remote",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "phase"
+          }
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 4,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "phase"
+          }
+        },
+        "rev": 5,
+        "seq": 3
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"epoch\":0,\"kind\":\"question\",\"question\":{\"prompts\":{\"url\":{\"url\":{\"message\":\"Continue in your browser\",\"url\":\"https://example.com/consent\"}}},\"source\":\"credential owner\"},\"seq\":1,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"kind\":\"interrupt\",\"seq\":2,\"t\":\"entry\"}",
+      "{\"seq\":2,\"t\":\"synced\"}",
+      "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":1,\"responses\":{\"url\":{\"accept\":{}}}}}"
+    ],
+    "hash": "6856fcb1efe2f0c1",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "kind": "question",
+        "question": {
+          "prompts": {
+            "url": {
+              "url": {
+                "message": "Continue in your browser",
+                "url": "https://example.com/consent"
+              }
+            }
+          },
+          "source": "credential owner"
+        },
+        "seq": 1,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "interrupt",
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "seq": 2,
+        "t": "synced"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "answer",
+        "seq": 3,
+        "t": "entry",
+        "value": {
+          "question": 1,
+          "responses": {
+            "url": {
+              "accept": {}
+            }
+          }
+        }
+      }
+    ],
+    "name": "independent URL question survives turn interruption",
+    "state": {
+      "items": [
+        {
+          "by": "plugin",
+          "call": 1,
+          "input": null,
+          "outcome": null,
+          "phase": {
+            "settled": "done"
+          },
+          "tool": "credential owner",
+          "type": "tool"
+        }
+      ],
+      "seq": 3,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "taken": [],
+        "turn": 0
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "by": "plugin",
+            "call": 1,
+            "input": null,
+            "outcome": null,
+            "phase": {
+              "waiting": {
+                "on": "question",
+                "question": {
+                  "prompts": {
+                    "url": {
+                      "url": {
+                        "message": "Continue in your browser",
+                        "url": "https://example.com/consent"
+                      }
+                    }
+                  },
+                  "source": "credential owner"
+                }
+              }
+            },
+            "tool": "credential owner",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "phase"
+          }
+        },
+        "rev": 4,
+        "seq": 3
       }
     ]
   }

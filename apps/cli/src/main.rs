@@ -585,6 +585,9 @@ impl Screen {
             Change::Added { item, .. } => {
                 if !matches!(item, Item::Assistant { .. }) {
                     print_all(&added(item), emit);
+                    if self.synced && view.present(item).question.is_some() {
+                        emit(format_args!("{}\n", ask(&view.present(item))));
+                    }
                 }
             }
             // Sent in place of a long replay: shown as the replay would be.
@@ -665,6 +668,51 @@ fn description_update(p: &Presented<'_>) -> Option<String> {
 
 /// The question a call waiting for approval puts.
 fn ask(p: &Presented<'_>) -> String {
+    if let (Some(question), Some(id), protocol::view::Buttons::Approve(call)) =
+        (p.question, p.question_seq, p.buttons)
+    {
+        let example = protocol::QuestionAnswer {
+            question: id,
+            responses: question
+                .prompts
+                .iter()
+                .map(|(key, prompt)| {
+                    let response = match prompt {
+                        protocol::Prompt::Form { fields, .. } => protocol::Response::Submit(
+                            fields
+                                .iter()
+                                .filter(|f| f.required || f.default.is_some())
+                                .map(|f| {
+                                    (
+                                        f.name.clone(),
+                                        f.default.clone().unwrap_or_else(protocol::Json::null),
+                                    )
+                                })
+                                .collect(),
+                        ),
+                        protocol::Prompt::Continue { .. } => {
+                            protocol::Response::Continue(protocol::ContinueAnswer::Proceed)
+                        }
+                        _ => protocol::Response::accept(),
+                    };
+                    (key.clone(), response)
+                })
+                .collect(),
+        };
+        let decline = client::QuestionDraft::default()
+            .answer(id, question, "decline")
+            .expect("decline needs no field values");
+        return format!(
+            "{}\nQuestion {} for call {}. Replace null placeholders with typed values; include optional fields as needed.\n/answer {} {}\nDecline: /answer {} {}",
+            client::sanitize(&client::question_text(question)),
+            id.get(),
+            call.get(),
+            call.get(),
+            protocol::Json::encode(&example).expect("answer JSON"),
+            call.get(),
+            protocol::Json::encode(&decline).expect("answer JSON")
+        );
+    }
     client::approval_parts(p)
         .into_iter()
         .map(|part| match part {

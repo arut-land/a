@@ -669,6 +669,34 @@ These supersede the original M1/M2/M3 schedule: web and remote SSH are already p
 checkpoints, additional codecs/transports, and deterministic fault simulation
 for the distributed design. Each needs its own contract and measurements.
 
+## Typed user questions
+
+Policy gates and extension questions share `Question`, `QuestionAnswer` and
+sequence identity. Pending user questions request immediate durable publication,
+so their frames do not wait for the otherwise-idle sync timer. A gate derives
+its Confirm question from its permission
+decision; an extension parks with `WaitOn::Question` and a private checkpoint.
+The log contains the question as asked, the checkpoint required to continue,
+and the answer, decline or cancel. Draft edits and browser opening remain
+client state. Client snapshots omit continuation checkpoints.
+
+`ext::QuestionTool` separates starting an external operation from continuing
+it. Returning Ask releases its execution future. A later answer is validated
+against the pending question and committed before the driver invokes the
+continuation. A new round receives a new question sequence. Parked questions
+survive daemon restart; unsafe work with an answer but no committed result is
+interrupted and never automatically resent. Human waiting has no deadline;
+network exchange timeouts resume when work resumes. Interrupt stops the turn
+without sending an elicitation response to the server.
+
+A shared service can obtain `Cx::questions()` while authorized and retain a
+QuestionPort independently of that caller's cancellation. Its standalone
+Question fact belongs to the session actor generation, not a tool call.
+Dropping its asking future cancels the question. Such live-owner questions
+are cancelled on restart because their listeners and authority cannot be
+recovered. OAuth uses this port: interrupting the presenting tool cannot
+decline authorization for other callers sharing its credential renewal.
+
 ## Open questions
 
 - What exact facts must a model call retain for reproducible requests across

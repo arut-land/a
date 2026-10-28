@@ -224,6 +224,11 @@ impl Registrar {
         self.dyn_tool(Arc::new(crate::tool::Resuming(Erased(tool, PhantomData))))
     }
 
+    /// Offers a tool with a typed, durable question continuation.
+    pub fn question_tool<T: crate::QuestionTool>(&mut self, tool: T) -> &mut Self {
+        self.dyn_tool(Arc::new(crate::question::Questioning(tool, PhantomData)))
+    }
+
     /// Offers a tool named at run time.
     pub fn dyn_tool(&mut self, tool: Arc<dyn DynTool>) -> &mut Self {
         let names = self.tools.iter().map(|t| t.name());

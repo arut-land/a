@@ -964,6 +964,11 @@ fn card(
     if let Some(first) = out.get_mut(from).and_then(|row| row.spans.first_mut()) {
         first.text = format!("  ⎿  {}", first.text.trim_start_matches(' ')).into();
     }
+    if let Some(question) = p.question {
+        for line in client::question_text(question).lines().chain(std::iter::once("tab / enter: edit fields · ctrl-s: submit · ctrl-n: decline · esc: cancel · ctrl-o: open URL")) {
+            out.extend(wrap(&[Span::new(sanitize(line), ASK)], width, &[Span::new("     ", MUTED)], &[Span::new("     ", MUTED)]));
+        }
+    }
     for part in review {
         match part {
             client::ApprovalPart::Controls { call, title } => {

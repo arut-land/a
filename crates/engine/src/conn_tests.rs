@@ -384,14 +384,20 @@ fn a_repeated_mutation_is_answered_again_but_not_done_again() {
     peer.send(&attach(Target::New, 0, ClientDecl::default()));
     peer.send(&input("hi", 1));
     peer.send(&input("hi", 1));
-    peer.send(&ClientMsg::Approve {
+    peer.send(&ClientMsg::Answer {
         call: CallId::new(9).unwrap(),
-        approved: true,
+        answer: protocol::QuestionAnswer::confirm(
+            Seq::new(1).unwrap(),
+            protocol::Response::accept(),
+        ),
         client_seq: Some(2),
     });
-    peer.send(&ClientMsg::Approve {
+    peer.send(&ClientMsg::Answer {
         call: CallId::new(9).unwrap(),
-        approved: true,
+        answer: protocol::QuestionAnswer::confirm(
+            Seq::new(1).unwrap(),
+            protocol::Response::accept(),
+        ),
         client_seq: Some(2),
     });
     assert!(matches!(peer.answer(), DaemonMsg::Welcome { .. }));

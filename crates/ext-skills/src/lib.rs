@@ -244,6 +244,7 @@ impl ext::DynTool for Command {
             };
             match ext::Json::encode(&self.load.load(&self.name, &args.args, cx).await) {
                 Ok(output) => ext::Called {
+                    parked: None,
                     outcome: protocol::Outcome::Done {
                         output: output.into(),
                     },

@@ -444,6 +444,7 @@ impl SessionClient {
             Cmd::Input(text) => self.offer().and_then(|o| o.input(text)),
             Cmd::Steer(text) => self.offer().and_then(|o| o.steer(text)),
             Cmd::Approve { call, approved } => self.offer().and_then(|o| o.approve(call, approved)),
+            Cmd::Answer { call, answer } => self.offer().and_then(|o| o.answer(call, answer)),
             Cmd::Interrupt => self.offer().and_then(Offer::interrupt),
             Cmd::RefreshEnv => self.offer().and_then(Offer::refresh_env),
             Cmd::Detach => Ok(self.detach()),
@@ -752,7 +753,34 @@ impl Offer<'_> {
         if !self.0.view.state.inbox().any(|c| c == call) {
             return Err(Notice::NotAsking(call));
         }
-        self.send(ClientMsg::approve(call, approved))
+        if !self.0.view.state.awaiting_permission(call) {
+            return Err(Notice::NotAsking(call));
+        }
+        let question = self
+            .0
+            .view
+            .state
+            .question_id(call)
+            .ok_or(Notice::NotAsking(call))?;
+        let response = if approved {
+            protocol::Response::accept()
+        } else {
+            protocol::Response::Decline
+        };
+        self.answer(call, protocol::QuestionAnswer::confirm(question, response))
+    }
+
+    /// Sends an answer only to the question the user actually reviewed.
+    pub fn answer(
+        self,
+        call: CallId,
+        answer: protocol::QuestionAnswer,
+    ) -> Result<Vec<Effect>, Notice> {
+        self.view()?;
+        if self.0.view.state.question_id(call) != Some(answer.question) {
+            return Err(Notice::NotAsking(call));
+        }
+        self.send(ClientMsg::answer(call, answer))
     }
 
     /// Sends this client's environment again.
@@ -807,7 +835,7 @@ pub(crate) const fn is_mutation(msg: &ClientMsg) -> bool {
         msg,
         ClientMsg::Input { .. }
             | ClientMsg::Withdraw { .. }
-            | ClientMsg::Approve { .. }
+            | ClientMsg::Answer { .. }
             | ClientMsg::Interrupt { .. }
     )
 }
@@ -1419,7 +1447,7 @@ mod tests {
             approved: true,
         });
         assert!(
-            matches!(sends(&out)[..], [ClientMsg::Approve { call: approved, .. }] if *approved == call)
+            matches!(sends(&out)[..], [ClientMsg::Answer { call: approved, .. }] if *approved == call)
         );
     }
 
@@ -1529,11 +1557,11 @@ mod tests {
         client.step(msg(1, ask(3, 2)));
         assert!(matches!(
             sends(&client.offer().unwrap().approve(two, false).unwrap())[..],
-            [ClientMsg::Approve {
+            [ClientMsg::Answer {
                 call,
-                approved: false,
+                answer,
                 ..
-            }] if *call == two
+            }] if *call == two && !answer.accepted()
         ));
         // Attached but reconnecting: offered, and queued until the
         // connection is up.

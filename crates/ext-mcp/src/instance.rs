@@ -65,7 +65,7 @@ pub(crate) struct Instance {
 }
 
 struct State {
-    requests: Mutex<BTreeMap<u64, Pending>>,
+    requests: Mutex<BTreeMap<rpc::RequestId, Pending>>,
     changed: rt::Notify,
     cancel: Cancel,
     scope: crate::config::Scope,
@@ -171,7 +171,7 @@ impl Instance {
             if self.state.cancel.is_set() {
                 return Err(Failure::Crashed);
             }
-            let id = rpc::next_id();
+            let id = rpc::RequestId::new();
             let mut frame = serde_json::to_vec(&rpc::request(id, method, params))
                 .map_err(|e| Failure::Protocol(e.to_string()))?;
             if frame.len() > rpc::LIMIT {
@@ -240,7 +240,7 @@ impl ScopedResource for Instance {
 // A dropped caller releases its authority immediately. Shared exchanges keep only
 // their charged ingress/drain state; they never retain a cancelled session's Cx.
 struct Waiting {
-    id: u64,
+    id: rpc::RequestId,
     state: Arc<State>,
 }
 impl Drop for Waiting {
@@ -309,18 +309,18 @@ impl State {
                 Err(e) => return e,
             };
             if value["method"] == "notifications/tools/list_changed" {
-                if let Err(error) = rpc::decode(&value, 0) {
+                if let Err(error) = rpc::decode(&value, None) {
                     return error;
                 }
                 self.discovery.invalidate();
             }
             if value.get("id").is_none()
-                && let Err(error) = rpc::decode(&value, 0)
+                && let Err(error) = rpc::decode(&value, None)
             {
                 return error;
             }
-            let response_id = value.get("id").and_then(Value::as_u64);
-            let progress_id = value["params"]["progressToken"].as_u64();
+            let response_id = value.get("id").and_then(rpc::RequestId::read);
+            let progress_id = rpc::RequestId::read(&value["params"]["progressToken"]);
             let mut requests = lock(&self.requests);
             if value.get("id").is_some() && response_id.is_none_or(|id| !requests.contains_key(&id))
             {

@@ -608,7 +608,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
         .collect();
     assert!(
         matches!(&answers[..], [e] if matches!(&e.body, Body::Answer { call: c, value, .. }
-            if *c == call && value.parse::<bool>().is_ok_and(|yes| yes))),
+            if *c == call && value.parse::<protocol::QuestionAnswer>().is_ok_and(|answer| answer.accepted()))),
         "{log:#?}"
     );
 }

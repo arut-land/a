@@ -221,6 +221,7 @@ impl DynTool for Declared {
     }
     fn call<'a>(&'a self, _: Parsed, _: &'a Cx) -> BoxFuture<'a, Called> {
         Box::pin(std::future::ready(Called {
+            parked: None,
             outcome: Outcome::Done {
                 output: Json::encode(&json!("declared")).unwrap().into(),
             },

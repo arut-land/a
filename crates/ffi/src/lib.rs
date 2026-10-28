@@ -475,9 +475,68 @@ pub struct Presentation {
     /// when it has nothing to say.
     pub status: String,
     pub approval: Vec<ApprovalPart>,
+    pub question: Option<UserQuestion>,
     pub body: Option<ShownBody>,
     /// A reply's token counts, once it has them.
     pub usage: Option<TokenUsage>,
+}
+
+/// A question and its field descriptors; drafts never enter the daemon log.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserQuestion {
+    pub call: u64,
+    pub id: u64,
+    pub source: String,
+    pub prompts: Vec<QuestionPrompt>,
+}
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionPrompt {
+    pub key: String,
+    pub message: String,
+    pub url: Option<String>,
+    pub fields: Vec<QuestionField>,
+}
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionField {
+    pub key: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub required: bool,
+    pub kind: QuestionFieldKind,
+    pub options: Vec<QuestionOption>,
+    pub initial: Option<String>,
+}
+#[data]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuestionFieldKind {
+    Text,
+    Number,
+    Boolean,
+    Choice,
+    MultipleChoice,
+}
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionOption {
+    pub value: String,
+    pub title: String,
+}
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionInput {
+    pub key: String,
+    pub value: String,
+    pub included: bool,
+}
+#[data]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuestionAction {
+    Accept,
+    Decline,
+    Cancel,
 }
 
 /// One of a query's answers, its JSON as text; nothing follows any but an
@@ -596,6 +655,87 @@ pub enum BodyKind {
     Markdown,
 }
 
+impl UserQuestion {
+    fn from_presented(p: &Presented<'_>) -> Option<Self> {
+        p.question.zip(p.question_seq).and_then(|(question, id)| {
+            let protocol::view::Buttons::Approve(call) = p.buttons else {
+                return None;
+            };
+            Some(UserQuestion {
+                call: call.get(),
+                id: id.get(),
+                source: question.source.clone(),
+                prompts: question
+                    .prompts
+                    .values()
+                    .enumerate()
+                    .map(|(pi, prompt)| QuestionPrompt {
+                        key: format!("p{pi}"),
+                        message: prompt.message().into(),
+                        url: if let protocol::Prompt::Url { url, .. } = prompt {
+                            Some(url.clone())
+                        } else {
+                            None
+                        },
+                        fields: if let protocol::Prompt::Form { fields, .. } = prompt {
+                            fields
+                                .iter()
+                                .enumerate()
+                                .map(|(fi, field)| {
+                                    let kind = match &field.kind {
+                                        protocol::FieldKind::String { .. } => {
+                                            QuestionFieldKind::Text
+                                        }
+                                        protocol::FieldKind::Number { .. } => {
+                                            QuestionFieldKind::Number
+                                        }
+                                        protocol::FieldKind::Boolean => QuestionFieldKind::Boolean,
+                                        protocol::FieldKind::Choice {
+                                            selection: protocol::Selection::One,
+                                            ..
+                                        } => QuestionFieldKind::Choice,
+                                        protocol::FieldKind::Choice { .. } => {
+                                            QuestionFieldKind::MultipleChoice
+                                        }
+                                    };
+                                    QuestionField {
+                                        key: format!("f{pi}_{fi}"),
+                                        title: field
+                                            .title
+                                            .clone()
+                                            .unwrap_or_else(|| field.name.clone()),
+                                        description: field.description.clone(),
+                                        required: field.required,
+                                        kind,
+                                        options: if let protocol::FieldKind::Choice {
+                                            options,
+                                            ..
+                                        } = &field.kind
+                                        {
+                                            options
+                                                .iter()
+                                                .map(|o| QuestionOption {
+                                                    value: o.value.clone(),
+                                                    title: o.title.clone(),
+                                                })
+                                                .collect()
+                                        } else {
+                                            Vec::new()
+                                        },
+                                        initial: field.default_text(),
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
+                    })
+                    .collect(),
+            })
+        })
+    }
+}
+
 impl From<&Presented<'_>> for Presentation {
     fn from(p: &Presented<'_>) -> Self {
         let body = match &p.body {
@@ -622,6 +762,7 @@ impl From<&Presented<'_>> for Presentation {
             },
             title: p.title.to_string(),
             status: p.status.to_string(),
+            question: UserQuestion::from_presented(p),
             approval: client::approval_parts(p)
                 .into_iter()
                 .map(|part| match part {

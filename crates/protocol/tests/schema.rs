@@ -138,7 +138,7 @@ fn log() -> Vec<Vec<u8>> {
         r#"{"seq":5,"epoch":0,"kind":"tool_call","tool":"bash","input":{"command":"ls"}}"#,
         r#"{"seq":6,"epoch":0,"kind":"decision","by":"policy","call":5,"d":"permission","permission":{"ask":{"mode":{"mode":"ask"}}}}"#,
         r#"{"seq":7,"epoch":0,"kind":"input","segments":[{"text":"and sizes"}],"mode":"steer"}"#,
-        r#"{"seq":8,"epoch":0,"kind":"answer","call":5,"value":true}"#,
+        r#"{"seq":8,"epoch":0,"kind":"answer","call":5,"value":{"question":7,"responses":{"confirm":{"accept":{}}}}}"#,
         r#"{"seq":9,"epoch":0,"kind":"tool_process","call":5,"pgid":42,"boot":"b"}"#,
         r#"{"seq":10,"epoch":0,"kind":"progress","call":5,"text":"src\n"}"#,
         r#"{"seq":11,"epoch":0,"kind":"take","input":7}"#,
@@ -266,9 +266,12 @@ fn every_wait_is_a_phase_of_its_call() {
     ));
     let cases = [
         (
-            r#""on":"dialog","ui":{"title":"pick"}"#,
-            WaitOn::Dialog {
-                ui: protocol::Json::encode(&serde_json::json!({ "title": "pick" })).unwrap(),
+            r#""on":"question","question":{"source":"authorization","prompts":{"confirm":{"confirm":{"message":"pick"}}}},"checkpoint":null"#,
+            WaitOn::Question {
+                request: Box::new(protocol::QuestionWait {
+                    question: protocol::Question::confirm("pick".into()),
+                    checkpoint: Some(protocol::Json::null()),
+                }),
             },
             Activity::Input,
         ),
@@ -296,7 +299,11 @@ fn every_wait_is_a_phase_of_its_call() {
             Phase::Waiting(on)
         );
         assert_eq!(ledger.activity(), activity);
-        assert_eq!(ledger.inbox().count(), 0, "only approvals are asked");
+        assert_eq!(
+            ledger.inbox().count(),
+            usize::from(activity == Activity::Input),
+            "every user question is actionable"
+        );
         ledger.apply(&line(&format!(
             r#"{{"seq":{},"epoch":0,"kind":"answer","call":1,"value":"a.txt"}}"#,
             seq + 1
@@ -330,7 +337,11 @@ fn the_log_knows_each_clients_last_mutation() {
         },
         Body::Answer {
             call: CallId::new(9).unwrap(),
-            value: protocol::Json::encode(&true).unwrap(),
+            value: protocol::Json::encode(&protocol::QuestionAnswer::confirm(
+                Seq::new(3).unwrap(),
+                protocol::Response::accept(),
+            ))
+            .unwrap(),
             origin: Some(author(2)),
         },
     ];

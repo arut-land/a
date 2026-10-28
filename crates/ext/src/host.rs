@@ -28,12 +28,24 @@ pub use crate::assemble::Built;
 pub use crate::history::{HistoryNamespace, ValidatedPrefix};
 pub use crate::point::{Decided, Hooks};
 
+/// Generation-scoped presentation authority granted while a caller is live.
+/// Its questions belong to their futures, not to the caller that obtained the port.
+pub trait QuestionPort: Send + Sync {
+    fn ask(
+        &self,
+        question: protocol::Question,
+    ) -> BoxFuture<'static, Result<protocol::QuestionAnswer, String>>;
+}
+
 /// The engine, as a running call reaches it.
 pub trait Host: Send + Sync {
     fn conversations(&self) -> Option<&dyn crate::Conversations> {
         None
     }
 
+    fn questions(&self) -> Option<Arc<dyn QuestionPort>> {
+        None
+    }
     fn invoke(
         self: Arc<Self>,
         cx: Cx,
@@ -117,7 +129,7 @@ impl Parts {
 
 /// Whether a call's result goes through [`Record`](crate::Record).
 #[derive(Clone, Copy)]
-enum Recorded {
+pub enum Recorded {
     Yes,
     No,
 }
@@ -182,10 +194,44 @@ impl Toolset {
         };
         Box::pin(async move {
             let called = tool.call(input, cx).await;
+            if called.parked.is_some() {
+                return called;
+            }
             match (recorded, cx.service::<dyn crate::Record>()) {
                 (Recorded::Yes, Some(record)) => record.record(tool, called, cx).await,
                 _ => called,
             }
+        })
+    }
+
+    /// Continues a committed question checkpoint, recording only its final result.
+    pub fn answer<'a>(
+        &'a self,
+        name: &str,
+        input: &Json,
+        state: Json,
+        answer: protocol::QuestionAnswer,
+        cx: &'a Cx,
+        recorded: Recorded,
+    ) -> BoxFuture<'a, Called> {
+        let Some(tool) = self.get(name) else {
+            return Box::pin(std::future::ready(Called::failed(format!(
+                "unknown tool {name}"
+            ))));
+        };
+        let input = match tool.parse(input) {
+            Ok(input) => input,
+            Err(error) => return Box::pin(std::future::ready(Called::failed(error))),
+        };
+        Box::pin(async move {
+            let called = tool.answer(input, state, answer, cx).await;
+            if matches!(recorded, Recorded::Yes)
+                && called.parked.is_none()
+                && let Some(record) = cx.service::<dyn crate::Record>()
+            {
+                return record.record(tool, called, cx).await;
+            }
+            called
         })
     }
 

@@ -358,7 +358,12 @@ fn states() -> Vec<(&'static str, Session)> {
     state("waiting approval", asking, vec![user("$ x")]);
     let dialog = Event::Waits {
         call: id(2),
-        on: WaitOn::Dialog { ui: Json::null() },
+        on: WaitOn::Question {
+            request: Box::new(protocol::QuestionWait {
+                question: protocol::Question::confirm("pick".into()),
+                checkpoint: Some(Json::null()),
+            }),
+        },
     };
     state("waiting dialog", Reg::echo(), vec![user("$ x"), dialog]);
     let spawn = Event::Spawn {
@@ -1318,5 +1323,25 @@ mod schedule_checks {
             .find("the gate broke")
             .expect("the real Core must reach the panicking gate");
         assert!(replay < panic, "{stderr}");
+    }
+}
+
+#[test]
+fn user_questions_request_durable_publication_under_either_durability_setting() {
+    for barriers in [kernel::Barriers::Step, kernel::Barriers::Effects] {
+        let mut session = Session::with_barriers(Reg::modeled().arc(), barriers);
+        session.step(user("question"));
+        session.step(prepared(2));
+        session.step(model_done(2, &[("bash", json!({"command":"true"}))]));
+        let plan = session.step(Event::Waits {
+            call: id(4),
+            on: WaitOn::Question {
+                request: Box::new(protocol::QuestionWait {
+                    question: protocol::Question::confirm("Continue?".into()),
+                    checkpoint: Some(Json::null()),
+                }),
+            },
+        });
+        assert!(plan.commit.unwrap().publish);
     }
 }

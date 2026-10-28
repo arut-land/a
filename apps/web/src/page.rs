@@ -73,6 +73,37 @@ impl Page {
         self.error.is_none()
     }
 
+    pub fn question(
+        &mut self,
+        call: protocol::CallId,
+        id: protocol::Seq,
+        action: &str,
+        values: std::collections::BTreeMap<String, String>,
+    ) -> Vec<Effect> {
+        let answer = self
+            .client
+            .view()
+            .state
+            .question(call)
+            .ok_or_else(|| "Question is no longer pending".to_string())
+            .and_then(|(current, question)| {
+                if current != id {
+                    return Err("Question changed; review it again".into());
+                }
+                client::QuestionDraft { values }.answer(id, &question, action)
+            });
+        match answer {
+            Ok(answer) => {
+                self.error = None;
+                self.client.run(Cmd::Answer { call, answer })
+            }
+            Err(error) => {
+                self.error = Some(error);
+                Vec::new()
+            }
+        }
+    }
+
     pub fn command(&mut self, cmd: Cmd) -> Vec<Effect> {
         match cmd {
             // This page's own controls do these, or nothing does.

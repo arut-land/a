@@ -1535,6 +1535,7 @@ impl DynTool for LuaTool {
                     },
                     card: None,
                     held: Vec::new(),
+                    parked: None,
                 },
                 Err(error) => Called::failed(format!("lua {}: {error}", self.owner)),
             }

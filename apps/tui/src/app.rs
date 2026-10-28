@@ -24,6 +24,7 @@ use protocol::{HostPath, SessionSummary, Target};
 pub enum Effect {
     /// The session client's to carry out.
     Cmd(Cmd),
+    OpenUrl(String),
     /// Replace an unresponsive daemon.
     Restart,
     Redraw,
@@ -65,6 +66,23 @@ struct Rows {
     streaming: bool,
 }
 
+struct QuestionInputField {
+    key: String,
+    title: String,
+    required: bool,
+}
+
+struct QuestionEdit {
+    call: protocol::CallId,
+    question: std::sync::Arc<protocol::Question>,
+    id: protocol::Seq,
+    field: usize,
+    url: usize,
+    draft: client::QuestionDraft,
+    fields: Vec<QuestionInputField>,
+    saved: Editor,
+}
+
 // Screen toggles and the frame owed, each read where it is set.
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
@@ -83,6 +101,7 @@ pub struct App {
     width: usize,
     body: u16,
     editor: Editor,
+    question_edit: Option<QuestionEdit>,
     input_session: Option<protocol::SessionId>,
     /// The slash menu's selected command.
     menu_at: Option<usize>,
@@ -184,6 +203,7 @@ impl App {
             width: 0,
             body: 0,
             editor: Editor::default(),
+            question_edit: None,
             input_session: None,
             menu_at: Some(0),
             deny: false,
@@ -286,6 +306,14 @@ impl App {
                 })
                 .collect();
         }
+        if self
+            .question_edit
+            .as_ref()
+            .is_some_and(|edit| self.client.view().state.question_id(edit.call) != Some(edit.id))
+            && let Some(edit) = self.question_edit.take()
+        {
+            self.editor = edit.saved;
+        }
         let len = self.view().items.len();
         if !matches!(update.change, Change::Delta { .. }) {
             self.summary = None;
@@ -366,6 +394,13 @@ impl App {
             Input::Key(key) => self.key(key),
             Input::Mouse(mouse) => self.mouse(mouse),
             Input::Paste(text) => {
+                if self.overlay.is_none()
+                    && let Some((call, id, question)) = self.current_question()
+                {
+                    self.enter_question(call, id, question);
+                    self.editor.insert(&text);
+                    return None;
+                }
                 if self.overlay.is_none() {
                     self.editor.paste(&text.replace('\t', "    "));
                     self.menu_at = Some(0);
@@ -381,6 +416,11 @@ impl App {
             return self.overlay_key(key);
         }
         let asked = self.client.turn().asking;
+        if key != Key::Ctrl('c')
+            && let Some((call, id, question)) = self.current_question()
+        {
+            return self.question_key(call, id, &question, key);
+        }
         let page = self.page();
         match key {
             Key::Ctrl('c') if self.client.turn().can_interrupt => return Some(self.interrupt()),
@@ -472,6 +512,192 @@ impl App {
                 }
             }
         }
+        None
+    }
+
+    fn current_question(
+        &self,
+    ) -> Option<(
+        protocol::CallId,
+        protocol::Seq,
+        std::sync::Arc<protocol::Question>,
+    )> {
+        let call = self.client.turn().asking?;
+        if self.client.view().state.awaiting_permission(call) {
+            return None;
+        }
+        let id = self.client.view().state.question_id(call)?;
+        let question = self
+            .question_edit
+            .as_ref()
+            .filter(|e| e.id == id)
+            .map_or_else(
+                || {
+                    std::sync::Arc::new(
+                        self.client
+                            .view()
+                            .state
+                            .question(call)
+                            .expect("pending question")
+                            .1,
+                    )
+                },
+                |e| e.question.clone(),
+            );
+        Some((call, id, question))
+    }
+
+    fn enter_question(
+        &mut self,
+        call: protocol::CallId,
+        id: protocol::Seq,
+        question: std::sync::Arc<protocol::Question>,
+    ) {
+        if self.question_edit.as_ref().is_none_or(|e| e.id != id) {
+            if let Some(edit) = self.question_edit.take() {
+                self.editor = edit.saved;
+            }
+            let draft = client::QuestionDraft::new(&question);
+            let saved = std::mem::take(&mut self.editor);
+            let mut fields = question
+                .prompts
+                .values()
+                .enumerate()
+                .flat_map(|(p, prompt)| match prompt {
+                    protocol::Prompt::Form { fields, .. } => fields
+                        .iter()
+                        .enumerate()
+                        .map(|(f, field)| QuestionInputField {
+                            key: format!("f{p}_{f}"),
+                            title: field.title.clone().unwrap_or_else(|| field.name.clone()),
+                            required: field.required,
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            if question.prompts.len() > 1 {
+                for p in (0..question.prompts.len()).rev() {
+                    fields.insert(
+                        0,
+                        QuestionInputField {
+                            key: format!("p{p}"),
+                            title: format!("Prompt {} response: accept, decline or cancel", p + 1),
+                            required: true,
+                        },
+                    );
+                }
+            }
+            if let Some(value) = fields.first().and_then(|f| draft.values.get(&f.key)) {
+                self.editor.insert(value);
+            }
+            self.question_edit = Some(QuestionEdit {
+                call,
+                question,
+                id,
+                field: 0,
+                url: 0,
+                draft,
+                fields,
+                saved,
+            });
+        }
+    }
+
+    fn question_key(
+        &mut self,
+        call: protocol::CallId,
+        id: protocol::Seq,
+        question: &std::sync::Arc<protocol::Question>,
+        key: Key,
+    ) -> Option<Effect> {
+        self.enter_question(call, id, question.clone());
+        let edit = self
+            .question_edit
+            .as_mut()
+            .expect("question editor initialized");
+        let fields = &edit.fields;
+        let action = match key {
+            Key::Esc => Some("cancel"),
+            Key::Ctrl('n') => Some("decline"),
+            Key::Ctrl('s') => Some("accept"),
+            Key::Enter if fields.is_empty() => Some("accept"),
+            _ => None,
+        };
+        if let Some(field) = fields.get(edit.field)
+            && (edit.draft.values.contains_key(&field.key) || !self.editor.is_empty())
+        {
+            edit.draft
+                .values
+                .insert(field.key.clone(), self.editor.text().into());
+        }
+        if let Some(action) = action {
+            match edit.draft.answer(id, question, action) {
+                Ok(answer) => {
+                    return Some(Effect::Cmd(Cmd::Answer { call, answer }));
+                }
+                Err(error) => {
+                    self.flash = Some((error, MUTED));
+                    return None;
+                }
+            }
+        }
+        match key {
+            Key::Ctrl('o') => {
+                let urls: Vec<_> = question
+                    .prompts
+                    .values()
+                    .filter_map(|p| match p {
+                        protocol::Prompt::Url { url, .. } => Some(url),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(url) = urls.get(edit.url) {
+                    edit.url = (edit.url + 1) % urls.len();
+                    return Some(Effect::OpenUrl((*url).clone()));
+                }
+            }
+            Key::Alt('i') => {
+                if let Some(field) = fields.get(edit.field) {
+                    let name = &field.key;
+                    edit.draft
+                        .values
+                        .insert(name.clone(), self.editor.text().into());
+                }
+            }
+            Key::Ctrl('u') => {
+                if let Some(field) = fields.get(edit.field)
+                    && !field.required
+                {
+                    edit.draft.values.remove(&field.key);
+                    self.editor.clear();
+                }
+            }
+            Key::Tab | Key::Enter | Key::BackTab if !fields.is_empty() => {
+                edit.field = if key == Key::BackTab {
+                    (edit.field + fields.len() - 1) % fields.len()
+                } else {
+                    (edit.field + 1) % fields.len()
+                };
+                self.editor.clear();
+                if let Some(value) = edit.draft.values.get(&fields[edit.field].key) {
+                    self.editor.insert(value);
+                }
+            }
+            key => {
+                self.editor.key_with_history(key, std::iter::empty::<&str>);
+            }
+        }
+        let label = fields
+            .get(edit.field)
+            .map_or("Continue", |field| field.title.as_str());
+        self.flash = Some((
+            format!(
+                "{} · tab: next · ctrl-s: submit · ctrl-n: decline · esc: cancel · ctrl-o: open URL · ctrl-u: omit · alt-i: include",
+                client::sanitize(label)
+            ),
+            MUTED,
+        ));
         None
     }
 

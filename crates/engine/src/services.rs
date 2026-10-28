@@ -152,7 +152,48 @@ impl CallPorts {
     }
 }
 
+struct QuestionPorts {
+    session: Arc<Session>,
+    fence: u64,
+}
+impl ext::host::QuestionPort for QuestionPorts {
+    fn ask(
+        &self,
+        question: protocol::Question,
+    ) -> BoxFuture<'static, Result<protocol::QuestionAnswer, String>> {
+        struct Waiting(ext::Cancel);
+        impl Drop for Waiting {
+            fn drop(&mut self) {
+                self.0.set();
+            }
+        }
+        let cancel = ext::Cancel::default();
+        let waiting = Waiting(cancel.clone());
+        let (reply, result) = oneshot::channel();
+        let _ = self.session.mail.send(super::Msg::Question {
+            fence: self.fence,
+            question,
+            cancel,
+            reply,
+        });
+        Box::pin(async move {
+            let _waiting = waiting;
+            result
+                .await
+                .unwrap_or_else(|| Err("question authority ended".into()))
+        })
+    }
+}
+
 impl Host for CallPorts {
+    fn questions(&self) -> Option<Arc<dyn ext::host::QuestionPort>> {
+        self.origin.current(&self.session).then(|| {
+            Arc::new(QuestionPorts {
+                session: Arc::clone(&self.session),
+                fence: self.origin.fence,
+            }) as Arc<dyn ext::host::QuestionPort>
+        })
+    }
     fn conversations(&self) -> Option<&dyn ext::Conversations> {
         Some(self)
     }
@@ -180,6 +221,7 @@ impl Host for CallPorts {
                 outcome: super::Outcome::Interrupted { output: None },
                 card: None,
                 held: Vec::new(),
+                parked: None,
             })
         })
     }
