@@ -10,7 +10,7 @@ everything around them is our own and small.
 | --- | --- | --- |
 | Spec | `spec.rs` | Provider-agnostic, serde-stable types. Messages are one enum per role (`System`, `User`, `Assistant`, `Tool`), each holding only the parts that role may. Every part carries `meta`: provider state keyed by the protocol that wrote it. |
 | Protocol | `protocol.rs` | A wire protocol is a pure `encode` (request to body) and a pure `Decoder` (frames to events). A `Provider` is data: id, base URL, auth, and a protocol value carrying that host's quirks. `Host` builds one from the environment. |
-| Conversation | `conversation.rs` | A conversation's messages, shared by every request that carries them, with what each protocol encoded of them: a fold writes each message's items once, as bytes, and later requests splice those bytes. A tool set keeps its definitions the same way, as bytes per wire. |
+| Conversation | `conversation.rs` | Canonical messages or one active target's retained encoding and mutable suffix. A fold writes new messages once; requests splice settled bytes. Canonical history is reconstructed from the daemon log when needed. Tool definitions are cached as bytes per wire. |
 | Writer | `writer.rs` | rig's completion fold as a sans-IO helper every decoder writes through (`Writes`). It owns the rules all wires share (see its module doc). |
 | JSON | `json.rs` | Lenient reads of what providers send, the borrowing frame reader every decoder shares (`json/read.rs`), and tool arguments parsed so a cut-off call never fails a reply. |
 | Models | `models/` | What model ids say: reasoning (levels, budgets, whether it turns off), sampling, vision, output limits and context windows, as id rules and const tables, one module per vendor. Protocols ask here and keep only how their wire spells an option. |
@@ -31,6 +31,32 @@ Protocols live in `protocols/<name>/` with a `KEY`, a protocol type holding
 | OpenAI Chat Completions | `openai.chat` | 24, from OpenAI and Azure to Groq, DeepSeek, Mistral, OpenRouter, Together, z.ai, Moonshot, MiniMax, Ollama and llama.cpp |
 | Anthropic Messages | `anthropic.messages` | Anthropic, z.ai, MiniMax, Moonshot, Xiaomi MiMo |
 | Gemini generateContent | `google.gemini` | Gemini Developer API |
+
+## Resident conversations
+
+A daemon session keeps the active target's encoded settled prefix, its
+prepare/fold continuation, and the mutable canonical tail. Once the
+continuation covers a canonical message, the session releases that message.
+Request-local reminders do not become part of the continuation. The
+[measurements](perf/turn-residency.md) show the resulting history growth
+and the retained fragment-cache CPU benefit.
+
+`Request.messages` is a `Conversation`: either canonical `Messages` or a
+retained continuation with a log-backed canonical source. Ordinary appends
+encode only new messages. Target/context changes, canonical edits, and
+consumers requiring canonical history reconstruct it at the saved log cut.
+The source captures disjoint committed and pending ranges so flushing the
+pending entries cannot change a saved reader's history. Canonical exports
+have independent caches and cannot attach encoded copies to the session's
+decoded tail. Consumers retaining a source beyond its registry generation
+must materialize it first.
+
+`prepare_request` produces a `Prepared` value containing wire bytes and
+decoder state, without retaining the canonical request or sending HTTP.
+The engine prepares on an `rt` CPU worker and dispatches only after logging
+Step decisions. Image fitting reconstructs and edits only the outgoing
+request; the stored history keeps every image. Client transcript paging is
+separate work and is not provided by this representation.
 
 ## Adding a host or a protocol
 

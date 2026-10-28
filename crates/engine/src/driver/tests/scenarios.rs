@@ -216,3 +216,69 @@ fn a_reminder_is_a_tail_message() {
     assert_eq!(bodies[0]["instructions"], bodies[1]["instructions"]);
     assert_eq!(bodies[0]["tools"], bodies[1]["tools"]);
 }
+
+struct CaptureHistory(Arc<Mutex<Vec<llm::Conversation>>>);
+
+impl Extension for CaptureHistory {
+    const NAME: &'static str = "capture_history";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        let requests = Arc::clone(&self.0);
+        r.on::<point::Step>(move |_, request| {
+            lock(&requests).push(request.messages.clone());
+            Rewrite::Pass
+        });
+    }
+}
+
+#[test]
+fn canonical_history_is_reconstructed_at_its_request_cut() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let http = Flaky::new((0..4).map(|_| Reply::Events(text_reply())));
+    let registry = Registry::default()
+        .with(&CaptureHistory(Arc::clone(&requests)))
+        .unwrap();
+    let session = fixture(registry, &http).start(&[]);
+    for input in [
+        "first-resident-input",
+        "second-resident-input",
+        "third-resident-input",
+    ] {
+        session.submit(input).unwrap();
+        settle(&session);
+    }
+    let before = Json::encode(&lock(&requests)[2]).unwrap();
+    session.submit("future-input-outside-the-cut").unwrap();
+    settle(&session);
+    session.halt();
+    let after = Json::encode(&lock(&requests)[2]).unwrap();
+    assert_eq!(before, after);
+    assert!(after.raw().contains("first-resident-input"));
+    assert!(after.raw().contains("third-resident-input"));
+    assert!(!after.raw().contains("future-input-outside-the-cut"));
+}
+
+#[test]
+fn retained_request_sources_do_not_pin_their_registry() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let http = Flaky::new((0..3).map(|_| Reply::Events(text_reply())));
+    let registry = Registry::default()
+        .with(&CaptureHistory(Arc::clone(&requests)))
+        .unwrap();
+    let fixture = fixture(registry, &http);
+    let generation = Arc::downgrade(&fixture.0.registry.get());
+    let session = fixture.start(&[]);
+    for input in ["first", "second", "third"] {
+        session.submit(input).unwrap();
+        settle(&session);
+    }
+    session.halt();
+    drop(session);
+    drop(fixture);
+    assert_eq!(lock(&requests).len(), 3);
+    assert!(
+        generation.upgrade().is_none(),
+        "retained readers keep their own registry alive"
+    );
+}

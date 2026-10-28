@@ -316,7 +316,11 @@ fn images_share_the_actual_encoded_body_budget_with_text_and_tools() {
         let mut request = many(2, 1024);
         request.model = model.into();
         let text = "\"\\\n".repeat(300);
-        request.messages.insert(0, Message::system(&text));
+        request
+            .messages
+            .canonical_mut()
+            .unwrap()
+            .insert(0, Message::system(&text));
         request.tools = vec![llm::Tool {
             name: "read".into(),
             description: text.clone(),
@@ -392,7 +396,13 @@ fn body_overlays_consume_the_image_budget_without_cutting_text() {
 fn parallel_results_precede_relocated_media_even_when_delivered_separately() {
     for split in [false, true] {
         let mut request = held();
-        let Message::Assistant(assistant) = request.messages.get_mut(1).unwrap() else {
+        let Message::Assistant(assistant) = request
+            .messages
+            .canonical_mut()
+            .unwrap()
+            .get_mut(1)
+            .unwrap()
+        else {
             panic!()
         };
         let mut second = assistant.content[0].clone();
@@ -400,7 +410,13 @@ fn parallel_results_precede_relocated_media_even_when_delivered_separately() {
             call.id = "call_2".into();
         }
         assistant.content.push(second);
-        let Message::Tool(tool) = request.messages.get_mut(2).unwrap() else {
+        let Message::Tool(tool) = request
+            .messages
+            .canonical_mut()
+            .unwrap()
+            .get_mut(2)
+            .unwrap()
+        else {
             panic!()
         };
         let mut second = tool.results[0].clone();
@@ -442,14 +458,21 @@ fn failures_keep_their_context_and_media_on_wires_without_an_error_field() {
         Output::Json(llm::Json::encode(&json!({"reason": "permission denied"})).unwrap()),
         Output::Content(vec![]),
         {
-            let Message::Tool(tool) = &held().messages[2] else {
+            let request = held();
+            let Message::Tool(tool) = &request.messages.canonical().unwrap()[2] else {
                 panic!()
             };
             tool.results[0].output.clone()
         },
     ] {
         let mut request = held();
-        let Message::Tool(tool) = request.messages.get_mut(2).unwrap() else {
+        let Message::Tool(tool) = request
+            .messages
+            .canonical_mut()
+            .unwrap()
+            .get_mut(2)
+            .unwrap()
+        else {
             panic!()
         };
         tool.results[0].error = true;

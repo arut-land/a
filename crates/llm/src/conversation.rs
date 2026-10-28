@@ -3,6 +3,7 @@
 //! Cached and fresh folds must produce identical bytes.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -29,8 +30,14 @@ fn mark() -> u64 {
 
 /// A conversation's messages. Cloning one shares them; changing a clone
 /// copies them first.
-#[derive(Clone, Default)]
-pub struct Messages(Arc<List>);
+#[derive(Clone)]
+pub struct Messages(Arc<List>, Option<Arc<Mutex<Vec<Encoding>>>>);
+
+impl Default for Messages {
+    fn default() -> Self {
+        Self(Arc::default(), Some(Arc::default()))
+    }
+}
 
 #[derive(Clone, Default)]
 struct List {
@@ -38,8 +45,6 @@ struct List {
     /// Each message's mark: an encoding of a prefix ending in a message
     /// with the same mark is still the prefix's.
     marks: Vec<u64>,
-    /// The encodings kept, shared with every copy of this list.
-    encodings: Arc<Mutex<Vec<Encoding>>>,
 }
 
 impl Messages {
@@ -96,11 +101,7 @@ impl std::ops::Deref for Messages {
 impl From<Vec<Message>> for Messages {
     fn from(messages: Vec<Message>) -> Self {
         let marks = messages.iter().map(|_| mark()).collect();
-        Self(Arc::new(List {
-            messages,
-            marks,
-            encodings: Arc::default(),
-        }))
+        Self(Arc::new(List { messages, marks }), Some(Arc::default()))
     }
 }
 
@@ -132,6 +133,250 @@ impl<'de> Deserialize<'de> for Messages {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let json = crate::Json::deserialize(deserializer)?;
         Self::from_json(json.raw()).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A canonical conversation, or a retained encoding with a log-backed source.
+#[derive(Clone)]
+pub struct Conversation(Source);
+
+#[derive(Clone)]
+enum Source {
+    Canonical(Messages),
+    Retained {
+        resident: Resident,
+        tail: Messages,
+        extra: Arc<Vec<Message>>,
+        restore: Arc<dyn Fn() -> Result<Messages, Error> + Send + Sync>,
+    },
+}
+
+/// The active target's continuation. Canonical settled messages belong to the log.
+#[derive(Clone, Default)]
+pub struct Resident {
+    encoding: Arc<Mutex<Option<Encoding>>>,
+    offset: usize,
+    mark: u64,
+    images: usize,
+}
+
+impl Resident {
+    /// Relinquishes canonical messages covered by the encoded continuation.
+    /// Protocol folds retain their unsettled tail; canonical rewrites reload the log.
+    pub fn retain(&mut self, tail: &mut Messages) {
+        let mut encoding = self.encoding.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some((kept, _)) = &*encoding else { return };
+        tail.1 = None;
+        let Some(count) = kept.len.checked_sub(self.offset) else {
+            *encoding = None;
+            return;
+        };
+        if count == 0 {
+            if kept.mark != self.mark {
+                *encoding = None;
+            }
+            return;
+        }
+        if count > tail.len() || !tail.holds(count, kept.mark) {
+            *encoding = None;
+            return;
+        }
+        self.offset = kept.len;
+        self.mark = kept.mark;
+        self.images = kept.images;
+        if count == tail.len() && Arc::get_mut(&mut tail.0).is_none() {
+            tail.0 = Arc::default();
+            return;
+        }
+        let list = tail.list();
+        list.messages.drain(..count);
+        list.marks.drain(..count);
+    }
+
+    /// Whether a prefix has left canonical memory.
+    pub const fn has_prefix(&self) -> bool {
+        self.offset != 0
+    }
+}
+
+impl Conversation {
+    /// A source may borrow its producer's generation. Materialize canonical data
+    /// before retaining it beyond that generation's lifetime. `restore` reconstructs
+    /// exactly the canonical history represented by `resident` and `tail`.
+    pub fn retained(
+        resident: Resident,
+        mut tail: Messages,
+        restore: impl Fn() -> Result<Messages, Error> + Send + Sync + 'static,
+    ) -> Self {
+        // Canonical exports own their caches; they cannot attach bytes to this decoded tail.
+        tail.1 = None;
+        Self(Source::Retained {
+            resident,
+            extra: Arc::default(),
+            tail,
+            restore: Arc::new(restore),
+        })
+    }
+
+    /// Loads canonical history only for consumers that need it.
+    pub fn canonical(&self) -> Result<Cow<'_, Messages>, Error> {
+        match &self.0 {
+            Source::Canonical(messages) => Ok(Cow::Borrowed(messages)),
+            Source::Retained {
+                resident,
+                tail,
+                extra,
+                restore,
+            } => {
+                if resident.offset == 0 {
+                    let mut messages = Messages(Arc::clone(&tail.0), Some(Arc::default()));
+                    for message in extra.iter() {
+                        messages.push(message.clone());
+                    }
+                    Ok(Cow::Owned(messages))
+                } else {
+                    restored(restore, extra).map(Cow::Owned)
+                }
+            }
+        }
+    }
+
+    /// Reconstructs a canonical value before a request-specific edit.
+    pub fn canonical_mut(&mut self) -> Result<&mut Messages, Error> {
+        if matches!(self.0, Source::Retained { .. }) {
+            self.0 = Source::Canonical(self.canonical()?.into_owned());
+        }
+        let Source::Canonical(messages) = &mut self.0 else {
+            unreachable!("canonical conversation")
+        };
+        Ok(messages)
+    }
+
+    /// Appends request-local instructions without reconstructing the prefix.
+    pub fn push(&mut self, message: Message) {
+        match &mut self.0 {
+            Source::Canonical(messages) => messages.push(message),
+            Source::Retained { extra, .. } => Arc::make_mut(extra).push(message),
+        }
+    }
+
+    pub fn images(&self) -> usize {
+        match &self.0 {
+            Source::Canonical(messages) => messages.iter().map(images).sum(),
+            Source::Retained {
+                resident,
+                tail,
+                extra,
+                ..
+            } => resident.images + tail.iter().chain(extra.iter()).map(images).sum::<usize>(),
+        }
+    }
+}
+
+impl Default for Conversation {
+    fn default() -> Self {
+        Messages::new().into()
+    }
+}
+
+impl From<Messages> for Conversation {
+    fn from(messages: Messages) -> Self {
+        Self(Source::Canonical(messages))
+    }
+}
+
+impl From<Vec<Message>> for Conversation {
+    fn from(messages: Vec<Message>) -> Self {
+        Messages::from(messages).into()
+    }
+}
+
+impl FromIterator<Message> for Conversation {
+    fn from_iter<I: IntoIterator<Item = Message>>(messages: I) -> Self {
+        Messages::from_iter(messages).into()
+    }
+}
+
+impl fmt::Debug for Conversation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Source::Canonical(messages) => messages.fmt(f),
+            Source::Retained {
+                resident,
+                tail,
+                extra,
+                ..
+            } => f
+                .debug_struct("Retained")
+                .field("prefix", &resident.offset)
+                .field("tail", tail)
+                .field("extra", extra)
+                .finish(),
+        }
+    }
+}
+
+impl PartialEq for Conversation {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Source::Canonical(a), Source::Canonical(b)) => a == b,
+            (
+                Source::Retained {
+                    resident: a,
+                    tail: at,
+                    extra: ae,
+                    ..
+                },
+                Source::Retained {
+                    resident: b,
+                    tail: bt,
+                    extra: be,
+                    ..
+                },
+            ) => {
+                Arc::ptr_eq(&a.encoding, &b.encoding)
+                    && a.offset == b.offset
+                    && a.mark == b.mark
+                    && at == bt
+                    && ae == be
+            }
+            (Source::Canonical(_), Source::Retained { .. })
+            | (Source::Retained { .. }, Source::Canonical(_)) => false,
+        }
+    }
+}
+
+impl Serialize for Conversation {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.canonical()
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Conversation {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Messages::deserialize(deserializer).map(Into::into)
+    }
+}
+
+fn images(message: &Message) -> usize {
+    let parts = |parts: &[crate::UserPart]| {
+        parts.iter().filter(|part| {
+        matches!(part, crate::UserPart::Media(media) if media.media_type.starts_with("image/"))
+    }).count()
+    };
+    match message {
+        Message::User(user) => parts(&user.content),
+        Message::Tool(tool) => tool
+            .results
+            .iter()
+            .map(|result| match &result.output {
+                crate::Output::Content(content) => parts(content),
+                crate::Output::Text(_) | crate::Output::Json(_) => 0,
+            })
+            .sum(),
+        Message::System(_) | Message::Assistant(_) => 0,
     }
 }
 
@@ -405,6 +650,7 @@ struct Kept {
     model: SmolStr,
     len: usize,
     mark: u64,
+    images: usize,
     pass: Prepare,
     settled: Vec<Shared>,
 }
@@ -423,22 +669,25 @@ impl Kept {
         target: &Target<'_>,
         fits: &dyn Fn(&(dyn Any + Send)) -> bool,
     ) -> (Self, Option<Box<dyn Any + Send>>) {
-        let mut kept = (messages.0.encodings.lock()).unwrap_or_else(PoisonError::into_inner);
-        let at = kept.iter().position(|(kept, fold)| {
-            kept.provider == target.provider.id
-                && kept.model == target.model
-                && fits(&**fold)
-                && messages.holds(kept.len, kept.mark)
-        });
-        if let Some(at) = at {
-            let (kept, fold) = kept.remove(at);
-            return (kept, Some(fold));
+        if let Some(encodings) = &messages.1 {
+            let mut kept = encodings.lock().unwrap_or_else(PoisonError::into_inner);
+            let at = kept.iter().position(|(kept, fold)| {
+                kept.provider == target.provider.id
+                    && kept.model == target.model
+                    && fits(&**fold)
+                    && messages.holds(kept.len, kept.mark)
+            });
+            if let Some(at) = at {
+                let (kept, fold) = kept.remove(at);
+                return (kept, Some(fold));
+            }
         }
         let new = Self {
             provider: target.provider.id.clone(),
             model: target.model.into(),
             len: 0,
             mark: 0,
+            images: 0,
             pass: Prepare::default(),
             settled: Vec::new(),
         };
@@ -463,9 +712,11 @@ impl Kept {
 
     fn keep(mut self, messages: &Messages, fold: Box<dyn Any + Send>) -> (Prepare, Vec<Shared>) {
         let copy = (self.pass.clone(), self.settled.clone());
-        if let Some(&mark) = messages.0.marks.last() {
+        if let Some(&mark) = messages.0.marks.last()
+            && let Some(encodings) = &messages.1
+        {
             (self.len, self.mark) = (messages.len(), mark);
-            let mut kept = (messages.0.encodings.lock()).unwrap_or_else(PoisonError::into_inner);
+            let mut kept = encodings.lock().unwrap_or_else(PoisonError::into_inner);
             kept.truncate(KEPT - 1);
             kept.insert(0, (self, fold));
         }
@@ -492,6 +743,22 @@ impl Settled {
 }
 
 pub(crate) fn fold<F: Fold>(
+    conversation: &Conversation,
+    target: &Target<'_>,
+    initial: F,
+) -> Result<(F, Vec<Shared>), Error> {
+    match &conversation.0 {
+        Source::Canonical(messages) => fold_messages(messages, target, initial),
+        Source::Retained {
+            resident,
+            tail,
+            extra,
+            restore,
+        } => fold_retained(resident, tail, extra, restore, target, initial),
+    }
+}
+
+fn fold_messages<F: Fold>(
     messages: &Messages,
     target: &Target<'_>,
     fold: F,
@@ -508,6 +775,105 @@ pub(crate) fn fold<F: Fold>(
     kept.grow(messages, target, &mut state)?;
     let (mut pass, mut settled) = kept.keep(messages, Box::new(state.clone()));
     let mut bytes = Settled::default();
+    pass.finish(&mut state, &mut bytes)?;
+    settled.extend(bytes.shared());
+    Ok((state, settled))
+}
+
+fn restored(
+    restore: &Arc<dyn Fn() -> Result<Messages, Error> + Send + Sync>,
+    extra: &[Message],
+) -> Result<Messages, Error> {
+    let mut messages = restore()?;
+    for message in extra {
+        messages.push(message.clone());
+    }
+    Ok(messages)
+}
+
+fn fold_retained<F: Fold>(
+    resident: &Resident,
+    tail: &Messages,
+    extra: &[Message],
+    restore: &Arc<dyn Fn() -> Result<Messages, Error> + Send + Sync>,
+    target: &Target<'_>,
+    initial: F,
+) -> Result<(F, Vec<Shared>), Error> {
+    let stop = resident.offset + tail.len();
+    let found = resident
+        .encoding
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    let found = found.filter(|(kept, fold)| {
+        kept.provider == target.provider.id
+            && kept.model == target.model
+            && kept.len >= resident.offset
+            && kept.len <= stop
+            && (if kept.len == resident.offset {
+                kept.mark == resident.mark
+            } else {
+                tail.holds(kept.len - resident.offset, kept.mark)
+            })
+            && fold
+                .downcast_ref::<F>()
+                .is_some_and(|state| state.cx() == initial.cx())
+    });
+    let canonical;
+    let (mut kept, mut state, append) = if let Some((kept, fold)) = found {
+        let at = kept.len - resident.offset;
+        (
+            kept,
+            *fold.downcast::<F>().expect("matched fold"),
+            &tail[at..],
+        )
+    } else {
+        canonical = if resident.offset == 0 {
+            Cow::Borrowed(tail)
+        } else {
+            Cow::Owned(restore()?)
+        };
+        (
+            Kept {
+                provider: target.provider.id.clone(),
+                model: target.model.into(),
+                len: 0,
+                mark: 0,
+                images: 0,
+                pass: Prepare::default(),
+                settled: Vec::new(),
+            },
+            initial,
+            &canonical[..],
+        )
+    };
+    let count = stop - kept.len;
+    let mut bytes = Settled::default();
+    for message in &append[..count] {
+        #[cfg(test)]
+        FOLDED.with(|folded| folded.set(folded.get() + 1));
+        kept.pass.push(target, message, &mut state, &mut bytes)?;
+        kept.images += images(message);
+    }
+    kept.len = stop;
+    kept.mark = if stop > resident.offset {
+        tail.0.marks[stop - resident.offset - 1]
+    } else {
+        resident.mark
+    };
+    kept.settled.extend(bytes.shared());
+    let mut pass = kept.pass.clone();
+    let mut settled = kept.settled.clone();
+    *resident
+        .encoding
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some((kept, Box::new(state.clone())));
+    let mut bytes = Settled::default();
+    for message in extra {
+        #[cfg(test)]
+        FOLDED.with(|folded| folded.set(folded.get() + 1));
+        pass.push(target, message, &mut state, &mut bytes)?;
+    }
     pass.finish(&mut state, &mut bytes)?;
     settled.extend(bytes.shared());
     Ok((state, settled))

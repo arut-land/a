@@ -23,8 +23,8 @@ pub mod tag;
 mod writer;
 
 pub use accumulate::Accumulator;
-pub use client::{Events, generate, origin, stream};
-pub use conversation::{ContextPolicy, History};
+pub use client::{Events, Prepared, generate, origin, prepare_request, stream};
+pub use conversation::{ContextPolicy, Conversation, History, Resident};
 pub use error::{Error, Kind};
 pub use http::Http;
 pub use json::parse_partial_arguments;

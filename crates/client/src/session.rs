@@ -312,6 +312,23 @@ impl SessionClient {
         &self.view
     }
 
+    /// Inputs still owned by this client, oldest first. Recorded inputs are
+    /// recalled from the session view instead, including its visible queue.
+    pub fn pending_inputs(&self) -> impl DoubleEndedIterator<Item = &Segments> {
+        let mut inputs: Vec<_> = self
+            .unanswered
+            .iter()
+            .chain(&self.queued)
+            .filter_map(|msg| match msg {
+                ClientMsg::Input { segments, .. } => Some((msg.client_seq(), segments)),
+                _ => None,
+            })
+            .collect();
+        // A draining rejection can move an older offer behind newer queued input.
+        inputs.sort_unstable_by_key(|(seq, _)| *seq);
+        inputs.into_iter().map(|(_, segments)| segments)
+    }
+
     pub fn sessions(&self) -> &[SessionSummary] {
         &self.sessions.sessions
     }
@@ -1066,6 +1083,81 @@ mod tests {
         let out = client.step(closed(1));
         assert!(out.is_empty());
         assert!(matches!(client.link(), Link::Connecting));
+    }
+
+    #[test]
+    fn pending_input_borrows_end_at_the_daemons_ownership_boundary() {
+        let (mut client, _) = attached(Env::Keep);
+        let pasted = Segments(vec![
+            protocol::Segment::Text("before ".into()),
+            protocol::Segment::Paste("a\nb\nc\nd".into()),
+        ]);
+        client.run(Cmd::Input(pasted.clone()));
+        client.run(Cmd::Input("second".into()));
+        assert_eq!(
+            client.pending_inputs().collect::<Vec<_>>(),
+            [&pasted, &Segments::from("second")]
+        );
+        let author = Author {
+            client: client.opened.client,
+            seq: ClientSeq::new(1).unwrap(),
+        };
+        client.step(msg(
+            1,
+            DaemonMsg::Entry(Entry::new(
+                Seq::new(2).unwrap(),
+                Epoch(0),
+                Body::Input {
+                    segments: pasted.clone(),
+                    mode: Mode::Queue,
+                    taken: false,
+                    origin: Some(author),
+                    force: false,
+                },
+            )),
+        ));
+        assert_eq!(
+            client
+                .pending_inputs()
+                .map(Segments::text)
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+        assert_eq!(
+            client.view().state.queued().next().unwrap().text,
+            pasted.text()
+        );
+        client.step(msg(1, DaemonMsg::Ack { client_seq: 2 }));
+        assert_eq!(client.pending_inputs().count(), 0);
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
+        client.run(Cmd::Input("during reconnect".into()));
+        assert_eq!(client.pending_inputs().next().unwrap(), "during reconnect");
+        client.open(Target::New);
+        assert_eq!(client.pending_inputs().count(), 0);
+    }
+
+    #[test]
+    fn pending_recall_keeps_offer_order_when_a_drain_requeues_older_input() {
+        let (mut client, _) = attached(Env::Keep);
+        client.run(Cmd::Input("one".into()));
+        client.run(Cmd::Input("two".into()));
+        client.step(msg(1, DaemonMsg::Draining { held: None }));
+        client.run(Cmd::Input("three".into()));
+        client.step(msg(
+            1,
+            DaemonMsg::Rejected {
+                client_seq: 1,
+                reason: Rejection::Draining,
+                message: "retry".into(),
+            },
+        ));
+        assert_eq!(
+            client
+                .pending_inputs()
+                .map(Segments::text)
+                .collect::<Vec<_>>(),
+            ["one", "two", "three"]
+        );
     }
 
     #[test]
