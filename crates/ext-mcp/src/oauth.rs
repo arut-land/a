@@ -1,7 +1,8 @@
 //! HTTP authorization owns secrets outside the session's durable tool graph.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::poll_fn;
+use std::future::{pending, poll_fn};
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -948,15 +949,31 @@ async fn authorize(
             },
         )]),
     };
-    let shown = questions
-        .ask(question)
-        .await
-        .map_err(|_| failure("authorization presentation ended"))?;
-    if !shown.accepted() {
-        return Err(failure("authorization declined"));
-    }
+    // Serve the browser before Continue, but exchange its code only after acceptance.
+    let mut callback = pin!(listener.receive());
+    let mut received = None;
+    rt::or(
+        async {
+            let shown = questions
+                .ask(question)
+                .await
+                .map_err(|_| failure("authorization presentation ended"))?;
+            if !shown.accepted() {
+                return Err(failure("authorization declined"));
+            }
+            Ok(())
+        },
+        async {
+            received = Some(callback.as_mut().await?);
+            pending().await
+        },
+    )
+    .await?;
     let deadline = Instant::now() + timeout;
-    let response = network(runtime, deadline, listener.receive()).await?;
+    let response = match received {
+        Some(response) => response,
+        None => network(runtime, deadline, callback).await?,
+    };
     let code = authorization_code(&response, &state, server)?;
     network(
         runtime,

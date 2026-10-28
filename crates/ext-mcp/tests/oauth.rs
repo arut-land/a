@@ -518,6 +518,9 @@ impl Client {
                                 assert!(get(redirect).starts_with("HTTP/1.1 200"));
                             })
                         });
+                        if let Some(browser) = browser {
+                            browser.join().unwrap();
+                        }
                         let answer = protocol::QuestionAnswer {
                             question: entry.seq,
                             responses: BTreeMap::from([(
@@ -534,9 +537,6 @@ impl Client {
                             &ClientMsg::answer(protocol::CallId(entry.seq), answer),
                         )
                         .unwrap();
-                        if let Some(browser) = browser {
-                            browser.join().unwrap();
-                        }
                     }
                     Body::ToolResult { call, outcome, .. } if Some(call) == parent => {
                         return (
@@ -1135,6 +1135,8 @@ fn interrupting_the_authorization_presenter_leaves_its_card_answerable_for_other
             .unwrap();
         assert!(get(redirect).starts_with("HTTP/1.1 200"));
     });
+    browser.join().unwrap();
+    assert!(!engine.root.dir.join("endpoint.tokens").exists());
     write_frame(
         &mut presenter.writer,
         &ClientMsg::answer(
@@ -1146,11 +1148,77 @@ fn interrupting_the_authorization_presenter_leaves_its_card_answerable_for_other
         ),
     )
     .unwrap();
-    browser.join().unwrap();
     assert_eq!(waiter.join().unwrap(), (json!({"ok":[]}), 0));
     assert_eq!(
         std::fs::read_to_string(engine.root.dir.join("endpoint.tokens")).unwrap(),
         "1"
     );
+    engine.stop();
+}
+
+#[test]
+fn declining_after_the_browser_callback_discards_the_authorization_code() {
+    use protocol::{Body, ClientMsg, DaemonMsg, read_frame, write_frame};
+    let mut engine = Engine::new("rotating");
+    let mut client = Client::attach(&engine.root.dir);
+    write_frame(
+        &mut client.writer,
+        &ClientMsg::Input {
+            segments: "call mcp_list {\"server\":\"fixture\"}".into(),
+            mode: protocol::Mode::default(),
+            force: false,
+            client_seq: None,
+        },
+    )
+    .unwrap();
+    let (id, question) = loop {
+        if let Some(DaemonMsg::Entry(entry)) = read_frame::<DaemonMsg>(&mut client.reader).unwrap()
+            && let Body::Question { question } = entry.body
+        {
+            break (entry.seq, question);
+        }
+    };
+    let (key, protocol::Prompt::Url { url, .. }) = question.prompts.iter().next().unwrap() else {
+        panic!("URL question");
+    };
+    let response = get(url);
+    let redirect = response
+        .lines()
+        .find_map(|line| line.strip_prefix("Location: "))
+        .unwrap();
+    assert!(get(redirect).contains("Return to a"));
+    assert!(!engine.root.dir.join("endpoint.tokens").exists());
+    write_frame(
+        &mut client.writer,
+        &ClientMsg::answer(
+            protocol::CallId(id),
+            protocol::QuestionAnswer {
+                question: id,
+                responses: BTreeMap::from([(key.clone(), protocol::Response::Decline)]),
+            },
+        ),
+    )
+    .unwrap();
+    loop {
+        if let Some(DaemonMsg::Entry(entry)) = read_frame::<DaemonMsg>(&mut client.reader).unwrap()
+            && let Body::ToolResult {
+                outcome:
+                    protocol::Outcome::Done {
+                        output: protocol::Payload::Inline(output),
+                    },
+                ..
+            } = entry.body
+        {
+            assert!(
+                output
+                    .parse::<serde_json::Value>()
+                    .unwrap()
+                    .get("failed")
+                    .is_some()
+            );
+            break;
+        }
+    }
+    assert!(!engine.root.dir.join("endpoint.tokens").exists());
     engine.stop();
 }

@@ -188,7 +188,8 @@ number/integer bounds, boolean, single/multiple enums and titled options,
 required properties and defaults. Optional absent, empty and false values
 remain distinct. No general JSON Schema evaluator or additional runtime is
 linked. A saved continuation hashes its exact configured server, transport,
-scope, registration and execution inputs. Changed bindings fail before
+scope, credential registration, declared environment and working directory.
+Unrelated inherited environment changes do not invalidate it. Changed bindings fail before
 contacting the server. Answers and continuation state are ordinary log facts.
 
 Human wait does not retain an exchange timer. Each resumed network exchange
@@ -202,8 +203,10 @@ result become Interrupted rather than being retried.
 
 OAuth authorization uses a service-owned question port. Its card remains
 answerable after the presenting tool is interrupted, and the shared renewal
-publishes one result to its waiters. OAuth's live callback listener cannot be
-restored, so restart cancels that card rather than reviving an unusable URL.
+publishes one result to its waiters. The callback serves the browser while the
+card awaits Continue; code exchange requires acceptance. Decline or dropping
+the authorization flow discards the code and closes the listener. OAuth's live
+callback listener cannot be restored, so restart cancels that card rather than reviving an unusable URL.
 
 The shared OAuth card has no human-wait deadline. Ordinary HTTP callers keep
 their existing per-request deadlines and cancellation; a renewal and its card

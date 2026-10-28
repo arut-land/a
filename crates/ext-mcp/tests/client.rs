@@ -1090,9 +1090,12 @@ fn a_saved_continuation_is_refused_before_contacting_a_changed_server_configurat
     let changed = Mcp::new(
         vec![Server {
             name: "fixture".parse().unwrap(),
-            description: "changed".into(),
-            transport: Transport::Stdio(vec!["must-not-be-started".into()]),
-            env: BTreeMap::new(),
+            description: "test server".into(),
+            transport: Transport::Stdio(vec![
+                env!("CARGO_BIN_EXE_mcp-fixture").into(),
+                "effects-question-binding".into(),
+            ]),
+            env: BTreeMap::from([("DECLARED_CONFIG".into(), "changed".into())]),
         }],
         Duration::from_secs(2),
     )
@@ -1205,6 +1208,57 @@ fn an_empty_input_request_map_can_continue_without_opaque_server_state() {
     let result =
         rt::block_on(tool.answer(tool.parse(&input).unwrap(), first.checkpoint, answer, &cx));
     assert!(result.parked.is_none());
+    let protocol::Outcome::Done {
+        output: protocol::Payload::Inline(output),
+    } = result.outcome
+    else {
+        panic!("a completed continuation");
+    };
+    assert_eq!(
+        output.parse::<Value>().unwrap()["ok"]["resultType"],
+        "complete"
+    );
+    finish(rig);
+}
+
+#[test]
+fn unrelated_inherited_environment_changes_do_not_invalidate_a_saved_continuation() {
+    let rig = rig("question-environment", Duration::from_secs(2));
+    let mut cx = rig.cx();
+    let input =
+        protocol::Json::encode(&json!({"server":"fixture","tool":"ask_empty","arguments":{}}))
+            .unwrap();
+    let tools = rig.registry.tools();
+    let tool = tools.get("mcp_call").unwrap();
+    let first = rt::block_on(tools.run("mcp_call", &input, None, &cx))
+        .parked
+        .unwrap();
+    let mut env = protocol::Environment::new(
+        cx.workspace.to_path_buf().try_into().unwrap(),
+        std::env::vars_os(),
+        false,
+    );
+    env.vars
+        .retain(|key, _| !protocol::Environment::is_secret(key));
+    env.vars
+        .insert("UNRELATED_INHERITED_VALUE".into(), "changed".into());
+    cx.env = Some(std::sync::Arc::new(env));
+    let answer = protocol::QuestionAnswer {
+        question: protocol::Seq::new(1).unwrap(),
+        responses: first
+            .question
+            .prompts
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    protocol::Response::Continue(protocol::ContinueAnswer::Proceed),
+                )
+            })
+            .collect(),
+    };
+    let result =
+        rt::block_on(tool.answer(tool.parse(&input).unwrap(), first.checkpoint, answer, &cx));
     let protocol::Outcome::Done {
         output: protocol::Payload::Inline(output),
     } = result.outcome

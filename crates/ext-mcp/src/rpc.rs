@@ -393,17 +393,22 @@ mod tests {
 
     #[test]
     fn responses_must_match_one_pending_request_and_one_outcome() {
-        for message in [
-            json!({"jsonrpc":"1.0","id":1,"result":{"resultType":"complete"}}),
-            json!({"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}),
-            json!({"jsonrpc":"2.0","id":1,"result":{"resultType":"complete"},"error":{"code":-1,"message":"error"}}),
-            json!({"jsonrpc":"2.0","id":1,"result":{}}),
-            json!({"jsonrpc":"2.0","id":1,"method":"sampling/createMessage"}),
+        let id = RequestId::test(1);
+        let valid = json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete"}});
+        assert_eq!(decode(&valid, Some(id)), Ok(Some(valid["result"].clone())));
+        for (field, value) in [
+            ("jsonrpc", json!("1.0")),
+            ("id", json!(RequestId::test(2))),
+            ("error", json!({"code":-1,"message":"error"})),
+            ("result", json!({})),
+            ("method", json!("sampling/createMessage")),
         ] {
-            assert!(matches!(
-                decode(&message, Some(RequestId::test(1))),
-                Err(Failure::Protocol(_))
-            ));
+            let mut message = valid.clone();
+            message[field] = value;
+            assert!(
+                matches!(decode(&message, Some(id)), Err(Failure::Protocol(_))),
+                "{message}"
+            );
         }
     }
 

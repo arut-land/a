@@ -44,11 +44,7 @@ impl Mcp {
                 Failure::Configuration("shared declaration has no directory".into())
             })?,
         };
-        let inherited = match &cx.env {
-            Some(env) if !scope.shared() => &env.vars,
-            _ => self.0.environment.get_or_init(crate::stdio::snapshot),
-        };
-        let binding = json!({"name":server.name,"description":server.description,"transport":transport,"env":server.env,"scope":match scope {crate::config::Scope::Session=>"session",crate::config::Scope::Workspace=>"workspace",crate::config::Scope::User=>"user"},"directory":self.0.directory,"registration":self.0.registrations.get(name).map(|r|(&r.id,&r.issuer)),"cwd":cwd,"environment":inherited});
+        let binding = json!({"name":server.name,"description":server.description,"transport":transport,"env":server.env,"scope":match scope {crate::config::Scope::Session=>"session",crate::config::Scope::Workspace=>"workspace",crate::config::Scope::User=>"user"},"directory":self.0.directory,"registration":self.0.registrations.get(name).map(|r|(&r.id,&r.issuer)),"cwd":cwd});
         Ok(Sha256::digest(binding.to_string().as_bytes()).into())
     }
 
