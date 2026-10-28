@@ -6,6 +6,8 @@ publish.workspace = true
 autotests = false
 
 [dependencies]
+form_urlencoded = "1.2.2"
+http-auth = { version = "0.1.10", default-features = false }
 sha2 = { version = "0.11", default-features = false }
 transport = { workspace = true, features = ["client"] }
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
@@ -40,4 +42,9 @@ test = false
 [[test]]
 name = "client"
 path = "tests/client.rs"
+required-features = ["fixture"]
+
+[[test]]
+name = "oauth"
+path = "tests/oauth.rs"
 required-features = ["fixture"]

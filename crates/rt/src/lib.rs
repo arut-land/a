@@ -13,6 +13,7 @@ mod events;
 mod flush;
 mod io;
 mod notify;
+mod oauth_redirect;
 pub mod oneshot;
 #[cfg(feature = "threads")]
 mod threads;
@@ -37,6 +38,7 @@ pub use futures_lite::future::yield_now;
 pub use futures_lite::future::zip;
 pub use io::{Async, Reactor, Source, capture_output};
 pub use notify::Notify;
+pub use oauth_redirect::OAuthRedirect;
 #[cfg(feature = "threads")]
 pub use threads::{Config, PoolLimits, Threads};
 pub use wakeup::Wakeup;

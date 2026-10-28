@@ -207,3 +207,68 @@ seconds. These are local observations on the shared host, not a controlled
 hash-performance comparison. Attach p99 was **193.54 µs**; the separate
 release quiet-shell budget also passed with **zero runtime wakes** in one
 second.
+
+## HTTP OAuth (round 3)
+
+The client uses the existing pooled HTTP transport with redirects refused.
+A 401 discovers protected-resource and authorization-server metadata, then uses
+an authorization code with S256 PKCE and resource indicators. Stored credentials
+bind the resource, issuer and client identity. A rejected access token can refresh;
+`invalid_grant` starts a new authorization. A 403 `insufficient_scope` requests the
+union of previous and challenged scopes. Only explicit authorization challenges
+permit retrying the original operation; other transport failures remain terminal.
+
+The default client ID is the single `OAUTH_CLIENT_ID` constant:
+`https://arut.land/.well-known/oauth-client/a.json`. The owner will host this
+metadata document; this change adds no hosted copy. The local fixture resolves
+that URL to its own document without contacting the public host. A server needing
+a pre-registered public client can set `<server>_client_id` and `<server>_issuer`
+together. The issuer must appear in that resource's metadata and match the
+validated authorization-server metadata. No need for dynamic registration was
+demonstrated, so it is not implemented.
+
+Authorization uses an ephemeral `127.0.0.1` listener through `rt`, with callback
+path `/oauth/callback`. An internal tool presents the authorization URL using the
+existing approval card. The headless daemon never opens a browser. The verifier,
+callback code and tokens stay outside tool inputs, results and session logs.
+Authorization state belongs to the credential store, independent of session replay.
+For a daemon on another host, the browser must be able to reach that host's
+loopback callback, for example through an SSH tunnel; automatic callback forwarding
+would need client/transport work outside the owned paths.
+
+`sys::credentials` uses Keychain on macOS and Credential Manager on Windows.
+Native calls run on the existing storage workers. Windows stores multiple native
+credential parts so its 2560-byte blob limit does not limit OAuth token length.
+The native round-trip test covers 10,000-byte values, replacement and deletion.
+It also reproduced macOS treating an empty data update as unchanged; a byte of
+native framing permits an empty value to replace an existing value.
+Integration tests use an isolated private-file store, never existing credentials.
+Linux uses the explicitly permitted 0600 file under the instance's state directory,
+inside a 0700 directory, through the existing private-file implementation.
+
+### Dependency comparison
+
+On the M3, Rust nightly-2026-10-17, `opt-level=z`, fat LTO, one codegen unit,
+stripped, a standalone Secret Service reader using `secret-service` 5.2.0 with
+`default-features=false, features=["rt-async-io-crypto-rust"]` linked **1,222,320
+bytes**. Its normal dependency graph contained **96 distinct packages including
+the probe**, with no crate named `tokio`. The same probe using `std::fs::read`
+linked **286,368 bytes**. The **935,952-byte** difference is an isolated reader
+comparison, not a predicted change to `a`; it does not include shared-dependency
+elimination in `a`. It establishes the substantial D-Bus/crypto surface needed
+for this otherwise small storage operation. This implementation chooses the
+permitted private-file backend instead of another D-Bus client and executor.
+Neither probe contacted a Secret Service daemon. These figures are native macOS
+code-size observations, not Linux runtime performance measurements.
+
+Header challenges use `http-auth` 0.1.10 with default features disabled; form
+encoding uses `form_urlencoded` 1.2.2. They handle quoted challenge parameters,
+multiple schemes and percent encoding rather than introducing custom parsers.
+Only `http-auth` is a new package in the workspace lock resolution; its `memchr`
+dependency, `form_urlencoded` and `percent-encoding` were already present.
+
+There is no OAuth background task, connection, poller or refresh timer. Credentials
+are loaded only inside an HTTP operation, and discovery/refresh/browser interaction
+happen only after an authorization challenge. Payload clones share their existing
+`Arc` pieces while authentication retries, rather than copying the request body.
+Shipped size and interleaved idle observations are recorded after main integration.
