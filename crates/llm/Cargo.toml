@@ -5,12 +5,14 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-client = ["transport/client"]
+# Return large receive buffers to the OS while retaining their address range.
+native-buffer = ["dep:sys"]
+client = ["transport/client", "native-buffer"]
 tls-native = ["transport/tls-native"]
 tls-rustls = ["transport/tls-rustls"]
 
 [dependencies]
-sys.workspace = true
+sys = { workspace = true, optional = true }
 # Bytes a caller holds go as base64 only as a request is written; the
 # shipped tree has it already, through ureq.
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }

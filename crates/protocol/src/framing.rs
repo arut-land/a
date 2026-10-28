@@ -4,11 +4,20 @@ use std::io;
 
 use crate::Decode;
 
-/// Ready frames share one read batch. Large accumulations retain their address
-/// range after completion, while their backing pages return to the OS.
+#[cfg(not(feature = "native-buffer"))]
+use self::heap::{ReadBuffer, TransientBuffer};
+#[cfg(feature = "native-buffer")]
+use sys::{ReadBuffer, TransientBuffer};
+
+#[cfg(not(feature = "native-buffer"))]
+#[path = "frame_heap.rs"]
+mod heap;
+
+/// Ready frames share one read batch. With `native-buffer`, large accumulations
+/// retain their address range while completed frames return backing pages to the OS.
 #[derive(Debug)]
 pub struct FrameReader {
-    buffered: sys::TransientBuffer,
+    buffered: TransientBuffer,
     end: Option<usize>,
 }
 
@@ -21,7 +30,7 @@ impl Default for FrameReader {
 impl FrameReader {
     pub const fn new() -> Self {
         Self {
-            buffered: sys::TransientBuffer::new(crate::MAX_FRAME as usize + 4 + (64 << 10)),
+            buffered: TransientBuffer::new(crate::MAX_FRAME as usize + 4 + (64 << 10)),
             end: None,
         }
     }
@@ -66,7 +75,7 @@ impl FrameReader {
         Ok(Some((end, msg)))
     }
     #[inline]
-    pub fn read_buffer(&mut self, len: usize) -> io::Result<sys::ReadBuffer<'_>> {
+    pub fn read_buffer(&mut self, len: usize) -> io::Result<ReadBuffer<'_>> {
         self.buffered.read_buffer(len)
     }
     pub fn extend_from_slice(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -111,7 +120,7 @@ mod tests {
     use crate::{ClientMsg, DaemonMsg, Frame};
 
     #[test]
-    fn large_frames_reuse_their_address_range_without_retaining_contents() {
+    fn completed_large_frames_preserve_the_next_partial_frame() {
         let large = Frame::new(&DaemonMsg::Error {
             message: "x".repeat(5 << 20),
         })
@@ -119,14 +128,19 @@ mod tests {
         let mut next = Vec::new();
         ClientMsg::Detach.write_frame(&mut next).unwrap();
         let mut reader = FrameReader::new();
+        #[cfg(feature = "native-buffer")]
         let mut address = None;
         for _ in 0..3 {
             reader.extend_from_slice(&large.as_bytes()[..4096]).unwrap();
             assert!(reader.decode::<DaemonMsg>().unwrap().is_none());
+            #[cfg(feature = "native-buffer")]
             if let Some(address) = address {
                 assert_eq!(reader.as_ref().as_ptr(), address);
             }
-            address = Some(reader.as_ref().as_ptr());
+            #[cfg(feature = "native-buffer")]
+            {
+                address = Some(reader.as_ref().as_ptr());
+            }
             reader.extend_from_slice(&large.as_bytes()[4096..]).unwrap();
             reader.extend_from_slice(&next[..3]).unwrap();
             assert!(

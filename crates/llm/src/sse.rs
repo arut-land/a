@@ -7,6 +7,14 @@
 use crate::error::Error;
 use crate::protocol::{Flow, Frame};
 
+#[cfg(feature = "native-buffer")]
+use sys::TransientBuffer;
+#[cfg(not(feature = "native-buffer"))]
+#[path = "sse_heap.rs"]
+mod heap;
+#[cfg(not(feature = "native-buffer"))]
+use heap::TransientBuffer;
+
 /// Per-reply ceilings, shared by framing and provider decoding.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DecodeLimits {
@@ -33,14 +41,14 @@ const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
 
 #[derive(Debug)]
 pub struct SseFramer {
-    buffer: sys::TransientBuffer,
+    buffer: TransientBuffer,
     limits: DecodeLimits,
     frame_bytes: usize,
     bom_prefix: usize,
     bom_done: bool,
     /// The event being assembled from its field lines.
-    event_type: sys::TransientBuffer,
-    data: sys::TransientBuffer,
+    event_type: TransientBuffer,
+    data: TransientBuffer,
 }
 
 impl Default for SseFramer {
@@ -112,9 +120,9 @@ impl SseFramer {
 
     pub(crate) fn with_limits(limits: DecodeLimits) -> Self {
         Self {
-            buffer: sys::TransientBuffer::new(limits.frame_bytes),
-            event_type: sys::TransientBuffer::new(limits.frame_bytes),
-            data: sys::TransientBuffer::new(limits.frame_bytes),
+            buffer: TransientBuffer::new(limits.frame_bytes),
+            event_type: TransientBuffer::new(limits.frame_bytes),
+            data: TransientBuffer::new(limits.frame_bytes),
             limits,
             frame_bytes: 0,
             bom_prefix: 0,
@@ -191,8 +199,8 @@ impl SseFramer {
 /// One non-blank field line into the event being assembled.
 fn line_field(
     line: &str,
-    event_type: &mut sys::TransientBuffer,
-    data: &mut sys::TransientBuffer,
+    event_type: &mut TransientBuffer,
+    data: &mut TransientBuffer,
 ) -> Result<(), Error> {
     if line.starts_with(':') {
         return Ok(());
@@ -235,7 +243,7 @@ mod storage_tests {
     use std::io::Write;
 
     #[test]
-    fn completed_large_events_return_to_the_small_buffers() {
+    fn completed_large_events_leave_no_unconsumed_data() {
         let mut wire = Vec::new();
         write!(&mut wire, "data: ").unwrap();
         serde_json::to_writer(&mut wire, &"x".repeat(5 << 20)).unwrap();
@@ -255,8 +263,11 @@ mod storage_tests {
             assert_eq!(seen, 1);
             assert!(framer.buffer.is_empty());
             assert!(framer.data.is_empty());
-            assert!(framer.buffer.capacity() < wire.len());
-            assert!(framer.data.capacity() < wire.len() / 2);
+            #[cfg(feature = "native-buffer")]
+            {
+                assert!(framer.buffer.capacity() < wire.len());
+                assert!(framer.data.capacity() < wire.len() / 2);
+            }
         }
     }
 }

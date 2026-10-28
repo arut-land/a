@@ -134,3 +134,35 @@ Native guidance: [Apple madvise](https://developer.apple.com/library/archive/doc
 [Linux THP](https://docs.kernel.org/admin-guide/mm/transhuge.html),
 [Windows VirtualFree](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualfree),
 [Windows discard](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi-discardvirtualmemory).
+
+## Pure consumers and native receive storage
+
+Protocol and llm expose `native-buffer` as an opt-in Cargo feature. It
+selects the shared sys page-backed storage; feature-off framing and SSE
+use plain Vec storage with the same limits and decoding behavior. Engine
+and client enable it at their socket/HTTP boundary; the shipped binary
+also enables it explicitly for llm. Ext and kernel retain their pure
+normal dependency graphs, with no sys/runtime edge and unchanged purity
+guards. Both storage paths run the framing and recorded SSE suites.
+
+The review regression invalidates the UTF-8 cache before read scratch is
+exposed, including when the caller forgets the guard. The real invariant
+failed before the fix and passes under Miri after it.
+
+Feature-boundary spot check on the M3: 11 interleaved release samples,
+main `e0202822` versus the reviewed candidate, same extracted real readers
+and SSE driver as the original tables. Times are median [min–max] ms:
+
+| Workload | Main | Native feature enabled |
+| --- | ---: | ---: |
+| Client ten 5 MiB frames | 47.76 [37.03–95.16] | 46.67 [45.31–101.95] |
+| Daemon ten 5 MiB frames | 72.55 [70.77–145.22] | 46.97 [44.76–100.37] |
+| SSE 1M small events | 189.96 [181.25–194.76] | 125.19 [121.58–136.53] |
+| SSE ten 5 MiB events | 169.21 [162.10–177.74] | 41.27 [39.30–43.80] |
+
+The framing readers retain 8.09 MiB live requested allocation on main,
+versus 0.15 MiB with native storage. SSE allocations are 6→4 for 1M small
+events and 23→11 for ten large events (constructor included). Shared-host
+outliers remain visible in the spreads. Raw samples, including RSS,
+phys_footprint and faults, are `feature-spot-samples.json` beside the
+original probe evidence. No model or inherited provider endpoint is used.
