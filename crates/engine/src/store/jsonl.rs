@@ -342,6 +342,14 @@ impl LogStore for Jsonl {
         Ok(headers)
     }
 
+    fn read_snapshot(&self, id: SessionId, covers: u64) -> Option<Snapshot> {
+        let snap = Snap::read(&self.path(id).ok()?)?;
+        (snap.covers == covers).then_some(Snapshot {
+            covers,
+            image: snap.image,
+        })
+    }
+
     /// Snapshots skip replay only after their covered entries validate.
     /// Cutting an unindexed torn tail leaves the next append on a fresh line.
     fn load(
