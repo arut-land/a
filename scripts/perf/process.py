@@ -38,9 +38,16 @@ def memory_maps(pid):
     if sys.platform == "darwin":
         import subprocess
         result = subprocess.run(["vmmap", "-resident", str(pid)], capture_output=True,
-                                text=True, timeout=30, check=True)
-        return dict(source="vmmap -resident (rounded native region columns)", vmmap=result.stdout,
-                    **vmmap_executable(result.stdout, process.exe()))
+                                text=True, timeout=30)
+        diagnostic = dict(source="vmmap -resident (rounded native region columns)",
+                          vmmap=result.stdout, vmmap_stderr=result.stderr,
+                          vmmap_returncode=result.returncode)
+        try:
+            result.check_returncode()
+            diagnostic.update(vmmap_executable(result.stdout, process.exe()))
+        except (OSError, subprocess.CalledProcessError, psutil.Error, ValueError) as error:
+            diagnostic["maps_error"] = str(error)
+        return diagnostic
     maps = [m._asdict() for m in process.memory_maps(grouped=False)]
     if sys.platform == "win32":
         for region in maps:
@@ -58,15 +65,16 @@ def memory_maps(pid):
 def vmmap_executable(text, executable):
     import re
     from pathlib import Path
-    executable = str(Path(executable).resolve())
+    executable = Path(executable).resolve()
     mapped, resident, code = [], [], []
     for line in text.splitlines():
-        if not line.endswith(" " + executable):
-            continue
-        match = re.match(r"(\S+)\s+[0-9a-f]+-[0-9a-f]+\s+\[\s*([\d.]+[BKMG]?)\s+([\d.]+[BKMG]?)", line)
+        match = re.match(r"(\S+)\s+[0-9a-f]+-[0-9a-f]+\s+\[\s*([\d.]+[BKMG]?)\s+([\d.]+[BKMG]?)"
+                         r"[^\]]*\]\s+\S+\s+SM=\S+\s+.*?(/.*)$", line)
         if match is None:
             continue
-        region, virtual, physical = match.groups()
+        region, virtual, physical, path = match.groups()
+        if Path(path).resolve() != executable:
+            continue
         def size(value):
             scale = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
             return float(value[:-1]) * scale[value[-1]] if value[-1] in scale else float(value)
@@ -76,7 +84,7 @@ def vmmap_executable(text, executable):
             code.append(size(physical))
     if not resident:
         raise ValueError(f"vmmap did not identify the executable {executable}")
-    return dict(executable=executable, executable_mapped_bytes=sum(mapped),
+    return dict(executable=str(executable), executable_mapped_bytes=sum(mapped),
                 executable_resident_bytes=sum(resident), executable_code_resident_bytes=sum(code))
 
 

@@ -149,32 +149,32 @@ jobs:
               env.write(f'RUSTUP_TOOLCHAIN={channel}-{target}\n')
           PYTHON
           echo "RUSTUP_HOME=$RUNNER_TEMP/perf-rustup" >> "$GITHUB_ENV"
-          echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
       - uses: actions/cache/restore@v6
         id: cache
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
-            ${{ runner.temp }}/mbx/actions
           key: perf-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('harness/rust-toolchain.toml', 'harness/Cargo.lock', 'harness/.cargo/*.toml') }}-${{ github.run_id }}
           restore-keys: perf-v2-${{ runner.os }}-${{ runner.arch }}-
       # ARM Windows has no Cranelift component; release and benches use LLVM.
       - id: toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src
-      - run: python -m unittest discover -s scripts/perf -p 'test_*.py'
       - uses: jdx/mise-action@v5
         with:
           working_directory: harness
-          install_args: hyperfine ${{ matrix.runner != 'macos-15-intel' && 'mr-boxington' || '' }} ${{ runner.os == 'Linux' && 'mold' || '' }}
+          install_args: hyperfine ${{ runner.os == 'Linux' && 'mold' || '' }}
+      - name: Inherit the native toolchain for all Cargo commands
+        run: python scripts/perf/hosted.py --phase toolchain --runner '${{ matrix.runner }}'
+      - run: python -m unittest discover -s scripts/perf -p 'test_*.py'
       - if: inputs.bloat
         name: Install native size attribution tool
         run: |
-          rustup run "$RUSTUP_TOOLCHAIN" cargo install cargo-bloat --version 0.12.1 --locked --root "$RUNNER_TEMP/perf-tools"
+          cargo install cargo-bloat --version 0.12.1 --locked --root "$RUNNER_TEMP/perf-tools"
           echo "$RUNNER_TEMP/perf-tools/bin" >> "$GITHUB_PATH"
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
-      # mbx publishes no Intel macOS executable; cache Cargo's native build there.
+      # Retain the Intel lane's existing native artifact cache.
       - uses: Swatinem/rust-cache@v2
         if: matrix.runner == 'macos-15-intel'
         with:
@@ -197,49 +197,29 @@ jobs:
           extra=()
           if [[ "$PERF_BUILD_ONLY" == true ]]; then extra+=(--build-only); fi
           if [[ "$PERF_BLOAT" == true ]]; then extra+=(--bloat); fi
-          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
-            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase build --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' "${extra[@]}"
-          else
-            mise exec -- python scripts/perf/hosted.py --phase build --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' "${extra[@]}"
-          fi
+          python scripts/perf/hosted.py --phase build --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' "${extra[@]}"
       - name: Measure startup workloads and benches
         timeout-minutes: 20
         if: env.PERF_BUILD_ONLY != 'true' && env.PERF_ABLATION != 'true' && env.PERF_SESSIONS != 'true' && env.PERF_MEMORY != 'true' && env.PERF_SURVEY != 'true'
         run: |
-          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
-            python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
-          else
-            mise exec -- python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
-          fi
+          python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
       - name: Measure alternating reference and candidate rounds
         timeout-minutes: ${{ inputs.ablation && 140 || 45 }}
         if: ${{ !cancelled() && steps.build.outcome == 'success' && env.PERF_REFERENCE != '' && env.PERF_BUILD_ONLY != 'true' }}
         run: |
-          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
-            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase paired --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
-          else
-            mise exec -- python scripts/perf/hosted.py --phase paired --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
-          fi
+          python scripts/perf/hosted.py --phase paired --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
       - name: Measure concurrently active sessions
         if: env.PERF_SESSIONS == 'true'
         timeout-minutes: 210
         run: |
-          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
-            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase sessions --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
-          else
-            mise exec -- python scripts/perf/hosted.py --phase sessions --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
-          fi
+          python scripts/perf/hosted.py --phase sessions --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
       - name: Measure survey CPU and memory workloads
         if: env.PERF_BUILD_ONLY != 'true' && env.PERF_ABLATION != 'true' && env.PERF_SESSIONS != 'true'
         run: |
           phase=evidence
           if [[ "$PERF_MEMORY" == true ]]; then phase=memory; fi
           if [[ "$PERF_SURVEY" == true ]]; then phase=survey; fi
-          if [[ '${{ matrix.runner }}' == macos-15-intel ]]; then
-            PERF_CARGO="$(rustup which cargo)" python scripts/perf/hosted.py --phase "$phase" --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
-          else
-            mise exec -- python scripts/perf/hosted.py --phase "$phase" --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
-          fi
+          python scripts/perf/hosted.py --phase "$phase" --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
       - name: Compare with main
         if: always()
         env:
@@ -262,7 +242,7 @@ jobs:
         timeout-minutes: 25
         run: |
           sudo apt-get install -y --no-install-recommends valgrind
-          mise exec -- python scripts/perf/profile.py ../measured
+          python scripts/perf/profile.py ../measured
       - uses: actions/upload-artifact@v5
         if: always()
         with:
@@ -291,7 +271,6 @@ jobs:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
-            ${{ runner.temp }}/mbx/actions
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # Autostart's lifetime handshake against each OS's real service manager
