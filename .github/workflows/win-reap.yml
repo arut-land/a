@@ -12,13 +12,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       CARGO_BUILD_JOBS: 2
-      CARGO_TARGET_DIR: ${{ runner.temp }}/win-reap-target
       CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
     defaults:
       run:
         shell: pwsh
     steps:
-      - run: git config --global core.autocrlf false
+      - run: |
+          git config --global core.autocrlf false
+          "CARGO_TARGET_DIR=$env:RUNNER_TEMP/win-reap-target" >> $env:GITHUB_ENV
       - uses: actions/checkout@v7
       - name: Install native Rust
         run: |
