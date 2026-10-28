@@ -6,7 +6,7 @@ use protocol::view::{Glyph, Item, Kind};
 
 use super::super::render::Viewport;
 use super::super::text::Line;
-use super::super::view::{self, CardCursor, Cursor, Layout, Look};
+use super::super::view::{self, CardCursor, Caret, Cursor, Layout, Look};
 use super::{App, Rows};
 
 impl App {
@@ -78,7 +78,15 @@ impl App {
             {
                 rows.total = cursor.len();
                 rows.start = rows.total.saturating_sub(usize::from(self.body).max(1));
-                rows.lines = cursor.window(text, rows.start..rows.total, streaming.is_some());
+                rows.lines = cursor.window(
+                    text,
+                    rows.start..rows.total,
+                    if streaming.is_some() {
+                        Caret::Visible
+                    } else {
+                        Caret::Hidden
+                    },
+                );
             }
         }
         if let Some(rows) = self.cache.get_mut(&i)
@@ -175,7 +183,15 @@ impl App {
                     .as_ref()
                     .filter(|s| matches!(item, Item::Reply { call, .. } if *call == s.call));
                 let text = stream.map_or_else(|| source(item), |s| s.text.as_str());
-                rows.lines = cursor.window(text, start..end, stream.is_some());
+                rows.lines = cursor.window(
+                    text,
+                    start..end,
+                    if stream.is_some() {
+                        Caret::Visible
+                    } else {
+                        Caret::Hidden
+                    },
+                );
                 rows.start = start;
             }
             if let Some(card) = &rows.card {

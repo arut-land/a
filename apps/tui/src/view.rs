@@ -536,6 +536,12 @@ impl Live {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Caret {
+    Visible,
+    Hidden,
+}
+
 /// Sparse parser positions, rather than an owning copy of every display row.
 /// Checkpoints keep the unfinished wrap so seeking never changes word placement.
 #[derive(Default)]
@@ -602,7 +608,7 @@ impl Cursor {
         self.state.base + self.tail.len()
     }
 
-    pub fn window(&self, text: &str, range: std::ops::Range<usize>, live: bool) -> Vec<Line> {
+    pub fn window(&self, text: &str, range: std::ops::Range<usize>, caret: Caret) -> Vec<Line> {
         let end = range.end.min(self.len());
         let mut rows = if range.start >= self.state.base {
             self.tail[range.start - self.state.base..end - self.state.base].to_vec()
@@ -648,7 +654,7 @@ impl Cursor {
             }
             rows[range.start - state.base..end - state.base].to_vec()
         };
-        if !live
+        if caret == Caret::Hidden
             && self.state.layout == Layout::Reply
             && end == self.len()
             && let Some(last) = rows.last_mut()
@@ -778,7 +784,11 @@ impl CardCursor {
                 } else {
                     output_text(&p.body)
                 };
-                out.extend(cursor.window(&text, start - offset + 1..end - offset + 1, false));
+                out.extend(cursor.window(
+                    &text,
+                    start - offset + 1..end - offset + 1,
+                    Caret::Hidden,
+                ));
             }
             offset += count;
         }
@@ -1463,7 +1473,7 @@ mod cursor_tests {
                 for start in (0..expected.len()).step_by(29) {
                     let end = (start + 30).min(expected.len());
                     assert_eq!(
-                        cursor.window(&text, start..end, false),
+                        cursor.window(&text, start..end, Caret::Hidden),
                         expected[start..end],
                         "user {user}, width {width}, row {start}"
                     );
@@ -1562,7 +1572,7 @@ mod streaming_cursor_tests {
                 .push(Span::new("▍", MUTED));
             let start = expected.len().saturating_sub(3);
             assert_eq!(
-                cursor.window(&text[..end], start..expected.len(), true),
+                cursor.window(&text[..end], start..expected.len(), Caret::Visible),
                 expected[start..]
             );
             assert!(cursor.tail.len() <= 4);
