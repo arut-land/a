@@ -41,7 +41,9 @@ All final probes use MISE_NO_ENV=1, an allowlisted environment, loopback
 endpoints and dummy credentials. No model is contacted. Main is pinned to
 7318ef3f; previous branch is a3283e2b. Framing probes extract the real reader
 implementations and use the real protocol encoder and native connections.
-Numbers are median [minimum–maximum]; times are milliseconds.
+Numbers are median [minimum–maximum]; times are milliseconds. The framing
+and SSE baseline source is unchanged between 7318ef3f and merged main
+63ac410a.
 
 ## M3 framing
 
@@ -57,7 +59,9 @@ Numbers are median [minimum–maximum]; times are milliseconds.
 The candidate is **not ready for performance acceptance**. Large-frame
 client time regresses. An experiment outside the worktree delegates
 rt's async-io read_with to the maintained async-io implementation and
-removes the regression. The necessary crates/rt/src/io.rs change is outside
+removes the ten-large-frame regression. Some medium client samples remain
+slower, so that experiment does not establish universal acceptance. The
+necessary crates/rt/src/io.rs change is outside
 the granted paths and remains owner-pending. The experiment column is not
 part of the committed implementation. After ten large frames, live receive
 allocation falls from about 8.09 MiB to 0.10–0.11 MiB per reader.
@@ -80,7 +84,13 @@ per-byte charging/pushing while preserving codec behavior.
 ## Other candidates
 
 MCP stdio was left unchanged: its 1 MiB message limit falls below the Linux
-crossover, and a provisional 256 KiB conversion slowed 900 KB messages.
+crossover. A fresh final-primitive M3 check (seven interleaved pairs)
+reduced charge but increased ten 900 KB message process CPU from
+9.26 [7.23–10.64] ms to 11.95 [9.01–12.54] ms; 128 KiB message CPU
+rose from 32.26 [30.19–35.01] ms to 46.84 [40.55–48.74] ms. Shared-host
+wall medians were 32.42 versus 30.34 ms, with broad overlapping ranges.
+This does not meet the CPU/speed criterion; main already releases completed
+MCP Vec allocations.
 Responses custom-tool escaping was removed after ten 5 MiB deltas slowed
 from 109.30 [108.71–110.55] ms to 180.82 [180.21–184.02] ms.
 Transport uses 16 KiB chunks and 64 KiB header/compression buffers, shell
@@ -96,7 +106,7 @@ Hosted measurements compare DONTNEED/FREE on Linux x64/ARM and
 commit/decommit, DiscardVirtualMemory and MEM_RESET on Windows x64/ARM.
 Policy runs: 40660702791, 40662329918. Aligned progressive Linux crossover
 run: 40687589452. The final native primitive checks and measurements use
-run 40694994211; its result is recorded in the phase-1 report.
+Linux run 40695367901 and Windows run 40696465232; results are recorded in the phase-1 report.
 
 Raw JSON, probe source, heap snapshots, rejected patches and exact scripts:
 /private/tmp/frame-buffers-probe/. The full phase-1 report is written to the

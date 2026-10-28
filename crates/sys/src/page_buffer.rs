@@ -740,8 +740,9 @@ mod tests {
     fn discarding_pages_preserves_the_reservation_and_hides_old_contents() {
         let mut bytes = TransientBuffer::new(8 << 20);
         let mut address = None;
-        for (marker, len) in [(0xa5, 5 << 20), (0x71, 2 << 20), (0x33, 5 << 20)] {
-            bytes.reserve_for(len).unwrap();
+        let frame_len = 5 << 20;
+        for (marker, len) in [(0xa5, frame_len), (0x71, 2 << 20), (0x33, frame_len)] {
+            bytes.reserve_for(frame_len).unwrap();
             let mut read = bytes.read_buffer(len).unwrap();
             read.as_mut().fill(marker);
             read.filled(len);
