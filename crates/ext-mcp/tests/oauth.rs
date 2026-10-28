@@ -663,6 +663,127 @@ fn token_expiry_joins_renewal_before_sending_an_expired_generation() {
 }
 
 #[test]
+fn generation_waiters_keep_their_own_deadlines_and_cancellation_during_shared_renewal() {
+    let root = Rig::new("generation-waiters", Registry::default());
+    let marker = root.dir.join("endpoint");
+    let (_peer, origin) = serve(&marker, "rotating-cancel");
+    let browser = Browser {
+        credentials: sys::credentials::Credentials::isolated(root.dir.join("credentials")),
+        approvals: Arc::default(),
+        threads: Arc::default(),
+        decline_write: false,
+    };
+    let authorizations = ext_mcp::Authorizations::default();
+    let registry = |timeout| {
+        let mcp = Mcp::with_authorizations(
+            vec![Server {
+                name: "fixture".parse().unwrap(),
+                description: String::new(),
+                transport: Transport::Http(format!("{origin}/mcp")),
+                env: BTreeMap::default(),
+            }],
+            timeout,
+            authorizations.clone(),
+        )
+        .unwrap();
+        Registry::default()
+            .with(&mcp)
+            .unwrap()
+            .with(&browser)
+            .unwrap()
+    };
+    let long = Rig::new("long-renewal", registry(Duration::from_secs(10)));
+    assert_eq!(
+        long.done("mcp_list", &json!({"server":"fixture"}))["ok"],
+        json!([])
+    );
+    assert!(get(&format!("{origin}/expire/1")).starts_with("HTTP/1.1 200"));
+    let leader = std::thread::spawn(move || long.done("mcp_list", &json!({"server":"fixture"})));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.with_extension("refresh-start").exists() {
+        assert!(Instant::now() < deadline, "renewal did not start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (send, receive) = std::sync::mpsc::channel();
+    let mut workers = Vec::new();
+    for cancelled in [false, true] {
+        for tool in ["mcp_list", "mcp_schema", "mcp_call"] {
+            let rig = Rig::new("short-waiter", registry(Duration::from_millis(100)));
+            let send = send.clone();
+            workers.push(std::thread::spawn(move || {
+                let started = Instant::now();
+                let input = json!({"server":"fixture","tool":"echo","arguments":{}});
+                let result = if cancelled {
+                    let cx = rig.cx();
+                    let input = protocol::Json::encode(&input).unwrap();
+                    let called = rt::block_on(rt::or(
+                        rig.registry.tools().run(tool, &input, None, &cx),
+                        async {
+                            // The first branch has already polled the real lookup.
+                            rig.cancel.set();
+                            std::future::pending().await
+                        },
+                    ));
+                    let protocol::Outcome::Done {
+                        output: protocol::Payload::Inline(output),
+                    } = called.outcome
+                    else {
+                        panic!("expected a typed MCP failure");
+                    };
+                    output.parse().unwrap()
+                } else {
+                    rig.done(tool, &input)
+                };
+                send.send((cancelled, tool, started.elapsed(), result))
+                    .unwrap();
+            }));
+        }
+    }
+    drop(send);
+    let mut results = Vec::new();
+    while results.len() < workers.len() {
+        match receive.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => results.push(result),
+            Err(_) => break,
+        }
+    }
+    let prompt = results.len();
+    // Always release the real peer and join every owned caller, even on regression.
+    std::fs::write(marker.with_extension("release"), b"ready").unwrap();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    results.extend(receive);
+    let completed = leader.join().unwrap();
+    for (cancelled, tool, elapsed, result) in &results {
+        eprintln!(
+            "generation_waiter cancelled={cancelled} tool={tool} elapsed_ms={:.3} result={result}",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+    assert_eq!(completed["ok"], json!([]), "{completed}");
+    assert_eq!(
+        std::fs::read_to_string(marker.with_extension("refreshes")).unwrap(),
+        "1"
+    );
+    for thread in browser.threads.lock().unwrap().drain(..) {
+        thread.join().unwrap();
+    }
+    drop(_peer);
+    assert_eq!(
+        prompt, 6,
+        "every short/cancelled waiter must return before the renewal is released"
+    );
+    for (cancelled, tool, _, result) in results {
+        assert_eq!(
+            result["failed"],
+            if cancelled { "cancelled" } else { "timeout" },
+            "{tool}: {result}"
+        );
+    }
+}
+
+#[test]
 fn cancelling_the_refresh_starter_does_not_cancel_other_sessions_renewal() {
     let mut engine = Engine::new("rotating-cancel");
     assert_eq!(

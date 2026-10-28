@@ -10,6 +10,52 @@ use serde_json::{Value, json};
 
 use crate::{Failure, incoming::Incoming, lock, rpc, stdio};
 
+/// Typed startup results must fan out as values: Scoped's I/O errors retain only text.
+pub(crate) struct Startup {
+    pub outcome: Result<Instance, Failure>,
+}
+
+pub(crate) struct Lease(ext::ScopeLease<Startup>);
+
+impl Lease {
+    pub(crate) fn retain(
+        scope: ext::ScopeLease<Startup>,
+        lifetimes: &ext::SessionLifetimes,
+    ) -> Result<Self, Failure> {
+        scope.outcome.as_ref().map_err(Clone::clone)?;
+        lifetimes.retain(&scope).map_err(|_| Failure::Cancelled)?;
+        Ok(Self(scope))
+    }
+}
+
+impl std::ops::Deref for Lease {
+    type Target = Instance;
+
+    fn deref(&self) -> &Instance {
+        self.0
+            .outcome
+            .as_ref()
+            .expect("only successful startup admits a lease")
+    }
+}
+
+impl ScopedResource for Startup {
+    fn ended(&self) -> ext::BoxFuture<'_, ()> {
+        match &self.outcome {
+            Ok(instance) => instance.ended(),
+            // Keep the outcome until every joined caller has observed it and released demand.
+            Err(_) => Box::pin(std::future::pending()),
+        }
+    }
+
+    fn close(&self) -> ext::BoxFuture<'_, ()> {
+        match &self.outcome {
+            Ok(instance) => instance.close(),
+            Err(_) => Box::pin(async {}),
+        }
+    }
+}
+
 pub(crate) struct Instance {
     child: Arc<OwnedProcess>,
     state: Arc<State>,
@@ -42,7 +88,6 @@ struct Pending {
 impl Instance {
     pub(crate) fn start(
         child: OwnedProcess,
-        cancel: Cancel,
         retired: Cancel,
         scope: crate::config::Scope,
         runtime: &Arc<dyn rt::Runtime>,
@@ -51,7 +96,9 @@ impl Instance {
         let state = Arc::new(State {
             requests: Mutex::default(),
             changed: rt::Notify::new(),
-            cancel,
+            // Closing a failed handshake must not cancel the scope before its
+            // typed startup outcome has reached every joined caller.
+            cancel: Cancel::default(),
             scope,
             // Admission delays requests rather than rejecting a server's features.
             // Credit follows a cancelled exchange until its bounded drain finishes.

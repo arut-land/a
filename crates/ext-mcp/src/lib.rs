@@ -51,7 +51,7 @@ pub struct Mcp(Arc<Inner>);
 struct Inner {
     servers: Vec<Server>,
     timeout: Duration,
-    instances: OnceLock<ext::Scoped<identity::Identity, instance::Instance>>,
+    instances: OnceLock<ext::Scoped<identity::Identity, instance::Startup>>,
     scopes: Vec<config::Scope>,
     directory: Option<std::path::PathBuf>,
     environment: OnceLock<BTreeMap<String, String>>,
@@ -243,33 +243,11 @@ impl Mcp {
         }
     }
 
-    async fn acquire(
-        &self,
-        server: &Server,
-        cx: &Cx,
-    ) -> Result<ext::ScopeLease<instance::Instance>, Failure> {
-        let runtime = cx.service::<dyn rt::Runtime>().expect("MCP runtime");
-        rt::or(self.acquire_inner(server, cx), async {
-            rt::or(
-                async {
-                    cx.cancel.wait().await;
-                    Err(Failure::Cancelled)
-                },
-                async {
-                    runtime.sleep(self.0.timeout).await;
-                    Err(Failure::Timeout)
-                },
-            )
-            .await
-        })
-        .await
+    async fn acquire(&self, server: &Server, cx: &Cx) -> Result<instance::Lease, Failure> {
+        rpc::guarded(self.0.timeout, cx, self.acquire_inner(server, cx)).await
     }
 
-    async fn acquire_inner(
-        &self,
-        server: &Server,
-        cx: &Cx,
-    ) -> Result<ext::ScopeLease<instance::Instance>, Failure> {
+    async fn acquire_inner(&self, server: &Server, cx: &Cx) -> Result<instance::Lease, Failure> {
         let index = self
             .0
             .servers
@@ -306,54 +284,57 @@ impl Mcp {
                 let mut startup_cx = cx.clone();
                 let retired = self.0.retired.clone();
                 Box::pin(async move {
-                    startup_cx.cancel = cancel.clone();
-                    let environment = env.0.as_ref().map_or_else(
-                        || owner.0.environment.get_or_init(stdio::snapshot).clone(),
-                        |env| env.vars.clone(),
-                    );
-                    let processes = startup_cx
-                        .service::<dyn ext::Processes>()
-                        .ok_or_else(|| std::io::Error::other("no process provider"))?;
-                    let launch = ext::LaunchSpec {
-                        process: stdio::spec(&owner.0.servers[index], cwd, environment),
-                        output: ext::ProcessOutput::Stdio,
-                    };
-                    let child = if scope.shared() {
-                        processes
-                            .launcher(&startup_cx)?
-                            .spawn(cancel.clone(), launch)
-                            .await?
-                    } else {
-                        processes.spawn(&startup_cx, launch).await?
-                    };
-                    let runtime = startup_cx
-                        .service_arc::<dyn rt::Runtime>()
-                        .expect("MCP runtime");
-                    let instance =
-                        instance::Instance::start(child, cancel, retired, scope, &runtime);
-                    if let Err(error) = instance
-                        .discover(&startup_cx, runtime.now() + timeout)
-                        .await
-                    {
-                        use ext::ScopedResource;
-                        instance.close().await;
-                        return Err(std::io::Error::other(error));
+                    let outcome = async {
+                        startup_cx.cancel = cancel.clone();
+                        let environment = env.0.as_ref().map_or_else(
+                            || owner.0.environment.get_or_init(stdio::snapshot).clone(),
+                            |env| env.vars.clone(),
+                        );
+                        let processes = startup_cx
+                            .service::<dyn ext::Processes>()
+                            .ok_or_else(|| Failure::Spawn("no process provider".into()))?;
+                        let launch = ext::LaunchSpec {
+                            process: stdio::spec(&owner.0.servers[index], cwd, environment),
+                            output: ext::ProcessOutput::Stdio,
+                        };
+                        let child = if scope.shared() {
+                            processes
+                                .launcher(&startup_cx)
+                                .map_err(|e| Failure::Spawn(e.to_string()))?
+                                .spawn(cancel.clone(), launch)
+                                .await
+                                .map_err(|e| Failure::Spawn(e.to_string()))?
+                        } else {
+                            processes
+                                .spawn(&startup_cx, launch)
+                                .await
+                                .map_err(|e| Failure::Spawn(e.to_string()))?
+                        };
+                        let runtime = startup_cx
+                            .service_arc::<dyn rt::Runtime>()
+                            .expect("MCP runtime");
+                        let instance = instance::Instance::start(child, retired, scope, &runtime);
+                        if let Err(error) = instance
+                            .discover(&startup_cx, runtime.now() + timeout)
+                            .await
+                        {
+                            use ext::ScopedResource;
+                            instance.close().await;
+                            return Err(error);
+                        }
+                        Ok(instance)
                     }
-                    Ok(instance)
+                    .await;
+                    Ok(instance::Startup { outcome })
                 })
             })
             .await
-            .map_err(|e| {
-                e.get_ref()
-                    .and_then(|e| e.downcast_ref::<Failure>())
-                    .cloned()
-                    .unwrap_or_else(|| Failure::Spawn(e.to_string()))
-            })?;
-        cx.service::<ext::SessionLifetimes>()
-            .ok_or_else(|| Failure::Configuration("no session lifetimes".into()))?
-            .retain(&lease)
-            .map_err(|_| Failure::Cancelled)?;
-        Ok(lease)
+            .map_err(|e| Failure::Spawn(e.to_string()))?;
+        instance::Lease::retain(
+            lease,
+            cx.service::<ext::SessionLifetimes>()
+                .ok_or_else(|| Failure::Configuration("no session lifetimes".into()))?,
+        )
     }
 
     async fn tools(&self, name: &ServerName, cx: &Cx) -> Result<Arc<[RemoteTool]>, Failure> {
@@ -371,10 +352,13 @@ impl Mcp {
         };
         let authorization = if let Transport::Http(url) = &server.transport {
             Some(
-                rpc::client(self.connection(&server), cx)
-                    .generation(url)
-                    .await
-                    .map_err(|e| Failure::Transport(e.to_string()))?,
+                rpc::guarded(self.0.timeout, cx, async {
+                    rpc::client(self.connection(&server), cx)
+                        .generation(url)
+                        .await
+                        .map_err(|e| Failure::Transport(e.to_string()))
+                })
+                .await?,
             )
         } else {
             None
@@ -439,7 +423,7 @@ impl Mcp {
     async fn fetch_tools(
         &self,
         server: Server,
-        lease: Option<ext::ScopeLease<instance::Instance>>,
+        lease: Option<instance::Lease>,
         cx: Cx,
     ) -> Result<discovery::Loaded, Failure> {
         let mut tools = Vec::new();

@@ -1,7 +1,7 @@
 //! The protocol subset shared by the two transports. It never retries
 //! requests: a server may have effected a call before losing its reply.
 
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ext::Cx;
@@ -122,23 +122,33 @@ pub(crate) async fn http_authorized(
 ) -> Result<Reply, Failure> {
     let timeout = connection.timeout;
     let client = client(connection, cx);
-    let runtime = cx.service::<dyn rt::Runtime>().expect("MCP runtime");
-    rt::or(
+    guarded(
+        timeout,
+        cx,
         exchange_reply(&client, url, method, params, headers, cx),
-        async {
-            rt::or(
-                async {
-                    cx.cancel.wait().await;
-                    Err(Failure::Cancelled)
-                },
-                async {
-                    runtime.sleep(timeout).await;
-                    Err(Failure::Timeout)
-                },
-            )
-            .await
-        },
     )
+    .await
+}
+
+pub(crate) async fn guarded<T>(
+    timeout: std::time::Duration,
+    cx: &Cx,
+    work: impl Future<Output = Result<T, Failure>>,
+) -> Result<T, Failure> {
+    let runtime = cx.service::<dyn rt::Runtime>().expect("MCP runtime");
+    rt::or(work, async {
+        rt::or(
+            async {
+                cx.cancel.wait().await;
+                Err(Failure::Cancelled)
+            },
+            async {
+                runtime.sleep(timeout).await;
+                Err(Failure::Timeout)
+            },
+        )
+        .await
+    })
     .await
 }
 

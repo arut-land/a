@@ -129,6 +129,81 @@ fn crashes_and_protocol_failures_are_logged_as_distinct_facts() {
 }
 
 #[test]
+fn discovery_startup_failures_preserve_their_typed_classification() {
+    use std::future::poll_fn;
+    use std::task::Poll;
+
+    for name in ["discover-crash", "discover-version"] {
+        let rig = rig(name, Duration::from_secs(10));
+        let contexts: Vec<_> = (0..8).map(|_| rig.cx()).collect();
+        let input = protocol::Json::encode(&json!({"server":"fixture"})).unwrap();
+        let mut calls: Vec<_> = contexts
+            .iter()
+            .map(|cx| rig.registry.tools().run("mcp_list", &input, None, cx))
+            .collect();
+        let results = rt::block_on(async {
+            poll_fn(|cx| {
+                for call in &mut calls {
+                    assert!(call.as_mut().poll(cx).is_pending());
+                }
+                Poll::Ready(())
+            })
+            .await;
+            std::fs::write(
+                rig.workspace().join(format!("effects-{name}.release")),
+                b"ready",
+            )
+            .unwrap();
+            let mut results = Vec::new();
+            for call in calls {
+                let protocol::Outcome::Done {
+                    output: protocol::Payload::Inline(output),
+                } = call.await.outcome
+                else {
+                    panic!("expected a typed startup failure");
+                };
+                results.push(output.parse::<Value>().unwrap());
+            }
+            results
+        });
+        for result in results {
+            let failure: Failure = serde_json::from_value(result["failed"].clone()).unwrap();
+            if name == "discover-crash" {
+                assert_eq!(failure, Failure::Crashed);
+            } else {
+                assert!(matches!(failure, Failure::Protocol(_)), "{failure:?}");
+            }
+        }
+        let effects =
+            std::fs::read_to_string(rig.workspace().join(format!("effects-{name}"))).unwrap();
+        assert_eq!(
+            effects
+                .lines()
+                .filter(|line| line.starts_with("start "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            effects.lines().filter(|line| *line == "discover").count(),
+            1
+        );
+        // A later explicit request retries after the failed generation is cleaned up.
+        let again = rig.done("mcp_list", &json!({"server":"fixture"}));
+        assert_eq!(
+            again["failed"],
+            if name == "discover-crash" {
+                json!(Failure::Crashed)
+            } else {
+                json!(Failure::Protocol(
+                    "server does not support MCP 2026-07-28".into()
+                ))
+            }
+        );
+        finish(rig);
+    }
+}
+
+#[test]
 fn timeout_kills_the_request_and_a_later_call_gets_a_new_process() {
     let rig = rig("timeout", Duration::from_secs(1));
     assert_eq!(failed(&rig, "wait"), Failure::Timeout);
