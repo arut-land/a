@@ -23,15 +23,8 @@ static RT: LazyLock<rt::Rt> = LazyLock::new(|| Arc::new(rt::Threads::default()))
 static HUB: LazyLock<Arc<rt::watch::Hub>> =
     LazyLock::new(|| Arc::new(rt::watch::Hub::new(Arc::clone(&RT))));
 
-/// Shared independently of call authority, as in the engine.
-static SERVICES: LazyLock<Arc<SessionServices>> = LazyLock::new(|| {
-    Arc::new(
-        SessionServices::default()
-            .with::<dyn rt::Runtime>(Arc::clone(&RT))
-            .with::<rt::watch::Hub>(Arc::clone(&HUB))
-            .with::<dyn transport::HttpClients>(Arc::new(transport::Clients::new(Arc::clone(&RT)))),
-    )
-});
+static HTTP: LazyLock<Arc<dyn transport::HttpClients>> =
+    LazyLock::new(|| Arc::new(transport::Clients::new(Arc::clone(&RT))));
 
 /// The trees a generation source watches, over the rig's watcher, as
 /// the engine hands them to [`Sources::open`](crate::host::Sources::open).
@@ -66,6 +59,7 @@ pub struct Rig {
 
 /// What the calls tell the engine.
 pub struct Recorder {
+    services: Arc<SessionServices>,
     pub registry: Registry,
     states: Mutex<States>,
     /// The `ext` entries the calls logged.
@@ -109,6 +103,18 @@ impl Rig {
             cancel: Cancel::default(),
             session,
             host: Arc::new(Recorder {
+                services: Arc::new(
+                    SessionServices::default()
+                        .with::<dyn rt::Runtime>(Arc::clone(&RT))
+                        .with::<rt::watch::Hub>(Arc::clone(&HUB))
+                        .with::<dyn transport::HttpClients>(Arc::clone(&HTTP))
+                        .with::<crate::Lifetimes>(Arc::new(crate::Lifetimes::new(Arc::new(
+                            |task| RT.spawn(task),
+                        ))))
+                        .with::<crate::SessionLifetimes>(Arc::new(
+                            crate::SessionLifetimes::default(),
+                        )),
+                ),
                 states: Mutex::new(registry.states()),
                 registry,
                 log: Mutex::default(),
@@ -147,7 +153,7 @@ impl Rig {
             model: "test:model".into(),
             blobs: self.blobs.clone(),
             cancel: self.cancel.clone(),
-            services: Arc::clone(&SERVICES),
+            services: Arc::clone(&self.host.services),
         }
         .cx(Arc::clone(&self.host) as _)
     }
@@ -185,6 +191,18 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
+        self.host
+            .services
+            .get::<crate::SessionLifetimes>()
+            .expect("rig session lifetimes")
+            .close();
+        let lifetimes = self
+            .host
+            .services
+            .get::<crate::Lifetimes>()
+            .expect("rig lifetimes");
+        lifetimes.close();
+        rt::block_on(lifetimes.ended());
         for (process, released) in lock(&self.processes).drain(..) {
             let _ = process.signal(crate::ProcessSignal::Kill);
             rt::block_on(released.wait());
@@ -237,7 +255,7 @@ impl Host for Recorder {
                 model: cx.model,
                 blobs: cx.blobs,
                 cancel: cx.cancel,
-                services: Arc::clone(&SERVICES),
+                services: Arc::clone(&self.services),
             }
             .cx(self.clone())
             .with_invocation(context);

@@ -260,7 +260,36 @@ impl Drop for Reap {
     }
 }
 
+struct Launcher(rt::Rt);
+
+impl ext::ProcessLauncher for Launcher {
+    fn spawn(
+        &self,
+        cancel: ext::Cancel,
+        spec: LaunchSpec,
+    ) -> BoxFuture<'static, Result<OwnedProcess, SpawnError>> {
+        let rt = Arc::clone(&self.0);
+        Box::pin(async move {
+            launch_owned(
+                rt,
+                cancel,
+                spec,
+                |child| child.exit_watch(),
+                |reactor, input, _| rt::Async::new(reactor, input),
+            )
+            .await
+        })
+    }
+}
+
 impl Processes for Provider {
+    fn launcher(&self, cx: &Cx) -> Result<Arc<dyn ext::ProcessLauncher>, SpawnError> {
+        Ok(Arc::new(Launcher(
+            cx.service_arc::<dyn rt::Runtime>()
+                .ok_or_else(|| io::Error::other("no runtime"))?,
+        )))
+    }
+
     fn spawn<'a>(
         &'a self,
         cx: &'a Cx,
@@ -322,13 +351,30 @@ async fn launch(
     }
     cx.spawn_hooks(&mut launch.process)
         .map_err(io::Error::other)?;
-    if launch.process.argv.is_empty() {
-        return Err(io::Error::other("a spawn hook left no program to run"));
+    launch_owned(rt, cx.cancel.clone(), launch, watch, register).await
+}
+
+async fn launch_owned(
+    rt: rt::Rt,
+    cancel: ext::Cancel,
+    launch: LaunchSpec,
+    watch: impl FnOnce(&mut sys::Child) -> io::Result<sys::ExitWatch>,
+    register: impl FnOnce(
+        &rt::Reactor,
+        sys::ProcessPipe,
+        u32,
+    ) -> io::Result<rt::Async<sys::ProcessPipe>>,
+) -> io::Result<OwnedProcess> {
+    if cancel.is_set() {
+        return Err(io::ErrorKind::Interrupted.into());
     }
-    let cancel = cx.cancel.clone();
+    if launch.process.argv.is_empty() {
+        return Err(io::Error::other("no program to run"));
+    }
+    let launching = cancel.clone();
     let runtime = Arc::clone(&rt);
     let launched = rt::try_unblock_with(&*rt, rt::BlockingClass::Storage, 0, move || {
-        if cancel.is_set() {
+        if launching.is_set() {
             return Err(io::ErrorKind::Interrupted.into());
         }
         let mut cmd = std::process::Command::new(&launch.process.argv[0]);
@@ -352,7 +398,7 @@ async fn launch(
         Ok::<_, io::Error>((Reap::new(child, live), pipes, capture))
     })
     .await??;
-    if cx.cancel.is_set() {
+    if cancel.is_set() {
         return Err(io::ErrorKind::Interrupted.into());
     }
     supervise(&rt, launched, watch, register).await

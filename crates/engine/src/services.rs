@@ -447,3 +447,26 @@ pub(super) fn attempt_clock() -> &'static (SessionId, std::time::Instant) {
     static CLOCK: std::sync::OnceLock<(SessionId, std::time::Instant)> = std::sync::OnceLock::new();
     CLOCK.get_or_init(|| (SessionId::new(), std::time::Instant::now()))
 }
+
+#[cfg(test)]
+impl super::Live {
+    pub(crate) fn process_session_weak(&self) -> Weak<dyn std::any::Any + Send + Sync> {
+        Arc::downgrade(&(self.session.clone() as Arc<dyn std::any::Any + Send + Sync>))
+    }
+
+    pub(crate) fn process_cx(&self) -> Cx {
+        let call = CallId::new(1).unwrap();
+        self.session.cx(
+            ContextOrigin::new(
+                call,
+                self.session.fence.load(Ordering::SeqCst),
+                super::Admission {
+                    through: 1,
+                    requirement: ext::Requirement::Ordered,
+                },
+                ext::Cancel::default(),
+            ),
+            &self.session.shared.registry.get(),
+        )
+    }
+}

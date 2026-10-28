@@ -36,6 +36,7 @@ mod ext;
 mod flag;
 mod history;
 pub mod host;
+mod lifetime;
 mod r#loop;
 pub mod point;
 pub mod query;
@@ -63,6 +64,9 @@ pub use agent::{
 pub use assemble::{Need, Provides};
 pub use ext::{DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
 pub use flag::{Cancel, Flag};
+pub use lifetime::{
+    InstanceKey, Lifetimes, Scope, ScopeLease, Scoped, ScopedResource, SessionLifetimes,
+};
 pub use llm::Json;
 pub use r#loop::{Defaults, LOOP, Loop, LoopPoints, Resume, StepLimit};
 pub use point::{
@@ -75,8 +79,9 @@ pub use queue::{Boundary, QueueView, Take};
 pub use schema::Schema;
 pub use service::{
     Budget, CwdOf, Given, Holds, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec, Native,
-    OwnedProcess, Parting, ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes,
-    Recipients, Record, Role, Route, RunningProcess, SideProvider, SideRetry, SpawnError, Topology,
+    OwnedProcess, Parting, ProcessLauncher, ProcessLease, ProcessOutput, ProcessPipe,
+    ProcessSignal, Processes, Recipients, Record, Role, Route, RunningProcess, SideProvider,
+    SideRetry, SpawnError, Topology,
 };
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};
