@@ -8,13 +8,13 @@ fn normalization_never_changes_frozen_settings_or_authority() {
     let original = crate::tests::spawn_intent(17, "frozen prompt");
     let before = protocol::publication::SpawnImage::from_json(&original).unwrap();
     let mut intent = SpawnIntent::from_json(&original).unwrap();
-    intent.image = crate::transcript::context_image(&[Entry::new(
+    intent.image = crate::context::test_image(crate::transcript::context_image(&[Entry::new(
         Seq::new(1).unwrap(),
         Epoch(0),
         Body::Assistant {
             text: "context".into(),
         },
-    )]);
+    )]));
     let after = protocol::publication::SpawnImage::from_json(&intent.into_json().unwrap()).unwrap();
     assert_eq!(before.authority, after.authority);
     let restored = SpawnIntent::from_json(&after.to_json().unwrap()).unwrap();
@@ -47,7 +47,9 @@ fn context_survives_removal_of_ancestor_files() {
         })
         .unwrap();
     let mut intent = SpawnIntent::from_json(&crate::tests::spawn_intent(1, "child")).unwrap();
-    intent.image = crate::transcript::context_image(&ancestor_store.entries(header.id).unwrap());
+    intent.image = crate::context::test_image(crate::transcript::context_image(
+        &ancestor_store.entries(header.id).unwrap(),
+    ));
     let nested_id = SessionId::new();
     let mut nested = ancestor_store
         .create(&Header {
@@ -63,7 +65,7 @@ fn context_survives_removal_of_ancestor_files() {
     let entries = ancestor_store.entries(nested_id).unwrap();
     let expected = Transcript::of(&entries, Arc::new(Registry::default()), "").into_context();
     let mut intent = SpawnIntent::from_json(&crate::tests::spawn_intent(1, "grandchild")).unwrap();
-    intent.image = crate::transcript::context_image(&entries);
+    intent.image = crate::context::test_image(crate::transcript::context_image(&entries));
     header.id = SessionId::new();
     let mut child = child_store.create(&header).unwrap();
     child

@@ -309,26 +309,40 @@ impl Actor {
                     "prefix is not committed in the owning conversation".into(),
                 ));
             } else {
-                let entries = self.live.entries().await;
-                if let Err(error) = &entries {
-                    refusal = Some(SpawnRefusal::Unavailable(error.to_string()));
-                }
-                if let Ok(entries) = entries {
-                    let pending: Vec<_> = self.pending_entries().collect();
-                    image = rt::unblock_with(
-                        &*self.live.session.shared.rt,
-                        rt::BlockingClass::Cpu,
-                        rt::STORAGE_BYTES,
-                        move || {
-                            let entries: Vec<_> = entries
-                                .into_iter()
-                                .chain(pending)
-                                .filter(|e| e.seq <= seq)
-                                .collect();
-                            crate::transcript::context_image(&entries)
-                        },
-                    )
-                    .await;
+                let session = Arc::clone(&self.live.session);
+                let frames = Arc::clone(&self.live.frames);
+                let pending: Vec<_> = self.pending_entries().collect();
+                let result = rt::unblock(&*self.live.session.shared.rt, move || {
+                    #[cfg(test)]
+                    crate::context::register_test_places(session.blobs.places());
+                    let mut cuts = lock(&session.context_cuts);
+                    let (through, previous) = cuts.before(seq.get());
+                    if through == seq.get() {
+                        return Ok(previous);
+                    }
+                    let mut entries = Vec::new();
+                    'committed: for batch in frames.batches_after(through) {
+                        for entry in batch? {
+                            if entry.seq > seq {
+                                break 'committed;
+                            }
+                            entries.push(entry);
+                        }
+                    }
+                    let committed = entries.last().map_or(through, |entry| entry.seq.get());
+                    entries.extend(
+                        pending
+                            .into_iter()
+                            .filter(|entry| entry.seq.get() > committed && entry.seq <= seq),
+                    );
+                    let image = crate::context::append(previous, entries, &*session.shared.blobs)?;
+                    cuts.insert(seq.get(), image.clone());
+                    io::Result::Ok(image)
+                })
+                .await;
+                match result {
+                    Ok(cut) => image = cut,
+                    Err(error) => refusal = Some(SpawnRefusal::Unavailable(error.to_string())),
                 }
             }
         }

@@ -2457,7 +2457,7 @@ fn compaction_summarises_inherited_context_with_local_edit_precedence() {
         entry(2, echo("inherited answer")),
     ];
     let mut intent = spawn::SpawnIntent::from_json(&crate::tests::spawn_intent(1, "")).unwrap();
-    intent.image = crate::transcript::context_image(&inherited);
+    intent.image = crate::context::test_image(crate::transcript::context_image(&inherited));
     intent.settings = ext::Checkpoint::default();
     let entries = [
         entry(

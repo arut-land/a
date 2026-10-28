@@ -1,9 +1,9 @@
 use super::*;
 use protocol::{Epoch, Json, Mode, SessionId};
-fn spawn_image(image: ContextImage) -> Json {
+fn spawn_image(image: Vec<ContextLayer>) -> Json {
     let intent = crate::tests::spawn_intent(1, "");
     let mut intent = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
-    intent.image = image;
+    intent.image = crate::context::test_image(image);
     intent.into_json().unwrap()
 }
 
@@ -213,7 +213,11 @@ fn pending_exchanges_never_become_child_work() {
     );
 }
 
-fn recursive_scope(image: &ContextImage, scope: usize, registry: &Arc<Registry>) -> Transcript {
+fn recursive_scope(
+    image: &Vec<ContextLayer>,
+    scope: usize,
+    registry: &Arc<Registry>,
+) -> Transcript {
     let mut transcript = Transcript::empty(registry.clone(), "", &Places::default());
     let Some(ContextLayer(runner, inputs)) = image.get(scope) else {
         return transcript;
@@ -247,7 +251,13 @@ fn recursive_projection(entries: &[Entry], registry: &Arc<Registry>) -> Transcri
             None => {
                 if let Body::Spawned { intent } = &e.body {
                     let image = protocol::publication::SpawnImage::from_json(intent).unwrap();
-                    let messages = recursive_scope(&image.image, 0, registry).into_context();
+                    let messages = recursive_scope(
+                        &crate::context::expand(&image.image, &crate::context::test_places())
+                            .unwrap(),
+                        0,
+                        registry,
+                    )
+                    .into_context();
                     for message in messages.iter() {
                         transcript.messages.push(message.clone());
                     }

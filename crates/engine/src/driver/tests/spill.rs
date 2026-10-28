@@ -447,7 +447,9 @@ fn a_detached_calls_spilled_result_comes_back_as_its_blob() {
     };
     assert_eq!(back.body.blobs(), [protocol::Held::Blob((**blob).clone())]);
     assert_eq!(background::read(&fixture, blob), long());
-    let messages = Transcript::placed(&log, Arc::new(registry), "", &places).into_messages();
+    let messages = Transcript::placed(&log, Arc::new(registry), "", &places)
+        .unwrap()
+        .into_messages();
     let said = format!("{messages:?}");
     assert!(said.contains("<truncated bytes="), "{said}");
     assert!(!said.contains("line 00500"), "{said}");

@@ -74,55 +74,28 @@ fn segments() -> protocol::Segments {
 }
 
 fn context_image() -> protocol::publication::ContextImage {
-    use protocol::publication::{
-        ContextInput, ContextLayer, ContextValue, Publication, RunnerKind,
-    };
-    let values = [
-        ContextValue::Inherited(1),
-        ContextValue::User("summary at an excluded position".into()),
-        ContextValue::Queued("consumed input".into(), Mode::Steer),
-        ContextValue::Inbox(envelope().id().clone(), "hello".into()),
-        ContextValue::Taken(Seq::new(3).unwrap()),
-        ContextValue::Assistant("answer".into()),
-        ContextValue::Context(
-            "published context".into(),
-            Some(Publication {
+    let mut publications = protocol::publication::Publications::default();
+    publications.apply(&Entry::new(
+        Seq::new(2).unwrap(),
+        Epoch(0),
+        Body::Context {
+            text: "published context".into(),
+            publication: Some(protocol::publication::Publication {
                 namespace: "skills".into(),
                 key: protocol::Json::encode("review").unwrap(),
             }),
-        ),
-        ContextValue::Child(Outcome::Interrupted { output: None }),
-        ContextValue::Into(Seq::new(3).unwrap(), CallId::new(9).unwrap()),
-        ContextValue::Withdrawn(Seq::new(3).unwrap()),
-        ContextValue::Detached(CallId::new(9).unwrap()),
-        ContextValue::Background(
-            CallId::new(9).unwrap(),
-            Outcome::Interrupted { output: None },
-            Vec::new(),
-        ),
-        ContextValue::Reply(protocol::Json::null()),
-        ContextValue::ToolCall("provider-id".into(), "example".into()),
-        ContextValue::ToolResult(
-            CallId::new(9).unwrap(),
-            Outcome::Interrupted { output: None },
-            Vec::new(),
-        ),
-    ];
-    let inputs: Vec<_> = values
-        .into_iter()
-        .zip(1..)
-        .map(|(value, seq)| ContextInput(Seq::new(seq).unwrap(), value))
-        .collect();
-    vec![
-        ContextLayer(RunnerKind::Agent, inputs),
-        ContextLayer(
-            RunnerKind::ModelOnly,
-            vec![ContextInput(
-                Seq::new(1).unwrap(),
-                ContextValue::User("ancestor".into()),
-            )],
-        ),
-    ]
+        },
+    ));
+    protocol::publication::ContextImage {
+        runner: protocol::publication::RunnerKind::Agent,
+        root: Some(protocol::BlobRef {
+            id: protocol::BlobId([0x37; 32]),
+            size: 1234,
+            media_type: "application/vnd.a.context+json".into(),
+            origin: protocol::BlobOrigin::Context,
+        }),
+        publications,
+    }
 }
 
 fn client_samples() -> Vec<Sample<ClientMsg>> {

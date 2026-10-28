@@ -341,6 +341,7 @@ pub enum Open {
 struct Session {
     services: Arc<SessionServices>,
     spawn: Mutex<Option<spawn::SpawnIntent>>,
+    context_cuts: Mutex<crate::context::Cuts>,
     fence: AtomicU64,
     id: SessionId,
     workspace: Arc<Path>,
@@ -646,14 +647,22 @@ impl Drop for Attachment {
 }
 
 impl Live {
-    async fn entries(&self) -> io::Result<Vec<Entry>> {
-        self.frames.read_entries(&*self.session.shared.rt).await
-    }
-
     /// Whether the session's log references blob `blob`.
     pub(crate) async fn references(&self, blob: protocol::BlobId) -> io::Result<bool> {
         let frames = Arc::clone(&self.frames);
-        rt::unblock(&*self.session.shared.rt, move || frames.references(&blob)).await
+        let image = lock(&self.session.spawn)
+            .as_ref()
+            .map(|spawn| spawn.image.clone());
+        let places = self.session.blobs.places();
+        rt::unblock(&*self.session.shared.rt, move || {
+            if frames.references(&blob)? {
+                return Ok(true);
+            }
+            image.map_or(Ok(false), |image| {
+                crate::context::references(&image, &places, blob)
+            })
+        })
+        .await
     }
 
     /// Opens session `header`'s log, folds it into a kernel and starts the
@@ -3146,6 +3155,7 @@ impl Session {
                 }
             }),
             spawn: Mutex::default(),
+            context_cuts: Mutex::default(),
             fence: AtomicU64::new(0),
             id: header.id,
             workspace: Arc::from(header.workspace.as_path()),

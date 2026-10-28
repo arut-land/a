@@ -765,10 +765,14 @@ impl Actor {
                 Some((ext::ModelTurn::typed(&spawn.request, call, text)?, None))
             })
             .ok_or("model-only turn has no admitted authority")?;
+        let policy = lock(&self.live.session.spawn)
+            .as_ref()
+            .and_then(|spawn| spawn.request.runner.context_policy())
+            .ok_or("model-only context policy is missing")?;
         let history = match turn.context {
             ext::Context::OwnerPrefix => llm::Messages::default(),
             ext::Context::Fresh | ext::Context::Owner => self
-                .canonical_conversation(CallId(seq))
+                .bounded_history(CallId(seq), policy.exchanges)
                 .await
                 .map_err(|e| e.to_string())?,
         };
@@ -783,10 +787,6 @@ impl Actor {
         } else {
             llm::Messages::default()
         };
-        let policy = lock(&self.live.session.spawn)
-            .as_ref()
-            .and_then(|spawn| spawn.request.runner.context_policy())
-            .ok_or("model-only context policy is missing")?;
         let system = self.registry.system_prompt();
         let current: llm::Messages = (!system.is_empty())
             .then(|| llm::Message::system(system))

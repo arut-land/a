@@ -1489,25 +1489,26 @@ fn view_snapshots_preserve_skill_and_mcp_publications() {
 
 fn inherited_publications() -> Entry {
     let key = Json::encode(&"loaded-publication").unwrap();
-    let inherited = vec![protocol::publication::ContextLayer(
-        protocol::publication::RunnerKind::Agent,
-        ["skills", "mcp-schemas"]
-            .into_iter()
-            .zip(1..)
-            .map(|(namespace, seq)| {
-                protocol::publication::ContextInput(
-                    Seq::new(seq).unwrap(),
-                    protocol::publication::ContextValue::Context(
-                        "execution context".into(),
-                        Some(Publication {
-                            namespace: namespace.into(),
-                            key: key.clone(),
-                        }),
-                    ),
-                )
-            })
-            .collect(),
-    )];
+    let mut publications = protocol::publication::Publications::default();
+    for (seq, namespace) in (1..).zip(["skills", "mcp-schemas"]) {
+        publications.apply(&Entry::new(
+            Seq::new(seq).unwrap(),
+            Epoch(0),
+            Body::Context {
+                text: "execution context".into(),
+                publication: Some(Publication {
+                    namespace: namespace.into(),
+                    key: key.clone(),
+                }),
+            },
+        ));
+    }
+    let inherited = protocol::publication::ContextImage {
+        runner: protocol::publication::RunnerKind::Agent,
+        root: None,
+        publications,
+    };
+
     Entry::new(
         Seq::new(1).unwrap(),
         Epoch(0),

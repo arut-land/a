@@ -202,8 +202,9 @@ fn a_detached_calls_stream_is_named_for_the_session_whose_log_holds_it() {
         .map(|(body, seq)| Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
         .collect();
     let places = session(SessionId::new()).places();
-    let messages =
-        Transcript::placed(&entries, Arc::new(Registry::default()), "", &places).into_messages();
+    let messages = Transcript::placed(&entries, Arc::new(Registry::default()), "", &places)
+        .unwrap()
+        .into_messages();
     let Some(Message::Tool(answers)) = messages.iter().last() else {
         panic!("{messages:#?}");
     };
@@ -243,6 +244,7 @@ fn a_held_blob_is_named_only_once_it_can_be_read() {
             .map(|(body, seq)| Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
             .collect();
         let messages = Transcript::placed(&entries, Arc::new(Registry::default()), "", &places)
+            .unwrap()
             .into_messages();
         let Some(Message::Tool(answers)) = messages.iter().last() else {
             panic!("{messages:#?}");
@@ -301,8 +303,9 @@ fn a_childs_result_held_as_a_blob_is_read_back_for_its_parent() {
     .zip(1..))
     .map(|(body, seq)| Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
     .collect();
-    let messages =
-        Transcript::placed(&entries, Arc::new(Registry::default()), "", &places).into_messages();
+    let messages = Transcript::placed(&entries, Arc::new(Registry::default()), "", &places)
+        .unwrap()
+        .into_messages();
     let said = format!("{messages:?}");
     assert!(
         said.contains("The child session finished:\\nthe child's whole answer"),

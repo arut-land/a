@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The exact protocol this build speaks.
-pub const PROTO: u32 = 37;
+pub const PROTO: u32 = 38;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -551,9 +551,9 @@ impl Body {
     /// Every reference the entry holds outside the log: what its `held`
     /// fields list, a tool outcome held as a blob (logged, replaced by a
     /// `post_tool` decision, a child's, or carried by an envelope), input
-    /// pasted or attached by reference, and all of these in the context
-    /// image a child is spawned with. What a sweep keeps, and what a
-    /// projection reads or names with I/O.
+    /// pasted or attached by reference, and engine-private context roots a child is spawned with. A collector
+    /// follows those roots through `publication::ContextNode::blobs`; fetching
+    /// payloads additionally checks the effective projection.
     pub fn blobs(&self) -> Vec<Held> {
         let mut found = Vec::new();
         match self {
@@ -569,28 +569,11 @@ impl Body {
             Self::Enqueue { envelope } => envelope_blobs(envelope, &mut found),
             Self::Input { segments, .. } => segment_blobs(segments, &mut found),
             // A malformed image is refused where the child is restored.
-            Self::Spawned { intent } => {
-                let image = publication::SpawnImage::from_json(intent);
-                for publication::ContextInput(_, value) in image
-                    .into_iter()
-                    .flat_map(|image| image.image)
-                    .flat_map(|publication::ContextLayer(_, inputs)| inputs)
+            Self::Link { intent, .. } | Self::Spawned { intent } => {
+                if let Ok(image) = publication::SpawnImage::from_json(intent)
+                    && let Some(root) = image.image.root
                 {
-                    use publication::ContextValue::{
-                        Assistant, Background, Child, Context, Detached, Inbox, Inherited, Into,
-                        Job, Queued, Reply, Taken, ToolCall, ToolResult, User, Withdrawn,
-                    };
-                    match value {
-                        Queued(segments, _) => segment_blobs(&segments, &mut found),
-                        Child(outcome) => outcome_blob(&outcome, &mut found),
-                        Background(_, outcome, held) | ToolResult(_, outcome, held) => {
-                            found.extend(held);
-                            outcome_blob(&outcome, &mut found);
-                        }
-                        Job(_, _, held) => found.extend(held),
-                        Inherited(_) | User(_) | Inbox(..) | Taken(_) | Into(..) | Withdrawn(_)
-                        | Assistant(_) | Context(..) | Detached(_) | Reply(_) | ToolCall(..) => {}
-                    }
+                    found.push(Held::Blob(root));
                 }
             }
             _ => {}
@@ -2528,27 +2511,21 @@ mod tests {
     /// did: the sweep keeps it, and no projection names it on the actor.
     #[test]
     fn a_spawn_image_lists_the_blobs_its_context_holds() {
-        use publication::{ContextInput, ContextLayer, ContextValue, RunnerKind, SpawnImage};
+        use publication::{RunnerKind, SpawnImage};
         let blob = BlobRef {
             id: BlobId([0x5a; 32]),
             size: 1,
             media_type: "text/plain".into(),
             origin: BlobOrigin::ToolOutput(CallId::new(1).unwrap()),
         };
-        let result = ContextValue::ToolResult(
-            CallId::new(1).unwrap(),
-            ToolOutcome::Done {
-                output: Payload::Blob(Box::new(blob.clone())),
-            },
-            Vec::new(),
-        );
         let image = SpawnImage {
             runner: RunnerKind::Agent,
             authority: Json::null(),
-            image: vec![ContextLayer(
-                RunnerKind::Agent,
-                vec![ContextInput(Seq::new(2).unwrap(), result)],
-            )],
+            image: publication::ContextImage {
+                runner: RunnerKind::Agent,
+                root: Some(blob.clone()),
+                publications: publication::Publications::default(),
+            },
         };
         let spawned = Body::Spawned {
             intent: image.to_json().unwrap(),

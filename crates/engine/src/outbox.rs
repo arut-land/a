@@ -123,8 +123,10 @@ impl FrameLog {
                         .blobs()
                         .into_iter()
                         .filter_map(|held| match held {
-                            Held::Blob(blob) => Some(blob.id),
-                            Held::Stream(_) => None,
+                            Held::Blob(blob) if blob.origin != protocol::BlobOrigin::Context => {
+                                Some(blob.id)
+                            }
+                            Held::Blob(_) | Held::Stream(_) => None,
                         }),
                 );
             }
@@ -202,17 +204,6 @@ impl FrameLog {
 
     pub fn entries(&self) -> io::Result<Vec<Entry>> {
         self.entries_after(0)
-    }
-
-    pub async fn read_entries(self: &Arc<Self>, rt: &dyn rt::Runtime) -> io::Result<Vec<Entry>> {
-        let log = Arc::clone(self);
-        rt::try_unblock_with(
-            rt,
-            rt::BlockingClass::Storage,
-            rt::STORAGE_BYTES,
-            move || log.entries(),
-        )
-        .await?
     }
 
     fn batch(&self, next: u64, last: u64) -> io::Result<Vec<u8>> {

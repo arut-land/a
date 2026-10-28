@@ -1783,7 +1783,12 @@ fn a_prefix_child_is_admitted_inside_its_unfinished_owning_turn() {
         panic!("{child:?}")
     };
     let image = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
-    assert!(image.image.iter().flat_map(|layer| &layer.1).any(
+    let places = ext::blob::Places::new(
+        std::sync::Arc::clone(&daemon.shared.blobs),
+        std::sync::Arc::clone(&daemon.shared.tree),
+    );
+    let layers = crate::context::expand(&image.image, &places).unwrap();
+    assert!(layers.iter().flat_map(|layer| &layer.1).any(
         |e| matches!(&e.1, protocol::publication::ContextValue::User(text) if text == "before")
     ));
     assert!(

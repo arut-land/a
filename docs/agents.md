@@ -33,7 +33,7 @@ conversation, and an impossible combination does not compile:
 | Storage | `S = Persisted` keeps an owned child log; `.ephemeral()` (turns only) gives `S = Ephemeral` | persisted |
 | Keyed reuse | `.key(k)` (turns only): a repeated key returns the committed result; a task is its call's, once per purpose | the owning call |
 | Thread | `.per_call()` (turns only) scopes the thread to the owning call | the session |
-| Context | `.owner_context()`: the owner's conversation before the owning call. Turns project it per input; tasks copy it as a prefix image | fresh |
+| Context | `.owner_context()`: the owner's conversation before the owning call. Turns project it per input; tasks freeze an immutable context cut | fresh |
 | Bounds | `.bounds(exchanges, bytes)` (turns only), `.max_tokens(n)`, `.budget(b)`, `.depth(n)` (tasks only) | 8 exchanges, 64 KiB; 4096 tokens, 60 s; depth 8 |
 | Routing | `.fast()`, `.role(ModelRole)`; `.kind(name)` (tasks only) selects another registered agent kind | the session's model; the current kind |
 | Placement | `.placement(Placement::Here)` | here |
@@ -127,26 +127,35 @@ existing positive token limit and duration types; they are not currency caps.
 
 A prefix child inherits the effective conversation through the chosen seq,
 including context edits and skill publications, but does not acquire the
-parent's executable ledger. Copy the prefix into an immutable context image
-owned by the child and record its source identity. Project it through the same
-transcript reducer used for the parent. Never load inherited tool intents,
-process groups, watches or pending actions into the child's kernel. This lets
-a tool fork its current context while its owning turn is unfinished. It is
-separate from the ordinary fork command's rest-point policy. Pending tool
-calls do not become executable work or unmatched provider tool exchanges in
-the child's context. The spawn envelope stores a flat typed `ContextImage`
-separately from frozen execution authority. Flat typed layers own their inputs'
-sequence spaces and runner kinds; explicit anchors refer to other layers.
-Only anchor indices are rebased when images are composed. Positional records
-keep decoding in the protocol crate without field-map visitors. No inherited
-envelope or encoded ledger entry survives composition. These inputs are never
-installed in the child's executable log. Unfinished tool intents and queued
-inputs are excluded, and unmatched provider exchanges
-are removed after projection. Edits beginning at an excluded ledger entry keep
-an inert position for their replacement, preserving summaries without ownership.
-Keeping projection inputs preserves provider state and uses the same reducer for live and recovered context. Effective skill
-publication identities are restored with the image, so an inherited skill is
-not published again merely because its source has a different sequence space.
+parent's executable ledger. Admission freezes a `ContextImage`: a content-store
+root and effective publication identities, separate from execution authority.
+Immutable `ContextNode` segments refer to the preceding local segment and to
+inherited cuts. A new admission writes only the local suffix; ancestor payloads
+are neither flattened into its intent nor read again at admission. Natural model
+result boundaries divide segments. The content store orders their sealed bytes
+before the intent's durable barrier, and a child retains the referenced closure
+independently of the source log's lifetime.
+
+Nodes contain projection inputs and edits in their local sequence space. They
+never contain executable ledgers, tool intents, process groups or watches.
+Nonprojecting entries retain only their positions, so a later edit can still
+replace their range. Reading a cut applies only edits within that cut, excludes
+unfinished queue/tool exchanges, and projects through the same transcript reducer
+as live history. Inherited runner kinds keep model-only input interpretation
+intact. Parent appends, edits and compaction cannot change an admitted cut.
+
+Graph nodes are engine-private content, not fetchable attachments. A client may
+fetch only payloads in its effective inherited projection; knowing a graph hash
+gives no access to stored older/edited-out inputs. A content collector follows
+`ContextNode::blobs` transitively from the roots named by durable admission links and spawn facts.
+The same references retain provider payloads and tool blobs after ancestor-log
+removal. No content collector currently runs during ordinary daemon work.
+
+Effective publication identities travel with the cut for protocol/view reducers,
+so a child does not republish an inherited skill merely because its sequence
+space differs. Context projection for bounded model-only history can stop after
+a sufficient complete local suffix, without materializing unrequested ancestors.
+It continues into older segments whenever queue or tool dependencies require it.
 Extension generation images accompany the prefix; only
 explicitly inheritable state is restored into the child.
 

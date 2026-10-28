@@ -1,6 +1,6 @@
 //! Named model context is recorded with its identity in the same sealed line.
 
-use crate::{Body, CallId, Entry, Json, Mode, Segments, Seq};
+use crate::{BlobRef, Body, CallId, Entry, Json, Mode, Segments, Seq};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -27,8 +27,46 @@ pub struct SpawnImage {
     pub image: ContextImage,
 }
 
-/// Scope indices qualify local sequence numbers without nesting spawn envelopes.
-pub type ContextImage = Vec<ContextLayer>;
+/// An immutable context cut. Payload nodes belong to the daemon's content store.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextImage {
+    pub runner: RunnerKind,
+    pub root: Option<BlobRef>,
+    pub publications: Publications,
+}
+
+/// A newly frozen local segment; preceding segments and inherited cuts stay shared.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContextNode {
+    pub previous: Option<BlobRef>,
+    pub runner: RunnerKind,
+    pub inputs: Vec<ContextInput>,
+    pub inherited: Vec<ContextImage>,
+    pub edits: Vec<(u64, u64, Option<String>)>,
+}
+
+impl ContextNode {
+    pub fn from_json(bytes: &[u8]) -> serde_json::Result<Self> {
+        let node: Self = serde_json::from_slice(bytes)?;
+        let mut position = 0;
+        for ContextInput(seq, value) in &node.inputs {
+            if seq.get() <= position {
+                return Err(serde::de::Error::custom("invalid context position"));
+            }
+            position = seq.get();
+            if let ContextValue::Inherited(child) = value
+                && *child >= node.inherited.len()
+            {
+                return Err(serde::de::Error::custom("invalid inherited cut"));
+            }
+        }
+        Ok(node)
+    }
+
+    pub fn to_json(&self) -> serde_json::Result<Json> {
+        Json::encode(self)
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ContextLayer(pub RunnerKind, pub Vec<ContextInput>);
@@ -39,6 +77,8 @@ pub struct ContextInput(pub Seq, pub ContextValue);
 /// Only projection facts can cross this boundary; no executable ledger is copied.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ContextValue {
+    /// An unprojected position can still be the anchor of a later edit.
+    Position,
     Inherited(usize),
     User(String),
     /// Input waiting to be taken up, as it was given: how a model reads
@@ -69,6 +109,56 @@ pub enum ContextValue {
     ToolResult(CallId, crate::ToolOutcome, Vec<crate::Held>),
 }
 
+impl ContextValue {
+    /// Payload references in a projection fact, excluding engine-private graph edges.
+    pub fn blobs(&self) -> Vec<crate::Held> {
+        let mut found = Vec::new();
+        match self {
+            Self::Queued(segments, _) => crate::segment_blobs(segments, &mut found),
+            Self::Child(outcome) => crate::outcome_blob(outcome, &mut found),
+            Self::Background(_, outcome, held) | Self::ToolResult(_, outcome, held) => {
+                found.extend(held.iter().cloned());
+                crate::outcome_blob(outcome, &mut found);
+            }
+            Self::Job(_, _, held) => found.extend(held.iter().cloned()),
+            Self::Position
+            | Self::Inherited(_)
+            | Self::User(_)
+            | Self::Inbox(..)
+            | Self::Taken(_)
+            | Self::Into(..)
+            | Self::Withdrawn(_)
+            | Self::Assistant(_)
+            | Self::Context(..)
+            | Self::Detached(_)
+            | Self::Reply(_)
+            | Self::ToolCall(..) => {}
+        }
+        found
+    }
+}
+
+impl ContextNode {
+    /// Direct content-store edges; a collector follows context nodes transitively.
+    pub fn blobs(&self) -> Vec<crate::Held> {
+        self.previous
+            .iter()
+            .chain(
+                self.inherited
+                    .iter()
+                    .filter_map(|image| image.root.as_ref()),
+            )
+            .cloned()
+            .map(crate::Held::Blob)
+            .chain(
+                self.inputs
+                    .iter()
+                    .flat_map(|ContextInput(_, value)| value.blobs()),
+            )
+            .collect()
+    }
+}
+
 /// Execution identity belongs to the owner, never to copied audit history.
 #[derive(Clone)]
 pub struct ThreadImage {
@@ -94,25 +184,6 @@ impl SpawnImage {
             authority,
             image,
         };
-        let mut owners = vec![false; image.image.len()];
-        for (scope, ContextLayer(_, inputs)) in image.image.iter().enumerate() {
-            let mut position = 0;
-            for ContextInput(seq, value) in inputs {
-                if seq.get() <= position {
-                    return Err(serde::de::Error::custom("invalid context position"));
-                }
-                position = seq.get();
-                if let ContextValue::Inherited(child) = *value {
-                    if child <= scope || child >= owners.len() || owners[child] {
-                        return Err(serde::de::Error::custom("invalid inherited scope"));
-                    }
-                    owners[child] = true;
-                }
-            }
-        }
-        if owners.iter().skip(1).any(|owned| !owned) {
-            return Err(serde::de::Error::custom("unowned context scope"));
-        }
         Ok(image)
     }
 
@@ -128,18 +199,7 @@ impl Publications {
         {
             self.0.insert(
                 entry.seq.get(),
-                image
-                    .image
-                    .into_iter()
-                    .flat_map(|ContextLayer(_, inputs)| inputs)
-                    .filter_map(|ContextInput(_, value)| {
-                        if let ContextValue::Context(_, publication) = value {
-                            publication
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
+                image.image.publications.0.into_values().flatten().collect(),
             );
         }
         if let Body::Edit { target, upto, .. } = &entry.body {

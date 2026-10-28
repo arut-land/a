@@ -2,6 +2,7 @@
 
 mod catalog;
 pub mod config;
+mod context;
 mod driver;
 mod fetch;
 mod handover;

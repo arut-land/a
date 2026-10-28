@@ -11,7 +11,7 @@ use ext::blob::Places;
 use ext::host::Registry;
 use llm::tag::Part;
 use llm::{Assistant, Message, Messages, Tag, ToolMessage, ToolResult, tag};
-use protocol::publication::{ContextImage, ContextInput, ContextLayer, ContextValue, RunnerKind};
+use protocol::publication::{ContextInput, ContextLayer, ContextValue, RunnerKind};
 use protocol::{
     BlobRef, Body, CallId, Carried, Entry, EnvelopeId, Held, Mode, Outcome, OutputStream, Payload,
     Segment, Segments, Seq, ToolOutcome, Verdict,
@@ -20,6 +20,8 @@ use protocol::{
 /// Provider replies remain intact; live updates and recovery share projection rules.
 pub struct Transcript {
     messages: Messages,
+    fault: Option<io::Error>,
+    context_exchanges: Option<u16>,
     resident: llm::Resident,
     model_only: bool,
     /// Where the next context message goes: after the system prompt and
@@ -117,7 +119,7 @@ fn inbox_text(id: &EnvelopeId, text: &str) -> String {
     .to_string()
 }
 
-fn context_fact(body: &Body) -> Option<ContextValue> {
+pub(super) fn context_fact(body: &Body) -> Option<ContextValue> {
     Some(match body {
         Body::Input {
             segments,
@@ -295,7 +297,7 @@ impl Transcript {
         registry: Arc<Registry>,
         system: &str,
         places: &Places,
-    ) -> Self {
+    ) -> io::Result<Self> {
         Self::replay(
             |each| {
                 for entry in entries {
@@ -307,15 +309,24 @@ impl Transcript {
             system,
             places,
         )
-        .expect("in-memory transcript replay cannot fail")
     }
 
     /// Replays a stable history twice, retaining edits and background call identities between passes.
     pub(super) fn replay(
+        entries: impl FnMut(&mut dyn FnMut(&Entry)) -> io::Result<()>,
+        registry: Arc<Registry>,
+        system: &str,
+        places: &Places,
+    ) -> io::Result<Self> {
+        Self::replay_bounded(entries, registry, system, places, None)
+    }
+
+    pub(super) fn replay_bounded(
         mut entries: impl FnMut(&mut dyn FnMut(&Entry)) -> io::Result<()>,
         registry: Arc<Registry>,
         system: &str,
         places: &Places,
+        context_exchanges: Option<u16>,
     ) -> io::Result<Self> {
         let mut edits = Vec::new();
         let mut background = HashSet::new();
@@ -345,6 +356,7 @@ impl Transcript {
         })?;
         let edits = Edits::new(edits);
         let mut transcript = Self::empty(registry, system, places);
+        transcript.context_exchanges = context_exchanges;
         entries(&mut |entry| {
             transcript.through = entry.seq.get();
             match edits.at(entry.seq) {
@@ -367,6 +379,9 @@ impl Transcript {
                 }
             }
         })?;
+        if let Some(error) = transcript.fault.take() {
+            return Err(error);
+        }
         Ok(transcript)
     }
 
@@ -375,6 +390,8 @@ impl Transcript {
         Self {
             context: messages.len(),
             messages,
+            fault: None,
+            context_exchanges: None,
             resident: llm::Resident::default(),
             model_only: false,
             calls: HashMap::new(),
@@ -402,8 +419,20 @@ impl Transcript {
         if let Body::Spawned { intent } = &e.body {
             if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
                 self.model_only = image.runner == RunnerKind::ModelOnly;
-                let messages = project(image.image, Arc::clone(&self.registry), "", &self.places)
-                    .into_context();
+                let layers = match self.context_exchanges.map_or_else(
+                    || crate::context::expand(&image.image, &self.places),
+                    |exchanges| {
+                        crate::context::expand_bounded(&image.image, &self.places, exchanges)
+                    },
+                ) {
+                    Ok(layers) => layers,
+                    Err(error) => {
+                        self.fault = Some(error);
+                        return false;
+                    }
+                };
+                let messages =
+                    project(layers, Arc::clone(&self.registry), "", &self.places).into_context();
                 self.inherit(&messages, e.seq);
             }
         } else if let Body::ToolProcess {
@@ -500,7 +529,7 @@ impl Transcript {
             ContextValue::ToolResult(call, outcome, held) => {
                 return self.answer(seq, call, &outcome, &held);
             }
-            ContextValue::Inherited(_) => return,
+            ContextValue::Inherited(_) | ContextValue::Position => return,
         };
         self.messages.push(message);
         self.last = seq.get();
@@ -760,7 +789,7 @@ impl Transcript {
     }
 }
 
-fn context_edit(entry: &Entry) -> Option<(u64, u64, Option<String>)> {
+pub(super) fn context_edit(entry: &Entry) -> Option<(u64, u64, Option<String>)> {
     match &entry.body {
         Body::Edit {
             target,
@@ -786,13 +815,13 @@ fn context_edits(
 }
 
 /// Disjoint intervals select the latest edit, including edits of edit entries.
-struct Edits {
+pub(super) struct Edits {
     edits: Vec<(u64, u64, Option<String>)>,
     spans: BTreeMap<u64, Option<usize>>,
 }
 
 impl Edits {
-    fn new(edits: Vec<(u64, u64, Option<String>)>) -> Self {
+    pub(super) fn new(edits: Vec<(u64, u64, Option<String>)>) -> Self {
         let mut events = BTreeMap::<u64, Vec<(usize, bool)>>::new();
         for (index, (from, to, _)) in edits.iter().enumerate() {
             if from > to {
@@ -818,7 +847,7 @@ impl Edits {
         Self { edits, spans }
     }
 
-    fn at(&self, seq: Seq) -> Option<(u64, &Option<String>)> {
+    pub(super) fn at(&self, seq: Seq) -> Option<(u64, &Option<String>)> {
         let index = self.spans.range(..=seq.get()).next_back()?.1.as_ref()?;
         let (from, _, text) = &self.edits[*index];
         Some((*from, text))
@@ -826,7 +855,8 @@ impl Edits {
 }
 
 /// Edits stay in their owning layer; only inherited anchors are rebased.
-pub(crate) fn context_image(entries: &[Entry]) -> ContextImage {
+#[cfg(test)]
+pub(crate) fn context_image(entries: &[Entry]) -> Vec<ContextLayer> {
     let edits = Edits::new(entries.iter().filter_map(context_edit).collect());
     let completed = entries
         .iter()
@@ -847,22 +877,24 @@ pub(crate) fn context_image(entries: &[Entry]) -> ContextImage {
             };
             ContextValue::User(text.clone())
         } else if let Body::Spawned { intent } = &e.body {
-            let Ok(mut spawn) = protocol::publication::SpawnImage::from_json(intent) else {
+            let Ok(spawn) = protocol::publication::SpawnImage::from_json(intent) else {
                 continue;
             };
             image[0].0 = spawn.runner;
+            let mut inherited =
+                crate::context::expand(&spawn.image, &crate::context::test_places()).unwrap();
             let offset = image.len();
-            if spawn.image.is_empty() {
+            if inherited.is_empty() {
                 image.push(ContextLayer::default());
             } else {
-                for ContextLayer(_, inputs) in &mut spawn.image {
+                for ContextLayer(_, inputs) in &mut inherited {
                     for ContextInput(_, value) in inputs {
                         if let ContextValue::Inherited(scope) = value {
                             *scope += offset;
                         }
                     }
                 }
-                image.extend(spawn.image);
+                image.extend(inherited);
             }
             ContextValue::Inherited(offset)
         } else {
@@ -889,7 +921,7 @@ pub(crate) fn context_image(entries: &[Entry]) -> ContextImage {
 }
 
 fn project(
-    image: ContextImage,
+    image: Vec<ContextLayer>,
     registry: Arc<Registry>,
     system: &str,
     places: &Places,

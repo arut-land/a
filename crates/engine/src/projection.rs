@@ -33,7 +33,7 @@ impl super::Shared {
         // log holds as a blob is read back from the store.
         let blobs = ext::blob::Blobs::new(Arc::clone(&self.blobs), Arc::clone(&self.tree), owner);
         let places = blobs.places();
-        Ok(Transcript::placed(&entries, Arc::clone(&registry), system, &places).into_messages())
+        Ok(Transcript::placed(&entries, Arc::clone(&registry), system, &places)?.into_messages())
     }
 }
 
@@ -316,7 +316,7 @@ impl Actor {
                 .as_mut()
                 .is_some_and(|transcript| {
                     transcript.through() + 1 == e.seq.get()
-                        && e.body.blobs().is_empty()
+                        && (matches!(e.body, Body::Link { .. }) || e.body.blobs().is_empty())
                         && !transcript.apply(e, replied.map(|(_, m)| m))
                 })
             {
@@ -445,25 +445,6 @@ impl Actor {
         frame
     }
 
-    pub(super) async fn canonical_conversation(
-        &mut self,
-        call: CallId,
-    ) -> io::Result<llm::Messages> {
-        let conversation = self.conversation(call).await?;
-        rt::try_unblock_with(
-            &*self.live.session.shared.rt,
-            Cpu,
-            rt::STORAGE_BYTES,
-            move || {
-                conversation
-                    .canonical()
-                    .map(std::borrow::Cow::into_owned)
-                    .map_err(io::Error::other)
-            },
-        )
-        .await?
-    }
-
     fn canonical_source(
         &self,
         call: CallId,
@@ -474,9 +455,35 @@ impl Actor {
             self.pending_entries().collect(),
             self.live.session.blobs.places(),
             self.live.session.model_only(),
-            self.journal.ordered_seq,
-            call,
+            HistoryCut {
+                through: self.journal.ordered_seq,
+                call,
+                exchanges: None,
+            },
         )
+    }
+
+    pub(super) async fn bounded_history(
+        &mut self,
+        call: CallId,
+        exchanges: u16,
+    ) -> io::Result<llm::Messages> {
+        let restore = history_reader(
+            Arc::clone(&self.live.frames),
+            &self.registry,
+            self.pending_entries().collect(),
+            self.live.session.blobs.places(),
+            self.live.session.model_only(),
+            HistoryCut {
+                through: self.journal.ordered_seq,
+                call,
+                exchanges: Some(exchanges),
+            },
+        );
+        rt::unblock(&*self.live.session.shared.rt, move || {
+            restore().map_err(io::Error::other)
+        })
+        .await
     }
 
     /// The conversation the model sees before entry `call`, extended on a CPU worker.
@@ -581,15 +588,26 @@ impl Actor {
     }
 }
 
+#[derive(Clone, Copy)]
+struct HistoryCut {
+    through: u64,
+    call: CallId,
+    exchanges: Option<u16>,
+}
+
 fn history_reader(
     source_frames: Arc<super::FrameLog>,
     registry: &Arc<ext::host::Registry>,
     source_pending: Vec<Entry>,
     source_places: ext::blob::Places,
     model_only: bool,
-    source_through: u64,
-    call: CallId,
+    cut: HistoryCut,
 ) -> Arc<dyn Fn() -> Result<llm::Messages, llm::Error> + Send + Sync> {
+    let HistoryCut {
+        through: source_through,
+        call,
+        exchanges: context_exchanges,
+    } = cut;
     let source_committed = source_frames.seq();
     let source_registry = Arc::downgrade(registry);
     Arc::new(move || {
@@ -599,7 +617,7 @@ fn history_reader(
                 "canonical history's registry generation has retired",
             )
         })?;
-        Transcript::replay(
+        Transcript::replay_bounded(
             |each| {
                 'history: for batch in source_frames.batches_after(0) {
                     for entry in batch? {
@@ -630,6 +648,7 @@ fn history_reader(
                 source_registry.system_prompt()
             },
             &source_places,
+            context_exchanges,
         )
         .map(Transcript::into_messages)
         .map_err(|error| llm::Error::new(llm::Kind::Other, error.to_string()))
@@ -681,8 +700,11 @@ mod tests {
             pending.to_vec(),
             ext::blob::Places::default(),
             true,
-            pending[0].seq.get(),
-            CallId::new(pending[0].seq.get() + 1).unwrap(),
+            HistoryCut {
+                through: pending[0].seq.get(),
+                call: CallId::new(pending[0].seq.get() + 1).unwrap(),
+                exchanges: None,
+            },
         );
         let before = reader().unwrap();
         assert!(Json::encode(&before).unwrap().raw().contains("pending"));
