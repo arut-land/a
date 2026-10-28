@@ -5,6 +5,7 @@ on:
     paths: ['.github/workflows/win-reap.yml']
 jobs:
   reproduce:
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -54,3 +55,44 @@ jobs:
           }
           Write-Output "RESULT $profile failures=$failures"
           }
+
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - run: |
+          git config --global core.autocrlf false
+          "CARGO_TARGET_DIR=$env:RUNNER_TEMP/win-reap-target" >> $env:GITHUB_ENV
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/win-reap-target
+          key: win-reap-native-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Install native Rust
+        run: |
+          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches.Groups[1].Value
+          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+          $toolchain = "$channel-$arch-pc-windows-msvc"
+          "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+          rustup toolchain install $toolchain --profile minimal --component rust-src
+      - name: Native termination regression
+        run: |
+          cargo test --release -p sys --lib --no-run --message-format=json | Tee-Object "$env:RUNNER_TEMP/native.jsonl"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $records = Get-Content "$env:RUNNER_TEMP/native.jsonl" | ForEach-Object { $_ | ConvertFrom-Json }
+          $exe = ($records | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'sys' -and $_.executable }).executable
+          $failures = 0
+          for ($i = 1; $i -le 100; $i++) {
+            & $exe --exact proc::imp::tests::termination_retains_watches_for_members_still_exiting --nocapture
+            if ($LASTEXITCODE) { $failures++ }
+          }
+          Write-Output "NATIVE failures=$failures"

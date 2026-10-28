@@ -307,8 +307,8 @@ pub fn group_alive(_id: u32) -> bool {
 }
 
 pub(super) fn terminate_group(job: &OwnedHandle) -> io::Result<()> {
-    // SAFETY: the borrowed job remains owned throughout termination.
     trace(format_args!("terminate begin"));
+    // SAFETY: the borrowed job remains owned throughout termination.
     let result = ok(unsafe { TerminateJobObject(job.as_raw_handle(), 1) });
     trace(format_args!("terminate end {result:?}"));
     result
@@ -701,6 +701,40 @@ mod tests {
             let status = unsafe { WaitForSingleObject(watch.as_raw_handle(), 5000) };
             assert_eq!(status, 0);
         }
+    }
+
+    #[test]
+    fn termination_retains_watches_for_members_still_exiting() {
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/C", "ping -n 60 127.0.0.1 >NUL"])
+            .envs(std::env::vars_os());
+        let mut child = spawn_group(&mut command,
+            File::options().write(true).open("NUL").unwrap()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let before = loop {
+            let watches = child.group.exit_watches().unwrap();
+            if watches.len() >= 2 { break watches; }
+            assert!(std::time::Instant::now() < deadline, "shell never launched its child");
+            std::thread::yield_now();
+        };
+        let started = std::time::Instant::now();
+        child.group.signal(Signal::Kill).unwrap();
+        let terminated = started.elapsed();
+        let after = child.group.exit_watches().unwrap();
+        let observed = started.elapsed();
+        let pending = before.iter().filter(|process| {
+            // SAFETY: each owned process handle includes synchronization rights.
+            unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } == WAIT_TIMEOUT
+        }).count();
+        let lost = after.is_empty() && pending != 0;
+        eprintln!("WIN_REAP native terminated={terminated:?} observed={observed:?} watches={} pending={pending}", after.len());
+        for process in before {
+            // SAFETY: only waits on handles retained for this test's own children.
+            assert_eq!(unsafe { WaitForSingleObject(process.as_raw_handle(), 5000) }, 0);
+        }
+        child.wait().unwrap();
+        assert!(!lost, "terminated job lost every watch while {pending} members were still exiting");
     }
 
     #[test]
